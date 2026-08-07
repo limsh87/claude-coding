@@ -13,7 +13,7 @@ def offer_download(paths: Sequence[str]):
         try:
             from google.colab import files as _f       # type: ignore
             for p in paths:
-                print(f"⬇  다운로드 시작: {os.path.basename(p)}")
+                _safe_print(f"⬇  다운로드 시작: {os.path.basename(p)}")
                 _f.download(p)
             return
         except Exception:
@@ -39,7 +39,7 @@ def offer_download(paths: Sequence[str]):
         display(HTML("".join(html)))
     except Exception:
         for p in paths:
-            print(f"⬇  산출물 경로: {p}")
+            _safe_print(f"⬇  산출물 경로: {p}")
 
 
 def collect_all(months: pd.DatetimeIndex) -> dict:
@@ -65,8 +65,23 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.DART", "DART 재무 · 직원 · 공시", "L1", budget_s=1800, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
-        fs = fetch_dart_financials(corps, years)
-        fin = tidy_financials(fs)
+        # 유동성 상위 종목의 corp_code 를 우선순위로 넘긴다 — 일일 한도로 끊겨도
+        # '투자 가능한 종목의 최근 데이터'가 먼저 완성되게 하기 위함이다.
+        prio: List[str] = []
+        try:
+            pm = ctx["panel"]["monthly"]
+            adv = (pm.groupby("code", observed=True)["adv20"].median()
+                     .sort_values(ascending=False))
+            c2c = (ctx["sec"].dropna(subset=["corp_code"])
+                             .set_index("code")["corp_code"].astype(str).to_dict())
+            prio = [c2c[c] for c in adv.index if c in c2c]
+        except Exception:
+            prio = []
+        # Tier-1: 주요계정 배치 (100사/호출) → 전 종목 헤드라인을 싸게 확보
+        multi = fetch_dart_multi_accounts(corps, years)
+        # Tier-2: 전체 재무제표 (우선순위·최근연도부터) → B/C축이 필요로 하는 상세 계정
+        fs = fetch_dart_financials(corps, years, priority=prio)
+        fin = tidy_financials(merge_financial_tiers(fs, multi))
         emp = fetch_dart_employees(corps, years)
         dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         ctx["fin"], ctx["emp"], ctx["disclosures"] = fin, emp, dis
@@ -204,6 +219,11 @@ def main() -> dict:
         if not run_selftest(full_chain=(RUN_MODE == "SMOKE")):
             raise RuntimeError("스모크 테스트 실패 — 실데이터 수집을 시작하지 않습니다.")
 
+    # ★ 스모크는 '계산경로'를, 리허설은 '수집경로'를 증명한다. 둘은 겹치지 않는다.
+    #   합성 스모크만 믿었다가 수집부 한 줄 때문에 실행 2분 만에 죽은 전례가 있다.
+    with PIPE.stage("L0.REHEARSAL", "실경로 리허설 (수집 함수 실물 실행)", "L0", budget_s=600):
+        run_rehearsal(strict=True)
+
     months = month_range(BACKTEST_START, BACKTEST_END)
     if RUN_MODE == "SMOKE":
         LOG.ok("RUN_MODE='SMOKE' — 합성데이터로 전 출력물(백테스트·성과·강건성·해석표)을 "
@@ -294,7 +314,7 @@ if __name__ == "__main__" or ENV["ipython"]:
         RESULT = main()
     except KillCriteria as e:
         LOG.banner("⛔ 킬 기준으로 중단", "§15 — 파라미터를 조정해 통과시키지 마십시오")
-        print(f"  {e}")
+        _safe_print(f"  {e}")
         PIPE.report_stages(); PIPE.report_runtime()
         try:
             report_robustness()
@@ -302,7 +322,7 @@ if __name__ == "__main__" or ENV["ipython"]:
             pass
     except StageFailure as e:
         LOG.banner("실행 중단", "위의 '실패 지점' 상세와 아래 표에서 원인을 확인하세요")
-        print(f"  {e}")
+        _safe_print(f"  {e}")
         PIPE.report_stages(); PIPE.report_flow(); PIPE.report_runtime()
     except KeyboardInterrupt:
         LOG.warn("사용자 중단. 여기까지 수집된 데이터는 드라이브에 저장되어 있으며 "

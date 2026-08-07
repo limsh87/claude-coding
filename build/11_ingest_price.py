@@ -179,19 +179,28 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if not isinstance(arr, list) or len(arr) < 2:
         return None
     hdr = [str(x).strip().lower() for x in arr[0]]
-    rows = arr[1:]
+    rows = [r for r in arr[1:] if isinstance(r, (list, tuple)) and len(r) == len(hdr)]
+    if not rows:
+        return None
     d = pd.DataFrame(rows, columns=hdr)
+    # ★ 이 rename 이 오랫동안 아무 일도 하지 않고 있었다.
+    #   {**ren, **{c: c for c in d.columns}} 는 두 번째 dict 가 첫 번째를 덮어써서
+    #   '날짜'→'날짜' 가 '날짜'→'date' 를 이긴다. 결과적으로 컬럼명이 한글로 남고
+    #   d.get("close") 가 None 이 되어 None*None TypeError 로 죽는다.
+    #   (pykrx/FDR 이 둘 다 없는 환경에서만 드러나므로 오래 숨어 있었다)
     ren = {"날짜": "date", "시가": "open", "고가": "high", "저가": "low",
-           "종가": "close", "거래량": "volume"}
-    d = d.rename(columns={**ren, **{c: c for c in d.columns}})
+           "종가": "close", "거래량": "volume", "외국인소진율": "foreign_ratio"}
+    d = d.rename(columns=ren)
     if "date" not in d.columns:
         d = d.rename(columns={d.columns[0]: "date"})
     for c in ("open", "high", "low", "close", "volume"):
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
-    d["amount"] = d.get("close") * d.get("volume")
+        if c not in d.columns:
+            d[c] = np.nan
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["amount"] = d["close"] * d["volume"]          # 네이버는 거래대금을 안 준다 → 근사(감사표에 명시)
     d["code"], d["src"] = code, "naver"
-    return d.reindex(columns=PRICE_COLS)
+    d = d.dropna(subset=["close"])
+    return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -278,8 +287,19 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
-        raise RuntimeError("가격 데이터를 하나도 확보하지 못했습니다. 네트워크와 패키지를 확인하거나 "
-                           "RUN_MODE='SMOKE' 로 계산경로만 먼저 검증하세요.")
+        avail = [nm for nm, _fn in PRICE_CHAIN
+                 if (nm != "pykrx" or pykrx_stock is not None)
+                 and (nm != "fdr" or fdr is not None)
+                 and (nm != "yfinance" or yf is not None)]
+        raise RuntimeError(
+            "가격 데이터를 한 종목도 확보하지 못했습니다.\n"
+            f"  · 시도한 소스 체인 : {', '.join(nm for nm, _ in PRICE_CHAIN)}\n"
+            f"  · 이번 실행에서 사용 가능했던 소스 : {', '.join(avail) or '없음'}\n"
+            f"  · 대상 종목 {len(codes):,}개 / 신규 수집 시도 {len(todo):,}개\n"
+            "  진단: ① 네트워크에서 fchart.stock.naver.com 접근이 되는지\n"
+            "        ② FinanceDataReader / pykrx 가 설치돼 있는지\n"
+            "        ③ 드라이브 캐시(krx_ohlcv_daily)가 비어 있지 않은지\n"
+            "  임시 우회: RUN_MODE='SMOKE' 로 두면 네트워크 없이 계산경로만 검증할 수 있습니다.")
     px = pd.concat(frames, ignore_index=True)
     px["date"] = as_ts_series(px["date"])
     px["code"] = px["code"].map(to_code6)

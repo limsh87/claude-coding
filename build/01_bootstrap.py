@@ -18,6 +18,52 @@ warnings.filterwarnings("ignore")
 os.environ.setdefault("PYTHONWARNINGS", "ignore")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# ★ 윈도우 콘솔 기본 인코딩(cp949)은 이 코드가 쓰는 罫線문자(╔═║)와 ✔✘⚠★ 를 인코딩하지 못한다.
+#   주피터는 UTF-8 이라 괜찮지만 `python 파일.py` 로 돌리면 첫 배너에서 UnicodeEncodeError 로
+#   즉사한다. 가능하면 표준출력을 UTF-8 로 바꾸고, 안 되면 아래 _safe_print 가 ASCII 로 낮춘다.
+for _s in ("stdout", "stderr"):
+    try:
+        _st = getattr(sys, _s, None)
+        if _st is not None and hasattr(_st, "reconfigure"):
+            _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def _console_ok(sample: str = "╔✔⚠★─") -> bool:
+    enc = (getattr(sys.stdout, "encoding", None) or "utf-8")
+    try:
+        sample.encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+CONSOLE_UNICODE = _console_ok()
+# 인코딩이 안 되는 콘솔용 치환표 (표 모양은 잃되 정보는 전부 보존한다)
+_ASCII_FALLBACK = str.maketrans({
+    "╔": "+", "╗": "+", "╚": "+", "╝": "+", "═": "=", "║": "|",
+    "┌": "+", "┐": "+", "└": "+", "┘": "+", "─": "-", "│": "|",
+    "┼": "+", "┬": "+", "┴": "+", "├": "+", "┤": "+",
+    "✔": "OK", "✘": "X", "⚠": "!", "★": "*", "▶": ">", "▷": ">",
+    "⬇": "v", "…": "...", "·": ".", "×": "x", "σ": "sigma", "θ": "theta",
+    "Δ": "d", "≥": ">=", "≤": "<=", "≈": "~", "①": "(1)", "②": "(2)",
+    "③": "(3)", "④": "(4)", "⑤": "(5)", "⑥": "(6)", "⑦": "(7)",
+    "⑧": "(8)", "⑨": "(9)", "⑩": "(10)", "⭐": "*", "⛔": "STOP", "∏": "prod",
+})
+
+
+def _safe_print(*args, **kw):
+    """어떤 콘솔에서도 죽지 않는 print. 인코딩 실패 시에만 ASCII 로 낮춘다."""
+    try:
+        print(*args, **kw)
+    except UnicodeEncodeError:
+        try:
+            print(*[str(a).translate(_ASCII_FALLBACK) for a in args], **kw)
+        except Exception:
+            enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+            print(*[str(a).encode(enc, "replace").decode(enc, "replace") for a in args], **kw)
+
 
 def _detect_env() -> Dict[str, Any]:
     """Colab / JupyterLab / VSCode / 순수 CLI 를 구분한다. 어느 쪽이든 죽지 않아야 한다."""
@@ -112,15 +158,22 @@ def _ensure_deps() -> Dict[str, bool]:
         _pip_install(missing_opt)          # 실패해도 계속 — 각 기능에서 개별적으로 degrade
         importlib.invalidate_caches()
 
-    avail = {}
-    for mod, _pkg, _why in _OPTIONAL:
-        try:
-            importlib.import_module(mod)
-            avail[mod] = True
-        except Exception:
-            avail[mod] = False
-    return avail
+    # ★ 가용성 확인을 import_module 로 하면 안 된다. pykrx 는 import 시점에 KRX 로그인을 수행하는데,
+    #   그게 아래 자격증명 주입보다 먼저 일어나면 비인증 세션이 만들어지고, 이후 모든 조회가
+    #   JSON 대신 로그인 HTML 을 받아 엉뚱한 곳에서 JSONDecodeError 로 터진다.
+    #   find_spec 은 모듈을 실행하지 않으므로 부작용이 없다. 실제 import 는 아래 통제된 블록에서만.
+    return {mod: (importlib.util.find_spec(mod) is not None) for mod, _pkg, _why in _OPTIONAL}
 
+
+# ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
+#   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
+#   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
+if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
+    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
+if KRX_OPENAPI_KEY:
+    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
+    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
 
 OPT = _ensure_deps()
 
@@ -146,18 +199,7 @@ random.seed(SEED)
 np.random.seed(SEED % (2 ** 32 - 1))
 RNG = np.random.default_rng(SEED)
 
-# ★★ pykrx 는 '모듈 임포트 시점'에 KRX 로그인을 수행한다(webio.build_krx_session).
-#    따라서 자격증명을 환경변수로 심는 일은 반드시 import 보다 먼저 와야 한다.
-#    순서를 뒤집으면 예외 없이 '비인증 세션'이 만들어지고, 나중에 JSON 대신 로그인 HTML 을
-#    받아 pandas 깊은 곳에서 JSONDecodeError 가 터진다 — 원인 추적이 매우 어려운 실패다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
-    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
-    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
-if KRX_OPENAPI_KEY:
-    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
-    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
-
-# 선택 모듈 핸들
+# 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
 if OPT.get("FinanceDataReader"):
     try:

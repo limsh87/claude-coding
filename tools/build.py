@@ -26,7 +26,8 @@ CORE_MID = ["20_pit.py", "21_axes.py", "29_pack_registry.py"]
 PACK_FILES = {"C": "p_c_capital.py", "N": "p_n_employment.py", "D": "p_d_text.py",
               "X": "p_x_customs.py", "P": "p_p_procurement.py"}
 CORE_POST = ["30_policy.py", "40_score.py", "41_backtest.py", "50_robust.py",
-             "60_report.py", "70_contracts.py", "80_selftest.py", "90_main.py"]
+             "60_report.py", "70_contracts.py", "75_rehearsal.py", "80_selftest.py",
+             "90_main.py"]
 
 STRATEGIES = [
     dict(sid="PACK_C", fname="tcd_v2_01_pack_c_capital.py", packs=["C"],

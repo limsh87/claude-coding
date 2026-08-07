@@ -58,13 +58,19 @@ CUSTOMS_API_KEY = ""
 
 # ── ④ KRX 데이터 마켓플레이스 (2025-12 인증 방식 변경 대응) ─────────────────────────────────
 #    가입: https://data.krx.co.kr  →  회원가입(무료) → 로그인 정보 입력
-#    ▶ 2025년 12월부터 KRX가 인증을 요구하면서 pykrx 경로가 불안정해졌습니다.
-#      아래를 채우면 KRX 정식 경로를 1순위로 씁니다.
-#      비워두면 자동으로 FinanceDataReader → 네이버 → yfinance → 캐시 순으로 폴백합니다.
-#      (폴백해도 백테스트는 정상 동작합니다. 어떤 소스가 쓰였는지 로그에 표로 나옵니다)
+#
+#    ▶ 비워두셔도 됩니다. 유니버스의 정확성은 상장일·폐지일(FDR/KIND)만으로 성립하도록
+#      설계되어 있고, KRX 스냅샷은 '검증·보강'일 뿐입니다. 비우면 그 단계만 건너뜁니다.
+#
+#    ⚠ 같은 계정을 브라우저나 다른 노트북에서 동시에 로그인해 두지 마세요.
+#      KRX는 중복 로그인 시 이전 세션을 강제 종료합니다(CD011). 그러면 실행 중인 수집이
+#      JSON 대신 로그인 HTML을 받아 대량 실패합니다.
+#      (이 코드는 로그인을 메인 스레드에서 1회만 하고 모든 호출을 직렬화해 스스로
+#       충돌하지 않지만, '바깥에서' 같은 계정을 쓰는 것까지는 막을 수 없습니다)
 KRX_MARKETPLACE_ID = ""
 KRX_MARKETPLACE_PW = ""
-KRX_OPENAPI_KEY    = ""   # (선택) KRX Open API 인증키를 별도 발급받았다면 여기에
+KRX_OPENAPI_KEY    = ""   # (선택) KRX Open API 인증키. 단, 엔드포인트별 '이용신청'이 따로
+                          #        필요하고 승인에 하루 정도 걸립니다. 키만으론 즉시 안 됩니다.
 
 # ── ⑤ 구글드라이브 캐시 ─────────────────────────────────────────────────────────────────────
 #    ★★★ 절대 원칙: 이 코드는 기존 캐시를 절대 삭제·덮어쓰기하지 않습니다. ★★★
@@ -132,10 +138,18 @@ ACCOUNT_KRW             = 30_000_000   # 소액계좌 가정 (최소주문/유�
 MIN_ADV_KRW             = 300_000_000  # V6 유동성 하한: 20일 평균거래대금
 
 # ── ⑩ 실행 모드 ─────────────────────────────────────────────────────────────────────────────
-#    "SMOKE" : 합성데이터로 전체 경로만 검증 (수 초). 네트워크/키 불필요.
-#    "FULL"  : 스모크 → 실데이터 수집 → 전체 백테스트 → 강건성 (권장)
-#    "CACHED": 스모크 → 드라이브 캐시만 사용(신규 수집 안 함) → 전체 백테스트
+#    "SMOKE" : 합성데이터로 전체 출력물을 예행연습 (수십 초). 네트워크/키 불필요.
+#              백테스트·성과·강건성·해석표·진단카드가 전부 나옵니다. 처음엔 이걸로 한 번.
+#    "FULL"  : 스모크 → 실경로 리허설 → 실데이터 수집 → 백테스트 → 강건성 (권장)
+#    "CACHED": 스모크 → 리허설 → 드라이브 캐시만 사용(신규 수집 안 함) → 백테스트
 RUN_MODE = "FULL"
+
+#    실행 전에 자동으로 도는 3중 검증 (전부 통과해야 실데이터 수집을 시작합니다):
+#      ① 계약 자동검정 C1~C12  — PIT·생존자편향·거부권 등 협상 불가 규칙
+#      ② 합성 스모크          — 피처→스코어→백테스트 '계산경로'
+#      ③ 실경로 리허설        — 네트워크만 가짜로 두고 '수집·정제 함수'를 실물 실행
+#    ③이 없던 빌드가 ①②를 다 통과하고도 실행 2분 만에 수집부 한 줄 때문에 죽은 적이 있어
+#    추가되었습니다. 세 검증은 서로 다른 것을 봅니다.
 
 SEED = 20260807          # C8 결정성: 모든 난수는 이 시드에서 파생
 VERBOSE = True
@@ -148,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_N"
 STRATEGY_NAME      = "PACK-N 국민연금 고용"
 ACTIVE_PACKS       = ["N"]
-BUILD_VERSION      = "v2.20260807.1108"
+BUILD_VERSION      = "v2.20260807.1153"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -169,6 +183,52 @@ from urllib.parse import urlencode, urljoin, quote, unquote, urlparse, parse_qs
 warnings.filterwarnings("ignore")
 os.environ.setdefault("PYTHONWARNINGS", "ignore")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# ★ 윈도우 콘솔 기본 인코딩(cp949)은 이 코드가 쓰는 罫線문자(╔═║)와 ✔✘⚠★ 를 인코딩하지 못한다.
+#   주피터는 UTF-8 이라 괜찮지만 `python 파일.py` 로 돌리면 첫 배너에서 UnicodeEncodeError 로
+#   즉사한다. 가능하면 표준출력을 UTF-8 로 바꾸고, 안 되면 아래 _safe_print 가 ASCII 로 낮춘다.
+for _s in ("stdout", "stderr"):
+    try:
+        _st = getattr(sys, _s, None)
+        if _st is not None and hasattr(_st, "reconfigure"):
+            _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def _console_ok(sample: str = "╔✔⚠★─") -> bool:
+    enc = (getattr(sys.stdout, "encoding", None) or "utf-8")
+    try:
+        sample.encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+CONSOLE_UNICODE = _console_ok()
+# 인코딩이 안 되는 콘솔용 치환표 (표 모양은 잃되 정보는 전부 보존한다)
+_ASCII_FALLBACK = str.maketrans({
+    "╔": "+", "╗": "+", "╚": "+", "╝": "+", "═": "=", "║": "|",
+    "┌": "+", "┐": "+", "└": "+", "┘": "+", "─": "-", "│": "|",
+    "┼": "+", "┬": "+", "┴": "+", "├": "+", "┤": "+",
+    "✔": "OK", "✘": "X", "⚠": "!", "★": "*", "▶": ">", "▷": ">",
+    "⬇": "v", "…": "...", "·": ".", "×": "x", "σ": "sigma", "θ": "theta",
+    "Δ": "d", "≥": ">=", "≤": "<=", "≈": "~", "①": "(1)", "②": "(2)",
+    "③": "(3)", "④": "(4)", "⑤": "(5)", "⑥": "(6)", "⑦": "(7)",
+    "⑧": "(8)", "⑨": "(9)", "⑩": "(10)", "⭐": "*", "⛔": "STOP", "∏": "prod",
+})
+
+
+def _safe_print(*args, **kw):
+    """어떤 콘솔에서도 죽지 않는 print. 인코딩 실패 시에만 ASCII 로 낮춘다."""
+    try:
+        print(*args, **kw)
+    except UnicodeEncodeError:
+        try:
+            print(*[str(a).translate(_ASCII_FALLBACK) for a in args], **kw)
+        except Exception:
+            enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+            print(*[str(a).encode(enc, "replace").decode(enc, "replace") for a in args], **kw)
 
 
 def _detect_env() -> Dict[str, Any]:
@@ -264,15 +324,22 @@ def _ensure_deps() -> Dict[str, bool]:
         _pip_install(missing_opt)          # 실패해도 계속 — 각 기능에서 개별적으로 degrade
         importlib.invalidate_caches()
 
-    avail = {}
-    for mod, _pkg, _why in _OPTIONAL:
-        try:
-            importlib.import_module(mod)
-            avail[mod] = True
-        except Exception:
-            avail[mod] = False
-    return avail
+    # ★ 가용성 확인을 import_module 로 하면 안 된다. pykrx 는 import 시점에 KRX 로그인을 수행하는데,
+    #   그게 아래 자격증명 주입보다 먼저 일어나면 비인증 세션이 만들어지고, 이후 모든 조회가
+    #   JSON 대신 로그인 HTML 을 받아 엉뚱한 곳에서 JSONDecodeError 로 터진다.
+    #   find_spec 은 모듈을 실행하지 않으므로 부작용이 없다. 실제 import 는 아래 통제된 블록에서만.
+    return {mod: (importlib.util.find_spec(mod) is not None) for mod, _pkg, _why in _OPTIONAL}
 
+
+# ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
+#   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
+#   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
+if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
+    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
+if KRX_OPENAPI_KEY:
+    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
+    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
 
 OPT = _ensure_deps()
 
@@ -298,18 +365,7 @@ random.seed(SEED)
 np.random.seed(SEED % (2 ** 32 - 1))
 RNG = np.random.default_rng(SEED)
 
-# ★★ pykrx 는 '모듈 임포트 시점'에 KRX 로그인을 수행한다(webio.build_krx_session).
-#    따라서 자격증명을 환경변수로 심는 일은 반드시 import 보다 먼저 와야 한다.
-#    순서를 뒤집으면 예외 없이 '비인증 세션'이 만들어지고, 나중에 JSON 대신 로그인 HTML 을
-#    받아 pandas 깊은 곳에서 JSONDecodeError 가 터진다 — 원인 추적이 매우 어려운 실패다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
-    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
-    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
-if KRX_OPENAPI_KEY:
-    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
-    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
-
-# 선택 모듈 핸들
+# 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
 if OPT.get("FinanceDataReader"):
     try:
@@ -422,7 +478,7 @@ class _Log:
         line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
         with self.lock:
             self.buffer.append(line)
-            print(line, flush=True)
+            _safe_print(line, flush=True)
 
     def debug(self, m): self._emit("DEBUG", m, "· ")
     def info(self, m):  self._emit("INFO",  m, "  ")
@@ -433,35 +489,35 @@ class _Log:
     def rule(self, title: str = "", ch: str = "─", width: int = 104):
         if title:
             pre = f"{ch * 3} {title} "
-            print(pre + ch * max(0, width - _dw(pre)), flush=True)
+            _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
         else:
-            print(ch * width, flush=True)
+            _safe_print(ch * width, flush=True)
 
     def banner(self, title: str, sub: str = "", width: int = 104):
-        print("", flush=True)
-        print("╔" + "═" * (width - 2) + "╗", flush=True)
-        print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
+        _safe_print("", flush=True)
+        _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
+        _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
         if sub:
-            print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
-        print("╚" + "═" * (width - 2) + "╝", flush=True)
+            _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
+        _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
 
     def table(self, rows: List[Sequence[Any]], headers: Sequence[str],
               aligns: Optional[Sequence[str]] = None, maxw: int = 46, title: str = ""):
         """한글 폭 보정 표. 강건성/성과/감사 출력 전부 이걸 쓴다."""
         if title:
-            print(f"\n▶ {title}", flush=True)
+            _safe_print(f"\n▶ {title}", flush=True)
         if not rows:
-            print("   (행 없음)", flush=True)
+            _safe_print("   (행 없음)", flush=True)
             return
         ncol = len(headers)
         aligns = list(aligns or ["l"] * ncol)
         cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r)) for r in rows]
         widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
         head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
-        print(head, flush=True)
-        print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
+        _safe_print(head, flush=True)
+        _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
         for r in cells:
-            print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
+            _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
 
 
 LOG = _Log("DEBUG" if VERBOSE else "INFO")
@@ -548,6 +604,24 @@ _DIAG_RULES: List[Tuple[str, str]] = [
      "parquet 읽기/쓰기 실패입니다. 드라이브 FUSE 마운트에서 쓰기가 중단되면 파일이 깨질 수 있습니다. "
      "코드는 임시파일→원자적 rename 으로 쓰므로, 깨진 건 이전 실행 잔재입니다. "
      "해당 파일만 지우고(원본 아님, 캐시임) 재실행하세요."),
+    (r"'DataFrame' object has no attribute 'name'|_wrap_agged_manager",
+     "중복 컬럼입니다. DataFrame 에 같은 이름의 컬럼이 두 개 있으면 df[col] 이 Series 가 아니라 "
+     "DataFrame 이 되고, groupby(...).agg() 가 pandas 내부에서 이 예외로 터집니다. "
+     "직전에 concat/reindex(columns=...)/merge 로 컬럼을 합친 곳을 보세요 — "
+     "리스트를 이어붙일 때(예: COLS + ['x'] 인데 COLS 에 이미 'x' 가 있는 경우) 가장 흔합니다. "
+     "assert_no_dup_cols() 로 발생 지점을 앞당겨 잡을 수 있습니다."),
+    (r"Expecting value: line \d+ column 1|JSONDecodeError|Error occurred in get_market",
+     "JSON 대신 HTML(대개 로그인/에러 페이지)을 받았습니다. KRX 계열이면 세션이 끊긴 것입니다. "
+     "pykrx 는 스레드마다 재로그인하며 KRX 는 중복 로그인 시 이전 세션을 끊습니다 — "
+     "모든 pykrx 호출은 KRXG.call() 게이트로 직렬화해야 합니다. "
+     "KRX ID/PW 를 다른 브라우저 탭에서 동시에 쓰고 있지 않은지도 확인하세요."),
+    (r"UnicodeEncodeError|cp949|charmap",
+     "콘솔 인코딩 문제입니다(윈도우 기본 cp949 는 罫線문자 ╔═║ 와 ✔✘ 를 못 씁니다). "
+     "코드가 stdout 을 UTF-8 로 재설정하고 실패 시 ASCII 로 낮추지만, 직접 출력을 추가했다면 "
+     "print 대신 _safe_print 를 쓰세요. 또는 실행 전 `chcp 65001` 을 하세요."),
+    (r"statvfs|WinError",
+     "윈도우 전용 이슈입니다. os.statvfs 는 윈도우에 없고(용량 표시만 생략됩니다), "
+     "파일 잠금·경로 구분자도 다릅니다. 기능에는 영향이 없어야 하며, 있다면 버그입니다."),
     (r"KeyError: 'knowledge_date'|knowledge_date",
      "PIT 컬럼 누락입니다. 모든 테이블은 event_date/knowledge_date 를 가져야 합니다(C1). "
      "새 수집 함수를 추가했다면 pit_frame() 으로 감싸주세요."),
@@ -670,8 +744,8 @@ class Pipeline:
 
     def _print_failure(self, rec: StageRecord):
         LOG.banner(f"✘ 실패 지점: [{rec.sid}] {rec.name}", f"계층 {rec.layer} · 경과 {rec.dur:.2f}s")
-        print(f"  예외      : {rec.err_type}: {rec.err_msg}")
-        print(f"  진단      : {rec.hint}")
+        _safe_print(f"  예외      : {rec.err_type}: {rec.err_msg}")
+        _safe_print(f"  진단      : {rec.hint}")
         recent = [e for e in self.flow if e.stage == rec.sid][-8:]
         if recent:
             LOG.table(
@@ -680,10 +754,10 @@ class Pipeline:
                 ["방향", "종류", "대상", "행수", "PIT", "상태", "소스/비고"],
                 ["c", "l", "l", "r", "c", "c", "l"],
                 title="이 스테이지의 직전 입출력 (여기서 무엇이 비었는지 보세요)")
-        print("\n  ── 트레이스백 (마지막 12줄) " + "─" * 60)
+        _safe_print("\n  ── 트레이스백 (마지막 12줄) " + "─" * 60)
         for ln in rec.err_tb.rstrip().split("\n")[-12:]:
-            print("   " + ln)
-        print("  " + "─" * 86)
+            _safe_print("   " + ln)
+        _safe_print("  " + "─" * 86)
 
     # -- 리포트 --------------------------------------------------------------------------
     def report_stages(self):
@@ -2104,22 +2178,133 @@ def report_http():
               ["l", "r", "r", "r", "r", "l"])
 
 
-
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L1-A  종목 마스터 & PIT 유니버스 (C2 생존자편향 제거)                                     ║
 # ║                                                                                          ║
-# ║  다중 소스 교차 구축:                                                                     ║
-# ║    ① pykrx 월말 상장종목 스냅샷 ← ★ 진짜 PIT. "그 날 실제로 상장돼 있던 종목"              ║
-# ║    ② FinanceDataReader StockListing('KRX')          — 현재 상장 + 상장일                   ║
-# ║    ③ FinanceDataReader StockListing('KRX-DELISTING')— 상장폐지 종목 + 폐지일 ★생존자편향   ║
-# ║    ④ KIND 상장법인목록                              — 상장일 보강                          ║
-# ║    ⑤ DART corpCode.xml                              — corp_code ↔ 종목코드 연결            ║
+# ║  다중 소스 교차 구축 — 우선순위와 역할이 각각 다르다:                                      ║
+# ║    ① FDR GitHub 캐시  listing/krx        상장 종목 + 상장일        ← 로그인 불필요, 1순위  ║
+# ║    ② FDR GitHub 캐시  listing/delisting  상장폐지 + 폐지일         ← ★생존자편향 제거 입력 ║
+# ║    ③ KIND 상장법인목록                   상장일·업종 보강                                  ║
+# ║    ④ pykrx 월/분기말 스냅샷              "그 날 실제 상장" 검증     ← 인증 필요, 보조      ║
+# ║    ⑤ DART corpCode.xml                   corp_code ↔ 종목코드                              ║
+# ║    ⑥ 네이버 금융                         ①~⑤ 어디에도 이름이 없는 잔여 코드 보강          ║
 # ║                                                                                          ║
-# ║  스냅샷은 공용 인덱스에 저장된다 → 다른 전략이 재수집 없이 그대로 쓴다.                     ║
+# ║  ★ 설계 원칙: 유니버스의 정확성은 ①②③⑤(상장일·폐지일)만으로 성립해야 한다.                ║
+# ║    ④ 스냅샷은 '검증·보강'이지 '의존'이 아니다. KRX 인증이 실패해도 백테스트는 정상이어야   ║
+# ║    한다. 실제로 KRX 는 부분 응답을 자주 내는데, 그걸 진실로 믿으면 그 달 유니버스가        ║
+# ║    조용히 쪼그라들어 곧바로 선택편향이 된다.                                               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
                    "corp_code", "industry", "sector_src", "src"]
+
+# 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
+#   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
+#   상장/폐지일이 이미 있으므로 분기 격자(40 × 2 = 80 호출)로도 검증 목적은 충분하다.
+UNIVERSE_SNAPSHOT_FREQ = "Q"
+
+
+# ── 중복 컬럼 방어 (이번 크래시의 직접 원인 유형) ────────────────────────────────────────────
+def assert_no_dup_cols(df: pd.DataFrame, where: str) -> pd.DataFrame:
+    """중복 컬럼은 pandas 에서 예외 없이 의미가 바뀐다.
+    df[col] 이 Series 가 아니라 DataFrame 이 되고, groupby.agg 가
+    'DataFrame object has no attribute name' 로 엉뚱한 곳에서 터진다.
+    조용히 지나가면 최악이므로 발생 지점에서 즉시 세운다."""
+    if df is None or df.empty:
+        return df
+    dup = df.columns[df.columns.duplicated()]
+    if len(dup):
+        raise RuntimeError(f"[{where}] 중복 컬럼 {sorted(set(map(str, dup)))} — "
+                           f"pandas 연산의 의미가 바뀌므로 여기서 중단합니다.")
+    return df
+
+
+# ── KRX 세션 게이트 ─────────────────────────────────────────────────────────────────────────
+class KRXGate:
+    """pykrx 호출을 단일 게이트로 통과시킨다.
+
+    ★ 왜 필요한가 (pykrx 1.2.8 소스 확인 결과):
+      get_auth_session() 은 모듈 전역 _auth_session 에 대해 락 없이 검사-후-생성을 한다.
+      스레드 6개가 동시에 None 을 보면 6개가 각자 로그인하고, KRX 는 중복 로그인(CD011)을
+      skipDup 로 처리하며 앞선 세션을 강제 종료시킨다. 살아남는 건 마지막 하나뿐이고
+      나머지 스레드는 죽은 쿠키로 요청해 JSON 대신 로그인 HTML 을 받는다.
+      → 실제 운영 로그의 'Error occurred in ...: Expecting value: line 13 column 1' 이 이것이다.
+      또 세션은 3600초(버퍼 300초 → 실효 55분) 만료라 긴 수집은 반드시 만료를 넘긴다.
+      만료 갱신도 같은 무락 경로를 타므로 장시간 실행에서 같은 폭풍이 재현된다.
+
+    대응: ① 메인 스레드에서 단 한 번 워밍업 ② 모든 pykrx 호출을 락으로 직렬화
+          ③ 만료 전에 선제 갱신 ④ 실패해도 예외 대신 None 을 돌려 상위가 폴백하게 한다.
+    """
+
+    def __init__(self):
+        self._lk = threading.RLock()
+        self._warm = False
+        self._authed = False
+        self._t_login = 0.0
+        self.calls = 0
+        self.fails = 0
+
+    def warmup(self) -> bool:
+        if pykrx_stock is None:
+            return False
+        with self._lk:
+            if self._warm:
+                return self._authed
+            self._warm = True
+            has_cred = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
+            try:
+                from pykrx.website.comm.auth import get_auth_session   # type: ignore
+                s = get_auth_session()
+                self._authed = s is not None and getattr(s, "is_authenticated", False)
+            except Exception:
+                self._authed = False
+            self._t_login = time.time()
+            if has_cred and self._authed:
+                LOG.ok("KRX 세션 확보 (메인 스레드 1회 로그인) — 이후 모든 pykrx 호출을 "
+                       "직렬화해 중복 로그인(CD011)으로 서로를 밀어내는 현상을 막습니다.")
+            elif has_cred:
+                LOG.warn("KRX 자격증명은 있으나 세션 인증에 실패했습니다. ID/PW 를 확인하세요. "
+                         "스냅샷 검증만 건너뛰며, 유니버스는 상장일·폐지일로 정확히 구성됩니다.")
+            else:
+                LOG.info("KRX 자격증명 미입력 — pykrx 스냅샷 검증은 생략합니다. "
+                         "유니버스는 FDR 상장/폐지 목록으로 구성되며 백테스트는 정상 동작합니다.")
+            return self._authed
+
+    def _refresh_if_stale(self):
+        # 실효 55분. 45분마다 선제 갱신해 '동시 만료 → 동시 재로그인'을 원천 차단한다.
+        if not self._authed or (time.time() - self._t_login) < 45 * 60:
+            return
+        try:
+            from pykrx.website.comm.auth import get_auth_session       # type: ignore
+            get_auth_session()
+            self._t_login = time.time()
+            LOG.debug("KRX 세션 선제 갱신")
+        except Exception:
+            pass
+
+    def call(self, fn: Callable, *a, **kw):
+        """모든 pykrx 호출의 유일한 통로. 직렬화 + 스로틀 + 예외 흡수."""
+        if pykrx_stock is None:
+            return None
+        with self._lk:
+            self._refresh_if_stale()
+            limiter("krx").wait()
+            self.calls += 1
+            try:
+                return fn(*a, **kw)
+            except Exception as e:                                     # noqa
+                self.fails += 1
+                LOG.debug(f"pykrx 호출 실패 {getattr(fn, '__name__', '?')}: {type(e).__name__}")
+                return None
+
+    def report(self):
+        if self.calls:
+            LOG.info(f"pykrx 게이트 — 호출 {self.calls:,}건 · 실패 {self.fails:,}건 "
+                     f"({100*self.fails/max(self.calls,1):.1f}%) · 직렬화 적용")
+
+
+KRXG = KRXGate()
+
 
 # ── 로그인 불필요 경로 ★1순위 ──────────────────────────────────────────────────────────────
 #   FinanceDataReader 가 실제로 읽는 GitHub 캐시. KRX 인증 변경의 영향을 받지 않는다.
@@ -2129,7 +2314,7 @@ FDR_CACHE = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
              "refs/heads/master/data/{kind}/{date}.csv")
 
 
-def _fdr_cache_csv(kind: str, back_days: int = 12) -> Optional[pd.DataFrame]:
+def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
     """영업일 CSV 만 존재하므로 최근 날짜부터 거꾸로 훑는다."""
     today = _dt.date.today()
     for i in range(back_days):
@@ -2137,99 +2322,44 @@ def _fdr_cache_csv(kind: str, back_days: int = 12) -> Optional[pd.DataFrame]:
         if d.weekday() >= 5:
             continue
         url = FDR_CACHE.format(kind=kind, date=d.isoformat())
-        raw = http_get(url, source="generic", as_bytes=True, tries=1, timeout=20)
+        raw = http_get(url, source="generic", as_bytes=True, tries=1, timeout=25)
         if not raw or len(raw) < 200 or raw[:15].lstrip().startswith(b"404"):
             continue
         try:
-            df = pd.read_csv(io.BytesIO(raw), index_col=0, encoding="utf-8-sig",
+            # ★ index_col=0 을 무조건 주면 안 된다.
+            #   listing CSV 는 이름 없는 인덱스 컬럼이 있지만 delisting CSV 는 없을 수 있고,
+            #   그때 첫 실컬럼(Symbol=종목코드)이 인덱스로 먹혀 통째로 사라진다.
+            #   → 상장폐지 종목이 전부 유실되고 그게 곧 생존자편향이다. 반드시 판별해서 읽는다.
+            df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig",
                              dtype={"Code": str, "Symbol": str, "ToSymbol": str,
-                                    "MarketId": str, "Market": str})
+                                    "MarketId": str, "Market": str, "ISU_CD": str,
+                                    "Unnamed: 0": str})
+            if len(df.columns) and str(df.columns[0]).strip().lower() in (
+                    "", "unnamed: 0", "unnamed:0", "index"):
+                df = df.drop(columns=[df.columns[0]])
             if len(df):
-                LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} ({len(df):,}행)")
+                LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} "
+                          f"({len(df):,}행 · 컬럼 {list(df.columns)[:6]})")
                 return df
         except Exception:
             continue
     return None
 
 
-def _pykrx_business_day(d: pd.Timestamp) -> str:
-    s = d.strftime("%Y%m%d")
-    if pykrx_stock is None:
-        return s
-    try:
-        return pykrx_stock.get_nearest_business_day_in_a_week(s, prev=True)
-    except Exception:
-        try:
-            return pykrx_stock.get_nearest_business_day_in_a_week(s)
-        except Exception:
-            return s
-
-
-def fetch_pykrx_snapshots(dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
-    """월말별 상장종목 스냅샷. C2의 핵심 — 이게 있으면 생존자편향이 구조적으로 불가능해진다."""
-    if pykrx_stock is None:
-        LOG.warn("pykrx 미설치 — 월말 상장 스냅샷을 만들 수 없습니다. "
-                 "상장일/폐지일 기반 재구성으로 폴백합니다(정확도 소폭 하락).")
-        return pd.DataFrame(columns=["snap_date", "code", "market"])
-
-    cached = VAULT.get_table("krx_listing_snapshots", scope="shared")
-    have = set()
-    if cached is not None and len(cached):
-        cached["snap_date"] = as_ts_series(cached["snap_date"])
-        have = set(cached["snap_date"].dt.strftime("%Y-%m-%d"))
-        LOG.info(f"공용 캐시에서 상장 스냅샷 {len(have)}개월 재사용")
-
-    todo = [d for d in dates if d.strftime("%Y-%m-%d") not in have]
-    new_rows: List[dict] = []
-    if todo and RUN_MODE != "CACHED":
-        def _one(d: pd.Timestamp):
-            bd = _pykrx_business_day(d)
-            out = []
-            for mkt in ("KOSPI", "KOSDAQ"):
-                limiter("krx").wait()
-                try:
-                    tk = pykrx_stock.get_market_ticker_list(bd, market=mkt)
-                except Exception:
-                    tk = []
-                for t in (tk or []):
-                    c = to_code6(t)
-                    if c:
-                        out.append({"snap_date": d.strftime("%Y-%m-%d"), "code": c, "market": mkt})
-            return out
-
-        res = pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="KRX 상장 스냅샷")
-        for r in res:
-            if r:
-                new_rows.extend(r)
-
-    frames = [cached] if cached is not None and len(cached) else []
-    if new_rows:
-        frames.append(pd.DataFrame(new_rows))
-    if not frames:
-        return pd.DataFrame(columns=["snap_date", "code", "market"])
-    snap = pd.concat(frames, ignore_index=True)
-    snap["snap_date"] = as_ts_series(snap["snap_date"])
-    snap = snap.dropna(subset=["snap_date", "code"]).drop_duplicates(["snap_date", "code"])
-    if new_rows:
-        out = snap.copy()
-        out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
-        VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
-                        source="pykrx", extra={"note": "월말 상장종목 스냅샷 — 전 전략 공용"})
-    PIPE.io("OUT", "DRIVE", "krx_listing_snapshots", snap, source="pykrx")
-    return snap
+def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
+    return {str(c).strip().lower(): c for c in d.columns}
 
 
 def fetch_fdr_listing() -> pd.DataFrame:
-    # ① 로그인 불필요 GitHub 캐시 직독 (KRX 인증 변경에 영향받지 않음)
     d = _fdr_cache_csv("listing/krx")
     if d is not None and len(d):
-        col = {str(c).lower(): c for c in d.columns}
-        code_c = col.get("code") or col.get("symbol")
-        name_c = col.get("name") or col.get("korean name")
+        col = _lower_map(d)
+        code_c = col.get("code") or col.get("symbol") or col.get("isu_cd")
+        name_c = col.get("name") or col.get("korean name") or col.get("isu_nm")
         if code_c and name_c:
             t = pd.DataFrame({
                 "code": d[code_c].map(to_code6),
-                "name": d[name_c].astype(str),
+                "name": d[name_c].astype(str).str.strip(),
                 "market": (d[col["market"]].astype(str) if "market" in col
                            else d[col["marketid"]].astype(str) if "marketid" in col else "KRX"),
                 "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
@@ -2237,104 +2367,115 @@ def fetch_fdr_listing() -> pd.DataFrame:
                              else d[col["industry"]].astype(str) if "industry" in col else ""),
             })
             t["sector_src"], t["src"] = "fdr_cache", "fdr_github_cache"
+            t["delisting_date"] = pd.NaT
+            t["corp_code"] = np.nan
+            n0 = len(t)
             r = t.dropna(subset=["code"]).drop_duplicates("code")
-            LOG.ok(f"상장목록(로그인 불필요 경로) {len(r):,}건 — KRX 인증 변경의 영향을 받지 않습니다.")
+            if n0 - len(r):
+                LOG.debug(f"상장목록 정규화 탈락 {n0-len(r):,}건(코드 형식 불일치/중복)")
+            LOG.ok(f"상장목록(로그인 불필요 경로) {len(r):,}건 — KRX 인증 변경 영향을 받지 않습니다.")
             return r
 
-    # ② 라이브러리 경로 폴백
     if fdr is None:
+        LOG.warn("상장목록을 확보하지 못했습니다 (GitHub 캐시 실패 + FinanceDataReader 없음).")
         return pd.DataFrame(columns=SEC_MASTER_COLS)
-    out = []
-    for key, mk in (("KRX", None), ("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")):
-        try:
-            limiter("krx").wait()
-            d = fdr.StockListing(key)
-        except Exception:
-            continue
-        if d is None or len(d) == 0:
-            continue
-        d = d.rename(columns={c: str(c) for c in d.columns})
-        col = {c.lower(): c for c in d.columns}
-        code_c = col.get("code") or col.get("symbol")
-        name_c = col.get("name") or col.get("korean name") or col.get("stock name")
-        if not code_c or not name_c:
-            continue
-        t = pd.DataFrame({
-            "code": d[code_c].map(to_code6),
-            "name": d[name_c].astype(str),
-            "market": d[col["market"]].astype(str) if "market" in col else (mk or "KRX"),
-            "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
-            "industry": d[col["sector"]].astype(str) if "sector" in col else
-                        (d[col["industry"]].astype(str) if "industry" in col else ""),
-        })
-        t["sector_src"] = "fdr"
-        t["src"] = f"fdr:{key}"
-        out.append(t)
-        break                                   # 'KRX' 하나면 충분. 실패했을 때만 시장별로 시도.
-    if not out:
+    try:
+        limiter("krx").wait()
+        d = fdr.StockListing("KRX")
+    except Exception as e:                                            # noqa
+        LOG.warn(f"fdr.StockListing('KRX') 실패({type(e).__name__}) — "
+                 f"FDR 은 최신 영업일 확인차 data.krx.co.kr 를 찌르는데 그게 막히면 "
+                 f"CSV 가 멀쩡해도 죽습니다.")
         return pd.DataFrame(columns=SEC_MASTER_COLS)
-    r = pd.concat(out, ignore_index=True).dropna(subset=["code"])
-    return r.drop_duplicates("code")
+    if d is None or len(d) == 0:
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    col = _lower_map(d)
+    code_c = col.get("code") or col.get("symbol")
+    name_c = col.get("name")
+    if not code_c or not name_c:
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    t = pd.DataFrame({
+        "code": d[code_c].map(to_code6), "name": d[name_c].astype(str),
+        "market": d[col["market"]].astype(str) if "market" in col else "KRX",
+        "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
+        "industry": d[col["sector"]].astype(str) if "sector" in col else "",
+        "delisting_date": pd.NaT, "corp_code": np.nan,
+        "sector_src": "fdr", "src": "fdr:KRX"})
+    return t.dropna(subset=["code"]).drop_duplicates("code")
 
 
 def fetch_fdr_delisting() -> pd.DataFrame:
-    """★ 생존자편향 제거의 핵심 입력. 이게 비면 백테스트 결과 전체를 신뢰할 수 없다.
-    KRX Open API 에는 상장폐지 엔드포인트가 아예 없다 → GitHub 캐시가 사실상 유일한 공개 경로."""
+    """★ 생존자편향 제거의 핵심 입력. KRX Open API 에는 상장폐지 엔드포인트가 아예 없어서
+    이 GitHub 캐시가 사실상 유일한 공개 경로다.
+
+    ★ 탈락 사유를 반드시 집계해 로그로 남긴다. 여기서 조용히 버려지는 종목이
+    그대로 생존자편향이 되기 때문이다(운영에서 4,172행 → 2,526행으로 줄었던 구간)."""
     d = _fdr_cache_csv("listing/delisting")
-    if d is not None and len(d):
-        col = {str(c).lower(): c for c in d.columns}
-        code_c = col.get("symbol") or col.get("code") or col.get("isu_cd")
-        if code_c:
-            dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "date", "dedate",
-                                          "listingdate") if k in col), None)
-            r = pd.DataFrame({
-                "code": d[code_c].map(to_code6),
-                "name": d[col.get("name", code_c)].astype(str),
-                "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
-                "market": d[col["market"]].astype(str) if "market" in col else "KRX",
-            }).dropna(subset=["code"]).drop_duplicates("code")
-            LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(r):,}건 — 생존자편향 제거 입력 확보")
-            return r
-    if fdr is None:
-        return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-    frames = []
-    for key in ("KRX-DELISTING", "KRX-DELISTING-KOSPI", "KRX-DELISTING-KOSDAQ"):
+    if d is None or len(d) == 0:
+        if fdr is None:
+            LOG.warn("상장폐지 목록을 확보하지 못했습니다 — C2(생존자편향 제거) 미충족 상태입니다. "
+                     "결과 해석 시 반드시 감안하세요.")
+            return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
         try:
             limiter("krx").wait()
-            d = fdr.StockListing(key)
+            d = fdr.StockListing("KRX-DELISTING")
         except Exception:
-            continue
+            d = None
         if d is None or len(d) == 0:
-            continue
-        col = {str(c).lower(): c for c in d.columns}
-        code_c = col.get("symbol") or col.get("code")
-        if not code_c:
-            continue
-        dl_c = (col.get("delistingdate") or col.get("delisting_date") or
-                col.get("date") or col.get("dedate"))
-        frames.append(pd.DataFrame({
-            "code": d[code_c].map(to_code6),
-            "name": d[col.get("name", code_c)].astype(str),
-            "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
-            "market": d[col["market"]].astype(str) if "market" in col else "KRX",
-        }))
-        break
-    if not frames:
+            return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
+
+    col = _lower_map(d)
+    code_c = col.get("symbol") or col.get("code") or col.get("isu_cd") or col.get("isu_srt_cd")
+    if not code_c:
+        LOG.warn(f"상장폐지 파일에서 종목코드 컬럼을 찾지 못했습니다: {list(d.columns)[:12]}")
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-    r = pd.concat(frames, ignore_index=True).dropna(subset=["code"])
-    return r.drop_duplicates("code")
+    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
+                                  "listingdate") if k in col), None)
+    name_c = col.get("name") or col.get("isu_nm") or code_c
+
+    n_raw = len(d)
+    raw_codes = d[code_c].astype(str)
+    codes = raw_codes.map(to_code6)
+    n_badcode = int(codes.isna().sum())
+    t = pd.DataFrame({
+        "code": codes,
+        "name": d[name_c].astype(str),
+        "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        "market": d[col["market"]].astype(str) if "market" in col else "KRX",
+        "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
+                      else d[col["kind"]].astype(str) if "kind" in col else ""),
+    })
+    t = t.dropna(subset=["code"])
+    n_dupe = int(t["code"].duplicated().sum())
+    # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
+    # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
+    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    n_nodate = int(t["delisting_date"].isna().sum())
+
+    LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
+    if n_raw - len(t):
+        LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
+                 f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
+                 f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
+        if n_badcode > n_raw * 0.25:
+            LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
+                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
+                     f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+    return t
 
 
 def fetch_kind_listing() -> pd.DataFrame:
-    """KIND 상장법인목록 — 상장일 보강. HTML 테이블(엑셀 위장)이라 read_html 로 읽는다."""
+    """KIND 상장법인목록 — 상장일·업종 보강.
+    ★ 종목코드가 정수로 와서 앞자리 0 이 날아간다(5930 ← 005930). to_code6 이 복구한다."""
     urls = [
         "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+        "http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
         "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download",
     ]
     for u in urls:
         raw = http_get(u, source="kind", as_bytes=True, tries=2,
                        referer="https://kind.krx.co.kr/corpgeneral/corpList.do?method=loadInitPage")
-        if not raw:
+        if not raw or len(raw) < 500:
             continue
         for enc in ("euc-kr", "cp949", "utf-8"):
             try:
@@ -2345,18 +2486,20 @@ def fetch_kind_listing() -> pd.DataFrame:
                 continue
             d = max(tabs, key=len)
             col = {str(c).strip(): c for c in d.columns}
-            code_c = col.get("종목코드")
-            name_c = col.get("회사명")
+            code_c, name_c = col.get("종목코드"), col.get("회사명")
             if not code_c or not name_c:
                 continue
-            return pd.DataFrame({
+            t = pd.DataFrame({
                 "code": d[code_c].map(to_code6),
-                "name": d[name_c].astype(str),
+                "name": d[name_c].astype(str).str.strip(),
                 "listing_date": as_ts_series(d[col["상장일"]]) if "상장일" in col else pd.NaT,
                 "industry": d[col["업종"]].astype(str) if "업종" in col else "",
                 "sector_src": "kind", "src": "kind", "market": "",
+                "delisting_date": pd.NaT, "corp_code": np.nan,
             }).dropna(subset=["code"]).drop_duplicates("code")
-    LOG.warn("KIND 상장법인목록을 받지 못했습니다 — 상장일은 FDR/pykrx 로만 채웁니다.")
+            LOG.ok(f"KIND 상장법인목록 {len(t):,}건 (상장일 {int(t['listing_date'].notna().sum()):,}건)")
+            return t
+    LOG.warn("KIND 상장법인목록을 받지 못했습니다 — 상장일은 FDR/스냅샷으로만 채웁니다.")
     return pd.DataFrame(columns=SEC_MASTER_COLS)
 
 
@@ -2371,26 +2514,25 @@ def fetch_dart_corpcode() -> pd.DataFrame:
     raw = http_get("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
                    params={"crtfc_key": DART_API_KEY}, as_bytes=True, tries=3)
     if not raw:
-        LOG.warn("DART corpCode.xml 수신 실패 — DART_API_KEY 를 확인하세요.")
+        LOG.warn("DART corpCode.xml 수신 실패 — DART_API_KEY 와 네트워크를 확인하세요.")
         return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
-    # ZIP 엔드포인트는 오류 시에도 zip content-type 을 광고한다 → 매직바이트로 먼저 판별
     if raw[:2] != b"PK":
         body = raw[:400].decode("utf-8", "ignore")
         st = re.search(r'"?status"?\s*[:>]\s*"?(\d{3})', body)
         code = st.group(1) if st else "?"
         LOG.warn(f"corpCode 응답이 ZIP 이 아닙니다 (status={code}: "
                  f"{DART_STATUS_MSG.get(code, '알 수 없음')}). DART_API_KEY 를 확인하세요.")
-        LOG.debug(body)
         return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
     try:
         zf = zipfile.ZipFile(io.BytesIO(raw))
         xml = b"".join(zf.read(n) for n in zf.namelist() if n.lower().endswith(".xml")) \
             or zf.read(zf.namelist()[0])
-    except Exception as e:                                        # noqa
+    except Exception as e:                                            # noqa
         LOG.warn(f"corpCode zip 해제 실패({type(e).__name__}).")
         return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    txt = _decode(xml, None, "corpcode")
     rows = []
-    for m in re.finditer(r"<list>(.*?)</list>", xml.decode("utf-8", "ignore"), re.S):
+    for m in re.finditer(r"<list>(.*?)</list>", txt, re.S):
         blk = m.group(1)
 
         def g(tag):
@@ -2399,98 +2541,268 @@ def fetch_dart_corpcode() -> pd.DataFrame:
         rows.append({"corp_code": g("corp_code"), "corp_name": g("corp_name"),
                      "code": to_code6(g("stock_code")), "modify_date": g("modify_date")})
     d = pd.DataFrame(rows)
-    VAULT.put_table("dart_corpcode", d, scope="shared", domain="dart", source="opendart")
+    if len(d):
+        VAULT.put_table("dart_corpcode", d, scope="shared", domain="dart", source="opendart")
     LOG.ok(f"DART corpCode {len(d):,}건 (상장 매칭 {int(d['code'].notna().sum()):,}건)")
     return d
 
 
+# ── pykrx 스냅샷 (보조·검증) ────────────────────────────────────────────────────────────────
+def _snapshot_grid(months: pd.DatetimeIndex) -> List[pd.Timestamp]:
+    f = str(UNIVERSE_SNAPSHOT_FREQ).upper()
+    if f in ("OFF", "NONE", ""):
+        return []
+    if f == "M":
+        return list(months)
+    if f == "A":
+        return [m for m in months if m.month == 12] or list(months[::12])
+    return [m for m in months if m.month in (3, 6, 9, 12)] or list(months[::3])   # 기본 Q
+
+
+def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
+    """분기말 상장종목 스냅샷. C2 의 '검증' 입력이다(의존 대상이 아님).
+
+    ★ 전부 KRXG 게이트를 통해 직렬로 호출한다. 병렬로 때리면 pykrx 가 스레드마다 재로그인해
+      서로를 밀어내고(CD011), 그 결과 JSON 대신 로그인 HTML 을 받아 대량 실패한다."""
+    cols = ["snap_date", "code", "market"]
+    cached = VAULT.get_table("krx_listing_snapshots", scope="shared")
+    have: set = set()
+    if cached is not None and len(cached):
+        cached = cached.copy()
+        cached["snap_date"] = as_ts_series(cached["snap_date"])
+        cached = cached.dropna(subset=["snap_date", "code"])
+        have = set(cached["snap_date"].dt.strftime("%Y-%m-%d"))
+        LOG.info(f"공용 캐시에서 상장 스냅샷 {len(have)}개 시점 재사용")
+
+    grid = _snapshot_grid(months)
+    todo = [d for d in grid if d.strftime("%Y-%m-%d") not in have]
+    if RUN_MODE == "CACHED":
+        todo = []
+
+    new_rows: List[dict] = []
+    if todo:
+        if not KRXG.warmup():
+            LOG.info(f"KRX 세션이 없어 스냅샷 {len(todo)}개 시점을 건너뜁니다. "
+                     f"유니버스는 상장일·폐지일로 구성되며 이는 정상 경로입니다.")
+            todo = []
+    if todo:
+        LOG.info(f"KRX 상장 스냅샷 {len(todo)}개 시점 수집 (주기={UNIVERSE_SNAPSHOT_FREQ}, 직렬)")
+        bad_streak = 0
+        for d in tqdm(todo, desc="KRX 상장 스냅샷", ncols=88, leave=False):
+            bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
+                           d.strftime("%Y%m%d"), prev=True) or d.strftime("%Y%m%d")
+            got_any = False
+            for mkt in ("KOSPI", "KOSDAQ"):
+                tk = KRXG.call(pykrx_stock.get_market_ticker_list, bd, market=mkt)
+                if not tk:
+                    continue
+                got_any = True
+                for t in tk:
+                    c = to_code6(t)
+                    if c:
+                        new_rows.append({"snap_date": d.strftime("%Y-%m-%d"),
+                                         "code": c, "market": mkt})
+            bad_streak = 0 if got_any else bad_streak + 1
+            if bad_streak >= 5:
+                LOG.warn("KRX 스냅샷이 연속 5회 비었습니다 — 세션이 끊겼거나 차단된 상태입니다. "
+                         "스냅샷 수집을 중단하고 상장일·폐지일 경로로 진행합니다(정상 폴백).")
+                break
+
+    frames = [cached] if cached is not None and len(cached) else []
+    if new_rows:
+        frames.append(pd.DataFrame(new_rows))
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    snap = pd.concat(frames, ignore_index=True)
+    snap["snap_date"] = as_ts_series(snap["snap_date"])
+    snap = (snap.dropna(subset=["snap_date", "code"])
+                .drop_duplicates(["snap_date", "code"])[cols])
+
+    # ★ 부분 응답 방어: 이웃 시점 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
+    #   그대로 쓰면 그 달 유니버스가 조용히 쪼그라들어 선택편향이 된다.
+    if len(snap):
+        size = snap.groupby("snap_date")["code"].size().sort_index()
+        med = float(size.median()) if len(size) else 0.0
+        bad = size[size < med * 0.80]
+        if len(bad) and med > 0:
+            LOG.warn(f"스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만이라 "
+                     f"부분 응답으로 판단하고 폐기합니다: "
+                     f"{[str(x.date()) for x in bad.index[:6]]}")
+            snap = snap[~snap["snap_date"].isin(bad.index)]
+    if new_rows:
+        out = snap.copy()
+        out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
+        VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
+                        source="pykrx", extra={"note": "상장종목 스냅샷 — 전 전략 공용"})
+    PIPE.io("OUT", "DRIVE", "krx_listing_snapshots", snap, source="pykrx")
+    return snap
+
+
+def fetch_naver_names(codes: Sequence[str], limit: int = 400) -> Dict[str, str]:
+    """①~⑤ 어디에도 이름이 없는 잔여 코드를 네이버로 보강한다.
+    이름이 비면 국민연금·조달 상호 매칭이 통째로 실패하므로 커버리지에 직접 영향이 있다."""
+    codes = [c for c in codes if c][:limit]
+    if not codes or RUN_MODE == "CACHED":
+        return {}
+
+    def _one(c: str):
+        h = http_get(f"https://finance.naver.com/item/main.naver?code={c}",
+                     source="naver", tries=1, force_enc="euc-kr",
+                     referer="https://finance.naver.com/")
+        if not h:
+            return None
+        m = re.search(r'<div class="wrap_company">\s*<h2>\s*<a[^>]*>([^<]+)</a>', h)
+        if not m:
+            m = re.search(r"<title>\s*([^:<]+?)\s*:", h)
+        return (c, _clean_cell(m.group(1))) if m else None
+
+    res = pmap_io(_one, codes, workers=min(6, N_WORKERS_IO), desc="네이버 종목명 보강")
+    out = {c: n for r in res if r for c, n in [r] if n}
+    if out:
+        LOG.ok(f"네이버로 종목명 {len(out):,}건 보강")
+    return out
+
+
+# ── 종목 마스터 ─────────────────────────────────────────────────────────────────────────────
 def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
-    """모든 소스를 합쳐 종목 마스터를 만든다. 충돌은 로그에 남기고 우선순위로 해소."""
-    parts = []
+    """모든 소스를 합쳐 종목 마스터를 만든다. 충돌은 우선순위로 해소하고 전부 로깅한다."""
+    parts: List[pd.DataFrame] = []
+    src_stats: List[Tuple[str, int]] = []
+
     lst = fetch_fdr_listing()
     if len(lst):
         parts.append(lst)
+        src_stats.append(("FDR 상장목록", len(lst)))
         PIPE.io("IN", "HTTP", "fdr:StockListing", lst, source="FinanceDataReader")
+
     kind = fetch_kind_listing()
     if len(kind):
         parts.append(kind)
+        src_stats.append(("KIND 상장법인", len(kind)))
         PIPE.io("IN", "HTTP", "kind:corpList", kind, source="KIND")
 
     dead = fetch_fdr_delisting()
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.copy()
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
         d2["listing_date"] = pd.NaT
         d2["industry"] = ""
+        d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
         d2["src"] = "fdr:delisting"
         parts.append(d2)
+        src_stats.append(("FDR 상장폐지", len(d2)))
 
-    # 스냅샷에만 존재하는 종목(=상장목록에서 이미 사라진 폐지 종목)도 반드시 살린다
-    if len(snapshots):
-        known = set(pd.concat(parts)["code"]) if parts else set()
+    # 스냅샷에만 존재하는 종목(=상장목록·폐지목록 어디에도 없는 종목)도 반드시 살린다
+    if snapshots is not None and len(snapshots):
+        known = set(pd.concat(parts, ignore_index=True)["code"]) if parts else set()
         extra = sorted(set(snapshots["code"]) - known)
         if extra:
-            parts.append(pd.DataFrame({"code": extra, "name": "", "market": "",
-                                       "listing_date": pd.NaT, "industry": "",
-                                       "sector_src": "snapshot", "src": "pykrx:snapshot"}))
-            LOG.info(f"스냅샷에만 존재하는 종목 {len(extra):,}건 추가 — 상장폐지 명단 누락분입니다. "
-                     f"(이걸 빠뜨리면 곧바로 생존자편향)")
+            parts.append(pd.DataFrame({
+                "code": extra, "name": "", "market": "", "listing_date": pd.NaT,
+                "delisting_date": pd.NaT, "corp_code": np.nan, "industry": "",
+                "sector_src": "snapshot", "src": "pykrx:snapshot"}))
+            src_stats.append(("스냅샷 전용", len(extra)))
+            LOG.info(f"스냅샷에만 존재하는 종목 {len(extra):,}건 추가 — 상장/폐지 명단 누락분입니다. "
+                     f"(빠뜨리면 곧바로 생존자편향)")
 
     if not parts:
-        raise RuntimeError("종목 마스터를 만들 소스가 하나도 없습니다. "
-                           "FinanceDataReader/pykrx 설치와 네트워크를 확인하세요.")
+        raise RuntimeError(
+            "종목 마스터를 만들 소스가 하나도 없습니다.\n"
+            "  · 네트워크에서 raw.githubusercontent.com 과 kind.krx.co.kr 에 접근 가능한지\n"
+            "  · FinanceDataReader 가 설치되어 있는지\n"
+            "확인하세요. RUN_MODE='SMOKE' 로는 네트워크 없이 계산경로만 검증할 수 있습니다.")
 
-    m = pd.concat([p.reindex(columns=SEC_MASTER_COLS + ["delisting_date"]) for p in parts],
-                  ignore_index=True)
+    # ★ 중복 컬럼 원천 차단: 컬럼 목록을 dict.fromkeys 로 유일화한 뒤 정렬한다.
+    #   (SEC_MASTER_COLS 에 이미 있는 이름을 다시 더하면 m[col] 이 DataFrame 이 되고
+    #    groupby.agg 가 'DataFrame object has no attribute name' 으로 터진다)
+    _cols = list(dict.fromkeys(SEC_MASTER_COLS))
+    m = pd.concat([p.reindex(columns=_cols) for p in parts], ignore_index=True)
+    assert_no_dup_cols(m, "security_master:concat")
     m["code"] = m["code"].map(to_code6)
     m = m.dropna(subset=["code"])
 
+    def _first_str(s):
+        for x in s:
+            if isinstance(x, str) and x.strip():
+                return x.strip()
+        return ""
+
     agg = m.groupby("code", as_index=False).agg(
-        name=("name", lambda s: next((x for x in s if isinstance(x, str) and x.strip()), "")),
-        market=("market", lambda s: next((x for x in s if isinstance(x, str) and x.strip()), "")),
+        name=("name", _first_str),
+        market=("market", _first_str),
         listing_date=("listing_date", "min"),
-        delisting_date=("delisting_date", "min"),
-        industry=("industry", lambda s: next((x for x in s if isinstance(x, str) and x.strip()), "")),
+        delisting_date=("delisting_date", "max"),
+        industry=("industry", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
     )
+    assert_no_dup_cols(agg, "security_master:agg")
 
-    # 스냅샷으로 상장/폐지일 보정 — 소스 날짜보다 관측이 우선한다
-    if len(snapshots):
+    # 스냅샷으로 상장/폐지일 보정 — 소스 날짜가 없을 때만 관측으로 채운다
+    if snapshots is not None and len(snapshots):
         g = snapshots.groupby("code")["snap_date"]
-        first_seen, last_seen = g.min(), g.max()
-        agg = agg.merge(first_seen.rename("snap_first"), left_on="code", right_index=True, how="left")
-        agg = agg.merge(last_seen.rename("snap_last"), left_on="code", right_index=True, how="left")
+        agg = agg.merge(g.min().rename("snap_first"), left_on="code", right_index=True, how="left")
+        agg = agg.merge(g.max().rename("snap_last"), left_on="code", right_index=True, how="left")
         need = agg["listing_date"].isna() & agg["snap_first"].notna()
         agg.loc[need, "listing_date"] = agg.loc[need, "snap_first"]
-        # 마지막 스냅샷 이전에 사라졌으면 폐지로 간주 (폐지 명단에 없어도)
         last_snap = snapshots["snap_date"].max()
-        gone = agg["delisting_date"].isna() & agg["snap_last"].notna() & \
-            (agg["snap_last"] < last_snap - pd.Timedelta(days=45))
+        gone = (agg["delisting_date"].isna() & agg["snap_last"].notna() &
+                (agg["snap_last"] < last_snap - pd.Timedelta(days=200)))
         agg.loc[gone, "delisting_date"] = agg.loc[gone, "snap_last"] + pd.offsets.MonthEnd(1)
         if int(gone.sum()):
-            LOG.info(f"스냅샷에서 사라진 {int(gone.sum()):,}종목을 폐지로 추정 처리 "
+            LOG.info(f"스냅샷에서 사라진 {int(gone.sum()):,}종목을 폐지로 추정 "
                      f"(폐지명단 누락 보완 — 생존자편향 2차 방어)")
+        agg = agg.drop(columns=[c for c in ("snap_first", "snap_last") if c in agg.columns])
 
     cc = fetch_dart_corpcode()
     if len(cc):
-        agg = agg.merge(cc[["code", "corp_code", "corp_name"]].dropna(subset=["code"]),
-                        on="code", how="left")
-        agg["name"] = agg["name"].where(agg["name"].astype(str).str.strip() != "", agg.get("corp_name", ""))
+        cc2 = cc.dropna(subset=["code"])[["code", "corp_code", "corp_name"]].drop_duplicates("code")
+        agg = agg.merge(cc2, on="code", how="left")
+        blank = agg["name"].astype(str).str.strip() == ""
+        agg.loc[blank, "name"] = agg.loc[blank, "corp_name"].fillna("")
+        agg = agg.drop(columns=["corp_name"])
     else:
         agg["corp_code"] = np.nan
 
+    # 네이버로 잔여 무명 종목 보강 (상호 매칭 커버리지에 직결)
+    nameless = agg.loc[agg["name"].astype(str).str.strip() == "", "code"].tolist()
+    if nameless:
+        LOG.info(f"이름이 비어 있는 종목 {len(nameless):,}건 — 네이버로 보강 시도")
+        nm = fetch_naver_names(nameless)
+        if nm:
+            agg["name"] = agg.apply(
+                lambda r: nm.get(r["code"], r["name"]) if not str(r["name"]).strip() else r["name"],
+                axis=1)
+
     agg["industry"] = agg["industry"].fillna("").astype(str).str.strip().replace("", "미분류")
-    agg = agg.drop(columns=[c for c in ("snap_first", "snap_last", "corp_name") if c in agg.columns])
-    LOG.ok(f"종목 마스터 {len(agg):,}건 — 상장일 보유 {int(agg['listing_date'].notna().sum()):,} / "
-           f"폐지일 보유 {int(agg['delisting_date'].notna().sum()):,}")
-    if int(agg["delisting_date"].notna().sum()) < 200:
-        LOG.warn("상장폐지 종목이 200건 미만입니다. 10년 구간이라면 통상 1,000건 이상이어야 합니다. "
-                 "생존자편향이 남아 있을 수 있으니 결과 해석 시 반드시 감안하세요. (C2 부분 미충족)")
-        PIPE.note("WARN: 상장폐지 표본 부족 — C2 생존자편향 완전 제거 미달")
+    agg["sector_src"] = "merged"
+    assert_no_dup_cols(agg, "security_master:final")
+
+    n_list = int(agg["listing_date"].notna().sum())
+    n_del = int(agg["delisting_date"].notna().sum())
+    n_corp = int(agg["corp_code"].notna().sum()) if "corp_code" in agg.columns else 0
+    n_name = int((agg["name"].astype(str).str.strip() != "").sum())
+    LOG.table([[lab, f"{n:,}"] for lab, n in src_stats] +
+              [["── 병합 결과 ──", ""],
+               ["고유 종목", f"{len(agg):,}"],
+               ["상장일 보유", f"{n_list:,} ({100*n_list/max(len(agg),1):.0f}%)"],
+               ["폐지일 보유", f"{n_del:,} ({100*n_del/max(len(agg),1):.0f}%)"],
+               ["corp_code 보유", f"{n_corp:,} ({100*n_corp/max(len(agg),1):.0f}%)"],
+               ["종목명 보유", f"{n_name:,} ({100*n_name/max(len(agg),1):.0f}%)"]],
+              ["소스 / 항목", "건수"], ["l", "r"], title="종목 마스터 구성 (다중소스 병합)")
+
+    if n_del < 200:
+        LOG.warn("상장폐지 종목이 200건 미만입니다. 10년 구간이면 통상 1,000건 이상이어야 합니다. "
+                 "생존자편향이 남아 있으니 결과 해석 시 반드시 감안하세요. (C2 부분 미충족)")
+        PIPE.note("WARN: 상장폐지 표본 부족 — C2 완전 제거 미달")
+    if n_corp < len(agg) * 0.3:
+        LOG.warn(f"corp_code 매칭률이 {100*n_corp/max(len(agg),1):.0f}% 로 낮습니다. "
+                 f"DART 재무·공시가 그만큼 결측이 되어 B/C축과 PACK-C/D 가 약해집니다. "
+                 f"DART_API_KEY 를 확인하세요.")
     VAULT.put_table("security_master", agg, scope="shared", domain="universe",
-                    source="fdr+kind+pykrx+dart")
+                    source="fdr+kind+pykrx+dart+naver")
+    KRXG.report()
     return agg
 
 
@@ -2674,19 +2986,28 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if not isinstance(arr, list) or len(arr) < 2:
         return None
     hdr = [str(x).strip().lower() for x in arr[0]]
-    rows = arr[1:]
+    rows = [r for r in arr[1:] if isinstance(r, (list, tuple)) and len(r) == len(hdr)]
+    if not rows:
+        return None
     d = pd.DataFrame(rows, columns=hdr)
+    # ★ 이 rename 이 오랫동안 아무 일도 하지 않고 있었다.
+    #   {**ren, **{c: c for c in d.columns}} 는 두 번째 dict 가 첫 번째를 덮어써서
+    #   '날짜'→'날짜' 가 '날짜'→'date' 를 이긴다. 결과적으로 컬럼명이 한글로 남고
+    #   d.get("close") 가 None 이 되어 None*None TypeError 로 죽는다.
+    #   (pykrx/FDR 이 둘 다 없는 환경에서만 드러나므로 오래 숨어 있었다)
     ren = {"날짜": "date", "시가": "open", "고가": "high", "저가": "low",
-           "종가": "close", "거래량": "volume"}
-    d = d.rename(columns={**ren, **{c: c for c in d.columns}})
+           "종가": "close", "거래량": "volume", "외국인소진율": "foreign_ratio"}
+    d = d.rename(columns=ren)
     if "date" not in d.columns:
         d = d.rename(columns={d.columns[0]: "date"})
     for c in ("open", "high", "low", "close", "volume"):
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
-    d["amount"] = d.get("close") * d.get("volume")
+        if c not in d.columns:
+            d[c] = np.nan
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["amount"] = d["close"] * d["volume"]          # 네이버는 거래대금을 안 준다 → 근사(감사표에 명시)
     d["code"], d["src"] = code, "naver"
-    return d.reindex(columns=PRICE_COLS)
+    d = d.dropna(subset=["close"])
+    return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -2773,8 +3094,19 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
-        raise RuntimeError("가격 데이터를 하나도 확보하지 못했습니다. 네트워크와 패키지를 확인하거나 "
-                           "RUN_MODE='SMOKE' 로 계산경로만 먼저 검증하세요.")
+        avail = [nm for nm, _fn in PRICE_CHAIN
+                 if (nm != "pykrx" or pykrx_stock is not None)
+                 and (nm != "fdr" or fdr is not None)
+                 and (nm != "yfinance" or yf is not None)]
+        raise RuntimeError(
+            "가격 데이터를 한 종목도 확보하지 못했습니다.\n"
+            f"  · 시도한 소스 체인 : {', '.join(nm for nm, _ in PRICE_CHAIN)}\n"
+            f"  · 이번 실행에서 사용 가능했던 소스 : {', '.join(avail) or '없음'}\n"
+            f"  · 대상 종목 {len(codes):,}개 / 신규 수집 시도 {len(todo):,}개\n"
+            "  진단: ① 네트워크에서 fchart.stock.naver.com 접근이 되는지\n"
+            "        ② FinanceDataReader / pykrx 가 설치돼 있는지\n"
+            "        ③ 드라이브 캐시(krx_ohlcv_daily)가 비어 있지 않은지\n"
+            "  임시 우회: RUN_MODE='SMOKE' 로 두면 네트워크 없이 계산경로만 검증할 수 있습니다.")
     px = pd.concat(frames, ignore_index=True)
     px["date"] = as_ts_series(px["date"])
     px["code"] = px["code"].map(to_code6)
@@ -3048,8 +3380,83 @@ def _fs_one(job) -> Optional[pd.DataFrame]:
     return d[_FS_KEEP]
 
 
-def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다."""
+# ── Tier-1: 다중회사 주요계정 (배치) ────────────────────────────────────────────────────────
+#   fnlttMultiAcnt 는 corp_code 를 콤마로 최대 100개까지 받는다.
+#   2,500사 × 10년 × 4분기를 단건으로 받으면 100,000 호출(일 20,000 한도로 5일)이지만
+#   배치로는 1,000 호출(1시간 이내)이면 끝난다. ★100배 차이다.
+#   다만 '주요계정'만 오므로 B/C축이 필요로 하는 재고·매출채권·영업CF 는 없다.
+#   → 헤드라인은 배치로 싹 깔고, 전체 재무제표는 우선순위대로 단건 수집해 덮어쓴다(2단 구성).
+DART_MULTI_BATCH = 100
+_MULTI_ACCOUNT_MAP = {
+    "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
+    "자산총계": "assets", "부채총계": "liabilities", "자본총계": "equity",
+}
+
+
+def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
+    """주요계정 배치 수집. 전체 재무제표의 '바닥'을 싸게 깔아둔다."""
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=_FS_KEEP)
+    cached = VAULT.get_table("dart_multi_raw", scope="shared")
+    done = set()
+    if cached is not None and len(cached):
+        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
+                       cached["reprt_code"].astype(str)))
+        LOG.info(f"공용 캐시에서 DART 주요계정 {len(cached):,}행 재사용")
+
+    reprts = [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]]
+    corps = [str(c) for c in corp_codes]
+    jobs = []
+    for y in sorted(years, reverse=True):          # 최근 연도 우선 (중단돼도 최신이 남게)
+        for r in reprts:
+            todo = [c for c in corps if (c, int(y), str(r)) not in done]
+            for i in range(0, len(todo), DART_MULTI_BATCH):
+                jobs.append((todo[i:i + DART_MULTI_BATCH], int(y), r))
+    if RUN_MODE == "CACHED":
+        jobs = []
+
+    def _one(job):
+        batch, y, r = job
+        js = dart_api("fnlttMultiAcnt.json",
+                      {"corp_code": ",".join(batch), "bsns_year": str(y), "reprt_code": r})
+        if not js or not isinstance(js.get("list"), list) or not js["list"]:
+            return None
+        d = pd.DataFrame(js["list"])
+        for c in _FS_KEEP:
+            if c not in d.columns:
+                d[c] = None
+        d["bsns_year"] = int(y)
+        d["reprt_code"] = r
+        return d[_FS_KEEP]
+
+    got = []
+    if jobs:
+        LOG.info(f"DART 주요계정 배치 {len(jobs):,}회 (1회당 최대 {DART_MULTI_BATCH}사) — "
+                 f"단건 수집이면 {len(jobs)*DART_MULTI_BATCH:,}회였을 분량입니다")
+        res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="DART 주요계정(배치)")
+        got = [d for d in res if d is not None and len(d)]
+
+    frames = ([cached] if cached is not None and len(cached) else []) + got
+    if not frames:
+        return pd.DataFrame(columns=_FS_KEEP)
+    M = pd.concat(frames, ignore_index=True)
+    M = M.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div",
+                           "account_nm"], keep="last")
+    if got:
+        VAULT.put_table("dart_multi_raw", M, scope="shared", domain="dart",
+                        source="opendart fnlttMultiAcnt")
+    LOG.ok(f"DART 주요계정 {len(M):,}행 · {M['corp_code'].nunique():,}사 "
+           f"(호출 {len(jobs):,}회로 확보)")
+    PIPE.io("OUT", "DRIVE", "dart_multi_raw", M, source="opendart fnlttMultiAcnt")
+    return M
+
+
+def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
+                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
+
+    priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
+    일일 한도로 중간에 끊겨도 '투자 가능한 종목의 최근 데이터'가 먼저 확보되도록 하기 위함이다."""
     if not DART_API_KEY:
         LOG.warn("DART_API_KEY 미입력 — B축(회계품질)·C축(자원투입)·PACK-C 가 전부 비활성화됩니다. "
                  "이 전략의 핵심 입력이므로 키 입력을 강력히 권합니다.")
@@ -3064,8 +3471,14 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int]) -> pd
 
     reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
               else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
-    jobs = [(c, y, r) for c in corp_codes for y in years for r in reprts
-            if (str(c), int(y), str(r)) not in done]
+    # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
+    #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
+    #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
+    order = {str(c): i for i, c in enumerate(priority or [])}
+    corp_sorted = sorted((str(c) for c in corp_codes),
+                         key=lambda c: (order.get(c, 10 ** 9), c))
+    jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
+            if (c, int(y), str(r)) not in done]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
@@ -3091,8 +3504,35 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int]) -> pd
                              "account_nm"], keep="last")
     if got:
         VAULT.put_table("dart_fnltt_raw", fs, scope="shared", domain="dart", source="opendart")
+    n_have = fs.groupby(["corp_code", "bsns_year", "reprt_code"]).ngroups if len(fs) else 0
+    n_need = len(corp_sorted) * len(years) * len(reprts)
+    LOG.info(f"DART 전체 재무제표 진행률 {n_have:,}/{n_need:,} "
+             f"({100*n_have/max(n_need,1):.1f}%) — 최근 연도·우선순위 종목부터 채웁니다. "
+             f"재실행하면 정확히 이 지점부터 이어받습니다.")
     PIPE.io("OUT", "DRIVE", "dart_fnltt_raw", fs, source="opendart fnlttSinglAcntAll")
     return fs
+
+
+def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFrame:
+    """Tier-2(전체 재무제표)를 우선하고, 없는 (회사, 기간)만 Tier-1(주요계정)로 메운다.
+
+    콜드빌드가 며칠 걸리는 동안에도 매출·영업이익·순이익·자산·부채·자본은 전 종목이
+    확보되어 있어 유니버스 구성과 규모 버킷(C11), R3 팩터가 즉시 동작한다."""
+    if multi is None or multi.empty:
+        return full if full is not None else pd.DataFrame(columns=_FS_KEEP)
+    if full is None or full.empty:
+        LOG.info("전체 재무제표가 아직 없어 주요계정(배치)만으로 진행합니다 — "
+                 "B축의 재고·매출채권·영업CF 는 결측이므로 TP_B1/TP_B2 가 약해집니다.")
+        return multi
+    have = set(zip(full["corp_code"].astype(str), full["bsns_year"].astype(int),
+                   full["reprt_code"].astype(str)))
+    key = list(zip(multi["corp_code"].astype(str), multi["bsns_year"].astype(int),
+                   multi["reprt_code"].astype(str)))
+    fill = multi[[k not in have for k in key]]
+    if len(fill):
+        LOG.info(f"주요계정으로 보완한 (회사×기간) {fill.groupby(['corp_code','bsns_year','reprt_code']).ngroups:,}건 "
+                 f"— 전체 재무제표 콜드빌드가 끝나면 자동으로 대체됩니다.")
+    return pd.concat([full, fill], ignore_index=True)
 
 
 # ── 계정 매핑 (한국 XBRL 계정명은 회사마다 다르다 → 정규식 다중 매칭) ────────────────────────
@@ -4493,57 +4933,82 @@ LISTING_SEASONING_DAYS = 250          # 상장일 + 250거래일 ≈ 1년
 
 
 class Universe:
-    def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame):
+    def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame,
+                 snap_window_days: int = 100):
         self.sec = sec.copy()
         self.snap = snapshots
         self.attrition: List[dict] = []
-        self._trading_days = np.sort(px_daily["date"].unique()) if len(px_daily) else np.array([])
+        self._cache_at: Dict[pd.Timestamp, List[str]] = {}
+        # 스냅샷 주기가 분기면 ±45일 창으로는 대부분의 달이 스냅샷을 못 만난다 → 창을 넓힌다.
+        self._snap_window_days = snap_window_days
+        self._trading_days = (np.sort(pd.unique(as_ts_series(px_daily["date"]).values))
+                              if px_daily is not None and len(px_daily) else
+                              np.array([], dtype="datetime64[ns]"))
         self._snap_by_month: Dict[pd.Timestamp, set] = {}
-        if len(snapshots):
+        if snapshots is not None and len(snapshots):
             for d, g in snapshots.groupby("snap_date"):
                 self._snap_by_month[as_ts(d)] = set(g["code"])
+
         self.sec["listing_date"] = as_ts_series(self.sec["listing_date"])
         self.sec["delisting_date"] = as_ts_series(self.sec["delisting_date"])
-        self._seasoned = {}
-        for r in self.sec.itertuples(index=False):
-            ld = r.listing_date
-            if pd.isna(ld) or len(self._trading_days) == 0:
-                self._seasoned[r.code] = ld
-            else:
-                i = int(np.searchsorted(self._trading_days, np.datetime64(ld), side="left"))
-                j = min(i + LISTING_SEASONING_DAYS, len(self._trading_days) - 1)
-                self._seasoned[r.code] = as_ts(self._trading_days[j])
+        self.sec = self.sec.drop_duplicates("code").reset_index(drop=True)
+
+        # 벡터화용 배열 (at() 이 매월 3,500행 itertuples 를 도는 것을 없앤다)
+        self._codes_arr = self.sec["code"].to_numpy(dtype=object)
+        self._ld_arr = self.sec["listing_date"].to_numpy(dtype="datetime64[ns]")
+        self._dd_arr = self.sec["delisting_date"].to_numpy(dtype="datetime64[ns]")
+        self._delist = {c: d for c, d in zip(self._codes_arr, self.sec["delisting_date"])
+                        if pd.notna(d)}
+
+        # 상장 후 250거래일 시즈닝 — 거래일 배열에 대한 searchsorted 를 한 번에 벡터화
+        self._seasoned: Dict[str, Any] = {}
+        if len(self._trading_days):
+            idx = np.searchsorted(self._trading_days, self._ld_arr, side="left")
+            idx = np.minimum(idx + LISTING_SEASONING_DAYS, len(self._trading_days) - 1)
+            seas = self._trading_days[idx]
+            for c, ld, s in zip(self._codes_arr, self._ld_arr, seas):
+                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(s)
+        else:
+            for c, ld in zip(self._codes_arr, self._ld_arr):
+                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(ld)
 
     def at(self, t) -> List[str]:
         """시점 t 의 유니버스. t 이후 상장 종목이 하나라도 섞이면 그 자체로 C2 위반이다."""
         t = as_ts(t)
-        # ① 스냅샷이 있으면 그것이 최우선 진실 (그 날 실제로 상장돼 있던 종목)
-        #    ★ 반드시 '과거' 스냅샷만 쓴다. 가장 가까운 스냅샷을 고르면 어떤 달의 수집이
-        #      실패했을 때 미래 스냅샷이 선택되어 그 자체로 미래누수가 된다.
+        if t in self._cache_at:
+            return self._cache_at[t]
+
+        # ① 상장일·폐지일로 유도한 집합이 '기준선'이다. 이건 항상 성립해야 한다.
+        base = set(self._codes_dated_at(t))
+
+        # ② 스냅샷은 '보강'이다. 대체가 아니다.
+        #    ★ 과거 스냅샷만 쓴다(미래 스냅샷을 고르면 그 자체가 누수).
+        #    ★ 교집합이 아니라 합집합이다. 부분 응답 스냅샷으로 기준선을 깎으면
+        #      그 달 유니버스가 조용히 줄어 곧바로 선택편향이 된다. 늘리기만 한다.
         past = [d for d in self._snap_by_month if d <= t]
-        key = max(past) if past else None
-        base = None
-        if key is not None and (t - key).days <= 45:
-            base = set(self._snap_by_month[key])
-        if base is None:
-            base = set()
-            for r in self.sec.itertuples(index=False):
-                ld, dd = r.listing_date, r.delisting_date
-                if pd.notna(ld) and ld > t:
-                    continue
-                if pd.notna(dd) and dd <= t:
-                    continue
-                if pd.isna(ld) and pd.isna(dd):
-                    continue                          # 근거 없는 종목은 넣지 않는다
-                base.add(r.code)
-        # ② 상장 후 250거래일 시즈닝
-        out = []
-        for c in base:
-            s = self._seasoned.get(c)
-            if s is not None and pd.notna(s) and s > t:
-                continue
-            out.append(c)
-        return sorted(out)
+        if past:
+            key = max(past)
+            if (t - key).days <= self._snap_window_days:
+                base |= set(self._snap_by_month[key])
+
+        # ③ 폐지 이후 종목은 어떤 경로로 들어왔든 반드시 제외한다.
+        base -= {c for c, dd in self._delist.items() if pd.notna(dd) and dd <= t}
+
+        # ④ 상장 후 250거래일 시즈닝
+        out = [c for c in base
+               if not (pd.notna(self._seasoned.get(c, pd.NaT)) and self._seasoned[c] > t)]
+        out = sorted(out)
+        self._cache_at[t] = out
+        return out
+
+    def _codes_dated_at(self, t: pd.Timestamp) -> List[str]:
+        """상장일/폐지일 기반 멤버십. itertuples 루프를 매월 도는 대신 벡터화한다
+        (종목 3,500 × 120개월 = 42만 회 파이썬 루프였다)."""
+        ld, dd = self._ld_arr, self._dd_arr
+        tt = np.datetime64(t)
+        ok = ~((~np.isnat(ld)) & (ld > tt)) & ~((~np.isnat(dd)) & (dd <= tt))
+        ok &= ~(np.isnat(ld) & np.isnat(dd))        # 근거가 전혀 없는 종목은 넣지 않는다
+        return self._codes_arr[ok].tolist()
 
     def delisting_map(self) -> Dict[str, pd.Timestamp]:
         return {r.code: r.delisting_date for r in self.sec.itertuples(index=False)
@@ -6298,21 +6763,21 @@ def diagnostic_card(P: pd.DataFrame, bt: dict, sec: pd.DataFrame, top_n: int = 5
     top = sub.nlargest(min(top_n, len(sub)), "Signal_rank")
     for r in top.itertuples(index=False):
         code = r.code
-        print("\n" + "─" * 104)
-        print(f"[{code}] {names.get(code, '')}    셀: {getattr(r, 'cell', '?')}    "
+        _safe_print("\n" + "─" * 104)
+        _safe_print(f"[{code}] {names.get(code, '')}    셀: {getattr(r, 'cell', '?')}    "
               f"신호일: {pd.Timestamp(last_m).date()}")
-        print("─" * 104)
+        _safe_print("─" * 104)
         sig = getattr(r, "Signal_rank", np.nan)
-        print(f"Signal {sig:.3f} (상위 {100*(1-sig):.1f}%)   "
+        _safe_print(f"Signal {sig:.3f} (상위 {100*(1-sig):.1f}%)   "
               f"E: {getattr(r,'E',np.nan):.3f}   U: {getattr(r,'U',np.nan):.3f}   "
               f"Veto: {'통과' if getattr(r,'VETO',0)==1 else '차단'}")
         act = ",".join(p["id"] for p in active_packs()
                        if p["E_col"] in P.columns and np.isfinite(getattr(r, p["E_col"], np.nan)))
         ina = ",".join(p["id"] for p in active_packs()
                        if p["E_col"] in P.columns and not np.isfinite(getattr(r, p["E_col"], np.nan)))
-        print(f"활성 팩: {act or '없음'}  |  비활성: {ina or '없음'}")
+        _safe_print(f"활성 팩: {act or '없음'}  |  비활성: {ina or '없음'}")
 
-        print("\n■ 발화한 트레이드오프")
+        _safe_print("\n■ 발화한 트레이드오프")
         tps = []
         for p in active_packs():
             for tp, fire, nofire in p["interp"]:
@@ -6326,39 +6791,39 @@ def diagnostic_card(P: pd.DataFrame, bt: dict, sec: pd.DataFrame, top_n: int = 5
                 tps.append((tp, v, meaning))
         for tp, v, meaning in sorted(tps, key=lambda x: -x[1])[:8]:
             mark = "발화" if v > 0 else "미발화"
-            print(f"  {_pad(tp,7)} {v:+7.2f}  [{mark}] {_trunc(meaning, 62)}")
+            _safe_print(f"  {_pad(tp,7)} {v:+7.2f}  [{mark}] {_trunc(meaning, 62)}")
 
-        print("\n■ 미반영도 (U)")
-        print(f"  d1  ΔlogE {getattr(r,'dlog_E',np.nan):+.3f}, ΔlogM {getattr(r,'dlog_M',np.nan):+.3f}"
+        _safe_print("\n■ 미반영도 (U)")
+        _safe_print(f"  d1  ΔlogE {getattr(r,'dlog_E',np.nan):+.3f}, ΔlogM {getattr(r,'dlog_M',np.nan):+.3f}"
               f"  → {getattr(r,'D_state','?')}")
         for k, lab in (("d2", "컨센 목표주가 리비전"), ("d3", "기관+외인 수급"), ("d4", "커버리지 변화")):
             v = getattr(r, k, np.nan)
-            print(f"  {k}  {lab}: " + (f"{v:+.4f}" if np.isfinite(v) else "데이터 부족(결측 — 0으로 채우지 않음)"))
+            _safe_print(f"  {k}  {lab}: " + (f"{v:+.4f}" if np.isfinite(v) else "데이터 부족(결측 — 0으로 채우지 않음)"))
         if np.isfinite(getattr(r, "n_analyst", np.nan)):
-            print(f"      커버 애널리스트 {int(getattr(r,'n_analyst',0))}명 · "
+            _safe_print(f"      커버 애널리스트 {int(getattr(r,'n_analyst',0))}명 · "
                   f"목표주가 중앙값 {getattr(r,'tp_median',np.nan):,.0f}원")
 
-        print("\n■ 정책 오염 점검")
+        _safe_print("\n■ 정책 오염 점검")
         det = getattr(r, "d_eff_tax", np.nan)
-        print(f"  유효세율 변화 {det:+.4f} (임계 -0.03)   "
+        _safe_print(f"  유효세율 변화 {det:+.4f} (임계 -0.03)   "
               f"{'✔ V8 통과' if getattr(r,'V8',1)==1 else '✘ V8 발동 — 정책 유인 채용 의심'}")
         if np.isfinite(getattr(r, "emp_band_flag", np.nan)):
-            print(f"  임계밴드(50/100/300인) 근접: "
+            _safe_print(f"  임계밴드(50/100/300인) 근접: "
                   f"{'❗해당 — 신뢰도 하향' if getattr(r,'emp_band_flag',0)==1 else '✔ 이격'}")
 
-        print("\n■ 거부권")
+        _safe_print("\n■ 거부권")
         vs = []
         for i in range(1, 9):
             v = getattr(r, f"V{i}", 1)
             vs.append(f"V{i} {'✔' if v == 1 else '✘'}")
-        print("  " + "  ".join(vs))
-    print("─" * 104)
+        _safe_print("  " + "  ".join(vs))
+    _safe_print("─" * 104)
 
 
 def report_dataflow_map():
     """거시적 흐름 한 장 — 어디서 어디로 데이터가 가는지."""
     LOG.banner("데이터 흐름 지도 (거시)", "모듈 경계와 계층 — 에러가 나면 어느 상자인지 먼저 보세요")
-    print("""
+    _safe_print("""
   ┌── L0 부트/캐시 ─────────────────────────────────────────────────────────────────────┐
   │  환경감지 → 의존성 → 구글드라이브 마운트 → VAULT(공용/전용 인덱스, append-only 저널)  │
   │            └ adopt_scan: 기존 캐시 '이동 없이 참조 등록'                              │
@@ -6631,21 +7096,45 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     # ── 회귀 방지: 유니버스는 미래 스냅샷을 쓰지 않을 것 ───────────────────────────────────
     def c_snapfuture():
-        sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["a", "b"],
-                            "market": ["KOSPI"] * 2, "industry": ["X"] * 2,
-                            "corp_code": [None, None],
-                            "listing_date": pd.to_datetime(["2010-01-01"] * 2),
-                            "delisting_date": [pd.NaT, pd.NaT]})
-        snaps = pd.DataFrame({"snap_date": pd.to_datetime(["2020-01-31", "2020-03-31"]),
-                              "code": ["000001", "000002"], "market": ["KOSPI"] * 2})
+        """스냅샷 semantics 3종 동시 검정.
+
+        스냅샷은 '대체'가 아니라 '보강'이다. KRX 는 부분 응답을 자주 내는데, 그걸 그 달의
+        진실로 믿고 날짜 근거를 덮어쓰면 유니버스가 조용히 줄어 곧바로 선택편향이 된다.
+        그래서 세 성질을 동시에 만족해야 한다:
+          (a) 미래 스냅샷에만 있는 종목은 절대 들어오면 안 된다      → 미래누수 금지
+          (b) 과거 스냅샷에만 있는 종목은 반드시 들어와야 한다        → 생존자편향 방지
+          (c) 부분 스냅샷에서 빠졌어도 날짜 근거가 있으면 남아야 한다 → 부분응답 방어
+        """
+        sec = pd.DataFrame({
+            "code": ["000001", "000002", "000003", "000004"],
+            "name": list("abcd"), "market": ["KOSPI"] * 4, "industry": ["X"] * 4,
+            "corp_code": [None] * 4,
+            # 003 = 스냅샷에만 존재(날짜 근거 없음), 004 = 2019 폐지
+            "listing_date": pd.to_datetime(["2010-01-01", "2010-01-01", None, "2010-01-01"]),
+            "delisting_date": pd.to_datetime([None, None, None, "2019-06-30"]),
+        })
+        snaps = pd.DataFrame({
+            "snap_date": pd.to_datetime(["2020-01-31", "2020-01-31", "2020-03-31"]),
+            # 2020-01 스냅샷은 '부분 응답'이라 000002 가 빠져 있다
+            "code": ["000001", "000003", "000009"], "market": ["KOSPI"] * 3})
         px = pd.DataFrame({"date": pd.bdate_range("2009-01-01", "2021-01-01"), "code": "000001"})
         u = Universe(sec, snaps, px)
-        got = u.at("2020-02-29")
-        if "000002" in got:
-            return False, ("★미래누수: 2020-02-29 유니버스에 2020-03-31 스냅샷에만 있는 종목이 "
-                           "포함되었습니다. 가장 '가까운' 스냅샷이 아니라 가장 '최근 과거' 스냅샷을 "
-                           "써야 합니다.")
-        return True, "과거 스냅샷만 사용 확인"
+        got = set(u.at("2020-02-29"))
+
+        if "000009" in got:
+            return False, ("★미래누수: 2020-03-31 스냅샷에만 있는 종목이 2020-02-29 유니버스에 "
+                           "들어왔습니다. 가장 '가까운'이 아니라 가장 '최근 과거' 스냅샷만 써야 합니다.")
+        if "000003" not in got:
+            return False, ("★생존자편향: 과거 스냅샷에만 존재하는 종목이 빠졌습니다. "
+                           "상장/폐지 명단에서 누락된 종목이 바로 이 경로로 들어옵니다.")
+        if "000002" not in got:
+            return False, ("★부분응답 사고: 스냅샷에서 빠졌다는 이유로 날짜 근거가 있는 종목이 "
+                           "탈락했습니다. 스냅샷은 대체가 아니라 보강이어야 합니다 "
+                           "(KRX 부분 응답이 그 달 유니버스를 통째로 깎습니다).")
+        if "000004" in got:
+            return False, "2019-06-30 폐지 종목이 2020년 유니버스에 남아 있습니다."
+        return True, ("미래 스냅샷 차단 · 과거 스냅샷 보강 · 부분응답 내성 · 폐지 후 제외 "
+                      "모두 확인 (스냅샷은 대체가 아닌 보강)")
 
     _c("C2c", "유니버스 스냅샷 방향성", c_snapfuture)
 
@@ -6759,6 +7248,493 @@ def run_contract_tests(strict: bool = True) -> bool:
                                "위반을 우회하지 말고 원인을 고치십시오(§2).")
         return False
     LOG.ok(f"계약 {len(CONTRACT_RESULTS)}건 전부 통과.")
+    return True
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-G  실경로 리허설 (REHEARSAL) — 수집 함수를 '진짜로' 실행해 본다                        ║
+# ║                                                                                          ║
+# ║  왜 이 계층이 생겼는가:                                                                    ║
+# ║    합성 스모크(§80)는 make_synthetic() 이 만든 완성 패널을 곧바로 주입한다. 즉               ║
+# ║    build_security_master · fetch_prices · tidy_financials · hankyung_collect 같은          ║
+# ║    실제 수집·정제 함수는 단 한 줄도 실행되지 않는다.                                        ║
+# ║    실제로 이 공백 때문에 계약 17건 + 스모크를 전부 통과한 빌드가 실행 2분 만에               ║
+# ║    build_security_master 의 중복 컬럼 한 줄로 죽었다.                                      ║
+# ║                                                                                          ║
+# ║  그래서 여기서는 네트워크 계층만 가짜로 바꾸고(HTTP·pykrx·FDR), 그 위의 수집·정제           ║
+# ║  로직은 실물 그대로 돌린다. 각 함수에 대해 네 가지를 먹인다:                                 ║
+# ║    ① 정상 응답  ② 빈 응답  ③ 깨진 응답  ④ 기대 컬럼이 빠진 응답                            ║
+# ║  전부 '예외 없이' 통과해야 하고, 정상 응답에서는 실제로 값이 나와야 한다.                    ║
+# ║                                                                                          ║
+# ║  수 초면 끝나고 네트워크·키가 필요 없다. 실수집 전에 반드시 통과해야 한다.                   ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+REHEARSAL_RESULTS: List[dict] = []
+
+
+def _rh(name: str, fn: Callable, expect_rows: bool = True, note: str = ""):
+    """리허설 1건 실행. 예외는 실패, 정상응답 0행도 (기대했다면) 실패."""
+    t0 = time.time()
+    try:
+        out = fn()
+        n = len(out) if hasattr(out, "__len__") else (1 if out is not None else 0)
+        ok = (not expect_rows) or n > 0
+        REHEARSAL_RESULTS.append({
+            "name": name, "ok": ok, "rows": n, "sec": time.time() - t0,
+            "err": "" if ok else "정상 응답을 줬는데 결과가 0행입니다(파싱 실패 가능성)",
+            "note": note})
+        return out
+    except Exception as e:                                          # noqa
+        REHEARSAL_RESULTS.append({
+            "name": name, "ok": False, "rows": -1, "sec": time.time() - t0,
+            "err": f"{type(e).__name__}: {str(e)[:200]}", "note": note,
+            "tb": traceback.format_exc()})
+        return None
+
+
+# ── 픽스처 ──────────────────────────────────────────────────────────────────────────────────
+def _fx_fdr_listing_csv(n: int = 40) -> bytes:
+    # FDR GitHub 캐시 실제 스키마 (ChagesRatio 오타는 업스트림 그대로)
+    rows = ["，Code,ISU_CD,Name,Market,Dept,Close,ChagesRatio,Marcap,Stocks,MarketId"
+            .replace("，", "")]
+    for i in range(n):
+        code = f"{i+1:06d}"
+        rows.append(f"{i},{code},KR7{code}003,합성{i+1:03d},"
+                    f"{'KOSPI' if i%2 else 'KOSDAQ'},,10000,0.5,1000000000,100000,"
+                    f"{'STK' if i%2 else 'KSQ'}")
+    return ("﻿" + "\n".join(rows)).encode("utf-8")
+
+
+def _fx_fdr_delisting_csv(n: int = 30) -> bytes:
+    rows = ["Symbol,Name,Market,SecuGroup,Kind,DelistingDate,ToSymbol,ToName,Reason"]
+    for i in range(n):
+        # 앞 20건은 정상 6자리, 뒤 10건은 비표준 코드(ETF/ELW/스팩 등) — 탈락 집계 검증용
+        code = f"{900000+i:06d}" if i < 20 else f"KR{i:08d}"
+        rows.append(f"{code},폐지{i+1:03d},KOSPI,주권,보통주,"
+                    f"{2017+(i%8)}-0{1+(i%9)}-15,,,상장폐지")
+    return ("﻿" + "\n".join(rows)).encode("utf-8")
+
+
+def _fx_kind_html(n: int = 30) -> bytes:
+    # KIND 는 HTML 표이고 종목코드가 '정수'로 와서 앞자리 0 이 날아간다
+    head = ("<table><tr><th>회사명</th><th>종목코드</th><th>업종</th><th>주요제품</th>"
+            "<th>상장일</th><th>결산월</th><th>대표자명</th><th>홈페이지</th><th>지역</th></tr>")
+    body = "".join(
+        f"<tr><td>합성{i+1:03d}</td><td>{i+1}</td><td>화학</td><td>제품</td>"
+        f"<td>2010-03-15</td><td>12월</td><td>홍길동</td><td>http://x</td><td>서울</td></tr>"
+        for i in range(n))
+    return (head + body + "</table>").encode("euc-kr")
+
+
+def _fx_dart_fnltt(corp: str, year: int) -> dict:
+    def row(sj, aid, anm, amt):
+        return {"rcept_no": f"{year}0331000001", "reprt_code": "11011", "bsns_year": str(year),
+                "corp_code": corp, "sj_div": sj, "sj_nm": sj, "account_id": aid,
+                "account_nm": anm, "thstrm_amount": amt, "frmtrm_amount": amt, "ord": "1"}
+    return {"status": "000", "message": "정상", "list": [
+        row("IS", "ifrs-full_Revenue", "매출액", "1,234,567,000,000"),
+        row("IS", "ifrs-full_CostOfSales", "매출원가", "900,000,000,000"),
+        row("IS", "dart_OperatingIncomeLoss", "영업이익", "120,000,000,000"),
+        row("IS", "ifrs-full_ProfitLoss", "당기순이익", "90,000,000,000"),
+        row("IS", "-표준계정코드 미사용-", "경상연구개발비", "30,000,000,000"),
+        row("IS", "ifrs-full_IncomeTaxExpense", "법인세비용", "20,000,000,000"),
+        row("IS", "ifrs-full_ProfitLossBeforeTax", "법인세비용차감전순이익", "110,000,000,000"),
+        row("IS", "dart_SellingGeneralAdministrativeExpenses", "판매비와관리비", "200,000,000,000"),
+        row("BS", "ifrs-full_Inventories", "재고자산", "150,000,000,000"),
+        row("BS", "ifrs-full_TradeAndOtherCurrentReceivables", "매출채권및기타채권", "180,000,000,000"),
+        row("BS", "ifrs-full_TradeAndOtherCurrentPayables", "매입채무및기타채무", "120,000,000,000"),
+        row("BS", "ifrs-full_Assets", "자산총계", "3,000,000,000,000"),
+        row("BS", "ifrs-full_Liabilities", "부채총계", "1,200,000,000,000"),
+        row("BS", "ifrs-full_Equity", "자본총계", "1,800,000,000,000"),
+        row("BS", "ifrs-full_PropertyPlantAndEquipment", "유형자산", "800,000,000,000"),
+        row("BS", "ifrs-full_IntangibleAssetsOtherThanGoodwill", "무형자산", "100,000,000,000"),
+        row("BS", "dart_ContractLiabilities", "계약부채", "50,000,000,000"),
+        row("CF", "ifrs-full_CashFlowsFromUsedInOperatingActivities", "영업활동현금흐름", "140,000,000,000"),
+        row("CF", "ifrs-full_PurchaseOfPropertyPlantAndEquipment", "유형자산의 취득", "-60,000,000,000"),
+        row("CF", "dart_DepreciationAndAmortisationExpense", "감가상각비와상각비", "50,000,000,000"),
+        row("CF", "ifrs-full_DividendsPaid", "배당금지급", "-15,000,000,000"),
+        row("CF", "dart_PaymentsToAcquireOrRedeemEntitysShares", "자기주식의 취득", "-8,000,000,000"),
+        row("CF", "ifrs-full_ProceedsFromBorrowings", "차입금의 증가", "40,000,000,000"),
+    ]}
+
+
+def _fx_dart_emp(corp: str, year: int) -> dict:
+    # 사업부문 × 성별로 쪼개진 실제 스키마 + '합계' 소계 행(이중계상 방지 검증)
+    def r(bbm, sex, sm, tot):
+        return {"rcept_no": f"{year}0331000001", "corp_code": corp, "fo_bbm": bbm,
+                "sexdstn": sex, "sm": sm, "fyer_salary_totamt": tot,
+                "jan_salary_am": "70,000,000"}
+    return {"status": "000", "list": [
+        r("반도체", "남", "1,200", "96,000,000,000"),
+        r("반도체", "여", "300", "21,000,000,000"),
+        r("디스플레이", "남", "500", "40,000,000,000"),
+        r("디스플레이", "여", "100", "7,000,000,000"),
+        r("합계", "합계", "2,100", "164,000,000,000"),
+    ]}
+
+
+def _fx_dart_list(bgn: str) -> dict:
+    y = bgn[:4]
+    return {"status": "000", "page_no": 1, "total_page": 1, "list": [
+        {"corp_code": "C0000001", "corp_name": "합성001", "stock_code": "000001",
+         "rcept_no": f"{y}0410000001", "rcept_dt": f"{y}0410",
+         "report_nm": "주요사항보고서(자기주식취득결정)", "flr_nm": "합성001", "corp_cls": "Y"},
+        {"corp_code": "C0000002", "corp_name": "합성002", "stock_code": "000002",
+         "rcept_no": f"{y}0412000002", "rcept_dt": f"{y}0412",
+         "report_nm": "주요사항보고서(유상증자결정)", "flr_nm": "합성002", "corp_cls": "Y"},
+        {"corp_code": "C0000003", "corp_name": "합성003", "stock_code": "000003",
+         "rcept_no": f"{y}0415000003", "rcept_dt": f"{y}0415",
+         "report_nm": "사업보고서 (2023.12)", "flr_nm": "합성003", "corp_cls": "Y"},
+    ]}
+
+
+def _fx_hankyung_html(n: int = 12) -> str:
+    hdr = ("<tr>" + "".join(f"<th>{h}</th>" for h in
+           ["작성일", "제목", "적정가격", "투자의견", "작성자", "제공출처",
+            "기업정보", "차트", "첨부"]) + "</tr>")
+    rows = []
+    for i in range(n):
+        idx = 500000 + i
+        rows.append(
+            "<tr>"
+            f"<td>2024-0{1+(i%9)}-15</td>"
+            f"<td class='text_l'><a href='/analysis/downpdf?report_idx={idx}'>"
+            f"합성{i+1:03d}({i+1:06d}) 실적 개선 전망</a></td>"
+            f"<td class='text_r'>{(i+5)*10000:,}</td><td>Buy</td>"
+            f"<td>애널{i%7:02d}</td><td>{'미래에셋대우' if i%2 else '하나금융투자'}</td>"
+            f"<td>-</td><td>-</td>"
+            f"<td><a href='/analysis/downpdf?report_idx={idx}'>PDF</a></td></tr>")
+    return f"<div id='contents'><div class='table_style01'><table>{hdr}{''.join(rows)}</table></div></div>"
+
+
+def _fx_naver_research_html(n: int = 12) -> str:
+    hdr = ("<tr><th>종목명</th><th>제목</th><th>증권사</th><th>첨부</th>"
+           "<th>작성일</th><th>조회수</th></tr>")
+    rows = []
+    for i in range(n):
+        rows.append(
+            "<tr>"
+            f"<td style='padding-left:10'><a class='stock_item' href='/item/main.naver?code={i+1:06d}' "
+            f"title='합성{i+1:03d}'>합성{i+1:03d}</a></td>"
+            f"<td><a href='company_read.naver?nid={90000+i}&amp;page=1'>실적 개선 전망</a></td>"
+            f"<td>{'KB증권' if i%2 else '신한금융투자'}</td>"
+            f"<td class='file'><a href='https://stock.pstatic.net/stock-research/company/16/"
+            f"2024011{i%9}_company_{800000+i}.pdf'><img alt='pdf'/></a></td>"
+            f"<td class='date'>24.0{1+(i%9)}.1{i%9}</td><td class='date'>1,234</td></tr>")
+    nav = ("<table class='Nnavi'><tr><td class='pgRR'>"
+           "<a href='/research/company_list.naver?&amp;page=3'>맨뒤</a></td></tr></table>")
+    return (f"<div id='contentarea_left'><div class='box_type_m'>"
+            f"<table class='type_1'>{hdr}{''.join(rows)}</table></div></div>{nav}")
+
+
+def _fx_nps_json(page: int) -> dict:
+    items = [{"wkplNm": f"합성{i+1:03d}", "bzowrRgstNo": f"{1000000000+i}",
+              "jnngpCnt": str(100 + i * 7), "crrmmNtcAmt": str((100 + i * 7) * 300000),
+              "nwAcqzrCnt": "5", "lssJnngpCnt": "3", "wkplRoadNmDtlAddr": "서울시 강남구",
+              "ldongAddrMgplDgCd": "11", "vldtVlKrnNm": "제조업", "seq": str(i)}
+             for i in range(40)]
+    return {"response": {"header": {"resultCode": "00"},
+                         "body": {"totalCount": 40, "pageNo": page, "numOfRows": 1000,
+                                  "items": {"item": items if page == 1 else []}}}}
+
+
+def _fx_g2b_json() -> dict:
+    items = [{"bizno": f"{1000000000+i}", "bidwinnrNm": f"합성{i+1:03d}",
+              "sucsfbidAmt": str(1_000_000_000 + i * 1_000_000),
+              "presmptPrce": str(1_200_000_000 + i * 1_000_000),
+              "sucsfbidRate": str(85 + (i % 10)), "dminsttNm": "조달청",
+              "prdctClsfcNo": f"{4000+i}"} for i in range(25)]
+    return {"response": {"body": {"items": {"item": items}}}}
+
+
+def _fx_customs_json() -> dict:
+    items = [{"expDlr": str(1_000_000 + i * 1000), "expWgt": str(500_000 + i * 500),
+              "statCd": ["US", "DE", "VN", "CN"][i % 4]} for i in range(8)]
+    return {"response": {"body": {"items": {"item": items}}}}
+
+
+def _fx_pdf() -> bytes:
+    return b"%PDF-1.4\n% synthetic fixture\n%%EOF\n"
+
+
+# ── 라우팅 ──────────────────────────────────────────────────────────────────────────────────
+class _FixtureNet:
+    """URL 로 픽스처를 골라주는 가짜 네트워크. mode 로 정상/빈/깨짐/컬럼누락을 전환한다."""
+
+    def __init__(self, mode: str = "ok"):
+        self.mode = mode
+        self.hits: Counter = Counter()
+
+    def _m(self, kind: str):
+        self.hits[kind] += 1
+
+    def get(self, url, source="generic", params=None, as_bytes=False, **kw):
+        u = str(url)
+        p = params or {}
+        if self.mode == "empty":
+            return b"" if as_bytes else ""
+        if self.mode == "broken":
+            return b"\x00\x01garbage" if as_bytes else "<html><body>오류</body></html>"
+
+        if "fdr_krx_data_cache" in u:
+            if "/delisting/" in u:
+                self._m("fdr_delisting")
+                return _fx_fdr_delisting_csv()
+            self._m("fdr_listing")
+            if self.mode == "missingcol":
+                return b"\xef\xbb\xbf,Foo,Bar\n0,1,2\n"
+            return _fx_fdr_listing_csv()
+        if "kind.krx.co.kr" in u:
+            self._m("kind")
+            return _fx_kind_html()
+        if "corpCode.xml" in u:
+            self._m("dart_corpcode")
+            buf = io.BytesIO()
+            xml = "<result>" + "".join(
+                f"<list><corp_code>C{i+1:07d}</corp_code><corp_name>합성{i+1:03d}</corp_name>"
+                f"<stock_code>{i+1:06d}</stock_code><modify_date>20240101</modify_date></list>"
+                for i in range(40)) + "</result>"
+            with zipfile.ZipFile(buf, "w") as z:
+                z.writestr("CORPCODE.xml", xml.encode("utf-8"))
+            return buf.getvalue()
+        if "document.xml" in u:
+            self._m("dart_document")
+            buf = io.BytesIO()
+            body = ("<?xml version='1.0' encoding='euc-kr'?><DOCUMENT>"
+                    "II. 사업의 내용 당사는 반도체 소재를 제조합니다. " * 30 +
+                    "위험요인 환율 변동 위험이 존재합니다. " * 30 +
+                    "우발부채 계류 중인 소송은 없습니다. " * 20 + "</DOCUMENT>")
+            with zipfile.ZipFile(buf, "w") as z:
+                z.writestr("doc.xml", body.encode("euc-kr"))
+            return buf.getvalue()
+        if "consensus.hankyung.com" in u:
+            if "downpdf" in u:
+                self._m("hk_pdf")
+                return _fx_pdf()
+            self._m("hankyung")
+            page = int(p.get("now_page", 1) or 1)
+            return _fx_hankyung_html() if page == 1 else "<td class='no_data'>데이터가 없습니다</td>"
+        if "finance.naver.com/research" in u:
+            self._m("naver_research")
+            page = int(p.get("page", 1) or 1)
+            if page <= 2:
+                return _fx_naver_research_html()
+            return "<div id='contentarea_left'><table class='type_1'></table></div>"
+        if "finance.naver.com/item/main" in u:
+            self._m("naver_item")
+            return ('<div class="wrap_company"><h2><a href="#">합성종목</a></h2></div>')
+        if "stock.pstatic.net" in u:
+            self._m("naver_pdf")
+            return _fx_pdf()
+        if "siseJson" in u:
+            self._m("naver_chart")
+            rows = ["['날짜','시가','고가','저가','종가','거래량','외국인소진율']"]
+            d = as_ts("2016-05-02")
+            for i in range(2600):
+                d2 = d + pd.Timedelta(days=i)
+                if d2.weekday() >= 5:
+                    continue
+                rows.append(f"['{d2:%Y%m%d}',10000,10100,9900,10050,120000,5.0]")
+            return "[" + ",".join(rows) + "]"
+        self._m("other")
+        return b"" if as_bytes else ""
+
+    def json(self, url, source="generic", params=None, **kw):
+        u, p = str(url), (params or {})
+        if self.mode == "empty":
+            return None
+        if self.mode == "broken":
+            return {"nonsense": True}
+        if "opendart" in u and "fnlttSinglAcntAll" in u:
+            self._m("dart_fnltt")
+            if self.mode == "missingcol":
+                return {"status": "000", "list": [{"corp_code": p.get("corp_code")}]}
+            return _fx_dart_fnltt(p.get("corp_code", "C0000001"), int(p.get("bsns_year", 2020)))
+        if "opendart" in u and "empSttus" in u:
+            self._m("dart_emp")
+            return _fx_dart_emp(p.get("corp_code", "C0000001"), int(p.get("bsns_year", 2020)))
+        if "opendart" in u and "list.json" in u:
+            self._m("dart_list")
+            return _fx_dart_list(str(p.get("bgn_de", "20200101")))
+        if "NpsBplcInfoInqireService" in u:
+            self._m("nps")
+            return _fx_nps_json(int(p.get("pageNo", 1) or 1))
+        if "ScsbidInfoService" in u:
+            self._m("g2b")
+            return _fx_g2b_json() if int(p.get("pageNo", 1) or 1) == 1 else {"response": {"body": {"items": []}}}
+        if "nitemtrade" in u:
+            self._m("customs")
+            return _fx_customs_json()
+        if "stockSecurity/researches" in u:
+            self._m("naver_api")
+            return []                       # JSON API 미가용 → HTML 폴백 경로를 타게 한다
+        self._m("other_json")
+        return None
+
+
+def run_rehearsal(strict: bool = True) -> bool:
+    """실제 수집·정제 함수를 픽스처로 전부 실행한다. 네트워크·키 불필요."""
+    LOG.banner("② 실경로 리허설 (REHEARSAL)",
+               "네트워크만 가짜로 바꾸고 수집·정제 로직은 실물 그대로 실행한다")
+    REHEARSAL_RESULTS.clear()
+    G = globals()
+    saved = {k: G.get(k) for k in ("http_get", "http_json", "http_post",
+                                   "fdr", "pykrx_stock", "yf", "DART_API_KEY",
+                                   "DATA_GO_KR_KEY", "CUSTOMS_API_KEY", "RUN_MODE",
+                                   "RESEARCH_DOWNLOAD_PDF", "UNIVERSE_SNAPSHOT_FREQ")}
+    tmp = tempfile.mkdtemp(prefix="tcd_rehearsal_")
+    saved_vault, saved_budget = G.get("VAULT"), G.get("DBUDGET")
+    months = month_range("2016-08-01", "2026-07-31")
+
+    try:
+        # 네트워크·외부 라이브러리 차단 + 키 주입 (키가 있어야 해당 분기가 실행된다)
+        net = _FixtureNet("ok")
+        G["http_get"] = net.get
+        G["http_json"] = net.json
+        G["http_post"] = lambda *a, **k: ""
+        G["fdr"] = None
+        G["pykrx_stock"] = None            # 스냅샷 경로는 '없을 때' 폴백을 검증
+        G["yf"] = None
+        G["DART_API_KEY"] = "REHEARSAL"
+        G["DATA_GO_KR_KEY"] = "REHEARSAL"
+        G["CUSTOMS_API_KEY"] = "REHEARSAL"
+        G["RUN_MODE"] = "FULL"
+        G["RESEARCH_DOWNLOAD_PDF"] = True
+        G["VAULT"] = Vault(tmp, "REHEARSAL")
+        G["DBUDGET"] = DartBudget()
+
+        # ── ① 유니버스 ────────────────────────────────────────────────────────────────────
+        snaps = _rh("fetch_pykrx_snapshots(pykrx 없음→폴백)",
+                    lambda: fetch_pykrx_snapshots(months), expect_rows=False,
+                    note="pykrx 미설치 상황에서 죽지 않고 빈 결과를 돌려줘야 한다")
+        _rh("fetch_fdr_listing", fetch_fdr_listing)
+        _rh("fetch_fdr_delisting", fetch_fdr_delisting)
+        _rh("fetch_kind_listing", fetch_kind_listing)
+        _rh("fetch_dart_corpcode", fetch_dart_corpcode)
+        sec = _rh("build_security_master ★이번 크래시 지점",
+                  lambda: build_security_master(snaps if snaps is not None else pd.DataFrame(
+                      columns=["snap_date", "code", "market"])),
+                  note="중복 컬럼 → groupby.agg 폭발이 여기서 났다")
+        if sec is None or not len(sec):
+            sec = pd.DataFrame({"code": [f"{i+1:06d}" for i in range(40)],
+                                "name": [f"합성{i+1:03d}" for i in range(40)],
+                                "market": "KOSPI", "industry": "화학",
+                                "corp_code": [f"C{i+1:07d}" for i in range(40)],
+                                "listing_date": as_ts("2010-01-01"),
+                                "delisting_date": pd.NaT, "sector_src": "fx", "src": "fx"})
+
+        # ── ② 가격 ────────────────────────────────────────────────────────────────────────
+        codes = sec["code"].dropna().tolist()[:12]
+        px = _rh("fetch_prices(네이버 차트 폴백)",
+                 lambda: fetch_prices(codes, "2016-05-01", "2026-07-31"),
+                 note="FDR/pykrx 없이 네이버 경로만으로 동작해야 한다")
+        if px is not None and len(px):
+            _rh("build_price_panel", lambda: build_price_panel(px, months))
+        _rh("fetch_investor_flows(pykrx 없음)",
+            lambda: fetch_investor_flows(codes, "2016-08-01", "2026-07-31"), expect_rows=False)
+
+        # ── ③ DART ────────────────────────────────────────────────────────────────────────
+        corps = sec["corp_code"].dropna().astype(str).tolist()[:6]
+        years = [2019, 2020, 2021]
+        fs = _rh("fetch_dart_financials", lambda: fetch_dart_financials(corps, years))
+        if fs is not None and len(fs):
+            _rh("tidy_financials", lambda: tidy_financials(fs))
+        _rh("fetch_dart_employees", lambda: fetch_dart_employees(corps, years),
+            note="사업부문×성별 분해 + '합계' 소계행 이중계상 방지")
+        dis = _rh("fetch_dart_disclosures",
+                  lambda: fetch_dart_disclosures("2019-01-01", "2019-06-30"))
+
+        # ── ④ 리서치 원장 ─────────────────────────────────────────────────────────────────
+        hk = _rh("hankyung_collect", lambda: hankyung_collect("2024-01-01", "2024-12-31"))
+        nv = _rh("naver_collect", lambda: naver_collect("2024-01-01", "2024-12-31",
+                                                        cats=("company",)))
+        if nv is not None and len(nv):
+            _rh("naver_enrich_detail", lambda: naver_enrich_detail(nv, limit=5),
+                expect_rows=False)
+        frames = [x for x in (hk, nv) if x is not None and len(x)]
+        rep = _rh("build_report_master(다중소스 병합)",
+                  lambda: build_report_master(frames, sec)) if frames else None
+        if rep is not None and len(rep):
+            rep2 = _rh("download_pdfs", lambda: download_pdfs(rep, cap_per_month=3))
+            A_L = _rh("build_analyst_ledger",
+                      lambda: build_analyst_ledger(rep2 if rep2 is not None else rep),
+                      expect_rows=False)
+            if A_L is not None:
+                A, L = A_L
+                _rh("audit_linkage", lambda: (audit_linkage(rep, A, L) or [1]),
+                    expect_rows=False)
+                _rh("build_consensus_panel", lambda: build_consensus_panel(L, months),
+                    expect_rows=False)
+
+        # ── ⑤ 팩 전용 수집 ────────────────────────────────────────────────────────────────
+        if "fetch_nps_workplaces" in G:
+            N = _rh("fetch_nps_workplaces", lambda: fetch_nps_workplaces(months[:3]))
+            if N is not None and len(N):
+                M = _rh("resolve_nps_to_corp",
+                        lambda: resolve_nps_to_corp(N, sec, pd.DataFrame())[0])
+                if M is not None and len(M):
+                    _rh("build_nps_panel", lambda: build_nps_panel(N, M, pd.DataFrame(), months),
+                        expect_rows=False)
+        if "fetch_procurement" in G:
+            _rh("fetch_procurement", lambda: fetch_procurement(months[:2]))
+        if "fetch_customs_trade" in G:
+            _rh("fetch_customs_trade",
+                lambda: fetch_customs_trade(months[:2], ["3901000000", "3902000000"]))
+        if "fetch_dart_documents" in G and dis is not None and len(dis):
+            T = _rh("fetch_dart_documents", lambda: fetch_dart_documents(dis, sec, max_docs=5),
+                    expect_rows=False)
+            if T is not None and len(T):
+                _rh("build_text_similarity", lambda: build_text_similarity(T),
+                    expect_rows=False)
+
+        # ── ⑥ 이상 응답 내성 (빈/깨짐/컬럼누락) ───────────────────────────────────────────
+        for mode, label in (("empty", "빈 응답"), ("broken", "깨진 응답"),
+                            ("missingcol", "기대 컬럼 누락")):
+            bad = _FixtureNet(mode)
+            G["http_get"], G["http_json"] = bad.get, bad.json
+            G["VAULT"] = Vault(tempfile.mkdtemp(prefix=f"tcd_rh_{mode}_"), "REHEARSAL")
+            for fname, fn in (("fetch_fdr_listing", fetch_fdr_listing),
+                              ("fetch_fdr_delisting", fetch_fdr_delisting),
+                              ("fetch_kind_listing", fetch_kind_listing),
+                              ("fetch_dart_corpcode", fetch_dart_corpcode)):
+                _rh(f"[{label}] {fname}", fn, expect_rows=False,
+                    note="예외 없이 빈 결과를 돌려줘야 한다")
+            _rh(f"[{label}] fetch_dart_financials",
+                lambda: fetch_dart_financials(corps, [2020]), expect_rows=False)
+            _rh(f"[{label}] hankyung_collect",
+                lambda: hankyung_collect("2024-01-01", "2024-03-31"), expect_rows=False)
+            _rh(f"[{label}] build_report_master(빈 입력)",
+                lambda: build_report_master([], sec), expect_rows=False)
+
+    finally:
+        for k, v in saved.items():
+            G[k] = v
+        G["VAULT"], G["DBUDGET"] = saved_vault, saved_budget
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    ok_n = sum(1 for r in REHEARSAL_RESULTS if r["ok"])
+    LOG.table([[r["name"], "✔" if r["ok"] else "✘",
+                f"{r['rows']:,}" if r["rows"] >= 0 else "예외",
+                f"{r['sec']:.2f}s", _trunc(r["err"] or r["note"], 62)]
+               for r in REHEARSAL_RESULTS],
+              ["실경로 함수", "판정", "결과", "소요", "비고"],
+              ["l", "c", "r", "r", "l"], maxw=64)
+    fails = [r for r in REHEARSAL_RESULTS if not r["ok"]]
+    if fails:
+        LOG.error(f"실경로 리허설 {len(fails)}/{len(REHEARSAL_RESULTS)}건 실패")
+        for r in fails[:4]:
+            LOG.banner(f"✘ 리허설 실패: {r['name']}", r["err"])
+            for ln in str(r.get("tb", "")).rstrip().split("\n")[-10:]:
+                _safe_print("   " + ln)
+        if strict:
+            raise RuntimeError(
+                f"실경로 리허설 실패 {len(fails)}건 — 실데이터 수집을 시작하지 않습니다. "
+                f"이 검사는 '수집 함수가 진짜 데이터 모양에서 도는지'를 보는 것이라, "
+                f"여기서 막는 것이 몇 시간 뒤 L1 에서 죽는 것보다 훨씬 쌉니다.")
+        return False
+    LOG.ok(f"실경로 리허설 {ok_n}/{len(REHEARSAL_RESULTS)}건 통과 — "
+           f"수집·정제 함수가 실제 데이터 모양에서 정상 동작합니다.")
     return True
 
 
@@ -7088,7 +8064,7 @@ def offer_download(paths: Sequence[str]):
         try:
             from google.colab import files as _f       # type: ignore
             for p in paths:
-                print(f"⬇  다운로드 시작: {os.path.basename(p)}")
+                _safe_print(f"⬇  다운로드 시작: {os.path.basename(p)}")
                 _f.download(p)
             return
         except Exception:
@@ -7114,7 +8090,7 @@ def offer_download(paths: Sequence[str]):
         display(HTML("".join(html)))
     except Exception:
         for p in paths:
-            print(f"⬇  산출물 경로: {p}")
+            _safe_print(f"⬇  산출물 경로: {p}")
 
 
 def collect_all(months: pd.DatetimeIndex) -> dict:
@@ -7140,8 +8116,23 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.DART", "DART 재무 · 직원 · 공시", "L1", budget_s=1800, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
-        fs = fetch_dart_financials(corps, years)
-        fin = tidy_financials(fs)
+        # 유동성 상위 종목의 corp_code 를 우선순위로 넘긴다 — 일일 한도로 끊겨도
+        # '투자 가능한 종목의 최근 데이터'가 먼저 완성되게 하기 위함이다.
+        prio: List[str] = []
+        try:
+            pm = ctx["panel"]["monthly"]
+            adv = (pm.groupby("code", observed=True)["adv20"].median()
+                     .sort_values(ascending=False))
+            c2c = (ctx["sec"].dropna(subset=["corp_code"])
+                             .set_index("code")["corp_code"].astype(str).to_dict())
+            prio = [c2c[c] for c in adv.index if c in c2c]
+        except Exception:
+            prio = []
+        # Tier-1: 주요계정 배치 (100사/호출) → 전 종목 헤드라인을 싸게 확보
+        multi = fetch_dart_multi_accounts(corps, years)
+        # Tier-2: 전체 재무제표 (우선순위·최근연도부터) → B/C축이 필요로 하는 상세 계정
+        fs = fetch_dart_financials(corps, years, priority=prio)
+        fin = tidy_financials(merge_financial_tiers(fs, multi))
         emp = fetch_dart_employees(corps, years)
         dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         ctx["fin"], ctx["emp"], ctx["disclosures"] = fin, emp, dis
@@ -7279,6 +8270,11 @@ def main() -> dict:
         if not run_selftest(full_chain=(RUN_MODE == "SMOKE")):
             raise RuntimeError("스모크 테스트 실패 — 실데이터 수집을 시작하지 않습니다.")
 
+    # ★ 스모크는 '계산경로'를, 리허설은 '수집경로'를 증명한다. 둘은 겹치지 않는다.
+    #   합성 스모크만 믿었다가 수집부 한 줄 때문에 실행 2분 만에 죽은 전례가 있다.
+    with PIPE.stage("L0.REHEARSAL", "실경로 리허설 (수집 함수 실물 실행)", "L0", budget_s=600):
+        run_rehearsal(strict=True)
+
     months = month_range(BACKTEST_START, BACKTEST_END)
     if RUN_MODE == "SMOKE":
         LOG.ok("RUN_MODE='SMOKE' — 합성데이터로 전 출력물(백테스트·성과·강건성·해석표)을 "
@@ -7369,7 +8365,7 @@ if __name__ == "__main__" or ENV["ipython"]:
         RESULT = main()
     except KillCriteria as e:
         LOG.banner("⛔ 킬 기준으로 중단", "§15 — 파라미터를 조정해 통과시키지 마십시오")
-        print(f"  {e}")
+        _safe_print(f"  {e}")
         PIPE.report_stages(); PIPE.report_runtime()
         try:
             report_robustness()
@@ -7377,7 +8373,7 @@ if __name__ == "__main__" or ENV["ipython"]:
             pass
     except StageFailure as e:
         LOG.banner("실행 중단", "위의 '실패 지점' 상세와 아래 표에서 원인을 확인하세요")
-        print(f"  {e}")
+        _safe_print(f"  {e}")
         PIPE.report_stages(); PIPE.report_flow(); PIPE.report_runtime()
     except KeyboardInterrupt:
         LOG.warn("사용자 중단. 여기까지 수집된 데이터는 드라이브에 저장되어 있으며 "

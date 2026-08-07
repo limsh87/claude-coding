@@ -141,57 +141,82 @@ LISTING_SEASONING_DAYS = 250          # 상장일 + 250거래일 ≈ 1년
 
 
 class Universe:
-    def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame):
+    def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame,
+                 snap_window_days: int = 100):
         self.sec = sec.copy()
         self.snap = snapshots
         self.attrition: List[dict] = []
-        self._trading_days = np.sort(px_daily["date"].unique()) if len(px_daily) else np.array([])
+        self._cache_at: Dict[pd.Timestamp, List[str]] = {}
+        # 스냅샷 주기가 분기면 ±45일 창으로는 대부분의 달이 스냅샷을 못 만난다 → 창을 넓힌다.
+        self._snap_window_days = snap_window_days
+        self._trading_days = (np.sort(pd.unique(as_ts_series(px_daily["date"]).values))
+                              if px_daily is not None and len(px_daily) else
+                              np.array([], dtype="datetime64[ns]"))
         self._snap_by_month: Dict[pd.Timestamp, set] = {}
-        if len(snapshots):
+        if snapshots is not None and len(snapshots):
             for d, g in snapshots.groupby("snap_date"):
                 self._snap_by_month[as_ts(d)] = set(g["code"])
+
         self.sec["listing_date"] = as_ts_series(self.sec["listing_date"])
         self.sec["delisting_date"] = as_ts_series(self.sec["delisting_date"])
-        self._seasoned = {}
-        for r in self.sec.itertuples(index=False):
-            ld = r.listing_date
-            if pd.isna(ld) or len(self._trading_days) == 0:
-                self._seasoned[r.code] = ld
-            else:
-                i = int(np.searchsorted(self._trading_days, np.datetime64(ld), side="left"))
-                j = min(i + LISTING_SEASONING_DAYS, len(self._trading_days) - 1)
-                self._seasoned[r.code] = as_ts(self._trading_days[j])
+        self.sec = self.sec.drop_duplicates("code").reset_index(drop=True)
+
+        # 벡터화용 배열 (at() 이 매월 3,500행 itertuples 를 도는 것을 없앤다)
+        self._codes_arr = self.sec["code"].to_numpy(dtype=object)
+        self._ld_arr = self.sec["listing_date"].to_numpy(dtype="datetime64[ns]")
+        self._dd_arr = self.sec["delisting_date"].to_numpy(dtype="datetime64[ns]")
+        self._delist = {c: d for c, d in zip(self._codes_arr, self.sec["delisting_date"])
+                        if pd.notna(d)}
+
+        # 상장 후 250거래일 시즈닝 — 거래일 배열에 대한 searchsorted 를 한 번에 벡터화
+        self._seasoned: Dict[str, Any] = {}
+        if len(self._trading_days):
+            idx = np.searchsorted(self._trading_days, self._ld_arr, side="left")
+            idx = np.minimum(idx + LISTING_SEASONING_DAYS, len(self._trading_days) - 1)
+            seas = self._trading_days[idx]
+            for c, ld, s in zip(self._codes_arr, self._ld_arr, seas):
+                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(s)
+        else:
+            for c, ld in zip(self._codes_arr, self._ld_arr):
+                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(ld)
 
     def at(self, t) -> List[str]:
         """시점 t 의 유니버스. t 이후 상장 종목이 하나라도 섞이면 그 자체로 C2 위반이다."""
         t = as_ts(t)
-        # ① 스냅샷이 있으면 그것이 최우선 진실 (그 날 실제로 상장돼 있던 종목)
-        #    ★ 반드시 '과거' 스냅샷만 쓴다. 가장 가까운 스냅샷을 고르면 어떤 달의 수집이
-        #      실패했을 때 미래 스냅샷이 선택되어 그 자체로 미래누수가 된다.
+        if t in self._cache_at:
+            return self._cache_at[t]
+
+        # ① 상장일·폐지일로 유도한 집합이 '기준선'이다. 이건 항상 성립해야 한다.
+        base = set(self._codes_dated_at(t))
+
+        # ② 스냅샷은 '보강'이다. 대체가 아니다.
+        #    ★ 과거 스냅샷만 쓴다(미래 스냅샷을 고르면 그 자체가 누수).
+        #    ★ 교집합이 아니라 합집합이다. 부분 응답 스냅샷으로 기준선을 깎으면
+        #      그 달 유니버스가 조용히 줄어 곧바로 선택편향이 된다. 늘리기만 한다.
         past = [d for d in self._snap_by_month if d <= t]
-        key = max(past) if past else None
-        base = None
-        if key is not None and (t - key).days <= 45:
-            base = set(self._snap_by_month[key])
-        if base is None:
-            base = set()
-            for r in self.sec.itertuples(index=False):
-                ld, dd = r.listing_date, r.delisting_date
-                if pd.notna(ld) and ld > t:
-                    continue
-                if pd.notna(dd) and dd <= t:
-                    continue
-                if pd.isna(ld) and pd.isna(dd):
-                    continue                          # 근거 없는 종목은 넣지 않는다
-                base.add(r.code)
-        # ② 상장 후 250거래일 시즈닝
-        out = []
-        for c in base:
-            s = self._seasoned.get(c)
-            if s is not None and pd.notna(s) and s > t:
-                continue
-            out.append(c)
-        return sorted(out)
+        if past:
+            key = max(past)
+            if (t - key).days <= self._snap_window_days:
+                base |= set(self._snap_by_month[key])
+
+        # ③ 폐지 이후 종목은 어떤 경로로 들어왔든 반드시 제외한다.
+        base -= {c for c, dd in self._delist.items() if pd.notna(dd) and dd <= t}
+
+        # ④ 상장 후 250거래일 시즈닝
+        out = [c for c in base
+               if not (pd.notna(self._seasoned.get(c, pd.NaT)) and self._seasoned[c] > t)]
+        out = sorted(out)
+        self._cache_at[t] = out
+        return out
+
+    def _codes_dated_at(self, t: pd.Timestamp) -> List[str]:
+        """상장일/폐지일 기반 멤버십. itertuples 루프를 매월 도는 대신 벡터화한다
+        (종목 3,500 × 120개월 = 42만 회 파이썬 루프였다)."""
+        ld, dd = self._ld_arr, self._dd_arr
+        tt = np.datetime64(t)
+        ok = ~((~np.isnat(ld)) & (ld > tt)) & ~((~np.isnat(dd)) & (dd <= tt))
+        ok &= ~(np.isnat(ld) & np.isnat(dd))        # 근거가 전혀 없는 종목은 넣지 않는다
+        return self._codes_arr[ok].tolist()
 
     def delisting_map(self) -> Dict[str, pd.Timestamp]:
         return {r.code: r.delisting_date for r in self.sec.itertuples(index=False)

@@ -3,3 +3,4 @@ __pycache__/
 build/.smoke_*.log
 tcd_cache/
 .ipynb_checkpoints/
+.audit/

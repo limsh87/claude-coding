@@ -62,7 +62,7 @@ class _Log:
         line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
         with self.lock:
             self.buffer.append(line)
-            print(line, flush=True)
+            _safe_print(line, flush=True)
 
     def debug(self, m): self._emit("DEBUG", m, "· ")
     def info(self, m):  self._emit("INFO",  m, "  ")
@@ -73,35 +73,35 @@ class _Log:
     def rule(self, title: str = "", ch: str = "─", width: int = 104):
         if title:
             pre = f"{ch * 3} {title} "
-            print(pre + ch * max(0, width - _dw(pre)), flush=True)
+            _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
         else:
-            print(ch * width, flush=True)
+            _safe_print(ch * width, flush=True)
 
     def banner(self, title: str, sub: str = "", width: int = 104):
-        print("", flush=True)
-        print("╔" + "═" * (width - 2) + "╗", flush=True)
-        print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
+        _safe_print("", flush=True)
+        _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
+        _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
         if sub:
-            print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
-        print("╚" + "═" * (width - 2) + "╝", flush=True)
+            _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
+        _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
 
     def table(self, rows: List[Sequence[Any]], headers: Sequence[str],
               aligns: Optional[Sequence[str]] = None, maxw: int = 46, title: str = ""):
         """한글 폭 보정 표. 강건성/성과/감사 출력 전부 이걸 쓴다."""
         if title:
-            print(f"\n▶ {title}", flush=True)
+            _safe_print(f"\n▶ {title}", flush=True)
         if not rows:
-            print("   (행 없음)", flush=True)
+            _safe_print("   (행 없음)", flush=True)
             return
         ncol = len(headers)
         aligns = list(aligns or ["l"] * ncol)
         cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r)) for r in rows]
         widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
         head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
-        print(head, flush=True)
-        print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
+        _safe_print(head, flush=True)
+        _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
         for r in cells:
-            print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
+            _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
 
 
 LOG = _Log("DEBUG" if VERBOSE else "INFO")
@@ -188,6 +188,24 @@ _DIAG_RULES: List[Tuple[str, str]] = [
      "parquet 읽기/쓰기 실패입니다. 드라이브 FUSE 마운트에서 쓰기가 중단되면 파일이 깨질 수 있습니다. "
      "코드는 임시파일→원자적 rename 으로 쓰므로, 깨진 건 이전 실행 잔재입니다. "
      "해당 파일만 지우고(원본 아님, 캐시임) 재실행하세요."),
+    (r"'DataFrame' object has no attribute 'name'|_wrap_agged_manager",
+     "중복 컬럼입니다. DataFrame 에 같은 이름의 컬럼이 두 개 있으면 df[col] 이 Series 가 아니라 "
+     "DataFrame 이 되고, groupby(...).agg() 가 pandas 내부에서 이 예외로 터집니다. "
+     "직전에 concat/reindex(columns=...)/merge 로 컬럼을 합친 곳을 보세요 — "
+     "리스트를 이어붙일 때(예: COLS + ['x'] 인데 COLS 에 이미 'x' 가 있는 경우) 가장 흔합니다. "
+     "assert_no_dup_cols() 로 발생 지점을 앞당겨 잡을 수 있습니다."),
+    (r"Expecting value: line \d+ column 1|JSONDecodeError|Error occurred in get_market",
+     "JSON 대신 HTML(대개 로그인/에러 페이지)을 받았습니다. KRX 계열이면 세션이 끊긴 것입니다. "
+     "pykrx 는 스레드마다 재로그인하며 KRX 는 중복 로그인 시 이전 세션을 끊습니다 — "
+     "모든 pykrx 호출은 KRXG.call() 게이트로 직렬화해야 합니다. "
+     "KRX ID/PW 를 다른 브라우저 탭에서 동시에 쓰고 있지 않은지도 확인하세요."),
+    (r"UnicodeEncodeError|cp949|charmap",
+     "콘솔 인코딩 문제입니다(윈도우 기본 cp949 는 罫線문자 ╔═║ 와 ✔✘ 를 못 씁니다). "
+     "코드가 stdout 을 UTF-8 로 재설정하고 실패 시 ASCII 로 낮추지만, 직접 출력을 추가했다면 "
+     "print 대신 _safe_print 를 쓰세요. 또는 실행 전 `chcp 65001` 을 하세요."),
+    (r"statvfs|WinError",
+     "윈도우 전용 이슈입니다. os.statvfs 는 윈도우에 없고(용량 표시만 생략됩니다), "
+     "파일 잠금·경로 구분자도 다릅니다. 기능에는 영향이 없어야 하며, 있다면 버그입니다."),
     (r"KeyError: 'knowledge_date'|knowledge_date",
      "PIT 컬럼 누락입니다. 모든 테이블은 event_date/knowledge_date 를 가져야 합니다(C1). "
      "새 수집 함수를 추가했다면 pit_frame() 으로 감싸주세요."),
@@ -310,8 +328,8 @@ class Pipeline:
 
     def _print_failure(self, rec: StageRecord):
         LOG.banner(f"✘ 실패 지점: [{rec.sid}] {rec.name}", f"계층 {rec.layer} · 경과 {rec.dur:.2f}s")
-        print(f"  예외      : {rec.err_type}: {rec.err_msg}")
-        print(f"  진단      : {rec.hint}")
+        _safe_print(f"  예외      : {rec.err_type}: {rec.err_msg}")
+        _safe_print(f"  진단      : {rec.hint}")
         recent = [e for e in self.flow if e.stage == rec.sid][-8:]
         if recent:
             LOG.table(
@@ -320,10 +338,10 @@ class Pipeline:
                 ["방향", "종류", "대상", "행수", "PIT", "상태", "소스/비고"],
                 ["c", "l", "l", "r", "c", "c", "l"],
                 title="이 스테이지의 직전 입출력 (여기서 무엇이 비었는지 보세요)")
-        print("\n  ── 트레이스백 (마지막 12줄) " + "─" * 60)
+        _safe_print("\n  ── 트레이스백 (마지막 12줄) " + "─" * 60)
         for ln in rec.err_tb.rstrip().split("\n")[-12:]:
-            print("   " + ln)
-        print("  " + "─" * 86)
+            _safe_print("   " + ln)
+        _safe_print("  " + "─" * 86)
 
     # -- 리포트 --------------------------------------------------------------------------
     def report_stages(self):

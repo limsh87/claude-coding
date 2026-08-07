@@ -154,8 +154,83 @@ def _fs_one(job) -> Optional[pd.DataFrame]:
     return d[_FS_KEEP]
 
 
-def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다."""
+# ── Tier-1: 다중회사 주요계정 (배치) ────────────────────────────────────────────────────────
+#   fnlttMultiAcnt 는 corp_code 를 콤마로 최대 100개까지 받는다.
+#   2,500사 × 10년 × 4분기를 단건으로 받으면 100,000 호출(일 20,000 한도로 5일)이지만
+#   배치로는 1,000 호출(1시간 이내)이면 끝난다. ★100배 차이다.
+#   다만 '주요계정'만 오므로 B/C축이 필요로 하는 재고·매출채권·영업CF 는 없다.
+#   → 헤드라인은 배치로 싹 깔고, 전체 재무제표는 우선순위대로 단건 수집해 덮어쓴다(2단 구성).
+DART_MULTI_BATCH = 100
+_MULTI_ACCOUNT_MAP = {
+    "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
+    "자산총계": "assets", "부채총계": "liabilities", "자본총계": "equity",
+}
+
+
+def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
+    """주요계정 배치 수집. 전체 재무제표의 '바닥'을 싸게 깔아둔다."""
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=_FS_KEEP)
+    cached = VAULT.get_table("dart_multi_raw", scope="shared")
+    done = set()
+    if cached is not None and len(cached):
+        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
+                       cached["reprt_code"].astype(str)))
+        LOG.info(f"공용 캐시에서 DART 주요계정 {len(cached):,}행 재사용")
+
+    reprts = [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]]
+    corps = [str(c) for c in corp_codes]
+    jobs = []
+    for y in sorted(years, reverse=True):          # 최근 연도 우선 (중단돼도 최신이 남게)
+        for r in reprts:
+            todo = [c for c in corps if (c, int(y), str(r)) not in done]
+            for i in range(0, len(todo), DART_MULTI_BATCH):
+                jobs.append((todo[i:i + DART_MULTI_BATCH], int(y), r))
+    if RUN_MODE == "CACHED":
+        jobs = []
+
+    def _one(job):
+        batch, y, r = job
+        js = dart_api("fnlttMultiAcnt.json",
+                      {"corp_code": ",".join(batch), "bsns_year": str(y), "reprt_code": r})
+        if not js or not isinstance(js.get("list"), list) or not js["list"]:
+            return None
+        d = pd.DataFrame(js["list"])
+        for c in _FS_KEEP:
+            if c not in d.columns:
+                d[c] = None
+        d["bsns_year"] = int(y)
+        d["reprt_code"] = r
+        return d[_FS_KEEP]
+
+    got = []
+    if jobs:
+        LOG.info(f"DART 주요계정 배치 {len(jobs):,}회 (1회당 최대 {DART_MULTI_BATCH}사) — "
+                 f"단건 수집이면 {len(jobs)*DART_MULTI_BATCH:,}회였을 분량입니다")
+        res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="DART 주요계정(배치)")
+        got = [d for d in res if d is not None and len(d)]
+
+    frames = ([cached] if cached is not None and len(cached) else []) + got
+    if not frames:
+        return pd.DataFrame(columns=_FS_KEEP)
+    M = pd.concat(frames, ignore_index=True)
+    M = M.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div",
+                           "account_nm"], keep="last")
+    if got:
+        VAULT.put_table("dart_multi_raw", M, scope="shared", domain="dart",
+                        source="opendart fnlttMultiAcnt")
+    LOG.ok(f"DART 주요계정 {len(M):,}행 · {M['corp_code'].nunique():,}사 "
+           f"(호출 {len(jobs):,}회로 확보)")
+    PIPE.io("OUT", "DRIVE", "dart_multi_raw", M, source="opendart fnlttMultiAcnt")
+    return M
+
+
+def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
+                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
+
+    priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
+    일일 한도로 중간에 끊겨도 '투자 가능한 종목의 최근 데이터'가 먼저 확보되도록 하기 위함이다."""
     if not DART_API_KEY:
         LOG.warn("DART_API_KEY 미입력 — B축(회계품질)·C축(자원투입)·PACK-C 가 전부 비활성화됩니다. "
                  "이 전략의 핵심 입력이므로 키 입력을 강력히 권합니다.")
@@ -170,8 +245,14 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int]) -> pd
 
     reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
               else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
-    jobs = [(c, y, r) for c in corp_codes for y in years for r in reprts
-            if (str(c), int(y), str(r)) not in done]
+    # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
+    #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
+    #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
+    order = {str(c): i for i, c in enumerate(priority or [])}
+    corp_sorted = sorted((str(c) for c in corp_codes),
+                         key=lambda c: (order.get(c, 10 ** 9), c))
+    jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
+            if (c, int(y), str(r)) not in done]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
@@ -197,8 +278,35 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int]) -> pd
                              "account_nm"], keep="last")
     if got:
         VAULT.put_table("dart_fnltt_raw", fs, scope="shared", domain="dart", source="opendart")
+    n_have = fs.groupby(["corp_code", "bsns_year", "reprt_code"]).ngroups if len(fs) else 0
+    n_need = len(corp_sorted) * len(years) * len(reprts)
+    LOG.info(f"DART 전체 재무제표 진행률 {n_have:,}/{n_need:,} "
+             f"({100*n_have/max(n_need,1):.1f}%) — 최근 연도·우선순위 종목부터 채웁니다. "
+             f"재실행하면 정확히 이 지점부터 이어받습니다.")
     PIPE.io("OUT", "DRIVE", "dart_fnltt_raw", fs, source="opendart fnlttSinglAcntAll")
     return fs
+
+
+def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFrame:
+    """Tier-2(전체 재무제표)를 우선하고, 없는 (회사, 기간)만 Tier-1(주요계정)로 메운다.
+
+    콜드빌드가 며칠 걸리는 동안에도 매출·영업이익·순이익·자산·부채·자본은 전 종목이
+    확보되어 있어 유니버스 구성과 규모 버킷(C11), R3 팩터가 즉시 동작한다."""
+    if multi is None or multi.empty:
+        return full if full is not None else pd.DataFrame(columns=_FS_KEEP)
+    if full is None or full.empty:
+        LOG.info("전체 재무제표가 아직 없어 주요계정(배치)만으로 진행합니다 — "
+                 "B축의 재고·매출채권·영업CF 는 결측이므로 TP_B1/TP_B2 가 약해집니다.")
+        return multi
+    have = set(zip(full["corp_code"].astype(str), full["bsns_year"].astype(int),
+                   full["reprt_code"].astype(str)))
+    key = list(zip(multi["corp_code"].astype(str), multi["bsns_year"].astype(int),
+                   multi["reprt_code"].astype(str)))
+    fill = multi[[k not in have for k in key]]
+    if len(fill):
+        LOG.info(f"주요계정으로 보완한 (회사×기간) {fill.groupby(['corp_code','bsns_year','reprt_code']).ngroups:,}건 "
+                 f"— 전체 재무제표 콜드빌드가 끝나면 자동으로 대체됩니다.")
+    return pd.concat([full, fill], ignore_index=True)
 
 
 # ── 계정 매핑 (한국 XBRL 계정명은 회사마다 다르다 → 정규식 다중 매칭) ────────────────────────
