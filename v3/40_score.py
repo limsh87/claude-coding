@@ -161,6 +161,38 @@ def assemble_score(P: pd.DataFrame, stage: str = "M3", tp_mode: str = "clip",
     return p
 
 
+def report_dead_signals(P: pd.DataFrame, stage: str = "M3"):
+    """★ '무엇이 죽었는가'를 백테스트 **전에** 표로 못박는다.
+
+    K1(벌크) 이 실패해 폴백 A 로 내려가면 재고·매출채권·영업CF 가 없어 TP_I2/TP_I4/TP_I1 이
+    조용히 결측이 된다. 그런데 파이프라인은 남은 축으로 평균을 내고 끝까지 '성공'한다.
+    사용자는 코어가 빠진 전략의 성과를 보면서 그 사실을 모른다. 그게 최악이다.
+    """
+    rows, dead = [], []
+    for tid, a, b, need, why in TP_DEFS:
+        if not _stage_ok(need, stage):
+            rows.append([tid, "—", "—", f"단계 미도달({need})", why])
+            continue
+        na = int(col(P, a).notna().sum()) if a in P.columns else 0
+        nb = int(col(P, b).notna().sum()) if b in P.columns else 0
+        ok = na > 0 and nb > 0
+        if not ok:
+            dead.append(tid)
+        rows.append([tid, f"{na:,}", f"{nb:,}",
+                     "✔ 살아있음" if ok else f"✘ 죽음 ({a if na == 0 else b} 결측)", why])
+    LOG.table(rows, ["TP", f"개선축 관측", "대가축 관측", "상태", "발화 의미"],
+              ["c", "r", "r", "l", "l"],
+              title="신호 생존 점검 — 어떤 트레이드오프 쌍이 실제로 계산되는가")
+    if dead:
+        LOG.warn(f"죽은 TP: {dead}. 이 전략의 코어가 그만큼 비어 있는 상태로 백테스트가 "
+                 f"진행됩니다 — 남은 축으로 평균을 내고 끝까지 '성공'하므로 결과만 보면 "
+                 f"알 수 없습니다. 가장 흔한 원인은 CANARY K1(벌크) 실패 후 폴백 A 로 "
+                 f"내려가 재고·매출채권·영업CF 가 없는 경우입니다. 위 '필수 계정 커버리지' "
+                 f"표에서 어느 계정이 비었는지 확인하세요.")
+        PIPE.note(f"WARN: 죽은 TP {dead}")
+    return dead
+
+
 def _report_score_health(p: pd.DataFrame, e_names, u_axes, floor_info):
     n = max(len(p), 1)
     e = p["E"]

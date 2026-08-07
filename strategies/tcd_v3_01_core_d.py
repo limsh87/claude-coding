@@ -1037,6 +1037,21 @@ def _ensure_dir(path: str):
         os.makedirs(d, exist_ok=True)
 
 
+def _replace_retry(src: str, dst: str, tries: int = 6):
+    """os.replace 는 POSIX 에서 원자적이지만 **Windows 에서는 대상 파일이 열려 있으면
+    PermissionError(WinError 5/32)** 를 낸다. 구글드라이브 동기화 클라이언트와 백신이
+    새로 쓰인 파일을 즉시 여는 것이 정상 동작이라, 이 경합은 드물지 않고 재현도 안 된다.
+    한 번 실패하면 캐시 저장이 통째로 실패하고 다음 실행이 같은 수집을 다시 한다."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.25 * (2 ** i) + random.random() * 0.1)
+
+
 def atomic_write_bytes(path: str, data: bytes) -> str:
     """임시파일 → flush/fsync → os.replace. 드라이브 마운트에서 중단돼도 원본이 반쪽 나지 않는다."""
     _ensure_dir(path)
@@ -1048,7 +1063,7 @@ def atomic_write_bytes(path: str, data: bytes) -> str:
             os.fsync(f.fileno())
         except Exception:
             pass                     # 일부 FUSE 는 fsync 미지원 — 실패해도 replace 는 유효
-    os.replace(tmp, path)
+    _replace_retry(tmp, path)
     return path
 
 
@@ -1058,7 +1073,9 @@ def atomic_write_text(path: str, text: str) -> str:
 
 def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd") -> str:
     _ensure_dir(path)
-    tmp = f"{path}.tmp.{os.getpid()}"
+    # ★ thread id 가 없으면 같은 프로세스의 두 스레드가 **같은 임시파일**에 동시에 쓰고
+    #   서로의 내용을 덮어쓴다(atomic_write_bytes 에는 있는데 여기만 빠져 있었다).
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     out = df.copy()
     for c in out.columns:                       # object 컬럼은 arrow 가 종종 거부한다 → 문자열화
         if out[c].dtype == object:
@@ -1070,7 +1087,7 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
         out.to_parquet(tmp, index=False, compression=compression)
     except Exception:
         out.to_parquet(tmp, index=False, compression="snappy")
-    os.replace(tmp, path)
+    _replace_retry(tmp, path)
     return path
 
 
@@ -2517,10 +2534,16 @@ def _rss_mb() -> float:
                             ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
                             ("PagefileUsage", ctypes.c_size_t),
                             ("PeakPagefileUsage", ctypes.c_size_t)]
+            # ★ argtypes/restype 을 지정하지 않으면 ctypes 가 핸들을 C int 로 취급해
+            #   64비트에서 상위 비트가 잘린다. 예외 없이 실패해 RSS 가 조용히 '-' 가 된다.
+            k32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE,
+                                                   ctypes.POINTER(_PMC), wintypes.DWORD]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
             c = _PMC()
             c.cb = ctypes.sizeof(_PMC)
-            if ctypes.windll.psapi.GetProcessMemoryInfo(
-                    ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb):
+            if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb):
                 return c.WorkingSetSize / 1e6
         except Exception:
             pass
@@ -3960,7 +3983,11 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     keep = nxt[["code", "date", "next_open", "next_date"]]
     last = last.merge(keep, on=["code", "date"], how="left")
 
-    monthly = last[["code", "month", "date", "close", "adv20", "next_open", "next_date"]].copy()
+    # ★ volume 을 반드시 실어 보낸다. 없으면 V6 의 '거래정지' 판정이 col(p,"volume") 에서
+    #   전부 NaN 이 되어 halted 가 항상 False → 거래정지 종목이 그대로 매수 후보에 남는다.
+    #   예외는 안 나고 거부권 절반이 조용히 죽는다.
+    monthly = last[["code", "month", "date", "close", "adv20", "volume",
+                    "next_open", "next_date"]].copy()
     monthly = monthly.rename(columns={"date": "signal_date"})
     monthly = monthly[monthly["month"].isin(months)]
 
@@ -4247,9 +4274,12 @@ def _bulk_fetch_one(fl_nm: str) -> Optional[bytes]:
     return None
 
 
-_BULK_VALUE_HINTS = ["당기 1분기 3개월", "당기 반기 3개월", "당기 3분기 3개월",
-                     "당기 1분기 누적", "당기 반기 누적", "당기 3분기 누적",
-                     "당기", "당기말"]
+# ★ 순서가 곧 의미다. 하류(tidy_financials)가 **누적→분기 차분**을 수행하므로 여기서는
+#   반드시 **누적** 금액을 집어야 한다. '3개월'(분기 단독)을 집으면 이미 분기값인 것을 또
+#   차분해 이중 차분이 되고, 예외 없이 전부 틀린 숫자가 나온다.
+#   재무상태표는 시점값이라 '당기말' 이 정답이다.
+_BULK_VALUE_HINTS = ["당기 1분기 누적", "당기 반기 누적", "당기 3분기 누적", "당기 누적",
+                     "당기말", "당기"]
 
 
 def _parse_bulk_txt(raw: bytes, year: int, reprt: str) -> pd.DataFrame:
@@ -4614,17 +4644,26 @@ def merge_financial_tiers(*tiers: pd.DataFrame) -> pd.DataFrame:
     tiers = [t for t in tiers if nonempty(t)]
     if not tiers:
         return pd.DataFrame(columns=_FS_KEEP)
+    def _idkey(df: pd.DataFrame) -> Optional[pd.Series]:
+        """티어마다 식별자가 다르다: 벌크는 stock_code, API 는 corp_code 를 준다.
+        ★ corp_code 로만 키를 만들면 벌크 쪽이 전부 NaN 이라 'have' 집합이 쓰레기가 되고
+          티어 우선순위가 통째로 무력화된다(하위 티어가 상위를 덮어쓴다). 있는 쪽을 쓴다."""
+        for c in ("corp_code", "stock_code"):
+            if c in df.columns and df[c].notna().any():
+                return df[c].astype(str)
+        return None
+
     out = tiers[0]
     for t in tiers[1:]:
-        keys = ("corp_code", "bsns_year", "reprt_code")
-        if not all(k in out.columns for k in keys) or not all(k in t.columns for k in keys):
+        ka, kb = _idkey(out), _idkey(t)
+        if ka is None or kb is None or not all(
+                k in out.columns and k in t.columns for k in ("bsns_year", "reprt_code")):
             out = pd.concat([out, t], ignore_index=True)
             continue
-        have = set(zip(out["corp_code"].astype(str), out["bsns_year"].astype(int),
-                       out["reprt_code"].astype(str)))
-        key = list(zip(t["corp_code"].astype(str), t["bsns_year"].astype(int),
-                       t["reprt_code"].astype(str)))
+        have = set(zip(ka, out["bsns_year"].astype(int), out["reprt_code"].astype(str)))
+        key = list(zip(kb, t["bsns_year"].astype(int), t["reprt_code"].astype(str)))
         fill = t[[k not in have for k in key]]
+        keys = ("bsns_year", "reprt_code")
         if len(fill):
             LOG.info(f"하위 티어로 보완한 (회사×기간) "
                      f"{fill.groupby(list(keys)).ngroups:,}건 — 상위 티어가 도착하면 자동 대체됩니다.")
@@ -7214,6 +7253,38 @@ def assemble_score(P: pd.DataFrame, stage: str = "M3", tp_mode: str = "clip",
     return p
 
 
+def report_dead_signals(P: pd.DataFrame, stage: str = "M3"):
+    """★ '무엇이 죽었는가'를 백테스트 **전에** 표로 못박는다.
+
+    K1(벌크) 이 실패해 폴백 A 로 내려가면 재고·매출채권·영업CF 가 없어 TP_I2/TP_I4/TP_I1 이
+    조용히 결측이 된다. 그런데 파이프라인은 남은 축으로 평균을 내고 끝까지 '성공'한다.
+    사용자는 코어가 빠진 전략의 성과를 보면서 그 사실을 모른다. 그게 최악이다.
+    """
+    rows, dead = [], []
+    for tid, a, b, need, why in TP_DEFS:
+        if not _stage_ok(need, stage):
+            rows.append([tid, "—", "—", f"단계 미도달({need})", why])
+            continue
+        na = int(col(P, a).notna().sum()) if a in P.columns else 0
+        nb = int(col(P, b).notna().sum()) if b in P.columns else 0
+        ok = na > 0 and nb > 0
+        if not ok:
+            dead.append(tid)
+        rows.append([tid, f"{na:,}", f"{nb:,}",
+                     "✔ 살아있음" if ok else f"✘ 죽음 ({a if na == 0 else b} 결측)", why])
+    LOG.table(rows, ["TP", f"개선축 관측", "대가축 관측", "상태", "발화 의미"],
+              ["c", "r", "r", "l", "l"],
+              title="신호 생존 점검 — 어떤 트레이드오프 쌍이 실제로 계산되는가")
+    if dead:
+        LOG.warn(f"죽은 TP: {dead}. 이 전략의 코어가 그만큼 비어 있는 상태로 백테스트가 "
+                 f"진행됩니다 — 남은 축으로 평균을 내고 끝까지 '성공'하므로 결과만 보면 "
+                 f"알 수 없습니다. 가장 흔한 원인은 CANARY K1(벌크) 실패 후 폴백 A 로 "
+                 f"내려가 재고·매출채권·영업CF 가 없는 경우입니다. 위 '필수 계정 커버리지' "
+                 f"표에서 어느 계정이 비었는지 확인하세요.")
+        PIPE.note(f"WARN: 죽은 TP {dead}")
+    return dead
+
+
 def _report_score_health(p: pd.DataFrame, e_names, u_axes, floor_info):
     n = max(len(p), 1)
     e = p["E"]
@@ -8264,7 +8335,13 @@ def R10_policy(P, months, sec, runner, base_bt) -> None:
               title="R10 — 정책 반증 (밸류업은 2024년 이후 · 그 이전 기여가 0이면 정책 베팅)")
     try:
         pre_contrib = float(rows[2][4].rstrip("p").rstrip("%")) / 100
-        if pre_contrib <= 0:
+        if not np.isfinite(pre_contrib):
+            # ★ NaN 은 `<= 0` 이 False 라 else 로 흘러 'PASS' 가 된다.
+            #   '측정 불가'를 '구조적 알파 확인'으로 보고하는 것은 최악의 자기기만이다.
+            _rec("R10", "정책 반증", "SKIP",
+                 "2024년 이전 구간에서 TP_P 기여를 측정할 수 없습니다(표본 부족 또는 "
+                 "TP_P1/P2 미구성). 측정 불가를 통과로 읽지 마세요.", "기여 NaN")
+        elif pre_contrib <= 0:
             _rec("R10", "정책 반증", "FAIL",
                  "2024년 이전 구간에서 TP_P1/TP_P2 의 기여가 0 이하입니다. 이건 구조적 알파가 "
                  "아니라 정책 베팅입니다 — 해당 TP 를 폐기하거나 '정책 의존'으로 명시하세요.",
@@ -9472,6 +9549,7 @@ def build_L1(ctx: dict, months: pd.DatetimeIndex, stage: str) -> Tuple[pd.DataFr
             if c not in P.columns:
                 P[c] = np.nan
         P = downcast(P)
+        report_dead_signals(P, stage=stage)      # 백테스트 전에 '무엇이 죽었는지'를 못박는다
         LOG.ok(f"L1 완성 {len(P):,}행 × {P.shape[1]}열 · {mem_mb(P):.0f}MB")
         # §3 구현 강제: L1 은 parquet 로 영속화하고 L2 는 이 parquet 만 읽는다
         VAULT.put_table(f"l1_panel_{STRATEGY_ID}", P, scope="private", domain="features",

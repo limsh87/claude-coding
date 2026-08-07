@@ -275,6 +275,7 @@ def build_L1(ctx: dict, months: pd.DatetimeIndex, stage: str) -> Tuple[pd.DataFr
             if c not in P.columns:
                 P[c] = np.nan
         P = downcast(P)
+        report_dead_signals(P, stage=stage)      # 백테스트 전에 '무엇이 죽었는지'를 못박는다
         LOG.ok(f"L1 완성 {len(P):,}행 × {P.shape[1]}열 · {mem_mb(P):.0f}MB")
         # §3 구현 강제: L1 은 parquet 로 영속화하고 L2 는 이 parquet 만 읽는다
         VAULT.put_table(f"l1_panel_{STRATEGY_ID}", P, scope="private", domain="features",

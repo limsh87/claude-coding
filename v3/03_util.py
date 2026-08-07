@@ -161,6 +161,21 @@ def _ensure_dir(path: str):
         os.makedirs(d, exist_ok=True)
 
 
+def _replace_retry(src: str, dst: str, tries: int = 6):
+    """os.replace 는 POSIX 에서 원자적이지만 **Windows 에서는 대상 파일이 열려 있으면
+    PermissionError(WinError 5/32)** 를 낸다. 구글드라이브 동기화 클라이언트와 백신이
+    새로 쓰인 파일을 즉시 여는 것이 정상 동작이라, 이 경합은 드물지 않고 재현도 안 된다.
+    한 번 실패하면 캐시 저장이 통째로 실패하고 다음 실행이 같은 수집을 다시 한다."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.25 * (2 ** i) + random.random() * 0.1)
+
+
 def atomic_write_bytes(path: str, data: bytes) -> str:
     """임시파일 → flush/fsync → os.replace. 드라이브 마운트에서 중단돼도 원본이 반쪽 나지 않는다."""
     _ensure_dir(path)
@@ -172,7 +187,7 @@ def atomic_write_bytes(path: str, data: bytes) -> str:
             os.fsync(f.fileno())
         except Exception:
             pass                     # 일부 FUSE 는 fsync 미지원 — 실패해도 replace 는 유효
-    os.replace(tmp, path)
+    _replace_retry(tmp, path)
     return path
 
 
@@ -182,7 +197,9 @@ def atomic_write_text(path: str, text: str) -> str:
 
 def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd") -> str:
     _ensure_dir(path)
-    tmp = f"{path}.tmp.{os.getpid()}"
+    # ★ thread id 가 없으면 같은 프로세스의 두 스레드가 **같은 임시파일**에 동시에 쓰고
+    #   서로의 내용을 덮어쓴다(atomic_write_bytes 에는 있는데 여기만 빠져 있었다).
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     out = df.copy()
     for c in out.columns:                       # object 컬럼은 arrow 가 종종 거부한다 → 문자열화
         if out[c].dtype == object:
@@ -194,7 +211,7 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
         out.to_parquet(tmp, index=False, compression=compression)
     except Exception:
         out.to_parquet(tmp, index=False, compression="snappy")
-    os.replace(tmp, path)
+    _replace_retry(tmp, path)
     return path
 
 

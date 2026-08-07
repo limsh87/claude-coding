@@ -211,9 +211,12 @@ def _bulk_fetch_one(fl_nm: str) -> Optional[bytes]:
     return None
 
 
-_BULK_VALUE_HINTS = ["당기 1분기 3개월", "당기 반기 3개월", "당기 3분기 3개월",
-                     "당기 1분기 누적", "당기 반기 누적", "당기 3분기 누적",
-                     "당기", "당기말"]
+# ★ 순서가 곧 의미다. 하류(tidy_financials)가 **누적→분기 차분**을 수행하므로 여기서는
+#   반드시 **누적** 금액을 집어야 한다. '3개월'(분기 단독)을 집으면 이미 분기값인 것을 또
+#   차분해 이중 차분이 되고, 예외 없이 전부 틀린 숫자가 나온다.
+#   재무상태표는 시점값이라 '당기말' 이 정답이다.
+_BULK_VALUE_HINTS = ["당기 1분기 누적", "당기 반기 누적", "당기 3분기 누적", "당기 누적",
+                     "당기말", "당기"]
 
 
 def _parse_bulk_txt(raw: bytes, year: int, reprt: str) -> pd.DataFrame:
@@ -578,17 +581,26 @@ def merge_financial_tiers(*tiers: pd.DataFrame) -> pd.DataFrame:
     tiers = [t for t in tiers if nonempty(t)]
     if not tiers:
         return pd.DataFrame(columns=_FS_KEEP)
+    def _idkey(df: pd.DataFrame) -> Optional[pd.Series]:
+        """티어마다 식별자가 다르다: 벌크는 stock_code, API 는 corp_code 를 준다.
+        ★ corp_code 로만 키를 만들면 벌크 쪽이 전부 NaN 이라 'have' 집합이 쓰레기가 되고
+          티어 우선순위가 통째로 무력화된다(하위 티어가 상위를 덮어쓴다). 있는 쪽을 쓴다."""
+        for c in ("corp_code", "stock_code"):
+            if c in df.columns and df[c].notna().any():
+                return df[c].astype(str)
+        return None
+
     out = tiers[0]
     for t in tiers[1:]:
-        keys = ("corp_code", "bsns_year", "reprt_code")
-        if not all(k in out.columns for k in keys) or not all(k in t.columns for k in keys):
+        ka, kb = _idkey(out), _idkey(t)
+        if ka is None or kb is None or not all(
+                k in out.columns and k in t.columns for k in ("bsns_year", "reprt_code")):
             out = pd.concat([out, t], ignore_index=True)
             continue
-        have = set(zip(out["corp_code"].astype(str), out["bsns_year"].astype(int),
-                       out["reprt_code"].astype(str)))
-        key = list(zip(t["corp_code"].astype(str), t["bsns_year"].astype(int),
-                       t["reprt_code"].astype(str)))
+        have = set(zip(ka, out["bsns_year"].astype(int), out["reprt_code"].astype(str)))
+        key = list(zip(kb, t["bsns_year"].astype(int), t["reprt_code"].astype(str)))
         fill = t[[k not in have for k in key]]
+        keys = ("bsns_year", "reprt_code")
         if len(fill):
             LOG.info(f"하위 티어로 보완한 (회사×기간) "
                      f"{fill.groupby(list(keys)).ngroups:,}건 — 상위 티어가 도착하면 자동 대체됩니다.")

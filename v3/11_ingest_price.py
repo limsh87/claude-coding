@@ -435,7 +435,11 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     keep = nxt[["code", "date", "next_open", "next_date"]]
     last = last.merge(keep, on=["code", "date"], how="left")
 
-    monthly = last[["code", "month", "date", "close", "adv20", "next_open", "next_date"]].copy()
+    # ★ volume 을 반드시 실어 보낸다. 없으면 V6 의 '거래정지' 판정이 col(p,"volume") 에서
+    #   전부 NaN 이 되어 halted 가 항상 False → 거래정지 종목이 그대로 매수 후보에 남는다.
+    #   예외는 안 나고 거부권 절반이 조용히 죽는다.
+    monthly = last[["code", "month", "date", "close", "adv20", "volume",
+                    "next_open", "next_date"]].copy()
     monthly = monthly.rename(columns={"date": "signal_date"})
     monthly = monthly[monthly["month"].isin(months)]
 

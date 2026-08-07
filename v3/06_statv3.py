@@ -73,10 +73,16 @@ def _rss_mb() -> float:
                             ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
                             ("PagefileUsage", ctypes.c_size_t),
                             ("PeakPagefileUsage", ctypes.c_size_t)]
+            # ★ argtypes/restype 을 지정하지 않으면 ctypes 가 핸들을 C int 로 취급해
+            #   64비트에서 상위 비트가 잘린다. 예외 없이 실패해 RSS 가 조용히 '-' 가 된다.
+            k32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE,
+                                                   ctypes.POINTER(_PMC), wintypes.DWORD]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
             c = _PMC()
             c.cb = ctypes.sizeof(_PMC)
-            if ctypes.windll.psapi.GetProcessMemoryInfo(
-                    ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb):
+            if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb):
                 return c.WorkingSetSize / 1e6
         except Exception:
             pass

@@ -582,7 +582,13 @@ def R10_policy(P, months, sec, runner, base_bt) -> None:
               title="R10 — 정책 반증 (밸류업은 2024년 이후 · 그 이전 기여가 0이면 정책 베팅)")
     try:
         pre_contrib = float(rows[2][4].rstrip("p").rstrip("%")) / 100
-        if pre_contrib <= 0:
+        if not np.isfinite(pre_contrib):
+            # ★ NaN 은 `<= 0` 이 False 라 else 로 흘러 'PASS' 가 된다.
+            #   '측정 불가'를 '구조적 알파 확인'으로 보고하는 것은 최악의 자기기만이다.
+            _rec("R10", "정책 반증", "SKIP",
+                 "2024년 이전 구간에서 TP_P 기여를 측정할 수 없습니다(표본 부족 또는 "
+                 "TP_P1/P2 미구성). 측정 불가를 통과로 읽지 마세요.", "기여 NaN")
+        elif pre_contrib <= 0:
             _rec("R10", "정책 반증", "FAIL",
                  "2024년 이전 구간에서 TP_P1/TP_P2 의 기여가 0 이하입니다. 이건 구조적 알파가 "
                  "아니라 정책 베팅입니다 — 해당 TP 를 폐기하거나 '정책 의존'으로 명시하세요.",
