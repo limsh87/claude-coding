@@ -373,24 +373,19 @@ def build_consensus_panel(L: pd.DataFrame, months: pd.DatetimeIndex,
     x["rev"] = np.where(x["target_price"].notna() & x["prev_tp"].notna(),
                         np.sign(x["target_price"] - x["prev_tp"]), np.nan)
 
-    out = []
-    for m in months:
-        lo = m - pd.Timedelta(days=window_days)
-        w = x[(x["pub_date"] > lo) & (x["pub_date"] <= m)]
-        if w.empty:
-            continue
-        g = w.groupby("stock_code", observed=True)
-        agg = pd.DataFrame({
-            "n_analyst": g["analyst_id"].nunique(),
-            "tp_median": g["target_price"].median(),
-            "rev_up": g["rev"].apply(lambda s: float((s > 0).sum())),
-            "rev_dn": g["rev"].apply(lambda s: float((s < 0).sum())),
-        }).reset_index().rename(columns={"stock_code": "code"})
-        agg["month"] = m
-        out.append(agg)
-    if not out:
+    # ★ 월 루프 + 전체 프레임 필터링(120 × 30만행)을 이벤트→월 전개 + groupby 1회로 바꾼다.
+    #   리포트가 목표치(30만건)에 도달하면 예전 경로는 수 분을 먹었다. 결과는 동일하다:
+    #   창 조건 (m-window, m] 을 인덱스 산술로 그대로 옮긴 것이기 때문이다.
+    x["rev_up1"] = (x["rev"] > 0).astype("float32")
+    x["rev_dn1"] = (x["rev"] < 0).astype("float32")
+    W = expand_events_to_months(x, "pub_date", months, window_days)
+    if not nonempty(W):
         return pd.DataFrame(columns=cols)
-    P = pd.concat(out, ignore_index=True)
+    g = W.groupby(["stock_code", "month"], observed=True)
+    P = g.agg(n_analyst=("analyst_id", "nunique"),
+              tp_median=("target_price", "median"),
+              rev_up=("rev_up1", "sum"),
+              rev_dn=("rev_dn1", "sum")).reset_index().rename(columns={"stock_code": "code"})
     P = P.sort_values(["code", "month"])
     # d2 = -(상향 리비전 수 / 커버리지)   d4 = -Δ(커버리지 애널리스트 수)
     P["d2_raw"] = -(P["rev_up"] / P["n_analyst"].replace(0, np.nan))

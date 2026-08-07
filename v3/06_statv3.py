@@ -231,12 +231,25 @@ def cell_rank(df: pd.DataFrame, col_or_series, keys: Sequence[str],
             s = c if s is None else (s + "\x1f" + c)
         return (s if s is not None else pd.Series("ALL", index=df.index)).to_numpy()
 
-    kf, kc = _key(keys), _key(fallback_keys)
+    kf = _key(keys)
     gf = v.groupby(kf, observed=True, dropna=False)
-    gc = v.groupby(kc, observed=True, dropna=False)
     fine = gf.rank(pct=True, method="average")
-    coarse = gc.rank(pct=True, method="average")
     n_fine = gf.transform("count")
+
+    # ★ 이중계산은 조건분기보다 빠르지만, '폴백이 필요 없을 때'까지 상위 셀을 계산할 이유는
+    #   없다. assemble_score 1회가 cell_rank 를 30회 넘게 부르고 강건성 스위트가 그걸
+    #   40회 반복하므로, 이 분기 하나가 전체의 절반을 좌우한다.
+    short = (n_fine < min_n) & v.notna()
+    if not bool(short.any()):
+        r = fine.where(v.notna())
+        if tag:
+            CELL_FALLBACK_STATS[tag] += 0
+            CELL_FALLBACK_STATS[f"{tag}__n"] += int(v.notna().sum())
+        return r.astype("float32")
+
+    kc = _key(fallback_keys)
+    gc = v.groupby(kc, observed=True, dropna=False)
+    coarse = gc.rank(pct=True, method="average")
     n_coarse = gc.transform("count")
 
     out = np.where(n_fine.to_numpy() >= min_n, fine.to_numpy(), coarse.to_numpy())
@@ -334,6 +347,50 @@ def rolling_ols_moment(Y: np.ndarray, X: np.ndarray, window: int,
         beta = np.einsum("ntkl,ntl->ntk", np.linalg.pinv(A), b)
     resid = Yc - np.einsum("ntk,ntk->nt", Xc, beta)
     out = np.where(full & ok, resid, np.nan)
+    return out
+
+
+def expand_events_to_months(ev: pd.DataFrame, date_col: str, months: pd.DatetimeIndex,
+                            window_days: int) -> pd.DataFrame:
+    """이벤트를 '그 이벤트가 유효한 월말들'로 펼친다. 월 루프를 없애는 핵심 원시함수.
+
+    ★ 왜: 원래 코드는 월마다 전체 프레임을 불리언 필터링했다.
+        for m in months:  w = x[(x.dt > m-90d) & (x.dt <= m)]
+      120개월 × 30만행 = 3,600만 회 비교 + groupby 120회. 리포트가 목표치(연 3만 × 10년 =
+      30만건)에 도달하면 이 한 함수가 수 분을 먹는다. 그런데 이벤트 하나가 영향을 주는
+      월말은 window/30 개뿐이다(90일이면 3~4개). 그 관계를 직접 만들면 전체 비용이
+      O(이벤트 × 창길이/30) 로 떨어지고 groupby 는 단 1회다.
+
+    반환: ev 를 (창에 걸리는 월말 수)만큼 복제하고 'month' 컬럼을 붙인 프레임.
+    """
+    if not nonempty(ev) or len(months) == 0:
+        out = ev.iloc[0:0].copy() if ev is not None else pd.DataFrame()
+        out["month"] = pd.Series(dtype="datetime64[ns]")
+        return out
+    m_arr = np.asarray(pd.DatetimeIndex(months).values, dtype="datetime64[ns]")
+    d = as_ts_series(ev[date_col]).to_numpy(dtype="datetime64[ns]")
+    ok = ~np.isnat(d)
+    if not ok.any():
+        out = ev.iloc[0:0].copy()
+        out["month"] = pd.Series(dtype="datetime64[ns]")
+        return out
+    sub = ev[ok].reset_index(drop=True)
+    d = d[ok]
+    # 이벤트가 유효한 구간: 월말 m 에 대해 (m - window) < d <= m
+    #   ⇔ d <= m 이고 m < d + window  ⇔ m ∈ [첫 월말 ≥ d, d + window)
+    lo = np.searchsorted(m_arr, d, side="left")
+    hi = np.searchsorted(m_arr, d + np.timedelta64(int(window_days), "D"), side="left")
+    cnt = np.maximum(hi - lo, 0)
+    if cnt.sum() == 0:
+        out = sub.iloc[0:0].copy()
+        out["month"] = pd.Series(dtype="datetime64[ns]")
+        return out
+    rep = np.repeat(np.arange(len(sub)), cnt)
+    # 각 복제행의 월 인덱스 = lo + (그룹 내 순번)
+    offs = np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+    midx = np.repeat(lo, cnt) + offs
+    out = sub.iloc[rep].reset_index(drop=True)
+    out["month"] = m_arr[midx]
     return out
 
 

@@ -220,18 +220,12 @@ def build_disclosure_sensors(P: pd.DataFrame, dis: pd.DataFrame,
             m = a.copy()
             m["executed"] = 0.0
         m["verdict_dt"] = m["acq_dt"] + pd.Timedelta(days=365)     # 판정이 끝나는 시점
-        rows = []
-        for t in months:
-            lo, hi = t - pd.Timedelta(days=730), t
-            w = m[(m["verdict_dt"] > lo) & (m["verdict_dt"] <= hi)]
-            if w.empty:
-                continue
-            g = w.groupby("stock_code")["executed"].agg(["mean", "size"]).reset_index()
-            g["month"] = t
-            rows.append(g)
-        if rows:
-            C = pd.concat(rows, ignore_index=True).rename(
-                columns={"stock_code": "code", "mean": "_pc", "size": "_pn"})
+        # 월 루프 대신 이벤트→월 전개 + groupby 1회 (창 조건은 동일하다)
+        W = expand_events_to_months(m, "verdict_dt", months, 730)
+        if nonempty(W):
+            C = (W.groupby(["stock_code", "month"], observed=True)["executed"]
+                 .agg(["mean", "size"]).reset_index()
+                 .rename(columns={"stock_code": "code", "mean": "_pc", "size": "_pn"}))
             C["code"] = C["code"].astype(str)
             p = p.merge(C[["code", "month", "_pc", "_pn"]], on=["code", "month"], how="left")
             p["p_cancel"] = p["_pc"]
@@ -249,16 +243,9 @@ def build_disclosure_sensors(P: pd.DataFrame, dis: pd.DataFrame,
     if len(dil):
         dil = dil.rename(columns={"stock_code": "code", "rcept_dt": "dt"})
         dil["code"] = dil["code"].astype(str)
-        rows = []
-        for t in months:
-            w = dil[(dil["dt"] > t - pd.Timedelta(days=90)) & (dil["dt"] <= t)]
-            if w.empty:
-                continue
-            g = w.groupby("code").size().reset_index(name="n")
-            g["month"] = t
-            rows.append(g)
-        if rows:
-            V = pd.concat(rows, ignore_index=True)
+        WV = expand_events_to_months(dil, "dt", months, 90)
+        if nonempty(WV):
+            V = WV.groupby(["code", "month"], observed=True).size().reset_index(name="n")
             p = p.merge(V, on=["code", "month"], how="left")
             p["v3_dilute"] = (p["n"].fillna(0) > 0).astype("float32")
             p = p.drop(columns=["n"])
