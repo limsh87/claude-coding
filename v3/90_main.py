@@ -289,8 +289,13 @@ def main() -> dict:
                f"{BACKTEST_START} ~ {BACKTEST_END} · 단계 {STAGE} · 모드 {RUN_MODE} · 빌드 {BUILD_VERSION}")
     LOG.table([["환경", "Colab" if ENV["colab"] else ("Jupyter" if ENV["ipython"] else "CLI")],
                ["파이썬", ENV["python"]], ["플랫폼", f"{ENV['platform']} / {ENV['cpu']}코어"],
-               ["병렬", f"IO {N_WORKERS_IO} 스레드 / CPU {N_CPU} " +
-                        ("프로세스(fork)" if CAN_FORK else "스레드(fork 불가 → 폴백)")],
+               # ★ fork 불가(Windows/macOS spawn) 환경에서 pmap_cpu 는 스레드가 아니라
+               #   **순차 실행**으로 폴백한다. "15 스레드"라고 찍으면 사용자가 병렬이 도는 줄
+               #   알고 병목을 엉뚱한 곳에서 찾게 된다. 실제 동작을 그대로 적는다.
+               ["병렬", f"IO {N_WORKERS_IO} 스레드 · 연산 " +
+                        (f"{N_CPU} 프로세스(fork)" if CAN_FORK else
+                         "순차(fork 불가 — 이 파이프라인의 연산부는 이미 벡터화되어 있어 "
+                         "영향이 크지 않습니다)")],
                ["시드", str(SEED)],
                ["DART 키", "입력됨" if DART_API_KEY else "❗ 미입력 — 재무 센서 전부 결측"],
                ["KRX 계정", "입력됨" if (KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW)

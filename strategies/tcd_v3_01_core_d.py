@@ -3794,18 +3794,47 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if todo:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
+        # ── 적응형 소스 체인 ────────────────────────────────────────────────────────
+        #  ★ 병목의 정체: 체인이 고정 순서라 **죽은 소스의 비용을 2,600종목 전부가 지불**한다.
+        #    pykrx 가 인증 실패로 못 쓰는 상태면 종목마다 pykrx 를 먼저 때리고 실패한 뒤
+        #    다음으로 넘어간다. 종목당 몇 초 × 2,600 = 수십 분이 통째로 낭비된다.
+        #    → 소스별 연속 실패를 세어 임계치를 넘으면 그 소스를 이번 실행에서 내린다.
+        #      한 번이라도 성공하면 카운터가 0 으로 돌아가므로 일시적 실패로 내려가지 않는다.
+        #    → 그리고 최근 성공한 소스를 앞으로 당긴다(대부분의 종목이 같은 소스에서 나온다).
+        _dead_after = 40
+        _fail = Counter()
+        _ok = Counter()
+        _lk = threading.Lock()
+
+        def _chain_order():
+            with _lk:
+                alive = [(nm, fn) for nm, fn in PRICE_CHAIN if _fail[nm] < _dead_after]
+                return sorted(alive, key=lambda x: -_ok[x[0]])
+
         def _one(job):
             code, st = job
-            # 폴백 체인. first_nonempty 는 DataFrame 진리값 오용(`a() or b()`)을
-            # 구조적으로 막는다 — 그 관용구는 소스가 막힌 환경에서만 통과한다.
-            d = first_nonempty(*[(lambda f=fn: f(code, st, end)) for _nm, fn in PRICE_CHAIN])
-            if nonempty(d):
-                d = d.dropna(subset=["date"])
+            for nm, fn in _chain_order():
+                try:
+                    d = fn(code, st, end)
+                except Exception:
+                    d = None
                 if nonempty(d):
-                    return d
+                    d = d.dropna(subset=["date"])
+                    if nonempty(d):
+                        with _lk:
+                            _ok[nm] += 1
+                            _fail[nm] = 0
+                        return d
+                with _lk:
+                    _fail[nm] += 1
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        _dropped = [nm for nm, _fn in PRICE_CHAIN if _fail[nm] >= _dead_after]
+        if _dropped:
+            LOG.warn(f"연속 {_dead_after}회 실패로 이번 실행에서 내린 가격 소스: {_dropped}. "
+                     f"(고정 순서로 두면 죽은 소스의 비용을 전 종목이 지불합니다) "
+                     f"성공 분포: {dict(_ok)}")
         failed = []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
@@ -9367,8 +9396,13 @@ def main() -> dict:
                f"{BACKTEST_START} ~ {BACKTEST_END} · 단계 {STAGE} · 모드 {RUN_MODE} · 빌드 {BUILD_VERSION}")
     LOG.table([["환경", "Colab" if ENV["colab"] else ("Jupyter" if ENV["ipython"] else "CLI")],
                ["파이썬", ENV["python"]], ["플랫폼", f"{ENV['platform']} / {ENV['cpu']}코어"],
-               ["병렬", f"IO {N_WORKERS_IO} 스레드 / CPU {N_CPU} " +
-                        ("프로세스(fork)" if CAN_FORK else "스레드(fork 불가 → 폴백)")],
+               # ★ fork 불가(Windows/macOS spawn) 환경에서 pmap_cpu 는 스레드가 아니라
+               #   **순차 실행**으로 폴백한다. "15 스레드"라고 찍으면 사용자가 병렬이 도는 줄
+               #   알고 병목을 엉뚱한 곳에서 찾게 된다. 실제 동작을 그대로 적는다.
+               ["병렬", f"IO {N_WORKERS_IO} 스레드 · 연산 " +
+                        (f"{N_CPU} 프로세스(fork)" if CAN_FORK else
+                         "순차(fork 불가 — 이 파이프라인의 연산부는 이미 벡터화되어 있어 "
+                         "영향이 크지 않습니다)")],
                ["시드", str(SEED)],
                ["DART 키", "입력됨" if DART_API_KEY else "❗ 미입력 — 재무 센서 전부 결측"],
                ["KRX 계정", "입력됨" if (KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW)
