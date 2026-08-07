@@ -154,8 +154,12 @@ def R1_leakage(P: pd.DataFrame, months, sec, runner, base_bt) -> None:
                             "v1_push", "v2_bad") if c in Pa.columns]
     Pa = Pa.sort_values(["code", "month"])
     Pa["_mi"] = _mi(Pa)
+    # ★ shift 는 '행'을 옮기지 '달'을 옮기지 않는다. 거래정지·폐지 직전처럼 달이 비면
+    #   4행 뒤가 4개월 뒤가 아니다. 그대로 두면 오염 강도가 종목마다 달라져 R1a 의
+    #   판정 근거가 흐려진다 — 정확히 4개월 뒤인 행만 오염시킨다.
+    ahead_ok = _lag_ok(Pa, -shift_n)
     for c in fin_cols:
-        Pa[c] = Pa.groupby("code", observed=True)[c].shift(-shift_n)
+        Pa[c] = Pa.groupby("code", observed=True)[c].shift(-shift_n).where(ahead_ok)
     bt_a = runner(Pa, label="R1a_shift120", signal="Signal_rank", floor=True, veto=True)
     ca = _cagr(bt_a)
     if np.isfinite(ca) and np.isfinite(base) and ca > base + 0.02:

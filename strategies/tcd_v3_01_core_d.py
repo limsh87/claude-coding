@@ -64,9 +64,15 @@ DART_API_KEY = ""
 #      1. https://data.krx.co.kr  접속 → 우측 상단 [회원가입]
 #      2. 가입한 아이디 / 비밀번호를 그대로 아래에 입력
 #
-#    ▶ 없어도 됩니다. 유니버스의 정확성은 상장일·폐지일(FDR/KIND)만으로 성립하도록 설계돼
-#      있고, KRX 는 '검증·보강'입니다. 비우면 그 단계만 건너뜁니다.
-#      다만 투자자별 수급(d3)은 pykrx 경유라 인증이 있으면 커버리지가 올라갑니다.
+#    ▶ 없어도 실행은 됩니다. 다만 v3 에서는 '있으면 좋은 것'이 아닙니다 — 무엇이 약해지는지
+#      정확히 알고 비우세요:
+#        · PIT 시가총액 : pykrx 가 유일한 정확한 소스입니다. 없으면 '상장주식수를 과거로
+#          고정하고 과거 종가를 곱하는' 근사로 대체되는데, 이건 유상증자·무상증자·감자를
+#          반영하지 못합니다. 그 결과 자본 이벤트가 있었던 기업의 U-MID 밴드 편입이
+#          체계적으로 틀어집니다 — 하필 TP_P1/TP_P2 가 겨냥하는 종목군입니다.
+#          유니버스 계약 C13 이 그만큼 약해지고, 실행 중 '시총 소스 감사표'에 비중이 찍힙니다.
+#        · 투자자별 수급(d3) : pykrx 경유입니다. 없으면 U 는 d1 단독으로 축소됩니다.
+#        · 상장일·폐지일 자체는 FDR/KIND 로 확보되므로 생존자편향 제거(C2)는 영향받지 않습니다.
 #
 #    ⚠ 같은 계정을 브라우저나 다른 노트북에서 동시에 로그인해 두지 마세요.
 #      KRX 는 중복 로그인 시 이전 세션을 강제 종료합니다(CD011). 그러면 실행 중인 수집이
@@ -7374,8 +7380,12 @@ def R1_leakage(P: pd.DataFrame, months, sec, runner, base_bt) -> None:
                             "v1_push", "v2_bad") if c in Pa.columns]
     Pa = Pa.sort_values(["code", "month"])
     Pa["_mi"] = _mi(Pa)
+    # ★ shift 는 '행'을 옮기지 '달'을 옮기지 않는다. 거래정지·폐지 직전처럼 달이 비면
+    #   4행 뒤가 4개월 뒤가 아니다. 그대로 두면 오염 강도가 종목마다 달라져 R1a 의
+    #   판정 근거가 흐려진다 — 정확히 4개월 뒤인 행만 오염시킨다.
+    ahead_ok = _lag_ok(Pa, -shift_n)
     for c in fin_cols:
-        Pa[c] = Pa.groupby("code", observed=True)[c].shift(-shift_n)
+        Pa[c] = Pa.groupby("code", observed=True)[c].shift(-shift_n).where(ahead_ok)
     bt_a = runner(Pa, label="R1a_shift120", signal="Signal_rank", floor=True, veto=True)
     ca = _cagr(bt_a)
     if np.isfinite(ca) and np.isfinite(base) and ca > base + 0.02:
