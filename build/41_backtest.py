@@ -54,12 +54,30 @@ def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
         conc = min(2.0, 0.5 + spread * 8.0)          # 격차 클수록 집중
         w = raw ** conc
         w = w / w.sum() if w.sum() > 0 else np.full(len(s), 1.0 / len(s))
-    w = np.clip(w, POS_MIN_WEIGHT, POS_MAX_WEIGHT)
-    # 소액계좌 유동성 상한: 20일 평균거래대금의 X% 이내
+    # 종목별 상한 = min(정책 상한, 유동성 상한). 유동성 상한은 20일 평균거래대금의 X%.
     adv = sub["adv20"].fillna(0).to_numpy(dtype=float)
-    cap = np.where(adv > 0, (adv * POS_ADV_PARTICIPATION) / max(ACCOUNT_KRW, 1), POS_MAX_WEIGHT)
-    w = np.minimum(w, np.maximum(cap, POS_MIN_WEIGHT * 0.5))
+    liq_cap = np.where(adv > 0, (adv * POS_ADV_PARTICIPATION) / max(ACCOUNT_KRW, 1),
+                       POS_MAX_WEIGHT)
+    cap = np.minimum(POS_MAX_WEIGHT, np.maximum(liq_cap, POS_MIN_WEIGHT * 0.5))
+
+    # ★ clip 후 w/w.sum() 으로 재정규화하면 상한이 도로 뚫린다(합이 1보다 작아지면 전부 커진다).
+    #   상한에 걸린 종목은 고정하고 나머지에만 잔여 비중을 재배분하는 water-filling 으로 강제한다.
+    w = np.clip(w, 0.0, None)
     w = w / w.sum() if w.sum() > 0 else np.full(len(s), 1.0 / len(s))
+    free = np.ones(len(w), dtype=bool)
+    for _ in range(24):
+        over = free & (w > cap)
+        if not over.any():
+            break
+        w[over] = cap[over]
+        free &= ~over
+        rem = 1.0 - w[~free].sum()
+        if rem <= 1e-12 or not free.any():
+            break
+        pool = w[free].sum()
+        w[free] = (w[free] / pool * rem) if pool > 1e-12 else (rem / free.sum())
+    if w.sum() > 1.0 + 1e-9:                 # 전 종목이 상한에 걸리면 현금을 남긴다
+        w = w * (1.0 / w.sum())
     return sub.assign(weight=w)
 
 
@@ -89,6 +107,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         uni.audit_row("거부권통과", m, g_veto["code"].tolist())
         uni.audit_row("하한선통과", m, g_floor["code"].tolist())
 
+        # 종목별 조회를 dict 로 미리 만든다. sub[sub.code==c] 를 종목마다 돌리면
+        # 백테스트가 강건성 스위트에서 10여 회 재실행될 때 그 비용이 그대로 곱해진다.
+        need_cols = [c for c in ("adv20", "fwd_ret", "VETO", "dlog_M", "dlog_E", signal_col)
+                     if c in sub.columns]
+        rec: Dict[str, dict] = {}
+        for _c, *_v in sub[["code"] + need_cols].itertuples(index=False, name=None):
+            rec[_c] = dict(zip(need_cols, _v))
+
         k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
                                              round(len(elig) * top_pct))))
         pick = elig.nlargest(k, signal_col) if len(elig) else elig.iloc[0:0]
@@ -97,17 +123,17 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
         keep = []
         for c, h in list(hold.items()):
-            row = sub[sub["code"] == c]
-            if row.empty:
+            r0 = rec.get(c)
+            if r0 is None:
                 continue
-            r0 = row.iloc[0]
+            dm, de = r0.get("dlog_M"), r0.get("dlog_E")
             exited = False
             if r0.get("VETO", 1) == 0:
                 exited = True                                    # 거부권 발동 시 즉시 강제청산
             elif h["months"] >= HOLD_MAX_MONTHS:
                 exited = True
-            elif (pd.notna(r0.get("dlog_M")) and pd.notna(r0.get("dlog_E")) and
-                  r0["dlog_M"] >= r0["dlog_E"] and r0["dlog_E"] > 0):
+            elif (dm is not None and de is not None and pd.notna(dm) and pd.notna(de)
+                  and dm >= de and de > 0):
                 exited = True                                    # 시장이 마침내 재분류 → 알파 소진
             if not exited:
                 keep.append(c)
@@ -126,8 +152,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 dw = w_new.get(c, 0) - prev_w.get(c, 0)
                 if abs(dw) < 1e-9:
                     continue
-                r = sub[sub["code"] == c]
-                adv = float(r["adv20"].iloc[0]) if len(r) and pd.notna(r["adv20"].iloc[0]) else 0.0
+                _r = rec.get(c) or {}
+                _a = _r.get("adv20")
+                adv = float(_a) if _a is not None and pd.notna(_a) else 0.0
                 notional = abs(dw) * ACCOUNT_KRW
                 c_bps = COMMISSION_BPS / 1e4
                 sl = slippage(notional, adv)
@@ -137,8 +164,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         # 다음 달 수익
         ret = 0.0
         for c, w in w_new.items():
-            r = sub[sub["code"] == c]
-            fr = float(r["fwd_ret"].iloc[0]) if len(r) and pd.notna(r["fwd_ret"].iloc[0]) else np.nan
+            _r = rec.get(c) or {}
+            _f = _r.get("fwd_ret")
+            fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
             dl = delist.get(c)
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
                 # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
@@ -146,8 +174,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
             if not np.isfinite(fr):
                 fr = 0.0
             ret += w * fr
+            _s = _r.get(signal_col)
             holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
-                                 "signal": float(r[signal_col].iloc[0]) if len(r) else np.nan})
+                                 "signal": float(_s) if _s is not None and pd.notna(_s) else np.nan})
         ret_net = ret - cost
         rows.append({"month": m, "ret": ret_net, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost})

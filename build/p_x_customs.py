@@ -163,26 +163,33 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
     # ── x2: 단가 잔차 — 36개월 롤링 OLS (벡터화 필수) ─────────────────────────────────────
     P["unit_price"] = safe_div(P["exp_usd"], P["exp_wgt"])
-    W = P.pivot_table(index="code", columns="month", values="unit_price", aggfunc="first")
-    Q = P.pivot_table(index="code", columns="month", values="exp_wgt", aggfunc="first")
+    # ★ 달력 연속성 유지: pivot 은 전 종목이 결측인 달의 컬럼을 통째로 없앤다.
+    #   그대로 두면 36개월 롤링 OLS 가 달력상 떨어진 구간을 이어붙여 추세항이 왜곡된다.
+    all_months = pd.DatetimeIndex(sorted(pd.Series(P["month"]).dropna().unique()))
+    W = P.pivot_table(index="code", columns="month", values="unit_price",
+                      aggfunc="first").reindex(columns=all_months)
+    Q = P.pivot_table(index="code", columns="month", values="exp_wgt",
+                      aggfunc="first").reindex(columns=all_months)
     if W.shape[1] >= 36:
         y = np.log(W.to_numpy(dtype=float, na_value=np.nan))
-        q = np.log(Q.reindex_like(W).to_numpy(dtype=float, na_value=np.nan))
+        q = np.log(Q.to_numpy(dtype=float, na_value=np.nan))
         n, t = y.shape
         X = np.stack([np.ones((n, t)), q, np.tile(np.arange(t, dtype=float), (n, 1))], axis=2)
         R = rolling_ols_resid(y, X, window=36)
-        rs = pd.DataFrame(R, index=W.index, columns=W.columns).stack(dropna=False)
-        rs.index.names = ["code", "month"]
-        rs = rs.rename("resid").reset_index()
+        # ★ stack(dropna=) 은 pandas 3.x 에서 제거된다 → 버전 안정적인 melt 를 쓴다.
+        rs = (pd.DataFrame(R, index=W.index, columns=all_months)
+                .reset_index()
+                .melt(id_vars="code", var_name="month", value_name="resid"))
+        rs["month"] = as_ts_series(rs["month"])
         P = P.merge(rs, on=["code", "month"], how="left")
         P["resid_mean6"] = g("resid").transform(lambda s: s.rolling(6, min_periods=4).mean())
         P["resid_std"] = g("resid").transform(lambda s: s.rolling(36, min_periods=18).std())
         P["x2"] = safe_div(P["resid_mean6"], P["resid_std"])
     # x4: 신규 HS10 등장 → 12M 지수감쇠 더미
     P["x4"] = 0.0
-    P["theta_X"] = safe_div(P["exp_usd"] * 1300.0, P.get("revenue_ttm")).clip(0, 2)
+    P["theta_X"] = safe_div(P["exp_usd"] * 1300.0, col(P, "revenue_ttm")).clip(0, 2)
 
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["d_sgna_ratio"] = g("sgna_ttm").transform(lambda s: s).pipe(
         lambda s: safe_div(s, P["revenue_ttm"])).pipe(lambda s: s.groupby(P["code"]).diff(12)) \
         if "sgna_ttm" in P.columns else np.nan

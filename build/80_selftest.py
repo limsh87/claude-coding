@@ -159,8 +159,58 @@ def make_synthetic(n_codes: int = 160, n_months: int = 60, seed: int = SEED) -> 
     nps = pd.DataFrame(nps_rows)
     nps = pit_frame(nps, "month", "knowledge_date", source="synthetic")
 
+    # ── 공시 텍스트 유사도 (PACK-D) ────────────────────────────────────────────────────────
+    tx_rows = []
+    for i, c in enumerate(codes):
+        for y in range(months[0].year, months[-1].year + 1):
+            d0 = as_ts(f"{y}-03-31")
+            tx_rows.append({"corp_code": sec["corp_code"].iloc[i], "rcept_dt": d0,
+                            "sim_risk": float(np.clip(0.9 + 0.03 * quality[i] +
+                                                      rng.normal(0, 0.05), 0, 1)),
+                            "sim_all": float(np.clip(0.9 + 0.02 * quality[i] +
+                                                     rng.normal(0, 0.04), 0, 1))})
+    txt = pit_frame(pd.DataFrame(tx_rows), "rcept_dt", "rcept_dt", source="synthetic")
+
+    # ── 관세 통관 + HS 매핑 (PACK-X) ───────────────────────────────────────────────────────
+    n_hs = max(60, n_codes // 2)              # 셀 내 z-score 가 성립할 만큼은 덮어야 한다
+    hs_list = [f"{3900+i:04d}000000" for i in range(n_hs)]
+    hs_map = pd.DataFrame({"code": [codes[i] for i in range(n_hs)],
+                           "hs": hs_list, "weight": 1.0,
+                           "valid_from": months[0], "valid_to": months[-1]})
+    cu_rows = []
+    for j, hs in enumerate(hs_list):
+        # θ_X(수출매출/연결매출)가 0.3~0.9 가 되도록 매출 규모에 맞춰 스케일링한다.
+        rev0 = float(np.exp(25.0))
+        base_usd = rev0 * rng.uniform(0.3, 0.9) / 1300.0
+        unit_px0 = rng.lognormal(1.0, 0.2)          # ※ 지역변수 px 는 일봉 DataFrame 이므로 금지
+        q = base_usd / unit_px0
+        for m in months:
+            q *= (1 + 0.004 * quality[j] + rng.normal(0, 0.04))
+            unit_px = unit_px0 * (1 + 0.03 * quality[j] + rng.normal(0, 0.02))
+            for grp in ("선진_미국", "선진_EU", "아세안", "중화권"):
+                w = q * rng.uniform(0.15, 0.35)
+                cu_rows.append({"ym": m.strftime("%Y%m"), "hs": hs, "grp": grp,
+                                "exp_wgt": float(w), "exp_usd": float(w * unit_px)})
+    customs = pd.DataFrame(cu_rows)
+
+    # ── 조달 낙찰 (PACK-P) ────────────────────────────────────────────────────────────────
+    g_rows = []
+    for i in range(0, n_codes, 3):
+        for m in months:
+            if rng.random() > 0.55:
+                continue
+            plan = rng.lognormal(19, 0.8)
+            rate = float(np.clip(85 + 4 * quality[i] + rng.normal(0, 3), 60, 110))
+            g_rows.append({"ym": m.strftime("%Y%m"), "biz_no": f"{1000000000+i}",
+                           "corp_nm": f"합성{i+1:03d}", "award_amt": plan * rate / 100.0,
+                           "plan_price": plan, "rate": rate,
+                           "org": rng.choice(["조달청", "국방부", "한전", "지자체", "철도공단"]),
+                           "item_cls": f"{rng.integers(1000,9999)}"})
+    procure = pd.DataFrame(g_rows)
+
     return {"sec": sec, "px": px, "fin": fin, "emp": emp, "dis": dis,
             "reports": rep, "links": L, "nps": nps, "months": months,
+            "text_sim": txt, "customs": customs, "hs_map": hs_map, "procure": procure,
             "flows": pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"]),
             "snapshots": pd.DataFrame(columns=["snap_date", "code", "market"])}
 
@@ -191,8 +241,8 @@ def run_selftest(full_chain: bool = False) -> bool:
     P = axis_D_U(P)
 
     ctx = {"disclosures": S["dis"], "nps_panel": S["nps"], "sec": S["sec"],
-           "text_sim": None, "customs": None, "hs_map": None, "procurement": None,
-           "administrative": None}
+           "text_sim": S["text_sim"], "customs": S["customs"], "hs_map": S["hs_map"],
+           "procurement": S["procure"], "administrative": None}
     for p in active_packs():
         P = p["features"](P, ctx)
     P = apply_vetoes(P, ctx)

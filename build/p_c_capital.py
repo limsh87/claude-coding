@@ -38,14 +38,14 @@ def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
     # ── 센서 ──────────────────────────────────────────────────────────────────────────────
     # p1: 총주주환원 / 영업현금흐름.  현금흐름표에서 직접 읽으므로 결정공시 파싱이 불필요하다.
-    payout = (P.get("dividend_paid_ttm").abs().fillna(0) +
-              P.get("treasury_buy_ttm").abs().fillna(0))
-    P["payout_ratio"] = safe_div(payout, P.get("cfo_ttm"))
+    payout = (col(P, "dividend_paid_ttm").abs().fillna(0) +
+              col(P, "treasury_buy_ttm").abs().fillna(0))
+    P["payout_ratio"] = safe_div(payout, col(P, "cfo_ttm"))
     P["p1"] = g("payout_ratio").diff(12)
 
     # p2: (CapEx + R&D) / 매출
-    invest = P.get("capex_ttm").abs().fillna(0) + P.get("rnd_ttm").abs().fillna(0)
-    P["invest_ratio"] = safe_div(invest, P.get("revenue_ttm"))
+    invest = col(P, "capex_ttm").abs().fillna(0) + col(P, "rnd_ttm").abs().fillna(0)
+    P["invest_ratio"] = safe_div(invest, col(P, "revenue_ttm"))
     P["p2"] = g("invest_ratio").diff(12)
 
     # p3: 자사주 취득공시 대비 12M 내 실제 소각 실행률
@@ -75,13 +75,13 @@ def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
             P["treasury_canc_n"] = (P.groupby("code", observed=True)["treasury_canc"]
                                      .transform(lambda s: s.rolling(12, min_periods=1).sum()))
     P["p3"] = safe_div(P["treasury_canc_n"], P["treasury_acq_n"]).clip(0, 2)
-    P["acq_size"] = safe_div(P.get("treasury_buy_ttm").abs(), P.get("assets"))
+    P["acq_size"] = safe_div(col(P, "treasury_buy_ttm").abs(), col(P, "assets"))
 
     # p4: 부채비율 변화 (axis_C 에서 이미 계산)
-    P["p4"] = P.get("d_debt_ratio")
+    P["p4"] = col(P, "d_debt_ratio")
 
     # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_P1"] = tp_product(z("p1"), z("p2"))          # ★ 이 팩의 전부: 환원↑ 인데 투자도↑
     P["TP_P2"] = tp_product(z("acq_size"), z("p3"))    # 취득 규모 큰데 소각까지 실행
     P["TP_P3"] = tp_product(z("p1"), -z("p4"))         # 환원↑ 인데 차입 안 늘림

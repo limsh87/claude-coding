@@ -401,33 +401,85 @@ def _winsor_np(a: np.ndarray, k: float = WINSOR_SIGMA) -> np.ndarray:
     return np.clip(a, m - k * s, m + k * s)
 
 
-def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
-    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다."""
+def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N,
+           k: float = WINSOR_SIGMA) -> pd.Series:
+    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다.
+
+    구현 주의 두 가지:
+     ① ±inf 를 반드시 먼저 NaN 으로 바꾼다. np.nanmean 은 NaN 은 무시하지만 inf 는 무시하지
+        않으므로, 셀에 inf 가 단 하나만 있어도 평균이 inf·표준편차가 NaN 이 되어
+        **그 셀 전체의 z-score 가 0으로 뭉개진다.** 비율 지표(diff/log)에서 흔히 발생한다.
+     ② groupby.transform(파이썬 UDF) 대신 네이티브 집계로 벡터화한다.
+        실데이터 규모(30만 행 × 수천 셀)에서 UDF 경로는 호출당 10초 이상이고,
+        파이프라인은 이 함수를 수십 번 부른다.
+    """
     v = pd.to_numeric(values, errors="coerce").astype("float64")
-    g = v.groupby(cells, observed=True, dropna=False)
+    v = v.replace([np.inf, -np.inf], np.nan)
+    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
 
-    def _f(x: pd.Series) -> pd.Series:
-        a = x.to_numpy(dtype="float64", copy=True)
-        ok = np.isfinite(a)
-        if ok.sum() < min_n:
-            return pd.Series(np.nan, index=x.index)
-        a2 = a.copy()
-        a2[ok] = _winsor_np(a[ok])
-        mu, sd = np.nanmean(a2), np.nanstd(a2)
-        if not np.isfinite(sd) or sd == 0:
-            return pd.Series(0.0, index=x.index).where(ok, np.nan)
-        return pd.Series((a2 - mu) / sd, index=x.index)
+    g = v.groupby(grp, observed=True, dropna=False)
+    cnt = g.transform("count")
+    mu0 = g.transform("mean")
+    sd0 = g.transform("std", ddof=0)
+    w = v.clip(lower=mu0 - k * sd0, upper=mu0 + k * sd0)          # ① winsorize
 
-    return g.transform(_f).astype("float32")
+    gw = w.groupby(grp, observed=True, dropna=False)
+    mu = gw.transform("mean")
+    sd = gw.transform("std", ddof=0)                               # ② z-score
+    z = (w - mu) / sd.where(sd > 0)
+    z = z.mask(sd.notna() & (sd <= 0) & w.notna(), 0.0)            # 셀 내 전원 동일값 → 0
+    return z.where(cnt >= min_n).astype("float32")
 
 
 def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
     """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
     v = pd.to_numeric(values, errors="coerce").astype("float64")
-    g = v.groupby(cells, observed=True, dropna=False)
+    v = v.replace([np.inf, -np.inf], np.nan)
+    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
+    g = v.groupby(grp, observed=True, dropna=False)
     cnt = g.transform("count")
     r = g.rank(pct=True, method="average")
     return r.where(cnt >= min_n).astype("float32")
+
+
+CELL_LADDER = ("cell", "cell_l2", "cell_l3")
+
+
+def xsec_z_l(P: pd.DataFrame, name: str, min_n: int = CELL_MIN_N) -> pd.Series:
+    """셀 폴백 사다리를 적용한 z-score (C11).
+
+    ★ 왜 필요한가: 셀에 종목이 30개 있어도 '그 센서를 관측한' 종목은 5개뿐일 수 있다.
+      (관세·조달처럼 일부 종목만 커버하는 팩이 정확히 이 경우다)
+      셀 크기만 보고 폴백하면 z-score 는 표본부족으로 전부 NaN 이 되고,
+      그 팩은 아무 신호도 못 내면서 로그에는 아무것도 남지 않는다 — 최악의 조용한 실패다.
+      그래서 '그 센서의 유효 관측 수' 기준으로 산업 상위 → 전체 순으로 단계적 폴백한다.
+    """
+    v = col(P, name)
+    if v.notna().sum() == 0:
+        return pd.Series(np.nan, index=P.index, dtype="float32")
+    z = xsec_z(v, P["cell"], min_n) if "cell" in P.columns else \
+        pd.Series(np.nan, index=P.index, dtype="float32")
+    for lvl in CELL_LADDER[1:]:
+        if not z.isna().any():
+            break
+        if lvl in P.columns:
+            z = z.where(z.notna(), xsec_z(v, P[lvl], min_n))
+    return z
+
+
+def xsec_rank_pct_l(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.Series:
+    v = col(P, name_or_series) if isinstance(name_or_series, str) else \
+        pd.to_numeric(name_or_series, errors="coerce")
+    if v.notna().sum() == 0:
+        return pd.Series(np.nan, index=P.index, dtype="float32")
+    r = xsec_rank_pct(v, P["cell"], min_n) if "cell" in P.columns else \
+        pd.Series(np.nan, index=P.index, dtype="float32")
+    for lvl in CELL_LADDER[1:]:
+        if not r.isna().any():
+            break
+        if lvl in P.columns:
+            r = r.where(r.notna(), xsec_rank_pct(v, P[lvl], min_n))
+    return r
 
 
 def tp_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
@@ -439,6 +491,20 @@ def tp_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
     a = pd.to_numeric(z_improve, errors="coerce")
     b = pd.to_numeric(z_nopay, errors="coerce")
     return (a * b).astype("float32")
+
+
+def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
+    """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
+
+    ★ df.get("x") 는 컬럼이 없으면 None 을 반환한다. 그러면 `None + Series` 나 `None.abs()`
+      로 TypeError/AttributeError 가 나는데, 하필 그 상황(= 특정 데이터 소스가 통째로 비어
+      해당 계정 컬럼이 아예 생성되지 않은 경우)은 실데이터 실행에서 가장 흔하다.
+      키 미입력·API 한도 소진·소급 데이터 없음 전부 이 경로로 들어온다.
+      그래서 피처 계산부는 df.get 대신 반드시 이 함수를 쓴다.
+    """
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce")
+    return pd.Series(default, index=df.index, dtype="float64")
 
 
 def safe_div(a, b, eps: float = 1e-12):

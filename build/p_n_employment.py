@@ -220,8 +220,19 @@ def build_nps_panel(N: pd.DataFrame, M: pd.DataFrame, emp: pd.DataFrame,
     """종목-월 단위 국민연금 패널 + θ_N (관측커버리지)."""
     if N is None or N.empty or M is None or M.empty:
         return pd.DataFrame(columns=["code", "month", "nps_members", "nps_amt", "theta_N"])
-    x = N.merge(M[["biz_no", "wkpl_name", "code"]], on=["biz_no", "wkpl_name"], how="inner")
+    keep = ["biz_no", "wkpl_name", "code"] + \
+           [c for c in ("valid_from", "valid_to") if c in M.columns]
+    x = N.merge(M[keep], on=["biz_no", "wkpl_name"], how="inner")
     x["month"] = as_ts_series(x["ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    # ★ C3: 매핑은 시간구간 테이블이다. 유효구간을 무시하고 전 기간에 적용하면
+    #   "나중에야 알게 된 사업장↔법인 관계"를 과거에 소급 적용하는 미래누수가 된다.
+    if "valid_from" in x.columns:
+        vf = as_ts_series(x["valid_from"])
+        vt = as_ts_series(x["valid_to"]) if "valid_to" in x.columns else pd.Series(pd.NaT, index=x.index)
+        before = len(x)
+        x = x[(vf.isna() | (x["month"] >= vf)) & (vt.isna() | (x["month"] <= vt))]
+        if before - len(x):
+            LOG.info(f"국민연금 매핑 유효구간(C3) 적용 — 구간 밖 {before-len(x):,}행 제외")
     agg = (x.groupby(["code", "month"], as_index=False)
             .agg(nps_members=("members", "sum"), nps_amt=("notice_amt", "sum"),
                  nps_acq=("acq_cnt", "sum"), nps_loss=("loss_cnt", "sum"),
@@ -236,14 +247,17 @@ def build_nps_panel(N: pd.DataFrame, M: pd.DataFrame, emp: pd.DataFrame,
 def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     npsp = ctx.get("nps_panel")
-    for c in ("nps_members", "nps_amt", "nps_acq", "nps_loss", "n_wkpl"):
-        if c not in P.columns:
-            P[c] = np.nan
+    NPS_COLS = ("nps_members", "nps_amt", "nps_acq", "nps_loss", "n_wkpl")
     if npsp is not None and len(npsp):
         PIT.register("nps_panel", npsp, key_cols=["code"])
         P = PIT.asof_join(P, "nps_panel", by="code", left_time="month",
-                          cols=["code", "knowledge_date", "nps_members", "nps_amt",
-                                "nps_acq", "nps_loss", "n_wkpl"], suffix="_nps")
+                          cols=["code", "knowledge_date", *NPS_COLS], suffix="_nps")
+    # ★ 결합 '이후에' 결측 컬럼을 채운다. 먼저 NaN 컬럼을 만들어두면 merge_asof 가 들어오는
+    #   실제 데이터에 접미사(_nps)를 붙여 다른 이름으로 넣고, 원래의 빈 컬럼이 그대로 남는다.
+    #   → 팩 전체가 조용히 결측이 되는 유형의 사고. (커버리지 0% 로만 드러난다)
+    for c in NPS_COLS:
+        if c not in P.columns:
+            P[c] = np.nan
     g = lambda c: P.groupby("code", observed=True)[c]
     P["_year"] = P["month"].dt.year
     P["_rate"] = P["_year"].map(NPS_CONTRIB_RATE).fillna(0.09)
@@ -290,7 +304,7 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["n6"] = g("n6").ffill(limit=11)
 
     # ── θ_N 관측커버리지 = 매핑 사업장 가입자수 / DART 종업원수(별도) ──────────────────────
-    P["theta_N"] = safe_div(P["nps_members"], P.get("employees")).clip(0, 2)
+    P["theta_N"] = safe_div(P["nps_members"], col(P, "employees")).clip(0, 2)
     P["theta_N"] = P["theta_N"].where(P["theta_N"] > 0)
 
     # ── 임계 밴드 플래그 (회귀불연속 구간) ────────────────────────────────────────────────
@@ -300,11 +314,11 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["emp_band_flag"] = band.astype("float32")
 
     # ── V8 입력: 유효세율 급락 ────────────────────────────────────────────────────────────
-    P["eff_tax_rate"] = safe_div(P.get("tax_expense"), P.get("pretax_income")).clip(-1, 1)
+    P["eff_tax_rate"] = safe_div(col(P, "tax_expense"), col(P, "pretax_income")).clip(-1, 1)
     P["d_eff_tax"] = g("eff_tax_rate").diff(12)
 
     # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_N1"] = tp_product(z("n1"), z("n2"))                    # 인원↑ 인데 신규가 고임금
     P["TP_N2"] = tp_product(z("n1"), z("n3"))                    # 인원↑ 인데 이직률 안 오름
     P["TP_N3"] = tp_product(z("n4"), z("n1"))                    # 신규 사업장 + 순증

@@ -83,14 +83,28 @@ class PITStore:
             if c not in use:
                 use.append(c)
         R = (right[use].dropna(subset=["knowledge_date", by])
-                        .sort_values("knowledge_date", kind="stable"))
-        L = panel.copy()
-        L["_ord"] = np.arange(len(L))
-        L = L.dropna(subset=[left_time, by]).sort_values(left_time, kind="stable")
-        if L.empty or R.empty:
+                        .sort_values("knowledge_date", kind="stable")).copy()
+        if R.empty:
+            return panel
+
+        # ★★ 결합키가 결측인 패널 행을 '떨어뜨리면' 안 된다. ★★
+        #   attach_fundamentals 에서 corp_code 가 없는 종목(대개 상장폐지·신규상장·비DART)이
+        #   통째로 사라지면 그게 곧 생존자편향 재유입이다(C2 위반). merge_asof 는 by 키에
+        #   NaN 이 있으면 다루지 못하므로, 유효키 부분만 결합한 뒤 전체 패널에 되붙인다.
+        base = panel.copy()
+        base["_ord"] = np.arange(len(base))
+        mask = base[left_time].notna() & base[by].notna()
+        n_drop = int((~mask).sum())
+        if n_drop:
+            LOG.debug(f"asof_join '{name}': 결합키 결측 {n_drop:,}행은 결측값으로 보존합니다"
+                      f"(행을 버리지 않습니다 — C2).")
+        L = base[mask].copy()
+        if L.empty:
+            LOG.warn(f"asof_join '{name}': 결합 가능한 행이 없습니다. 결합을 건너뜁니다.")
             return panel
         R[by] = R[by].astype(str)
         L[by] = L[by].astype(str)
+        L = L.sort_values(left_time, kind="stable")
         try:
             M = pd.merge_asof(L, R, left_on=left_time, right_on="knowledge_date",
                               by=by, direction="backward", suffixes=("", suffix or "_r"))
@@ -98,9 +112,15 @@ class PITStore:
             LOG.warn(f"asof_join 실패({type(e).__name__}) — '{name}' 결합을 건너뜁니다. "
                      f"대개 정렬/타입 문제입니다.")
             return panel
-        M = M.sort_values("_ord").drop(columns=["_ord"])
-        M.index = panel.index[:len(M)] if len(M) == len(panel) else range(len(M))
-        return M
+        new_cols = [c for c in M.columns if c not in base.columns]
+        if not new_cols:
+            return panel
+        add = M.set_index("_ord")[new_cols]
+        out = base.set_index("_ord")
+        out = out.join(add, how="left")            # 결합 실패 행은 NaN 으로 남고, 행은 유지된다
+        out = out.sort_index().reset_index(drop=True)
+        out.index = panel.index
+        return out
 
     def report(self):
         rows = []
@@ -146,9 +166,12 @@ class Universe:
         """시점 t 의 유니버스. t 이후 상장 종목이 하나라도 섞이면 그 자체로 C2 위반이다."""
         t = as_ts(t)
         # ① 스냅샷이 있으면 그것이 최우선 진실 (그 날 실제로 상장돼 있던 종목)
-        key = min(self._snap_by_month, key=lambda d: abs((d - t).days)) if self._snap_by_month else None
+        #    ★ 반드시 '과거' 스냅샷만 쓴다. 가장 가까운 스냅샷을 고르면 어떤 달의 수집이
+        #      실패했을 때 미래 스냅샷이 선택되어 그 자체로 미래누수가 된다.
+        past = [d for d in self._snap_by_month if d <= t]
+        key = max(past) if past else None
         base = None
-        if key is not None and abs((key - t).days) <= 45:
+        if key is not None and (t - key).days <= 45:
             base = set(self._snap_by_month[key])
         if base is None:
             base = set()
@@ -224,20 +247,29 @@ def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N)
     p["industry"] = p["code"].map(ind).fillna("미분류").astype(str)
     p["industry_l1"] = p["industry"].str.slice(0, 4)                 # 폴백용 상위 단위
     p["size_bucket"] = p["employees"].map(size_bucket) if "employees" in p.columns else "미상"
-    p["cell"] = (p["month"].dt.strftime("%Y%m") + "|" + p["industry"] + "|" + p["size_bucket"])
+    ym = p["month"].dt.strftime("%Y%m")
+    p["cell"] = ym + "|" + p["industry"] + "|" + p["size_bucket"]
+    # 폴백 사다리를 컬럼으로 미리 만들어 둔다. 센서별로 유효 관측이 부족할 때
+    # xsec_z_l 이 이 사다리를 타고 내려간다(C11 "산업 상위 단위로 폴백").
+    p["cell_l2"] = ym + "|" + p["industry_l1"] + "|ALL"
+    p["cell_l3"] = ym + "|ALL|ALL"
 
     cnt = p.groupby("cell", observed=True)["code"].transform("size")
     small = cnt < min_n
     n_small = int(small.sum())
+    still_n = 0
     if n_small:
-        p.loc[small, "cell"] = (p.loc[small, "month"].dt.strftime("%Y%m") + "|" +
-                                p.loc[small, "industry_l1"] + "|ALL")
+        p.loc[small, "cell"] = p.loc[small, "cell_l2"]
         cnt2 = p.groupby("cell", observed=True)["code"].transform("size")
         still = cnt2 < min_n
+        still_n = int(still.sum())
         if still.any():
-            p.loc[still, "cell"] = p.loc[still, "month"].dt.strftime("%Y%m") + "|ALL|ALL"
-        LOG.info(f"셀 폴백 발생: 1차 {n_small:,}행(산업 상위단위로) / 2차 {int(still.sum()):,}행(전체로). "
+            p.loc[still, "cell"] = p.loc[still, "cell_l3"]
+        LOG.info(f"셀 폴백 발생: 1차 {n_small:,}행(산업 상위단위로) / 2차 {still_n:,}행(전체로). "
                  f"C11 요구대로 폴백을 로깅합니다.")
         PIPE.note(f"셀 폴백 {n_small:,}행")
-    p["cell"] = p["cell"].astype("category")
+    for c in ("cell", "cell_l2", "cell_l3"):
+        p[c] = p[c].astype("category")
+    LOG.debug(f"셀 구성: 1단계 {p['cell'].nunique():,}개 · 2단계 {p['cell_l2'].nunique():,}개 · "
+              f"3단계 {p['cell_l3'].nunique():,}개")
     return p

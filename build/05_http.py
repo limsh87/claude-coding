@@ -72,9 +72,13 @@ def _korean_score(t: str) -> float:
 
 def _decode(content: bytes, resp_enc: Optional[str], url: str,
             force_enc: Optional[str] = None) -> str:
+    # force_enc 는 '우선 후보'일 뿐 절대 지정이 아니다. 소스가 UTF-8 로 바뀌면
+    # euc-kr 강제 디코딩은 예외 없이 깨진 글자를 돌려주므로, 점수로 검증한 뒤에만 채택한다.
     if force_enc:
         try:
-            return content.decode(force_enc, "replace")
+            t = content.decode(force_enc, "replace")
+            if _korean_score(t) > 30:
+                return t
         except Exception:
             pass
     head = content[:4096].decode("ascii", "ignore").lower()
@@ -116,7 +120,8 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              headers: Optional[dict] = None, timeout: int = 25, tries: int = 4,
              as_bytes: bool = False, allow_status: Sequence[int] = (200,),
              referer: Optional[str] = None, quiet: bool = True,
-             force_enc: Optional[str] = None) -> Optional[Union[str, bytes]]:
+             force_enc: Optional[str] = None,
+             on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -124,6 +129,11 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
     last_exc = None
     for attempt in range(tries):
         lim.wait()
+        if on_attempt is not None:
+            try:
+                on_attempt()
+            except Exception:
+                pass
         try:
             s = _session()
             if attempt > 0:

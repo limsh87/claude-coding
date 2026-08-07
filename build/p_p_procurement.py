@@ -146,7 +146,7 @@ def pack_p_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["q1"] = g("award_amt").transform(lambda s: dlog(s.rolling(12, min_periods=6).sum(), 12))
     P["q2"] = g("win_rate").diff(12)
     P["q3"] = -g("hhi_org").diff(12)
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_Q1"] = tp_product(z("q1"), z("q2"))
     P["TP_Q2"] = tp_product(z("q3"), z("q2"))
     P["E_P"] = nanmean_cols(P, ["TP_Q1", "TP_Q2"])

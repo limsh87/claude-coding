@@ -58,6 +58,12 @@ class DartBudget:
         except Exception:
             pass
 
+    def refund(self, k: int = 1):
+        if k <= 0:
+            return
+        with self._lk:
+            self.n = max(0, self.n - k)
+
     def take(self, k: int = 1) -> bool:
         with self._lk:
             if self.n + k > DART_DAILY_LIMIT:
@@ -80,15 +86,21 @@ DBUDGET: Optional[DartBudget] = None
 
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
-             tries: int = 3) -> Optional[dict]:
+             tries: int = 2) -> Optional[dict]:
+    """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
+    호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
+    → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
     if not DART_API_KEY:
         return None
-    if DBUDGET is not None and not DBUDGET.take():
+    if DBUDGET is not None and not DBUDGET.take(tries):
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
+    attempts = {"n": 0}
     js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
-                   referer="https://opendart.fss.or.kr/")
+                   referer="https://opendart.fss.or.kr/", on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
+    if DBUDGET is not None:
+        DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
     if not isinstance(js, dict):
         return None
     st = str(js.get("status", ""))
@@ -268,18 +280,33 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     # 누적치 → 분기 단독치 (Q1/H1/Q3/FY 는 누적 공시다. 차분하지 않으면 계절성이 곧 신호가 된다)
     order = {REPRT_CODES["Q1"]: 1, REPRT_CODES["H1"]: 2, REPRT_CODES["Q3"]: 3, REPRT_CODES["FY"]: 4}
     W["q"] = W["reprt_code"].map(order)
-    W = W.sort_values(["corp_code", "bsns_year", "q"])
-    flow_items = ["revenue", "cogs", "gross_profit", "sgna", "op_income", "net_income",
-                  "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise"]
+    W = W.sort_values(["corp_code", "bsns_year", "q"]).reset_index(drop=True)
+    # ★ 손익·현금흐름 성격의 전 계정을 여기에 넣어야 한다. 빠뜨리면 <계정>_ttm 컬럼이
+    #   아예 생성되지 않고, 그걸 쓰는 팩이 실데이터 실행에서만 터진다(합성 스모크는 통과).
+    flow_items = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "net_income",
+                  "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise",
+                  "tax_expense", "pretax_income", "other_income"]
+    # 누적 → 분기 단독. 직전 분기가 실제로 존재할 때만 차분한다.
+    # (누락된 분기를 0으로 간주하면 반기 누적치가 한 분기 실적으로 둔갑한다 — fail-open 금지)
+    gk = ["corp_code", "bsns_year"]
+    W["_q_prev"] = W.groupby(gk, observed=True)["q"].shift(1)
+    contiguous = (W["q"] - W["_q_prev"]) == 1
     for c in flow_items:
         if c not in W.columns:
             W[c] = np.nan
-        cum = W.groupby(["corp_code", "bsns_year"], observed=True)[c]
-        W[c + "_q"] = W[c] - cum.shift(1).fillna(0)
-        W.loc[W["q"] == 1, c + "_q"] = W.loc[W["q"] == 1, c]
-        # 연간(TTM) — 4분기 이동합
+        prev = W.groupby(gk, observed=True)[c].shift(1)
+        q_val = np.where(W["q"] == 1, W[c],
+                         np.where(contiguous, W[c] - prev, np.nan))
+        W[c + "_q"] = q_val
+        # TTM = 4분기 이동합. min_periods=4 — 3개만으로 TTM 이라 부르면 15~25% 과소계상된다.
         W[c + "_ttm"] = (W.groupby("corp_code", observed=True)[c + "_q"]
-                          .transform(lambda s: s.rolling(4, min_periods=3).sum()))
+                          .transform(lambda s: s.rolling(4, min_periods=4).sum()))
+    W = W.drop(columns=["_q_prev"])
+    n_ttm = int(W["revenue_ttm"].notna().sum()) if "revenue_ttm" in W.columns else 0
+    if len(W) and n_ttm / len(W) < 0.35:
+        LOG.warn(f"TTM 산출률이 {100*n_ttm/len(W):.0f}% 로 낮습니다. 분기보고서가 결측인 기업이 "
+                 f"많다는 뜻이며(중소형주에서 흔함), 해당 종목은 B/C축이 결측 처리됩니다. "
+                 f"DART_STATEMENT_FREQ='quarterly' 콜드빌드가 아직 미완이라면 이어받기를 계속하세요.")
     W = pit_frame(W, "period_end", "knowledge_date", source="dart")
     LOG.ok(f"DART 재무 정제 {len(W):,}행 · {W['corp_code'].nunique():,}사 "
            f"(knowledge_date = 접수일자 기준, 누적→분기 차분 완료)")

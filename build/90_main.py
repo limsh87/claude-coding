@@ -97,6 +97,14 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
         rep = build_report_master(frames, ctx["sec"])
         if len(rep):
             rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+            # ★ PDF 에서 추출한 목표주가를 원장에 실제로 반영한다.
+            #   (추출만 하고 쓰지 않으면 네이버 단독 건의 목표주가가 영원히 결측으로 남는다)
+            if "pdf_target" in rep.columns:
+                fill = rep["target_price"].isna() & rep["pdf_target"].notna()
+                if fill.any():
+                    rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
+                    LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건을 추가로 채웠습니다 "
+                           f"(리스트에 목표주가가 없는 네이버 단독 건 보강).")
             VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
                             source="hankyung+naver")
             VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",

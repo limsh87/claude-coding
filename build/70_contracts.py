@@ -121,7 +121,15 @@ def run_contract_tests(strict: bool = True) -> bool:
         small = xsec_rank_pct(pd.Series([1.0, 2.0]), pd.Series(["B", "B"]))
         if small.notna().any():
             return False, "표본 부족 셀이 NaN 으로 처리되지 않았습니다(0으로 채우면 안 됩니다)"
-        return True, "winsorize(±2σ)→z→rank_pct 순서 및 표본부족 NaN 처리 확인"
+        # ±inf 오염: nanmean 은 NaN 은 무시하지만 inf 는 무시하지 않는다.
+        # inf 하나가 셀 전체 z 를 0으로 뭉개면 그 셀의 신호가 통째로 사라진다.
+        vi = pd.Series([1.0, 2.0, 3.0, np.inf, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+        zi = xsec_z(vi, pd.Series(["A"] * 10))
+        if zi.notna().sum() < 9 or float(zi.dropna().std()) < 0.5:
+            return False, (f"★inf 오염: 셀에 ±inf 가 하나 있으면 z-score 가 전부 뭉개집니다 "
+                           f"(유효 {int(zi.notna().sum())}개, 표준편차 {float(zi.dropna().std()):.3f}). "
+                           f"비율/로그 지표에서 흔히 발생하며 해당 셀의 신호가 통째로 소실됩니다.")
+        return True, ("winsorize(±2σ)→z→rank_pct 순서 · 표본부족 NaN · ±inf 무해화 확인")
 
     _c("C5", "윈저라이즈→랭크 순서 고정", c5)
 
@@ -203,6 +211,94 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _c("TP", "트레이드오프 쌍은 곱(§1.1)", c_tp)
 
+    # ── 회귀 방지: as-of 결합이 행을 버리지 않을 것 (C1+C2 동시) ──────────────────────────
+    def c_asof():
+        panel = pd.DataFrame({"code": ["A", "B", "C", "A", "B", "C"],
+                              "corp_code": ["c1", None, "c3", "c1", None, "c3"],
+                              "month": pd.to_datetime(["2020-01-31"] * 3 + ["2020-02-29"] * 3)})
+        fin = pit_frame(pd.DataFrame({"corp_code": ["c1", "c1", "c3"],
+                                      "revenue_ttm": [100.0, 999.0, 300.0],
+                                      "pe": pd.to_datetime(["2019-12-31", "2020-03-31", "2019-12-31"]),
+                                      "kd": pd.to_datetime(["2020-01-15", "2020-05-15", "2020-01-15"])}),
+                        "pe", "kd")
+        st = PITStore()
+        st.register("fin", fin, key_cols=["corp_code"])
+        out = st.asof_join(panel, "fin", by="corp_code", left_time="month")
+        if len(out) != len(panel):
+            return False, (f"★C2 재유입: 결합키가 결측인 행이 버려졌습니다 "
+                           f"({len(out)}/{len(panel)}행). corp_code 없는 종목(대개 상장폐지)이 "
+                           f"통째로 사라지면 그게 곧 생존자편향입니다.")
+        if not out.loc[out["code"] == "B", "revenue_ttm"].isna().all():
+            return False, "결합키 결측 행에 값이 붙었습니다"
+        if out.loc[out["code"] == "A", "revenue_ttm"].tolist() != [100.0, 100.0]:
+            return False, (f"★C1 위반: 2020-05-15 에야 알 수 있는 값(999)이 새어나오거나 "
+                           f"행 정렬이 어긋났습니다 → {out.loc[out['code']=='A','revenue_ttm'].tolist()}")
+        if out.loc[out["code"] == "C", "revenue_ttm"].tolist() != [300.0, 300.0]:
+            return False, "결합 결과가 다른 종목에 붙었습니다(정렬 오류)"
+        return True, "결합키 결측 행 보존 · 미래값 차단 · 종목별 정렬 정확"
+
+    _c("C1/C2b", "as-of 결합 무결성", c_asof)
+
+    # ── 회귀 방지: 유니버스는 미래 스냅샷을 쓰지 않을 것 ───────────────────────────────────
+    def c_snapfuture():
+        sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["a", "b"],
+                            "market": ["KOSPI"] * 2, "industry": ["X"] * 2,
+                            "corp_code": [None, None],
+                            "listing_date": pd.to_datetime(["2010-01-01"] * 2),
+                            "delisting_date": [pd.NaT, pd.NaT]})
+        snaps = pd.DataFrame({"snap_date": pd.to_datetime(["2020-01-31", "2020-03-31"]),
+                              "code": ["000001", "000002"], "market": ["KOSPI"] * 2})
+        px = pd.DataFrame({"date": pd.bdate_range("2009-01-01", "2021-01-01"), "code": "000001"})
+        u = Universe(sec, snaps, px)
+        got = u.at("2020-02-29")
+        if "000002" in got:
+            return False, ("★미래누수: 2020-02-29 유니버스에 2020-03-31 스냅샷에만 있는 종목이 "
+                           "포함되었습니다. 가장 '가까운' 스냅샷이 아니라 가장 '최근 과거' 스냅샷을 "
+                           "써야 합니다.")
+        return True, "과거 스냅샷만 사용 확인"
+
+    _c("C2c", "유니버스 스냅샷 방향성", c_snapfuture)
+
+    # ── 회귀 방지: 결측 컬럼 산술이 죽지 않을 것 ──────────────────────────────────────────
+    def c_col():
+        df = pd.DataFrame({"x": [1.0, 2.0]})
+        s = col(df, "rnd_ttm")
+        if not isinstance(s, pd.Series) or len(s) != 2 or s.notna().any():
+            return False, "col() 이 결측 Series 를 반환하지 않습니다"
+        _ = s.abs().fillna(0) + col(df, "capex_ttm").abs().fillna(0)
+        if df.get("rnd_ttm") is not None:
+            return False, "테스트 전제 오류"
+        return True, ("없는 컬럼도 NaN Series 로 안전 반환 — 데이터 소스가 통째로 빈 실행에서 "
+                      "AttributeError 로 죽지 않음")
+
+    _c("COL", "결측 컬럼 안전 접근", c_col)
+
+    # ── 회귀 방지: 비중 상한이 실제로 강제될 것 (§8.5 — 코드 상수로 못박은 규칙) ───────────
+    def c_size():
+        for name, sig, adv in (
+            ("균등", np.linspace(0.5, 1.0, 10), np.full(10, 1e12)),
+            ("극단집중", np.array([1.0] + [0.01] * 9), np.full(10, 1e12)),
+            ("소수종목", np.linspace(0.6, 1.0, 5), np.full(5, 1e12)),
+            ("저유동성", np.linspace(0.5, 1.0, 10), np.array([1e7] * 3 + [1e12] * 7)),
+        ):
+            sub = pd.DataFrame({"Signal_rank": sig, "adv20": adv,
+                                "code": [f"{i:06d}" for i in range(len(sig))]})
+            w = size_positions(sub)["weight"].to_numpy(dtype=float)
+            if w.max() > POS_MAX_WEIGHT + 1e-9:
+                return False, (f"★[{name}] 종목당 최대비중 {POS_MAX_WEIGHT:.0%} 가 뚫렸습니다 "
+                               f"(최대 {w.max():.4f}). clip 후 재정규화하면 상한이 무력화됩니다.")
+            if w.sum() > 1.0 + 1e-9:
+                return False, f"[{name}] 비중 합이 1을 초과합니다 ({w.sum():.6f})"
+            liq = np.where(adv > 0, (adv * POS_ADV_PARTICIPATION) / max(ACCOUNT_KRW, 1),
+                           POS_MAX_WEIGHT)
+            cap = np.minimum(POS_MAX_WEIGHT, np.maximum(liq, POS_MIN_WEIGHT * 0.5))
+            if (w > cap + 1e-9).any():
+                return False, f"★[{name}] 유동성 상한(20일 평균거래대금×{POS_ADV_PARTICIPATION:.0%})이 뚫렸습니다"
+        return True, (f"종목당 상한 {POS_MAX_WEIGHT:.0%} · 유동성 상한 · 합≤1 "
+                      f"모두 강제 확인 (water-filling)")
+
+    _c("SIZE", "포지션 비중 상한 강제", c_size)
+
     # ── 추가: 종목코드 정규화 (2024 영숫자 티커) ──────────────────────────────────────────
     def c_code():
         cases = {"005930": "005930", 5930: "005930", "A005930": "005930",
@@ -213,6 +309,52 @@ def run_contract_tests(strict: bool = True) -> bool:
         return True, "구형 6자리 + 2024 영숫자 티커(09701K) 모두 정상 처리"
 
     _c("CODE", "종목코드 정규화", c_code)
+
+    # ── 회귀 방지: 수집 파서 (실데이터 없이도 검증 가능한 부분) ────────────────────────────
+    def c_ingest():
+        # ① YY.MM.DD — pandas 자동추론은 '26.01.19'를 2019-01-26 으로 읽는다(연·일 전치)
+        for raw, exp in (("26.01.19", "2026-01-19"), ("19.12.31", "2019-12-31"),
+                         ("24.11.30", "2024-11-30"), ("2020-05-01", "2020-05-01")):
+            if parse_kr_date(raw) != exp:
+                return False, (f"★날짜 파싱: {raw} → {parse_kr_date(raw)} (기대 {exp}). "
+                               f"두 자리 연도를 자동추론에 맡기면 연·일이 뒤바뀌어 "
+                               f"리포트 원장의 시간축이 통째로 어긋납니다.")
+        # ② 목표주가 '0'/'-' 은 결측이지 0원이 아니다
+        for raw, exp in (("95,000", 95000.0), ("0", None), ("-", None), ("없음", None)):
+            if parse_target_price(raw) != exp:
+                return False, f"목표주가 파싱: {raw!r} → {parse_target_price(raw)!r} (기대 {exp!r})"
+        # ③ 증권사 사명 변경 정규화 (안 하면 같은 애널리스트가 다른 사람이 된다)
+        for raw, exp in (("미래에셋대우", "미래에셋증권"), ("하나금융투자", "하나증권"),
+                         ("신한금융투자", "신한투자증권"), ("이베스트투자증권", "LS증권"),
+                         ("KTB투자증권", "다올투자증권"), ("하이투자증권", "iM증권")):
+            if normalize_broker(raw)[1] != exp:
+                return False, f"증권사 정규화: {raw} → {normalize_broker(raw)[1]} (기대 {exp})"
+        # ④ 한경 9컬럼/6컬럼/헤더없음 — 컬럼 인덱스가 아니라 헤더명으로 매핑되는지
+        def _mk(hdr, rows):
+            h = ("<tr>" + "".join(f"<th>{x}</th>" for x in hdr) + "</tr>") if hdr else ""
+            b = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+            return f"<div class='table_style01'><table>{h}{b}</table></div>"
+        r9 = [["2024-05-02",
+               "<a href='/analysis/downpdf?report_idx=123456'>삼성전자(005930) 실적 개선</a>",
+               "95,000", "Buy", "홍길동", "미래에셋대우", "-", "-",
+               "<a href='/analysis/downpdf?report_idx=123456'>P</a>"]]
+        o9 = _hk_parse(_mk(["작성일", "제목", "적정가격", "투자의견", "작성자", "제공출처",
+                            "기업정보", "차트", "첨부"], r9), "t_business")
+        if not o9 or o9[0]["stock_code"] != "005930" or o9[0]["target_price"] != 95000.0 \
+                or o9[0]["analyst_raw"] != "홍길동":
+            return False, f"한경 9컬럼 파싱 실패: {o9[:1]}"
+        o0 = _hk_parse(_mk(None, r9), "t_noheader")       # thead 가 없어도 살아남아야 한다
+        if not o0 or o0[0]["stock_code"] != "005930":
+            return False, f"한경 헤더없음 폴백 실패: {o0[:1]}"
+        # ⑤ 인코딩: force_enc 는 힌트일 뿐 — 소스가 UTF-8 로 바뀌어도 깨지면 안 된다
+        ko = "네이버 금융 리서치 종목분석 삼성전자 목표주가 상향" * 4
+        for enc in ("euc-kr", "utf-8"):
+            if "네이버" not in _decode(ko.encode(enc), None, "x", force_enc="euc-kr"):
+                return False, f"인코딩 판별 실패: 실제 {enc} 인데 깨짐"
+        return True, ("YY.MM.DD 연·일 전치 방지 · 목표주가 0/- 결측처리 · 사명변경 정규화 · "
+                      "헤더명 기반 컬럼매핑(9/6/무헤더) · EUC-KR↔UTF-8 자동판별 확인")
+
+    _c("INGEST", "수집 파서 회귀 검사", c_ingest)
 
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30), "✔ 통과" if r["pass"] else "✘ 실패",

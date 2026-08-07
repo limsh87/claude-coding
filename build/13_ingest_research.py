@@ -86,6 +86,34 @@ def parse_opinion(x: Any) -> Optional[str]:
     return t[:20] or None
 
 
+_YYMMDD = re.compile(r"^\s*(\d{2})[.\-/](\d{2})[.\-/](\d{2})\s*$")
+
+
+def parse_kr_date(s: Any) -> Optional[str]:
+    """★ 네이버 리스트의 'YY.MM.DD' 를 반드시 명시 포맷으로 파싱한다.
+
+    pandas 자동추론은 '26.01.19' 를 2019-01-26 으로, '19.12.31' 을 2031-12-19 로 읽는다.
+    (연·일이 뒤바뀌고 미래 날짜가 만들어진다) 예외가 나지 않으므로 조용히 통과하며,
+    리포트 원장의 시간축 전체가 어긋나 PIT 순서가 무의미해진다.
+    → 두 자리 연도는 여기서 4자리로 확정한 뒤에만 하위로 넘긴다.
+    """
+    if s is None:
+        return None
+    t = str(s).strip()
+    m = _YYMMDD.match(t)
+    if m:
+        yy, mm, dd = (int(x) for x in m.groups())
+        # 백테스트 대상은 2000년대. 두 자리 연도는 2000+yy 로 확정한다.
+        year = 2000 + yy
+        if year > _dt.date.today().year + 1:
+            year -= 100
+        try:
+            return f"{year:04d}-{mm:02d}-{dd:02d}" if 1 <= mm <= 12 and 1 <= dd <= 31 else None
+        except Exception:
+            return None
+    return t or None
+
+
 _CODE_IN_TITLE = re.compile(r"[（(]\s*([0-9]{6})\s*[)）]")
 
 
@@ -202,7 +230,7 @@ def _hk_parse(html: str, category: str) -> List[dict]:
 
         out.append({
             "source": "hankyung", "src_report_id": str(ridx), "category": category,
-            "pub_date": date_s, "title": title,
+            "pub_date": parse_kr_date(date_s), "title": title,
             "stock_code": code_from_title(title), "stock_name": name_from_title(title),
             "broker_raw": _clean_cell(bk), "analyst_raw": _clean_cell(an),
             "target_price": parse_target_price(tp), "opinion": parse_opinion(op),
@@ -227,6 +255,7 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
         skin, sd, ed = job
         got: List[dict] = []
         seen_ids: set = set()
+        empty_streak = 0
         for page in range(1, max_pages + 1):
             params = {
                 "skinType": skin, "sdate": sd.strftime("%Y-%m-%d"), "edate": ed.strftime("%Y-%m-%d"),
@@ -245,8 +274,19 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
             for b in fresh:
                 seen_ids.add(b["src_report_id"])
             got.extend(fresh)
-            if len(fresh) == 0 or len(batch) < page_size * 0.5:
-                break
+            # ★ 조기 종료 조건을 느슨하게 잡으면 데이터가 조용히 잘려나간다.
+            #   파싱 실패나 일시적 짧은 페이지 하나로 그 해 전체 수집이 끊길 수 있으므로,
+            #   '새 항목 0건'이 2회 연속일 때만 멈춘다.
+            if len(fresh) == 0:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+            else:
+                empty_streak = 0
+            if page == max_pages:
+                LOG.warn(f"한경 {skin} {sd:%Y} 구간이 최대 페이지({max_pages})에 도달했습니다 — "
+                         f"데이터가 잘렸을 수 있습니다. max_pages 를 늘리거나 구간을 분기 단위로 "
+                         f"쪼개세요. (지금까지 {len(got):,}건)")
         return got
 
     res = pmap_io(_sweep, jobs, workers=min(4, N_WORKERS_IO), desc="한경컨센서스")
@@ -330,7 +370,7 @@ def _nv_parse_list(html: str, cat: str) -> List[dict]:
 
         out.append({
             "source": "naver", "src_report_id": str(nid), "category": cat,
-            "pub_date": dt, "title": _dedup_repeat(title or ""),
+            "pub_date": parse_kr_date(dt), "title": _dedup_repeat(title or ""),
             "stock_code": code or code_from_title(title or ""),
             "stock_name": sname or name_from_title(title or ""),
             "broker_raw": _clean_cell(bk), "analyst_raw": "",
@@ -568,7 +608,8 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
             data = VAULT.get_blob(known[uid], "shared")
             if data:
                 return (uid, known[uid], data)
-            return (uid, "", b"")
+            # 인덱스에는 있는데 실제 파일이 없으면(드라이브 동기화 누락 등) 재수집으로 폴백한다.
+            # 여기서 포기하면 그 보고서는 영구히 비어 있는 채로 남는다.
         raw = http_get(url, source="hankyung" if "hankyung" in str(url) else "naver",
                        as_bytes=True, tries=2, referer=HK_BASE + "/" if "hankyung" in str(url) else NV_BASE)
         if not raw or raw[:5] != b"%PDF-":

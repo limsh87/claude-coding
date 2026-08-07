@@ -165,10 +165,19 @@ def build_text_similarity(T: pd.DataFrame) -> pd.DataFrame:
             prev_tok, prev_year = cur, r.year
     if not rows:
         return pd.DataFrame(columns=["corp_code", "knowledge_date", "sim_risk", "sim_all"])
-    S = pd.DataFrame(rows)
-    # ★ 연도×섹션 중앙값으로 정규화 — 서식 개정 해의 전 기업 일괄 변경을 제거한다
-    med = S.groupby(["year", "section"], observed=True)["sim"].transform("median")
-    S["sim_norm"] = S["sim"] - med
+    S = pd.DataFrame(rows).sort_values("rcept_dt")
+    # ★ 섹션별 중앙값으로 정규화 — 서식 개정 해의 '전 기업 일괄 변경' 공통충격을 제거한다.
+    #   단, 같은 해 전체(=아직 제출되지 않은 미래 공시 포함) 중앙값을 쓰면 그 자체가 미래누수다.
+    #   → 그 시점까지 '이미 접수된' 공시들만으로 확장(expanding) 중앙값을 만든다.
+    #   사업보고서는 3월에 몰리므로 초반 표본이 얇다 → 최소 30건 이상일 때만 정규화한다.
+    S["_med"] = (S.groupby("section", observed=True)["sim"]
+                  .transform(lambda s: s.shift(1).expanding(min_periods=30).median()))
+    S["sim_norm"] = S["sim"] - S["_med"]
+    unnorm = int(S["_med"].isna().sum())
+    if unnorm:
+        LOG.info(f"공시 유사도 {unnorm:,}건은 과거 표본 부족으로 정규화 없이 원값을 씁니다 "
+                 f"(미래 표본으로 정규화하면 그 자체가 누수이므로 확장 중앙값만 사용).")
+        S["sim_norm"] = S["sim_norm"].fillna(S["sim"] - S["sim"].expanding().median())
     W = S.pivot_table(index=["corp_code", "rcept_dt"], columns="section",
                       values="sim_norm", aggfunc="mean").reset_index()
     W["sim_risk"] = nanmean_cols(W, ["위험요인", "우발부채"])
@@ -180,17 +189,18 @@ def build_text_similarity(T: pd.DataFrame) -> pd.DataFrame:
 
 def pack_d_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     sim = ctx.get("text_sim")
-    for c in ("sim_risk", "sim_all"):
-        if c not in P.columns:
-            P[c] = np.nan
     if sim is not None and len(sim):
         PIT.register("dart_text_sim", sim, key_cols=["corp_code"])
         P = PIT.asof_join(P, "dart_text_sim", by="corp_code", left_time="month",
                           cols=["corp_code", "knowledge_date", "sim_risk", "sim_all"],
                           suffix="_txt")
+    # 결합 이후에 채운다 (먼저 만들면 merge_asof 가 실제 데이터에 접미사를 붙여 흘려버린다)
+    for c in ("sim_risk", "sim_all"):
+        if c not in P.columns:
+            P[c] = np.nan
     # V7 입력: 위험요인·우발부채 유사도가 셀 내 하위 5%
-    P["sim_risk_pct"] = xsec_rank_pct(P["sim_risk"], P["cell"])
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["sim_risk_pct"] = xsec_rank_pct_l(P, "sim_risk")
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     # 양(+)의 기여는 '문안이 안정적'인 경우에만. 주 용도는 어디까지나 거부권이다.
     P["TP_D1"] = z("sim_all")
     P["E_D"] = P["TP_D1"]

@@ -35,8 +35,8 @@ def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["V1"] = np.where((d_rev > 0) & (push > 1.5), 0.0, 1.0)
 
     # ── V2 이익-현금 괴리 3분기(=9개월) 연속 ───────────────────────────────────────────────
-    bad = ((P.get("net_income_ttm") > 0) &
-           (P.get("cfo_ttm") < 0.5 * P.get("net_income_ttm"))).astype(float)
+    bad = ((col(P, "net_income_ttm") > 0) &
+           (col(P, "cfo_ttm") < 0.5 * col(P, "net_income_ttm"))).astype(float)
     P["v2_streak"] = bad.groupby(P["code"], observed=True).transform(
         lambda s: s.rolling(9, min_periods=9).min())
     P["V2"] = np.where(P["v2_streak"] >= 1.0, 0.0, 1.0)
@@ -72,7 +72,7 @@ def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                          f"{ecol} 무효화 (전면 제외가 아님)")
 
     # ── V5 감사의견/관리종목/자본잠식 ──────────────────────────────────────────────────────
-    impair = (P.get("equity") <= 0)
+    impair = (col(P, "equity") <= 0)
     P["V5"] = np.where(impair.fillna(False), 0.0, 1.0)
     adm = ctx.get("administrative")
     if adm is not None and len(adm):
@@ -138,7 +138,7 @@ def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
 
     # 팩 간 동일가중 (C7)
     P["E_raw"] = nanmean_cols(P, all_e)
-    P["E"] = xsec_rank_pct(P["E_raw"], P["cell"])
+    P["E"] = xsec_rank_pct_l(P, P["E_raw"])
     P["n_axes_active"] = P[all_e].notna().sum(axis=1)
 
     # ── ② 하한선 (§8.2) ───────────────────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
     ok_cnt = pd.Series(0, index=P.index)
     bad_cnt = pd.Series(0, index=P.index)
     for c in all_e:
-        pct = xsec_rank_pct(P[c], P["cell"])
+        pct = xsec_rank_pct_l(P, c)
         P[f"pct_{c}"] = pct
         ok_cnt += (pct >= 0.50).fillna(False).astype(int)
         bad_cnt += (pct < 0.50).fillna(False).astype(int)

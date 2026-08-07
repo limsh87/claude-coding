@@ -48,29 +48,29 @@ def axis_B(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     g = lambda c: P.groupby("code", observed=True)[c]
 
-    rev = P.get("revenue_ttm")
-    cogs = P.get("cogs_ttm")
+    rev = col(P, "revenue_ttm")
+    cogs = col(P, "cogs_ttm")
     P["gpm"] = safe_div(rev - cogs, rev) if rev is not None and cogs is not None else np.nan
     # b1: GPM 추세 기울기 (12개월 창의 선형 기울기 — 4분기 추세의 월간 등가물)
     P["b1"] = g("gpm").transform(lambda s: s.rolling(12, min_periods=6)
                                  .apply(lambda w: np.polyfit(np.arange(len(w)), w, 1)[0]
                                         if np.isfinite(w).all() else np.nan, raw=True))
-    P["DIO"] = safe_div(P.get("inventory"), P.get("cogs_ttm")) * 365.0
-    P["DSO"] = safe_div(P.get("receivable"), P.get("revenue_ttm")) * 365.0
+    P["DIO"] = safe_div(col(P, "inventory"), col(P, "cogs_ttm")) * 365.0
+    P["DSO"] = safe_div(col(P, "receivable"), col(P, "revenue_ttm")) * 365.0
     P["turn_days"] = P["DIO"] + P["DSO"]
     P["d_turn"] = g("turn_days").diff(12)
     P["dlog_rev"] = g("revenue_ttm").transform(lambda s: dlog(s, 12))
 
     # accruals (Sloan) — 순이익이 음수인 구간에서 CF/NI 비율을 쓰지 말 것(§7.1)
-    avg_assets = (P.get("assets") + g("assets").shift(12)) / 2.0
-    P["accruals"] = safe_div(P.get("net_income_ttm") - P.get("cfo_ttm"), avg_assets)
+    avg_assets = (col(P, "assets") + g("assets").shift(12)) / 2.0
+    P["accruals"] = safe_div(col(P, "net_income_ttm") - col(P, "cfo_ttm"), avg_assets)
     P["d_accruals"] = g("accruals").diff(12)
-    P["b4"] = safe_div(g("contract_liab").diff(12), P.get("revenue_ttm"))
+    P["b4"] = safe_div(g("contract_liab").diff(12), col(P, "revenue_ttm"))
     return P
 
 
 def axis_B_tp(P: pd.DataFrame) -> pd.DataFrame:
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_B1"] = tp_product(z("dlog_rev"), -z("d_turn"))      # 매출↑ 인데 회전 유지
     P["TP_B2"] = tp_product(z("dlog_rev"), -z("d_accruals"))  # 매출↑ 인데 발생액 유지
     P["E_AXB"] = nanmean_cols(P, ["TP_B1", "TP_B2"]) * 0.5 + \
@@ -82,27 +82,27 @@ def axis_B_tp(P: pd.DataFrame) -> pd.DataFrame:
 def axis_C(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     g = lambda c: P.groupby("code", observed=True)[c]
-    nwc = (P.get("receivable").fillna(0) + P.get("inventory").fillna(0) -
-           P.get("payable").fillna(0)) if "receivable" in P.columns else np.nan
-    P["IC"] = nwc + P.get("ppe").fillna(0) + P.get("intangible").fillna(0)
+    nwc = (col(P, "receivable").fillna(0) + col(P, "inventory").fillna(0) -
+           col(P, "payable").fillna(0)) if "receivable" in P.columns else np.nan
+    P["IC"] = nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)
     P["dlog_IC"] = g("IC").transform(lambda s: dlog(s, 12))
-    nopat = P.get("op_income_ttm") * 0.78                      # 법인세 22% 가정(셀 내 상대값이라 수준은 무해)
+    nopat = col(P, "op_income_ttm") * 0.78                      # 법인세 22% 가정(셀 내 상대값이라 수준은 무해)
     avg_ic = (P["IC"] + g("IC").shift(12)) / 2.0
     P["ROIC"] = safe_div(nopat, avg_ic)
     P["d_ROIC"] = g("ROIC").diff(12)
-    P["value_added"] = (P.get("op_income_ttm").fillna(0) + P.get("payroll").fillna(0) +
-                        P.get("dep_ttm").fillna(0))
-    P["va_per_emp"] = safe_div(P["value_added"], P.get("employees"))
+    P["value_added"] = (col(P, "op_income_ttm").fillna(0) + col(P, "payroll").fillna(0) +
+                        col(P, "dep_ttm").fillna(0))
+    P["va_per_emp"] = safe_div(P["value_added"], col(P, "employees"))
     P["d_va_per_emp"] = g("va_per_emp").diff(12)
     P["dlog_emp"] = g("employees").transform(lambda s: dlog(s, 12))
-    P["c3"] = safe_div(P.get("capex_ttm").abs(), P.get("dep_ttm").abs())
-    P["debt_ratio"] = safe_div(P.get("liabilities"), P.get("equity"))
+    P["c3"] = safe_div(col(P, "capex_ttm").abs(), col(P, "dep_ttm").abs())
+    P["debt_ratio"] = safe_div(col(P, "liabilities"), col(P, "equity"))
     P["d_debt_ratio"] = g("debt_ratio").diff(12)
     return P
 
 
 def axis_C_tp(P: pd.DataFrame) -> pd.DataFrame:
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_C1"] = tp_product(z("dlog_IC"), z("d_ROIC"))            # 확장하는데 수익성 유지
     P["TP_C2"] = tp_product(z("dlog_emp"), z("d_va_per_emp"))     # 인원↑ 인데 생산성 유지
     P["E_AXC"] = nanmean_cols(P, ["TP_C1", "TP_C2"]) * 0.5 + \
@@ -127,7 +127,7 @@ def axis_D(P: pd.DataFrame, px_daily: pd.DataFrame, flows: pd.DataFrame,
     g = lambda c: P.groupby("code", observed=True)[c]
 
     # E 대리: TTM 순이익. M 대리: 시가총액/TTM순이익 → 주식수를 모를 때도 비율은 성립한다.
-    P["E_proxy"] = P.get("net_income_ttm")
+    P["E_proxy"] = col(P, "net_income_ttm")
     P["mktcap_proxy"] = P["close"]                       # 셀 내 상대비교라 주식수 상수배는 무해
     # 120거래일 ≈ 6개월 창
     P["dlog_E"] = g("E_proxy").transform(lambda s: dlog(s, 6))
@@ -169,12 +169,12 @@ def axis_D(P: pd.DataFrame, px_daily: pd.DataFrame, flows: pd.DataFrame,
 
 def axis_D_U(P: pd.DataFrame) -> pd.DataFrame:
     """U = 결측 제외 평균. ★ 결측 축을 0으로 채우지 않는다(§7.3)."""
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     Z = pd.DataFrame({"z_d1": z("d1"), "z_d2": z("d2"), "z_d3": z("d3"), "z_d4": z("d4")})
     avail = Z.notna().sum(axis=1)
     P["U_raw"] = nanmean_cols(Z, list(Z.columns))
     P["U_axes_used"] = avail
-    P["U"] = xsec_rank_pct(P["U_raw"], P["cell"])
+    P["U"] = xsec_rank_pct_l(P, P["U_raw"])
     used = {c: int(Z[c].notna().sum()) for c in Z.columns}
     LOG.info("D축 가용성 — " + " · ".join(f"{k}:{v:,}행" for k, v in used.items()) +
              f"  (평균 가용 축 {avail.mean():.2f}개)")

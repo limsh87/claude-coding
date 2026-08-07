@@ -332,9 +332,24 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
 
     # 월간 수익률(체결가→체결가). 상장폐지 처리는 backtest 엔진에서 -100% 로 강제한다.
     monthly = monthly.sort_values(["code", "month"])
-    monthly["exec_px"] = monthly["next_open"].fillna(monthly["close"])
-    monthly["fwd_ret"] = (monthly.groupby("code", observed=True)["exec_px"].shift(-1) /
-                          monthly["exec_px"] - 1.0)
+    # 체결가 = 신호 산출일의 '다음 거래일 시가'. 그 다음 거래일이 너무 멀면(거래정지·상폐 직전)
+    # 그 가격으로 체결했다고 가정할 수 없으므로 종가로 폴백한다.
+    gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
+    monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
+    monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
+
+    # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
+    #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
+    nxt_px = monthly.groupby("code", observed=True)["exec_px"].shift(-1)
+    nxt_m = monthly.groupby("code", observed=True)["month"].shift(-1)
+    adjacent = (((nxt_m.dt.year - monthly["month"].dt.year) * 12 +
+                 (nxt_m.dt.month - monthly["month"].dt.month)) == 1)
+    monthly["fwd_ret"] = (nxt_px / monthly["exec_px"] - 1.0).where(adjacent)
+    n_gap = int((nxt_m.notna() & ~adjacent).sum())
+    if n_gap:
+        LOG.info(f"월 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
+                 f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
+                 f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
     PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
     return {"daily": px, "monthly": downcast(monthly)}
 

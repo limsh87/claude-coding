@@ -148,7 +148,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "INTEGRATED"
 STRATEGY_NAME      = "통합 (전 센서팩)"
 ACTIVE_PACKS       = ["C", "N", "D", "X", "P"]
-BUILD_VERSION      = "v2.20260807.1044"
+BUILD_VERSION      = "v2.20260807.1108"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -1140,33 +1140,85 @@ def _winsor_np(a: np.ndarray, k: float = WINSOR_SIGMA) -> np.ndarray:
     return np.clip(a, m - k * s, m + k * s)
 
 
-def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
-    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다."""
+def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N,
+           k: float = WINSOR_SIGMA) -> pd.Series:
+    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다.
+
+    구현 주의 두 가지:
+     ① ±inf 를 반드시 먼저 NaN 으로 바꾼다. np.nanmean 은 NaN 은 무시하지만 inf 는 무시하지
+        않으므로, 셀에 inf 가 단 하나만 있어도 평균이 inf·표준편차가 NaN 이 되어
+        **그 셀 전체의 z-score 가 0으로 뭉개진다.** 비율 지표(diff/log)에서 흔히 발생한다.
+     ② groupby.transform(파이썬 UDF) 대신 네이티브 집계로 벡터화한다.
+        실데이터 규모(30만 행 × 수천 셀)에서 UDF 경로는 호출당 10초 이상이고,
+        파이프라인은 이 함수를 수십 번 부른다.
+    """
     v = pd.to_numeric(values, errors="coerce").astype("float64")
-    g = v.groupby(cells, observed=True, dropna=False)
+    v = v.replace([np.inf, -np.inf], np.nan)
+    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
 
-    def _f(x: pd.Series) -> pd.Series:
-        a = x.to_numpy(dtype="float64", copy=True)
-        ok = np.isfinite(a)
-        if ok.sum() < min_n:
-            return pd.Series(np.nan, index=x.index)
-        a2 = a.copy()
-        a2[ok] = _winsor_np(a[ok])
-        mu, sd = np.nanmean(a2), np.nanstd(a2)
-        if not np.isfinite(sd) or sd == 0:
-            return pd.Series(0.0, index=x.index).where(ok, np.nan)
-        return pd.Series((a2 - mu) / sd, index=x.index)
+    g = v.groupby(grp, observed=True, dropna=False)
+    cnt = g.transform("count")
+    mu0 = g.transform("mean")
+    sd0 = g.transform("std", ddof=0)
+    w = v.clip(lower=mu0 - k * sd0, upper=mu0 + k * sd0)          # ① winsorize
 
-    return g.transform(_f).astype("float32")
+    gw = w.groupby(grp, observed=True, dropna=False)
+    mu = gw.transform("mean")
+    sd = gw.transform("std", ddof=0)                               # ② z-score
+    z = (w - mu) / sd.where(sd > 0)
+    z = z.mask(sd.notna() & (sd <= 0) & w.notna(), 0.0)            # 셀 내 전원 동일값 → 0
+    return z.where(cnt >= min_n).astype("float32")
 
 
 def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
     """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
     v = pd.to_numeric(values, errors="coerce").astype("float64")
-    g = v.groupby(cells, observed=True, dropna=False)
+    v = v.replace([np.inf, -np.inf], np.nan)
+    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
+    g = v.groupby(grp, observed=True, dropna=False)
     cnt = g.transform("count")
     r = g.rank(pct=True, method="average")
     return r.where(cnt >= min_n).astype("float32")
+
+
+CELL_LADDER = ("cell", "cell_l2", "cell_l3")
+
+
+def xsec_z_l(P: pd.DataFrame, name: str, min_n: int = CELL_MIN_N) -> pd.Series:
+    """셀 폴백 사다리를 적용한 z-score (C11).
+
+    ★ 왜 필요한가: 셀에 종목이 30개 있어도 '그 센서를 관측한' 종목은 5개뿐일 수 있다.
+      (관세·조달처럼 일부 종목만 커버하는 팩이 정확히 이 경우다)
+      셀 크기만 보고 폴백하면 z-score 는 표본부족으로 전부 NaN 이 되고,
+      그 팩은 아무 신호도 못 내면서 로그에는 아무것도 남지 않는다 — 최악의 조용한 실패다.
+      그래서 '그 센서의 유효 관측 수' 기준으로 산업 상위 → 전체 순으로 단계적 폴백한다.
+    """
+    v = col(P, name)
+    if v.notna().sum() == 0:
+        return pd.Series(np.nan, index=P.index, dtype="float32")
+    z = xsec_z(v, P["cell"], min_n) if "cell" in P.columns else \
+        pd.Series(np.nan, index=P.index, dtype="float32")
+    for lvl in CELL_LADDER[1:]:
+        if not z.isna().any():
+            break
+        if lvl in P.columns:
+            z = z.where(z.notna(), xsec_z(v, P[lvl], min_n))
+    return z
+
+
+def xsec_rank_pct_l(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.Series:
+    v = col(P, name_or_series) if isinstance(name_or_series, str) else \
+        pd.to_numeric(name_or_series, errors="coerce")
+    if v.notna().sum() == 0:
+        return pd.Series(np.nan, index=P.index, dtype="float32")
+    r = xsec_rank_pct(v, P["cell"], min_n) if "cell" in P.columns else \
+        pd.Series(np.nan, index=P.index, dtype="float32")
+    for lvl in CELL_LADDER[1:]:
+        if not r.isna().any():
+            break
+        if lvl in P.columns:
+            r = r.where(r.notna(), xsec_rank_pct(v, P[lvl], min_n))
+    return r
 
 
 def tp_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
@@ -1178,6 +1230,20 @@ def tp_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
     a = pd.to_numeric(z_improve, errors="coerce")
     b = pd.to_numeric(z_nopay, errors="coerce")
     return (a * b).astype("float32")
+
+
+def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
+    """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
+
+    ★ df.get("x") 는 컬럼이 없으면 None 을 반환한다. 그러면 `None + Series` 나 `None.abs()`
+      로 TypeError/AttributeError 가 나는데, 하필 그 상황(= 특정 데이터 소스가 통째로 비어
+      해당 계정 컬럼이 아예 생성되지 않은 경우)은 실데이터 실행에서 가장 흔하다.
+      키 미입력·API 한도 소진·소급 데이터 없음 전부 이 경로로 들어온다.
+      그래서 피처 계산부는 df.get 대신 반드시 이 함수를 쓴다.
+    """
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce")
+    return pd.Series(default, index=df.index, dtype="float64")
 
 
 def safe_div(a, b, eps: float = 1e-12):
@@ -1487,8 +1553,20 @@ class Vault:
                         allcols.append(c)
             frames = [f.reindex(columns=allcols) for f in frames]
             idx = pd.concat(frames, ignore_index=True)
+            # ★ uid 가 없거나 결측인 레거시 행을 그대로 두면 astype(str) 이 전부 "nan" 이 되고
+            #   drop_duplicates(uid) 가 그 파일 전체를 단 한 줄로 붕괴시킨다 = 인덱스 유실.
+            #   절대 1원칙에 정면으로 반하므로, 결측 uid 는 행 내용 해시로 개별 부여한다.
             if "uid" not in idx.columns:
-                idx["uid"] = [sha1_str("legacy", i) for i in range(len(idx))]
+                idx["uid"] = np.nan
+            miss = idx["uid"].isna() | (idx["uid"].astype(str).str.strip().isin(("", "nan", "None")))
+            if miss.any():
+                fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
+                                        "_legacy_file") if c in idx.columns]
+                idx.loc[miss, "uid"] = [
+                    sha1_str("legacy", i, *[str(idx.iloc[i].get(c, "")) for c in fill_src])
+                    for i in np.where(miss.to_numpy())[0]]
+                LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 uid 를 부여했습니다 "
+                         f"(uid 결측 행이 하나로 뭉개지는 것을 방지 — 기존 기록 보존).")
             idx["uid"] = idx["uid"].astype(str)
             if "collected_at" in idx.columns:
                 idx = idx.sort_values("collected_at", kind="stable")
@@ -1862,9 +1940,13 @@ def _korean_score(t: str) -> float:
 
 def _decode(content: bytes, resp_enc: Optional[str], url: str,
             force_enc: Optional[str] = None) -> str:
+    # force_enc 는 '우선 후보'일 뿐 절대 지정이 아니다. 소스가 UTF-8 로 바뀌면
+    # euc-kr 강제 디코딩은 예외 없이 깨진 글자를 돌려주므로, 점수로 검증한 뒤에만 채택한다.
     if force_enc:
         try:
-            return content.decode(force_enc, "replace")
+            t = content.decode(force_enc, "replace")
+            if _korean_score(t) > 30:
+                return t
         except Exception:
             pass
     head = content[:4096].decode("ascii", "ignore").lower()
@@ -1906,7 +1988,8 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              headers: Optional[dict] = None, timeout: int = 25, tries: int = 4,
              as_bytes: bool = False, allow_status: Sequence[int] = (200,),
              referer: Optional[str] = None, quiet: bool = True,
-             force_enc: Optional[str] = None) -> Optional[Union[str, bytes]]:
+             force_enc: Optional[str] = None,
+             on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -1914,6 +1997,11 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
     last_exc = None
     for attempt in range(tries):
         lim.wait()
+        if on_attempt is not None:
+            try:
+                on_attempt()
+            except Exception:
+                pass
         try:
             s = _session()
             if attempt > 0:
@@ -2739,9 +2827,24 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
 
     # 월간 수익률(체결가→체결가). 상장폐지 처리는 backtest 엔진에서 -100% 로 강제한다.
     monthly = monthly.sort_values(["code", "month"])
-    monthly["exec_px"] = monthly["next_open"].fillna(monthly["close"])
-    monthly["fwd_ret"] = (monthly.groupby("code", observed=True)["exec_px"].shift(-1) /
-                          monthly["exec_px"] - 1.0)
+    # 체결가 = 신호 산출일의 '다음 거래일 시가'. 그 다음 거래일이 너무 멀면(거래정지·상폐 직전)
+    # 그 가격으로 체결했다고 가정할 수 없으므로 종가로 폴백한다.
+    gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
+    monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
+    monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
+
+    # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
+    #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
+    nxt_px = monthly.groupby("code", observed=True)["exec_px"].shift(-1)
+    nxt_m = monthly.groupby("code", observed=True)["month"].shift(-1)
+    adjacent = (((nxt_m.dt.year - monthly["month"].dt.year) * 12 +
+                 (nxt_m.dt.month - monthly["month"].dt.month)) == 1)
+    monthly["fwd_ret"] = (nxt_px / monthly["exec_px"] - 1.0).where(adjacent)
+    n_gap = int((nxt_m.notna() & ~adjacent).sum())
+    if n_gap:
+        LOG.info(f"월 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
+                 f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
+                 f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
     PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
     return {"daily": px, "monthly": downcast(monthly)}
 
@@ -2849,6 +2952,12 @@ class DartBudget:
         except Exception:
             pass
 
+    def refund(self, k: int = 1):
+        if k <= 0:
+            return
+        with self._lk:
+            self.n = max(0, self.n - k)
+
     def take(self, k: int = 1) -> bool:
         with self._lk:
             if self.n + k > DART_DAILY_LIMIT:
@@ -2871,15 +2980,21 @@ DBUDGET: Optional[DartBudget] = None
 
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
-             tries: int = 3) -> Optional[dict]:
+             tries: int = 2) -> Optional[dict]:
+    """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
+    호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
+    → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
     if not DART_API_KEY:
         return None
-    if DBUDGET is not None and not DBUDGET.take():
+    if DBUDGET is not None and not DBUDGET.take(tries):
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
+    attempts = {"n": 0}
     js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
-                   referer="https://opendart.fss.or.kr/")
+                   referer="https://opendart.fss.or.kr/", on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
+    if DBUDGET is not None:
+        DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
     if not isinstance(js, dict):
         return None
     st = str(js.get("status", ""))
@@ -3059,18 +3174,33 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     # 누적치 → 분기 단독치 (Q1/H1/Q3/FY 는 누적 공시다. 차분하지 않으면 계절성이 곧 신호가 된다)
     order = {REPRT_CODES["Q1"]: 1, REPRT_CODES["H1"]: 2, REPRT_CODES["Q3"]: 3, REPRT_CODES["FY"]: 4}
     W["q"] = W["reprt_code"].map(order)
-    W = W.sort_values(["corp_code", "bsns_year", "q"])
-    flow_items = ["revenue", "cogs", "gross_profit", "sgna", "op_income", "net_income",
-                  "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise"]
+    W = W.sort_values(["corp_code", "bsns_year", "q"]).reset_index(drop=True)
+    # ★ 손익·현금흐름 성격의 전 계정을 여기에 넣어야 한다. 빠뜨리면 <계정>_ttm 컬럼이
+    #   아예 생성되지 않고, 그걸 쓰는 팩이 실데이터 실행에서만 터진다(합성 스모크는 통과).
+    flow_items = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "net_income",
+                  "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise",
+                  "tax_expense", "pretax_income", "other_income"]
+    # 누적 → 분기 단독. 직전 분기가 실제로 존재할 때만 차분한다.
+    # (누락된 분기를 0으로 간주하면 반기 누적치가 한 분기 실적으로 둔갑한다 — fail-open 금지)
+    gk = ["corp_code", "bsns_year"]
+    W["_q_prev"] = W.groupby(gk, observed=True)["q"].shift(1)
+    contiguous = (W["q"] - W["_q_prev"]) == 1
     for c in flow_items:
         if c not in W.columns:
             W[c] = np.nan
-        cum = W.groupby(["corp_code", "bsns_year"], observed=True)[c]
-        W[c + "_q"] = W[c] - cum.shift(1).fillna(0)
-        W.loc[W["q"] == 1, c + "_q"] = W.loc[W["q"] == 1, c]
-        # 연간(TTM) — 4분기 이동합
+        prev = W.groupby(gk, observed=True)[c].shift(1)
+        q_val = np.where(W["q"] == 1, W[c],
+                         np.where(contiguous, W[c] - prev, np.nan))
+        W[c + "_q"] = q_val
+        # TTM = 4분기 이동합. min_periods=4 — 3개만으로 TTM 이라 부르면 15~25% 과소계상된다.
         W[c + "_ttm"] = (W.groupby("corp_code", observed=True)[c + "_q"]
-                          .transform(lambda s: s.rolling(4, min_periods=3).sum()))
+                          .transform(lambda s: s.rolling(4, min_periods=4).sum()))
+    W = W.drop(columns=["_q_prev"])
+    n_ttm = int(W["revenue_ttm"].notna().sum()) if "revenue_ttm" in W.columns else 0
+    if len(W) and n_ttm / len(W) < 0.35:
+        LOG.warn(f"TTM 산출률이 {100*n_ttm/len(W):.0f}% 로 낮습니다. 분기보고서가 결측인 기업이 "
+                 f"많다는 뜻이며(중소형주에서 흔함), 해당 종목은 B/C축이 결측 처리됩니다. "
+                 f"DART_STATEMENT_FREQ='quarterly' 콜드빌드가 아직 미완이라면 이어받기를 계속하세요.")
     W = pit_frame(W, "period_end", "knowledge_date", source="dart")
     LOG.ok(f"DART 재무 정제 {len(W):,}행 · {W['corp_code'].nunique():,}사 "
            f"(knowledge_date = 접수일자 기준, 누적→분기 차분 완료)")
@@ -3296,6 +3426,34 @@ def parse_opinion(x: Any) -> Optional[str]:
     return t[:20] or None
 
 
+_YYMMDD = re.compile(r"^\s*(\d{2})[.\-/](\d{2})[.\-/](\d{2})\s*$")
+
+
+def parse_kr_date(s: Any) -> Optional[str]:
+    """★ 네이버 리스트의 'YY.MM.DD' 를 반드시 명시 포맷으로 파싱한다.
+
+    pandas 자동추론은 '26.01.19' 를 2019-01-26 으로, '19.12.31' 을 2031-12-19 로 읽는다.
+    (연·일이 뒤바뀌고 미래 날짜가 만들어진다) 예외가 나지 않으므로 조용히 통과하며,
+    리포트 원장의 시간축 전체가 어긋나 PIT 순서가 무의미해진다.
+    → 두 자리 연도는 여기서 4자리로 확정한 뒤에만 하위로 넘긴다.
+    """
+    if s is None:
+        return None
+    t = str(s).strip()
+    m = _YYMMDD.match(t)
+    if m:
+        yy, mm, dd = (int(x) for x in m.groups())
+        # 백테스트 대상은 2000년대. 두 자리 연도는 2000+yy 로 확정한다.
+        year = 2000 + yy
+        if year > _dt.date.today().year + 1:
+            year -= 100
+        try:
+            return f"{year:04d}-{mm:02d}-{dd:02d}" if 1 <= mm <= 12 and 1 <= dd <= 31 else None
+        except Exception:
+            return None
+    return t or None
+
+
 _CODE_IN_TITLE = re.compile(r"[（(]\s*([0-9]{6})\s*[)）]")
 
 
@@ -3412,7 +3570,7 @@ def _hk_parse(html: str, category: str) -> List[dict]:
 
         out.append({
             "source": "hankyung", "src_report_id": str(ridx), "category": category,
-            "pub_date": date_s, "title": title,
+            "pub_date": parse_kr_date(date_s), "title": title,
             "stock_code": code_from_title(title), "stock_name": name_from_title(title),
             "broker_raw": _clean_cell(bk), "analyst_raw": _clean_cell(an),
             "target_price": parse_target_price(tp), "opinion": parse_opinion(op),
@@ -3437,6 +3595,7 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
         skin, sd, ed = job
         got: List[dict] = []
         seen_ids: set = set()
+        empty_streak = 0
         for page in range(1, max_pages + 1):
             params = {
                 "skinType": skin, "sdate": sd.strftime("%Y-%m-%d"), "edate": ed.strftime("%Y-%m-%d"),
@@ -3455,8 +3614,19 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
             for b in fresh:
                 seen_ids.add(b["src_report_id"])
             got.extend(fresh)
-            if len(fresh) == 0 or len(batch) < page_size * 0.5:
-                break
+            # ★ 조기 종료 조건을 느슨하게 잡으면 데이터가 조용히 잘려나간다.
+            #   파싱 실패나 일시적 짧은 페이지 하나로 그 해 전체 수집이 끊길 수 있으므로,
+            #   '새 항목 0건'이 2회 연속일 때만 멈춘다.
+            if len(fresh) == 0:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+            else:
+                empty_streak = 0
+            if page == max_pages:
+                LOG.warn(f"한경 {skin} {sd:%Y} 구간이 최대 페이지({max_pages})에 도달했습니다 — "
+                         f"데이터가 잘렸을 수 있습니다. max_pages 를 늘리거나 구간을 분기 단위로 "
+                         f"쪼개세요. (지금까지 {len(got):,}건)")
         return got
 
     res = pmap_io(_sweep, jobs, workers=min(4, N_WORKERS_IO), desc="한경컨센서스")
@@ -3540,7 +3710,7 @@ def _nv_parse_list(html: str, cat: str) -> List[dict]:
 
         out.append({
             "source": "naver", "src_report_id": str(nid), "category": cat,
-            "pub_date": dt, "title": _dedup_repeat(title or ""),
+            "pub_date": parse_kr_date(dt), "title": _dedup_repeat(title or ""),
             "stock_code": code or code_from_title(title or ""),
             "stock_name": sname or name_from_title(title or ""),
             "broker_raw": _clean_cell(bk), "analyst_raw": "",
@@ -3778,7 +3948,8 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
             data = VAULT.get_blob(known[uid], "shared")
             if data:
                 return (uid, known[uid], data)
-            return (uid, "", b"")
+            # 인덱스에는 있는데 실제 파일이 없으면(드라이브 동기화 누락 등) 재수집으로 폴백한다.
+            # 여기서 포기하면 그 보고서는 영구히 비어 있는 채로 남는다.
         raw = http_get(url, source="hankyung" if "hankyung" in str(url) else "naver",
                        as_bytes=True, tries=2, referer=HK_BASE + "/" if "hankyung" in str(url) else NV_BASE)
         if not raw or raw[:5] != b"%PDF-":
@@ -3935,12 +4106,20 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     d = pd.concat([f.reindex(columns=sorted(set().union(*[set(x.columns) for x in frames])))
                    for f in frames], ignore_index=True)
 
+    # 두 자리 연도는 수집부 parse_kr_date 에서 이미 4자리로 확정된다.
+    # 여기서는 남은 이상치만 걸러낸다(교정하지 않는다 — 잘못된 교정이 더 위험하다).
+    n_raw0 = len(d)
     d["pub_date"] = as_ts_series(d["pub_date"])
-    # 네이버 리스트는 'YY.MM.DD' — 2자리 연도가 1900년대로 파싱되는 사고를 막는다
-    bad = d["pub_date"].notna() & (d["pub_date"].dt.year < 2000)
+    lo, hi = as_ts("1999-01-01"), as_ts(BACKTEST_END) + pd.Timedelta(days=400)
+    bad = d["pub_date"].isna() | (d["pub_date"] < lo) | (d["pub_date"] > hi)
     if bad.any():
-        d.loc[bad, "pub_date"] = d.loc[bad, "pub_date"] + pd.offsets.DateOffset(years=100)
-    d = d.dropna(subset=["pub_date"])
+        LOG.warn(f"발간일이 없거나 범위를 벗어난 리포트 {int(bad.sum()):,}건을 제외했습니다 "
+                 f"({100*bad.mean():.2f}%). 이 비율이 크면 소스의 날짜 형식이 바뀐 것입니다 — "
+                 f"조용히 넘기지 말고 parse_kr_date 를 확인하세요.")
+    d = d[~bad]
+    if len(d) == 0:
+        LOG.error("발간일이 유효한 리포트가 하나도 없습니다. 날짜 파싱이 깨졌습니다.")
+        return pd.DataFrame(columns=REPORT_COLS)
 
     bid = d["broker_raw"].map(normalize_broker)
     d["broker_id"] = [x[0] for x in bid]
@@ -3987,8 +4166,8 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "detail_url": ("detail_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
     }
     m = d.groupby("dedup_key", as_index=False).agg(**agg)
-    LOG.info(f"보고서 원장 병합: 원시 {n_raw:,}건 → 고유 {len(m):,}건 "
-             f"(소스 간 중복 {n_raw - len(m):,}건 병합)")
+    LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
+             f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")
 
     m["event_date"] = m["pub_date"]
     m["knowledge_date"] = m["pub_date"]          # 리포트는 발간=공개 (C1)
@@ -4256,14 +4435,28 @@ class PITStore:
             if c not in use:
                 use.append(c)
         R = (right[use].dropna(subset=["knowledge_date", by])
-                        .sort_values("knowledge_date", kind="stable"))
-        L = panel.copy()
-        L["_ord"] = np.arange(len(L))
-        L = L.dropna(subset=[left_time, by]).sort_values(left_time, kind="stable")
-        if L.empty or R.empty:
+                        .sort_values("knowledge_date", kind="stable")).copy()
+        if R.empty:
+            return panel
+
+        # ★★ 결합키가 결측인 패널 행을 '떨어뜨리면' 안 된다. ★★
+        #   attach_fundamentals 에서 corp_code 가 없는 종목(대개 상장폐지·신규상장·비DART)이
+        #   통째로 사라지면 그게 곧 생존자편향 재유입이다(C2 위반). merge_asof 는 by 키에
+        #   NaN 이 있으면 다루지 못하므로, 유효키 부분만 결합한 뒤 전체 패널에 되붙인다.
+        base = panel.copy()
+        base["_ord"] = np.arange(len(base))
+        mask = base[left_time].notna() & base[by].notna()
+        n_drop = int((~mask).sum())
+        if n_drop:
+            LOG.debug(f"asof_join '{name}': 결합키 결측 {n_drop:,}행은 결측값으로 보존합니다"
+                      f"(행을 버리지 않습니다 — C2).")
+        L = base[mask].copy()
+        if L.empty:
+            LOG.warn(f"asof_join '{name}': 결합 가능한 행이 없습니다. 결합을 건너뜁니다.")
             return panel
         R[by] = R[by].astype(str)
         L[by] = L[by].astype(str)
+        L = L.sort_values(left_time, kind="stable")
         try:
             M = pd.merge_asof(L, R, left_on=left_time, right_on="knowledge_date",
                               by=by, direction="backward", suffixes=("", suffix or "_r"))
@@ -4271,9 +4464,15 @@ class PITStore:
             LOG.warn(f"asof_join 실패({type(e).__name__}) — '{name}' 결합을 건너뜁니다. "
                      f"대개 정렬/타입 문제입니다.")
             return panel
-        M = M.sort_values("_ord").drop(columns=["_ord"])
-        M.index = panel.index[:len(M)] if len(M) == len(panel) else range(len(M))
-        return M
+        new_cols = [c for c in M.columns if c not in base.columns]
+        if not new_cols:
+            return panel
+        add = M.set_index("_ord")[new_cols]
+        out = base.set_index("_ord")
+        out = out.join(add, how="left")            # 결합 실패 행은 NaN 으로 남고, 행은 유지된다
+        out = out.sort_index().reset_index(drop=True)
+        out.index = panel.index
+        return out
 
     def report(self):
         rows = []
@@ -4319,9 +4518,12 @@ class Universe:
         """시점 t 의 유니버스. t 이후 상장 종목이 하나라도 섞이면 그 자체로 C2 위반이다."""
         t = as_ts(t)
         # ① 스냅샷이 있으면 그것이 최우선 진실 (그 날 실제로 상장돼 있던 종목)
-        key = min(self._snap_by_month, key=lambda d: abs((d - t).days)) if self._snap_by_month else None
+        #    ★ 반드시 '과거' 스냅샷만 쓴다. 가장 가까운 스냅샷을 고르면 어떤 달의 수집이
+        #      실패했을 때 미래 스냅샷이 선택되어 그 자체로 미래누수가 된다.
+        past = [d for d in self._snap_by_month if d <= t]
+        key = max(past) if past else None
         base = None
-        if key is not None and abs((key - t).days) <= 45:
+        if key is not None and (t - key).days <= 45:
             base = set(self._snap_by_month[key])
         if base is None:
             base = set()
@@ -4397,22 +4599,31 @@ def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N)
     p["industry"] = p["code"].map(ind).fillna("미분류").astype(str)
     p["industry_l1"] = p["industry"].str.slice(0, 4)                 # 폴백용 상위 단위
     p["size_bucket"] = p["employees"].map(size_bucket) if "employees" in p.columns else "미상"
-    p["cell"] = (p["month"].dt.strftime("%Y%m") + "|" + p["industry"] + "|" + p["size_bucket"])
+    ym = p["month"].dt.strftime("%Y%m")
+    p["cell"] = ym + "|" + p["industry"] + "|" + p["size_bucket"]
+    # 폴백 사다리를 컬럼으로 미리 만들어 둔다. 센서별로 유효 관측이 부족할 때
+    # xsec_z_l 이 이 사다리를 타고 내려간다(C11 "산업 상위 단위로 폴백").
+    p["cell_l2"] = ym + "|" + p["industry_l1"] + "|ALL"
+    p["cell_l3"] = ym + "|ALL|ALL"
 
     cnt = p.groupby("cell", observed=True)["code"].transform("size")
     small = cnt < min_n
     n_small = int(small.sum())
+    still_n = 0
     if n_small:
-        p.loc[small, "cell"] = (p.loc[small, "month"].dt.strftime("%Y%m") + "|" +
-                                p.loc[small, "industry_l1"] + "|ALL")
+        p.loc[small, "cell"] = p.loc[small, "cell_l2"]
         cnt2 = p.groupby("cell", observed=True)["code"].transform("size")
         still = cnt2 < min_n
+        still_n = int(still.sum())
         if still.any():
-            p.loc[still, "cell"] = p.loc[still, "month"].dt.strftime("%Y%m") + "|ALL|ALL"
-        LOG.info(f"셀 폴백 발생: 1차 {n_small:,}행(산업 상위단위로) / 2차 {int(still.sum()):,}행(전체로). "
+            p.loc[still, "cell"] = p.loc[still, "cell_l3"]
+        LOG.info(f"셀 폴백 발생: 1차 {n_small:,}행(산업 상위단위로) / 2차 {still_n:,}행(전체로). "
                  f"C11 요구대로 폴백을 로깅합니다.")
         PIPE.note(f"셀 폴백 {n_small:,}행")
-    p["cell"] = p["cell"].astype("category")
+    for c in ("cell", "cell_l2", "cell_l3"):
+        p[c] = p[c].astype("category")
+    LOG.debug(f"셀 구성: 1단계 {p['cell'].nunique():,}개 · 2단계 {p['cell_l2'].nunique():,}개 · "
+              f"3단계 {p['cell_l3'].nunique():,}개")
     return p
 
 
@@ -4465,29 +4676,29 @@ def axis_B(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     g = lambda c: P.groupby("code", observed=True)[c]
 
-    rev = P.get("revenue_ttm")
-    cogs = P.get("cogs_ttm")
+    rev = col(P, "revenue_ttm")
+    cogs = col(P, "cogs_ttm")
     P["gpm"] = safe_div(rev - cogs, rev) if rev is not None and cogs is not None else np.nan
     # b1: GPM 추세 기울기 (12개월 창의 선형 기울기 — 4분기 추세의 월간 등가물)
     P["b1"] = g("gpm").transform(lambda s: s.rolling(12, min_periods=6)
                                  .apply(lambda w: np.polyfit(np.arange(len(w)), w, 1)[0]
                                         if np.isfinite(w).all() else np.nan, raw=True))
-    P["DIO"] = safe_div(P.get("inventory"), P.get("cogs_ttm")) * 365.0
-    P["DSO"] = safe_div(P.get("receivable"), P.get("revenue_ttm")) * 365.0
+    P["DIO"] = safe_div(col(P, "inventory"), col(P, "cogs_ttm")) * 365.0
+    P["DSO"] = safe_div(col(P, "receivable"), col(P, "revenue_ttm")) * 365.0
     P["turn_days"] = P["DIO"] + P["DSO"]
     P["d_turn"] = g("turn_days").diff(12)
     P["dlog_rev"] = g("revenue_ttm").transform(lambda s: dlog(s, 12))
 
     # accruals (Sloan) — 순이익이 음수인 구간에서 CF/NI 비율을 쓰지 말 것(§7.1)
-    avg_assets = (P.get("assets") + g("assets").shift(12)) / 2.0
-    P["accruals"] = safe_div(P.get("net_income_ttm") - P.get("cfo_ttm"), avg_assets)
+    avg_assets = (col(P, "assets") + g("assets").shift(12)) / 2.0
+    P["accruals"] = safe_div(col(P, "net_income_ttm") - col(P, "cfo_ttm"), avg_assets)
     P["d_accruals"] = g("accruals").diff(12)
-    P["b4"] = safe_div(g("contract_liab").diff(12), P.get("revenue_ttm"))
+    P["b4"] = safe_div(g("contract_liab").diff(12), col(P, "revenue_ttm"))
     return P
 
 
 def axis_B_tp(P: pd.DataFrame) -> pd.DataFrame:
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_B1"] = tp_product(z("dlog_rev"), -z("d_turn"))      # 매출↑ 인데 회전 유지
     P["TP_B2"] = tp_product(z("dlog_rev"), -z("d_accruals"))  # 매출↑ 인데 발생액 유지
     P["E_AXB"] = nanmean_cols(P, ["TP_B1", "TP_B2"]) * 0.5 + \
@@ -4499,27 +4710,27 @@ def axis_B_tp(P: pd.DataFrame) -> pd.DataFrame:
 def axis_C(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     g = lambda c: P.groupby("code", observed=True)[c]
-    nwc = (P.get("receivable").fillna(0) + P.get("inventory").fillna(0) -
-           P.get("payable").fillna(0)) if "receivable" in P.columns else np.nan
-    P["IC"] = nwc + P.get("ppe").fillna(0) + P.get("intangible").fillna(0)
+    nwc = (col(P, "receivable").fillna(0) + col(P, "inventory").fillna(0) -
+           col(P, "payable").fillna(0)) if "receivable" in P.columns else np.nan
+    P["IC"] = nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)
     P["dlog_IC"] = g("IC").transform(lambda s: dlog(s, 12))
-    nopat = P.get("op_income_ttm") * 0.78                      # 법인세 22% 가정(셀 내 상대값이라 수준은 무해)
+    nopat = col(P, "op_income_ttm") * 0.78                      # 법인세 22% 가정(셀 내 상대값이라 수준은 무해)
     avg_ic = (P["IC"] + g("IC").shift(12)) / 2.0
     P["ROIC"] = safe_div(nopat, avg_ic)
     P["d_ROIC"] = g("ROIC").diff(12)
-    P["value_added"] = (P.get("op_income_ttm").fillna(0) + P.get("payroll").fillna(0) +
-                        P.get("dep_ttm").fillna(0))
-    P["va_per_emp"] = safe_div(P["value_added"], P.get("employees"))
+    P["value_added"] = (col(P, "op_income_ttm").fillna(0) + col(P, "payroll").fillna(0) +
+                        col(P, "dep_ttm").fillna(0))
+    P["va_per_emp"] = safe_div(P["value_added"], col(P, "employees"))
     P["d_va_per_emp"] = g("va_per_emp").diff(12)
     P["dlog_emp"] = g("employees").transform(lambda s: dlog(s, 12))
-    P["c3"] = safe_div(P.get("capex_ttm").abs(), P.get("dep_ttm").abs())
-    P["debt_ratio"] = safe_div(P.get("liabilities"), P.get("equity"))
+    P["c3"] = safe_div(col(P, "capex_ttm").abs(), col(P, "dep_ttm").abs())
+    P["debt_ratio"] = safe_div(col(P, "liabilities"), col(P, "equity"))
     P["d_debt_ratio"] = g("debt_ratio").diff(12)
     return P
 
 
 def axis_C_tp(P: pd.DataFrame) -> pd.DataFrame:
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_C1"] = tp_product(z("dlog_IC"), z("d_ROIC"))            # 확장하는데 수익성 유지
     P["TP_C2"] = tp_product(z("dlog_emp"), z("d_va_per_emp"))     # 인원↑ 인데 생산성 유지
     P["E_AXC"] = nanmean_cols(P, ["TP_C1", "TP_C2"]) * 0.5 + \
@@ -4544,7 +4755,7 @@ def axis_D(P: pd.DataFrame, px_daily: pd.DataFrame, flows: pd.DataFrame,
     g = lambda c: P.groupby("code", observed=True)[c]
 
     # E 대리: TTM 순이익. M 대리: 시가총액/TTM순이익 → 주식수를 모를 때도 비율은 성립한다.
-    P["E_proxy"] = P.get("net_income_ttm")
+    P["E_proxy"] = col(P, "net_income_ttm")
     P["mktcap_proxy"] = P["close"]                       # 셀 내 상대비교라 주식수 상수배는 무해
     # 120거래일 ≈ 6개월 창
     P["dlog_E"] = g("E_proxy").transform(lambda s: dlog(s, 6))
@@ -4586,12 +4797,12 @@ def axis_D(P: pd.DataFrame, px_daily: pd.DataFrame, flows: pd.DataFrame,
 
 def axis_D_U(P: pd.DataFrame) -> pd.DataFrame:
     """U = 결측 제외 평균. ★ 결측 축을 0으로 채우지 않는다(§7.3)."""
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     Z = pd.DataFrame({"z_d1": z("d1"), "z_d2": z("d2"), "z_d3": z("d3"), "z_d4": z("d4")})
     avail = Z.notna().sum(axis=1)
     P["U_raw"] = nanmean_cols(Z, list(Z.columns))
     P["U_axes_used"] = avail
-    P["U"] = xsec_rank_pct(P["U_raw"], P["cell"])
+    P["U"] = xsec_rank_pct_l(P, P["U_raw"])
     used = {c: int(Z[c].notna().sum()) for c in Z.columns}
     LOG.info("D축 가용성 — " + " · ".join(f"{k}:{v:,}행" for k, v in used.items()) +
              f"  (평균 가용 축 {avail.mean():.2f}개)")
@@ -4682,14 +4893,14 @@ def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
     # ── 센서 ──────────────────────────────────────────────────────────────────────────────
     # p1: 총주주환원 / 영업현금흐름.  현금흐름표에서 직접 읽으므로 결정공시 파싱이 불필요하다.
-    payout = (P.get("dividend_paid_ttm").abs().fillna(0) +
-              P.get("treasury_buy_ttm").abs().fillna(0))
-    P["payout_ratio"] = safe_div(payout, P.get("cfo_ttm"))
+    payout = (col(P, "dividend_paid_ttm").abs().fillna(0) +
+              col(P, "treasury_buy_ttm").abs().fillna(0))
+    P["payout_ratio"] = safe_div(payout, col(P, "cfo_ttm"))
     P["p1"] = g("payout_ratio").diff(12)
 
     # p2: (CapEx + R&D) / 매출
-    invest = P.get("capex_ttm").abs().fillna(0) + P.get("rnd_ttm").abs().fillna(0)
-    P["invest_ratio"] = safe_div(invest, P.get("revenue_ttm"))
+    invest = col(P, "capex_ttm").abs().fillna(0) + col(P, "rnd_ttm").abs().fillna(0)
+    P["invest_ratio"] = safe_div(invest, col(P, "revenue_ttm"))
     P["p2"] = g("invest_ratio").diff(12)
 
     # p3: 자사주 취득공시 대비 12M 내 실제 소각 실행률
@@ -4719,13 +4930,13 @@ def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
             P["treasury_canc_n"] = (P.groupby("code", observed=True)["treasury_canc"]
                                      .transform(lambda s: s.rolling(12, min_periods=1).sum()))
     P["p3"] = safe_div(P["treasury_canc_n"], P["treasury_acq_n"]).clip(0, 2)
-    P["acq_size"] = safe_div(P.get("treasury_buy_ttm").abs(), P.get("assets"))
+    P["acq_size"] = safe_div(col(P, "treasury_buy_ttm").abs(), col(P, "assets"))
 
     # p4: 부채비율 변화 (axis_C 에서 이미 계산)
-    P["p4"] = P.get("d_debt_ratio")
+    P["p4"] = col(P, "d_debt_ratio")
 
     # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_P1"] = tp_product(z("p1"), z("p2"))          # ★ 이 팩의 전부: 환원↑ 인데 투자도↑
     P["TP_P2"] = tp_product(z("acq_size"), z("p3"))    # 취득 규모 큰데 소각까지 실행
     P["TP_P3"] = tp_product(z("p1"), -z("p4"))         # 환원↑ 인데 차입 안 늘림
@@ -4962,8 +5173,19 @@ def build_nps_panel(N: pd.DataFrame, M: pd.DataFrame, emp: pd.DataFrame,
     """종목-월 단위 국민연금 패널 + θ_N (관측커버리지)."""
     if N is None or N.empty or M is None or M.empty:
         return pd.DataFrame(columns=["code", "month", "nps_members", "nps_amt", "theta_N"])
-    x = N.merge(M[["biz_no", "wkpl_name", "code"]], on=["biz_no", "wkpl_name"], how="inner")
+    keep = ["biz_no", "wkpl_name", "code"] + \
+           [c for c in ("valid_from", "valid_to") if c in M.columns]
+    x = N.merge(M[keep], on=["biz_no", "wkpl_name"], how="inner")
     x["month"] = as_ts_series(x["ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    # ★ C3: 매핑은 시간구간 테이블이다. 유효구간을 무시하고 전 기간에 적용하면
+    #   "나중에야 알게 된 사업장↔법인 관계"를 과거에 소급 적용하는 미래누수가 된다.
+    if "valid_from" in x.columns:
+        vf = as_ts_series(x["valid_from"])
+        vt = as_ts_series(x["valid_to"]) if "valid_to" in x.columns else pd.Series(pd.NaT, index=x.index)
+        before = len(x)
+        x = x[(vf.isna() | (x["month"] >= vf)) & (vt.isna() | (x["month"] <= vt))]
+        if before - len(x):
+            LOG.info(f"국민연금 매핑 유효구간(C3) 적용 — 구간 밖 {before-len(x):,}행 제외")
     agg = (x.groupby(["code", "month"], as_index=False)
             .agg(nps_members=("members", "sum"), nps_amt=("notice_amt", "sum"),
                  nps_acq=("acq_cnt", "sum"), nps_loss=("loss_cnt", "sum"),
@@ -4978,14 +5200,17 @@ def build_nps_panel(N: pd.DataFrame, M: pd.DataFrame, emp: pd.DataFrame,
 def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     npsp = ctx.get("nps_panel")
-    for c in ("nps_members", "nps_amt", "nps_acq", "nps_loss", "n_wkpl"):
-        if c not in P.columns:
-            P[c] = np.nan
+    NPS_COLS = ("nps_members", "nps_amt", "nps_acq", "nps_loss", "n_wkpl")
     if npsp is not None and len(npsp):
         PIT.register("nps_panel", npsp, key_cols=["code"])
         P = PIT.asof_join(P, "nps_panel", by="code", left_time="month",
-                          cols=["code", "knowledge_date", "nps_members", "nps_amt",
-                                "nps_acq", "nps_loss", "n_wkpl"], suffix="_nps")
+                          cols=["code", "knowledge_date", *NPS_COLS], suffix="_nps")
+    # ★ 결합 '이후에' 결측 컬럼을 채운다. 먼저 NaN 컬럼을 만들어두면 merge_asof 가 들어오는
+    #   실제 데이터에 접미사(_nps)를 붙여 다른 이름으로 넣고, 원래의 빈 컬럼이 그대로 남는다.
+    #   → 팩 전체가 조용히 결측이 되는 유형의 사고. (커버리지 0% 로만 드러난다)
+    for c in NPS_COLS:
+        if c not in P.columns:
+            P[c] = np.nan
     g = lambda c: P.groupby("code", observed=True)[c]
     P["_year"] = P["month"].dt.year
     P["_rate"] = P["_year"].map(NPS_CONTRIB_RATE).fillna(0.09)
@@ -5032,7 +5257,7 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["n6"] = g("n6").ffill(limit=11)
 
     # ── θ_N 관측커버리지 = 매핑 사업장 가입자수 / DART 종업원수(별도) ──────────────────────
-    P["theta_N"] = safe_div(P["nps_members"], P.get("employees")).clip(0, 2)
+    P["theta_N"] = safe_div(P["nps_members"], col(P, "employees")).clip(0, 2)
     P["theta_N"] = P["theta_N"].where(P["theta_N"] > 0)
 
     # ── 임계 밴드 플래그 (회귀불연속 구간) ────────────────────────────────────────────────
@@ -5042,11 +5267,11 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["emp_band_flag"] = band.astype("float32")
 
     # ── V8 입력: 유효세율 급락 ────────────────────────────────────────────────────────────
-    P["eff_tax_rate"] = safe_div(P.get("tax_expense"), P.get("pretax_income")).clip(-1, 1)
+    P["eff_tax_rate"] = safe_div(col(P, "tax_expense"), col(P, "pretax_income")).clip(-1, 1)
     P["d_eff_tax"] = g("eff_tax_rate").diff(12)
 
     # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_N1"] = tp_product(z("n1"), z("n2"))                    # 인원↑ 인데 신규가 고임금
     P["TP_N2"] = tp_product(z("n1"), z("n3"))                    # 인원↑ 인데 이직률 안 오름
     P["TP_N3"] = tp_product(z("n4"), z("n1"))                    # 신규 사업장 + 순증
@@ -5230,10 +5455,19 @@ def build_text_similarity(T: pd.DataFrame) -> pd.DataFrame:
             prev_tok, prev_year = cur, r.year
     if not rows:
         return pd.DataFrame(columns=["corp_code", "knowledge_date", "sim_risk", "sim_all"])
-    S = pd.DataFrame(rows)
-    # ★ 연도×섹션 중앙값으로 정규화 — 서식 개정 해의 전 기업 일괄 변경을 제거한다
-    med = S.groupby(["year", "section"], observed=True)["sim"].transform("median")
-    S["sim_norm"] = S["sim"] - med
+    S = pd.DataFrame(rows).sort_values("rcept_dt")
+    # ★ 섹션별 중앙값으로 정규화 — 서식 개정 해의 '전 기업 일괄 변경' 공통충격을 제거한다.
+    #   단, 같은 해 전체(=아직 제출되지 않은 미래 공시 포함) 중앙값을 쓰면 그 자체가 미래누수다.
+    #   → 그 시점까지 '이미 접수된' 공시들만으로 확장(expanding) 중앙값을 만든다.
+    #   사업보고서는 3월에 몰리므로 초반 표본이 얇다 → 최소 30건 이상일 때만 정규화한다.
+    S["_med"] = (S.groupby("section", observed=True)["sim"]
+                  .transform(lambda s: s.shift(1).expanding(min_periods=30).median()))
+    S["sim_norm"] = S["sim"] - S["_med"]
+    unnorm = int(S["_med"].isna().sum())
+    if unnorm:
+        LOG.info(f"공시 유사도 {unnorm:,}건은 과거 표본 부족으로 정규화 없이 원값을 씁니다 "
+                 f"(미래 표본으로 정규화하면 그 자체가 누수이므로 확장 중앙값만 사용).")
+        S["sim_norm"] = S["sim_norm"].fillna(S["sim"] - S["sim"].expanding().median())
     W = S.pivot_table(index=["corp_code", "rcept_dt"], columns="section",
                       values="sim_norm", aggfunc="mean").reset_index()
     W["sim_risk"] = nanmean_cols(W, ["위험요인", "우발부채"])
@@ -5245,17 +5479,18 @@ def build_text_similarity(T: pd.DataFrame) -> pd.DataFrame:
 
 def pack_d_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     sim = ctx.get("text_sim")
-    for c in ("sim_risk", "sim_all"):
-        if c not in P.columns:
-            P[c] = np.nan
     if sim is not None and len(sim):
         PIT.register("dart_text_sim", sim, key_cols=["corp_code"])
         P = PIT.asof_join(P, "dart_text_sim", by="corp_code", left_time="month",
                           cols=["corp_code", "knowledge_date", "sim_risk", "sim_all"],
                           suffix="_txt")
+    # 결합 이후에 채운다 (먼저 만들면 merge_asof 가 실제 데이터에 접미사를 붙여 흘려버린다)
+    for c in ("sim_risk", "sim_all"):
+        if c not in P.columns:
+            P[c] = np.nan
     # V7 입력: 위험요인·우발부채 유사도가 셀 내 하위 5%
-    P["sim_risk_pct"] = xsec_rank_pct(P["sim_risk"], P["cell"])
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["sim_risk_pct"] = xsec_rank_pct_l(P, "sim_risk")
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     # 양(+)의 기여는 '문안이 안정적'인 경우에만. 주 용도는 어디까지나 거부권이다.
     P["TP_D1"] = z("sim_all")
     P["E_D"] = P["TP_D1"]
@@ -5433,26 +5668,33 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
     # ── x2: 단가 잔차 — 36개월 롤링 OLS (벡터화 필수) ─────────────────────────────────────
     P["unit_price"] = safe_div(P["exp_usd"], P["exp_wgt"])
-    W = P.pivot_table(index="code", columns="month", values="unit_price", aggfunc="first")
-    Q = P.pivot_table(index="code", columns="month", values="exp_wgt", aggfunc="first")
+    # ★ 달력 연속성 유지: pivot 은 전 종목이 결측인 달의 컬럼을 통째로 없앤다.
+    #   그대로 두면 36개월 롤링 OLS 가 달력상 떨어진 구간을 이어붙여 추세항이 왜곡된다.
+    all_months = pd.DatetimeIndex(sorted(pd.Series(P["month"]).dropna().unique()))
+    W = P.pivot_table(index="code", columns="month", values="unit_price",
+                      aggfunc="first").reindex(columns=all_months)
+    Q = P.pivot_table(index="code", columns="month", values="exp_wgt",
+                      aggfunc="first").reindex(columns=all_months)
     if W.shape[1] >= 36:
         y = np.log(W.to_numpy(dtype=float, na_value=np.nan))
-        q = np.log(Q.reindex_like(W).to_numpy(dtype=float, na_value=np.nan))
+        q = np.log(Q.to_numpy(dtype=float, na_value=np.nan))
         n, t = y.shape
         X = np.stack([np.ones((n, t)), q, np.tile(np.arange(t, dtype=float), (n, 1))], axis=2)
         R = rolling_ols_resid(y, X, window=36)
-        rs = pd.DataFrame(R, index=W.index, columns=W.columns).stack(dropna=False)
-        rs.index.names = ["code", "month"]
-        rs = rs.rename("resid").reset_index()
+        # ★ stack(dropna=) 은 pandas 3.x 에서 제거된다 → 버전 안정적인 melt 를 쓴다.
+        rs = (pd.DataFrame(R, index=W.index, columns=all_months)
+                .reset_index()
+                .melt(id_vars="code", var_name="month", value_name="resid"))
+        rs["month"] = as_ts_series(rs["month"])
         P = P.merge(rs, on=["code", "month"], how="left")
         P["resid_mean6"] = g("resid").transform(lambda s: s.rolling(6, min_periods=4).mean())
         P["resid_std"] = g("resid").transform(lambda s: s.rolling(36, min_periods=18).std())
         P["x2"] = safe_div(P["resid_mean6"], P["resid_std"])
     # x4: 신규 HS10 등장 → 12M 지수감쇠 더미
     P["x4"] = 0.0
-    P["theta_X"] = safe_div(P["exp_usd"] * 1300.0, P.get("revenue_ttm")).clip(0, 2)
+    P["theta_X"] = safe_div(P["exp_usd"] * 1300.0, col(P, "revenue_ttm")).clip(0, 2)
 
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["d_sgna_ratio"] = g("sgna_ttm").transform(lambda s: s).pipe(
         lambda s: safe_div(s, P["revenue_ttm"])).pipe(lambda s: s.groupby(P["code"]).diff(12)) \
         if "sgna_ttm" in P.columns else np.nan
@@ -5618,7 +5860,7 @@ def pack_p_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["q1"] = g("award_amt").transform(lambda s: dlog(s.rolling(12, min_periods=6).sum(), 12))
     P["q2"] = g("win_rate").diff(12)
     P["q3"] = -g("hhi_org").diff(12)
-    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_Q1"] = tp_product(z("q1"), z("q2"))
     P["TP_Q2"] = tp_product(z("q3"), z("q2"))
     P["E_P"] = nanmean_cols(P, ["TP_Q1", "TP_Q2"])
@@ -5733,8 +5975,8 @@ def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["V1"] = np.where((d_rev > 0) & (push > 1.5), 0.0, 1.0)
 
     # ── V2 이익-현금 괴리 3분기(=9개월) 연속 ───────────────────────────────────────────────
-    bad = ((P.get("net_income_ttm") > 0) &
-           (P.get("cfo_ttm") < 0.5 * P.get("net_income_ttm"))).astype(float)
+    bad = ((col(P, "net_income_ttm") > 0) &
+           (col(P, "cfo_ttm") < 0.5 * col(P, "net_income_ttm"))).astype(float)
     P["v2_streak"] = bad.groupby(P["code"], observed=True).transform(
         lambda s: s.rolling(9, min_periods=9).min())
     P["V2"] = np.where(P["v2_streak"] >= 1.0, 0.0, 1.0)
@@ -5770,7 +6012,7 @@ def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                          f"{ecol} 무효화 (전면 제외가 아님)")
 
     # ── V5 감사의견/관리종목/자본잠식 ──────────────────────────────────────────────────────
-    impair = (P.get("equity") <= 0)
+    impair = (col(P, "equity") <= 0)
     P["V5"] = np.where(impair.fillna(False), 0.0, 1.0)
     adm = ctx.get("administrative")
     if adm is not None and len(adm):
@@ -5836,7 +6078,7 @@ def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
 
     # 팩 간 동일가중 (C7)
     P["E_raw"] = nanmean_cols(P, all_e)
-    P["E"] = xsec_rank_pct(P["E_raw"], P["cell"])
+    P["E"] = xsec_rank_pct_l(P, P["E_raw"])
     P["n_axes_active"] = P[all_e].notna().sum(axis=1)
 
     # ── ② 하한선 (§8.2) ───────────────────────────────────────────────────────────────────
@@ -5855,7 +6097,7 @@ def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
     ok_cnt = pd.Series(0, index=P.index)
     bad_cnt = pd.Series(0, index=P.index)
     for c in all_e:
-        pct = xsec_rank_pct(P[c], P["cell"])
+        pct = xsec_rank_pct_l(P, c)
         P[f"pct_{c}"] = pct
         ok_cnt += (pct >= 0.50).fillna(False).astype(int)
         bad_cnt += (pct < 0.50).fillna(False).astype(int)
@@ -5944,12 +6186,30 @@ def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
         conc = min(2.0, 0.5 + spread * 8.0)          # 격차 클수록 집중
         w = raw ** conc
         w = w / w.sum() if w.sum() > 0 else np.full(len(s), 1.0 / len(s))
-    w = np.clip(w, POS_MIN_WEIGHT, POS_MAX_WEIGHT)
-    # 소액계좌 유동성 상한: 20일 평균거래대금의 X% 이내
+    # 종목별 상한 = min(정책 상한, 유동성 상한). 유동성 상한은 20일 평균거래대금의 X%.
     adv = sub["adv20"].fillna(0).to_numpy(dtype=float)
-    cap = np.where(adv > 0, (adv * POS_ADV_PARTICIPATION) / max(ACCOUNT_KRW, 1), POS_MAX_WEIGHT)
-    w = np.minimum(w, np.maximum(cap, POS_MIN_WEIGHT * 0.5))
+    liq_cap = np.where(adv > 0, (adv * POS_ADV_PARTICIPATION) / max(ACCOUNT_KRW, 1),
+                       POS_MAX_WEIGHT)
+    cap = np.minimum(POS_MAX_WEIGHT, np.maximum(liq_cap, POS_MIN_WEIGHT * 0.5))
+
+    # ★ clip 후 w/w.sum() 으로 재정규화하면 상한이 도로 뚫린다(합이 1보다 작아지면 전부 커진다).
+    #   상한에 걸린 종목은 고정하고 나머지에만 잔여 비중을 재배분하는 water-filling 으로 강제한다.
+    w = np.clip(w, 0.0, None)
     w = w / w.sum() if w.sum() > 0 else np.full(len(s), 1.0 / len(s))
+    free = np.ones(len(w), dtype=bool)
+    for _ in range(24):
+        over = free & (w > cap)
+        if not over.any():
+            break
+        w[over] = cap[over]
+        free &= ~over
+        rem = 1.0 - w[~free].sum()
+        if rem <= 1e-12 or not free.any():
+            break
+        pool = w[free].sum()
+        w[free] = (w[free] / pool * rem) if pool > 1e-12 else (rem / free.sum())
+    if w.sum() > 1.0 + 1e-9:                 # 전 종목이 상한에 걸리면 현금을 남긴다
+        w = w * (1.0 / w.sum())
     return sub.assign(weight=w)
 
 
@@ -5979,6 +6239,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         uni.audit_row("거부권통과", m, g_veto["code"].tolist())
         uni.audit_row("하한선통과", m, g_floor["code"].tolist())
 
+        # 종목별 조회를 dict 로 미리 만든다. sub[sub.code==c] 를 종목마다 돌리면
+        # 백테스트가 강건성 스위트에서 10여 회 재실행될 때 그 비용이 그대로 곱해진다.
+        need_cols = [c for c in ("adv20", "fwd_ret", "VETO", "dlog_M", "dlog_E", signal_col)
+                     if c in sub.columns]
+        rec: Dict[str, dict] = {}
+        for _c, *_v in sub[["code"] + need_cols].itertuples(index=False, name=None):
+            rec[_c] = dict(zip(need_cols, _v))
+
         k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
                                              round(len(elig) * top_pct))))
         pick = elig.nlargest(k, signal_col) if len(elig) else elig.iloc[0:0]
@@ -5987,17 +6255,17 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
         keep = []
         for c, h in list(hold.items()):
-            row = sub[sub["code"] == c]
-            if row.empty:
+            r0 = rec.get(c)
+            if r0 is None:
                 continue
-            r0 = row.iloc[0]
+            dm, de = r0.get("dlog_M"), r0.get("dlog_E")
             exited = False
             if r0.get("VETO", 1) == 0:
                 exited = True                                    # 거부권 발동 시 즉시 강제청산
             elif h["months"] >= HOLD_MAX_MONTHS:
                 exited = True
-            elif (pd.notna(r0.get("dlog_M")) and pd.notna(r0.get("dlog_E")) and
-                  r0["dlog_M"] >= r0["dlog_E"] and r0["dlog_E"] > 0):
+            elif (dm is not None and de is not None and pd.notna(dm) and pd.notna(de)
+                  and dm >= de and de > 0):
                 exited = True                                    # 시장이 마침내 재분류 → 알파 소진
             if not exited:
                 keep.append(c)
@@ -6016,8 +6284,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 dw = w_new.get(c, 0) - prev_w.get(c, 0)
                 if abs(dw) < 1e-9:
                     continue
-                r = sub[sub["code"] == c]
-                adv = float(r["adv20"].iloc[0]) if len(r) and pd.notna(r["adv20"].iloc[0]) else 0.0
+                _r = rec.get(c) or {}
+                _a = _r.get("adv20")
+                adv = float(_a) if _a is not None and pd.notna(_a) else 0.0
                 notional = abs(dw) * ACCOUNT_KRW
                 c_bps = COMMISSION_BPS / 1e4
                 sl = slippage(notional, adv)
@@ -6027,8 +6296,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         # 다음 달 수익
         ret = 0.0
         for c, w in w_new.items():
-            r = sub[sub["code"] == c]
-            fr = float(r["fwd_ret"].iloc[0]) if len(r) and pd.notna(r["fwd_ret"].iloc[0]) else np.nan
+            _r = rec.get(c) or {}
+            _f = _r.get("fwd_ret")
+            fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
             dl = delist.get(c)
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
                 # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
@@ -6036,8 +6306,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
             if not np.isfinite(fr):
                 fr = 0.0
             ret += w * fr
+            _s = _r.get(signal_col)
             holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
-                                 "signal": float(r[signal_col].iloc[0]) if len(r) else np.nan})
+                                 "signal": float(_s) if _s is not None and pd.notna(_s) else np.nan})
         ret_net = ret - cost
         rows.append({"month": m, "ret": ret_net, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost})
@@ -6285,11 +6556,11 @@ def R3_orthogonal(P: pd.DataFrame, bt: dict, months) -> None:
         _record("R3", "퀄리티 팩터 직교화", None, "보유 이력이 없어 판정 불가")
         return
     Q = P.copy()
-    Q["f_prof"] = safe_div(Q.get("op_income_ttm"), Q.get("assets"))
-    Q["f_qual"] = safe_div(Q.get("equity"), Q.get("assets"))
+    Q["f_prof"] = safe_div(col(Q, "op_income_ttm"), col(Q, "assets"))
+    Q["f_qual"] = safe_div(col(Q, "equity"), col(Q, "assets"))
     Q["f_mom"] = Q.groupby("code", observed=True)["close"].transform(lambda s: s.pct_change(12))
     Q["f_size"] = np.log(Q["adv20"].where(Q["adv20"] > 0))
-    Q["f_val"] = safe_div(Q.get("net_income_ttm"), Q["close"])
+    Q["f_val"] = safe_div(col(Q, "net_income_ttm"), Q["close"])
     facs = ["f_prof", "f_qual", "f_mom", "f_size", "f_val"]
 
     fac_ret = []
@@ -6923,7 +7194,15 @@ def run_contract_tests(strict: bool = True) -> bool:
         small = xsec_rank_pct(pd.Series([1.0, 2.0]), pd.Series(["B", "B"]))
         if small.notna().any():
             return False, "표본 부족 셀이 NaN 으로 처리되지 않았습니다(0으로 채우면 안 됩니다)"
-        return True, "winsorize(±2σ)→z→rank_pct 순서 및 표본부족 NaN 처리 확인"
+        # ±inf 오염: nanmean 은 NaN 은 무시하지만 inf 는 무시하지 않는다.
+        # inf 하나가 셀 전체 z 를 0으로 뭉개면 그 셀의 신호가 통째로 사라진다.
+        vi = pd.Series([1.0, 2.0, 3.0, np.inf, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+        zi = xsec_z(vi, pd.Series(["A"] * 10))
+        if zi.notna().sum() < 9 or float(zi.dropna().std()) < 0.5:
+            return False, (f"★inf 오염: 셀에 ±inf 가 하나 있으면 z-score 가 전부 뭉개집니다 "
+                           f"(유효 {int(zi.notna().sum())}개, 표준편차 {float(zi.dropna().std()):.3f}). "
+                           f"비율/로그 지표에서 흔히 발생하며 해당 셀의 신호가 통째로 소실됩니다.")
+        return True, ("winsorize(±2σ)→z→rank_pct 순서 · 표본부족 NaN · ±inf 무해화 확인")
 
     _c("C5", "윈저라이즈→랭크 순서 고정", c5)
 
@@ -7005,6 +7284,94 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _c("TP", "트레이드오프 쌍은 곱(§1.1)", c_tp)
 
+    # ── 회귀 방지: as-of 결합이 행을 버리지 않을 것 (C1+C2 동시) ──────────────────────────
+    def c_asof():
+        panel = pd.DataFrame({"code": ["A", "B", "C", "A", "B", "C"],
+                              "corp_code": ["c1", None, "c3", "c1", None, "c3"],
+                              "month": pd.to_datetime(["2020-01-31"] * 3 + ["2020-02-29"] * 3)})
+        fin = pit_frame(pd.DataFrame({"corp_code": ["c1", "c1", "c3"],
+                                      "revenue_ttm": [100.0, 999.0, 300.0],
+                                      "pe": pd.to_datetime(["2019-12-31", "2020-03-31", "2019-12-31"]),
+                                      "kd": pd.to_datetime(["2020-01-15", "2020-05-15", "2020-01-15"])}),
+                        "pe", "kd")
+        st = PITStore()
+        st.register("fin", fin, key_cols=["corp_code"])
+        out = st.asof_join(panel, "fin", by="corp_code", left_time="month")
+        if len(out) != len(panel):
+            return False, (f"★C2 재유입: 결합키가 결측인 행이 버려졌습니다 "
+                           f"({len(out)}/{len(panel)}행). corp_code 없는 종목(대개 상장폐지)이 "
+                           f"통째로 사라지면 그게 곧 생존자편향입니다.")
+        if not out.loc[out["code"] == "B", "revenue_ttm"].isna().all():
+            return False, "결합키 결측 행에 값이 붙었습니다"
+        if out.loc[out["code"] == "A", "revenue_ttm"].tolist() != [100.0, 100.0]:
+            return False, (f"★C1 위반: 2020-05-15 에야 알 수 있는 값(999)이 새어나오거나 "
+                           f"행 정렬이 어긋났습니다 → {out.loc[out['code']=='A','revenue_ttm'].tolist()}")
+        if out.loc[out["code"] == "C", "revenue_ttm"].tolist() != [300.0, 300.0]:
+            return False, "결합 결과가 다른 종목에 붙었습니다(정렬 오류)"
+        return True, "결합키 결측 행 보존 · 미래값 차단 · 종목별 정렬 정확"
+
+    _c("C1/C2b", "as-of 결합 무결성", c_asof)
+
+    # ── 회귀 방지: 유니버스는 미래 스냅샷을 쓰지 않을 것 ───────────────────────────────────
+    def c_snapfuture():
+        sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["a", "b"],
+                            "market": ["KOSPI"] * 2, "industry": ["X"] * 2,
+                            "corp_code": [None, None],
+                            "listing_date": pd.to_datetime(["2010-01-01"] * 2),
+                            "delisting_date": [pd.NaT, pd.NaT]})
+        snaps = pd.DataFrame({"snap_date": pd.to_datetime(["2020-01-31", "2020-03-31"]),
+                              "code": ["000001", "000002"], "market": ["KOSPI"] * 2})
+        px = pd.DataFrame({"date": pd.bdate_range("2009-01-01", "2021-01-01"), "code": "000001"})
+        u = Universe(sec, snaps, px)
+        got = u.at("2020-02-29")
+        if "000002" in got:
+            return False, ("★미래누수: 2020-02-29 유니버스에 2020-03-31 스냅샷에만 있는 종목이 "
+                           "포함되었습니다. 가장 '가까운' 스냅샷이 아니라 가장 '최근 과거' 스냅샷을 "
+                           "써야 합니다.")
+        return True, "과거 스냅샷만 사용 확인"
+
+    _c("C2c", "유니버스 스냅샷 방향성", c_snapfuture)
+
+    # ── 회귀 방지: 결측 컬럼 산술이 죽지 않을 것 ──────────────────────────────────────────
+    def c_col():
+        df = pd.DataFrame({"x": [1.0, 2.0]})
+        s = col(df, "rnd_ttm")
+        if not isinstance(s, pd.Series) or len(s) != 2 or s.notna().any():
+            return False, "col() 이 결측 Series 를 반환하지 않습니다"
+        _ = s.abs().fillna(0) + col(df, "capex_ttm").abs().fillna(0)
+        if df.get("rnd_ttm") is not None:
+            return False, "테스트 전제 오류"
+        return True, ("없는 컬럼도 NaN Series 로 안전 반환 — 데이터 소스가 통째로 빈 실행에서 "
+                      "AttributeError 로 죽지 않음")
+
+    _c("COL", "결측 컬럼 안전 접근", c_col)
+
+    # ── 회귀 방지: 비중 상한이 실제로 강제될 것 (§8.5 — 코드 상수로 못박은 규칙) ───────────
+    def c_size():
+        for name, sig, adv in (
+            ("균등", np.linspace(0.5, 1.0, 10), np.full(10, 1e12)),
+            ("극단집중", np.array([1.0] + [0.01] * 9), np.full(10, 1e12)),
+            ("소수종목", np.linspace(0.6, 1.0, 5), np.full(5, 1e12)),
+            ("저유동성", np.linspace(0.5, 1.0, 10), np.array([1e7] * 3 + [1e12] * 7)),
+        ):
+            sub = pd.DataFrame({"Signal_rank": sig, "adv20": adv,
+                                "code": [f"{i:06d}" for i in range(len(sig))]})
+            w = size_positions(sub)["weight"].to_numpy(dtype=float)
+            if w.max() > POS_MAX_WEIGHT + 1e-9:
+                return False, (f"★[{name}] 종목당 최대비중 {POS_MAX_WEIGHT:.0%} 가 뚫렸습니다 "
+                               f"(최대 {w.max():.4f}). clip 후 재정규화하면 상한이 무력화됩니다.")
+            if w.sum() > 1.0 + 1e-9:
+                return False, f"[{name}] 비중 합이 1을 초과합니다 ({w.sum():.6f})"
+            liq = np.where(adv > 0, (adv * POS_ADV_PARTICIPATION) / max(ACCOUNT_KRW, 1),
+                           POS_MAX_WEIGHT)
+            cap = np.minimum(POS_MAX_WEIGHT, np.maximum(liq, POS_MIN_WEIGHT * 0.5))
+            if (w > cap + 1e-9).any():
+                return False, f"★[{name}] 유동성 상한(20일 평균거래대금×{POS_ADV_PARTICIPATION:.0%})이 뚫렸습니다"
+        return True, (f"종목당 상한 {POS_MAX_WEIGHT:.0%} · 유동성 상한 · 합≤1 "
+                      f"모두 강제 확인 (water-filling)")
+
+    _c("SIZE", "포지션 비중 상한 강제", c_size)
+
     # ── 추가: 종목코드 정규화 (2024 영숫자 티커) ──────────────────────────────────────────
     def c_code():
         cases = {"005930": "005930", 5930: "005930", "A005930": "005930",
@@ -7015,6 +7382,52 @@ def run_contract_tests(strict: bool = True) -> bool:
         return True, "구형 6자리 + 2024 영숫자 티커(09701K) 모두 정상 처리"
 
     _c("CODE", "종목코드 정규화", c_code)
+
+    # ── 회귀 방지: 수집 파서 (실데이터 없이도 검증 가능한 부분) ────────────────────────────
+    def c_ingest():
+        # ① YY.MM.DD — pandas 자동추론은 '26.01.19'를 2019-01-26 으로 읽는다(연·일 전치)
+        for raw, exp in (("26.01.19", "2026-01-19"), ("19.12.31", "2019-12-31"),
+                         ("24.11.30", "2024-11-30"), ("2020-05-01", "2020-05-01")):
+            if parse_kr_date(raw) != exp:
+                return False, (f"★날짜 파싱: {raw} → {parse_kr_date(raw)} (기대 {exp}). "
+                               f"두 자리 연도를 자동추론에 맡기면 연·일이 뒤바뀌어 "
+                               f"리포트 원장의 시간축이 통째로 어긋납니다.")
+        # ② 목표주가 '0'/'-' 은 결측이지 0원이 아니다
+        for raw, exp in (("95,000", 95000.0), ("0", None), ("-", None), ("없음", None)):
+            if parse_target_price(raw) != exp:
+                return False, f"목표주가 파싱: {raw!r} → {parse_target_price(raw)!r} (기대 {exp!r})"
+        # ③ 증권사 사명 변경 정규화 (안 하면 같은 애널리스트가 다른 사람이 된다)
+        for raw, exp in (("미래에셋대우", "미래에셋증권"), ("하나금융투자", "하나증권"),
+                         ("신한금융투자", "신한투자증권"), ("이베스트투자증권", "LS증권"),
+                         ("KTB투자증권", "다올투자증권"), ("하이투자증권", "iM증권")):
+            if normalize_broker(raw)[1] != exp:
+                return False, f"증권사 정규화: {raw} → {normalize_broker(raw)[1]} (기대 {exp})"
+        # ④ 한경 9컬럼/6컬럼/헤더없음 — 컬럼 인덱스가 아니라 헤더명으로 매핑되는지
+        def _mk(hdr, rows):
+            h = ("<tr>" + "".join(f"<th>{x}</th>" for x in hdr) + "</tr>") if hdr else ""
+            b = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+            return f"<div class='table_style01'><table>{h}{b}</table></div>"
+        r9 = [["2024-05-02",
+               "<a href='/analysis/downpdf?report_idx=123456'>삼성전자(005930) 실적 개선</a>",
+               "95,000", "Buy", "홍길동", "미래에셋대우", "-", "-",
+               "<a href='/analysis/downpdf?report_idx=123456'>P</a>"]]
+        o9 = _hk_parse(_mk(["작성일", "제목", "적정가격", "투자의견", "작성자", "제공출처",
+                            "기업정보", "차트", "첨부"], r9), "t_business")
+        if not o9 or o9[0]["stock_code"] != "005930" or o9[0]["target_price"] != 95000.0 \
+                or o9[0]["analyst_raw"] != "홍길동":
+            return False, f"한경 9컬럼 파싱 실패: {o9[:1]}"
+        o0 = _hk_parse(_mk(None, r9), "t_noheader")       # thead 가 없어도 살아남아야 한다
+        if not o0 or o0[0]["stock_code"] != "005930":
+            return False, f"한경 헤더없음 폴백 실패: {o0[:1]}"
+        # ⑤ 인코딩: force_enc 는 힌트일 뿐 — 소스가 UTF-8 로 바뀌어도 깨지면 안 된다
+        ko = "네이버 금융 리서치 종목분석 삼성전자 목표주가 상향" * 4
+        for enc in ("euc-kr", "utf-8"):
+            if "네이버" not in _decode(ko.encode(enc), None, "x", force_enc="euc-kr"):
+                return False, f"인코딩 판별 실패: 실제 {enc} 인데 깨짐"
+        return True, ("YY.MM.DD 연·일 전치 방지 · 목표주가 0/- 결측처리 · 사명변경 정규화 · "
+                      "헤더명 기반 컬럼매핑(9/6/무헤더) · EUC-KR↔UTF-8 자동판별 확인")
+
+    _c("INGEST", "수집 파서 회귀 검사", c_ingest)
 
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30), "✔ 통과" if r["pass"] else "✘ 실패",
@@ -7192,8 +7605,58 @@ def make_synthetic(n_codes: int = 160, n_months: int = 60, seed: int = SEED) -> 
     nps = pd.DataFrame(nps_rows)
     nps = pit_frame(nps, "month", "knowledge_date", source="synthetic")
 
+    # ── 공시 텍스트 유사도 (PACK-D) ────────────────────────────────────────────────────────
+    tx_rows = []
+    for i, c in enumerate(codes):
+        for y in range(months[0].year, months[-1].year + 1):
+            d0 = as_ts(f"{y}-03-31")
+            tx_rows.append({"corp_code": sec["corp_code"].iloc[i], "rcept_dt": d0,
+                            "sim_risk": float(np.clip(0.9 + 0.03 * quality[i] +
+                                                      rng.normal(0, 0.05), 0, 1)),
+                            "sim_all": float(np.clip(0.9 + 0.02 * quality[i] +
+                                                     rng.normal(0, 0.04), 0, 1))})
+    txt = pit_frame(pd.DataFrame(tx_rows), "rcept_dt", "rcept_dt", source="synthetic")
+
+    # ── 관세 통관 + HS 매핑 (PACK-X) ───────────────────────────────────────────────────────
+    n_hs = max(60, n_codes // 2)              # 셀 내 z-score 가 성립할 만큼은 덮어야 한다
+    hs_list = [f"{3900+i:04d}000000" for i in range(n_hs)]
+    hs_map = pd.DataFrame({"code": [codes[i] for i in range(n_hs)],
+                           "hs": hs_list, "weight": 1.0,
+                           "valid_from": months[0], "valid_to": months[-1]})
+    cu_rows = []
+    for j, hs in enumerate(hs_list):
+        # θ_X(수출매출/연결매출)가 0.3~0.9 가 되도록 매출 규모에 맞춰 스케일링한다.
+        rev0 = float(np.exp(25.0))
+        base_usd = rev0 * rng.uniform(0.3, 0.9) / 1300.0
+        unit_px0 = rng.lognormal(1.0, 0.2)          # ※ 지역변수 px 는 일봉 DataFrame 이므로 금지
+        q = base_usd / unit_px0
+        for m in months:
+            q *= (1 + 0.004 * quality[j] + rng.normal(0, 0.04))
+            unit_px = unit_px0 * (1 + 0.03 * quality[j] + rng.normal(0, 0.02))
+            for grp in ("선진_미국", "선진_EU", "아세안", "중화권"):
+                w = q * rng.uniform(0.15, 0.35)
+                cu_rows.append({"ym": m.strftime("%Y%m"), "hs": hs, "grp": grp,
+                                "exp_wgt": float(w), "exp_usd": float(w * unit_px)})
+    customs = pd.DataFrame(cu_rows)
+
+    # ── 조달 낙찰 (PACK-P) ────────────────────────────────────────────────────────────────
+    g_rows = []
+    for i in range(0, n_codes, 3):
+        for m in months:
+            if rng.random() > 0.55:
+                continue
+            plan = rng.lognormal(19, 0.8)
+            rate = float(np.clip(85 + 4 * quality[i] + rng.normal(0, 3), 60, 110))
+            g_rows.append({"ym": m.strftime("%Y%m"), "biz_no": f"{1000000000+i}",
+                           "corp_nm": f"합성{i+1:03d}", "award_amt": plan * rate / 100.0,
+                           "plan_price": plan, "rate": rate,
+                           "org": rng.choice(["조달청", "국방부", "한전", "지자체", "철도공단"]),
+                           "item_cls": f"{rng.integers(1000,9999)}"})
+    procure = pd.DataFrame(g_rows)
+
     return {"sec": sec, "px": px, "fin": fin, "emp": emp, "dis": dis,
             "reports": rep, "links": L, "nps": nps, "months": months,
+            "text_sim": txt, "customs": customs, "hs_map": hs_map, "procure": procure,
             "flows": pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"]),
             "snapshots": pd.DataFrame(columns=["snap_date", "code", "market"])}
 
@@ -7224,8 +7687,8 @@ def run_selftest(full_chain: bool = False) -> bool:
     P = axis_D_U(P)
 
     ctx = {"disclosures": S["dis"], "nps_panel": S["nps"], "sec": S["sec"],
-           "text_sim": None, "customs": None, "hs_map": None, "procurement": None,
-           "administrative": None}
+           "text_sim": S["text_sim"], "customs": S["customs"], "hs_map": S["hs_map"],
+           "procurement": S["procure"], "administrative": None}
     for p in active_packs():
         P = p["features"](P, ctx)
     P = apply_vetoes(P, ctx)
@@ -7392,6 +7855,14 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
         rep = build_report_master(frames, ctx["sec"])
         if len(rep):
             rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+            # ★ PDF 에서 추출한 목표주가를 원장에 실제로 반영한다.
+            #   (추출만 하고 쓰지 않으면 네이버 단독 건의 목표주가가 영원히 결측으로 남는다)
+            if "pdf_target" in rep.columns:
+                fill = rep["target_price"].isna() & rep["pdf_target"].notna()
+                if fill.any():
+                    rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
+                    LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건을 추가로 채웠습니다 "
+                           f"(리스트에 목표주가가 없는 네이버 단독 건 보강).")
             VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
                             source="hankyung+naver")
             VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",

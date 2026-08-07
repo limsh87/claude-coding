@@ -175,8 +175,20 @@ class Vault:
                         allcols.append(c)
             frames = [f.reindex(columns=allcols) for f in frames]
             idx = pd.concat(frames, ignore_index=True)
+            # ★ uid 가 없거나 결측인 레거시 행을 그대로 두면 astype(str) 이 전부 "nan" 이 되고
+            #   drop_duplicates(uid) 가 그 파일 전체를 단 한 줄로 붕괴시킨다 = 인덱스 유실.
+            #   절대 1원칙에 정면으로 반하므로, 결측 uid 는 행 내용 해시로 개별 부여한다.
             if "uid" not in idx.columns:
-                idx["uid"] = [sha1_str("legacy", i) for i in range(len(idx))]
+                idx["uid"] = np.nan
+            miss = idx["uid"].isna() | (idx["uid"].astype(str).str.strip().isin(("", "nan", "None")))
+            if miss.any():
+                fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
+                                        "_legacy_file") if c in idx.columns]
+                idx.loc[miss, "uid"] = [
+                    sha1_str("legacy", i, *[str(idx.iloc[i].get(c, "")) for c in fill_src])
+                    for i in np.where(miss.to_numpy())[0]]
+                LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 uid 를 부여했습니다 "
+                         f"(uid 결측 행이 하나로 뭉개지는 것을 방지 — 기존 기록 보존).")
             idx["uid"] = idx["uid"].astype(str)
             if "collected_at" in idx.columns:
                 idx = idx.sort_values("collected_at", kind="stable")

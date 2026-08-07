@@ -117,12 +117,20 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     d = pd.concat([f.reindex(columns=sorted(set().union(*[set(x.columns) for x in frames])))
                    for f in frames], ignore_index=True)
 
+    # 두 자리 연도는 수집부 parse_kr_date 에서 이미 4자리로 확정된다.
+    # 여기서는 남은 이상치만 걸러낸다(교정하지 않는다 — 잘못된 교정이 더 위험하다).
+    n_raw0 = len(d)
     d["pub_date"] = as_ts_series(d["pub_date"])
-    # 네이버 리스트는 'YY.MM.DD' — 2자리 연도가 1900년대로 파싱되는 사고를 막는다
-    bad = d["pub_date"].notna() & (d["pub_date"].dt.year < 2000)
+    lo, hi = as_ts("1999-01-01"), as_ts(BACKTEST_END) + pd.Timedelta(days=400)
+    bad = d["pub_date"].isna() | (d["pub_date"] < lo) | (d["pub_date"] > hi)
     if bad.any():
-        d.loc[bad, "pub_date"] = d.loc[bad, "pub_date"] + pd.offsets.DateOffset(years=100)
-    d = d.dropna(subset=["pub_date"])
+        LOG.warn(f"발간일이 없거나 범위를 벗어난 리포트 {int(bad.sum()):,}건을 제외했습니다 "
+                 f"({100*bad.mean():.2f}%). 이 비율이 크면 소스의 날짜 형식이 바뀐 것입니다 — "
+                 f"조용히 넘기지 말고 parse_kr_date 를 확인하세요.")
+    d = d[~bad]
+    if len(d) == 0:
+        LOG.error("발간일이 유효한 리포트가 하나도 없습니다. 날짜 파싱이 깨졌습니다.")
+        return pd.DataFrame(columns=REPORT_COLS)
 
     bid = d["broker_raw"].map(normalize_broker)
     d["broker_id"] = [x[0] for x in bid]
@@ -169,8 +177,8 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "detail_url": ("detail_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
     }
     m = d.groupby("dedup_key", as_index=False).agg(**agg)
-    LOG.info(f"보고서 원장 병합: 원시 {n_raw:,}건 → 고유 {len(m):,}건 "
-             f"(소스 간 중복 {n_raw - len(m):,}건 병합)")
+    LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
+             f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")
 
     m["event_date"] = m["pub_date"]
     m["knowledge_date"] = m["pub_date"]          # 리포트는 발간=공개 (C1)

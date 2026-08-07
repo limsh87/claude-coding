@@ -153,11 +153,11 @@ def R3_orthogonal(P: pd.DataFrame, bt: dict, months) -> None:
         _record("R3", "퀄리티 팩터 직교화", None, "보유 이력이 없어 판정 불가")
         return
     Q = P.copy()
-    Q["f_prof"] = safe_div(Q.get("op_income_ttm"), Q.get("assets"))
-    Q["f_qual"] = safe_div(Q.get("equity"), Q.get("assets"))
+    Q["f_prof"] = safe_div(col(Q, "op_income_ttm"), col(Q, "assets"))
+    Q["f_qual"] = safe_div(col(Q, "equity"), col(Q, "assets"))
     Q["f_mom"] = Q.groupby("code", observed=True)["close"].transform(lambda s: s.pct_change(12))
     Q["f_size"] = np.log(Q["adv20"].where(Q["adv20"] > 0))
-    Q["f_val"] = safe_div(Q.get("net_income_ttm"), Q["close"])
+    Q["f_val"] = safe_div(col(Q, "net_income_ttm"), Q["close"])
     facs = ["f_prof", "f_qual", "f_mom", "f_size", "f_val"]
 
     fac_ret = []
