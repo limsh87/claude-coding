@@ -539,6 +539,42 @@ def tp_signed_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
     return (a * b).astype("float32")
 
 
+def nonempty(x) -> bool:
+    """DataFrame/Series/배열/None 을 안전하게 '내용이 있는가'로 판정한다.
+
+    ★ 왜 함수로 만드는가: `a() or b()` 는 DataFrame 에서
+      "ValueError: The truth value of a DataFrame is ambiguous" 로 죽는다.
+      그런데 이 버그는 **a() 가 None 을 반환하는 환경에서는 숨는다**(None or b 는 합법).
+      즉 '소스가 막힌 개발 환경에서는 통과하고, 소스가 살아 있는 실환경에서만 터진다'.
+      실제로 CANARY K4 가 정확히 그렇게 죽었다 — 네트워크가 차단된 곳에서 전부 통과했다.
+      쓰기 쉬운 잘못된 관용구(`or`)를 대체할 쓰기 쉬운 올바른 관용구가 없으면 재발한다.
+    """
+    if x is None:
+        return False
+    if isinstance(x, (pd.DataFrame, pd.Series, pd.Index, np.ndarray)):
+        return len(x) > 0
+    try:
+        return bool(len(x))
+    except TypeError:
+        return bool(x)
+
+
+def first_nonempty(*sources, min_len: int = 1):
+    """폴백 체인. 각 source 는 호출가능(지연평가) 또는 값.
+
+    비어 있지 않은 첫 결과를 돌려주고, 전부 비면 None. 예외는 그 소스만 건너뛴다.
+        d = first_nonempty(lambda: _px_fdr(c, s, e), lambda: _px_naver(c, s, e))
+    """
+    for s in sources:
+        try:
+            v = s() if callable(s) else s
+        except Exception:                                   # noqa — 소스 하나의 실패로 체인을 죽이지 않는다
+            continue
+        if nonempty(v) and (not hasattr(v, "__len__") or len(v) >= min_len):
+            return v
+    return None
+
+
 def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
 

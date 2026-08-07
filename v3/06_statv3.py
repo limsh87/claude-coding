@@ -46,16 +46,49 @@ def Stage(name: str, budget_min: Optional[float] = None):
 
 
 def _rss_mb() -> float:
-    """상주 메모리(MB). psutil 없이도 동작한다(리눅스 /proc, 그 외는 resource)."""
+    """상주 메모리(MB). 리눅스·macOS·Windows 전부에서 동작한다.
+
+    ★ 예전엔 /proc 과 resource 에만 의존해 **Windows 에서 전부 NaN** 이었다. 런타임 표의
+      RSS 열이 통째로 '-' 로 나와 메모리 감사가 무의미해진다 — 하필 Colab 아닌 로컬
+      주피터가 메모리 압박을 가장 먼저 받는 환경이다. psutil 은 선택 의존이므로
+      없어도 되는 경로를 셋 다 갖춘다.
+    """
     try:
-        with open("/proc/self/statm") as f:
+        with open("/proc/self/statm") as f:                       # Linux
             return int(f.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") / 1e6)
     except Exception:
         pass
+    if sys.platform.startswith("win"):
+        try:                                                       # Windows: PSAPI
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t),
+                            ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t)]
+            c = _PMC()
+            c.cb = ctypes.sizeof(_PMC)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                    ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb):
+                return c.WorkingSetSize / 1e6
+        except Exception:
+            pass
     try:
-        import resource
+        import psutil                                              # 있으면 가장 정확
+        return psutil.Process().memory_info().rss / 1e6
+    except Exception:
+        pass
+    try:
+        import resource                                            # macOS/BSD 폴백(최대치)
         ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return ru / 1e3 if sys.platform == "darwin" else ru / 1e3
+        return ru / 1e6 if sys.platform == "darwin" else ru / 1e3
     except Exception:
         return float("nan")
 

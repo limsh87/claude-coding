@@ -139,12 +139,33 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         ctx["disclosures"] = dis
         kmap = build_knowledge_map(dis)
         reprts = [REPRT_CODES[k] for k in ("Q1", "H1", "Q3", "FY")]
-        raw = pd.DataFrame()
-        if "bulk" not in DISABLED:
-            raw = fetch_dart_bulk(years, reprts)
-        if raw is None or raw.empty:
-            corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-            raw = fetch_dart_multi(corps, years, reprts)
+        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+        # 유동성 상위 종목의 corp_code 를 우선순위로 넘긴다 — 일일 한도로 끊겨도
+        # '투자 가능한 종목의 최근 데이터'가 먼저 완성되게 하기 위함이다.
+        prio: List[str] = []
+        try:
+            adv = (ctx["pp"]["monthly"].groupby("code", observed=True)["adv20"]
+                   .median().sort_values(ascending=False))
+            c2c = (ctx["sec"].dropna(subset=["corp_code"])
+                   .assign(corp_code=lambda d: d["corp_code"].astype(str))
+                   .set_index("code")["corp_code"].to_dict())
+            prio = [c2c[c] for c in adv.index if c in c2c]
+        except Exception:
+            prio = []
+
+        # ── §4.1 3단 티어. 정보량 순으로 쌓고, 상위 티어가 없는 조합만 하위가 메운다 ──
+        #   Tier1 벌크            : 전 계정 · 1회 다운로드 (최선)
+        #   Tier3 fnlttSinglAcntAll: 전 계정 · 단건(며칠 소요, 이어받기)
+        #   Tier2 fnlttMultiAcnt  : 주요계정 6개 · 배치(즉시) — '바닥'을 싸게 깐다
+        t_bulk = fetch_dart_bulk(years, reprts) if "bulk" not in DISABLED else pd.DataFrame()
+        t_multi = fetch_dart_multi(corps, years, reprts)
+        t_full = pd.DataFrame()
+        if not nonempty(t_bulk):
+            LOG.warn("벌크가 비어 Fallback B(fnlttSinglAcntAll)를 가동합니다. 주요계정만으로는 "
+                     "재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽기 때문입니다 — "
+                     "이 경로 없이 나온 성과는 '코어가 빠진 전략'의 성과입니다.")
+            t_full = fetch_dart_full(corps, years, priority=prio)
+        raw = merge_financial_tiers(t_bulk, t_full, t_multi)
         ctx["fin"] = tidy_financials(raw, kmap, ctx.get("code_of_corp"))
         ctx["weak_tp"] = report_account_coverage()
 
@@ -293,7 +314,12 @@ def main() -> dict:
                 LOG.warn("여유 공간 2GB 미만 — RESEARCH_DOWNLOAD_PDF=False 를 권합니다.")
         VAULT.load_index("shared")
         VAULT.load_index("private")
-        VAULT.adopt_scan(GDRIVE_ADOPT_DIRS)
+        # 설정된 경로 + 플랫폼별 자동 탐지. 손으로 경로를 고치지 않아도 이미 모아둔
+        # 리포트를 찾아낸다(읽기 전용 등록 — 이동·삭제 없음).
+        adopt = list(dict.fromkeys(list(GDRIVE_ADOPT_DIRS) + discover_drive_dirs(VAULT.root)))
+        LOG.info(f"기존 캐시 스캔 대상 {len(adopt)}곳 (설정 {len(GDRIVE_ADOPT_DIRS)} + 자동탐지 "
+                 f"{len(adopt) - len(GDRIVE_ADOPT_DIRS)})")
+        VAULT.adopt_scan(adopt)
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
@@ -320,12 +346,28 @@ def main() -> dict:
     months = month_range(BACKTEST_START, BACKTEST_END)
     stage = STAGE if STAGE in STAGE_ORDER else "M3"
 
-    with PIPE.stage("CANARY", "CANARY K1~K7", "L0", budget_s=1500), Stage("CANARY", 20):
-        probe_sec = fetch_fdr_listing()
-        probe_codes = probe_sec["code"].dropna().astype(str).tolist()[:200] if len(probe_sec) else []
-        cc = fetch_dart_corpcode()
-        probe_corps = cc.dropna(subset=["code"])["corp_code"].astype(str).tolist()[:200] \
-            if len(cc) else []
+    # ★ 스테이지 밖에서 초기화한다. 안에서만 대입하면 CANARY 가 예외로 죽었을 때
+    #   L0.PERSIST 의 참조가 UnboundLocalError 를 내고, 그러면 '왜 죽었는지'를 담은
+    #   산출물 저장 자체가 실패해 진단 정보를 잃는다.
+    ctx_canary = pd.DataFrame()
+    with PIPE.stage("CANARY", "CANARY K1~K7", "L0", budget_s=1500, critical=False), \
+            Stage("CANARY", 20):
+        # ★ critical=False. §1 의 설계는 "FAIL 항목에 의존하는 단계를 큐에서 제거하고 진행"
+        #   이다. CANARY 가 전체 실행을 죽이면 그 설계와 정면으로 어긋난다.
+        #   진짜 중단 사유(K5 상장폐지 미확보)는 KillCriteria 로 별도 전파된다.
+        probe_codes, probe_corps = [], []
+        try:
+            probe_sec = fetch_fdr_listing()
+            if nonempty(probe_sec):
+                probe_codes = probe_sec["code"].dropna().astype(str).tolist()[:200]
+        except Exception as e:                                   # noqa
+            LOG.warn(f"CANARY 표본 종목 확보 실패({type(e).__name__}) — 기본 표본으로 진행합니다.")
+        try:
+            cc = fetch_dart_corpcode()
+            if nonempty(cc):
+                probe_corps = cc.dropna(subset=["code"])["corp_code"].astype(str).tolist()[:200]
+        except Exception as e:                                   # noqa
+            LOG.warn(f"CANARY corp_code 확보 실패({type(e).__name__}) — K7 은 건너뜁니다.")
         ctx_canary = run_canary(probe_codes, probe_corps)
 
     ctx = collect_all(months, stage)

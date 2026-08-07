@@ -492,11 +492,63 @@ def _safe_size(p: str) -> int:
 
 
 def free_gb(path: str) -> float:
+    """여유 디스크(GB). os.statvfs 는 Windows 에 없다 — shutil.disk_usage 가 크로스플랫폼이다."""
+    try:
+        return shutil.disk_usage(path).free / 1e9
+    except Exception:
+        pass
     try:
         st = os.statvfs(path)
         return st.f_bavail * st.f_frsize / 1e9
     except Exception:
         return float("nan")
+
+
+def discover_drive_dirs(cache_root: str) -> List[str]:
+    """플랫폼별 구글드라이브·기존 캐시 후보 경로를 자동 탐지한다.
+
+    ★ 왜 필요한가: GDRIVE_ADOPT_DIRS 기본값이 Colab 경로(/content/...)라, 로컬 주피터에서
+      돌리면 "흡수할 파일을 찾지 못했습니다" 만 뜨고 사용자가 이미 모아둔 리포트가
+      통째로 무시된다. 사용자에게 경로를 손으로 고치라고 요구하는 대신 흔한 위치를 훑는다.
+      (읽기 전용 스캔이며 파일을 옮기거나 지우지 않는다 — adopt-by-reference)
+    """
+    cands: List[str] = []
+    home = os.path.expanduser("~")
+    if cache_root:
+        cands += [cache_root, os.path.dirname(os.path.abspath(cache_root))]
+    if sys.platform.startswith("win"):
+        for drv in "GHIJKDEF":
+            cands += [f"{drv}:\\내 드라이브", f"{drv}:\\My Drive", f"{drv}:\\"]
+        cands += [os.path.join(home, "Google Drive"), os.path.join(home, "GoogleDrive"),
+                  os.path.join(home, "Documents"), os.path.join(home, "Downloads")]
+    elif sys.platform == "darwin":
+        cands += [os.path.join(home, "Google Drive"),
+                  os.path.join(home, "Library/CloudStorage")]
+    else:
+        cands += ["/content/drive/MyDrive", os.path.join(home, "Google Drive"),
+                  os.path.join(home, "GoogleDrive")]
+    out, seen = [], set()
+    for c in cands:
+        try:
+            if not c or not os.path.isdir(c):
+                continue
+            r = os.path.realpath(c)
+            # 드라이브 루트 전체 스캔은 너무 비싸다 — 하위의 그럴듯한 폴더만 고른다
+            if len(r) <= 3:
+                for sub in os.listdir(c)[:60]:
+                    p = os.path.join(c, sub)
+                    if os.path.isdir(p) and any(
+                            k in sub.lower() for k in ("tcd", "research", "report", "consensus",
+                                                       "리서치", "리포트", "컨센서스", "quant", "qunat")):
+                        rp = os.path.realpath(p)
+                        if rp not in seen:
+                            seen.add(rp); out.append(p)
+                continue
+            if r not in seen:
+                seen.add(r); out.append(c)
+        except Exception:
+            continue
+    return out
 
 
 VAULT: Optional[Vault] = None

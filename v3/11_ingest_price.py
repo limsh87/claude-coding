@@ -311,15 +311,13 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
         def _one(job):
             code, st = job
-            for nm, fn in PRICE_CHAIN:
-                try:
-                    d = fn(code, st, end)
-                except Exception:
-                    d = None
-                if d is not None and len(d):
-                    d = d.dropna(subset=["date"])
-                    if len(d):
-                        return d
+            # 폴백 체인. first_nonempty 는 DataFrame 진리값 오용(`a() or b()`)을
+            # 구조적으로 막는다 — 그 관용구는 소스가 막힌 환경에서만 통과한다.
+            d = first_nonempty(*[(lambda f=fn: f(code, st, end)) for _nm, fn in PRICE_CHAIN])
+            if nonempty(d):
+                d = d.dropna(subset=["date"])
+                if nonempty(d):
+                    return d
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")

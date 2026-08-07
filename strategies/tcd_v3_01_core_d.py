@@ -1415,6 +1415,42 @@ def tp_signed_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
     return (a * b).astype("float32")
 
 
+def nonempty(x) -> bool:
+    """DataFrame/Series/배열/None 을 안전하게 '내용이 있는가'로 판정한다.
+
+    ★ 왜 함수로 만드는가: `a() or b()` 는 DataFrame 에서
+      "ValueError: The truth value of a DataFrame is ambiguous" 로 죽는다.
+      그런데 이 버그는 **a() 가 None 을 반환하는 환경에서는 숨는다**(None or b 는 합법).
+      즉 '소스가 막힌 개발 환경에서는 통과하고, 소스가 살아 있는 실환경에서만 터진다'.
+      실제로 CANARY K4 가 정확히 그렇게 죽었다 — 네트워크가 차단된 곳에서 전부 통과했다.
+      쓰기 쉬운 잘못된 관용구(`or`)를 대체할 쓰기 쉬운 올바른 관용구가 없으면 재발한다.
+    """
+    if x is None:
+        return False
+    if isinstance(x, (pd.DataFrame, pd.Series, pd.Index, np.ndarray)):
+        return len(x) > 0
+    try:
+        return bool(len(x))
+    except TypeError:
+        return bool(x)
+
+
+def first_nonempty(*sources, min_len: int = 1):
+    """폴백 체인. 각 source 는 호출가능(지연평가) 또는 값.
+
+    비어 있지 않은 첫 결과를 돌려주고, 전부 비면 None. 예외는 그 소스만 건너뛴다.
+        d = first_nonempty(lambda: _px_fdr(c, s, e), lambda: _px_naver(c, s, e))
+    """
+    for s in sources:
+        try:
+            v = s() if callable(s) else s
+        except Exception:                                   # noqa — 소스 하나의 실패로 체인을 죽이지 않는다
+            continue
+        if nonempty(v) and (not hasattr(v, "__len__") or len(v) >= min_len):
+            return v
+    return None
+
+
 def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
 
@@ -2072,11 +2108,63 @@ def _safe_size(p: str) -> int:
 
 
 def free_gb(path: str) -> float:
+    """여유 디스크(GB). os.statvfs 는 Windows 에 없다 — shutil.disk_usage 가 크로스플랫폼이다."""
+    try:
+        return shutil.disk_usage(path).free / 1e9
+    except Exception:
+        pass
     try:
         st = os.statvfs(path)
         return st.f_bavail * st.f_frsize / 1e9
     except Exception:
         return float("nan")
+
+
+def discover_drive_dirs(cache_root: str) -> List[str]:
+    """플랫폼별 구글드라이브·기존 캐시 후보 경로를 자동 탐지한다.
+
+    ★ 왜 필요한가: GDRIVE_ADOPT_DIRS 기본값이 Colab 경로(/content/...)라, 로컬 주피터에서
+      돌리면 "흡수할 파일을 찾지 못했습니다" 만 뜨고 사용자가 이미 모아둔 리포트가
+      통째로 무시된다. 사용자에게 경로를 손으로 고치라고 요구하는 대신 흔한 위치를 훑는다.
+      (읽기 전용 스캔이며 파일을 옮기거나 지우지 않는다 — adopt-by-reference)
+    """
+    cands: List[str] = []
+    home = os.path.expanduser("~")
+    if cache_root:
+        cands += [cache_root, os.path.dirname(os.path.abspath(cache_root))]
+    if sys.platform.startswith("win"):
+        for drv in "GHIJKDEF":
+            cands += [f"{drv}:\\내 드라이브", f"{drv}:\\My Drive", f"{drv}:\\"]
+        cands += [os.path.join(home, "Google Drive"), os.path.join(home, "GoogleDrive"),
+                  os.path.join(home, "Documents"), os.path.join(home, "Downloads")]
+    elif sys.platform == "darwin":
+        cands += [os.path.join(home, "Google Drive"),
+                  os.path.join(home, "Library/CloudStorage")]
+    else:
+        cands += ["/content/drive/MyDrive", os.path.join(home, "Google Drive"),
+                  os.path.join(home, "GoogleDrive")]
+    out, seen = [], set()
+    for c in cands:
+        try:
+            if not c or not os.path.isdir(c):
+                continue
+            r = os.path.realpath(c)
+            # 드라이브 루트 전체 스캔은 너무 비싸다 — 하위의 그럴듯한 폴더만 고른다
+            if len(r) <= 3:
+                for sub in os.listdir(c)[:60]:
+                    p = os.path.join(c, sub)
+                    if os.path.isdir(p) and any(
+                            k in sub.lower() for k in ("tcd", "research", "report", "consensus",
+                                                       "리서치", "리포트", "컨센서스", "quant", "qunat")):
+                        rp = os.path.realpath(p)
+                        if rp not in seen:
+                            seen.add(rp); out.append(p)
+                continue
+            if r not in seen:
+                seen.add(r); out.append(c)
+        except Exception:
+            continue
+    return out
 
 
 VAULT: Optional[Vault] = None
@@ -2376,16 +2464,49 @@ def Stage(name: str, budget_min: Optional[float] = None):
 
 
 def _rss_mb() -> float:
-    """상주 메모리(MB). psutil 없이도 동작한다(리눅스 /proc, 그 외는 resource)."""
+    """상주 메모리(MB). 리눅스·macOS·Windows 전부에서 동작한다.
+
+    ★ 예전엔 /proc 과 resource 에만 의존해 **Windows 에서 전부 NaN** 이었다. 런타임 표의
+      RSS 열이 통째로 '-' 로 나와 메모리 감사가 무의미해진다 — 하필 Colab 아닌 로컬
+      주피터가 메모리 압박을 가장 먼저 받는 환경이다. psutil 은 선택 의존이므로
+      없어도 되는 경로를 셋 다 갖춘다.
+    """
     try:
-        with open("/proc/self/statm") as f:
+        with open("/proc/self/statm") as f:                       # Linux
             return int(f.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") / 1e6)
     except Exception:
         pass
+    if sys.platform.startswith("win"):
+        try:                                                       # Windows: PSAPI
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t),
+                            ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t)]
+            c = _PMC()
+            c.cb = ctypes.sizeof(_PMC)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                    ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb):
+                return c.WorkingSetSize / 1e6
+        except Exception:
+            pass
     try:
-        import resource
+        import psutil                                              # 있으면 가장 정확
+        return psutil.Process().memory_info().rss / 1e6
+    except Exception:
+        pass
+    try:
+        import resource                                            # macOS/BSD 폴백(최대치)
         ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return ru / 1e3 if sys.platform == "darwin" else ru / 1e3
+        return ru / 1e6 if sys.platform == "darwin" else ru / 1e3
     except Exception:
         return float("nan")
 
@@ -3618,15 +3739,13 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
         def _one(job):
             code, st = job
-            for nm, fn in PRICE_CHAIN:
-                try:
-                    d = fn(code, st, end)
-                except Exception:
-                    d = None
-                if d is not None and len(d):
-                    d = d.dropna(subset=["date"])
-                    if len(d):
-                        return d
+            # 폴백 체인. first_nonempty 는 DataFrame 진리값 오용(`a() or b()`)을
+            # 구조적으로 막는다 — 그 관용구는 소스가 막힌 환경에서만 통과한다.
+            d = first_nonempty(*[(lambda f=fn: f(code, st, end)) for _nm, fn in PRICE_CHAIN])
+            if nonempty(d):
+                d = d.dropna(subset=["date"])
+                if nonempty(d):
+                    return d
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
@@ -3938,15 +4057,35 @@ def _bulk_candidates(year: int, reprt: str) -> List[str]:
     return out
 
 
-def _bulk_discover(year: int, reprt: str) -> List[str]:
-    """페이지에서 실제 fl_nm 을 찾아낸다. 파일명 규칙을 추측하지 않는 것이 1순위다."""
+def _bulk_discover(year: int, reprt: str) -> Tuple[List[str], str]:
+    """페이지에서 실제 fl_nm 을 찾아낸다. 파일명 규칙을 추측하지 않는 것이 1순위다.
+
+    반환 (후보 목록, 진단문자열).
+    ★ 진단문자열이 핵심이다. "후보 N개 전부 실패" 만 남기면 사용자 로그를 받아도 원인을
+      특정할 수 없다. 페이지를 받았는지 / 로그인 벽인지 / 어떤 링크·폼·스크립트가 있었는지를
+      남겨야 다음 실행 로그 한 장으로 고칠 수 있다.
+    """
     html = http_get(DART_BULK_PAGE, source="dart", tries=2,
                     params={"selectYear": str(year), "selectReprtCode": reprt},
                     referer="https://opendart.fss.or.kr/")
     if not html:
-        return []
+        return [], "페이지 응답 없음(네트워크 차단·타임아웃·403 가능). HTTP 감사표를 확인하세요"
+    low = html.lower()
+    marks = []
+    if "login" in low or "로그인" in html:
+        marks.append("로그인벽 의심")
+    for kw in ("downloadfnltt", "fl_nm", "downloadzip", "flnm", "download.do"):
+        if kw in low:
+            marks.append(f"'{kw}' 발견")
     hits = [h for h in dict.fromkeys(_BULK_FLNM_RE.findall(html)) if str(year) in h]
-    return hits
+    # 폼/앵커에서 실제 액션 URL 과 파라미터 이름을 긁어 남긴다
+    acts = dict.fromkeys(re.findall(r'(?:action|href)\s*=\s*["\']([^"\']*(?:down|fnltt)[^"\']*)["\']',
+                                    html, re.I))
+    names = dict.fromkeys(re.findall(r'<input[^>]+name\s*=\s*["\']([^"\']+)["\']', html, re.I))
+    diag = (f"HTML {len(html):,}자 · 후보 {len(hits)}개 · "
+            f"{', '.join(marks) if marks else '단서 없음'} · "
+            f"액션 {list(acts)[:3]} · 폼필드 {list(names)[:6]}")
+    return hits, diag
 
 
 def _bulk_fetch_one(fl_nm: str) -> Optional[bytes]:
@@ -4063,7 +4202,10 @@ def fetch_dart_bulk(years: Sequence[int], reprts: Sequence[str]) -> pd.DataFrame
     if jobs:
         LOG.info(f"DART 재무정보 일괄다운로드 {len(jobs)} 분기 (분기당 파일 여러 개)")
         for y, r in tqdm(jobs, desc="DART 벌크", ncols=88, leave=False):
-            names = _bulk_discover(y, r) or _bulk_candidates(y, r)
+            names, diag = _bulk_discover(y, r)
+            if not names:
+                names = _bulk_candidates(y, r)
+                LOG.debug(f"벌크 {y}/{REPRT_NAME.get(r, r)} 발견 실패 → 추측 후보 사용 · {diag}")
             frames = []
             for fl in names:
                 raw = _bulk_fetch_one(fl)
@@ -4171,6 +4313,129 @@ def fetch_dart_multi(corp_codes: Sequence[str], years: Sequence[int],
     LOG.ok(f"DART 주요계정 {len(M):,}행 · {M['corp_code'].nunique():,}사")
     PIPE.io("IN", "HTTP", "dart:multi", M, source="opendart fnlttMultiAcnt")
     return M
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+#  §4.1 Fallback B — fnlttSinglAcntAll (전체 재무제표, 회사×연도×보고서 단건)
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+#  ★ 왜 이게 필요한가 (실측으로 확인된 상황):
+#    벌크(K1)가 실패하면 Fallback A(fnlttMultiAcnt)만 남는데, A 는 '주요계정'만 준다 —
+#    매출·영업이익·순이익·자산·부채·자본. **재고·매출채권·영업CF·유형자산취득이 없다.**
+#    그러면 i_dio·i_dso·i_accr·i_capex 가 전부 결측이 되고
+#    TP_I2(매출↑인데 회전 유지)·TP_I4(매출↑인데 발생액 유지)·TP_I1(확장하는데 ROIC 유지)이
+#    죽는다. 즉 전략의 코어가 사라진 채로 백테스트가 '성공'한다. 그건 결과가 아니라 착시다.
+#
+#  ★ 비용의 현실을 숨기지 않는다:
+#    연 1회(사업보고서)  : 2,600사 × 11년         ≈ 28,600 콜 → 일 19,000 한도로 약 2일
+#    분기 전체           : 2,600사 × 11년 × 4분기 ≈ 114,400 콜 →              약 6일
+#    그래서 기본값은 annual 이고, 이어받기가 전제다. 중단돼도 받은 만큼 드라이브에 남고
+#    다음 실행이 정확히 그 지점부터 잇는다.
+DART_FS_FREQ = "annual"          # "annual"(약 2일) | "quarterly"(약 6일)
+
+
+def _fs_one(job) -> Optional[pd.DataFrame]:
+    corp, year, reprt = job
+    # 연결(CFS) 우선, 없으면 개별(OFS). 순서를 바꾸면 지주사에서 매출이 통째로 달라진다.
+    for fs_div in ("CFS", "OFS"):
+        js = dart_api("fnlttSinglAcntAll.json",
+                      {"corp_code": corp, "bsns_year": str(year),
+                       "reprt_code": reprt, "fs_div": fs_div})
+        if js and isinstance(js.get("list"), list) and js["list"]:
+            d = pd.DataFrame(js["list"])
+            for c in _FS_KEEP:
+                if c not in d.columns:
+                    d[c] = None
+            d["corp_code"] = corp
+            d["bsns_year"] = int(year)
+            d["reprt_code"] = str(reprt)
+            d["fs_div"] = fs_div
+            return d[_FS_KEEP]
+    return None
+
+
+def fetch_dart_full(corp_codes: Sequence[str], years: Sequence[int],
+                    priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """전체 재무제표. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
+
+    priority 를 주면 그 순서(유동성 상위)대로 먼저 받는다. 일일 한도로 중간에 끊기는 것이
+    **정상 시나리오**이므로, 끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가
+    되도록 정렬한다. 무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아
+    백테스트를 못 돌린다.
+    """
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=_FS_KEEP)
+    cached = VAULT.get_table("dart_fnltt_raw", scope="shared")
+    done = set()
+    if nonempty(cached):
+        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
+                       cached["reprt_code"].astype(str)))
+        LOG.info(f"공용 캐시에서 DART 전체재무제표 {len(cached):,}행 재사용 ({len(done):,} 조합)")
+
+    reprts = ([REPRT_CODES["FY"]] if DART_FS_FREQ == "annual"
+              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    order = {str(c): i for i, c in enumerate(priority or [])}
+    corp_sorted = sorted((str(c) for c in corp_codes), key=lambda c: (order.get(c, 10 ** 9), c))
+    jobs = [(c, y, r) for y in sorted(years, reverse=True)      # 최근 연도 우선
+            for c in corp_sorted for r in reprts
+            if (c, int(y), str(r)) not in done]
+    if RUN_MODE == "CACHED":
+        jobs = []
+
+    got = []
+    if jobs:
+        avail = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+        days = math.ceil(len(jobs) * 1.3 / max(DART_DAILY_LIMIT, 1))
+        LOG.warn(f"전체 재무제표 신규 수집 대상 {len(jobs):,}건 (오늘 가용 호출 {avail:,}건). "
+                 f"콜당 최대 2회 요청이므로 콜드빌드에 약 {days}일이 걸립니다 "
+                 f"(DART_FS_FREQ='{DART_FS_FREQ}'). 오늘 받을 수 있는 만큼 받아 드라이브에 "
+                 f"저장하고, 내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다. "
+                 f"유동성 상위·최근 연도부터 채우므로 중간에 끊겨도 상위 종목은 먼저 완성됩니다.")
+        res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 전체재무제표")
+        got = [d for d in res if nonempty(d)]
+
+    frames = ([cached] if nonempty(cached) else []) + got
+    if not frames:
+        return pd.DataFrame(columns=_FS_KEEP)
+    F = pd.concat(frames, ignore_index=True)
+    F = F.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id",
+                           "account_nm"], keep="last")
+    if got:
+        VAULT.put_table("dart_fnltt_raw", F, scope="shared", domain="dart",
+                        source="opendart fnlttSinglAcntAll")
+    n_have = F.groupby(["corp_code", "bsns_year", "reprt_code"]).ngroups if len(F) else 0
+    n_need = len(corp_sorted) * len(years) * len(reprts)
+    LOG.info(f"전체 재무제표 진행률 {n_have:,}/{n_need:,} ({100*n_have/max(n_need,1):.1f}%) — "
+             f"재실행하면 이 지점부터 이어받습니다.")
+    PIPE.io("IN", "HTTP", "dart:fnlttSinglAcntAll", F, source="opendart", ok=len(F) > 0)
+    return F
+
+
+def merge_financial_tiers(*tiers: pd.DataFrame) -> pd.DataFrame:
+    """상위 티어를 우선하고, 없는 (회사, 기간) 조합만 하위 티어로 메운다.
+
+    티어 순서 = 정보량 순서: 벌크/전체재무제표(전 계정) > 주요계정(6개 계정).
+    콜드빌드가 며칠 걸리는 동안에도 주요계정이 전 종목을 덮고 있어 유니버스·규모버킷·
+    R3 팩터가 즉시 동작하고, 전체 재무제표가 도착하는 종목부터 TP 가 살아난다.
+    """
+    tiers = [t for t in tiers if nonempty(t)]
+    if not tiers:
+        return pd.DataFrame(columns=_FS_KEEP)
+    out = tiers[0]
+    for t in tiers[1:]:
+        keys = ("corp_code", "bsns_year", "reprt_code")
+        if not all(k in out.columns for k in keys) or not all(k in t.columns for k in keys):
+            out = pd.concat([out, t], ignore_index=True)
+            continue
+        have = set(zip(out["corp_code"].astype(str), out["bsns_year"].astype(int),
+                       out["reprt_code"].astype(str)))
+        key = list(zip(t["corp_code"].astype(str), t["bsns_year"].astype(int),
+                       t["reprt_code"].astype(str)))
+        fill = t[[k not in have for k in key]]
+        if len(fill):
+            LOG.info(f"하위 티어로 보완한 (회사×기간) "
+                     f"{fill.groupby(list(keys)).ngroups:,}건 — 상위 티어가 도착하면 자동 대체됩니다.")
+            out = pd.concat([out, fill], ignore_index=True)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -8091,124 +8356,159 @@ def _canary(cid: str, item: str, ok: bool, measured: str, action: str,
     (LOG.ok if ok else LOG.warn)(f"[{cid}] {item} — {'PASS' if ok else 'FAIL'} · {measured}")
 
 
+@contextmanager
+def _probe(cid: str, item: str, disables: Sequence[str] = ()):
+    """★ 프로브 하나의 예외가 CANARY 전체를 죽이지 않게 격리한다.
+
+    §1 의 설계는 "FAIL 항목에 의존하는 단계를 큐에서 제거하고 진행" 이다. 그런데 프로브가
+    예외를 던지면 스테이지가 critical 이라 실행 전체가 중단되어 설계와 정면으로 어긋난다.
+    실제로 K4 의 DataFrame truthiness 예외 하나가 CANARY 를 통째로 죽이고 사용자의
+    10년 백테스트를 시작조차 못 하게 만들었다.
+
+    예외는 삼키지 않는다 — FAIL 로 기록하고 예외 종류를 실측값에 남긴다. 즉 '조용히 넘어감'이
+    아니라 '이 항목은 실패했고 이유는 코드 예외'로 보고된다.
+    """
+    try:
+        yield
+    except KillCriteria:
+        raise                                   # K5 중단은 그대로 위로 올린다
+    except Exception as e:                      # noqa
+        _canary(cid, item, False,
+                f"프로브 예외 {type(e).__name__}: {str(e)[:80]}",
+                "이 항목에 의존하는 단계를 비활성화하고 진행합니다 (코드 결함일 수 있으니 "
+                "위 트레이스백 없이도 종류가 남도록 기록합니다)", disables)
+        LOG.debug(traceback.format_exc()[-800:])
+
+
 def run_canary(sample_codes: Sequence[str], sample_corps: Sequence[str]) -> pd.DataFrame:
     LOG.banner("CANARY (§1) — 코드가 의존하는 전제를 실측으로 확인",
                "FAIL 항목에 의존하는 단계는 큐에서 제거합니다. 추측으로 진행하지 않습니다.")
     smp = list(sample_codes)[:200]
     corps = list(sample_corps)[:200]
-
+    # ★ 프로브 간 공유 변수는 반드시 _probe 바깥에서 정의한다. 안에서 정의하면 그 프로브가
+    #   예외로 중단됐을 때 뒤 프로브가 NameError 를 내고, 격리의 의미가 사라진다.
+    probe = smp[:12] or ["005930", "000660", "035420"]
+    ok1 = False
     # ── K1 · K2  DART 재무정보 일괄다운로드 ────────────────────────────────────────────
-    t0 = time.time()
-    k1_rows, first_q = 0, None
-    k1_detail = "DART_API_KEY 미입력"
-    if DART_API_KEY:
-        names = _bulk_discover(2016, REPRT_CODES["Q1"]) or _bulk_candidates(2016, REPRT_CODES["Q1"])
-        raw = None
-        used = ""
-        for fl in names[:8]:
-            if time.time() - t0 > 180:
-                break
-            raw = _bulk_fetch_one(fl)
+    with _probe("K1", "DART 재무정보 일괄다운로드 2016Q1", {"bulk"}):
+        t0 = time.time()
+        k1_rows = 0
+        k1_detail = "DART_API_KEY 미입력"
+        if DART_API_KEY:
+            names, diag = _bulk_discover(2016, REPRT_CODES["Q1"])
+            if not names:
+                names = _bulk_candidates(2016, REPRT_CODES["Q1"])
+            raw, used = None, ""
+            for fl in names[:8]:
+                if time.time() - t0 > 180:
+                    break
+                raw = _bulk_fetch_one(fl)
+                if raw:
+                    used = fl
+                    break
             if raw:
-                used = fl
-                break
-        if raw:
-            t = _parse_bulk_txt(raw, 2016, REPRT_CODES["Q1"])
-            k1_rows = len(t)
-            k1_detail = f"{k1_rows:,}행 / {len(raw)/1e6:.1f}MB / {time.time()-t0:.1f}s / {used}"
-        else:
-            k1_detail = (f"후보 {len(names)}개 전부 실패 — 벌크는 공개 API 가 아니라 웹 "
-                         f"다운로드라 사이트 구조 변경에 취약합니다")
-    ok1 = k1_rows > 100_000
-    _canary("K1", "DART 재무정보 일괄다운로드 2016Q1", ok1, k1_detail,
-            "진행" if ok1 else "Fallback A(fnlttMultiAcnt 배치)로 전환 — 재고·매출채권·영업CF가 "
-                              "없어 TP_I2/TP_I4/TP_I1 이 약해집니다(§4.1)",
-            disables=() if ok1 else {"bulk"})
+                k1_rows = len(_parse_bulk_txt(raw, 2016, REPRT_CODES["Q1"]))
+                k1_detail = f"{k1_rows:,}행 / {len(raw)/1e6:.1f}MB / {time.time()-t0:.1f}s / {used}"
+            else:
+                # ★ "후보 N개 전부 실패" 만으로는 아무것도 고칠 수 없다. 페이지가 실제로
+                #   무엇을 돌려줬는지(상태·길이·로그인 여부·발견된 링크)를 남겨야
+                #   다음 실행 로그만 보고도 원인을 특정할 수 있다.
+                k1_detail = f"후보 {len(names)}개 실패 · {diag}"
+        _canary("K1", "DART 재무정보 일괄다운로드 2016Q1", k1_rows > 100_000, k1_detail,
+                "진행" if k1_rows > 100_000 else
+                "Fallback A(fnlttMultiAcnt 배치) → Fallback B(fnlttSinglAcntAll 이어받기)로 전환. "
+                "A 만으로는 재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽습니다(§4.1)",
+                disables=() if k1_rows > 100_000 else {"bulk"})
+        ok1 = k1_rows > 100_000
 
-    if ok1:
-        first_q = "2016Q1"
-        ok2 = True
-        k2_detail = "2016Q1 취득 성공 → 최초 제공 분기 ≤ 2016Q1"
-    else:
-        ok2 = False
-        k2_detail = "벌크 미취득으로 최초 제공 분기를 판정할 수 없음"
-    _canary("K2", "일괄다운로드 최초 제공 분기 ≤ 2016Q1", ok2, k2_detail,
-            "진행" if ok2 else "폴백 경로는 2016년부터 조회 가능하므로 백테스트 시작일은 유지합니다")
+    with _probe("K2", "일괄다운로드 최초 제공 분기 ≤ 2016Q1"):
+        _canary("K2", "일괄다운로드 최초 제공 분기 ≤ 2016Q1", ok1,
+                "2016Q1 취득 성공 → 최초 제공 분기 ≤ 2016Q1" if ok1
+                else "벌크 미취득으로 최초 제공 분기를 판정할 수 없음",
+                "진행" if ok1 else "폴백 경로는 2016년부터 조회 가능하므로 백테스트 시작일은 유지합니다")
 
     # ── K4  가격 10년 ─────────────────────────────────────────────────────────────────
-    #   ★ 시간 상한이 필수다. 소스가 전부 막힌 환경에서 20종목 × 4소스 × 재시도는
-    #     최악 30분 이상이고 §1 의 CANARY 예산(20분)을 카나리아 하나가 통째로 먹는다.
-    #     '몇 종목을 봤는지'를 함께 보고하면 조기 종료가 판정을 왜곡하지 않는다.
-    t0 = time.time()
-    n_ok, n_try, n_miss = 0, 0, []
-    probe = smp[:12] or ["005930", "000660", "035420"]
-    for c in probe:
-        if time.time() - t0 > 120:
-            break
-        n_try += 1
-        d = _px_fdr(c, BACKTEST_START, BACKTEST_END) or _px_naver(c, BACKTEST_START, BACKTEST_END)
-        if d is not None and len(d) > 1000:
-            n_ok += 1
-        else:
-            n_miss.append(c)
-    ok4 = n_try > 0 and n_ok >= max(1, int(0.9 * n_try))
-    _canary("K4", "가격 10년 취득 (FDR→네이버→yfinance)", ok4,
-            f"{n_ok}/{n_try} 성공 ({time.time()-t0:.1f}s"
-            + (", 시간상한 조기종료" if n_try < len(probe) else "") + ")"
-            + (f" · 실패 예시 {n_miss[:4]}" if n_miss else ""),
-            "진행" if ok4 else "폴백 체인으로 계속하되 커버리지 감소를 감안하세요. "
-                              "전부 실패라면 네트워크에서 fchart.stock.naver.com 접근을 확인하세요")
+    with _probe("K4", "가격 10년 취득"):
+        #   ★ 시간 상한이 필수다. 소스가 전부 막힌 환경에서 20종목 × 4소스 × 재시도는
+        #     최악 30분 이상이고 §1 의 CANARY 예산(20분)을 카나리아 하나가 통째로 먹는다.
+        #     '몇 종목을 봤는지'를 함께 보고하면 조기 종료가 판정을 왜곡하지 않는다.
+        t0 = time.time()
+        n_ok, n_try, n_miss = 0, 0, []
+        for c in probe:
+            if time.time() - t0 > 120:
+                break
+            n_try += 1
+            # ★ `_px_fdr(...) or _px_naver(...)` 로 쓰면 안 된다. DataFrame 에 or 를 걸면
+            #   __bool__ 이 호출되어 ValueError 로 죽는데, FDR 이 막힌 환경에서는 None 이 돌아와
+            #   `None or x` 로 조용히 통과한다 — 소스가 살아 있는 실환경에서만 터진다.
+            d = first_nonempty(lambda: _px_fdr(c, BACKTEST_START, BACKTEST_END),
+                               lambda: _px_naver(c, BACKTEST_START, BACKTEST_END),
+                               lambda: _px_yf(c, BACKTEST_START, BACKTEST_END))
+            if nonempty(d) and len(d) > 1000:
+                n_ok += 1
+            else:
+                n_miss.append(c)
+        ok4 = n_try > 0 and n_ok >= max(1, int(0.9 * n_try))
+        _canary("K4", "가격 10년 취득 (FDR→네이버→yfinance)", ok4,
+                f"{n_ok}/{n_try} 성공 ({time.time()-t0:.1f}s"
+                + (", 시간상한 조기종료" if n_try < len(probe) else "") + ")"
+                + (f" · 실패 예시 {n_miss[:4]}" if n_miss else ""),
+                "진행" if ok4 else "폴백 체인으로 계속하되 커버리지 감소를 감안하세요. "
+                                  "전부 실패라면 네트워크에서 fchart.stock.naver.com 접근을 확인하세요")
 
     # ── K5  상장폐지 목록 (C2) ★ FAIL 이면 중단 ────────────────────────────────────────
-    t0 = time.time()
-    dead = fetch_fdr_delisting()
-    n_dead = 0
-    if dead is not None and len(dead):
-        dd = as_ts_series(dead["delisting_date"])
-        n_dead = int(((dd >= as_ts(BACKTEST_START)) & (dd <= as_ts(BACKTEST_END))).sum())
-    ok5 = n_dead >= 200
-    _canary("K5", "상장폐지 목록 (생존자편향 제거 · C2)", ok5,
-            f"전체 {len(dead) if dead is not None else 0:,}건 · 백테스트 구간 내 {n_dead:,}건 "
-            f"({time.time()-t0:.1f}s)",
-            "진행" if ok5 else "⛔ 중단 — 생존자편향을 제거할 수 없으면 어떤 성과 숫자도 "
-                              "의미가 없습니다(§11-1)",
-            disables=() if ok5 else {"__abort__"})
+    with _probe("K5", "상장폐지 목록 (C2)"):
+        t0 = time.time()
+        dead = fetch_fdr_delisting()
+        n_dead = 0
+        if dead is not None and len(dead):
+            dd = as_ts_series(dead["delisting_date"])
+            n_dead = int(((dd >= as_ts(BACKTEST_START)) & (dd <= as_ts(BACKTEST_END))).sum())
+        ok5 = n_dead >= 200
+        _canary("K5", "상장폐지 목록 (생존자편향 제거 · C2)", ok5,
+                f"전체 {len(dead) if dead is not None else 0:,}건 · 백테스트 구간 내 {n_dead:,}건 "
+                f"({time.time()-t0:.1f}s)",
+                "진행" if ok5 else "⛔ 중단 — 생존자편향을 제거할 수 없으면 어떤 성과 숫자도 "
+                                  "의미가 없습니다(§11-1)",
+                disables=() if ok5 else {"__abort__"})
 
     # ── K6  KRX 투자자별 수급 ──────────────────────────────────────────────────────────
-    t0 = time.time()
-    n6 = 0
-    if pykrx_stock is not None:
-        KRXG.warmup()
-        for c in probe[:5]:
-            r = KRXG.call(pykrx_stock.get_market_trading_value_by_date,
-                          "20240102", "20240131", c)
-            if r is not None and len(r):
-                n6 += 1
-    ok6 = n6 >= 3
-    _canary("K6", "KRX 투자자별 수급", ok6,
-            f"표본 5종목 중 {n6} 성공 ({time.time()-t0:.1f}s)"
-            + ("" if pykrx_stock is not None else " · pykrx 미설치"),
-            "진행" if ok6 else "d3 비활성화 — U 를 d1 단독으로 구성합니다(§1 K6)",
-            disables=() if ok6 else {"d3"})
+    with _probe("K6", "KRX 투자자별 수급", {"d3"}):
+        t0 = time.time()
+        n6 = 0
+        if pykrx_stock is not None:
+            KRXG.warmup()
+            for c in probe[:5]:
+                r = KRXG.call(pykrx_stock.get_market_trading_value_by_date,
+                              "20240102", "20240131", c)
+                if r is not None and len(r):
+                    n6 += 1
+        ok6 = n6 >= 3
+        _canary("K6", "KRX 투자자별 수급", ok6,
+                f"표본 5종목 중 {n6} 성공 ({time.time()-t0:.1f}s)"
+                + ("" if pykrx_stock is not None else " · pykrx 미설치"),
+                "진행" if ok6 else "d3 비활성화 — U 를 d1 단독으로 구성합니다(§1 K6)",
+                disables=() if ok6 else {"d3"})
 
     # ── K7  DART empSttus (직원현황) ──────────────────────────────────────────────────
-    t0 = time.time()
-    n7, tried = 0, 0
-    if DART_API_KEY and corps:
-        for cc in corps[:20]:
-            if time.time() - t0 > 90:
-                break
-            tried += 1
-            js = dart_api("empSttus.json", {"corp_code": str(cc), "bsns_year": "2016",
-                                            "reprt_code": REPRT_CODES["FY"]})
-            if js and isinstance(js.get("list"), list) and js["list"]:
-                n7 += 1
-    rate7 = n7 / max(tried, 1)
-    ok7 = rate7 >= 0.80
-    _canary("K7", "DART empSttus 2016 응답률 ≥ 80%", ok7,
-            f"{n7}/{tried} = {100*rate7:.0f}% ({time.time()-t0:.1f}s)",
-            "진행" if ok7 else "TP_I3(인원↑인데 생산성 유지) 비활성화(§1 K7)",
-            disables=() if ok7 else {"TP_I3"})
+    with _probe("K7", "DART empSttus", {"TP_I3"}):
+        t0 = time.time()
+        n7, tried = 0, 0
+        if DART_API_KEY and corps:
+            for cc in corps[:20]:
+                if time.time() - t0 > 90:
+                    break
+                tried += 1
+                js = dart_api("empSttus.json", {"corp_code": str(cc), "bsns_year": "2016",
+                                                "reprt_code": REPRT_CODES["FY"]})
+                if js and isinstance(js.get("list"), list) and js["list"]:
+                    n7 += 1
+        rate7 = n7 / max(tried, 1)
+        ok7 = rate7 >= 0.80
+        _canary("K7", "DART empSttus 2016 응답률 ≥ 80%", ok7,
+                f"{n7}/{tried} = {100*rate7:.0f}% ({time.time()-t0:.1f}s)",
+                "진행" if ok7 else "TP_I3(인원↑인데 생산성 유지) 비활성화(§1 K7)",
+                disables=() if ok7 else {"TP_I3"})
 
     # ── K3  필수 계정 태그 커버리지 — 본 수집 후 report_account_coverage 가 본선 판정 ──
     _canary("K3", "필수 계정 태그 커버리지 ≥ 85%", True,
@@ -8491,6 +8791,30 @@ def run_contract_tests(strict: bool = True) -> bool:
     _t("C10", "모든 단계가 계측된다 (추측 금지)",
        any(r["stage"] == "selftest.probe" for r in RUNTIME_LOG))
 
+    # ── 폴백 체인이 DataFrame 진리값에서 죽지 않는다 ──────────────────────────────────
+    #   ★ 이 결함은 '소스가 막힌 환경에서만 통과'한다. 개발 중엔 _px_fdr 이 None 을 돌려줘
+    #     `None or x` 로 조용히 지나가고, 소스가 살아 있는 실환경에서만 ValueError 로 죽었다.
+    #     그래서 두 방향을 다 검정한다: ① 올바른 관용구가 동작하는가 ② 잘못된 관용구가
+    #     실제로 죽는가(죽지 않는다면 이 검정 자체가 무의미해진 것이다).
+    _df = pd.DataFrame({"a": [1, 2, 3]})
+    ok_chain = False
+    try:
+        got = first_nonempty(lambda: None, lambda: pd.DataFrame(), lambda: _df,
+                             lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        ok_chain = isinstance(got, pd.DataFrame) and len(got) == 3
+    except Exception:
+        ok_chain = False
+    raises = False
+    try:
+        _ = (_df or pd.DataFrame())          # 예전 관용구 — 반드시 죽어야 한다
+    except ValueError:
+        raises = True
+    _t("CHAIN", "폴백 체인이 DataFrame 에서 죽지 않는다 (first_nonempty)",
+       ok_chain and raises,
+       f"체인 정상 {ok_chain} · 구 관용구(`df or x`)가 여전히 ValueError 를 냄 {raises}")
+    _t("CHAIN-ERR", "체인 중간 소스의 예외가 전체를 죽이지 않는다",
+       first_nonempty(lambda: (_ for _ in ()).throw(RuntimeError("x")), lambda: _df) is not None)
+
     # ── 혼합 포맷 날짜 (재실행 경로의 조용한 유실) ───────────────────────────────────
     mixed = pd.Series([pd.Timestamp("2016-01-15"), "2016-01-15", "2016/01/15",
                        "20160115", None, ""])
@@ -8531,6 +8855,9 @@ def _vault_integrity_test() -> Tuple[str, str, bool, str]:
     global VAULT
     keep = VAULT
     tmp = tempfile.mkdtemp(prefix="tcd_vault_selftest_")
+    # 자가검정은 금고를 3회 재적재하므로 정보 로그가 8회쯤 반복된다. 검정 동안만 조용히 한다
+    # (경고·오류는 그대로 통과시킨다 — 진짜 문제를 숨기면 안 된다).
+    _lvl, LOG.min = LOG.min, LOG.LEVELS["WARN"]
     try:
         V = Vault(tmp, "SELFTEST")
         VAULT = globals()["VAULT"] = V
@@ -8572,6 +8899,7 @@ def _vault_integrity_test() -> Tuple[str, str, bool, str]:
         return ("VAULT", "기존 캐시·인덱스 훼손 불가 (절대 1원칙)", False,
                 f"{type(e).__name__}: {str(e)[:60]}")
     finally:
+        LOG.min = _lvl
         VAULT = globals()["VAULT"] = keep
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -8761,12 +9089,33 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         ctx["disclosures"] = dis
         kmap = build_knowledge_map(dis)
         reprts = [REPRT_CODES[k] for k in ("Q1", "H1", "Q3", "FY")]
-        raw = pd.DataFrame()
-        if "bulk" not in DISABLED:
-            raw = fetch_dart_bulk(years, reprts)
-        if raw is None or raw.empty:
-            corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-            raw = fetch_dart_multi(corps, years, reprts)
+        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+        # 유동성 상위 종목의 corp_code 를 우선순위로 넘긴다 — 일일 한도로 끊겨도
+        # '투자 가능한 종목의 최근 데이터'가 먼저 완성되게 하기 위함이다.
+        prio: List[str] = []
+        try:
+            adv = (ctx["pp"]["monthly"].groupby("code", observed=True)["adv20"]
+                   .median().sort_values(ascending=False))
+            c2c = (ctx["sec"].dropna(subset=["corp_code"])
+                   .assign(corp_code=lambda d: d["corp_code"].astype(str))
+                   .set_index("code")["corp_code"].to_dict())
+            prio = [c2c[c] for c in adv.index if c in c2c]
+        except Exception:
+            prio = []
+
+        # ── §4.1 3단 티어. 정보량 순으로 쌓고, 상위 티어가 없는 조합만 하위가 메운다 ──
+        #   Tier1 벌크            : 전 계정 · 1회 다운로드 (최선)
+        #   Tier3 fnlttSinglAcntAll: 전 계정 · 단건(며칠 소요, 이어받기)
+        #   Tier2 fnlttMultiAcnt  : 주요계정 6개 · 배치(즉시) — '바닥'을 싸게 깐다
+        t_bulk = fetch_dart_bulk(years, reprts) if "bulk" not in DISABLED else pd.DataFrame()
+        t_multi = fetch_dart_multi(corps, years, reprts)
+        t_full = pd.DataFrame()
+        if not nonempty(t_bulk):
+            LOG.warn("벌크가 비어 Fallback B(fnlttSinglAcntAll)를 가동합니다. 주요계정만으로는 "
+                     "재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽기 때문입니다 — "
+                     "이 경로 없이 나온 성과는 '코어가 빠진 전략'의 성과입니다.")
+            t_full = fetch_dart_full(corps, years, priority=prio)
+        raw = merge_financial_tiers(t_bulk, t_full, t_multi)
         ctx["fin"] = tidy_financials(raw, kmap, ctx.get("code_of_corp"))
         ctx["weak_tp"] = report_account_coverage()
 
@@ -8915,7 +9264,12 @@ def main() -> dict:
                 LOG.warn("여유 공간 2GB 미만 — RESEARCH_DOWNLOAD_PDF=False 를 권합니다.")
         VAULT.load_index("shared")
         VAULT.load_index("private")
-        VAULT.adopt_scan(GDRIVE_ADOPT_DIRS)
+        # 설정된 경로 + 플랫폼별 자동 탐지. 손으로 경로를 고치지 않아도 이미 모아둔
+        # 리포트를 찾아낸다(읽기 전용 등록 — 이동·삭제 없음).
+        adopt = list(dict.fromkeys(list(GDRIVE_ADOPT_DIRS) + discover_drive_dirs(VAULT.root)))
+        LOG.info(f"기존 캐시 스캔 대상 {len(adopt)}곳 (설정 {len(GDRIVE_ADOPT_DIRS)} + 자동탐지 "
+                 f"{len(adopt) - len(GDRIVE_ADOPT_DIRS)})")
+        VAULT.adopt_scan(adopt)
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
@@ -8942,12 +9296,28 @@ def main() -> dict:
     months = month_range(BACKTEST_START, BACKTEST_END)
     stage = STAGE if STAGE in STAGE_ORDER else "M3"
 
-    with PIPE.stage("CANARY", "CANARY K1~K7", "L0", budget_s=1500), Stage("CANARY", 20):
-        probe_sec = fetch_fdr_listing()
-        probe_codes = probe_sec["code"].dropna().astype(str).tolist()[:200] if len(probe_sec) else []
-        cc = fetch_dart_corpcode()
-        probe_corps = cc.dropna(subset=["code"])["corp_code"].astype(str).tolist()[:200] \
-            if len(cc) else []
+    # ★ 스테이지 밖에서 초기화한다. 안에서만 대입하면 CANARY 가 예외로 죽었을 때
+    #   L0.PERSIST 의 참조가 UnboundLocalError 를 내고, 그러면 '왜 죽었는지'를 담은
+    #   산출물 저장 자체가 실패해 진단 정보를 잃는다.
+    ctx_canary = pd.DataFrame()
+    with PIPE.stage("CANARY", "CANARY K1~K7", "L0", budget_s=1500, critical=False), \
+            Stage("CANARY", 20):
+        # ★ critical=False. §1 의 설계는 "FAIL 항목에 의존하는 단계를 큐에서 제거하고 진행"
+        #   이다. CANARY 가 전체 실행을 죽이면 그 설계와 정면으로 어긋난다.
+        #   진짜 중단 사유(K5 상장폐지 미확보)는 KillCriteria 로 별도 전파된다.
+        probe_codes, probe_corps = [], []
+        try:
+            probe_sec = fetch_fdr_listing()
+            if nonempty(probe_sec):
+                probe_codes = probe_sec["code"].dropna().astype(str).tolist()[:200]
+        except Exception as e:                                   # noqa
+            LOG.warn(f"CANARY 표본 종목 확보 실패({type(e).__name__}) — 기본 표본으로 진행합니다.")
+        try:
+            cc = fetch_dart_corpcode()
+            if nonempty(cc):
+                probe_corps = cc.dropna(subset=["code"])["corp_code"].astype(str).tolist()[:200]
+        except Exception as e:                                   # noqa
+            LOG.warn(f"CANARY corp_code 확보 실패({type(e).__name__}) — K7 은 건너뜁니다.")
         ctx_canary = run_canary(probe_codes, probe_corps)
 
     ctx = collect_all(months, stage)

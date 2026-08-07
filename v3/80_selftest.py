@@ -252,6 +252,30 @@ def run_contract_tests(strict: bool = True) -> bool:
     _t("C10", "모든 단계가 계측된다 (추측 금지)",
        any(r["stage"] == "selftest.probe" for r in RUNTIME_LOG))
 
+    # ── 폴백 체인이 DataFrame 진리값에서 죽지 않는다 ──────────────────────────────────
+    #   ★ 이 결함은 '소스가 막힌 환경에서만 통과'한다. 개발 중엔 _px_fdr 이 None 을 돌려줘
+    #     `None or x` 로 조용히 지나가고, 소스가 살아 있는 실환경에서만 ValueError 로 죽었다.
+    #     그래서 두 방향을 다 검정한다: ① 올바른 관용구가 동작하는가 ② 잘못된 관용구가
+    #     실제로 죽는가(죽지 않는다면 이 검정 자체가 무의미해진 것이다).
+    _df = pd.DataFrame({"a": [1, 2, 3]})
+    ok_chain = False
+    try:
+        got = first_nonempty(lambda: None, lambda: pd.DataFrame(), lambda: _df,
+                             lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        ok_chain = isinstance(got, pd.DataFrame) and len(got) == 3
+    except Exception:
+        ok_chain = False
+    raises = False
+    try:
+        _ = (_df or pd.DataFrame())          # 예전 관용구 — 반드시 죽어야 한다
+    except ValueError:
+        raises = True
+    _t("CHAIN", "폴백 체인이 DataFrame 에서 죽지 않는다 (first_nonempty)",
+       ok_chain and raises,
+       f"체인 정상 {ok_chain} · 구 관용구(`df or x`)가 여전히 ValueError 를 냄 {raises}")
+    _t("CHAIN-ERR", "체인 중간 소스의 예외가 전체를 죽이지 않는다",
+       first_nonempty(lambda: (_ for _ in ()).throw(RuntimeError("x")), lambda: _df) is not None)
+
     # ── 혼합 포맷 날짜 (재실행 경로의 조용한 유실) ───────────────────────────────────
     mixed = pd.Series([pd.Timestamp("2016-01-15"), "2016-01-15", "2016/01/15",
                        "20160115", None, ""])
@@ -292,6 +316,9 @@ def _vault_integrity_test() -> Tuple[str, str, bool, str]:
     global VAULT
     keep = VAULT
     tmp = tempfile.mkdtemp(prefix="tcd_vault_selftest_")
+    # 자가검정은 금고를 3회 재적재하므로 정보 로그가 8회쯤 반복된다. 검정 동안만 조용히 한다
+    # (경고·오류는 그대로 통과시킨다 — 진짜 문제를 숨기면 안 된다).
+    _lvl, LOG.min = LOG.min, LOG.LEVELS["WARN"]
     try:
         V = Vault(tmp, "SELFTEST")
         VAULT = globals()["VAULT"] = V
@@ -333,6 +360,7 @@ def _vault_integrity_test() -> Tuple[str, str, bool, str]:
         return ("VAULT", "기존 캐시·인덱스 훼손 불가 (절대 1원칙)", False,
                 f"{type(e).__name__}: {str(e)[:60]}")
     finally:
+        LOG.min = _lvl
         VAULT = globals()["VAULT"] = keep
         shutil.rmtree(tmp, ignore_errors=True)
 
