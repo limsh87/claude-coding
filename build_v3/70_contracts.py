@@ -136,6 +136,51 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     _cc("원칙2", "TP = clip(z,0) × clip(z,0) — z×z 금지", p2)
 
+    # ── C1b : 수급(d3) 경로의 행 정렬 무결성 ──────────────────────────────────────────────
+    def c1b():
+        """★ 실제로 터졌던 미래누수를 고정하는 회귀 테스트.
+
+        `f["month"] = as_ts_series(<ndarray>)` 는 값은 위치로 계산하고 배치는 라벨로 하는
+        대입이다. flows 가 구멍 난 인덱스로 들어오거나 sort_values 가 순서를 바꾸면
+        다른 종목·다른 날짜의 달이 그 행에 실리고, 미래 수급이 과거 달로 흘러든다.
+        d3 는 PIT.asof_join 을 타지 않으므로 C1 이 잡지 못한다 — 그래서 따로 검정한다.
+        """
+        # ★ 표본은 반드시 rolling(120, min_periods=40) 이 실제로 값을 내는 크기여야 한다.
+        #   월 30행짜리로 만들면 cum120 이 전부 NaN 이라 아래 검사가 공회전하고,
+        #   버그가 있어도 통과한다(검정 같아 보이지만 아무것도 재지 않는 테스트).
+        days = pd.bdate_range("2020-01-01", periods=320)
+        rows = []
+        for c in ("000002", "000001"):                 # 정렬 전 순서를 일부러 역순으로
+            for i, d in enumerate(days):
+                # 순매수를 시간에 따라 증가시킨다 → 120일 누적도 시간 단조 증가해야 한다
+                rows.append({"code": c, "date": d, "inst_net": float(i), "foreign_net": 0.0})
+        fl = pd.DataFrame(rows)
+        fl = fl[fl.index % 7 != 3]                     # 인덱스에 구멍 (필터/concat 의 정상 결과)
+        months = pd.DatetimeIndex(sorted(set(days + pd.offsets.MonthEnd(0))))
+        P = pd.DataFrame({"code": np.repeat(["000001", "000002"], len(months)),
+                          "month": list(months) * 2, "close": 1000.0, "adv20": 1e9,
+                          "net_income_ttm": 1e10})
+        P["cell"] = P["cell_l2"] = P["cell_l3"] = "C"
+        out = axis_U_v3(P, fl)
+        if "cum120" not in out.columns:
+            return False, "수급 결합이 일어나지 않았습니다 — d3 경로가 죽어 있습니다"
+        obs = out["cum120"].notna().sum()
+        if obs < 8:
+            return False, (f"cum120 유효 관측이 {obs}건뿐입니다 — 표본이 롤링 창을 못 채웠거나 "
+                           f"월 배치가 어긋나 대량 결측(NaT)이 발생했습니다")
+        # 시간이 흐를수록 누적순매수가 커져야 한다. 미래 값이 과거 달에 실리면 단조성이 깨진다.
+        bad = 0
+        for c, g in out.dropna(subset=["cum120"]).groupby("code"):
+            s = g.sort_values("month")["cum120"].to_numpy()
+            bad += int((np.diff(s) < -1e-9).sum())
+        if bad:
+            return False, (f"★수급 누적값이 시간 역행하는 구간 {bad}건 — 행 정렬이 어긋나 "
+                           f"미래 수급이 과거 달에 실렸습니다(d3→U→Signal 오염)")
+        return True, (f"구멍 난 인덱스·역순 입력에서도 월 배치가 행과 일치 "
+                      f"(표본 {len(fl):,}행 · cum120 유효 {obs}건 · 시간 단조성 유지)")
+
+    _cc("C1b", "수급(d3) 행 정렬 — 미래 수급 유입 차단", c1b)
+
     # ── 원칙 3 : 셀 정규화에 groupby.apply 금지 ───────────────────────────────────────────
     def p3():
         src = _src_of(cell_rank, cell_z, _rank_in)

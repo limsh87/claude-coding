@@ -91,9 +91,17 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     try:
         time.sleep(0.05 + random.random() * 0.10)          # §5 — 0.05~0.15s 지연
         js = dart_api("empSttus.json", {"corp_code": str(corp), "bsns_year": str(int(year)),
-                                        "reprt_code": REPRT_CODES["FY"]})
+                                        "reprt_code": REPRT_CODES["FY"]}, no_data_ok=True)
     except Exception:
         _emp_cb_mark(False)
+        return None
+    # ★ '그 해에 사업보고서를 안 낸 회사'(status 013)는 **정상 응답**이지 실패가 아니다.
+    #   실패로 세면 서킷브레이커가 정상 데이터만으로 터진다: 잡 격자가 corp × year 라
+    #   신규상장사·폐지사는 초기/말기 연도가 통째로 013 이고, 12개 스레드가 공유하는
+    #   연속실패 카운터는 그런 회사 몇 곳이면 15에 도달한다. 그러면 아직 받지 않은
+    #   수천 건을 전부 포기하고, 로그에는 '차단당한 것 같다'는 오해를 남긴다.
+    if isinstance(js, dict) and str(js.get("status", "")) == "013":
+        _emp_cb_mark(True)
         return None
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
         _emp_cb_mark(False)

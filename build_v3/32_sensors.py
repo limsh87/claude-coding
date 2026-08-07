@@ -265,7 +265,26 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
                | col(P, "dep_ttm").notna())
     P["value_added"] = va.where(any_obs)
     P["va_per_emp"] = safe_div(P["value_added"], col(P, "employees"))
-    P["nl_vapp"] = g("va_per_emp").diff(12)
+
+    # ★★ 구성이 바뀐 채로 차분하면 '경제'가 아니라 '공시 완비도'를 잰다 ★★
+    #   3항목을 각각 fillna(0) 하므로, 급여총액이 작년엔 결측이고 올해는 기재된 회사는
+    #   부가가치가 실제로 늘지 않았는데도 nl_vapp 가 급등한다. 한국 중형주에서 인건비는
+    #   부가가치의 지배적 항이고 payroll_total 은 설계상(단위 불일치 폐기·무기재) 상당수가
+    #   결측이므로 이 인공 점프는 드물지 않다. TP_N2 는 그걸 '희석 없는 확장'으로 읽는다.
+    #   → t 와 t-12 의 **관측 패턴이 동일할 때만** 차분한다. 수준(value_added)은 건드리지 않는다.
+    comp = (col(P, "op_income_ttm").notna().astype(int) * 4
+            + col(P, "payroll_total").notna().astype(int) * 2
+            + col(P, "dep_ttm").notna().astype(int))
+    P["_va_comp"] = comp
+    same_comp = comp == g("_va_comp").shift(12)
+    raw_vapp = g("va_per_emp").diff(12)
+    P["nl_vapp"] = raw_vapp.where(same_comp.fillna(False))
+    n_drop = int((raw_vapp.notna() & ~same_comp.fillna(False)).sum())
+    if n_drop:
+        LOG.info(f"nl_vapp — 부가가치 3항목(영업이익·인건비·감가상각)의 관측 구성이 전년과 "
+                 f"달라진 {n_drop:,}행을 결측 처리했습니다. 그대로 두면 '공시가 새로 생긴 것'이 "
+                 f"'생산성이 좋아진 것'으로 계산됩니다.")
+    P = P.drop(columns=["_va_comp"], errors="ignore")
 
     if emp_start is not None:
         pre = P["month"] < as_ts(emp_start)
@@ -361,7 +380,10 @@ def axis_U_v3(P: pd.DataFrame, flows: Optional[pd.DataFrame]) -> pd.DataFrame:
     # d3: 120일 기관+외국인 누적순매수 (부호 반전 — 아직 안 들어온 쪽이 좋다)
     P["d3"] = np.nan
     if flows is not None and len(flows):
-        f = flows.copy()
+        # ★ 인덱스를 즉시 리셋한다. 아래 컬럼 대입들은 '라벨 정렬'로 동작하는데, flows 는
+        #   불리언 필터·concat·부분 갱신을 거쳐 구멍 난 인덱스로 들어오는 것이 정상이다.
+        #   라벨과 위치가 어긋난 채로 대입하면 다른 종목·다른 날짜의 값이 그 행에 실린다.
+        f = flows.copy().reset_index(drop=True)
         f["date"] = as_ts_series(f["date"])
         inst = pd.to_numeric(f["inst_net"], errors="coerce") if "inst_net" in f.columns else 0.0
         fore = pd.to_numeric(f["foreign_net"], errors="coerce") if "foreign_net" in f.columns else 0.0
@@ -369,7 +391,16 @@ def axis_U_v3(P: pd.DataFrame, flows: Optional[pd.DataFrame]) -> pd.DataFrame:
         f = f.sort_values(["code", "date"])
         f["cum120"] = (f.groupby("code", observed=True)["net"]
                         .transform(lambda s: s.rolling(120, min_periods=40).sum()))
-        f["month"] = as_ts_series(f["date"].values.astype("datetime64[M]")) + pd.offsets.MonthEnd(0)
+        # ★★ 미래누수 지점 ★★ 절대로 as_ts_series(<ndarray>) 를 컬럼에 대입하지 말 것.
+        #   as_ts_series 는 ndarray 를 받으면 0..N-1 짜리 **새 인덱스**를 단 Series 를 돌려준다.
+        #   그런데 `f["month"] = <Series>` 는 **라벨 정렬** 대입이다. 값은 위치 기준으로 계산돼
+        #   있는데 배치는 라벨 기준으로 일어나므로, 바로 위 sort_values 가 순서를 바꾼 순간
+        #   위치 p 의 행이 라벨 p 짜리 다른 행의 달을 받는다. 프레임이 종목-major 라
+        #   2026년 A종목 행이 2016년 B종목의 달을 받는 일이 일상적으로 생기고,
+        #   groupby(code, month).last() 가 그 미래 누적수급을 과거 달에 실어 보낸다
+        #   → d3 → U → Signal. 전 종목 선정 랭킹이 최대 수년치 미래 정보로 오염된다.
+        #   date 는 이미 Series 이므로 그대로 더하면 인덱스가 구조적으로 어긋날 수 없다.
+        f["month"] = f["date"] + pd.offsets.MonthEnd(0)
         fm = f.groupby(["code", "month"], observed=True)["cum120"].last().reset_index()
         P = P.merge(fm, on=["code", "month"], how="left")
         adv = col(P, "adv20").replace(0, np.nan)

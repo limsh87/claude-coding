@@ -234,7 +234,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260807.2125"
+BUILD_VERSION  = "v3.20260807.2232"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -3586,7 +3586,7 @@ DBUDGET: Optional[DartBudget] = None
 
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
-             tries: int = 2) -> Optional[dict]:
+             tries: int = 2, no_data_ok: bool = False) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
     호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
     → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
@@ -3615,6 +3615,12 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
                       f"DART_API_KEY 를 확인하세요.")
         elif st != "013":
             LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
+        # ★ 013("조회된 데이터 없음")은 통신 실패가 아니라 **정상 응답**이다. 그런데 None 으로
+        #   뭉개면 호출자가 '실패'와 구별할 수 없다. 서킷브레이커를 둔 호출자에게 이건 치명적이다
+        #   — 그 해에 사업보고서를 안 낸 회사가 몇 곳만 연속돼도 브레이커가 터져 남은 수집을
+        #   통째로 포기한다. 원하는 호출자만 opt-in 으로 빈 응답을 받아 구별할 수 있게 한다.
+        if st == "013" and no_data_ok:
+            return {"status": "013", "list": []}
         return None
     return js
 
@@ -5877,9 +5883,17 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     try:
         time.sleep(0.05 + random.random() * 0.10)          # §5 — 0.05~0.15s 지연
         js = dart_api("empSttus.json", {"corp_code": str(corp), "bsns_year": str(int(year)),
-                                        "reprt_code": REPRT_CODES["FY"]})
+                                        "reprt_code": REPRT_CODES["FY"]}, no_data_ok=True)
     except Exception:
         _emp_cb_mark(False)
+        return None
+    # ★ '그 해에 사업보고서를 안 낸 회사'(status 013)는 **정상 응답**이지 실패가 아니다.
+    #   실패로 세면 서킷브레이커가 정상 데이터만으로 터진다: 잡 격자가 corp × year 라
+    #   신규상장사·폐지사는 초기/말기 연도가 통째로 013 이고, 12개 스레드가 공유하는
+    #   연속실패 카운터는 그런 회사 몇 곳이면 15에 도달한다. 그러면 아직 받지 않은
+    #   수천 건을 전부 포기하고, 로그에는 '차단당한 것 같다'는 오해를 남긴다.
+    if isinstance(js, dict) and str(js.get("status", "")) == "013":
+        _emp_cb_mark(True)
         return None
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
         _emp_cb_mark(False)
@@ -6607,7 +6621,26 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
                | col(P, "dep_ttm").notna())
     P["value_added"] = va.where(any_obs)
     P["va_per_emp"] = safe_div(P["value_added"], col(P, "employees"))
-    P["nl_vapp"] = g("va_per_emp").diff(12)
+
+    # ★★ 구성이 바뀐 채로 차분하면 '경제'가 아니라 '공시 완비도'를 잰다 ★★
+    #   3항목을 각각 fillna(0) 하므로, 급여총액이 작년엔 결측이고 올해는 기재된 회사는
+    #   부가가치가 실제로 늘지 않았는데도 nl_vapp 가 급등한다. 한국 중형주에서 인건비는
+    #   부가가치의 지배적 항이고 payroll_total 은 설계상(단위 불일치 폐기·무기재) 상당수가
+    #   결측이므로 이 인공 점프는 드물지 않다. TP_N2 는 그걸 '희석 없는 확장'으로 읽는다.
+    #   → t 와 t-12 의 **관측 패턴이 동일할 때만** 차분한다. 수준(value_added)은 건드리지 않는다.
+    comp = (col(P, "op_income_ttm").notna().astype(int) * 4
+            + col(P, "payroll_total").notna().astype(int) * 2
+            + col(P, "dep_ttm").notna().astype(int))
+    P["_va_comp"] = comp
+    same_comp = comp == g("_va_comp").shift(12)
+    raw_vapp = g("va_per_emp").diff(12)
+    P["nl_vapp"] = raw_vapp.where(same_comp.fillna(False))
+    n_drop = int((raw_vapp.notna() & ~same_comp.fillna(False)).sum())
+    if n_drop:
+        LOG.info(f"nl_vapp — 부가가치 3항목(영업이익·인건비·감가상각)의 관측 구성이 전년과 "
+                 f"달라진 {n_drop:,}행을 결측 처리했습니다. 그대로 두면 '공시가 새로 생긴 것'이 "
+                 f"'생산성이 좋아진 것'으로 계산됩니다.")
+    P = P.drop(columns=["_va_comp"], errors="ignore")
 
     if emp_start is not None:
         pre = P["month"] < as_ts(emp_start)
@@ -6703,7 +6736,10 @@ def axis_U_v3(P: pd.DataFrame, flows: Optional[pd.DataFrame]) -> pd.DataFrame:
     # d3: 120일 기관+외국인 누적순매수 (부호 반전 — 아직 안 들어온 쪽이 좋다)
     P["d3"] = np.nan
     if flows is not None and len(flows):
-        f = flows.copy()
+        # ★ 인덱스를 즉시 리셋한다. 아래 컬럼 대입들은 '라벨 정렬'로 동작하는데, flows 는
+        #   불리언 필터·concat·부분 갱신을 거쳐 구멍 난 인덱스로 들어오는 것이 정상이다.
+        #   라벨과 위치가 어긋난 채로 대입하면 다른 종목·다른 날짜의 값이 그 행에 실린다.
+        f = flows.copy().reset_index(drop=True)
         f["date"] = as_ts_series(f["date"])
         inst = pd.to_numeric(f["inst_net"], errors="coerce") if "inst_net" in f.columns else 0.0
         fore = pd.to_numeric(f["foreign_net"], errors="coerce") if "foreign_net" in f.columns else 0.0
@@ -6711,7 +6747,16 @@ def axis_U_v3(P: pd.DataFrame, flows: Optional[pd.DataFrame]) -> pd.DataFrame:
         f = f.sort_values(["code", "date"])
         f["cum120"] = (f.groupby("code", observed=True)["net"]
                         .transform(lambda s: s.rolling(120, min_periods=40).sum()))
-        f["month"] = as_ts_series(f["date"].values.astype("datetime64[M]")) + pd.offsets.MonthEnd(0)
+        # ★★ 미래누수 지점 ★★ 절대로 as_ts_series(<ndarray>) 를 컬럼에 대입하지 말 것.
+        #   as_ts_series 는 ndarray 를 받으면 0..N-1 짜리 **새 인덱스**를 단 Series 를 돌려준다.
+        #   그런데 `f["month"] = <Series>` 는 **라벨 정렬** 대입이다. 값은 위치 기준으로 계산돼
+        #   있는데 배치는 라벨 기준으로 일어나므로, 바로 위 sort_values 가 순서를 바꾼 순간
+        #   위치 p 의 행이 라벨 p 짜리 다른 행의 달을 받는다. 프레임이 종목-major 라
+        #   2026년 A종목 행이 2016년 B종목의 달을 받는 일이 일상적으로 생기고,
+        #   groupby(code, month).last() 가 그 미래 누적수급을 과거 달에 실어 보낸다
+        #   → d3 → U → Signal. 전 종목 선정 랭킹이 최대 수년치 미래 정보로 오염된다.
+        #   date 는 이미 Series 이므로 그대로 더하면 인덱스가 구조적으로 어긋날 수 없다.
+        f["month"] = f["date"] + pd.offsets.MonthEnd(0)
         fm = f.groupby(["code", "month"], observed=True)["cum120"].last().reset_index()
         P = P.merge(fm, on=["code", "month"], how="left")
         adv = col(P, "adv20").replace(0, np.nan)
@@ -6888,16 +6933,23 @@ def apply_vetoes_v3(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     if dis is not None and len(dis) and "corp_code" in P.columns and "event" in dis.columns:
         d = dis[dis["event"].isin(["rights_issue", "cb_issue", "bw_issue", "capital_reduce"])].copy()
         if len(d):
+            # ★★ 90일 창은 '패널 행 3개'가 아니라 '달력 3개월'이어야 한다 ★★
+            #   이 패널은 U-MID 대역으로 이미 잘려 있어 종목별 행이 월 연속이 아니다.
+            #   rolling(3) 을 쓰면 (a) 유동성이 출렁여 중간 달이 빠진 종목에서 창이 실제
+            #   6~9개월로 늘어나 멀쩡한 종목을 계속 제외하고, (b) 공시가 난 달에 패널 행이
+            #   없으면 그 이벤트는 아예 사라져 거부권이 발동조차 하지 않는다.
+            #   → 이벤트 날짜에서 직접 창을 펼쳐 패널 행 유무와 무관하게 만든다.
             d["month"] = as_ts_series(d["rcept_dt"]) + pd.offsets.MonthEnd(0)
-            ev = d.groupby(["corp_code", "month"]).size().rename("dilution").reset_index()
+            ev = d[["corp_code", "month"]].dropna().drop_duplicates()
             ev["corp_code"] = ev["corp_code"].astype(str)
+            win = pd.concat([ev.assign(month=ev["month"] + pd.offsets.MonthEnd(k))
+                             for k in range(3)], ignore_index=True)   # 공시 당월 + 2개월
+            win = win.drop_duplicates()
+            win["dilution_win"] = 1.0
             P["corp_code"] = P["corp_code"].astype(str)
-            P = P.merge(ev, on=["corp_code", "month"], how="left")
-            P["dilution"] = P["dilution"].fillna(0.0)
-            P = P.sort_values(["code", "month"])
-            rec = (P.groupby("code", observed=True)["dilution"]
-                    .transform(lambda s: s.rolling(3, min_periods=1).sum()))   # 90일 ≈ 3개월
-            P["V3"] = np.where(rec > 0, 0.0, 1.0)
+            P = P.merge(win, on=["corp_code", "month"], how="left")
+            P["V3"] = np.where(P["dilution_win"].fillna(0.0) > 0, 0.0, 1.0)
+            P = P.drop(columns=["dilution_win"], errors="ignore")
 
     # V5 — 자본잠식/관리종목
     P["V5"] = np.where(col(P, "equity").le(0).fillna(False), 0.0, 1.0)
@@ -7015,6 +7067,12 @@ TAX_SCHEDULE = [
 COMMISSION_BPS = 1.5          # 편도. 개인 온라인 수수료 가정
 SLIPPAGE_K = 0.10             # 제곱근 충격 계수
 
+# 보유 중 패널에서 사라진 종목을 '폐지 진행'으로 볼 최대 대기 기간.
+#   KRX 는 매매거래정지 → 개선기간 → 정리매매 → 상장폐지 경로가 흔히 3~24개월이다.
+#   거래가 정지되면 그 달부터 패널에 행이 생기지 않으므로, 폐지일이 '다음 달 안'일 때만
+#   -100% 를 물리면 이 경로가 통째로 0% 청산으로 빠져나간다(생존자편향).
+DELIST_VANISH_HORIZON_M = 24
+
 
 def sell_tax(dt, market: str) -> float:
     t = as_ts(dt)
@@ -7076,12 +7134,19 @@ def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
         return sub.assign(weight=[])
     med = np.median(s)
     spread = float(np.mean(np.abs(s - med)))
-    if spread < 1e-6:
+    lo, hi = float(np.min(s)), float(np.max(s))
+    if spread < 1e-6 or (hi - lo) < 1e-12:
         w = np.full(len(s), 1.0 / len(s))
     else:
-        raw = np.clip(s - med, 0, None) + 1e-9
+        # ★ 예전엔 raw = clip(s - median, 0, None) + 1e-9 였다. 그러면 **선정된 종목의 정확히
+        #   절반**(중앙값 이하)이 raw=1e-9 로 깔려 비중이 사실상 0 이 된다 — 25종목을 골랐다고
+        #   로그에 찍으면서 실제로는 12~13종목만 보유하는 셈이고, '평균종목수' 지표가 실효
+        #   보유수의 2배 넘게 부풀려진다. 분산 효과도 그만큼 과대평가된다.
+        #   선정집합 내부 순위로 바꾸면 모든 선정 종목이 양(+)의 비중을 갖고,
+        #   집중도는 conc 하나로만 조절된다(문서화된 의도 그대로).
+        r = pd.Series(s).rank(method="average").to_numpy(dtype=float)   # 1..n
         conc = min(2.0, 0.5 + spread * 8.0)          # 격차 클수록 집중
-        w = raw ** conc
+        w = (r / r.sum()) ** conc
         w = w / w.sum() if w.sum() > 0 else np.full(len(s), 1.0 / len(s))
     # 종목별 상한 = min(정책 상한, 유동성 상한). 유동성 상한은 20일 평균거래대금의 X%.
     adv = sub["adv20"].fillna(0).to_numpy(dtype=float)
@@ -7122,6 +7187,11 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     # 폐지 손실을 이미 반영한 종목 — 같은 종목에 -100% 를 두 번 물리지 않기 위한 장부
     delist_realized: set = set()
     vanished_delisted = vanished_other = 0
+    # 종목별 '패널에 마지막으로 등장한 달'. 사라진 종목이 나중에 돌아오는지(유동성 회복 등)를
+    # 판별해야 '거래정지→폐지'와 '일시적 유니버스 이탈'을 가를 수 있다.
+    _pm = P[P["month"].isin(months)] if len(P) else P
+    last_seen = (_pm.groupby("code", observed=True)["month"].max().to_dict()
+                 if len(_pm) else {})
 
     for i, m in enumerate(months):
         sub = P[(P["month"] == m)].copy()
@@ -7165,10 +7235,15 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 #   실제로는 정리매매가 없으면 -100% 다. 사라진 이유를 갈라서 처리한다:
                 #     · 폐지가 임박/진행 중  → -100% (이미 반영한 종목은 제외)
                 #     · 그 외(유니버스 이탈) → 직전가로 청산, 그 달 수익 0% (로그로 드러냄)
+                #   ★ 창을 '다음 달까지'로 잡으면 안 된다. 거래가 정지되면 그 달부터 패널에
+                #     행이 없어지는데, 실제 폐지일은 3~24개월 뒤다. 그래서 '이 달 이후 패널에
+                #     다시 나타나지 않는가(=영구 이탈)' + '폐지일이 그 안에 있는가'로 판정한다.
                 dl = delist.get(c)
                 w_prev = prev_w.get(c, 0.0)
-                if (w_prev > 0 and dl is not None and pd.notna(dl)
-                        and c not in delist_realized and dl <= m + pd.offsets.MonthEnd(1)):
+                never_back = m > last_seen.get(c, m)
+                terminal = (dl is not None and pd.notna(dl) and never_back
+                            and dl <= m + pd.DateOffset(months=DELIST_VANISH_HORIZON_M))
+                if w_prev > 0 and terminal and c not in delist_realized:
                     vanished_loss += w_prev * -1.0
                     delist_realized.add(c)
                     vanished_delisted += 1
@@ -7311,7 +7386,10 @@ def benchmark_returns(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
         d = None
         if fdr is not None:
             try:
-                d = fdr.DataReader(sym, months[0] - pd.offsets.MonthEnd(2), months[-1])
+                # ★ 끝을 2개월 늘린다. 아래 shift(-1) 때문에 마지막 달이 NaN 이 되면
+                #   비교표의 dropna 에서 그 달이 조용히 빠진다.
+                d = fdr.DataReader(sym, months[0] - pd.offsets.MonthEnd(2),
+                                   months[-1] + pd.offsets.MonthEnd(2))
             except Exception:
                 d = None
         if d is None or len(d) == 0:
@@ -7320,7 +7398,10 @@ def benchmark_returns(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
         d.columns = [str(c).lower() for c in d.columns]
         d["date"] = as_ts_series(d[d.columns[0]])
         d["month"] = d["date"] + pd.offsets.MonthEnd(0)
-        s = d.groupby("month")["close"].last().pct_change()
+        # ★★ 위상 정렬 ★★ 전략 수익률은 '월 m 행 = 월 m+1 에 실현된 수익'(fwd_ret) 규약이다.
+        #   지수를 pct_change() 그대로 두면 한 달 어긋난 채로 차분되어, 시장요인이 상쇄되기는
+        #   커녕 두 배로 들어간다. 초과수익의 t통계량이 절반 수준으로 눌린다.
+        s = d.groupby("month")["close"].last().pct_change().shift(-1)
         out[name] = s.reindex(months)
     return out
 
@@ -8220,6 +8301,51 @@ def run_contracts_v3(strict: bool = True) -> bool:
         return True, f"음수 불가 · 최악사분면=0 · 결측 전파 (표본 {n})"
 
     _cc("원칙2", "TP = clip(z,0) × clip(z,0) — z×z 금지", p2)
+
+    # ── C1b : 수급(d3) 경로의 행 정렬 무결성 ──────────────────────────────────────────────
+    def c1b():
+        """★ 실제로 터졌던 미래누수를 고정하는 회귀 테스트.
+
+        `f["month"] = as_ts_series(<ndarray>)` 는 값은 위치로 계산하고 배치는 라벨로 하는
+        대입이다. flows 가 구멍 난 인덱스로 들어오거나 sort_values 가 순서를 바꾸면
+        다른 종목·다른 날짜의 달이 그 행에 실리고, 미래 수급이 과거 달로 흘러든다.
+        d3 는 PIT.asof_join 을 타지 않으므로 C1 이 잡지 못한다 — 그래서 따로 검정한다.
+        """
+        # ★ 표본은 반드시 rolling(120, min_periods=40) 이 실제로 값을 내는 크기여야 한다.
+        #   월 30행짜리로 만들면 cum120 이 전부 NaN 이라 아래 검사가 공회전하고,
+        #   버그가 있어도 통과한다(검정 같아 보이지만 아무것도 재지 않는 테스트).
+        days = pd.bdate_range("2020-01-01", periods=320)
+        rows = []
+        for c in ("000002", "000001"):                 # 정렬 전 순서를 일부러 역순으로
+            for i, d in enumerate(days):
+                # 순매수를 시간에 따라 증가시킨다 → 120일 누적도 시간 단조 증가해야 한다
+                rows.append({"code": c, "date": d, "inst_net": float(i), "foreign_net": 0.0})
+        fl = pd.DataFrame(rows)
+        fl = fl[fl.index % 7 != 3]                     # 인덱스에 구멍 (필터/concat 의 정상 결과)
+        months = pd.DatetimeIndex(sorted(set(days + pd.offsets.MonthEnd(0))))
+        P = pd.DataFrame({"code": np.repeat(["000001", "000002"], len(months)),
+                          "month": list(months) * 2, "close": 1000.0, "adv20": 1e9,
+                          "net_income_ttm": 1e10})
+        P["cell"] = P["cell_l2"] = P["cell_l3"] = "C"
+        out = axis_U_v3(P, fl)
+        if "cum120" not in out.columns:
+            return False, "수급 결합이 일어나지 않았습니다 — d3 경로가 죽어 있습니다"
+        obs = out["cum120"].notna().sum()
+        if obs < 8:
+            return False, (f"cum120 유효 관측이 {obs}건뿐입니다 — 표본이 롤링 창을 못 채웠거나 "
+                           f"월 배치가 어긋나 대량 결측(NaT)이 발생했습니다")
+        # 시간이 흐를수록 누적순매수가 커져야 한다. 미래 값이 과거 달에 실리면 단조성이 깨진다.
+        bad = 0
+        for c, g in out.dropna(subset=["cum120"]).groupby("code"):
+            s = g.sort_values("month")["cum120"].to_numpy()
+            bad += int((np.diff(s) < -1e-9).sum())
+        if bad:
+            return False, (f"★수급 누적값이 시간 역행하는 구간 {bad}건 — 행 정렬이 어긋나 "
+                           f"미래 수급이 과거 달에 실렸습니다(d3→U→Signal 오염)")
+        return True, (f"구멍 난 인덱스·역순 입력에서도 월 배치가 행과 일치 "
+                      f"(표본 {len(fl):,}행 · cum120 유효 {obs}건 · 시간 단조성 유지)")
+
+    _cc("C1b", "수급(d3) 행 정렬 — 미래 수급 유입 차단", c1b)
 
     # ── 원칙 3 : 셀 정규화에 groupby.apply 금지 ───────────────────────────────────────────
     def p3():

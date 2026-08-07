@@ -155,16 +155,23 @@ def apply_vetoes_v3(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     if dis is not None and len(dis) and "corp_code" in P.columns and "event" in dis.columns:
         d = dis[dis["event"].isin(["rights_issue", "cb_issue", "bw_issue", "capital_reduce"])].copy()
         if len(d):
+            # ★★ 90일 창은 '패널 행 3개'가 아니라 '달력 3개월'이어야 한다 ★★
+            #   이 패널은 U-MID 대역으로 이미 잘려 있어 종목별 행이 월 연속이 아니다.
+            #   rolling(3) 을 쓰면 (a) 유동성이 출렁여 중간 달이 빠진 종목에서 창이 실제
+            #   6~9개월로 늘어나 멀쩡한 종목을 계속 제외하고, (b) 공시가 난 달에 패널 행이
+            #   없으면 그 이벤트는 아예 사라져 거부권이 발동조차 하지 않는다.
+            #   → 이벤트 날짜에서 직접 창을 펼쳐 패널 행 유무와 무관하게 만든다.
             d["month"] = as_ts_series(d["rcept_dt"]) + pd.offsets.MonthEnd(0)
-            ev = d.groupby(["corp_code", "month"]).size().rename("dilution").reset_index()
+            ev = d[["corp_code", "month"]].dropna().drop_duplicates()
             ev["corp_code"] = ev["corp_code"].astype(str)
+            win = pd.concat([ev.assign(month=ev["month"] + pd.offsets.MonthEnd(k))
+                             for k in range(3)], ignore_index=True)   # 공시 당월 + 2개월
+            win = win.drop_duplicates()
+            win["dilution_win"] = 1.0
             P["corp_code"] = P["corp_code"].astype(str)
-            P = P.merge(ev, on=["corp_code", "month"], how="left")
-            P["dilution"] = P["dilution"].fillna(0.0)
-            P = P.sort_values(["code", "month"])
-            rec = (P.groupby("code", observed=True)["dilution"]
-                    .transform(lambda s: s.rolling(3, min_periods=1).sum()))   # 90일 ≈ 3개월
-            P["V3"] = np.where(rec > 0, 0.0, 1.0)
+            P = P.merge(win, on=["corp_code", "month"], how="left")
+            P["V3"] = np.where(P["dilution_win"].fillna(0.0) > 0, 0.0, 1.0)
+            P = P.drop(columns=["dilution_win"], errors="ignore")
 
     # V5 — 자본잠식/관리종목
     P["V5"] = np.where(col(P, "equity").le(0).fillna(False), 0.0, 1.0)
