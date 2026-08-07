@@ -27,7 +27,38 @@ def as_ts(x) -> Optional[pd.Timestamp]:
 
 
 def as_ts_series(s) -> pd.Series:
-    out = pd.to_datetime(pd.Series(s), errors="coerce")
+    """★ 혼합 포맷 방어. pandas 2.x 는 **첫 비결측 원소에서 포맷 하나를 추론해 전체에 엄격
+    적용**한다. 그래서 ['2016-01-15 00:00:00', '2016-01-15'] 처럼 섞이면 뒤쪽이 전부 NaT 이
+    되고, errors='coerce' 라 예외도 안 난다.
+
+    이 모양이 나오는 곳이 하필 **재실행 경로**다: 드라이브 캐시에서 읽은 파싱 완료
+    Timestamp + 이번에 새로 수집한 문자열을 concat 하면 정확히 이렇게 된다. 실측으로
+    보고서 원장 1,500건 중 1,000건이 '날짜 무효'로 조용히 탈락했다.
+    → 1차 추론에서 실패한 원소만 골라 mixed 포맷으로, 그래도 안 되면 원소별로 재시도한다.
+      실패분에만 적용하므로 정상 경로의 비용은 0 이다.
+    """
+    ser = pd.Series(s)
+    out = pd.to_datetime(ser, errors="coerce")
+    try:
+        raw_ok = ser.notna() & (ser.astype(str).str.strip().str.lower()
+                                .isin(("", "nan", "none", "nat", "null")) == False)  # noqa: E712
+        bad = out.isna() & raw_ok
+        if bad.any():
+            try:
+                out = out.astype("datetime64[ns]")
+            except Exception:
+                pass
+            try:
+                out.loc[bad] = pd.to_datetime(ser[bad], errors="coerce", format="mixed")
+            except (TypeError, ValueError):
+                pass
+            bad2 = out.isna() & raw_ok
+            if bad2.any():
+                out.loc[bad2] = pd.Series(
+                    [pd.to_datetime(x, errors="coerce") for x in ser[bad2]],
+                    index=ser.index[bad2])
+    except Exception:
+        pass
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)

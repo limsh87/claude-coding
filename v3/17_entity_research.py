@@ -142,6 +142,10 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     # 두 자리 연도는 수집부 parse_kr_date 에서 이미 4자리로 확정된다.
     # 여기서는 남은 이상치만 걸러낸다(교정하지 않는다 — 잘못된 교정이 더 위험하다).
     n_raw0 = len(d)
+    # ★ 마지막 방어선: 수집부에서 정규화를 놓친 소스가 있어도 여기서 두 자리 연도를 살린다.
+    #   as_ts_series 로 바로 넘기면 pandas 자동추론이 '16.01.15' 를 2015-01-16 으로 읽고,
+    #   그 값은 범위 밖도 아니라서 경고 없이 통과한다 — 시간축이 통째로 어긋난 채로.
+    d["pub_date"] = d["pub_date"].map(parse_kr_date)
     d["pub_date"] = as_ts_series(d["pub_date"])
     lo, hi = as_ts("1999-01-01"), as_ts(BACKTEST_END) + pd.Timedelta(days=400)
     bad = d["pub_date"].isna() | (d["pub_date"] < lo) | (d["pub_date"] > hi)

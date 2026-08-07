@@ -252,6 +252,18 @@ def run_contract_tests(strict: bool = True) -> bool:
     _t("C10", "모든 단계가 계측된다 (추측 금지)",
        any(r["stage"] == "selftest.probe" for r in RUNTIME_LOG))
 
+    # ── 혼합 포맷 날짜 (재실행 경로의 조용한 유실) ───────────────────────────────────
+    mixed = pd.Series([pd.Timestamp("2016-01-15"), "2016-01-15", "2016/01/15",
+                       "20160115", None, ""])
+    got = as_ts_series(mixed)
+    _t("DATE-MIX", "혼합 포맷 날짜가 조용히 NaT 이 되지 않는다 (캐시+신규 concat 경로)",
+       int(got.notna().sum()) == 4,
+       f"유효 {int(got.notna().sum())}/4 (pandas 2.x 는 첫 원소 포맷을 전체에 강제한다)")
+    ymd = as_ts_series(pd.Series(["26.01.19", "19.12.31"]).map(parse_kr_date))
+    _t("DATE-YY", "두 자리 연도가 연·일 뒤바뀜 없이 해석된다",
+       list(ymd.dt.strftime("%Y-%m-%d")) == ["2026-01-19", "2019-12-31"],
+       f"{list(ymd.dt.strftime('%Y-%m-%d'))} (자동추론이면 2019-01-26 / 2031-12-19)")
+
     # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
     _t(*_vault_integrity_test())
 

@@ -416,7 +416,13 @@ def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
             rows.append({
                 "source": "naver", "category": cat,
                 "src_report_id": str(it.get("id") or it.get("nid") or it.get("researchId") or ""),
-                "pub_date": it.get("createDate") or it.get("date") or it.get("writeDate"),
+                # ★ JSON 경로도 반드시 parse_kr_date 를 통과시킨다. HTML 파서에는 있는 가드가
+                #   여기만 빠져 있었다. 네이버가 'YY.MM.DD' 를 주면 pandas 자동추론이
+                #   '26.01.19' 를 2019-01-26 으로 읽어(연·일 뒤바뀜) 예외 없이 통과하고,
+                #   리포트 원장의 시간축 전체가 어긋나 PIT 순서가 무의미해진다.
+                #   (실측: 원장 병합 단계에서 절반이 '범위 밖'으로 조용히 탈락)
+                "pub_date": parse_kr_date(it.get("createDate") or it.get("date")
+                                          or it.get("writeDate")),
                 "title": _dedup_repeat(str(it.get("title") or "")),
                 "stock_code": to_code6(it.get("itemCode") or it.get("stockCode") or ""),
                 "stock_name": str(it.get("itemName") or it.get("stockName") or ""),

@@ -897,7 +897,38 @@ def as_ts(x) -> Optional[pd.Timestamp]:
 
 
 def as_ts_series(s) -> pd.Series:
-    out = pd.to_datetime(pd.Series(s), errors="coerce")
+    """★ 혼합 포맷 방어. pandas 2.x 는 **첫 비결측 원소에서 포맷 하나를 추론해 전체에 엄격
+    적용**한다. 그래서 ['2016-01-15 00:00:00', '2016-01-15'] 처럼 섞이면 뒤쪽이 전부 NaT 이
+    되고, errors='coerce' 라 예외도 안 난다.
+
+    이 모양이 나오는 곳이 하필 **재실행 경로**다: 드라이브 캐시에서 읽은 파싱 완료
+    Timestamp + 이번에 새로 수집한 문자열을 concat 하면 정확히 이렇게 된다. 실측으로
+    보고서 원장 1,500건 중 1,000건이 '날짜 무효'로 조용히 탈락했다.
+    → 1차 추론에서 실패한 원소만 골라 mixed 포맷으로, 그래도 안 되면 원소별로 재시도한다.
+      실패분에만 적용하므로 정상 경로의 비용은 0 이다.
+    """
+    ser = pd.Series(s)
+    out = pd.to_datetime(ser, errors="coerce")
+    try:
+        raw_ok = ser.notna() & (ser.astype(str).str.strip().str.lower()
+                                .isin(("", "nan", "none", "nat", "null")) == False)  # noqa: E712
+        bad = out.isna() & raw_ok
+        if bad.any():
+            try:
+                out = out.astype("datetime64[ns]")
+            except Exception:
+                pass
+            try:
+                out.loc[bad] = pd.to_datetime(ser[bad], errors="coerce", format="mixed")
+            except (TypeError, ValueError):
+                pass
+            bad2 = out.isna() & raw_ok
+            if bad2.any():
+                out.loc[bad2] = pd.Series(
+                    [pd.to_datetime(x, errors="coerce") for x in ser[bad2]],
+                    index=ser.index[bad2])
+    except Exception:
+        pass
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
@@ -5219,7 +5250,13 @@ def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
             rows.append({
                 "source": "naver", "category": cat,
                 "src_report_id": str(it.get("id") or it.get("nid") or it.get("researchId") or ""),
-                "pub_date": it.get("createDate") or it.get("date") or it.get("writeDate"),
+                # ★ JSON 경로도 반드시 parse_kr_date 를 통과시킨다. HTML 파서에는 있는 가드가
+                #   여기만 빠져 있었다. 네이버가 'YY.MM.DD' 를 주면 pandas 자동추론이
+                #   '26.01.19' 를 2019-01-26 으로 읽어(연·일 뒤바뀜) 예외 없이 통과하고,
+                #   리포트 원장의 시간축 전체가 어긋나 PIT 순서가 무의미해진다.
+                #   (실측: 원장 병합 단계에서 절반이 '범위 밖'으로 조용히 탈락)
+                "pub_date": parse_kr_date(it.get("createDate") or it.get("date")
+                                          or it.get("writeDate")),
                 "title": _dedup_repeat(str(it.get("title") or "")),
                 "stock_code": to_code6(it.get("itemCode") or it.get("stockCode") or ""),
                 "stock_name": str(it.get("itemName") or it.get("stockName") or ""),
@@ -5618,6 +5655,10 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     # 두 자리 연도는 수집부 parse_kr_date 에서 이미 4자리로 확정된다.
     # 여기서는 남은 이상치만 걸러낸다(교정하지 않는다 — 잘못된 교정이 더 위험하다).
     n_raw0 = len(d)
+    # ★ 마지막 방어선: 수집부에서 정규화를 놓친 소스가 있어도 여기서 두 자리 연도를 살린다.
+    #   as_ts_series 로 바로 넘기면 pandas 자동추론이 '16.01.15' 를 2015-01-16 으로 읽고,
+    #   그 값은 범위 밖도 아니라서 경고 없이 통과한다 — 시간축이 통째로 어긋난 채로.
+    d["pub_date"] = d["pub_date"].map(parse_kr_date)
     d["pub_date"] = as_ts_series(d["pub_date"])
     lo, hi = as_ts("1999-01-01"), as_ts(BACKTEST_END) + pd.Timedelta(days=400)
     bad = d["pub_date"].isna() | (d["pub_date"] < lo) | (d["pub_date"] > hi)
@@ -8439,6 +8480,18 @@ def run_contract_tests(strict: bool = True) -> bool:
         time.sleep(0.01)
     _t("C10", "모든 단계가 계측된다 (추측 금지)",
        any(r["stage"] == "selftest.probe" for r in RUNTIME_LOG))
+
+    # ── 혼합 포맷 날짜 (재실행 경로의 조용한 유실) ───────────────────────────────────
+    mixed = pd.Series([pd.Timestamp("2016-01-15"), "2016-01-15", "2016/01/15",
+                       "20160115", None, ""])
+    got = as_ts_series(mixed)
+    _t("DATE-MIX", "혼합 포맷 날짜가 조용히 NaT 이 되지 않는다 (캐시+신규 concat 경로)",
+       int(got.notna().sum()) == 4,
+       f"유효 {int(got.notna().sum())}/4 (pandas 2.x 는 첫 원소 포맷을 전체에 강제한다)")
+    ymd = as_ts_series(pd.Series(["26.01.19", "19.12.31"]).map(parse_kr_date))
+    _t("DATE-YY", "두 자리 연도가 연·일 뒤바뀜 없이 해석된다",
+       list(ymd.dt.strftime("%Y-%m-%d")) == ["2026-01-19", "2019-12-31"],
+       f"{list(ymd.dt.strftime('%Y-%m-%d'))} (자동추론이면 2019-01-26 / 2031-12-19)")
 
     # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
     _t(*_vault_integrity_test())
