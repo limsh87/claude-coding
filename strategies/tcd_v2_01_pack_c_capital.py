@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_C"
 STRATEGY_NAME      = "PACK-C 자본배분 체제 전환"
 ACTIVE_PACKS       = ["C"]
-BUILD_VERSION      = "v2.20260807.1208"
+BUILD_VERSION      = "v2.20260807.1316"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -1318,6 +1318,20 @@ def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     if name in df.columns:
         return pd.to_numeric(df[name], errors="coerce")
     return pd.Series(default, index=df.index, dtype="float64")
+
+
+def gby(df: pd.DataFrame, name: str, key: str = "code"):
+    """col() 의 groupby 판(版). 없는 컬럼도 NaN 으로 만든 뒤 그룹화한다.
+
+    ★ col() 이 막지 못하는 구멍이 정확히 여기였다. 피처 계산부는 결측 컬럼 산술을 col() 로
+      막아 두었지만, `P.groupby("code")[c]` 는 여전히 맨손이라 c 가 없으면 KeyError 로 죽는다.
+      DART 키가 없거나 재무 수집이 부분 실패하면 assets·contract_liab 같은 재무상태표 계정이
+      아예 생성되지 않는데, 이 경로는 critical 스테이지(L1.PANEL)라 그대로 실행 전체가 중단된다.
+      "키 없이도 실행은 된다"는 상단 안내와 정면으로 어긋나므로 groupby 도 안전 접근으로 통일한다.
+    """
+    if name not in df.columns:
+        df[name] = np.nan
+    return df.groupby(key, observed=True)[name]
 
 
 def safe_div(a, b, eps: float = 1e-12):
@@ -3054,10 +3068,40 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
     start_ts, end_ts = as_ts(start), as_ts(end)
-    todo, n_back, n_fwd = [], 0, 0
+
+    # ── 시도 원장 (음성 캐시) ─────────────────────────────────────────────────────────────
+    #  ★ 폐지 종목과 '어느 소스에도 없는 종목'은 매 실행마다 전 소스 체인을 헛돌게 만든다.
+    #    성공한 종목만 캐시에 남으므로 실패는 영원히 기억되지 않고, 그 수는 백테스트 기간이
+    #    길어질수록 단조 증가한다. 실측상 완전 캐시 상태의 실행에서도 13~15분을 여기서 쓴다.
+    #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
+    #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
+    RETRY_AFTER_DAYS = 30
+    _today = as_ts(end)
+    attempts: Dict[str, dict] = {}
+    _att = VAULT.get_table("price_fetch_attempts", scope="shared")
+    if _att is not None and len(_att):
+        _att["attempted_at"] = as_ts_series(_att["attempted_at"])
+        _att["requested_from"] = as_ts_series(_att["requested_from"])
+        _att = _att.sort_values("attempted_at").drop_duplicates("code", keep="last")
+        attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from}
+                    for r in _att.itertuples(index=False)}
+
+    def _recently_failed(c: str, want_from: pd.Timestamp) -> bool:
+        p = attempts.get(c)
+        if p is None or pd.isna(p["at"]):
+            return False
+        # 이번에 더 이른 구간을 원한다면 이전 실패는 근거가 되지 않는다.
+        if pd.notna(p["frm"]) and p["frm"] > want_from:
+            return False
+        return (_today - p["at"]).days < RETRY_AFTER_DAYS
+
+    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
+            if _recently_failed(c, start_ts):
+                n_skip += 1
+                continue
             todo.append((c, start))
             continue
         # ★ 과거 방향 백필을 반드시 함께 본다.
@@ -3073,6 +3117,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
                  f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+    if n_skip:
+        LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
+                 f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
@@ -3097,14 +3144,26 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
-        for d in res:
+        failed = []
+        for (c, st), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
-        miss = len(todo) - len(new_frames)
-        if miss:
-            LOG.warn(f"일봉 수집 실패 {miss:,}종목 — 전 소스에서 데이터를 못 받았습니다. "
-                     f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다)")
+            else:
+                failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if failed:
+            LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
+                     f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
+                     f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
+            # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
+            #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
+            _prev = _att if _att is not None and len(_att) else None
+            _new = pd.DataFrame(failed)
+            _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
+            _all = (_all.sort_values("attempted_at")
+                        .drop_duplicates("code", keep="last").reset_index(drop=True))
+            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
+                            source="fetch_prices:negative_cache")
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
@@ -3581,6 +3640,20 @@ ACCOUNT_PATTERNS: Dict[str, Tuple[str, List[str]]] = {
 }
 _SJ_MAP = {"BS": ("BS",), "IS": ("IS", "CIS"), "CF": ("CF",)}
 
+# ★ 손익·현금흐름 성격의 전 계정. 빠뜨리면 <계정>_ttm 컬럼이 아예 생성되지 않고,
+#   그걸 쓰는 팩이 실데이터 실행에서만 터진다(합성 스모크는 통과한다).
+FLOW_ITEMS = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "net_income",
+              "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise",
+              "tax_expense", "pretax_income", "other_income"]
+
+# 재무 결합 후 패널이 반드시 보유해야 하는 컬럼 전체 목록.
+# attach_fundamentals 가 이 목록으로 스키마를 계약적으로 보장한다 — 수집이 얼마나 실패하든
+# 패널의 컬럼 집합은 항상 같아야 한다. 그래야 "어떤 실행에선 있고 어떤 실행엔 없는" 축이
+# 사라지고, 결측은 결측대로 조용히가 아니라 표로 드러난다.
+FUNDAMENTAL_COLS = (list(ACCOUNT_PATTERNS)
+                    + [f"{c}{s}" for c in FLOW_ITEMS for s in ("_q", "_ttm")]
+                    + ["employees", "payroll", "v2_bad_3q"])
+
 
 def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     """원시 계정 → (corp_code, period, 항목) 와이드 테이블. knowledge_date 를 여기서 확정한다."""
@@ -3629,11 +3702,7 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     order = {REPRT_CODES["Q1"]: 1, REPRT_CODES["H1"]: 2, REPRT_CODES["Q3"]: 3, REPRT_CODES["FY"]: 4}
     W["q"] = W["reprt_code"].map(order)
     W = W.sort_values(["corp_code", "bsns_year", "q"]).reset_index(drop=True)
-    # ★ 손익·현금흐름 성격의 전 계정을 여기에 넣어야 한다. 빠뜨리면 <계정>_ttm 컬럼이
-    #   아예 생성되지 않고, 그걸 쓰는 팩이 실데이터 실행에서만 터진다(합성 스모크는 통과).
-    flow_items = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "net_income",
-                  "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise",
-                  "tax_expense", "pretax_income", "other_income"]
+    flow_items = FLOW_ITEMS
     # 누적 → 분기 단독. 직전 분기가 실제로 존재할 때만 차분한다.
     # (누락된 분기를 0으로 간주하면 반기 누적치가 한 분기 실적으로 둔갑한다 — fail-open 금지)
     gk = ["corp_code", "bsns_year"]
@@ -3656,6 +3725,17 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     for _k in ACCOUNT_PATTERNS:
         if _k not in W.columns:
             W[_k] = np.nan
+    # ── V2 거부권용 '이익-현금 괴리 3분기 연속' 플래그 ─────────────────────────────────────
+    #   ★ 여기서 만드는 이유: 연속성은 분기 관측을 세야 하는데, 월 패널에서 세면
+    #     같은 분기값이 1~4개월 반복되므로 어떤 고정 개월수도 정답이 아니다. 분기 프레임은
+    #     관측당 정확히 한 행이고 이미 (corp_code, bsns_year, q) 로 정렬돼 있다.
+    #     as-of 결합이 이 플래그를 C1 게이트웨이 그대로 실어 나른다.
+    #   min_periods=3 — 제출분이 3개 미만이면 NaN(=거부하지 않음). 근거 없는 제외 금지.
+    _bad_q = ((col(W, "net_income_ttm") > 0) &
+              (col(W, "cfo_ttm") < 0.5 * col(W, "net_income_ttm"))).astype(float)
+    W["v2_bad_3q"] = (_bad_q.groupby(W["corp_code"], observed=True)
+                            .transform(lambda s: s.rolling(3, min_periods=3).min()))
+
     _missing = [k for k in ACCOUNT_PATTERNS if W[k].notna().sum() == 0]
     if _missing:
         LOG.warn(f"DART 재무에서 한 건도 매칭되지 않은 계정 {len(_missing)}개: "
@@ -4426,8 +4506,8 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     if len(idx) and "domain" in idx.columns:
         sub = idx[(idx["domain"].astype(str) == "research") &
                   (idx["subtype"].astype(str) == "report_pdf")]
-        for _, r in sub.iterrows():
-            known[str(r.get("key"))] = str(r.get("uid"))
+        # iterrows 는 30만 행에서 13초를 쓴다. zip 은 같은 결과를 0.2초에 만든다.
+        known = dict(zip(sub["key"].astype(str), sub["uid"].astype(str)))
     LOG.info(f"PDF 대상 {len(work):,}건 (드라이브 캐시 보유 {sum(1 for k in work['report_uid'] if k in known):,}건)")
 
     def _one(rec):
@@ -4445,24 +4525,35 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
         return (uid, "", raw)
 
     jobs = list(zip(work["report_uid"].astype(str), work["pdf_url"].astype(str)))
-    res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 10), desc="리포트 PDF")
 
+    # ★ 청크로 끊어 받는다. pmap_io 는 결과 리스트를 통째로 들고 있으므로, 한 번에 던지면
+    #   내려받은 PDF 본문 전부가 동시에 RAM 에 남는다. 목표치인 연 3만건 × 10년 = 30만건에
+    #   평균 300KB 를 곱하면 90GB 다. 캐시가 차 있어도 마찬가지다 — 캐시 경로도 blob 바이트를
+    #   그대로 반환하기 때문에 오히려 더 빨리 쌓인다. 청크 단위로 소비하고 버리면 상주량이
+    #   작업 수와 무관하게 평평해진다(약 600MB). 청크마다 flush 하므로 중간에 끊겨도 이어받는다.
+    PDF_CHUNK = 2000
     rows = []
     ok = 0
-    for r in res:
-        if not r:
-            continue
-        uid, existing_blob_uid, data = r
-        if not data:
-            continue
-        ok += 1
-        blob_uid = existing_blob_uid
-        if not blob_uid:
-            p = VAULT.put_blob("research", "report_pdf", uid, data, "pdf",
-                               source="report_pdf", scope="shared")
-            blob_uid = sha1_str("research", "report_pdf", uid, sha1_bytes(data)) if p else ""
-        f = pdf_extract_fields(pdf_text(data))
-        rows.append({"report_uid": uid, "pdf_uid": blob_uid, **f})
+    for k0 in range(0, len(jobs), PDF_CHUNK):
+        chunk = jobs[k0:k0 + PDF_CHUNK]
+        res = pmap_io(_one, chunk, workers=min(N_WORKERS_IO, 10),
+                      desc=f"리포트 PDF {k0//PDF_CHUNK + 1}/{(len(jobs)-1)//PDF_CHUNK + 1}")
+        for r in res:
+            if not r:
+                continue
+            uid, existing_blob_uid, data = r
+            if not data:
+                continue
+            ok += 1
+            blob_uid = existing_blob_uid
+            if not blob_uid:
+                p = VAULT.put_blob("research", "report_pdf", uid, data, "pdf",
+                                   source="report_pdf", scope="shared")
+                blob_uid = sha1_str("research", "report_pdf", uid, sha1_bytes(data)) if p else ""
+            f = pdf_extract_fields(pdf_text(data))
+            rows.append({"report_uid": uid, "pdf_uid": blob_uid, **f})
+        del res
+        VAULT.flush("shared")
     VAULT.flush("shared")
     LOG.ok(f"PDF 확보 {ok:,}/{len(jobs):,}건 — 공용 인덱스에 저장(내용해시 중복제거 적용)")
     if not rows:
@@ -4684,7 +4775,7 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "broker_name": ("broker_name", "min"),
         "broker_raw": ("broker_raw", _pick_str),
         "analyst_raw": ("analyst_raw", _pick_str),
-        "target_price": ("target_price", lambda s: pd.Series(list(s)).dropna().max()),
+        "target_price": ("target_price", "max"),      # 네이티브 max = NaN 무시. 파이썬 람다는 30만건에서 50초.
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
@@ -5234,16 +5325,30 @@ def attach_fundamentals(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
         P = PIT.asof_join(P, "dart_employees", by="corp_code", left_time="month",
                           cols=["corp_code", "knowledge_date", "employees", "payroll"],
                           suffix="_emp")
-    for c in ("employees", "payroll"):
+    # ★ 결합 '이후에' 채운다. 먼저 만들어 두면 merge_asof 가 접미사를 붙여 실제 값을 흘려버린다.
+    #
+    #   왜 전 계정을 계약적으로 보장하는가 ─────────────────────────────────────────────────
+    #   DART 키가 없거나(상단 안내가 "아무것도 안 채워도 실행된다"고 약속한다) 재무 수집이
+    #   부분 실패하면 asof_join 이 아예 일어나지 않아 revenue_ttm·assets 같은 컬럼이
+    #   존재하지 않게 된다. 피처 계산부는 col() 로 결측 컬럼을 막아 두었지만
+    #   groupby(...)[c] 는 KeyError 로 죽고, 그 위치(L1.PANEL)는 critical 스테이지라
+    #   실행 전체가 중단된다. 특히 손익·현금흐름 계정은 tidy_financials 가 항상 만들지만
+    #   재무상태표 계정(assets·contract_liab 등)은 그 계정이 매칭됐을 때만 생기므로,
+    #   "DART 는 응답했는데 BS 계정만 정규식이 안 맞은" 경우엔 패널이 멀쩡한 채로 죽는다.
+    #   여기서 전부 NaN 으로 채워 두면 B/C축이 통째로 결측이 될 뿐 실행은 끝까지 간다.
+    for c in FUNDAMENTAL_COLS:
         if c not in P.columns:
             P[c] = np.nan
+    if not PIT.has("dart_financials"):
+        LOG.warn("DART 재무가 없어 B축(회계품질)·C축(자원투입)과 PACK-C 가 전부 결측입니다. "
+                 "실행은 계속되지만 증거층이 얇아집니다 — DART_API_KEY 를 넣으면 살아납니다.")
     return P
 
 
 # ── B축: 회계 품질 ──────────────────────────────────────────────────────────────────────────
 def axis_B(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
 
     rev = col(P, "revenue_ttm")
     cogs = col(P, "cogs_ttm")
@@ -5278,7 +5383,7 @@ def axis_B_tp(P: pd.DataFrame) -> pd.DataFrame:
 # ── C축: 자원 투입 ──────────────────────────────────────────────────────────────────────────
 def axis_C(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
     nwc = (col(P, "receivable").fillna(0) + col(P, "inventory").fillna(0) -
            col(P, "payable").fillna(0)) if "receivable" in P.columns else np.nan
     P["IC"] = nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)
@@ -5321,7 +5426,7 @@ def axis_D(P: pd.DataFrame, px_daily: pd.DataFrame, flows: pd.DataFrame,
       이 대리변수의 한계를 리포트에 반드시 명시하고 숨기지 않는다.
     """
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
 
     # E 대리: TTM 순이익. M 대리: 시가총액/TTM순이익 → 주식수를 모를 때도 비율은 성립한다.
     P["E_proxy"] = col(P, "net_income_ttm")
@@ -5458,7 +5563,7 @@ PACK_C_INTERP = [
 
 def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
 
     # ── 센서 ──────────────────────────────────────────────────────────────────────────────
     # p1: 총주주환원 / 영업현금흐름.  현금흐름표에서 직접 읽으므로 결정공시 파싱이 불필요하다.
@@ -5507,7 +5612,13 @@ def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
     z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_P1"] = tp_product(z("p1"), z("p2"))          # ★ 이 팩의 전부: 환원↑ 인데 투자도↑
-    P["TP_P2"] = tp_product(z("acq_size"), z("p3"))    # 취득 규모 큰데 소각까지 실행
+    # 취득 규모가 큰데 소각까지 실행 — '큰데'가 조건이므로 지출이 없는 쪽은 판단 대상이 아니다.
+    #  ★ z 를 그대로 곱하면 저-저 사분면(자사주를 거의 안 샀고 소각도 안 함)에서 음×음=양이 되어,
+    #    아무것도 안 한 기업이 '진정성 있는 환원'으로 뒤집힌다. 실측상 이 사분면이 정의역의 절반이다.
+    #    셀 평균(=z가 0을 지나는 지점) 아래의 취득은 NaN 으로 둔다. 0 으로 채우면
+    #    tp_product 규약("0으로 채우면 '대가를 안 치렀다'는 거짓 주장")을 정면으로 어긴다.
+    _zi = z("acq_size")
+    P["TP_P2"] = tp_product(_zi.where(_zi > 0), z("p3"))
     P["TP_P3"] = tp_product(z("p1"), -z("p4"))         # 환원↑ 인데 차입 안 늘림
     P["E_C_pack"] = nanmean_cols(P, ["TP_P1", "TP_P2", "TP_P3"])
     P["E_C"] = P["E_C_pack"]                            # 레지스트리 규약: E_<pid>
@@ -5610,7 +5721,7 @@ VETO_DEFS = [
 def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     """V_k ∈ {0,1}. 연속화·가중치화·상쇄 금지 (C6)."""
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)          # 없는 컬럼도 NaN 으로 만들어 준 뒤 그룹화 (DART 부분실패 내성)
     n = len(P)
 
     # ── V1 밀어내기 ────────────────────────────────────────────────────────────────────────
@@ -5621,12 +5732,22 @@ def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["v1_metric"] = push
     P["V1"] = np.where((d_rev > 0) & (push > 1.5), 0.0, 1.0)
 
-    # ── V2 이익-현금 괴리 3분기(=9개월) 연속 ───────────────────────────────────────────────
-    bad = ((col(P, "net_income_ttm") > 0) &
-           (col(P, "cfo_ttm") < 0.5 * col(P, "net_income_ttm"))).astype(float)
-    P["v2_streak"] = bad.groupby(P["code"], observed=True).transform(
-        lambda s: s.rolling(9, min_periods=9).min())
-    P["V2"] = np.where(P["v2_streak"] >= 1.0, 0.0, 1.0)
+    # ── V2 이익-현금 괴리 '3분기 연속' ─────────────────────────────────────────────────────
+    #   ★ 연속성은 반드시 '분기 프레임'에서 센다. 예전엔 월 패널에서 rolling(9) 로 셌는데,
+    #     그건 "3분기 = 9개월"이라는 잘못된 전제다. 월 패널의 한 행은 분기 관측이 아니라
+    #     '그 시점에 가장 최근 알려진 분기값'이고, 같은 분기값이 몇 달 동안 반복되는지는
+    #     보고서 유형과 제출 지연에 따라 1~4개월로 들쭉날쭉하다. 그래서 rolling(9) 는
+    #     발동이 1~2개월 늦고, 결산→1Q→반기처럼 반복이 짧은 창은 아예 놓친다.
+    #     분기 프레임에서 rolling(3) 으로 만든 플래그(v2_bad_3q)를 as-of 결합으로 실어 오면
+    #     C1 게이트웨이를 그대로 타면서 지연도 0 이 된다. (12_ingest_dart_fin 참조)
+    v2q = col(P, "v2_bad_3q")
+    if v2q.notna().any():
+        P["v2_streak"] = v2q
+        P["V2"] = np.where(v2q.fillna(0.0) >= 1.0, 0.0, 1.0)
+    else:
+        # 분기 플래그가 없으면(재무 미수집) 거부하지 않는다 — 근거 없는 제외가 더 위험하다.
+        P["v2_streak"] = np.nan
+        P["V2"] = 1.0
 
     # ── V3 희석성 조달 (공시목록에서 직접 관측) ────────────────────────────────────────────
     P["V3"] = 1.0
@@ -5698,6 +5819,72 @@ def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     return P
 
 
+MIN_FLOOR_AXES = 2
+
+
+def compute_floor(P: pd.DataFrame, cols: Sequence[str], min_axes: int = MIN_FLOOR_AXES,
+                  pct_out: Optional[dict] = None) -> pd.Series:
+    """§8.2 하한선 — "그 종목이 실제로 보유한 축은 모두 셀 내 50th 이상 + 축이 최소 2개".
+
+    ★ 왜 함수로 빼는가: 하한선은 본선에서만 쓰이는 게 아니라 R2 킬게이트·R5 절제실험의
+      비교팔에서도 다시 만들어져야 한다. 예전엔 비교팔이 본선의 FLOOR 컬럼을 그대로
+      복사해 썼는데, FLOOR 는 전부 TP 에서 파생된 값이라 '나이브 팔'조차 TP 로 선별된
+      종목만 보게 된다. 실측하면 FLOOR 하나가 종목 선정의 92% 를 끝내 버려서, TP 팔과
+      균등난수 팔의 보유종목 자카드 유사도가 0.73 이었다 — 무엇과도 구별하지 못하는
+      킬게이트는 킬게이트가 아니다. 규칙을 한 곳에 두고 각 팔이 '자기 증거'로 만든다.
+    """
+    ok = pd.Series(0, index=P.index)
+    bad = pd.Series(0, index=P.index)
+    for c in cols:
+        pct = xsec_rank_pct_l(P, c)
+        if pct_out is not None:
+            pct_out[c] = pct
+        ok += (pct >= 0.50).fillna(False).astype(int)
+        bad += (pct < 0.50).fillna(False).astype(int)
+    return ((bad == 0) & (ok >= min_axes)).astype(float)
+
+
+def score_from_axes(P: pd.DataFrame, all_e: Sequence[str],
+                    min_axes: int = MIN_FLOOR_AXES) -> dict:
+    """주어진 축 집합 하나로 E·FLOOR·Signal·Signal_rank 를 만드는 단일 경로.
+
+    본선(assemble_score)과 강건성 비교팔(R2·R5)이 **반드시 이 함수만** 통과해야 한다.
+    비교팔이 다른 경로로 점수를 만들면 Δ가 '무엇을 뺐는가'가 아니라 '계산 방식이 달라졌는가'를
+    재게 된다. 실제로 아무것도 빼지 않은 널-절제의 ΔSharpe 가 +2.08 로 나온 적이 있다.
+
+    두 가지 계산상의 선택을 여기에 못박는다:
+
+    ① 축을 평균하기 전에 축별로 z 표준화한다.
+       E_AXB 같은 축은 표준편차가 0.9, E_X 같은 축은 0.1 인데 원값을 그대로 평균하면
+       "팩 간 동일가중(C7)"이라고 로그에 찍으면서 실제로는 분산비 만큼(실측 9.4배)
+       가중이 갈린다. z 로 분산을 맞춘 뒤 평균해야 로그가 참이 된다.
+       (백분위 평균이 아니라 z 평균인 이유: 백분위는 1.0 에서 잘려서 '트레이드오프가
+        극적으로 붕괴한 종목'과 '그냥 괜찮은 종목'을 구별하지 못한다. 이 전략이 재려는
+        크기 정보가 바로 거기 있다. C5 가 정한 winsorize→z→백분위 순서와도 맞는다)
+
+    ② Signal_rank 는 '월 전체' 백분위다. (month, pack_profile) 로 나눠 매기면 안 된다.
+       프로파일이 다른 종목끼리 랭크가 서로 비교 불가능해지는데, 정작 선정부는
+       nlargest 로 월 전체를 한 줄로 세워 뽑는다. 그러면 '자기 프로파일에서 혼자'인
+       종목이 전부 1.0 을 받아 상위를 채우고, 실측상 월 보유종목의 70%가 동점 1.0 중
+       종목코드 순으로 결정됐다. 정보량 차이는 pack_profile 랭킹이 아니라
+       FLOOR(빈 축 없음 + 최소 2축)가 이미 막는다.
+    """
+    all_e = list(all_e)
+    pcts: dict = {}
+    Z = pd.DataFrame({c: xsec_z_l(P, c) for c in all_e}, index=P.index)
+    E_raw = nanmean_cols(Z, all_e)                       # ① 축별 z → 동일가중 평균
+    E = xsec_rank_pct_l(P, E_raw)
+    FLOOR = compute_floor(P, all_e, min_axes, pct_out=pcts)
+    U = P["U"].fillna(0) if "U" in P.columns else pd.Series(0.0, index=P.index)
+    VETO = P["VETO"].fillna(0) if "VETO" in P.columns else pd.Series(1.0, index=P.index)
+    Signal = E.fillna(0) * U * VETO * FLOOR
+    prof = P[all_e].notna().astype(int).astype(str).agg("".join, axis=1)
+    rank = Signal.groupby(P["month"], observed=True).rank(pct=True, method="average")  # ②
+    return {"E_raw": E_raw, "E": E, "FLOOR": FLOOR, "Signal": Signal,
+            "pack_profile": prof, "Signal_rank": rank,
+            "n_axes_active": P[all_e].notna().sum(axis=1), "pcts": pcts}
+
+
 def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
     """E = mean(활성 팩 + 공용축 B·C), U = 반영도, Signal = rank(E)×rank(U)×∏V.
 
@@ -5722,34 +5909,25 @@ def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
     if not all_e:
         raise RuntimeError("합성할 증거층(E) 컬럼이 하나도 없습니다. "
                            "활성 팩의 원천 데이터가 전부 비어 있는지 위 수집 로그를 확인하세요.")
+    if "U" not in P.columns:
+        P["U"] = np.nan
 
-    # 팩 간 동일가중 (C7)
-    P["E_raw"] = nanmean_cols(P, all_e)
-    P["E"] = xsec_rank_pct_l(P, P["E_raw"])
-    P["n_axes_active"] = P[all_e].notna().sum(axis=1)
-
-    # ── ② 하한선 (§8.2) ───────────────────────────────────────────────────────────────────
-    #   원문: "활성 센서팩 및 B·C축 각각의 셀 내 백분위가 모두 ≥ 50th"
-    #         "'모든 축이 상위'가 아니라 '빈 축이 없을 것'. 표본 붕괴 없이 단일 축 편중을 막고"
+    # ── ② 점수 조립 — 본선도 비교팔과 완전히 같은 경로를 탄다 ────────────────────────────
+    #   (§8.2 하한선 원문: "활성 센서팩 및 B·C축 각각의 셀 내 백분위가 모두 ≥ 50th"
+    #    "'모든 축이 상위'가 아니라 '빈 축이 없을 것'. 표본 붕괴 없이 단일 축 편중을 막고"
     #
-    #   ★ 순진하게 '전 축 conjunction' 으로 구현하면 두 가지가 깨진다:
-    #     (a) V4 는 §9에서 유일한 '부분' 거부권인데, θ 미달로 E_N 이 NaN 이 되면 그 종목이
-    #         하한선에서 통째로 탈락한다 → 부분 거부권이 전면 제외로 변질된다.
-    #     (b) 축이 7개면 잔존율이 0.5^7 ≈ 0.8% 로 붕괴한다 → 스펙이 명시적으로 금지한 '표본 붕괴'.
-    #
-    #   그래서 이렇게 읽는다: "그 종목이 실제로 보유한 축은 모두 50th 이상일 것" +
-    #   "축이 최소 MIN_FLOOR_AXES 개는 있을 것"(=빈 깡통 배제). 정보량이 다른 종목끼리의
-    #   직접 비교는 §8.4의 pack_profile 별도 랭킹이 이미 막는다.
-    MIN_FLOOR_AXES = 2
-    ok_cnt = pd.Series(0, index=P.index)
-    bad_cnt = pd.Series(0, index=P.index)
-    for c in all_e:
-        pct = xsec_rank_pct_l(P, c)
+    #    ★ 순진하게 '전 축 conjunction' 으로 구현하면 두 가지가 깨진다:
+    #      (a) V4 는 §9에서 유일한 '부분' 거부권인데, θ 미달로 E_N 이 NaN 이 되면 그 종목이
+    #          하한선에서 통째로 탈락한다 → 부분 거부권이 전면 제외로 변질된다.
+    #      (b) 축이 7개면 잔존율이 0.5^7 ≈ 0.8% 로 붕괴한다 → 스펙이 명시적으로 금지한 '표본 붕괴'.
+    #    그래서 "보유한 축은 모두 50th 이상" + "축 최소 MIN_FLOOR_AXES 개" 로 읽는다)
+    S = score_from_axes(P, all_e)
+    for k in ("E_raw", "E", "FLOOR", "Signal", "pack_profile", "Signal_rank", "n_axes_active"):
+        P[k] = S[k]
+    for c, pct in S["pcts"].items():
         P[f"pct_{c}"] = pct
-        ok_cnt += (pct >= 0.50).fillna(False).astype(int)
-        bad_cnt += (pct < 0.50).fillna(False).astype(int)
-    P["FLOOR"] = ((bad_cnt == 0) & (ok_cnt >= MIN_FLOOR_AXES)).astype(float)
 
+    # ── ③ 진단 출력 ───────────────────────────────────────────────────────────────────────
     ret = float(P["FLOOR"].mean()) if len(P) else 0.0
     rows = [[c, f"{float(P[c].notna().mean())*100:.1f}%",
              f"{float((P[f'pct_{c}'] >= 0.50).mean())*100:.1f}%"] for c in all_e]
@@ -5763,17 +5941,11 @@ def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
                  f"§8.2 는 '표본 붕괴 없이' 를 명시하므로, 활성 팩 수를 줄이거나 "
                  f"팩별 단독 파일로 나눠 돌리는 편이 스펙 의도에 더 가깝습니다.")
 
-    if "U" not in P.columns:
-        P["U"] = np.nan
-    P["Signal"] = P["E"].fillna(0) * P["U"].fillna(0) * P["VETO"].fillna(0) * P["FLOOR"].fillna(0)
-
-    # 활성 팩 조합이 같은 종목끼리 별도 랭킹 후 합친다 (§8.4 — 정보량이 다른 종목의 직접 비교 방지)
-    P["pack_profile"] = P[all_e].notna().astype(int).astype(str).agg("".join, axis=1)
-    P["Signal_rank"] = (P.groupby(["month", "pack_profile"], observed=True)["Signal"]
-                         .rank(pct=True, method="average"))
-    LOG.ok(f"스코어 조립 완료 — 증거층 {len(all_e)}개 축 동일가중 "
+    prof_n = int(P["pack_profile"].nunique())
+    LOG.ok(f"스코어 조립 완료 — 증거층 {len(all_e)}개 축 z표준화 후 동일가중 "
            f"({', '.join(all_e)}) · 하한선 통과 {int(P['FLOOR'].sum()):,}행 "
-           f"({100*P['FLOOR'].mean():.1f}%)")
+           f"({100*P['FLOOR'].mean():.1f}%) · Signal_rank 는 월 전체 백분위 "
+           f"(정보량 프로파일 {prof_n}종은 진단용으로만 기록)")
     PIPE.io("OUT", "MEM", "scored_panel", P)
     return P
 
@@ -5816,6 +5988,41 @@ def slippage(trade_krw: float, adv_krw: float) -> float:
         return 0.02
     part = min(1.0, abs(trade_krw) / adv_krw)
     return float(SLIPPAGE_K * math.sqrt(part))
+
+
+def exit_gate(dm, de) -> bool:
+    """청산 판단: '진입 시의 목표상태'를 벗어났는가.
+
+    진입 조건(axis_D)은 ΔlogE > 0 AND 시장이 아직 자본화를 안 함(ΔlogM < ΔlogE) 이다.
+    그 상태를 벗어나면 청산한다. 두 경우가 한 식에 들어간다:
+      · dm >= de → 시장이 마침내 재분류했다. 알파 소진(원래 의도한 청산)
+      · de <= 0  → 이익 증가 자체가 소멸했다. 논거 무효
+
+    ★ 예전엔 `dm >= de and de > 0` 이었다. 앞 조건이 참이면 뒤 조건도 거의 항상 참이라
+      보이지만, 실제로 걸러지는 건 'de <= 0' 인 전 구간 — 즉 논거가 깨진 종목을 청산하는
+      경로가 통째로 닫혀 있었다. 그 종목들은 보유상한(24개월)까지 자리를 차지했다.
+    NaN 은 '보유'로 떨어진다 — 모르는 것을 이유로 팔지 않는다.
+    """
+    if dm is None or de is None or pd.isna(dm) or pd.isna(de):
+        return False
+    return not (de > 0 and dm < de)
+
+
+def _top_n(df: pd.DataFrame, n: int, signal_col: str) -> pd.DataFrame:
+    """상위 n 종목 선정. 동점은 명시적 키로 깬다 — 행 순서로 깨지 않는다.
+
+    ★ nlargest(keep="first") 는 동점일 때 '데이터프레임에 먼저 나온 행'을 고른다. 패널은
+      ["code","month"] 로 정렬되어 있으므로 그건 곧 '종목코드가 작은 순'이다. 동점이 드물면
+      무해하지만, 실측상 월 보유종목의 상당수가 동점 구간에서 결정됐고 행 순서를 섞으면
+      포트폴리오가 통째로 바뀌었다 — 즉 보유종목이 데이터가 아니라 정렬의 함수였다.
+      그래서 ① 1차 키는 signal_col, ② 2차 키는 랭크 이전의 원 Signal(정보량이 더 많다),
+      ③ 최후에만 code 로 깬다. 이러면 동점 처리가 결정적이면서 '왜 그 종목인가'가 설명된다.
+    """
+    if not len(df):
+        return df.iloc[0:0]
+    keys = [signal_col] + [c for c in ("Signal", "code") if c in df.columns and c != signal_col]
+    asc = [False] + [False if c == "Signal" else True for c in keys[1:]]
+    return df.sort_values(keys, ascending=asc, kind="mergesort").head(n)
 
 
 def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
@@ -5896,7 +6103,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
 
         k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
                                              round(len(elig) * top_pct))))
-        pick = elig.nlargest(k, signal_col) if len(elig) else elig.iloc[0:0]
+        pick = _top_n(elig, k, signal_col)
         uni.audit_row("최종선정", m, pick["code"].tolist())
 
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
@@ -5911,15 +6118,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 exited = True                                    # 거부권 발동 시 즉시 강제청산
             elif h["months"] >= HOLD_MAX_MONTHS:
                 exited = True
-            elif (dm is not None and de is not None and pd.notna(dm) and pd.notna(de)
-                  and dm >= de and de > 0):
-                exited = True                                    # 시장이 마침내 재분류 → 알파 소진
+            elif exit_gate(dm, de):
+                exited = True                        # 목표상태 이탈 (재분류 완료 또는 논거 무효)
             if not exited:
                 keep.append(c)
         target = pd.concat([pick, sub[sub["code"].isin(keep) & ~sub["code"].isin(pick["code"])]],
                            ignore_index=True) if len(keep) else pick
         if len(target) > PORTFOLIO_MAX_NAMES:
-            target = target.nlargest(PORTFOLIO_MAX_NAMES, signal_col)
+            target = _top_n(target, PORTFOLIO_MAX_NAMES, signal_col)
         target = size_positions(target) if len(target) else target.assign(weight=[])
 
         w_new = dict(zip(target["code"], target["weight"])) if len(target) else {}
@@ -6151,34 +6357,51 @@ def R1_leakage(P: pd.DataFrame, months, uni, sec, run_fn) -> None:
 def R2_tp_vs_naive(P: pd.DataFrame, run_fn) -> None:
     """TP = z(개선) × z(대가회피) 가 z(개선) 단독보다 낫지 않다면,
     트레이드오프 논리 전체가 불필요한 복잡도다. 정면으로 검정하고 있는 그대로 보고한다."""
-    tp_cols, naive_cols = [], []
-    for p in active_packs():
-        tp_cols += [c for c in p["tp_cols"] if c in P.columns]
-    tp_cols += [c for c in ("TP_B1", "TP_B2", "TP_C1", "TP_C2") if c in P.columns]
+    # ★ 두 팔의 '축 개수'를 맞춘다. 하한선은 "보유한 축이 모두 50th 이상"이라 축이 많을수록
+    #   기하급수적으로 좁아진다(축 k개면 대략 0.5^k). TP 팔에 원시 TP 13개, 나이브 팔에
+    #   원지표 7개를 넣으면 유니버스 폭이 1.68% 대 7.13% 로 벌어져서, 신호 품질이 아니라
+    #   유니버스 폭 차이를 재게 된다. TP 쪽의 올바른 '축'은 팩 단위 집계인 E_* 컬럼이고,
+    #   그게 본선이 실제로 쓰는 구성이기도 하다 — 검정 대상과 운용 대상이 일치해야 한다.
+    tp_cols = [p["E_col"] for p in active_packs() if p["E_col"] in P.columns] + \
+              [c for c in ("E_AXB", "E_AXC") if c in P.columns]
+    if not tp_cols:                       # E_* 가 없으면 원시 TP 로 폴백
+        for p in active_packs():
+            tp_cols += [c for c in p["tp_cols"] if c in P.columns]
+        tp_cols += [c for c in ("TP_B1", "TP_B2", "TP_C1", "TP_C2") if c in P.columns]
     # 나이브 = '개선 항목 단독' (곱의 첫 인자에 해당하는 원지표들)
-    for c in ("n1", "p1", "x1", "q1", "dlog_rev", "dlog_IC", "dlog_emp"):
-        if c in P.columns:
-            naive_cols.append(c)
+    naive_cols = [c for c in ("n1", "p1", "x1", "q1", "dlog_rev", "dlog_IC", "dlog_emp")
+                  if c in P.columns]
     if not tp_cols or not naive_cols:
         _record("R2", "TP vs 나이브", None, "비교할 컬럼이 부족합니다.")
         return
 
-    Q = P.copy()
-    Q["E_raw"] = nanmean_cols(Q, tp_cols)
-    Q["E"] = xsec_rank_pct(Q["E_raw"], Q["cell"])
-    Q["Signal_rank"] = (Q["E"].fillna(0) * Q["U"].fillna(0) * Q["VETO"].fillna(0) *
-                        Q["FLOOR"].fillna(0))
-    Q["Signal_rank"] = Q.groupby("month", observed=True)["Signal_rank"].rank(pct=True)
-    tp_bt = run_fn(Q, label="R2_TP")
+    # ── 각 팔은 '자기 증거'로 하한선까지 다시 만든다 ──────────────────────────────────────
+    #   ★ 예전엔 두 팔이 본선의 FLOOR 컬럼을 그대로 물려받았다. 그런데 FLOOR 는 전부 TP 에서
+    #     파생된 값이라, '나이브 팔'조차 TP 로 선별된 종목만 보게 된다. 실측하면 FLOOR 하나가
+    #     종목 선정의 92.4% 를 끝내 버려서, TP 팔과 '균등난수 팔'의 보유종목 자카드 유사도가
+    #     0.73 이었다. 무엇과도 구별하지 못하는 게이트는 킬 게이트가 아니다.
+    #     각 팔이 자기 증거로 하한선을 만들면 자카드가 0.64 → 0.14 로 떨어지고 비교가 성립한다.
+    def _arm(cols: Sequence[str], label: str):
+        A = P.copy()
+        Z = pd.DataFrame({c: xsec_z_l(A, c) for c in cols}, index=A.index)
+        A["E_raw"] = nanmean_cols(Z, list(cols))
+        A["E"] = xsec_rank_pct_l(A, A["E_raw"])
+        A["FLOOR"] = compute_floor(A, cols)
+        A["Signal"] = A["E"].fillna(0) * A["U"].fillna(0) * A["VETO"].fillna(0) * A["FLOOR"]
+        A["Signal_rank"] = (A.groupby("month", observed=True)["Signal"]
+                             .rank(pct=True, method="average"))
+        return A, run_fn(A, label=label)
 
-    N = P.copy()
-    zc = [xsec_z(N[c], N["cell"]).rename(c) for c in naive_cols]
-    N["E_raw"] = nanmean_cols(pd.concat(zc, axis=1), naive_cols)
-    N["E"] = xsec_rank_pct(N["E_raw"], N["cell"])
-    N["Signal_rank"] = (N["E"].fillna(0) * N["U"].fillna(0) * N["VETO"].fillna(0) *
-                        N["FLOOR"].fillna(0))
-    N["Signal_rank"] = N.groupby("month", observed=True)["Signal_rank"].rank(pct=True)
-    nv_bt = run_fn(N, label="R2_naive")
+    Q, tp_bt = _arm(tp_cols, "R2_TP")
+    N, nv_bt = _arm(naive_cols, "R2_naive")
+
+    f_tp, f_nv = float(Q["FLOOR"].mean()), float(N["FLOOR"].mean())
+    LOG.info(f"R2 각 팔의 하한선 잔존율 — TP {f_tp*100:.2f}% · 나이브 {f_nv*100:.2f}% "
+             f"(두 팔이 각자의 증거로 하한선을 만듭니다)")
+    if not (0.5 <= f_nv / max(f_tp, 1e-9) <= 2.0):
+        LOG.warn(f"두 팔의 유니버스 폭이 {f_nv/max(f_tp,1e-9):.2f}배로 벌어졌습니다. "
+                 f"이 비교는 신호 품질이 아니라 유니버스 폭 차이를 재고 있을 수 있습니다 — "
+                 f"아래 판정을 그만큼 할인해서 읽으십시오.")
 
     a, b = tp_bt["returns"]["ret"].fillna(0).to_numpy(), nv_bt["returns"]["ret"].fillna(0).to_numpy()
     k = min(len(a), len(b))
@@ -6193,6 +6416,25 @@ def R2_tp_vs_naive(P: pd.DataFrame, run_fn) -> None:
                                   "§15-2에 따라 트레이드오프 패러다임의 근거가 소멸합니다. "
                                   "유리하게 해석하지 않고 그대로 보고합니다."),
             kill=True, metrics={"sharpe_tp": s_tp, "sharpe_naive": s_nv, "t_diff": t})
+
+    # ── R2b 하니스 자체 검정: TP 가 '무정보 균등난수'는 이겨야 한다 ────────────────────────
+    #   이건 전략이 아니라 '비교 장치'를 검정한다. 만약 난수 팔이 TP 와 비슷한 성과를 내면
+    #   위 R2 판정은 신호가 아니라 선별 게이트가 만든 것이고, 그 순간 R2 는 아무것도 판정하지
+    #   못한다. 실제로 하한선을 공유하던 시절엔 난수 팔이 TP 팔과 자카드 0.73 이었다.
+    Z = P.copy()
+    Z["_noise"] = np.random.default_rng(SEED).random(len(Z))
+    Z["E"] = xsec_rank_pct_l(Z, Z["_noise"])
+    Z["FLOOR"] = compute_floor(Z, tp_cols)          # 유니버스 폭은 TP 팔과 동일하게 맞춘다
+    Z["Signal"] = Z["E"].fillna(0) * Z["U"].fillna(0) * Z["VETO"].fillna(0) * Z["FLOOR"]
+    Z["Signal_rank"] = Z.groupby("month", observed=True)["Signal"].rank(pct=True, method="average")
+    s_rd = _sharpe(run_fn(Z, label="R2_noise")["returns"])
+    _record("R2b", "TP vs 무정보 난수 (하니스 검정)", bool(s_tp > s_rd),
+            f"TP Sharpe {s_tp:.3f} vs 균등난수 {s_rd:.3f}. " +
+            ("비교 장치가 신호와 무신호를 구별합니다 — R2 판정을 신뢰할 수 있습니다."
+             if s_tp > s_rd else
+             "★ TP 가 무정보 난수조차 이기지 못했습니다. 이 경우 위 R2 판정은 신호가 아니라 "
+             "선별 게이트(하한선·거부권)가 만든 것입니다. R2 결과를 그대로 믿지 마십시오."),
+            metrics={"sharpe_tp": s_tp, "sharpe_random": s_rd})
 
 
 # ── R3. 퀄리티 팩터 직교화 ─────────────────────────────────────────────────────────────────
@@ -6322,23 +6564,32 @@ def R10_policy_falsify(P: pd.DataFrame, cal: pd.DataFrame, months, run_fn) -> No
 # ── R5. 절제 (ablation) ─────────────────────────────────────────────────────────────────────
 def R5_ablation(P: pd.DataFrame, run_fn) -> None:
     """팩별·TP별로 하나씩 빼고 돌려 기여를 귀속한다. L2 만 건드리므로 몇 분이면 끝난다."""
-    base = run_fn(P, label="R5_base")
-    s0 = _sharpe(base["returns"])
-    rows = [["(전체)", f"{s0:.3f}", "—", "—"]]
     packs = active_packs()
     all_e = [p["E_col"] for p in packs if p["E_col"] in P.columns] + \
             [c for c in ("E_AXB", "E_AXC") if c in P.columns]
+
+    # ★ 기준선도 절제팔과 똑같이 score_from_axes 를 통과시킨다.
+    #   예전엔 기준선은 본선 컬럼을 그대로 쓰고 절제팔만 별도 식으로 점수를 다시 만들었다.
+    #   그러면 Δ가 '무엇을 뺐는가'가 아니라 '계산 방식이 달라졌는가'를 잰다. 실제로
+    #   아무것도 빼지 않은 널-절제의 ΔSharpe 가 +2.08 로 나왔다(0.000 이어야 한다).
+    def _score_arm(cols: Sequence[str], label: str):
+        A = P.copy()
+        S = score_from_axes(A, cols)
+        for k in ("E_raw", "E", "FLOOR", "Signal", "pack_profile", "Signal_rank"):
+            A[k] = S[k]
+        return _sharpe(run_fn(A, label=label)["returns"])
+
+    s0 = _score_arm(all_e, "R5_base")
+    rows = [["(전체)", f"{s0:.3f}", "—", "—"]]
     for drop in all_e:
-        Q = P.copy()
         rest = [c for c in all_e if c != drop]
-        if not rest:
+        if len(rest) < MIN_FLOOR_AXES:
+            # 남은 축이 하한선 최소개수보다 적으면 FLOOR 가 전원 탈락한다 — 절제가 아니라
+            # 유니버스 전멸이므로 Δ를 기여도로 읽으면 안 된다. 건너뛰되 표에 남긴다.
+            rows.append([f"− {drop}", "—", "—",
+                         f"측정 불가 (잔여 축 {len(rest)}개 < 하한선 최소 {MIN_FLOOR_AXES}개)"])
             continue
-        Q["E_raw"] = nanmean_cols(Q, rest)
-        Q["E"] = xsec_rank_pct(Q["E_raw"], Q["cell"])
-        Q["Signal_rank"] = Q.groupby("month", observed=True).apply(
-            lambda g: (g["E"].fillna(0) * g["U"].fillna(0) * g["VETO"].fillna(0) *
-                       g["FLOOR"].fillna(0)).rank(pct=True)).reset_index(level=0, drop=True)
-        s = _sharpe(run_fn(Q, label=f"R5_no_{drop}")["returns"])
+        s = _score_arm(rest, f"R5_no_{drop}")
         rows.append([f"− {drop}", f"{s:.3f}", f"{s - s0:+.3f}",
                      "기여함" if s < s0 - 0.03 else ("무기여" if s > s0 + 0.03 else "중립")])
     LOG.table(rows, ["절제 대상", "Sharpe", "Δ", "판정"], ["l", "r", "r", "l"],
@@ -7174,6 +7425,107 @@ def run_contract_tests(strict: bool = True) -> bool:
                       f"source({m1['source'].iloc[0]})·src_report_id·report_uid 불변")
 
     _c("MERGE", "원장 병합 멱등성", c_merge)
+
+    # ── 회귀 방지: Signal_rank 는 '월 전체' 백분위일 것 ────────────────────────────────────
+    def c_rank():
+        """선정부(nlargest)는 월 전체를 한 줄로 세워 뽑는다. 따라서 랭크도 월 전체여야 한다.
+
+        한때 (month, pack_profile) 로 나눠 랭크를 매겼다. 그러면 자기 프로파일에 혼자인 종목이
+        무조건 1.0 을 받아 상위를 채운다 — 실측상 월 보유종목의 70%가 동점 1.0 이었고,
+        그중 상당수가 그달 '가장 낮은' 원점수였다. 정보량 차이는 랭크 분할이 아니라
+        하한선(빈 축 없음 + 최소 축수)이 막는다.
+        """
+        n = 60
+        P = pd.DataFrame({
+            "code": [f"{i:06d}" for i in range(n + 1)],
+            "month": as_ts("2020-06-30"), "cell": "X", "U": 1.0, "VETO": 1.0,
+            "E_A": list(np.linspace(0.0, 1.0, n)) + [0.60],
+            "E_B": list(np.linspace(0.0, 1.0, n)) + [np.nan],   # 마지막 1행만 축이 1개
+        })
+        S = score_from_axes(P, ["E_A", "E_B"], min_axes=1)
+        sig, rank = S["Signal"], S["Signal_rank"]
+        if int(S["pack_profile"].nunique()) < 2:
+            return False, "테스트 전제 오류: 정보량 프로파일이 2종 이상이어야 합니다."
+        top_by_rank = int(rank.idxmax())
+        top_by_sig = int(sig.idxmax())
+        if top_by_rank != top_by_sig:
+            return False, (f"★랭크가 원점수와 어긋납니다: 최고 랭크는 {P['code'][top_by_rank]}"
+                           f"(Signal {sig[top_by_rank]:.4f}) 인데 최고 원점수는 "
+                           f"{P['code'][top_by_sig]}(Signal {sig[top_by_sig]:.4f}) 입니다. "
+                           f"Signal_rank 를 pack_profile 로 나눠 매기면 '자기 그룹에 혼자인' "
+                           f"종목이 1.0 을 받아 상위를 차지합니다.")
+        d = pd.DataFrame({"s": sig, "r": rank}).dropna()
+        rho = float(d["s"].corr(d["r"], method="spearman"))
+        if not (rho > 0.999):
+            return False, f"★Signal_rank 가 Signal 의 단조함수가 아닙니다 (spearman={rho:.4f})."
+        return True, (f"월 전체 백분위 확인 — 랭크가 원점수의 단조함수(ρ={rho:.4f})이고 "
+                      f"축이 1개뿐인 종목이 상위를 가로채지 않음 (프로파일 "
+                      f"{int(S['pack_profile'].nunique())}종)")
+
+    _c("RANK", "선정 랭크 정합성", c_rank)
+
+    # ── 회귀 방지: 활성 팩은 전용 수집이 배선되어 있을 것 ──────────────────────────────────
+    def c_wire():
+        """'수집이 배선되지 않음'과 '수집했는데 비어 있음'은 완전히 다른 사건이다.
+
+        한때 어느 팩도 ingest_fn 을 등록하지 않아 collect_all 의 팩 수집 루프가 통째로
+        무동작이었다. 5개 팩 전략이 실제로는 PACK-C 하나로 돌면서 성과표를 끝까지 출력했고,
+        하류 커버리지 검사는 그걸 '데이터 부재'로 보고해 운영자를 API 키 쪽으로 오도했다.
+        """
+        bad = [p["id"] for p in active_packs() if not p.get("ingest") and p["id"] != "C"]
+        if bad:
+            return False, (f"★센서팩 {bad} 이 활성인데 ingest_fn 이 없습니다. 이 팩들은 "
+                           f"수집 자체가 일어나지 않아 전 구간 결측이 되며, 키를 넣어도 "
+                           f"해결되지 않습니다.")
+        wired = [p["id"] for p in active_packs() if p.get("ingest")]
+        return True, (f"활성 팩 {[p['id'] for p in active_packs()]} 중 전용 수집 배선 {wired} "
+                      f"확인 (C 는 L1.DART 재무를 그대로 읽으므로 전용 수집 없음이 정상)")
+
+    _c("WIRE", "센서팩 수집 배선", c_wire)
+
+    # ── 회귀 방지: 청산 게이트의 모든 분기가 도달 가능할 것 ────────────────────────────────
+    def c_exit():
+        """`dm >= de and de > 0` 처럼 뒤 조건이 앞 조건에 거의 포함되는 식은, 실제로는
+        '논거가 깨진 종목을 파는 경로'만 골라서 닫아버린다. 네 사분면을 전부 검정한다."""
+        cases = [
+            (0.05, 0.10, False, "ΔlogE>0 이고 시장이 아직 자본화 안 함 → 보유(목표상태)"),
+            (0.15, 0.10, True,  "시장이 재분류 완료(ΔlogM≥ΔlogE) → 청산(알파 소진)"),
+            (-0.20, -0.05, True, "이익 증가 소멸 → 청산(논거 무효). 예전엔 이 경로가 닫혀 있었다"),
+            (0.05, -0.05, True, "이익 감소 + 주가 상승 → 청산"),
+            (np.nan, 0.10, False, "결측 → 보유(모르는 것을 이유로 팔지 않는다)"),
+            (0.05, np.nan, False, "결측 → 보유"),
+        ]
+        for dm, de, want, why in cases:
+            got = bool(exit_gate(dm, de))
+            if got != want:
+                return False, (f"★청산 게이트: ΔlogM={dm}, ΔlogE={de} → {got} (기대 {want}). {why}")
+        return True, ("네 사분면 + 결측 전부 확인 — 재분류 완료와 논거 무효를 모두 청산하고, "
+                      "결측은 보유로 떨어짐")
+
+    _c("EXIT", "청산 게이트 도달성", c_exit)
+
+    # ── 회귀 방지: TP_P2 의 저-저 사분면 부호 ──────────────────────────────────────────────
+    def c_tpp2():
+        """TP = z(개선) × z(대가회피) 는 곱이라, 두 인자가 모두 음수면 양수가 된다.
+        '취득 규모가 큰데 소각까지 실행했는가'를 묻는 TP_P2 에서는 이게 치명적이다 —
+        자사주를 거의 안 샀고 소각도 안 한 기업이 '진정성 있는 환원'으로 뒤집힌다."""
+        zi = pd.Series([-1.5, -0.5, 1.2, 2.0])       # 취득 규모 z
+        zp = pd.Series([-1.5, 1.0, -0.8, 1.5])       # 소각 실행률 z
+        out = tp_product(zi.where(zi > 0), zp)
+        if pd.notna(out.iloc[0]):
+            return False, (f"★저-저 사분면(취득 안 함 + 소각 안 함)이 {out.iloc[0]:.3f} 로 "
+                           f"산출됐습니다. 음×음=양 때문에 '아무것도 안 한 기업'이 상위로 "
+                           f"올라갑니다. 지출이 없는 쪽은 NaN 이어야 합니다.")
+        if pd.notna(out.iloc[1]):
+            return False, "취득 규모가 셀 평균 미만인데 값이 나왔습니다."
+        if not (pd.notna(out.iloc[3]) and out.iloc[3] > 0):
+            return False, f"고-고 사분면(취득 큼 + 소각 실행)이 양수가 아닙니다: {out.iloc[3]}"
+        if not (pd.notna(out.iloc[2]) and out.iloc[2] < 0):
+            return False, f"취득은 컸는데 소각 안 한 경우가 음수가 아닙니다: {out.iloc[2]}"
+        return True, ("저-저 사분면 NaN(0 아님) · 고-고 양수 · 고-저 음수 확인 — "
+                      "'대가를 안 치렀다'는 거짓 주장을 만들지 않음")
+
+    _c("TPP2", "자사주 TP 부호", c_tpp2)
 
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30), "✔ 통과" if r["pass"] else "✘ 실패",
@@ -8123,6 +8475,19 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
                             source="entity_resolution")
         ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
 
+    # ── 팩 전용 수집 ──────────────────────────────────────────────────────────────────────
+    #  ★ 배선 검정을 먼저 한다. 이 루프는 `if p.get("ingest")` 로 조용히 건너뛸 수 있는데,
+    #    한때 어느 팩도 ingest_fn 을 등록하지 않아 루프 전체가 무동작이었다. 그 결과
+    #    "5개 센서팩 전략"이 실제로는 PACK-C 하나로 돌면서 성과표·강건성표를 끝까지 출력했다.
+    #    하류의 커버리지 검사는 이걸 "데이터 부재"로 보고해서 운영자를 API 키 쪽으로 오도한다.
+    #    '수집이 배선되지 않음'과 '수집했는데 비어 있음'은 완전히 다른 사건이므로 여기서 가른다.
+    #    (PACK-C 는 L1.DART 가 채운 재무를 그대로 읽으므로 전용 수집이 없는 게 정상이다)
+    unwired = [p["id"] for p in active_packs() if not p.get("ingest") and p["id"] != "C"]
+    if unwired:
+        raise RuntimeError(
+            f"[배선 결함] 센서팩 {unwired} 이 ACTIVE_PACKS 에 있는데 ingest_fn 이 등록되지 "
+            f"않았습니다. 이건 '데이터 부재'가 아니라 '수집 자체가 배선되지 않음' 입니다 — "
+            f"키를 넣어도 해결되지 않습니다. register_pack(..., ingest_fn=...) 를 확인하세요.")
     for p in active_packs():
         if p.get("ingest"):
             with PIPE.stage(f"L1.PACK.{p['id']}", f"팩 {p['id']} 전용 수집", "L1",

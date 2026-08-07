@@ -247,10 +247,40 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
     start_ts, end_ts = as_ts(start), as_ts(end)
-    todo, n_back, n_fwd = [], 0, 0
+
+    # ── 시도 원장 (음성 캐시) ─────────────────────────────────────────────────────────────
+    #  ★ 폐지 종목과 '어느 소스에도 없는 종목'은 매 실행마다 전 소스 체인을 헛돌게 만든다.
+    #    성공한 종목만 캐시에 남으므로 실패는 영원히 기억되지 않고, 그 수는 백테스트 기간이
+    #    길어질수록 단조 증가한다. 실측상 완전 캐시 상태의 실행에서도 13~15분을 여기서 쓴다.
+    #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
+    #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
+    RETRY_AFTER_DAYS = 30
+    _today = as_ts(end)
+    attempts: Dict[str, dict] = {}
+    _att = VAULT.get_table("price_fetch_attempts", scope="shared")
+    if _att is not None and len(_att):
+        _att["attempted_at"] = as_ts_series(_att["attempted_at"])
+        _att["requested_from"] = as_ts_series(_att["requested_from"])
+        _att = _att.sort_values("attempted_at").drop_duplicates("code", keep="last")
+        attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from}
+                    for r in _att.itertuples(index=False)}
+
+    def _recently_failed(c: str, want_from: pd.Timestamp) -> bool:
+        p = attempts.get(c)
+        if p is None or pd.isna(p["at"]):
+            return False
+        # 이번에 더 이른 구간을 원한다면 이전 실패는 근거가 되지 않는다.
+        if pd.notna(p["frm"]) and p["frm"] > want_from:
+            return False
+        return (_today - p["at"]).days < RETRY_AFTER_DAYS
+
+    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
+            if _recently_failed(c, start_ts):
+                n_skip += 1
+                continue
             todo.append((c, start))
             continue
         # ★ 과거 방향 백필을 반드시 함께 본다.
@@ -266,6 +296,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
                  f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+    if n_skip:
+        LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
+                 f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
@@ -290,14 +323,26 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
-        for d in res:
+        failed = []
+        for (c, st), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
-        miss = len(todo) - len(new_frames)
-        if miss:
-            LOG.warn(f"일봉 수집 실패 {miss:,}종목 — 전 소스에서 데이터를 못 받았습니다. "
-                     f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다)")
+            else:
+                failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if failed:
+            LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
+                     f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
+                     f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
+            # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
+            #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
+            _prev = _att if _att is not None and len(_att) else None
+            _new = pd.DataFrame(failed)
+            _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
+            _all = (_all.sort_values("attempted_at")
+                        .drop_duplicates("code", keep="last").reset_index(drop=True))
+            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
+                            source="fetch_prices:negative_cache")
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:

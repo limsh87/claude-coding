@@ -37,16 +37,30 @@ def attach_fundamentals(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
         P = PIT.asof_join(P, "dart_employees", by="corp_code", left_time="month",
                           cols=["corp_code", "knowledge_date", "employees", "payroll"],
                           suffix="_emp")
-    for c in ("employees", "payroll"):
+    # ★ 결합 '이후에' 채운다. 먼저 만들어 두면 merge_asof 가 접미사를 붙여 실제 값을 흘려버린다.
+    #
+    #   왜 전 계정을 계약적으로 보장하는가 ─────────────────────────────────────────────────
+    #   DART 키가 없거나(상단 안내가 "아무것도 안 채워도 실행된다"고 약속한다) 재무 수집이
+    #   부분 실패하면 asof_join 이 아예 일어나지 않아 revenue_ttm·assets 같은 컬럼이
+    #   존재하지 않게 된다. 피처 계산부는 col() 로 결측 컬럼을 막아 두었지만
+    #   groupby(...)[c] 는 KeyError 로 죽고, 그 위치(L1.PANEL)는 critical 스테이지라
+    #   실행 전체가 중단된다. 특히 손익·현금흐름 계정은 tidy_financials 가 항상 만들지만
+    #   재무상태표 계정(assets·contract_liab 등)은 그 계정이 매칭됐을 때만 생기므로,
+    #   "DART 는 응답했는데 BS 계정만 정규식이 안 맞은" 경우엔 패널이 멀쩡한 채로 죽는다.
+    #   여기서 전부 NaN 으로 채워 두면 B/C축이 통째로 결측이 될 뿐 실행은 끝까지 간다.
+    for c in FUNDAMENTAL_COLS:
         if c not in P.columns:
             P[c] = np.nan
+    if not PIT.has("dart_financials"):
+        LOG.warn("DART 재무가 없어 B축(회계품질)·C축(자원투입)과 PACK-C 가 전부 결측입니다. "
+                 "실행은 계속되지만 증거층이 얇아집니다 — DART_API_KEY 를 넣으면 살아납니다.")
     return P
 
 
 # ── B축: 회계 품질 ──────────────────────────────────────────────────────────────────────────
 def axis_B(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
 
     rev = col(P, "revenue_ttm")
     cogs = col(P, "cogs_ttm")
@@ -81,7 +95,7 @@ def axis_B_tp(P: pd.DataFrame) -> pd.DataFrame:
 # ── C축: 자원 투입 ──────────────────────────────────────────────────────────────────────────
 def axis_C(P: pd.DataFrame) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
     nwc = (col(P, "receivable").fillna(0) + col(P, "inventory").fillna(0) -
            col(P, "payable").fillna(0)) if "receivable" in P.columns else np.nan
     P["IC"] = nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)
@@ -124,7 +138,7 @@ def axis_D(P: pd.DataFrame, px_daily: pd.DataFrame, flows: pd.DataFrame,
       이 대리변수의 한계를 리포트에 반드시 명시하고 숨기지 않는다.
     """
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
 
     # E 대리: TTM 순이익. M 대리: 시가총액/TTM순이익 → 주식수를 모를 때도 비율은 성립한다.
     P["E_proxy"] = col(P, "net_income_ttm")

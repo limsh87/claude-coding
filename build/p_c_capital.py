@@ -34,7 +34,7 @@ PACK_C_INTERP = [
 
 def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
 
     # ── 센서 ──────────────────────────────────────────────────────────────────────────────
     # p1: 총주주환원 / 영업현금흐름.  현금흐름표에서 직접 읽으므로 결정공시 파싱이 불필요하다.
@@ -83,7 +83,13 @@ def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
     z = lambda c: xsec_z_l(P, c)          # 셀 폴백 사다리 적용 (C11)
     P["TP_P1"] = tp_product(z("p1"), z("p2"))          # ★ 이 팩의 전부: 환원↑ 인데 투자도↑
-    P["TP_P2"] = tp_product(z("acq_size"), z("p3"))    # 취득 규모 큰데 소각까지 실행
+    # 취득 규모가 큰데 소각까지 실행 — '큰데'가 조건이므로 지출이 없는 쪽은 판단 대상이 아니다.
+    #  ★ z 를 그대로 곱하면 저-저 사분면(자사주를 거의 안 샀고 소각도 안 함)에서 음×음=양이 되어,
+    #    아무것도 안 한 기업이 '진정성 있는 환원'으로 뒤집힌다. 실측상 이 사분면이 정의역의 절반이다.
+    #    셀 평균(=z가 0을 지나는 지점) 아래의 취득은 NaN 으로 둔다. 0 으로 채우면
+    #    tp_product 규약("0으로 채우면 '대가를 안 치렀다'는 거짓 주장")을 정면으로 어긴다.
+    _zi = z("acq_size")
+    P["TP_P2"] = tp_product(_zi.where(_zi > 0), z("p3"))
     P["TP_P3"] = tp_product(z("p1"), -z("p4"))         # 환원↑ 인데 차입 안 늘림
     P["E_C_pack"] = nanmean_cols(P, ["TP_P1", "TP_P2", "TP_P3"])
     P["E_C"] = P["E_C_pack"]                            # 레지스트리 규약: E_<pid>

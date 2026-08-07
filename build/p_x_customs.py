@@ -164,7 +164,7 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                       cols=["code", "knowledge_date", "exp_usd", "exp_wgt",
                             "hhi_dest", "adv_share"], suffix="_cus")
     P = P.sort_values(["code", "month"])
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
     P["x1"] = g("exp_wgt").transform(lambda s: dlog(s, 12))
     P["x3_1"] = -g("hhi_dest").diff(12)
     P["x3_2"] = g("adv_share").diff(12)
@@ -208,9 +208,30 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     return P
 
 
+def pack_x_ingest(ctx: dict, months: pd.DatetimeIndex) -> None:
+    """PACK-X 전용 수집.
+
+    ★ 수집할 HS 목록은 코드가 고를 수 있는 값이 아니다. §6.3 은 이 팩을 전 종목에 적용하지
+      말라고 명시한다(국내 생산자 1~3개사인 과점 품목 우선). 즉 HS 유니버스는 연구자가
+      HS↔기업 매핑을 만들면서 함께 결정하는 '연구 입력'이다. 그래서 상수를 지어내지 않고,
+      공용 인덱스의 hs_corp_map 에 실제로 들어 있는 HS 만 수집한다.
+      매핑이 없으면 수집 대상 자체가 없으므로 팩은 자동 비활성화된다
+      (사유 경고는 map_hs_to_codes 가 직접 낸다).
+    """
+    M = map_hs_to_codes(pd.DataFrame(), ctx.get("sec"), ctx.get("fin"))
+    ctx["hs_map"] = M
+    hs = sorted({str(h) for h in M["hs"].dropna()}) if M is not None and len(M) else []
+    if not hs:
+        ctx["customs"] = pd.DataFrame()
+        return
+    LOG.info(f"PACK-X 수집 대상 HS {len(hs):,}개 (매핑 테이블에서 도출)")
+    ctx["customs"] = fetch_customs_trade(months, hs)
+
+
 register_pack(
     pid="X", name="관세청 수출", tp_cols=["TP_X1", "TP_X2", "TP_X3"],
     features_fn=pack_x_features, policy=PACK_X_POLICY, interp=PACK_X_INTERP,
+    ingest_fn=pack_x_ingest,
     theta_col="theta_X",
     notes="x2(수출단가 잔차)는 GPM으로 대체 불가. GPM은 원재료 하락으로도 개선되지만 "
           "수출단가는 판매가격 그 자체 — 원가 노이즈 0의 순수 가격결정력 측정치.")

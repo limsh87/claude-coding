@@ -341,6 +341,20 @@ ACCOUNT_PATTERNS: Dict[str, Tuple[str, List[str]]] = {
 }
 _SJ_MAP = {"BS": ("BS",), "IS": ("IS", "CIS"), "CF": ("CF",)}
 
+# ★ 손익·현금흐름 성격의 전 계정. 빠뜨리면 <계정>_ttm 컬럼이 아예 생성되지 않고,
+#   그걸 쓰는 팩이 실데이터 실행에서만 터진다(합성 스모크는 통과한다).
+FLOW_ITEMS = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "net_income",
+              "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise",
+              "tax_expense", "pretax_income", "other_income"]
+
+# 재무 결합 후 패널이 반드시 보유해야 하는 컬럼 전체 목록.
+# attach_fundamentals 가 이 목록으로 스키마를 계약적으로 보장한다 — 수집이 얼마나 실패하든
+# 패널의 컬럼 집합은 항상 같아야 한다. 그래야 "어떤 실행에선 있고 어떤 실행엔 없는" 축이
+# 사라지고, 결측은 결측대로 조용히가 아니라 표로 드러난다.
+FUNDAMENTAL_COLS = (list(ACCOUNT_PATTERNS)
+                    + [f"{c}{s}" for c in FLOW_ITEMS for s in ("_q", "_ttm")]
+                    + ["employees", "payroll", "v2_bad_3q"])
+
 
 def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     """원시 계정 → (corp_code, period, 항목) 와이드 테이블. knowledge_date 를 여기서 확정한다."""
@@ -389,11 +403,7 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     order = {REPRT_CODES["Q1"]: 1, REPRT_CODES["H1"]: 2, REPRT_CODES["Q3"]: 3, REPRT_CODES["FY"]: 4}
     W["q"] = W["reprt_code"].map(order)
     W = W.sort_values(["corp_code", "bsns_year", "q"]).reset_index(drop=True)
-    # ★ 손익·현금흐름 성격의 전 계정을 여기에 넣어야 한다. 빠뜨리면 <계정>_ttm 컬럼이
-    #   아예 생성되지 않고, 그걸 쓰는 팩이 실데이터 실행에서만 터진다(합성 스모크는 통과).
-    flow_items = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "net_income",
-                  "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise",
-                  "tax_expense", "pretax_income", "other_income"]
+    flow_items = FLOW_ITEMS
     # 누적 → 분기 단독. 직전 분기가 실제로 존재할 때만 차분한다.
     # (누락된 분기를 0으로 간주하면 반기 누적치가 한 분기 실적으로 둔갑한다 — fail-open 금지)
     gk = ["corp_code", "bsns_year"]
@@ -416,6 +426,17 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     for _k in ACCOUNT_PATTERNS:
         if _k not in W.columns:
             W[_k] = np.nan
+    # ── V2 거부권용 '이익-현금 괴리 3분기 연속' 플래그 ─────────────────────────────────────
+    #   ★ 여기서 만드는 이유: 연속성은 분기 관측을 세야 하는데, 월 패널에서 세면
+    #     같은 분기값이 1~4개월 반복되므로 어떤 고정 개월수도 정답이 아니다. 분기 프레임은
+    #     관측당 정확히 한 행이고 이미 (corp_code, bsns_year, q) 로 정렬돼 있다.
+    #     as-of 결합이 이 플래그를 C1 게이트웨이 그대로 실어 나른다.
+    #   min_periods=3 — 제출분이 3개 미만이면 NaN(=거부하지 않음). 근거 없는 제외 금지.
+    _bad_q = ((col(W, "net_income_ttm") > 0) &
+              (col(W, "cfo_ttm") < 0.5 * col(W, "net_income_ttm"))).astype(float)
+    W["v2_bad_3q"] = (_bad_q.groupby(W["corp_code"], observed=True)
+                            .transform(lambda s: s.rolling(3, min_periods=3).min()))
+
     _missing = [k for k in ACCOUNT_PATTERNS if W[k].notna().sum() == 0]
     if _missing:
         LOG.warn(f"DART 재무에서 한 건도 매칭되지 않은 계정 {len(_missing)}개: "

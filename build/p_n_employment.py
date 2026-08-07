@@ -162,6 +162,18 @@ def resolve_nps_to_corp(N: pd.DataFrame, sec: pd.DataFrame,
         return (pd.DataFrame(), pd.DataFrame())
     cached = VAULT.get_table("nps_entity_map", scope="shared")
     if cached is not None and len(cached) and RUN_MODE != "FULL":
+        # ★ 캐시의 valid_to 는 '캐시를 만들 때 본 마지막 월'이다. 그 뒤로 N 이 최근 월을
+        #   더 받아왔다면, 오래된 valid_to 가 새 데이터를 조용히 잘라낸다. 최근 방향으로만 넓힌다
+        #   (과거 방향은 손대지 않는다 — 그쪽을 넓히면 그게 바로 소급 누수다).
+        cached = cached.copy()
+        if "valid_to" in cached.columns and "ym" in N.columns:
+            n_last = as_ts(str(N["ym"].astype(str).max()) + "01") + pd.offsets.MonthEnd(0)
+            vt = as_ts_series(cached["valid_to"])
+            grew = int((vt < n_last).sum())
+            cached["valid_to"] = vt.where(vt >= n_last, n_last)
+            if grew:
+                LOG.info(f"캐시된 매핑 {grew:,}건의 유효구간 끝을 새로 수집된 최신월({n_last:%Y-%m})까지 "
+                         f"연장했습니다 — 오래된 valid_to 가 신규 데이터를 잘라내지 않도록.")
         LOG.info(f"공용 캐시에서 국민연금 매칭 {len(cached):,}건 재사용")
         return (cached, pd.DataFrame())
 
@@ -219,8 +231,36 @@ def resolve_nps_to_corp(N: pd.DataFrame, sec: pd.DataFrame,
     exact["match_method"] = np.where(exact["match_score"] >= 99.9, "exact_name", "fuzzy_name")
     M = exact.dropna(subset=["code"])[["biz_no", "wkpl_name", "code", "match_method",
                                        "match_score", "first_ym", "last_ym"]]
-    M["valid_from"] = as_ts_series(M["first_ym"].astype(str) + "01")
-    M["valid_to"] = as_ts_series(M["last_ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    # ── 매핑 유효구간 (C3) ────────────────────────────────────────────────────────────────
+    #  ★ 사업장의 '존속기간'을 유효구간이라고 부르면 안 된다. 그건 지금 걸러내려는 바로 그
+    #    컬럼(ym)의 min/max 라서, build_nps_panel 의 구간 필터가 항상 참이 된다 —
+    #    한 행도 못 거르는 항등식이면서 "C3 을 지켰다"고 로그에 찍는 최악의 조합이다.
+    #    유효구간은 '그 매칭을 언제부터 알 수 있었는가'를 말해야 한다.
+    #
+    #    지금 확보 가능한 근거는 발행사의 상장일/폐지일이다. 사업장을 그 법인의 상장 이전으로
+    #    귀속시킬 수는 없고, 폐지 이후로도 마찬가지다. 이걸로 구간을 좁힌다.
+    #
+    #    ⚠ 남는 한계를 숨기지 않는다: 유사매칭(fuzzy)은 '현재 사명'으로 맞춘 것이라
+    #      사명 변경 이전 구간에는 원리적으로 소급이다. 사명 변경 이력(DART 회사명 변경)이
+    #      들어오기 전까지 이 부분은 해소되지 않으므로 match_method 를 남겨 R 검정이
+    #      유사매칭만 떼어내고 재현할 수 있게 한다.
+    _lif = sec.set_index("code")["listing_date"].to_dict() if "listing_date" in sec.columns else {}
+    _dlf = sec.set_index("code")["delisting_date"].to_dict() if "delisting_date" in sec.columns else {}
+    _wk_from = as_ts_series(M["first_ym"].astype(str) + "01")
+    _wk_to = as_ts_series(M["last_ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    _ld = as_ts_series(M["code"].map(_lif))
+    _dd = as_ts_series(M["code"].map(_dlf))
+    M["valid_from"] = np.maximum(_wk_from, _ld.fillna(_wk_from))
+    M["valid_to"] = np.minimum(_wk_to, _dd.fillna(_wk_to))
+    _n_clamped = int((M["valid_from"] > _wk_from).sum() + (M["valid_to"] < _wk_to).sum())
+    if _n_clamped:
+        LOG.info(f"매핑 유효구간을 상장일/폐지일로 좁힌 건수 {_n_clamped:,} — "
+                 f"상장 전·폐지 후 사업장 귀속을 차단합니다(C3).")
+    _n_fuzzy = int((M["match_method"] == "fuzzy_name").sum())
+    if _n_fuzzy:
+        LOG.warn(f"유사매칭 {_n_fuzzy:,}건은 '현재 사명' 기준입니다. 사명 변경 이력이 없으면 "
+                 f"변경 이전 구간에 대해 소급 위험이 남습니다 — match_method 컬럼으로 "
+                 f"유사매칭만 제외한 재현이 가능하도록 원장에 남깁니다.")
     VAULT.put_table("nps_entity_map", M, scope="shared", domain="nps", source="entity_resolution")
     LOG.ok(f"국민연금 사업장 매칭 {len(M):,}건 → {M['code'].nunique():,}종목 "
            f"(정확일치 {int((M['match_method']=='exact_name').sum()):,} / "
@@ -275,7 +315,7 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     for c in NPS_COLS:
         if c not in P.columns:
             P[c] = np.nan
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
     P["_year"] = P["month"].dt.year
     P["_rate"] = P["_year"].map(NPS_CONTRIB_RATE).fillna(0.09)
     P["_cap"] = P["_year"].map(NPS_INCOME_CAP).fillna(6_370_000)
@@ -345,9 +385,21 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     return P
 
 
+def pack_n_ingest(ctx: dict, months: pd.DatetimeIndex) -> None:
+    """PACK-N 전용 수집. collect_all 의 팩 수집 루프가 호출한다.
+
+    ctx["emp"](DART 직원현황)와 ctx["sec"] 이 이미 채워진 뒤에 실행된다 — 사업장→종목 매칭이
+    둘을 모두 쓰기 때문이다. collect_all 의 팩 루프가 L1.DART 스테이지 뒤에 있어 순서는 보장된다.
+    """
+    N = fetch_nps_workplaces(months)
+    M, _ = resolve_nps_to_corp(N, ctx.get("sec"), ctx.get("emp"))
+    ctx["nps_panel"] = build_nps_panel(N, M, ctx.get("emp"), months)
+
+
 register_pack(
     pid="N", name="국민연금 고용", tp_cols=["TP_N1", "TP_N2", "TP_N3", "TP_N4"],
     features_fn=pack_n_features, policy=PACK_N_POLICY, interp=PACK_N_INTERP,
+    ingest_fn=pack_n_ingest,
     theta_col="theta_N",
     notes="한계임금(n2)이 핵심. 보조금 유인 채용은 구조적으로 저임금이므로 "
           "wage_premium<1 → 보조금 필터가 산식에 내장된다.")

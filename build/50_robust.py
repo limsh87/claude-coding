@@ -101,34 +101,51 @@ def R1_leakage(P: pd.DataFrame, months, uni, sec, run_fn) -> None:
 def R2_tp_vs_naive(P: pd.DataFrame, run_fn) -> None:
     """TP = z(개선) × z(대가회피) 가 z(개선) 단독보다 낫지 않다면,
     트레이드오프 논리 전체가 불필요한 복잡도다. 정면으로 검정하고 있는 그대로 보고한다."""
-    tp_cols, naive_cols = [], []
-    for p in active_packs():
-        tp_cols += [c for c in p["tp_cols"] if c in P.columns]
-    tp_cols += [c for c in ("TP_B1", "TP_B2", "TP_C1", "TP_C2") if c in P.columns]
+    # ★ 두 팔의 '축 개수'를 맞춘다. 하한선은 "보유한 축이 모두 50th 이상"이라 축이 많을수록
+    #   기하급수적으로 좁아진다(축 k개면 대략 0.5^k). TP 팔에 원시 TP 13개, 나이브 팔에
+    #   원지표 7개를 넣으면 유니버스 폭이 1.68% 대 7.13% 로 벌어져서, 신호 품질이 아니라
+    #   유니버스 폭 차이를 재게 된다. TP 쪽의 올바른 '축'은 팩 단위 집계인 E_* 컬럼이고,
+    #   그게 본선이 실제로 쓰는 구성이기도 하다 — 검정 대상과 운용 대상이 일치해야 한다.
+    tp_cols = [p["E_col"] for p in active_packs() if p["E_col"] in P.columns] + \
+              [c for c in ("E_AXB", "E_AXC") if c in P.columns]
+    if not tp_cols:                       # E_* 가 없으면 원시 TP 로 폴백
+        for p in active_packs():
+            tp_cols += [c for c in p["tp_cols"] if c in P.columns]
+        tp_cols += [c for c in ("TP_B1", "TP_B2", "TP_C1", "TP_C2") if c in P.columns]
     # 나이브 = '개선 항목 단독' (곱의 첫 인자에 해당하는 원지표들)
-    for c in ("n1", "p1", "x1", "q1", "dlog_rev", "dlog_IC", "dlog_emp"):
-        if c in P.columns:
-            naive_cols.append(c)
+    naive_cols = [c for c in ("n1", "p1", "x1", "q1", "dlog_rev", "dlog_IC", "dlog_emp")
+                  if c in P.columns]
     if not tp_cols or not naive_cols:
         _record("R2", "TP vs 나이브", None, "비교할 컬럼이 부족합니다.")
         return
 
-    Q = P.copy()
-    Q["E_raw"] = nanmean_cols(Q, tp_cols)
-    Q["E"] = xsec_rank_pct(Q["E_raw"], Q["cell"])
-    Q["Signal_rank"] = (Q["E"].fillna(0) * Q["U"].fillna(0) * Q["VETO"].fillna(0) *
-                        Q["FLOOR"].fillna(0))
-    Q["Signal_rank"] = Q.groupby("month", observed=True)["Signal_rank"].rank(pct=True)
-    tp_bt = run_fn(Q, label="R2_TP")
+    # ── 각 팔은 '자기 증거'로 하한선까지 다시 만든다 ──────────────────────────────────────
+    #   ★ 예전엔 두 팔이 본선의 FLOOR 컬럼을 그대로 물려받았다. 그런데 FLOOR 는 전부 TP 에서
+    #     파생된 값이라, '나이브 팔'조차 TP 로 선별된 종목만 보게 된다. 실측하면 FLOOR 하나가
+    #     종목 선정의 92.4% 를 끝내 버려서, TP 팔과 '균등난수 팔'의 보유종목 자카드 유사도가
+    #     0.73 이었다. 무엇과도 구별하지 못하는 게이트는 킬 게이트가 아니다.
+    #     각 팔이 자기 증거로 하한선을 만들면 자카드가 0.64 → 0.14 로 떨어지고 비교가 성립한다.
+    def _arm(cols: Sequence[str], label: str):
+        A = P.copy()
+        Z = pd.DataFrame({c: xsec_z_l(A, c) for c in cols}, index=A.index)
+        A["E_raw"] = nanmean_cols(Z, list(cols))
+        A["E"] = xsec_rank_pct_l(A, A["E_raw"])
+        A["FLOOR"] = compute_floor(A, cols)
+        A["Signal"] = A["E"].fillna(0) * A["U"].fillna(0) * A["VETO"].fillna(0) * A["FLOOR"]
+        A["Signal_rank"] = (A.groupby("month", observed=True)["Signal"]
+                             .rank(pct=True, method="average"))
+        return A, run_fn(A, label=label)
 
-    N = P.copy()
-    zc = [xsec_z(N[c], N["cell"]).rename(c) for c in naive_cols]
-    N["E_raw"] = nanmean_cols(pd.concat(zc, axis=1), naive_cols)
-    N["E"] = xsec_rank_pct(N["E_raw"], N["cell"])
-    N["Signal_rank"] = (N["E"].fillna(0) * N["U"].fillna(0) * N["VETO"].fillna(0) *
-                        N["FLOOR"].fillna(0))
-    N["Signal_rank"] = N.groupby("month", observed=True)["Signal_rank"].rank(pct=True)
-    nv_bt = run_fn(N, label="R2_naive")
+    Q, tp_bt = _arm(tp_cols, "R2_TP")
+    N, nv_bt = _arm(naive_cols, "R2_naive")
+
+    f_tp, f_nv = float(Q["FLOOR"].mean()), float(N["FLOOR"].mean())
+    LOG.info(f"R2 각 팔의 하한선 잔존율 — TP {f_tp*100:.2f}% · 나이브 {f_nv*100:.2f}% "
+             f"(두 팔이 각자의 증거로 하한선을 만듭니다)")
+    if not (0.5 <= f_nv / max(f_tp, 1e-9) <= 2.0):
+        LOG.warn(f"두 팔의 유니버스 폭이 {f_nv/max(f_tp,1e-9):.2f}배로 벌어졌습니다. "
+                 f"이 비교는 신호 품질이 아니라 유니버스 폭 차이를 재고 있을 수 있습니다 — "
+                 f"아래 판정을 그만큼 할인해서 읽으십시오.")
 
     a, b = tp_bt["returns"]["ret"].fillna(0).to_numpy(), nv_bt["returns"]["ret"].fillna(0).to_numpy()
     k = min(len(a), len(b))
@@ -143,6 +160,25 @@ def R2_tp_vs_naive(P: pd.DataFrame, run_fn) -> None:
                                   "§15-2에 따라 트레이드오프 패러다임의 근거가 소멸합니다. "
                                   "유리하게 해석하지 않고 그대로 보고합니다."),
             kill=True, metrics={"sharpe_tp": s_tp, "sharpe_naive": s_nv, "t_diff": t})
+
+    # ── R2b 하니스 자체 검정: TP 가 '무정보 균등난수'는 이겨야 한다 ────────────────────────
+    #   이건 전략이 아니라 '비교 장치'를 검정한다. 만약 난수 팔이 TP 와 비슷한 성과를 내면
+    #   위 R2 판정은 신호가 아니라 선별 게이트가 만든 것이고, 그 순간 R2 는 아무것도 판정하지
+    #   못한다. 실제로 하한선을 공유하던 시절엔 난수 팔이 TP 팔과 자카드 0.73 이었다.
+    Z = P.copy()
+    Z["_noise"] = np.random.default_rng(SEED).random(len(Z))
+    Z["E"] = xsec_rank_pct_l(Z, Z["_noise"])
+    Z["FLOOR"] = compute_floor(Z, tp_cols)          # 유니버스 폭은 TP 팔과 동일하게 맞춘다
+    Z["Signal"] = Z["E"].fillna(0) * Z["U"].fillna(0) * Z["VETO"].fillna(0) * Z["FLOOR"]
+    Z["Signal_rank"] = Z.groupby("month", observed=True)["Signal"].rank(pct=True, method="average")
+    s_rd = _sharpe(run_fn(Z, label="R2_noise")["returns"])
+    _record("R2b", "TP vs 무정보 난수 (하니스 검정)", bool(s_tp > s_rd),
+            f"TP Sharpe {s_tp:.3f} vs 균등난수 {s_rd:.3f}. " +
+            ("비교 장치가 신호와 무신호를 구별합니다 — R2 판정을 신뢰할 수 있습니다."
+             if s_tp > s_rd else
+             "★ TP 가 무정보 난수조차 이기지 못했습니다. 이 경우 위 R2 판정은 신호가 아니라 "
+             "선별 게이트(하한선·거부권)가 만든 것입니다. R2 결과를 그대로 믿지 마십시오."),
+            metrics={"sharpe_tp": s_tp, "sharpe_random": s_rd})
 
 
 # ── R3. 퀄리티 팩터 직교화 ─────────────────────────────────────────────────────────────────
@@ -272,23 +308,32 @@ def R10_policy_falsify(P: pd.DataFrame, cal: pd.DataFrame, months, run_fn) -> No
 # ── R5. 절제 (ablation) ─────────────────────────────────────────────────────────────────────
 def R5_ablation(P: pd.DataFrame, run_fn) -> None:
     """팩별·TP별로 하나씩 빼고 돌려 기여를 귀속한다. L2 만 건드리므로 몇 분이면 끝난다."""
-    base = run_fn(P, label="R5_base")
-    s0 = _sharpe(base["returns"])
-    rows = [["(전체)", f"{s0:.3f}", "—", "—"]]
     packs = active_packs()
     all_e = [p["E_col"] for p in packs if p["E_col"] in P.columns] + \
             [c for c in ("E_AXB", "E_AXC") if c in P.columns]
+
+    # ★ 기준선도 절제팔과 똑같이 score_from_axes 를 통과시킨다.
+    #   예전엔 기준선은 본선 컬럼을 그대로 쓰고 절제팔만 별도 식으로 점수를 다시 만들었다.
+    #   그러면 Δ가 '무엇을 뺐는가'가 아니라 '계산 방식이 달라졌는가'를 잰다. 실제로
+    #   아무것도 빼지 않은 널-절제의 ΔSharpe 가 +2.08 로 나왔다(0.000 이어야 한다).
+    def _score_arm(cols: Sequence[str], label: str):
+        A = P.copy()
+        S = score_from_axes(A, cols)
+        for k in ("E_raw", "E", "FLOOR", "Signal", "pack_profile", "Signal_rank"):
+            A[k] = S[k]
+        return _sharpe(run_fn(A, label=label)["returns"])
+
+    s0 = _score_arm(all_e, "R5_base")
+    rows = [["(전체)", f"{s0:.3f}", "—", "—"]]
     for drop in all_e:
-        Q = P.copy()
         rest = [c for c in all_e if c != drop]
-        if not rest:
+        if len(rest) < MIN_FLOOR_AXES:
+            # 남은 축이 하한선 최소개수보다 적으면 FLOOR 가 전원 탈락한다 — 절제가 아니라
+            # 유니버스 전멸이므로 Δ를 기여도로 읽으면 안 된다. 건너뛰되 표에 남긴다.
+            rows.append([f"− {drop}", "—", "—",
+                         f"측정 불가 (잔여 축 {len(rest)}개 < 하한선 최소 {MIN_FLOOR_AXES}개)"])
             continue
-        Q["E_raw"] = nanmean_cols(Q, rest)
-        Q["E"] = xsec_rank_pct(Q["E_raw"], Q["cell"])
-        Q["Signal_rank"] = Q.groupby("month", observed=True).apply(
-            lambda g: (g["E"].fillna(0) * g["U"].fillna(0) * g["VETO"].fillna(0) *
-                       g["FLOOR"].fillna(0)).rank(pct=True)).reset_index(level=0, drop=True)
-        s = _sharpe(run_fn(Q, label=f"R5_no_{drop}")["returns"])
+        s = _score_arm(rest, f"R5_no_{drop}")
         rows.append([f"− {drop}", f"{s:.3f}", f"{s - s0:+.3f}",
                      "기여함" if s < s0 - 0.03 else ("무기여" if s > s0 + 0.03 else "중립")])
     LOG.table(rows, ["절제 대상", "Sharpe", "Δ", "판정"], ["l", "r", "r", "l"],

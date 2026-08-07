@@ -207,8 +207,15 @@ def pack_d_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     return P
 
 
+def pack_d_ingest(ctx: dict, months: pd.DatetimeIndex) -> None:
+    """PACK-D 전용 수집. 공시목록(ctx["disclosures"])에서 사업보고서 원문을 받아 유사도를 만든다."""
+    ctx["text_sim"] = build_text_similarity(
+        fetch_dart_documents(ctx.get("disclosures"), ctx.get("sec")))
+
+
 register_pack(
     pid="D", name="공시텍스트 경직성", tp_cols=["TP_D1"],
     features_fn=pack_d_features, policy=PACK_D_POLICY, interp=PACK_D_INTERP,
+    ingest_fn=pack_d_ingest,
     notes="주 용도는 V7 거부권. 다른 팩이 매수 신호를 냈는데 위험요인/우발부채 문단이 "
           "대폭 확대되었다면 센서가 못 본 무언가가 있다는 뜻.")

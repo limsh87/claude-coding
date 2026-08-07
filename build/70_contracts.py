@@ -455,6 +455,107 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _c("MERGE", "원장 병합 멱등성", c_merge)
 
+    # ── 회귀 방지: Signal_rank 는 '월 전체' 백분위일 것 ────────────────────────────────────
+    def c_rank():
+        """선정부(nlargest)는 월 전체를 한 줄로 세워 뽑는다. 따라서 랭크도 월 전체여야 한다.
+
+        한때 (month, pack_profile) 로 나눠 랭크를 매겼다. 그러면 자기 프로파일에 혼자인 종목이
+        무조건 1.0 을 받아 상위를 채운다 — 실측상 월 보유종목의 70%가 동점 1.0 이었고,
+        그중 상당수가 그달 '가장 낮은' 원점수였다. 정보량 차이는 랭크 분할이 아니라
+        하한선(빈 축 없음 + 최소 축수)이 막는다.
+        """
+        n = 60
+        P = pd.DataFrame({
+            "code": [f"{i:06d}" for i in range(n + 1)],
+            "month": as_ts("2020-06-30"), "cell": "X", "U": 1.0, "VETO": 1.0,
+            "E_A": list(np.linspace(0.0, 1.0, n)) + [0.60],
+            "E_B": list(np.linspace(0.0, 1.0, n)) + [np.nan],   # 마지막 1행만 축이 1개
+        })
+        S = score_from_axes(P, ["E_A", "E_B"], min_axes=1)
+        sig, rank = S["Signal"], S["Signal_rank"]
+        if int(S["pack_profile"].nunique()) < 2:
+            return False, "테스트 전제 오류: 정보량 프로파일이 2종 이상이어야 합니다."
+        top_by_rank = int(rank.idxmax())
+        top_by_sig = int(sig.idxmax())
+        if top_by_rank != top_by_sig:
+            return False, (f"★랭크가 원점수와 어긋납니다: 최고 랭크는 {P['code'][top_by_rank]}"
+                           f"(Signal {sig[top_by_rank]:.4f}) 인데 최고 원점수는 "
+                           f"{P['code'][top_by_sig]}(Signal {sig[top_by_sig]:.4f}) 입니다. "
+                           f"Signal_rank 를 pack_profile 로 나눠 매기면 '자기 그룹에 혼자인' "
+                           f"종목이 1.0 을 받아 상위를 차지합니다.")
+        d = pd.DataFrame({"s": sig, "r": rank}).dropna()
+        rho = float(d["s"].corr(d["r"], method="spearman"))
+        if not (rho > 0.999):
+            return False, f"★Signal_rank 가 Signal 의 단조함수가 아닙니다 (spearman={rho:.4f})."
+        return True, (f"월 전체 백분위 확인 — 랭크가 원점수의 단조함수(ρ={rho:.4f})이고 "
+                      f"축이 1개뿐인 종목이 상위를 가로채지 않음 (프로파일 "
+                      f"{int(S['pack_profile'].nunique())}종)")
+
+    _c("RANK", "선정 랭크 정합성", c_rank)
+
+    # ── 회귀 방지: 활성 팩은 전용 수집이 배선되어 있을 것 ──────────────────────────────────
+    def c_wire():
+        """'수집이 배선되지 않음'과 '수집했는데 비어 있음'은 완전히 다른 사건이다.
+
+        한때 어느 팩도 ingest_fn 을 등록하지 않아 collect_all 의 팩 수집 루프가 통째로
+        무동작이었다. 5개 팩 전략이 실제로는 PACK-C 하나로 돌면서 성과표를 끝까지 출력했고,
+        하류 커버리지 검사는 그걸 '데이터 부재'로 보고해 운영자를 API 키 쪽으로 오도했다.
+        """
+        bad = [p["id"] for p in active_packs() if not p.get("ingest") and p["id"] != "C"]
+        if bad:
+            return False, (f"★센서팩 {bad} 이 활성인데 ingest_fn 이 없습니다. 이 팩들은 "
+                           f"수집 자체가 일어나지 않아 전 구간 결측이 되며, 키를 넣어도 "
+                           f"해결되지 않습니다.")
+        wired = [p["id"] for p in active_packs() if p.get("ingest")]
+        return True, (f"활성 팩 {[p['id'] for p in active_packs()]} 중 전용 수집 배선 {wired} "
+                      f"확인 (C 는 L1.DART 재무를 그대로 읽으므로 전용 수집 없음이 정상)")
+
+    _c("WIRE", "센서팩 수집 배선", c_wire)
+
+    # ── 회귀 방지: 청산 게이트의 모든 분기가 도달 가능할 것 ────────────────────────────────
+    def c_exit():
+        """`dm >= de and de > 0` 처럼 뒤 조건이 앞 조건에 거의 포함되는 식은, 실제로는
+        '논거가 깨진 종목을 파는 경로'만 골라서 닫아버린다. 네 사분면을 전부 검정한다."""
+        cases = [
+            (0.05, 0.10, False, "ΔlogE>0 이고 시장이 아직 자본화 안 함 → 보유(목표상태)"),
+            (0.15, 0.10, True,  "시장이 재분류 완료(ΔlogM≥ΔlogE) → 청산(알파 소진)"),
+            (-0.20, -0.05, True, "이익 증가 소멸 → 청산(논거 무효). 예전엔 이 경로가 닫혀 있었다"),
+            (0.05, -0.05, True, "이익 감소 + 주가 상승 → 청산"),
+            (np.nan, 0.10, False, "결측 → 보유(모르는 것을 이유로 팔지 않는다)"),
+            (0.05, np.nan, False, "결측 → 보유"),
+        ]
+        for dm, de, want, why in cases:
+            got = bool(exit_gate(dm, de))
+            if got != want:
+                return False, (f"★청산 게이트: ΔlogM={dm}, ΔlogE={de} → {got} (기대 {want}). {why}")
+        return True, ("네 사분면 + 결측 전부 확인 — 재분류 완료와 논거 무효를 모두 청산하고, "
+                      "결측은 보유로 떨어짐")
+
+    _c("EXIT", "청산 게이트 도달성", c_exit)
+
+    # ── 회귀 방지: TP_P2 의 저-저 사분면 부호 ──────────────────────────────────────────────
+    def c_tpp2():
+        """TP = z(개선) × z(대가회피) 는 곱이라, 두 인자가 모두 음수면 양수가 된다.
+        '취득 규모가 큰데 소각까지 실행했는가'를 묻는 TP_P2 에서는 이게 치명적이다 —
+        자사주를 거의 안 샀고 소각도 안 한 기업이 '진정성 있는 환원'으로 뒤집힌다."""
+        zi = pd.Series([-1.5, -0.5, 1.2, 2.0])       # 취득 규모 z
+        zp = pd.Series([-1.5, 1.0, -0.8, 1.5])       # 소각 실행률 z
+        out = tp_product(zi.where(zi > 0), zp)
+        if pd.notna(out.iloc[0]):
+            return False, (f"★저-저 사분면(취득 안 함 + 소각 안 함)이 {out.iloc[0]:.3f} 로 "
+                           f"산출됐습니다. 음×음=양 때문에 '아무것도 안 한 기업'이 상위로 "
+                           f"올라갑니다. 지출이 없는 쪽은 NaN 이어야 합니다.")
+        if pd.notna(out.iloc[1]):
+            return False, "취득 규모가 셀 평균 미만인데 값이 나왔습니다."
+        if not (pd.notna(out.iloc[3]) and out.iloc[3] > 0):
+            return False, f"고-고 사분면(취득 큼 + 소각 실행)이 양수가 아닙니다: {out.iloc[3]}"
+        if not (pd.notna(out.iloc[2]) and out.iloc[2] < 0):
+            return False, f"취득은 컸는데 소각 안 한 경우가 음수가 아닙니다: {out.iloc[2]}"
+        return True, ("저-저 사분면 NaN(0 아님) · 고-고 양수 · 고-저 음수 확인 — "
+                      "'대가를 안 치렀다'는 거짓 주장을 만들지 않음")
+
+    _c("TPP2", "자사주 TP 부호", c_tpp2)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30), "✔ 통과" if r["pass"] else "✘ 실패",
              _trunc(r["msg"], 76)] for r in CONTRACT_RESULTS]

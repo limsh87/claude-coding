@@ -142,7 +142,7 @@ def pack_p_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                       cols=["code", "knowledge_date", "award_amt", "win_rate", "hhi_org", "n_award"],
                       suffix="_g2b")
     P = P.sort_values(["code", "month"])
-    g = lambda c: P.groupby("code", observed=True)[c]
+    g = lambda c: gby(P, c)      # 없는 컬럼도 NaN 으로 만든 뒤 그룹화 (수집 부분실패 내성)
     P["q1"] = g("award_amt").transform(lambda s: dlog(s.rolling(12, min_periods=6).sum(), 12))
     P["q2"] = g("win_rate").diff(12)
     P["q3"] = -g("hhi_org").diff(12)
@@ -153,8 +153,14 @@ def pack_p_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     return P
 
 
+def pack_p_ingest(ctx: dict, months: pd.DatetimeIndex) -> None:
+    """PACK-P 전용 수집 — 조달청 낙찰 원장."""
+    ctx["procurement"] = fetch_procurement(months)
+
+
 register_pack(
     pid="P", name="조달청 낙찰", tp_cols=["TP_Q1", "TP_Q2"],
     features_fn=pack_p_features, policy=PACK_P_POLICY, interp=PACK_P_INTERP,
+    ingest_fn=pack_p_ingest,
     notes="낙찰률은 원가 노이즈가 없는 순수 가격 지표 — 수출단가와 동일한 성질. "
           "단 방산·원전 레짐 편승 위험이 크므로 R7 필수.")

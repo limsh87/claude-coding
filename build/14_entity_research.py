@@ -207,7 +207,7 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "broker_name": ("broker_name", "min"),
         "broker_raw": ("broker_raw", _pick_str),
         "analyst_raw": ("analyst_raw", _pick_str),
-        "target_price": ("target_price", lambda s: pd.Series(list(s)).dropna().max()),
+        "target_price": ("target_price", "max"),      # 네이티브 max = NaN 무시. 파이썬 람다는 30만건에서 50초.
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),

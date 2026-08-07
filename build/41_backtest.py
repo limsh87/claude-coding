@@ -39,6 +39,41 @@ def slippage(trade_krw: float, adv_krw: float) -> float:
     return float(SLIPPAGE_K * math.sqrt(part))
 
 
+def exit_gate(dm, de) -> bool:
+    """청산 판단: '진입 시의 목표상태'를 벗어났는가.
+
+    진입 조건(axis_D)은 ΔlogE > 0 AND 시장이 아직 자본화를 안 함(ΔlogM < ΔlogE) 이다.
+    그 상태를 벗어나면 청산한다. 두 경우가 한 식에 들어간다:
+      · dm >= de → 시장이 마침내 재분류했다. 알파 소진(원래 의도한 청산)
+      · de <= 0  → 이익 증가 자체가 소멸했다. 논거 무효
+
+    ★ 예전엔 `dm >= de and de > 0` 이었다. 앞 조건이 참이면 뒤 조건도 거의 항상 참이라
+      보이지만, 실제로 걸러지는 건 'de <= 0' 인 전 구간 — 즉 논거가 깨진 종목을 청산하는
+      경로가 통째로 닫혀 있었다. 그 종목들은 보유상한(24개월)까지 자리를 차지했다.
+    NaN 은 '보유'로 떨어진다 — 모르는 것을 이유로 팔지 않는다.
+    """
+    if dm is None or de is None or pd.isna(dm) or pd.isna(de):
+        return False
+    return not (de > 0 and dm < de)
+
+
+def _top_n(df: pd.DataFrame, n: int, signal_col: str) -> pd.DataFrame:
+    """상위 n 종목 선정. 동점은 명시적 키로 깬다 — 행 순서로 깨지 않는다.
+
+    ★ nlargest(keep="first") 는 동점일 때 '데이터프레임에 먼저 나온 행'을 고른다. 패널은
+      ["code","month"] 로 정렬되어 있으므로 그건 곧 '종목코드가 작은 순'이다. 동점이 드물면
+      무해하지만, 실측상 월 보유종목의 상당수가 동점 구간에서 결정됐고 행 순서를 섞으면
+      포트폴리오가 통째로 바뀌었다 — 즉 보유종목이 데이터가 아니라 정렬의 함수였다.
+      그래서 ① 1차 키는 signal_col, ② 2차 키는 랭크 이전의 원 Signal(정보량이 더 많다),
+      ③ 최후에만 code 로 깬다. 이러면 동점 처리가 결정적이면서 '왜 그 종목인가'가 설명된다.
+    """
+    if not len(df):
+        return df.iloc[0:0]
+    keys = [signal_col] + [c for c in ("Signal", "code") if c in df.columns and c != signal_col]
+    asc = [False] + [False if c == "Signal" else True for c in keys[1:]]
+    return df.sort_values(keys, ascending=asc, kind="mergesort").head(n)
+
+
 def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
     """신호 강도 기반 사이징. 분포가 평평하면 분산, 격차가 크면 집중(§8.5).
     비중 상한은 코드 상수로 이미 못박혀 있다 — 드로다운 한가운데서 정하지 않는다."""
@@ -117,7 +152,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
 
         k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
                                              round(len(elig) * top_pct))))
-        pick = elig.nlargest(k, signal_col) if len(elig) else elig.iloc[0:0]
+        pick = _top_n(elig, k, signal_col)
         uni.audit_row("최종선정", m, pick["code"].tolist())
 
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
@@ -132,15 +167,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 exited = True                                    # 거부권 발동 시 즉시 강제청산
             elif h["months"] >= HOLD_MAX_MONTHS:
                 exited = True
-            elif (dm is not None and de is not None and pd.notna(dm) and pd.notna(de)
-                  and dm >= de and de > 0):
-                exited = True                                    # 시장이 마침내 재분류 → 알파 소진
+            elif exit_gate(dm, de):
+                exited = True                        # 목표상태 이탈 (재분류 완료 또는 논거 무효)
             if not exited:
                 keep.append(c)
         target = pd.concat([pick, sub[sub["code"].isin(keep) & ~sub["code"].isin(pick["code"])]],
                            ignore_index=True) if len(keep) else pick
         if len(target) > PORTFOLIO_MAX_NAMES:
-            target = target.nlargest(PORTFOLIO_MAX_NAMES, signal_col)
+            target = _top_n(target, PORTFOLIO_MAX_NAMES, signal_col)
         target = size_positions(target) if len(target) else target.assign(weight=[])
 
         w_new = dict(zip(target["code"], target["weight"])) if len(target) else {}

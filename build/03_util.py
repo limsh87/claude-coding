@@ -507,6 +507,20 @@ def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     return pd.Series(default, index=df.index, dtype="float64")
 
 
+def gby(df: pd.DataFrame, name: str, key: str = "code"):
+    """col() 의 groupby 판(版). 없는 컬럼도 NaN 으로 만든 뒤 그룹화한다.
+
+    ★ col() 이 막지 못하는 구멍이 정확히 여기였다. 피처 계산부는 결측 컬럼 산술을 col() 로
+      막아 두었지만, `P.groupby("code")[c]` 는 여전히 맨손이라 c 가 없으면 KeyError 로 죽는다.
+      DART 키가 없거나 재무 수집이 부분 실패하면 assets·contract_liab 같은 재무상태표 계정이
+      아예 생성되지 않는데, 이 경로는 critical 스테이지(L1.PANEL)라 그대로 실행 전체가 중단된다.
+      "키 없이도 실행은 된다"는 상단 안내와 정면으로 어긋나므로 groupby 도 안전 접근으로 통일한다.
+    """
+    if name not in df.columns:
+        df[name] = np.nan
+    return df.groupby(key, observed=True)[name]
+
+
 def safe_div(a, b, eps: float = 1e-12):
     a = pd.to_numeric(a, errors="coerce")
     b = pd.to_numeric(b, errors="coerce")
