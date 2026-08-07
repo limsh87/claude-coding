@@ -9394,8 +9394,22 @@ def customs_a2_residual(hsm: pd.DataFrame, cost: pd.DataFrame,
     out = out.merge(pd.DataFrame({"hs": np.asarray(hss), "a2_beta": beta[:, 1]}),
                     on="hs", how="left")
     n_ok = int(np.isfinite(out["a2"]).sum())
+    b_med = float(np.nanmedian(beta[:, 1]))
     LOG.ok(f"a2 단가잔차: HS {len(hss)}개 × {len(yms)}개월 → 유효 {n_ok:,}관측 "
-           f"(β 중앙값 {np.nanmedian(beta[:, 1]):+.3f} — 음수여야 정상)")
+           f"(β 중앙값 {b_med:+.3f} — 음수여야 정상)")
+    # ★ 이 전략의 전제는 "정상 기업은 β<0 (많이 팔려면 깎아야 한다)"이다.
+    #   β 중앙값이 0 근처거나 양수면 전제가 데이터에서 성립하지 않는 것이고,
+    #   그러면 a2 는 '제약선 이동'이 아니라 잡음을 재는 지표가 된다. 조용히 넘기지 않는다.
+    if not np.isfinite(b_med):
+        LOG.warn("a2: β 를 추정하지 못했습니다 — 단가 축 판정을 신뢰할 수 없습니다.")
+    elif b_med > -0.02:
+        LOG.warn(
+            f"a2: β 중앙값이 {b_med:+.3f} 로 음수가 아닙니다. 이 전략의 전제("
+            f"'많이 팔려면 깎아야 한다')가 이 표본에서 성립하지 않습니다.\n"
+            f"    가능한 원인 ① 중량 보고오차가 회귀변수에 실려 β 가 0 으로 끌려감"
+            f"(errors-in-variables 감쇠) ② 투입원가지수가 단가와 공선형이라 γ 가 β 를 흡수"
+            f"(HS 하나가 章 하나를 독점하는 경우) ③ 해당 품목이 실제로 가격수용자.\n"
+            f"    → a2 해석에 주의하고 R5 절제에서 a2 의존 TP(TP_X1·TP_X2) 기여를 반드시 확인하세요.")
     return out
 
 
@@ -11170,9 +11184,14 @@ def synth_xcb(n_hs: int = 40, n_firm: int = 90, n_month: int = 120) -> dict:
             up = 3.0 * math.exp(rng.normal(0, 0.05)
                                 - 0.25 * math.log(max(tot, 1) / base_w[i])
                                 + 0.30 * math.log(icost))
-            for c in ctys:
-                sh = rng.dirichlet(np.ones(len(ctys)))[ctys.index(c)]
-                w = tot * sh
+            # ★ 목적지 비중은 (hs, 월)마다 **한 번만** 뽑아 합이 정확히 1이 되게 한다.
+            #   국가별로 따로 뽑으면 합이 1이 아니게 되어 관측 물량이 tot·Σsh 가 되고,
+            #   회귀변수에 측정오차가 실려 β 가 0 쪽으로 끌려간다(errors-in-variables).
+            #   실제로 이 버그 때문에 스모크의 β 가 -0.13 으로 나와 '단가 축이 죽었는지'를
+            #   판별하지 못했다. 같은 감쇠는 실데이터의 중량 보고오차에서도 일어난다.
+            shares_t = rng.dirichlet(np.ones(len(ctys)))
+            for ci, c in enumerate(ctys):
+                w = tot * shares_t[ci]
                 iw = max(w * rng.uniform(0.2, 0.6), 1.0)
                 rows.append({"hs": h, "ym": m, "country": c,
                              "exp_wgt": w, "exp_usd": w * up * rng.uniform(0.85, 1.15),
@@ -11206,7 +11225,9 @@ def synth_xcb(n_hs: int = 40, n_firm: int = 90, n_month: int = 120) -> dict:
     grid["c6"] = np.abs(rng.normal(0, 1, len(grid)))
     grid["theta_x"] = rng.uniform(0.3, 0.95, len(grid))
     grid["mcap"] = rng.lognormal(25, 1.0, len(grid))
-    grid["adtv20"] = rng.lognormal(20.5, 1.0, len(grid))
+    # ★ 프로덕션 가격패널이 내는 이름(adv20)만 만든다. 예전엔 adtv20 도 같이 만들어서
+    #   실제 파이프라인의 이름 불일치를 스모크가 못 잡았다.
+    grid["adv20"] = rng.lognormal(20.5, 1.0, len(grid))
     grid["cv_dest"] = rng.uniform(0.05, 0.9, len(grid))
     grid["etr_chg"] = rng.normal(0, 0.01, len(grid))
     grid["v1_ratio"] = np.abs(rng.normal(0.5, 0.4, len(grid)))
@@ -11227,7 +11248,6 @@ def synth_xcb(n_hs: int = 40, n_firm: int = 90, n_month: int = 120) -> dict:
     px = 10000 * np.exp(grid.groupby("code", observed=True)["fwd_ret"].cumsum().to_numpy())
     grid["close"] = px
     grid["exec_px"] = px
-    grid["adv20"] = grid["adtv20"]
     grid["month"] = grid["ym"]
     grid["hs_main"] = [hs[i % n_hs] for i in range(len(grid))]
     grid["hs_n"] = 1
@@ -11257,6 +11277,9 @@ def smoke_xcb() -> bool:
     P = S["panel"].merge(a_corp.drop(columns=[c for c in ("hs_main", "hs_n")
                                               if c in a_corp.columns]),
                          on=["code", "ym"], how="left")
+    # 프로덕션 build_panel_xcb 와 동일한 별칭 정규화를 거친다(스모크가 실경로를 검사하도록).
+    if "adtv20" not in P.columns and "adv20" in P.columns:
+        P["adtv20"] = pd.to_numeric(P["adv20"], errors="coerce")
     cvd = customs_cv_dest(S["cx"])
     P = P.drop(columns=["cv_dest"]).merge(cvd[["hs", "cv_dest"]].rename(
         columns={"hs": "hs_main"}), on="hs_main", how="left")
@@ -11330,6 +11353,13 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     """L1 — 원시 센서만. 정규화는 여기서 하지 않는다(전부 L2)."""
     P = build_base_panel(months, px_m, px_d, sec, mcap)
     P["ym"] = as_ts_series(P["month"]).astype("datetime64[ns]")
+    # ★ 가격패널은 20일 평균거래대금을 'adv20' 으로 낸다. 거부권 V6 와 규모버킷은 'adtv20' 을
+    #   읽는다. 이름이 어긋나면 예외 없이 **V6 가 영원히 발동하지 않고** 규모버킷이 NA 로
+    #   무너진다(합성데이터가 두 이름을 다 갖고 있으면 스모크는 통과한다 — 실제로 그랬다).
+    if "adtv20" not in P.columns and "adv20" in P.columns:
+        P["adtv20"] = pd.to_numeric(P["adv20"], errors="coerce")
+    elif "adv20" not in P.columns and "adtv20" in P.columns:
+        P["adv20"] = pd.to_numeric(P["adtv20"], errors="coerce")
 
     # ── A축: HS 격자에서 산출 → 매핑표로 종목 격자로 이동
     a_hs = customs_a_sensors(cx)
@@ -11357,7 +11387,13 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     th = derive_theta_x(fin, mapping, cx)
     sub = build_subsidy_signal(fin)
     imp = build_capital_impairment(fin)
-    srcs = {"b": b, "c": c, "theta": th, "subsidy": sub, "impair": imp}
+    # ★ 재무 '원값' 통과 소스. b/c 센서는 파생값만 내보내므로, D축(eps_ttm)과 거부권이
+    #   필요로 하는 원계정(net_income_ttm 등)이 패널에 아예 없게 된다.
+    #   그러면 d1(이 시스템에서 가장 중요한 단일 지표)이 통째로 결측이 되는데 예외는 안 난다.
+    _raw_cols = [c_ for c_ in ("net_income_ttm", "revenue_ttm", "cfo_ttm", "assets",
+                               "equity", "shares_out") if c_ in fin.columns]
+    fund = (fin[["code", "knowledge_date"] + _raw_cols].copy() if _raw_cols else None)
+    srcs = {"b": b, "c": c, "theta": th, "subsidy": sub, "impair": imp, "fund": fund}
     P = build_pit_panel(P, {k: v for k, v in srcs.items() if v is not None and len(v)},
                         by="code", left_time="month")
     viol = assert_c1(P, strict=False)
@@ -11378,10 +11414,16 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
 
     # ── D축
     fin_m = P[["code", "ym"]].copy()
-    ni = pd.to_numeric(P.get("net_income_ttm"), errors="coerce")
-    sh = pd.to_numeric(P.get("mcap"), errors="coerce") / pd.to_numeric(
-        P.get("close"), errors="coerce").replace(0, np.nan)
+    ni = (pd.to_numeric(P["net_income_ttm"], errors="coerce")
+          if "net_income_ttm" in P.columns else pd.Series(np.nan, index=P.index))
+    sh = safe_div(pd.to_numeric(P.get("mcap"), errors="coerce"),
+                  pd.to_numeric(P.get("close"), errors="coerce").replace(0, np.nan))
     fin_m["eps_ttm"] = safe_div(ni, sh)
+    _cov_eps = float(fin_m["eps_ttm"].notna().mean()) if len(fin_m) else 0.0
+    if _cov_eps < 0.05:
+        LOG.warn(f"eps_ttm 커버리지가 {_cov_eps*100:.1f}% 입니다 — d1(ΔlogE/ΔlogM 재분류 갭)이 "
+                 f"사실상 죽습니다. d1 은 이 시스템에서 가장 중요한 단일 지표이므로 "
+                 f"net_income_ttm(재무) 과 mcap(시총) 확보 상태를 먼저 확인하세요.")
     cov = build_coverage_panel(reports, months)
     flows = None
     _codes = sorted(P.loc[P.get("xcb_uni", True), "code"].astype(str).unique()) \

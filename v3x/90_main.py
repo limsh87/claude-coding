@@ -36,6 +36,13 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     """L1 — 원시 센서만. 정규화는 여기서 하지 않는다(전부 L2)."""
     P = build_base_panel(months, px_m, px_d, sec, mcap)
     P["ym"] = as_ts_series(P["month"]).astype("datetime64[ns]")
+    # ★ 가격패널은 20일 평균거래대금을 'adv20' 으로 낸다. 거부권 V6 와 규모버킷은 'adtv20' 을
+    #   읽는다. 이름이 어긋나면 예외 없이 **V6 가 영원히 발동하지 않고** 규모버킷이 NA 로
+    #   무너진다(합성데이터가 두 이름을 다 갖고 있으면 스모크는 통과한다 — 실제로 그랬다).
+    if "adtv20" not in P.columns and "adv20" in P.columns:
+        P["adtv20"] = pd.to_numeric(P["adv20"], errors="coerce")
+    elif "adv20" not in P.columns and "adtv20" in P.columns:
+        P["adv20"] = pd.to_numeric(P["adtv20"], errors="coerce")
 
     # ── A축: HS 격자에서 산출 → 매핑표로 종목 격자로 이동
     a_hs = customs_a_sensors(cx)
@@ -63,7 +70,13 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     th = derive_theta_x(fin, mapping, cx)
     sub = build_subsidy_signal(fin)
     imp = build_capital_impairment(fin)
-    srcs = {"b": b, "c": c, "theta": th, "subsidy": sub, "impair": imp}
+    # ★ 재무 '원값' 통과 소스. b/c 센서는 파생값만 내보내므로, D축(eps_ttm)과 거부권이
+    #   필요로 하는 원계정(net_income_ttm 등)이 패널에 아예 없게 된다.
+    #   그러면 d1(이 시스템에서 가장 중요한 단일 지표)이 통째로 결측이 되는데 예외는 안 난다.
+    _raw_cols = [c_ for c_ in ("net_income_ttm", "revenue_ttm", "cfo_ttm", "assets",
+                               "equity", "shares_out") if c_ in fin.columns]
+    fund = (fin[["code", "knowledge_date"] + _raw_cols].copy() if _raw_cols else None)
+    srcs = {"b": b, "c": c, "theta": th, "subsidy": sub, "impair": imp, "fund": fund}
     P = build_pit_panel(P, {k: v for k, v in srcs.items() if v is not None and len(v)},
                         by="code", left_time="month")
     viol = assert_c1(P, strict=False)
@@ -84,10 +97,16 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
 
     # ── D축
     fin_m = P[["code", "ym"]].copy()
-    ni = pd.to_numeric(P.get("net_income_ttm"), errors="coerce")
-    sh = pd.to_numeric(P.get("mcap"), errors="coerce") / pd.to_numeric(
-        P.get("close"), errors="coerce").replace(0, np.nan)
+    ni = (pd.to_numeric(P["net_income_ttm"], errors="coerce")
+          if "net_income_ttm" in P.columns else pd.Series(np.nan, index=P.index))
+    sh = safe_div(pd.to_numeric(P.get("mcap"), errors="coerce"),
+                  pd.to_numeric(P.get("close"), errors="coerce").replace(0, np.nan))
     fin_m["eps_ttm"] = safe_div(ni, sh)
+    _cov_eps = float(fin_m["eps_ttm"].notna().mean()) if len(fin_m) else 0.0
+    if _cov_eps < 0.05:
+        LOG.warn(f"eps_ttm 커버리지가 {_cov_eps*100:.1f}% 입니다 — d1(ΔlogE/ΔlogM 재분류 갭)이 "
+                 f"사실상 죽습니다. d1 은 이 시스템에서 가장 중요한 단일 지표이므로 "
+                 f"net_income_ttm(재무) 과 mcap(시총) 확보 상태를 먼저 확인하세요.")
     cov = build_coverage_panel(reports, months)
     flows = None
     _codes = sorted(P.loc[P.get("xcb_uni", True), "code"].astype(str).unique()) \

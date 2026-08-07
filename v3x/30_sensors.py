@@ -218,8 +218,22 @@ def customs_a2_residual(hsm: pd.DataFrame, cost: pd.DataFrame,
     out = out.merge(pd.DataFrame({"hs": np.asarray(hss), "a2_beta": beta[:, 1]}),
                     on="hs", how="left")
     n_ok = int(np.isfinite(out["a2"]).sum())
+    b_med = float(np.nanmedian(beta[:, 1]))
     LOG.ok(f"a2 단가잔차: HS {len(hss)}개 × {len(yms)}개월 → 유효 {n_ok:,}관측 "
-           f"(β 중앙값 {np.nanmedian(beta[:, 1]):+.3f} — 음수여야 정상)")
+           f"(β 중앙값 {b_med:+.3f} — 음수여야 정상)")
+    # ★ 이 전략의 전제는 "정상 기업은 β<0 (많이 팔려면 깎아야 한다)"이다.
+    #   β 중앙값이 0 근처거나 양수면 전제가 데이터에서 성립하지 않는 것이고,
+    #   그러면 a2 는 '제약선 이동'이 아니라 잡음을 재는 지표가 된다. 조용히 넘기지 않는다.
+    if not np.isfinite(b_med):
+        LOG.warn("a2: β 를 추정하지 못했습니다 — 단가 축 판정을 신뢰할 수 없습니다.")
+    elif b_med > -0.02:
+        LOG.warn(
+            f"a2: β 중앙값이 {b_med:+.3f} 로 음수가 아닙니다. 이 전략의 전제("
+            f"'많이 팔려면 깎아야 한다')가 이 표본에서 성립하지 않습니다.\n"
+            f"    가능한 원인 ① 중량 보고오차가 회귀변수에 실려 β 가 0 으로 끌려감"
+            f"(errors-in-variables 감쇠) ② 투입원가지수가 단가와 공선형이라 γ 가 β 를 흡수"
+            f"(HS 하나가 章 하나를 독점하는 경우) ③ 해당 품목이 실제로 가격수용자.\n"
+            f"    → a2 해석에 주의하고 R5 절제에서 a2 의존 TP(TP_X1·TP_X2) 기여를 반드시 확인하세요.")
     return out
 
 

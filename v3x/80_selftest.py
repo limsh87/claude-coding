@@ -175,9 +175,14 @@ def synth_xcb(n_hs: int = 40, n_firm: int = 90, n_month: int = 120) -> dict:
             up = 3.0 * math.exp(rng.normal(0, 0.05)
                                 - 0.25 * math.log(max(tot, 1) / base_w[i])
                                 + 0.30 * math.log(icost))
-            for c in ctys:
-                sh = rng.dirichlet(np.ones(len(ctys)))[ctys.index(c)]
-                w = tot * sh
+            # ★ 목적지 비중은 (hs, 월)마다 **한 번만** 뽑아 합이 정확히 1이 되게 한다.
+            #   국가별로 따로 뽑으면 합이 1이 아니게 되어 관측 물량이 tot·Σsh 가 되고,
+            #   회귀변수에 측정오차가 실려 β 가 0 쪽으로 끌려간다(errors-in-variables).
+            #   실제로 이 버그 때문에 스모크의 β 가 -0.13 으로 나와 '단가 축이 죽었는지'를
+            #   판별하지 못했다. 같은 감쇠는 실데이터의 중량 보고오차에서도 일어난다.
+            shares_t = rng.dirichlet(np.ones(len(ctys)))
+            for ci, c in enumerate(ctys):
+                w = tot * shares_t[ci]
                 iw = max(w * rng.uniform(0.2, 0.6), 1.0)
                 rows.append({"hs": h, "ym": m, "country": c,
                              "exp_wgt": w, "exp_usd": w * up * rng.uniform(0.85, 1.15),
@@ -211,7 +216,9 @@ def synth_xcb(n_hs: int = 40, n_firm: int = 90, n_month: int = 120) -> dict:
     grid["c6"] = np.abs(rng.normal(0, 1, len(grid)))
     grid["theta_x"] = rng.uniform(0.3, 0.95, len(grid))
     grid["mcap"] = rng.lognormal(25, 1.0, len(grid))
-    grid["adtv20"] = rng.lognormal(20.5, 1.0, len(grid))
+    # ★ 프로덕션 가격패널이 내는 이름(adv20)만 만든다. 예전엔 adtv20 도 같이 만들어서
+    #   실제 파이프라인의 이름 불일치를 스모크가 못 잡았다.
+    grid["adv20"] = rng.lognormal(20.5, 1.0, len(grid))
     grid["cv_dest"] = rng.uniform(0.05, 0.9, len(grid))
     grid["etr_chg"] = rng.normal(0, 0.01, len(grid))
     grid["v1_ratio"] = np.abs(rng.normal(0.5, 0.4, len(grid)))
@@ -232,7 +239,6 @@ def synth_xcb(n_hs: int = 40, n_firm: int = 90, n_month: int = 120) -> dict:
     px = 10000 * np.exp(grid.groupby("code", observed=True)["fwd_ret"].cumsum().to_numpy())
     grid["close"] = px
     grid["exec_px"] = px
-    grid["adv20"] = grid["adtv20"]
     grid["month"] = grid["ym"]
     grid["hs_main"] = [hs[i % n_hs] for i in range(len(grid))]
     grid["hs_n"] = 1
@@ -262,6 +268,9 @@ def smoke_xcb() -> bool:
     P = S["panel"].merge(a_corp.drop(columns=[c for c in ("hs_main", "hs_n")
                                               if c in a_corp.columns]),
                          on=["code", "ym"], how="left")
+    # 프로덕션 build_panel_xcb 와 동일한 별칭 정규화를 거친다(스모크가 실경로를 검사하도록).
+    if "adtv20" not in P.columns and "adv20" in P.columns:
+        P["adtv20"] = pd.to_numeric(P["adv20"], errors="coerce")
     cvd = customs_cv_dest(S["cx"])
     P = P.drop(columns=["cv_dest"]).merge(cvd[["hs", "cv_dest"]].rename(
         columns={"hs": "hs_main"}), on="hs_main", how="left")
