@@ -84,8 +84,10 @@ _ANALYST_SPLIT = re.compile(r"[,/·∙•|;]|\s{2,}|\s외\s|\s및\s")
 
 def split_analysts(raw: Any) -> List[str]:
     """'홍길동, 김철수' / '홍길동/김철수' / '홍길동 외 1인' → ['홍길동','김철수']"""
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return []
     t = _clean_cell(raw)
-    if not t:
+    if not t or t.lower() in ("nan", "none", "nat", "<na>", "null"):
         return []
     t = re.sub(r"\(.*?\)", " ", t)
     t = re.sub(r"(연구원|애널리스트|수석|책임|선임|팀장|센터장|위원|박사)", " ", t)
@@ -231,17 +233,30 @@ def build_analyst_ledger(rep: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     if rep.empty:
         return (pd.DataFrame(columns=["analyst_id", "name", "broker_id", "broker_name"]),
                 pd.DataFrame(columns=["report_uid", "analyst_id", "link_method", "link_conf"]))
+    def _txt(v) -> str:
+        """★ NaN 은 truthy 다. `getattr(r, "pdf_analysts", "") or ""` 는 NaN 을 통과시키고
+        str(nan)=='nan' 이 또 truthy 라 **'nan' 이라는 유령 애널리스트**가 만들어진다.
+        download_pdfs 가 how="left" 로 머지하므로 PDF 없는 행의 pdf_analysts 는 전부 NaN 이고,
+        그러면 그 유령 하나가 수만 건의 보고서를 가져가 애널리스트 원장과 d2(목표주가 리비전)를
+        통째로 오염시킨다. 예외는 나지 않는다."""
+        if v is None or v is pd.NaT:
+            return ""
+        if isinstance(v, float) and math.isnan(v):
+            return ""
+        s = str(v).strip()
+        return "" if s.lower() in ("nan", "none", "nat", "<na>", "null") else s
+
     links = []
     for r in rep.itertuples(index=False):
         names, method, conf = [], "unresolved", 0.0
-        raw = getattr(r, "analyst_raw", "") or ""
-        if str(raw).strip():
+        raw = _txt(getattr(r, "analyst_raw", ""))
+        if raw:
             names = split_analysts(raw)
             method, conf = "list_field", 0.98        # 한경 '작성자' 컬럼 — 가장 신뢰도 높음
         if not names:
-            praw = getattr(r, "pdf_analysts", "") or ""
-            if str(praw).strip():
-                names = [n for n in str(praw).split(",") if n.strip()]
+            praw = _txt(getattr(r, "pdf_analysts", ""))
+            if praw:
+                names = [n for n in praw.split(",") if _txt(n)]
                 method, conf = "pdf_header", 0.80
         if not names:
             continue

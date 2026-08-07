@@ -114,13 +114,16 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 
 # ── 개별 소스 ───────────────────────────────────────────────────────────────────────────────
 def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """★ 반드시 KRXG.call 을 통과시킨다. 이 파일 상단 KRXGate 독스트링이 금지하는 바로 그
+    상황이었다 — pykrx 의 get_auth_session() 은 락 없이 검사-후-생성을 하므로, 12스레드가
+    동시에 이 함수를 부르면 각자 로그인하고 KRX 가 중복로그인(CD011)으로 앞 세션을 끊는다.
+    살아남는 건 마지막 하나뿐이고 나머지는 죽은 쿠키로 요청해 JSON 대신 로그인 HTML 을 받는다.
+    → pykrx 가 설치되고 인증까지 된 **실환경에서만** 대량 실패가 나므로 개발 중엔 안 보인다.
+    """
     if pykrx_stock is None:
         return None
-    try:
-        limiter("krx").wait()
-        d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
-    except Exception:
-        return None
+    d = KRXG.call(pykrx_stock.get_market_ohlcv,
+                  start.replace("-", ""), end.replace("-", ""), code)
     if d is None or len(d) == 0:
         return None
     d = d.reset_index()
@@ -475,12 +478,10 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
     codes = sorted({c for c in map(to_code6, codes) if c})
 
     def _one(code: str):
-        try:
-            limiter("krx").wait()
-            d = pykrx_stock.get_market_trading_value_by_date(
-                as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
-        except Exception:
-            return None
+        # ★ 여기도 KRXG 게이트를 통과시킨다. 8스레드가 pykrx 를 직접 때리면 CD011 폭풍으로
+        #   d3(수급)가 대량 실패한다 — 게이트가 직렬화하므로 느리지만 실제로 데이터가 온다.
+        d = KRXG.call(pykrx_stock.get_market_trading_value_by_date,
+                      as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
         if d is None or len(d) == 0:
             return None
         d = d.reset_index()

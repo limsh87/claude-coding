@@ -250,8 +250,18 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     if not code_c:
         LOG.warn(f"상장폐지 파일에서 종목코드 컬럼을 찾지 못했습니다: {list(d.columns)[:12]}")
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
-                                  "listingdate") if k in col), None)
+    # ★ 'listingdate' 를 후보에 넣으면 안 된다. 그건 폐지일이 아니라 **상장일**이다.
+    #   DelistingDate 계열이 없고 ListingDate 만 있는 스냅샷을 만나면 모든 폐지 종목의
+    #   delisting_date 가 상장일이 되고, 그러면 listed = ~(delisting_date <= month) 가
+    #   전 구간 False 라 **폐지 종목이 유니버스에서 통째로 증발**한다(선택편향).
+    #   차라리 결측으로 두는 편이 안전하다 — 결측은 아래에서 크게 경고된다.
+    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "delistdate")
+                 if k in col), None)
+    if dl_c is None:
+        LOG.warn(f"상장폐지 목록에서 폐지일 컬럼을 찾지 못했습니다 (컬럼: {list(d.columns)[:10]}). "
+                 f"폐지일을 결측으로 두고 진행합니다 — 상장일 컬럼을 폐지일로 잘못 쓰면 "
+                 f"폐지 종목이 유니버스에서 통째로 사라져 훨씬 위험합니다. "
+                 f"이 상태에서는 C2(생존자편향 제거)가 부분적으로만 성립합니다.")
     name_c = col.get("name") or col.get("isu_nm") or code_c
 
     n_raw = len(d)
@@ -270,7 +280,11 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
-    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    # ★ na_position 을 명시하지 않으면 pandas 기본값이 "last" 라 NaT 이 맨 뒤로 가고
+    #   keep="last" 가 **NaT 행을 남긴다**. 그러면 실제 폐지일이 있는데도 '폐지 안 됨'이
+    #   되어 그 종목이 패널 전 구간에 살아남는다 — C2 생존자편향의 재유입이다.
+    #   (실측 재현: (2018-05-10, NaT) 두 행에서 NaT 이 이겼다)
+    t = t.sort_values("delisting_date", na_position="first").drop_duplicates("code", keep="last")
     n_nodate = int(t["delisting_date"].isna().sum())
 
     LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")

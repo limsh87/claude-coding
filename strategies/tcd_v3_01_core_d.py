@@ -1424,15 +1424,41 @@ def nonempty(x) -> bool:
       즉 '소스가 막힌 개발 환경에서는 통과하고, 소스가 살아 있는 실환경에서만 터진다'.
       실제로 CANARY K4 가 정확히 그렇게 죽었다 — 네트워크가 차단된 곳에서 전부 통과했다.
       쓰기 쉬운 잘못된 관용구(`or`)를 대체할 쓰기 쉬운 올바른 관용구가 없으면 재발한다.
+
+    ★ 이 함수 자신이 같은 부류의 버그를 갖고 있었다(적대적 검증에서 실측 적발):
+        nonempty(np.nan) → True     (float 은 len() 이 없어 bool(nan)=True 로 떨어졌다)
+        nonempty(pd.NaT) → True
+        nonempty(pd.NA)  → TypeError
+        nonempty(np.array(5)) → TypeError (0차원 배열은 len() 불가)
+      진리값 버그를 막으려고 만든 헬퍼 안에 진리값 버그가 있으면 방어선이 아니라 확성기다.
     """
     if x is None:
         return False
-    if isinstance(x, (pd.DataFrame, pd.Series, pd.Index, np.ndarray)):
+    if isinstance(x, (pd.DataFrame, pd.Index)):
         return len(x) > 0
+    if isinstance(x, (pd.Series, np.ndarray)):
+        # ★ getattr(x, "size", len(x)) 로 쓰면 안 된다 — 파이썬은 기본값 인자를 **먼저**
+        #   평가하므로 len(x) 가 무조건 실행되고, 0차원 배열에서 TypeError 로 죽는다.
+        #   (이 실수를 계약 검정 NONEMPTY 가 즉시 잡았다)
+        return int(x.size if hasattr(x, "size") else len(x)) > 0
+    if x is pd.NaT:
+        return False
+    if isinstance(x, float) and math.isnan(x):
+        return False
+    try:
+        na = pd.isna(x)
+        if na is True:                                    # 스칼라 결측(np.nan/NaT/pd.NA)
+            return False
+    except (TypeError, ValueError):
+        pass
     try:
         return bool(len(x))
     except TypeError:
+        pass
+    try:
         return bool(x)
+    except (TypeError, ValueError):
+        return True                                       # 판정 불가면 '있다'로 본다(보수적)
 
 
 def first_nonempty(*sources, min_len: int = 1):
@@ -3081,8 +3107,18 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     if not code_c:
         LOG.warn(f"상장폐지 파일에서 종목코드 컬럼을 찾지 못했습니다: {list(d.columns)[:12]}")
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
-                                  "listingdate") if k in col), None)
+    # ★ 'listingdate' 를 후보에 넣으면 안 된다. 그건 폐지일이 아니라 **상장일**이다.
+    #   DelistingDate 계열이 없고 ListingDate 만 있는 스냅샷을 만나면 모든 폐지 종목의
+    #   delisting_date 가 상장일이 되고, 그러면 listed = ~(delisting_date <= month) 가
+    #   전 구간 False 라 **폐지 종목이 유니버스에서 통째로 증발**한다(선택편향).
+    #   차라리 결측으로 두는 편이 안전하다 — 결측은 아래에서 크게 경고된다.
+    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "delistdate")
+                 if k in col), None)
+    if dl_c is None:
+        LOG.warn(f"상장폐지 목록에서 폐지일 컬럼을 찾지 못했습니다 (컬럼: {list(d.columns)[:10]}). "
+                 f"폐지일을 결측으로 두고 진행합니다 — 상장일 컬럼을 폐지일로 잘못 쓰면 "
+                 f"폐지 종목이 유니버스에서 통째로 사라져 훨씬 위험합니다. "
+                 f"이 상태에서는 C2(생존자편향 제거)가 부분적으로만 성립합니다.")
     name_c = col.get("name") or col.get("isu_nm") or code_c
 
     n_raw = len(d)
@@ -3101,7 +3137,11 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
-    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    # ★ na_position 을 명시하지 않으면 pandas 기본값이 "last" 라 NaT 이 맨 뒤로 가고
+    #   keep="last" 가 **NaT 행을 남긴다**. 그러면 실제 폐지일이 있는데도 '폐지 안 됨'이
+    #   되어 그 종목이 패널 전 구간에 살아남는다 — C2 생존자편향의 재유입이다.
+    #   (실측 재현: (2018-05-10, NaT) 두 행에서 NaT 이 이겼다)
+    t = t.sort_values("delisting_date", na_position="first").drop_duplicates("code", keep="last")
     n_nodate = int(t["delisting_date"].isna().sum())
 
     LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
@@ -3599,13 +3639,16 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 
 # ── 개별 소스 ───────────────────────────────────────────────────────────────────────────────
 def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """★ 반드시 KRXG.call 을 통과시킨다. 이 파일 상단 KRXGate 독스트링이 금지하는 바로 그
+    상황이었다 — pykrx 의 get_auth_session() 은 락 없이 검사-후-생성을 하므로, 12스레드가
+    동시에 이 함수를 부르면 각자 로그인하고 KRX 가 중복로그인(CD011)으로 앞 세션을 끊는다.
+    살아남는 건 마지막 하나뿐이고 나머지는 죽은 쿠키로 요청해 JSON 대신 로그인 HTML 을 받는다.
+    → pykrx 가 설치되고 인증까지 된 **실환경에서만** 대량 실패가 나므로 개발 중엔 안 보인다.
+    """
     if pykrx_stock is None:
         return None
-    try:
-        limiter("krx").wait()
-        d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
-    except Exception:
-        return None
+    d = KRXG.call(pykrx_stock.get_market_ohlcv,
+                  start.replace("-", ""), end.replace("-", ""), code)
     if d is None or len(d) == 0:
         return None
     d = d.reset_index()
@@ -3960,12 +4003,10 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
     codes = sorted({c for c in map(to_code6, codes) if c})
 
     def _one(code: str):
-        try:
-            limiter("krx").wait()
-            d = pykrx_stock.get_market_trading_value_by_date(
-                as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
-        except Exception:
-            return None
+        # ★ 여기도 KRXG 게이트를 통과시킨다. 8스레드가 pykrx 를 직접 때리면 CD011 폭풍으로
+        #   d3(수급)가 대량 실패한다 — 게이트가 직렬화하므로 느리지만 실제로 데이터가 온다.
+        d = KRXG.call(pykrx_stock.get_market_trading_value_by_date,
+                      as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
         if d is None or len(d) == 0:
             return None
         d = d.reset_index()
@@ -6021,8 +6062,10 @@ _ANALYST_SPLIT = re.compile(r"[,/·∙•|;]|\s{2,}|\s외\s|\s및\s")
 
 def split_analysts(raw: Any) -> List[str]:
     """'홍길동, 김철수' / '홍길동/김철수' / '홍길동 외 1인' → ['홍길동','김철수']"""
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return []
     t = _clean_cell(raw)
-    if not t:
+    if not t or t.lower() in ("nan", "none", "nat", "<na>", "null"):
         return []
     t = re.sub(r"\(.*?\)", " ", t)
     t = re.sub(r"(연구원|애널리스트|수석|책임|선임|팀장|센터장|위원|박사)", " ", t)
@@ -6168,17 +6211,30 @@ def build_analyst_ledger(rep: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     if rep.empty:
         return (pd.DataFrame(columns=["analyst_id", "name", "broker_id", "broker_name"]),
                 pd.DataFrame(columns=["report_uid", "analyst_id", "link_method", "link_conf"]))
+    def _txt(v) -> str:
+        """★ NaN 은 truthy 다. `getattr(r, "pdf_analysts", "") or ""` 는 NaN 을 통과시키고
+        str(nan)=='nan' 이 또 truthy 라 **'nan' 이라는 유령 애널리스트**가 만들어진다.
+        download_pdfs 가 how="left" 로 머지하므로 PDF 없는 행의 pdf_analysts 는 전부 NaN 이고,
+        그러면 그 유령 하나가 수만 건의 보고서를 가져가 애널리스트 원장과 d2(목표주가 리비전)를
+        통째로 오염시킨다. 예외는 나지 않는다."""
+        if v is None or v is pd.NaT:
+            return ""
+        if isinstance(v, float) and math.isnan(v):
+            return ""
+        s = str(v).strip()
+        return "" if s.lower() in ("nan", "none", "nat", "<na>", "null") else s
+
     links = []
     for r in rep.itertuples(index=False):
         names, method, conf = [], "unresolved", 0.0
-        raw = getattr(r, "analyst_raw", "") or ""
-        if str(raw).strip():
+        raw = _txt(getattr(r, "analyst_raw", ""))
+        if raw:
             names = split_analysts(raw)
             method, conf = "list_field", 0.98        # 한경 '작성자' 컬럼 — 가장 신뢰도 높음
         if not names:
-            praw = getattr(r, "pdf_analysts", "") or ""
-            if str(praw).strip():
-                names = [n for n in str(praw).split(",") if n.strip()]
+            praw = _txt(getattr(r, "pdf_analysts", ""))
+            if praw:
+                names = [n for n in praw.split(",") if _txt(n)]
                 method, conf = "pdf_header", 0.80
         if not names:
             continue
@@ -8947,6 +9003,40 @@ def run_contract_tests(strict: bool = True) -> bool:
        f"체인 정상 {ok_chain} · 구 관용구(`df or x`)가 여전히 ValueError 를 냄 {raises}")
     _t("CHAIN-ERR", "체인 중간 소스의 예외가 전체를 죽이지 않는다",
        first_nonempty(lambda: (_ for _ in ()).throw(RuntimeError("x")), lambda: _df) is not None)
+    # ★ 헬퍼 자신이 같은 부류의 버그를 갖고 있었다(적대적 검증 실측). NaN 은 truthy 라
+    #   len() 없는 타입에서 bool(nan)=True 로 떨어졌고, 0차원 배열은 len() 이 아예 불가였다.
+    _na_cases = [(np.nan, False), (pd.NaT, False), (pd.NA, False), (None, False),
+                 (np.array(5), True), (np.array([]), False), (pd.Series(dtype=float), False),
+                 (pd.DataFrame({"a": [1]}), True), ([], False), ([0], True), ("", False)]
+    _bad = []
+    for v, exp in _na_cases:
+        try:
+            got = nonempty(v)
+        except Exception as e:                                   # noqa
+            got = f"ERR:{type(e).__name__}"
+        if got is not exp:
+            _bad.append(f"{type(v).__name__}({v})→{got}≠{exp}")
+    _t("NONEMPTY", "nonempty 가 NaN/NaT/pd.NA/0차원배열을 올바로 판정한다",
+       not _bad, "위반 " + (", ".join(_bad)[:70] if _bad else "없음"))
+    _t("CHAIN-NAN", "폴백 체인이 NaN 을 '내용 있음'으로 착각하지 않는다",
+       isinstance(first_nonempty(lambda: np.nan, lambda: _df), pd.DataFrame))
+
+    # ── NaN 이 유령 애널리스트를 만들지 않는다 ────────────────────────────────────────
+    #   PDF 가 없는 행의 pdf_analysts 는 merge(how="left") 때문에 전부 NaN 이다.
+    #   `getattr(...) or ""` 는 NaN 을 통과시키고 str(nan)=='nan' 이 또 truthy 라
+    #   'nan' 이라는 애널리스트 한 명이 수만 건의 보고서를 가져간다(d2 전체 오염).
+    _rep = pd.DataFrame({
+        "report_uid": ["u1", "u2"], "analyst_raw": [np.nan, "김철수"],
+        "pdf_analysts": [np.nan, np.nan], "broker_id": ["b1", "b1"],
+        "broker_name": ["A증권", "A증권"], "pub_date": [pd.Timestamp("2020-01-01")] * 2,
+        "stock_code": ["005930", "005930"], "target_price": [1000.0, 1100.0],
+        "opinion": ["BUY", "BUY"]})
+    _A, _L = build_analyst_ledger(_rep)
+    _ghost = [n for n in (_A["name"].astype(str).tolist() if len(_A) else [])
+              if n.strip().lower() in ("nan", "none", "nat", "<na>")]
+    _t("GHOST", "결측 애널리스트가 'nan' 이라는 유령으로 등록되지 않는다",
+       not _ghost and len(_A) == 1,
+       f"원장 {len(_A)}명 {list(_A['name']) if len(_A) else []} · 유령 {_ghost}")
 
     # ── 혼합 포맷 날짜 (재실행 경로의 조용한 유실) ───────────────────────────────────
     mixed = pd.Series([pd.Timestamp("2016-01-15"), "2016-01-15", "2016/01/15",

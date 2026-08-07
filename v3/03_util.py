@@ -548,15 +548,41 @@ def nonempty(x) -> bool:
       즉 '소스가 막힌 개발 환경에서는 통과하고, 소스가 살아 있는 실환경에서만 터진다'.
       실제로 CANARY K4 가 정확히 그렇게 죽었다 — 네트워크가 차단된 곳에서 전부 통과했다.
       쓰기 쉬운 잘못된 관용구(`or`)를 대체할 쓰기 쉬운 올바른 관용구가 없으면 재발한다.
+
+    ★ 이 함수 자신이 같은 부류의 버그를 갖고 있었다(적대적 검증에서 실측 적발):
+        nonempty(np.nan) → True     (float 은 len() 이 없어 bool(nan)=True 로 떨어졌다)
+        nonempty(pd.NaT) → True
+        nonempty(pd.NA)  → TypeError
+        nonempty(np.array(5)) → TypeError (0차원 배열은 len() 불가)
+      진리값 버그를 막으려고 만든 헬퍼 안에 진리값 버그가 있으면 방어선이 아니라 확성기다.
     """
     if x is None:
         return False
-    if isinstance(x, (pd.DataFrame, pd.Series, pd.Index, np.ndarray)):
+    if isinstance(x, (pd.DataFrame, pd.Index)):
         return len(x) > 0
+    if isinstance(x, (pd.Series, np.ndarray)):
+        # ★ getattr(x, "size", len(x)) 로 쓰면 안 된다 — 파이썬은 기본값 인자를 **먼저**
+        #   평가하므로 len(x) 가 무조건 실행되고, 0차원 배열에서 TypeError 로 죽는다.
+        #   (이 실수를 계약 검정 NONEMPTY 가 즉시 잡았다)
+        return int(x.size if hasattr(x, "size") else len(x)) > 0
+    if x is pd.NaT:
+        return False
+    if isinstance(x, float) and math.isnan(x):
+        return False
+    try:
+        na = pd.isna(x)
+        if na is True:                                    # 스칼라 결측(np.nan/NaT/pd.NA)
+            return False
+    except (TypeError, ValueError):
+        pass
     try:
         return bool(len(x))
     except TypeError:
+        pass
+    try:
         return bool(x)
+    except (TypeError, ValueError):
+        return True                                       # 판정 불가면 '있다'로 본다(보수적)
 
 
 def first_nonempty(*sources, min_len: int = 1):

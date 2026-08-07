@@ -275,6 +275,40 @@ def run_contract_tests(strict: bool = True) -> bool:
        f"체인 정상 {ok_chain} · 구 관용구(`df or x`)가 여전히 ValueError 를 냄 {raises}")
     _t("CHAIN-ERR", "체인 중간 소스의 예외가 전체를 죽이지 않는다",
        first_nonempty(lambda: (_ for _ in ()).throw(RuntimeError("x")), lambda: _df) is not None)
+    # ★ 헬퍼 자신이 같은 부류의 버그를 갖고 있었다(적대적 검증 실측). NaN 은 truthy 라
+    #   len() 없는 타입에서 bool(nan)=True 로 떨어졌고, 0차원 배열은 len() 이 아예 불가였다.
+    _na_cases = [(np.nan, False), (pd.NaT, False), (pd.NA, False), (None, False),
+                 (np.array(5), True), (np.array([]), False), (pd.Series(dtype=float), False),
+                 (pd.DataFrame({"a": [1]}), True), ([], False), ([0], True), ("", False)]
+    _bad = []
+    for v, exp in _na_cases:
+        try:
+            got = nonempty(v)
+        except Exception as e:                                   # noqa
+            got = f"ERR:{type(e).__name__}"
+        if got is not exp:
+            _bad.append(f"{type(v).__name__}({v})→{got}≠{exp}")
+    _t("NONEMPTY", "nonempty 가 NaN/NaT/pd.NA/0차원배열을 올바로 판정한다",
+       not _bad, "위반 " + (", ".join(_bad)[:70] if _bad else "없음"))
+    _t("CHAIN-NAN", "폴백 체인이 NaN 을 '내용 있음'으로 착각하지 않는다",
+       isinstance(first_nonempty(lambda: np.nan, lambda: _df), pd.DataFrame))
+
+    # ── NaN 이 유령 애널리스트를 만들지 않는다 ────────────────────────────────────────
+    #   PDF 가 없는 행의 pdf_analysts 는 merge(how="left") 때문에 전부 NaN 이다.
+    #   `getattr(...) or ""` 는 NaN 을 통과시키고 str(nan)=='nan' 이 또 truthy 라
+    #   'nan' 이라는 애널리스트 한 명이 수만 건의 보고서를 가져간다(d2 전체 오염).
+    _rep = pd.DataFrame({
+        "report_uid": ["u1", "u2"], "analyst_raw": [np.nan, "김철수"],
+        "pdf_analysts": [np.nan, np.nan], "broker_id": ["b1", "b1"],
+        "broker_name": ["A증권", "A증권"], "pub_date": [pd.Timestamp("2020-01-01")] * 2,
+        "stock_code": ["005930", "005930"], "target_price": [1000.0, 1100.0],
+        "opinion": ["BUY", "BUY"]})
+    _A, _L = build_analyst_ledger(_rep)
+    _ghost = [n for n in (_A["name"].astype(str).tolist() if len(_A) else [])
+              if n.strip().lower() in ("nan", "none", "nat", "<na>")]
+    _t("GHOST", "결측 애널리스트가 'nan' 이라는 유령으로 등록되지 않는다",
+       not _ghost and len(_A) == 1,
+       f"원장 {len(_A)}명 {list(_A['name']) if len(_A) else []} · 유령 {_ghost}")
 
     # ── 혼합 포맷 날짜 (재실행 경로의 조용한 유실) ───────────────────────────────────
     mixed = pd.Series([pd.Timestamp("2016-01-15"), "2016-01-15", "2016/01/15",
