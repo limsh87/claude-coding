@@ -170,6 +170,19 @@ RESEARCH_PDF_MAX_PER_MONTH = 0    # 0 = 무제한
 RESEARCH_TARGET_PER_YEAR   = 30000
 RESEARCH_MAX_MISSING_RATE  = 0.25 # C14-c: 결측률 이 값 초과 → U층에서 자동 제외
 
+# ── ⑩-B 런타임 예산 ★계약(§10) — 코드가 스스로 강제한다 ────────────────────────────────────
+#    "총 wall-clock 1~4시간 이내에 결과가 나와야 한다"는 협상 대상이 아니다.
+#    아래 값은 '희망'이 아니라 **강제 한도**다. 각 수집 단계는 시작 전에
+#      ① 남은 시간 ② 남은 DART 호출 한도
+#    로 필요량을 견적내고, 예산 안에 못 들어가면 **더 싼 경로로 내려가거나 그 단계를 줄인다.**
+#    예산을 넘길 수밖에 없으면 시작하지 않고 무엇을 못 했는지 표로 보고한다.
+#    ▶ 콜드빌드(캐시가 비어 있는 첫 실행)를 며칠에 걸쳐 완성하고 싶다면
+#      COLD_BUILD_MODE=True 로 두세요. 그때만 예산 강제가 풀립니다(그 사실을 로그에 명시).
+MAX_WALLCLOCK_MIN   = 240     # 전체 실행 상한 (§10 하드 제약)
+COLLECT_BUDGET_MIN  = 55      # 수집(L1) 전체 예산 (§5)
+DART_BUDGET_MIN     = 20      # 그중 DART 재무에 배정 (§5 '벌크재무 15분' + 여유)
+COLD_BUILD_MODE     = False   # True = 예산 강제 해제. 며칠에 걸친 콜드빌드 전용.
+
 # ── ⑪ 성능 / 자원 ───────────────────────────────────────────────────────────────────────────
 N_WORKERS_IO   = 12     # 네트워크 병렬(스레드). 차단 위험을 낮추려면 8로 줄이세요.
 N_WORKERS_CPU  = 0      # 연산 병렬(프로세스). 0 = CPU 코어수 자동(-1)
@@ -197,7 +210,7 @@ STOP_ON_KILL_CRITERIA = True  # §12 킬 기준 위반 시 즉시 중단하고 �
 
 STRATEGY_ID     = "TCD_V3_MICRO_FW"
 STRATEGY_NAME   = "MICRO-FW · U-MICRO 방화벽 중심 전략"
-BUILD_VERSION   = "v3.20260807.2231"
+BUILD_VERSION   = "v3.20260807.2321"
 ACTIVE_PACKS: list = []          # v3 전략2는 센서팩을 쓰지 않는다(경량화). 호환용 빈 목록.
 
 # 공공데이터포털/관세청 키는 이 전략에서 쓰지 않는다(경량화). 코어 호환을 위해 빈 값만 유지.
@@ -2256,6 +2269,8 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              referer: Optional[str] = None, quiet: bool = True,
              force_enc: Optional[str] = None,
              on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
+    if source == "krx" and krx_blocked():
+        return None                       # 차단 중에는 요청 자체를 보내지 않는다(연장 방지)
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -2276,7 +2291,12 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:{r.status_code}"] += 1
             if r.status_code in allow_status:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                out = r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                # ★ 차단은 200 OK 로 온다. 안내 페이지를 데이터로 착각하면 계속 때리게 된다.
+                if _check_krx_block(source, out if isinstance(out, str) else
+                                    (out[:4000].decode("utf-8", "ignore") if out else "")):
+                    return None
+                return out
             if r.status_code in (429, 503):
                 time.sleep(min(30.0, 2.0 * (2 ** attempt)) + random.random())
                 last_exc = requests.HTTPError(f"{r.status_code} {url}")
@@ -2302,6 +2322,8 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
               json_body: Optional[dict] = None, headers: Optional[dict] = None,
               timeout: int = 30, tries: int = 3, as_bytes: bool = False,
               referer: Optional[str] = None) -> Optional[Union[str, bytes]]:
+    if source == "krx" and krx_blocked():
+        return None
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -2313,7 +2335,10 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:POST{r.status_code}"] += 1
             if r.status_code == 200:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url)
+                out = r.content if as_bytes else _decode(r.content, r.encoding, url)
+                if _check_krx_block(source, out if isinstance(out, str) else ""):
+                    return None
+                return out
             time.sleep(1.5 * (attempt + 1))
         except Exception as e:                                # noqa
             with _HTTP_LK:
@@ -2322,6 +2347,90 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
     with _HTTP_LK:
         HTTP_STATS[f"{source}:POSTFAIL"] += 1
     return None
+
+
+# ── KRX 접속 차단 감지 ──────────────────────────────────────────────────────────────────────
+#  ★ 실제 사고: 자동화 대량 조회로 판단되어 사용자 IP 가 1일 차단됐다.
+#    KRX Data Marketplace 는 차단 시 200 OK 로 '이용 제한 안내' HTML 을 준다. 그래서
+#    코드는 실패로 인식하지 못하고 계속 때렸고, 그게 차단을 연장시킬 수 있다.
+#    → 차단 페이지를 감지하면 즉시 이번 실행의 KRX 경로를 전부 끄고, 마커를 남겨
+#      다음 실행에서도 해제 시각까지 KRX 를 건드리지 않는다. 재시도는 하지 않는다.
+_KRX_BLOCK_PAT = re.compile(
+    r"이용\s*제한|비정상\s*대량\s*조회|ip-block-page|자동화\s*수단", re.I)
+KRX_BLOCK = {"blocked": False, "until": 0.0, "logged": False}
+KRX_BLOCK_HOURS = 24.0
+
+
+def _krx_marker_path() -> Optional[str]:
+    root = None
+    try:
+        v = globals().get("VAULT")
+        root = getattr(v, "root", None) if v is not None else None
+    except Exception:
+        root = None
+    root = root or globals().get("LOCAL_CACHE_ROOT")
+    if not root:
+        return None
+    return os.path.join(str(root), "_locks", "krx_block.json")
+
+
+def krx_block_load():
+    """이전 실행에서 남긴 차단 마커를 읽는다. 해제 시각 전이면 이번에도 KRX 를 쓰지 않는다."""
+    p = _krx_marker_path()
+    if not p or not os.path.exists(p):
+        return
+    try:
+        info = json.loads(open(p, encoding="utf-8").read() or "{}")
+        until = float(info.get("until", 0))
+    except Exception:
+        return
+    if until > time.time():
+        KRX_BLOCK["blocked"], KRX_BLOCK["until"] = True, until
+        LOG.warn(f"이전 실행에서 KRX 접속 제한이 감지되었습니다. 해제 예정 "
+                 f"{_dt.datetime.fromtimestamp(until):%Y-%m-%d %H:%M} 까지 KRX 경로를 "
+                 f"사용하지 않습니다. 유니버스·가격은 FDR/네이버 경로로 정상 동작합니다.")
+
+
+def krx_mark_blocked():
+    KRX_BLOCK["blocked"] = True
+    KRX_BLOCK["until"] = time.time() + KRX_BLOCK_HOURS * 3600
+    if not KRX_BLOCK["logged"]:
+        KRX_BLOCK["logged"] = True
+        LOG.error(
+            "KRX 접속 제한 감지 — 이번 실행의 KRX 경로를 전부 중단합니다.\n"
+            "   KRX Data Marketplace 가 '자동화 수단을 통한 비정상 대량 조회'로 판단해\n"
+            "   해당 IP 를 약 1일간 제한했습니다(차단 시에도 HTTP 200 으로 안내 페이지를 줍니다).\n"
+            "   · 이번 실행: 시총 스냅샷 등 KRX 의존 단계를 건너뛰고 FDR/네이버/DART 로 진행합니다.\n"
+            "   · 다음 실행: 해제 시각까지 KRX 를 아예 건드리지 않습니다(마커 저장).\n"
+            "   · 권장: KRX_MARKETPLACE_ID/PW 를 비우고 돌리거나, 공식 경로인\n"
+            "     KRX Open API(openapi.krx.co.kr)의 인증키를 KRX_OPENAPI_KEY 에 넣으세요.")
+    p = _krx_marker_path()
+    if p:
+        try:
+            _ensure_dir(p)
+            atomic_write_text(p, json.dumps({"until": KRX_BLOCK["until"],
+                                             "at": _dt.datetime.now().isoformat()}))
+        except Exception:
+            pass
+
+
+def krx_blocked() -> bool:
+    if KRX_BLOCK["blocked"] and KRX_BLOCK["until"] > time.time():
+        return True
+    if KRX_BLOCK["blocked"] and KRX_BLOCK["until"] <= time.time():
+        KRX_BLOCK["blocked"] = False
+    return KRX_BLOCK["blocked"]
+
+
+def _check_krx_block(source: str, text: Optional[str]) -> bool:
+    """차단 안내 페이지인지 확인. 맞으면 True(=이 응답은 데이터가 아니다)."""
+    if not text or source != "krx":
+        return False
+    head = text[:4000]
+    if _KRX_BLOCK_PAT.search(head) and ("KRX" in head or "krx" in head):
+        krx_mark_blocked()
+        return True
+    return False
 
 
 def soup_of(html: Optional[str]) -> Optional[BeautifulSoup]:
@@ -2439,6 +2548,9 @@ class KRXGate:
     def warmup(self) -> bool:
         if pykrx_stock is None:
             return False
+        if krx_blocked():
+            self._warm, self._authed = True, False
+            return False
         with self._lk:
             if self._warm:
                 return self._authed
@@ -2477,6 +2589,8 @@ class KRXGate:
     def call(self, fn: Callable, *a, **kw):
         """모든 pykrx 호출의 유일한 통로. 직렬화 + 스로틀 + 예외 흡수."""
         if pykrx_stock is None:
+            return None
+        if krx_blocked():          # 차단 중에는 pykrx 도 KRX 를 때린다 → 전면 중단
             return None
         with self._lk:
             self._refresh_if_stale()
@@ -3062,6 +3176,11 @@ class KRXAuth:
         self.openapi_ok = False
 
     def login(self) -> bool:
+        if krx_blocked():
+            self.status = "BLOCKED"
+            LOG.warn("KRX 접속 제한 상태이므로 로그인을 시도하지 않습니다 "
+                     "(재시도가 제한을 연장시킬 수 있습니다).")
+            return False
         if self.apikey:
             self.openapi_ok = self._probe_openapi()
             self.status = "OPENAPI_OK" if self.openapi_ok else "OPENAPI_KEY_UNAUTHORIZED"
@@ -3122,7 +3241,7 @@ class KRXAuth:
     def json_data(self, bld: str, **params) -> Optional[dict]:
         """마켓플레이스 bld 조회. 세션이 없으면 JSON 대신 로그인 HTML 이 와서
         엉뚱한 곳에서 JSONDecodeError 가 난다 → 여기서 미리 막는다."""
-        if not self.session_ok:
+        if not self.session_ok or krx_blocked():
             return None
         body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
         txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
@@ -6199,6 +6318,293 @@ def derive_halt_from_price(px_daily: pd.DataFrame, P: pd.DataFrame) -> pd.DataFr
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-B  런타임 예산 강제 + DART 재무 수집 사다리 (§5 · §10)                                 ║
+# ║                                                                                          ║
+# ║  ★ 이 모듈이 존재하는 이유 (실제로 계약을 어긴 사고) ─────────────────────────────────    ║
+# ║    한때 여기서 전 종목(3,915사) × 12연도 × 4보고서 = 187,920 건을 단건 API 로 요청했다.   ║
+# ║    일일 한도가 20,000 이므로 코드가 스스로 "약 10일 걸립니다"라고 말하면서 그대로         ║
+# ║    실행을 시작했다. §10 의 '총 4시간' 은 협상 대상이 아닌데도.                             ║
+# ║    문제는 느린 게 아니라 **예산을 넘길 것을 알면서 시작한 것**이다.                        ║
+# ║                                                                                          ║
+# ║  → 원칙: 견적을 먼저 낸다. 예산에 안 들어가면 시작하지 않는다.                             ║
+# ║          더 싼 경로로 내려가고, 그래도 안 되면 '무엇을 못 했는지'를 표로 보고한다.         ║
+# ║          임계를 늘려 통과시키지 않는다. 조용히 오래 도는 것은 금지다.                     ║
+# ║                                                                                          ║
+# ║  수집 사다리 (싼 것부터. 각 단계는 남은 예산 안에서만 돈다)                                 ║
+# ║    ① 드라이브 공용 캐시            — 0 호출                                                ║
+# ║    ② 재무정보 일괄다운로드(벌크)   — 분기당 1 파일. 되면 여기서 끝난다                     ║
+# ║    ③ fnlttMultiAcnt 배치           — 1 호출당 100사. 주요계정만(자본금·자산·부채·자본·매출) ║
+# ║    ④ fnlttSinglAcntAll 단건        — 전 계정. ★예산 안에서 '유동성 상위부터'만            ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+class Deadline:
+    """실행 전체의 시계. 각 단계가 '남은 시간'을 물어보고 스스로 줄인다."""
+
+    def __init__(self, total_min: float):
+        self.t0 = time.time()
+        self.total_s = float(total_min) * 60.0
+        self.enforced = not COLD_BUILD_MODE
+
+    def elapsed_s(self) -> float:
+        return time.time() - self.t0
+
+    def remain_s(self, budget_min: Optional[float] = None, spent_s: float = 0.0) -> float:
+        """남은 초. budget_min 을 주면 '그 단계 예산'과 '전체 잔여' 중 작은 쪽."""
+        left_total = self.total_s - self.elapsed_s()
+        if budget_min is None:
+            return max(0.0, left_total)
+        return max(0.0, min(left_total, float(budget_min) * 60.0 - spent_s))
+
+    def over(self) -> bool:
+        return self.enforced and self.elapsed_s() > self.total_s
+
+    def report(self):
+        el = self.elapsed_s() / 60.0
+        pct = 100 * el / max(self.total_s / 60.0, 1e-9)
+        (LOG.warn if pct > 100 else LOG.info)(
+            f"런타임 예산 — 경과 {el:.1f}분 / 상한 {self.total_s/60:.0f}분 ({pct:.0f}%)"
+            + ("  ※ COLD_BUILD_MODE=True 라 강제하지 않습니다" if not self.enforced else ""))
+
+
+DEADLINE: Optional[Deadline] = None
+
+
+def dart_calls_left() -> int:
+    """오늘 남은 DART 호출 수. 예산 견적의 기준이 된다."""
+    try:
+        used = int(getattr(DBUDGET, "n", 0) or 0)
+    except Exception:
+        used = 0
+    return max(0, DART_DAILY_LIMIT - used)
+
+
+def plan_dart_collection(corp_codes: Sequence[str], years: Sequence[int],
+                         budget_min: float) -> dict:
+    """수집 '계획'을 먼저 세우고 표로 보여준다. 계획 없이 시작하지 않는다.
+
+    반환: {"mode": "bulk"|"batch"|"single"|"cache_only", "corps": [...], "years": [...], ...}
+    """
+    n_corp, n_year = len(corp_codes), len(years)
+    reprts = 4
+    need_single = n_corp * n_year * reprts
+    need_batch = (math.ceil(n_corp / max(DART_MULTI_BATCH, 1)) * n_year * reprts)
+    left_calls = dart_calls_left()
+    # 실측 처리율: 단건 ≈ 4.4 call/s (운영 로그 기준), 배치도 호출당 비용은 비슷하다.
+    rate = 4.0
+    can_do_calls = int(max(0.0, budget_min * 60.0) * rate)
+    cap = min(left_calls, can_do_calls)
+
+    rows = [
+        ["단건 전량 (fnlttSinglAcntAll)", f"{need_single:,}",
+         f"{need_single/rate/3600:.1f}시간", "✘ 예산 초과" if need_single > cap else "✔"],
+        ["배치 (fnlttMultiAcnt, 100사/회)", f"{need_batch:,}",
+         f"{need_batch/rate/60:.0f}분", "✘ 예산 초과" if need_batch > cap else "✔"],
+        ["── 이번 실행 가용", f"{cap:,}",
+         f"{budget_min:.0f}분", f"일일잔여 {left_calls:,} · 시간환산 {can_do_calls:,}"],
+    ]
+    LOG.table(rows, ["경로", "필요 호출", "예상 소요", "예산 판정"], ["l", "r", "r", "l"],
+              title="DART 수집 계획 (§5 · §10) — 시작 전에 견적부터 낸다")
+
+    if not COLD_BUILD_MODE and need_single > cap:
+        LOG.warn(f"단건 전량은 {need_single:,}회로 이번 실행 예산({cap:,}회)을 "
+                 f"{need_single/max(cap,1):.0f}배 초과합니다. 시작하지 않습니다 — "
+                 f"싼 경로(벌크→배치)로 내려가고, 단건은 '유동성 상위'부터 예산 안에서만 받습니다. "
+                 f"전 종목 콜드빌드를 며칠에 걸쳐 하려면 COLD_BUILD_MODE=True 로 두세요.")
+    return {"need_single": need_single, "need_batch": need_batch, "cap": cap,
+            "left_calls": left_calls, "rate": rate}
+
+
+# ── ② 재무정보 일괄다운로드 (벌크) ──────────────────────────────────────────────────────────
+#   ★ 이 경로는 '있으면 쓰고 없으면 조용히 내려간다'. 응답을 반드시 검증한다:
+#     ZIP 매직바이트(PK) 확인 → 내부 파일 파싱 성공 → 필요한 컬럼 존재.
+#     검증을 통과하지 못하면 '벌크 미확인'으로 로깅하고 배치 경로로 간다.
+#     (엔드포인트를 추측해서 성공한 척하지 않는다 — 실패는 실패로 보고한다)
+DART_BULK_URLS = [
+    "https://opendart.fss.or.kr/cmm/downloadFnlttZip.do?fl_nm={fl}",
+    "https://opendart.fss.or.kr/disclosureinfo/fnltt/dwld/download.do?fl_nm={fl}",
+]
+DART_BULK_NAMES = [
+    "{y}_{q}_{fs}.zip",
+    "{y}년_{q}_{fs}.zip",
+]
+_BULK_Q = {"11013": "1분기보고서", "11012": "반기보고서",
+           "11014": "3분기보고서", "11011": "사업보고서"}
+
+
+def fetch_dart_bulk(years: Sequence[int], reprts: Sequence[str]) -> pd.DataFrame:
+    """분기 단위 벌크 zip. 종목별 루프 금지(§5). 되면 호출 수가 '분기 수'로 끝난다."""
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=_FS_KEEP)
+    cached = VAULT.get_table("dart_bulk_raw", scope="shared")
+    have = set()
+    if cached is not None and len(cached):
+        have = set(zip(cached["bsns_year"].astype(int), cached["reprt_code"].astype(str)))
+        LOG.ok(f"공용 캐시에서 DART 벌크 재무 {len(cached):,}행 재사용 ({len(have)}개 분기)")
+    todo = [(int(y), str(r)) for y in years for r in reprts if (int(y), str(r)) not in have]
+    if RUN_MODE == "CACHED" or not todo:
+        return cached if cached is not None else pd.DataFrame(columns=_FS_KEEP)
+
+    got, ok_n, fail_n = [], 0, 0
+    for y, r in todo:
+        if DEADLINE is not None and DEADLINE.over():
+            break
+        blob = None
+        for url_t in DART_BULK_URLS:
+            for nm_t in DART_BULK_NAMES:
+                fl = nm_t.format(y=y, q=_BULK_Q.get(r, r), fs="재무제표")
+                raw = http_get(url_t.format(fl=quote(fl)), source="dart",
+                               as_bytes=True, tries=1, timeout=90)
+                if raw and len(raw) > 2048 and raw[:2] == b"PK":     # ZIP 매직바이트 검증
+                    blob = raw
+                    break
+            if blob:
+                break
+        if not blob:
+            fail_n += 1
+            continue
+        try:
+            z = zipfile.ZipFile(io.BytesIO(blob))
+            parts = []
+            for nm in z.namelist():
+                try:
+                    d = pd.read_csv(io.BytesIO(z.read(nm)), sep="\t",
+                                    dtype=str, encoding="cp949", on_bad_lines="skip")
+                except Exception:
+                    continue
+                if len(d):
+                    parts.append(d)
+            if not parts:
+                fail_n += 1
+                continue
+            D = pd.concat(parts, ignore_index=True)
+            D.columns = [str(c).strip().replace(" ", "") for c in D.columns]
+            ren = {"종목코드": "stock_code", "회사명": "corp_name", "재무제표종류": "sj_nm",
+                   "항목코드": "account_id", "항목명": "account_nm", "당기금액": "thstrm_amount",
+                   "결산기준일": "period_end_raw"}
+            D = D.rename(columns={k: v for k, v in ren.items() if k in D.columns})
+            if "account_nm" not in D.columns or "thstrm_amount" not in D.columns:
+                fail_n += 1
+                continue
+            D["bsns_year"], D["reprt_code"] = int(y), str(r)
+            got.append(D)
+            ok_n += 1
+        except Exception:
+            fail_n += 1
+
+    if not got:
+        LOG.info(f"재무정보 일괄다운로드(벌크) 경로를 확인하지 못했습니다 "
+                 f"(시도 {len(todo)}분기 · 실패 {fail_n}). 배치 경로로 진행합니다 — "
+                 f"K1 의 'Fallback: fnlttMultiAcnt 배치 호출' 규칙 그대로입니다.")
+        return cached if cached is not None else pd.DataFrame(columns=_FS_KEEP)
+
+    B = pd.concat(([cached] if cached is not None and len(cached) else []) + got,
+                  ignore_index=True)
+    VAULT.put_table("dart_bulk_raw", B, scope="shared", domain="dart",
+                    source="opendart 재무정보 일괄다운로드")
+    LOG.ok(f"DART 벌크 재무 {len(B):,}행 · {ok_n}개 분기 확보 "
+           f"(종목별 루프 없이 분기 단위로 — §5)")
+    return B
+
+
+# ── 사다리 실행 ─────────────────────────────────────────────────────────────────────────────
+def collect_dart_financials_budgeted(sec: pd.DataFrame, months: pd.DatetimeIndex,
+                                     px_daily: Optional[pd.DataFrame],
+                                     budget_min: float) -> pd.DataFrame:
+    """예산 안에서 최대한 받는다. 예산을 넘길 것 같으면 '시작하지 않고' 줄인다."""
+    t_start = time.time()
+    ccs_all = sec["corp_code"].dropna().astype(str).unique().tolist()
+    yrs = sorted({int(m.year) for m in months} | {int(months[0].year) - 1})
+    reprts = [REPRT_CODES[k] for k in ("Q1", "H1", "Q3", "FY")]
+    plan = plan_dart_collection(ccs_all, yrs, budget_min)
+
+    frames: List[pd.DataFrame] = []
+
+    # ② 벌크 (되면 여기서 대부분 끝난다)
+    B = fetch_dart_bulk(yrs, reprts)
+    if B is not None and len(B):
+        frames.append(B)
+
+    def _spent() -> float:
+        return time.time() - t_start
+
+    def _left_min() -> float:
+        if DEADLINE is None:
+            return max(0.0, budget_min - _spent() / 60.0)
+        return DEADLINE.remain_s(budget_min, _spent()) / 60.0
+
+    # ③ 배치 (주요계정) — 자본금·자산·부채·자본·매출·영업이익·순이익
+    if _left_min() > 1 and plan["need_batch"] <= plan["cap"] * 3:
+        try:
+            M = fetch_dart_multi_accounts(ccs_all, yrs)
+            if M is not None and len(M):
+                frames.append(M)
+        except Exception as e:                                     # noqa
+            LOG.warn(f"DART 주요계정 배치 실패({type(e).__name__}) — 단건 경로로 넘어갑니다.")
+    else:
+        LOG.warn("남은 예산이 부족해 주요계정 배치를 건너뜁니다.")
+
+    # ④ 단건 (전 계정) — ★유동성 상위부터, 예산 안에서만
+    left_min = _left_min()
+    rate = plan["rate"]
+    cap_calls = int(min(dart_calls_left(), max(0.0, left_min) * 60.0 * rate))
+    if COLD_BUILD_MODE:
+        cap_calls = dart_calls_left()
+        LOG.warn("COLD_BUILD_MODE=True — 단건 수집의 예산 강제를 해제합니다. "
+                 "이 실행은 §10 의 4시간 제약을 지키지 않을 수 있습니다(의도된 선택).")
+    if cap_calls > 0:
+        prio = _liquidity_priority(sec, px_daily)
+        n_corp_afford = max(1, cap_calls // (len(yrs) * len(reprts)))
+        pick = prio[:n_corp_afford] if prio else ccs_all[:n_corp_afford]
+        LOG.info(f"단건 전 계정 수집 — 예산 {cap_calls:,}회로 유동성 상위 "
+                 f"{len(pick):,}사 × {len(yrs)}연도 × {len(reprts)}보고서. "
+                 f"(전 종목 {len(ccs_all):,}사 중 {100*len(pick)/max(len(ccs_all),1):.0f}%)")
+        try:
+            F = fetch_dart_financials(pick, yrs, priority=pick)
+            if F is not None and len(F):
+                frames.append(F)
+        except Exception as e:                                     # noqa
+            LOG.warn(f"DART 단건 수집 실패({type(e).__name__}) — 받은 분량으로 진행합니다.")
+    else:
+        LOG.warn("남은 예산이 없어 단건 전 계정 수집을 건너뜁니다 — "
+                 "재고·매출원가·영업CF·이자비용이 결측이 되어 증거층이 얇아집니다. "
+                 "다음 실행에서 캐시에 이어받습니다(진행분은 이미 저장됨).")
+
+    if not frames:
+        return pd.DataFrame(columns=_FS_KEEP)
+    out = pd.concat([f.reindex(columns=sorted(set().union(*[set(x.columns) for x in frames])))
+                     for f in frames], ignore_index=True)
+    LOG.ok(f"DART 재무 원시 {len(out):,}행 확보 — 소요 {_spent()/60:.1f}분 "
+           f"(예산 {budget_min:.0f}분)")
+    return out
+
+
+def _liquidity_priority(sec: pd.DataFrame, px_daily: Optional[pd.DataFrame]) -> List[str]:
+    """거래대금 상위 순 corp_code. 예산이 부족할 때 '무엇을 먼저 받을지'의 기준.
+
+    ★ 유동성 상위부터 받는 이유: U-MICRO 는 adv20 ≥ 하한을 요구하므로, 유동성이 없는
+      종목은 어차피 유니버스에 못 들어온다. 예산이 잘릴 때 버려질 종목을 먼저 버리는 것이
+      가장 손실이 적다. (유니버스 '정의'를 바꾸는 게 아니라 '수집 순서'만 바꾼다)
+    """
+    if px_daily is None or len(px_daily) == 0 or "amount" not in px_daily.columns:
+        return []
+    try:
+        amt = (px_daily.groupby("code", observed=True)["amount"].median()
+               .sort_values(ascending=False))
+        c2c = (sec.dropna(subset=["corp_code"]).drop_duplicates("code")
+                  .set_index("code")["corp_code"].astype(str).to_dict())
+        out, seen = [], set()
+        for code in amt.index:
+            cc = c2c.get(str(code))
+            if cc and cc not in seen:
+                seen.add(cc)
+                out.append(cc)
+        return out
+    except Exception:
+        return []
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L1-S  U-MICRO 패널 · L1 센서 (§8)                                                        ║
 # ║                                                                                          ║
 # ║  ★ 센서는 '분기 재무 프레임'에서 계산한다. 월 패널에서 shift(12) 로 계산하지 않는다.       ║
@@ -8426,6 +8832,44 @@ def run_contracts() -> bool:
             return False, "D 구성에서 방화벽이 중립화되었습니다."
         return True, "B 는 방화벽·거부권 중립화 · D 는 유지 — 구성 간 분리 확인"
 
+    # ── §10 런타임 예산: 예산을 넘길 것을 알면서 시작하면 안 된다 ──────────────────────
+    def budget_guard():
+        """실제 사고 재현: 전 종목 단건 수집은 187,920회 = 약 10일. 그걸 시작했었다."""
+        corps = [f"{i:08d}" for i in range(3915)]
+        years = list(range(2015, 2027))
+        plan = plan_dart_collection(corps, years, budget_min=DART_BUDGET_MIN)
+        if plan["need_single"] <= plan["cap"]:
+            return False, ("전 종목 단건 수집이 예산 안이라고 판정됐습니다 — 견적식이 잘못됐습니다.")
+        if plan["need_batch"] > plan["need_single"] / 10:
+            return False, "배치 경로가 단건 대비 충분히 싸지 않습니다(배치 산식 오류)."
+        if MAX_WALLCLOCK_MIN > 240:
+            return False, f"MAX_WALLCLOCK_MIN={MAX_WALLCLOCK_MIN} — 계약 상한(240분)을 넘겼습니다."
+        return True, (f"단건 {plan['need_single']:,}회는 예산 {plan['cap']:,}회의 "
+                      f"{plan['need_single']/max(plan['cap'],1):.0f}배 → 시작하지 않고 "
+                      f"배치({plan['need_batch']:,}회)로 내려감 · 상한 {MAX_WALLCLOCK_MIN}분")
+
+    # ── KRX 차단 페이지를 데이터로 착각하지 않는다 ────────────────────────────────────
+    def krx_block_detect():
+        html = ('<html><head><title>에러페이지 - 한국거래소 | Data Marketplace</title></head>'
+                '<body><div class="ip-block-page"><h1>KRX Data Marketplace</h1>'
+                '<h2>KDM 이용 제한 안내</h2><p>자동화 수단을 통한 비정상 대량 조회가 '
+                '감지되어 해당 IP의 접속이 일시적으로 제한되었습니다.</p></div></body></html>')
+        before = dict(KRX_BLOCK)
+        try:
+            KRX_BLOCK["blocked"], KRX_BLOCK["until"], KRX_BLOCK["logged"] = False, 0.0, True
+            if not _check_krx_block("krx", html):
+                return False, ("KRX 차단 안내 페이지를 데이터로 취급했습니다. 차단은 200 OK 로 "
+                               "오므로, 못 잡으면 계속 요청해 제한이 연장됩니다.")
+            if not krx_blocked():
+                return False, "차단을 감지했는데 이후 요청이 막히지 않았습니다."
+            if _check_krx_block("naver", html):
+                return False, "KRX 가 아닌 소스의 응답까지 차단으로 오인했습니다."
+            return True, "차단 페이지 감지 → 이번 실행 KRX 전면 중단 + 마커 저장 확인"
+        finally:
+            KRX_BLOCK.update(before)
+
+    _c("BUDGET", "런타임 예산 강제 (§10)", budget_guard)
+    _c("KRXBLK", "KRX 차단 페이지 감지", krx_block_detect)
     _c("C1", "PIT (미래누수 차단)", c1)
     _c("C2", "생존자편향 제거 · 상폐 -100%", c2)
     _c("C13", "유니버스 PIT · 랭크 시점별 재산출", c13)
@@ -8687,16 +9131,13 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
         ctx["panel"] = build_price_panel(px, months)
         VAULT.flush()
 
-    with PIPE.stage("L1.MCAP", "시가총액·상장주식수", "L1", budget_s=1200):
-        snap_m = fetch_mcap_snapshots(months, ctx["sec"])
-        ctx["mcap_snap"] = snap_m
-        ctx["mcap"] = build_mcap_panel(ctx["panel"]["monthly"], snap_m, ctx["sec"], months)
-        VAULT.flush()
 
-    with PIPE.stage("L1.DART", "DART 재무 → 분기 센서", "L1", budget_s=3600, critical=False):
-        ccs = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-        yrs = sorted({int(m.year) for m in months} | {int(months[0].year) - 1})
-        fs = fetch_dart_financials(ccs, yrs)
+    with PIPE.stage("L1.DART", "DART 재무 → 분기 센서", "L1",
+                    budget_s=DART_BUDGET_MIN * 60, critical=False):
+        # ★ 전 종목×전 연도를 단건 API 로 도는 것은 §5('종목별 루프 금지')와 §10(4시간)을
+        #   동시에 어긴다. 예산 견적 → 싼 경로부터 → 남은 예산 안에서만 단건.
+        fs = collect_dart_financials_budgeted(ctx["sec"], months, ctx.get("px_daily"),
+                                              budget_min=DART_BUDGET_MIN)
         W = tidy_financials(fs) if len(fs) else pd.DataFrame()
         Q = add_micro_sensors_quarterly(W) if len(W) else pd.DataFrame()
         ctx["fin_q"] = Q
@@ -8704,6 +9145,15 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
             PIT.register("dart_micro", Q, key_cols=["corp_code"])
             VAULT.put_table(f"micro_sensors_q_{STRATEGY_ID}", Q, scope="private",
                             domain="feature", source="dart tidy + micro sensors")
+        VAULT.flush()
+
+    # ★ 시총은 DART 재무 '뒤'에 둔다.
+    #   주식총수 보강이 DART 호출을 먼저 태우면, 정작 이 전략의 본체인 재무를 받을
+    #   한도가 사라진다. 실제로 그 순서 때문에 재무 시작 시점에 한도가 1,000건 깎여 있었다.
+    with PIPE.stage("L1.MCAP", "시가총액·상장주식수", "L1", budget_s=1200):
+        snap_m = fetch_mcap_snapshots(months, ctx["sec"])
+        ctx["mcap_snap"] = snap_m
+        ctx["mcap"] = build_mcap_panel(ctx["panel"]["monthly"], snap_m, ctx["sec"], months)
         VAULT.flush()
 
     with PIPE.stage("L1.ACT", "관리종목·감사의견·거래정지", "L1", budget_s=1200, critical=False):
@@ -8870,6 +9320,8 @@ def _main_inner() -> dict:
     LOG.banner(f"TCD v3 · {STRATEGY_NAME}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · 빌드 {BUILD_VERSION} · 모드 {RUN_MODE}")
     months = month_range(BACKTEST_START, BACKTEST_END)
+    global DEADLINE
+    DEADLINE = Deadline(MAX_WALLCLOCK_MIN)
     outputs: List[str] = []
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -8879,6 +9331,7 @@ def _main_inner() -> dict:
         root, mode = _mount_drive()
         VAULT = Vault(root, mode)
         LOG.ok(f"캐시 루트: {root}  (모드 {mode})")
+        krx_block_load()      # 이전 실행에서 KRX 차단을 만났다면 해제 시각까지 건드리지 않는다
         LOG.info(f"공용 인덱스 = {GDRIVE_SHARED_NS} (전 전략 공유) · "
                  f"전용 인덱스 = {GDRIVE_PRIVATE_NS} (이 전략)")
         try:
@@ -8958,7 +9411,10 @@ def _main_inner() -> dict:
     PIPE.report_runtime()
     report_http()
     KRXG.report()
-    LOG.banner("완료", f"총 소요 {(time.time()-t_start)/60:.1f}분")
+    if DEADLINE is not None:
+        DEADLINE.report()
+    LOG.banner("완료", f"총 소요 {(time.time()-t_start)/60:.1f}분 "
+                       f"(계약 상한 {MAX_WALLCLOCK_MIN}분)")
     offer_download(outputs)
     return {"P": P, "bts": bts, "outputs": outputs}
 

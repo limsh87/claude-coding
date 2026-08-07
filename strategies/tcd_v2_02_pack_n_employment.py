@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_N"
 STRATEGY_NAME      = "PACK-N 국민연금 고용"
 ACTIVE_PACKS       = ["N"]
-BUILD_VERSION      = "v2.20260807.2233"
+BUILD_VERSION      = "v2.20260807.2321"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -2216,6 +2216,8 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              referer: Optional[str] = None, quiet: bool = True,
              force_enc: Optional[str] = None,
              on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
+    if source == "krx" and krx_blocked():
+        return None                       # 차단 중에는 요청 자체를 보내지 않는다(연장 방지)
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -2236,7 +2238,12 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:{r.status_code}"] += 1
             if r.status_code in allow_status:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                out = r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                # ★ 차단은 200 OK 로 온다. 안내 페이지를 데이터로 착각하면 계속 때리게 된다.
+                if _check_krx_block(source, out if isinstance(out, str) else
+                                    (out[:4000].decode("utf-8", "ignore") if out else "")):
+                    return None
+                return out
             if r.status_code in (429, 503):
                 time.sleep(min(30.0, 2.0 * (2 ** attempt)) + random.random())
                 last_exc = requests.HTTPError(f"{r.status_code} {url}")
@@ -2262,6 +2269,8 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
               json_body: Optional[dict] = None, headers: Optional[dict] = None,
               timeout: int = 30, tries: int = 3, as_bytes: bool = False,
               referer: Optional[str] = None) -> Optional[Union[str, bytes]]:
+    if source == "krx" and krx_blocked():
+        return None
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -2273,7 +2282,10 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:POST{r.status_code}"] += 1
             if r.status_code == 200:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url)
+                out = r.content if as_bytes else _decode(r.content, r.encoding, url)
+                if _check_krx_block(source, out if isinstance(out, str) else ""):
+                    return None
+                return out
             time.sleep(1.5 * (attempt + 1))
         except Exception as e:                                # noqa
             with _HTTP_LK:
@@ -2282,6 +2294,90 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
     with _HTTP_LK:
         HTTP_STATS[f"{source}:POSTFAIL"] += 1
     return None
+
+
+# ── KRX 접속 차단 감지 ──────────────────────────────────────────────────────────────────────
+#  ★ 실제 사고: 자동화 대량 조회로 판단되어 사용자 IP 가 1일 차단됐다.
+#    KRX Data Marketplace 는 차단 시 200 OK 로 '이용 제한 안내' HTML 을 준다. 그래서
+#    코드는 실패로 인식하지 못하고 계속 때렸고, 그게 차단을 연장시킬 수 있다.
+#    → 차단 페이지를 감지하면 즉시 이번 실행의 KRX 경로를 전부 끄고, 마커를 남겨
+#      다음 실행에서도 해제 시각까지 KRX 를 건드리지 않는다. 재시도는 하지 않는다.
+_KRX_BLOCK_PAT = re.compile(
+    r"이용\s*제한|비정상\s*대량\s*조회|ip-block-page|자동화\s*수단", re.I)
+KRX_BLOCK = {"blocked": False, "until": 0.0, "logged": False}
+KRX_BLOCK_HOURS = 24.0
+
+
+def _krx_marker_path() -> Optional[str]:
+    root = None
+    try:
+        v = globals().get("VAULT")
+        root = getattr(v, "root", None) if v is not None else None
+    except Exception:
+        root = None
+    root = root or globals().get("LOCAL_CACHE_ROOT")
+    if not root:
+        return None
+    return os.path.join(str(root), "_locks", "krx_block.json")
+
+
+def krx_block_load():
+    """이전 실행에서 남긴 차단 마커를 읽는다. 해제 시각 전이면 이번에도 KRX 를 쓰지 않는다."""
+    p = _krx_marker_path()
+    if not p or not os.path.exists(p):
+        return
+    try:
+        info = json.loads(open(p, encoding="utf-8").read() or "{}")
+        until = float(info.get("until", 0))
+    except Exception:
+        return
+    if until > time.time():
+        KRX_BLOCK["blocked"], KRX_BLOCK["until"] = True, until
+        LOG.warn(f"이전 실행에서 KRX 접속 제한이 감지되었습니다. 해제 예정 "
+                 f"{_dt.datetime.fromtimestamp(until):%Y-%m-%d %H:%M} 까지 KRX 경로를 "
+                 f"사용하지 않습니다. 유니버스·가격은 FDR/네이버 경로로 정상 동작합니다.")
+
+
+def krx_mark_blocked():
+    KRX_BLOCK["blocked"] = True
+    KRX_BLOCK["until"] = time.time() + KRX_BLOCK_HOURS * 3600
+    if not KRX_BLOCK["logged"]:
+        KRX_BLOCK["logged"] = True
+        LOG.error(
+            "KRX 접속 제한 감지 — 이번 실행의 KRX 경로를 전부 중단합니다.\n"
+            "   KRX Data Marketplace 가 '자동화 수단을 통한 비정상 대량 조회'로 판단해\n"
+            "   해당 IP 를 약 1일간 제한했습니다(차단 시에도 HTTP 200 으로 안내 페이지를 줍니다).\n"
+            "   · 이번 실행: 시총 스냅샷 등 KRX 의존 단계를 건너뛰고 FDR/네이버/DART 로 진행합니다.\n"
+            "   · 다음 실행: 해제 시각까지 KRX 를 아예 건드리지 않습니다(마커 저장).\n"
+            "   · 권장: KRX_MARKETPLACE_ID/PW 를 비우고 돌리거나, 공식 경로인\n"
+            "     KRX Open API(openapi.krx.co.kr)의 인증키를 KRX_OPENAPI_KEY 에 넣으세요.")
+    p = _krx_marker_path()
+    if p:
+        try:
+            _ensure_dir(p)
+            atomic_write_text(p, json.dumps({"until": KRX_BLOCK["until"],
+                                             "at": _dt.datetime.now().isoformat()}))
+        except Exception:
+            pass
+
+
+def krx_blocked() -> bool:
+    if KRX_BLOCK["blocked"] and KRX_BLOCK["until"] > time.time():
+        return True
+    if KRX_BLOCK["blocked"] and KRX_BLOCK["until"] <= time.time():
+        KRX_BLOCK["blocked"] = False
+    return KRX_BLOCK["blocked"]
+
+
+def _check_krx_block(source: str, text: Optional[str]) -> bool:
+    """차단 안내 페이지인지 확인. 맞으면 True(=이 응답은 데이터가 아니다)."""
+    if not text or source != "krx":
+        return False
+    head = text[:4000]
+    if _KRX_BLOCK_PAT.search(head) and ("KRX" in head or "krx" in head):
+        krx_mark_blocked()
+        return True
+    return False
 
 
 def soup_of(html: Optional[str]) -> Optional[BeautifulSoup]:
@@ -2399,6 +2495,9 @@ class KRXGate:
     def warmup(self) -> bool:
         if pykrx_stock is None:
             return False
+        if krx_blocked():
+            self._warm, self._authed = True, False
+            return False
         with self._lk:
             if self._warm:
                 return self._authed
@@ -2437,6 +2536,8 @@ class KRXGate:
     def call(self, fn: Callable, *a, **kw):
         """모든 pykrx 호출의 유일한 통로. 직렬화 + 스로틀 + 예외 흡수."""
         if pykrx_stock is None:
+            return None
+        if krx_blocked():          # 차단 중에는 pykrx 도 KRX 를 때린다 → 전면 중단
             return None
         with self._lk:
             self._refresh_if_stale()
@@ -3022,6 +3123,11 @@ class KRXAuth:
         self.openapi_ok = False
 
     def login(self) -> bool:
+        if krx_blocked():
+            self.status = "BLOCKED"
+            LOG.warn("KRX 접속 제한 상태이므로 로그인을 시도하지 않습니다 "
+                     "(재시도가 제한을 연장시킬 수 있습니다).")
+            return False
         if self.apikey:
             self.openapi_ok = self._probe_openapi()
             self.status = "OPENAPI_OK" if self.openapi_ok else "OPENAPI_KEY_UNAUTHORIZED"
@@ -3082,7 +3188,7 @@ class KRXAuth:
     def json_data(self, bld: str, **params) -> Optional[dict]:
         """마켓플레이스 bld 조회. 세션이 없으면 JSON 대신 로그인 HTML 이 와서
         엉뚱한 곳에서 JSONDecodeError 가 난다 → 여기서 미리 막는다."""
-        if not self.session_ok:
+        if not self.session_ok or krx_blocked():
             return None
         body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
         txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,

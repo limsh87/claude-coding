@@ -68,6 +68,9 @@ class KRXGate:
     def warmup(self) -> bool:
         if pykrx_stock is None:
             return False
+        if krx_blocked():
+            self._warm, self._authed = True, False
+            return False
         with self._lk:
             if self._warm:
                 return self._authed
@@ -106,6 +109,8 @@ class KRXGate:
     def call(self, fn: Callable, *a, **kw):
         """모든 pykrx 호출의 유일한 통로. 직렬화 + 스로틀 + 예외 흡수."""
         if pykrx_stock is None:
+            return None
+        if krx_blocked():          # 차단 중에는 pykrx 도 KRX 를 때린다 → 전면 중단
             return None
         with self._lk:
             self._refresh_if_stale()

@@ -31,6 +31,7 @@ PARTS = [
     (V2, "20_pit.py"),             # PIT 저장소 · 유니버스(C2)
     (V3, "15_ingest_mcap.py"),     # ★신규: 시가총액·상장주식수 PIT
     (V3, "16_ingest_watchlist.py"),  # ★신규: 관리종목·감사의견·거래정지 PIT
+    (V3, "17_dart_budget.py"),   # ★신규: 런타임 예산 강제 + DART 수집 사다리
     (V3, "30_micro_panel.py"),     # L1 센서(§8) · 셀(C14) · 유니버스 게이트(§6)
     (V3, "35_firewall_score.py"),  # S1_FIREWALL(§7) · 거부권 · TP · 신호
     (V3, "41_backtest_micro.py"),  # 백테스트(§10)

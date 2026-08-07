@@ -282,6 +282,44 @@ def run_contracts() -> bool:
             return False, "D 구성에서 방화벽이 중립화되었습니다."
         return True, "B 는 방화벽·거부권 중립화 · D 는 유지 — 구성 간 분리 확인"
 
+    # ── §10 런타임 예산: 예산을 넘길 것을 알면서 시작하면 안 된다 ──────────────────────
+    def budget_guard():
+        """실제 사고 재현: 전 종목 단건 수집은 187,920회 = 약 10일. 그걸 시작했었다."""
+        corps = [f"{i:08d}" for i in range(3915)]
+        years = list(range(2015, 2027))
+        plan = plan_dart_collection(corps, years, budget_min=DART_BUDGET_MIN)
+        if plan["need_single"] <= plan["cap"]:
+            return False, ("전 종목 단건 수집이 예산 안이라고 판정됐습니다 — 견적식이 잘못됐습니다.")
+        if plan["need_batch"] > plan["need_single"] / 10:
+            return False, "배치 경로가 단건 대비 충분히 싸지 않습니다(배치 산식 오류)."
+        if MAX_WALLCLOCK_MIN > 240:
+            return False, f"MAX_WALLCLOCK_MIN={MAX_WALLCLOCK_MIN} — 계약 상한(240분)을 넘겼습니다."
+        return True, (f"단건 {plan['need_single']:,}회는 예산 {plan['cap']:,}회의 "
+                      f"{plan['need_single']/max(plan['cap'],1):.0f}배 → 시작하지 않고 "
+                      f"배치({plan['need_batch']:,}회)로 내려감 · 상한 {MAX_WALLCLOCK_MIN}분")
+
+    # ── KRX 차단 페이지를 데이터로 착각하지 않는다 ────────────────────────────────────
+    def krx_block_detect():
+        html = ('<html><head><title>에러페이지 - 한국거래소 | Data Marketplace</title></head>'
+                '<body><div class="ip-block-page"><h1>KRX Data Marketplace</h1>'
+                '<h2>KDM 이용 제한 안내</h2><p>자동화 수단을 통한 비정상 대량 조회가 '
+                '감지되어 해당 IP의 접속이 일시적으로 제한되었습니다.</p></div></body></html>')
+        before = dict(KRX_BLOCK)
+        try:
+            KRX_BLOCK["blocked"], KRX_BLOCK["until"], KRX_BLOCK["logged"] = False, 0.0, True
+            if not _check_krx_block("krx", html):
+                return False, ("KRX 차단 안내 페이지를 데이터로 취급했습니다. 차단은 200 OK 로 "
+                               "오므로, 못 잡으면 계속 요청해 제한이 연장됩니다.")
+            if not krx_blocked():
+                return False, "차단을 감지했는데 이후 요청이 막히지 않았습니다."
+            if _check_krx_block("naver", html):
+                return False, "KRX 가 아닌 소스의 응답까지 차단으로 오인했습니다."
+            return True, "차단 페이지 감지 → 이번 실행 KRX 전면 중단 + 마커 저장 확인"
+        finally:
+            KRX_BLOCK.update(before)
+
+    _c("BUDGET", "런타임 예산 강제 (§10)", budget_guard)
+    _c("KRXBLK", "KRX 차단 페이지 감지", krx_block_detect)
     _c("C1", "PIT (미래누수 차단)", c1)
     _c("C2", "생존자편향 제거 · 상폐 -100%", c2)
     _c("C13", "유니버스 PIT · 랭크 시점별 재산출", c13)

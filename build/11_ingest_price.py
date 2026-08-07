@@ -36,6 +36,11 @@ class KRXAuth:
         self.openapi_ok = False
 
     def login(self) -> bool:
+        if krx_blocked():
+            self.status = "BLOCKED"
+            LOG.warn("KRX 접속 제한 상태이므로 로그인을 시도하지 않습니다 "
+                     "(재시도가 제한을 연장시킬 수 있습니다).")
+            return False
         if self.apikey:
             self.openapi_ok = self._probe_openapi()
             self.status = "OPENAPI_OK" if self.openapi_ok else "OPENAPI_KEY_UNAUTHORIZED"
@@ -96,7 +101,7 @@ class KRXAuth:
     def json_data(self, bld: str, **params) -> Optional[dict]:
         """마켓플레이스 bld 조회. 세션이 없으면 JSON 대신 로그인 HTML 이 와서
         엉뚱한 곳에서 JSONDecodeError 가 난다 → 여기서 미리 막는다."""
-        if not self.session_ok:
+        if not self.session_ok or krx_blocked():
             return None
         body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
         txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,

@@ -61,16 +61,13 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
         ctx["panel"] = build_price_panel(px, months)
         VAULT.flush()
 
-    with PIPE.stage("L1.MCAP", "시가총액·상장주식수", "L1", budget_s=1200):
-        snap_m = fetch_mcap_snapshots(months, ctx["sec"])
-        ctx["mcap_snap"] = snap_m
-        ctx["mcap"] = build_mcap_panel(ctx["panel"]["monthly"], snap_m, ctx["sec"], months)
-        VAULT.flush()
 
-    with PIPE.stage("L1.DART", "DART 재무 → 분기 센서", "L1", budget_s=3600, critical=False):
-        ccs = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-        yrs = sorted({int(m.year) for m in months} | {int(months[0].year) - 1})
-        fs = fetch_dart_financials(ccs, yrs)
+    with PIPE.stage("L1.DART", "DART 재무 → 분기 센서", "L1",
+                    budget_s=DART_BUDGET_MIN * 60, critical=False):
+        # ★ 전 종목×전 연도를 단건 API 로 도는 것은 §5('종목별 루프 금지')와 §10(4시간)을
+        #   동시에 어긴다. 예산 견적 → 싼 경로부터 → 남은 예산 안에서만 단건.
+        fs = collect_dart_financials_budgeted(ctx["sec"], months, ctx.get("px_daily"),
+                                              budget_min=DART_BUDGET_MIN)
         W = tidy_financials(fs) if len(fs) else pd.DataFrame()
         Q = add_micro_sensors_quarterly(W) if len(W) else pd.DataFrame()
         ctx["fin_q"] = Q
@@ -78,6 +75,15 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
             PIT.register("dart_micro", Q, key_cols=["corp_code"])
             VAULT.put_table(f"micro_sensors_q_{STRATEGY_ID}", Q, scope="private",
                             domain="feature", source="dart tidy + micro sensors")
+        VAULT.flush()
+
+    # ★ 시총은 DART 재무 '뒤'에 둔다.
+    #   주식총수 보강이 DART 호출을 먼저 태우면, 정작 이 전략의 본체인 재무를 받을
+    #   한도가 사라진다. 실제로 그 순서 때문에 재무 시작 시점에 한도가 1,000건 깎여 있었다.
+    with PIPE.stage("L1.MCAP", "시가총액·상장주식수", "L1", budget_s=1200):
+        snap_m = fetch_mcap_snapshots(months, ctx["sec"])
+        ctx["mcap_snap"] = snap_m
+        ctx["mcap"] = build_mcap_panel(ctx["panel"]["monthly"], snap_m, ctx["sec"], months)
         VAULT.flush()
 
     with PIPE.stage("L1.ACT", "관리종목·감사의견·거래정지", "L1", budget_s=1200, critical=False):
@@ -244,6 +250,8 @@ def _main_inner() -> dict:
     LOG.banner(f"TCD v3 · {STRATEGY_NAME}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · 빌드 {BUILD_VERSION} · 모드 {RUN_MODE}")
     months = month_range(BACKTEST_START, BACKTEST_END)
+    global DEADLINE
+    DEADLINE = Deadline(MAX_WALLCLOCK_MIN)
     outputs: List[str] = []
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -253,6 +261,7 @@ def _main_inner() -> dict:
         root, mode = _mount_drive()
         VAULT = Vault(root, mode)
         LOG.ok(f"캐시 루트: {root}  (모드 {mode})")
+        krx_block_load()      # 이전 실행에서 KRX 차단을 만났다면 해제 시각까지 건드리지 않는다
         LOG.info(f"공용 인덱스 = {GDRIVE_SHARED_NS} (전 전략 공유) · "
                  f"전용 인덱스 = {GDRIVE_PRIVATE_NS} (이 전략)")
         try:
@@ -332,7 +341,10 @@ def _main_inner() -> dict:
     PIPE.report_runtime()
     report_http()
     KRXG.report()
-    LOG.banner("완료", f"총 소요 {(time.time()-t_start)/60:.1f}분")
+    if DEADLINE is not None:
+        DEADLINE.report()
+    LOG.banner("완료", f"총 소요 {(time.time()-t_start)/60:.1f}분 "
+                       f"(계약 상한 {MAX_WALLCLOCK_MIN}분)")
     offer_download(outputs)
     return {"P": P, "bts": bts, "outputs": outputs}
 
