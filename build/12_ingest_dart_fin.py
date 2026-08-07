@@ -410,6 +410,18 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
         W[c + "_ttm"] = (W.groupby("corp_code", observed=True)[c + "_q"]
                           .transform(lambda s: s.rolling(4, min_periods=4).sum()))
     W = W.drop(columns=["_q_prev"])
+    # ★ 재무상태표 항목(재고·매출채권·자산·자본 등)은 pivot 결과에 그 계정이 없으면
+    #   컬럼 자체가 생성되지 않는다. 그러면 패널 스키마가 실행마다 달라져
+    #   "어떤 날은 있고 어떤 날은 없는" 축이 생긴다. 여기서 전 항목을 계약적으로 보장한다.
+    for _k in ACCOUNT_PATTERNS:
+        if _k not in W.columns:
+            W[_k] = np.nan
+    _missing = [k for k in ACCOUNT_PATTERNS if W[k].notna().sum() == 0]
+    if _missing:
+        LOG.warn(f"DART 재무에서 한 건도 매칭되지 않은 계정 {len(_missing)}개: "
+                 f"{_missing[:8]}{'...' if len(_missing) > 8 else ''} — "
+                 f"해당 계정을 쓰는 지표는 전부 결측이 됩니다(0으로 채우지 않음). "
+                 f"ACCOUNT_PATTERNS 정규식이 이 회사들의 계정명과 안 맞을 수 있습니다.")
     n_ttm = int(W["revenue_ttm"].notna().sum()) if "revenue_ttm" in W.columns else 0
     if len(W) and n_ttm / len(W) < 0.35:
         LOG.warn(f"TTM 산출률이 {100*n_ttm/len(W):.0f}% 로 낮습니다. 분기보고서가 결측인 기업이 "
@@ -467,9 +479,13 @@ def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.
     if not frames:
         return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
     E = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"], keep="last")
+    # ★ E.get("rcept_no", "") 는 컬럼이 없으면 '문자열'을 돌려주고, zip 이 그걸 글자 단위로
+    #   훑어 knowledge_date 가 전부 깨진다. 컬럼 존재를 먼저 보장한다.
+    if "rcept_no" not in E.columns:
+        E["rcept_no"] = ""
     E["period_end"] = as_ts_series(E["bsns_year"].astype(int).astype(str) + "-12-31")
     E["knowledge_date"] = [_knowledge_from_rcept(rn, REPRT_CODES["FY"], int(y))
-                           for rn, y in zip(E.get("rcept_no", ""), E["bsns_year"])]
+                           for rn, y in zip(E["rcept_no"], E["bsns_year"])]
     if got:
         VAULT.put_table("dart_employees", E, scope="shared", domain="dart", source="opendart empSttus")
     E = pit_frame(E, "period_end", "knowledge_date", source="dart")
@@ -507,19 +523,29 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     if RUN_MODE == "CACHED":
         todo = []
 
+    # ★ 파이프라인이 실제로 소비하는 공시 유형을 전부 훑어야 한다.
+    #   B(주요사항보고)만 훑으면 PACK-C 의 자사주·증자는 잡히지만
+    #   PACK-D 가 필요로 하는 '사업보고서'는 A(정기공시)라 단 한 건도 안 잡힌다.
+    #   그러면 fetch_dart_documents 가 걸러낼 대상이 없어 팩 전체가 조용히 죽는다.
+    #   (실경로에서만 드러나는 유형 — 합성 스모크는 dis 를 직접 만들어 넣으므로 못 본다)
+    DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
+
     def _one(m):
-        rows, page = [], 1
-        while page <= 100:
-            js = dart_api("list.json", {
-                "bgn_de": m.start_time.strftime("%Y%m%d"),
-                "end_de": m.end_time.strftime("%Y%m%d"),
-                "pblntf_ty": "B", "page_no": page, "page_count": 100, "last_reprt_at": "N"})
-            if not js or not isinstance(js.get("list"), list) or not js["list"]:
-                break
-            rows.extend(js["list"])
-            if page >= int(js.get("total_page", 1)):
-                break
-            page += 1
+        rows = []
+        for ty in DISCLOSURE_TYPES:
+            page = 1
+            while page <= 100:
+                js = dart_api("list.json", {
+                    "bgn_de": m.start_time.strftime("%Y%m%d"),
+                    "end_de": m.end_time.strftime("%Y%m%d"),
+                    "pblntf_ty": ty, "page_no": page, "page_count": 100,
+                    "last_reprt_at": "N"})
+                if not js or not isinstance(js.get("list"), list) or not js["list"]:
+                    break
+                rows.extend(js["list"])
+                if page >= int(js.get("total_page", 1) or 1):
+                    break
+                page += 1
         return rows
 
     new = []

@@ -171,7 +171,24 @@ def resolve_nps_to_corp(N: pd.DataFrame, sec: pd.DataFrame,
     wk["nm"] = wk["wkpl_name"].map(norm_corp_name)
     sec2 = sec.copy()
     sec2["nm"] = sec2["name"].map(norm_corp_name)
-    exact = wk.merge(sec2[["code", "corp_code", "name", "nm"]], on="nm", how="left")
+
+    # ★ 빈 정규화명끼리 서로 매칭되면 곱집합으로 폭발한다.
+    #   국민연금 사업장명·종목명 어느 쪽에도 빈 값이 흔히 있어서(이름 미보강 종목 등)
+    #   가드가 없으면 수만 × 수천 행이 만들어지고, 매칭 결과도 전부 쓰레기가 된다.
+    sec2 = sec2[sec2["nm"].astype(str).str.len() >= 2].drop_duplicates("nm", keep="first")
+    joinable = wk["nm"].astype(str).str.len() >= 2
+    n_blank = int((~joinable).sum())
+    if n_blank:
+        LOG.info(f"사업장명 정규화 결과가 비어 매칭 대상에서 제외 {n_blank:,}건")
+
+    n_before = len(wk)
+    exact = wk.merge(sec2[["code", "corp_code", "name", "nm"]].where(sec2["nm"].notna()),
+                     on="nm", how="left")
+    if len(exact) > n_before:
+        LOG.warn(f"상호 매칭에서 행이 {n_before:,}→{len(exact):,} 로 증식했습니다 "
+                 f"(동일 정규화명 중복). 사업장 기준으로 첫 매칭만 남깁니다.")
+        exact = exact.drop_duplicates(["biz_no", "wkpl_name"], keep="first")
+    exact.loc[~joinable.reindex(exact.index, fill_value=False), "code"] = None
 
     unmatched = exact[exact["code"].isna()].copy()
     if len(unmatched) and len(sec2):

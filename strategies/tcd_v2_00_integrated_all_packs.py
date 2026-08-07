@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "INTEGRATED"
 STRATEGY_NAME      = "통합 (전 센서팩)"
 ACTIVE_PACKS       = ["C", "N", "D", "X", "P"]
-BUILD_VERSION      = "v2.20260807.1153"
+BUILD_VERSION      = "v2.20260807.1208"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -3045,20 +3045,34 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     codes = sorted({c for c in map(to_code6, codes) if c})
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
+    have_min: Dict[str, pd.Timestamp] = {}
     if cached is not None and len(cached):
         cached["date"] = as_ts_series(cached["date"])
         cached = cached.dropna(subset=["date", "code"])
-        have_max = cached.groupby("code")["date"].max().to_dict()
+        g = cached.groupby("code")["date"]
+        have_max, have_min = g.max().to_dict(), g.min().to_dict()
         LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
-    end_ts = as_ts(end)
-    todo = []
+    start_ts, end_ts = as_ts(start), as_ts(end)
+    todo, n_back, n_fwd = [], 0, 0
     for c in codes:
-        mx = have_max.get(c)
+        mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
             todo.append((c, start))
+            continue
+        # ★ 과거 방향 백필을 반드시 함께 본다.
+        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
+        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
+        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
+        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+            todo.append((c, start))
+            n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+            n_fwd += 1
+    if n_back:
+        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
+                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
@@ -3636,6 +3650,18 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
         W[c + "_ttm"] = (W.groupby("corp_code", observed=True)[c + "_q"]
                           .transform(lambda s: s.rolling(4, min_periods=4).sum()))
     W = W.drop(columns=["_q_prev"])
+    # ★ 재무상태표 항목(재고·매출채권·자산·자본 등)은 pivot 결과에 그 계정이 없으면
+    #   컬럼 자체가 생성되지 않는다. 그러면 패널 스키마가 실행마다 달라져
+    #   "어떤 날은 있고 어떤 날은 없는" 축이 생긴다. 여기서 전 항목을 계약적으로 보장한다.
+    for _k in ACCOUNT_PATTERNS:
+        if _k not in W.columns:
+            W[_k] = np.nan
+    _missing = [k for k in ACCOUNT_PATTERNS if W[k].notna().sum() == 0]
+    if _missing:
+        LOG.warn(f"DART 재무에서 한 건도 매칭되지 않은 계정 {len(_missing)}개: "
+                 f"{_missing[:8]}{'...' if len(_missing) > 8 else ''} — "
+                 f"해당 계정을 쓰는 지표는 전부 결측이 됩니다(0으로 채우지 않음). "
+                 f"ACCOUNT_PATTERNS 정규식이 이 회사들의 계정명과 안 맞을 수 있습니다.")
     n_ttm = int(W["revenue_ttm"].notna().sum()) if "revenue_ttm" in W.columns else 0
     if len(W) and n_ttm / len(W) < 0.35:
         LOG.warn(f"TTM 산출률이 {100*n_ttm/len(W):.0f}% 로 낮습니다. 분기보고서가 결측인 기업이 "
@@ -3693,9 +3719,13 @@ def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.
     if not frames:
         return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
     E = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"], keep="last")
+    # ★ E.get("rcept_no", "") 는 컬럼이 없으면 '문자열'을 돌려주고, zip 이 그걸 글자 단위로
+    #   훑어 knowledge_date 가 전부 깨진다. 컬럼 존재를 먼저 보장한다.
+    if "rcept_no" not in E.columns:
+        E["rcept_no"] = ""
     E["period_end"] = as_ts_series(E["bsns_year"].astype(int).astype(str) + "-12-31")
     E["knowledge_date"] = [_knowledge_from_rcept(rn, REPRT_CODES["FY"], int(y))
-                           for rn, y in zip(E.get("rcept_no", ""), E["bsns_year"])]
+                           for rn, y in zip(E["rcept_no"], E["bsns_year"])]
     if got:
         VAULT.put_table("dart_employees", E, scope="shared", domain="dart", source="opendart empSttus")
     E = pit_frame(E, "period_end", "knowledge_date", source="dart")
@@ -3733,19 +3763,29 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     if RUN_MODE == "CACHED":
         todo = []
 
+    # ★ 파이프라인이 실제로 소비하는 공시 유형을 전부 훑어야 한다.
+    #   B(주요사항보고)만 훑으면 PACK-C 의 자사주·증자는 잡히지만
+    #   PACK-D 가 필요로 하는 '사업보고서'는 A(정기공시)라 단 한 건도 안 잡힌다.
+    #   그러면 fetch_dart_documents 가 걸러낼 대상이 없어 팩 전체가 조용히 죽는다.
+    #   (실경로에서만 드러나는 유형 — 합성 스모크는 dis 를 직접 만들어 넣으므로 못 본다)
+    DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
+
     def _one(m):
-        rows, page = [], 1
-        while page <= 100:
-            js = dart_api("list.json", {
-                "bgn_de": m.start_time.strftime("%Y%m%d"),
-                "end_de": m.end_time.strftime("%Y%m%d"),
-                "pblntf_ty": "B", "page_no": page, "page_count": 100, "last_reprt_at": "N"})
-            if not js or not isinstance(js.get("list"), list) or not js["list"]:
-                break
-            rows.extend(js["list"])
-            if page >= int(js.get("total_page", 1)):
-                break
-            page += 1
+        rows = []
+        for ty in DISCLOSURE_TYPES:
+            page = 1
+            while page <= 100:
+                js = dart_api("list.json", {
+                    "bgn_de": m.start_time.strftime("%Y%m%d"),
+                    "end_de": m.end_time.strftime("%Y%m%d"),
+                    "pblntf_ty": ty, "page_no": page, "page_count": 100,
+                    "last_reprt_at": "N"})
+                if not js or not isinstance(js.get("list"), list) or not js["list"]:
+                    break
+                rows.extend(js["list"])
+                if page >= int(js.get("total_page", 1) or 1):
+                    break
+                page += 1
         return rows
 
     new = []
@@ -4300,7 +4340,15 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     got = pd.DataFrame([r for r in res if r])
     if got.empty:
         return df
+    # ★ detail_url 이 유일하지 않으면 merge 가 행을 증식시킨다(리포트가 복제됨).
+    #   원장 건수가 조용히 불어나 커버리지·리비전 통계가 전부 틀어진다.
+    got = got.drop_duplicates("detail_url", keep="last")
+    n_before = len(df)
     df = df.merge(got, on="detail_url", how="left", suffixes=("", "_d"))
+    if len(df) != n_before:
+        LOG.warn(f"상세 보강 머지에서 행수가 {n_before:,}→{len(df):,} 로 변했습니다 — "
+                 f"중복 detail_url 로 인한 증식입니다.")
+        df = df.drop_duplicates("report_uid", keep="first")
     for c in ("target_price", "opinion"):
         if f"{c}_d" in df.columns:
             df[c] = df[c].where(df[c].notna(), df[f"{c}_d"])
@@ -4537,6 +4585,28 @@ def _name_to_code_map(sec: pd.DataFrame) -> Dict[str, str]:
     return m
 
 
+def _atoms(vals, sep: str) -> List[str]:
+    """합성 토큰을 원자로 되돌린 뒤 정렬·중복제거. 병합을 멱등하게 만드는 핵심 함수."""
+    out = set()
+    for v in vals:
+        s = str(v)
+        if not s or s.lower() in ("nan", "none", "<na>"):
+            continue
+        for tok in s.split(sep):
+            tok = tok.strip()
+            if tok and tok.lower() not in ("nan", "none", "<na>"):
+                out.add(tok)
+    return sorted(out)
+
+
+def _pick_str(vals) -> str:
+    """비어있지 않은 값 중 사전순 최소. '행 순서상 첫 값'과 달리 실행 간 재현된다."""
+    c = sorted({str(v).strip() for v in vals
+                if v is not None and str(v).strip()
+                and str(v).strip().lower() not in ("nan", "none", "<na>")})
+    return c[0] if c else ""
+
+
 def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd.DataFrame:
     """다중 소스 병합 → 보고서 원장. 중복 제거가 아니라 '병합'이다(정보를 버리지 않는다)."""
     frames = [f for f in frames if f is not None and len(f)]
@@ -4577,8 +4647,14 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
             lambda s: n2c.get(norm_corp_name(s)))
 
     d["title"] = d["title"].map(_dedup_repeat)
-    d["report_uid"] = [sha1_str(s, i) for s, i in zip(d["source"].astype(str),
-                                                      d["src_report_id"].astype(str))]
+    # report_uid 는 '한 번 붙으면 안 바뀌는' 식별자여야 한다. 이미 붙어 있으면 보존한다.
+    # (드라이브 캐시의 병합 결과가 다시 입력으로 들어올 때 source 가 "hankyung+naver" 같은
+    #  합성 토큰이라, 무조건 재계산하면 실행마다 uid 가 달라져 PDF 캐시가 통째로 무효화된다)
+    _uid_new = [sha1_str(s, i) for s, i in zip(d["source"].astype(str),
+                                               d["src_report_id"].astype(str))]
+    _uid_old = (d["report_uid"].tolist() if "report_uid" in d.columns else [None] * len(d))
+    d["report_uid"] = [u if isinstance(u, str) and len(u) >= 8 else n
+                       for u, n in zip(_uid_old, _uid_new)]
     # 소스 간 동일 보고서 판정 키
     d["dedup_key"] = [sha1_str(pd.Timestamp(dt).strftime("%Y%m%d"), b,
                                c or "", norm_text(t)[:40])
@@ -4587,25 +4663,32 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     n_raw = len(d)
     d = d.sort_values(["dedup_key", "source"])
 
-    agg = {
-        "report_uid": ("report_uid", "first"),
-        "src_report_id": ("src_report_id", lambda s: "|".join(sorted(set(map(str, s))))),
-        "source": ("source", lambda s: "+".join(sorted(set(map(str, s))))),
-        "category": ("category", "first"),
+    # ── 멱등 병합 (재실행 안전) ─────────────────────────────────────────────────────────
+    #   이 함수의 출력(원장)은 다음 실행에서 드라이브 캐시로부터 '입력 프레임'으로 되돌아온다.
+    #   그때 source="hankyung+naver" 같은 합성 토큰이 다시 들어오므로, 단순 set 병합은
+    #   "hankyung+naver" 를 원자 하나로 취급해 실행할 때마다 문자열이 무한히 길어진다
+    #   (hankyung+naver → hankyung+hankyung+naver+naver → …). 구분자로 먼저 분해한다.
+    #   report_uid 도 "first"(행 순서 의존)면 캐시만으로 도는 실행에서 값이 바뀌어
+    #   PDF 캐시·애널리스트 연결표가 통째로 끊긴다. 순서에 무관한 min 으로 고정한다.
+    #   (min 은 병합행이 다시 들어와도 같은 값을 낸다: min{u1,u2,min(u1,u2)} = min(u1,u2))
+    m = d.groupby("dedup_key", as_index=False).agg(**{
+        "report_uid": ("report_uid", "min"),
+        "src_report_id": ("src_report_id", lambda s: "|".join(_atoms(s, "|"))),
+        "source": ("source", lambda s: "+".join(_atoms(s, "+"))),
+        "category": ("category", _pick_str),
         "pub_date": ("pub_date", "min"),
-        "title": ("title", lambda s: max(map(str, s), key=len)),
-        "stock_code": ("stock_code", lambda s: next((x for x in s if isinstance(x, str)), None)),
-        "stock_name": ("stock_name", lambda s: next((x for x in map(str, s) if x.strip()), "")),
-        "broker_id": ("broker_id", "first"),
-        "broker_name": ("broker_name", "first"),
-        "broker_raw": ("broker_raw", "first"),
-        "analyst_raw": ("analyst_raw", lambda s: next((x for x in map(str, s) if x.strip()), "")),
+        "title": ("title", lambda s: max(sorted(set(map(str, s))), key=len)),
+        "stock_code": ("stock_code", lambda s: _pick_str(s) or None),
+        "stock_name": ("stock_name", _pick_str),
+        "broker_id": ("broker_id", "min"),          # dedup_key 구성요소라 그룹 내 동일
+        "broker_name": ("broker_name", "min"),
+        "broker_raw": ("broker_raw", _pick_str),
+        "analyst_raw": ("analyst_raw", _pick_str),
         "target_price": ("target_price", lambda s: pd.Series(list(s)).dropna().max()),
-        "opinion": ("opinion", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
-        "pdf_url": ("pdf_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
-        "detail_url": ("detail_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
-    }
-    m = d.groupby("dedup_key", as_index=False).agg(**agg)
+        "opinion": ("opinion", lambda s: _pick_str(s) or None),
+        "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
+        "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
+    })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")
 
@@ -4961,16 +5044,37 @@ class Universe:
                         if pd.notna(d)}
 
         # 상장 후 250거래일 시즈닝 — 거래일 배열에 대한 searchsorted 를 한 번에 벡터화
+        #
+        # ★ 앵커 주의 (조용한 유니버스 붕괴의 원인) ─────────────────────────────────────
+        #   searchsorted 는 '가격패널 시작일 이전에 상장한' 종목을 전부 index 0 으로 보낸다.
+        #   거기에 +250 을 더하면 1990년 상장 종목조차 "패널 시작 후 250거래일"에야 시즈닝이
+        #   끝난 것으로 계산된다. 2016-08 시작 패널이면 2017년 중반까지 삼성전자를 포함한
+        #   기존 상장사 전부가 유니버스에서 빠진다. 에러 없이, 로그도 없이.
+        #   → 시즈닝의 앵커는 '패널 시작일'이 아니라 '상장일'이다. 패널 시작 전 상장분은
+        #     이미 오래전에 시즈닝이 끝난 것으로 확정한다.
         self._seasoned: Dict[str, Any] = {}
+        _FAR = pd.Timestamp("2100-01-01")     # 패널 안에서 시즈닝이 끝나지 않는 신규 상장
         if len(self._trading_days):
+            t0 = self._trading_days[0]
             idx = np.searchsorted(self._trading_days, self._ld_arr, side="left")
-            idx = np.minimum(idx + LISTING_SEASONING_DAYS, len(self._trading_days) - 1)
-            seas = self._trading_days[idx]
-            for c, ld, s in zip(self._codes_arr, self._ld_arr, seas):
-                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(s)
+            idx_s = idx + LISTING_SEASONING_DAYS
+            n_td = len(self._trading_days)
+            inside = idx_s < n_td
+            seas = np.where(inside,
+                            self._trading_days[np.minimum(idx_s, n_td - 1)],
+                            np.datetime64(_FAR.isoformat(), "ns"))
+            # 패널 시작 전 상장 → 달력 1년으로 확정(패널 시작보다 앞서므로 사실상 제약이 아님)
+            pre = (~np.isnat(self._ld_arr)) & (self._ld_arr < t0)
+            for c, ld, s, p in zip(self._codes_arr, self._ld_arr, seas, pre):
+                if np.isnat(ld):
+                    self._seasoned[c] = pd.NaT
+                elif p:
+                    self._seasoned[c] = as_ts(ld) + pd.Timedelta(days=365)
+                else:
+                    self._seasoned[c] = as_ts(s)
         else:
             for c, ld in zip(self._codes_arr, self._ld_arr):
-                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(ld)
+                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(ld) + pd.Timedelta(days=365)
 
     def at(self, t) -> List[str]:
         """시점 t 의 유니버스. t 이후 상장 종목이 하나라도 섞이면 그 자체로 C2 위반이다."""
@@ -5589,7 +5693,24 @@ def resolve_nps_to_corp(N: pd.DataFrame, sec: pd.DataFrame,
     wk["nm"] = wk["wkpl_name"].map(norm_corp_name)
     sec2 = sec.copy()
     sec2["nm"] = sec2["name"].map(norm_corp_name)
-    exact = wk.merge(sec2[["code", "corp_code", "name", "nm"]], on="nm", how="left")
+
+    # ★ 빈 정규화명끼리 서로 매칭되면 곱집합으로 폭발한다.
+    #   국민연금 사업장명·종목명 어느 쪽에도 빈 값이 흔히 있어서(이름 미보강 종목 등)
+    #   가드가 없으면 수만 × 수천 행이 만들어지고, 매칭 결과도 전부 쓰레기가 된다.
+    sec2 = sec2[sec2["nm"].astype(str).str.len() >= 2].drop_duplicates("nm", keep="first")
+    joinable = wk["nm"].astype(str).str.len() >= 2
+    n_blank = int((~joinable).sum())
+    if n_blank:
+        LOG.info(f"사업장명 정규화 결과가 비어 매칭 대상에서 제외 {n_blank:,}건")
+
+    n_before = len(wk)
+    exact = wk.merge(sec2[["code", "corp_code", "name", "nm"]].where(sec2["nm"].notna()),
+                     on="nm", how="left")
+    if len(exact) > n_before:
+        LOG.warn(f"상호 매칭에서 행이 {n_before:,}→{len(exact):,} 로 증식했습니다 "
+                 f"(동일 정규화명 중복). 사업장 기준으로 첫 매칭만 남깁니다.")
+        exact = exact.drop_duplicates(["biz_no", "wkpl_name"], keep="first")
+    exact.loc[~joinable.reindex(exact.index, fill_value=False), "code"] = None
 
     unmatched = exact[exact["code"].isna()].copy()
     if len(unmatched) and len(sec2):
@@ -6068,7 +6189,15 @@ def fetch_customs_trade(months: pd.DatetimeIndex, hs_codes: Sequence[str]) -> pd
     if not frames:
         return pd.DataFrame()
     C = pd.concat(frames, ignore_index=True)
-    C["grp"] = C["country"].map(COUNTRY_GROUPS).fillna("기타")
+    # ★ 캐시에는 이미 grp 로 축약된 형태가 저장돼 있고 country 컬럼이 없다.
+    #   두 번째 실행에서 country 를 다시 찾으면 KeyError 이거나 전부 '기타'로 뭉개진다
+    #   (= 목적지 HHI·선진시장 비중이 통째로 죽어 TP_X2/TP_X3 가 무의미해진다).
+    if "grp" not in C.columns:
+        C["grp"] = np.nan
+    if "country" in C.columns:
+        from_country = C["country"].map(COUNTRY_GROUPS)
+        C["grp"] = C["grp"].where(C["grp"].notna(), from_country)
+    C["grp"] = C["grp"].fillna("기타")
     C = (C.groupby(["ym", "hs", "grp"], as_index=False)
           .agg(exp_usd=("exp_usd", "sum"), exp_wgt=("exp_wgt", "sum")))
     if new:
@@ -7917,6 +8046,81 @@ def run_contract_tests(strict: bool = True) -> bool:
                       "헤더명 기반 컬럼매핑(9/6/무헤더) · EUC-KR↔UTF-8 자동판별 확인")
 
     _c("INGEST", "수집 파서 회귀 검사", c_ingest)
+
+    # ── 회귀 방지: 시즈닝의 기준점은 '상장일'이지 '가격패널 시작일'이 아닐 것 ───────────────
+    def c_season():
+        """패널 시작 전에 상장한 종목이 백테스트 첫 1년 동안 사라지지 않아야 한다.
+
+        searchsorted 는 패널 시작 이전 상장분을 전부 index 0 으로 보낸다. 거기에 +250거래일을
+        더하면 1990년 상장 종목조차 '패널 시작 후 1년'에야 시즈닝이 끝난 것으로 계산되어,
+        2016-08 시작 백테스트의 첫 1년 유니버스가 통째로 비어버린다. 에러도 경고도 없이.
+        """
+        sec = pd.DataFrame({
+            "code": ["000001", "000002", "000003"],
+            "name": list("abc"), "market": ["KOSPI"] * 3, "industry": ["X"] * 3,
+            "corp_code": [None] * 3,
+            "listing_date": pd.to_datetime(["1990-03-02",    # 패널보다 26년 전 상장
+                                            "2016-09-01",    # 패널 직후 상장(아직 미시즈닝)
+                                            "2013-01-02"]),  # 패널 3년 전 상장
+            "delisting_date": pd.to_datetime([None, None, None]),
+        })
+        px = pd.DataFrame({"date": pd.bdate_range("2016-08-01", "2019-12-31"), "code": "000001"})
+        u = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+        first = set(u.at("2016-08-31"))
+        miss = [c for c in ("000001", "000003") if c not in first]
+        if miss:
+            return False, (f"★시즈닝 앵커 오류: 패널 시작 전 상장 종목 {miss} 가 백테스트 첫 "
+                           f"달에서 빠졌습니다. 기준점이 '상장일'이 아니라 '가격패널 시작일'로 "
+                           f"잡혀 있습니다 — 첫 1년 유니버스가 통째로 증발합니다.")
+        if "000002" in first:
+            return False, "2016-09-01 상장 종목이 2016-08-31 유니버스에 있습니다(미래 상장)."
+        if "000002" in set(u.at("2017-03-31")):
+            return False, "상장 250거래일 미만 신규 상장이 시즈닝을 통과했습니다."
+        if "000002" not in set(u.at("2017-10-31")):
+            return False, "상장 250거래일이 지난 종목이 여전히 시즈닝에 막혀 있습니다."
+        return True, ("시즈닝 기준점 = 상장일 확인 (기존 상장사 첫 달 생존 · 신규 상장 "
+                      "250거래일 대기 · 대기 후 편입)")
+
+    _c("C2d", "시즈닝 기준점", c_season)
+
+    # ── 회귀 방지: 원장 병합은 멱등일 것 (출력이 다음 실행의 입력이 된다) ──────────────────
+    def c_merge():
+        """드라이브 캐시에 저장된 병합 결과는 다음 실행에서 '입력 프레임'으로 되돌아온다.
+        그래서 병합은 반드시 멱등이어야 한다. 아니면 실행할 때마다 source 문자열이 길어지고
+        report_uid 가 바뀌어 PDF 캐시·애널리스트 연결표가 조용히 끊긴다."""
+        sec = pd.DataFrame(columns=["code", "name", "corp_code", "market", "industry",
+                                    "listing_date", "delisting_date"])
+
+        def _f(src, rid, tp):
+            return pd.DataFrame([{
+                "source": src, "src_report_id": rid, "pub_date": "2024-05-02",
+                "category": "기업", "title": "삼성전자(005930) 실적 개선",
+                "stock_code": "005930", "stock_name": "삼성전자",
+                "broker_raw": "미래에셋증권", "analyst_raw": "홍길동",
+                "target_price": tp, "opinion": "Buy", "pdf_url": None, "detail_url": None,
+            }])
+
+        a, b = _f("hankyung", "h1", 95000.0), _f("naver", "n1", 90000.0)
+        m1 = build_report_master([a, b], sec)
+        m2 = build_report_master([a, b, m1], sec)     # 캐시 재투입
+        m3 = build_report_master([m1], sec)           # 캐시만으로 실행
+        if not (len(m1) == len(m2) == len(m3) == 1):
+            return False, f"소스 간 중복 병합 실패: {len(m1)}/{len(m2)}/{len(m3)}건 (기대 1/1/1)"
+        for nm, mm in (("캐시 재투입", m2), ("캐시 전용", m3)):
+            for c, why in (("source", "합성 토큰을 원자로 분해하지 않으면 실행마다 문자열이 "
+                                      "무한히 길어집니다"),
+                           ("src_report_id", "원본 보고서 ID 추적이 불가능해집니다"),
+                           ("report_uid", "PDF 캐시와 애널리스트 연결표가 통째로 끊깁니다")):
+                if mm[c].iloc[0] != m1[c].iloc[0]:
+                    return False, (f"★{nm} 실행에서 {c} 가 "
+                                   f"{str(m1[c].iloc[0])[:28]!r} → {str(mm[c].iloc[0])[:28]!r} "
+                                   f"로 바뀌었습니다. {why}.")
+        if float(m1["target_price"].iloc[0]) != 95000.0:
+            return False, f"목표주가 병합이 최대값을 취하지 않았습니다: {m1['target_price'].iloc[0]}"
+        return True, ("병합 멱등성 확인 — 캐시 재투입·캐시 전용 실행 모두에서 "
+                      f"source({m1['source'].iloc[0]})·src_report_id·report_uid 불변")
+
+    _c("MERGE", "원장 병합 멱등성", c_merge)
 
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30), "✔ 통과" if r["pass"] else "✘ 실패",

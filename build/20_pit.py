@@ -169,16 +169,37 @@ class Universe:
                         if pd.notna(d)}
 
         # 상장 후 250거래일 시즈닝 — 거래일 배열에 대한 searchsorted 를 한 번에 벡터화
+        #
+        # ★ 앵커 주의 (조용한 유니버스 붕괴의 원인) ─────────────────────────────────────
+        #   searchsorted 는 '가격패널 시작일 이전에 상장한' 종목을 전부 index 0 으로 보낸다.
+        #   거기에 +250 을 더하면 1990년 상장 종목조차 "패널 시작 후 250거래일"에야 시즈닝이
+        #   끝난 것으로 계산된다. 2016-08 시작 패널이면 2017년 중반까지 삼성전자를 포함한
+        #   기존 상장사 전부가 유니버스에서 빠진다. 에러 없이, 로그도 없이.
+        #   → 시즈닝의 앵커는 '패널 시작일'이 아니라 '상장일'이다. 패널 시작 전 상장분은
+        #     이미 오래전에 시즈닝이 끝난 것으로 확정한다.
         self._seasoned: Dict[str, Any] = {}
+        _FAR = pd.Timestamp("2100-01-01")     # 패널 안에서 시즈닝이 끝나지 않는 신규 상장
         if len(self._trading_days):
+            t0 = self._trading_days[0]
             idx = np.searchsorted(self._trading_days, self._ld_arr, side="left")
-            idx = np.minimum(idx + LISTING_SEASONING_DAYS, len(self._trading_days) - 1)
-            seas = self._trading_days[idx]
-            for c, ld, s in zip(self._codes_arr, self._ld_arr, seas):
-                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(s)
+            idx_s = idx + LISTING_SEASONING_DAYS
+            n_td = len(self._trading_days)
+            inside = idx_s < n_td
+            seas = np.where(inside,
+                            self._trading_days[np.minimum(idx_s, n_td - 1)],
+                            np.datetime64(_FAR.isoformat(), "ns"))
+            # 패널 시작 전 상장 → 달력 1년으로 확정(패널 시작보다 앞서므로 사실상 제약이 아님)
+            pre = (~np.isnat(self._ld_arr)) & (self._ld_arr < t0)
+            for c, ld, s, p in zip(self._codes_arr, self._ld_arr, seas, pre):
+                if np.isnat(ld):
+                    self._seasoned[c] = pd.NaT
+                elif p:
+                    self._seasoned[c] = as_ts(ld) + pd.Timedelta(days=365)
+                else:
+                    self._seasoned[c] = as_ts(s)
         else:
             for c, ld in zip(self._codes_arr, self._ld_arr):
-                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(ld)
+                self._seasoned[c] = pd.NaT if np.isnat(ld) else as_ts(ld) + pd.Timedelta(days=365)
 
     def at(self, t) -> List[str]:
         """시점 t 의 유니버스. t 이후 상장 종목이 하나라도 섞이면 그 자체로 C2 위반이다."""

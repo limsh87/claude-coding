@@ -98,7 +98,15 @@ def fetch_customs_trade(months: pd.DatetimeIndex, hs_codes: Sequence[str]) -> pd
     if not frames:
         return pd.DataFrame()
     C = pd.concat(frames, ignore_index=True)
-    C["grp"] = C["country"].map(COUNTRY_GROUPS).fillna("기타")
+    # ★ 캐시에는 이미 grp 로 축약된 형태가 저장돼 있고 country 컬럼이 없다.
+    #   두 번째 실행에서 country 를 다시 찾으면 KeyError 이거나 전부 '기타'로 뭉개진다
+    #   (= 목적지 HHI·선진시장 비중이 통째로 죽어 TP_X2/TP_X3 가 무의미해진다).
+    if "grp" not in C.columns:
+        C["grp"] = np.nan
+    if "country" in C.columns:
+        from_country = C["country"].map(COUNTRY_GROUPS)
+        C["grp"] = C["grp"].where(C["grp"].notna(), from_country)
+    C["grp"] = C["grp"].fillna("기타")
     C = (C.groupby(["ym", "hs", "grp"], as_index=False)
           .agg(exp_usd=("exp_usd", "sum"), exp_wgt=("exp_wgt", "sum")))
     if new:

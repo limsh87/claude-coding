@@ -380,6 +380,81 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _c("INGEST", "수집 파서 회귀 검사", c_ingest)
 
+    # ── 회귀 방지: 시즈닝의 기준점은 '상장일'이지 '가격패널 시작일'이 아닐 것 ───────────────
+    def c_season():
+        """패널 시작 전에 상장한 종목이 백테스트 첫 1년 동안 사라지지 않아야 한다.
+
+        searchsorted 는 패널 시작 이전 상장분을 전부 index 0 으로 보낸다. 거기에 +250거래일을
+        더하면 1990년 상장 종목조차 '패널 시작 후 1년'에야 시즈닝이 끝난 것으로 계산되어,
+        2016-08 시작 백테스트의 첫 1년 유니버스가 통째로 비어버린다. 에러도 경고도 없이.
+        """
+        sec = pd.DataFrame({
+            "code": ["000001", "000002", "000003"],
+            "name": list("abc"), "market": ["KOSPI"] * 3, "industry": ["X"] * 3,
+            "corp_code": [None] * 3,
+            "listing_date": pd.to_datetime(["1990-03-02",    # 패널보다 26년 전 상장
+                                            "2016-09-01",    # 패널 직후 상장(아직 미시즈닝)
+                                            "2013-01-02"]),  # 패널 3년 전 상장
+            "delisting_date": pd.to_datetime([None, None, None]),
+        })
+        px = pd.DataFrame({"date": pd.bdate_range("2016-08-01", "2019-12-31"), "code": "000001"})
+        u = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+        first = set(u.at("2016-08-31"))
+        miss = [c for c in ("000001", "000003") if c not in first]
+        if miss:
+            return False, (f"★시즈닝 앵커 오류: 패널 시작 전 상장 종목 {miss} 가 백테스트 첫 "
+                           f"달에서 빠졌습니다. 기준점이 '상장일'이 아니라 '가격패널 시작일'로 "
+                           f"잡혀 있습니다 — 첫 1년 유니버스가 통째로 증발합니다.")
+        if "000002" in first:
+            return False, "2016-09-01 상장 종목이 2016-08-31 유니버스에 있습니다(미래 상장)."
+        if "000002" in set(u.at("2017-03-31")):
+            return False, "상장 250거래일 미만 신규 상장이 시즈닝을 통과했습니다."
+        if "000002" not in set(u.at("2017-10-31")):
+            return False, "상장 250거래일이 지난 종목이 여전히 시즈닝에 막혀 있습니다."
+        return True, ("시즈닝 기준점 = 상장일 확인 (기존 상장사 첫 달 생존 · 신규 상장 "
+                      "250거래일 대기 · 대기 후 편입)")
+
+    _c("C2d", "시즈닝 기준점", c_season)
+
+    # ── 회귀 방지: 원장 병합은 멱등일 것 (출력이 다음 실행의 입력이 된다) ──────────────────
+    def c_merge():
+        """드라이브 캐시에 저장된 병합 결과는 다음 실행에서 '입력 프레임'으로 되돌아온다.
+        그래서 병합은 반드시 멱등이어야 한다. 아니면 실행할 때마다 source 문자열이 길어지고
+        report_uid 가 바뀌어 PDF 캐시·애널리스트 연결표가 조용히 끊긴다."""
+        sec = pd.DataFrame(columns=["code", "name", "corp_code", "market", "industry",
+                                    "listing_date", "delisting_date"])
+
+        def _f(src, rid, tp):
+            return pd.DataFrame([{
+                "source": src, "src_report_id": rid, "pub_date": "2024-05-02",
+                "category": "기업", "title": "삼성전자(005930) 실적 개선",
+                "stock_code": "005930", "stock_name": "삼성전자",
+                "broker_raw": "미래에셋증권", "analyst_raw": "홍길동",
+                "target_price": tp, "opinion": "Buy", "pdf_url": None, "detail_url": None,
+            }])
+
+        a, b = _f("hankyung", "h1", 95000.0), _f("naver", "n1", 90000.0)
+        m1 = build_report_master([a, b], sec)
+        m2 = build_report_master([a, b, m1], sec)     # 캐시 재투입
+        m3 = build_report_master([m1], sec)           # 캐시만으로 실행
+        if not (len(m1) == len(m2) == len(m3) == 1):
+            return False, f"소스 간 중복 병합 실패: {len(m1)}/{len(m2)}/{len(m3)}건 (기대 1/1/1)"
+        for nm, mm in (("캐시 재투입", m2), ("캐시 전용", m3)):
+            for c, why in (("source", "합성 토큰을 원자로 분해하지 않으면 실행마다 문자열이 "
+                                      "무한히 길어집니다"),
+                           ("src_report_id", "원본 보고서 ID 추적이 불가능해집니다"),
+                           ("report_uid", "PDF 캐시와 애널리스트 연결표가 통째로 끊깁니다")):
+                if mm[c].iloc[0] != m1[c].iloc[0]:
+                    return False, (f"★{nm} 실행에서 {c} 가 "
+                                   f"{str(m1[c].iloc[0])[:28]!r} → {str(mm[c].iloc[0])[:28]!r} "
+                                   f"로 바뀌었습니다. {why}.")
+        if float(m1["target_price"].iloc[0]) != 95000.0:
+            return False, f"목표주가 병합이 최대값을 취하지 않았습니다: {m1['target_price'].iloc[0]}"
+        return True, ("병합 멱등성 확인 — 캐시 재투입·캐시 전용 실행 모두에서 "
+                      f"source({m1['source'].iloc[0]})·src_report_id·report_uid 불변")
+
+    _c("MERGE", "원장 병합 멱등성", c_merge)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30), "✔ 통과" if r["pass"] else "✘ 실패",
              _trunc(r["msg"], 76)] for r in CONTRACT_RESULTS]

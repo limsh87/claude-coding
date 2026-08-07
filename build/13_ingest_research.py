@@ -520,7 +520,15 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     got = pd.DataFrame([r for r in res if r])
     if got.empty:
         return df
+    # ★ detail_url 이 유일하지 않으면 merge 가 행을 증식시킨다(리포트가 복제됨).
+    #   원장 건수가 조용히 불어나 커버리지·리비전 통계가 전부 틀어진다.
+    got = got.drop_duplicates("detail_url", keep="last")
+    n_before = len(df)
     df = df.merge(got, on="detail_url", how="left", suffixes=("", "_d"))
+    if len(df) != n_before:
+        LOG.warn(f"상세 보강 머지에서 행수가 {n_before:,}→{len(df):,} 로 변했습니다 — "
+                 f"중복 detail_url 로 인한 증식입니다.")
+        df = df.drop_duplicates("report_uid", keep="first")
     for c in ("target_price", "opinion"):
         if f"{c}_d" in df.columns:
             df[c] = df[c].where(df[c].notna(), df[f"{c}_d"])

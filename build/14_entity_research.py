@@ -108,6 +108,28 @@ def _name_to_code_map(sec: pd.DataFrame) -> Dict[str, str]:
     return m
 
 
+def _atoms(vals, sep: str) -> List[str]:
+    """합성 토큰을 원자로 되돌린 뒤 정렬·중복제거. 병합을 멱등하게 만드는 핵심 함수."""
+    out = set()
+    for v in vals:
+        s = str(v)
+        if not s or s.lower() in ("nan", "none", "<na>"):
+            continue
+        for tok in s.split(sep):
+            tok = tok.strip()
+            if tok and tok.lower() not in ("nan", "none", "<na>"):
+                out.add(tok)
+    return sorted(out)
+
+
+def _pick_str(vals) -> str:
+    """비어있지 않은 값 중 사전순 최소. '행 순서상 첫 값'과 달리 실행 간 재현된다."""
+    c = sorted({str(v).strip() for v in vals
+                if v is not None and str(v).strip()
+                and str(v).strip().lower() not in ("nan", "none", "<na>")})
+    return c[0] if c else ""
+
+
 def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd.DataFrame:
     """다중 소스 병합 → 보고서 원장. 중복 제거가 아니라 '병합'이다(정보를 버리지 않는다)."""
     frames = [f for f in frames if f is not None and len(f)]
@@ -148,8 +170,14 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
             lambda s: n2c.get(norm_corp_name(s)))
 
     d["title"] = d["title"].map(_dedup_repeat)
-    d["report_uid"] = [sha1_str(s, i) for s, i in zip(d["source"].astype(str),
-                                                      d["src_report_id"].astype(str))]
+    # report_uid 는 '한 번 붙으면 안 바뀌는' 식별자여야 한다. 이미 붙어 있으면 보존한다.
+    # (드라이브 캐시의 병합 결과가 다시 입력으로 들어올 때 source 가 "hankyung+naver" 같은
+    #  합성 토큰이라, 무조건 재계산하면 실행마다 uid 가 달라져 PDF 캐시가 통째로 무효화된다)
+    _uid_new = [sha1_str(s, i) for s, i in zip(d["source"].astype(str),
+                                               d["src_report_id"].astype(str))]
+    _uid_old = (d["report_uid"].tolist() if "report_uid" in d.columns else [None] * len(d))
+    d["report_uid"] = [u if isinstance(u, str) and len(u) >= 8 else n
+                       for u, n in zip(_uid_old, _uid_new)]
     # 소스 간 동일 보고서 판정 키
     d["dedup_key"] = [sha1_str(pd.Timestamp(dt).strftime("%Y%m%d"), b,
                                c or "", norm_text(t)[:40])
@@ -158,25 +186,32 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     n_raw = len(d)
     d = d.sort_values(["dedup_key", "source"])
 
-    agg = {
-        "report_uid": ("report_uid", "first"),
-        "src_report_id": ("src_report_id", lambda s: "|".join(sorted(set(map(str, s))))),
-        "source": ("source", lambda s: "+".join(sorted(set(map(str, s))))),
-        "category": ("category", "first"),
+    # ── 멱등 병합 (재실행 안전) ─────────────────────────────────────────────────────────
+    #   이 함수의 출력(원장)은 다음 실행에서 드라이브 캐시로부터 '입력 프레임'으로 되돌아온다.
+    #   그때 source="hankyung+naver" 같은 합성 토큰이 다시 들어오므로, 단순 set 병합은
+    #   "hankyung+naver" 를 원자 하나로 취급해 실행할 때마다 문자열이 무한히 길어진다
+    #   (hankyung+naver → hankyung+hankyung+naver+naver → …). 구분자로 먼저 분해한다.
+    #   report_uid 도 "first"(행 순서 의존)면 캐시만으로 도는 실행에서 값이 바뀌어
+    #   PDF 캐시·애널리스트 연결표가 통째로 끊긴다. 순서에 무관한 min 으로 고정한다.
+    #   (min 은 병합행이 다시 들어와도 같은 값을 낸다: min{u1,u2,min(u1,u2)} = min(u1,u2))
+    m = d.groupby("dedup_key", as_index=False).agg(**{
+        "report_uid": ("report_uid", "min"),
+        "src_report_id": ("src_report_id", lambda s: "|".join(_atoms(s, "|"))),
+        "source": ("source", lambda s: "+".join(_atoms(s, "+"))),
+        "category": ("category", _pick_str),
         "pub_date": ("pub_date", "min"),
-        "title": ("title", lambda s: max(map(str, s), key=len)),
-        "stock_code": ("stock_code", lambda s: next((x for x in s if isinstance(x, str)), None)),
-        "stock_name": ("stock_name", lambda s: next((x for x in map(str, s) if x.strip()), "")),
-        "broker_id": ("broker_id", "first"),
-        "broker_name": ("broker_name", "first"),
-        "broker_raw": ("broker_raw", "first"),
-        "analyst_raw": ("analyst_raw", lambda s: next((x for x in map(str, s) if x.strip()), "")),
+        "title": ("title", lambda s: max(sorted(set(map(str, s))), key=len)),
+        "stock_code": ("stock_code", lambda s: _pick_str(s) or None),
+        "stock_name": ("stock_name", _pick_str),
+        "broker_id": ("broker_id", "min"),          # dedup_key 구성요소라 그룹 내 동일
+        "broker_name": ("broker_name", "min"),
+        "broker_raw": ("broker_raw", _pick_str),
+        "analyst_raw": ("analyst_raw", _pick_str),
         "target_price": ("target_price", lambda s: pd.Series(list(s)).dropna().max()),
-        "opinion": ("opinion", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
-        "pdf_url": ("pdf_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
-        "detail_url": ("detail_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
-    }
-    m = d.groupby("dedup_key", as_index=False).agg(**agg)
+        "opinion": ("opinion", lambda s: _pick_str(s) or None),
+        "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
+        "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
+    })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")
 

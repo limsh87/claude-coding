@@ -238,20 +238,34 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     codes = sorted({c for c in map(to_code6, codes) if c})
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
+    have_min: Dict[str, pd.Timestamp] = {}
     if cached is not None and len(cached):
         cached["date"] = as_ts_series(cached["date"])
         cached = cached.dropna(subset=["date", "code"])
-        have_max = cached.groupby("code")["date"].max().to_dict()
+        g = cached.groupby("code")["date"]
+        have_max, have_min = g.max().to_dict(), g.min().to_dict()
         LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
-    end_ts = as_ts(end)
-    todo = []
+    start_ts, end_ts = as_ts(start), as_ts(end)
+    todo, n_back, n_fwd = [], 0, 0
     for c in codes:
-        mx = have_max.get(c)
+        mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
             todo.append((c, start))
+            continue
+        # ★ 과거 방향 백필을 반드시 함께 본다.
+        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
+        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
+        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
+        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+            todo.append((c, start))
+            n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+            n_fwd += 1
+    if n_back:
+        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
+                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
