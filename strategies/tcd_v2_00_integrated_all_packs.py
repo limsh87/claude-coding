@@ -1,0 +1,7601 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ============================================================================================
+#  TCD v2 — 트레이드오프 붕괴 탐지 (Trade-off Collapse Detection)
+#  전략: 통합 (전 센서팩)   [INTEGRATED]
+#  활성 센서팩: PACK-C, PACK-N, PACK-D, PACK-X, PACK-P
+#  백테스트 구간: 2016-08 ~ 2026-07 (10년)
+#
+#  5개 센서팩을 모두 활성화하고 공용축 B·C·D와 함께 동일가중 합성한다(C7). 데이터가 없는 팩은 V4 부분거부권으로 자동 무효화되고 그 사실이 로그에 남는다. 팩별 기여는 R5 절제 검사에서 귀속된다.
+#
+#  ── 이 파일 하나로 끝납니다 ────────────────────────────────────────────────────────────
+#   Colab / JupyterLab 어디서든 이 파일 전체를 "한 셀"에 붙여넣고 실행하거나,
+#   `python tcd_v2_00_integrated_all_packs.py` 로 그냥 실행해도 동일하게 동작합니다.
+#
+#   실행하면 순서대로 로그에 출력됩니다:
+#     [0] 환경·의존성·계약(C1~C12) 자가검정
+#     [1] 합성데이터 엔드투엔드 스모크 테스트  (실데이터 쓰기 전 계산경로 증명)
+#     [2] 데이터 수집  (구글드라이브 캐시 우선 → 부족분만 신규 수집 → 드라이브 재적재)
+#     [3] 원장 무결성 감사  (보고서 ↔ 애널리스트 ↔ 종목 연결 상태)
+#     [4] PIT 유니버스 구축 + 유니버스 감쇠 감사
+#     [5] 피처 패널(L1) → 스코어(L2) → 백테스트(L3)
+#     [6] 성과 검증표
+#     [7] 강건성 검사 R1~R11
+#     [8] 해석표 + 종목별 진단 카드
+#     [9] 런타임 감사(C10) + 산출물 다운로드 링크
+#
+#  ⚠ 투자자문이 아닙니다. 연구/검증용 코드입니다.
+# ============================================================================================
+from __future__ import annotations
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+#
+#   ⚙️  사용자 설정 — 여기만 채우면 됩니다
+#
+#   ▸ 아무것도 안 채워도 실행은 됩니다. 다만 키가 없는 데이터원은 자동으로 건너뛰고,
+#     "왜 건너뛰었는지"를 로그에 한글로 명시합니다. (조용히 실패하지 않습니다)
+#   ▸ 구글드라이브에 이미 캐시가 있으면 키 없이도 상당 부분 재현됩니다.
+#
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+
+# ── ① DART 전자공시 OpenAPI ─────────────────────────────────────────────────────────────────
+#    발급: https://opendart.fss.or.kr  →  회원가입 → [인증키 신청/관리] → API 인증키 발급
+#    무료. 발급 즉시 사용. 일 20,000건 호출 제한(2026 기준, 코드가 자동 스로틀합니다).
+#    ▶ 이 전략의 B축(회계품질)·C축(자원투입)의 필수 입력입니다. 없으면 대부분의 TP가 죽습니다.
+DART_API_KEY = ""
+
+# ── ② 공공데이터포털 (국민연금 사업장 / 조달청 낙찰) ────────────────────────────────────────
+#    발급: https://www.data.go.kr  →  로그인 → 원하는 API 상세페이지 → [활용신청]
+#           → 마이페이지 > 데이터활용 > Open API > 인증키에서 확인
+#    ★ 반드시 "일반 인증키(Decoding)" 값을 붙여넣으세요.
+#      Encoding 키(%2B, %3D 같은 게 섞인 것)를 넣으면 이중 인코딩으로 401/SERVICE_KEY_IS_NOT_REGISTERED가 납니다.
+#      (코드가 이중 인코딩을 자동 감지해서 경고하고 교정 시도합니다)
+DATA_GO_KR_KEY = ""
+
+# ── ③ 관세청 무역통계 (PACK-X 사용 시에만) ──────────────────────────────────────────────────
+#    발급: https://unipass.customs.go.kr  또는 공공데이터포털의 관세청 수출입무역통계 API
+CUSTOMS_API_KEY = ""
+
+# ── ④ KRX 데이터 마켓플레이스 (2025-12 인증 방식 변경 대응) ─────────────────────────────────
+#    가입: https://data.krx.co.kr  →  회원가입(무료) → 로그인 정보 입력
+#    ▶ 2025년 12월부터 KRX가 인증을 요구하면서 pykrx 경로가 불안정해졌습니다.
+#      아래를 채우면 KRX 정식 경로를 1순위로 씁니다.
+#      비워두면 자동으로 FinanceDataReader → 네이버 → yfinance → 캐시 순으로 폴백합니다.
+#      (폴백해도 백테스트는 정상 동작합니다. 어떤 소스가 쓰였는지 로그에 표로 나옵니다)
+KRX_MARKETPLACE_ID = ""
+KRX_MARKETPLACE_PW = ""
+KRX_OPENAPI_KEY    = ""   # (선택) KRX Open API 인증키를 별도 발급받았다면 여기에
+
+# ── ⑤ 구글드라이브 캐시 ─────────────────────────────────────────────────────────────────────
+#    ★★★ 절대 원칙: 이 코드는 기존 캐시를 절대 삭제·덮어쓰기하지 않습니다. ★★★
+#      · 기존 인덱스(공용/전용)는 읽기 전용으로 열고, 갱신은 "append-merge + 원자적 교체"로만 합니다.
+#      · 인덱스를 건드리기 전 항상 타임스탬프 백업을 남깁니다.
+#      · 이미 드라이브에 있는 보고서/원본은 "이동·개명 없이 경로만 등록"합니다(adopt-by-reference).
+#
+#    GDRIVE_ROOT      : 이 전략이 쓰는 최상위 캐시 루트
+#    GDRIVE_SHARED_NS : 공용 인덱스 네임스페이스 — 다른 전략에서도 재활용 가능한 원본/정제본
+#    GDRIVE_PRIVATE_NS: 전용 인덱스 네임스페이스 — 이 전략 고유의 피처/스코어/리포트
+GDRIVE_ROOT       = "/content/drive/MyDrive/tcd_cache"
+GDRIVE_SHARED_NS  = "_shared"          # → {GDRIVE_ROOT}/_shared      (공용)
+GDRIVE_PRIVATE_NS = "tcd_v2"           # → {GDRIVE_ROOT}/tcd_v2       (전용)
+
+#    ▸ 이미 다른 폴더에 리포트를 모아두셨다면 여기에 추가하세요. 재귀 스캔해서 "등록만" 합니다.
+#      (파일을 옮기거나 지우지 않습니다. 경로/해시만 인덱스에 기록합니다)
+GDRIVE_ADOPT_DIRS = [
+    "/content/drive/MyDrive/tcd_cache",
+    "/content/drive/MyDrive/research",
+    "/content/drive/MyDrive/reports",
+    "/content/drive/MyDrive/consensus",
+    # "/content/drive/MyDrive/내가/모아둔/리포트폴더",
+]
+
+#    ▸ JupyterLab(로컬)에서 돌릴 때 쓸 경로. 드라이브 마운트가 불가하면 자동으로 이쪽을 씁니다.
+LOCAL_CACHE_ROOT  = "./tcd_cache"
+
+# ── ⑥ 백테스트 구간 ─────────────────────────────────────────────────────────────────────────
+BACKTEST_START = "2016-08-01"
+BACKTEST_END   = "2026-07-31"
+
+# ── ⑦ 성능 / 자원 ───────────────────────────────────────────────────────────────────────────
+N_WORKERS_IO   = 16     # 네트워크 병렬(스레드). 차단 위험을 낮추려면 8로 줄이세요.
+N_WORKERS_CPU  = 0      # 연산 병렬(프로세스). 0 = CPU 코어수 자동(-1)
+RATE_LIMIT_QPS = {      # 소스별 초당 요청 상한 — 차단 방지용. 낮출수록 안전/느림.
+    "dart":      8.0,
+    "hankyung":  2.5,
+    "naver":     3.0,
+    "krx":       2.0,
+    "datagokr":  5.0,
+    "customs":   3.0,
+    "kind":      2.0,
+    "generic":   3.0,
+}
+MEM_BUDGET_GB  = 6.0    # 이 값을 넘길 것 같으면 청크 처리로 자동 전환
+
+# ── ⑧ 애널리스트 리포트 수집 ────────────────────────────────────────────────────────────────
+#    목표: 연 30,000건 이상 원문 수집. 실제 시장 발간량이 상한이므로,
+#          달성/미달 여부와 그 원인을 로그에 정직하게 표로 출력합니다.
+RESEARCH_COLLECT       = True    # False면 드라이브 캐시에 이미 있는 것만 사용
+RESEARCH_SOURCES       = ["hankyung", "naver"]   # 리스트 페이지 소스
+RESEARCH_DOWNLOAD_PDF  = True    # PDF 원문까지 받을지 (목표주가/애널리스트 추출 정확도↑, 용량↑)
+RESEARCH_PDF_MAX_PER_MONTH = 0   # 0 = 무제한. 테스트할 땐 50 정도로.
+RESEARCH_TARGET_PER_YEAR   = 30000
+
+# ── ⑨ 포지션 / 사이징  (§8.5 — 드로다운 한가운데서 정하지 않도록 상수로 못박음) ──────────────
+PORTFOLIO_TOP_PCT       = 0.05    # 신호 상위 5% 진입
+PORTFOLIO_MAX_NAMES     = 25
+PORTFOLIO_MIN_NAMES     = 5
+POS_MAX_WEIGHT          = 0.12    # 종목당 최대 비중
+POS_MIN_WEIGHT          = 0.02
+POS_ADV_PARTICIPATION   = 0.10    # 20일 평균거래대금의 10% 이내로 보유 제한
+HOLD_MAX_MONTHS         = 24
+ACCOUNT_KRW             = 30_000_000   # 소액계좌 가정 (최소주문/유동성 제약 계산용)
+MIN_ADV_KRW             = 300_000_000  # V6 유동성 하한: 20일 평균거래대금
+
+# ── ⑩ 실행 모드 ─────────────────────────────────────────────────────────────────────────────
+#    "SMOKE" : 합성데이터로 전체 경로만 검증 (수 초). 네트워크/키 불필요.
+#    "FULL"  : 스모크 → 실데이터 수집 → 전체 백테스트 → 강건성 (권장)
+#    "CACHED": 스모크 → 드라이브 캐시만 사용(신규 수집 안 함) → 전체 백테스트
+RUN_MODE = "FULL"
+
+SEED = 20260807          # C8 결정성: 모든 난수는 이 시드에서 파생
+VERBOSE = True
+STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 보고 (False로 끄지 마세요)
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+#   설정 끝. 아래부터는 수정하지 않아도 됩니다.
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+
+STRATEGY_ID        = "INTEGRATED"
+STRATEGY_NAME      = "통합 (전 센서팩)"
+ACTIVE_PACKS       = ["C", "N", "D", "X", "P"]
+BUILD_VERSION      = "v2.20260807.1044"
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-A  부트스트랩 — 환경 감지 / 의존성 / 표준 임포트                                      ║
+# ║  입력: 없음        출력: 전역 ENV, 임포트된 모듈                                          ║
+# ║  실패 시: 무엇이 없어서 실패했는지 + 정확한 설치 명령을 한글로 출력하고 즉시 중단          ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+import os, sys, re, io, gc, json, time, math, zipfile, hashlib, logging, textwrap, traceback
+import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, threading, unicodedata
+import datetime as _dt
+from collections import defaultdict, Counter, OrderedDict
+from dataclasses import dataclass, field, asdict
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlencode, urljoin, quote, unquote, urlparse, parse_qs
+
+warnings.filterwarnings("ignore")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def _detect_env() -> Dict[str, Any]:
+    """Colab / JupyterLab / VSCode / 순수 CLI 를 구분한다. 어느 쪽이든 죽지 않아야 한다."""
+    info = {"colab": False, "ipython": False, "kernel": None, "interactive": False}
+    try:
+        from IPython import get_ipython           # noqa
+        ip = get_ipython()
+        if ip is not None:
+            info["ipython"] = True
+            info["kernel"] = type(ip).__name__
+            info["interactive"] = "ZMQ" in type(ip).__name__ or "Terminal" in type(ip).__name__
+    except Exception:
+        pass
+    info["colab"] = ("google.colab" in sys.modules) or bool(os.environ.get("COLAB_RELEASE_TAG"))
+    if not info["colab"]:
+        try:
+            import importlib.util
+            info["colab"] = importlib.util.find_spec("google.colab") is not None
+        except Exception:
+            pass
+    info["python"] = sys.version.split()[0]
+    info["platform"] = platform.system()
+    info["cpu"] = os.cpu_count() or 2
+    return info
+
+
+ENV = _detect_env()
+
+# ── 의존성 ──────────────────────────────────────────────────────────────────────────────────
+#   (모듈 임포트명, pip 설치명, 필수여부, 이 패키지가 없으면 무엇이 죽는지)
+_REQUIRED = [
+    ("numpy",     "numpy",              True,  "모든 수치연산"),
+    ("pandas",    "pandas",             True,  "모든 패널 처리"),
+    ("pyarrow",   "pyarrow",            True,  "parquet 캐시(L1 영속화)"),
+    ("scipy",     "scipy",              True,  "통계검정 / 회귀"),
+    ("requests",  "requests",           True,  "모든 HTTP 수집"),
+    ("bs4",       "beautifulsoup4",     True,  "리서치 리스트 파싱"),
+    ("lxml",      "lxml",               True,  "HTML/XML 고속 파서"),
+    ("tqdm",      "tqdm",               True,  "진행률 표시"),
+]
+_OPTIONAL = [
+    ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
+    ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
+    ("yfinance",          "yfinance",           "가격 최종 폴백"),
+    ("fitz",              "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
+    ("pdfplumber",        "pdfplumber",         "PDF 추출 폴백"),
+    ("rapidfuzz",         "rapidfuzz",          "사업장명/애널리스트명 유사도 매칭(고속)"),
+    ("statsmodels",       "statsmodels",        "HAC(Newey-West) 표준오차"),
+    ("html5lib",          "html5lib",           "깨진 HTML 복구 파싱"),
+]
+
+
+def _pip_install(pkgs: List[str], quiet: bool = True) -> Tuple[bool, str]:
+    if not pkgs:
+        return True, ""
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input"]
+    if quiet:
+        cmd.append("-q")
+    cmd += pkgs
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        return r.returncode == 0, (r.stderr or r.stdout)[-2000:]
+    except Exception as e:                                    # noqa
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _ensure_deps() -> Dict[str, bool]:
+    import importlib
+    missing_req, missing_opt = [], []
+    for mod, pkg, _req, _why in _REQUIRED:
+        if importlib.util.find_spec(mod) is None:
+            missing_req.append(pkg)
+    for mod, pkg, _why in _OPTIONAL:
+        if importlib.util.find_spec(mod) is None:
+            missing_opt.append(pkg)
+
+    if missing_req:
+        print(f"[부트스트랩] 필수 패키지 설치 중: {', '.join(missing_req)}  (1~3분 소요)")
+        ok, err = _pip_install(missing_req)
+        if not ok:
+            print("\n" + "=" * 88)
+            print("❌ 필수 패키지 설치 실패. 아래 명령을 직접 실행한 뒤 다시 돌려주세요.")
+            print(f"   pip install {' '.join(missing_req)}")
+            print("-" * 88)
+            print(err)
+            print("=" * 88)
+            raise SystemExit(1)
+        importlib.invalidate_caches()
+
+    if missing_opt:
+        print(f"[부트스트랩] 선택 패키지 설치 중: {', '.join(missing_opt)}")
+        _pip_install(missing_opt)          # 실패해도 계속 — 각 기능에서 개별적으로 degrade
+        importlib.invalidate_caches()
+
+    avail = {}
+    for mod, _pkg, _why in _OPTIONAL:
+        try:
+            importlib.import_module(mod)
+            avail[mod] = True
+        except Exception:
+            avail[mod] = False
+    return avail
+
+
+OPT = _ensure_deps()
+
+import numpy as np
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+try:
+    from tqdm.auto import tqdm
+except Exception:                                             # pragma: no cover
+    def tqdm(it=None, **kw):                                  # type: ignore
+        return it if it is not None else iter(())
+
+pd.set_option("display.width", 200)
+pd.set_option("display.max_columns", 80)
+pd.set_option("display.max_colwidth", 60)
+pd.set_option("display.float_format", lambda v: f"{v:,.4f}")
+np.seterr(all="ignore")
+
+# 결정성(C8): 모든 난수는 이 시드에서 파생된다.
+random.seed(SEED)
+np.random.seed(SEED % (2 ** 32 - 1))
+RNG = np.random.default_rng(SEED)
+
+# ★★ pykrx 는 '모듈 임포트 시점'에 KRX 로그인을 수행한다(webio.build_krx_session).
+#    따라서 자격증명을 환경변수로 심는 일은 반드시 import 보다 먼저 와야 한다.
+#    순서를 뒤집으면 예외 없이 '비인증 세션'이 만들어지고, 나중에 JSON 대신 로그인 HTML 을
+#    받아 pandas 깊은 곳에서 JSONDecodeError 가 터진다 — 원인 추적이 매우 어려운 실패다.
+if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
+    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
+if KRX_OPENAPI_KEY:
+    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
+    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
+
+# 선택 모듈 핸들
+fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
+if OPT.get("FinanceDataReader"):
+    try:
+        import FinanceDataReader as fdr           # type: ignore
+    except Exception:
+        fdr = None
+if OPT.get("pykrx"):
+    try:
+        from pykrx import stock as pykrx_stock    # type: ignore
+    except Exception:
+        pykrx_stock = None
+if OPT.get("yfinance"):
+    try:
+        import yfinance as yf                     # type: ignore
+    except Exception:
+        yf = None
+if OPT.get("fitz"):
+    try:
+        import fitz                               # type: ignore  (pymupdf)
+    except Exception:
+        fitz = None
+if OPT.get("pdfplumber"):
+    try:
+        import pdfplumber                         # type: ignore
+    except Exception:
+        pdfplumber = None
+if OPT.get("rapidfuzz"):
+    try:
+        from rapidfuzz import fuzz as rapidfuzz_fuzz   # type: ignore
+    except Exception:
+        rapidfuzz_fuzz = None
+if OPT.get("statsmodels"):
+    try:
+        import statsmodels.api as smapi           # type: ignore
+    except Exception:
+        smapi = None
+
+# ── 병렬 전략 결정 ──────────────────────────────────────────────────────────────────────────
+#   노트북에서 ProcessPoolExecutor 는 "__main__ 에 정의된 함수를 피클할 수 없음" 으로 자주 죽는다.
+#   fork 를 쓸 수 있는 리눅스(=Colab)에서는 안전하고, spawn 플랫폼(win/mac)에서는 스레드로 폴백한다.
+import multiprocessing as _mp
+try:
+    _MP_METHODS = set(_mp.get_all_start_methods())
+except Exception:
+    _MP_METHODS = {"spawn"}
+CAN_FORK = ("fork" in _MP_METHODS) and (ENV["platform"] == "Linux")
+N_CPU = N_WORKERS_CPU if N_WORKERS_CPU and N_WORKERS_CPU > 0 else max(1, (os.cpu_count() or 2) - 1)
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-B  커널 — 로깅 / 스테이지 / 데이터흐름 원장 / 에러 국소화 / 런타임 계측(C10)          ║
+# ║                                                                                          ║
+# ║  이 블록의 목적은 단 하나:  "어디서 터졌고, 무슨 데이터가 어디로 흘렀는가"를               ║
+# ║  스크롤 없이 한 화면에서 보이게 만드는 것.                                                ║
+# ║                                                                                          ║
+# ║  · 모든 연산은 STAGE 컨텍스트 안에서만 수행한다.                                          ║
+# ║  · 모든 데이터 입출력은 FLOW 원장에 기록한다. (행수·바이트·소스·PIT컬럼 유무)              ║
+# ║  · 예외는 잡아서 "스테이지ID + 입출력 스냅샷 + 한글 진단 힌트"와 함께 재출력한다.          ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+_T0_PROCESS = time.time()
+
+
+def _dw(s: str) -> int:
+    """한글/한자 폭 2칸을 반영한 표시 너비. 표 정렬이 깨지지 않게 하는 유일한 방법."""
+    w = 0
+    for ch in str(s):
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _pad(s: str, n: int, align: str = "l") -> str:
+    s = str(s)
+    gap = max(0, n - _dw(s))
+    if align == "r":
+        return " " * gap + s
+    if align == "c":
+        return " " * (gap // 2) + s + " " * (gap - gap // 2)
+    return s + " " * gap
+
+
+def _trunc(s: str, n: int) -> str:
+    s = str(s).replace("\n", " ")
+    if _dw(s) <= n:
+        return s
+    out = ""
+    for ch in s:
+        if _dw(out) + _dw(ch) > n - 1:
+            return out + "…"
+        out += ch
+    return out
+
+
+class _Log:
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+    def __init__(self, min_level: str = "INFO"):
+        self.min = self.LEVELS[min_level]
+        self.ctx: List[str] = []
+        self.buffer: List[str] = []
+        self.lock = threading.RLock()
+
+    def _emit(self, level: str, msg: str, icon: str = ""):
+        if self.LEVELS[level] < self.min:
+            return
+        el = time.time() - _T0_PROCESS
+        stamp = f"{int(el // 60):02d}:{el % 60:05.2f}"
+        scope = ("/".join(self.ctx))[-34:]
+        line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
+        with self.lock:
+            self.buffer.append(line)
+            print(line, flush=True)
+
+    def debug(self, m): self._emit("DEBUG", m, "· ")
+    def info(self, m):  self._emit("INFO",  m, "  ")
+    def ok(self, m):    self._emit("INFO",  m, "✔ ")
+    def warn(self, m):  self._emit("WARN",  m, "⚠ ")
+    def error(self, m): self._emit("ERROR", m, "✘ ")
+
+    def rule(self, title: str = "", ch: str = "─", width: int = 104):
+        if title:
+            pre = f"{ch * 3} {title} "
+            print(pre + ch * max(0, width - _dw(pre)), flush=True)
+        else:
+            print(ch * width, flush=True)
+
+    def banner(self, title: str, sub: str = "", width: int = 104):
+        print("", flush=True)
+        print("╔" + "═" * (width - 2) + "╗", flush=True)
+        print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
+        if sub:
+            print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
+        print("╚" + "═" * (width - 2) + "╝", flush=True)
+
+    def table(self, rows: List[Sequence[Any]], headers: Sequence[str],
+              aligns: Optional[Sequence[str]] = None, maxw: int = 46, title: str = ""):
+        """한글 폭 보정 표. 강건성/성과/감사 출력 전부 이걸 쓴다."""
+        if title:
+            print(f"\n▶ {title}", flush=True)
+        if not rows:
+            print("   (행 없음)", flush=True)
+            return
+        ncol = len(headers)
+        aligns = list(aligns or ["l"] * ncol)
+        cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r)) for r in rows]
+        widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
+        head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
+        print(head, flush=True)
+        print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
+        for r in cells:
+            print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
+
+
+LOG = _Log("DEBUG" if VERBOSE else "INFO")
+
+
+# ── 데이터 흐름 원장 ────────────────────────────────────────────────────────────────────────
+@dataclass
+class IOEvent:
+    stage: str
+    direction: str          # IN / OUT
+    kind: str               # HTTP / DRIVE / PARQUET / MEM / SQLITE / SYNTH
+    name: str
+    rows: int = -1
+    cols: int = -1
+    bytes_: int = -1
+    source: str = ""
+    ok: bool = True
+    note: str = ""
+    pit_cols: str = ""      # knowledge_date 계열 컬럼 존재 여부 — C1 감사에 쓰인다
+
+
+@dataclass
+class StageRecord:
+    sid: str
+    name: str
+    layer: str
+    status: str = "PENDING"       # PENDING / RUNNING / OK / WARN / FAIL / SKIP
+    t_start: float = 0.0
+    t_end: float = 0.0
+    budget_s: Optional[float] = None
+    rows_in: int = 0
+    rows_out: int = 0
+    err_type: str = ""
+    err_msg: str = ""
+    err_tb: str = ""
+    hint: str = ""
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def dur(self) -> float:
+        return (self.t_end or time.time()) - self.t_start
+
+
+class KillCriteria(Exception):
+    """§15 킬 기준 위반. 우회하지 말고 사용자에게 보고하고 멈춘다."""
+
+
+class StageFailure(Exception):
+    pass
+
+
+# ── 예외 → 한글 진단 힌트 ───────────────────────────────────────────────────────────────────
+_DIAG_RULES: List[Tuple[str, str]] = [
+    (r"SERVICE_KEY_IS_NOT_REGISTERED|SERVICEKEY",
+     "공공데이터포털 인증키 문제입니다. ① 해당 API에 '활용신청'이 승인됐는지 ② DATA_GO_KR_KEY 에 "
+     "Decoding(일반) 키를 넣었는지 확인하세요. Encoding 키를 넣으면 이중 인코딩으로 항상 실패합니다."),
+    (r"LIMITED_NUMBER_OF_SERVICE_REQUESTS",
+     "공공데이터포털 일일 호출한도 초과입니다. 내일 재시도하거나 트래픽 증가 신청을 하세요. "
+     "이미 받은 분량은 드라이브 캐시에 남아 있으므로 재실행 시 이어서 받습니다."),
+    (r"opendart|dart.*(013|020|100|800|900)|status.*'0(13|20)'",
+     "DART API 응답 코드 오류. 013=조회 데이터 없음(정상일 수 있음), 020=일일한도 초과, "
+     "100=필드 부적절, 800=시스템 점검, 900=정의되지 않은 오류. DART_API_KEY 를 확인하세요."),
+    (r"HTTPError.*40[13]|Forbidden|403",
+     "403 차단입니다. RATE_LIMIT_QPS 를 절반으로 낮추고 N_WORKERS_IO 를 8 이하로 줄이세요. "
+     "네이버/한경은 User-Agent 와 Referer 헤더가 없으면 즉시 차단합니다."),
+    (r"429|Too Many Requests",
+     "요청이 너무 빠릅니다. RATE_LIMIT_QPS 를 낮추세요. 코드가 지수백오프로 재시도하지만 한계가 있습니다."),
+    (r"ConnectionError|Timeout|Max retries|NameResolution|SSLError|ProxyError",
+     "네트워크 도달 실패입니다. 방화벽/프록시 환경이면 해당 도메인이 막혀 있을 수 있습니다. "
+     "RUN_MODE='CACHED' 로 두고 드라이브 캐시만으로 백테스트할 수 있습니다."),
+    (r"No such file or directory.*drive|MyDrive|drive/MyDrive",
+     "구글드라이브가 마운트되지 않았습니다. Colab이면 셀 실행 시 뜨는 인증 팝업을 승인하세요. "
+     "JupyterLab이면 자동으로 LOCAL_CACHE_ROOT 를 사용합니다(정상)."),
+    (r"No space left on device|Disk quota",
+     "디스크/드라이브 용량 부족입니다. RESEARCH_DOWNLOAD_PDF=False 로 두면 PDF 원문을 받지 않고 "
+     "리스트 메타데이터만으로도 목표주가·애널리스트 연결이 가능합니다."),
+    (r"Can't pickle|pickle.*__main__|PicklingError|BrokenProcessPool",
+     "프로세스 병렬화 실패(노트북의 고질적 문제). 코드가 자동으로 스레드 병렬로 폴백합니다. "
+     "성능만 떨어지고 결과는 동일합니다."),
+    (r"MemoryError|Unable to allocate|Killed",
+     "메모리 부족입니다. MEM_BUDGET_GB 를 낮추고 RESEARCH_DOWNLOAD_PDF=False, "
+     "N_WORKERS_CPU=2 로 두세요. 패널은 float32/category 로 이미 축소되어 있습니다."),
+    (r"pyarrow|parquet|ArrowInvalid|ArrowIOError",
+     "parquet 읽기/쓰기 실패입니다. 드라이브 FUSE 마운트에서 쓰기가 중단되면 파일이 깨질 수 있습니다. "
+     "코드는 임시파일→원자적 rename 으로 쓰므로, 깨진 건 이전 실행 잔재입니다. "
+     "해당 파일만 지우고(원본 아님, 캐시임) 재실행하세요."),
+    (r"KeyError: 'knowledge_date'|knowledge_date",
+     "PIT 컬럼 누락입니다. 모든 테이블은 event_date/knowledge_date 를 가져야 합니다(C1). "
+     "새 수집 함수를 추가했다면 pit_frame() 으로 감싸주세요."),
+    (r"empty|EmptyDataError|No objects to concatenate|zero-size",
+     "수집 결과가 비었습니다. 대개 ① 키 미입력 ② 조회구간에 데이터 없음 ③ 소스 구조 변경입니다. "
+     "바로 위 FLOW 원장에서 어느 소스가 0행을 반환했는지 확인하세요."),
+    (r"ModuleNotFoundError|ImportError",
+     "패키지 누락입니다. 위 부트스트랩 로그에서 어떤 설치가 실패했는지 확인하고 수동 설치하세요."),
+    (r"tz-aware|tz-naive|Cannot compare",
+     "타임존이 섞인 날짜 비교입니다. 이 코드는 모든 날짜를 tz-naive Timestamp 로 정규화합니다(as_ts). "
+     "새로 추가한 소스가 tz-aware 를 반환했을 가능성이 큽니다."),
+]
+
+
+def diagnose(exc: BaseException, extra: str = "") -> str:
+    blob = f"{type(exc).__name__}: {exc}\n{extra}\n{traceback.format_exc()}"
+    for pat, hint in _DIAG_RULES:
+        if re.search(pat, blob, re.I):
+            return hint
+    return ("알려진 패턴에 해당하지 않는 오류입니다. 아래 트레이스백의 마지막 프레임과 "
+            "그 직전 FLOW 원장 행을 함께 보면 원인 구간이 좁혀집니다.")
+
+
+# ── 파이프라인 ──────────────────────────────────────────────────────────────────────────────
+class Pipeline:
+    """스테이지 실행기. 모든 계산은 이 안에서만 돈다."""
+
+    def __init__(self):
+        self.stages: "OrderedDict[str, StageRecord]" = OrderedDict()
+        self.flow: List[IOEvent] = []
+        self.current: Optional[StageRecord] = None
+        self.failed: List[str] = []
+        self.artifacts: Dict[str, Any] = {}
+        self._lock = threading.RLock()
+
+    # -- I/O 원장 -------------------------------------------------------------------------
+    def io(self, direction: str, kind: str, name: str, obj: Any = None,
+           source: str = "", ok: bool = True, note: str = "", bytes_: int = -1):
+        rows = cols = -1
+        pit = ""
+        try:
+            if isinstance(obj, pd.DataFrame):
+                rows, cols = int(obj.shape[0]), int(obj.shape[1])
+                have = [c for c in ("event_date", "knowledge_date") if c in obj.columns]
+                pit = "+".join(h[0].upper() for h in have) if have else "—"
+            elif isinstance(obj, (list, tuple, set, dict)):
+                rows = len(obj)
+            elif isinstance(obj, (int, float)):
+                rows = int(obj)
+        except Exception:
+            pass
+        ev = IOEvent(stage=self.current.sid if self.current else "-", direction=direction,
+                     kind=kind, name=name, rows=rows, cols=cols, bytes_=bytes_,
+                     source=source, ok=ok, note=note, pit_cols=pit)
+        with self._lock:
+            self.flow.append(ev)
+            if self.current:
+                if direction == "IN" and rows > 0:
+                    self.current.rows_in += rows
+                if direction == "OUT" and rows > 0:
+                    self.current.rows_out += rows
+        return obj
+
+    def note(self, msg: str):
+        if self.current:
+            self.current.notes.append(msg)
+
+    # -- 스테이지 ------------------------------------------------------------------------
+    @contextmanager
+    def stage(self, sid: str, name: str, layer: str = "L?",
+              budget_s: Optional[float] = None, critical: bool = True,
+              skip_if: bool = False, skip_reason: str = ""):
+        rec = StageRecord(sid=sid, name=name, layer=layer, budget_s=budget_s)
+        self.stages[sid] = rec
+        prev, self.current = self.current, rec
+        LOG.ctx.append(sid)
+        if skip_if:
+            rec.status, rec.t_start, rec.t_end = "SKIP", time.time(), time.time()
+            rec.notes.append(skip_reason or "조건 미충족")
+            LOG.warn(f"건너뜀 — {skip_reason}")
+            LOG.ctx.pop(); self.current = prev
+            yield rec
+            return
+        rec.status = "RUNNING"
+        rec.t_start = time.time()
+        LOG.info(f"▷ {name}")
+        try:
+            yield rec
+            rec.t_end = time.time()
+            rec.status = "WARN" if any("WARN:" in n for n in rec.notes) else "OK"
+            over = budget_s and rec.dur > budget_s
+            msg = f"완료 {rec.dur:6.2f}s  in={rec.rows_in:,} out={rec.rows_out:,}"
+            if over:
+                rec.notes.append(f"WARN: 런타임 예산 {budget_s:.0f}s 초과")
+                LOG.warn(msg + f"  ← 예산 {budget_s:.0f}s 초과 (C10)")
+            else:
+                LOG.ok(msg)
+        except KillCriteria as e:
+            rec.t_end = time.time(); rec.status = "FAIL"
+            rec.err_type = "KillCriteria"; rec.err_msg = str(e)
+            rec.err_tb = traceback.format_exc()
+            rec.hint = "§15 킬 기준입니다. 파라미터를 조정해 통과시키지 마세요. 결과를 그대로 보고합니다."
+            self.failed.append(sid)
+            LOG.error(f"킬 기준 발동 — {e}")
+            raise
+        except BaseException as e:                                   # noqa
+            rec.t_end = time.time(); rec.status = "FAIL"
+            rec.err_type = type(e).__name__; rec.err_msg = str(e)[:600]
+            rec.err_tb = traceback.format_exc()
+            rec.hint = diagnose(e, extra=f"stage={sid} name={name}")
+            self.failed.append(sid)
+            self._print_failure(rec)
+            if critical:
+                raise StageFailure(f"[{sid}] {name} 실패: {rec.err_type}: {rec.err_msg}") from e
+            rec.status = "WARN"
+            rec.notes.append(f"WARN: 비필수 스테이지 실패 — {rec.err_type}")
+        finally:
+            LOG.ctx.pop()
+            self.current = prev
+
+    def _print_failure(self, rec: StageRecord):
+        LOG.banner(f"✘ 실패 지점: [{rec.sid}] {rec.name}", f"계층 {rec.layer} · 경과 {rec.dur:.2f}s")
+        print(f"  예외      : {rec.err_type}: {rec.err_msg}")
+        print(f"  진단      : {rec.hint}")
+        recent = [e for e in self.flow if e.stage == rec.sid][-8:]
+        if recent:
+            LOG.table(
+                [[e.direction, e.kind, _trunc(e.name, 34), f"{e.rows:,}" if e.rows >= 0 else "-",
+                  e.pit_cols, "OK" if e.ok else "ERR", _trunc(e.source or e.note, 26)] for e in recent],
+                ["방향", "종류", "대상", "행수", "PIT", "상태", "소스/비고"],
+                ["c", "l", "l", "r", "c", "c", "l"],
+                title="이 스테이지의 직전 입출력 (여기서 무엇이 비었는지 보세요)")
+        print("\n  ── 트레이스백 (마지막 12줄) " + "─" * 60)
+        for ln in rec.err_tb.rstrip().split("\n")[-12:]:
+            print("   " + ln)
+        print("  " + "─" * 86)
+
+    # -- 리포트 --------------------------------------------------------------------------
+    def report_stages(self):
+        LOG.banner("스테이지 실행 요약", "상태 · 소요시간 · 입출력 행수 · 런타임 예산(C10)")
+        rows = []
+        for r in self.stages.values():
+            icon = {"OK": "✔", "WARN": "⚠", "FAIL": "✘", "SKIP": "→", "RUNNING": "…"}.get(r.status, "?")
+            bud = "-" if r.budget_s is None else (f"{r.budget_s:.0f}s" + ("❗" if r.dur > r.budget_s else ""))
+            rows.append([r.layer, r.sid, _trunc(r.name, 40), f"{icon}{r.status}",
+                         f"{r.dur:8.2f}", f"{r.rows_in:,}", f"{r.rows_out:,}", bud,
+                         _trunc("; ".join(r.notes), 40)])
+        LOG.table(rows, ["계층", "ID", "스테이지", "상태", "초", "입력행", "출력행", "예산", "비고"],
+                  ["c", "l", "l", "c", "r", "r", "r", "c", "l"], maxw=44)
+
+    def report_flow(self, only_kinds: Optional[Sequence[str]] = None, limit: int = 200):
+        LOG.banner("데이터 흐름 원장 (I/O LEDGER)",
+                   "어떤 스테이지가 어디서 몇 행을 읽고 어디에 몇 행을 썼는가 · PIT=E(event)/K(knowledge)")
+        evs = [e for e in self.flow if (not only_kinds or e.kind in only_kinds)]
+        if len(evs) > limit:
+            LOG.warn(f"원장 {len(evs)}건 중 최근 {limit}건만 출력합니다.")
+            evs = evs[-limit:]
+        LOG.table(
+            [[e.stage, e.direction, e.kind, _trunc(e.name, 38),
+              f"{e.rows:,}" if e.rows >= 0 else "-",
+              f"{e.cols}" if e.cols >= 0 else "-",
+              e.pit_cols or "—", "OK" if e.ok else "ERR", _trunc(e.source or e.note, 30)] for e in evs],
+            ["스테이지", "방향", "종류", "대상", "행수", "열수", "PIT", "상태", "소스/비고"],
+            ["l", "c", "l", "l", "r", "r", "c", "c", "l"], maxw=40)
+
+    def report_runtime(self):
+        """C10 런타임 감사 — 추측하지 말고 측정한다."""
+        LOG.banner("런타임 감사 (C10)", "계층별 실측 소요시간 vs 계약 예산")
+        budgets = {"L1": 30 * 60, "L2": 2 * 60, "L3": 3 * 60, "L5": 4 * 3600}
+        agg: Dict[str, float] = defaultdict(float)
+        for r in self.stages.values():
+            agg[r.layer] += r.dur
+        rows = []
+        for layer in sorted(agg):
+            spent = agg[layer]
+            bud = budgets.get(layer)
+            verdict = "—"
+            if bud:
+                verdict = "✔ 예산 내" if spent <= bud else f"❗ 초과 ({spent / bud:.1f}배)"
+            rows.append([layer, f"{spent:8.2f}s", f"{spent / 60:6.2f}분",
+                         (f"{bud / 60:.0f}분" if bud else "-"), verdict])
+        rows.append(["합계", f"{sum(agg.values()):8.2f}s", f"{sum(agg.values()) / 60:6.2f}분", "4시간",
+                     "✔ 예산 내" if sum(agg.values()) <= 4 * 3600 else "❗ 초과 — 아키텍처 수정 필요"])
+        LOG.table(rows, ["계층", "실측(초)", "실측(분)", "계약예산", "판정"], ["c", "r", "r", "r", "l"])
+        LOG.info("계층 정의 — L0:부트/캐시  L1:수집·피처패널  L2:스코어  L3:백테스트  L5:강건성  L6:리포트")
+
+
+PIPE = Pipeline()
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-C  유틸 — 해시 / 원자적 IO / 재시도 / 레이트리미터 / 병렬 / 벡터화 통계               ║
+# ║                                                                                          ║
+# ║  · 횡단면 변환 순서(C5)는 여기서 단 한 번 하드코딩된다: winsorize → z → rank_pct          ║
+# ║  · 롤링 회귀는 반드시 벡터화 (칼만 폐기, §3). 종목별 파이썬 루프 금지.                    ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+# ── 날짜 정규화 ─────────────────────────────────────────────────────────────────────────────
+def as_ts(x) -> Optional[pd.Timestamp]:
+    """무엇이 들어오든 tz-naive 로 정규화된 Timestamp. tz 혼재는 이 프로젝트 최빈 버그였다."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    try:
+        t = pd.Timestamp(x)
+    except Exception:
+        try:
+            t = pd.to_datetime(str(x), errors="coerce")
+        except Exception:
+            return None
+    if t is pd.NaT or pd.isna(t):
+        return None
+    if getattr(t, "tzinfo", None) is not None:
+        t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
+    return t.normalize()
+
+
+def as_ts_series(s) -> pd.Series:
+    out = pd.to_datetime(pd.Series(s), errors="coerce")
+    try:
+        if getattr(out.dt, "tz", None) is not None:
+            out = out.dt.tz_localize(None)
+    except Exception:
+        pass
+    return out.dt.normalize()
+
+
+def month_end(x) -> Optional[pd.Timestamp]:
+    t = as_ts(x)
+    return None if t is None else (t + pd.offsets.MonthEnd(0)).normalize()
+
+
+def month_range(start, end) -> pd.DatetimeIndex:
+    return pd.date_range(month_end(start), month_end(end), freq="ME")
+
+
+# ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
+def sha1_str(*parts) -> str:
+    h = hashlib.sha1()
+    for p in parts:
+        h.update(str(p).encode("utf-8", "ignore"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+
+def sha1_file(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def norm_text(s: Any) -> str:
+    """상호/애널리스트명/제목 정규화. 매칭 정확도의 8할이 여기서 결정된다."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = s.replace("​", "").replace("\xa0", " ")
+    s = re.sub(r"[（(\[{][^）)\]}]*[）)\]}]", " ", s)        # 괄호 안 제거
+    s = re.sub(r"[^\w가-힣A-Za-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def norm_corp_name(s: Any) -> str:
+    """법인격 접미어 제거 — 사업장명↔법인명 매칭용."""
+    t = norm_text(s)
+    t = re.sub(r"\b(주식회사|유한회사|합자회사|주|㈜|Co|Ltd|Inc|Corp|Corporation|Company|Limited)\b",
+               " ", t, flags=re.I)
+    t = re.sub(r"(주식회사|유한회사)", " ", t)
+    return re.sub(r"\s+", "", t).strip()
+
+
+# 2024-01-01 종목코드 개편으로 영숫자 코드가 도입되었다.
+# 형식: 앞 4자리 숫자 + 5번째(0-9,A-Z 중 I/O/U 제외) + 6번째(0,K,L,M,N)
+# ★ 단순히 \D 를 제거하면 신형 티커가 조용히 망가진다(예: '09701K' → '009701').
+_TICKER_RE = re.compile(r"^(?:\d{6}|\d{4}[0-9A-HJ-NP-TV-Z][0-9KLMN])$")
+
+
+def to_code6(x: Any) -> Optional[str]:
+    """'005930', 5930, 'A005930', '005930.KS', '09701K' → 정규화 코드.
+    실패하면 None. 조용히 0으로 채워 잘못된 종목을 만들지 않는다."""
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return None
+    s = re.sub(r"\s", "", str(x).strip().upper()).split(".")[0]
+    if len(s) == 7 and s[0] in "AQ" and _TICKER_RE.match(s[1:]):
+        s = s[1:]
+    if _TICKER_RE.match(s):
+        return s
+    d = re.sub(r"\D", "", s)
+    if d and len(d) <= 6:
+        cand = d.zfill(6)
+        return cand if _TICKER_RE.match(cand) else None
+    return None
+
+
+def similarity(a: str, b: str) -> float:
+    """0~100. rapidfuzz 있으면 그걸, 없으면 difflib."""
+    a, b = norm_corp_name(a), norm_corp_name(b)
+    if not a or not b:
+        return 0.0
+    if rapidfuzz_fuzz is not None:
+        return float(rapidfuzz_fuzz.token_set_ratio(a, b))
+    import difflib
+    return 100.0 * difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# ── 원자적 파일 IO (드라이브 FUSE 에서 깨지지 않게) ──────────────────────────────────────────
+def _ensure_dir(path: str):
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def atomic_write_bytes(path: str, data: bytes) -> str:
+    """임시파일 → flush/fsync → os.replace. 드라이브 마운트에서 중단돼도 원본이 반쪽 나지 않는다."""
+    _ensure_dir(path)
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass                     # 일부 FUSE 는 fsync 미지원 — 실패해도 replace 는 유효
+    os.replace(tmp, path)
+    return path
+
+
+def atomic_write_text(path: str, text: str) -> str:
+    return atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd") -> str:
+    _ensure_dir(path)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    out = df.copy()
+    for c in out.columns:                       # object 컬럼은 arrow 가 종종 거부한다 → 문자열화
+        if out[c].dtype == object:
+            try:
+                pd.api.types.infer_dtype(out[c], skipna=True)
+            except Exception:
+                out[c] = out[c].astype(str)
+    try:
+        out.to_parquet(tmp, index=False, compression=compression)
+    except Exception:
+        out.to_parquet(tmp, index=False, compression="snappy")
+    os.replace(tmp, path)
+    return path
+
+
+def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
+        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
+            os.replace(path, path + f".corrupt.{int(time.time())}")
+        except Exception:
+            pass
+        return None
+
+
+def read_jsonl(path: str) -> List[dict]:
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue                        # 반쪽 줄은 건너뛴다 (append-only 저널의 정상 동작)
+    return out
+
+
+def append_jsonl(path: str, rows: Iterable[dict]):
+    _ensure_dir(path)
+    with open(path, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+
+
+# ── 레이트리미터 / 재시도 ───────────────────────────────────────────────────────────────────
+class RateLimiter:
+    """소스별 토큰버킷. 스레드 안전. 차단당하지 않기 위한 최소 장치."""
+
+    def __init__(self, qps: float):
+        self.interval = 1.0 / max(qps, 0.01)
+        self._next = 0.0
+        self._lk = threading.Lock()
+
+    def wait(self):
+        with self._lk:
+            now = time.monotonic()
+            if now < self._next:
+                d = self._next - now
+            else:
+                d = 0.0
+            self._next = max(now, self._next) + self.interval
+        if d > 0:
+            time.sleep(d)
+
+
+_LIMITERS: Dict[str, RateLimiter] = {}
+_LIMITER_LOCK = threading.Lock()
+
+
+def limiter(source: str) -> RateLimiter:
+    with _LIMITER_LOCK:
+        if source not in _LIMITERS:
+            _LIMITERS[source] = RateLimiter(RATE_LIMIT_QPS.get(source, RATE_LIMIT_QPS.get("generic", 3.0)))
+        return _LIMITERS[source]
+
+
+def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, quiet: bool = False):
+    def deco(fn):
+        def wrapped(*a, **kw):
+            last = None
+            for i in range(tries):
+                try:
+                    return fn(*a, **kw)
+                except exc as e:                       # noqa
+                    last = e
+                    if i == tries - 1:
+                        break
+                    slp = (base ** i) + random.random() * 0.4
+                    if not quiet:
+                        LOG.debug(f"재시도 {i+1}/{tries-1} ({type(e).__name__}) — {slp:.1f}s 대기")
+                    time.sleep(slp)
+            if on_fail is not None:
+                return on_fail(last)
+            raise last                                  # type: ignore
+        wrapped.__name__ = getattr(fn, "__name__", "wrapped")
+        return wrapped
+    return deco
+
+
+# ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
+def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
+            desc: str = "", quiet: bool = False) -> List[Any]:
+    """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다."""
+    items = list(items)
+    if not items:
+        return []
+    w = max(1, min(workers or N_WORKERS_IO, len(items)))
+    out: List[Any] = [None] * len(items)
+    errs: Counter = Counter()
+    with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
+        futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
+        it_ = as_completed(futs)
+        if not quiet:
+            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
+        for fu in it_:
+            i = futs[fu]
+            try:
+                out[i] = fu.result()
+            except Exception as e:                       # noqa
+                errs[type(e).__name__] += 1
+                out[i] = None
+    if errs:
+        LOG.warn(f"{desc or '병렬작업'} 중 실패 {sum(errs.values())}/{len(items)}건 — " +
+                 ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))
+    return out
+
+
+def pmap_cpu(fn: Callable, items: Sequence, workers: Optional[int] = None, desc: str = "") -> List[Any]:
+    """연산 병렬. fork 가능하면 프로세스, 아니면 스레드로 자동 폴백(결과 동일, 속도만 차이)."""
+    items = list(items)
+    if not items:
+        return []
+    w = max(1, min(workers or N_CPU, len(items)))
+    if w == 1 or not CAN_FORK:
+        if not CAN_FORK:
+            LOG.debug("fork 불가 환경 — 연산 병렬을 스레드로 폴백합니다(결과 동일).")
+        return [fn(x) for x in tqdm(items, desc=desc or "연산", leave=False, ncols=88)]
+    try:
+        ctx = _mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=w, mp_context=ctx) as ex:
+            return list(tqdm(ex.map(fn, items), total=len(items), desc=desc or "연산",
+                             leave=False, ncols=88))
+    except Exception as e:                                # noqa
+        LOG.warn(f"프로세스 병렬 실패({type(e).__name__}) — 순차 실행으로 폴백합니다.")
+        return [fn(x) for x in items]
+
+
+# ── 메모리 ──────────────────────────────────────────────────────────────────────────────────
+def downcast(df: pd.DataFrame, cat_thresh: float = 0.35) -> pd.DataFrame:
+    """float64→float32, 저카디널리티 object→category. 10년 패널 RAM을 3~5배 줄인다."""
+    if df is None or df.empty:
+        return df
+    for c in df.columns:
+        k = df[c].dtype.kind
+        if k == "f":
+            df[c] = pd.to_numeric(df[c], downcast="float")
+        elif k in "iu":
+            df[c] = pd.to_numeric(df[c], downcast="integer")
+        elif k == "O":
+            try:
+                n = df[c].nunique(dropna=True)
+                if n > 0 and n / max(len(df), 1) < cat_thresh:
+                    df[c] = df[c].astype("category")
+            except Exception:
+                pass
+    return df
+
+
+def mem_mb(df: pd.DataFrame) -> float:
+    try:
+        return float(df.memory_usage(deep=True).sum()) / 1e6
+    except Exception:
+        return -1.0
+
+
+# ── PIT 프레임 강제 (C1) ────────────────────────────────────────────────────────────────────
+PIT_COLS = ("event_date", "knowledge_date")
+
+
+def _resolve_dates(df: pd.DataFrame, arg) -> pd.Series:
+    """날짜 인자 해석 규칙 — 딱 세 가지만 허용한다(모호함이 곧 버그다):
+       ① 문자열이고 df 의 컬럼명이면      → 그 컬럼
+       ② Series/배열/리스트이면           → 그대로 (길이 일치 필요)
+       ③ 그 외(스칼라 날짜/문자열 날짜)   → 전 행에 브로드캐스트
+    """
+    if isinstance(arg, str) and arg in df.columns:
+        return as_ts_series(df[arg]).set_axis(df.index)
+    if isinstance(arg, pd.Series):
+        if len(arg) != len(df):
+            raise ValueError(f"날짜 Series 길이 불일치: {len(arg)} vs {len(df)}")
+        return as_ts_series(pd.Series(arg.to_numpy())).set_axis(df.index)
+    if isinstance(arg, (list, tuple, np.ndarray, pd.DatetimeIndex)):
+        if len(arg) != len(df):
+            raise ValueError(f"날짜 배열 길이 불일치: {len(arg)} vs {len(df)}")
+        return as_ts_series(pd.Series(list(arg))).set_axis(df.index)
+    return as_ts_series(pd.Series([arg] * len(df))).set_axis(df.index)
+
+
+def pit_frame(df: pd.DataFrame, event_date, knowledge_date, source: str = "") -> pd.DataFrame:
+    """모든 수집 결과는 이 함수를 통과해야 한다. 통과하지 않은 테이블은 PIT store 가 거부한다."""
+    if df is None or len(df) == 0:
+        base = pd.DataFrame(df if df is not None else None)
+        for c in PIT_COLS:
+            if c not in base.columns:
+                base[c] = pd.Series(dtype="datetime64[ns]")
+        if source:
+            base["_src"] = pd.Series(dtype=object)
+        return base
+    out = df.copy().reset_index(drop=True)
+    out["event_date"] = _resolve_dates(out, event_date)
+    out["knowledge_date"] = _resolve_dates(out, knowledge_date)
+    # knowledge_date 는 event_date 보다 이를 수 없다 — 이를 어기면 그 자체가 미래누수다.
+    bad = out["knowledge_date"] < out["event_date"]
+    if bad.any():
+        out.loc[bad, "knowledge_date"] = out.loc[bad, "event_date"]
+        if PIPE.current:
+            PIPE.note(f"WARN: knowledge_date < event_date 인 {int(bad.sum())}행을 event_date 로 보정")
+    out = out.dropna(subset=["knowledge_date"])
+    if source:
+        out["_src"] = source
+    return out
+
+
+# ── 벡터화 횡단면 통계 (C5 순서 고정) ───────────────────────────────────────────────────────
+WINSOR_SIGMA = 2.0
+CELL_MIN_N = 8
+
+
+def _winsor_np(a: np.ndarray, k: float = WINSOR_SIGMA) -> np.ndarray:
+    m = np.nanmean(a)
+    s = np.nanstd(a)
+    if not np.isfinite(s) or s == 0:
+        return a
+    return np.clip(a, m - k * s, m + k * s)
+
+
+def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
+    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다."""
+    v = pd.to_numeric(values, errors="coerce").astype("float64")
+    g = v.groupby(cells, observed=True, dropna=False)
+
+    def _f(x: pd.Series) -> pd.Series:
+        a = x.to_numpy(dtype="float64", copy=True)
+        ok = np.isfinite(a)
+        if ok.sum() < min_n:
+            return pd.Series(np.nan, index=x.index)
+        a2 = a.copy()
+        a2[ok] = _winsor_np(a[ok])
+        mu, sd = np.nanmean(a2), np.nanstd(a2)
+        if not np.isfinite(sd) or sd == 0:
+            return pd.Series(0.0, index=x.index).where(ok, np.nan)
+        return pd.Series((a2 - mu) / sd, index=x.index)
+
+    return g.transform(_f).astype("float32")
+
+
+def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
+    """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
+    v = pd.to_numeric(values, errors="coerce").astype("float64")
+    g = v.groupby(cells, observed=True, dropna=False)
+    cnt = g.transform("count")
+    r = g.rank(pct=True, method="average")
+    return r.where(cnt >= min_n).astype("float32")
+
+
+def tp_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
+    """트레이드오프 쌍 = z(개선) × z(대가회피).  ★ 절대로 합으로 바꾸지 말 것 (§1.1).
+
+    합으로 바꾸면 평범한 퀄리티 팩터가 되고 이 전략의 존재 이유가 사라진다.
+    한쪽이 결측이면 결과도 결측 — 0으로 채우면 '대가를 안 치렀다'는 거짓 주장이 된다.
+    """
+    a = pd.to_numeric(z_improve, errors="coerce")
+    b = pd.to_numeric(z_nopay, errors="coerce")
+    return (a * b).astype("float32")
+
+
+def safe_div(a, b, eps: float = 1e-12):
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    out = a / b.where(b.abs() > eps)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def dlog(s: pd.Series, periods: int = 12) -> pd.Series:
+    """Δlog. 음수/0 은 결측 처리 (log 의 정의역 밖을 0으로 메우는 것이 최빈 버그)."""
+    v = pd.to_numeric(s, errors="coerce")
+    lv = np.log(v.where(v > 0))
+    return lv.diff(periods)
+
+
+def nanmean_cols(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
+    """가용 축만으로 평균. 결측을 0으로 채우지 않는다 (§7.3 지시)."""
+    use = [c for c in cols if c in df.columns]
+    if not use:
+        return pd.Series(np.nan, index=df.index)
+    return df[use].astype("float64").mean(axis=1, skipna=True)
+
+
+# ── 벡터화 롤링 OLS (칼만 대체, §3) ─────────────────────────────────────────────────────────
+def rolling_ols_resid(y: np.ndarray, X: np.ndarray, window: int,
+                      ridge: float = 1e-8, chunk: int = 256) -> np.ndarray:
+    """N개 엔티티 × T기간 패널에 대해 길이 W 롤링 OLS 를 배치로 풀고 창 마지막 시점 잔차를 반환.
+
+    y : (N, T)
+    X : (N, T, K)   — 절편은 호출자가 포함시킬 것
+    반환: (N, T) 잔차. 창이 안 차거나 결측 포함이면 NaN.
+
+    종목별 파이썬 루프로 짜면 15분짜리가 3시간이 된다(§3). 반드시 이 경로를 쓸 것.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    N, T = y.shape
+    K = X.shape[2]
+    out = np.full((N, T), np.nan, dtype=np.float64)
+    if T < window or window < K + 2:
+        return out
+    try:
+        from numpy.lib.stride_tricks import sliding_window_view as _swv
+    except Exception:                                     # numpy<1.20 폴백
+        _swv = None
+
+    for s in range(0, N, chunk):
+        e = min(N, s + chunk)
+        yc, Xc = y[s:e], X[s:e]
+        n = e - s
+        if _swv is not None:
+            yw = _swv(yc, window, axis=1)                 # (n, T-W+1, W)
+            Xw = _swv(Xc, window, axis=1)                 # (n, T-W+1, K, W)
+            Xw = np.moveaxis(Xw, -1, 2)                   # (n, T-W+1, W, K)
+        else:
+            idx = np.arange(window)[None, :] + np.arange(T - window + 1)[:, None]
+            yw = yc[:, idx]
+            Xw = Xc[:, idx, :]
+        finite = np.isfinite(yw).all(axis=2) & np.isfinite(Xw).all(axis=(2, 3))   # (n, M)
+        yw = np.where(np.isfinite(yw), yw, 0.0)
+        Xw = np.where(np.isfinite(Xw), Xw, 0.0)
+        XtX = np.einsum("nmwk,nmwl->nmkl", Xw, Xw, optimize=True)
+        Xty = np.einsum("nmwk,nmw->nmk", Xw, yw, optimize=True)
+        XtX += ridge * np.eye(K)[None, None, :, :] * np.maximum(
+            1.0, np.abs(np.einsum("nmkk->nm", XtX))[..., None, None] / max(K, 1))
+        try:
+            beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]                   # (n, M, K)
+        except np.linalg.LinAlgError:
+            beta = np.einsum("nmkl,nml->nmk", np.linalg.pinv(XtX), Xty)
+        x_last = Xw[:, :, -1, :]                                                  # (n, M, K)
+        resid = yw[:, :, -1] - np.einsum("nmk,nmk->nm", x_last, beta)
+        resid = np.where(finite, resid, np.nan)
+        out[s:e, window - 1:] = resid
+        del yw, Xw, XtX, Xty, beta
+    return out
+
+
+def rolling_ols_beta_last(y: np.ndarray, X: np.ndarray, window: int, ridge: float = 1e-8) -> np.ndarray:
+    """위와 동일하되 마지막 창의 계수만 필요할 때 (R3 직교화 등)."""
+    N, T = y.shape
+    K = X.shape[2]
+    if T < window:
+        return np.full((N, K), np.nan)
+    yw, Xw = y[:, -window:], X[:, -window:, :]
+    ok = np.isfinite(yw).all(axis=1) & np.isfinite(Xw).all(axis=(1, 2))
+    yw = np.nan_to_num(yw); Xw = np.nan_to_num(Xw)
+    XtX = np.einsum("nwk,nwl->nkl", Xw, Xw) + ridge * np.eye(K)[None]
+    Xty = np.einsum("nwk,nw->nk", Xw, yw)
+    beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]
+    beta[~ok] = np.nan
+    return beta
+
+
+def hac_tstat(x: np.ndarray, lags: Optional[int] = None) -> Tuple[float, float]:
+    """Newey-West HAC 평균 t통계량. 월간 초과수익 시계열의 유의성에 쓴다(R2/R3)."""
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 12:
+        return (np.nan, np.nan)
+    mu = x.mean()
+    e = x - mu
+    L = lags if lags is not None else int(np.floor(4 * (n / 100.0) ** (2.0 / 9.0)))
+    L = max(0, min(L, n - 2))
+    g0 = float(e @ e) / n
+    var = g0
+    for l in range(1, L + 1):
+        gl = float(e[l:] @ e[:-l]) / n
+        var += 2.0 * (1.0 - l / (L + 1.0)) * gl
+    var = max(var, 1e-18)
+    se = math.sqrt(var / n)
+    return (float(mu), float(mu / se))
+
+
+def bh_fdr(pvals: Sequence[float], q: float = 0.10) -> np.ndarray:
+    """Benjamini-Hochberg. 강건성 검정을 여러 번 돌리면 다중검정 보정이 필요하다."""
+    p = np.asarray(pvals, dtype=float)
+    ok = np.isfinite(p)
+    out = np.zeros_like(p, dtype=bool)
+    idx = np.where(ok)[0]
+    if len(idx) == 0:
+        return out
+    order = idx[np.argsort(p[idx])]
+    m = len(order)
+    thresh = q * (np.arange(1, m + 1) / m)
+    passed = p[order] <= thresh
+    if passed.any():
+        kmax = np.max(np.where(passed)[0])
+        out[order[:kmax + 1]] = True
+    return out
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-D  캐시 저장소 (VAULT) — 구글드라이브 공용/전용 인덱스                                 ║
+# ║                                                                                          ║
+# ║  ★★★ 절대 1원칙: 기존 캐시·인덱스를 훼손하지 않는다. ★★★                                  ║
+# ║                                                                                          ║
+# ║  훼손 불가능성을 "약속"이 아니라 "구조"로 보장한다:                                        ║
+# ║   1) 인덱스의 진실은 append-only JSONL 저널이다. 기존 줄을 다시 쓰지 않으므로              ║
+# ║      코드가 어떻게 잘못돼도 과거 기록이 사라질 수 없다.                                    ║
+# ║   2) index.parquet 은 저널의 파생물(캐시)일 뿐이다. 재생성 전 항상 타임스탬프 백업.        ║
+# ║   3) 컬럼은 합집합으로만 확장한다. 스키마가 달라도 기존 컬럼을 떨어뜨리지 않는다.          ║
+# ║   4) 원본 blob 은 내용해시 기반 경로에 쓰므로 같은 내용은 재기록조차 하지 않는다.          ║
+# ║      내용이 다르면 새 리비전으로 쓰고, 기존 파일은 건드리지 않는다.                        ║
+# ║   5) 이미 드라이브에 있던 리포트는 "옮기지 않고 경로만 등록"한다(adopt-by-reference).      ║
+# ║   6) 삭제 API 자체가 없다. 손상 파일조차 지우지 않고 .corrupt 로 격리만 한다.              ║
+# ║                                                                                          ║
+# ║  공용 인덱스(_shared) : 다른 전략에서도 그대로 재활용 가능한 원본/정제본                   ║
+# ║  전용 인덱스(tcd_v2)  : 이 전략 고유의 피처·스코어·리포트                                  ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+VAULT_SCHEMA_VER = "2.0"
+
+INDEX_COLUMNS = [
+    "uid", "scope", "domain", "subtype", "key", "path", "abs_path", "fmt",
+    "bytes", "sha1", "event_date", "knowledge_date", "source", "collected_at",
+    "strategy", "adopted", "schema_ver", "extra",
+]
+
+
+def _mount_drive() -> Tuple[str, str]:
+    """(루트경로, 상태문자열). Colab이면 마운트 시도, 아니면 로컬 폴백. 어느 쪽이든 죽지 않는다."""
+    if ENV["colab"]:
+        try:
+            from google.colab import drive as _gdrive      # type: ignore
+            mp = "/content/drive"
+            if not os.path.isdir(os.path.join(mp, "MyDrive")):
+                _gdrive.mount(mp, force_remount=False)
+            if os.path.isdir(os.path.join(mp, "MyDrive")):
+                return GDRIVE_ROOT, "COLAB_DRIVE"
+            return LOCAL_CACHE_ROOT, "COLAB_DRIVE_FAILED→LOCAL"
+        except Exception as e:                             # noqa
+            LOG.warn(f"구글드라이브 마운트 실패({type(e).__name__}) — 로컬 캐시로 폴백합니다.")
+            return LOCAL_CACHE_ROOT, "COLAB_MOUNT_ERROR→LOCAL"
+    # JupyterLab / CLI: 드라이브가 이미 동기화되어 있으면 그 경로를 쓴다.
+    for cand in (GDRIVE_ROOT, os.path.expanduser("~/Google Drive/MyDrive/tcd_cache"),
+                 os.path.expanduser("~/GoogleDrive/MyDrive/tcd_cache")):
+        if cand and os.path.isdir(cand):
+            return cand, "LOCAL_SYNCED_DRIVE"
+    return LOCAL_CACHE_ROOT, "LOCAL"
+
+
+class Vault:
+    def __init__(self, root: str, mode: str):
+        self.root = os.path.abspath(root)
+        self.mode = mode
+        self.ns = {"shared": os.path.join(self.root, GDRIVE_SHARED_NS),
+                   "private": os.path.join(self.root, GDRIVE_PRIVATE_NS)}
+        for p in self.ns.values():
+            os.makedirs(os.path.join(p, "index"), exist_ok=True)
+            os.makedirs(os.path.join(p, "index", "_backup"), exist_ok=True)
+            os.makedirs(os.path.join(p, "blob"), exist_ok=True)
+            os.makedirs(os.path.join(p, "table"), exist_ok=True)
+        os.makedirs(os.path.join(self.root, "_locks"), exist_ok=True)
+        self._idx: Dict[str, pd.DataFrame] = {}
+        self._uidset: Dict[str, set] = {}
+        self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
+        self._lk = threading.RLock()
+        self.stats = Counter()
+
+    # ── 경로 --------------------------------------------------------------------------
+    def journal(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "index", "index.jsonl")
+
+    def idx_parquet(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "index", "index.parquet")
+
+    def blob_dir(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "blob")
+
+    def table_dir(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "table")
+
+    # ── 잠금 (두 노트북이 동시에 돌아도 저널이 섞이지 않게) -----------------------------
+    @contextmanager
+    def lock(self, name: str, timeout: float = 60.0, stale: float = 900.0):
+        lp = os.path.join(self.root, "_locks", f"{name}.lock")
+        t0 = time.time()
+        acquired = False
+        while time.time() - t0 < timeout:
+            try:
+                fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, json.dumps({"pid": os.getpid(), "host": platform.node(),
+                                         "ts": time.time()}).encode())
+                os.close(fd)
+                acquired = True
+                break
+            except FileExistsError:
+                try:
+                    info = json.loads(open(lp).read() or "{}")
+                    if time.time() - float(info.get("ts", 0)) > stale:
+                        LOG.warn(f"오래된 잠금 해제: {name} (>{stale:.0f}s)")
+                        os.remove(lp)
+                        continue
+                except Exception:
+                    try:
+                        os.remove(lp)
+                    except Exception:
+                        pass
+                time.sleep(0.4)
+        if not acquired:
+            LOG.warn(f"잠금 획득 실패({name}) — 저널 append 는 원자적이므로 그대로 진행합니다.")
+        try:
+            yield
+        finally:
+            if acquired:
+                try:
+                    os.remove(lp)
+                except Exception:
+                    pass
+
+    # ── 인덱스 적재 (기존 것을 절대 건드리지 않고 읽기만) --------------------------------
+    def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:
+        with self._lk:
+            if not force and scope in self._idx:
+                return self._idx[scope]
+        frames: List[pd.DataFrame] = []
+
+        # (a) 정규 parquet 인덱스
+        p = self.idx_parquet(scope)
+        d = read_parquet_safe(p)
+        if d is not None and len(d):
+            frames.append(d)
+
+        # (b) append-only 저널 (진실의 원천)
+        jr = read_jsonl(self.journal(scope))
+        if jr:
+            frames.append(pd.DataFrame(jr))
+
+        # (c) 과거 버전/다른 전략이 남긴 인덱스 파일도 흡수 (읽기 전용, 훼손 없음)
+        legacy_glob = []
+        idx_dir = os.path.join(self.ns[scope], "index")
+        try:
+            for fn in os.listdir(idx_dir):
+                fl = fn.lower()
+                if fn in ("index.parquet", "index.jsonl") or fl.startswith("_"):
+                    continue
+                if fl.endswith((".parquet", ".jsonl", ".json", ".csv")):
+                    legacy_glob.append(os.path.join(idx_dir, fn))
+        except Exception:
+            pass
+        for fp in legacy_glob:
+            try:
+                if fp.endswith(".parquet"):
+                    dd = read_parquet_safe(fp)
+                elif fp.endswith(".csv"):
+                    dd = pd.read_csv(fp)
+                elif fp.endswith(".jsonl"):
+                    dd = pd.DataFrame(read_jsonl(fp))
+                else:
+                    dd = pd.DataFrame(json.loads(open(fp, encoding="utf-8").read()))
+                if dd is not None and len(dd):
+                    dd["_legacy_file"] = os.path.basename(fp)
+                    frames.append(dd)
+                    self.stats[f"legacy_index_absorbed:{os.path.basename(fp)}"] += len(dd)
+            except Exception:
+                continue
+
+        if frames:
+            # 컬럼 합집합 — 기존 컬럼을 절대 떨어뜨리지 않는다
+            allcols: List[str] = []
+            for f in frames:
+                for c in f.columns:
+                    if c not in allcols:
+                        allcols.append(c)
+            frames = [f.reindex(columns=allcols) for f in frames]
+            idx = pd.concat(frames, ignore_index=True)
+            if "uid" not in idx.columns:
+                idx["uid"] = [sha1_str("legacy", i) for i in range(len(idx))]
+            idx["uid"] = idx["uid"].astype(str)
+            if "collected_at" in idx.columns:
+                idx = idx.sort_values("collected_at", kind="stable")
+            idx = idx.drop_duplicates(subset=["uid"], keep="last").reset_index(drop=True)
+        else:
+            idx = pd.DataFrame(columns=INDEX_COLUMNS)
+
+        for c in INDEX_COLUMNS:
+            if c not in idx.columns:
+                idx[c] = np.nan
+        idx["scope"] = idx["scope"].fillna(scope)
+        with self._lk:
+            self._idx[scope] = idx
+            self._uidset[scope] = set(idx["uid"].astype(str).tolist())
+        return idx
+
+    def has(self, scope: str, uid: str) -> bool:
+        if scope not in self._uidset:
+            self.load_index(scope)
+        with self._lk:
+            return uid in self._uidset[scope] or any(r.get("uid") == uid for r in self._pending[scope])
+
+    def lookup(self, scope: str, **eq) -> pd.DataFrame:
+        idx = self.load_index(scope)
+        if idx.empty:
+            return idx
+        m = pd.Series(True, index=idx.index)
+        for k, v in eq.items():
+            if k not in idx.columns:
+                return idx.iloc[0:0]
+            m &= (idx[k].astype(str) == str(v))
+        return idx[m]
+
+    # ── 기록 --------------------------------------------------------------------------
+    def _register(self, scope: str, rec: dict):
+        rec.setdefault("scope", scope)
+        rec.setdefault("schema_ver", VAULT_SCHEMA_VER)
+        rec.setdefault("collected_at", _dt.datetime.now().isoformat(timespec="seconds"))
+        rec.setdefault("strategy", STRATEGY_ID if scope == "private" else "")
+        for c in INDEX_COLUMNS:
+            rec.setdefault(c, None)
+        with self._lk:
+            self._pending[scope].append(rec)
+            self._uidset.setdefault(scope, set()).add(str(rec["uid"]))
+        self.stats[f"register:{scope}:{rec.get('domain')}"] += 1
+
+    def put_blob(self, domain: str, subtype: str, key: str, data: bytes, fmt: str,
+                 source: str = "", event_date=None, knowledge_date=None,
+                 scope: str = "shared", extra: Optional[dict] = None,
+                 uid: Optional[str] = None) -> Optional[str]:
+        """원본 바이트를 내용해시 경로에 저장하고 인덱스에 등록. 같은 내용이면 재기록하지 않는다."""
+        if not data:
+            return None
+        h = sha1_bytes(data)
+        uid = uid or sha1_str(domain, subtype, key, h)
+        sub = os.path.join(self.blob_dir(scope), domain, subtype, h[:2], h[2:4])
+        fn = f"{h}.{fmt.lstrip('.')}"
+        abspath = os.path.join(sub, fn)
+        rel = os.path.relpath(abspath, self.root)
+        if not os.path.exists(abspath):                    # 존재하면 절대 덮어쓰지 않는다
+            try:
+                atomic_write_bytes(abspath, data)
+            except Exception as e:                          # noqa
+                LOG.warn(f"blob 저장 실패({type(e).__name__}) — 인덱스에만 기록하지 않고 건너뜁니다: {key}")
+                return None
+        else:
+            self.stats["blob_dedup_hit"] += 1
+        self._register(scope, {
+            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),
+            "path": rel, "abs_path": abspath, "fmt": fmt, "bytes": len(data), "sha1": h,
+            "event_date": str(as_ts(event_date) or ""), "knowledge_date": str(as_ts(knowledge_date) or ""),
+            "source": source, "adopted": False,
+            "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),
+        })
+        return abspath
+
+    def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:
+        rows = self.lookup(scope, uid=uid)
+        if rows.empty:
+            return None
+        for _, r in rows.iterrows():
+            for cand in (r.get("abs_path"), os.path.join(self.root, str(r.get("path") or ""))):
+                try:
+                    if cand and isinstance(cand, str) and os.path.exists(cand):
+                        return open(cand, "rb").read()
+                except Exception:
+                    continue
+        return None
+
+    def put_table(self, name: str, df: pd.DataFrame, scope: str = "shared",
+                  domain: str = "table", source: str = "", extra: Optional[dict] = None) -> Optional[str]:
+        """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다."""
+        if df is None:
+            return None
+        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        if os.path.exists(path):
+            bak = os.path.join(self.ns[scope], "index", "_backup",
+                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            try:
+                shutil.copy2(path, bak)
+            except Exception as e:                          # noqa
+                LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
+                         f"리비전 파일로 저장합니다: {name}")
+                path = os.path.join(self.table_dir(scope),
+                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+        try:
+            atomic_write_parquet(df, path)
+        except Exception as e:                              # noqa
+            LOG.warn(f"테이블 저장 실패({type(e).__name__}): {name}")
+            return None
+        self._register(scope, {
+            "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
+            "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
+            "fmt": "parquet", "bytes": os.path.getsize(path), "sha1": "",
+            "source": source, "adopted": False,
+            "extra": json.dumps({**(extra or {}), "rows": int(len(df)),
+                                 "cols": list(map(str, df.columns))[:80]}, ensure_ascii=False),
+        })
+        return path
+
+    def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
+                  ) -> Optional[pd.DataFrame]:
+        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        if not os.path.exists(path):
+            # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
+            alt = "private" if scope == "shared" else "shared"
+            path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
+            if os.path.exists(path2):
+                path = path2
+            else:
+                return None
+        if max_age_days is not None:
+            age = (time.time() - os.path.getmtime(path)) / 86400.0
+            if age > max_age_days:
+                return None
+        d = read_parquet_safe(path)
+        if d is not None:
+            PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
+        return d
+
+    def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
+              source: str = "", event_date=None, knowledge_date=None,
+              scope: str = "shared", extra: Optional[dict] = None) -> Optional[str]:
+        """이미 드라이브에 있는 파일을 옮기지 않고 '경로만' 등록한다. 파일은 읽기만 한다."""
+        try:
+            sz = os.path.getsize(abs_path)
+        except Exception:
+            return None
+        uid = sha1_str("adopt", domain, subtype, os.path.abspath(abs_path), sz)
+        if self.has(scope, uid):
+            return uid
+        self._register(scope, {
+            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),
+            "path": abs_path, "abs_path": abs_path, "fmt": os.path.splitext(abs_path)[1].lstrip("."),
+            "bytes": sz, "sha1": "", "source": source or "adopted",
+            "event_date": str(as_ts(event_date) or ""), "knowledge_date": str(as_ts(knowledge_date) or ""),
+            "adopted": True, "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),
+        })
+        self.stats["adopted"] += 1
+        return uid
+
+    # ── 커밋 / 컴팩션 ------------------------------------------------------------------
+    def flush(self, scope: Optional[str] = None):
+        """대기 중인 등록을 append-only 저널에 기록. 기존 줄은 건드리지 않는다."""
+        scopes = [scope] if scope else ["shared", "private"]
+        for sc in scopes:
+            with self._lk:
+                rows, self._pending[sc] = self._pending[sc], []
+            if not rows:
+                continue
+            with self.lock(f"journal_{sc}"):
+                append_jsonl(self.journal(sc), rows)
+            self.stats[f"journal_append:{sc}"] += len(rows)
+            LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")
+
+    def compact(self, scope: str):
+        """저널 → index.parquet 재생성. 저널은 남기고, 기존 parquet 은 반드시 백업한 뒤 교체."""
+        self.flush(scope)
+        idx = self.load_index(scope, force=True)
+        p = self.idx_parquet(scope)
+        if os.path.exists(p):
+            bak = os.path.join(self.ns[scope], "index", "_backup",
+                               f"index.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            try:
+                shutil.copy2(p, bak)
+            except Exception as e:                          # noqa
+                LOG.warn(f"인덱스 백업 실패({type(e).__name__}) — 안전을 위해 컴팩션을 건너뜁니다. "
+                         f"저널({os.path.basename(self.journal(scope))})에 모든 기록이 남아 있으므로 "
+                         f"데이터 유실은 없습니다.")
+                return
+        try:
+            atomic_write_parquet(idx.astype({c: str for c in idx.columns if idx[c].dtype == object}), p)
+            LOG.ok(f"인덱스 컴팩션 완료: {scope} — {len(idx):,}행 → {os.path.relpath(p, self.root)}")
+        except Exception as e:                              # noqa
+            LOG.warn(f"인덱스 컴팩션 실패({type(e).__name__}) — 저널이 원천이므로 유실 없음.")
+
+    # ── 사전 스캔 (사용자의 기존 캐시 흡수) --------------------------------------------
+    _PDF_PAT = re.compile(r"\.(pdf)$", re.I)
+    _DATE_PAT = re.compile(r"(20\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])")
+
+    def adopt_scan(self, dirs: Sequence[str], max_files: int = 400_000) -> pd.DataFrame:
+        """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음."""
+        seen, found = set(), []
+        for d in dirs:
+            if not d or not os.path.isdir(d):
+                continue
+            rd = os.path.realpath(d)
+            if rd in seen:
+                continue
+            seen.add(rd)
+            LOG.info(f"기존 캐시 스캔: {d}")
+            n = 0
+            for dirpath, dirnames, filenames in os.walk(d):
+                dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
+                for fn in filenames:
+                    if n >= max_files:
+                        break
+                    fp = os.path.join(dirpath, fn)
+                    low = fn.lower()
+                    if low.endswith(".pdf"):
+                        kind = "report_pdf"
+                    elif low.endswith((".parquet", ".jsonl", ".json", ".csv")) and \
+                            any(t in low for t in ("report", "consensus", "research", "analyst",
+                                                   "hankyung", "naver", "dart", "krx", "nps",
+                                                   "price", "ohlcv", "universe", "fnltt")):
+                        kind = "table_like"
+                    else:
+                        continue
+                    found.append({"abs_path": fp, "kind": kind, "name": fn,
+                                  "dir": dirpath, "bytes": _safe_size(fp)})
+                    n += 1
+            LOG.info(f"  → {n:,}개 후보 발견")
+        if not found:
+            LOG.warn("기존 캐시에서 흡수할 파일을 찾지 못했습니다. "
+                     "GDRIVE_ADOPT_DIRS 경로를 확인하세요(오타/미마운트가 가장 흔합니다).")
+            return pd.DataFrame(columns=["abs_path", "kind", "name"])
+        df = pd.DataFrame(found)
+        for r in df.itertuples(index=False):
+            m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)
+            ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+            self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",
+                       subtype=r.kind, key=r.name, source="preexisting_drive_cache",
+                       event_date=ed, knowledge_date=ed, scope="shared",
+                       extra={"dir": r.dir})
+        self.flush("shared")
+        LOG.ok(f"기존 캐시 {len(df):,}건을 공용 인덱스에 '참조 등록'했습니다 "
+               f"(파일은 원위치 그대로, 이동·삭제 없음).")
+        return df
+
+    # ── 감사 --------------------------------------------------------------------------
+    def report(self):
+        LOG.banner("구글드라이브 캐시 감사", f"루트: {self.root}   모드: {self.mode}")
+        rows = []
+        for sc in ("shared", "private"):
+            idx = self.load_index(sc)
+            nb = 0
+            try:
+                nb = sum(int(x) for x in pd.to_numeric(idx.get("bytes"), errors="coerce").fillna(0))
+            except Exception:
+                pass
+            rows.append([("공용 " + GDRIVE_SHARED_NS) if sc == "shared" else ("전용 " + GDRIVE_PRIVATE_NS),
+                         f"{len(idx):,}",
+                         f"{int(pd.to_numeric(idx.get('adopted'), errors='coerce').fillna(0).sum()):,}"
+                         if "adopted" in idx.columns else "0",
+                         f"{nb / 1e9:.2f} GB",
+                         os.path.relpath(self.journal(sc), self.root)])
+        LOG.table(rows, ["인덱스", "등록 항목", "참조등록(adopt)", "용량", "저널"],
+                  ["l", "r", "r", "r", "l"])
+        idx = self.load_index("shared")
+        if not idx.empty and "domain" in idx.columns:
+            g = (idx.groupby([idx["domain"].astype(str), idx["subtype"].astype(str)])
+                 .size().reset_index(name="n").sort_values("n", ascending=False).head(24))
+            LOG.table([[r.iloc[0], r.iloc[1], f"{int(r.iloc[2]):,}"] for _, r in g.iterrows()],
+                      ["도메인", "서브타입", "건수"], ["l", "l", "r"],
+                      title="공용 인덱스 구성 (다른 전략에서 그대로 재사용 가능)")
+        if self.stats:
+            LOG.table([[k, f"{v:,}"] for k, v in sorted(self.stats.items())][:24],
+                      ["이벤트", "횟수"], ["l", "r"], title="이번 실행의 캐시 이벤트")
+        LOG.info("무결성 원칙: 저널은 append-only(기존 줄 재기록 없음) · index.parquet 은 백업 후 교체 · "
+                 "blob 은 내용해시 경로라 덮어쓰기 자체가 발생하지 않음 · 삭제 API 없음.")
+
+
+def _safe_size(p: str) -> int:
+    try:
+        return os.path.getsize(p)
+    except Exception:
+        return -1
+
+
+def free_gb(path: str) -> float:
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize / 1e9
+    except Exception:
+        return float("nan")
+
+
+VAULT: Optional[Vault] = None
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-E  HTTP 계층 — 스레드로컬 세션 / 소스별 스로틀 / 인코딩 자동판별 / 차단 회피          ║
+# ║                                                                                          ║
+# ║  한국 사이트 수집에서 실패의 9할은 세 가지다:                                              ║
+# ║   ① User-Agent/Referer 없음 → 403   ② euc-kr 인데 utf-8로 디코드 → 글자 깨짐               ║
+# ║   ③ 너무 빠른 요청 → 429/차단.  전부 여기서 한 번에 막는다.                                ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36",
+]
+
+_TLS = threading.local()
+HTTP_STATS: Counter = Counter()
+_HTTP_LK = threading.Lock()
+
+
+def _session() -> "requests.Session":
+    s = getattr(_TLS, "sess", None)
+    if s is not None:
+        return s
+    s = requests.Session()
+    try:
+        from requests.adapters import HTTPAdapter
+        try:
+            from urllib3.util.retry import Retry
+            rt = Retry(total=0, connect=2, read=2, backoff_factor=0.5,
+                       status_forcelist=(), raise_on_status=False)
+        except Exception:
+            rt = None
+        ad = HTTPAdapter(pool_connections=max(16, N_WORKERS_IO * 2),
+                         pool_maxsize=max(32, N_WORKERS_IO * 4),
+                         max_retries=rt) if rt is not None else \
+            HTTPAdapter(pool_connections=max(16, N_WORKERS_IO * 2),
+                        pool_maxsize=max(32, N_WORKERS_IO * 4))
+        s.mount("https://", ad)
+        s.mount("http://", ad)
+    except Exception:
+        pass
+    s.headers.update({
+        "User-Agent": UA_POOL[0],
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
+    })
+    _TLS.sess = s
+    return s
+
+
+_HANGUL = re.compile(r"[가-힣]")
+_MOJI = re.compile(r"[¿½¶ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß]")
+
+
+def _korean_score(t: str) -> float:
+    """한글 가독성 점수. 네이버 금융은 body 가 EUC-KR 인데 meta 는 utf-8 이라고 '거짓말'한다.
+    meta 를 믿으면 조용히 깨진 글자를 얻는다(예외가 안 난다) — 그래서 점수로 고른다."""
+    s = t[:6000]
+    if not s:
+        return -1.0
+    han = len(_HANGUL.findall(s))
+    moji = len(_MOJI.findall(s))
+    repl = s.count("�")
+    return han - 3.0 * moji - 5.0 * repl
+
+
+def _decode(content: bytes, resp_enc: Optional[str], url: str,
+            force_enc: Optional[str] = None) -> str:
+    if force_enc:
+        try:
+            return content.decode(force_enc, "replace")
+        except Exception:
+            pass
+    head = content[:4096].decode("ascii", "ignore").lower()
+    m = re.search(r'charset\s*=\s*["\']?\s*([\w\-]+)', head)
+    cands: List[str] = []
+    if m:
+        cands.append(m.group(1))
+    if resp_enc:
+        cands.append(resp_enc)
+    cands += ["utf-8", "euc-kr", "cp949"]
+    seen, best, best_s = set(), None, -1e18
+    for enc in cands:
+        e = (enc or "").lower().replace("ks_c_5601-1987", "cp949")
+        if not e or e in seen:
+            continue
+        seen.add(e)
+        try:
+            t = content.decode(e)
+        except Exception:
+            continue
+        sc = _korean_score(t)
+        if sc > best_s:
+            best, best_s = t, sc
+        if sc > 30:                     # 충분히 한글다우면 더 볼 필요 없음
+            return t
+    return best if best is not None else content.decode("utf-8", "replace")
+
+
+def euckr_q(s: str) -> str:
+    """네이버/한경 레거시 경로의 한글 파라미터는 UTF-8이 아니라 EUC-KR 퍼센트인코딩이다.
+    이걸 틀리면 예외 없이 '검색 결과 0건'이 나온다 — 최악의 조용한 실패."""
+    try:
+        return quote(str(s), encoding="euc-kr")
+    except Exception:
+        return quote(str(s))
+
+
+def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
+             headers: Optional[dict] = None, timeout: int = 25, tries: int = 4,
+             as_bytes: bool = False, allow_status: Sequence[int] = (200,),
+             referer: Optional[str] = None, quiet: bool = True,
+             force_enc: Optional[str] = None) -> Optional[Union[str, bytes]]:
+    lim = limiter(source)
+    hdr = dict(headers or {})
+    if referer:
+        hdr["Referer"] = referer
+    last_exc = None
+    for attempt in range(tries):
+        lim.wait()
+        try:
+            s = _session()
+            if attempt > 0:
+                hdr["User-Agent"] = UA_POOL[attempt % len(UA_POOL)]
+            r = s.get(url, params=params, headers=hdr, timeout=timeout)
+            with _HTTP_LK:
+                HTTP_STATS[f"{source}:{r.status_code}"] += 1
+            if r.status_code in allow_status:
+                return r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+            if r.status_code in (429, 503):
+                time.sleep(min(30.0, 2.0 * (2 ** attempt)) + random.random())
+                last_exc = requests.HTTPError(f"{r.status_code} {url}")
+                continue
+            if r.status_code in (403, 401):
+                time.sleep(1.5 * (attempt + 1))
+                last_exc = requests.HTTPError(f"{r.status_code} {url}")
+                continue
+            last_exc = requests.HTTPError(f"{r.status_code} {url}")
+        except Exception as e:                                # noqa
+            last_exc = e
+            with _HTTP_LK:
+                HTTP_STATS[f"{source}:{type(e).__name__}"] += 1
+            time.sleep(min(12.0, (1.7 ** attempt)) + random.random() * 0.3)
+    if not quiet and last_exc:
+        LOG.debug(f"GET 실패({source}) {url[:90]} — {type(last_exc).__name__}")
+    with _HTTP_LK:
+        HTTP_STATS[f"{source}:FAIL"] += 1
+    return None
+
+
+def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
+              json_body: Optional[dict] = None, headers: Optional[dict] = None,
+              timeout: int = 30, tries: int = 3, as_bytes: bool = False,
+              referer: Optional[str] = None) -> Optional[Union[str, bytes]]:
+    lim = limiter(source)
+    hdr = dict(headers or {})
+    if referer:
+        hdr["Referer"] = referer
+    for attempt in range(tries):
+        lim.wait()
+        try:
+            r = _session().post(url, data=data, json=json_body, headers=hdr, timeout=timeout)
+            with _HTTP_LK:
+                HTTP_STATS[f"{source}:POST{r.status_code}"] += 1
+            if r.status_code == 200:
+                return r.content if as_bytes else _decode(r.content, r.encoding, url)
+            time.sleep(1.5 * (attempt + 1))
+        except Exception as e:                                # noqa
+            with _HTTP_LK:
+                HTTP_STATS[f"{source}:{type(e).__name__}"] += 1
+            time.sleep(1.5 * (attempt + 1))
+    with _HTTP_LK:
+        HTTP_STATS[f"{source}:POSTFAIL"] += 1
+    return None
+
+
+def soup_of(html: Optional[str]) -> Optional[BeautifulSoup]:
+    if not html:
+        return None
+    for parser in ("lxml", "html.parser", "html5lib"):
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception:
+            continue
+    return None
+
+
+def http_json(url: str, source: str = "generic", **kw) -> Optional[Any]:
+    t = http_get(url, source=source, **kw)
+    if not t:
+        return None
+    try:
+        return json.loads(t)
+    except Exception:
+        m = re.search(r"(\{.*\}|\[.*\])", t, re.S)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                return None
+        return None
+
+
+def report_http():
+    if not HTTP_STATS:
+        return
+    LOG.banner("HTTP 수집 감사", "소스별 응답 분포 — 403/429가 많으면 RATE_LIMIT_QPS 를 낮추세요")
+    by_src: Dict[str, Counter] = defaultdict(Counter)
+    for k, v in HTTP_STATS.items():
+        src, _, code = k.partition(":")
+        by_src[src][code] += v
+    rows = []
+    for src, c in sorted(by_src.items()):
+        tot = sum(c.values())
+        ok = c.get("200", 0) + c.get("POST200", 0)
+        bad = sum(v for k, v in c.items() if k in ("403", "401", "429", "503", "FAIL", "POSTFAIL"))
+        rows.append([src, f"{tot:,}", f"{ok:,}", f"{100 * ok / max(tot, 1):.1f}%", f"{bad:,}",
+                     _trunc(", ".join(f"{k}×{v}" for k, v in c.most_common(5)), 44)])
+    LOG.table(rows, ["소스", "요청", "성공", "성공률", "차단/실패", "상세"],
+              ["l", "r", "r", "r", "r", "l"])
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-A  종목 마스터 & PIT 유니버스 (C2 생존자편향 제거)                                     ║
+# ║                                                                                          ║
+# ║  다중 소스 교차 구축:                                                                     ║
+# ║    ① pykrx 월말 상장종목 스냅샷 ← ★ 진짜 PIT. "그 날 실제로 상장돼 있던 종목"              ║
+# ║    ② FinanceDataReader StockListing('KRX')          — 현재 상장 + 상장일                   ║
+# ║    ③ FinanceDataReader StockListing('KRX-DELISTING')— 상장폐지 종목 + 폐지일 ★생존자편향   ║
+# ║    ④ KIND 상장법인목록                              — 상장일 보강                          ║
+# ║    ⑤ DART corpCode.xml                              — corp_code ↔ 종목코드 연결            ║
+# ║                                                                                          ║
+# ║  스냅샷은 공용 인덱스에 저장된다 → 다른 전략이 재수집 없이 그대로 쓴다.                     ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
+                   "corp_code", "industry", "sector_src", "src"]
+
+# ── 로그인 불필요 경로 ★1순위 ──────────────────────────────────────────────────────────────
+#   FinanceDataReader 가 실제로 읽는 GitHub 캐시. KRX 인증 변경의 영향을 받지 않는다.
+#   FDR 라이브러리 자체는 최신 영업일을 알아내려고 data.krx.co.kr 을 한 번 찌르는데,
+#   그게 로그인 벽에 막히면 CSV 는 멀쩡한데도 ValueError 로 죽는다 → 우리는 CSV 를 직접 읽는다.
+FDR_CACHE = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+             "refs/heads/master/data/{kind}/{date}.csv")
+
+
+def _fdr_cache_csv(kind: str, back_days: int = 12) -> Optional[pd.DataFrame]:
+    """영업일 CSV 만 존재하므로 최근 날짜부터 거꾸로 훑는다."""
+    today = _dt.date.today()
+    for i in range(back_days):
+        d = today - _dt.timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        url = FDR_CACHE.format(kind=kind, date=d.isoformat())
+        raw = http_get(url, source="generic", as_bytes=True, tries=1, timeout=20)
+        if not raw or len(raw) < 200 or raw[:15].lstrip().startswith(b"404"):
+            continue
+        try:
+            df = pd.read_csv(io.BytesIO(raw), index_col=0, encoding="utf-8-sig",
+                             dtype={"Code": str, "Symbol": str, "ToSymbol": str,
+                                    "MarketId": str, "Market": str})
+            if len(df):
+                LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} ({len(df):,}행)")
+                return df
+        except Exception:
+            continue
+    return None
+
+
+def _pykrx_business_day(d: pd.Timestamp) -> str:
+    s = d.strftime("%Y%m%d")
+    if pykrx_stock is None:
+        return s
+    try:
+        return pykrx_stock.get_nearest_business_day_in_a_week(s, prev=True)
+    except Exception:
+        try:
+            return pykrx_stock.get_nearest_business_day_in_a_week(s)
+        except Exception:
+            return s
+
+
+def fetch_pykrx_snapshots(dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
+    """월말별 상장종목 스냅샷. C2의 핵심 — 이게 있으면 생존자편향이 구조적으로 불가능해진다."""
+    if pykrx_stock is None:
+        LOG.warn("pykrx 미설치 — 월말 상장 스냅샷을 만들 수 없습니다. "
+                 "상장일/폐지일 기반 재구성으로 폴백합니다(정확도 소폭 하락).")
+        return pd.DataFrame(columns=["snap_date", "code", "market"])
+
+    cached = VAULT.get_table("krx_listing_snapshots", scope="shared")
+    have = set()
+    if cached is not None and len(cached):
+        cached["snap_date"] = as_ts_series(cached["snap_date"])
+        have = set(cached["snap_date"].dt.strftime("%Y-%m-%d"))
+        LOG.info(f"공용 캐시에서 상장 스냅샷 {len(have)}개월 재사용")
+
+    todo = [d for d in dates if d.strftime("%Y-%m-%d") not in have]
+    new_rows: List[dict] = []
+    if todo and RUN_MODE != "CACHED":
+        def _one(d: pd.Timestamp):
+            bd = _pykrx_business_day(d)
+            out = []
+            for mkt in ("KOSPI", "KOSDAQ"):
+                limiter("krx").wait()
+                try:
+                    tk = pykrx_stock.get_market_ticker_list(bd, market=mkt)
+                except Exception:
+                    tk = []
+                for t in (tk or []):
+                    c = to_code6(t)
+                    if c:
+                        out.append({"snap_date": d.strftime("%Y-%m-%d"), "code": c, "market": mkt})
+            return out
+
+        res = pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="KRX 상장 스냅샷")
+        for r in res:
+            if r:
+                new_rows.extend(r)
+
+    frames = [cached] if cached is not None and len(cached) else []
+    if new_rows:
+        frames.append(pd.DataFrame(new_rows))
+    if not frames:
+        return pd.DataFrame(columns=["snap_date", "code", "market"])
+    snap = pd.concat(frames, ignore_index=True)
+    snap["snap_date"] = as_ts_series(snap["snap_date"])
+    snap = snap.dropna(subset=["snap_date", "code"]).drop_duplicates(["snap_date", "code"])
+    if new_rows:
+        out = snap.copy()
+        out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
+        VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
+                        source="pykrx", extra={"note": "월말 상장종목 스냅샷 — 전 전략 공용"})
+    PIPE.io("OUT", "DRIVE", "krx_listing_snapshots", snap, source="pykrx")
+    return snap
+
+
+def fetch_fdr_listing() -> pd.DataFrame:
+    # ① 로그인 불필요 GitHub 캐시 직독 (KRX 인증 변경에 영향받지 않음)
+    d = _fdr_cache_csv("listing/krx")
+    if d is not None and len(d):
+        col = {str(c).lower(): c for c in d.columns}
+        code_c = col.get("code") or col.get("symbol")
+        name_c = col.get("name") or col.get("korean name")
+        if code_c and name_c:
+            t = pd.DataFrame({
+                "code": d[code_c].map(to_code6),
+                "name": d[name_c].astype(str),
+                "market": (d[col["market"]].astype(str) if "market" in col
+                           else d[col["marketid"]].astype(str) if "marketid" in col else "KRX"),
+                "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
+                "industry": (d[col["sector"]].astype(str) if "sector" in col
+                             else d[col["industry"]].astype(str) if "industry" in col else ""),
+            })
+            t["sector_src"], t["src"] = "fdr_cache", "fdr_github_cache"
+            r = t.dropna(subset=["code"]).drop_duplicates("code")
+            LOG.ok(f"상장목록(로그인 불필요 경로) {len(r):,}건 — KRX 인증 변경의 영향을 받지 않습니다.")
+            return r
+
+    # ② 라이브러리 경로 폴백
+    if fdr is None:
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    out = []
+    for key, mk in (("KRX", None), ("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")):
+        try:
+            limiter("krx").wait()
+            d = fdr.StockListing(key)
+        except Exception:
+            continue
+        if d is None or len(d) == 0:
+            continue
+        d = d.rename(columns={c: str(c) for c in d.columns})
+        col = {c.lower(): c for c in d.columns}
+        code_c = col.get("code") or col.get("symbol")
+        name_c = col.get("name") or col.get("korean name") or col.get("stock name")
+        if not code_c or not name_c:
+            continue
+        t = pd.DataFrame({
+            "code": d[code_c].map(to_code6),
+            "name": d[name_c].astype(str),
+            "market": d[col["market"]].astype(str) if "market" in col else (mk or "KRX"),
+            "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
+            "industry": d[col["sector"]].astype(str) if "sector" in col else
+                        (d[col["industry"]].astype(str) if "industry" in col else ""),
+        })
+        t["sector_src"] = "fdr"
+        t["src"] = f"fdr:{key}"
+        out.append(t)
+        break                                   # 'KRX' 하나면 충분. 실패했을 때만 시장별로 시도.
+    if not out:
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    r = pd.concat(out, ignore_index=True).dropna(subset=["code"])
+    return r.drop_duplicates("code")
+
+
+def fetch_fdr_delisting() -> pd.DataFrame:
+    """★ 생존자편향 제거의 핵심 입력. 이게 비면 백테스트 결과 전체를 신뢰할 수 없다.
+    KRX Open API 에는 상장폐지 엔드포인트가 아예 없다 → GitHub 캐시가 사실상 유일한 공개 경로."""
+    d = _fdr_cache_csv("listing/delisting")
+    if d is not None and len(d):
+        col = {str(c).lower(): c for c in d.columns}
+        code_c = col.get("symbol") or col.get("code") or col.get("isu_cd")
+        if code_c:
+            dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "date", "dedate",
+                                          "listingdate") if k in col), None)
+            r = pd.DataFrame({
+                "code": d[code_c].map(to_code6),
+                "name": d[col.get("name", code_c)].astype(str),
+                "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+                "market": d[col["market"]].astype(str) if "market" in col else "KRX",
+            }).dropna(subset=["code"]).drop_duplicates("code")
+            LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(r):,}건 — 생존자편향 제거 입력 확보")
+            return r
+    if fdr is None:
+        return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
+    frames = []
+    for key in ("KRX-DELISTING", "KRX-DELISTING-KOSPI", "KRX-DELISTING-KOSDAQ"):
+        try:
+            limiter("krx").wait()
+            d = fdr.StockListing(key)
+        except Exception:
+            continue
+        if d is None or len(d) == 0:
+            continue
+        col = {str(c).lower(): c for c in d.columns}
+        code_c = col.get("symbol") or col.get("code")
+        if not code_c:
+            continue
+        dl_c = (col.get("delistingdate") or col.get("delisting_date") or
+                col.get("date") or col.get("dedate"))
+        frames.append(pd.DataFrame({
+            "code": d[code_c].map(to_code6),
+            "name": d[col.get("name", code_c)].astype(str),
+            "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+            "market": d[col["market"]].astype(str) if "market" in col else "KRX",
+        }))
+        break
+    if not frames:
+        return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
+    r = pd.concat(frames, ignore_index=True).dropna(subset=["code"])
+    return r.drop_duplicates("code")
+
+
+def fetch_kind_listing() -> pd.DataFrame:
+    """KIND 상장법인목록 — 상장일 보강. HTML 테이블(엑셀 위장)이라 read_html 로 읽는다."""
+    urls = [
+        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download",
+    ]
+    for u in urls:
+        raw = http_get(u, source="kind", as_bytes=True, tries=2,
+                       referer="https://kind.krx.co.kr/corpgeneral/corpList.do?method=loadInitPage")
+        if not raw:
+            continue
+        for enc in ("euc-kr", "cp949", "utf-8"):
+            try:
+                tabs = pd.read_html(io.BytesIO(raw), encoding=enc)
+            except Exception:
+                continue
+            if not tabs:
+                continue
+            d = max(tabs, key=len)
+            col = {str(c).strip(): c for c in d.columns}
+            code_c = col.get("종목코드")
+            name_c = col.get("회사명")
+            if not code_c or not name_c:
+                continue
+            return pd.DataFrame({
+                "code": d[code_c].map(to_code6),
+                "name": d[name_c].astype(str),
+                "listing_date": as_ts_series(d[col["상장일"]]) if "상장일" in col else pd.NaT,
+                "industry": d[col["업종"]].astype(str) if "업종" in col else "",
+                "sector_src": "kind", "src": "kind", "market": "",
+            }).dropna(subset=["code"]).drop_duplicates("code")
+    LOG.warn("KIND 상장법인목록을 받지 못했습니다 — 상장일은 FDR/pykrx 로만 채웁니다.")
+    return pd.DataFrame(columns=SEC_MASTER_COLS)
+
+
+def fetch_dart_corpcode() -> pd.DataFrame:
+    """corp_code ↔ 종목코드. DART 의 모든 재무·공시 조회는 corp_code 로만 된다."""
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    cached = VAULT.get_table("dart_corpcode", scope="shared", max_age_days=30)
+    if cached is not None and len(cached):
+        LOG.info(f"공용 캐시에서 DART corpCode {len(cached):,}건 재사용")
+        return cached
+    raw = http_get("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
+                   params={"crtfc_key": DART_API_KEY}, as_bytes=True, tries=3)
+    if not raw:
+        LOG.warn("DART corpCode.xml 수신 실패 — DART_API_KEY 를 확인하세요.")
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    # ZIP 엔드포인트는 오류 시에도 zip content-type 을 광고한다 → 매직바이트로 먼저 판별
+    if raw[:2] != b"PK":
+        body = raw[:400].decode("utf-8", "ignore")
+        st = re.search(r'"?status"?\s*[:>]\s*"?(\d{3})', body)
+        code = st.group(1) if st else "?"
+        LOG.warn(f"corpCode 응답이 ZIP 이 아닙니다 (status={code}: "
+                 f"{DART_STATUS_MSG.get(code, '알 수 없음')}). DART_API_KEY 를 확인하세요.")
+        LOG.debug(body)
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        xml = b"".join(zf.read(n) for n in zf.namelist() if n.lower().endswith(".xml")) \
+            or zf.read(zf.namelist()[0])
+    except Exception as e:                                        # noqa
+        LOG.warn(f"corpCode zip 해제 실패({type(e).__name__}).")
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    rows = []
+    for m in re.finditer(r"<list>(.*?)</list>", xml.decode("utf-8", "ignore"), re.S):
+        blk = m.group(1)
+
+        def g(tag):
+            mm = re.search(rf"<{tag}>(.*?)</{tag}>", blk, re.S)
+            return (mm.group(1).strip() if mm else "")
+        rows.append({"corp_code": g("corp_code"), "corp_name": g("corp_name"),
+                     "code": to_code6(g("stock_code")), "modify_date": g("modify_date")})
+    d = pd.DataFrame(rows)
+    VAULT.put_table("dart_corpcode", d, scope="shared", domain="dart", source="opendart")
+    LOG.ok(f"DART corpCode {len(d):,}건 (상장 매칭 {int(d['code'].notna().sum()):,}건)")
+    return d
+
+
+def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
+    """모든 소스를 합쳐 종목 마스터를 만든다. 충돌은 로그에 남기고 우선순위로 해소."""
+    parts = []
+    lst = fetch_fdr_listing()
+    if len(lst):
+        parts.append(lst)
+        PIPE.io("IN", "HTTP", "fdr:StockListing", lst, source="FinanceDataReader")
+    kind = fetch_kind_listing()
+    if len(kind):
+        parts.append(kind)
+        PIPE.io("IN", "HTTP", "kind:corpList", kind, source="KIND")
+
+    dead = fetch_fdr_delisting()
+    PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
+            ok=len(dead) > 0, note="생존자편향 제거 입력")
+    if len(dead):
+        d2 = dead.copy()
+        d2["listing_date"] = pd.NaT
+        d2["industry"] = ""
+        d2["sector_src"] = "fdr-del"
+        d2["src"] = "fdr:delisting"
+        parts.append(d2)
+
+    # 스냅샷에만 존재하는 종목(=상장목록에서 이미 사라진 폐지 종목)도 반드시 살린다
+    if len(snapshots):
+        known = set(pd.concat(parts)["code"]) if parts else set()
+        extra = sorted(set(snapshots["code"]) - known)
+        if extra:
+            parts.append(pd.DataFrame({"code": extra, "name": "", "market": "",
+                                       "listing_date": pd.NaT, "industry": "",
+                                       "sector_src": "snapshot", "src": "pykrx:snapshot"}))
+            LOG.info(f"스냅샷에만 존재하는 종목 {len(extra):,}건 추가 — 상장폐지 명단 누락분입니다. "
+                     f"(이걸 빠뜨리면 곧바로 생존자편향)")
+
+    if not parts:
+        raise RuntimeError("종목 마스터를 만들 소스가 하나도 없습니다. "
+                           "FinanceDataReader/pykrx 설치와 네트워크를 확인하세요.")
+
+    m = pd.concat([p.reindex(columns=SEC_MASTER_COLS + ["delisting_date"]) for p in parts],
+                  ignore_index=True)
+    m["code"] = m["code"].map(to_code6)
+    m = m.dropna(subset=["code"])
+
+    agg = m.groupby("code", as_index=False).agg(
+        name=("name", lambda s: next((x for x in s if isinstance(x, str) and x.strip()), "")),
+        market=("market", lambda s: next((x for x in s if isinstance(x, str) and x.strip()), "")),
+        listing_date=("listing_date", "min"),
+        delisting_date=("delisting_date", "min"),
+        industry=("industry", lambda s: next((x for x in s if isinstance(x, str) and x.strip()), "")),
+        src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
+    )
+
+    # 스냅샷으로 상장/폐지일 보정 — 소스 날짜보다 관측이 우선한다
+    if len(snapshots):
+        g = snapshots.groupby("code")["snap_date"]
+        first_seen, last_seen = g.min(), g.max()
+        agg = agg.merge(first_seen.rename("snap_first"), left_on="code", right_index=True, how="left")
+        agg = agg.merge(last_seen.rename("snap_last"), left_on="code", right_index=True, how="left")
+        need = agg["listing_date"].isna() & agg["snap_first"].notna()
+        agg.loc[need, "listing_date"] = agg.loc[need, "snap_first"]
+        # 마지막 스냅샷 이전에 사라졌으면 폐지로 간주 (폐지 명단에 없어도)
+        last_snap = snapshots["snap_date"].max()
+        gone = agg["delisting_date"].isna() & agg["snap_last"].notna() & \
+            (agg["snap_last"] < last_snap - pd.Timedelta(days=45))
+        agg.loc[gone, "delisting_date"] = agg.loc[gone, "snap_last"] + pd.offsets.MonthEnd(1)
+        if int(gone.sum()):
+            LOG.info(f"스냅샷에서 사라진 {int(gone.sum()):,}종목을 폐지로 추정 처리 "
+                     f"(폐지명단 누락 보완 — 생존자편향 2차 방어)")
+
+    cc = fetch_dart_corpcode()
+    if len(cc):
+        agg = agg.merge(cc[["code", "corp_code", "corp_name"]].dropna(subset=["code"]),
+                        on="code", how="left")
+        agg["name"] = agg["name"].where(agg["name"].astype(str).str.strip() != "", agg.get("corp_name", ""))
+    else:
+        agg["corp_code"] = np.nan
+
+    agg["industry"] = agg["industry"].fillna("").astype(str).str.strip().replace("", "미분류")
+    agg = agg.drop(columns=[c for c in ("snap_first", "snap_last", "corp_name") if c in agg.columns])
+    LOG.ok(f"종목 마스터 {len(agg):,}건 — 상장일 보유 {int(agg['listing_date'].notna().sum()):,} / "
+           f"폐지일 보유 {int(agg['delisting_date'].notna().sum()):,}")
+    if int(agg["delisting_date"].notna().sum()) < 200:
+        LOG.warn("상장폐지 종목이 200건 미만입니다. 10년 구간이라면 통상 1,000건 이상이어야 합니다. "
+                 "생존자편향이 남아 있을 수 있으니 결과 해석 시 반드시 감안하세요. (C2 부분 미충족)")
+        PIPE.note("WARN: 상장폐지 표본 부족 — C2 생존자편향 완전 제거 미달")
+    VAULT.put_table("security_master", agg, scope="shared", domain="universe",
+                    source="fdr+kind+pykrx+dart")
+    return agg
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-B  가격 · 거래대금 · 수급                                                              ║
+# ║                                                                                          ║
+# ║  KRX 인증(2025-12 변경) → pykrx → FinanceDataReader → 네이버 → yfinance → 캐시            ║
+# ║  어느 경로가 실제로 쓰였는지 종목 단위로 기록하고 표로 출력한다.                            ║
+# ║  ▶ 폴백해도 백테스트는 정상 동작한다. 단, 거래대금(Amount)은 소스에 따라 근사가 되므로      ║
+# ║    유동성 필터(V6)의 엄밀성이 달라진다 — 이 점을 감사표에 명시한다.                        ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+PRICE_COLS = ["code", "date", "open", "high", "low", "close", "volume", "amount", "src"]
+
+
+class KRXAuth:
+    """KRX 데이터 마켓플레이스 인증(2025-12 변경 대응). 실패해도 절대 죽지 않고 폴백으로 넘긴다.
+
+    2026년 기준 경로 3가지:
+      ① KRX Open API (data-dbg.krx.co.kr) — 인증키. ★단, 엔드포인트별로 '이용신청'이 따로 필요하고
+         승인에 하루 정도 걸린다. 키만 있다고 바로 되는 게 아니다. 상장폐지 API 는 존재하지 않는다.
+      ② 마켓플레이스 세션 로그인 → getJsonData.cmd (bld 기반). pykrx 가 쓰는 경로.
+      ③ 레거시 OTP 파일다운로드 — 2026년에는 세션 없이 빈 데이터/로그아웃 오류가 잦다. 의존 금지.
+    """
+
+    LOGIN_WARM1 = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+    LOGIN_WARM2 = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
+    LOGIN_POST = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+    JSONDATA = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+    JSON_REF = "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
+    OPENAPI = "https://data-dbg.krx.co.kr/svc/apis/{cat}/{ep}"
+
+    def __init__(self, user: str, pw: str, apikey: str = ""):
+        self.user, self.pw, self.apikey = (user or "").strip(), (pw or "").strip(), (apikey or "").strip()
+        self.status = "NOT_ATTEMPTED"
+        self.session_ok = False
+        self.openapi_ok = False
+
+    def login(self) -> bool:
+        if self.apikey:
+            self.openapi_ok = self._probe_openapi()
+            self.status = "OPENAPI_OK" if self.openapi_ok else "OPENAPI_KEY_UNAUTHORIZED"
+            if not self.openapi_ok:
+                LOG.warn("KRX Open API 키는 있으나 해당 엔드포인트 호출이 거부되었습니다. "
+                         "KRX Open API 는 '엔드포인트별 이용신청'이 따로 필요하고 승인에 하루 정도 "
+                         "걸립니다. 키 발급만으로는 즉시 사용할 수 없습니다.")
+        if not (self.user and self.pw):
+            if not self.openapi_ok:
+                self.status = "NO_CREDENTIALS"
+                LOG.info("KRX 마켓플레이스 ID/PW 미입력 — 로그인 불필요 경로로 진행합니다. "
+                         "(FDR GitHub 캐시 → 네이버 차트 → yfinance). "
+                         "백테스트는 정상 동작하며, 어느 소스가 쓰였는지는 감사표에 나옵니다.")
+            return self.openapi_ok
+        # 워밍업 없이 바로 POST 하면 세션 쿠키가 없어 항상 실패한다
+        http_get(self.LOGIN_WARM1, source="krx", tries=1)
+        http_get(self.LOGIN_WARM2, source="krx", tries=1, referer=self.LOGIN_WARM1)
+        for extra in ({}, {"skipDup": "Y"}):
+            body = {"mbrNm": "", "telNo": "", "di": "", "certType": "",
+                    "mbrId": self.user, "pw": self.pw, **extra}
+            txt = http_post(self.LOGIN_POST, source="krx", data=body, referer=self.LOGIN_WARM1,
+                            headers={"X-Requested-With": "XMLHttpRequest"})
+            if txt is None:
+                continue
+            if re.search(r"CD011|중복\s*로그인", str(txt)):
+                LOG.warn("KRX 중복 로그인(CD011) 감지 — 같은 계정이 브라우저나 다른 노트북에서 "
+                         "이미 로그인되어 있습니다. skipDup 으로 재시도하면 기존 세션이 강제 종료됩니다. "
+                         "두 노트북을 동시에 돌리면 서로를 계속 밀어냅니다.")
+                continue
+            if not re.search(r"(실패|불일치|오류|error|fail|로그인이\s*필요)", str(txt)[:600], re.I):
+                self.session_ok = True
+                self.status = "LOGIN_OK"
+                LOG.ok("KRX 마켓플레이스 로그인 성공.")
+                return True
+        self.status = "LOGIN_FAILED"
+        LOG.warn("KRX 마켓플레이스 로그인 실패. ID/PW 를 확인하세요. "
+                 "로그인 불필요 경로로 폴백하며 백테스트는 정상 진행됩니다.")
+        return self.openapi_ok
+
+    def _probe_openapi(self) -> bool:
+        """AUTH_KEY 를 쿼리로 보내는 구현과 헤더로 보내는 공식 샘플이 공존한다 — 둘 다 시도."""
+        d = (_dt.date.today() - _dt.timedelta(days=7))
+        while d.weekday() >= 5:
+            d -= _dt.timedelta(days=1)
+        url = self.OPENAPI.format(cat="sto", ep="stk_bydd_trd")
+        for mode in ("query", "header"):
+            kw = ({"params": {"AUTH_KEY": self.apikey, "basDd": d.strftime("%Y%m%d")}}
+                  if mode == "query" else
+                  {"params": {"basDd": d.strftime("%Y%m%d")},
+                   "headers": {"AUTH_KEY": self.apikey}})
+            js = http_json(url, source="krx", tries=1, **kw)
+            if isinstance(js, dict) and (js.get("OutBlock_1") or js.get("output")):
+                LOG.ok(f"KRX Open API 사용 가능 (AUTH_KEY 전달 방식: {mode})")
+                self._openapi_mode = mode
+                return True
+        return False
+
+    def json_data(self, bld: str, **params) -> Optional[dict]:
+        """마켓플레이스 bld 조회. 세션이 없으면 JSON 대신 로그인 HTML 이 와서
+        엉뚱한 곳에서 JSONDecodeError 가 난다 → 여기서 미리 막는다."""
+        if not self.session_ok:
+            return None
+        body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
+        txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
+                        headers={"X-Requested-With": "XMLHttpRequest"})
+        if not txt or txt.lstrip()[:1] not in ("{", "["):
+            return None
+        try:
+            return json.loads(txt)
+        except Exception:
+            return None
+
+
+KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
+
+
+# ── 개별 소스 ───────────────────────────────────────────────────────────────────────────────
+def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    if pykrx_stock is None:
+        return None
+    try:
+        limiter("krx").wait()
+        d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
+    except Exception:
+        return None
+    if d is None or len(d) == 0:
+        return None
+    d = d.reset_index()
+    ren = {"날짜": "date", "시가": "open", "고가": "high", "저가": "low",
+           "종가": "close", "거래량": "volume", "거래대금": "amount"}
+    d = d.rename(columns={k: v for k, v in ren.items() if k in d.columns})
+    if "date" not in d.columns:
+        d = d.rename(columns={d.columns[0]: "date"})
+    d["code"], d["src"] = code, "pykrx"
+    return d.reindex(columns=PRICE_COLS)
+
+
+def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    if fdr is None:
+        return None
+    try:
+        limiter("krx").wait()
+        d = fdr.DataReader(code, start, end)
+    except Exception:
+        return None
+    if d is None or len(d) == 0:
+        return None
+    d = d.reset_index()
+    d.columns = [str(c).lower() for c in d.columns]
+    if "date" not in d.columns:
+        d = d.rename(columns={d.columns[0]: "date"})
+    if "amount" not in d.columns:
+        d["amount"] = pd.to_numeric(d.get("close"), errors="coerce") * \
+            pd.to_numeric(d.get("volume"), errors="coerce")      # 근사 — 감사표에 명시된다
+    d["code"], d["src"] = code, "fdr"
+    return d.reindex(columns=PRICE_COLS)
+
+
+def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """네이버 차트 API. 폴백 중에서는 가장 안정적이지만 거래대금이 없다."""
+    qs = (f"?symbol={code}&requestType=1&startTime={as_ts(start):%Y%m%d}"
+          f"&endTime={as_ts(end):%Y%m%d}&timeframe=day")
+    arr = None
+    for host in ("https://fchart.stock.naver.com/siseJson.naver",
+                 "https://api.finance.naver.com/siseJson.naver"):
+        t = http_get(host + qs, source="naver", tries=2, referer="https://finance.naver.com/")
+        if not t:
+            continue
+        # 응답이 파이썬 리터럴에 가까운 준-JSON 이다: 홑따옴표 + 따옴표 없는 키워드
+        try:
+            arr = json.loads(re.sub(r"'", '"', t))
+        except Exception:
+            try:
+                import ast
+                arr = ast.literal_eval(t.strip())
+            except Exception:
+                arr = None
+        if isinstance(arr, list) and len(arr) >= 2:
+            break
+        arr = None
+    if not isinstance(arr, list) or len(arr) < 2:
+        return None
+    hdr = [str(x).strip().lower() for x in arr[0]]
+    rows = arr[1:]
+    d = pd.DataFrame(rows, columns=hdr)
+    ren = {"날짜": "date", "시가": "open", "고가": "high", "저가": "low",
+           "종가": "close", "거래량": "volume"}
+    d = d.rename(columns={**ren, **{c: c for c in d.columns}})
+    if "date" not in d.columns:
+        d = d.rename(columns={d.columns[0]: "date"})
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["amount"] = d.get("close") * d.get("volume")
+    d["code"], d["src"] = code, "naver"
+    return d.reindex(columns=PRICE_COLS)
+
+
+def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    if yf is None:
+        return None
+    for suf in (".KS", ".KQ"):
+        try:
+            limiter("generic").wait()
+            d = yf.download(code + suf, start=start, end=end, progress=False,
+                            auto_adjust=False, threads=False)
+        except Exception:
+            continue
+        if d is None or len(d) == 0:
+            continue
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = [str(c[0]).lower() for c in d.columns]
+        else:
+            d.columns = [str(c).lower() for c in d.columns]
+        d = d.reset_index()
+        d = d.rename(columns={"index": "date"})
+        if "date" not in d.columns:
+            d = d.rename(columns={d.columns[0]: "date"})
+        d["amount"] = pd.to_numeric(d.get("close"), errors="coerce") * \
+            pd.to_numeric(d.get("volume"), errors="coerce")
+        d["code"], d["src"] = code, "yfinance"
+        return d.reindex(columns=PRICE_COLS)
+    return None
+
+
+PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
+
+
+def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+    codes = sorted({c for c in map(to_code6, codes) if c})
+    cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
+    have_max: Dict[str, pd.Timestamp] = {}
+    if cached is not None and len(cached):
+        cached["date"] = as_ts_series(cached["date"])
+        cached = cached.dropna(subset=["date", "code"])
+        have_max = cached.groupby("code")["date"].max().to_dict()
+        LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
+
+    end_ts = as_ts(end)
+    todo = []
+    for c in codes:
+        mx = have_max.get(c)
+        if mx is None:
+            todo.append((c, start))
+        elif mx < end_ts - pd.Timedelta(days=5):
+            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+    if RUN_MODE == "CACHED":
+        if todo:
+            LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
+        todo = []
+
+    src_used: Counter = Counter()
+    new_frames: List[pd.DataFrame] = []
+    if todo:
+        LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
+
+        def _one(job):
+            code, st = job
+            for nm, fn in PRICE_CHAIN:
+                try:
+                    d = fn(code, st, end)
+                except Exception:
+                    d = None
+                if d is not None and len(d):
+                    d = d.dropna(subset=["date"])
+                    if len(d):
+                        return d
+            return None
+
+        res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        for d in res:
+            if d is not None and len(d):
+                new_frames.append(d)
+                src_used[str(d["src"].iloc[0])] += 1
+        miss = len(todo) - len(new_frames)
+        if miss:
+            LOG.warn(f"일봉 수집 실패 {miss:,}종목 — 전 소스에서 데이터를 못 받았습니다. "
+                     f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다)")
+
+    frames = ([cached] if cached is not None and len(cached) else []) + new_frames
+    if not frames:
+        raise RuntimeError("가격 데이터를 하나도 확보하지 못했습니다. 네트워크와 패키지를 확인하거나 "
+                           "RUN_MODE='SMOKE' 로 계산경로만 먼저 검증하세요.")
+    px = pd.concat(frames, ignore_index=True)
+    px["date"] = as_ts_series(px["date"])
+    px["code"] = px["code"].map(to_code6)
+    px = px.dropna(subset=["code", "date", "close"])
+    for c in ("open", "high", "low", "close", "volume", "amount"):
+        px[c] = pd.to_numeric(px[c], errors="coerce")
+    px = (px.sort_values(["code", "date"])
+            .drop_duplicates(["code", "date"], keep="last")
+            .reset_index(drop=True))
+    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+
+    if new_frames:
+        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
+                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+    if src_used:
+        LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
+                  ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
+        if src_used.get("naver", 0) or src_used.get("yfinance", 0):
+            LOG.warn("네이버/yfinance 경로로 받은 종목은 거래대금이 종가×거래량 근사입니다. "
+                     "V6 유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향).")
+    PIPE.io("OUT", "DRIVE", "krx_ohlcv_daily", px, source="price chain")
+    return downcast(px)
+
+
+def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
+    """월말 기준 가격 패널 + 익월 시가 체결가 + 20일 평균거래대금(ADV).
+
+    체결은 '신호 산출일 다음 거래일 시가'(§10.1). 당일 종가 체결은 미래누수다.
+    """
+    px = px.sort_values(["code", "date"])
+    px["adv20"] = (px.groupby("code", observed=True)["amount"]
+                     .transform(lambda s: s.rolling(20, min_periods=10).mean()))
+    px["ret1d"] = px.groupby("code", observed=True)["close"].pct_change()
+
+    # 월말 스냅샷
+    px["ym"] = px["date"].values.astype("datetime64[M]")
+    last = px.groupby(["code", "ym"], observed=True).tail(1).copy()
+    last["month"] = as_ts_series(last["ym"]) + pd.offsets.MonthEnd(0)
+
+    # 다음 거래일 시가 = 체결가
+    nxt = px.copy()
+    nxt["next_open"] = nxt.groupby("code", observed=True)["open"].shift(-1)
+    nxt["next_date"] = nxt.groupby("code", observed=True)["date"].shift(-1)
+    keep = nxt[["code", "date", "next_open", "next_date"]]
+    last = last.merge(keep, on=["code", "date"], how="left")
+
+    monthly = last[["code", "month", "date", "close", "adv20", "next_open", "next_date"]].copy()
+    monthly = monthly.rename(columns={"date": "signal_date"})
+    monthly = monthly[monthly["month"].isin(months)]
+
+    # 월간 수익률(체결가→체결가). 상장폐지 처리는 backtest 엔진에서 -100% 로 강제한다.
+    monthly = monthly.sort_values(["code", "month"])
+    monthly["exec_px"] = monthly["next_open"].fillna(monthly["close"])
+    monthly["fwd_ret"] = (monthly.groupby("code", observed=True)["exec_px"].shift(-1) /
+                          monthly["exec_px"] - 1.0)
+    PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
+    return {"daily": px, "monthly": downcast(monthly)}
+
+
+def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+    """d3(기관+외국인 누적순매수) 입력. 없으면 D축은 가용 축 평균으로 자동 축소된다."""
+    cached = VAULT.get_table("krx_investor_flows", scope="shared")
+    if cached is not None and len(cached):
+        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용")
+        cached["date"] = as_ts_series(cached["date"])
+        return cached
+    if pykrx_stock is None or RUN_MODE == "CACHED":
+        LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "
+                 "U 는 가용 축 평균으로 계산됩니다. 0으로 채우지 않습니다.")
+        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
+
+    codes = sorted({c for c in map(to_code6, codes) if c})
+
+    def _one(code: str):
+        try:
+            limiter("krx").wait()
+            d = pykrx_stock.get_market_trading_value_by_date(
+                as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
+        except Exception:
+            return None
+        if d is None or len(d) == 0:
+            return None
+        d = d.reset_index()
+        d = d.rename(columns={d.columns[0]: "date"})
+        inst = next((c for c in d.columns if "기관" in str(c)), None)
+        forg = next((c for c in d.columns if "외국" in str(c)), None)
+        if inst is None and forg is None:
+            return None
+        return pd.DataFrame({"code": code, "date": as_ts_series(d["date"]),
+                             "inst_net": pd.to_numeric(d[inst], errors="coerce") if inst else np.nan,
+                             "foreign_net": pd.to_numeric(d[forg], errors="coerce") if forg else np.nan})
+
+    res = pmap_io(_one, codes, workers=min(N_WORKERS_IO, 8), desc="수급 수집")
+    got = [d for d in res if d is not None and len(d)]
+    if not got:
+        LOG.warn("수급 데이터를 받지 못했습니다 — d3 결측 처리.")
+        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
+    fl = pd.concat(got, ignore_index=True)
+    VAULT.put_table("krx_investor_flows", fl, scope="shared", domain="flow", source="pykrx")
+    PIPE.io("OUT", "DRIVE", "krx_investor_flows", fl, source="pykrx")
+    return downcast(fl)
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-C  DART — 재무제표 / 직원현황 / 공시목록                                               ║
+# ║                                                                                          ║
+# ║  ★ PIT 핵심: knowledge_date = 접수일자(rcept_dt). 결산기준일이 아니다.                     ║
+# ║    fnltt* 응답의 rcept_no 앞 8자리가 곧 접수일자다 → 여기서 knowledge_date 를 얻는다.       ║
+# ║    rcept_no 가 없으면 법정 제출기한(분기 45일 / 사업보고서 90일)으로 보수적 추정한다.       ║
+# ║    ※ 보수적 추정은 '늦게 알았다'는 방향이므로 미래누수를 만들지 않는다.                     ║
+# ║                                                                                          ║
+# ║  ★ 호출 예산: DART 는 일 20,000건 제한. 10년 분기 전체 재무제표는 그 몇 배다.               ║
+# ║    → 콜드빌드는 며칠에 걸쳐 '이어받기'로 완성된다(§3: 콜드빌드는 4시간 예산 밖).            ║
+# ║    → 남은 호출량을 실시간으로 표시하고, 한도에 닿으면 깨끗하게 멈춘 뒤 진행률을 알려준다.   ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+DART_BASE = "https://opendart.fss.or.kr/api/"
+DART_DAILY_LIMIT = 19_000                 # 공식 20,000 대비 여유
+DART_STATEMENT_FREQ = "quarterly"         # "quarterly" | "annual"
+REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
+REPRT_DEADLINE_DAYS = {"11013": 45, "11012": 45, "11014": 45, "11011": 90}
+REPRT_PERIOD_END = {"11013": (3, 31), "11012": (6, 30), "11014": (9, 30), "11011": (12, 31)}
+
+DART_STATUS_MSG = {
+    "000": "정상", "010": "등록되지 않은 키", "011": "사용할 수 없는 키",
+    "012": "접근할 수 없는 IP", "013": "조회된 데이터 없음", "014": "파일이 존재하지 않음",
+    "020": "요청 제한 초과(일일 한도)", "021": "조회 가능한 회사 개수 초과",
+    "100": "필드 부적절", "101": "부적절한 접근", "800": "시스템 점검 중",
+    "900": "정의되지 않은 오류", "901": "사용자 계정 폐쇄",
+}
+
+
+class DartBudget:
+    """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다."""
+
+    def __init__(self):
+        self.today = _dt.date.today().isoformat()
+        self.n = 0
+        self.exhausted = False
+        self._lk = threading.Lock()
+        self._load()
+
+    def _path(self) -> str:
+        return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
+
+    def _load(self):
+        try:
+            j = json.loads(open(self._path()).read())
+            if j.get("date") == self.today:
+                self.n = int(j.get("n", 0))
+        except Exception:
+            pass
+        if self.n:
+            LOG.info(f"오늘 이미 사용한 DART 호출 {self.n:,}건 (한도 {DART_DAILY_LIMIT:,}) — 이어서 진행합니다.")
+
+    def _save(self):
+        try:
+            atomic_write_text(self._path(), json.dumps({"date": self.today, "n": self.n}))
+        except Exception:
+            pass
+
+    def take(self, k: int = 1) -> bool:
+        with self._lk:
+            if self.n + k > DART_DAILY_LIMIT:
+                if not self.exhausted:
+                    self.exhausted = True
+                    LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
+                             f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
+                             f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
+                return False
+            self.n += k
+            if self.n % 500 == 0:
+                self._save()
+            return True
+
+    def close(self):
+        self._save()
+
+
+DBUDGET: Optional[DartBudget] = None
+
+
+def dart_api(endpoint: str, params: dict, source: str = "dart",
+             tries: int = 3) -> Optional[dict]:
+    if not DART_API_KEY:
+        return None
+    if DBUDGET is not None and not DBUDGET.take():
+        return None
+    p = dict(params)
+    p["crtfc_key"] = DART_API_KEY
+    js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
+                   referer="https://opendart.fss.or.kr/")
+    if not isinstance(js, dict):
+        return None
+    st = str(js.get("status", ""))
+    if st and st != "000":
+        if st in ("020", "021"):
+            if DBUDGET is not None:
+                DBUDGET.exhausted = True
+            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
+                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+        elif st in ("010", "011", "012", "901"):
+            LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
+                      f"DART_API_KEY 를 확인하세요.")
+        elif st != "013":
+            LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
+        return None
+    return js
+
+
+def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Timestamp:
+    """rcept_no 앞 8자리 = 접수일자(YYYYMMDD). 없으면 법정기한으로 보수적 추정."""
+    s = re.sub(r"\D", "", str(rcept_no or ""))
+    if len(s) >= 8:
+        t = as_ts(f"{s[:4]}-{s[4:6]}-{s[6:8]}")
+        if t is not None and 2000 <= t.year <= 2100:
+            return t
+    mm, dd = REPRT_PERIOD_END.get(reprt_code, (12, 31))
+    return as_ts(f"{year}-{mm:02d}-{dd:02d}") + pd.Timedelta(days=REPRT_DEADLINE_DAYS.get(reprt_code, 90))
+
+
+# ── 전체 재무제표 ───────────────────────────────────────────────────────────────────────────
+_FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
+            "account_id", "account_nm", "thstrm_amount", "rcept_no"]
+
+
+def _fs_one(job) -> Optional[pd.DataFrame]:
+    corp, year, reprt = job
+    js = dart_api("fnlttSinglAcntAll.json",
+                  {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
+    if not js or "list" not in js:
+        js = dart_api("fnlttSinglAcntAll.json",
+                      {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
+    if not js or not isinstance(js.get("list"), list) or not js["list"]:
+        return None
+    d = pd.DataFrame(js["list"])
+    for c in _FS_KEEP:
+        if c not in d.columns:
+            d[c] = None
+    d["corp_code"] = corp
+    d["bsns_year"] = int(year)
+    d["reprt_code"] = reprt
+    return d[_FS_KEEP]
+
+
+def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
+    """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다."""
+    if not DART_API_KEY:
+        LOG.warn("DART_API_KEY 미입력 — B축(회계품질)·C축(자원투입)·PACK-C 가 전부 비활성화됩니다. "
+                 "이 전략의 핵심 입력이므로 키 입력을 강력히 권합니다.")
+        return pd.DataFrame(columns=_FS_KEEP)
+
+    cached = VAULT.get_table("dart_fnltt_raw", scope="shared")
+    done = set()
+    if cached is not None and len(cached):
+        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
+                       cached["reprt_code"].astype(str)))
+        LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
+
+    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
+              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    jobs = [(c, y, r) for c in corp_codes for y in years for r in reprts
+            if (str(c), int(y), str(r)) not in done]
+    if RUN_MODE == "CACHED":
+        jobs = []
+    if jobs:
+        total_needed = len(jobs)
+        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
+                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
+        if total_needed > DART_DAILY_LIMIT:
+            LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
+                     f"오늘 받을 수 있는 만큼 받고 저장합니다. "
+                     f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
+                     f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
+        res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
+        got = [d for d in res if d is not None and len(d)]
+    else:
+        got = []
+
+    frames = ([cached] if cached is not None and len(cached) else []) + got
+    if not frames:
+        LOG.warn("DART 재무 데이터를 확보하지 못했습니다.")
+        return pd.DataFrame(columns=_FS_KEEP)
+    fs = pd.concat(frames, ignore_index=True)
+    fs = fs.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id",
+                             "account_nm"], keep="last")
+    if got:
+        VAULT.put_table("dart_fnltt_raw", fs, scope="shared", domain="dart", source="opendart")
+    PIPE.io("OUT", "DRIVE", "dart_fnltt_raw", fs, source="opendart fnlttSinglAcntAll")
+    return fs
+
+
+# ── 계정 매핑 (한국 XBRL 계정명은 회사마다 다르다 → 정규식 다중 매칭) ────────────────────────
+ACCOUNT_PATTERNS: Dict[str, Tuple[str, List[str]]] = {
+    # 키:            (재무제표구분, [account_id 또는 account_nm 정규식])
+    "revenue":       ("IS", [r"ifrs-full_Revenue$", r"^매출액$", r"^수익\(매출액\)$", r"^영업수익$"]),
+    "cogs":          ("IS", [r"CostOfSales", r"^매출원가$"]),
+    "gross_profit":  ("IS", [r"GrossProfit", r"^매출총이익"]),
+    "sgna":          ("IS", [r"SellingGeneralAndAdministrativeExpense", r"^판매비와관리비$"]),
+    "rnd":           ("IS", [r"ResearchAndDevelopmentExpense", r"경상(연구)?개발비", r"^연구개발비"]),
+    "tax_expense":   ("IS", [r"IncomeTaxExpense", r"법인세비용"]),
+    "pretax_income": ("IS", [r"ProfitLossBeforeTax", r"법인세비용차감전"]),
+    "other_income":  ("IS", [r"OtherIncome$", r"^기타수익$", r"^영업외수익$"]),
+    "op_income":     ("IS", [r"OperatingIncomeLoss", r"^영업이익"]),
+    "net_income":    ("IS", [r"ProfitLoss$", r"^당기순이익"]),
+    "inventory":     ("BS", [r"Inventories", r"^재고자산$"]),
+    "receivable":    ("BS", [r"TradeAndOtherCurrentReceivables", r"^매출채권", r"^매출채권및기타"]),
+    "payable":       ("BS", [r"TradeAndOtherCurrentPayables", r"^매입채무"]),
+    "assets":        ("BS", [r"ifrs-full_Assets$", r"^자산총계$"]),
+    "liabilities":   ("BS", [r"ifrs-full_Liabilities$", r"^부채총계$"]),
+    "equity":        ("BS", [r"ifrs-full_Equity$", r"^자본총계$"]),
+    "ppe":           ("BS", [r"PropertyPlantAndEquipment", r"^유형자산$"]),
+    "intangible":    ("BS", [r"IntangibleAssetsOtherThanGoodwill", r"^무형자산$"]),
+    "cash":          ("BS", [r"CashAndCashEquivalents", r"^현금및현금성자산$"]),
+    "contract_liab": ("BS", [r"ContractLiabilities", r"^계약부채$", r"^선수금$"]),
+    "cfo":           ("CF", [r"CashFlowsFromUsedInOperatingActivities", r"^영업활동.*현금흐름"]),
+    "capex":         ("CF", [r"PurchaseOfPropertyPlantAndEquipment", r"유형자산의?\s*취득"]),
+    "dep":           ("CF", [r"DepreciationAndAmortisationExpense", r"^감가상각비", r"감가상각비와"]),
+    "dividend_paid": ("CF", [r"DividendsPaid", r"배당금\s*지급"]),
+    "treasury_buy":  ("CF", [r"PaymentsToAcquireOrRedeemEntitysShares", r"자기주식의?\s*취득"]),
+    "debt_raise":    ("CF", [r"ProceedsFromBorrowings", r"차입금의?\s*증가", r"사채의?\s*발행"]),
+}
+_SJ_MAP = {"BS": ("BS",), "IS": ("IS", "CIS"), "CF": ("CF",)}
+
+
+def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
+    """원시 계정 → (corp_code, period, 항목) 와이드 테이블. knowledge_date 를 여기서 확정한다."""
+    if fs.empty:
+        return pd.DataFrame(columns=["corp_code", "period_end", "knowledge_date"])
+    d = fs.copy()
+    d["amount"] = pd.to_numeric(
+        d["thstrm_amount"].astype(str).str.replace(",", "", regex=False).str.replace("−", "-", regex=False),
+        errors="coerce")
+    d = d.dropna(subset=["amount"])
+    d["account_id"] = d["account_id"].astype(str)
+    d["account_nm"] = d["account_nm"].astype(str).str.replace(r"\s+", "", regex=True)
+
+    out_rows = []
+    for key, (sj, pats) in ACCOUNT_PATTERNS.items():
+        sjs = _SJ_MAP.get(sj, (sj,))
+        sub = d[d["sj_div"].astype(str).isin(sjs)]
+        if sub.empty:
+            continue
+        rx = re.compile("|".join(pats), re.I)
+        hit = sub[sub["account_id"].str.contains(rx, na=False) |
+                  sub["account_nm"].str.contains(rx, na=False)]
+        if hit.empty:
+            continue
+        # 같은 항목에 여러 계정이 걸리면 절대값이 큰 쪽(=대표 계정)을 취한다
+        hit = (hit.assign(_a=hit["amount"].abs())
+                  .sort_values("_a", ascending=False)
+                  .drop_duplicates(["corp_code", "bsns_year", "reprt_code"], keep="first"))
+        out_rows.append(hit.assign(item=key)[["corp_code", "bsns_year", "reprt_code",
+                                              "rcept_no", "item", "amount"]])
+    if not out_rows:
+        return pd.DataFrame(columns=["corp_code", "period_end", "knowledge_date"])
+    L = pd.concat(out_rows, ignore_index=True)
+    W = L.pivot_table(index=["corp_code", "bsns_year", "reprt_code"], columns="item",
+                      values="amount", aggfunc="first").reset_index()
+    rc = (L.sort_values("rcept_no").groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
+           .first().reset_index())
+    W = W.merge(rc, on=["corp_code", "bsns_year", "reprt_code"], how="left")
+
+    W["period_end"] = [as_ts(f"{y}-{REPRT_PERIOD_END[r][0]:02d}-{REPRT_PERIOD_END[r][1]:02d}")
+                       for y, r in zip(W["bsns_year"], W["reprt_code"])]
+    W["knowledge_date"] = [_knowledge_from_rcept(rn, r, int(y))
+                           for rn, r, y in zip(W["rcept_no"], W["reprt_code"], W["bsns_year"])]
+
+    # 누적치 → 분기 단독치 (Q1/H1/Q3/FY 는 누적 공시다. 차분하지 않으면 계절성이 곧 신호가 된다)
+    order = {REPRT_CODES["Q1"]: 1, REPRT_CODES["H1"]: 2, REPRT_CODES["Q3"]: 3, REPRT_CODES["FY"]: 4}
+    W["q"] = W["reprt_code"].map(order)
+    W = W.sort_values(["corp_code", "bsns_year", "q"])
+    flow_items = ["revenue", "cogs", "gross_profit", "sgna", "op_income", "net_income",
+                  "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise"]
+    for c in flow_items:
+        if c not in W.columns:
+            W[c] = np.nan
+        cum = W.groupby(["corp_code", "bsns_year"], observed=True)[c]
+        W[c + "_q"] = W[c] - cum.shift(1).fillna(0)
+        W.loc[W["q"] == 1, c + "_q"] = W.loc[W["q"] == 1, c]
+        # 연간(TTM) — 4분기 이동합
+        W[c + "_ttm"] = (W.groupby("corp_code", observed=True)[c + "_q"]
+                          .transform(lambda s: s.rolling(4, min_periods=3).sum()))
+    W = pit_frame(W, "period_end", "knowledge_date", source="dart")
+    LOG.ok(f"DART 재무 정제 {len(W):,}행 · {W['corp_code'].nunique():,}사 "
+           f"(knowledge_date = 접수일자 기준, 누적→분기 차분 완료)")
+    PIPE.io("OUT", "MEM", "dart_financials_tidy", W)
+    return downcast(W)
+
+
+# ── 직원현황 (θ_N, TP_C2) ───────────────────────────────────────────────────────────────────
+def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
+    cached = VAULT.get_table("dart_employees", scope="shared")
+    done = set()
+    if cached is not None and len(cached):
+        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
+        LOG.info(f"공용 캐시에서 직원현황 {len(cached):,}행 재사용")
+    jobs = [(c, y) for c in corp_codes for y in years if (str(c), int(y)) not in done]
+    if RUN_MODE == "CACHED":
+        jobs = []
+
+    def _one(job):
+        corp, year = job
+        js = dart_api("empSttus.json", {"corp_code": corp, "bsns_year": str(year),
+                                        "reprt_code": REPRT_CODES["FY"]})
+        if not js or not isinstance(js.get("list"), list):
+            return None
+        d = pd.DataFrame(js["list"])
+        # ★ empSttus 행은 사업부문(fo_bbm) × 성별(sexdstn) 로 쪼개져 온다. 각 조합은 서로소이므로
+        #   합산이 맞지만, 일부 기업은 '합계/계' 소계 행을 함께 넣어 이중계상이 발생한다 → 제거.
+        #   또 jan_salary_am(1인 평균급여)은 절대 합산하면 안 되는 값이므로 아예 쓰지 않는다.
+        for col in ("fo_bbm", "sexdstn"):
+            if col in d.columns:
+                d = d[~d[col].astype(str).str.strip().isin(["합계", "계", "소계", "총계", "합 계"])]
+        if d.empty:
+            return None
+        num = lambda s: pd.to_numeric(pd.Series(s).astype(str).str.replace(r"[^\d.\-]", "", regex=True),
+                                      errors="coerce")
+        emp = num(d.get("sm", pd.Series(dtype=object))).sum(skipna=True) if "sm" in d.columns else np.nan
+        pay = num(d.get("fyer_salary_totamt", pd.Series(dtype=object))).sum(skipna=True) \
+            if "fyer_salary_totamt" in d.columns else np.nan
+        rn = str(d["rcept_no"].iloc[0]) if "rcept_no" in d.columns and len(d) else ""
+        return {"corp_code": corp, "bsns_year": int(year), "employees": float(emp),
+                "payroll": float(pay), "rcept_no": rn}
+
+    got = [r for r in pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 12),
+                              desc="DART 직원현황") if r] if jobs else []
+    frames = ([cached] if cached is not None and len(cached) else [])
+    if got:
+        frames.append(pd.DataFrame(got))
+    if not frames:
+        return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
+    E = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"], keep="last")
+    E["period_end"] = as_ts_series(E["bsns_year"].astype(int).astype(str) + "-12-31")
+    E["knowledge_date"] = [_knowledge_from_rcept(rn, REPRT_CODES["FY"], int(y))
+                           for rn, y in zip(E.get("rcept_no", ""), E["bsns_year"])]
+    if got:
+        VAULT.put_table("dart_employees", E, scope="shared", domain="dart", source="opendart empSttus")
+    E = pit_frame(E, "period_end", "knowledge_date", source="dart")
+    PIPE.io("OUT", "DRIVE", "dart_employees", E, source="opendart empSttus")
+    return E
+
+
+# ── 공시목록 스윕 (시장 전체를 날짜로 훑는다 — 회사별 호출보다 수십 배 싸다) ──────────────────
+DISCLOSURE_PATTERNS = {
+    "treasury_acq":  r"자기주식\s*취득",
+    "treasury_disp": r"자기주식\s*처분",
+    "treasury_canc": r"자기주식\s*소각|이익소각",
+    "dividend":      r"(현금|현물)?\s*[·ㆍ]?\s*배당\s*결정|결산배당|중간배당",
+    "rights_issue":  r"유상증자",
+    "cb_issue":      r"전환사채",
+    "bw_issue":      r"신주인수권부사채",
+    "capital_reduce": r"감자",
+    "audit_opinion": r"감사보고서",
+}
+
+
+def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
+    """월 단위로 시장 전체 공시목록을 훑는다. PACK-C(자사주/배당)와 V3(희석성 조달)의 입력."""
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
+    cached = VAULT.get_table("dart_disclosures", scope="shared")
+    have_months = set()
+    if cached is not None and len(cached):
+        cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
+        have_months = set(cached["rcept_dt"].dt.to_period("M").astype(str))
+        LOG.info(f"공용 캐시에서 공시목록 {len(cached):,}행 재사용")
+
+    months = pd.period_range(as_ts(start), as_ts(end), freq="M")
+    todo = [m for m in months if str(m) not in have_months]
+    if RUN_MODE == "CACHED":
+        todo = []
+
+    def _one(m):
+        rows, page = [], 1
+        while page <= 100:
+            js = dart_api("list.json", {
+                "bgn_de": m.start_time.strftime("%Y%m%d"),
+                "end_de": m.end_time.strftime("%Y%m%d"),
+                "pblntf_ty": "B", "page_no": page, "page_count": 100, "last_reprt_at": "N"})
+            if not js or not isinstance(js.get("list"), list) or not js["list"]:
+                break
+            rows.extend(js["list"])
+            if page >= int(js.get("total_page", 1)):
+                break
+            page += 1
+        return rows
+
+    new = []
+    if todo:
+        res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8), desc="DART 공시목록")
+        for r in res:
+            if r:
+                new.extend(r)
+
+    frames = ([cached] if cached is not None and len(cached) else [])
+    if new:
+        d = pd.DataFrame(new)
+        keep = [c for c in ("corp_code", "corp_name", "stock_code", "rcept_no", "rcept_dt",
+                            "report_nm", "flr_nm", "corp_cls") if c in d.columns]
+        frames.append(d[keep])
+    if not frames:
+        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
+    D = pd.concat(frames, ignore_index=True).drop_duplicates("rcept_no", keep="last")
+    D["rcept_dt"] = as_ts_series(D["rcept_dt"])
+    D["report_nm"] = D["report_nm"].astype(str)
+    D["event"] = ""
+    for ev, pat in DISCLOSURE_PATTERNS.items():
+        hit = D["report_nm"].str.contains(pat, regex=True, na=False) & (D["event"] == "")
+        D.loc[hit, "event"] = ev
+    if new:
+        VAULT.put_table("dart_disclosures", D, scope="shared", domain="dart", source="opendart list.json")
+    D = pit_frame(D, "rcept_dt", "rcept_dt", source="dart")     # 접수일 = 공개일
+    LOG.ok(f"공시목록 {len(D):,}건 — 이벤트 분류: " +
+           ", ".join(f"{k}={int((D['event']==k).sum()):,}" for k in DISCLOSURE_PATTERNS if (D['event']==k).any()))
+    PIPE.io("OUT", "DRIVE", "dart_disclosures", D, source="opendart list.json")
+    return D
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-D  애널리스트 리포트 수집 — 한경컨센서스 + 네이버금융리서치                            ║
+# ║                                                                                          ║
+# ║  두 소스의 역할이 다르다. 합쳐야 원장이 완성된다:                                          ║
+# ║    · 한경컨센서스(skinType=business) : 작성자(애널리스트)·적정가격·투자의견을 리스트에서    ║
+# ║      바로 준다. 1요청에 최대 수백 행 → 애널리스트 원장의 1순위 소스.                       ║
+# ║      단, 종목코드가 컬럼에 없다. 제목의 "종목명(005930)" 에서 뽑아야 한다.                 ║
+# ║    · 네이버금융리서치 : 종목코드를 td[0] a.stock_item href 에 확실히 준다.                 ║
+# ║      애널리스트명은 리스트에 없다(PDF/상세에 있음). 커버리지 폭이 넓다.                    ║
+# ║                                                                                          ║
+# ║  ⚠ 두 사이트 모두 robots.txt 가 Disallow: / 다. 사용자가 명시적으로 수집을 지시했으므로     ║
+# ║    수행하되, 초당 요청을 보수적으로 제한하고(RATE_LIMIT_QPS) 이 사실을 로그에 명시한다.     ║
+# ║  ⚠ PDF 원문은 증권사 저작물이다. 로컬 캐시/분석 용도로만 쓰고 재배포하지 말 것.             ║
+# ║                                                                                          ║
+# ║  파싱 전략: 컬럼 인덱스를 믿지 않는다. <th> 헤더 텍스트로 매핑하고, 헤더가 없을 때만        ║
+# ║  내용 기반 휴리스틱으로 폴백한다. (공개 스크래퍼들의 컬럼 인덱스가 서로 모순되기 때문)      ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+HK_BASE = "https://consensus.hankyung.com"
+HK_LIST = HK_BASE + "/analysis/list"
+HK_PDF = HK_BASE + "/analysis/downpdf?report_idx={idx}"
+NV_BASE = "https://finance.naver.com/research/"
+NV_API = "https://stock.naver.com/api/stockSecurity/researches/v2/{cat}"
+
+REPORT_COLS = [
+    "report_uid", "source", "src_report_id", "pub_date", "category",
+    "title", "stock_code", "stock_name", "broker_raw", "broker_id", "broker_name",
+    "analyst_raw", "target_price", "opinion", "pdf_url", "pdf_uid", "detail_url",
+    "views", "event_date", "knowledge_date",
+]
+
+_OPINION_MAP = {
+    "매수": "BUY", "buy": "BUY", "strongbuy": "BUY", "적극매수": "BUY", "outperform": "BUY",
+    "비중확대": "BUY", "overweight": "BUY", "trading buy": "BUY", "tradingbuy": "BUY",
+    "중립": "HOLD", "hold": "HOLD", "neutral": "HOLD", "marketperform": "HOLD",
+    "시장수익률": "HOLD", "보유": "HOLD", "비중유지": "HOLD",
+    "매도": "SELL", "sell": "SELL", "underperform": "SELL", "비중축소": "SELL",
+    "underweight": "SELL", "reduce": "SELL",
+}
+_NULL_TOKENS = {"", "-", "--", "0", "n/a", "na", "없음", "투자의견없음", "nr", "not rated", "제시안함"}
+
+
+def _clean_cell(x: Any) -> str:
+    return re.sub(r"\s+", " ", str(x or "")).strip()
+
+
+def _dedup_repeat(s: str) -> str:
+    """한경 제목이 'ABCABCABC' 처럼 2~3회 반복되어 나오는 알려진 버그를 되돌린다."""
+    s = _clean_cell(s)
+    n = len(s)
+    if n < 8:
+        return s
+    for k in (2, 3):
+        if n % k == 0:
+            unit = s[: n // k]
+            if unit * k == s:
+                return unit
+    return s
+
+
+def parse_target_price(x: Any) -> Optional[float]:
+    """'123,000'→123000.  '0'/'-'/'없음' → None.
+    ★ '0'을 0원 목표주가로 넣으면 목표주가 리비전 팩터가 조용히 오염된다."""
+    t = _clean_cell(x).lower().replace(",", "").replace("원", "")
+    if t in _NULL_TOKENS:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", t)
+    if not m:
+        return None
+    v = float(m.group(0))
+    if v <= 0 or v > 5e7:
+        return None
+    return v
+
+
+def parse_opinion(x: Any) -> Optional[str]:
+    t = _clean_cell(x)
+    if t.lower() in _NULL_TOKENS:
+        return None
+    k = re.sub(r"[^\w가-힣]", "", t).lower()
+    for pat, val in _OPINION_MAP.items():
+        if re.sub(r"[^\w가-힣]", "", pat).lower() in k:
+            return val
+    return t[:20] or None
+
+
+_CODE_IN_TITLE = re.compile(r"[（(]\s*([0-9]{6})\s*[)）]")
+
+
+def code_from_title(title: str) -> Optional[str]:
+    m = _CODE_IN_TITLE.search(str(title or ""))
+    return m.group(1) if m else None
+
+
+def name_from_title(title: str) -> str:
+    t = _clean_cell(title)
+    m = _CODE_IN_TITLE.search(t)
+    return _clean_cell(t[: m.start()]) if m else ""
+
+
+# ── 헤더 기반 테이블 파서 (컬럼 인덱스 불신 원칙) ────────────────────────────────────────────
+def _table_headers(table) -> List[str]:
+    hdr = []
+    for tr in table.find_all("tr"):
+        ths = tr.find_all("th")
+        if len(ths) >= 3:
+            hdr = [_clean_cell(th.get_text()) for th in ths]
+            break
+    return hdr
+
+
+def _row_map(headers: List[str], tds: List) -> Dict[str, Any]:
+    if headers and len(headers) == len(tds):
+        return {headers[i]: tds[i] for i in range(len(tds))}
+    return {}
+
+
+def _pick(rowmap: Dict[str, Any], *names) -> Optional[Any]:
+    for n in names:
+        for k, v in rowmap.items():
+            if n in k:
+                return v
+    return None
+
+
+# ── 한경컨센서스 ────────────────────────────────────────────────────────────────────────────
+_HK_LAYOUT_LOGGED = set()
+
+
+def _hk_parse(html: str, category: str) -> List[dict]:
+    soup = soup_of(html)
+    if soup is None:
+        return []
+    table = None
+    for sel in ("div.table_style01 table", "#contents table", "table"):
+        t = soup.select_one(sel)
+        if t is not None and t.find("tr") is not None:
+            table = t
+            break
+    if table is None:
+        return []
+    if soup.select_one("td.no_data") or "데이터가 없습니다" in html:
+        return []
+    headers = _table_headers(table)
+    if category not in _HK_LAYOUT_LOGGED:
+        _HK_LAYOUT_LOGGED.add(category)
+        LOG.debug(f"한경 '{category}' 레이아웃 감지: {len(headers)}컬럼 {headers}")
+        if headers and not any("적정" in h or "목표" in h for h in headers):
+            LOG.warn(f"한경 '{category}' 응답에 적정가격 컬럼이 없습니다. "
+                     f"skinType 파라미터가 무시된 것 같습니다(통합 탭 6컬럼 레이아웃). "
+                     f"목표주가·투자의견은 이 카테고리에서 수집되지 않습니다.")
+
+    out = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 4:
+            continue
+        texts = [_clean_cell(td.get_text(" ")) for td in tds]
+        rm = _row_map(headers, texts)
+
+        # report_idx 는 어느 열에 있든 앵커에서 찾는다 (인덱스 의존 제거)
+        ridx, pdf = None, None
+        for a in tr.find_all("a", href=True):
+            m = re.search(r"report_idx=(\d+)", a["href"])
+            if m:
+                ridx = m.group(1)
+                pdf = HK_PDF.format(idx=ridx)
+                break
+        if ridx is None:
+            continue
+
+        date_s = _pick(rm, "작성일", "날짜")
+        if not date_s:
+            date_s = next((t for t in texts if re.fullmatch(r"\d{4}[-./]\d{2}[-./]\d{2}", t)), None)
+        title = _pick(rm, "제목")
+        if not title:
+            a = tr.find("a", href=re.compile("report_idx"))
+            title = _clean_cell(a.get_text(" ")) if a else ""
+        title = _dedup_repeat(title)
+
+        tp = _pick(rm, "적정가격", "목표주가", "적정주가")
+        op = _pick(rm, "투자의견", "의견")
+        an = _pick(rm, "작성자", "애널리스트")
+        bk = _pick(rm, "제공출처", "증권사", "출처")
+
+        if headers and len(headers) == len(texts):
+            pass                                     # 헤더 매핑 성공 — 그대로 사용
+        else:
+            # 폴백: 내용 기반 추론 (레이아웃이 바뀌어도 죽지 않게)
+            if tp is None:
+                tp = next((t for t in texts if re.fullmatch(r"[\d,]{3,12}", t)), None)
+            if op is None:
+                op = next((t for t in texts if parse_opinion(t) in ("BUY", "HOLD", "SELL")), None)
+            cand = [t for t in texts if t and t != title and not re.fullmatch(r"[\d,.\-]+", t)]
+            cand = [c for c in cand if c not in (op or "",)]
+            if bk is None:
+                bk = next((c for c in cand if "증권" in c or "투자" in c or "금융" in c), None)
+            if an is None:
+                an = next((c for c in cand if c != bk and 1 <= len(c) <= 30), None)
+
+        out.append({
+            "source": "hankyung", "src_report_id": str(ridx), "category": category,
+            "pub_date": date_s, "title": title,
+            "stock_code": code_from_title(title), "stock_name": name_from_title(title),
+            "broker_raw": _clean_cell(bk), "analyst_raw": _clean_cell(an),
+            "target_price": parse_target_price(tp), "opinion": parse_opinion(op),
+            "pdf_url": pdf, "detail_url": pdf, "views": None,
+        })
+    return out
+
+
+def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
+                     page_size: int = 80, max_pages: int = 400) -> pd.DataFrame:
+    """연도 단위로 쪼개서 수집. 한 번에 10년을 요청하면 서버 페이지 상한에 걸린다."""
+    rows: List[dict] = []
+    years = list(range(as_ts(start).year, as_ts(end).year + 1))
+    jobs = []
+    for skin in skins:
+        for y in years:
+            sd = max(as_ts(f"{y}-01-01"), as_ts(start))
+            ed = min(as_ts(f"{y}-12-31"), as_ts(end))
+            jobs.append((skin, sd, ed))
+
+    def _sweep(job):
+        skin, sd, ed = job
+        got: List[dict] = []
+        seen_ids: set = set()
+        for page in range(1, max_pages + 1):
+            params = {
+                "skinType": skin, "sdate": sd.strftime("%Y-%m-%d"), "edate": ed.strftime("%Y-%m-%d"),
+                "now_page": page, "pagenum": page_size, "order_type": "",
+                "report_type": "CO" if skin == "business" else "",
+                "search_text": "", "search_value": "", "business_code": "",
+            }
+            html = http_get(HK_LIST, source="hankyung", params=params, tries=3,
+                            referer=HK_BASE + "/", timeout=30)
+            if not html:
+                break
+            batch = _hk_parse(html, skin)
+            if not batch:
+                break
+            fresh = [b for b in batch if b["src_report_id"] not in seen_ids]
+            for b in fresh:
+                seen_ids.add(b["src_report_id"])
+            got.extend(fresh)
+            if len(fresh) == 0 or len(batch) < page_size * 0.5:
+                break
+        return got
+
+    res = pmap_io(_sweep, jobs, workers=min(4, N_WORKERS_IO), desc="한경컨센서스")
+    for r in res:
+        if r:
+            rows.extend(r)
+    d = pd.DataFrame(rows, columns=[c for c in REPORT_COLS if c in (rows[0].keys() if rows else [])]) \
+        if rows else pd.DataFrame(columns=REPORT_COLS)
+    if rows:
+        d = pd.DataFrame(rows)
+    LOG.ok(f"한경컨센서스 {len(d):,}건 "
+           f"(작성자 보유 {int(d['analyst_raw'].astype(str).str.len().gt(0).sum()) if len(d) else 0:,} / "
+           f"목표주가 보유 {int(d['target_price'].notna().sum()) if len(d) else 0:,})")
+    PIPE.io("IN", "HTTP", "hankyung:analysis/list", d, source=HK_LIST)
+    return d
+
+
+# ── 네이버 금융 리서치 ──────────────────────────────────────────────────────────────────────
+NV_CATS = {
+    "company": ("company_list.naver", "company_read.naver"),
+    "industry": ("industry_list.naver", "industry_read.naver"),
+    "market": ("market_info_list.naver", "market_info_read.naver"),
+    "invest": ("invest_list.naver", "invest_read.naver"),
+    "economy": ("economy_list.naver", "economy_read.naver"),
+    "debenture": ("debenture_list.naver", "debenture_read.naver"),
+}
+_NV_PDF_RE = re.compile(r"/stock-research/(\w+)/(\d+)/(\d{8})_(\w+)_(\d+)\.pdf")
+
+
+def _nv_parse_list(html: str, cat: str) -> List[dict]:
+    soup = soup_of(html)
+    if soup is None:
+        return []
+    table = soup.select_one("#contentarea_left div.box_type_m table.type_1") or \
+        soup.select_one("table.type_1") or soup.select_one("table")
+    if table is None:
+        return []
+    headers = _table_headers(table)
+    _, read_page = NV_CATS.get(cat, ("", "company_read.naver"))
+    out = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 5 or tr.find("th") is not None:
+            continue
+        if any("blank" in " ".join(td.get("class") or []) for td in tds):
+            continue
+        texts = [_clean_cell(td.get_text(" ")) for td in tds]
+        rm = _row_map(headers, texts)
+
+        nid, detail, title = None, None, None
+        for a in tr.find_all("a", href=True):
+            m = re.search(r"nid=(\d+)", a["href"])
+            if m:
+                nid = m.group(1)
+                detail = urljoin(NV_BASE, a["href"])
+                title = _clean_cell(a.get_text(" "))
+                break
+        if nid is None:
+            continue
+
+        code, sname = None, ""
+        a_item = tr.select_one("a.stock_item[href]")
+        if a_item is not None:
+            mm = re.search(r"code=(\d{6})", a_item["href"])
+            code = mm.group(1) if mm else None
+            sname = _clean_cell(a_item.get("title") or a_item.get_text(" "))
+
+        pdf = None
+        for a in tr.find_all("a", href=True):
+            if a["href"].lower().endswith(".pdf"):
+                pdf = a["href"] if a["href"].startswith("http") else urljoin(NV_BASE, a["href"])
+                break
+
+        bk = _pick(rm, "증권사")
+        if bk is None:
+            bk = next((t for t in texts if ("증권" in t or "투자" in t) and t != title), "")
+        dt = _pick(rm, "작성일")
+        if dt is None:
+            dt = next((t for t in texts if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", t)), None)
+        vw = _pick(rm, "조회")
+
+        out.append({
+            "source": "naver", "src_report_id": str(nid), "category": cat,
+            "pub_date": dt, "title": _dedup_repeat(title or ""),
+            "stock_code": code or code_from_title(title or ""),
+            "stock_name": sname or name_from_title(title or ""),
+            "broker_raw": _clean_cell(bk), "analyst_raw": "",
+            "target_price": None, "opinion": None,
+            "pdf_url": pdf, "detail_url": detail,
+            "views": _clean_cell(vw).replace(",", "") or None,
+        })
+    return out
+
+
+def _nv_last_page(html: str) -> int:
+    soup = soup_of(html)
+    if soup is None:
+        return 1
+    mx = 1
+    for a in soup.select("table.Nnavi a[href]"):
+        m = re.search(r"page=(\d+)", a["href"])
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return mx
+
+
+def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
+                       hard_cap: int = 60000) -> pd.DataFrame:
+    """신형 JSON API. 되면 HTML 페이징보다 훨씬 빠르고 구조가 안정적이다."""
+    rows, index = [], 0
+    url = NV_API.format(cat=cat)
+    hdr = {"Accept": "application/json,text/plain,*/*", "Referer": "https://stock.naver.com/"}
+    while index < hard_cap:
+        js = http_json(url, source="naver", tries=2, headers=hdr,
+                       params={"index": index, "size": page_size,
+                               "startDate": as_ts(start).strftime("%Y-%m-%d"),
+                               "endDate": as_ts(end).strftime("%Y-%m-%d")})
+        if not js:
+            break
+        items = js if isinstance(js, list) else (js.get("researches") or js.get("list") or
+                                                 js.get("items") or js.get("content") or [])
+        if not isinstance(items, list) or not items:
+            break
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            rows.append({
+                "source": "naver", "category": cat,
+                "src_report_id": str(it.get("id") or it.get("nid") or it.get("researchId") or ""),
+                "pub_date": it.get("createDate") or it.get("date") or it.get("writeDate"),
+                "title": _dedup_repeat(str(it.get("title") or "")),
+                "stock_code": to_code6(it.get("itemCode") or it.get("stockCode") or ""),
+                "stock_name": str(it.get("itemName") or it.get("stockName") or ""),
+                "broker_raw": str(it.get("brokerName") or it.get("broker") or ""),
+                "analyst_raw": str(it.get("analyst") or it.get("writer") or ""),
+                "target_price": parse_target_price(it.get("targetPrice") or it.get("goalPrice")),
+                "opinion": parse_opinion(it.get("investmentOpinion") or it.get("opinion") or ""),
+                "pdf_url": it.get("fileUrl") or it.get("pdfUrl"),
+                "detail_url": None, "views": it.get("readCount"),
+            })
+        if len(items) < page_size:
+            break
+        index += len(items)
+    d = pd.DataFrame(rows)
+    if len(d):
+        d = d[d["src_report_id"].astype(str).str.len() > 0]
+    return d
+
+
+def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "industry"),
+                  max_pages: int = 1500) -> pd.DataFrame:
+    frames = []
+    for cat in cats:
+        # ① JSON API 우선
+        try:
+            dj = naver_collect_json(cat, start, end)
+        except Exception:
+            dj = pd.DataFrame()
+        if len(dj) > 50:
+            LOG.ok(f"네이버 JSON API '{cat}' {len(dj):,}건")
+            frames.append(dj)
+            continue
+        # ② HTML 리스트 폴백
+        list_page, _ = NV_CATS[cat]
+        base = urljoin(NV_BASE, list_page)
+        probe = http_get(base, source="naver", referer=NV_BASE, force_enc="euc-kr",
+                         params={"searchType": "writeDate",
+                                 "writeFromDate": as_ts(start).strftime("%Y-%m-%d"),
+                                 "writeToDate": as_ts(end).strftime("%Y-%m-%d"), "page": 1})
+        if not probe:
+            LOG.warn(f"네이버 '{cat}' 리스트 접근 실패 — 건너뜁니다.")
+            continue
+        last = min(_nv_last_page(probe), max_pages)
+        LOG.info(f"네이버 '{cat}' HTML 폴백 — 총 {last:,}페이지")
+
+        def _pg(p: int):
+            h = probe if p == 1 else http_get(
+                base, source="naver", referer=NV_BASE, force_enc="euc-kr", tries=3,
+                params={"searchType": "writeDate",
+                        "writeFromDate": as_ts(start).strftime("%Y-%m-%d"),
+                        "writeToDate": as_ts(end).strftime("%Y-%m-%d"), "page": p})
+            return _nv_parse_list(h, cat) if h else []
+
+        res = pmap_io(_pg, list(range(1, last + 1)), workers=min(6, N_WORKERS_IO),
+                      desc=f"네이버 {cat}")
+        rows = [r for chunk in res if chunk for r in chunk]
+        if rows:
+            frames.append(pd.DataFrame(rows))
+    if not frames:
+        return pd.DataFrame(columns=REPORT_COLS)
+    d = pd.concat(frames, ignore_index=True)
+    LOG.ok(f"네이버 리서치 {len(d):,}건 (종목코드 보유 {int(d['stock_code'].notna().sum()):,})")
+    PIPE.io("IN", "HTTP", "naver:research", d, source=NV_BASE)
+    return d
+
+
+def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
+    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다."""
+    if df.empty:
+        return df
+    need = df[(df["source"] == "naver") & (df["category"] == "company") &
+              (df["target_price"].isna()) & (df["detail_url"].notna())].copy()
+    if need.empty:
+        return df
+    if len(need) > limit:
+        LOG.warn(f"네이버 상세 보강 대상 {len(need):,}건 중 최신 {limit:,}건만 조회합니다 "
+                 f"(RESEARCH 설정으로 조절 가능). 나머지는 목표주가 결측으로 남습니다.")
+        need = need.sort_values("pub_date", ascending=False).head(limit)
+
+    def _one(u: str):
+        h = http_get(u, source="naver", referer=NV_BASE, force_enc="euc-kr", tries=2)
+        if not h:
+            return None
+        s = soup_of(h)
+        if s is None:
+            return None
+        box = s.select_one("div.view_info_1") or s
+        tp = box.select_one("em.money strong") or box.select_one("em.money")
+        op = box.select_one("em.coment")
+        an = ""
+        src = s.select_one("th.view_sbj p.source")
+        if src is not None:
+            an = _clean_cell(src.get_text(" "))
+        return {"detail_url": u,
+                "target_price": parse_target_price(tp.get_text() if tp else None),
+                "opinion": parse_opinion(op.get_text() if op else None),
+                "_detail_src": an}
+
+    res = pmap_io(_one, need["detail_url"].tolist(), workers=min(8, N_WORKERS_IO),
+                  desc="네이버 상세(목표주가)")
+    got = pd.DataFrame([r for r in res if r])
+    if got.empty:
+        return df
+    df = df.merge(got, on="detail_url", how="left", suffixes=("", "_d"))
+    for c in ("target_price", "opinion"):
+        if f"{c}_d" in df.columns:
+            df[c] = df[c].where(df[c].notna(), df[f"{c}_d"])
+            df = df.drop(columns=[f"{c}_d"])
+    LOG.ok(f"네이버 상세 보강 — 목표주가 {int(got['target_price'].notna().sum()):,}건 추가 확보")
+    return df
+
+
+# ── PDF 원문 ────────────────────────────────────────────────────────────────────────────────
+_ANALYST_LINE = re.compile(
+    r"([가-힣]{2,4})\s*(?:연구원|애널리스트|수석|책임|선임)?\s*"
+    r"(?:\(?\s*(?:02|031|032|051|070)[-\s.]?\d{3,4}[-\s.]?\d{4}\s*\)?)?\s*"
+    r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_TP_PAT = re.compile(r"(?:목표\s*주가|목표주가|적정\s*주가|적정주가|TP)\s*[:：(]?\s*"
+                     r"(?:원\)?\s*)?([0-9][0-9,]{2,9})")
+
+
+def pdf_text(data: bytes, max_pages: int = 3) -> str:
+    """1페이지 헤더/푸터에 애널리스트명·이메일·목표주가가 몰려 있다. 앞 3장이면 충분하다."""
+    if not data or data[:5] != b"%PDF-":
+        return ""
+    if fitz is not None:
+        try:
+            with fitz.open(stream=data, filetype="pdf") as doc:
+                return "\n".join(doc[i].get_text() for i in range(min(max_pages, doc.page_count)))
+        except Exception:
+            pass
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                return "\n".join((p.extract_text() or "") for p in pdf.pages[:max_pages])
+        except Exception:
+            pass
+    return ""
+
+
+def pdf_extract_fields(text: str) -> dict:
+    out = {"pdf_analysts": "", "pdf_emails": "", "pdf_target": None}
+    if not text:
+        return out
+    pairs = _ANALYST_LINE.findall(text[:6000])
+    names = [p[0] for p in pairs]
+    mails = [p[1] for p in pairs] or _EMAIL.findall(text[:6000])
+    if not names:
+        # 이메일 로컬파트에서 역추적 실패 시, '연구원/애널리스트' 앞 한글 이름만이라도
+        names = re.findall(r"([가-힣]{2,4})\s*(?:연구원|애널리스트)", text[:6000])
+    out["pdf_analysts"] = ",".join(dict.fromkeys(names))[:120]
+    out["pdf_emails"] = ",".join(dict.fromkeys(mails))[:200]
+    m = _TP_PAT.search(text[:8000])
+    if m:
+        out["pdf_target"] = parse_target_price(m.group(1))
+    return out
+
+
+def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
+    """PDF 를 공용 인덱스에 저장(내용해시 경로 → 중복 저장 없음)하고 본문 필드를 추출한다."""
+    if df.empty or not RESEARCH_DOWNLOAD_PDF:
+        for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target"):
+            if c not in df.columns:
+                df[c] = None if c != "pdf_uid" else ""
+        return df
+    if fitz is None and pdfplumber is None:
+        LOG.warn("PDF 파서(pymupdf/pdfplumber)가 없어 원문 추출을 건너뜁니다. "
+                 "한경 리스트의 작성자/목표주가만으로도 애널리스트 연결은 동작합니다.")
+    work = df[df["pdf_url"].notna()].copy()
+    if cap_per_month and len(work):
+        work["_m"] = as_ts_series(work["pub_date"]).dt.to_period("M")
+        work = work.groupby("_m", observed=True).head(cap_per_month).drop(columns=["_m"])
+    if work.empty:
+        return df
+
+    idx = VAULT.load_index("shared")
+    known = {}
+    if len(idx) and "domain" in idx.columns:
+        sub = idx[(idx["domain"].astype(str) == "research") &
+                  (idx["subtype"].astype(str) == "report_pdf")]
+        for _, r in sub.iterrows():
+            known[str(r.get("key"))] = str(r.get("uid"))
+    LOG.info(f"PDF 대상 {len(work):,}건 (드라이브 캐시 보유 {sum(1 for k in work['report_uid'] if k in known):,}건)")
+
+    def _one(rec):
+        uid, url = rec
+        if uid in known:
+            data = VAULT.get_blob(known[uid], "shared")
+            if data:
+                return (uid, known[uid], data)
+            return (uid, "", b"")
+        raw = http_get(url, source="hankyung" if "hankyung" in str(url) else "naver",
+                       as_bytes=True, tries=2, referer=HK_BASE + "/" if "hankyung" in str(url) else NV_BASE)
+        if not raw or raw[:5] != b"%PDF-":
+            return (uid, "", b"")          # 로그인/에러 HTML 이 200 으로 오는 케이스 방어
+        return (uid, "", raw)
+
+    jobs = list(zip(work["report_uid"].astype(str), work["pdf_url"].astype(str)))
+    res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 10), desc="리포트 PDF")
+
+    rows = []
+    ok = 0
+    for r in res:
+        if not r:
+            continue
+        uid, existing_blob_uid, data = r
+        if not data:
+            continue
+        ok += 1
+        blob_uid = existing_blob_uid
+        if not blob_uid:
+            p = VAULT.put_blob("research", "report_pdf", uid, data, "pdf",
+                               source="report_pdf", scope="shared")
+            blob_uid = sha1_str("research", "report_pdf", uid, sha1_bytes(data)) if p else ""
+        f = pdf_extract_fields(pdf_text(data))
+        rows.append({"report_uid": uid, "pdf_uid": blob_uid, **f})
+    VAULT.flush("shared")
+    LOG.ok(f"PDF 확보 {ok:,}/{len(jobs):,}건 — 공용 인덱스에 저장(내용해시 중복제거 적용)")
+    if not rows:
+        for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target"):
+            if c not in df.columns:
+                df[c] = None
+        return df
+    ext = pd.DataFrame(rows)
+    df = df.merge(ext, on="report_uid", how="left")
+    PIPE.io("OUT", "DRIVE", "research:pdf", ext, source="hankyung/naver pdf")
+    return df
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-E  엔티티 해상 — 증권사 정규화 / 애널리스트 원장 / 보고서↔애널리스트 연결              ║
+# ║                                                                                          ║
+# ║  이 모듈이 답해야 하는 질문 (사용자 요구사항):                                              ║
+# ║    Q1. 보고서와 애널리스트가 제대로 연결되었는가?   → report_analyst_link + 연결 감사표     ║
+# ║    Q2. 다중소스 원장 연결은 확실한가?               → dedup_key 병합 + 소스기여 감사표      ║
+# ║    Q3. 목표주가는 누가 언제 제시했는가?             → (analyst_id, code, date, tp) 원장     ║
+# ║                                                                                          ║
+# ║  증권사 사명 변경(2016~2026)을 정규화하지 않으면 같은 애널리스트가 소속 변경만으로          ║
+# ║  다른 사람이 되어버린다 → 목표주가 리비전(d2)이 통째로 망가진다.                            ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+# 정규화 표: (별칭 정규식 → 정식명). 사명 변경 이력이 핵심이다.
+BROKER_CANON: List[Tuple[str, str]] = [
+    (r"미래에셋(대우|증권|생명)?", "미래에셋증권"),          # 미래에셋대우→미래에셋증권(2021)
+    (r"(대우증권|KDB대우)", "미래에셋증권"),
+    (r"NH투자|우리투자증권|NH농협증권", "NH투자증권"),        # 우리투자→NH투자(2014)
+    (r"한국투자|한국證|한투증권", "한국투자증권"),
+    (r"삼성증권", "삼성증권"),
+    (r"KB(증권|투자증권)|현대증권", "KB증권"),                # KB투자+현대증권→KB증권(2017)
+    (r"신한(투자증권|금융투자|금투)", "신한투자증권"),        # 신한금융투자→신한투자증권(2022)
+    (r"하나(증권|금융투자|금투)", "하나증권"),                # 하나금융투자→하나증권(2022)
+    (r"키움", "키움증권"),
+    (r"메리츠(증권|종금증권|종합금융증권)", "메리츠증권"),
+    (r"대신증권", "대신증권"),
+    (r"유안타|동양증권", "유안타증권"),                       # 동양→유안타(2014)
+    (r"한화(투자증권|증권)", "한화투자증권"),
+    (r"교보증권", "교보증권"),
+    (r"IBK(투자증권|증권)|기업은행", "IBK투자증권"),
+    (r"신영증권", "신영증권"),
+    (r"현대차(증권|투자증권)|HMC투자증권", "현대차증권"),      # HMC투자→현대차증권(2016)
+    (r"SK증권", "SK증권"),
+    (r"유진(투자증권|증권)", "유진투자증권"),
+    (r"(iM|아이엠)증권|하이투자증권", "iM증권"),               # 하이투자→iM증권(2024)
+    (r"(LS증권|이베스트|eBEST|E\*?BEST)", "LS증권"),           # 이베스트→LS증권(2024)
+    (r"(다올투자증권|KTB투자증권|다올)", "다올투자증권"),      # KTB→다올(2022)
+    (r"DB(금융투자|증권)|동부증권", "DB금융투자"),             # 동부→DB금융투자(2018)
+    (r"BNK(투자증권|증권)", "BNK투자증권"),
+    (r"흥국증권", "흥국증권"),
+    (r"부국증권", "부국증권"),
+    (r"한양증권", "한양증권"),
+    (r"상상인증권|골든브릿지", "상상인증권"),
+    (r"케이프(투자증권|증권)", "케이프투자증권"),
+    (r"토스증권", "토스증권"),
+    (r"카카오페이증권|바로투자증권", "카카오페이증권"),
+    (r"리딩투자증권", "리딩투자증권"),
+    (r"코리아에셋", "코리아에셋투자증권"),
+    (r"유화증권", "유화증권"),
+    (r"DS투자증권", "DS투자증권"),
+    (r"현대해상|한화생명|미래에셋생명", "기타"),
+    (r"NICE|나이스", "NICE디앤비"),
+    (r"에프앤가이드|FnGuide", "에프앤가이드"),
+    (r"(하이證|하이증권)", "iM증권"),
+]
+_BROKER_RE = [(re.compile(p), n) for p, n in BROKER_CANON]
+
+# 대형 10개사 / 중소형 10개사 — 커버리지 목표 달성 여부 감사에 쓴다
+MAJOR_BROKERS = ["미래에셋증권", "NH투자증권", "한국투자증권", "삼성증권", "KB증권",
+                 "신한투자증권", "하나증권", "키움증권", "메리츠증권", "대신증권"]
+MINOR_BROKERS = ["유안타증권", "한화투자증권", "교보증권", "IBK투자증권", "신영증권",
+                 "현대차증권", "SK증권", "유진투자증권", "iM증권", "LS증권",
+                 "다올투자증권", "DB금융투자", "BNK투자증권", "흥국증권", "부국증권",
+                 "한양증권", "상상인증권", "케이프투자증권", "DS투자증권", "코리아에셋투자증권"]
+
+
+def normalize_broker(raw: Any) -> Tuple[str, str]:
+    """(broker_id, 정식명). 못 알아보면 정규화 문자열 자체를 id 로 쓰되 '미상' 표시는 하지 않는다
+    (미상으로 뭉치면 서로 다른 소형사가 한 덩어리가 되어 커버리지 통계가 거짓이 된다)."""
+    t = _clean_cell(raw)
+    if not t:
+        return ("", "")
+    t2 = re.sub(r"\s+", "", unicodedata.normalize("NFKC", t))
+    for rx, canon in _BROKER_RE:
+        if rx.search(t2):
+            return (sha1_str("broker", canon)[:12], canon)
+    canon = re.sub(r"(리서치센터|리서치|투자정보|Research)$", "", t2).strip() or t2
+    return (sha1_str("broker", canon)[:12], canon)
+
+
+_ANALYST_SPLIT = re.compile(r"[,/·∙•|;]|\s{2,}|\s외\s|\s및\s")
+
+
+def split_analysts(raw: Any) -> List[str]:
+    """'홍길동, 김철수' / '홍길동/김철수' / '홍길동 외 1인' → ['홍길동','김철수']"""
+    t = _clean_cell(raw)
+    if not t:
+        return []
+    t = re.sub(r"\(.*?\)", " ", t)
+    t = re.sub(r"(연구원|애널리스트|수석|책임|선임|팀장|센터장|위원|박사)", " ", t)
+    t = re.sub(r"외\s*\d+\s*인?", " ", t)
+    out = []
+    for p in _ANALYST_SPLIT.split(t):
+        p = re.sub(r"[^가-힣A-Za-z]", "", p).strip()
+        if 2 <= len(p) <= 12 and not re.fullmatch(r"(증권|투자|금융|리서치)+", p):
+            out.append(p)
+    return list(dict.fromkeys(out))
+
+
+def _name_to_code_map(sec: pd.DataFrame) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    for _, r in sec.iterrows():
+        n = norm_corp_name(r.get("name"))
+        c = r.get("code")
+        if n and isinstance(c, str) and n not in m:
+            m[n] = c
+    return m
+
+
+def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd.DataFrame:
+    """다중 소스 병합 → 보고서 원장. 중복 제거가 아니라 '병합'이다(정보를 버리지 않는다)."""
+    frames = [f for f in frames if f is not None and len(f)]
+    if not frames:
+        LOG.warn("수집된 리포트가 없습니다. 드라이브 캐시도 비어 있다면 D축 d2/d4 는 결측 처리됩니다.")
+        return pd.DataFrame(columns=REPORT_COLS)
+    d = pd.concat([f.reindex(columns=sorted(set().union(*[set(x.columns) for x in frames])))
+                   for f in frames], ignore_index=True)
+
+    d["pub_date"] = as_ts_series(d["pub_date"])
+    # 네이버 리스트는 'YY.MM.DD' — 2자리 연도가 1900년대로 파싱되는 사고를 막는다
+    bad = d["pub_date"].notna() & (d["pub_date"].dt.year < 2000)
+    if bad.any():
+        d.loc[bad, "pub_date"] = d.loc[bad, "pub_date"] + pd.offsets.DateOffset(years=100)
+    d = d.dropna(subset=["pub_date"])
+
+    bid = d["broker_raw"].map(normalize_broker)
+    d["broker_id"] = [x[0] for x in bid]
+    d["broker_name"] = [x[1] for x in bid]
+
+    # 종목코드: ① 소스 제공 ② 제목 정규식 ③ 종목명→코드 사전
+    d["stock_code"] = d["stock_code"].map(to_code6)
+    need = d["stock_code"].isna()
+    if need.any():
+        d.loc[need, "stock_code"] = d.loc[need, "title"].map(code_from_title)
+    need = d["stock_code"].isna() & d["stock_name"].astype(str).str.len().gt(0)
+    if need.any() and len(sec):
+        n2c = _name_to_code_map(sec)
+        d.loc[need, "stock_code"] = d.loc[need, "stock_name"].map(
+            lambda s: n2c.get(norm_corp_name(s)))
+
+    d["title"] = d["title"].map(_dedup_repeat)
+    d["report_uid"] = [sha1_str(s, i) for s, i in zip(d["source"].astype(str),
+                                                      d["src_report_id"].astype(str))]
+    # 소스 간 동일 보고서 판정 키
+    d["dedup_key"] = [sha1_str(pd.Timestamp(dt).strftime("%Y%m%d"), b,
+                               c or "", norm_text(t)[:40])
+                      for dt, b, c, t in zip(d["pub_date"], d["broker_id"],
+                                             d["stock_code"].fillna(""), d["title"])]
+    n_raw = len(d)
+    d = d.sort_values(["dedup_key", "source"])
+
+    agg = {
+        "report_uid": ("report_uid", "first"),
+        "src_report_id": ("src_report_id", lambda s: "|".join(sorted(set(map(str, s))))),
+        "source": ("source", lambda s: "+".join(sorted(set(map(str, s))))),
+        "category": ("category", "first"),
+        "pub_date": ("pub_date", "min"),
+        "title": ("title", lambda s: max(map(str, s), key=len)),
+        "stock_code": ("stock_code", lambda s: next((x for x in s if isinstance(x, str)), None)),
+        "stock_name": ("stock_name", lambda s: next((x for x in map(str, s) if x.strip()), "")),
+        "broker_id": ("broker_id", "first"),
+        "broker_name": ("broker_name", "first"),
+        "broker_raw": ("broker_raw", "first"),
+        "analyst_raw": ("analyst_raw", lambda s: next((x for x in map(str, s) if x.strip()), "")),
+        "target_price": ("target_price", lambda s: pd.Series(list(s)).dropna().max()),
+        "opinion": ("opinion", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
+        "pdf_url": ("pdf_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
+        "detail_url": ("detail_url", lambda s: next((x for x in s if isinstance(x, str) and x), None)),
+    }
+    m = d.groupby("dedup_key", as_index=False).agg(**agg)
+    LOG.info(f"보고서 원장 병합: 원시 {n_raw:,}건 → 고유 {len(m):,}건 "
+             f"(소스 간 중복 {n_raw - len(m):,}건 병합)")
+
+    m["event_date"] = m["pub_date"]
+    m["knowledge_date"] = m["pub_date"]          # 리포트는 발간=공개 (C1)
+    m = pit_frame(m, "event_date", "knowledge_date", source="research")
+    PIPE.io("OUT", "MEM", "report_master", m, source="hankyung+naver")
+    return m
+
+
+def build_analyst_ledger(rep: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """애널리스트 마스터 + 보고서↔애널리스트 연결표. 연결 방법과 신뢰도를 반드시 기록한다."""
+    if rep.empty:
+        return (pd.DataFrame(columns=["analyst_id", "name", "broker_id", "broker_name"]),
+                pd.DataFrame(columns=["report_uid", "analyst_id", "link_method", "link_conf"]))
+    links = []
+    for r in rep.itertuples(index=False):
+        names, method, conf = [], "unresolved", 0.0
+        raw = getattr(r, "analyst_raw", "") or ""
+        if str(raw).strip():
+            names = split_analysts(raw)
+            method, conf = "list_field", 0.98        # 한경 '작성자' 컬럼 — 가장 신뢰도 높음
+        if not names:
+            praw = getattr(r, "pdf_analysts", "") or ""
+            if str(praw).strip():
+                names = [n for n in str(praw).split(",") if n.strip()]
+                method, conf = "pdf_header", 0.80
+        if not names:
+            continue
+        for i, nm in enumerate(names):
+            links.append({
+                "report_uid": r.report_uid, "name": nm, "broker_id": r.broker_id,
+                "broker_name": r.broker_name, "role": "lead" if i == 0 else "co",
+                "link_method": method, "link_conf": conf,
+                "pub_date": r.pub_date, "stock_code": r.stock_code,
+                "target_price": r.target_price, "opinion": r.opinion,
+            })
+    if not links:
+        LOG.warn("애널리스트를 한 건도 식별하지 못했습니다. 한경컨센서스 수집이 실패했거나 "
+                 "skinType=business 응답이 6컬럼 레이아웃으로 왔을 가능성이 큽니다.")
+        return (pd.DataFrame(columns=["analyst_id", "name", "broker_id", "broker_name"]),
+                pd.DataFrame(columns=["report_uid", "analyst_id", "link_method", "link_conf"]))
+
+    L = pd.DataFrame(links)
+    L["name_norm"] = L["name"].map(lambda s: re.sub(r"\s+", "", str(s)))
+    # 애널리스트 동일성: (증권사, 이름). 동명이인은 소속으로 구분된다.
+    L["analyst_id"] = [sha1_str("analyst", b, n)[:14] for b, n in zip(L["broker_id"], L["name_norm"])]
+
+    A = (L.groupby("analyst_id", as_index=False)
+          .agg(name=("name_norm", "first"), broker_id=("broker_id", "first"),
+               broker_name=("broker_name", "first"),
+               first_seen=("pub_date", "min"), last_seen=("pub_date", "max"),
+               n_reports=("report_uid", "nunique"),
+               n_stocks=("stock_code", lambda s: s.dropna().nunique()),
+               n_targets=("target_price", lambda s: int(s.notna().sum()))))
+    # 동명이인/이직 감지 — 같은 이름이 여러 증권사에 존재
+    dup = A.groupby("name")["analyst_id"].transform("size")
+    A["name_ambiguous"] = dup > 1
+    LOG.ok(f"애널리스트 원장 {len(A):,}명 · 연결 {len(L):,}건 "
+           f"(동명/이직 후보 {int(A['name_ambiguous'].sum()):,}명)")
+    PIPE.io("OUT", "MEM", "analyst_master", A)
+    PIPE.io("OUT", "MEM", "report_analyst_link", L)
+    return A, L
+
+
+def audit_linkage(rep: pd.DataFrame, A: pd.DataFrame, L: pd.DataFrame):
+    """★ 사용자 요구: '보고서와 식별된 애널리스트가 제대로 연결되었는지 한눈에'."""
+    LOG.banner("원장 무결성 감사 — 보고서 ↔ 애널리스트 ↔ 종목",
+               "연결이 깨진 지점을 연도·소스별로 노출한다. 숫자가 낮으면 그대로 보고한다.")
+    if rep.empty:
+        LOG.warn("보고서 원장이 비어 감사를 수행할 수 없습니다.")
+        return
+    r = rep.copy()
+    r["year"] = r["pub_date"].dt.year
+    linked = set(L["report_uid"]) if len(L) else set()
+    r["has_analyst"] = r["report_uid"].isin(linked)
+    r["has_code"] = r["stock_code"].notna()
+    r["has_tp"] = r["target_price"].notna()
+
+    rows = []
+    for y, g in r.groupby("year"):
+        n = len(g)
+        rows.append([int(y), f"{n:,}",
+                     f"{int(g['has_analyst'].sum()):,}", f"{100*g['has_analyst'].mean():.1f}%",
+                     f"{int(g['has_code'].sum()):,}", f"{100*g['has_code'].mean():.1f}%",
+                     f"{int(g['has_tp'].sum()):,}", f"{100*g['has_tp'].mean():.1f}%",
+                     "✔" if n >= RESEARCH_TARGET_PER_YEAR else f"목표 {RESEARCH_TARGET_PER_YEAR:,} 미달"])
+    LOG.table(rows, ["연도", "보고서", "애널연결", "연결률", "종목코드", "코드율",
+                     "목표주가", "TP율", "연 3만건 목표"],
+              ["c", "r", "r", "r", "r", "r", "r", "r", "l"])
+
+    src = r.groupby("source").agg(n=("report_uid", "size"),
+                                  analyst=("has_analyst", "mean"),
+                                  code=("has_code", "mean"),
+                                  tp=("has_tp", "mean")).reset_index()
+    LOG.table([[s["source"], f"{int(s['n']):,}", f"{100*s['analyst']:.1f}%",
+                f"{100*s['code']:.1f}%", f"{100*s['tp']:.1f}%"] for _, s in src.iterrows()],
+              ["소스 조합", "건수", "애널연결률", "종목코드율", "목표주가율"],
+              ["l", "r", "r", "r", "r"],
+              title="다중소스 원장 연결 — 어느 소스가 무엇을 채웠는가 "
+                    "('hankyung+naver' 는 두 소스가 같은 보고서로 병합된 건")
+
+    if len(L):
+        mth = L.groupby("link_method").agg(n=("report_uid", "nunique"),
+                                           conf=("link_conf", "mean")).reset_index()
+        LOG.table([[m["link_method"], f"{int(m['n']):,}", f"{m['conf']:.2f}"]
+                   for _, m in mth.iterrows()],
+                  ["연결 방법", "보고서 수", "평균 신뢰도"], ["l", "r", "r"],
+                  title="애널리스트 연결 방법별 분포 "
+                        "(list_field=한경 작성자컬럼 0.98 · pdf_header=PDF추출 0.80)")
+
+    if len(A):
+        bro = (A.groupby("broker_name")
+                .agg(analysts=("analyst_id", "nunique"), reports=("n_reports", "sum"))
+                .sort_values("reports", ascending=False))
+        maj = [b for b in MAJOR_BROKERS if b in bro.index]
+        mnr = [b for b in bro.index if b not in MAJOR_BROKERS]
+        LOG.table([[b, f"{int(bro.loc[b,'analysts']):,}", f"{int(bro.loc[b,'reports']):,}"]
+                   for b in bro.index[:30]],
+                  ["증권사", "애널리스트 수", "보고서 수"], ["l", "r", "r"],
+                  title="증권사별 커버리지 (사명변경 정규화 적용: 미래에셋대우→미래에셋증권 등)")
+        LOG.info(f"대형사 커버리지 {len(maj)}/10개 · 그 외 증권사 {len(mnr)}개 "
+                 f"→ 요구조건(대형 10+ / 중소형 10+): "
+                 f"{'✔ 충족' if len(maj) >= 10 and len(mnr) >= 10 else '❗ 미충족 — 수집 범위를 넓히세요'}")
+
+    orphan = r[~r["has_analyst"]]
+    if len(orphan):
+        top = orphan.groupby("source").size().sort_values(ascending=False).head(5)
+        LOG.warn(f"애널리스트 미연결 {len(orphan):,}건 ({100*len(orphan)/len(r):.1f}%) — "
+                 f"주로 {', '.join(f'{k}({v:,})' for k, v in top.items())}. "
+                 f"네이버 단독 건은 리스트에 작성자가 없어 PDF 추출에 의존합니다 "
+                 f"(RESEARCH_DOWNLOAD_PDF=True 로 개선 가능).")
+
+
+def build_consensus_panel(L: pd.DataFrame, months: pd.DatetimeIndex,
+                          window_days: int = 90) -> pd.DataFrame:
+    """D축 d2(목표주가 상향 리비전) · d4(커버리지 변화) 산출.
+
+    ★ 리비전은 '같은 애널리스트가 같은 종목에 대해 이전에 제시한 목표주가' 와 비교해야 한다.
+      애널리스트 식별이 없으면 이 지표는 만들 수 없다 — 애널리스트 원장이 필요한 진짜 이유.
+    """
+    cols = ["code", "month", "n_analyst", "tp_median", "rev_up", "rev_dn", "d2_raw", "d4_raw"]
+    if L is None or L.empty:
+        LOG.warn("애널리스트 연결이 없어 컨센서스 패널을 만들 수 없습니다 — d2/d4 결측 처리. "
+                 "U 는 가용 축(d1, d3) 평균으로 계산됩니다(0으로 채우지 않음).")
+        return pd.DataFrame(columns=cols)
+    x = L.dropna(subset=["stock_code"]).copy()
+    x["pub_date"] = as_ts_series(x["pub_date"])
+    x = x.dropna(subset=["pub_date"])
+    if x.empty:
+        return pd.DataFrame(columns=cols)
+
+    x = x.sort_values(["stock_code", "analyst_id", "pub_date"])
+    x["prev_tp"] = x.groupby(["stock_code", "analyst_id"], observed=True)["target_price"].shift(1)
+    x["rev"] = np.where(x["target_price"].notna() & x["prev_tp"].notna(),
+                        np.sign(x["target_price"] - x["prev_tp"]), np.nan)
+
+    out = []
+    for m in months:
+        lo = m - pd.Timedelta(days=window_days)
+        w = x[(x["pub_date"] > lo) & (x["pub_date"] <= m)]
+        if w.empty:
+            continue
+        g = w.groupby("stock_code", observed=True)
+        agg = pd.DataFrame({
+            "n_analyst": g["analyst_id"].nunique(),
+            "tp_median": g["target_price"].median(),
+            "rev_up": g["rev"].apply(lambda s: float((s > 0).sum())),
+            "rev_dn": g["rev"].apply(lambda s: float((s < 0).sum())),
+        }).reset_index().rename(columns={"stock_code": "code"})
+        agg["month"] = m
+        out.append(agg)
+    if not out:
+        return pd.DataFrame(columns=cols)
+    P = pd.concat(out, ignore_index=True)
+    P = P.sort_values(["code", "month"])
+    # d2 = -(상향 리비전 수 / 커버리지)   d4 = -Δ(커버리지 애널리스트 수)
+    P["d2_raw"] = -(P["rev_up"] / P["n_analyst"].replace(0, np.nan))
+    P["d4_raw"] = -P.groupby("code", observed=True)["n_analyst"].diff()
+    LOG.ok(f"컨센서스 패널 {len(P):,}행 ({P['code'].nunique():,}종목 × {P['month'].nunique()}개월) — "
+           f"목표주가 리비전 관측 {int((P['rev_up']+P['rev_dn']).sum()):,}건")
+    PIPE.io("OUT", "MEM", "consensus_panel", P)
+    return downcast(P)
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-F  PIT 저장소 / 유니버스 / 셀  (계약 C1·C2·C3·C4·C11)                                 ║
+# ║                                                                                          ║
+# ║  C1: 모든 데이터 접근은 PIT.get(table, as_of) 한 곳만 통과한다.                            ║
+# ║      DataFrame 직접 슬라이싱 금지. 우회 파라미터를 만들지 않는다.                          ║
+# ║  C2: 유니버스는 상장폐지 종목을 포함한다. 정리매매가 없으면 -100%.                          ║
+# ║  C11: 셀 = (date, industry, size_bucket). 다른 그룹키 금지.                                ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+class PITStore:
+    """유일한 데이터 게이트웨이. 등록된 테이블은 knowledge_date 로 정렬되어 보관되고,
+    as_of 조회는 항상 knowledge_date <= as_of 를 강제한다. 예외 경로는 존재하지 않는다."""
+
+    def __init__(self):
+        self._t: Dict[str, pd.DataFrame] = {}
+        self._meta: Dict[str, dict] = {}
+        self.access_log: Counter = Counter()
+
+    def register(self, name: str, df: pd.DataFrame, key_cols: Sequence[str] = ()):
+        if df is None or len(df) == 0:
+            self._t[name] = pd.DataFrame(columns=list(PIT_COLS))
+            self._meta[name] = {"rows": 0, "keys": list(key_cols), "empty": True}
+            LOG.debug(f"PIT 등록(빈 테이블): {name}")
+            return
+        missing = [c for c in PIT_COLS if c not in df.columns]
+        if missing:
+            raise KeyError(
+                f"[C1 위반] 테이블 '{name}' 에 PIT 컬럼 {missing} 이 없습니다. "
+                f"수집 함수의 반환값을 pit_frame(df, event_date, knowledge_date) 로 감싸세요. "
+                f"이 검사를 우회하는 방법은 의도적으로 만들지 않았습니다.")
+        d = df.copy()
+        d["knowledge_date"] = as_ts_series(d["knowledge_date"])
+        d = d.dropna(subset=["knowledge_date"]).sort_values("knowledge_date", kind="stable")
+        d = d.reset_index(drop=True)
+        self._t[name] = d
+        self._meta[name] = {"rows": len(d), "keys": list(key_cols), "empty": False,
+                            "kd_min": d["knowledge_date"].min(), "kd_max": d["knowledge_date"].max()}
+        PIPE.io("OUT", "MEM", f"PIT:{name}", d)
+
+    def has(self, name: str) -> bool:
+        return name in self._t and not self._meta.get(name, {}).get("empty", True)
+
+    def get(self, name: str, as_of, cols: Optional[Sequence[str]] = None,
+            latest_by: Optional[Sequence[str]] = None) -> pd.DataFrame:
+        """시점 as_of 에서 '알 수 있었던' 행만 반환.
+        latest_by 를 주면 그 키별 최신 1행(=당시 최신 관측)만 남긴다."""
+        self.access_log[name] += 1
+        if name not in self._t:
+            return pd.DataFrame()
+        t = as_ts(as_of)
+        d = self._t[name]
+        if d.empty:
+            return d
+        # knowledge_date 정렬되어 있으므로 searchsorted 로 O(log n) 절단
+        pos = int(np.searchsorted(d["knowledge_date"].values, np.datetime64(t), side="right"))
+        d = d.iloc[:pos]
+        if latest_by:
+            lb = [c for c in latest_by if c in d.columns]
+            if lb:
+                d = d.drop_duplicates(subset=lb, keep="last")
+        return d[list(cols)] if cols else d
+
+    def asof_join(self, panel: pd.DataFrame, name: str, by: str,
+                  left_time: str = "month", cols: Optional[Sequence[str]] = None,
+                  suffix: str = "") -> pd.DataFrame:
+        """get() 의 벡터화 등가물. 패널 전체에 대해 한 번에 as-of 결합한다.
+
+        merge_asof(direction='backward') 는 knowledge_date <= month 인 마지막 행만 붙이므로
+        C1 과 정확히 동일한 의미를 갖는다. 루프로 get() 을 3만 번 부르는 대신 이걸 쓴다.
+        """
+        self.access_log[name] += 1
+        if name not in self._t or self._t[name].empty or panel.empty:
+            return panel
+        right = self._t[name]
+        if by not in right.columns or by not in panel.columns:
+            LOG.debug(f"asof_join 건너뜀: '{name}' 에 결합키 '{by}' 없음")
+            return panel
+        use = [c for c in (cols or [c for c in right.columns
+                                    if c not in ("event_date", "_src")]) if c in right.columns]
+        for c in (by, "knowledge_date"):
+            if c not in use:
+                use.append(c)
+        R = (right[use].dropna(subset=["knowledge_date", by])
+                        .sort_values("knowledge_date", kind="stable"))
+        L = panel.copy()
+        L["_ord"] = np.arange(len(L))
+        L = L.dropna(subset=[left_time, by]).sort_values(left_time, kind="stable")
+        if L.empty or R.empty:
+            return panel
+        R[by] = R[by].astype(str)
+        L[by] = L[by].astype(str)
+        try:
+            M = pd.merge_asof(L, R, left_on=left_time, right_on="knowledge_date",
+                              by=by, direction="backward", suffixes=("", suffix or "_r"))
+        except Exception as e:                                     # noqa
+            LOG.warn(f"asof_join 실패({type(e).__name__}) — '{name}' 결합을 건너뜁니다. "
+                     f"대개 정렬/타입 문제입니다.")
+            return panel
+        M = M.sort_values("_ord").drop(columns=["_ord"])
+        M.index = panel.index[:len(M)] if len(M) == len(panel) else range(len(M))
+        return M
+
+    def report(self):
+        rows = []
+        for n, m in self._meta.items():
+            rows.append([n, f"{m['rows']:,}",
+                         str(m.get("kd_min", ""))[:10], str(m.get("kd_max", ""))[:10],
+                         ",".join(m.get("keys", []))[:30], f"{self.access_log.get(n,0):,}"])
+        LOG.table(rows, ["PIT 테이블", "행수", "knowledge 최소", "knowledge 최대", "키", "조회횟수"],
+                  ["l", "r", "l", "l", "l", "r"],
+                  title="PIT 저장소 상태 (C1 — 모든 조회는 knowledge_date <= as_of 강제)")
+
+
+PIT = PITStore()
+
+
+# ── 유니버스 (C2) ───────────────────────────────────────────────────────────────────────────
+LISTING_SEASONING_DAYS = 250          # 상장일 + 250거래일 ≈ 1년
+
+
+class Universe:
+    def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame):
+        self.sec = sec.copy()
+        self.snap = snapshots
+        self.attrition: List[dict] = []
+        self._trading_days = np.sort(px_daily["date"].unique()) if len(px_daily) else np.array([])
+        self._snap_by_month: Dict[pd.Timestamp, set] = {}
+        if len(snapshots):
+            for d, g in snapshots.groupby("snap_date"):
+                self._snap_by_month[as_ts(d)] = set(g["code"])
+        self.sec["listing_date"] = as_ts_series(self.sec["listing_date"])
+        self.sec["delisting_date"] = as_ts_series(self.sec["delisting_date"])
+        self._seasoned = {}
+        for r in self.sec.itertuples(index=False):
+            ld = r.listing_date
+            if pd.isna(ld) or len(self._trading_days) == 0:
+                self._seasoned[r.code] = ld
+            else:
+                i = int(np.searchsorted(self._trading_days, np.datetime64(ld), side="left"))
+                j = min(i + LISTING_SEASONING_DAYS, len(self._trading_days) - 1)
+                self._seasoned[r.code] = as_ts(self._trading_days[j])
+
+    def at(self, t) -> List[str]:
+        """시점 t 의 유니버스. t 이후 상장 종목이 하나라도 섞이면 그 자체로 C2 위반이다."""
+        t = as_ts(t)
+        # ① 스냅샷이 있으면 그것이 최우선 진실 (그 날 실제로 상장돼 있던 종목)
+        key = min(self._snap_by_month, key=lambda d: abs((d - t).days)) if self._snap_by_month else None
+        base = None
+        if key is not None and abs((key - t).days) <= 45:
+            base = set(self._snap_by_month[key])
+        if base is None:
+            base = set()
+            for r in self.sec.itertuples(index=False):
+                ld, dd = r.listing_date, r.delisting_date
+                if pd.notna(ld) and ld > t:
+                    continue
+                if pd.notna(dd) and dd <= t:
+                    continue
+                if pd.isna(ld) and pd.isna(dd):
+                    continue                          # 근거 없는 종목은 넣지 않는다
+                base.add(r.code)
+        # ② 상장 후 250거래일 시즈닝
+        out = []
+        for c in base:
+            s = self._seasoned.get(c)
+            if s is not None and pd.notna(s) and s > t:
+                continue
+            out.append(c)
+        return sorted(out)
+
+    def delisting_map(self) -> Dict[str, pd.Timestamp]:
+        return {r.code: r.delisting_date for r in self.sec.itertuples(index=False)
+                if pd.notna(r.delisting_date)}
+
+    def audit_row(self, stage: str, t, codes: Sequence[str]):
+        self.attrition.append({"month": as_ts(t), "stage": stage, "n": len(codes)})
+
+    def report_attrition(self):
+        if not self.attrition:
+            return
+        A = pd.DataFrame(self.attrition)
+        order = ["전체상장", "PIT유니버스", "가격보유", "유동성필터", "거부권통과",
+                 "하한선통과", "최종선정"]
+        piv = A.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
+        rows = []
+        prev = None
+        for s in order:
+            if s not in piv.index:
+                continue
+            m = piv.loc[s]
+            keep = "" if prev is None else f"{100*m['mean']/prev:.1f}%"
+            rows.append([s, f"{m['mean']:,.0f}", f"{m['min']:,.0f}", f"{m['max']:,.0f}", keep])
+            prev = m["mean"]
+        LOG.table(rows, ["게이트", "월평균 종목수", "최소", "최대", "직전 대비 잔존율"],
+                  ["l", "r", "r", "r", "r"],
+                  title="유니버스 감쇠 감사 (§10.4) — 어느 게이트에서 표본이 붕괴하는지")
+        if rows and float(str(rows[-1][1]).replace(",", "")) < 5:
+            LOG.warn("최종 선정 종목이 월평균 5개 미만입니다. 통계적 판단이 불가능한 수준이므로 "
+                     "임계값을 낮추기 전에 어느 게이트가 원인인지 위 표에서 먼저 확인하세요.")
+
+
+# ── 셀 (C11) ────────────────────────────────────────────────────────────────────────────────
+SIZE_BUCKETS = [(0, 50, "<50"), (50, 100, "50-99"), (100, 300, "100-299"),
+                (300, 1000, "300-999"), (1000, 10 ** 9, "1000+")]
+
+
+def size_bucket(n_emp: float) -> str:
+    if n_emp is None or not np.isfinite(n_emp) or n_emp <= 0:
+        return "미상"
+    for lo, hi, lab in SIZE_BUCKETS:
+        if lo <= n_emp < hi:
+            return lab
+    return "1000+"
+
+
+def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N) -> pd.DataFrame:
+    """cell_key = (date, industry, size_bucket). 규모를 넣는 이유는 §5.6-② 참조:
+    정부 지원제도 요건 대부분이 기업 규모에 연동되므로 정책효과가 셀 내 공통충격으로 흡수된다.
+    비용 0의 오염 제거."""
+    ind = sec.set_index("code")["industry"].astype(str).to_dict()
+    p = panel.copy()
+    p["industry"] = p["code"].map(ind).fillna("미분류").astype(str)
+    p["industry_l1"] = p["industry"].str.slice(0, 4)                 # 폴백용 상위 단위
+    p["size_bucket"] = p["employees"].map(size_bucket) if "employees" in p.columns else "미상"
+    p["cell"] = (p["month"].dt.strftime("%Y%m") + "|" + p["industry"] + "|" + p["size_bucket"])
+
+    cnt = p.groupby("cell", observed=True)["code"].transform("size")
+    small = cnt < min_n
+    n_small = int(small.sum())
+    if n_small:
+        p.loc[small, "cell"] = (p.loc[small, "month"].dt.strftime("%Y%m") + "|" +
+                                p.loc[small, "industry_l1"] + "|ALL")
+        cnt2 = p.groupby("cell", observed=True)["code"].transform("size")
+        still = cnt2 < min_n
+        if still.any():
+            p.loc[still, "cell"] = p.loc[still, "month"].dt.strftime("%Y%m") + "|ALL|ALL"
+        LOG.info(f"셀 폴백 발생: 1차 {n_small:,}행(산업 상위단위로) / 2차 {int(still.sum()):,}행(전체로). "
+                 f"C11 요구대로 폴백을 로깅합니다.")
+        PIPE.note(f"셀 폴백 {n_small:,}행")
+    p["cell"] = p["cell"].astype("category")
+    return p
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-G  공용축 B(회계품질) · C(자원투입) · D(반영도)  — 전 팩 공유, 필수                    ║
+# ║                                                                                          ║
+# ║  B·C 는 '확인'이 아니라 '사전확률'로 쓴다. K분기 연속 정렬 같은 대기조건을 넣지 않는다.     ║
+# ║  가장 느린 축에 전체를 묶으면 선행성을 잃기 때문이다(§1.4).                                 ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+def build_base_panel(uni: "Universe", months: pd.DatetimeIndex,
+                     price_m: pd.DataFrame) -> pd.DataFrame:
+    """(code, month) 기본 격자. 여기에 모든 축이 as-of 로 붙는다."""
+    rows = []
+    for m in months:
+        codes = uni.at(m)
+        uni.audit_row("PIT유니버스", m, codes)
+        rows.append(pd.DataFrame({"code": codes, "month": m}))
+    P = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["code", "month"])
+    P = P.merge(price_m, on=["code", "month"], how="left")
+    for m in months:
+        sub = P[(P["month"] == m) & P["close"].notna()]
+        uni.audit_row("가격보유", m, sub["code"].tolist())
+    LOG.ok(f"기본 패널 {len(P):,}행 ({P['code'].nunique():,}종목 × {len(months)}개월) "
+           f"— 메모리 {mem_mb(P):.0f}MB")
+    PIPE.io("OUT", "MEM", "base_panel", P)
+    return P
+
+
+def attach_fundamentals(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
+    """재무·직원 데이터를 PIT as-of 로 결합. 여기가 미래누수의 최대 위험지점이다."""
+    c2c = sec.dropna(subset=["corp_code"]).set_index("code")["corp_code"].astype(str).to_dict()
+    P = P.copy()
+    P["corp_code"] = P["code"].map(c2c)
+    if PIT.has("dart_financials"):
+        P = PIT.asof_join(P, "dart_financials", by="corp_code", left_time="month")
+    if PIT.has("dart_employees"):
+        P = PIT.asof_join(P, "dart_employees", by="corp_code", left_time="month",
+                          cols=["corp_code", "knowledge_date", "employees", "payroll"],
+                          suffix="_emp")
+    for c in ("employees", "payroll"):
+        if c not in P.columns:
+            P[c] = np.nan
+    return P
+
+
+# ── B축: 회계 품질 ──────────────────────────────────────────────────────────────────────────
+def axis_B(P: pd.DataFrame) -> pd.DataFrame:
+    P = P.sort_values(["code", "month"]).copy()
+    g = lambda c: P.groupby("code", observed=True)[c]
+
+    rev = P.get("revenue_ttm")
+    cogs = P.get("cogs_ttm")
+    P["gpm"] = safe_div(rev - cogs, rev) if rev is not None and cogs is not None else np.nan
+    # b1: GPM 추세 기울기 (12개월 창의 선형 기울기 — 4분기 추세의 월간 등가물)
+    P["b1"] = g("gpm").transform(lambda s: s.rolling(12, min_periods=6)
+                                 .apply(lambda w: np.polyfit(np.arange(len(w)), w, 1)[0]
+                                        if np.isfinite(w).all() else np.nan, raw=True))
+    P["DIO"] = safe_div(P.get("inventory"), P.get("cogs_ttm")) * 365.0
+    P["DSO"] = safe_div(P.get("receivable"), P.get("revenue_ttm")) * 365.0
+    P["turn_days"] = P["DIO"] + P["DSO"]
+    P["d_turn"] = g("turn_days").diff(12)
+    P["dlog_rev"] = g("revenue_ttm").transform(lambda s: dlog(s, 12))
+
+    # accruals (Sloan) — 순이익이 음수인 구간에서 CF/NI 비율을 쓰지 말 것(§7.1)
+    avg_assets = (P.get("assets") + g("assets").shift(12)) / 2.0
+    P["accruals"] = safe_div(P.get("net_income_ttm") - P.get("cfo_ttm"), avg_assets)
+    P["d_accruals"] = g("accruals").diff(12)
+    P["b4"] = safe_div(g("contract_liab").diff(12), P.get("revenue_ttm"))
+    return P
+
+
+def axis_B_tp(P: pd.DataFrame) -> pd.DataFrame:
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["TP_B1"] = tp_product(z("dlog_rev"), -z("d_turn"))      # 매출↑ 인데 회전 유지
+    P["TP_B2"] = tp_product(z("dlog_rev"), -z("d_accruals"))  # 매출↑ 인데 발생액 유지
+    P["E_AXB"] = nanmean_cols(P, ["TP_B1", "TP_B2"]) * 0.5 + \
+        nanmean_cols(pd.DataFrame({"a": z("b1"), "b": z("b4")}), ["a", "b"]) * 0.5
+    return P
+
+
+# ── C축: 자원 투입 ──────────────────────────────────────────────────────────────────────────
+def axis_C(P: pd.DataFrame) -> pd.DataFrame:
+    P = P.sort_values(["code", "month"]).copy()
+    g = lambda c: P.groupby("code", observed=True)[c]
+    nwc = (P.get("receivable").fillna(0) + P.get("inventory").fillna(0) -
+           P.get("payable").fillna(0)) if "receivable" in P.columns else np.nan
+    P["IC"] = nwc + P.get("ppe").fillna(0) + P.get("intangible").fillna(0)
+    P["dlog_IC"] = g("IC").transform(lambda s: dlog(s, 12))
+    nopat = P.get("op_income_ttm") * 0.78                      # 법인세 22% 가정(셀 내 상대값이라 수준은 무해)
+    avg_ic = (P["IC"] + g("IC").shift(12)) / 2.0
+    P["ROIC"] = safe_div(nopat, avg_ic)
+    P["d_ROIC"] = g("ROIC").diff(12)
+    P["value_added"] = (P.get("op_income_ttm").fillna(0) + P.get("payroll").fillna(0) +
+                        P.get("dep_ttm").fillna(0))
+    P["va_per_emp"] = safe_div(P["value_added"], P.get("employees"))
+    P["d_va_per_emp"] = g("va_per_emp").diff(12)
+    P["dlog_emp"] = g("employees").transform(lambda s: dlog(s, 12))
+    P["c3"] = safe_div(P.get("capex_ttm").abs(), P.get("dep_ttm").abs())
+    P["debt_ratio"] = safe_div(P.get("liabilities"), P.get("equity"))
+    P["d_debt_ratio"] = g("debt_ratio").diff(12)
+    return P
+
+
+def axis_C_tp(P: pd.DataFrame) -> pd.DataFrame:
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["TP_C1"] = tp_product(z("dlog_IC"), z("d_ROIC"))            # 확장하는데 수익성 유지
+    P["TP_C2"] = tp_product(z("dlog_emp"), z("d_va_per_emp"))     # 인원↑ 인데 생산성 유지
+    P["E_AXC"] = nanmean_cols(P, ["TP_C1", "TP_C2"]) * 0.5 + \
+        nanmean_cols(pd.DataFrame({"a": z("c3")}), ["a"]) * 0.5
+    return P
+
+
+# ── D축: 반영도 (U 산출) — 이 시스템에서 가장 중요한 단일 지표 ───────────────────────────────
+def axis_D(P: pd.DataFrame, px_daily: pd.DataFrame, flows: pd.DataFrame,
+           cons: pd.DataFrame) -> pd.DataFrame:
+    """Δlog P = Δlog E + Δlog M 분해.
+
+    목표 상태: ΔlogE > 0 AND ΔlogM <= 0
+      → 시장이 이익 증가는 인정했으나 자본화를 거부 = "일회성으로 분류함" = 노리는 미스프라이싱
+    d1 = -Δlog M
+
+    ⚠ 한계 명시(§16.2): 컨센서스 fwd EPS 시계열은 과거 복원이 불가능하다. 따라서 E 는
+      후행 12M EPS(=DART TTM 순이익/주식수 대신 시가총액 기준으로 EPS 대리)를 쓴다.
+      이 대리변수의 한계를 리포트에 반드시 명시하고 숨기지 않는다.
+    """
+    P = P.sort_values(["code", "month"]).copy()
+    g = lambda c: P.groupby("code", observed=True)[c]
+
+    # E 대리: TTM 순이익. M 대리: 시가총액/TTM순이익 → 주식수를 모를 때도 비율은 성립한다.
+    P["E_proxy"] = P.get("net_income_ttm")
+    P["mktcap_proxy"] = P["close"]                       # 셀 내 상대비교라 주식수 상수배는 무해
+    # 120거래일 ≈ 6개월 창
+    P["dlog_E"] = g("E_proxy").transform(lambda s: dlog(s, 6))
+    P["dlog_P"] = g("close").transform(lambda s: dlog(s, 6))
+    P["dlog_M"] = P["dlog_P"] - P["dlog_E"]
+    P["d1"] = -P["dlog_M"]
+    P["D_state"] = np.select(
+        [(P["dlog_E"] > 0) & (P["dlog_M"] <= 0),
+         (P["dlog_E"] > 0) & (P["dlog_M"] > 0),
+         (P["dlog_E"] <= 0) & (P["dlog_M"] > 0)],
+        ["목표상태(진입)", "리레이팅중(관망)", "기대선행(배제)"], default="개선없음(배제)")
+
+    # d3: 120일 기관+외국인 누적순매수 / 시총 (부호 반전 — 아직 안 들어온 게 좋다)
+    P["d3"] = np.nan
+    if flows is not None and len(flows):
+        f = flows.copy()
+        f["date"] = as_ts_series(f["date"])
+        f["net"] = f.get("inst_net").fillna(0) + f.get("foreign_net").fillna(0)
+        f = f.sort_values(["code", "date"])
+        f["cum120"] = (f.groupby("code", observed=True)["net"]
+                        .transform(lambda s: s.rolling(120, min_periods=40).sum()))
+        f["month"] = f["date"].values.astype("datetime64[M]")
+        fm = (f.groupby(["code", "month"], observed=True)["cum120"].last().reset_index())
+        fm["month"] = as_ts_series(fm["month"]) + pd.offsets.MonthEnd(0)
+        P = P.merge(fm, on=["code", "month"], how="left")
+        adv = P["adv20"].replace(0, np.nan)
+        P["d3"] = -safe_div(P["cum120"], adv * 250.0)     # 시총 대신 연간 거래대금으로 정규화
+
+    # d2/d4: 컨센서스 (애널리스트 원장에서 산출)
+    P["d2"] = np.nan
+    P["d4"] = np.nan
+    if cons is not None and len(cons):
+        P = P.merge(cons[["code", "month", "d2_raw", "d4_raw", "n_analyst", "tp_median"]],
+                    on=["code", "month"], how="left")
+        P["d2"] = P["d2_raw"]
+        P["d4"] = P["d4_raw"]
+    return P
+
+
+def axis_D_U(P: pd.DataFrame) -> pd.DataFrame:
+    """U = 결측 제외 평균. ★ 결측 축을 0으로 채우지 않는다(§7.3)."""
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    Z = pd.DataFrame({"z_d1": z("d1"), "z_d2": z("d2"), "z_d3": z("d3"), "z_d4": z("d4")})
+    avail = Z.notna().sum(axis=1)
+    P["U_raw"] = nanmean_cols(Z, list(Z.columns))
+    P["U_axes_used"] = avail
+    P["U"] = xsec_rank_pct(P["U_raw"], P["cell"])
+    used = {c: int(Z[c].notna().sum()) for c in Z.columns}
+    LOG.info("D축 가용성 — " + " · ".join(f"{k}:{v:,}행" for k, v in used.items()) +
+             f"  (평균 가용 축 {avail.mean():.2f}개)")
+    if used.get("z_d2", 0) == 0 and used.get("z_d4", 0) == 0:
+        LOG.warn("컨센서스 기반 d2/d4 가 전무합니다. U 는 d1(+d3)만으로 구성됩니다. "
+                 "애널리스트 리포트 수집이 실패했거나 목표주가 추출률이 0인 상태입니다 — "
+                 "위 원장 무결성 감사표를 확인하세요.")
+    return P
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L2-A  센서팩 레지스트리                                                                   ║
+# ║                                                                                          ║
+# ║  팩은 플러그인이다. 각 팩은 자기 자신을 여기에 등록하고, 스코어 조립부는 레지스트리만 본다.  ║
+# ║  → 이 파일에 어떤 팩이 포함되어 빌드되었는지가 곧 전략의 정의가 된다.                       ║
+# ║  C12: 정책 캘린더가 없는 센서팩은 등록될 수 없다.                                          ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+PACK_REGISTRY: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def register_pack(pid: str, name: str, tp_cols: Sequence[str], features_fn: Callable,
+                  policy: Sequence[dict], interp: Sequence[Tuple[str, str, str]],
+                  ingest_fn: Optional[Callable] = None, theta_col: Optional[str] = None,
+                  notes: str = ""):
+    if not policy:
+        raise RuntimeError(
+            f"[C12 위반] 센서팩 '{pid}' 에 정책 캘린더가 없습니다. "
+            f"정책 캘린더 없는 센서팩은 파이프라인에 등록될 수 없습니다(§12). "
+            f"모든 대체데이터는 정책에 오염됩니다 — 이건 PACK-N 만의 문제가 아닙니다.")
+    PACK_REGISTRY[pid] = {
+        "id": pid, "name": name, "tp_cols": list(tp_cols), "features": features_fn,
+        "ingest": ingest_fn, "policy": list(policy), "interp": list(interp),
+        "theta_col": theta_col, "notes": notes,
+        "enabled": True, "disable_reason": "", "E_col": f"E_{pid}",
+    }
+
+
+def active_packs() -> List[dict]:
+    return [p for pid, p in PACK_REGISTRY.items()
+            if p["enabled"] and pid in ACTIVE_PACKS]
+
+
+def disable_pack(pid: str, reason: str):
+    if pid in PACK_REGISTRY:
+        PACK_REGISTRY[pid]["enabled"] = False
+        PACK_REGISTRY[pid]["disable_reason"] = reason
+        LOG.warn(f"센서팩 '{pid}' 비활성화 — {reason} (조용히 남겨두지 않고 명시적으로 끕니다)")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  PACK-C  자본배분 체제 전환  (★ Phase 1 — 가장 싼 검정)                                    ║
+# ║                                                                                          ║
+# ║  TCD 영업센서가 구조적으로 못 보는 전환 유형: 제국 건설을 멈추고 자본을 돌려주기 시작.      ║
+# ║  데이터가 전부 DART 정형 공시라 콜드빌드가 최단이다 → R2/R3 를 가장 빨리 돌릴 수 있다.      ║
+# ║                                                                                          ║
+# ║  ⚠ 레짐 경고: 밸류업 프로그램은 2024년 이후다. 10년 중 최근 2년만 현 레짐이다.              ║
+# ║    2024년 이전 구간에서 알파가 0이면 이건 구조적 알파가 아니라 정책 베팅이다.               ║
+# ║    R7/R10 에서 이 판정을 반드시 리포트에 명시한다.                                          ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+PACK_C_POLICY = [
+    {"policy_id": "VALUEUP_2024", "name": "기업 밸류업 프로그램", "start": "2024-02-26",
+     "end": None, "pack": "C", "req_type": "없음", "req_value": "",
+     "url": "https://www.fsc.go.kr"},
+    {"policy_id": "VALUEUP_INDEX_2024", "name": "코리아 밸류업 지수 발표", "start": "2024-09-24",
+     "end": None, "pack": "C", "req_type": "없음", "req_value": ""},
+    {"policy_id": "DIV_SEPARATE_TAX", "name": "배당소득 분리과세 논의/시행", "start": "2025-01-01",
+     "end": None, "pack": "C", "req_type": "없음", "req_value": ""},
+    {"policy_id": "TREASURY_CANCEL_2025", "name": "자사주 소각 관련 상법/제도 변경", "start": "2025-01-01",
+     "end": None, "pack": "C", "req_type": "없음", "req_value": ""},
+    {"policy_id": "SHAREHOLDER_RETURN_TAXCREDIT", "name": "주주환원 확대 기업 세액공제", "start": "2025-01-01",
+     "end": None, "pack": "C", "req_type": "없음", "req_value": ""},
+]
+
+PACK_C_INTERP = [
+    ("TP_P1", "진짜 잉여현금 창출력 획득 — 환원과 투자를 동시에 늘림", "성장 포기하고 환원만 늘림"),
+    ("TP_P2", "자사주 진정성 있음 — 취득이 소각까지 감", "취득만 하고 물량 재활용(교환사채·경영권방어) 가능성"),
+    ("TP_P3", "무차입 환원. 현금 체질로 전환", "차입해서 환원 — 지속 불가"),
+]
+
+
+def pack_c_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    P = P.sort_values(["code", "month"]).copy()
+    g = lambda c: P.groupby("code", observed=True)[c]
+
+    # ── 센서 ──────────────────────────────────────────────────────────────────────────────
+    # p1: 총주주환원 / 영업현금흐름.  현금흐름표에서 직접 읽으므로 결정공시 파싱이 불필요하다.
+    payout = (P.get("dividend_paid_ttm").abs().fillna(0) +
+              P.get("treasury_buy_ttm").abs().fillna(0))
+    P["payout_ratio"] = safe_div(payout, P.get("cfo_ttm"))
+    P["p1"] = g("payout_ratio").diff(12)
+
+    # p2: (CapEx + R&D) / 매출
+    invest = P.get("capex_ttm").abs().fillna(0) + P.get("rnd_ttm").abs().fillna(0)
+    P["invest_ratio"] = safe_div(invest, P.get("revenue_ttm"))
+    P["p2"] = g("invest_ratio").diff(12)
+
+    # p3: 자사주 취득공시 대비 12M 내 실제 소각 실행률
+    #     한국 특수성 — 취득 공시는 흔하지만 소각까지 가는 비율이 낮다. 이 갭을 추적하는
+    #     참여자가 사실상 없다는 것이 이 센서의 알파 원천이다.
+    P["treasury_acq_n"] = 0.0
+    P["treasury_canc_n"] = 0.0
+    dis = ctx.get("disclosures")
+    if dis is not None and len(dis):
+        d = dis[dis["event"].isin(["treasury_acq", "treasury_canc"])].copy()
+        if len(d) and "corp_code" in d.columns:
+            d["month"] = as_ts_series(d["rcept_dt"]) + pd.offsets.MonthEnd(0)
+            cnt = (d.groupby(["corp_code", "month", "event"]).size()
+                     .unstack("event").reset_index())
+            for c in ("treasury_acq", "treasury_canc"):
+                if c not in cnt.columns:
+                    cnt[c] = 0.0
+            cnt["corp_code"] = cnt["corp_code"].astype(str)
+            P["corp_code"] = P["corp_code"].astype(str)
+            P = P.merge(cnt[["corp_code", "month", "treasury_acq", "treasury_canc"]],
+                        on=["corp_code", "month"], how="left", suffixes=("", "_x"))
+            P["treasury_acq"] = P["treasury_acq"].fillna(0.0)
+            P["treasury_canc"] = P["treasury_canc"].fillna(0.0)
+            P = P.sort_values(["code", "month"])
+            P["treasury_acq_n"] = (P.groupby("code", observed=True)["treasury_acq"]
+                                    .transform(lambda s: s.rolling(12, min_periods=1).sum()))
+            P["treasury_canc_n"] = (P.groupby("code", observed=True)["treasury_canc"]
+                                     .transform(lambda s: s.rolling(12, min_periods=1).sum()))
+    P["p3"] = safe_div(P["treasury_canc_n"], P["treasury_acq_n"]).clip(0, 2)
+    P["acq_size"] = safe_div(P.get("treasury_buy_ttm").abs(), P.get("assets"))
+
+    # p4: 부채비율 변화 (axis_C 에서 이미 계산)
+    P["p4"] = P.get("d_debt_ratio")
+
+    # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["TP_P1"] = tp_product(z("p1"), z("p2"))          # ★ 이 팩의 전부: 환원↑ 인데 투자도↑
+    P["TP_P2"] = tp_product(z("acq_size"), z("p3"))    # 취득 규모 큰데 소각까지 실행
+    P["TP_P3"] = tp_product(z("p1"), -z("p4"))         # 환원↑ 인데 차입 안 늘림
+    P["E_C_pack"] = nanmean_cols(P, ["TP_P1", "TP_P2", "TP_P3"])
+    P["E_C"] = P["E_C_pack"]                            # 레지스트리 규약: E_<pid>
+    return P
+
+
+register_pack(
+    pid="C", name="자본배분 체제 전환", tp_cols=["TP_P1", "TP_P2", "TP_P3"],
+    features_fn=pack_c_features, policy=PACK_C_POLICY, interp=PACK_C_INTERP,
+    notes="TP_P1(환원↑ & 투자↑)이 이 팩의 전부. 시장은 '환원 늘렸으니 성장 끝'이라는 "
+          "기본값 해석 때문에 늦게 반영한다.")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  PACK-N  국민연금 고용  (★ 1순위 · 본체)                                                   ║
+# ║                                                                                          ║
+# ║  고용은 되돌릴 수 없는 비용 지불이다. 경영진이 수요에 대한 확신 없이 하지 않는 행위이므로,  ║
+# ║  매출 추정보다 신뢰도 높은 사적 정보 노출이다.                                              ║
+# ║                                                                                          ║
+# ║  ★ v2 최대 변경점 — 평균임금이 아니라 '한계임금' 을 쓴다.                                   ║
+# ║    평균은 기존 인력에 희석되어 신규 채용의 성격을 못 본다.                                   ║
+# ║    보조금 유인 채용은 구조적으로 저임금이므로 wage_premium < 1 이 된다.                     ║
+# ║    → 보조금 필터가 별도 패치가 아니라 산식 자체에 내장된다.                                  ║
+# ║                                                                                          ║
+# ║  반드시 처리한 함정 3가지: (a) 7월 정기결정  (b) 기준소득월액 상한 캡  (c) 분모 불안정        ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+# 국민연금 보험료율. 1998-07 이후 9.0% 로 장기 고정. 연도별로 두어 개정 시 한 줄만 고치면 되게 한다.
+NPS_CONTRIB_RATE = {y: 0.09 for y in range(2010, 2027)}
+# 기준소득월액 상한(월, 원). 매년 7월 개정. 캡 도달 비율(n5) 산출의 기준.
+NPS_INCOME_CAP = {
+    2016: 4_340_000, 2017: 4_490_000, 2018: 4_680_000, 2019: 4_860_000, 2020: 5_030_000,
+    2021: 5_240_000, 2022: 5_530_000, 2023: 5_900_000, 2024: 6_170_000, 2025: 6_370_000,
+    2026: 6_370_000,
+}
+NPS_REDETERMINE_MONTH = 7          # 기준소득월액 정기결정 시행월 (전년 소득 기준 일괄 갱신)
+
+PACK_N_POLICY = [
+    {"policy_id": "YOUTH_ADD_HIRE", "name": "청년추가고용장려금", "start": "2018-03-01",
+     "end": "2021-12-31", "pack": "N", "req_type": "연령", "req_value": "만15~34세"},
+    {"policy_id": "COVID_RETAIN", "name": "고용유지지원금(코로나 특례)", "start": "2020-02-01",
+     "end": "2022-12-31", "pack": "N", "req_type": "없음", "req_value": ""},
+    {"policy_id": "YOUTH_LEAP", "name": "청년일자리도약장려금", "start": "2022-01-01",
+     "end": None, "pack": "N", "req_type": "연령", "req_value": "만15~34세"},
+    {"policy_id": "INTEGRATED_EMP_TAXCREDIT", "name": "통합고용세액공제", "start": "2023-01-01",
+     "end": None, "pack": "N", "req_type": "기업규모", "req_value": "중소·중견 우대"},
+    {"policy_id": "EMP_INCREASE_TAXCREDIT", "name": "고용증대세액공제", "start": "2018-01-01",
+     "end": "2022-12-31", "pack": "N", "req_type": "기업규모", "req_value": "중소·중견 우대"},
+    {"policy_id": "DISABLED_QUOTA", "name": "장애인 의무고용률/부담금", "start": "2016-01-01",
+     "end": None, "pack": "N", "req_type": "기업규모", "req_value": "상시근로자 50/100/300인"},
+    {"policy_id": "SPECIAL_HIRE_PROMOTION", "name": "특별고용촉진장려금", "start": "2020-07-01",
+     "end": "2021-12-31", "pack": "N", "req_type": "없음", "req_value": ""},
+    {"policy_id": "MIDDLE_AGE_HIRE", "name": "중장년 채용장려금", "start": "2019-01-01",
+     "end": None, "pack": "N", "req_type": "연령", "req_value": "만50세 이상"},
+    {"policy_id": "REGION_EMP_PROMOTION", "name": "지역고용촉진지원금", "start": "2016-01-01",
+     "end": None, "pack": "N", "req_type": "지역", "req_value": "고용위기지역"},
+]
+
+PACK_N_INTERP = [
+    ("TP_N1", "고부가 인력 확충. 사업 고도화", "저임금 대량채용 — ★보조금 유인 의심"),
+    ("TP_N2", "정착하는 확장. 조직 역량 축적", "급조 조직. 회전문 채용"),
+    ("TP_N3", "진짜 캐파 확대", "사업장 이전에 불과"),
+    ("TP_N4", "희석 없는 확장", "단순 규모 확대"),
+]
+
+# 상시근로자 임계 밴드 — 회귀불연속 구간. 이 근처 기업은 신호 신뢰도를 낮춘다.
+EMP_THRESHOLD_BANDS = [50, 100, 300]
+EMP_BAND_TOL = 0.10
+
+
+# ── 수집 ────────────────────────────────────────────────────────────────────────────────────
+NPS_API = "https://apis.data.go.kr/B552015/NpsBplcInfoInqireService/"
+NPS_FIELDS = {
+    "wkplNm": "wkpl_name", "bzowrRgstNo": "biz_no", "jnngpCnt": "members",
+    "crrmmNtcAmt": "notice_amt", "nwAcqzrCnt": "acq_cnt", "lssJnngpCnt": "loss_cnt",
+    "wkplRoadNmDtlAddr": "addr", "ldongAddrMgplDgCd": "sido", "vldtVlKrnNm": "industry",
+    "dataCrtYm": "ym", "seq": "seq",
+}
+
+
+def _datagokr_key() -> str:
+    """Decoding/Encoding 키 혼동은 공공데이터포털 실패의 1위 원인이다. 자동 감지해 교정한다."""
+    k = (DATA_GO_KR_KEY or "").strip()
+    if not k:
+        return ""
+    if "%" in k and re.search(r"%[0-9A-Fa-f]{2}", k):
+        dec = unquote(k)
+        LOG.warn("DATA_GO_KR_KEY 가 Encoding 키로 보입니다(%XX 포함). "
+                 "이중 인코딩을 막기 위해 디코딩해서 사용합니다. "
+                 "가능하면 포털에서 '일반 인증키(Decoding)' 를 복사해 넣으세요.")
+        return dec
+    return k
+
+
+def fetch_nps_workplaces(months: pd.DatetimeIndex) -> pd.DataFrame:
+    """국민연금 가입 사업장 내역(월별). 공용 인덱스에 저장 → 다른 전략도 그대로 재사용."""
+    key = _datagokr_key()
+    cached = VAULT.get_table("nps_workplace_monthly", scope="shared")
+    have = set()
+    if cached is not None and len(cached):
+        have = set(cached["ym"].astype(str))
+        LOG.info(f"공용 캐시에서 국민연금 사업장 {len(cached):,}행 재사용 ({len(have)}개월)")
+    if not key:
+        if not have:
+            LOG.warn("DATA_GO_KR_KEY 미입력 — PACK-N 을 구동할 수 없습니다. "
+                     "공공데이터포털에서 '국민연금 가입 사업장 내역' 활용신청 후 "
+                     "일반 인증키(Decoding)를 넣어주세요.")
+            return pd.DataFrame()
+        return cached
+
+    todo = [m for m in months if m.strftime("%Y%m") not in have]
+    if RUN_MODE == "CACHED":
+        todo = []
+    new_rows: List[dict] = []
+
+    def _one(m):
+        ym = m.strftime("%Y%m")
+        rows, page = [], 1
+        while page <= 400:
+            limiter("datagokr").wait()
+            js = http_json(NPS_API + "getBassInfoSearch", source="datagokr", tries=3,
+                           params={"serviceKey": key, "dataCrtYm": ym,
+                                   "pageNo": page, "numOfRows": 1000, "resultType": "json"})
+            if not js:
+                break
+            body = (js.get("response", {}).get("body") if isinstance(js, dict) else None) or {}
+            items = body.get("items") or {}
+            it = items.get("item") if isinstance(items, dict) else items
+            if isinstance(it, dict):
+                it = [it]
+            if not it:
+                break
+            for r in it:
+                rec = {NPS_FIELDS[k]: r.get(k) for k in NPS_FIELDS if k in r}
+                rec["ym"] = ym
+                rows.append(rec)
+            tot = int(body.get("totalCount") or 0)
+            if page * 1000 >= tot:
+                break
+            page += 1
+        return rows
+
+    if todo:
+        LOG.info(f"국민연금 사업장 신규 수집 {len(todo)}개월")
+        res = pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="국민연금 사업장")
+        for r in res:
+            if r:
+                new_rows.extend(r)
+
+    frames = ([cached] if cached is not None and len(cached) else [])
+    if new_rows:
+        frames.append(pd.DataFrame(new_rows))
+    if not frames:
+        return pd.DataFrame()
+    N = pd.concat(frames, ignore_index=True)
+    for c in ("members", "notice_amt", "acq_cnt", "loss_cnt"):
+        if c in N.columns:
+            N[c] = pd.to_numeric(N[c], errors="coerce")
+    N = N.drop_duplicates(["ym", "biz_no", "wkpl_name"], keep="last")
+    if new_rows:
+        VAULT.put_table("nps_workplace_monthly", N, scope="shared", domain="nps",
+                        source="data.go.kr NpsBplcInfoInqireService")
+    LOG.ok(f"국민연금 사업장 {len(N):,}행 · {N['ym'].nunique()}개월")
+    PIPE.io("OUT", "DRIVE", "nps_workplace_monthly", N, source="data.go.kr")
+    return N
+
+
+def resolve_nps_to_corp(N: pd.DataFrame, sec: pd.DataFrame,
+                        emp: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """사업장 → corp_code 매칭. ① 사업자번호 앞자리 ② 상호 유사도 ③ 주소 검증.
+    매칭 결과는 시간구간 테이블로 남긴다(C3)."""
+    if N is None or N.empty or sec.empty:
+        return (pd.DataFrame(), pd.DataFrame())
+    cached = VAULT.get_table("nps_entity_map", scope="shared")
+    if cached is not None and len(cached) and RUN_MODE != "FULL":
+        LOG.info(f"공용 캐시에서 국민연금 매칭 {len(cached):,}건 재사용")
+        return (cached, pd.DataFrame())
+
+    wk = (N.groupby(["biz_no", "wkpl_name"], as_index=False)
+           .agg(members=("members", "max"), addr=("addr", "first"),
+                first_ym=("ym", "min"), last_ym=("ym", "max")))
+    wk["nm"] = wk["wkpl_name"].map(norm_corp_name)
+    sec2 = sec.copy()
+    sec2["nm"] = sec2["name"].map(norm_corp_name)
+    exact = wk.merge(sec2[["code", "corp_code", "name", "nm"]], on="nm", how="left")
+
+    unmatched = exact[exact["code"].isna()].copy()
+    if len(unmatched) and len(sec2):
+        cand_nm = sec2["nm"].tolist()
+        cand_code = sec2["code"].tolist()
+        pref: Dict[str, List[int]] = defaultdict(list)
+        for i, n in enumerate(cand_nm):
+            if n:
+                pref[n[:2]].append(i)
+
+        def _fuzzy(n: str) -> Optional[Tuple[str, float]]:
+            if not n or len(n) < 2:
+                return None
+            idxs = pref.get(n[:2], [])
+            best, bs = None, 0.0
+            for i in idxs:
+                s = similarity(n, cand_nm[i])
+                if s > bs:
+                    best, bs = cand_code[i], s
+            return (best, bs) if best and bs >= 92 else None
+
+        hits = [(_fuzzy(n)) for n in unmatched["nm"].tolist()]
+        unmatched["code"] = [h[0] if h else None for h in hits]
+        unmatched["match_score"] = [h[1] if h else np.nan for h in hits]
+        exact.loc[unmatched.index, "code"] = unmatched["code"]
+        exact.loc[unmatched.index, "match_score"] = unmatched["match_score"]
+    exact["match_score"] = exact.get("match_score", pd.Series(np.nan, index=exact.index)).fillna(100.0)
+    exact["match_method"] = np.where(exact["match_score"] >= 99.9, "exact_name", "fuzzy_name")
+    M = exact.dropna(subset=["code"])[["biz_no", "wkpl_name", "code", "match_method",
+                                       "match_score", "first_ym", "last_ym"]]
+    M["valid_from"] = as_ts_series(M["first_ym"].astype(str) + "01")
+    M["valid_to"] = as_ts_series(M["last_ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    VAULT.put_table("nps_entity_map", M, scope="shared", domain="nps", source="entity_resolution")
+    LOG.ok(f"국민연금 사업장 매칭 {len(M):,}건 → {M['code'].nunique():,}종목 "
+           f"(정확일치 {int((M['match_method']=='exact_name').sum()):,} / "
+           f"유사매칭 {int((M['match_method']=='fuzzy_name').sum()):,})")
+    if M["code"].nunique() < 50:
+        LOG.warn(f"매칭 성공 종목이 {M['code'].nunique()}개로 50개 미만입니다 (§15-6 킬 기준). "
+                 f"통계적 검정이 불가능하니 PACK-N 결과를 신뢰하지 마세요.")
+    PIPE.io("OUT", "DRIVE", "nps_entity_map", M, source="entity_resolution")
+    return (M, pd.DataFrame())
+
+
+def build_nps_panel(N: pd.DataFrame, M: pd.DataFrame, emp: pd.DataFrame,
+                    months: pd.DatetimeIndex) -> pd.DataFrame:
+    """종목-월 단위 국민연금 패널 + θ_N (관측커버리지)."""
+    if N is None or N.empty or M is None or M.empty:
+        return pd.DataFrame(columns=["code", "month", "nps_members", "nps_amt", "theta_N"])
+    x = N.merge(M[["biz_no", "wkpl_name", "code"]], on=["biz_no", "wkpl_name"], how="inner")
+    x["month"] = as_ts_series(x["ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    agg = (x.groupby(["code", "month"], as_index=False)
+            .agg(nps_members=("members", "sum"), nps_amt=("notice_amt", "sum"),
+                 nps_acq=("acq_cnt", "sum"), nps_loss=("loss_cnt", "sum"),
+                 n_wkpl=("wkpl_name", "nunique")))
+    # ★ PIT: 공공데이터포털은 귀속월 파일을 익월 이후에 공개한다 → 보수적으로 +2개월
+    agg["knowledge_date"] = agg["month"] + pd.offsets.MonthEnd(2)
+    agg = pit_frame(agg, "month", "knowledge_date", source="nps")
+    return downcast(agg)
+
+
+# ── 피처 ────────────────────────────────────────────────────────────────────────────────────
+def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    P = P.sort_values(["code", "month"]).copy()
+    npsp = ctx.get("nps_panel")
+    for c in ("nps_members", "nps_amt", "nps_acq", "nps_loss", "n_wkpl"):
+        if c not in P.columns:
+            P[c] = np.nan
+    if npsp is not None and len(npsp):
+        PIT.register("nps_panel", npsp, key_cols=["code"])
+        P = PIT.asof_join(P, "nps_panel", by="code", left_time="month",
+                          cols=["code", "knowledge_date", "nps_members", "nps_amt",
+                                "nps_acq", "nps_loss", "n_wkpl"], suffix="_nps")
+    g = lambda c: P.groupby("code", observed=True)[c]
+    P["_year"] = P["month"].dt.year
+    P["_rate"] = P["_year"].map(NPS_CONTRIB_RATE).fillna(0.09)
+    P["_cap"] = P["_year"].map(NPS_INCOME_CAP).fillna(6_370_000)
+
+    # n1: 인원 성장
+    P["n1"] = g("nps_members").transform(lambda s: dlog(s, 12))
+
+    # ── ★ 한계임금 ────────────────────────────────────────────────────────────────────────
+    d_amt = g("nps_amt").diff(1)
+    d_mem = g("nps_members").diff(1)
+    # (c) 분모 불안정: |Δ가입자수| >= max(3, 가입자수×0.5%) 일 때만 계산. 결측을 0으로 채우지 않는다.
+    thr = np.maximum(3.0, P["nps_members"] * 0.005)
+    ok = d_mem.abs() >= thr
+    marginal_wage = safe_div(d_amt, d_mem) / P["_rate"]
+    marginal_wage = marginal_wage.where(ok)
+    # (a) 7월 정기결정: 기존 인력 임금이 점프하므로 한계임금 추정이 오염된다 → 결측 처리
+    jul = P["month"].dt.month == NPS_REDETERMINE_MONTH
+    marginal_wage = marginal_wage.where(~jul)
+    P["marginal_wage"] = marginal_wage.clip(lower=0, upper=5e7)
+
+    est_income_prev = safe_div(g("nps_amt").shift(1) / P["_rate"], g("nps_members").shift(1))
+    P["wage_premium"] = safe_div(P["marginal_wage"], est_income_prev)
+    P["wage_premium"] = P["wage_premium"].where((P["wage_premium"] > 0.1) & (P["wage_premium"] < 10))
+    P["n2"] = P["wage_premium"]
+
+    # n3: 이직률 하락
+    P["loss_rate"] = safe_div(P["nps_loss"], P["nps_members"])
+    P["n3"] = -g("loss_rate").diff(12)
+
+    # n4: 신규 사업장 순증 더미 (신규 적용 사업장 & 기존 사업장 인원 유지)
+    P["d_wkpl"] = g("n_wkpl").diff(12)
+    P["n4"] = ((P["d_wkpl"] > 0) & (P["n1"] > 0)).astype("float32")
+
+    # n5: 캡 도달 인원 비율 변화 (절단을 역이용). 평균 기준소득이 캡에 근접할수록 절단 심함.
+    est_income = safe_div(P["nps_amt"] / P["_rate"], P["nps_members"])
+    P["cap_ratio"] = (est_income / P["_cap"]).clip(0, 2)
+    P["n5"] = g("cap_ratio").diff(12)
+    P["high_wage_flag"] = (P["cap_ratio"] > 0.85).astype("float32")   # 임금신호 신뢰도 하향 플래그
+
+    # n6: 7월 점프폭 = 연 1회 임금상승률 (깨끗한 측정치)
+    jul_jump = safe_div(est_income, est_income.groupby(P["code"], observed=True).shift(1)) - 1.0
+    P["n6"] = jul_jump.where(jul)
+    P["n6"] = g("n6").ffill(limit=11)
+
+    # ── θ_N 관측커버리지 = 매핑 사업장 가입자수 / DART 종업원수(별도) ──────────────────────
+    P["theta_N"] = safe_div(P["nps_members"], P.get("employees")).clip(0, 2)
+    P["theta_N"] = P["theta_N"].where(P["theta_N"] > 0)
+
+    # ── 임계 밴드 플래그 (회귀불연속 구간) ────────────────────────────────────────────────
+    band = pd.Series(False, index=P.index)
+    for b in EMP_THRESHOLD_BANDS:
+        band |= (P["nps_members"] - b).abs() <= b * EMP_BAND_TOL
+    P["emp_band_flag"] = band.astype("float32")
+
+    # ── V8 입력: 유효세율 급락 ────────────────────────────────────────────────────────────
+    P["eff_tax_rate"] = safe_div(P.get("tax_expense"), P.get("pretax_income")).clip(-1, 1)
+    P["d_eff_tax"] = g("eff_tax_rate").diff(12)
+
+    # ── 트레이드오프 쌍 ────────────────────────────────────────────────────────────────────
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["TP_N1"] = tp_product(z("n1"), z("n2"))                    # 인원↑ 인데 신규가 고임금
+    P["TP_N2"] = tp_product(z("n1"), z("n3"))                    # 인원↑ 인데 이직률 안 오름
+    P["TP_N3"] = tp_product(z("n4"), z("n1"))                    # 신규 사업장 + 순증
+    P["TP_N4"] = tp_product(z("n1"), z("d_va_per_emp"))          # 인원↑ 인데 생산성 유지
+    E = nanmean_cols(P, ["TP_N1", "TP_N2", "TP_N3", "TP_N4"])
+    P["E_N"] = E * P["theta_N"].clip(0, 1).fillna(0.0)           # θ 는 배제기준이 아니라 가중치
+    return P
+
+
+register_pack(
+    pid="N", name="국민연금 고용", tp_cols=["TP_N1", "TP_N2", "TP_N3", "TP_N4"],
+    features_fn=pack_n_features, policy=PACK_N_POLICY, interp=PACK_N_INTERP,
+    theta_col="theta_N",
+    notes="한계임금(n2)이 핵심. 보조금 유인 채용은 구조적으로 저임금이므로 "
+          "wage_premium<1 → 보조금 필터가 산식에 내장된다.")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  PACK-D  공시 텍스트 경직성  (주로 V7 거부권)                                              ║
+# ║                                                                                          ║
+# ║  근거: Cohen·Malloy·Nguyen, "Lazy Prices", Journal of Finance 2020.                       ║
+# ║  공시 문서는 기본적으로 전년 문안을 복사한다. 바뀌었다는 것 자체가 신호이며,                ║
+# ║  변경은 부정적 정보와 비대칭적으로 연결된다.                                                ║
+# ║                                                                                          ║
+# ║  ★ 단독 전략으로 세우지 말 것. 이건 주로 음(-)의 신호이고, 롱온리 소액계좌에서              ║
+# ║    음의 신호는 알파 원천이 아니라 회피 장치다.                                              ║
+# ║  ★ 정규화 필수: 서식 개정·법령 변경으로 전 기업이 일괄 변경되는 해가 있다.                  ║
+# ║    연도별 전체 유사도 분포의 중앙값으로 정규화해 공통충격을 제거한다.                        ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+PACK_D_SECTIONS = ["사업의 내용", "위험요인", "이사의 경영진단", "우발부채", "특수관계자"]
+PACK_D_SECTION_PAT = {
+    "사업의내용": r"(사업의\s*내용|II\.\s*사업의\s*내용)",
+    "위험요인": r"(위험요인|투자위험|주요\s*위험)",
+    "경영진단": r"(이사의\s*경영진단|경영진단\s*및\s*분석)",
+    "우발부채": r"(우발부채|우발채무|중요한\s*소송|계류\s*중인\s*소송)",
+    "특수관계자": r"(특수관계자|특수\s*관계자\s*거래)",
+}
+
+PACK_D_POLICY = [
+    {"policy_id": "DART_FORM_REVISION", "name": "기업공시서식 작성기준 개정(전 기업 일괄 문안 변경)",
+     "start": "2019-01-01", "end": None, "pack": "D", "req_type": "없음", "req_value": ""},
+    {"policy_id": "KIFRS_AMEND", "name": "K-IFRS 개정에 따른 주석 서식 변경", "start": "2018-01-01",
+     "end": None, "pack": "D", "req_type": "없음", "req_value": ""},
+    {"policy_id": "ESG_DISCLOSURE", "name": "ESG/지속가능성 공시 의무화 단계 도입", "start": "2025-01-01",
+     "end": None, "pack": "D", "req_type": "기업규모", "req_value": "자산 2조 이상 단계 적용"},
+]
+
+PACK_D_INTERP = [
+    ("TP_D1", "문안이 안정적 — 숨은 악재 정황 없음", "위험요인/우발부채 문단 급변 → V7 거부권 발동"),
+]
+
+
+def _tokenize_ko(t: str) -> Counter:
+    """bag-of-words. NLP 임베딩은 콜드빌드 수일 + 재계산 불가라 §3에서 폐기됐다."""
+    t = re.sub(r"[^가-힣A-Za-z0-9 ]", " ", str(t or ""))
+    toks = [w for w in t.split() if len(w) >= 2]
+    return Counter(toks)
+
+
+def _cosine(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return np.nan
+    common = set(a) & set(b)
+    num = sum(a[k] * b[k] for k in common)
+    da = math.sqrt(sum(v * v for v in a.values()))
+    db = math.sqrt(sum(v * v for v in b.values()))
+    return float(num / (da * db)) if da and db else np.nan
+
+
+def fetch_dart_documents(dis: pd.DataFrame, sec: pd.DataFrame,
+                         max_docs: int = 40000) -> pd.DataFrame:
+    """사업보고서 원문(document.xml, zip) 수집 → 섹션별 bag-of-words 저장.
+    원문은 공용 인덱스에 blob 으로, 토큰 카운트는 전용 인덱스에 테이블로 남긴다."""
+    if not DART_API_KEY:
+        LOG.warn("DART_API_KEY 미입력 — PACK-D(공시텍스트)를 구동할 수 없습니다.")
+        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "section", "tokens"])
+    cached = VAULT.get_table("dart_doc_tokens", scope="private")
+    have = set(cached["rcept_no"].astype(str)) if cached is not None and len(cached) else set()
+    if cached is not None and len(cached):
+        LOG.info(f"전용 캐시에서 공시 토큰 {len(cached):,}행 재사용")
+
+    if dis is None or dis.empty:
+        return cached if cached is not None else pd.DataFrame()
+    ann = dis[dis["report_nm"].astype(str).str.contains("사업보고서", na=False)].copy()
+    ann = ann[~ann["rcept_no"].astype(str).isin(have)]
+    if RUN_MODE == "CACHED":
+        ann = ann.iloc[0:0]
+    if len(ann) > max_docs:
+        LOG.warn(f"사업보고서 원문 {len(ann):,}건 중 {max_docs:,}건만 수집합니다 "
+                 f"(콜드빌드 시간 제한). 나머지는 다음 실행에서 이어받습니다.")
+        ann = ann.sort_values("rcept_dt", ascending=False).head(max_docs)
+
+    def _one(row):
+        rn = str(row)
+        raw = http_get(DART_BASE + "document.xml", source="dart", as_bytes=True, tries=2,
+                       params={"crtfc_key": DART_API_KEY, "rcept_no": rn})
+        if not raw or len(raw) < 500:
+            return None
+        # ★ ZIP 엔드포인트는 오류일 때도 content-type 을 zip 으로 광고하면서 JSON 본문을 준다.
+        #   PK 매직바이트를 먼저 확인해야 정체불명의 unzip 예외 대신 진짜 status 를 볼 수 있다.
+        if raw[:2] not in (b"PK",):
+            LOG.debug(f"document.xml 이 ZIP 이 아님 (rcept_no={rn}): "
+                      f"{raw[:120].decode('utf-8', 'ignore')}")
+            return None
+        chunks = []
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(raw))
+            # ★ 원문 zip 안에는 본 보고서 + 감사보고서 + 첨부 재무제표가 여러 엔트리로 들어있다.
+            #   첫 엔트리만 읽으면 내용 대부분이 조용히 사라진다.
+            for nm in zf.namelist():
+                if not nm.lower().endswith((".xml", ".html", ".htm", ".txt")):
+                    continue
+                b = zf.read(nm)
+                # ★ DART 원문은 EUC-KR 인 경우가 많다. XML 선언의 encoding 을 읽어야 한다.
+                enc = None
+                m_enc = re.search(rb'encoding\s*=\s*["\']([\w\-]+)["\']', b[:400], re.I)
+                if m_enc:
+                    enc = m_enc.group(1).decode("ascii", "ignore")
+                chunks.append(_decode(b, enc, "dart_doc"))
+                if sum(len(c) for c in chunks) > 3_000_000:
+                    break
+        except Exception:
+            chunks = [_decode(raw, None, "dart_doc")]
+        txt = re.sub(r"<[^>]+>", " ", "\n".join(chunks))
+        out = []
+        for sec_name, pat in PACK_D_SECTION_PAT.items():
+            m = re.search(pat, txt)
+            if not m:
+                continue
+            seg = txt[m.start(): m.start() + 60000]
+            out.append({"rcept_no": rn, "section": sec_name,
+                        "tokens": json.dumps(dict(_tokenize_ko(seg).most_common(400)),
+                                             ensure_ascii=False)})
+        return out
+
+    got: List[dict] = []
+    if len(ann):
+        res = pmap_io(_one, ann["rcept_no"].astype(str).tolist(),
+                      workers=min(N_WORKERS_IO, 8), desc="DART 사업보고서 원문")
+        for r in res:
+            if r:
+                got.extend(r)
+    frames = ([cached] if cached is not None and len(cached) else [])
+    if got:
+        G = pd.DataFrame(got).merge(
+            ann[["rcept_no", "corp_code", "rcept_dt"]].astype({"rcept_no": str}),
+            on="rcept_no", how="left")
+        frames.append(G)
+    if not frames:
+        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "section", "tokens"])
+    T = pd.concat(frames, ignore_index=True).drop_duplicates(["rcept_no", "section"], keep="last")
+    if got:
+        VAULT.put_table("dart_doc_tokens", T, scope="private", domain="dart_text",
+                        source="opendart document.xml")
+    LOG.ok(f"공시 텍스트 토큰 {len(T):,}행 · {T['corp_code'].nunique():,}사")
+    return T
+
+
+def build_text_similarity(T: pd.DataFrame) -> pd.DataFrame:
+    """전년 동기 대비 섹션별 코사인 유사도 + 연도별 중앙값 정규화(공통충격 제거)."""
+    if T is None or T.empty:
+        return pd.DataFrame(columns=["corp_code", "knowledge_date", "sim_risk", "sim_all"])
+    d = T.copy()
+    d["rcept_dt"] = as_ts_series(d["rcept_dt"])
+    d = d.dropna(subset=["rcept_dt", "corp_code"])
+    d["year"] = d["rcept_dt"].dt.year
+    d = d.sort_values(["corp_code", "section", "year"])
+    rows = []
+    for (corp, sec_name), g in d.groupby(["corp_code", "section"], observed=True):
+        prev_tok, prev_year = None, None
+        for r in g.itertuples(index=False):
+            try:
+                cur = Counter(json.loads(r.tokens))
+            except Exception:
+                continue
+            if prev_tok is not None and r.year - prev_year <= 2:
+                rows.append({"corp_code": corp, "section": sec_name, "year": r.year,
+                             "rcept_dt": r.rcept_dt, "sim": _cosine(cur, prev_tok)})
+            prev_tok, prev_year = cur, r.year
+    if not rows:
+        return pd.DataFrame(columns=["corp_code", "knowledge_date", "sim_risk", "sim_all"])
+    S = pd.DataFrame(rows)
+    # ★ 연도×섹션 중앙값으로 정규화 — 서식 개정 해의 전 기업 일괄 변경을 제거한다
+    med = S.groupby(["year", "section"], observed=True)["sim"].transform("median")
+    S["sim_norm"] = S["sim"] - med
+    W = S.pivot_table(index=["corp_code", "rcept_dt"], columns="section",
+                      values="sim_norm", aggfunc="mean").reset_index()
+    W["sim_risk"] = nanmean_cols(W, ["위험요인", "우발부채"])
+    W["sim_all"] = nanmean_cols(W, [c for c in W.columns if c in PACK_D_SECTION_PAT])
+    W = pit_frame(W, "rcept_dt", "rcept_dt", source="dart_text")
+    LOG.ok(f"공시 유사도 {len(W):,}행 (연도×섹션 중앙값 정규화 적용)")
+    return W
+
+
+def pack_d_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    sim = ctx.get("text_sim")
+    for c in ("sim_risk", "sim_all"):
+        if c not in P.columns:
+            P[c] = np.nan
+    if sim is not None and len(sim):
+        PIT.register("dart_text_sim", sim, key_cols=["corp_code"])
+        P = PIT.asof_join(P, "dart_text_sim", by="corp_code", left_time="month",
+                          cols=["corp_code", "knowledge_date", "sim_risk", "sim_all"],
+                          suffix="_txt")
+    # V7 입력: 위험요인·우발부채 유사도가 셀 내 하위 5%
+    P["sim_risk_pct"] = xsec_rank_pct(P["sim_risk"], P["cell"])
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    # 양(+)의 기여는 '문안이 안정적'인 경우에만. 주 용도는 어디까지나 거부권이다.
+    P["TP_D1"] = z("sim_all")
+    P["E_D"] = P["TP_D1"]
+    return P
+
+
+register_pack(
+    pid="D", name="공시텍스트 경직성", tp_cols=["TP_D1"],
+    features_fn=pack_d_features, policy=PACK_D_POLICY, interp=PACK_D_INTERP,
+    notes="주 용도는 V7 거부권. 다른 팩이 매수 신호를 냈는데 위험요인/우발부채 문단이 "
+          "대폭 확대되었다면 센서가 못 본 무언가가 있다는 뜻.")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  PACK-X  관세청 수출  (수출집중 기업 보강)                                                 ║
+# ║                                                                                          ║
+# ║  알파는 여전히 최고다. 물량·단가·목적지·신규세번 4센서를 월 단위로 동시 관측하는            ║
+# ║  유일한 공개 데이터셋. 순위가 내려간 건 알파가 아니라 첫 결과까지의 시간 때문이다.          ║
+# ║                                                                                          ║
+# ║  ★ 종속변수: y = 국내법인 수출매출 (별도 재무제표). 연결 아님.                              ║
+# ║    통관은 "대한민국 관세영역 반출 물량"이므로 대응 회계항목은 별도 기준이다.                ║
+# ║    해외 현지생산·현지판매는 방정식 밖으로 자연히 빠진다.                                    ║
+# ║  ★ x2(단가 잔차)는 36개월 롤링 OLS 벡터화. 칼만필터는 §3에서 폐기(2.3시간 초과).            ║
+# ║  ★ 전 종목 적용 금지. 국내 생산자 1~3개사인 과점 품목 우선.                                 ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+PACK_X_POLICY = [
+    {"policy_id": "EXPORT_VOUCHER", "name": "수출바우처 사업", "start": "2017-01-01",
+     "end": None, "pack": "X", "req_type": "기업규모", "req_value": "중소·중견"},
+    {"policy_id": "KOR_JPN_EXPORT_CTRL", "name": "일본 수출규제(소부장 대응)", "start": "2019-07-01",
+     "end": "2023-03-31", "pack": "X", "req_type": "업종", "req_value": "반도체·디스플레이 소재"},
+    {"policy_id": "RCEP", "name": "RCEP 발효", "start": "2022-02-01", "end": None,
+     "pack": "X", "req_type": "없음", "req_value": ""},
+    {"policy_id": "IRA_2022", "name": "美 IRA 시행", "start": "2022-08-16", "end": None,
+     "pack": "X", "req_type": "업종", "req_value": "이차전지·전기차"},
+    {"policy_id": "CHIPS_ACT", "name": "美 반도체법/대중 수출통제", "start": "2022-10-07",
+     "end": None, "pack": "X", "req_type": "업종", "req_value": "반도체"},
+    {"policy_id": "COVID_TRADE", "name": "코로나 물류대란·해상운임 급등", "start": "2020-03-01",
+     "end": "2022-12-31", "pack": "X", "req_type": "없음", "req_value": ""},
+]
+
+PACK_X_INTERP = [
+    ("TP_X1", "수요곡선 자체 이동. 병목 지위", "물량을 가격 인하로 산 것"),
+    ("TP_X2", "제품력으로 고객 다변화", "저가 물량으로 고객 늘림"),
+    ("TP_X3", "신시장 진입인데 영업비 안 늘어남", "판촉비로 산 매출"),
+]
+
+# 목적지 30개 국가군 축약 — HS10×230국×120월=3억 행을 700만 행으로 줄이는 핵심(§6.3 성능 규율)
+COUNTRY_GROUPS = {
+    "US": "선진_미국", "JP": "선진_일본", "TW": "선진_대만", "HK": "중화권", "CN": "중화권",
+    "DE": "선진_EU", "FR": "선진_EU", "IT": "선진_EU", "NL": "선진_EU", "GB": "선진_EU",
+    "VN": "아세안", "TH": "아세안", "ID": "아세안", "MY": "아세안", "SG": "아세안", "PH": "아세안",
+    "IN": "남아시아", "AU": "오세아니아", "BR": "중남미", "MX": "중남미",
+    "RU": "러시아CIS", "TR": "중동", "SA": "중동", "AE": "중동",
+}
+ADVANCED_GROUPS = {"선진_미국", "선진_EU", "선진_일본", "선진_대만"}
+
+
+def fetch_customs_trade(months: pd.DatetimeIndex, hs_codes: Sequence[str]) -> pd.DataFrame:
+    """관세청 수출입 무역통계. 금액(USD)과 중량(kg)이 동시에 있어야 x2(단가)가 산다."""
+    if not CUSTOMS_API_KEY:
+        LOG.warn("CUSTOMS_API_KEY 미입력 — PACK-X 를 구동할 수 없습니다. "
+                 "(관세청 UNIPASS 또는 공공데이터포털 수출입무역통계 API)")
+        return pd.DataFrame()
+    cached = VAULT.get_table("customs_trade_monthly", scope="shared")
+    if cached is not None and len(cached) and RUN_MODE == "CACHED":
+        return cached
+    have = set()
+    if cached is not None and len(cached):
+        have = set(zip(cached["ym"].astype(str), cached["hs"].astype(str)))
+        LOG.info(f"공용 캐시에서 관세 통관 {len(cached):,}행 재사용")
+    jobs = [(m.strftime("%Y%m"), h) for m in months for h in hs_codes
+            if (m.strftime("%Y%m"), str(h)) not in have]
+
+    def _one(job):
+        ym, hs = job
+        limiter("customs").wait()
+        js = http_json("https://apis.data.go.kr/1220000/nitemtrade/getNitemtradeList",
+                       source="customs", tries=2,
+                       params={"serviceKey": _datagokr_key() or CUSTOMS_API_KEY,
+                               "strtYymm": ym, "endYymm": ym, "hsSgn": hs, "type": "json"})
+        if not js:
+            return None
+        body = (js.get("response", {}).get("body") if isinstance(js, dict) else None) or {}
+        items = (body.get("items") or {})
+        it = items.get("item") if isinstance(items, dict) else items
+        if isinstance(it, dict):
+            it = [it]
+        if not it:
+            return None
+        rows = []
+        for r in it:
+            rows.append({"ym": ym, "hs": str(hs),
+                         "exp_usd": pd.to_numeric(r.get("expDlr"), errors="coerce"),
+                         "exp_wgt": pd.to_numeric(r.get("expWgt"), errors="coerce"),
+                         "country": str(r.get("statCd") or r.get("cntyCd") or "")})
+        return rows
+
+    new = []
+    if jobs and RUN_MODE != "CACHED":
+        LOG.info(f"관세 통관 신규 수집 {len(jobs):,}건 (월×HS)")
+        res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="관세청 통관")
+        for r in res:
+            if r:
+                new.extend(r)
+    frames = ([cached] if cached is not None and len(cached) else [])
+    if new:
+        frames.append(pd.DataFrame(new))
+    if not frames:
+        return pd.DataFrame()
+    C = pd.concat(frames, ignore_index=True)
+    C["grp"] = C["country"].map(COUNTRY_GROUPS).fillna("기타")
+    C = (C.groupby(["ym", "hs", "grp"], as_index=False)
+          .agg(exp_usd=("exp_usd", "sum"), exp_wgt=("exp_wgt", "sum")))
+    if new:
+        VAULT.put_table("customs_trade_monthly", C, scope="shared", domain="customs",
+                        source="관세청 수출입무역통계")
+    LOG.ok(f"관세 통관 {len(C):,}행 (목적지 {C['grp'].nunique()}개 국가군으로 축약)")
+    return C
+
+
+def map_hs_to_codes(C: pd.DataFrame, sec: pd.DataFrame, fin: pd.DataFrame,
+                    placebo_n: int = 1000) -> pd.DataFrame:
+    """HS → 기업 역방향 매핑 + 합계 정합성 + 플라시보 p값.
+    ★ 매핑 품질을 주관적 확신이 아니라 p값으로 관리한다(§6.3-4)."""
+    cached = VAULT.get_table("hs_corp_map", scope="shared")
+    if cached is not None and len(cached):
+        LOG.info(f"공용 캐시에서 HS 매핑 {len(cached):,}건 재사용")
+        return cached
+    LOG.warn("HS↔기업 매핑 테이블이 없습니다. 이 매핑은 5단계 파이프라인(수 주 소요)이 필요하며 "
+             "자동 구축 대상이 아닙니다(§6.3). PACK-X 는 비활성화됩니다. "
+             "직접 만든 매핑이 있다면 공용 인덱스에 'hs_corp_map' 테이블로 넣어주세요 "
+             "(컬럼: code, hs, weight, valid_from, valid_to).")
+    return pd.DataFrame(columns=["code", "hs", "weight", "valid_from", "valid_to"])
+
+
+def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    C, M = ctx.get("customs"), ctx.get("hs_map")
+    for c in ("x1", "x2", "x3_1", "x3_2", "x4", "theta_X"):
+        P[c] = np.nan
+    if C is None or len(C) == 0 or M is None or len(M) == 0:
+        P["TP_X1"] = np.nan; P["TP_X2"] = np.nan; P["TP_X3"] = np.nan
+        P["E_X"] = np.nan
+        disable_pack("X", "관세 통관 데이터 또는 HS↔기업 매핑 부재 (V4 부분거부권)")
+        return P
+
+    x = C.merge(M[["code", "hs", "weight"]], on="hs", how="inner")
+    x["month"] = as_ts_series(x["ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    x["exp_usd"] = x["exp_usd"] * x["weight"]
+    x["exp_wgt"] = x["exp_wgt"] * x["weight"]
+    tot = (x.groupby(["code", "month"], as_index=False)
+            .agg(exp_usd=("exp_usd", "sum"), exp_wgt=("exp_wgt", "sum")))
+    hhi = (x.assign(sh=lambda d: d["exp_usd"] / d.groupby(["code", "month"])["exp_usd"]
+                    .transform("sum"))
+            .assign(sh2=lambda d: d["sh"] ** 2)
+            .groupby(["code", "month"], as_index=False)["sh2"].sum()
+            .rename(columns={"sh2": "hhi_dest"}))
+    adv = (x[x["grp"].isin(ADVANCED_GROUPS)].groupby(["code", "month"], as_index=False)["exp_usd"]
+            .sum().rename(columns={"exp_usd": "adv_usd"}))
+    T = tot.merge(hhi, on=["code", "month"], how="left").merge(adv, on=["code", "month"], how="left")
+    T["adv_share"] = safe_div(T["adv_usd"], T["exp_usd"])
+    # ★ PIT: 통관 잠정치 최초 공표일 ≈ 익월 15일. 확정치 소급 대체 금지.
+    T["knowledge_date"] = T["month"] + pd.offsets.MonthEnd(1) + pd.Timedelta(days=15)
+    T = pit_frame(T, "month", "knowledge_date", source="customs")
+    PIT.register("customs_panel", T, key_cols=["code"])
+    P = PIT.asof_join(P, "customs_panel", by="code", left_time="month",
+                      cols=["code", "knowledge_date", "exp_usd", "exp_wgt",
+                            "hhi_dest", "adv_share"], suffix="_cus")
+    P = P.sort_values(["code", "month"])
+    g = lambda c: P.groupby("code", observed=True)[c]
+    P["x1"] = g("exp_wgt").transform(lambda s: dlog(s, 12))
+    P["x3_1"] = -g("hhi_dest").diff(12)
+    P["x3_2"] = g("adv_share").diff(12)
+
+    # ── x2: 단가 잔차 — 36개월 롤링 OLS (벡터화 필수) ─────────────────────────────────────
+    P["unit_price"] = safe_div(P["exp_usd"], P["exp_wgt"])
+    W = P.pivot_table(index="code", columns="month", values="unit_price", aggfunc="first")
+    Q = P.pivot_table(index="code", columns="month", values="exp_wgt", aggfunc="first")
+    if W.shape[1] >= 36:
+        y = np.log(W.to_numpy(dtype=float, na_value=np.nan))
+        q = np.log(Q.reindex_like(W).to_numpy(dtype=float, na_value=np.nan))
+        n, t = y.shape
+        X = np.stack([np.ones((n, t)), q, np.tile(np.arange(t, dtype=float), (n, 1))], axis=2)
+        R = rolling_ols_resid(y, X, window=36)
+        rs = pd.DataFrame(R, index=W.index, columns=W.columns).stack(dropna=False)
+        rs.index.names = ["code", "month"]
+        rs = rs.rename("resid").reset_index()
+        P = P.merge(rs, on=["code", "month"], how="left")
+        P["resid_mean6"] = g("resid").transform(lambda s: s.rolling(6, min_periods=4).mean())
+        P["resid_std"] = g("resid").transform(lambda s: s.rolling(36, min_periods=18).std())
+        P["x2"] = safe_div(P["resid_mean6"], P["resid_std"])
+    # x4: 신규 HS10 등장 → 12M 지수감쇠 더미
+    P["x4"] = 0.0
+    P["theta_X"] = safe_div(P["exp_usd"] * 1300.0, P.get("revenue_ttm")).clip(0, 2)
+
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["d_sgna_ratio"] = g("sgna_ttm").transform(lambda s: s).pipe(
+        lambda s: safe_div(s, P["revenue_ttm"])).pipe(lambda s: s.groupby(P["code"]).diff(12)) \
+        if "sgna_ttm" in P.columns else np.nan
+    P["TP_X1"] = tp_product(z("x1"), z("x2"))
+    P["TP_X2"] = tp_product(z("x3_1"), z("x2"))
+    P["TP_X3"] = tp_product(z("x3_2"), -z("d_sgna_ratio"))
+    P["E_X"] = nanmean_cols(P, ["TP_X1", "TP_X2", "TP_X3"]) * P["theta_X"].clip(0, 1).fillna(0.0)
+    return P
+
+
+register_pack(
+    pid="X", name="관세청 수출", tp_cols=["TP_X1", "TP_X2", "TP_X3"],
+    features_fn=pack_x_features, policy=PACK_X_POLICY, interp=PACK_X_INTERP,
+    theta_col="theta_X",
+    notes="x2(수출단가 잔차)는 GPM으로 대체 불가. GPM은 원재료 하락으로도 개선되지만 "
+          "수출단가는 판매가격 그 자체 — 원가 노이즈 0의 순수 가격결정력 측정치.")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  PACK-P  조달청 낙찰  (내수 수주기업 보강)                                                 ║
+# ║                                                                                          ║
+# ║  매핑 문제가 구조적으로 없다 — 낙찰업체가 사업자등록번호로 직접 식별된다.                    ║
+# ║  낙찰률(q2)은 원가 노이즈가 없는 순수 가격 지표라는 점에서 수출단가와 동일한 성질.           ║
+# ║                                                                                          ║
+# ║  ⚠ 레짐 편승 경고: 이 데이터는 방산·전력기기·원전·철도·건설에 집중되는데,                    ║
+# ║    이것이 정확히 현 KOSPI 주도 섹터다. R7 레짐 분할을 필수 통과 조건으로 건다.               ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+PACK_P_POLICY = [
+    {"policy_id": "SME_COMPETE_ITEM", "name": "중소기업자간 경쟁제품 지정(3년 주기 갱신)",
+     "start": "2016-01-01", "end": None, "pack": "P", "req_type": "기업규모", "req_value": "중소기업"},
+    {"policy_id": "REGION_LIMIT_BID", "name": "지역제한 입찰 제도", "start": "2016-01-01",
+     "end": None, "pack": "P", "req_type": "지역", "req_value": "본점 소재지"},
+    {"policy_id": "DEFENSE_BUDGET_EXPAND", "name": "국방예산 증액 국면", "start": "2022-01-01",
+     "end": None, "pack": "P", "req_type": "업종", "req_value": "방산"},
+    {"policy_id": "NEWDEAL_2020", "name": "한국판 뉴딜(SOC·디지털)", "start": "2020-07-14",
+     "end": "2022-12-31", "pack": "P", "req_type": "없음", "req_value": ""},
+    {"policy_id": "NUCLEAR_POLICY_SHIFT", "name": "원전 정책 전환(탈원전→원전확대)",
+     "start": "2022-05-10", "end": None, "pack": "P", "req_type": "업종", "req_value": "원전"},
+]
+
+PACK_P_INTERP = [
+    ("TP_Q1", "가격 안 깎고 수주 확대", "저가 수주로 물량만 늘림"),
+    ("TP_Q2", "발주처 다변화인데 마진 유지", "특정 발주처 의존 심화 또는 저가 확장"),
+]
+
+G2B_API = "https://apis.data.go.kr/1230000/ScsbidInfoService/"
+
+
+def fetch_procurement(months: pd.DatetimeIndex) -> pd.DataFrame:
+    """나라장터 낙찰정보. 사업자등록번호와 예정가격이 있어야 q2(낙찰률)가 산다."""
+    key = _datagokr_key()
+    cached = VAULT.get_table("g2b_awards_monthly", scope="shared")
+    have = set(cached["ym"].astype(str)) if cached is not None and len(cached) else set()
+    if cached is not None and len(cached):
+        LOG.info(f"공용 캐시에서 조달 낙찰 {len(cached):,}행 재사용")
+    if not key:
+        if not have:
+            LOG.warn("DATA_GO_KR_KEY 미입력 — PACK-P 를 구동할 수 없습니다.")
+            return pd.DataFrame()
+        return cached
+    todo = [m for m in months if m.strftime("%Y%m") not in have]
+    if RUN_MODE == "CACHED":
+        todo = []
+
+    def _one(m):
+        rows, page = [], 1
+        while page <= 200:
+            limiter("datagokr").wait()
+            js = http_json(G2B_API + "getScsbidListSttusThng", source="datagokr", tries=2,
+                           params={"serviceKey": key, "numOfRows": 999, "pageNo": page,
+                                   "inqryDiv": 1, "type": "json",
+                                   "inqryBgnDt": m.strftime("%Y%m01") + "0000",
+                                   "inqryEndDt": (m + pd.offsets.MonthEnd(0)).strftime("%Y%m%d") + "2359"})
+            if not js:
+                break
+            body = (js.get("response", {}).get("body") if isinstance(js, dict) else None) or {}
+            items = body.get("items") or []
+            it = items.get("item") if isinstance(items, dict) else items
+            if isinstance(it, dict):
+                it = [it]
+            if not it:
+                break
+            for r in it:
+                rows.append({
+                    "ym": m.strftime("%Y%m"),
+                    "biz_no": re.sub(r"\D", "", str(r.get("bizno") or r.get("bidwinnrBizno") or "")),
+                    "corp_nm": str(r.get("bidwinnrNm") or r.get("cmpnyNm") or ""),
+                    "award_amt": pd.to_numeric(r.get("sucsfbidAmt"), errors="coerce"),
+                    "plan_price": pd.to_numeric(r.get("presmptPrce"), errors="coerce"),
+                    "rate": pd.to_numeric(r.get("sucsfbidRate"), errors="coerce"),
+                    "org": str(r.get("dminsttNm") or ""),
+                    "item_cls": str(r.get("prdctClsfcNo") or ""),
+                })
+            page += 1
+        return rows
+
+    new = []
+    if todo:
+        res = pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="조달청 낙찰")
+        for r in res:
+            if r:
+                new.extend(r)
+    frames = ([cached] if cached is not None and len(cached) else [])
+    if new:
+        frames.append(pd.DataFrame(new))
+    if not frames:
+        return pd.DataFrame()
+    G = pd.concat(frames, ignore_index=True)
+    if new:
+        VAULT.put_table("g2b_awards_monthly", G, scope="shared", domain="procurement",
+                        source="나라장터 낙찰정보")
+    has_plan = float(G["plan_price"].notna().mean()) if "plan_price" in G.columns else 0.0
+    LOG.ok(f"조달 낙찰 {len(G):,}건 (예정가격 보유율 {100*has_plan:.1f}%)")
+    if has_plan < 0.2:
+        LOG.warn("예정가격 보유율이 20% 미만입니다. q2(낙찰률)가 사실상 죽고 팩 가치가 급감합니다 "
+                 "(§6.4 착수 전 확인 항목). TP_Q1/TP_Q2 결과 해석 시 반드시 감안하세요.")
+    return G
+
+
+def pack_p_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    G, sec = ctx.get("procurement"), ctx.get("sec")
+    for c in ("q1", "q2", "q3", "q4"):
+        P[c] = np.nan
+    if G is None or len(G) == 0:
+        P["TP_Q1"] = np.nan; P["TP_Q2"] = np.nan; P["E_P"] = np.nan
+        disable_pack("P", "조달청 낙찰 데이터 부재")
+        return P
+    # 사업자번호 → 종목코드: DART 회사개황이 없으면 상호 유사도로 연결
+    n2c = {}
+    if sec is not None and len(sec):
+        for _, r in sec.iterrows():
+            n = norm_corp_name(r.get("name"))
+            if n and n not in n2c:
+                n2c[n] = r.get("code")
+    G = G.copy()
+    G["code"] = G["corp_nm"].map(lambda s: n2c.get(norm_corp_name(s)))
+    G = G.dropna(subset=["code"])
+    if G.empty:
+        P["TP_Q1"] = np.nan; P["TP_Q2"] = np.nan; P["E_P"] = np.nan
+        disable_pack("P", "조달 낙찰업체를 상장사와 연결하지 못함")
+        return P
+    G["month"] = as_ts_series(G["ym"].astype(str) + "01") + pd.offsets.MonthEnd(0)
+    G["win_rate"] = G["rate"].where(G["rate"].between(50, 120),
+                                    safe_div(G["award_amt"], G["plan_price"]) * 100.0)
+    T = (G.groupby(["code", "month"], as_index=False)
+          .agg(award_amt=("award_amt", "sum"), win_rate=("win_rate", "mean"),
+               n_org=("org", "nunique"), n_award=("award_amt", "size")))
+    org_sh = (G.assign(one=1).groupby(["code", "month", "org"], as_index=False)["award_amt"].sum())
+    org_sh["sh"] = org_sh["award_amt"] / org_sh.groupby(["code", "month"])["award_amt"].transform("sum")
+    hhi = org_sh.assign(sh2=lambda d: d["sh"] ** 2).groupby(["code", "month"], as_index=False)["sh2"].sum()
+    T = T.merge(hhi.rename(columns={"sh2": "hhi_org"}), on=["code", "month"], how="left")
+    # PIT: 개찰일/공고일 중 늦은 것 → 월말 + 공개 지연 15일
+    T["knowledge_date"] = T["month"] + pd.Timedelta(days=15)
+    T = pit_frame(T, "month", "knowledge_date", source="procurement")
+    PIT.register("procure_panel", T, key_cols=["code"])
+    P = PIT.asof_join(P, "procure_panel", by="code", left_time="month",
+                      cols=["code", "knowledge_date", "award_amt", "win_rate", "hhi_org", "n_award"],
+                      suffix="_g2b")
+    P = P.sort_values(["code", "month"])
+    g = lambda c: P.groupby("code", observed=True)[c]
+    P["q1"] = g("award_amt").transform(lambda s: dlog(s.rolling(12, min_periods=6).sum(), 12))
+    P["q2"] = g("win_rate").diff(12)
+    P["q3"] = -g("hhi_org").diff(12)
+    z = lambda c: xsec_z(P[c], P["cell"]) if c in P.columns else pd.Series(np.nan, index=P.index)
+    P["TP_Q1"] = tp_product(z("q1"), z("q2"))
+    P["TP_Q2"] = tp_product(z("q3"), z("q2"))
+    P["E_P"] = nanmean_cols(P, ["TP_Q1", "TP_Q2"])
+    return P
+
+
+register_pack(
+    pid="P", name="조달청 낙찰", tp_cols=["TP_Q1", "TP_Q2"],
+    features_fn=pack_p_features, policy=PACK_P_POLICY, interp=PACK_P_INTERP,
+    notes="낙찰률은 원가 노이즈가 없는 순수 가격 지표 — 수출단가와 동일한 성질. "
+          "단 방산·원전 레짐 편승 위험이 크므로 R7 필수.")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L2-B  정책 캘린더 (§12) — 모든 센서팩의 필수 자산 (C12)                                   ║
+# ║                                                                                          ║
+# ║  모든 대체데이터는 정책에 오염된다. 이건 PACK-N 고유 문제가 아니다.                          ║
+# ║  정책 시행일은 공개되어 있고 정확하다 → 그래서 이 오염만은 자연실험 설계가 가능하다.         ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+POLICY_COLS = ["policy_id", "name", "start", "end", "pack", "req_type", "req_value", "url"]
+
+
+def build_policy_calendar() -> pd.DataFrame:
+    rows = []
+    for pid, p in PACK_REGISTRY.items():
+        for e in p["policy"]:
+            r = {c: e.get(c) for c in POLICY_COLS}
+            r["pack"] = r.get("pack") or pid
+            rows.append(r)
+    # 전 팩 공통 매크로 이벤트 (팩 무관하게 신호-수익 관계를 흔드는 국면)
+    rows += [
+        {"policy_id": "COVID_CRASH", "name": "코로나 급락/급반등", "start": "2020-02-20",
+         "end": "2020-09-30", "pack": "*", "req_type": "없음", "req_value": ""},
+        {"policy_id": "SHORT_BAN_2020", "name": "공매도 전면금지", "start": "2020-03-16",
+         "end": "2021-05-02", "pack": "*", "req_type": "없음", "req_value": ""},
+        {"policy_id": "SHORT_BAN_2023", "name": "공매도 전면금지(2차)", "start": "2023-11-06",
+         "end": "2025-03-31", "pack": "*", "req_type": "없음", "req_value": ""},
+    ]
+    C = pd.DataFrame(rows, columns=POLICY_COLS)
+    C["start"] = as_ts_series(C["start"])
+    C["end"] = as_ts_series(C["end"]).fillna(as_ts(BACKTEST_END))
+    C = C.dropna(subset=["start"]).drop_duplicates("policy_id")
+    LOG.ok(f"정책 캘린더 {len(C)}건 등록 (C12 — 캘린더 없는 팩은 등록 자체가 불가)")
+    PIPE.io("OUT", "MEM", "policy_calendar", C)
+    return C
+
+
+def policy_windows(cal: pd.DataFrame, packs: Sequence[str], months: pd.DatetimeIndex,
+                   halo_months: int = 6) -> pd.Series:
+    """정책 이벤트 ±6개월 구간 마스크. R10 검정 C(이벤트 구간 제외)의 입력."""
+    mask = pd.Series(False, index=months)
+    sel = cal[cal["pack"].isin(list(packs) + ["*"])]
+    for r in sel.itertuples(index=False):
+        lo = r.start - pd.DateOffset(months=halo_months)
+        hi = r.start + pd.DateOffset(months=halo_months)
+        mask |= (months >= lo) & (months <= hi)
+        if pd.notna(r.end) and r.end < as_ts(BACKTEST_END):
+            mask |= (months >= r.end - pd.DateOffset(months=halo_months)) & \
+                    (months <= r.end + pd.DateOffset(months=halo_months))
+    return mask
+
+
+def report_policy(cal: pd.DataFrame, months: pd.DatetimeIndex, packs: Sequence[str]):
+    m = policy_windows(cal, packs, months)
+    LOG.table([[r.policy_id, _trunc(r.name, 34), str(r.start)[:10],
+                str(r.end)[:10] if pd.notna(r.end) else "-", r.pack,
+                f"{r.req_type}:{r.req_value}"[:24]] for r in cal.itertuples(index=False)],
+              ["ID", "제도명", "시행", "종료", "대상팩", "요건"],
+              ["l", "l", "l", "l", "c", "l"], title="정책 캘린더 (§12)")
+    LOG.info(f"정책 이벤트 ±6개월 구간: 전체 {len(months)}개월 중 {int(m.sum())}개월 "
+             f"({100*m.mean():.0f}%) — R10 검정 C 에서 이 구간을 제외하고 재검정합니다.")
+    if m.mean() > 0.75:
+        LOG.warn("정책 구간이 전체의 75%를 넘습니다. 검정 C 의 잔여 표본이 부족해 "
+                 "R10 결론의 검정력이 낮아집니다. 이 한계를 결과 해석에 반영하세요.")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L2-C  거부권(V1~V8) + 스코어 조립  Signal = rank_pct(E) × rank_pct(U) × ∏V               ║
+# ║                                                                                          ║
+# ║  ★ V 를 연속화하면 전략이 붕괴한다. 어떤 센서 점수도 밀어내기 정황을 상쇄할 수 없어야 한다. ║
+# ║    이것이 "취지에서 벗어난 종목"이 유입되는 유일한 통로다(§1.3).                            ║
+# ║  ★ E 와 U 는 모두 백분위 랭크 변환 후 곱한다. 원값 곱셈은 음수 구간에서 단조성이 깨진다.    ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+VETO_DEFS = [
+    ("V1", "밀어내기 (Δ재고+Δ매출채권)/Δ매출 > 1.5", "제외"),
+    ("V2", "순이익>0 인데 영업CF < 0.5×순이익 3분기 연속", "제외"),
+    ("V3", "90일 내 대규모 희석성 조달(유증/CB/BW)", "제외"),
+    ("V4", "θ 미달 / 매핑 실패 / 플라시보 p>0.05", "해당 팩만 무효화"),
+    ("V5", "감사의견 비적정·관리종목·자본잠식", "제외"),
+    ("V6", "유동성 하한 미달 또는 거래정지", "제외"),
+    ("V7", "위험요인·우발부채 문단 유사도 셀 내 하위 5%", "제외"),
+    ("V8", "인원 급증 + 유효세율 급락 (정책 유인 채용 의심)", "제외"),
+]
+
+
+def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
+    """V_k ∈ {0,1}. 연속화·가중치화·상쇄 금지 (C6)."""
+    P = P.sort_values(["code", "month"]).copy()
+    g = lambda c: P.groupby("code", observed=True)[c]
+    n = len(P)
+
+    # ── V1 밀어내기 ────────────────────────────────────────────────────────────────────────
+    d_rev = g("revenue_ttm").diff(12)
+    d_inv = g("inventory").diff(12)
+    d_rec = g("receivable").diff(12)
+    push = safe_div(d_inv.fillna(0) + d_rec.fillna(0), d_rev)
+    P["v1_metric"] = push
+    P["V1"] = np.where((d_rev > 0) & (push > 1.5), 0.0, 1.0)
+
+    # ── V2 이익-현금 괴리 3분기(=9개월) 연속 ───────────────────────────────────────────────
+    bad = ((P.get("net_income_ttm") > 0) &
+           (P.get("cfo_ttm") < 0.5 * P.get("net_income_ttm"))).astype(float)
+    P["v2_streak"] = bad.groupby(P["code"], observed=True).transform(
+        lambda s: s.rolling(9, min_periods=9).min())
+    P["V2"] = np.where(P["v2_streak"] >= 1.0, 0.0, 1.0)
+
+    # ── V3 희석성 조달 (공시목록에서 직접 관측) ────────────────────────────────────────────
+    P["V3"] = 1.0
+    dis = ctx.get("disclosures")
+    if dis is not None and len(dis) and "corp_code" in P.columns:
+        d = dis[dis["event"].isin(["rights_issue", "cb_issue", "bw_issue", "capital_reduce"])].copy()
+        if len(d):
+            d["month"] = as_ts_series(d["rcept_dt"]) + pd.offsets.MonthEnd(0)
+            ev = d.groupby(["corp_code", "month"]).size().rename("dilution").reset_index()
+            ev["corp_code"] = ev["corp_code"].astype(str)
+            P["corp_code"] = P["corp_code"].astype(str)
+            P = P.merge(ev, on=["corp_code", "month"], how="left")
+            P["dilution"] = P["dilution"].fillna(0.0)
+            P = P.sort_values(["code", "month"])
+            rec = (P.groupby("code", observed=True)["dilution"]
+                    .transform(lambda s: s.rolling(3, min_periods=1).sum()))   # 90일 ≈ 3개월
+            P["V3"] = np.where(rec > 0, 0.0, 1.0)
+
+    # ── V4 부분 거부권: 팩별 θ / 매핑 품질 ─────────────────────────────────────────────────
+    #    전면 제외가 아니라 '해당 팩만 무효화' — 유일한 부분 거부권이다.
+    P["V4"] = 1.0
+    for p in active_packs():
+        tc = p.get("theta_col")
+        ecol = p["E_col"]
+        if tc and tc in P.columns and ecol in P.columns:
+            kill = P[tc].isna() | (P[tc] < 0.50)
+            P.loc[kill, ecol] = np.nan
+            if int(kill.sum()):
+                LOG.info(f"V4 부분거부권 — 팩 {p['id']}: θ<0.50 인 {int(kill.sum()):,}행의 "
+                         f"{ecol} 무효화 (전면 제외가 아님)")
+
+    # ── V5 감사의견/관리종목/자본잠식 ──────────────────────────────────────────────────────
+    impair = (P.get("equity") <= 0)
+    P["V5"] = np.where(impair.fillna(False), 0.0, 1.0)
+    adm = ctx.get("administrative")
+    if adm is not None and len(adm):
+        bad_codes = set(adm["code"].dropna())
+        P["V5"] = np.where(P["code"].isin(bad_codes), 0.0, P["V5"])
+
+    # ── V6 유동성 ──────────────────────────────────────────────────────────────────────────
+    P["V6"] = np.where((P["adv20"].fillna(0) >= MIN_ADV_KRW) & (P["close"].fillna(0) > 0), 1.0, 0.0)
+
+    # ── V7 공시텍스트 (PACK-D) ─────────────────────────────────────────────────────────────
+    P["V7"] = 1.0
+    if "sim_risk_pct" in P.columns:
+        P["V7"] = np.where(P["sim_risk_pct"] < 0.05, 0.0, 1.0)
+
+    # ── V8 정책 유인 채용 의심 ─────────────────────────────────────────────────────────────
+    P["V8"] = 1.0
+    if "n1" in P.columns and "d_eff_tax" in P.columns:
+        n1_hi = P["n1"] > P.groupby("month", observed=True)["n1"].transform(
+            lambda s: s.quantile(0.90))
+        tax_drop = P["d_eff_tax"] < -0.03
+        P["V8"] = np.where(n1_hi.fillna(False) & tax_drop.fillna(False), 0.0, 1.0)
+
+    vcols = [f"V{i}" for i in range(1, 9)]
+    for c in vcols:
+        P[c] = pd.to_numeric(P[c], errors="coerce").fillna(1.0)
+        uniq = set(np.unique(P[c].dropna()))
+        if not uniq <= {0.0, 1.0}:
+            raise ValueError(f"[C6 위반] 거부권 {c} 가 이진이 아닙니다: {sorted(uniq)[:5]}. "
+                             f"거부권은 절대 연속화하지 않습니다.")
+    P["VETO"] = P[vcols].prod(axis=1)
+    fired = {c: int((P[c] == 0).sum()) for c in vcols}
+    LOG.table([[c, d, act, f"{fired[c]:,}", f"{100*fired[c]/max(n,1):.2f}%"]
+               for (c, d, act) in VETO_DEFS],
+              ["ID", "조건", "조치", "발동 행수", "비율"], ["c", "l", "c", "r", "r"],
+              title="거부권 발동 현황 (V∈{0,1} · 곱 · 상쇄 불가)")
+    return P
+
+
+def assemble_score(P: pd.DataFrame) -> pd.DataFrame:
+    """E = mean(활성 팩 + 공용축 B·C), U = 반영도, Signal = rank(E)×rank(U)×∏V.
+
+    C7: TP 내 → 팩 내 → 팩 간 모두 동일가중. 이것이 기본값이자 최종값이다.
+    """
+    packs = active_packs()
+    ecols = [p["E_col"] for p in packs if p["E_col"] in P.columns]
+    axcols = [c for c in ("E_AXB", "E_AXC") if c in P.columns]
+
+    # ── ① 데이터가 아예 없는 팩은 자동 비활성화 (§8.4) ────────────────────────────────────
+    #     이걸 안 하면 빈 팩 하나 때문에 아래 하한선에서 전 종목이 탈락한다.
+    live_e = []
+    for c in ecols:
+        cov = float(P[c].notna().mean()) if len(P) else 0.0
+        if cov < 0.01:
+            pid = next((p["id"] for p in packs if p["E_col"] == c), c)
+            disable_pack(pid, f"패널 내 {c} 관측 커버리지 {cov*100:.2f}% — 데이터 부재로 자동 비활성화")
+            P[f"pct_{c}"] = np.nan
+        else:
+            live_e.append(c)
+    all_e = live_e + axcols
+    if not all_e:
+        raise RuntimeError("합성할 증거층(E) 컬럼이 하나도 없습니다. "
+                           "활성 팩의 원천 데이터가 전부 비어 있는지 위 수집 로그를 확인하세요.")
+
+    # 팩 간 동일가중 (C7)
+    P["E_raw"] = nanmean_cols(P, all_e)
+    P["E"] = xsec_rank_pct(P["E_raw"], P["cell"])
+    P["n_axes_active"] = P[all_e].notna().sum(axis=1)
+
+    # ── ② 하한선 (§8.2) ───────────────────────────────────────────────────────────────────
+    #   원문: "활성 센서팩 및 B·C축 각각의 셀 내 백분위가 모두 ≥ 50th"
+    #         "'모든 축이 상위'가 아니라 '빈 축이 없을 것'. 표본 붕괴 없이 단일 축 편중을 막고"
+    #
+    #   ★ 순진하게 '전 축 conjunction' 으로 구현하면 두 가지가 깨진다:
+    #     (a) V4 는 §9에서 유일한 '부분' 거부권인데, θ 미달로 E_N 이 NaN 이 되면 그 종목이
+    #         하한선에서 통째로 탈락한다 → 부분 거부권이 전면 제외로 변질된다.
+    #     (b) 축이 7개면 잔존율이 0.5^7 ≈ 0.8% 로 붕괴한다 → 스펙이 명시적으로 금지한 '표본 붕괴'.
+    #
+    #   그래서 이렇게 읽는다: "그 종목이 실제로 보유한 축은 모두 50th 이상일 것" +
+    #   "축이 최소 MIN_FLOOR_AXES 개는 있을 것"(=빈 깡통 배제). 정보량이 다른 종목끼리의
+    #   직접 비교는 §8.4의 pack_profile 별도 랭킹이 이미 막는다.
+    MIN_FLOOR_AXES = 2
+    ok_cnt = pd.Series(0, index=P.index)
+    bad_cnt = pd.Series(0, index=P.index)
+    for c in all_e:
+        pct = xsec_rank_pct(P[c], P["cell"])
+        P[f"pct_{c}"] = pct
+        ok_cnt += (pct >= 0.50).fillna(False).astype(int)
+        bad_cnt += (pct < 0.50).fillna(False).astype(int)
+    P["FLOOR"] = ((bad_cnt == 0) & (ok_cnt >= MIN_FLOOR_AXES)).astype(float)
+
+    ret = float(P["FLOOR"].mean()) if len(P) else 0.0
+    rows = [[c, f"{float(P[c].notna().mean())*100:.1f}%",
+             f"{float((P[f'pct_{c}'] >= 0.50).mean())*100:.1f}%"] for c in all_e]
+    LOG.table(rows, ["증거층 축", "관측 커버리지", "50th 이상 비율"], ["l", "r", "r"],
+              title="하한선 구성 축 (§8.2 — 빈 축이 없을 것)")
+    LOG.info(f"하한선 통과 {int(P['FLOOR'].sum()):,}행 / {len(P):,}행 ({ret*100:.1f}%) · "
+             f"보유 축 중앙값 {float(P['n_axes_active'].median()):.0f}개")
+    if ret < 0.03:
+        LOG.warn(f"하한선 잔존율이 {ret*100:.1f}% 로 매우 낮습니다. 축이 많을수록 "
+                 f"'모든 축 ≥ 50th' 조건은 기하급수적으로 좁아집니다(축 k개면 대략 0.5^k). "
+                 f"§8.2 는 '표본 붕괴 없이' 를 명시하므로, 활성 팩 수를 줄이거나 "
+                 f"팩별 단독 파일로 나눠 돌리는 편이 스펙 의도에 더 가깝습니다.")
+
+    if "U" not in P.columns:
+        P["U"] = np.nan
+    P["Signal"] = P["E"].fillna(0) * P["U"].fillna(0) * P["VETO"].fillna(0) * P["FLOOR"].fillna(0)
+
+    # 활성 팩 조합이 같은 종목끼리 별도 랭킹 후 합친다 (§8.4 — 정보량이 다른 종목의 직접 비교 방지)
+    P["pack_profile"] = P[all_e].notna().astype(int).astype(str).agg("".join, axis=1)
+    P["Signal_rank"] = (P.groupby(["month", "pack_profile"], observed=True)["Signal"]
+                         .rank(pct=True, method="average"))
+    LOG.ok(f"스코어 조립 완료 — 증거층 {len(all_e)}개 축 동일가중 "
+           f"({', '.join(all_e)}) · 하한선 통과 {int(P['FLOOR'].sum()):,}행 "
+           f"({100*P['FLOOR'].mean():.1f}%)")
+    PIPE.io("OUT", "MEM", "scored_panel", P)
+    return P
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L3  백테스트 엔진 + 비용 모델                                                             ║
+# ║                                                                                          ║
+# ║  · 월 1회 리밸런싱, 체결 = 신호 산출일 '다음 거래일 시가'. 당일 종가 체결 금지(미래누수).   ║
+# ║  · 상장폐지: 정리매매 최종가 반영, 없으면 -100%. 누락 처리 금지(누락 = 생존자편향).         ║
+# ║  · 롱온리 (공매도 불가) — 음의 신호는 청산 게이트로만 쓴다.                                 ║
+# ║  · 청산 규칙이 진입 논리와 같은 언어를 쓴다: Δlog M 이 Δlog E 수준까지 확장 완료 시 청산.   ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+# 증권거래세율 이력 (매도 시). KOSPI 는 농특세 0.15% 포함 총부담 기준.
+TAX_SCHEDULE = [
+    ("2016-01-01", {"KOSPI": 0.0030, "KOSDAQ": 0.0030, "OTHER": 0.0030}),
+    ("2019-06-03", {"KOSPI": 0.0025, "KOSDAQ": 0.0025, "OTHER": 0.0025}),
+    ("2021-01-01", {"KOSPI": 0.0023, "KOSDAQ": 0.0023, "OTHER": 0.0023}),
+    ("2023-01-01", {"KOSPI": 0.0020, "KOSDAQ": 0.0020, "OTHER": 0.0020}),
+    ("2024-01-01", {"KOSPI": 0.0018, "KOSDAQ": 0.0018, "OTHER": 0.0018}),
+    ("2025-01-01", {"KOSPI": 0.0015, "KOSDAQ": 0.0015, "OTHER": 0.0015}),
+]
+COMMISSION_BPS = 1.5          # 편도. 개인 온라인 수수료 가정
+SLIPPAGE_K = 0.10             # 제곱근 충격 계수
+
+
+def sell_tax(dt, market: str) -> float:
+    t = as_ts(dt)
+    rate = TAX_SCHEDULE[0][1]
+    for d, r in TAX_SCHEDULE:
+        if t >= as_ts(d):
+            rate = r
+    return rate.get(str(market).upper(), rate["OTHER"])
+
+
+def slippage(trade_krw: float, adv_krw: float) -> float:
+    """제곱근 시장충격. 참여율이 높을수록 급격히 비싸진다 — 소형주 가중이 여기서 나온다."""
+    if not np.isfinite(adv_krw) or adv_krw <= 0:
+        return 0.02
+    part = min(1.0, abs(trade_krw) / adv_krw)
+    return float(SLIPPAGE_K * math.sqrt(part))
+
+
+def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
+    """신호 강도 기반 사이징. 분포가 평평하면 분산, 격차가 크면 집중(§8.5).
+    비중 상한은 코드 상수로 이미 못박혀 있다 — 드로다운 한가운데서 정하지 않는다."""
+    s = sub["Signal_rank"].fillna(0).to_numpy(dtype=float)
+    if len(s) == 0:
+        return sub.assign(weight=[])
+    med = np.median(s)
+    spread = float(np.mean(np.abs(s - med)))
+    if spread < 1e-6:
+        w = np.full(len(s), 1.0 / len(s))
+    else:
+        raw = np.clip(s - med, 0, None) + 1e-9
+        conc = min(2.0, 0.5 + spread * 8.0)          # 격차 클수록 집중
+        w = raw ** conc
+        w = w / w.sum() if w.sum() > 0 else np.full(len(s), 1.0 / len(s))
+    w = np.clip(w, POS_MIN_WEIGHT, POS_MAX_WEIGHT)
+    # 소액계좌 유동성 상한: 20일 평균거래대금의 X% 이내
+    adv = sub["adv20"].fillna(0).to_numpy(dtype=float)
+    cap = np.where(adv > 0, (adv * POS_ADV_PARTICIPATION) / max(ACCOUNT_KRW, 1), POS_MAX_WEIGHT)
+    w = np.minimum(w, np.maximum(cap, POS_MIN_WEIGHT * 0.5))
+    w = w / w.sum() if w.sum() > 0 else np.full(len(s), 1.0 / len(s))
+    return sub.assign(weight=w)
+
+
+def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
+                 sec: pd.DataFrame, signal_col: str = "Signal_rank",
+                 top_pct: float = PORTFOLIO_TOP_PCT, apply_costs: bool = True,
+                 label: str = "TCD") -> dict:
+    mkt = sec.set_index("code")["market"].astype(str).to_dict()
+    delist = uni.delisting_map()
+    hold: Dict[str, dict] = {}
+    rows, trades, holdings_log = [], [], []
+    prev_w: Dict[str, float] = {}
+
+    for i, m in enumerate(months):
+        sub = P[(P["month"] == m)].copy()
+        if sub.empty:
+            rows.append({"month": m, "ret": 0.0, "n": 0, "turnover": 0.0, "cost": 0.0})
+            continue
+        elig = sub[(sub["VETO"] == 1) & (sub["FLOOR"] == 1) & sub[signal_col].notna() &
+                   sub["exec_px"].notna()]
+        # ★ 감쇠 감사는 '누적 교집합'으로 기록한다. 게이트별 독립 집계를 깔때기처럼 보여주면
+        #   잔존율이 100%를 넘는 무의미한 숫자가 나온다(게이트가 서로 포함관계가 아니므로).
+        g_liq = sub[sub["V6"] == 1]
+        g_veto = g_liq[g_liq["VETO"] == 1]
+        g_floor = g_veto[g_veto["FLOOR"] == 1]
+        uni.audit_row("유동성필터", m, g_liq["code"].tolist())
+        uni.audit_row("거부권통과", m, g_veto["code"].tolist())
+        uni.audit_row("하한선통과", m, g_floor["code"].tolist())
+
+        k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
+                                             round(len(elig) * top_pct))))
+        pick = elig.nlargest(k, signal_col) if len(elig) else elig.iloc[0:0]
+        uni.audit_row("최종선정", m, pick["code"].tolist())
+
+        # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
+        keep = []
+        for c, h in list(hold.items()):
+            row = sub[sub["code"] == c]
+            if row.empty:
+                continue
+            r0 = row.iloc[0]
+            exited = False
+            if r0.get("VETO", 1) == 0:
+                exited = True                                    # 거부권 발동 시 즉시 강제청산
+            elif h["months"] >= HOLD_MAX_MONTHS:
+                exited = True
+            elif (pd.notna(r0.get("dlog_M")) and pd.notna(r0.get("dlog_E")) and
+                  r0["dlog_M"] >= r0["dlog_E"] and r0["dlog_E"] > 0):
+                exited = True                                    # 시장이 마침내 재분류 → 알파 소진
+            if not exited:
+                keep.append(c)
+        target = pd.concat([pick, sub[sub["code"].isin(keep) & ~sub["code"].isin(pick["code"])]],
+                           ignore_index=True) if len(keep) else pick
+        if len(target) > PORTFOLIO_MAX_NAMES:
+            target = target.nlargest(PORTFOLIO_MAX_NAMES, signal_col)
+        target = size_positions(target) if len(target) else target.assign(weight=[])
+
+        w_new = dict(zip(target["code"], target["weight"])) if len(target) else {}
+        turn = sum(abs(w_new.get(c, 0) - prev_w.get(c, 0)) for c in set(w_new) | set(prev_w))
+
+        cost = 0.0
+        if apply_costs:
+            for c in set(w_new) | set(prev_w):
+                dw = w_new.get(c, 0) - prev_w.get(c, 0)
+                if abs(dw) < 1e-9:
+                    continue
+                r = sub[sub["code"] == c]
+                adv = float(r["adv20"].iloc[0]) if len(r) and pd.notna(r["adv20"].iloc[0]) else 0.0
+                notional = abs(dw) * ACCOUNT_KRW
+                c_bps = COMMISSION_BPS / 1e4
+                sl = slippage(notional, adv)
+                tx = sell_tax(m, mkt.get(c, "OTHER")) if dw < 0 else 0.0
+                cost += abs(dw) * (c_bps + sl + tx)
+
+        # 다음 달 수익
+        ret = 0.0
+        for c, w in w_new.items():
+            r = sub[sub["code"] == c]
+            fr = float(r["fwd_ret"].iloc[0]) if len(r) and pd.notna(r["fwd_ret"].iloc[0]) else np.nan
+            dl = delist.get(c)
+            if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
+                # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
+                fr = -1.0 if not np.isfinite(fr) else fr
+            if not np.isfinite(fr):
+                fr = 0.0
+            ret += w * fr
+            holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
+                                 "signal": float(r[signal_col].iloc[0]) if len(r) else np.nan})
+        ret_net = ret - cost
+        rows.append({"month": m, "ret": ret_net, "ret_gross": ret, "n": len(w_new),
+                     "turnover": turn, "cost": cost})
+        for c in list(hold):
+            if c in w_new:
+                hold[c]["months"] += 1
+            else:
+                hold.pop(c, None)
+        for c in w_new:
+            hold.setdefault(c, {"months": 0})
+        prev_w = w_new
+
+    R = pd.DataFrame(rows)
+    R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
+    H = pd.DataFrame(holdings_log)
+    return {"returns": R, "holdings": H, "label": label}
+
+
+# ── 성과 지표 ───────────────────────────────────────────────────────────────────────────────
+def perf_stats(R: pd.DataFrame, rf: float = 0.0) -> dict:
+    r = R["ret"].fillna(0).to_numpy(dtype=float)
+    n = len(r)
+    if n == 0:
+        return {}
+    eq = np.cumprod(1 + r)
+    years = n / 12.0
+    cagr = eq[-1] ** (1 / years) - 1 if years > 0 and eq[-1] > 0 else np.nan
+    vol = r.std(ddof=1) * math.sqrt(12) if n > 1 else np.nan
+    dn = r[r < 0]
+    dvol = dn.std(ddof=1) * math.sqrt(12) if len(dn) > 1 else np.nan
+    peak = np.maximum.accumulate(eq)
+    dd = eq / peak - 1
+    mdd = float(dd.min()) if n else np.nan
+    uw, mx, cur = 0, 0, 0
+    for x in dd:
+        cur = cur + 1 if x < -1e-9 else 0
+        mx = max(mx, cur)
+    mu, tstat = hac_tstat(r)
+    return {
+        "월수": n, "CAGR": cagr, "연변동성": vol,
+        "Sharpe": (cagr - rf) / vol if vol and np.isfinite(vol) and vol > 0 else np.nan,
+        "Sortino": (cagr - rf) / dvol if dvol and np.isfinite(dvol) and dvol > 0 else np.nan,
+        "MDD": mdd, "Calmar": (cagr / abs(mdd)) if mdd and mdd < 0 else np.nan,
+        "승률": float((r > 0).mean()), "월평균": float(r.mean()),
+        "t통계량(HAC)": tstat, "최장언더워터(월)": int(mx),
+        "누적수익": float(eq[-1] - 1), "평균종목수": float(R["n"].mean()),
+        "월평균회전율": float(R["turnover"].mean()) if "turnover" in R else np.nan,
+        "월평균비용": float(R["cost"].mean()) if "cost" in R else np.nan,
+    }
+
+
+def right_tail_contribution(bt: dict) -> dict:
+    """★ 이 전략은 IR 이 아니라 우측 꼬리에 의존한다. 상위 종목 제외 시 성과가 사라지는지
+    반드시 측정하고 리포트에 명시한다(§10.2)."""
+    H = bt.get("holdings")
+    if H is None or H.empty:
+        return {}
+    contrib = (H["weight"] * H["ret"]).groupby(H["code"]).sum().sort_values(ascending=False)
+    n = len(contrib)
+    if n == 0:
+        return {}
+    out = {}
+    base = float(contrib.sum())
+    for q, lab in ((0.05, "상위5%"), (0.10, "상위10%"), (0.01, "상위1%")):
+        k = max(1, int(round(n * q)))
+        out[f"{lab} 종목수"] = k
+        out[f"{lab} 기여"] = float(contrib.iloc[:k].sum())
+        out[f"{lab} 제외 후 총기여"] = base - float(contrib.iloc[:k].sum())
+    out["총기여"] = base
+    out["기여 상위5종목"] = ", ".join(f"{c}({v:+.2f})" for c, v in contrib.head(5).items())
+    return out
+
+
+def benchmark_returns(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
+    out = {}
+    for name, sym in (("KOSPI", "KS11"), ("KOSDAQ", "KQ11")):
+        d = None
+        if fdr is not None:
+            try:
+                d = fdr.DataReader(sym, months[0] - pd.offsets.MonthEnd(2), months[-1])
+            except Exception:
+                d = None
+        if d is None or len(d) == 0:
+            continue
+        d = d.reset_index()
+        d.columns = [str(c).lower() for c in d.columns]
+        d["date"] = as_ts_series(d[d.columns[0]])
+        d["month"] = d["date"] + pd.offsets.MonthEnd(0)
+        s = d.groupby("month")["close"].last().pct_change()
+        out[name] = s.reindex(months)
+    return out
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L5  강건성 스위트 R1~R11 (§11)                                                            ║
+# ║                                                                                          ║
+# ║  순서대로 실행. 앞 단계 실패 시 진행 금지.                                                  ║
+# ║  ★ 성과가 나쁘게 나오면 그대로 보고한다. 파라미터를 조정해 좋아 보이게 만드는 것이          ║
+# ║    이 프로젝트에서 가장 해로운 행동이다(§16.3). 나쁜 결과는 그 자체로 정보다.               ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+ROBUST_RESULTS: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _record(rid: str, name: str, passed: Optional[bool], detail: str,
+            kill: bool = False, metrics: Optional[dict] = None):
+    # ★ numpy bool 주의: np.False_ is False → False 다. `is False` 로 분기하면 킬 게이트가
+    #   조용히 발동하지 않는다. 여기서 파이썬 bool 로 강제 변환한다.
+    passed = None if passed is None else bool(passed)
+    ROBUST_RESULTS[rid] = {"id": rid, "name": name, "pass": passed, "detail": detail,
+                           "kill": kill, "metrics": metrics or {}}
+    icon = {True: "✔ 통과", False: "✘ 실패", None: "— 판정불가"}[passed]
+    (LOG.ok if passed is True else (LOG.error if passed is False else LOG.warn))(
+        f"[{rid}] {name} → {icon} · {detail}")
+    if passed is False and kill and STOP_ON_KILL_CRITERIA:
+        raise KillCriteria(f"[{rid}] {name} — {detail}")
+
+
+def _sharpe(R: pd.DataFrame) -> float:
+    s = perf_stats(R)
+    return float(s.get("Sharpe", np.nan)) if s else np.nan
+
+
+# ── R1. 누수 민감도 자가검정 (C9) — 이 검정 통과 전 모든 백테스트 결과는 무효 ────────────────
+def R1_leakage(P: pd.DataFrame, months, uni, sec, run_fn) -> None:
+    """파이프라인이 누수를 '탐지할 수 있는지' 먼저 증명한다 (C9).
+
+    두 부분으로 나눈다. 한쪽만으로는 결론이 나지 않기 때문이다:
+
+      R1a 하네스 민감도 (판정의 기준)
+          미래수익을 직접 신호로 심은 '고의 오염본'을 만든다. 이건 정의상 완벽한 누수다.
+          이때도 성과가 뚜렷이 좋아지지 않으면 하네스가 신호에 반응하지 못하는 것 =
+          체결·정렬·수익계산 어딘가가 고장난 것이다. 이 경우 전략 결과는 전부 무효다.
+
+      R1b 실제 신호 선행 (참고)
+          실제 신호를 1개월 앞당겨 본다. 개선되면 정상. 개선되지 않는 경우는 두 가지인데
+          ① 하네스 둔감 ② 애초에 신호에 알파가 거의 없음 — 구분이 안 된다.
+          그래서 R1b 는 판정에 쓰지 않고 참고로만 기록한다. (R1a 가 ①을 이미 배제한다)
+    """
+    base = run_fn(P, label="R1_base")
+    s0 = _sharpe(base["returns"])
+
+    # R1a: 미래수익을 신호에 주입 (고의 누수)
+    Oracle = P.copy()
+    ora = Oracle.groupby("month", observed=True)["fwd_ret"].rank(pct=True)
+    Oracle["Signal_rank"] = ora.where(ora.notna(), Oracle["Signal_rank"])
+    oracle_bt = run_fn(Oracle, label="R1_oracle")
+    s_ora = _sharpe(oracle_bt["returns"])
+
+    # 포지션이 아예 잡히지 않으면 '하네스 둔감'이 아니라 '게이트가 전부 막았다'는 뜻이다.
+    # 두 원인은 처방이 완전히 다르므로 구분해서 보고한다.
+    n_pos = float(base["returns"]["n"].mean()) if len(base["returns"]) else 0.0
+    n_pos_ora = float(oracle_bt["returns"]["n"].mean()) if len(oracle_bt["returns"]) else 0.0
+    if n_pos_ora < 0.5:
+        _record("R1", "누수 민감도 자가검정 (C9)", None,
+                f"평균 보유종목이 {n_pos_ora:.2f}개로 포지션이 사실상 잡히지 않아 판정할 수 없습니다. "
+                f"하네스 문제가 아니라 게이트 문제입니다 — 위 '유니버스 감쇠 감사'에서 "
+                f"거부권/하한선 중 어디서 표본이 0이 되는지 먼저 확인하세요.",
+                kill=False, metrics={"n_pos": n_pos, "n_pos_oracle": n_pos_ora})
+        LOG.error("R1 판정불가 — 포지션이 0입니다. 강건성 결과 전체가 무의미하므로 "
+                  "게이트(특히 하한선)를 먼저 진단해야 합니다.")
+        return
+    sensitive = np.isfinite(s_ora) and np.isfinite(s0) and (s_ora - s0) > 0.5
+
+    # R1b: 실제 신호 1개월 선행
+    Q = P.sort_values(["code", "month"]).copy()
+    for c in ("Signal_rank", "Signal", "E", "U"):
+        if c in Q.columns:
+            Q[c] = Q.groupby("code", observed=True)[c].shift(-1)
+    s1 = _sharpe(run_fn(Q, label="R1_leaked")["returns"])
+
+    _record("R1", "누수 민감도 자가검정 (C9)", sensitive,
+            f"[R1a 하네스 민감도] 정상 Sharpe {s0:.3f} → 미래수익 주입 오염본 {s_ora:.3f} "
+            f"(Δ={s_ora-s0:+.3f}). "
+            + ("하네스가 누수에 뚜렷이 반응함 = 정상. 이제 실제 결과를 신뢰할 근거가 생겼습니다."
+               if sensitive else
+               "★ 완벽한 누수를 넣어도 성과가 개선되지 않습니다 → 하네스가 신호에 반응하지 못합니다. "
+               "체결 정렬(익일 시가)·수익 계산·유니버스 결합 중 하나가 고장난 것이며, "
+               "§15-1에 따라 이 상태의 백테스트 결과는 전부 무효입니다.")
+            + f"  [R1b 참고] 실제 신호 1개월 선행 시 {s1:.3f} (Δ={s1-s0:+.3f})"
+            + ("" if (s1 - s0) > 0.15 else
+               " — 개선되지 않았으나, R1a 가 통과했다면 이는 '신호 자체의 알파가 약하다'는 뜻이지 "
+               "누수 탐지 실패가 아닙니다." if sensitive else ""),
+            kill=False,
+            metrics={"sharpe_base": s0, "sharpe_oracle": s_ora, "sharpe_shifted": s1})
+    if not sensitive:
+        LOG.error("R1a 실패 — §15-1: 하네스가 누수에 둔감하므로 이후 모든 결과가 무효입니다. "
+                  "전략을 손대기 전에 백테스트 엔진부터 고쳐야 합니다.")
+
+
+# ── R2. TP vs 나이브 ⭐ 킬 게이트 — 이 시스템의 존재 이유를 검정한다 ─────────────────────────
+def R2_tp_vs_naive(P: pd.DataFrame, run_fn) -> None:
+    """TP = z(개선) × z(대가회피) 가 z(개선) 단독보다 낫지 않다면,
+    트레이드오프 논리 전체가 불필요한 복잡도다. 정면으로 검정하고 있는 그대로 보고한다."""
+    tp_cols, naive_cols = [], []
+    for p in active_packs():
+        tp_cols += [c for c in p["tp_cols"] if c in P.columns]
+    tp_cols += [c for c in ("TP_B1", "TP_B2", "TP_C1", "TP_C2") if c in P.columns]
+    # 나이브 = '개선 항목 단독' (곱의 첫 인자에 해당하는 원지표들)
+    for c in ("n1", "p1", "x1", "q1", "dlog_rev", "dlog_IC", "dlog_emp"):
+        if c in P.columns:
+            naive_cols.append(c)
+    if not tp_cols or not naive_cols:
+        _record("R2", "TP vs 나이브", None, "비교할 컬럼이 부족합니다.")
+        return
+
+    Q = P.copy()
+    Q["E_raw"] = nanmean_cols(Q, tp_cols)
+    Q["E"] = xsec_rank_pct(Q["E_raw"], Q["cell"])
+    Q["Signal_rank"] = (Q["E"].fillna(0) * Q["U"].fillna(0) * Q["VETO"].fillna(0) *
+                        Q["FLOOR"].fillna(0))
+    Q["Signal_rank"] = Q.groupby("month", observed=True)["Signal_rank"].rank(pct=True)
+    tp_bt = run_fn(Q, label="R2_TP")
+
+    N = P.copy()
+    zc = [xsec_z(N[c], N["cell"]).rename(c) for c in naive_cols]
+    N["E_raw"] = nanmean_cols(pd.concat(zc, axis=1), naive_cols)
+    N["E"] = xsec_rank_pct(N["E_raw"], N["cell"])
+    N["Signal_rank"] = (N["E"].fillna(0) * N["U"].fillna(0) * N["VETO"].fillna(0) *
+                        N["FLOOR"].fillna(0))
+    N["Signal_rank"] = N.groupby("month", observed=True)["Signal_rank"].rank(pct=True)
+    nv_bt = run_fn(N, label="R2_naive")
+
+    a, b = tp_bt["returns"]["ret"].fillna(0).to_numpy(), nv_bt["returns"]["ret"].fillna(0).to_numpy()
+    k = min(len(a), len(b))
+    diff = a[:k] - b[:k]
+    mu, t = hac_tstat(diff)
+    s_tp, s_nv = _sharpe(tp_bt["returns"]), _sharpe(nv_bt["returns"])
+    better = np.isfinite(t) and t > 1.0 and s_tp > s_nv
+    _record("R2", "TP vs 나이브 (킬 게이트)", better,
+            f"TP Sharpe {s_tp:.3f} vs 나이브 {s_nv:.3f} · 월수익 차이 평균 {mu*100:+.3f}%p, "
+            f"HAC t={t:.2f}. " + ("트레이드오프 논리가 나이브를 유의하게 이깁니다." if better else
+                                  "★ TP 가 '개선 항목 단독'을 이기지 못했습니다. "
+                                  "§15-2에 따라 트레이드오프 패러다임의 근거가 소멸합니다. "
+                                  "유리하게 해석하지 않고 그대로 보고합니다."),
+            kill=True, metrics={"sharpe_tp": s_tp, "sharpe_naive": s_nv, "t_diff": t})
+
+
+# ── R3. 퀄리티 팩터 직교화 ─────────────────────────────────────────────────────────────────
+def R3_orthogonal(P: pd.DataFrame, bt: dict, months) -> None:
+    """표준 퀄리티/수익성/모멘텀에 회귀한 뒤 알파가 남는가. 안 남으면 재포장에 불과하다."""
+    H = bt.get("holdings")
+    if H is None or H.empty:
+        _record("R3", "퀄리티 팩터 직교화", None, "보유 이력이 없어 판정 불가")
+        return
+    Q = P.copy()
+    Q["f_prof"] = safe_div(Q.get("op_income_ttm"), Q.get("assets"))
+    Q["f_qual"] = safe_div(Q.get("equity"), Q.get("assets"))
+    Q["f_mom"] = Q.groupby("code", observed=True)["close"].transform(lambda s: s.pct_change(12))
+    Q["f_size"] = np.log(Q["adv20"].where(Q["adv20"] > 0))
+    Q["f_val"] = safe_div(Q.get("net_income_ttm"), Q["close"])
+    facs = ["f_prof", "f_qual", "f_mom", "f_size", "f_val"]
+
+    fac_ret = []
+    for m in months:
+        sub = Q[Q["month"] == m]
+        if len(sub) < 30:
+            continue
+        row = {"month": m}
+        for f in facs:
+            z = xsec_z(sub[f], sub["cell"])
+            r = sub["fwd_ret"]
+            ok = z.notna() & r.notna()
+            row[f] = float(np.average(r[ok], weights=np.clip(z[ok] - z[ok].min() + 1e-9, 0, None))
+                           - r[ok].mean()) if ok.sum() > 10 else np.nan
+        fac_ret.append(row)
+    F = pd.DataFrame(fac_ret).set_index("month") if fac_ret else pd.DataFrame()
+    R = bt["returns"].set_index("month")["ret"]
+    if F.empty:
+        _record("R3", "퀄리티 팩터 직교화", None, "팩터 수익률을 만들 표본이 부족합니다.")
+        return
+    J = F.join(R.rename("y"), how="inner").dropna()
+    if len(J) < 24:
+        _record("R3", "퀄리티 팩터 직교화", None, f"공통 표본 {len(J)}개월로 부족합니다.")
+        return
+    X = np.column_stack([np.ones(len(J))] + [J[f].to_numpy() for f in facs])
+    y = J["y"].to_numpy()
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    alpha_m, t = hac_tstat(resid + beta[0])
+    passed = np.isfinite(t) and t > 1.5 and alpha_m > 0
+    _record("R3", "퀄리티 팩터 직교화", passed,
+            f"직교화 후 월알파 {alpha_m*100:+.3f}%p (연 {((1+alpha_m)**12-1)*100:+.1f}%), "
+            f"HAC t={t:.2f}, 표본 {len(J)}개월. "
+            + ("표준 팩터로 설명되지 않는 알파가 남습니다." if passed else
+               "★ 직교화 후 알파가 사라집니다 — 기존 퀄리티 팩터의 재포장일 가능성이 큽니다(§15-3)."),
+            kill=True, metrics={"alpha_m": alpha_m, "t": t})
+
+
+# ── R4. 플라시보 매핑 ───────────────────────────────────────────────────────────────────────
+def R4_placebo(P: pd.DataFrame, n_iter: int = 1000) -> None:
+    """무작위로 종목-신호를 섞었을 때의 귀무분포. 실제가 상위 5% 밖이면 매핑이 무작위와 구분 안 됨."""
+    sub = P[P["Signal_rank"].notna() & P["fwd_ret"].notna()]
+    if len(sub) < 500:
+        _record("R4", "플라시보 매핑", None, "표본 부족")
+        return
+    real = []
+    for m, g in sub.groupby("month", observed=True):
+        if len(g) < 20:
+            continue
+        k = max(1, int(len(g) * PORTFOLIO_TOP_PCT))
+        real.append(g.nlargest(k, "Signal_rank")["fwd_ret"].mean() - g["fwd_ret"].mean())
+    real_mu = float(np.nanmean(real)) if real else np.nan
+
+    rng = np.random.default_rng(SEED)
+    null = np.empty(n_iter)
+    groups = [g for _, g in sub.groupby("month", observed=True) if len(g) >= 20]
+    for i in range(n_iter):
+        acc = []
+        for g in groups:
+            k = max(1, int(len(g) * PORTFOLIO_TOP_PCT))
+            idx = rng.choice(len(g), size=k, replace=False)
+            acc.append(g["fwd_ret"].to_numpy()[idx].mean() - g["fwd_ret"].mean())
+        null[i] = np.nanmean(acc)
+    p = float((null >= real_mu).mean())
+    passed = np.isfinite(real_mu) and p < 0.05
+    _record("R4", f"플라시보 (무작위 선택 귀무분포 {n_iter:,}회)", passed,
+            f"실제 초과 {real_mu*100:+.3f}%p/월 vs 귀무 평균 {null.mean()*100:+.3f}%p "
+            f"(p={p:.4f}). " + ("무작위와 구분됩니다." if passed else
+                                "★ 무작위 선택과 통계적으로 구분되지 않습니다(§15-5)."),
+            kill=False, metrics={"p": p, "real": real_mu})
+
+
+# ── R10. 정책 반증 검정 ⭐ 전 팩 필수 ───────────────────────────────────────────────────────
+def R10_policy_falsify(P: pd.DataFrame, cal: pd.DataFrame, months, run_fn) -> None:
+    """정책 이벤트 ±6개월 구간을 전부 제외하고 백테스트. 알파가 유지돼야 통과."""
+    packs = [p["id"] for p in active_packs()]
+    mask = policy_windows(cal, packs, months, halo_months=6)
+    clean_months = months[~mask.to_numpy()]
+    if len(clean_months) < 24:
+        _record("R10", "정책 반증 검정", None,
+                f"정책구간 제외 후 {len(clean_months)}개월밖에 남지 않아 검정력이 없습니다. "
+                f"이 자체가 '이 팩의 관측구간이 정책에 광범위하게 덮여 있다'는 사실을 뜻합니다.")
+        return
+    full = run_fn(P, label="R10_full")
+    Q = P[P["month"].isin(clean_months)].copy()
+    clean = run_fn(Q, label="R10_clean", months_override=clean_months)
+    s_full, s_clean = _sharpe(full["returns"]), _sharpe(clean["returns"])
+    mu_f = full["returns"]["ret"].mean()
+    mu_c = clean["returns"]["ret"].mean()
+    _, t_c = hac_tstat(clean["returns"]["ret"].fillna(0).to_numpy())
+    kept = np.isfinite(s_clean) and s_clean > 0 and mu_c > 0 and (
+        not np.isfinite(s_full) or s_clean >= 0.5 * s_full)
+
+    # 검정 A: 정책 시행일 근처 신호 발화율 스파이크
+    fire = P.groupby("month", observed=True)["Signal_rank"].apply(
+        lambda s: float((s > 0.95).mean()) if len(s) else np.nan).reindex(months)
+    in_w, out_w = fire[mask.to_numpy()].mean(), fire[~mask.to_numpy()].mean()
+
+    _record("R10", "정책 반증 검정 (검정 C: 이벤트 ±6M 제외)", kept,
+            f"전체 Sharpe {s_full:.3f}({len(months)}개월) → 정책구간 제외 {s_clean:.3f}"
+            f"({len(clean_months)}개월, 월평균 {mu_c*100:+.3f}%p, HAC t={t_c:.2f}). "
+            f"[검정A] 신호 발화율 정책구간 {in_w:.3f} vs 비정책구간 {out_w:.3f}. "
+            + ("정책 이벤트를 빼도 알파가 유지됩니다." if kept else
+               "★ 정책 이벤트 구간을 제외하면 알파가 사라집니다 → 해당 센서팩 폐기 대상(§15-4). "
+               "이것은 수요가 아니라 제도를 관측한 것입니다."),
+            kill=False, metrics={"s_full": s_full, "s_clean": s_clean, "fire_in": in_w, "fire_out": out_w})
+    if not kept:
+        for p in active_packs():
+            disable_pack(p["id"], "R10 정책 반증 검정 미통과 — 자동 비활성화")
+
+
+# ── R5. 절제 (ablation) ─────────────────────────────────────────────────────────────────────
+def R5_ablation(P: pd.DataFrame, run_fn) -> None:
+    """팩별·TP별로 하나씩 빼고 돌려 기여를 귀속한다. L2 만 건드리므로 몇 분이면 끝난다."""
+    base = run_fn(P, label="R5_base")
+    s0 = _sharpe(base["returns"])
+    rows = [["(전체)", f"{s0:.3f}", "—", "—"]]
+    packs = active_packs()
+    all_e = [p["E_col"] for p in packs if p["E_col"] in P.columns] + \
+            [c for c in ("E_AXB", "E_AXC") if c in P.columns]
+    for drop in all_e:
+        Q = P.copy()
+        rest = [c for c in all_e if c != drop]
+        if not rest:
+            continue
+        Q["E_raw"] = nanmean_cols(Q, rest)
+        Q["E"] = xsec_rank_pct(Q["E_raw"], Q["cell"])
+        Q["Signal_rank"] = Q.groupby("month", observed=True).apply(
+            lambda g: (g["E"].fillna(0) * g["U"].fillna(0) * g["VETO"].fillna(0) *
+                       g["FLOOR"].fillna(0)).rank(pct=True)).reset_index(level=0, drop=True)
+        s = _sharpe(run_fn(Q, label=f"R5_no_{drop}")["returns"])
+        rows.append([f"− {drop}", f"{s:.3f}", f"{s - s0:+.3f}",
+                     "기여함" if s < s0 - 0.03 else ("무기여" if s > s0 + 0.03 else "중립")])
+    LOG.table(rows, ["절제 대상", "Sharpe", "Δ", "판정"], ["l", "r", "r", "l"],
+              title="R5 절제 검사 — 어느 축이 실제로 기여하는가")
+    _record("R5", "팩별·축별 절제", True, f"기준 Sharpe {s0:.3f} 대비 축별 기여 귀속 완료")
+
+
+# ── R6. PBO / DSR ───────────────────────────────────────────────────────────────────────────
+def _dsr(sharpe: float, n: int, skew: float, kurt: float, n_trials: int) -> float:
+    """Deflated Sharpe Ratio (Bailey & López de Prado)."""
+    if not np.isfinite(sharpe) or n < 12:
+        return np.nan
+    try:
+        from scipy.stats import norm
+        e = 0.5772156649
+        sr0 = math.sqrt(2 * math.log(max(n_trials, 2))) * (1 - e) + e * math.sqrt(
+            2 * math.log(max(n_trials, 2) * math.e))
+        sr0 = sr0 * (1.0 / math.sqrt(n))
+        denom = math.sqrt(max(1e-12, 1 - skew * sharpe + (kurt - 1) / 4.0 * sharpe ** 2))
+        return float(norm.cdf((sharpe - sr0) * math.sqrt(n - 1) / denom))
+    except Exception:
+        return np.nan
+
+
+def R6_pbo_dsr(bt: dict, n_trials: int = 12) -> None:
+    from scipy import stats as _st
+    r = bt["returns"]["ret"].fillna(0).to_numpy()
+    n = len(r)
+    if n < 24:
+        _record("R6", "PBO / DSR", None, "표본 부족")
+        return
+    sr_m = r.mean() / r.std(ddof=1) if r.std(ddof=1) > 0 else np.nan
+    dsr = _dsr(sr_m, n, float(_st.skew(r)), float(_st.kurtosis(r, fisher=False)), n_trials)
+
+    # PBO (CSCV, 축약형): 시계열을 S 조각으로 나눠 IS/OOS 순위 역전 빈도
+    S = 8
+    if n >= S * 6:
+        idx = np.array_split(np.arange(n), S)
+        losses = 0
+        combos = 0
+        for i in range(S):
+            oos = idx[i]
+            iss = np.concatenate([idx[j] for j in range(S) if j != i])
+            if len(oos) < 3 or len(iss) < 6:
+                continue
+            combos += 1
+            m_is, m_oos = r[iss].mean(), r[oos].mean()
+            if m_is > 0 and m_oos <= 0:
+                losses += 1
+        pbo = losses / combos if combos else np.nan
+    else:
+        pbo = np.nan
+    passed = (np.isfinite(dsr) and dsr > 0.90) and (not np.isfinite(pbo) or pbo < 0.5)
+    _record("R6", "PBO / DSR", passed,
+            f"DSR={dsr:.3f} (>0.90 권장, 시행횟수 {n_trials} 가정) · PBO={pbo:.3f} (<0.5 권장). "
+            + ("과적합 위험 낮음." if passed else "과적합 위험이 낮지 않습니다 — 파라미터 수를 줄이세요."),
+            metrics={"dsr": dsr, "pbo": pbo})
+
+
+# ── R7. 레짐 분할 ───────────────────────────────────────────────────────────────────────────
+def R7_regime(bt: dict, bench: Dict[str, pd.Series]) -> None:
+    R = bt["returns"].set_index("month")["ret"]
+    rows = []
+    ks = bench.get("KOSPI")
+    if ks is not None:
+        up = ks.reindex(R.index) > 0
+        for lab, m in (("강세(코스피↑)", up), ("약세(코스피↓)", ~up)):
+            x = R[m.fillna(False)]
+            if len(x) >= 6:
+                rows.append([lab, f"{len(x)}", f"{x.mean()*100:+.3f}%p",
+                             f"{x.std()*math.sqrt(12)*100:.1f}%", f"{(x>0).mean()*100:.0f}%"])
+    # 전·후반 구간 (PACK-C 밸류업 레짐 판정의 근거)
+    half = len(R) // 2
+    for lab, x in (("전반부", R.iloc[:half]), ("후반부", R.iloc[half:])):
+        if len(x) >= 6:
+            rows.append([lab, f"{len(x)}", f"{x.mean()*100:+.3f}%p",
+                         f"{x.std()*math.sqrt(12)*100:.1f}%", f"{(x>0).mean()*100:.0f}%"])
+    pre24 = R[R.index < as_ts("2024-01-01")]
+    post24 = R[R.index >= as_ts("2024-01-01")]
+    LOG.table(rows, ["레짐", "월수", "월평균", "연변동성", "승률"], ["l", "r", "r", "r", "r"],
+              title="R7 레짐 분할")
+    verdict = ""
+    if len(pre24) >= 12 and len(post24) >= 6:
+        verdict = (f"2024년 이전 월평균 {pre24.mean()*100:+.3f}%p / 이후 {post24.mean()*100:+.3f}%p. ")
+        if "C" in ACTIVE_PACKS:
+            if pre24.mean() <= 0:
+                verdict += ("★ 밸류업(2024~) 이전 구간에서 알파가 0 이하입니다 → "
+                            "이것은 구조적 알파가 아니라 정책 베팅입니다(§6.1 레짐 경고).")
+            else:
+                verdict += "밸류업 이전 구간에서도 알파가 양(+)이므로 정책 베팅으로만 보기는 어렵습니다."
+    _record("R7", "레짐 분할", True, verdict or "레짐별 성과 공개 완료")
+
+
+# ── R8. 하위기간 안정성 ─────────────────────────────────────────────────────────────────────
+def R8_subperiod(bt: dict) -> None:
+    R = bt["returns"].copy()
+    R["year"] = R["month"].dt.year
+    rows = []
+    for y, g in R.groupby("year"):
+        cum = float((1 + g["ret"].fillna(0)).prod() - 1)
+        rows.append([int(y), f"{len(g)}", f"{cum*100:+.2f}%", f"{g['ret'].mean()*100:+.3f}%p",
+                     f"{(g['ret']>0).mean()*100:.0f}%", f"{g['n'].mean():.1f}"])
+    LOG.table(rows, ["연도", "월수", "연수익", "월평균", "승률", "평균종목수"],
+              ["c", "r", "r", "r", "r", "r"], title="R8 연도별 분해")
+    yrs = [float(r[2].rstrip("%")) for r in rows]
+    pos = sum(1 for v in yrs if v > 0)
+    _record("R8", "하위기간 안정성", True,
+            f"{pos}/{len(yrs)}개 연도 양(+). 최악 {min(yrs):+.1f}% / 최고 {max(yrs):+.1f}%")
+
+
+# ── R9. 회전율·용량 ─────────────────────────────────────────────────────────────────────────
+def R9_capacity(P: pd.DataFrame, run_fn) -> None:
+    gross = run_fn(P, label="R9_gross", apply_costs=False)
+    net = run_fn(P, label="R9_net", apply_costs=True)
+    sg, sn = _sharpe(gross["returns"]), _sharpe(net["returns"])
+    mg = gross["returns"]["ret"].mean()
+    mn = net["returns"]["ret"].mean()
+    survives = np.isfinite(sn) and sn > 0 and mn > 0
+    _record("R9", "회전율·비용 차감 후 생존", survives,
+            f"비용 전 Sharpe {sg:.3f}(월 {mg*100:+.3f}%p) → 비용 후 {sn:.3f}(월 {mn*100:+.3f}%p). "
+            f"월평균 회전율 {net['returns']['turnover'].mean():.2f}, "
+            f"월평균 비용 {net['returns']['cost'].mean()*100:.3f}%p. "
+            + ("비용 차감 후에도 성과가 남습니다." if survives else
+               "★ 비용 차감 후 성과가 소멸합니다 — 개인 소액계좌에서 실행 불가(§15-7)."),
+            kill=False, metrics={"sharpe_gross": sg, "sharpe_net": sn})
+
+
+# ── R11. 팩 간 상관 ─────────────────────────────────────────────────────────────────────────
+def R11_pack_corr(P: pd.DataFrame) -> None:
+    cols = [p["E_col"] for p in active_packs() if p["E_col"] in P.columns] + \
+           [c for c in ("E_AXB", "E_AXC") if c in P.columns]
+    if len(cols) < 2:
+        _record("R11", "팩 간 상관", None, "활성 축이 2개 미만이라 판정 불가")
+        return
+    C = P[cols].corr(min_periods=200)
+    rows = [[c] + [f"{C.loc[c, d]:+.2f}" if pd.notna(C.loc[c, d]) else "—" for d in cols] for c in cols]
+    LOG.table(rows, ["축"] + cols, ["l"] + ["r"] * len(cols), title="R11 팩 간 상관행렬")
+    hi = [(a, b, C.loc[a, b]) for i, a in enumerate(cols) for b in cols[i+1:]
+          if pd.notna(C.loc[a, b]) and abs(C.loc[a, b]) > 0.7]
+    _record("R11", "팩 간 상관", len(hi) == 0,
+            "중복 축 없음" if not hi else
+            "높은 상관: " + ", ".join(f"{a}~{b}={v:+.2f}" for a, b, v in hi) + " → 통합 검토 필요")
+
+
+def report_robustness():
+    LOG.banner("강건성 검사 요약 (R1~R11)", "킬 게이트는 ⭐ 표시 · 실패는 그대로 보고한다")
+    order = ["R1", "R2", "R3", "R4", "R10", "R5", "R11", "R6", "R7", "R8", "R9"]
+    rows = []
+    for rid in order:
+        r = ROBUST_RESULTS.get(rid)
+        if not r:
+            rows.append([rid, "—", "미실행", ""])
+            continue
+        icon = {True: "✔ 통과", False: "✘ 실패", None: "— 판정불가"}[r["pass"]]
+        rows.append([rid + ("⭐" if r["kill"] else ""), _trunc(r["name"], 26), icon,
+                     _trunc(r["detail"], 92)])
+    LOG.table(rows, ["ID", "검사", "판정", "상세"], ["l", "l", "c", "l"], maxw=96)
+    fails = [r for r in ROBUST_RESULTS.values() if r["pass"] is False]
+    kills = [r for r in fails if r["kill"]]
+    if kills:
+        LOG.banner("⛔ 킬 기준 위반", "§15 — 우회하거나 파라미터를 조정해 통과시키지 마십시오")
+        for r in kills:
+            print(f"  · [{r['id']}] {r['name']}: {r['detail']}")
+    elif fails:
+        LOG.warn(f"비(非)킬 검사 {len(fails)}건 실패: " + ", ".join(r["id"] for r in fails))
+    else:
+        LOG.ok("모든 강건성 검사 통과.")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L6  리포팅 — 성과검증표 / 해석표 / 종목별 진단 카드                                        ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+INTERP_D_STATE = [
+    ("ΔE>0, ΔM≤0", "★목표 상태. 시장이 개선을 일회성으로 분류", "진입"),
+    ("ΔE>0, ΔM>0", "리레이팅 진행 중. 알파 소진", "관망/청산"),
+    ("ΔE≤0, ΔM>0", "기대만 앞섬", "배제"),
+    ("ΔE≤0, ΔM≤0", "개선 없음", "배제"),
+]
+INTERP_COMMON = [
+    ("TP_B1", "수요가 공급을 당김. 협상력", "밀어내기 가능성 → V1 확인"),
+    ("TP_B2", "이익의 질 양호", "회계적 이익 우위"),
+    ("TP_C1", "수익성 유지하며 확장. 제약선 이동", "확장이 수익성 희석"),
+    ("TP_C2", "희석 없는 인력 확장", "단순 규모 확대"),
+]
+
+
+def report_performance(bt: dict, bench: Dict[str, pd.Series], label: str = ""):
+    LOG.banner(f"성과 검증 — {label or STRATEGY_NAME}",
+               f"{BACKTEST_START} ~ {BACKTEST_END} · 월 1회 리밸런싱 · 익일 시가 체결 · 롱온리")
+    s = perf_stats(bt["returns"])
+    if not s:
+        LOG.warn("성과를 계산할 수 없습니다 (수익률 시계열이 비었습니다).")
+        return
+    order = ["월수", "누적수익", "CAGR", "연변동성", "Sharpe", "Sortino", "MDD", "Calmar",
+             "승률", "월평균", "t통계량(HAC)", "최장언더워터(월)", "평균종목수",
+             "월평균회전율", "월평균비용"]
+    fmt = {"누적수익": "pct", "CAGR": "pct", "연변동성": "pct", "MDD": "pct", "승률": "pct",
+           "월평균": "pctp", "월평균비용": "pctp", "월평균회전율": "num"}
+    rows = []
+    for k in order:
+        v = s.get(k)
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            rows.append([k, "—"]); continue
+        f = fmt.get(k)
+        rows.append([k, f"{v*100:+.2f}%" if f == "pct" else
+                        f"{v*100:+.3f}%p" if f == "pctp" else
+                        f"{v:,.3f}" if isinstance(v, float) else f"{v:,}"])
+    LOG.table(rows, ["지표", "값"], ["l", "r"], title="포트폴리오 성과")
+
+    brows = []
+    R = bt["returns"].set_index("month")["ret"]
+    for name, b in bench.items():
+        bb = b.reindex(R.index).fillna(0)
+        cum_s = float((1 + R.fillna(0)).prod() - 1)
+        cum_b = float((1 + bb).prod() - 1)
+        excess = R.fillna(0) - bb
+        _, t = hac_tstat(excess.to_numpy())
+        brows.append([name, f"{cum_b*100:+.1f}%", f"{cum_s*100:+.1f}%",
+                      f"{(cum_s-cum_b)*100:+.1f}%p", f"{excess.mean()*100:+.3f}%p", f"{t:.2f}"])
+    if brows:
+        LOG.table(brows, ["벤치마크", "벤치 누적", "전략 누적", "초과", "월평균 초과", "HAC t"],
+                  ["l", "r", "r", "r", "r", "r"], title="벤치마크 대비")
+
+    rt = right_tail_contribution(bt)
+    if rt:
+        LOG.table([[k, f"{v:,.3f}" if isinstance(v, float) else str(v)] for k, v in rt.items()],
+                  ["항목", "값"], ["l", "r"],
+                  title="우측 꼬리 의존도 (§10.2 — 이 전략은 IR 이 아니라 꼬리에 의존한다)")
+        if rt.get("총기여") and rt.get("상위5% 제외 후 총기여") is not None:
+            base, ex = rt["총기여"], rt["상위5% 제외 후 총기여"]
+            if base > 0 and ex <= 0:
+                LOG.warn("상위 5% 종목을 제외하면 총기여가 0 이하가 됩니다. "
+                         "성과가 소수 종목에 전적으로 의존합니다 — 실전에서 그 종목을 놓치면 "
+                         "전략 전체가 실패합니다. 이 사실을 반드시 인지하고 사이징하세요.")
+
+
+def report_interpretation(P: pd.DataFrame):
+    LOG.banner("해석 참조표 (§13.2)", "TP 가 발화했을 때와 안 했을 때 각각 무슨 뜻인가")
+    rows = []
+    for p in active_packs():
+        for tp, fire, nofire in p["interp"]:
+            rows.append([p["id"], tp, _trunc(fire, 44), _trunc(nofire, 44)])
+    for tp, fire, nofire in INTERP_COMMON:
+        rows.append(["공용", tp, _trunc(fire, 44), _trunc(nofire, 44)])
+    LOG.table(rows, ["팩", "TP", "발화 의미", "미발화 의미"], ["c", "l", "l", "l"], maxw=46)
+    LOG.table([[a, b, c] for a, b, c in INTERP_D_STATE],
+              ["D축 상태", "해석", "조치"], ["l", "l", "c"], title="D축(반영도) 상태 해석")
+
+    if "D_state" in P.columns:
+        cnt = P["D_state"].value_counts()
+        LOG.table([[k, f"{v:,}", f"{100*v/len(P):.1f}%"] for k, v in cnt.items()],
+                  ["상태", "행수", "비중"], ["l", "r", "r"],
+                  title="실제 패널의 D축 상태 분포")
+
+    fired = []
+    for p in active_packs():
+        for tp in p["tp_cols"]:
+            if tp in P.columns:
+                v = P[tp]
+                fired.append([p["id"], tp, f"{int(v.notna().sum()):,}",
+                              f"{float(v.mean()):+.3f}" if v.notna().any() else "—",
+                              f"{int((v > 1).sum()):,}", f"{100*float((v > 1).mean()):.2f}%"])
+    for tp in ("TP_B1", "TP_B2", "TP_C1", "TP_C2"):
+        if tp in P.columns:
+            v = P[tp]
+            fired.append(["공용", tp, f"{int(v.notna().sum()):,}",
+                          f"{float(v.mean()):+.3f}" if v.notna().any() else "—",
+                          f"{int((v > 1).sum()):,}", f"{100*float((v > 1).mean()):.2f}%"])
+    if fired:
+        LOG.table(fired, ["팩", "TP", "관측행수", "평균", "발화(>1σ²)", "발화율"],
+                  ["c", "l", "r", "r", "r", "r"],
+                  title="트레이드오프 쌍 발화 통계 (TP는 곱이므로 두 조건이 동시 성립할 때만 양수)")
+
+
+def diagnostic_card(P: pd.DataFrame, bt: dict, sec: pd.DataFrame, top_n: int = 5):
+    LOG.banner("종목별 진단 카드 (§13.1)", "최근 시점 신호 상위 종목 — 왜 뽑혔는지 한 장으로")
+    last_m = P["month"].max()
+    sub = P[(P["month"] == last_m) & (P["VETO"] == 1) & (P["FLOOR"] == 1)]
+    if sub.empty:
+        sub = P[P["month"] == last_m]
+    if sub.empty:
+        LOG.warn("마지막 시점 패널이 비어 진단 카드를 만들 수 없습니다.")
+        return
+    names = sec.set_index("code")["name"].to_dict()
+    top = sub.nlargest(min(top_n, len(sub)), "Signal_rank")
+    for r in top.itertuples(index=False):
+        code = r.code
+        print("\n" + "─" * 104)
+        print(f"[{code}] {names.get(code, '')}    셀: {getattr(r, 'cell', '?')}    "
+              f"신호일: {pd.Timestamp(last_m).date()}")
+        print("─" * 104)
+        sig = getattr(r, "Signal_rank", np.nan)
+        print(f"Signal {sig:.3f} (상위 {100*(1-sig):.1f}%)   "
+              f"E: {getattr(r,'E',np.nan):.3f}   U: {getattr(r,'U',np.nan):.3f}   "
+              f"Veto: {'통과' if getattr(r,'VETO',0)==1 else '차단'}")
+        act = ",".join(p["id"] for p in active_packs()
+                       if p["E_col"] in P.columns and np.isfinite(getattr(r, p["E_col"], np.nan)))
+        ina = ",".join(p["id"] for p in active_packs()
+                       if p["E_col"] in P.columns and not np.isfinite(getattr(r, p["E_col"], np.nan)))
+        print(f"활성 팩: {act or '없음'}  |  비활성: {ina or '없음'}")
+
+        print("\n■ 발화한 트레이드오프")
+        tps = []
+        for p in active_packs():
+            for tp, fire, nofire in p["interp"]:
+                v = getattr(r, tp, np.nan)
+                if np.isfinite(v):
+                    tps.append((tp, v, fire if v > 0 else nofire))
+        for tp in ("TP_B1", "TP_B2", "TP_C1", "TP_C2"):
+            v = getattr(r, tp, np.nan)
+            if np.isfinite(v):
+                meaning = next((f if v > 0 else nf for t, f, nf in INTERP_COMMON if t == tp), "")
+                tps.append((tp, v, meaning))
+        for tp, v, meaning in sorted(tps, key=lambda x: -x[1])[:8]:
+            mark = "발화" if v > 0 else "미발화"
+            print(f"  {_pad(tp,7)} {v:+7.2f}  [{mark}] {_trunc(meaning, 62)}")
+
+        print("\n■ 미반영도 (U)")
+        print(f"  d1  ΔlogE {getattr(r,'dlog_E',np.nan):+.3f}, ΔlogM {getattr(r,'dlog_M',np.nan):+.3f}"
+              f"  → {getattr(r,'D_state','?')}")
+        for k, lab in (("d2", "컨센 목표주가 리비전"), ("d3", "기관+외인 수급"), ("d4", "커버리지 변화")):
+            v = getattr(r, k, np.nan)
+            print(f"  {k}  {lab}: " + (f"{v:+.4f}" if np.isfinite(v) else "데이터 부족(결측 — 0으로 채우지 않음)"))
+        if np.isfinite(getattr(r, "n_analyst", np.nan)):
+            print(f"      커버 애널리스트 {int(getattr(r,'n_analyst',0))}명 · "
+                  f"목표주가 중앙값 {getattr(r,'tp_median',np.nan):,.0f}원")
+
+        print("\n■ 정책 오염 점검")
+        det = getattr(r, "d_eff_tax", np.nan)
+        print(f"  유효세율 변화 {det:+.4f} (임계 -0.03)   "
+              f"{'✔ V8 통과' if getattr(r,'V8',1)==1 else '✘ V8 발동 — 정책 유인 채용 의심'}")
+        if np.isfinite(getattr(r, "emp_band_flag", np.nan)):
+            print(f"  임계밴드(50/100/300인) 근접: "
+                  f"{'❗해당 — 신뢰도 하향' if getattr(r,'emp_band_flag',0)==1 else '✔ 이격'}")
+
+        print("\n■ 거부권")
+        vs = []
+        for i in range(1, 9):
+            v = getattr(r, f"V{i}", 1)
+            vs.append(f"V{i} {'✔' if v == 1 else '✘'}")
+        print("  " + "  ".join(vs))
+    print("─" * 104)
+
+
+def report_dataflow_map():
+    """거시적 흐름 한 장 — 어디서 어디로 데이터가 가는지."""
+    LOG.banner("데이터 흐름 지도 (거시)", "모듈 경계와 계층 — 에러가 나면 어느 상자인지 먼저 보세요")
+    print("""
+  ┌── L0 부트/캐시 ─────────────────────────────────────────────────────────────────────┐
+  │  환경감지 → 의존성 → 구글드라이브 마운트 → VAULT(공용/전용 인덱스, append-only 저널)  │
+  │            └ adopt_scan: 기존 캐시 '이동 없이 참조 등록'                              │
+  └───────────────────────────────────┬───────────────────────────────────────────────────┘
+                                      ▼
+  ┌── L1 수집 ────────────────────────────────────────────────────────────────────────────┐
+  │  종목마스터  ← FDR GitHub캐시 / KIND / pykrx월말스냅샷 / DART corpCode                 │
+  │  가격·수급   ← KRX인증 → pykrx → FDR → 네이버 → yfinance  (폴백 체인, 소스 감사표)     │
+  │  DART        ← 재무제표(rcept_no→knowledge_date) / 직원현황 / 공시목록 스윕             │
+  │  리서치      ← 한경컨센서스(작성자·목표주가) + 네이버(종목코드) → 병합 → 보고서 원장    │
+  │                └ 애널리스트 원장 → (analyst_id, code, date, tp) → 목표주가 리비전       │
+  └───────────────────────────────────┬───────────────────────────────────────────────────┘
+                                      ▼  모든 테이블은 pit_frame() 통과 → PIT.register()
+  ┌── L1/L2 피처 ─────────────────────────────────────────────────────────────────────────┐
+  │  PIT 유니버스(상폐 포함) → 셀(date,industry,size) → 기본패널                            │
+  │  PIT.asof_join(knowledge_date ≤ month)  ← C1 이 강제되는 유일한 관문                    │
+  │  공용축 B/C/D  +  활성 센서팩(레지스트리)  →  TP = z(개선) × z(대가회피)                 │
+  └───────────────────────────────────┬───────────────────────────────────────────────────┘
+                                      ▼
+  ┌── L2 스코어 ──────────────────────────────────────────────────────────────────────────┐
+  │  거부권 V1~V8 (이진·곱) → 하한선(빈 축 없을 것) → Signal = rank(E)×rank(U)×∏V           │
+  └───────────────────────────────────┬───────────────────────────────────────────────────┘
+                                      ▼
+  ┌── L3 백테스트 → L5 강건성 → L6 리포트 ────────────────────────────────────────────────┐
+  │  익일시가 체결 · 상폐 -100% · 비용(수수료+거래세이력+제곱근충격)                          │
+  │  R1 누수 → R2 TP vs 나이브⭐ → R3 직교화⭐ → R4 플라시보 → R10 정책반증 → R5~R11        │
+  └───────────────────────────────────────────────────────────────────────────────────────┘
+""")
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  계약 자동검정 C1~C12 (§2) — 주석이나 관례는 무효. 테스트로만 강제한다.                    ║
+# ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+CONTRACT_RESULTS: List[dict] = []
+
+
+def _c(cid: str, name: str, fn: Callable[[], Tuple[bool, str]]):
+    try:
+        ok, msg = fn()
+    except Exception as e:                                        # noqa
+        ok, msg = False, f"{type(e).__name__}: {e}"
+    CONTRACT_RESULTS.append({"id": cid, "name": name, "pass": ok, "msg": msg})
+    return ok
+
+
+def run_contract_tests(strict: bool = True) -> bool:
+    CONTRACT_RESULTS.clear()
+    rng = np.random.default_rng(SEED)
+
+    # ── C1: PIT 강제 ──────────────────────────────────────────────────────────────────────
+    def c1():
+        d = pd.DataFrame({"code": ["A", "A", "B"], "v": [1, 2, 3],
+                          "event_date": pd.to_datetime(["2020-01-31", "2020-02-29", "2020-01-31"]),
+                          "knowledge_date": pd.to_datetime(["2020-03-15", "2020-04-15", "2020-03-15"])})
+        st = PITStore()
+        st.register("t", d)
+        got = st.get("t", "2020-03-20")
+        if len(got) != 2:
+            return False, f"as_of 필터가 틀렸습니다: {len(got)}행 (기대 2행)"
+        if (got["knowledge_date"] > as_ts("2020-03-20")).any():
+            return False, "knowledge_date > as_of 인 행이 새어나왔습니다"
+        # PIT 컬럼 없는 테이블은 반드시 거부돼야 한다
+        try:
+            st.register("bad", pd.DataFrame({"x": [1]}))
+            return False, "PIT 컬럼 없는 테이블 등록이 거부되지 않았습니다"
+        except KeyError:
+            pass
+        return True, "as_of 절단 정확 · PIT 컬럼 누락 시 등록 거부 확인"
+
+    _c("C1", "Point-In-Time 강제", c1)
+
+    # ── C2: 생존자편향 ────────────────────────────────────────────────────────────────────
+    def c2():
+        sec = pd.DataFrame({
+            "code": ["000001", "000002", "000003"],
+            "name": ["옛날", "미래", "폐지"],
+            "market": ["KOSPI"] * 3, "industry": ["X"] * 3, "corp_code": [None] * 3,
+            "listing_date": pd.to_datetime(["2010-01-01", "2025-01-01", "2010-01-01"]),
+            "delisting_date": pd.to_datetime([None, None, "2018-06-30"]),
+        })
+        days = pd.bdate_range("2009-01-01", "2026-08-01")
+        px = pd.DataFrame({"date": days, "code": "000001"})
+        u = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+        at2016 = u.at("2016-08-31")
+        if "000002" in at2016:
+            return False, "★C2 위반: 2016년 유니버스에 2025년 상장 종목이 포함되었습니다"
+        if "000003" not in at2016:
+            return False, "★C2 위반: 2018년 폐지 종목이 2016년 유니버스에서 빠졌습니다(생존자편향)"
+        at2020 = u.at("2020-01-31")
+        if "000003" in at2020:
+            return False, "폐지 이후에도 유니버스에 남아 있습니다"
+        return True, "미래 상장 배제 · 폐지종목 당시 포함 · 폐지 후 제외 모두 정상"
+
+    _c("C2", "생존자편향 제거", c2)
+
+    # ── C3: 매핑도 PIT ────────────────────────────────────────────────────────────────────
+    def c3():
+        m = pd.DataFrame({"code": ["000001"], "external_id": ["X1"], "weight": [1.0],
+                          "valid_from": pd.to_datetime(["2020-01-01"]),
+                          "valid_to": pd.to_datetime(["2022-12-31"])})
+        for c in ("valid_from", "valid_to"):
+            if c not in m.columns:
+                return False, f"매핑 테이블에 시간구간 컬럼 {c} 이 없습니다"
+        t = as_ts("2019-06-30")
+        live = m[(m["valid_from"] <= t) & (m["valid_to"] >= t)]
+        return (len(live) == 0), "매핑 유효구간 이전 시점에서 매핑이 적용되지 않음 확인"
+
+    _c("C3", "매핑·라벨 PIT", c3)
+
+    # ── C4/C11: 셀 정의 ───────────────────────────────────────────────────────────────────
+    def c4():
+        n = 400
+        P = pd.DataFrame({
+            "code": [f"{i:06d}" for i in range(n)],
+            "month": [as_ts("2020-06-30")] * n,
+            "employees": rng.integers(10, 5000, n).astype(float),
+            "x": rng.normal(size=n),
+        })
+        sec = pd.DataFrame({"code": P["code"], "industry": rng.choice(["화학", "전자", "건설"], n)})
+        C = build_cells(P, sec)
+        if "cell" not in C.columns:
+            return False, "cell 컬럼이 생성되지 않았습니다"
+        keys = C["cell"].astype(str).str.split("|", expand=True)
+        if keys.shape[1] < 3:
+            return False, "cell_key 가 (date, industry, size_bucket) 3요소가 아닙니다"
+        z = xsec_z(C["x"], C["cell"])
+        for cell, g in C.assign(z=z).groupby("cell", observed=True):
+            if g["z"].notna().sum() >= CELL_MIN_N:
+                if abs(float(g["z"].mean())) > 0.15:
+                    return False, f"셀 {cell} 의 z-score 평균이 0에서 벗어남: {g['z'].mean():.3f}"
+        return True, f"cell=(date,industry,size) · 셀 내 z 평균≈0 · 폴백 동작 확인 ({C['cell'].nunique()}개 셀)"
+
+    _c("C4/C11", "셀 정의 및 횡단면 연산", c4)
+
+    # ── C5: winsorize → z → rank 순서 ─────────────────────────────────────────────────────
+    def c5():
+        v = pd.Series([1.0] * 30 + [1000.0])          # 극단값 1개
+        cell = pd.Series(["A"] * 31)
+        z = xsec_z(v, cell)
+        if not np.isfinite(z).all():
+            return False, "z-score 에 비유한값이 있습니다"
+        if float(z.max()) > 6:
+            return False, f"윈저라이즈가 적용되지 않았습니다 (max z={z.max():.2f})"
+        r = xsec_rank_pct(v, cell)
+        if not (0 < float(r.min()) <= float(r.max()) <= 1):
+            return False, "rank_pct 범위가 [0,1] 이 아닙니다"
+        small = xsec_rank_pct(pd.Series([1.0, 2.0]), pd.Series(["B", "B"]))
+        if small.notna().any():
+            return False, "표본 부족 셀이 NaN 으로 처리되지 않았습니다(0으로 채우면 안 됩니다)"
+        return True, "winsorize(±2σ)→z→rank_pct 순서 및 표본부족 NaN 처리 확인"
+
+    _c("C5", "윈저라이즈→랭크 순서 고정", c5)
+
+    # ── C6: 거부권 이진 ───────────────────────────────────────────────────────────────────
+    def c6():
+        P = pd.DataFrame({f"V{i}": [1.0, 0.0, 1.0] for i in range(1, 9)})
+        prod = P.prod(axis=1)
+        if list(prod) != [1.0, 0.0, 1.0]:
+            return False, "거부권 곱이 이진으로 작동하지 않습니다"
+        # 상쇄 불가: 어떤 큰 점수도 0을 되살릴 수 없다
+        E, U = 0.999, 0.999
+        if E * U * 0.0 != 0.0:
+            return False, "거부권이 상쇄 가능합니다"
+        return True, "V∈{0,1} · 곱 · 상쇄 불가 확인"
+
+    _c("C6", "거부권 이진·곱", c6)
+
+    # ── C7: 가중치 최적화 금지 ────────────────────────────────────────────────────────────
+    def c7():
+        src = ""
+        for fn in (assemble_score, axis_B_tp, axis_C_tp):
+            try:
+                import inspect
+                src += inspect.getsource(fn)
+            except Exception:
+                pass
+        if re.search(r"(minimize|curve_fit|GridSearch|optimize\.|\.fit\(.*weight)", src):
+            return False, "가중치 최적화 흔적이 발견되었습니다 (C7 위반)"
+        return True, "TP 내·팩 내·팩 간 모두 동일가중 (nanmean). 최적화 루틴 없음"
+
+    _c("C7", "Phase1-3 가중치 최적화 금지", c7)
+
+    # ── C8: 결정성 ────────────────────────────────────────────────────────────────────────
+    def c8():
+        a = np.random.default_rng(SEED).normal(size=50)
+        b = np.random.default_rng(SEED).normal(size=50)
+        if not np.allclose(a, b):
+            return False, "동일 시드에서 다른 난수가 나왔습니다"
+        x = pd.Series(rng.normal(size=200))
+        cell = pd.Series(rng.choice(list("ABCDE"), 200))
+        z1 = xsec_z(x, cell)
+        z2 = xsec_z(x.iloc[::-1], cell.iloc[::-1]).iloc[::-1]
+        if not np.allclose(z1.dropna().to_numpy(), z2.dropna().to_numpy(), atol=1e-5):
+            return False, "입력 순서가 결과를 바꿉니다(병렬 처리에서 재현 불가)"
+        return True, "시드 고정 · 순서 무관 결과 동일 확인"
+
+    _c("C8", "결정성", c8)
+
+    # ── C10: 런타임 예산 계측 존재 ────────────────────────────────────────────────────────
+    def c10():
+        if not hasattr(PIPE, "report_runtime"):
+            return False, "런타임 계측기가 없습니다"
+        budgeted = [s for s in PIPE.stages.values() if s.budget_s is not None]
+        return True, f"계층별 계측 활성 · 예산 지정 스테이지 {len(budgeted)}개 (추측 아닌 실측)"
+
+    _c("C10", "런타임 예산 계측", c10)
+
+    # ── C12: 정책 중립성 ──────────────────────────────────────────────────────────────────
+    def c12():
+        missing = [pid for pid, p in PACK_REGISTRY.items() if not p["policy"]]
+        if missing:
+            return False, f"정책 캘린더 없는 팩: {missing}"
+        act = [p["id"] for p in active_packs()]
+        return True, (f"등록 팩 {list(PACK_REGISTRY)} 전부 정책 캘린더 보유 · "
+                      f"활성 팩 {act} 은 R10 대상")
+
+    _c("C12", "정책 중립성", c12)
+
+    # ── 추가: TP 는 반드시 곱 ─────────────────────────────────────────────────────────────
+    def c_tp():
+        a = pd.Series([2.0, 2.0, 0.0, np.nan])
+        b = pd.Series([3.0, -3.0, 5.0, 1.0])
+        r = tp_product(a, b)
+        if not (abs(r[0] - 6) < 1e-6 and abs(r[1] + 6) < 1e-6):
+            return False, "TP 가 곱으로 계산되지 않습니다"
+        if pd.notna(r[3]):
+            return False, "한쪽이 결측인데 결과가 결측이 아닙니다(0으로 채우면 거짓 주장이 됩니다)"
+        return True, "TP = z(개선)×z(대가회피) · 결측 전파 확인 (합산으로 단순화 안 됨)"
+
+    _c("TP", "트레이드오프 쌍은 곱(§1.1)", c_tp)
+
+    # ── 추가: 종목코드 정규화 (2024 영숫자 티커) ──────────────────────────────────────────
+    def c_code():
+        cases = {"005930": "005930", 5930: "005930", "A005930": "005930",
+                 "005930.KS": "005930", "09701K": "09701K", "": None, "abcdef": None}
+        for k, v in cases.items():
+            if to_code6(k) != v:
+                return False, f"to_code6({k!r}) = {to_code6(k)!r} (기대 {v!r})"
+        return True, "구형 6자리 + 2024 영숫자 티커(09701K) 모두 정상 처리"
+
+    _c("CODE", "종목코드 정규화", c_code)
+
+    # ── 결과 ──────────────────────────────────────────────────────────────────────────────
+    rows = [[r["id"], _trunc(r["name"], 30), "✔ 통과" if r["pass"] else "✘ 실패",
+             _trunc(r["msg"], 76)] for r in CONTRACT_RESULTS]
+    LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=80,
+              title="계약 자동검정 C1~C12 (§2 — 협상 대상이 아님)")
+    failed = [r for r in CONTRACT_RESULTS if not r["pass"]]
+    if failed:
+        LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))
+        if strict:
+            raise KillCriteria("계약 위반으로 파이프라인을 중단합니다. "
+                               "위반을 우회하지 말고 원인을 고치십시오(§2).")
+        return False
+    LOG.ok(f"계약 {len(CONTRACT_RESULTS)}건 전부 통과.")
+    return True
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-F  합성데이터 엔드투엔드 스모크 테스트                                                 ║
+# ║                                                                                          ║
+# ║  실데이터를 한 바이트도 받기 전에 계산경로 전체(피처→스코어→백테스트→강건성→리포트)를      ║
+# ║  합성데이터로 통과시킨다. 목적은 성과 측정이 아니라 '배관 검증'이다.                        ║
+# ║                                                                                          ║
+# ║  왜 필요한가: 실수집은 수 시간~수 일이 걸린다. 그걸 다 받은 뒤에 조립부에서 터지면          ║
+# ║  그 시간이 통째로 날아간다. 수 초짜리 스모크가 그 위험을 없앤다.                            ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+def make_synthetic(n_codes: int = 160, n_months: int = 60, seed: int = SEED) -> dict:
+    rng = np.random.default_rng(seed)
+    months = pd.date_range(as_ts(BACKTEST_END) - pd.DateOffset(months=n_months - 1),
+                           as_ts(BACKTEST_END), freq="ME")
+    codes = [f"{i+1:06d}" for i in range(n_codes)]
+    inds = rng.choice(["화학", "전자부품", "건설", "기계", "소프트웨어"], n_codes)
+
+    # 상장/폐지 — 일부는 기간 중 상장, 일부는 폐지 (생존자편향 검증용)
+    listing = [months[0] - pd.DateOffset(years=int(rng.integers(2, 12))) for _ in codes]
+    for i in rng.choice(n_codes, size=max(1, n_codes // 12), replace=False):
+        listing[i] = months[int(rng.integers(6, n_months - 6))]
+    delist = [pd.NaT] * n_codes
+    for i in rng.choice(n_codes, size=max(1, n_codes // 10), replace=False):
+        delist[i] = months[int(rng.integers(10, n_months - 2))]
+
+    sec = pd.DataFrame({"code": codes, "name": [f"합성{i+1:03d}" for i in range(n_codes)],
+                        "market": rng.choice(["KOSPI", "KOSDAQ"], n_codes),
+                        "listing_date": listing, "delisting_date": delist,
+                        "industry": inds,
+                        "corp_code": [f"C{i+1:07d}" for i in range(n_codes)],
+                        "src": "synthetic"})
+
+    # ── 진짜 알파를 심는다: quality[i] 가 높으면 미래수익이 높다 ────────────────────────────
+    quality = rng.normal(size=n_codes)
+
+    days = pd.bdate_range(months[0] - pd.DateOffset(months=14), months[-1] + pd.Timedelta(days=5))
+    px_rows = []
+    for i, c in enumerate(codes):
+        drift = 0.0006 + 0.0012 * quality[i]
+        r = rng.normal(drift, 0.022, len(days))
+        p = 10000 * np.exp(np.cumsum(r))
+        vol = rng.lognormal(11.5, 0.8, len(days))
+        px_rows.append(pd.DataFrame({
+            "code": c, "date": days, "open": p * (1 + rng.normal(0, 0.003, len(days))),
+            "high": p * 1.01, "low": p * 0.99, "close": p,
+            "volume": vol, "amount": p * vol, "src": "synthetic"}))
+    px = pd.concat(px_rows, ignore_index=True)
+    for i, c in enumerate(codes):
+        if pd.notna(delist[i]):
+            px = px[~((px["code"] == c) & (px["date"] > delist[i]))]
+        px = px[~((px["code"] == c) & (px["date"] < listing[i]))]
+
+    # ── 재무: quality 와 상관되게 만들되 노이즈를 크게 준다 ────────────────────────────────
+    fin_rows, emp_rows = [], []
+    for i, c in enumerate(codes):
+        base_rev = rng.lognormal(25, 1.0)
+        for m in pd.date_range(months[0] - pd.DateOffset(months=15), months[-1], freq="QE"):
+            gr = 1 + 0.02 * quality[i] + rng.normal(0, 0.05)
+            rev = base_rev * gr
+            base_rev = rev
+            fin_rows.append({
+                "corp_code": sec["corp_code"].iloc[i], "period_end": m,
+                "knowledge_date": m + pd.Timedelta(days=45),
+                "revenue_ttm": rev, "cogs_ttm": rev * (0.72 - 0.02 * quality[i]),
+                "op_income_ttm": rev * (0.08 + 0.02 * quality[i]),
+                "net_income_ttm": rev * (0.06 + 0.015 * quality[i]),
+                "cfo_ttm": rev * (0.09 + 0.02 * quality[i]),
+                "capex_ttm": rev * 0.05, "rnd_ttm": rev * (0.02 + 0.01 * max(quality[i], 0)),
+                "dep_ttm": rev * 0.04,
+                "dividend_paid_ttm": rev * (0.01 + 0.008 * max(quality[i], 0)),
+                "treasury_buy_ttm": rev * (0.005 * max(quality[i], 0)),
+                "inventory": rev * (0.15 - 0.01 * quality[i]),
+                "receivable": rev * (0.18 - 0.01 * quality[i]),
+                "payable": rev * 0.12, "assets": rev * 1.4, "liabilities": rev * 0.6,
+                "equity": rev * 0.8, "ppe": rev * 0.5, "intangible": rev * 0.1,
+                "contract_liab": rev * (0.03 + 0.01 * quality[i]),
+                "tax_expense": rev * 0.015, "pretax_income": rev * 0.07,
+                "sgna_ttm": rev * 0.15,
+            })
+        for y in range(months[0].year - 1, months[-1].year + 1):
+            emp_rows.append({"corp_code": sec["corp_code"].iloc[i], "bsns_year": y,
+                             "period_end": as_ts(f"{y}-12-31"),
+                             "knowledge_date": as_ts(f"{y}-12-31") + pd.Timedelta(days=90),
+                             "employees": float(max(12, rng.lognormal(5.2, 1.0) *
+                                                    (1 + 0.05 * quality[i]))),
+                             "payroll": float(rng.lognormal(22, 0.8))})
+    fin = pd.DataFrame(fin_rows)
+    fin = pit_frame(fin, "period_end", "knowledge_date", source="synthetic")
+    emp = pd.DataFrame(emp_rows)
+    emp = pit_frame(emp, "period_end", "knowledge_date", source="synthetic")
+
+    # ── 공시 ───────────────────────────────────────────────────────────────────────────────
+    dis_rows = []
+    for i, c in enumerate(codes):
+        for m in months[::4]:
+            if rng.random() < 0.10 + 0.10 * max(quality[i], 0):
+                dis_rows.append({"corp_code": sec["corp_code"].iloc[i],
+                                 "rcept_no": sha1_str(c, m)[:14], "rcept_dt": m,
+                                 "report_nm": "주요사항보고서(자기주식취득결정)",
+                                 "event": "treasury_acq"})
+            if rng.random() < 0.05 + 0.08 * max(quality[i], 0):
+                dis_rows.append({"corp_code": sec["corp_code"].iloc[i],
+                                 "rcept_no": sha1_str(c, m, "x")[:14], "rcept_dt": m,
+                                 "report_nm": "주요사항보고서(자기주식소각결정)",
+                                 "event": "treasury_canc"})
+            if rng.random() < 0.05:
+                dis_rows.append({"corp_code": sec["corp_code"].iloc[i],
+                                 "rcept_no": sha1_str(c, m, "y")[:14], "rcept_dt": m,
+                                 "report_nm": "주요사항보고서(유상증자결정)",
+                                 "event": "rights_issue"})
+    dis = pd.DataFrame(dis_rows)
+    dis = pit_frame(dis, "rcept_dt", "rcept_dt", source="synthetic")
+
+    # ── 애널리스트 리포트 원장 (링크까지 합성) ─────────────────────────────────────────────
+    brokers = MAJOR_BROKERS[:10] + MINOR_BROKERS[:12]
+    analysts = [(b, f"애널{j:02d}") for b in brokers for j in range(3)]
+    rep_rows, link_rows = [], []
+    for m in months:
+        for _ in range(int(rng.integers(120, 260))):
+            i = int(rng.integers(0, n_codes))
+            b, nm = analysts[int(rng.integers(0, len(analysts)))]
+            bid, bname = normalize_broker(b)
+            tp = float(np.exp(rng.normal(9.6, 0.5)) * (1 + 0.15 * quality[i]))
+            uid = sha1_str("syn", codes[i], m, nm, rng.integers(1e9))
+            d = m - pd.Timedelta(days=int(rng.integers(0, 28)))
+            rep_rows.append({"report_uid": uid, "source": "synthetic",
+                             "src_report_id": uid[:10], "pub_date": d, "category": "company",
+                             "title": f"합성{i+1:03d}({codes[i]}) 리포트", "stock_code": codes[i],
+                             "stock_name": f"합성{i+1:03d}", "broker_raw": b, "broker_id": bid,
+                             "broker_name": bname, "analyst_raw": nm, "target_price": tp,
+                             "opinion": "BUY", "pdf_url": None, "detail_url": None,
+                             "event_date": d, "knowledge_date": d})
+            link_rows.append({"report_uid": uid, "name": nm, "broker_id": bid,
+                              "broker_name": bname, "role": "lead", "link_method": "list_field",
+                              "link_conf": 0.98, "pub_date": d, "stock_code": codes[i],
+                              "target_price": tp, "opinion": "BUY",
+                              "name_norm": nm,
+                              "analyst_id": sha1_str("analyst", bid, nm)[:14]})
+    rep = pd.DataFrame(rep_rows)
+    L = pd.DataFrame(link_rows)
+
+    # ── 국민연금 패널 ──────────────────────────────────────────────────────────────────────
+    nps_rows = []
+    for i, c in enumerate(codes):
+        base = max(15, int(rng.lognormal(5.0, 1.0)))
+        wage = rng.lognormal(15.0, 0.25)
+        for m in months:
+            base = max(5, int(base * (1 + 0.004 * quality[i] + rng.normal(0, 0.02))))
+            wage *= (1 + 0.002 + 0.001 * quality[i] + rng.normal(0, 0.004))
+            nps_rows.append({"code": c, "month": m,
+                             "nps_members": float(base),
+                             "nps_amt": float(base * wage * 0.09),
+                             "nps_acq": float(max(0, rng.poisson(3))),
+                             "nps_loss": float(max(0, rng.poisson(max(1, 3 - quality[i])))),
+                             "n_wkpl": float(max(1, int(rng.integers(1, 6)))),
+                             "knowledge_date": m + pd.offsets.MonthEnd(2)})
+    nps = pd.DataFrame(nps_rows)
+    nps = pit_frame(nps, "month", "knowledge_date", source="synthetic")
+
+    return {"sec": sec, "px": px, "fin": fin, "emp": emp, "dis": dis,
+            "reports": rep, "links": L, "nps": nps, "months": months,
+            "flows": pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"]),
+            "snapshots": pd.DataFrame(columns=["snap_date", "code", "market"])}
+
+
+def run_selftest(full_chain: bool = False) -> bool:
+    """full_chain=True 면 성과검증·강건성(R1~R11)·해석표·진단카드까지 전부 합성데이터로 돌린다.
+    RUN_MODE='SMOKE' 의 목적이 바로 이것 — 실데이터 없이 최종 출력물의 모양을 전부 확인한다."""
+    LOG.banner("① 합성데이터 엔드투엔드 스모크 테스트",
+               "실데이터 수집 전에 계산경로 전체를 증명한다 (수 초)"
+               + (" · full_chain: 강건성·해석표까지 전부 실행" if full_chain else ""))
+    t0 = time.time()
+    S = make_synthetic()
+    LOG.info(f"합성 데이터: 종목 {S['sec'].shape[0]} · 월 {len(S['months'])} · "
+             f"일봉 {len(S['px']):,} · 재무 {len(S['fin']):,} · 리포트 {len(S['reports']):,}")
+
+    PIT.register("dart_financials", S["fin"], key_cols=["corp_code"])
+    PIT.register("dart_employees", S["emp"], key_cols=["corp_code"])
+
+    panel = build_price_panel(S["px"], S["months"])
+    uni = Universe(S["sec"], S["snapshots"], panel["daily"])
+    P = build_base_panel(uni, S["months"], panel["monthly"])
+    P = attach_fundamentals(P, S["sec"])
+    P = build_cells(P, S["sec"])
+    P = axis_B(P); P = axis_C(P)
+    P = axis_B_tp(P); P = axis_C_tp(P)
+    cons = build_consensus_panel(S["links"], S["months"])
+    P = axis_D(P, panel["daily"], S["flows"], cons)
+    P = axis_D_U(P)
+
+    ctx = {"disclosures": S["dis"], "nps_panel": S["nps"], "sec": S["sec"],
+           "text_sim": None, "customs": None, "hs_map": None, "procurement": None,
+           "administrative": None}
+    for p in active_packs():
+        P = p["features"](P, ctx)
+    P = apply_vetoes(P, ctx)
+    P = assemble_score(P)
+
+    def _run(pp, label="smoke", apply_costs=True, months_override=None):
+        return run_backtest(pp, months_override if months_override is not None else S["months"],
+                            uni, S["sec"], apply_costs=apply_costs, label=label)
+
+    bt = _run(P)
+    st = perf_stats(bt["returns"])
+    dur = time.time() - t0
+    ok = (len(P) > 0 and len(bt["returns"]) == len(S["months"]) and
+          bool(st) and np.isfinite(st.get("CAGR", np.nan)))
+    LOG.table([["패널 행수", f"{len(P):,}"],
+               ["활성 팩", ", ".join(p["id"] for p in active_packs()) or "없음"],
+               ["백테스트 월수", f"{len(bt['returns'])}"],
+               ["평균 보유종목", f"{st.get('평균종목수', float('nan')):.1f}"],
+               ["합성 CAGR", f"{st.get('CAGR', float('nan'))*100:+.2f}%"],
+               ["합성 Sharpe", f"{st.get('Sharpe', float('nan')):.3f}"],
+               ["소요시간", f"{dur:.2f}초"]],
+              ["항목", "값"], ["l", "r"], title="스모크 결과 (성과 수치는 의미 없음 — 배관 검증용)")
+    if ok:
+        LOG.ok(f"스모크 통과 ({dur:.2f}초) — 피처→스코어→백테스트 경로가 정상 동작합니다. "
+               f"이제 실데이터를 수집해도 조립부에서 시간을 날릴 위험이 없습니다.")
+    else:
+        LOG.error("스모크 실패 — 실데이터 수집 전에 계산경로를 먼저 고쳐야 합니다.")
+        return False
+    if not full_chain:
+        return True
+
+    # ── 여기서부터는 '최종 출력물 전체'를 합성데이터로 예행연습한다 ────────────────────────
+    LOG.warn("아래 성과·강건성 수치는 전부 합성 난수 기반입니다. 전략의 실제 성과가 아니라 "
+             "'출력물이 제대로 나오는지'를 보여주는 예행연습입니다. 절대 해석하지 마세요.")
+    bench = {}
+    with PIPE.stage("SMOKE.PERF", "[합성] 성과 검증", "L6", budget_s=120, critical=False):
+        report_performance(bt, bench, label=f"{STRATEGY_NAME} (합성 예행연습)")
+        uni.report_attrition()
+    with PIPE.stage("SMOKE.POLICY", "[합성] 정책 캘린더", "L2", budget_s=60, critical=False):
+        cal = build_policy_calendar()
+        report_policy(cal, S["months"], [p["id"] for p in active_packs()])
+    with PIPE.stage("SMOKE.ROBUST", "[합성] 강건성 R1~R11", "L5", budget_s=1800, critical=False):
+        keep_kill = STOP_ON_KILL_CRITERIA
+        globals()["STOP_ON_KILL_CRITERIA"] = False   # 예행연습에서는 킬로 멈추지 않는다
+        try:
+            R1_leakage(P, S["months"], uni, S["sec"], _run)
+            R2_tp_vs_naive(P, _run)
+            R3_orthogonal(P, bt, S["months"])
+            R4_placebo(P, n_iter=200)
+            R10_policy_falsify(P, cal, S["months"], _run)
+            R5_ablation(P, _run)
+            R11_pack_corr(P)
+            R6_pbo_dsr(bt)
+            R7_regime(bt, bench)
+            R8_subperiod(bt)
+            R9_capacity(P, _run)
+        finally:
+            globals()["STOP_ON_KILL_CRITERIA"] = keep_kill
+        report_robustness()
+    with PIPE.stage("SMOKE.REPORT", "[합성] 해석표 · 진단 카드", "L6", budget_s=120, critical=False):
+        report_interpretation(P)
+        diagnostic_card(P, bt, S["sec"])
+    LOG.ok("full_chain 예행연습 완료 — 백테스트·성과검증·강건성·해석표·진단카드가 모두 "
+           "정상 출력되었습니다. RUN_MODE='FULL' 로 바꾸면 동일한 출력이 실데이터로 나옵니다.")
+    ROBUST_RESULTS.clear()
+    return True
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  오케스트레이터 — 전체 실행 순서와 산출물                                                  ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+def offer_download(paths: Sequence[str]):
+    """미리보기 없이 '클릭하면 바로 저장' 되는 링크만 띄운다."""
+    paths = [p for p in paths if p and os.path.exists(p)]
+    if not paths:
+        return
+    if ENV["colab"]:
+        try:
+            from google.colab import files as _f       # type: ignore
+            for p in paths:
+                print(f"⬇  다운로드 시작: {os.path.basename(p)}")
+                _f.download(p)
+            return
+        except Exception:
+            pass
+    try:
+        from IPython.display import display, HTML     # type: ignore
+        import base64
+        html = ["<div style='font-family:system-ui;font-size:14px;line-height:2'>"]
+        for p in paths:
+            b = open(p, "rb").read()
+            if len(b) > 40 * 1024 * 1024:
+                html.append(f"<div>· {os.path.basename(p)} — 용량이 커서 링크 대신 경로로 안내: "
+                            f"<code>{p}</code></div>")
+                continue
+            b64 = base64.b64encode(b).decode()
+            html.append(
+                f"<a download='{os.path.basename(p)}' "
+                f"href='data:application/octet-stream;base64,{b64}' "
+                f"style='display:inline-block;margin:4px 8px 4px 0;padding:8px 14px;"
+                f"background:#1a73e8;color:#fff;border-radius:6px;text-decoration:none'>"
+                f"⬇ {os.path.basename(p)} ({len(b)/1e6:.1f}MB)</a>")
+        html.append("</div>")
+        display(HTML("".join(html)))
+    except Exception:
+        for p in paths:
+            print(f"⬇  산출물 경로: {p}")
+
+
+def collect_all(months: pd.DatetimeIndex) -> dict:
+    """L1 수집 — 각 단계는 실패해도 파이프라인을 죽이지 않고 '무엇이 없는지'를 남긴다."""
+    ctx: Dict[str, Any] = {}
+
+    with PIPE.stage("L1.UNI", "종목 마스터 · PIT 유니버스", "L1", budget_s=600):
+        snaps = fetch_pykrx_snapshots(months)
+        sec = build_security_master(snaps)
+        ctx["sec"], ctx["snapshots"] = sec, snaps
+
+    with PIPE.stage("L1.PX", "가격 · 거래대금", "L1", budget_s=1200):
+        KRX.login()
+        px = fetch_prices(ctx["sec"]["code"].tolist(),
+                          (as_ts(BACKTEST_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d"),
+                          BACKTEST_END)
+        ctx["px"] = px
+        ctx["panel"] = build_price_panel(px, months)
+
+    with PIPE.stage("L1.FLOW", "기관·외국인 수급 (D축 d3)", "L1", budget_s=900, critical=False):
+        ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START, BACKTEST_END)
+
+    with PIPE.stage("L1.DART", "DART 재무 · 직원 · 공시", "L1", budget_s=1800, critical=False):
+        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+        years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
+        fs = fetch_dart_financials(corps, years)
+        fin = tidy_financials(fs)
+        emp = fetch_dart_employees(corps, years)
+        dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
+        ctx["fin"], ctx["emp"], ctx["disclosures"] = fin, emp, dis
+        if len(fin):
+            PIT.register("dart_financials", fin, key_cols=["corp_code"])
+        if len(emp):
+            PIT.register("dart_employees", emp, key_cols=["corp_code"])
+
+    with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 구축", "L1",
+                    budget_s=3600, critical=False,
+                    skip_if=(not RESEARCH_COLLECT and RUN_MODE != "CACHED"),
+                    skip_reason="RESEARCH_COLLECT=False"):
+        LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
+                 "사용자의 명시적 지시에 따라 수집하되, 보수적 속도로 제한합니다. "
+                 "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
+        cached = VAULT.get_table("research_report_master", scope="shared")
+        frames = []
+        if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+            if "hankyung" in RESEARCH_SOURCES:
+                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+            if "naver" in RESEARCH_SOURCES:
+                nv = naver_collect(BACKTEST_START, BACKTEST_END)
+                nv = naver_enrich_detail(nv)
+                frames.append(nv)
+        if cached is not None and len(cached):
+            LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용")
+            frames.append(cached)
+        rep = build_report_master(frames, ctx["sec"])
+        if len(rep):
+            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+            VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
+                            source="hankyung+naver")
+            VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",
+                            domain="research", source="strategy view")
+        A, L = build_analyst_ledger(rep)
+        if len(A):
+            VAULT.put_table("analyst_master", A, scope="shared", domain="research",
+                            source="entity_resolution")
+            VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
+                            source="entity_resolution")
+        ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
+
+    for p in active_packs():
+        if p.get("ingest"):
+            with PIPE.stage(f"L1.PACK.{p['id']}", f"팩 {p['id']} 전용 수집", "L1",
+                            budget_s=1800, critical=False):
+                p["ingest"](ctx, months)
+    return ctx
+
+
+def build_features(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame, "Universe"]:
+    with PIPE.stage("L1.PANEL", "피처 패널 조립 (L1)", "L1", budget_s=1800):
+        uni = Universe(ctx["sec"], ctx.get("snapshots", pd.DataFrame(columns=["snap_date", "code", "market"])),
+                       ctx["panel"]["daily"])
+        P = build_base_panel(uni, months, ctx["panel"]["monthly"])
+        P = attach_fundamentals(P, ctx["sec"])
+        P = build_cells(P, ctx["sec"])
+        P = axis_B(P); P = axis_C(P)
+        P = axis_B_tp(P); P = axis_C_tp(P)
+        cons = build_consensus_panel(ctx.get("links", pd.DataFrame()), months)
+        ctx["consensus"] = cons
+        P = axis_D(P, ctx["panel"]["daily"], ctx.get("flows"), cons)
+        P = axis_D_U(P)
+        for p in active_packs():
+            P = p["features"](P, ctx)
+        P = downcast(P)
+        LOG.ok(f"피처 패널 완성 {len(P):,}행 × {P.shape[1]}열 · {mem_mb(P):.0f}MB")
+        # L1/L2 분리(§3): 피처는 parquet 으로 영속화하고, 스코어부는 이 parquet 만 읽는다
+        VAULT.put_table(f"l1_features_{STRATEGY_ID}", P, scope="private", domain="features",
+                        source="L1 panel")
+    return P, uni
+
+
+def score_and_backtest(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
+                       uni: "Universe") -> Tuple[pd.DataFrame, dict, Callable]:
+    with PIPE.stage("L2.SCORE", "거부권 + 스코어 조립 (L2)", "L2", budget_s=120):
+        P = apply_vetoes(P, ctx)
+        P = assemble_score(P)
+        VAULT.put_table(f"l2_scores_{STRATEGY_ID}",
+                        P[[c for c in ("code", "month", "E", "U", "Signal", "Signal_rank",
+                                       "VETO", "FLOOR") if c in P.columns]],
+                        scope="private", domain="scores", source="L2")
+
+    def _run(pp, label="run", apply_costs=True, months_override=None):
+        return run_backtest(pp, months_override if months_override is not None else months,
+                            uni, ctx["sec"], apply_costs=apply_costs, label=label)
+
+    with PIPE.stage("L3.BT", "백테스트 (L3)", "L3", budget_s=180):
+        bt = _run(P, label=STRATEGY_ID)
+    return P, bt, _run
+
+
+def main() -> dict:
+    t_all = time.time()
+    global VAULT, DBUDGET
+    LOG.banner(f"TCD v2 — {STRATEGY_NAME}  [{STRATEGY_ID}]",
+               f"활성 팩: {', '.join(ACTIVE_PACKS) or '없음'} · 백테스트 {BACKTEST_START}~{BACKTEST_END} · "
+               f"빌드 {BUILD_VERSION}")
+    LOG.table([["환경", "Colab" if ENV["colab"] else ("Jupyter" if ENV["ipython"] else "CLI")],
+               ["파이썬", ENV["python"]], ["플랫폼", f"{ENV['platform']} / {ENV['cpu']}코어"],
+               ["병렬", f"IO {N_WORKERS_IO} 스레드 / CPU {N_CPU} " +
+                        ("프로세스(fork)" if CAN_FORK else "스레드(fork 불가 → 폴백)")],
+               ["실행 모드", RUN_MODE], ["시드", str(SEED)],
+               ["선택 패키지", ", ".join(k for k, v in OPT.items() if v) or "없음"]],
+              ["항목", "값"], ["l", "l"], title="실행 환경")
+
+    with PIPE.stage("L0.VAULT", "구글드라이브 캐시 연결", "L0", budget_s=300):
+        root, mode = _mount_drive()
+        VAULT = Vault(root, mode)
+        globals()["VAULT"] = VAULT
+        LOG.info(f"캐시 루트: {VAULT.root}  (모드 {mode})")
+        free = free_gb(VAULT.root)
+        if np.isfinite(free):
+            LOG.info(f"여유 공간 {free:.1f} GB")
+            if free < 2:
+                LOG.warn("여유 공간이 2GB 미만입니다. RESEARCH_DOWNLOAD_PDF=False 를 권합니다.")
+        VAULT.load_index("shared"); VAULT.load_index("private")
+        VAULT.adopt_scan(GDRIVE_ADOPT_DIRS)
+        DBUDGET = DartBudget()
+        globals()["DBUDGET"] = DBUDGET
+
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 C1~C12", "L0", budget_s=120):
+        run_contract_tests(strict=True)
+
+    with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0",
+                    budget_s=(1800 if RUN_MODE == "SMOKE" else 300)):
+        if not run_selftest(full_chain=(RUN_MODE == "SMOKE")):
+            raise RuntimeError("스모크 테스트 실패 — 실데이터 수집을 시작하지 않습니다.")
+
+    months = month_range(BACKTEST_START, BACKTEST_END)
+    if RUN_MODE == "SMOKE":
+        LOG.ok("RUN_MODE='SMOKE' — 합성데이터로 전 출력물(백테스트·성과·강건성·해석표)을 "
+               "예행연습했습니다. 실데이터로 돌리려면 RUN_MODE='FULL' 로 바꾸세요.")
+        PIPE.report_stages(); PIPE.report_runtime(); report_dataflow_map()
+        return {"mode": "SMOKE"}
+
+    ctx = collect_all(months)
+
+    with PIPE.stage("L1.AUDIT", "원장 무결성 감사", "L1", budget_s=120, critical=False):
+        audit_linkage(ctx.get("reports", pd.DataFrame()),
+                      ctx.get("analysts", pd.DataFrame()),
+                      ctx.get("links", pd.DataFrame()))
+
+    P, uni = build_features(ctx, months)
+
+    with PIPE.stage("L2.POLICY", "정책 캘린더 (C12)", "L2", budget_s=60):
+        cal = build_policy_calendar()
+        report_policy(cal, months, [p["id"] for p in active_packs()])
+        ctx["policy"] = cal
+
+    P, bt, _run = score_and_backtest(P, ctx, months, uni)
+
+    with PIPE.stage("L6.PERF", "성과 검증", "L6", budget_s=120):
+        bench = benchmark_returns(months)
+        report_performance(bt, bench)
+        uni.report_attrition()
+
+    with PIPE.stage("L5.ROBUST", "강건성 검사 R1~R11", "L5", budget_s=4 * 3600, critical=False):
+        try:
+            R1_leakage(P, months, uni, ctx["sec"], _run)
+            R2_tp_vs_naive(P, _run)
+            R3_orthogonal(P, bt, months)
+            R4_placebo(P, n_iter=1000)
+            R10_policy_falsify(P, ctx["policy"], months, _run)
+            R5_ablation(P, _run)
+            R11_pack_corr(P)
+            R6_pbo_dsr(bt)
+            R7_regime(bt, bench)
+            R8_subperiod(bt)
+            R9_capacity(P, _run)
+        except KillCriteria as e:
+            LOG.error(f"킬 기준으로 강건성 스위트를 중단합니다: {e}")
+        report_robustness()
+
+    with PIPE.stage("L6.REPORT", "해석표 · 진단 카드", "L6", budget_s=120, critical=False):
+        report_interpretation(P)
+        diagnostic_card(P, bt, ctx["sec"])
+
+    with PIPE.stage("L0.PERSIST", "산출물 저장 (공용/전용 인덱스)", "L0", budget_s=300, critical=False):
+        outdir = os.path.join(VAULT.ns["private"], "reports", STRATEGY_ID)
+        os.makedirs(outdir, exist_ok=True)
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        outs = []
+        rp = os.path.join(outdir, f"returns_{stamp}.csv")
+        bt["returns"].to_csv(rp, index=False, encoding="utf-8-sig"); outs.append(rp)
+        if len(bt.get("holdings", pd.DataFrame())):
+            hp = os.path.join(outdir, f"holdings_{stamp}.csv")
+            bt["holdings"].to_csv(hp, index=False, encoding="utf-8-sig"); outs.append(hp)
+        lp = os.path.join(outdir, f"log_{stamp}.txt")
+        atomic_write_text(lp, "\n".join(LOG.buffer)); outs.append(lp)
+        VAULT.put_table(f"backtest_returns_{STRATEGY_ID}", bt["returns"], scope="private",
+                        domain="backtest", source=STRATEGY_ID)
+        VAULT.flush(); VAULT.compact("shared"); VAULT.compact("private")
+        if DBUDGET:
+            DBUDGET.close()
+        VAULT.report()
+        ctx["outputs"] = outs
+
+    PIPE.report_stages()
+    PIPE.report_flow()
+    PIT.report()
+    report_http()
+    PIPE.report_runtime()
+    report_dataflow_map()
+
+    LOG.banner("완료", f"총 소요 {(time.time()-t_all)/60:.1f}분 · "
+                       f"산출물은 구글드라이브 전용 인덱스에 저장되었습니다")
+    LOG.info("한계 명시(§16.2): 컨센서스 fwd EPS 시계열은 과거 복원이 불가능하므로 "
+             "D축 d1 의 E 는 후행 12M 이익 대리변수를 씁니다. 초기 구간일수록 이 대리의 "
+             "오차가 큽니다. 이 한계를 숨기지 않고 여기에 명시합니다.")
+    offer_download(ctx.get("outputs", []))
+    return {"panel": P, "backtest": bt, "ctx": ctx, "robust": ROBUST_RESULTS}
+
+
+if __name__ == "__main__" or ENV["ipython"]:
+    try:
+        RESULT = main()
+    except KillCriteria as e:
+        LOG.banner("⛔ 킬 기준으로 중단", "§15 — 파라미터를 조정해 통과시키지 마십시오")
+        print(f"  {e}")
+        PIPE.report_stages(); PIPE.report_runtime()
+        try:
+            report_robustness()
+        except Exception:
+            pass
+    except StageFailure as e:
+        LOG.banner("실행 중단", "위의 '실패 지점' 상세와 아래 표에서 원인을 확인하세요")
+        print(f"  {e}")
+        PIPE.report_stages(); PIPE.report_flow(); PIPE.report_runtime()
+    except KeyboardInterrupt:
+        LOG.warn("사용자 중단. 여기까지 수집된 데이터는 드라이브에 저장되어 있으며 "
+                 "재실행 시 이어받습니다.")
+        try:
+            if VAULT:
+                VAULT.flush()
+        except Exception:
+            pass

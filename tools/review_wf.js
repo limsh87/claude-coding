@@ -1,0 +1,235 @@
+export const meta = {
+  name: 'tcd-v2-review',
+  description: 'Adversarial multi-lens review of the assembled TCD v2 strategy file to find real defects before delivery',
+  phases: [
+    { title: 'Review', detail: 'independent lenses over the assembled file' },
+    { title: 'Verify', detail: 'adversarially confirm or refute each finding' },
+  ],
+}
+
+const FILE = '/home/user/claude-coding/strategies/tcd_v2_00_integrated_all_packs.py'
+
+const FINDINGS = {
+  type: 'object',
+  properties: {
+    lens: { type: 'string' },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          line: { type: 'number' },
+          symbol: { type: 'string', description: 'function/class name where it lives' },
+          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+          problem: { type: 'string' },
+          failure_scenario: { type: 'string', description: 'concrete inputs/state -> wrong output or crash' },
+          fix: { type: 'string', description: 'concrete minimal fix' },
+        },
+        required: ['title', 'severity', 'problem', 'failure_scenario', 'fix'],
+      },
+    },
+  },
+  required: ['lens', 'findings'],
+}
+
+const CONTEXT = [
+  'You are reviewing a single-file Korean-equity quant backtest engine at:',
+  '  ' + FILE,
+  '(~7,500 lines, one-cell executable for Colab/JupyterLab, Korean comments).',
+  '',
+  'It implements the "TCD v2" spec: trade-off collapse detection. Key invariants the code MUST hold:',
+  ' - C1 Point-in-time: every feature at time t may only use rows with knowledge_date <= t. Single gateway PITStore.get / PITStore.asof_join.',
+  ' - C2 Survivorship: universe includes delisted names; delisting return is -100% when no final price.',
+  ' - C5 order: winsorize(2 sigma) -> z-score within cell -> percentile rank. Hardcoded.',
+  ' - C6 Vetoes V1..V8 are binary {0,1} and multiplied. Never continuous, never offsetting.',
+  ' - C7 Equal weighting everywhere. No optimization.',
+  ' - C11 cell = (date, industry, size_bucket) only.',
+  ' - TP = z(improvement) * z(cost-not-paid). MUST be a product, never a sum. Missing propagates as NaN.',
+  ' - Execution is next-trading-day OPEN, never same-day close.',
+  '',
+  'The environment has pandas/numpy/pyarrow/scipy/requests/bs4 installed. The file has ALREADY been run',
+  'end-to-end in SMOKE mode (synthetic data) and passes, so trivial syntax/import errors are ruled out.',
+  'Do NOT report those. Look for defects that only appear with REAL data, at scale, or in edge cases.',
+  '',
+  'Read the file with Read (use offset/limit to page through - it is large). Use Grep to find symbols fast.',
+  'You MAY write and run small python scripts in the scratchpad to actually test a suspicion - that is',
+  'strongly encouraged, and a finding backed by a reproduction is worth ten speculative ones.',
+  '',
+  'Report ONLY defects you are confident are real. An empty findings list is a perfectly good answer.',
+  'Do not report style opinions, missing docstrings, or "consider adding". Rank by severity.',
+].join('\n')
+
+phase('Review')
+
+const LENSES = [
+  {
+    key: 'pit-leakage',
+    prompt: CONTEXT + [
+      '',
+      'LENS: POINT-IN-TIME CORRECTNESS AND LOOKAHEAD LEAKAGE. This is the highest-stakes lens.',
+      'Focus on:',
+      ' - PITStore.asof_join: does merge_asof with by= and direction=backward preserve row alignment?',
+      '   Check the _ord / index restoration logic carefully. If rows are dropped by dropna(subset=[left_time, by])',
+      '   the returned frame length differs from the input and the index assignment could silently misalign',
+      '   features to the wrong (code, month). Build a case where some panel rows have NaN corp_code and verify.',
+      ' - attach_fundamentals: what happens to panel rows whose corp_code is NaN?',
+      ' - Rolling/groupby computations in axis_B/axis_C/axis_D and the packs: does any use future data?',
+      '   e.g. diff(-n), shift(-n), rolling(center=True), or a transform that spans across codes.',
+      ' - build_price_panel: fwd_ret uses exec_px shifted -1. Confirm the signal at month m is paired with the',
+      '   return earned AFTER m, and that exec_px (next_open) is not itself known only after the decision.',
+      ' - _knowledge_from_rcept and the statutory-deadline fallback: could it ever produce a knowledge_date',
+      '   EARLIER than the true public date? That direction is the dangerous one.',
+      ' - build_consensus_panel: window pub_date > m-90d and <= m. Is that PIT-safe?',
+      ' - PACK-N nps knowledge_date (+2 months) and PACK-X customs (+1 month +15d).',
+      'Verify with a reproduction where you can.',
+    ].join('\n'),
+  },
+  {
+    key: 'numerics-panel',
+    prompt: CONTEXT + [
+      '',
+      'LENS: NUMERICAL AND PANDAS CORRECTNESS AT SCALE.',
+      'Focus on:',
+      ' - xsec_z / xsec_rank_pct: groupby.transform with a function returning a Series. Index alignment',
+      '   correctness, all-NaN groups, and categorical cell columns with unused categories (observed=True).',
+      ' - rolling_ols_resid: the sliding_window_view + einsum path. Check the ridge term construction for',
+      '   shape/broadcast correctness, and whether resid is placed at the right time offset (out[:, window-1:]).',
+      '   Write a test with a known linear DGP and confirm residuals come out right and at the right index.',
+      ' - The pack_x pivot/stack round trip: stack(dropna=False) then merge on (code, month). Check the month',
+      '   dtype after the pivot round trip, and pandas 2.x deprecation/behavior change of stack(dropna=).',
+      ' - safe_div / dlog with zeros and negatives.',
+      ' - downcast(): converting object to category then later doing groupby/merge on those columns.',
+      ' - CRITICAL: every use of P.get("colname") in arithmetic. P.get returns None when the column is absent,',
+      '   and None + Series raises TypeError. Enumerate every such site and say which are actually reachable',
+      '   when a data source is missing (e.g. no DART key so no revenue_ttm column exists at all).',
+      ' - perf_stats when returns are all zero or a single month.',
+      'Actually run small reproductions for the ones you suspect.',
+    ].join('\n'),
+  },
+  {
+    key: 'scale-memory',
+    prompt: CONTEXT + [
+      '',
+      'LENS: REAL-DATA SCALE, MEMORY, AND RUNTIME.',
+      'The real run is ~2,500 tickers x 120 months, ~6M daily price rows, and up to 300k analyst reports.',
+      'Focus on:',
+      ' - run_backtest: inside the month loop it does sub[sub["code"] == c] per holding, and again per traded',
+      '   name for costs. With 25 holdings x 120 months that is thousands of full boolean scans. Quantify with',
+      '   a real timing experiment at realistic size, then propose the concrete fix (dict lookup / set_index).',
+      ' - R3_orthogonal and R4_placebo loop over months x 1000 iterations. Estimate wall clock at real scale',
+      '   and check against the C10 budget (L5 <= 4 hours). R4 in particular: 1000 iterations x 120 monthly',
+      '   groups x numpy choice. Time it.',
+      ' - Universe.at() is called per month and loops over sec.itertuples with ~3,500 securities x 120 months.',
+      ' - build_base_panel builds a DataFrame per month then concats.',
+      ' - Memory: how many columns does the panel have after all packs? Does downcast() run before or after the',
+      '   expensive merges? Note P.copy() in every axis function.',
+      ' - fetch_prices: concat of cached + new then drop_duplicates over ~6M rows.',
+      'Give concrete measured numbers, not vibes. Generate synthetic frames of the real size and time the',
+      'actual functions by importing them from the file.',
+    ].join('\n'),
+  },
+  {
+    key: 'ingest-robustness',
+    prompt: CONTEXT + [
+      '',
+      'LENS: DATA INGESTION ROBUSTNESS AGAINST REAL, MESSY, PARTIALLY-BROKEN SOURCES.',
+      'The network is blocked in this environment so you cannot call the real endpoints. Reason from the code',
+      'and test parsers against hand-built HTML fixtures.',
+      'Focus on:',
+      ' - hankyung_collect / _hk_parse: header-name-based column mapping. What if the site returns the',
+      '   6-column layout (no target price)? If thead is missing? If the same report_idx repeats across pages?',
+      '   Is the pagination termination condition len(batch) < page_size*0.5 safe, or could it stop early on a',
+      '   legitimately short page and silently lose data? Build fixtures and run _hk_parse on them.',
+      ' - naver_collect / _nv_parse_list: YY.MM.DD date parsing. The code post-corrects years < 2000 by adding',
+      '   100 years. Trace what pd.to_datetime actually produces for "26.01.19" and for "98.05.02". Is the',
+      '   correction right, and could it corrupt already-correct dates? Run it.',
+      ' - build_report_master: groupby.agg with named aggregation using lambdas over object columns.',
+      '   Does pd.Series(list(s)).dropna().max() on target_price behave? What if a dedup group mixes',
+      '   different stock_codes? What if pub_date has NaT?',
+      ' - download_pdfs: blob_uid is recomputed as sha1_str(...) mirroring put_blob internal uid. Check whether',
+      '   the recomputed value actually equals what put_blob registered. If not, cache lookups silently miss.',
+      ' - Vault.load_index / compact: could a legacy index file with a conflicting uid column type cause data',
+      '   loss on compaction? Verify the append-only guarantee actually holds by writing a test that simulates',
+      '   a pre-existing index with extra columns and a partially-written journal line.',
+      ' - _decode / _korean_score on EUC-KR bytes.',
+      ' - DartBudget.take() called from 12 threads: is the counter safe and the limit actually enforced?',
+    ].join('\n'),
+  },
+  {
+    key: 'strategy-semantics',
+    prompt: CONTEXT + [
+      '',
+      'LENS: STRATEGY AND SPEC-CONFORMANCE SEMANTICS. Does the code compute what the spec says?',
+      'Focus on:',
+      ' - assemble_score: E is rank_pct of the mean of E-columns. Spec says Signal = rank_pct(E) * rank_pct(U)',
+      '   * prod(V). Check U is already a rank_pct (axis_D_U sets P["U"] = xsec_rank_pct(...)) and is not',
+      '   double-ranked, and that Signal_rank (re-ranked within month x pack_profile) is what the backtest uses.',
+      '   Is re-ranking AFTER multiplying by binary vetoes correct, or can it resurrect vetoed names by giving',
+      '   them a nonzero rank? Note run_backtest also filters VETO==1 separately - confirm that fully covers it.',
+      ' - apply_vetoes V2: bad.rolling(9).min() >= 1 - does that correctly express "3 quarters consecutive"?',
+      '   bad is monthly but built from TTM columns that only change quarterly.',
+      ' - PACK-N marginal wage: est_income_prev = (amt.shift(1)/rate) / members.shift(1). Check the algebra',
+      '   against the spec formula wage_premium = marginal_wage / (est_income_{t-1} / members_{t-1}).',
+      '   Note est_income in the spec is already a total, so dividing by members gives per-head. Is the code',
+      '   consistent? Also check the July exclusion and the |delta members| >= max(3, 0.5%) gate.',
+      ' - PACK-C p3 treasury cancellation ratio: acq/canc are rolling 12M sums of monthly disclosure COUNTS,',
+      '   not amounts. Does TP_P2 = z(acq_size) * z(p3) still mean what the spec says? Also: is the merge that',
+      '   creates treasury_acq/treasury_canc columns safe when the column already exists (suffixes=("","_x"))?',
+      ' - The breadth floor in assemble_score requires EVERY E-column >= 50th pct. With 3-7 axes and roughly',
+      '   independent ranks that retains ~12% down to ~1%. The spec says "활성 센서팩 및 B·C축 각각의 셀 내',
+      '   백분위가 모두 >= 50th" which does read as a conjunction - but check whether applying it to the',
+      '   per-axis E columns (which are themselves means of TPs, often NaN) makes NaN axes fail the floor and',
+      '   thereby exclude names that merely lack one data source. That would be a serious silent bias.',
+      ' - Exit rule: dlog_M >= dlog_E and dlog_E > 0. Consistent with spec section 8.5?',
+      ' - size_positions: weights are clipped to POS_MAX_WEIGHT then renormalized by w/w.sum(), which can push',
+      '   weights back above the cap. Is the max-weight cap actually enforced? Reproduce.',
+    ].join('\n'),
+  },
+]
+
+const results = await pipeline(
+  LENSES,
+  l => agent(l.prompt, { label: 'review:' + l.key, phase: 'Review', schema: FINDINGS, effort: 'high' }),
+  (res, l) => {
+    if (!res || !res.findings || res.findings.length === 0) return { lens: l.key, verified: [] }
+    return parallel(res.findings.slice(0, 8).map(f => () =>
+      agent(CONTEXT + [
+        '',
+        'You are ADVERSARIALLY VERIFYING a claimed defect. Default to REFUTED unless you can demonstrate it.',
+        '',
+        'CLAIM: ' + f.title,
+        'SEVERITY CLAIMED: ' + f.severity,
+        'LOCATION: ' + (f.symbol || '?') + ' (line ~' + (f.line || '?') + ')',
+        'PROBLEM: ' + f.problem,
+        'FAILURE SCENARIO: ' + f.failure_scenario,
+        'PROPOSED FIX: ' + f.fix,
+        '',
+        'Do this:',
+        '1. Read the actual code at that location. Quote the real lines.',
+        '2. Try to REFUTE it: is there a guard elsewhere that prevents it? Is the reviewer misreading',
+        '   pandas/numpy semantics? Is the scenario unreachable given how the function is actually called?',
+        '3. If you cannot refute it, REPRODUCE it: write and run a minimal python script in the scratchpad',
+        '   that demonstrates the wrong behavior. A finding without a reproduction or an airtight code-quote',
+        '   argument is REFUTED.',
+        '4. Judge whether the proposed fix is correct and minimal, or propose a better one.',
+        '',
+        'Return your verdict.',
+      ].join('\n'),
+        { label: 'verify:' + (f.title || '').slice(0, 26), phase: 'Verify', effort: 'high',
+          schema: { type: 'object', properties: {
+            title: { type: 'string' },
+            verdict: { type: 'string', enum: ['CONFIRMED', 'REFUTED', 'PARTIAL'] },
+            evidence: { type: 'string', description: 'quoted code and/or reproduction output' },
+            severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+            symbol: { type: 'string' },
+            recommended_fix: { type: 'string' },
+          }, required: ['title', 'verdict', 'evidence', 'severity', 'recommended_fix'] } }))
+    ).then(vs => ({ lens: l.key, verified: vs.filter(Boolean) }))
+  }
+)
+
+const all = results.filter(Boolean).flatMap(r => (r.verified || []).map(v => Object.assign({}, v, { lens: r.lens })))
+const confirmed = all.filter(v => v.verdict === 'CONFIRMED' || v.verdict === 'PARTIAL')
+log('verified: ' + confirmed.length + ' confirmed of ' + all.length + ' claims')
+return { confirmed: confirmed, refuted: all.filter(v => v.verdict === 'REFUTED').map(v => v.title) }
