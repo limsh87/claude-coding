@@ -4105,13 +4105,15 @@ BULK_CONSOL = ["연결", "개별"]
 _BULK_FLNM_RE = re.compile(r"(20\d{2}_[^\"'<>|]{4,80}?\.(?:zip|txt))", re.I)
 
 
-def _bulk_candidates(year: int, reprt: str) -> List[str]:
-    nm = REPRT_NAME.get(reprt, "사업보고서")
-    out = []
-    for i, st in enumerate(BULK_STATEMENTS, start=1):
-        for cs in BULK_CONSOL:
-            out.append(f"{year}_{nm}_{i:02d}_{st}_{cs}.zip")
-    return out
+#  ★★ 추측 후보를 만들지 않는다 ★★
+#  예전엔 f"{year}_{보고서}_{NN}_{제표}_{연결구분}.zip" 8개를 만들어 시도했다. 성공 확률은
+#  **구조적으로 0** 이다 — 실물 파일명이
+#      2024_사업보고서_01_재무상태표_연결_20250606.txt
+#  처럼 끝에 **배포일자**를 달고 있고, 그건 관측하지 않으면 알 수 없다(제표·연도마다 다르고
+#  재배포되면 바뀐다). 게다가 개별은 '_개별'이 아니라 접미사가 없고 확장자도 상황에 따라 다르다.
+#  그 결과 이 함수는 '안전망'이 아니라 **실패를 8배로 부풀려 진짜 원인(목록 발견 실패)을
+#  로그에서 가리는 장치**였고, 분기마다 32요청을 헛되이 태웠다.
+#  → 발견하지 못하면 즉시 폴백으로 내려간다. 그게 유일하게 정직한 동작이다.
 
 
 def _bulk_discover(year: int, reprt: str) -> Tuple[List[str], str]:
@@ -4122,11 +4124,26 @@ def _bulk_discover(year: int, reprt: str) -> Tuple[List[str], str]:
       특정할 수 없다. 페이지를 받았는지 / 로그인 벽인지 / 어떤 링크·폼·스크립트가 있었는지를
       남겨야 다음 실행 로그 한 장으로 고칠 수 있다.
     """
+    # ★ 파라미터 이름을 창작하지 않는다. selectYear/selectReprtCode 는 근거가 없는 이름이었고
+    #   (공개 코드 전수검색 0건), 그걸 붙여도 서버는 무시하고 기본(최신) 연도 목록만 준다.
+    #   그러면 `if str(year) in h` 필터에서 hits=[] 가 되어 '발견 실패'가 조용히 발생한다.
+    #   → 폼/스크립트에서 **실제 파라미터 이름을 배워서** 재시도한다. 배우지 못하면 실패로 보고.
     html = http_get(DART_BULK_PAGE, source="dart", tries=2,
-                    params={"selectYear": str(year), "selectReprtCode": reprt},
                     referer="https://opendart.fss.or.kr/")
     if not html:
         return [], "페이지 응답 없음(네트워크 차단·타임아웃·403 가능). HTTP 감사표를 확인하세요"
+    fields = dict.fromkeys(re.findall(r'<(?:input|select)[^>]+name\s*=\s*["\']([^"\']+)["\']',
+                                      html, re.I))
+    y_key = next((k for k in fields if re.search(r"year|yr|연도", k, re.I)), None)
+    r_key = next((k for k in fields if re.search(r"reprt|report|qtr|quarter|분기", k, re.I)), None)
+    if y_key:
+        params = {y_key: str(year)}
+        if r_key:
+            params[r_key] = reprt
+        h2 = http_get(DART_BULK_PAGE, source="dart", tries=1, params=params,
+                      referer=DART_BULK_PAGE)
+        if h2 and str(year) in h2:
+            html = h2
     low = html.lower()
     marks = []
     if "login" in low or "로그인" in html:
@@ -4134,14 +4151,19 @@ def _bulk_discover(year: int, reprt: str) -> Tuple[List[str], str]:
     for kw in ("downloadfnltt", "fl_nm", "downloadzip", "flnm", "download.do"):
         if kw in low:
             marks.append(f"'{kw}' 발견")
-    hits = [h for h in dict.fromkeys(_BULK_FLNM_RE.findall(html)) if str(year) in h]
-    # 폼/앵커에서 실제 액션 URL 과 파라미터 이름을 긁어 남긴다
+    # 확인된 DOM(셀레늄 자동화 선례): table.tb01 의 a[onclick] 마지막 인자가 실제 파일명이다.
+    hits = list(dict.fromkeys(
+        [m for m in _BULK_FLNM_RE.findall(html)] +
+        [a for a in re.findall(r"['\"]([^'\"]*\.(?:zip|txt))['\"]", html, re.I)
+         if re.match(r"^20\d{2}_", a)]))
+    hits = [h for h in hits if str(year) in h]
     acts = dict.fromkeys(re.findall(r'(?:action|href)\s*=\s*["\']([^"\']*(?:down|fnltt)[^"\']*)["\']',
                                     html, re.I))
-    names = dict.fromkeys(re.findall(r'<input[^>]+name\s*=\s*["\']([^"\']+)["\']', html, re.I))
+    fns = dict.fromkeys(re.findall(r'onclick\s*=\s*["\'](?:javascript:)?\s*([A-Za-z_$][\w$]*)\s*\(',
+                                   html, re.I))
     diag = (f"HTML {len(html):,}자 · 후보 {len(hits)}개 · "
             f"{', '.join(marks) if marks else '단서 없음'} · "
-            f"액션 {list(acts)[:3]} · 폼필드 {list(names)[:6]}")
+            f"액션 {list(acts)[:3]} · 폼필드 {list(fields)[:6]} · onclick함수 {list(fns)[:4]}")
     return hits, diag
 
 
@@ -4261,8 +4283,10 @@ def fetch_dart_bulk(years: Sequence[int], reprts: Sequence[str]) -> pd.DataFrame
         for y, r in tqdm(jobs, desc="DART 벌크", ncols=88, leave=False):
             names, diag = _bulk_discover(y, r)
             if not names:
-                names = _bulk_candidates(y, r)
-                LOG.debug(f"벌크 {y}/{REPRT_NAME.get(r, r)} 발견 실패 → 추측 후보 사용 · {diag}")
+                # 추측 후보를 만들지 않는다(성공확률 0 · 원인만 가림). 즉시 폴백으로 내려간다.
+                LOG.debug(f"벌크 {y}/{REPRT_NAME.get(r, r)} 목록 발견 실패 → 건너뜀 · {diag}")
+                fail_q.append((y, r))
+                continue
             frames = []
             for fl in names:
                 raw = _bulk_fetch_one(fl)
@@ -4309,7 +4333,7 @@ def fetch_dart_bulk(years: Sequence[int], reprts: Sequence[str]) -> pd.DataFrame
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 DART_MULTI_BATCH = 100
 _FS_KEEP = ["corp_code", "stock_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
-            "account_id", "account_nm", "thstrm_amount", "rcept_no"]
+            "account_id", "account_nm", "thstrm_amount", "rcept_no", "restated"]
 
 
 def fetch_dart_multi(corp_codes: Sequence[str], years: Sequence[int],
@@ -4390,23 +4414,61 @@ def fetch_dart_multi(corp_codes: Sequence[str], years: Sequence[int],
 DART_FS_FREQ = "annual"          # "annual"(약 2일) | "quarterly"(약 6일)
 
 
+DART_MIN_YEAR = 2015          # OpenDART 재무 API 는 2015년 이후만 제공한다(그 이전 호출은 순낭비)
+# 사업보고서 응답에는 전기(frmtrm_amount)·전전기(bfefrmtrm_amount)가 함께 온다.
+_PRIOR_COLS = (("frmtrm_amount", 1), ("bfefrmtrm_amount", 2))
+
+
 def _fs_one(job) -> Optional[pd.DataFrame]:
+    """(corp, year, reprt) 1건. 사업보고서면 전기·전전기 비교치도 함께 수확한다.
+
+    ★★ PIT 주의 — 이 수확은 '콜 수를 1/3 로 줄이는' 용도가 **아니다** ★★
+      전기·전전기 금액은 그 보고서가 제출된 시점에 비로소 알 수 있다. 그러므로
+      knowledge_date 는 **원 보고서의 접수일이 아니라 이 보고서의 접수일**이다.
+      (게다가 소급 재작성된 값일 수 있어 원 공시치와 다르다 — restated=True 로 표시한다)
+
+      만약 "FY2025 한 번 호출해서 2023·2024 를 채우자" 라고 하면, 2024년 백테스트 시점에
+      2026년에야 알 수 있는 값을 쓰게 된다. 그건 정확히 미래누수다.
+      그래서 이 수확분은 ① 항상 이 보고서의 rcept_no 를 달고 ② 원 공시가 없는 (회사,연도)
+      조합을 메우는 용도로만 쓴다. 연도를 건너뛰며 호출하지 않는다.
+
+      실익은 '콜 절감'이 아니라 **YoY 계산의 정합성**이다. t 시점에 알 수 있는 당기값과
+      전기값이 같은 문서에서 나오므로 회계기준 변경·재작성으로 인한 불연속이 사라진다.
+    """
     corp, year, reprt = job
+    if int(year) < DART_MIN_YEAR:
+        return None
     # 연결(CFS) 우선, 없으면 개별(OFS). 순서를 바꾸면 지주사에서 매출이 통째로 달라진다.
     for fs_div in ("CFS", "OFS"):
         js = dart_api("fnlttSinglAcntAll.json",
                       {"corp_code": corp, "bsns_year": str(year),
                        "reprt_code": reprt, "fs_div": fs_div})
-        if js and isinstance(js.get("list"), list) and js["list"]:
-            d = pd.DataFrame(js["list"])
-            for c in _FS_KEEP:
-                if c not in d.columns:
-                    d[c] = None
-            d["corp_code"] = corp
-            d["bsns_year"] = int(year)
-            d["reprt_code"] = str(reprt)
-            d["fs_div"] = fs_div
-            return d[_FS_KEEP]
+        if not (js and isinstance(js.get("list"), list) and js["list"]):
+            continue
+        d = pd.DataFrame(js["list"])
+        for c in _FS_KEEP:
+            if c not in d.columns:
+                d[c] = None
+        d["corp_code"] = corp
+        d["bsns_year"] = int(year)
+        d["reprt_code"] = str(reprt)
+        d["fs_div"] = fs_div
+        d["restated"] = False
+        out = [d[_FS_KEEP]]
+        if str(reprt) == REPRT_CODES["FY"]:
+            for src_col, back in _PRIOR_COLS:
+                if src_col not in d.columns:
+                    continue
+                p = d.copy()
+                p["thstrm_amount"] = p[src_col]
+                p["bsns_year"] = int(year) - back
+                p["restated"] = True
+                p = p[p["thstrm_amount"].notna()]
+                # rcept_no 는 **이 보고서의 것**을 그대로 유지한다 → knowledge_date 가
+                # 자동으로 '이 보고서 접수일'이 되어 PIT 가 지켜진다.
+                if len(p) and int(year) - back >= DART_MIN_YEAR - 2:
+                    out.append(p[_FS_KEEP])
+        return pd.concat(out, ignore_index=True)
     return None
 
 
@@ -4434,7 +4496,7 @@ def fetch_dart_full(corp_codes: Sequence[str], years: Sequence[int],
     corp_sorted = sorted((str(c) for c in corp_codes), key=lambda c: (order.get(c, 10 ** 9), c))
     jobs = [(c, y, r) for y in sorted(years, reverse=True)      # 최근 연도 우선
             for c in corp_sorted for r in reprts
-            if (c, int(y), str(r)) not in done]
+            if int(y) >= DART_MIN_YEAR and (c, int(y), str(r)) not in done]
     if RUN_MODE == "CACHED":
         jobs = []
 
@@ -4454,8 +4516,13 @@ def fetch_dart_full(corp_codes: Sequence[str], years: Sequence[int],
     if not frames:
         return pd.DataFrame(columns=_FS_KEEP)
     F = pd.concat(frames, ignore_index=True)
+    # ★ 원 공시(restated=False)가 재작성 수확치(True)를 항상 이긴다. 원 공시가 knowledge_date
+    #   가 더 이르고(= 그 시점에 실제로 알 수 있었고) 값도 당시 공시된 그대로이기 때문이다.
+    if "restated" in F.columns:
+        F["restated"] = F["restated"].fillna(True).astype(bool)
+        F = F.sort_values("restated", kind="stable")
     F = F.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id",
-                           "account_nm"], keep="last")
+                           "account_nm"], keep="first")
     if got:
         VAULT.put_table("dart_fnltt_raw", F, scope="shared", domain="dart",
                         source="opendart fnlttSinglAcntAll")
@@ -8435,8 +8502,6 @@ def run_canary(sample_codes: Sequence[str], sample_corps: Sequence[str]) -> pd.D
         k1_detail = "DART_API_KEY 미입력"
         if DART_API_KEY:
             names, diag = _bulk_discover(2016, REPRT_CODES["Q1"])
-            if not names:
-                names = _bulk_candidates(2016, REPRT_CODES["Q1"])
             raw, used = None, ""
             for fl in names[:8]:
                 if time.time() - t0 > 180:
@@ -8865,6 +8930,30 @@ def run_contract_tests(strict: bool = True) -> bool:
     _t("DATE-YY", "두 자리 연도가 연·일 뒤바뀜 없이 해석된다",
        list(ymd.dt.strftime("%Y-%m-%d")) == ["2026-01-19", "2019-12-31"],
        f"{list(ymd.dt.strftime('%Y-%m-%d'))} (자동추론이면 2019-01-26 / 2031-12-19)")
+
+    # ── 전기/전전기 수확이 미래누수를 만들지 않는다 ──────────────────────────────────
+    #   사업보고서 응답의 전기·전전기 금액은 **그 보고서가 제출된 시점에** 비로소 알 수 있다.
+    #   원 보고서의 접수일을 붙이면 그게 곧 미래누수다(2026년 문서의 값을 2024년에 사용).
+    _saved_api = globals().get("dart_api")
+    try:
+        globals()["dart_api"] = lambda ep, params, **kw: {
+            "status": "000",
+            "list": [{"account_id": "ifrs-full_Revenue", "account_nm": "매출액", "sj_div": "IS",
+                      "thstrm_amount": "300", "frmtrm_amount": "200",
+                      "bfefrmtrm_amount": "100", "rcept_no": "20260315000001"}]}
+        h = _fs_one(("00126380", 2025, REPRT_CODES["FY"]))
+        yrs = sorted(h["bsns_year"].tolist()) if nonempty(h) else []
+        one_rcept = (h["rcept_no"].astype(str).nunique() == 1) if nonempty(h) else False
+        n_res = int(h["restated"].sum()) if nonempty(h) else -1
+        _t("HARVEST", "전기·전전기 수확이 '그 보고서의 접수일'을 그대로 단다 (PIT 보존)",
+           yrs == [2023, 2024, 2025] and one_rcept and n_res == 2,
+           f"연도 {yrs} · rcept_no 단일 {one_rcept} · restated {n_res}건 "
+           f"(원 보고서 접수일을 붙이면 그게 미래누수다)")
+    except Exception as e:                                       # noqa
+        _t("HARVEST", "전기·전전기 수확이 PIT 를 보존한다", False, f"{type(e).__name__}: {e}")
+    finally:
+        if _saved_api is not None:
+            globals()["dart_api"] = _saved_api
 
     # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
     _t(*_vault_integrity_test())

@@ -61,8 +61,6 @@ def run_canary(sample_codes: Sequence[str], sample_corps: Sequence[str]) -> pd.D
         k1_detail = "DART_API_KEY 미입력"
         if DART_API_KEY:
             names, diag = _bulk_discover(2016, REPRT_CODES["Q1"])
-            if not names:
-                names = _bulk_candidates(2016, REPRT_CODES["Q1"])
             raw, used = None, ""
             for fl in names[:8]:
                 if time.time() - t0 > 180:

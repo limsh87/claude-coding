@@ -288,6 +288,30 @@ def run_contract_tests(strict: bool = True) -> bool:
        list(ymd.dt.strftime("%Y-%m-%d")) == ["2026-01-19", "2019-12-31"],
        f"{list(ymd.dt.strftime('%Y-%m-%d'))} (자동추론이면 2019-01-26 / 2031-12-19)")
 
+    # ── 전기/전전기 수확이 미래누수를 만들지 않는다 ──────────────────────────────────
+    #   사업보고서 응답의 전기·전전기 금액은 **그 보고서가 제출된 시점에** 비로소 알 수 있다.
+    #   원 보고서의 접수일을 붙이면 그게 곧 미래누수다(2026년 문서의 값을 2024년에 사용).
+    _saved_api = globals().get("dart_api")
+    try:
+        globals()["dart_api"] = lambda ep, params, **kw: {
+            "status": "000",
+            "list": [{"account_id": "ifrs-full_Revenue", "account_nm": "매출액", "sj_div": "IS",
+                      "thstrm_amount": "300", "frmtrm_amount": "200",
+                      "bfefrmtrm_amount": "100", "rcept_no": "20260315000001"}]}
+        h = _fs_one(("00126380", 2025, REPRT_CODES["FY"]))
+        yrs = sorted(h["bsns_year"].tolist()) if nonempty(h) else []
+        one_rcept = (h["rcept_no"].astype(str).nunique() == 1) if nonempty(h) else False
+        n_res = int(h["restated"].sum()) if nonempty(h) else -1
+        _t("HARVEST", "전기·전전기 수확이 '그 보고서의 접수일'을 그대로 단다 (PIT 보존)",
+           yrs == [2023, 2024, 2025] and one_rcept and n_res == 2,
+           f"연도 {yrs} · rcept_no 단일 {one_rcept} · restated {n_res}건 "
+           f"(원 보고서 접수일을 붙이면 그게 미래누수다)")
+    except Exception as e:                                       # noqa
+        _t("HARVEST", "전기·전전기 수확이 PIT 를 보존한다", False, f"{type(e).__name__}: {e}")
+    finally:
+        if _saved_api is not None:
+            globals()["dart_api"] = _saved_api
+
     # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
     _t(*_vault_integrity_test())
 
