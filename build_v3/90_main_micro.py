@@ -393,7 +393,8 @@ def _run_pipeline_from_ctx(ctx: dict, months: pd.DatetimeIndex, smoke: bool) -> 
     """수집 결과(ctx)를 받아 패널→스코어→백테스트까지. 합성/실데이터가 같은 경로를 탄다."""
     if ctx.get("synthetic"):
         # 합성 ctx 는 원시 형태이므로 실데이터와 같은 정제 경로를 통과시킨다.
-        ctx = dict(ctx)
+        # ★ 복사본을 만들면 여기서 채운 reports/analysts/links 가 호출자의 ctx 에 반영되지
+        #   않아, 원장 무결성 감사표가 '리포트 없음'으로 렌더링된다. 원본을 그대로 채운다.
         ctx["px_daily"] = ctx["px"]
         ctx["panel"] = build_price_panel(ctx["px"], months)
         ctx["snapshots"] = ctx["snap"][["snap_date", "code"]].assign(market="KOSDAQ")
@@ -403,6 +404,13 @@ def _run_pipeline_from_ctx(ctx: dict, months: pd.DatetimeIndex, smoke: bool) -> 
         Q = add_micro_sensors_quarterly(W)
         PIT.register("dart_micro", Q, key_cols=["corp_code"])
         ctx["fin_q"] = Q
+        # 리포트 원장·애널리스트 원장도 실경로와 동일하게 조립한다(원장 감사표 예행연습).
+        try:
+            _rep = build_report_master([ctx.get("rep")], ctx["sec"])
+            _A, _L = build_analyst_ledger(_rep) if len(_rep) else (pd.DataFrame(), pd.DataFrame())
+            ctx["reports"], ctx["analysts"], ctx["links"] = _rep, _A, _L
+        except Exception as e:                                         # noqa
+            LOG.warn(f"합성 리포트 원장 조립 실패({type(e).__name__}) — 원장 감사표는 건너뜁니다.")
     P, uni, tables = build_panel(ctx, months)
     M, bts, bench_ew, bench_idx = score_and_backtest(P, months, uni, tables)
     return {"P": M, "uni": uni, "bts": bts, "bench_ew": bench_ew,

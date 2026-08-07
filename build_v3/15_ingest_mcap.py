@@ -340,8 +340,8 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
             except Exception as e:                                     # noqa
                 LOG.debug(f"DART 주식총수 결합 실패: {type(e).__name__}")
 
-    # ③ FDR 현재 상장주식수 — ★비PIT 최후수단
-    if shares.isna().any():
+    # ③ FDR 현재 상장주식수 — ★비PIT 최후수단 (설정으로 끌 수 있다)
+    if shares.isna().any() and MCAP_ALLOW_NONPIT_FALLBACK:
         F = _shares_from_fdr()
         if len(F):
             m = base["code"].map(F.set_index("code")["shares_now"].to_dict())
@@ -350,6 +350,11 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
             n_add = int(shares.notna().sum()) - n_before
             if n_add:
                 src_used["FDR 현재값(비PIT 근사)"] = n_add
+                LOG.warn(f"상장주식수 {n_add:,}행을 '현재 값'으로 채웠습니다 — 이 행들은 PIT 가 "
+                         f"아닙니다. 액면분할·무상증자·유상증자를 거친 종목은 과거 시총이 "
+                         f"그 배수만큼 과대평가되어 U-MICRO 밴드에서 잘못 빠질 수 있습니다. "
+                         f"엄밀한 재현이 필요하면 MCAP_ALLOW_NONPIT_FALLBACK=False 로 두고 "
+                         f"시총 미상 행을 거래대금 대리변수로 처리하세요.")
 
     # ★ 시총 = 상장주식수(as-of) × '그 달의' 종가.  스냅샷의 mcap 을 그대로 쓰지 않는다.
     #   스냅샷 격자는 분기(3/6/9/12월)이고 merge_asof 는 그 값을 앞으로 끌고 온다.

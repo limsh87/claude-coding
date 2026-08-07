@@ -429,11 +429,20 @@ def synth_context(months: pd.DatetimeIndex, n_codes: int = 140) -> dict:
     for i in rng.choice(n_codes, size=max(4, n_codes // 4), replace=False):
         for _ in range(int(rng.integers(1, 5))):
             t = pd.Timestamp(months[int(rng.integers(0, len(months)))])
-            rep_rows.append({"code": codes[i], "corp_name": f"합성{i+1:03d}",
-                             "analyst": f"애널{int(rng.integers(1, 30)):02d}",
-                             "broker": "합성증권", "target_price": float(rng.integers(3000, 20000)),
-                             "opinion": "매수", "event_date": t, "knowledge_date": t,
-                             "source": "synth", "title": "합성 리포트"})
+            _br = ["미래에셋증권", "NH투자증권", "한국투자증권", "키움증권",
+                   "합성증권"][int(rng.integers(0, 5))]
+            rep_rows.append({
+                "source": ["hankyung", "naver"][int(rng.integers(0, 2))],
+                "src_report_id": f"S{i:05d}{int(rng.integers(0, 9999)):04d}",
+                "pub_date": t, "category": "company",
+                "title": f"합성{i+1:03d}({codes[i]}) 실적 리뷰",
+                "stock_code": codes[i], "stock_name": f"합성{i+1:03d}",
+                "broker_raw": _br, "analyst_raw": f"애널{int(rng.integers(1, 30)):02d}",
+                "target_price": float(rng.integers(3000, 20000)), "opinion": "매수",
+                "pdf_url": "", "detail_url": "", "views": 0,
+                "event_date": t, "knowledge_date": t})
+    # ★ 실데이터와 같은 정제·엔티티 경로를 통과시킨다. 그래야 '리포트↔애널리스트↔종목'
+    #   원장 무결성 감사표가 스모크에서도 실제로 렌더링되어 형식을 확인할 수 있다.
     rep = pd.DataFrame(rep_rows)
 
     return {"sec": sec, "px": px, "snap": snap, "fs": fs, "actions": actions,

@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_X"
 STRATEGY_NAME      = "PACK-X 관세청 수출"
 ACTIVE_PACKS       = ["X"]
-BUILD_VERSION      = "v2.20260807.2154"
+BUILD_VERSION      = "v2.20260807.2200"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -642,6 +642,12 @@ _DIAG_RULES: List[Tuple[str, str]] = [
     (r"empty|EmptyDataError|No objects to concatenate|zero-size",
      "수집 결과가 비었습니다. 대개 ① 키 미입력 ② 조회구간에 데이터 없음 ③ 소스 구조 변경입니다. "
      "바로 위 FLOW 원장에서 어느 소스가 0행을 반환했는지 확인하세요."),
+    (r"가격 데이터를 한 종목도|서킷브레이커",
+     "가격 소스에 전혀 도달하지 못했습니다. ① 방화벽/프록시 환경이면 "
+     "raw.githubusercontent.com · fchart.stock.naver.com · data.krx.co.kr 접근을 확인하세요. "
+     "② 드라이브 캐시(krx_ohlcv_daily)가 있으면 RUN_MODE='CACHED' 로 두면 네트워크 없이 "
+     "백테스트가 됩니다. ③ 서킷브레이커는 '연속 실패'를 감지해 조기 종료한 것이므로, "
+     "네트워크가 정상인 환경에서 재실행하면 캐시에 정확히 이어서 받습니다."),
     (r"ModuleNotFoundError|ImportError",
      "패키지 누락입니다. 위 부트스트랩 로그에서 어떤 설치가 실패했는지 확인하고 수동 설치하세요."),
     (r"tz-aware|tz-naive|Cannot compare",

@@ -267,7 +267,14 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
     cand_coarse = ym + "|" + p["ind_l1"]
 
     med_fine = float(cand_fine.groupby(cand_fine).transform("size").median()) if len(p) else 0.0
-    if med_fine < min_n:
+    _crule = str(globals().get("CELL_RULE", "auto")).lower()
+    if _crule == "fine":
+        p["cell"], p["cell_l2"] = cand_fine, cand_coarse
+        LOG.info("셀 규칙: 업종 그대로 고정(CELL_RULE='fine') — 사전 지정.")
+    elif _crule == "coarse":
+        p["cell"], p["cell_l2"] = cand_coarse, ym + "|ALL"
+        LOG.info("셀 규칙: 상위 업종 고정(CELL_RULE='coarse') — 사전 지정.")
+    elif med_fine < min_n:
         med_coarse = float(cand_coarse.groupby(cand_coarse).transform("size").median()) if len(p) else 0.0
         LOG.warn(f"C14-b 발동 — 셀당 중앙값 종목수 {med_fine:.0f} < {min_n}. "
                  f"산업분류를 한 단계 상위로 올립니다(상위 기준 중앙값 {med_coarse:.0f}).")
@@ -276,6 +283,9 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
     else:
         p["cell"] = cand_fine
         p["cell_l2"] = cand_coarse
+    if _crule == "auto":
+        LOG.debug("셀 규칙: 자동 선택 — 전 구간 셀 크기 중앙값 기준입니다(설정 단계 룩어헤드). "
+                  "CELL_RULE 로 고정할 수 있습니다.")
     p["cell_l3"] = ym + "|ALL"
 
     cnt = p.groupby("cell", observed=True)["code"].transform("size")
@@ -388,8 +398,20 @@ def apply_umicro_gates(P: pd.DataFrame, uni: "Universe") -> Tuple[pd.DataFrame, 
     band_abs = gates(False)
     med_abs = float((band_abs & liq & has_px).groupby(P["month"], observed=True).sum().median()) \
         if len(P) else 0.0
-    use_pctl = med_abs < 50
-    if use_pctl:
+    rule = str(globals().get("UMICRO_BAND_RULE", "auto")).lower()
+    if rule == "rank":
+        use_pctl = False
+        LOG.info("밴드 규칙: 절대 랭크 고정(UMICRO_BAND_RULE='rank') — 사전 지정이므로 "
+                 "규칙 선택에 미래 정보가 들어가지 않습니다.")
+    elif rule == "pctl":
+        use_pctl = True
+        LOG.info("밴드 규칙: 분위 고정(UMICRO_BAND_RULE='pctl') — 사전 지정.")
+    else:
+        use_pctl = med_abs < 50
+        LOG.info("밴드 규칙: 자동 선택(UMICRO_BAND_RULE='auto'). ★규칙 선택에 전 구간 통계를 "
+                 "쓰므로 '설정 단계의 룩어헤드'입니다(신호값이 새는 것은 아닙니다). "
+                 "엄밀한 재현이 필요하면 'rank' 또는 'pctl' 로 고정하세요.")
+    if use_pctl and rule == "auto" and med_abs < 50:
         LOG.warn(f"절대 랭크 기준(>{UMICRO_MCAP_RANK_MIN})으로는 U-MICRO 가 월평균 "
                  f"{med_abs:,.0f}종목뿐입니다 (시총 랭크 산출 종목이 월 {med_ranked:,.0f}개). "
                  f"분위 기준(상위 {100*UMICRO_PCTL_MIN:.0f}% 밖)으로 전환합니다 — "

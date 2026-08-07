@@ -115,6 +115,19 @@ UMICRO_MIN_ADV_KRW   = 1e8         # 20일 평균거래대금 하한 (§7 방화
 UMICRO_SEASONING_D   = 250         # 상장 + 250거래일
 ATTRITION_GAP_TOL    = 0.20        # 2016 vs 2026 종목수 차이 허용치 → 초과 시 분위 기준 전환
 
+#    ▸ 밴드 규칙 / 셀 세분화를 '사전에' 고정할지, 전 구간 통계로 자동 선택할지.
+#      "auto" 는 편의를 위한 기본값이지만, 규칙 선택에 전 구간 통계(2026년 상장사 수 등)를
+#      쓰므로 엄밀히는 '설정 단계의 룩어헤드'다. 신호값이 새는 것은 아니지만, 논문급
+#      엄밀성이 필요하면 "rank"/"pctl", "fine"/"coarse" 로 고정하고 그 사실을 명시하세요.
+#      어느 쪽이든 실행 시 어떤 규칙이 쓰였는지 로그와 감쇠표에 그대로 찍힙니다.
+UMICRO_BAND_RULE     = "auto"      # "auto" | "rank"(절대 랭크) | "pctl"(분위)
+CELL_RULE            = "auto"      # "auto" | "fine"(업종 그대로) | "coarse"(상위 업종)
+
+#    ▸ 시총 스냅샷을 못 얻은 구간에서 '현재 상장주식수'로 근사할지.
+#      True 면 커버리지가 올라가지만 액면분할·유상증자가 잦았던 종목의 과거 시총이
+#      과대평가된다(비PIT). False 면 그런 행은 시총 미상으로 남고 거래대금 대리변수로 판정한다.
+MCAP_ALLOW_NONPIT_FALLBACK = True
+
 # ── ⑦ 방화벽 / 거부권 임계 (§7 · §9) ────────────────────────────────────────────────────────
 FW_VALUE_RANK_MAX    = 0.30        # 딥밸류 진입: PBR·PER 결합 밸류 랭크 하위 30%
 FW_OPCF_NEG_STREAK   = 4           # 최근 N분기 연속 영업CF<0
@@ -184,7 +197,7 @@ STOP_ON_KILL_CRITERIA = True  # §12 킬 기준 위반 시 즉시 중단하고 �
 
 STRATEGY_ID     = "TCD_V3_MICRO_FW"
 STRATEGY_NAME   = "MICRO-FW · U-MICRO 방화벽 중심 전략"
-BUILD_VERSION   = "v3.20260807.2153"
+BUILD_VERSION   = "v3.20260807.2202"
 ACTIVE_PACKS: list = []          # v3 전략2는 센서팩을 쓰지 않는다(경량화). 호환용 빈 목록.
 
 # 공공데이터포털/관세청 키는 이 전략에서 쓰지 않는다(경량화). 코어 호환을 위해 빈 값만 유지.
@@ -669,6 +682,12 @@ _DIAG_RULES: List[Tuple[str, str]] = [
     (r"empty|EmptyDataError|No objects to concatenate|zero-size",
      "수집 결과가 비었습니다. 대개 ① 키 미입력 ② 조회구간에 데이터 없음 ③ 소스 구조 변경입니다. "
      "바로 위 FLOW 원장에서 어느 소스가 0행을 반환했는지 확인하세요."),
+    (r"가격 데이터를 한 종목도|서킷브레이커",
+     "가격 소스에 전혀 도달하지 못했습니다. ① 방화벽/프록시 환경이면 "
+     "raw.githubusercontent.com · fchart.stock.naver.com · data.krx.co.kr 접근을 확인하세요. "
+     "② 드라이브 캐시(krx_ohlcv_daily)가 있으면 RUN_MODE='CACHED' 로 두면 네트워크 없이 "
+     "백테스트가 됩니다. ③ 서킷브레이커는 '연속 실패'를 감지해 조기 종료한 것이므로, "
+     "네트워크가 정상인 환경에서 재실행하면 캐시에 정확히 이어서 받습니다."),
     (r"ModuleNotFoundError|ImportError",
      "패키지 누락입니다. 위 부트스트랩 로그에서 어떤 설치가 실패했는지 확인하고 수동 설치하세요."),
     (r"tz-aware|tz-naive|Cannot compare",
@@ -5778,8 +5797,8 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
             except Exception as e:                                     # noqa
                 LOG.debug(f"DART 주식총수 결합 실패: {type(e).__name__}")
 
-    # ③ FDR 현재 상장주식수 — ★비PIT 최후수단
-    if shares.isna().any():
+    # ③ FDR 현재 상장주식수 — ★비PIT 최후수단 (설정으로 끌 수 있다)
+    if shares.isna().any() and MCAP_ALLOW_NONPIT_FALLBACK:
         F = _shares_from_fdr()
         if len(F):
             m = base["code"].map(F.set_index("code")["shares_now"].to_dict())
@@ -5788,6 +5807,11 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
             n_add = int(shares.notna().sum()) - n_before
             if n_add:
                 src_used["FDR 현재값(비PIT 근사)"] = n_add
+                LOG.warn(f"상장주식수 {n_add:,}행을 '현재 값'으로 채웠습니다 — 이 행들은 PIT 가 "
+                         f"아닙니다. 액면분할·무상증자·유상증자를 거친 종목은 과거 시총이 "
+                         f"그 배수만큼 과대평가되어 U-MICRO 밴드에서 잘못 빠질 수 있습니다. "
+                         f"엄밀한 재현이 필요하면 MCAP_ALLOW_NONPIT_FALLBACK=False 로 두고 "
+                         f"시총 미상 행을 거래대금 대리변수로 처리하세요.")
 
     # ★ 시총 = 상장주식수(as-of) × '그 달의' 종가.  스냅샷의 mcap 을 그대로 쓰지 않는다.
     #   스냅샷 격자는 분기(3/6/9/12월)이고 merge_asof 는 그 값을 앞으로 끌고 온다.
@@ -6426,7 +6450,14 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
     cand_coarse = ym + "|" + p["ind_l1"]
 
     med_fine = float(cand_fine.groupby(cand_fine).transform("size").median()) if len(p) else 0.0
-    if med_fine < min_n:
+    _crule = str(globals().get("CELL_RULE", "auto")).lower()
+    if _crule == "fine":
+        p["cell"], p["cell_l2"] = cand_fine, cand_coarse
+        LOG.info("셀 규칙: 업종 그대로 고정(CELL_RULE='fine') — 사전 지정.")
+    elif _crule == "coarse":
+        p["cell"], p["cell_l2"] = cand_coarse, ym + "|ALL"
+        LOG.info("셀 규칙: 상위 업종 고정(CELL_RULE='coarse') — 사전 지정.")
+    elif med_fine < min_n:
         med_coarse = float(cand_coarse.groupby(cand_coarse).transform("size").median()) if len(p) else 0.0
         LOG.warn(f"C14-b 발동 — 셀당 중앙값 종목수 {med_fine:.0f} < {min_n}. "
                  f"산업분류를 한 단계 상위로 올립니다(상위 기준 중앙값 {med_coarse:.0f}).")
@@ -6435,6 +6466,9 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
     else:
         p["cell"] = cand_fine
         p["cell_l2"] = cand_coarse
+    if _crule == "auto":
+        LOG.debug("셀 규칙: 자동 선택 — 전 구간 셀 크기 중앙값 기준입니다(설정 단계 룩어헤드). "
+                  "CELL_RULE 로 고정할 수 있습니다.")
     p["cell_l3"] = ym + "|ALL"
 
     cnt = p.groupby("cell", observed=True)["code"].transform("size")
@@ -6547,8 +6581,20 @@ def apply_umicro_gates(P: pd.DataFrame, uni: "Universe") -> Tuple[pd.DataFrame, 
     band_abs = gates(False)
     med_abs = float((band_abs & liq & has_px).groupby(P["month"], observed=True).sum().median()) \
         if len(P) else 0.0
-    use_pctl = med_abs < 50
-    if use_pctl:
+    rule = str(globals().get("UMICRO_BAND_RULE", "auto")).lower()
+    if rule == "rank":
+        use_pctl = False
+        LOG.info("밴드 규칙: 절대 랭크 고정(UMICRO_BAND_RULE='rank') — 사전 지정이므로 "
+                 "규칙 선택에 미래 정보가 들어가지 않습니다.")
+    elif rule == "pctl":
+        use_pctl = True
+        LOG.info("밴드 규칙: 분위 고정(UMICRO_BAND_RULE='pctl') — 사전 지정.")
+    else:
+        use_pctl = med_abs < 50
+        LOG.info("밴드 규칙: 자동 선택(UMICRO_BAND_RULE='auto'). ★규칙 선택에 전 구간 통계를 "
+                 "쓰므로 '설정 단계의 룩어헤드'입니다(신호값이 새는 것은 아닙니다). "
+                 "엄밀한 재현이 필요하면 'rank' 또는 'pctl' 로 고정하세요.")
+    if use_pctl and rule == "auto" and med_abs < 50:
         LOG.warn(f"절대 랭크 기준(>{UMICRO_MCAP_RANK_MIN})으로는 U-MICRO 가 월평균 "
                  f"{med_abs:,.0f}종목뿐입니다 (시총 랭크 산출 종목이 월 {med_ranked:,.0f}개). "
                  f"분위 기준(상위 {100*UMICRO_PCTL_MIN:.0f}% 밖)으로 전환합니다 — "
@@ -8495,11 +8541,20 @@ def synth_context(months: pd.DatetimeIndex, n_codes: int = 140) -> dict:
     for i in rng.choice(n_codes, size=max(4, n_codes // 4), replace=False):
         for _ in range(int(rng.integers(1, 5))):
             t = pd.Timestamp(months[int(rng.integers(0, len(months)))])
-            rep_rows.append({"code": codes[i], "corp_name": f"합성{i+1:03d}",
-                             "analyst": f"애널{int(rng.integers(1, 30)):02d}",
-                             "broker": "합성증권", "target_price": float(rng.integers(3000, 20000)),
-                             "opinion": "매수", "event_date": t, "knowledge_date": t,
-                             "source": "synth", "title": "합성 리포트"})
+            _br = ["미래에셋증권", "NH투자증권", "한국투자증권", "키움증권",
+                   "합성증권"][int(rng.integers(0, 5))]
+            rep_rows.append({
+                "source": ["hankyung", "naver"][int(rng.integers(0, 2))],
+                "src_report_id": f"S{i:05d}{int(rng.integers(0, 9999)):04d}",
+                "pub_date": t, "category": "company",
+                "title": f"합성{i+1:03d}({codes[i]}) 실적 리뷰",
+                "stock_code": codes[i], "stock_name": f"합성{i+1:03d}",
+                "broker_raw": _br, "analyst_raw": f"애널{int(rng.integers(1, 30)):02d}",
+                "target_price": float(rng.integers(3000, 20000)), "opinion": "매수",
+                "pdf_url": "", "detail_url": "", "views": 0,
+                "event_date": t, "knowledge_date": t})
+    # ★ 실데이터와 같은 정제·엔티티 경로를 통과시킨다. 그래야 '리포트↔애널리스트↔종목'
+    #   원장 무결성 감사표가 스모크에서도 실제로 렌더링되어 형식을 확인할 수 있다.
     rep = pd.DataFrame(rep_rows)
 
     return {"sec": sec, "px": px, "snap": snap, "fs": fs, "actions": actions,
@@ -8901,7 +8956,8 @@ def _run_pipeline_from_ctx(ctx: dict, months: pd.DatetimeIndex, smoke: bool) -> 
     """수집 결과(ctx)를 받아 패널→스코어→백테스트까지. 합성/실데이터가 같은 경로를 탄다."""
     if ctx.get("synthetic"):
         # 합성 ctx 는 원시 형태이므로 실데이터와 같은 정제 경로를 통과시킨다.
-        ctx = dict(ctx)
+        # ★ 복사본을 만들면 여기서 채운 reports/analysts/links 가 호출자의 ctx 에 반영되지
+        #   않아, 원장 무결성 감사표가 '리포트 없음'으로 렌더링된다. 원본을 그대로 채운다.
         ctx["px_daily"] = ctx["px"]
         ctx["panel"] = build_price_panel(ctx["px"], months)
         ctx["snapshots"] = ctx["snap"][["snap_date", "code"]].assign(market="KOSDAQ")
@@ -8911,6 +8967,13 @@ def _run_pipeline_from_ctx(ctx: dict, months: pd.DatetimeIndex, smoke: bool) -> 
         Q = add_micro_sensors_quarterly(W)
         PIT.register("dart_micro", Q, key_cols=["corp_code"])
         ctx["fin_q"] = Q
+        # 리포트 원장·애널리스트 원장도 실경로와 동일하게 조립한다(원장 감사표 예행연습).
+        try:
+            _rep = build_report_master([ctx.get("rep")], ctx["sec"])
+            _A, _L = build_analyst_ledger(_rep) if len(_rep) else (pd.DataFrame(), pd.DataFrame())
+            ctx["reports"], ctx["analysts"], ctx["links"] = _rep, _A, _L
+        except Exception as e:                                         # noqa
+            LOG.warn(f"합성 리포트 원장 조립 실패({type(e).__name__}) — 원장 감사표는 건너뜁니다.")
     P, uni, tables = build_panel(ctx, months)
     M, bts, bench_ew, bench_idx = score_and_backtest(P, months, uni, tables)
     return {"P": M, "uni": uni, "bts": bts, "bench_ew": bench_ew,
