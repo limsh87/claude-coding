@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_P"
 STRATEGY_NAME      = "PACK-P 조달청 낙찰"
 ACTIVE_PACKS       = ["P"]
-BUILD_VERSION      = "v2.20260807.2200"
+BUILD_VERSION      = "v2.20260807.2233"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -264,13 +264,17 @@ _REQUIRED = [
     ("numpy",     "numpy",              True,  "모든 수치연산"),
     ("pandas",    "pandas",             True,  "모든 패널 처리"),
     ("pyarrow",   "pyarrow",            True,  "parquet 캐시(L1 영속화)"),
-    ("scipy",     "scipy",              True,  "통계검정 / 회귀"),
+    # scipy 는 이 파일에서 직접 import 하지 않는다(HAC t·회귀는 numpy 로 구현).
+    # 필수로 두면 설치 실패 시 SystemExit 로 실행 자체가 막히므로 선택으로 내린다.
+    # 단 pandas 의 corr(method="spearman") 은 내부적으로 scipy 를 요구하므로, 그 경로를
+    # 쓰는 코드를 추가한다면 여기서 다시 필수로 올려야 한다.
     ("requests",  "requests",           True,  "모든 HTTP 수집"),
     ("bs4",       "beautifulsoup4",     True,  "리서치 리스트 파싱"),
     ("lxml",      "lxml",               True,  "HTML/XML 고속 파서"),
     ("tqdm",      "tqdm",               True,  "진행률 표시"),
 ]
 _OPTIONAL = [
+    ("scipy",     "scipy",              "통계검정(현재 미사용 — pandas spearman 사용 시 필요)"),
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
@@ -898,7 +902,9 @@ def month_end(x) -> Optional[pd.Timestamp]:
 
 
 def month_range(start, end) -> pd.DatetimeIndex:
-    return pd.date_range(month_end(start), month_end(end), freq="ME")
+    # ★ "ME" 별칭은 pandas 2.2 이상에서만 유효하다. offset 객체는 1.x~3.x 전부에서 동작한다.
+    #   (Colab 의 pandas 가 2.0/2.1 이면 이 한 줄 때문에 실행이 시작도 못 하고 죽는다)
+    return pd.date_range(month_end(start), month_end(end), freq=pd.offsets.MonthEnd())
 
 
 # ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
@@ -1082,9 +1088,12 @@ def read_jsonl(path: str) -> List[dict]:
 
 def append_jsonl(path: str, rows: Iterable[dict]):
     _ensure_dir(path)
+    # ★ 줄마다 write 하면 기본 8KiB 버퍼가 임의 지점에서 flush 되어, 두 노트북이 동시에
+    #   append 할 때 한 줄이 반토막 난 채 섞인다(read_jsonl 이 그 줄을 조용히 버린다).
+    #   한 번의 write 로 넘기면 대부분의 경우 원자적으로 처리된다.
+    blob = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows)
     with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        f.write(blob)
         f.flush()
         try:
             os.fsync(f.fileno())
@@ -1715,7 +1724,12 @@ class Vault:
             #   drop_duplicates(uid) 가 그 파일 전체를 단 한 줄로 붕괴시킨다 = 인덱스 유실.
             #   절대 1원칙에 정면으로 반하므로, 결측 uid 는 행 내용 해시로 개별 부여한다.
             if "uid" not in idx.columns:
-                idx["uid"] = np.nan
+                # ★ dtype 주의: np.nan 으로 만들면 float64 컬럼이 되고, 아래에서 sha1 문자열을
+                #   .loc 로 넣는 순간 pandas 2.x 는 FutureWarning, **pandas 3.0 은 TypeError** 다.
+                #   그런데 이 코드는 critical 스테이지(L0.VAULT) 안이라 실행 전체가 죽는다.
+                #   트리거도 흔하다 — uid 컬럼이 없는 레거시 인덱스 파일 하나면 충분하고,
+                #   이 파일은 v2 캐시 루트를 그대로 재사용하라고 안내한다.
+                idx["uid"] = pd.Series(np.nan, index=idx.index, dtype=object)
             miss = idx["uid"].isna() | (idx["uid"].astype(str).str.strip().isin(("", "nan", "None")))
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
@@ -1734,7 +1748,8 @@ class Vault:
 
         for c in INDEX_COLUMNS:
             if c not in idx.columns:
-                idx[c] = np.nan
+                # 같은 이유로 object 로 만든다 — INDEX_COLUMNS 는 대부분 문자열 컬럼이다.
+                idx[c] = pd.Series(np.nan, index=idx.index, dtype=object)
         idx["scope"] = idx["scope"].fillna(scope)
         with self._lk:
             self._idx[scope] = idx
@@ -8334,7 +8349,7 @@ def run_rehearsal(strict: bool = True) -> bool:
 def make_synthetic(n_codes: int = 160, n_months: int = 60, seed: int = SEED) -> dict:
     rng = np.random.default_rng(seed)
     months = pd.date_range(as_ts(BACKTEST_END) - pd.DateOffset(months=n_months - 1),
-                           as_ts(BACKTEST_END), freq="ME")
+                           as_ts(BACKTEST_END), freq=pd.offsets.MonthEnd())
     codes = [f"{i+1:06d}" for i in range(n_codes)]
     inds = rng.choice(["화학", "전자부품", "건설", "기계", "소프트웨어"], n_codes)
 

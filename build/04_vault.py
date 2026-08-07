@@ -179,7 +179,12 @@ class Vault:
             #   drop_duplicates(uid) 가 그 파일 전체를 단 한 줄로 붕괴시킨다 = 인덱스 유실.
             #   절대 1원칙에 정면으로 반하므로, 결측 uid 는 행 내용 해시로 개별 부여한다.
             if "uid" not in idx.columns:
-                idx["uid"] = np.nan
+                # ★ dtype 주의: np.nan 으로 만들면 float64 컬럼이 되고, 아래에서 sha1 문자열을
+                #   .loc 로 넣는 순간 pandas 2.x 는 FutureWarning, **pandas 3.0 은 TypeError** 다.
+                #   그런데 이 코드는 critical 스테이지(L0.VAULT) 안이라 실행 전체가 죽는다.
+                #   트리거도 흔하다 — uid 컬럼이 없는 레거시 인덱스 파일 하나면 충분하고,
+                #   이 파일은 v2 캐시 루트를 그대로 재사용하라고 안내한다.
+                idx["uid"] = pd.Series(np.nan, index=idx.index, dtype=object)
             miss = idx["uid"].isna() | (idx["uid"].astype(str).str.strip().isin(("", "nan", "None")))
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
@@ -198,7 +203,8 @@ class Vault:
 
         for c in INDEX_COLUMNS:
             if c not in idx.columns:
-                idx[c] = np.nan
+                # 같은 이유로 object 로 만든다 — INDEX_COLUMNS 는 대부분 문자열 컬럼이다.
+                idx[c] = pd.Series(np.nan, index=idx.index, dtype=object)
         idx["scope"] = idx["scope"].fillna(scope)
         with self._lk:
             self._idx[scope] = idx

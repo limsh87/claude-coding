@@ -45,7 +45,7 @@ def run_contracts() -> bool:
 
     # ── C2: 상장폐지 종목 포함 + 정리매매 없으면 -100% ────────────────────────────────
     def c2():
-        months = pd.date_range("2020-01-31", periods=3, freq="ME")
+        months = pd.date_range("2020-01-31", periods=3, freq=pd.offsets.MonthEnd())
         sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["a", "b"],
                             "market": ["KOSPI"] * 2,
                             "listing_date": pd.to_datetime(["2010-01-01"] * 2),
@@ -84,7 +84,7 @@ def run_contracts() -> bool:
                             "delisting_date": [pd.NaT, pd.NaT], "industry": ["X", "X"],
                             "corp_code": ["A", "B"], "src": ["t", "t"]})
         px = pd.DataFrame({"code": ["000001"] * 3,
-                           "date": pd.date_range("2020-01-31", periods=3, freq="ME")})
+                           "date": pd.date_range("2020-01-31", periods=3, freq=pd.offsets.MonthEnd())})
         uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
         if "000002" in uni.at(pd.Timestamp("2020-06-30")):
             return False, "2023년 상장 종목이 2020년 유니버스에 있습니다 — 미래누수."
@@ -175,7 +175,7 @@ def run_contracts() -> bool:
 
     # ── 비용 단조성: 비용이 커지면 수익률은 낮아져야 한다 ────────────────────────────
     def costmono():
-        months = pd.date_range("2020-01-31", periods=6, freq="ME")
+        months = pd.date_range("2020-01-31", periods=6, freq=pd.offsets.MonthEnd())
         rows = []
         for m in months:
             for i in range(10):
@@ -228,7 +228,7 @@ def run_contracts() -> bool:
 
     # ── 거래정지→수개월 뒤 상장폐지 경로도 -100% 여야 한다 ─────────────────────────────
     def delist_gap():
-        months = pd.date_range("2019-04-30", periods=2, freq="ME")
+        months = pd.date_range("2019-04-30", periods=2, freq=pd.offsets.MonthEnd())
         sec = pd.DataFrame({"code": ["000002"], "name": ["b"], "market": ["KOSDAQ"],
                             "listing_date": [pd.Timestamp("2010-01-01")],
                             "delisting_date": [pd.Timestamp("2020-03-15")],
@@ -292,7 +292,38 @@ def run_contracts() -> bool:
     _c("COST", "비용 모형 단조성", costmono)
     _c("WATCH", "관리종목 상태 복원 (해제 선행)", watchstate)
     _c("AUDIT", "단발 사건 만료 누적 최댓값", oneshot)
+    # ── 폐지일을 아예 모르는 종목의 거래중단도 -100% 여야 한다 ──────────────────────────
+    def delist_nomap():
+        months = pd.date_range("2019-04-30", periods=2, freq=pd.offsets.MonthEnd())
+        sec = pd.DataFrame({"code": ["000003", "000004"], "name": ["c", "d"],
+                            "market": ["KOSDAQ"] * 2,
+                            "listing_date": [pd.Timestamp("2010-01-01")] * 2,
+                            "delisting_date": [pd.NaT, pd.NaT],   # ★ 둘 다 폐지목록에 없다
+                            "industry": ["X", "X"], "corp_code": ["C", "D"], "src": ["t", "t"]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"code": ["000004"] * 2, "date": months}))
+        # 000003 은 1개월차까지만 패널에 있고(수익률 결측) 2개월차에 사라진다 = 거래 중단.
+        # 000004 는 계속 살아 있어 '패널 자체의 공백'과 구분된다(그 경우엔 0% 가 맞다).
+        P = pd.DataFrame({
+            "code": ["000003", "000004", "000004"],
+            "month": [months[0], months[0], months[1]],
+            "Signal": [1.0, 0.9, 0.9], "fwd_ret": [np.nan, 0.0, 0.0],
+            "adv20": [1e9] * 3, "VETO": [1.0] * 3, "FW": [1] * 3,
+            "close": [1000.0] * 3, "d1_trailing": [-0.5] * 3})
+        bt = run_backtest_micro(P, pd.DatetimeIndex(months), uni, "D",
+                                COST_BASE_SCENARIO, label="DNOMAP", quiet=True)
+        H = bt["holdings"]
+        if H is None or len(H) == 0:
+            return False, "백테스트가 보유내역을 만들지 않았습니다."
+        h0 = H[(H["month"] == months[0]) & (H["code"] == "000003")]
+        r = float(h0["fwd_ret"].iloc[0]) if len(h0) else 0.0
+        if r > -0.999:
+            return False, (f"폐지목록에 없는 종목이 거래를 멈췄는데 종목수익률이 {r:.3f} 입니다. "
+                           f"0% 로 계상하면 폐지목록 커버리지가 나쁠수록 성과가 좋아집니다.")
+        return True, "폐지일 미상 + 다음 달 패널 이탈 → 종목수익률 -100% 확정"
+
     _c("DLGAP", "정지→지연 상장폐지 -100%", delist_gap)
+    _c("DLNOM", "폐지일 미상 종목의 거래중단 -100%", delist_nomap)
     _c("VALUE", "적자 다수 셀의 밸류 랭크 생존", valuecell)
     _c("VSEP", "R2-M 구성 분리 (B ≠ C)", variantsep)
 

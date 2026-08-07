@@ -174,20 +174,32 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
         # ── 수익률 (상장폐지 -100% 강제) ─────────────────────────────────────────────
         fr = pd.to_numeric(sub.reindex(w.index)["fwd_ret"], errors="coerce")
         nxt = t + pd.offsets.MonthEnd(1)
+        nxt_sub = by_month.get(nxt)
+        nxt_codes = set(nxt_sub["code"].astype(str)) if nxt_sub is not None else None
+        n_forced = 0
         for c in w.index:
             dd = dmap.get(c)
-            if dd is None or pd.isna(dd) or dd <= t:
-                continue
+            has_dd = dd is not None and pd.notna(dd) and dd > t
             # ★ 폐지월 창(t < dd <= 다음달)만 보면 안 된다.
             #   한국 소형주의 전형적 경로는 '거래정지 → 수 개월 실질심사 → 상장폐지'다.
             #   정지 시점부터 가격 행이 끊겨 fwd_ret 이 NaN 이 되는데, 폐지일은 몇 달 뒤라
-            #   창 조건이 거짓이 되고, 아래 fillna(0.0) 이 그 달을 0% 로 기록한다.
-            #   = 상장폐지로 전액을 잃은 포지션이 '본전'으로 계상된다(생존자편향 재유입, C2 위반).
-            #   → 폐지가 예정된 종목의 거래가 끊긴 시점에 -100% 를 확정한다.
-            if dd <= nxt or pd.isna(fr.get(c, np.nan)):
-                fr.at[c] = -1.0                                # 정리매매가 없으면 전액 손실
+            #   창 조건이 거짓이 되고, fillna(0.0) 이 그 달을 0% 로 기록한다.
+            #   = 전액을 잃은 포지션이 '본전'으로 계상된다(생존자편향 재유입, C2 위반).
+            if has_dd and (dd <= nxt or pd.isna(fr.get(c, np.nan))):
+                fr.at[c] = -1.0
+                n_forced += 1
+                continue
+            # ★ 폐지일을 아예 모르는 종목이 더 위험하다.
+            #   FDR 폐지목록은 부분적일 수 있고(코드가 그 사실을 경고한다), 그런 종목은
+            #   dmap 에 없어서 위 분기를 전부 비껴간다. 거래가 끊겼는데 폐지일도 없으면
+            #   조용히 0% 가 된다 — 커버리지가 나쁠수록 성과가 좋아지는 최악의 편향이다.
+            #   → 다음 달 패널에서 사라졌고 수익률도 없으면 '사실상 상장폐지'로 간주한다.
+            if (not has_dd) and pd.isna(fr.get(c, np.nan)) and nxt_codes is not None \
+                    and c not in nxt_codes:
+                fr.at[c] = -1.0
+                n_forced += 1
         n_nan = int(fr.isna().sum())
-        fr = fr.fillna(0.0)                                    # 거래 없는 달은 0 (추정 금지)
+        fr = fr.fillna(0.0)             # 다음 달에도 살아 있는 종목의 일시적 결측만 0 (추정 금지)
 
         ret_gross = float((w * fr).sum())                      # 현금분은 수익률 0
 
@@ -209,7 +221,7 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
 
         recs.append({"month": t, "ret_gross": ret_gross, "cost": cost,
                      "ret": ret_gross - cost, "n": int(len(w)), "turnover": turn,
-                     "cash_w": cash_w, "na_fwd": n_nan})
+                     "cash_w": cash_w, "na_fwd": n_nan, "delist_forced": n_forced})
         for c in w.index:
             holdings_log.append({"month": t, "code": c, "w": float(w[c]),
                                  "signal": float(sub.at[c, "Signal"] or 0.0),
@@ -232,7 +244,8 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
         #   전 구간 격자에 맞춰 채운다 — 쉰 달은 수익률 0 이다.
         full = pd.DataFrame({"month": pd.DatetimeIndex(months)})
         R = full.merge(R, on="month", how="left")
-        for c in ("ret_gross", "cost", "ret", "turnover", "n", "cash_w", "na_fwd"):
+        for c in ("ret_gross", "cost", "ret", "turnover", "n", "cash_w", "na_fwd",
+                  "delist_forced"):
             if c in R.columns:
                 R[c] = pd.to_numeric(R[c], errors="coerce").fillna(0.0)
         R.loc[R["n"] == 0, "cash_w"] = 1.0
@@ -245,7 +258,8 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
         LOG.ok(f"[{label or variant}·{scenario}] CAGR {100*s['cagr']:.2f}% · "
                f"MDD {100*s['mdd']:.1f}% · Calmar {s['calmar']:.2f} · "
                f"Sharpe {s['sharpe']:.2f} · 월평균 {s['avg_n']:.0f}종목 · "
-               f"회전율 {100*s['turnover']:.0f}%/월")
+               f"회전율 {100*s['turnover']:.0f}%/월 · 상폐확정 {s.get('delist_forced', 0):.0f}건"
+               + (f" · 결측0%처리 {s.get('na_zero', 0):.0f}건" if s.get('na_zero', 0) else ""))
     PIPE.io("OUT", "MEM", f"backtest:{label or variant}", R)
     return out
 
@@ -255,7 +269,8 @@ def perf_stats(R: pd.DataFrame) -> dict:
     if R is None or len(R) == 0 or "ret" not in R.columns:
         return {"n_months": 0, "cagr": np.nan, "vol": np.nan, "sharpe": np.nan,
                 "mdd": np.nan, "calmar": np.nan, "hit": np.nan, "turnover": np.nan,
-                "avg_n": np.nan, "total": np.nan, "cost_drag": np.nan, "cash": np.nan}
+                "avg_n": np.nan, "total": np.nan, "cost_drag": np.nan, "cash": np.nan,
+                "delist_forced": np.nan, "na_zero": np.nan}
     r = pd.to_numeric(R["ret"], errors="coerce").fillna(0.0).to_numpy()
     n = len(r)
     # ★ 자본 기준선 1.0 을 앞에 붙인다.
@@ -287,7 +302,8 @@ def perf_stats(R: pd.DataFrame) -> dict:
     return {"n_months": n, "cagr": cagr, "vol": vol, "sharpe": sharpe, "mdd": mdd,
             "calmar": calmar, "hit": float((r > 0).mean()), "total": total,
             "turnover": _m("turnover"), "avg_n": _m("n"), "cost_drag": _m("cost", "sum"),
-            "cash": _m("cash_w")}
+            "cash": _m("cash_w"), "delist_forced": _m("delist_forced", "sum"),
+            "na_zero": _m("na_fwd", "sum")}
 
 
 def benchmark_universe_ew(P: pd.DataFrame, months: pd.DatetimeIndex,
@@ -380,7 +396,8 @@ def benchmark_index(months: pd.DatetimeIndex) -> Dict[str, dict]:
             continue
         if d is None or len(d) == 0 or "Close" not in d.columns:
             continue
-        s = d["Close"].resample("ME").last() if hasattr(d["Close"], "resample") else None
+        s = (d["Close"].resample(pd.offsets.MonthEnd()).last()
+             if hasattr(d["Close"], "resample") else None)
         if s is None or len(s) < 3:
             continue
         r = s.pct_change().dropna()

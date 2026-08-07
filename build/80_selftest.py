@@ -13,7 +13,7 @@
 def make_synthetic(n_codes: int = 160, n_months: int = 60, seed: int = SEED) -> dict:
     rng = np.random.default_rng(seed)
     months = pd.date_range(as_ts(BACKTEST_END) - pd.DateOffset(months=n_months - 1),
-                           as_ts(BACKTEST_END), freq="ME")
+                           as_ts(BACKTEST_END), freq=pd.offsets.MonthEnd())
     codes = [f"{i+1:06d}" for i in range(n_codes)]
     inds = rng.choice(["화학", "전자부품", "건설", "기계", "소프트웨어"], n_codes)
 

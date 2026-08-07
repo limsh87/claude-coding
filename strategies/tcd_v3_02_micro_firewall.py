@@ -197,7 +197,7 @@ STOP_ON_KILL_CRITERIA = True  # §12 킬 기준 위반 시 즉시 중단하고 �
 
 STRATEGY_ID     = "TCD_V3_MICRO_FW"
 STRATEGY_NAME   = "MICRO-FW · U-MICRO 방화벽 중심 전략"
-BUILD_VERSION   = "v3.20260807.2202"
+BUILD_VERSION   = "v3.20260807.2231"
 ACTIVE_PACKS: list = []          # v3 전략2는 센서팩을 쓰지 않는다(경량화). 호환용 빈 목록.
 
 # 공공데이터포털/관세청 키는 이 전략에서 쓰지 않는다(경량화). 코어 호환을 위해 빈 값만 유지.
@@ -304,13 +304,17 @@ _REQUIRED = [
     ("numpy",     "numpy",              True,  "모든 수치연산"),
     ("pandas",    "pandas",             True,  "모든 패널 처리"),
     ("pyarrow",   "pyarrow",            True,  "parquet 캐시(L1 영속화)"),
-    ("scipy",     "scipy",              True,  "통계검정 / 회귀"),
+    # scipy 는 이 파일에서 직접 import 하지 않는다(HAC t·회귀는 numpy 로 구현).
+    # 필수로 두면 설치 실패 시 SystemExit 로 실행 자체가 막히므로 선택으로 내린다.
+    # 단 pandas 의 corr(method="spearman") 은 내부적으로 scipy 를 요구하므로, 그 경로를
+    # 쓰는 코드를 추가한다면 여기서 다시 필수로 올려야 한다.
     ("requests",  "requests",           True,  "모든 HTTP 수집"),
     ("bs4",       "beautifulsoup4",     True,  "리서치 리스트 파싱"),
     ("lxml",      "lxml",               True,  "HTML/XML 고속 파서"),
     ("tqdm",      "tqdm",               True,  "진행률 표시"),
 ]
 _OPTIONAL = [
+    ("scipy",     "scipy",              "통계검정(현재 미사용 — pandas spearman 사용 시 필요)"),
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
@@ -938,7 +942,9 @@ def month_end(x) -> Optional[pd.Timestamp]:
 
 
 def month_range(start, end) -> pd.DatetimeIndex:
-    return pd.date_range(month_end(start), month_end(end), freq="ME")
+    # ★ "ME" 별칭은 pandas 2.2 이상에서만 유효하다. offset 객체는 1.x~3.x 전부에서 동작한다.
+    #   (Colab 의 pandas 가 2.0/2.1 이면 이 한 줄 때문에 실행이 시작도 못 하고 죽는다)
+    return pd.date_range(month_end(start), month_end(end), freq=pd.offsets.MonthEnd())
 
 
 # ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
@@ -1122,9 +1128,12 @@ def read_jsonl(path: str) -> List[dict]:
 
 def append_jsonl(path: str, rows: Iterable[dict]):
     _ensure_dir(path)
+    # ★ 줄마다 write 하면 기본 8KiB 버퍼가 임의 지점에서 flush 되어, 두 노트북이 동시에
+    #   append 할 때 한 줄이 반토막 난 채 섞인다(read_jsonl 이 그 줄을 조용히 버린다).
+    #   한 번의 write 로 넘기면 대부분의 경우 원자적으로 처리된다.
+    blob = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows)
     with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        f.write(blob)
         f.flush()
         try:
             os.fsync(f.fileno())
@@ -1755,7 +1764,12 @@ class Vault:
             #   drop_duplicates(uid) 가 그 파일 전체를 단 한 줄로 붕괴시킨다 = 인덱스 유실.
             #   절대 1원칙에 정면으로 반하므로, 결측 uid 는 행 내용 해시로 개별 부여한다.
             if "uid" not in idx.columns:
-                idx["uid"] = np.nan
+                # ★ dtype 주의: np.nan 으로 만들면 float64 컬럼이 되고, 아래에서 sha1 문자열을
+                #   .loc 로 넣는 순간 pandas 2.x 는 FutureWarning, **pandas 3.0 은 TypeError** 다.
+                #   그런데 이 코드는 critical 스테이지(L0.VAULT) 안이라 실행 전체가 죽는다.
+                #   트리거도 흔하다 — uid 컬럼이 없는 레거시 인덱스 파일 하나면 충분하고,
+                #   이 파일은 v2 캐시 루트를 그대로 재사용하라고 안내한다.
+                idx["uid"] = pd.Series(np.nan, index=idx.index, dtype=object)
             miss = idx["uid"].isna() | (idx["uid"].astype(str).str.strip().isin(("", "nan", "None")))
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
@@ -1774,7 +1788,8 @@ class Vault:
 
         for c in INDEX_COLUMNS:
             if c not in idx.columns:
-                idx[c] = np.nan
+                # 같은 이유로 object 로 만든다 — INDEX_COLUMNS 는 대부분 문자열 컬럼이다.
+                idx[c] = pd.Series(np.nan, index=idx.index, dtype=object)
         idx["scope"] = idx["scope"].fillna(scope)
         with self._lk:
             self._idx[scope] = idx
@@ -7191,20 +7206,32 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
         # ── 수익률 (상장폐지 -100% 강제) ─────────────────────────────────────────────
         fr = pd.to_numeric(sub.reindex(w.index)["fwd_ret"], errors="coerce")
         nxt = t + pd.offsets.MonthEnd(1)
+        nxt_sub = by_month.get(nxt)
+        nxt_codes = set(nxt_sub["code"].astype(str)) if nxt_sub is not None else None
+        n_forced = 0
         for c in w.index:
             dd = dmap.get(c)
-            if dd is None or pd.isna(dd) or dd <= t:
-                continue
+            has_dd = dd is not None and pd.notna(dd) and dd > t
             # ★ 폐지월 창(t < dd <= 다음달)만 보면 안 된다.
             #   한국 소형주의 전형적 경로는 '거래정지 → 수 개월 실질심사 → 상장폐지'다.
             #   정지 시점부터 가격 행이 끊겨 fwd_ret 이 NaN 이 되는데, 폐지일은 몇 달 뒤라
-            #   창 조건이 거짓이 되고, 아래 fillna(0.0) 이 그 달을 0% 로 기록한다.
-            #   = 상장폐지로 전액을 잃은 포지션이 '본전'으로 계상된다(생존자편향 재유입, C2 위반).
-            #   → 폐지가 예정된 종목의 거래가 끊긴 시점에 -100% 를 확정한다.
-            if dd <= nxt or pd.isna(fr.get(c, np.nan)):
-                fr.at[c] = -1.0                                # 정리매매가 없으면 전액 손실
+            #   창 조건이 거짓이 되고, fillna(0.0) 이 그 달을 0% 로 기록한다.
+            #   = 전액을 잃은 포지션이 '본전'으로 계상된다(생존자편향 재유입, C2 위반).
+            if has_dd and (dd <= nxt or pd.isna(fr.get(c, np.nan))):
+                fr.at[c] = -1.0
+                n_forced += 1
+                continue
+            # ★ 폐지일을 아예 모르는 종목이 더 위험하다.
+            #   FDR 폐지목록은 부분적일 수 있고(코드가 그 사실을 경고한다), 그런 종목은
+            #   dmap 에 없어서 위 분기를 전부 비껴간다. 거래가 끊겼는데 폐지일도 없으면
+            #   조용히 0% 가 된다 — 커버리지가 나쁠수록 성과가 좋아지는 최악의 편향이다.
+            #   → 다음 달 패널에서 사라졌고 수익률도 없으면 '사실상 상장폐지'로 간주한다.
+            if (not has_dd) and pd.isna(fr.get(c, np.nan)) and nxt_codes is not None \
+                    and c not in nxt_codes:
+                fr.at[c] = -1.0
+                n_forced += 1
         n_nan = int(fr.isna().sum())
-        fr = fr.fillna(0.0)                                    # 거래 없는 달은 0 (추정 금지)
+        fr = fr.fillna(0.0)             # 다음 달에도 살아 있는 종목의 일시적 결측만 0 (추정 금지)
 
         ret_gross = float((w * fr).sum())                      # 현금분은 수익률 0
 
@@ -7226,7 +7253,7 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
 
         recs.append({"month": t, "ret_gross": ret_gross, "cost": cost,
                      "ret": ret_gross - cost, "n": int(len(w)), "turnover": turn,
-                     "cash_w": cash_w, "na_fwd": n_nan})
+                     "cash_w": cash_w, "na_fwd": n_nan, "delist_forced": n_forced})
         for c in w.index:
             holdings_log.append({"month": t, "code": c, "w": float(w[c]),
                                  "signal": float(sub.at[c, "Signal"] or 0.0),
@@ -7249,7 +7276,8 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
         #   전 구간 격자에 맞춰 채운다 — 쉰 달은 수익률 0 이다.
         full = pd.DataFrame({"month": pd.DatetimeIndex(months)})
         R = full.merge(R, on="month", how="left")
-        for c in ("ret_gross", "cost", "ret", "turnover", "n", "cash_w", "na_fwd"):
+        for c in ("ret_gross", "cost", "ret", "turnover", "n", "cash_w", "na_fwd",
+                  "delist_forced"):
             if c in R.columns:
                 R[c] = pd.to_numeric(R[c], errors="coerce").fillna(0.0)
         R.loc[R["n"] == 0, "cash_w"] = 1.0
@@ -7262,7 +7290,8 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
         LOG.ok(f"[{label or variant}·{scenario}] CAGR {100*s['cagr']:.2f}% · "
                f"MDD {100*s['mdd']:.1f}% · Calmar {s['calmar']:.2f} · "
                f"Sharpe {s['sharpe']:.2f} · 월평균 {s['avg_n']:.0f}종목 · "
-               f"회전율 {100*s['turnover']:.0f}%/월")
+               f"회전율 {100*s['turnover']:.0f}%/월 · 상폐확정 {s.get('delist_forced', 0):.0f}건"
+               + (f" · 결측0%처리 {s.get('na_zero', 0):.0f}건" if s.get('na_zero', 0) else ""))
     PIPE.io("OUT", "MEM", f"backtest:{label or variant}", R)
     return out
 
@@ -7272,7 +7301,8 @@ def perf_stats(R: pd.DataFrame) -> dict:
     if R is None or len(R) == 0 or "ret" not in R.columns:
         return {"n_months": 0, "cagr": np.nan, "vol": np.nan, "sharpe": np.nan,
                 "mdd": np.nan, "calmar": np.nan, "hit": np.nan, "turnover": np.nan,
-                "avg_n": np.nan, "total": np.nan, "cost_drag": np.nan, "cash": np.nan}
+                "avg_n": np.nan, "total": np.nan, "cost_drag": np.nan, "cash": np.nan,
+                "delist_forced": np.nan, "na_zero": np.nan}
     r = pd.to_numeric(R["ret"], errors="coerce").fillna(0.0).to_numpy()
     n = len(r)
     # ★ 자본 기준선 1.0 을 앞에 붙인다.
@@ -7304,7 +7334,8 @@ def perf_stats(R: pd.DataFrame) -> dict:
     return {"n_months": n, "cagr": cagr, "vol": vol, "sharpe": sharpe, "mdd": mdd,
             "calmar": calmar, "hit": float((r > 0).mean()), "total": total,
             "turnover": _m("turnover"), "avg_n": _m("n"), "cost_drag": _m("cost", "sum"),
-            "cash": _m("cash_w")}
+            "cash": _m("cash_w"), "delist_forced": _m("delist_forced", "sum"),
+            "na_zero": _m("na_fwd", "sum")}
 
 
 def benchmark_universe_ew(P: pd.DataFrame, months: pd.DatetimeIndex,
@@ -7397,7 +7428,8 @@ def benchmark_index(months: pd.DatetimeIndex) -> Dict[str, dict]:
             continue
         if d is None or len(d) == 0 or "Close" not in d.columns:
             continue
-        s = d["Close"].resample("ME").last() if hasattr(d["Close"], "resample") else None
+        s = (d["Close"].resample(pd.offsets.MonthEnd()).last()
+             if hasattr(d["Close"], "resample") else None)
         if s is None or len(s) < 3:
             continue
         r = s.pct_change().dropna()
@@ -8157,7 +8189,7 @@ def run_contracts() -> bool:
 
     # ── C2: 상장폐지 종목 포함 + 정리매매 없으면 -100% ────────────────────────────────
     def c2():
-        months = pd.date_range("2020-01-31", periods=3, freq="ME")
+        months = pd.date_range("2020-01-31", periods=3, freq=pd.offsets.MonthEnd())
         sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["a", "b"],
                             "market": ["KOSPI"] * 2,
                             "listing_date": pd.to_datetime(["2010-01-01"] * 2),
@@ -8196,7 +8228,7 @@ def run_contracts() -> bool:
                             "delisting_date": [pd.NaT, pd.NaT], "industry": ["X", "X"],
                             "corp_code": ["A", "B"], "src": ["t", "t"]})
         px = pd.DataFrame({"code": ["000001"] * 3,
-                           "date": pd.date_range("2020-01-31", periods=3, freq="ME")})
+                           "date": pd.date_range("2020-01-31", periods=3, freq=pd.offsets.MonthEnd())})
         uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
         if "000002" in uni.at(pd.Timestamp("2020-06-30")):
             return False, "2023년 상장 종목이 2020년 유니버스에 있습니다 — 미래누수."
@@ -8287,7 +8319,7 @@ def run_contracts() -> bool:
 
     # ── 비용 단조성: 비용이 커지면 수익률은 낮아져야 한다 ────────────────────────────
     def costmono():
-        months = pd.date_range("2020-01-31", periods=6, freq="ME")
+        months = pd.date_range("2020-01-31", periods=6, freq=pd.offsets.MonthEnd())
         rows = []
         for m in months:
             for i in range(10):
@@ -8340,7 +8372,7 @@ def run_contracts() -> bool:
 
     # ── 거래정지→수개월 뒤 상장폐지 경로도 -100% 여야 한다 ─────────────────────────────
     def delist_gap():
-        months = pd.date_range("2019-04-30", periods=2, freq="ME")
+        months = pd.date_range("2019-04-30", periods=2, freq=pd.offsets.MonthEnd())
         sec = pd.DataFrame({"code": ["000002"], "name": ["b"], "market": ["KOSDAQ"],
                             "listing_date": [pd.Timestamp("2010-01-01")],
                             "delisting_date": [pd.Timestamp("2020-03-15")],
@@ -8404,7 +8436,38 @@ def run_contracts() -> bool:
     _c("COST", "비용 모형 단조성", costmono)
     _c("WATCH", "관리종목 상태 복원 (해제 선행)", watchstate)
     _c("AUDIT", "단발 사건 만료 누적 최댓값", oneshot)
+    # ── 폐지일을 아예 모르는 종목의 거래중단도 -100% 여야 한다 ──────────────────────────
+    def delist_nomap():
+        months = pd.date_range("2019-04-30", periods=2, freq=pd.offsets.MonthEnd())
+        sec = pd.DataFrame({"code": ["000003", "000004"], "name": ["c", "d"],
+                            "market": ["KOSDAQ"] * 2,
+                            "listing_date": [pd.Timestamp("2010-01-01")] * 2,
+                            "delisting_date": [pd.NaT, pd.NaT],   # ★ 둘 다 폐지목록에 없다
+                            "industry": ["X", "X"], "corp_code": ["C", "D"], "src": ["t", "t"]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"code": ["000004"] * 2, "date": months}))
+        # 000003 은 1개월차까지만 패널에 있고(수익률 결측) 2개월차에 사라진다 = 거래 중단.
+        # 000004 는 계속 살아 있어 '패널 자체의 공백'과 구분된다(그 경우엔 0% 가 맞다).
+        P = pd.DataFrame({
+            "code": ["000003", "000004", "000004"],
+            "month": [months[0], months[0], months[1]],
+            "Signal": [1.0, 0.9, 0.9], "fwd_ret": [np.nan, 0.0, 0.0],
+            "adv20": [1e9] * 3, "VETO": [1.0] * 3, "FW": [1] * 3,
+            "close": [1000.0] * 3, "d1_trailing": [-0.5] * 3})
+        bt = run_backtest_micro(P, pd.DatetimeIndex(months), uni, "D",
+                                COST_BASE_SCENARIO, label="DNOMAP", quiet=True)
+        H = bt["holdings"]
+        if H is None or len(H) == 0:
+            return False, "백테스트가 보유내역을 만들지 않았습니다."
+        h0 = H[(H["month"] == months[0]) & (H["code"] == "000003")]
+        r = float(h0["fwd_ret"].iloc[0]) if len(h0) else 0.0
+        if r > -0.999:
+            return False, (f"폐지목록에 없는 종목이 거래를 멈췄는데 종목수익률이 {r:.3f} 입니다. "
+                           f"0% 로 계상하면 폐지목록 커버리지가 나쁠수록 성과가 좋아집니다.")
+        return True, "폐지일 미상 + 다음 달 패널 이탈 → 종목수익률 -100% 확정"
+
     _c("DLGAP", "정지→지연 상장폐지 -100%", delist_gap)
+    _c("DLNOM", "폐지일 미상 종목의 거래중단 -100%", delist_nomap)
     _c("VALUE", "적자 다수 셀의 밸류 랭크 생존", valuecell)
     _c("VSEP", "R2-M 구성 분리 (B ≠ C)", variantsep)
 

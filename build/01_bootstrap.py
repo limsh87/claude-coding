@@ -98,13 +98,17 @@ _REQUIRED = [
     ("numpy",     "numpy",              True,  "모든 수치연산"),
     ("pandas",    "pandas",             True,  "모든 패널 처리"),
     ("pyarrow",   "pyarrow",            True,  "parquet 캐시(L1 영속화)"),
-    ("scipy",     "scipy",              True,  "통계검정 / 회귀"),
+    # scipy 는 이 파일에서 직접 import 하지 않는다(HAC t·회귀는 numpy 로 구현).
+    # 필수로 두면 설치 실패 시 SystemExit 로 실행 자체가 막히므로 선택으로 내린다.
+    # 단 pandas 의 corr(method="spearman") 은 내부적으로 scipy 를 요구하므로, 그 경로를
+    # 쓰는 코드를 추가한다면 여기서 다시 필수로 올려야 한다.
     ("requests",  "requests",           True,  "모든 HTTP 수집"),
     ("bs4",       "beautifulsoup4",     True,  "리서치 리스트 파싱"),
     ("lxml",      "lxml",               True,  "HTML/XML 고속 파서"),
     ("tqdm",      "tqdm",               True,  "진행률 표시"),
 ]
 _OPTIONAL = [
+    ("scipy",     "scipy",              "통계검정(현재 미사용 — pandas spearman 사용 시 필요)"),
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),

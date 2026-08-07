@@ -65,7 +65,9 @@ def month_end(x) -> Optional[pd.Timestamp]:
 
 
 def month_range(start, end) -> pd.DatetimeIndex:
-    return pd.date_range(month_end(start), month_end(end), freq="ME")
+    # ★ "ME" 별칭은 pandas 2.2 이상에서만 유효하다. offset 객체는 1.x~3.x 전부에서 동작한다.
+    #   (Colab 의 pandas 가 2.0/2.1 이면 이 한 줄 때문에 실행이 시작도 못 하고 죽는다)
+    return pd.date_range(month_end(start), month_end(end), freq=pd.offsets.MonthEnd())
 
 
 # ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
@@ -249,9 +251,12 @@ def read_jsonl(path: str) -> List[dict]:
 
 def append_jsonl(path: str, rows: Iterable[dict]):
     _ensure_dir(path)
+    # ★ 줄마다 write 하면 기본 8KiB 버퍼가 임의 지점에서 flush 되어, 두 노트북이 동시에
+    #   append 할 때 한 줄이 반토막 난 채 섞인다(read_jsonl 이 그 줄을 조용히 버린다).
+    #   한 번의 write 로 넘기면 대부분의 경우 원자적으로 처리된다.
+    blob = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows)
     with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        f.write(blob)
         f.flush()
         try:
             os.fsync(f.fileno())
