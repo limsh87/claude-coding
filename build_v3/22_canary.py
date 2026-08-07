@@ -195,6 +195,48 @@ def _canary_emp(corps: Sequence[str], year: int) -> Tuple[Optional[bool], Option
     return k7, k8, k9
 
 
+def canary_sample(sec: pd.DataFrame, monthly: pd.DataFrame, n: int = None) -> List[str]:
+    """CANARY 표본 추출 — U-MID 대역에서, **폐지 종목 비율까지 유니버스와 맞춰서** 뽑는다.
+
+    ★ 전 구간 거래대금 중앙값으로 한 줄 세우면 표본이 조용히 생존자 쪽으로 쏠린다.
+      일찍 폐지된 종목은 관측 개월 수가 적어 중앙값 순위가 낮게 잡히고, 그 결과 K3/K7/K8 이
+      '오래 살아남은 회사의 공시 충실도'를 재게 된다 — 실제 수집률보다 낙관적인 수치가 나오고,
+      그걸 근거로 수집을 시작한다. 캐너리의 목적과 정반대다.
+    → ① 월별 랭크로 U-MID 대역에 한 번이라도 들어온 종목을 후보로 삼고
+      ② 그 후보 안에서 폐지/존속 비율을 그대로 유지해 균등 간격 추출한다.
+    """
+    n = CANARY_SAMPLE_N if n is None else n
+    if monthly is None or monthly.empty or "adv20" not in monthly.columns:
+        return sec["code"].astype(str).tolist()[:n]
+    pm = monthly[["code", "month", "adv20"]].copy()
+    pm["rk"] = pm.groupby("month", observed=True)["adv20"].rank(ascending=False, method="first")
+    band = pm[pm["rk"].between(UMID_RANK_LO, UMID_RANK_HI) & (pm["adv20"] >= MIN_ADV_KRW)]
+    cand = band["code"].value_counts()               # 대역에 머문 개월 수 순
+    codes = [str(c) for c in cand.index]
+    if not codes:
+        LOG.warn("U-MID 대역 후보가 없어 거래대금 상위 순으로 캐너리 표본을 뽑습니다.")
+        codes = (monthly.groupby("code", observed=True)["adv20"].median()
+                 .sort_values(ascending=False).index.astype(str).tolist())
+    dead = set(sec.loc[sec["delisting_date"].notna(), "code"].astype(str))
+    d_list = [c for c in codes if c in dead]
+    l_list = [c for c in codes if c not in dead]
+    share = len(d_list) / max(len(codes), 1)
+    n_d = min(len(d_list), int(round(n * share)))
+    n_l = min(len(l_list), n - n_d)
+
+    def _stride(xs, k):
+        if k <= 0 or not xs:
+            return []
+        step = max(1, len(xs) // k)
+        return xs[::step][:k]
+
+    pick = _stride(d_list, n_d) + _stride(l_list, n_l)
+    LOG.info(f"CANARY 표본 {len(pick)}종목 — U-MID 대역 후보 {len(codes):,}개 중 "
+             f"폐지 {n_d}·존속 {n_l} (대역 내 폐지비율 {share:.1%}을 그대로 반영해 "
+             f"생존자 쏠림을 제거)")
+    return pick
+
+
 def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
     """CANARY 전체 실행. 반환 dict 는 하류가 '무엇을 끄고 갈지' 정하는 데 쓴다."""
     LOG.banner("③ CANARY K1~K9", "수집을 시작해도 되는지 25분 안에 판정합니다 (스펙 §2)")

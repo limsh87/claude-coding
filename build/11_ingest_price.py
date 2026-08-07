@@ -457,8 +457,21 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
     """d3(기관+외국인 누적순매수) 입력. 없으면 D축은 가용 축 평균으로 자동 축소된다."""
     cached = VAULT.get_table("krx_investor_flows", scope="shared")
     if cached is not None and len(cached):
-        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용")
+        cached = cached.copy()                      # 공용 캐시 객체를 제자리에서 고치지 않는다
         cached["date"] = as_ts_series(cached["date"])
+        lo, hi = cached["date"].min(), cached["date"].max()
+        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용 "
+                 f"({lo:%Y-%m} ~ {hi:%Y-%m} · {cached['code'].nunique():,}종목)")
+        # ★ 이 캐시는 증분 갱신 경로가 없다(있으면 통째로 재사용). 다른 전략이 더 짧은 구간으로
+        #   만들어 둔 캐시를 물려받으면 요청 구간의 뒷부분 d3 가 조용히 전부 결측이 된다.
+        #   조용히 두지 않고 '어디까지 덮는지'를 명시한다.
+        need_lo, need_hi = as_ts(start), as_ts(end)
+        if pd.notna(lo) and pd.notna(hi) and (lo > need_lo + pd.Timedelta(days=45) or
+                                              hi < need_hi - pd.Timedelta(days=45)):
+            LOG.warn(f"수급 캐시가 요청 구간({need_lo:%Y-%m}~{need_hi:%Y-%m})을 다 덮지 못합니다 "
+                     f"— 덮이지 않는 달의 d3 는 결측이 되고 U 는 d1 단독으로 계산됩니다. "
+                     f"(이 캐시는 증분 갱신 경로가 없어 전체를 다시 받아야 넓어집니다. "
+                     f"공용 캐시를 지우지 않는 것이 원칙이므로 자동 삭제하지 않습니다)")
         return cached
     if pykrx_stock is None or RUN_MODE == "CACHED":
         LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "

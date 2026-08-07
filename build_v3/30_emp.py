@@ -14,7 +14,8 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 EMP_EXT_COLS = ["corp_code", "bsns_year", "rcept_no", "rcept_dt", "employees",
-                "regular", "payroll_total", "avg_salary", "n_rows", "unit_fix", "src_flag"]
+                "regular", "payroll_total", "avg_salary", "n_rows", "unit_fix",
+                "pay_fix", "src_flag"]
 
 _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 계", "합계(계)", "-"}
 
@@ -129,30 +130,38 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     else:
         avg = np.nan
 
-    avg, mult = _norm_money(avg, "avg")
-    unit_fix = mult
+    avg, unit_fix = _norm_money(avg, "avg")
 
-    # 급여총액 단위 보정: tot ≈ avg × emp 가 성립해야 한다. 1000 배수로 스냅.
+    # ── 급여총액 단위 보정 ──────────────────────────────────────────────────────────────
+    #   tot ≈ avg × emp 가 성립해야 한다. 다만 **먼저 '고칠 필요가 있는가'를 묻는다.**
+    #
+    #   ★ 가장 가까운 1000 배수를 무조건 고르면 멀쩡한 값을 망친다: 1인평균급여가 그 회사를
+    #     대표하지 못하는 제출본(예: 임원만 기재)에서는 expect 가 실제보다 수십 배 작아지고,
+    #     그러면 '÷1000' 이 오히려 오차를 줄이는 것처럼 보여 **정확한 급여총액이 1000분의 1로
+    #     조용히 축소된다.** 한계임금은 이 값의 차분이므로 그대로 신호가 뒤집힌다.
+    #   → 원값이 이미 10배 이내면 손대지 않는다. 명백히 틀렸을 때만, 그것도 배수 보정이
+    #     3배 이내로 들어맞을 때만 고친다. 둘 다 아니면 폐기한다(0 채움 금지).
+    pay_fix = 1
     if np.isfinite(payroll) and np.isfinite(avg) and np.isfinite(emp) and emp > 0 and avg > 0:
         expect = avg * emp
-        best, best_err = None, np.inf
-        for m2 in (1, 1_000, 1_000_000, 0.001, 0.000001):
-            err = abs(math.log10(max(payroll * m2, 1e-9) / expect))
-            if err < best_err:
-                best, best_err = m2, err
-        if best_err <= 1.0:                       # 10배 이내로 맞으면 채택
-            payroll = payroll * best
-            if best != 1:
-                unit_fix = int(unit_fix * (best if best >= 1 else 1))
-        else:
-            payroll = np.nan                      # §5 — 불일치 10배+ 는 폐기 (0 채움 금지)
+        err0 = abs(math.log10(max(payroll, 1e-9) / expect))
+        if err0 > 1.0:                                     # 10배 넘게 어긋난 경우에만 개입
+            best, best_err = None, np.inf
+            for m2 in (1_000, 1_000_000, 0.001, 0.000001):
+                err = abs(math.log10(max(payroll * m2, 1e-9) / expect))
+                if err < best_err:
+                    best, best_err = m2, err
+            if best_err <= 0.5:                            # 보정 후 3배 이내로 맞을 때만 채택
+                payroll, pay_fix = payroll * best, best
+            else:
+                payroll = np.nan                           # §5 — 불일치 10배+ 폐기
 
     rn = str(sel["rcept_no"].iloc[0]) if "rcept_no" in sel.columns and len(sel) else ""
     kd = _knowledge_from_rcept(rn, REPRT_CODES["FY"], int(year))
     return {"corp_code": str(corp), "bsns_year": int(year), "rcept_no": rn,
             "rcept_dt": kd, "employees": emp, "regular": regular,
             "payroll_total": payroll, "avg_salary": avg, "n_rows": int(len(sel)),
-            "unit_fix": int(unit_fix), "src_flag": flag}
+            "unit_fix": int(unit_fix), "pay_fix": float(pay_fix), "src_flag": flag}
 
 
 def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
@@ -224,6 +233,26 @@ def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict]) -> pd.DataFra
     LOG.ok(f"직원현황 총 {len(E):,}행 · {E['corp_code'].nunique():,}사 · "
            f"{E['bsns_year'].min()}~{E['bsns_year'].max()}년 "
            f"(급여총액 기재 {E['payroll_total'].notna().mean():.0%})")
+    # 단위 정규화가 얼마나 개입했는지 드러낸다 — 조용한 보정은 조용한 오염과 구별되지 않는다.
+    rows = []
+    if "unit_fix" in E.columns:
+        for m, n in E["unit_fix"].value_counts().sort_index().items():
+            rows.append([f"1인평균급여 ×{int(m):,}", f"{int(n):,}",
+                         "원 단위 그대로" if int(m) == 1 else "천원/백만원 기재로 판단해 환산"])
+    if "pay_fix" in E.columns:
+        for m, n in E["pay_fix"].value_counts().sort_index().items():
+            rows.append([f"급여총액 ×{float(m):g}", f"{int(n):,}",
+                         "손대지 않음" if float(m) == 1.0 else "10배 초과 불일치 → 배수 보정"])
+    n_drop = int(E["payroll_total"].isna().sum())
+    rows.append(["급여총액 결측/폐기", f"{n_drop:,}", "무기재이거나 10배+ 불일치로 폐기(0 채움 안 함)"])
+    if "src_flag" in E.columns:
+        for f, n in E["src_flag"].value_counts().items():
+            rows.append([f"행 선택 경로: {f}", f"{int(n):,}",
+                         {"detail": "부문×성별 분해행 사용(정상)",
+                          "half": "한쪽만 합계 — 부분 분해",
+                          "total_only": "합계행만 제출 — 이중계상 위험 없음"}.get(str(f), "")])
+    LOG.table(rows, ["단위·행선택 정규화", "건수", "의미"], ["l", "r", "l"],
+              title="직원현황 정규화 감사 (K9 단위 정합성의 실측 결과)")
     return E
 
 
@@ -334,20 +363,34 @@ def test_c15(df: pd.DataFrame) -> Tuple[bool, str]:
 
 
 # ── §6 커버리지 감사 (필수 출력) ────────────────────────────────────────────────────────────
-def emp_coverage_audit(S: pd.DataFrame, umid_by_year: Dict[int, int]) -> pd.DataFrame:
+def emp_coverage_audit(S: pd.DataFrame, umid_n: Dict[int, int],
+                       umid_corps: Optional[Dict[int, set]] = None) -> pd.DataFrame:
     """연도별: U-MID 대상 / empSttus 성공 / 급여총액 기재 / C15 통과 / 유효 관측치.
 
+    ★ 분자와 분모는 반드시 같은 모집단이어야 한다. umid_corps 를 주면 그 해 U-MID 였던
+      기업으로 분자를 제한한다. 주지 않으면 전 상장사 기준이며, 그 사실을 표 제목에 밝힌다.
     반환 DataFrame 은 emp_coverage.csv 로 저장되고, 시작연도 판정의 근거가 된다.
     """
     rows = []
     if S is None or S.empty:
         LOG.warn("직원현황 패널이 비어 커버리지 감사를 출력할 수 없습니다.")
         return pd.DataFrame(columns=["year", "u_mid", "emp_ok", "pay_ok", "c15_ok", "valid"])
+    scoped = umid_corps is not None and len(umid_corps) > 0
     for y in sorted(S["bsns_year"].dropna().astype(int).unique()):
         sub = S[S["bsns_year"] == y]
+        if scoped:
+            # 사업연도 y 의 공시는 y+1 년에 알려지므로, 그 해 U-MID 였던 기업 기준으로 센다.
+            #   ★ 교집합이 비면 그 해엔 U-MID 종목이 아예 없다는 뜻이다(대개 백테스트 창 밖).
+            #     그때 필터를 건너뛰면 분자만 전 상장사로 튀어 분모(0)와 어긋난다 → 0 으로 센다.
+            keep = umid_corps.get(int(y), set()) | umid_corps.get(int(y) + 1, set())
+            sub = sub[sub["corp_code"].astype(str).isin(keep)] if keep else sub.iloc[0:0]
+        # ★ 분모도 분자와 **같은 집합**에서 센다. 분모를 '그 해 U-MID', 분자를 'y 또는 y+1 에
+        #   U-MID' 로 두면 (사업연도 y 의 공시는 y+1 에 알려지므로 분자는 y+1 을 포함해야 한다)
+        #   표가 자기모순에 빠진다 — 분모 0 인데 분자 84 같은 행이 나온다.
+        denom = len(keep) if scoped else int(umid_n.get(int(y), 0))
         rows.append({
             "year": int(y),
-            "u_mid": int(umid_by_year.get(int(y), 0)),
+            "u_mid": int(denom),
             "emp_ok": int(sub["employees"].notna().sum()),
             "pay_ok": int(sub["payroll_total"].notna().sum()),
             "c15_ok": int(sub["nl_marginal"].notna().sum()),
@@ -356,13 +399,18 @@ def emp_coverage_audit(S: pd.DataFrame, umid_by_year: Dict[int, int]) -> pd.Data
     C = pd.DataFrame(rows)
     LOG.table([[str(r.year), f"{r.u_mid:,}", f"{r.emp_ok:,}", f"{r.pay_ok:,}",
                 f"{r.c15_ok:,}", f"{r.valid:,}",
-                "부족" if r.valid < C15_MIN_OBS_PER_YR else
-                ("경계" if r.valid < COVERAGE_MIN_OBS_START else "충분")]
+                "구간밖" if (scoped and r.u_mid == 0) else
+                ("부족" if r.valid < C15_MIN_OBS_PER_YR else
+                 ("경계" if r.valid < COVERAGE_MIN_OBS_START else "충분"))]
                for r in C.itertuples(index=False)],
               ["사업연도", "U-MID 대상", "empSttus 성공", "급여총액 기재", "C15 통과",
                "유효 관측치", "판정"],
               ["c", "r", "r", "r", "r", "r", "c"],
-              title="EMP 커버리지 감사 (§6 — 필수 출력)")
+              title="EMP 커버리지 감사 (§6 — 필수 출력) · 분자 모집단 = " +
+                    ("U-MID 기업" if scoped else "전 상장사(분모와 불일치, 참고용)"))
+    if not scoped:
+        LOG.warn("커버리지 분자를 U-MID 로 제한하지 못했습니다(corp_code 매핑 부재). "
+                 "비율이 과대평가될 수 있으므로 시작연도 판정을 보수적으로 읽으세요.")
     return C
 
 

@@ -234,7 +234,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260807.2110"
+BUILD_VERSION  = "v3.20260807.2125"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -3446,8 +3446,21 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
     """d3(기관+외국인 누적순매수) 입력. 없으면 D축은 가용 축 평균으로 자동 축소된다."""
     cached = VAULT.get_table("krx_investor_flows", scope="shared")
     if cached is not None and len(cached):
-        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용")
+        cached = cached.copy()                      # 공용 캐시 객체를 제자리에서 고치지 않는다
         cached["date"] = as_ts_series(cached["date"])
+        lo, hi = cached["date"].min(), cached["date"].max()
+        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용 "
+                 f"({lo:%Y-%m} ~ {hi:%Y-%m} · {cached['code'].nunique():,}종목)")
+        # ★ 이 캐시는 증분 갱신 경로가 없다(있으면 통째로 재사용). 다른 전략이 더 짧은 구간으로
+        #   만들어 둔 캐시를 물려받으면 요청 구간의 뒷부분 d3 가 조용히 전부 결측이 된다.
+        #   조용히 두지 않고 '어디까지 덮는지'를 명시한다.
+        need_lo, need_hi = as_ts(start), as_ts(end)
+        if pd.notna(lo) and pd.notna(hi) and (lo > need_lo + pd.Timedelta(days=45) or
+                                              hi < need_hi - pd.Timedelta(days=45)):
+            LOG.warn(f"수급 캐시가 요청 구간({need_lo:%Y-%m}~{need_hi:%Y-%m})을 다 덮지 못합니다 "
+                     f"— 덮이지 않는 달의 d3 는 결측이 되고 U 는 d1 단독으로 계산됩니다. "
+                     f"(이 캐시는 증분 갱신 경로가 없어 전체를 다시 받아야 넓어집니다. "
+                     f"공용 캐시를 지우지 않는 것이 원칙이므로 자동 삭제하지 않습니다)")
         return cached
     if pykrx_stock is None or RUN_MODE == "CACHED":
         LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "
@@ -5673,6 +5686,48 @@ def _canary_emp(corps: Sequence[str], year: int) -> Tuple[Optional[bool], Option
     return k7, k8, k9
 
 
+def canary_sample(sec: pd.DataFrame, monthly: pd.DataFrame, n: int = None) -> List[str]:
+    """CANARY 표본 추출 — U-MID 대역에서, **폐지 종목 비율까지 유니버스와 맞춰서** 뽑는다.
+
+    ★ 전 구간 거래대금 중앙값으로 한 줄 세우면 표본이 조용히 생존자 쪽으로 쏠린다.
+      일찍 폐지된 종목은 관측 개월 수가 적어 중앙값 순위가 낮게 잡히고, 그 결과 K3/K7/K8 이
+      '오래 살아남은 회사의 공시 충실도'를 재게 된다 — 실제 수집률보다 낙관적인 수치가 나오고,
+      그걸 근거로 수집을 시작한다. 캐너리의 목적과 정반대다.
+    → ① 월별 랭크로 U-MID 대역에 한 번이라도 들어온 종목을 후보로 삼고
+      ② 그 후보 안에서 폐지/존속 비율을 그대로 유지해 균등 간격 추출한다.
+    """
+    n = CANARY_SAMPLE_N if n is None else n
+    if monthly is None or monthly.empty or "adv20" not in monthly.columns:
+        return sec["code"].astype(str).tolist()[:n]
+    pm = monthly[["code", "month", "adv20"]].copy()
+    pm["rk"] = pm.groupby("month", observed=True)["adv20"].rank(ascending=False, method="first")
+    band = pm[pm["rk"].between(UMID_RANK_LO, UMID_RANK_HI) & (pm["adv20"] >= MIN_ADV_KRW)]
+    cand = band["code"].value_counts()               # 대역에 머문 개월 수 순
+    codes = [str(c) for c in cand.index]
+    if not codes:
+        LOG.warn("U-MID 대역 후보가 없어 거래대금 상위 순으로 캐너리 표본을 뽑습니다.")
+        codes = (monthly.groupby("code", observed=True)["adv20"].median()
+                 .sort_values(ascending=False).index.astype(str).tolist())
+    dead = set(sec.loc[sec["delisting_date"].notna(), "code"].astype(str))
+    d_list = [c for c in codes if c in dead]
+    l_list = [c for c in codes if c not in dead]
+    share = len(d_list) / max(len(codes), 1)
+    n_d = min(len(d_list), int(round(n * share)))
+    n_l = min(len(l_list), n - n_d)
+
+    def _stride(xs, k):
+        if k <= 0 or not xs:
+            return []
+        step = max(1, len(xs) // k)
+        return xs[::step][:k]
+
+    pick = _stride(d_list, n_d) + _stride(l_list, n_l)
+    LOG.info(f"CANARY 표본 {len(pick)}종목 — U-MID 대역 후보 {len(codes):,}개 중 "
+             f"폐지 {n_d}·존속 {n_l} (대역 내 폐지비율 {share:.1%}을 그대로 반영해 "
+             f"생존자 쏠림을 제거)")
+    return pick
+
+
 def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
     """CANARY 전체 실행. 반환 dict 는 하류가 '무엇을 끄고 갈지' 정하는 데 쓴다."""
     LOG.banner("③ CANARY K1~K9", "수집을 시작해도 되는지 25분 안에 판정합니다 (스펙 §2)")
@@ -5745,7 +5800,8 @@ def canary_report_md() -> str:
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 EMP_EXT_COLS = ["corp_code", "bsns_year", "rcept_no", "rcept_dt", "employees",
-                "regular", "payroll_total", "avg_salary", "n_rows", "unit_fix", "src_flag"]
+                "regular", "payroll_total", "avg_salary", "n_rows", "unit_fix",
+                "pay_fix", "src_flag"]
 
 _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 계", "합계(계)", "-"}
 
@@ -5860,30 +5916,38 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     else:
         avg = np.nan
 
-    avg, mult = _norm_money(avg, "avg")
-    unit_fix = mult
+    avg, unit_fix = _norm_money(avg, "avg")
 
-    # 급여총액 단위 보정: tot ≈ avg × emp 가 성립해야 한다. 1000 배수로 스냅.
+    # ── 급여총액 단위 보정 ──────────────────────────────────────────────────────────────
+    #   tot ≈ avg × emp 가 성립해야 한다. 다만 **먼저 '고칠 필요가 있는가'를 묻는다.**
+    #
+    #   ★ 가장 가까운 1000 배수를 무조건 고르면 멀쩡한 값을 망친다: 1인평균급여가 그 회사를
+    #     대표하지 못하는 제출본(예: 임원만 기재)에서는 expect 가 실제보다 수십 배 작아지고,
+    #     그러면 '÷1000' 이 오히려 오차를 줄이는 것처럼 보여 **정확한 급여총액이 1000분의 1로
+    #     조용히 축소된다.** 한계임금은 이 값의 차분이므로 그대로 신호가 뒤집힌다.
+    #   → 원값이 이미 10배 이내면 손대지 않는다. 명백히 틀렸을 때만, 그것도 배수 보정이
+    #     3배 이내로 들어맞을 때만 고친다. 둘 다 아니면 폐기한다(0 채움 금지).
+    pay_fix = 1
     if np.isfinite(payroll) and np.isfinite(avg) and np.isfinite(emp) and emp > 0 and avg > 0:
         expect = avg * emp
-        best, best_err = None, np.inf
-        for m2 in (1, 1_000, 1_000_000, 0.001, 0.000001):
-            err = abs(math.log10(max(payroll * m2, 1e-9) / expect))
-            if err < best_err:
-                best, best_err = m2, err
-        if best_err <= 1.0:                       # 10배 이내로 맞으면 채택
-            payroll = payroll * best
-            if best != 1:
-                unit_fix = int(unit_fix * (best if best >= 1 else 1))
-        else:
-            payroll = np.nan                      # §5 — 불일치 10배+ 는 폐기 (0 채움 금지)
+        err0 = abs(math.log10(max(payroll, 1e-9) / expect))
+        if err0 > 1.0:                                     # 10배 넘게 어긋난 경우에만 개입
+            best, best_err = None, np.inf
+            for m2 in (1_000, 1_000_000, 0.001, 0.000001):
+                err = abs(math.log10(max(payroll * m2, 1e-9) / expect))
+                if err < best_err:
+                    best, best_err = m2, err
+            if best_err <= 0.5:                            # 보정 후 3배 이내로 맞을 때만 채택
+                payroll, pay_fix = payroll * best, best
+            else:
+                payroll = np.nan                           # §5 — 불일치 10배+ 폐기
 
     rn = str(sel["rcept_no"].iloc[0]) if "rcept_no" in sel.columns and len(sel) else ""
     kd = _knowledge_from_rcept(rn, REPRT_CODES["FY"], int(year))
     return {"corp_code": str(corp), "bsns_year": int(year), "rcept_no": rn,
             "rcept_dt": kd, "employees": emp, "regular": regular,
             "payroll_total": payroll, "avg_salary": avg, "n_rows": int(len(sel)),
-            "unit_fix": int(unit_fix), "src_flag": flag}
+            "unit_fix": int(unit_fix), "pay_fix": float(pay_fix), "src_flag": flag}
 
 
 def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
@@ -5955,6 +6019,26 @@ def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict]) -> pd.DataFra
     LOG.ok(f"직원현황 총 {len(E):,}행 · {E['corp_code'].nunique():,}사 · "
            f"{E['bsns_year'].min()}~{E['bsns_year'].max()}년 "
            f"(급여총액 기재 {E['payroll_total'].notna().mean():.0%})")
+    # 단위 정규화가 얼마나 개입했는지 드러낸다 — 조용한 보정은 조용한 오염과 구별되지 않는다.
+    rows = []
+    if "unit_fix" in E.columns:
+        for m, n in E["unit_fix"].value_counts().sort_index().items():
+            rows.append([f"1인평균급여 ×{int(m):,}", f"{int(n):,}",
+                         "원 단위 그대로" if int(m) == 1 else "천원/백만원 기재로 판단해 환산"])
+    if "pay_fix" in E.columns:
+        for m, n in E["pay_fix"].value_counts().sort_index().items():
+            rows.append([f"급여총액 ×{float(m):g}", f"{int(n):,}",
+                         "손대지 않음" if float(m) == 1.0 else "10배 초과 불일치 → 배수 보정"])
+    n_drop = int(E["payroll_total"].isna().sum())
+    rows.append(["급여총액 결측/폐기", f"{n_drop:,}", "무기재이거나 10배+ 불일치로 폐기(0 채움 안 함)"])
+    if "src_flag" in E.columns:
+        for f, n in E["src_flag"].value_counts().items():
+            rows.append([f"행 선택 경로: {f}", f"{int(n):,}",
+                         {"detail": "부문×성별 분해행 사용(정상)",
+                          "half": "한쪽만 합계 — 부분 분해",
+                          "total_only": "합계행만 제출 — 이중계상 위험 없음"}.get(str(f), "")])
+    LOG.table(rows, ["단위·행선택 정규화", "건수", "의미"], ["l", "r", "l"],
+              title="직원현황 정규화 감사 (K9 단위 정합성의 실측 결과)")
     return E
 
 
@@ -6065,20 +6149,34 @@ def test_c15(df: pd.DataFrame) -> Tuple[bool, str]:
 
 
 # ── §6 커버리지 감사 (필수 출력) ────────────────────────────────────────────────────────────
-def emp_coverage_audit(S: pd.DataFrame, umid_by_year: Dict[int, int]) -> pd.DataFrame:
+def emp_coverage_audit(S: pd.DataFrame, umid_n: Dict[int, int],
+                       umid_corps: Optional[Dict[int, set]] = None) -> pd.DataFrame:
     """연도별: U-MID 대상 / empSttus 성공 / 급여총액 기재 / C15 통과 / 유효 관측치.
 
+    ★ 분자와 분모는 반드시 같은 모집단이어야 한다. umid_corps 를 주면 그 해 U-MID 였던
+      기업으로 분자를 제한한다. 주지 않으면 전 상장사 기준이며, 그 사실을 표 제목에 밝힌다.
     반환 DataFrame 은 emp_coverage.csv 로 저장되고, 시작연도 판정의 근거가 된다.
     """
     rows = []
     if S is None or S.empty:
         LOG.warn("직원현황 패널이 비어 커버리지 감사를 출력할 수 없습니다.")
         return pd.DataFrame(columns=["year", "u_mid", "emp_ok", "pay_ok", "c15_ok", "valid"])
+    scoped = umid_corps is not None and len(umid_corps) > 0
     for y in sorted(S["bsns_year"].dropna().astype(int).unique()):
         sub = S[S["bsns_year"] == y]
+        if scoped:
+            # 사업연도 y 의 공시는 y+1 년에 알려지므로, 그 해 U-MID 였던 기업 기준으로 센다.
+            #   ★ 교집합이 비면 그 해엔 U-MID 종목이 아예 없다는 뜻이다(대개 백테스트 창 밖).
+            #     그때 필터를 건너뛰면 분자만 전 상장사로 튀어 분모(0)와 어긋난다 → 0 으로 센다.
+            keep = umid_corps.get(int(y), set()) | umid_corps.get(int(y) + 1, set())
+            sub = sub[sub["corp_code"].astype(str).isin(keep)] if keep else sub.iloc[0:0]
+        # ★ 분모도 분자와 **같은 집합**에서 센다. 분모를 '그 해 U-MID', 분자를 'y 또는 y+1 에
+        #   U-MID' 로 두면 (사업연도 y 의 공시는 y+1 에 알려지므로 분자는 y+1 을 포함해야 한다)
+        #   표가 자기모순에 빠진다 — 분모 0 인데 분자 84 같은 행이 나온다.
+        denom = len(keep) if scoped else int(umid_n.get(int(y), 0))
         rows.append({
             "year": int(y),
-            "u_mid": int(umid_by_year.get(int(y), 0)),
+            "u_mid": int(denom),
             "emp_ok": int(sub["employees"].notna().sum()),
             "pay_ok": int(sub["payroll_total"].notna().sum()),
             "c15_ok": int(sub["nl_marginal"].notna().sum()),
@@ -6087,13 +6185,18 @@ def emp_coverage_audit(S: pd.DataFrame, umid_by_year: Dict[int, int]) -> pd.Data
     C = pd.DataFrame(rows)
     LOG.table([[str(r.year), f"{r.u_mid:,}", f"{r.emp_ok:,}", f"{r.pay_ok:,}",
                 f"{r.c15_ok:,}", f"{r.valid:,}",
-                "부족" if r.valid < C15_MIN_OBS_PER_YR else
-                ("경계" if r.valid < COVERAGE_MIN_OBS_START else "충분")]
+                "구간밖" if (scoped and r.u_mid == 0) else
+                ("부족" if r.valid < C15_MIN_OBS_PER_YR else
+                 ("경계" if r.valid < COVERAGE_MIN_OBS_START else "충분"))]
                for r in C.itertuples(index=False)],
               ["사업연도", "U-MID 대상", "empSttus 성공", "급여총액 기재", "C15 통과",
                "유효 관측치", "판정"],
               ["c", "r", "r", "r", "r", "r", "c"],
-              title="EMP 커버리지 감사 (§6 — 필수 출력)")
+              title="EMP 커버리지 감사 (§6 — 필수 출력) · 분자 모집단 = " +
+                    ("U-MID 기업" if scoped else "전 상장사(분모와 불일치, 참고용)"))
+    if not scoped:
+        LOG.warn("커버리지 분자를 U-MID 로 제한하지 못했습니다(corp_code 매핑 부재). "
+                 "비율이 과대평가될 수 있으므로 시작연도 판정을 보수적으로 읽으세요.")
     return C
 
 
@@ -6559,6 +6662,21 @@ def umid_by_year(P: pd.DataFrame) -> Dict[int, int]:
     return sub.groupby("year")["code"].nunique().to_dict()
 
 
+def umid_corps_by_year(P: pd.DataFrame) -> Dict[int, set]:
+    """연도별 U-MID 기업의 corp_code 집합 — §6 표의 **분자**를 분모와 같은 모집단으로 맞춘다.
+
+    ★ 이걸 안 하면 분자는 전 상장사에서 세고 분모는 U-MID 에서 세게 되어,
+      'U-MID 대상 1,102 / empSttus 성공 2,400' 처럼 비율이 100%를 넘는 표가 나온다.
+      그 표를 근거로 시작연도를 판정하므로(§6), 커버리지를 과대평가한 채 창을 앞당기게 된다.
+    """
+    if P.empty or "u_mid" not in P.columns or "corp_code" not in P.columns:
+        return {}
+    sub = P.loc[P["u_mid"] & P["corp_code"].notna(), ["corp_code", "month"]].copy()
+    sub["year"] = sub["month"].dt.year
+    return {int(y): set(g["corp_code"].astype(str))
+            for y, g in sub.groupby("year", observed=True)}
+
+
 # ── U축: 반영도 (스펙 §8 — U = mean(z(d1), z(d3))) ─────────────────────────────────────────
 def axis_U_v3(P: pd.DataFrame, flows: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Δlog P = Δlog E + Δlog M 분해.  d1 = -Δlog M  (120거래일 ≈ 6개월)
@@ -7001,6 +7119,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     hold: Dict[str, dict] = {}
     rows, trades, holdings_log = [], [], []
     prev_w: Dict[str, float] = {}
+    # 폐지 손실을 이미 반영한 종목 — 같은 종목에 -100% 를 두 번 물리지 않기 위한 장부
+    delist_realized: set = set()
+    vanished_delisted = vanished_other = 0
 
     for i, m in enumerate(months):
         sub = P[(P["month"] == m)].copy()
@@ -7033,9 +7154,26 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
 
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
         keep = []
+        vanished_loss = 0.0
         for c, h in list(hold.items()):
             r0 = rec.get(c)
             if r0 is None:
+                # ★★ 패널에서 사라진 보유 종목 (C2 생존자편향의 마지막 구멍) ★★
+                #   예전엔 그냥 continue 였다. 그러면 '거래정지 → 몇 달 뒤 상장폐지' 경로가
+                #   손실 0%로 조용히 청산된다. 거래가 끊긴 종목은 월 패널에 행이 생기지 않으므로
+                #   아래 fwd_ret 기반 -100% 규칙이 **한 번도 발동하지 못한다.**
+                #   실제로는 정리매매가 없으면 -100% 다. 사라진 이유를 갈라서 처리한다:
+                #     · 폐지가 임박/진행 중  → -100% (이미 반영한 종목은 제외)
+                #     · 그 외(유니버스 이탈) → 직전가로 청산, 그 달 수익 0% (로그로 드러냄)
+                dl = delist.get(c)
+                w_prev = prev_w.get(c, 0.0)
+                if (w_prev > 0 and dl is not None and pd.notna(dl)
+                        and c not in delist_realized and dl <= m + pd.offsets.MonthEnd(1)):
+                    vanished_loss += w_prev * -1.0
+                    delist_realized.add(c)
+                    vanished_delisted += 1
+                elif w_prev > 0:
+                    vanished_other += 1
                 continue
             dm, de = r0.get("dlog_M"), r0.get("dlog_E")
             exited = False
@@ -7081,12 +7219,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
                 # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
                 fr = -1.0 if not np.isfinite(fr) else fr
+                delist_realized.add(c)      # 이 종목의 폐지 손익은 여기서 확정 — 재차감 금지
             if not np.isfinite(fr):
                 fr = 0.0
             ret += w * fr
             _s = _r.get(signal_col)
             holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
                                  "signal": float(_s) if _s is not None and pd.notna(_s) else np.nan})
+        ret += vanished_loss                 # 패널에서 사라진 폐지 종목의 -100% 를 이달에 반영
         ret_net = ret - cost
         rows.append({"month": m, "ret": ret_net, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost})
@@ -7102,7 +7242,12 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     R = pd.DataFrame(rows)
     R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
     H = pd.DataFrame(holdings_log)
-    return {"returns": R, "holdings": H, "label": label}
+    if vanished_delisted or vanished_other:
+        LOG.info(f"[{label}] 보유 중 패널에서 사라진 종목 — 폐지 진행 {vanished_delisted}건은 "
+                 f"-100% 로 반영, 그 외 {vanished_other}건은 직전가 청산(그 달 수익 0%). "
+                 f"조용히 사라지게 두지 않습니다(C2).")
+    return {"returns": R, "holdings": H, "label": label,
+            "vanished_delisted": vanished_delisted, "vanished_other": vanished_other}
 
 
 # ── 성과 지표 ───────────────────────────────────────────────────────────────────────────────
@@ -8856,84 +9001,100 @@ def make_synthetic_v3(n_codes: int = 320, n_months: int = 60, seed: int = None) 
 
 
 def run_selftest_v3(full_chain: bool = False) -> bool:
+    """★ 프로덕션 함수를 그대로 호출한다. 스모크가 자기 사본을 돌리면 아무것도 증명하지 못한다.
+
+    예전 구조는 build_features_v3 의 호출 순서를 스모크가 손으로 베껴 두는 방식이었다.
+    그러면 프로덕션 쪽만 고쳤을 때 스모크는 여전히 통과하고, 2시간 반짜리 FULL 실행이
+    수집을 다 끝낸 뒤 L1.PANEL 한 줄에서 죽는다. 실제로 그런 전례가 있다.
+    → 합성 ctx 를 만들어 build_features_v3 → score_and_backtest_v3 → persist_outputs_v3 을
+      **실물로** 통과시킨다.
+
+    VAULT 는 임시 디렉터리로 바꿔 끼운다. 합성 피처·스코어가 사용자의 전용 인덱스에
+    기록되면 그것이야말로 캐시 오염이다(절대 1원칙).
+    """
     LOG.banner("① 합성데이터 엔드투엔드 스모크",
-               "네트워크·키 없이 계산경로(센서→TP→스코어→백테스트→강건성)를 증명합니다")
+               "네트워크·키 없이 프로덕션 함수를 실물 호출해 계산경로를 증명합니다")
     t0 = time.time()
-    S = make_synthetic_v3()
-    months = S["months"]
-    PIT._t.clear(); PIT._meta.clear()
+    G = globals()
+    saved_vault = G.get("VAULT")
+    saved_runtime = list(RUNTIME_ROWS)      # 합성 실행의 소요시간이 §10 예산표에 섞이지 않게
+    tmp = tempfile.mkdtemp(prefix="tcd_v3_smoke_")
+    try:
+        G["VAULT"] = Vault(tmp, "SMOKE")
+        S = make_synthetic_v3()
+        months = S["months"]
+        PIT._t.clear(); PIT._meta.clear()
 
-    uni = Universe(S["sec"], pd.DataFrame(columns=["snap_date", "code", "market"]), S["px"])
-    panel = build_price_panel(S["px"], months)
-    P = build_base_panel_v3(uni, months, panel["monthly"])
+        ES = build_emp_sensors(S["emp_raw"])
+        PIT.register("dart_financials", S["fin"], key_cols=["corp_code"])
+        PIT.register("emp_sensors",
+                     pit_frame(ES, "period_end", "knowledge_date", source="synthetic"),
+                     key_cols=["corp_code"])
 
-    ES = build_emp_sensors(S["emp_raw"])
-    PIT.register("dart_financials", S["fin"], key_cols=["corp_code"])
-    PIT.register("emp_sensors",
-                 pit_frame(ES, "period_end", "knowledge_date", source="synthetic"),
-                 key_cols=["corp_code"])
+        ctx: Dict[str, Any] = {
+            "sec": S["sec"],
+            "snapshots": pd.DataFrame(columns=["snap_date", "code", "market"]),
+            "panel": build_price_panel(S["px"], months),
+            "flows": S["flows"], "disclosures": S["disclosures"],
+            "emp_raw": S["emp_raw"], "emp_sensors": ES, "fin": S["fin"],
+        }
 
-    P = attach_pit_sources(P, S["sec"])
-    # ★ 프로덕션 경로와 같은 순서로 태운다. 스모크가 건너뛴 함수는 증명되지 않은 함수다.
-    P = apply_umid(P, uni)
-    P = build_cells_v3(P, S["sec"])
-    P = core_d_sensors(P, {"disclosures": S["disclosures"]})
-    cov = emp_coverage_audit(ES, umid_by_year(P))
-    emp_start, verdict = coverage_verdict(cov)
-    LOG.info(f"§6 판정(합성) — {verdict}")
-    P = emp_lite_sensors(P, emp_start)
-    P = axis_U_v3(P, S["flows"])
-    n_before = len(P)
-    P = P[P["u_mid"]].reset_index(drop=True)
-    LOG.info(f"U-MID 스코어링 패널 확정(합성) — {n_before:,} → {len(P):,}행")
-    if P.empty:
-        LOG.error("U-MID 필터 후 패널이 비었습니다 — apply_umid 폴백이 동작하지 않았습니다.")
-        return False
-    P = build_tps(P)
-    P = apply_vetoes_v3(P, {"disclosures": S["disclosures"]})
-    P = assemble_score_v3(P)
+        # ── 프로덕션 경로 실물 호출 ────────────────────────────────────────────────────
+        P, uni, ctx = build_features_v3(ctx, months)
+        if P.empty:
+            LOG.error("U-MID 필터 후 패널이 비었습니다 — apply_umid 폴백이 동작하지 않았습니다.")
+            return False
+        P, bt, _run = score_and_backtest_v3(P, ctx, months, uni)
 
-    def _run(pp, label="run", apply_costs=True, months_override=None):
-        return run_backtest(pp, months_override if months_override is not None else months,
-                            uni, S["sec"], apply_costs=apply_costs, label=label)
+        R = bt["returns"]
+        if R.empty or not np.isfinite(R["ret"].fillna(0)).all():
+            LOG.error("스모크 백테스트가 유효한 수익률 시계열을 만들지 못했습니다.")
+            return False
 
-    bt = _run(P, label="SMOKE")
-    R = bt["returns"]
-    if R.empty or not np.isfinite(R["ret"].fillna(0)).all():
-        LOG.error("스모크 백테스트가 유효한 수익률 시계열을 만들지 못했습니다.")
-        return False
+        # 미래누수 자가검정 — 소스별 지식일이 모두 관측월 이하여야 한다
+        bad = 0
+        for kd in ("kd_fin", "kd_emp"):
+            if kd in P.columns:
+                bad += int((P[kd].notna() & (P[kd] > P["month"])).sum())
+        if bad:
+            LOG.error(f"★스모크에서 미래정보 유입 {bad:,}행 감지 — merge_asof 방향을 확인하세요.")
+            return False
 
-    # 미래누수 자가검정 — 합성 단계에서도 반드시 통과해야 한다
-    bad = int((P["knowledge_date"].notna() & (P["knowledge_date"] > P["month"])).sum()) \
-        if "knowledge_date" in P.columns else 0
-    if bad:
-        LOG.error(f"★스모크에서 미래정보 유입 {bad:,}행 감지 — merge_asof 방향을 확인하세요.")
-        return False
+        LOG.ok(f"스모크 통과 — 패널 {len(P):,}행 × {P.shape[1]}열 · 백테스트 {len(R)}개월 · "
+               f"평균 보유 {R['n'].mean():.1f}종목 · {time.time()-t0:.1f}초")
 
-    LOG.ok(f"스모크 통과 — 패널 {len(P):,}행 × {P.shape[1]}열 · 백테스트 {len(R)}개월 · "
-           f"평균 보유 {R['n'].mean():.1f}종목 · {time.time()-t0:.1f}초")
-
-    if full_chain:
-        bench = R0_benchmark(P, bt, months)
-        report_performance_v3(bt, bench, label="SMOKE(합성)")
-        uni.report_attrition()
-        try:
-            R1_leakage(P, months, _run)
-            R2N_kill_gate(P, _run)
-            R3_orthogonal(P, _run)
-            R5_ablation(P, _run)
-            R7_regime(bt, bench)
-            R8_subperiod(bt)
+        if full_chain:
+            bench = R0_benchmark(P, bt, months)
+            report_performance_v3(bt, bench, label="SMOKE(합성)")
+            uni.report_attrition()
+            uni.attrition = []
             cal = build_policy_calendar_v3()
             report_policy_v3(cal, months)
-            R10_policy_falsify(P, cal, months, _run)
-        except KillCriteria as e:
-            LOG.warn(f"스모크 강건성에서 킬 기준 발동(합성데이터이므로 정상일 수 있음): {e}")
-        report_robustness_v3()
-        report_interpretation_v3(P)
-        diagnostic_card_v3(P, bt, S["sec"])
-        report_ledger_v3({"sec": S["sec"], "emp_raw": S["emp_raw"], "fin": S["fin"]})
-    return True
+            ctx["policy"] = cal
+            try:
+                R1_leakage(P, months, _run)
+                R2N_kill_gate(P, _run)
+                R3_orthogonal(P, _run)
+                R5_ablation(P, _run)
+                R7_regime(bt, bench)
+                R8_subperiod(bt)
+                R10_policy_falsify(P, cal, months, _run)
+            except KillCriteria as e:
+                LOG.warn(f"스모크 강건성에서 킬 기준 발동(합성데이터이므로 정상일 수 있음): {e}")
+            report_robustness_v3()
+            report_interpretation_v3(P)
+            diagnostic_card_v3(P, bt, ctx["sec"])
+            report_ledger_v3(ctx)
+            # 산출물 경로까지 실물로 태운다 — FULL 2시간 뒤 저장부에서 죽는 것을 막는다
+            outs = persist_outputs_v3(P, bt, ctx, bench, t0)
+            LOG.ok(f"산출물 경로 검증 완료 — {len(outs)}개 파일 생성(임시 디렉터리, 곧 삭제됨): "
+                   + ", ".join(os.path.basename(p) for p in outs[:6]))
+        return True
+    finally:
+        G["VAULT"] = saved_vault
+        if RUN_MODE != "SMOKE":                 # SMOKE 모드에선 이 표가 유일한 런타임 기록이다
+            RUNTIME_ROWS[:] = saved_runtime
+        shutil.rmtree(tmp, ignore_errors=True)
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  오케스트레이터 — 전체 실행 순서와 산출물                                                  ║
@@ -9032,12 +9193,8 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
         ctx["panel"] = build_price_panel(px, months)
 
     with PIPE.stage("L0.CANARY", "CANARY K1~K9", "L0", budget_s=2100):
-        pm = ctx["panel"]["monthly"]
-        adv = (pm.groupby("code", observed=True)["adv20"].median().sort_values(ascending=False))
-        # U-MID 대역(대형주 250 제외) 근방에서 표본을 뽑아야 K3/K7/K8 이 대표성을 갖는다
-        band = adv.index[UMID_RANK_LO - 1: UMID_RANK_HI].tolist() or adv.index.tolist()
-        step = max(1, len(band) // max(CANARY_SAMPLE_N, 1))
-        ctx["canary"] = run_canary(ctx["sec"], band[::step][:CANARY_SAMPLE_N])
+        ctx["canary"] = run_canary(ctx["sec"],
+                                   canary_sample(ctx["sec"], ctx["panel"]["monthly"]))
 
     with PIPE.stage("L1.FLOW", "기관·외국인 수급 (U축 d3)", "L1", budget_s=1200, critical=False):
         ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START, BACKTEST_END)
@@ -9144,7 +9301,8 @@ def build_features_v3(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         P = core_d_sensors(P, ctx)
 
         # §6 커버리지 감사 → 판정 → EMP 유효 시작월
-        C = emp_coverage_audit(ctx.get("emp_sensors", pd.DataFrame()), umid_by_year(P))
+        C = emp_coverage_audit(ctx.get("emp_sensors", pd.DataFrame()),
+                               umid_by_year(P), umid_corps_by_year(P))
         emp_start, verdict = coverage_verdict(C)
         LOG.info(f"§6 판정 — {verdict}")
         ctx["emp_coverage"], ctx["emp_coverage_verdict"] = C, verdict

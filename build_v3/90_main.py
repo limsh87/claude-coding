@@ -95,12 +95,8 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
         ctx["panel"] = build_price_panel(px, months)
 
     with PIPE.stage("L0.CANARY", "CANARY K1~K9", "L0", budget_s=2100):
-        pm = ctx["panel"]["monthly"]
-        adv = (pm.groupby("code", observed=True)["adv20"].median().sort_values(ascending=False))
-        # U-MID 대역(대형주 250 제외) 근방에서 표본을 뽑아야 K3/K7/K8 이 대표성을 갖는다
-        band = adv.index[UMID_RANK_LO - 1: UMID_RANK_HI].tolist() or adv.index.tolist()
-        step = max(1, len(band) // max(CANARY_SAMPLE_N, 1))
-        ctx["canary"] = run_canary(ctx["sec"], band[::step][:CANARY_SAMPLE_N])
+        ctx["canary"] = run_canary(ctx["sec"],
+                                   canary_sample(ctx["sec"], ctx["panel"]["monthly"]))
 
     with PIPE.stage("L1.FLOW", "기관·외국인 수급 (U축 d3)", "L1", budget_s=1200, critical=False):
         ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START, BACKTEST_END)
@@ -207,7 +203,8 @@ def build_features_v3(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         P = core_d_sensors(P, ctx)
 
         # §6 커버리지 감사 → 판정 → EMP 유효 시작월
-        C = emp_coverage_audit(ctx.get("emp_sensors", pd.DataFrame()), umid_by_year(P))
+        C = emp_coverage_audit(ctx.get("emp_sensors", pd.DataFrame()),
+                               umid_by_year(P), umid_corps_by_year(P))
         emp_start, verdict = coverage_verdict(C)
         LOG.info(f"§6 판정 — {verdict}")
         ctx["emp_coverage"], ctx["emp_coverage_verdict"] = C, verdict

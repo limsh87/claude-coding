@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_D"
 STRATEGY_NAME      = "PACK-D 공시텍스트 경직성"
 ACTIVE_PACKS       = ["D"]
-BUILD_VERSION      = "v2.20260807.1316"
+BUILD_VERSION      = "v2.20260807.2122"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -3189,11 +3189,31 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+    # ★★ 공용 캐시 보존 (절대 1원칙) ★★
+    #   반환값은 이번 백테스트 창(+400일 워밍업)으로 자르는 게 맞지만, **그 잘린 프레임을
+    #   공용 테이블에 그대로 써버리면** 창 밖의 과거가 활성 parquet 에서 영구히 사라진다.
+    #   put_table 은 백업을 남기지만 get_table 은 활성 파일만 읽으므로, 다른 전략(또는 더 이른
+    #   시작일로 도는 다음 실행)이 보기에 캐시가 통째로 파괴된 것과 같다.
+    #   → 저장은 '기존 캐시 ∪ 신규'로 하고, 반환만 창으로 자른다.
+    win = (px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)
+    px_out = px[win]
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
+        to_store = px
+        if cached is not None and len(cached):
+            outside = cached[~((cached["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                               (cached["date"] <= end_ts))]
+            if len(outside):
+                to_store = (pd.concat([outside.reindex(columns=px.columns), px],
+                                      ignore_index=True)
+                              .sort_values(["code", "date"])
+                              .drop_duplicates(["code", "date"], keep="last")
+                              .reset_index(drop=True))
+                LOG.info(f"공용 가격 캐시 보존 — 이번 창 밖의 과거 {len(outside):,}행을 "
+                         f"합쳐서 저장합니다(잘라내지 않습니다).")
+        VAULT.put_table("krx_ohlcv_daily", to_store, scope="shared", domain="price",
                         source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+    px = px_out
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
@@ -3258,8 +3278,21 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
     """d3(기관+외국인 누적순매수) 입력. 없으면 D축은 가용 축 평균으로 자동 축소된다."""
     cached = VAULT.get_table("krx_investor_flows", scope="shared")
     if cached is not None and len(cached):
-        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용")
+        cached = cached.copy()                      # 공용 캐시 객체를 제자리에서 고치지 않는다
         cached["date"] = as_ts_series(cached["date"])
+        lo, hi = cached["date"].min(), cached["date"].max()
+        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용 "
+                 f"({lo:%Y-%m} ~ {hi:%Y-%m} · {cached['code'].nunique():,}종목)")
+        # ★ 이 캐시는 증분 갱신 경로가 없다(있으면 통째로 재사용). 다른 전략이 더 짧은 구간으로
+        #   만들어 둔 캐시를 물려받으면 요청 구간의 뒷부분 d3 가 조용히 전부 결측이 된다.
+        #   조용히 두지 않고 '어디까지 덮는지'를 명시한다.
+        need_lo, need_hi = as_ts(start), as_ts(end)
+        if pd.notna(lo) and pd.notna(hi) and (lo > need_lo + pd.Timedelta(days=45) or
+                                              hi < need_hi - pd.Timedelta(days=45)):
+            LOG.warn(f"수급 캐시가 요청 구간({need_lo:%Y-%m}~{need_hi:%Y-%m})을 다 덮지 못합니다 "
+                     f"— 덮이지 않는 달의 d3 는 결측이 되고 U 는 d1 단독으로 계산됩니다. "
+                     f"(이 캐시는 증분 갱신 경로가 없어 전체를 다시 받아야 넓어집니다. "
+                     f"공용 캐시를 지우지 않는 것이 원칙이므로 자동 삭제하지 않습니다)")
         return cached
     if pykrx_stock is None or RUN_MODE == "CACHED":
         LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "
@@ -5216,7 +5249,9 @@ class Universe:
         if not self.attrition:
             return
         A = pd.DataFrame(self.attrition)
-        order = ["전체상장", "PIT유니버스", "가격보유", "유동성필터", "거부권통과",
+        # ★ 이 목록에 없는 단계는 표에서 조용히 사라진다(오류도 경고도 없이).
+        #   새 게이트를 추가했다면 반드시 여기에도 넣을 것.
+        order = ["전체상장", "PIT유니버스", "가격보유", "U-MID대역", "유동성필터", "거부권통과",
                  "하한선통과", "최종선정"]
         piv = A.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
         rows = []
@@ -6194,6 +6229,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     hold: Dict[str, dict] = {}
     rows, trades, holdings_log = [], [], []
     prev_w: Dict[str, float] = {}
+    # 폐지 손실을 이미 반영한 종목 — 같은 종목에 -100% 를 두 번 물리지 않기 위한 장부
+    delist_realized: set = set()
+    vanished_delisted = vanished_other = 0
 
     for i, m in enumerate(months):
         sub = P[(P["month"] == m)].copy()
@@ -6226,9 +6264,26 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
 
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
         keep = []
+        vanished_loss = 0.0
         for c, h in list(hold.items()):
             r0 = rec.get(c)
             if r0 is None:
+                # ★★ 패널에서 사라진 보유 종목 (C2 생존자편향의 마지막 구멍) ★★
+                #   예전엔 그냥 continue 였다. 그러면 '거래정지 → 몇 달 뒤 상장폐지' 경로가
+                #   손실 0%로 조용히 청산된다. 거래가 끊긴 종목은 월 패널에 행이 생기지 않으므로
+                #   아래 fwd_ret 기반 -100% 규칙이 **한 번도 발동하지 못한다.**
+                #   실제로는 정리매매가 없으면 -100% 다. 사라진 이유를 갈라서 처리한다:
+                #     · 폐지가 임박/진행 중  → -100% (이미 반영한 종목은 제외)
+                #     · 그 외(유니버스 이탈) → 직전가로 청산, 그 달 수익 0% (로그로 드러냄)
+                dl = delist.get(c)
+                w_prev = prev_w.get(c, 0.0)
+                if (w_prev > 0 and dl is not None and pd.notna(dl)
+                        and c not in delist_realized and dl <= m + pd.offsets.MonthEnd(1)):
+                    vanished_loss += w_prev * -1.0
+                    delist_realized.add(c)
+                    vanished_delisted += 1
+                elif w_prev > 0:
+                    vanished_other += 1
                 continue
             dm, de = r0.get("dlog_M"), r0.get("dlog_E")
             exited = False
@@ -6274,12 +6329,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
                 # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
                 fr = -1.0 if not np.isfinite(fr) else fr
+                delist_realized.add(c)      # 이 종목의 폐지 손익은 여기서 확정 — 재차감 금지
             if not np.isfinite(fr):
                 fr = 0.0
             ret += w * fr
             _s = _r.get(signal_col)
             holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
                                  "signal": float(_s) if _s is not None and pd.notna(_s) else np.nan})
+        ret += vanished_loss                 # 패널에서 사라진 폐지 종목의 -100% 를 이달에 반영
         ret_net = ret - cost
         rows.append({"month": m, "ret": ret_net, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost})
@@ -6295,7 +6352,12 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     R = pd.DataFrame(rows)
     R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
     H = pd.DataFrame(holdings_log)
-    return {"returns": R, "holdings": H, "label": label}
+    if vanished_delisted or vanished_other:
+        LOG.info(f"[{label}] 보유 중 패널에서 사라진 종목 — 폐지 진행 {vanished_delisted}건은 "
+                 f"-100% 로 반영, 그 외 {vanished_other}건은 직전가 청산(그 달 수익 0%). "
+                 f"조용히 사라지게 두지 않습니다(C2).")
+    return {"returns": R, "holdings": H, "label": label,
+            "vanished_delisted": vanished_delisted, "vanished_other": vanished_other}
 
 
 # ── 성과 지표 ───────────────────────────────────────────────────────────────────────────────
@@ -7682,6 +7744,11 @@ def run_contract_tests(strict: bool = True) -> bool:
 
 REHEARSAL_RESULTS: List[dict] = []
 
+# 전략별 추가 리허설 훅. 시그니처: fn(G: dict, sec: pd.DataFrame, corps: List[str],
+# months: pd.DatetimeIndex) -> None.  가짜 네트워크가 이미 물려 있는 안쪽에서 호출된다.
+# 코어만 빌드하면 빈 리스트라 동작이 바뀌지 않는다(순수 추가).
+REHEARSAL_HOOKS: List[Callable] = []
+
 
 def _rh(name: str, fn: Callable, expect_rows: bool = True, note: str = ""):
     """리허설 1건 실행. 예외는 실패, 정상응답 0행도 (기대했다면) 실패."""
@@ -8097,6 +8164,16 @@ def run_rehearsal(strict: bool = True) -> bool:
             if T is not None and len(T):
                 _rh("build_text_similarity", lambda: build_text_similarity(T),
                     expect_rows=False)
+
+        # ── ⑤-b 전략별 추가 리허설 (가짜 네트워크가 물려 있는 상태에서 실행) ──────────────
+        for _hook in list(REHEARSAL_HOOKS):
+            try:
+                _hook(G, sec, corps, months)
+            except Exception as _e:                                  # noqa
+                REHEARSAL_RESULTS.append({
+                    "name": f"[훅] {getattr(_hook, '__name__', 'hook')}", "ok": False,
+                    "rows": -1, "sec": 0.0, "err": f"{type(_e).__name__}: {_e}",
+                    "note": "", "tb": traceback.format_exc()})
 
         # ── ⑥ 이상 응답 내성 (빈/깨짐/컬럼누락) ───────────────────────────────────────────
         for mode, label in (("empty", "빈 응답"), ("broken", "깨진 응답"),

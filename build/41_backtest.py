@@ -125,6 +125,9 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     hold: Dict[str, dict] = {}
     rows, trades, holdings_log = [], [], []
     prev_w: Dict[str, float] = {}
+    # 폐지 손실을 이미 반영한 종목 — 같은 종목에 -100% 를 두 번 물리지 않기 위한 장부
+    delist_realized: set = set()
+    vanished_delisted = vanished_other = 0
 
     for i, m in enumerate(months):
         sub = P[(P["month"] == m)].copy()
@@ -157,9 +160,26 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
 
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
         keep = []
+        vanished_loss = 0.0
         for c, h in list(hold.items()):
             r0 = rec.get(c)
             if r0 is None:
+                # ★★ 패널에서 사라진 보유 종목 (C2 생존자편향의 마지막 구멍) ★★
+                #   예전엔 그냥 continue 였다. 그러면 '거래정지 → 몇 달 뒤 상장폐지' 경로가
+                #   손실 0%로 조용히 청산된다. 거래가 끊긴 종목은 월 패널에 행이 생기지 않으므로
+                #   아래 fwd_ret 기반 -100% 규칙이 **한 번도 발동하지 못한다.**
+                #   실제로는 정리매매가 없으면 -100% 다. 사라진 이유를 갈라서 처리한다:
+                #     · 폐지가 임박/진행 중  → -100% (이미 반영한 종목은 제외)
+                #     · 그 외(유니버스 이탈) → 직전가로 청산, 그 달 수익 0% (로그로 드러냄)
+                dl = delist.get(c)
+                w_prev = prev_w.get(c, 0.0)
+                if (w_prev > 0 and dl is not None and pd.notna(dl)
+                        and c not in delist_realized and dl <= m + pd.offsets.MonthEnd(1)):
+                    vanished_loss += w_prev * -1.0
+                    delist_realized.add(c)
+                    vanished_delisted += 1
+                elif w_prev > 0:
+                    vanished_other += 1
                 continue
             dm, de = r0.get("dlog_M"), r0.get("dlog_E")
             exited = False
@@ -205,12 +225,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
                 # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
                 fr = -1.0 if not np.isfinite(fr) else fr
+                delist_realized.add(c)      # 이 종목의 폐지 손익은 여기서 확정 — 재차감 금지
             if not np.isfinite(fr):
                 fr = 0.0
             ret += w * fr
             _s = _r.get(signal_col)
             holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
                                  "signal": float(_s) if _s is not None and pd.notna(_s) else np.nan})
+        ret += vanished_loss                 # 패널에서 사라진 폐지 종목의 -100% 를 이달에 반영
         ret_net = ret - cost
         rows.append({"month": m, "ret": ret_net, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost})
@@ -226,7 +248,12 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     R = pd.DataFrame(rows)
     R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
     H = pd.DataFrame(holdings_log)
-    return {"returns": R, "holdings": H, "label": label}
+    if vanished_delisted or vanished_other:
+        LOG.info(f"[{label}] 보유 중 패널에서 사라진 종목 — 폐지 진행 {vanished_delisted}건은 "
+                 f"-100% 로 반영, 그 외 {vanished_other}건은 직전가 청산(그 달 수익 0%). "
+                 f"조용히 사라지게 두지 않습니다(C2).")
+    return {"returns": R, "holdings": H, "label": label,
+            "vanished_delisted": vanished_delisted, "vanished_other": vanished_other}
 
 
 # ── 성과 지표 ───────────────────────────────────────────────────────────────────────────────

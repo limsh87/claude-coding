@@ -320,6 +320,21 @@ def umid_by_year(P: pd.DataFrame) -> Dict[int, int]:
     return sub.groupby("year")["code"].nunique().to_dict()
 
 
+def umid_corps_by_year(P: pd.DataFrame) -> Dict[int, set]:
+    """연도별 U-MID 기업의 corp_code 집합 — §6 표의 **분자**를 분모와 같은 모집단으로 맞춘다.
+
+    ★ 이걸 안 하면 분자는 전 상장사에서 세고 분모는 U-MID 에서 세게 되어,
+      'U-MID 대상 1,102 / empSttus 성공 2,400' 처럼 비율이 100%를 넘는 표가 나온다.
+      그 표를 근거로 시작연도를 판정하므로(§6), 커버리지를 과대평가한 채 창을 앞당기게 된다.
+    """
+    if P.empty or "u_mid" not in P.columns or "corp_code" not in P.columns:
+        return {}
+    sub = P.loc[P["u_mid"] & P["corp_code"].notna(), ["corp_code", "month"]].copy()
+    sub["year"] = sub["month"].dt.year
+    return {int(y): set(g["corp_code"].astype(str))
+            for y, g in sub.groupby("year", observed=True)}
+
+
 # ── U축: 반영도 (스펙 §8 — U = mean(z(d1), z(d3))) ─────────────────────────────────────────
 def axis_U_v3(P: pd.DataFrame, flows: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Δlog P = Δlog E + Δlog M 분해.  d1 = -Δlog M  (120거래일 ≈ 6개월)

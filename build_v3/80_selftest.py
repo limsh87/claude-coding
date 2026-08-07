@@ -136,81 +136,97 @@ def make_synthetic_v3(n_codes: int = 320, n_months: int = 60, seed: int = None) 
 
 
 def run_selftest_v3(full_chain: bool = False) -> bool:
+    """★ 프로덕션 함수를 그대로 호출한다. 스모크가 자기 사본을 돌리면 아무것도 증명하지 못한다.
+
+    예전 구조는 build_features_v3 의 호출 순서를 스모크가 손으로 베껴 두는 방식이었다.
+    그러면 프로덕션 쪽만 고쳤을 때 스모크는 여전히 통과하고, 2시간 반짜리 FULL 실행이
+    수집을 다 끝낸 뒤 L1.PANEL 한 줄에서 죽는다. 실제로 그런 전례가 있다.
+    → 합성 ctx 를 만들어 build_features_v3 → score_and_backtest_v3 → persist_outputs_v3 을
+      **실물로** 통과시킨다.
+
+    VAULT 는 임시 디렉터리로 바꿔 끼운다. 합성 피처·스코어가 사용자의 전용 인덱스에
+    기록되면 그것이야말로 캐시 오염이다(절대 1원칙).
+    """
     LOG.banner("① 합성데이터 엔드투엔드 스모크",
-               "네트워크·키 없이 계산경로(센서→TP→스코어→백테스트→강건성)를 증명합니다")
+               "네트워크·키 없이 프로덕션 함수를 실물 호출해 계산경로를 증명합니다")
     t0 = time.time()
-    S = make_synthetic_v3()
-    months = S["months"]
-    PIT._t.clear(); PIT._meta.clear()
+    G = globals()
+    saved_vault = G.get("VAULT")
+    saved_runtime = list(RUNTIME_ROWS)      # 합성 실행의 소요시간이 §10 예산표에 섞이지 않게
+    tmp = tempfile.mkdtemp(prefix="tcd_v3_smoke_")
+    try:
+        G["VAULT"] = Vault(tmp, "SMOKE")
+        S = make_synthetic_v3()
+        months = S["months"]
+        PIT._t.clear(); PIT._meta.clear()
 
-    uni = Universe(S["sec"], pd.DataFrame(columns=["snap_date", "code", "market"]), S["px"])
-    panel = build_price_panel(S["px"], months)
-    P = build_base_panel_v3(uni, months, panel["monthly"])
+        ES = build_emp_sensors(S["emp_raw"])
+        PIT.register("dart_financials", S["fin"], key_cols=["corp_code"])
+        PIT.register("emp_sensors",
+                     pit_frame(ES, "period_end", "knowledge_date", source="synthetic"),
+                     key_cols=["corp_code"])
 
-    ES = build_emp_sensors(S["emp_raw"])
-    PIT.register("dart_financials", S["fin"], key_cols=["corp_code"])
-    PIT.register("emp_sensors",
-                 pit_frame(ES, "period_end", "knowledge_date", source="synthetic"),
-                 key_cols=["corp_code"])
+        ctx: Dict[str, Any] = {
+            "sec": S["sec"],
+            "snapshots": pd.DataFrame(columns=["snap_date", "code", "market"]),
+            "panel": build_price_panel(S["px"], months),
+            "flows": S["flows"], "disclosures": S["disclosures"],
+            "emp_raw": S["emp_raw"], "emp_sensors": ES, "fin": S["fin"],
+        }
 
-    P = attach_pit_sources(P, S["sec"])
-    # ★ 프로덕션 경로와 같은 순서로 태운다. 스모크가 건너뛴 함수는 증명되지 않은 함수다.
-    P = apply_umid(P, uni)
-    P = build_cells_v3(P, S["sec"])
-    P = core_d_sensors(P, {"disclosures": S["disclosures"]})
-    cov = emp_coverage_audit(ES, umid_by_year(P))
-    emp_start, verdict = coverage_verdict(cov)
-    LOG.info(f"§6 판정(합성) — {verdict}")
-    P = emp_lite_sensors(P, emp_start)
-    P = axis_U_v3(P, S["flows"])
-    n_before = len(P)
-    P = P[P["u_mid"]].reset_index(drop=True)
-    LOG.info(f"U-MID 스코어링 패널 확정(합성) — {n_before:,} → {len(P):,}행")
-    if P.empty:
-        LOG.error("U-MID 필터 후 패널이 비었습니다 — apply_umid 폴백이 동작하지 않았습니다.")
-        return False
-    P = build_tps(P)
-    P = apply_vetoes_v3(P, {"disclosures": S["disclosures"]})
-    P = assemble_score_v3(P)
+        # ── 프로덕션 경로 실물 호출 ────────────────────────────────────────────────────
+        P, uni, ctx = build_features_v3(ctx, months)
+        if P.empty:
+            LOG.error("U-MID 필터 후 패널이 비었습니다 — apply_umid 폴백이 동작하지 않았습니다.")
+            return False
+        P, bt, _run = score_and_backtest_v3(P, ctx, months, uni)
 
-    def _run(pp, label="run", apply_costs=True, months_override=None):
-        return run_backtest(pp, months_override if months_override is not None else months,
-                            uni, S["sec"], apply_costs=apply_costs, label=label)
+        R = bt["returns"]
+        if R.empty or not np.isfinite(R["ret"].fillna(0)).all():
+            LOG.error("스모크 백테스트가 유효한 수익률 시계열을 만들지 못했습니다.")
+            return False
 
-    bt = _run(P, label="SMOKE")
-    R = bt["returns"]
-    if R.empty or not np.isfinite(R["ret"].fillna(0)).all():
-        LOG.error("스모크 백테스트가 유효한 수익률 시계열을 만들지 못했습니다.")
-        return False
+        # 미래누수 자가검정 — 소스별 지식일이 모두 관측월 이하여야 한다
+        bad = 0
+        for kd in ("kd_fin", "kd_emp"):
+            if kd in P.columns:
+                bad += int((P[kd].notna() & (P[kd] > P["month"])).sum())
+        if bad:
+            LOG.error(f"★스모크에서 미래정보 유입 {bad:,}행 감지 — merge_asof 방향을 확인하세요.")
+            return False
 
-    # 미래누수 자가검정 — 합성 단계에서도 반드시 통과해야 한다
-    bad = int((P["knowledge_date"].notna() & (P["knowledge_date"] > P["month"])).sum()) \
-        if "knowledge_date" in P.columns else 0
-    if bad:
-        LOG.error(f"★스모크에서 미래정보 유입 {bad:,}행 감지 — merge_asof 방향을 확인하세요.")
-        return False
+        LOG.ok(f"스모크 통과 — 패널 {len(P):,}행 × {P.shape[1]}열 · 백테스트 {len(R)}개월 · "
+               f"평균 보유 {R['n'].mean():.1f}종목 · {time.time()-t0:.1f}초")
 
-    LOG.ok(f"스모크 통과 — 패널 {len(P):,}행 × {P.shape[1]}열 · 백테스트 {len(R)}개월 · "
-           f"평균 보유 {R['n'].mean():.1f}종목 · {time.time()-t0:.1f}초")
-
-    if full_chain:
-        bench = R0_benchmark(P, bt, months)
-        report_performance_v3(bt, bench, label="SMOKE(합성)")
-        uni.report_attrition()
-        try:
-            R1_leakage(P, months, _run)
-            R2N_kill_gate(P, _run)
-            R3_orthogonal(P, _run)
-            R5_ablation(P, _run)
-            R7_regime(bt, bench)
-            R8_subperiod(bt)
+        if full_chain:
+            bench = R0_benchmark(P, bt, months)
+            report_performance_v3(bt, bench, label="SMOKE(합성)")
+            uni.report_attrition()
+            uni.attrition = []
             cal = build_policy_calendar_v3()
             report_policy_v3(cal, months)
-            R10_policy_falsify(P, cal, months, _run)
-        except KillCriteria as e:
-            LOG.warn(f"스모크 강건성에서 킬 기준 발동(합성데이터이므로 정상일 수 있음): {e}")
-        report_robustness_v3()
-        report_interpretation_v3(P)
-        diagnostic_card_v3(P, bt, S["sec"])
-        report_ledger_v3({"sec": S["sec"], "emp_raw": S["emp_raw"], "fin": S["fin"]})
-    return True
+            ctx["policy"] = cal
+            try:
+                R1_leakage(P, months, _run)
+                R2N_kill_gate(P, _run)
+                R3_orthogonal(P, _run)
+                R5_ablation(P, _run)
+                R7_regime(bt, bench)
+                R8_subperiod(bt)
+                R10_policy_falsify(P, cal, months, _run)
+            except KillCriteria as e:
+                LOG.warn(f"스모크 강건성에서 킬 기준 발동(합성데이터이므로 정상일 수 있음): {e}")
+            report_robustness_v3()
+            report_interpretation_v3(P)
+            diagnostic_card_v3(P, bt, ctx["sec"])
+            report_ledger_v3(ctx)
+            # 산출물 경로까지 실물로 태운다 — FULL 2시간 뒤 저장부에서 죽는 것을 막는다
+            outs = persist_outputs_v3(P, bt, ctx, bench, t0)
+            LOG.ok(f"산출물 경로 검증 완료 — {len(outs)}개 파일 생성(임시 디렉터리, 곧 삭제됨): "
+                   + ", ".join(os.path.basename(p) for p in outs[:6]))
+        return True
+    finally:
+        G["VAULT"] = saved_vault
+        if RUN_MODE != "SMOKE":                 # SMOKE 모드에선 이 표가 유일한 런타임 기록이다
+            RUNTIME_ROWS[:] = saved_runtime
+        shutil.rmtree(tmp, ignore_errors=True)
