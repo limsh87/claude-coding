@@ -141,11 +141,11 @@ def assemble_score(P: pd.DataFrame, stage: str = "M3", tp_mode: str = "clip",
                    if len(u_axes) else pd.Series(1.0, index=p.index, dtype="float32"))
 
     # ── V: 거부권 (이진, 상쇄 금지 — C6) ────────────────────────────────────────────────
-    p = apply_vetoes(p, stage=stage, quiet=quiet)
+    p = apply_vetoes(p, stage=stage, quiet=quiet, copy=False)
 
     # ── 하한선 (breadth floor) ──────────────────────────────────────────────────────────
     p, floor_info = apply_breadth_floor(p, stage=stage, tps=tps, floor_pct=floor_pct,
-                                        cell_keys=cell_keys, quiet=quiet)
+                                        cell_keys=cell_keys, quiet=quiet, copy=False)
 
     # ── Signal ──────────────────────────────────────────────────────────────────────────
     p["Signal"] = (p["E_rank"].astype("float64") * p["U_rank"].astype("float64")
@@ -200,13 +200,18 @@ VETO_DEFS = [
 ]
 
 
-def apply_vetoes(P: pd.DataFrame, stage: str = "M3", quiet: bool = False) -> pd.DataFrame:
+def apply_vetoes(P: pd.DataFrame, stage: str = "M3", quiet: bool = False,
+                 copy: bool = True) -> pd.DataFrame:
     """각 거부권은 독립 이진이고 곱으로 결합한다. 점수로 환산해 상쇄시키지 않는다(C6).
 
     ★ 결측 = 통과다. 근거 없이 종목을 제외하면 그게 곧 선택편향이다.
       (예: 재무가 없는 종목을 V2 로 자르면 DART 커버리지가 낮은 소형주만 통째로 사라진다)
+
+    copy=False 는 호출자가 이미 소유한 복사본일 때만 쓴다. 실데이터 패널은 300~400MB 라
+    assemble_score 안에서 무조건 복사하면 한 번의 L2 통과에 전체 패널이 3벌 상주하고,
+    R5 절제가 그걸 18회 반복한다.
     """
-    p = P.copy()
+    p = P.copy() if copy else P
     v1 = ~(col(p, "v1_push") > 1.5).fillna(False)
     v2 = ~(col(p, "v2_bad") >= 1.0).fillna(False)
     v3 = ~(col(p, "v3_dilute") > 0).fillna(False) if _stage_ok("M1", stage) else pd.Series(True, index=p.index)
@@ -236,7 +241,7 @@ def apply_vetoes(P: pd.DataFrame, stage: str = "M3", quiet: bool = False) -> pd.
 def apply_breadth_floor(P: pd.DataFrame, stage: str, tps: Sequence[str],
                         floor_pct: float = BREADTH_FLOOR_PCT,
                         cell_keys: Sequence[str] = CELL_KEYS,
-                        quiet: bool = False) -> Tuple[pd.DataFrame, dict]:
+                        quiet: bool = False, copy: bool = True) -> Tuple[pd.DataFrame, dict]:
     """활성 센서군 각각의 셀 내 백분위 ≥ floor_pct.
 
     ★ 축 단위가 아니라 '군' 단위다. 7개 축 전부에 50th 를 걸면 독립 가정에서 0.8% 만
@@ -245,7 +250,7 @@ def apply_breadth_floor(P: pd.DataFrame, stage: str, tps: Sequence[str],
     ★ 군이 '활성'인지는 단계(STAGE)로 결정한다. 단계에 도달하지 않은 군은 존재하지 않는 것이지
       비어 있는 것이 아니다. 이 구분이 없으면 M0 에서 자본배분군이 없다는 이유로 전 종목이 탈락한다.
     """
-    p = P.copy()
+    p = P.copy() if copy else P
     fb = list(cell_keys[:-1]) or list(cell_keys)
     ok = pd.Series(True, index=p.index)
     info = {"groups": [], "pass_rate": {}}

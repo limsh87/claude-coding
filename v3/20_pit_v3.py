@@ -323,9 +323,19 @@ def build_cells(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
     p["size_bucket"] = np.select([q <= 1 / 3, q <= 2 / 3, q > 2 / 3],
                                  ["S", "M", "L"], default="NA")
     n_cell = p.groupby(CELL_KEYS, observed=True)["code"].transform("size")
+    n_ind = int(p["ind_mid"].nunique())
     LOG.info(f"셀 구성: {p.groupby(CELL_KEYS, observed=True).ngroups:,}개 "
-             f"(중앙 크기 {int(n_cell.median()):,}종목) · 폴백 사다리 "
+             f"(중앙 크기 {int(n_cell.median()):,}종목 · 산업 {n_ind}종) · 폴백 사다리 "
              f"{'>'.join(['+'.join(CELL_KEYS), '+'.join(CELL_FALLBACK), '+'.join(CELL_FALLBACK2)])}")
+    unclassified = float((p["ind_mid"] == "미분류").mean())
+    if n_ind <= 2 or unclassified > 0.5:
+        LOG.warn(f"산업 분류가 사실상 없습니다 (고유 {n_ind}종 · 미분류 {100*unclassified:.0f}%). "
+                 f"KIND 상장법인목록을 못 받으면 이렇게 됩니다 — FDR GitHub 상장목록 CSV 에는 "
+                 f"업종 컬럼이 없는 스냅샷이 있습니다. 이 상태에서는 '셀 내 정규화'가 "
+                 f"'규모버킷 내 정규화'로 퇴화합니다. 예외는 안 나지만 산업 공통충격이 "
+                 f"제거되지 않아 경기민감 업종이 통째로 상·하위를 차지할 수 있습니다. "
+                 f"kind.krx.co.kr 접근을 확인하세요.")
+        PIPE.note("WARN: 산업 분류 부재 — 셀 정규화 퇴화")
     return p
 
 

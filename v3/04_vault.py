@@ -184,11 +184,24 @@ class Vault:
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
                                         "_legacy_file") if c in idx.columns]
-                idx.loc[miss, "uid"] = [
-                    sha1_str("legacy", i, *[str(idx.iloc[i].get(c, "")) for c in fill_src])
-                    for i in np.where(miss.to_numpy())[0]]
-                LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 uid 를 부여했습니다 "
-                         f"(uid 결측 행이 하나로 뭉개지는 것을 방지 — 기존 기록 보존).")
+                # ★★ uid 는 **행 내용에서만** 유도해야 한다. 예전 구현은 concat 후의 '위치 i' 를
+                #   해시에 넣었는데, 그 위치는 저널이 길어질수록 달라진다. 그러면 같은 레거시
+                #   행이 실행할 때마다 다른 uid 를 받아 drop_duplicates 를 통과하고, 인덱스가
+                #   매 실행 두 배로 불어난다. 데이터가 사라지진 않지만 인덱스는 망가진다 —
+                #   사용자의 절대 1원칙에 정면으로 걸린다.
+                #   (실측: 같은 레거시 CSV 3행이 두 번째 실행에서 6행이 되었다)
+                #   또 idx.iloc[i] 를 행마다 부르면 40만 행 레거시에서 수 분이 걸린다. 벡터화한다.
+                sub = idx.loc[miss, fill_src].astype(str) if fill_src else \
+                    pd.DataFrame(index=idx.index[miss])
+                key = (sub.agg("\x1f".join, axis=1) if len(fill_src)
+                       else pd.Series("", index=sub.index))
+                # 내용이 완전히 같은 행이 여러 개면 파일 내 등장 순서로만 구분한다
+                # (그 순서는 같은 파일을 같은 방식으로 읽는 한 실행 간 재현된다).
+                occ = key.groupby(key).cumcount()
+                idx.loc[miss, "uid"] = [sha1_str("legacy", k, o) for k, o in zip(key, occ)]
+                LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 내용 기반 uid 를 부여했습니다 "
+                         f"(uid 결측 행이 하나로 뭉개지지도, 실행마다 중복되지도 않게 — "
+                         f"기존 기록 보존).")
             idx["uid"] = idx["uid"].astype(str)
             if "collected_at" in idx.columns:
                 idx = idx.sort_values("collected_at", kind="stable")

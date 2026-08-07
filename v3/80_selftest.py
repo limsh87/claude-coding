@@ -252,6 +252,68 @@ def run_contract_tests(strict: bool = True) -> bool:
     _t("C10", "모든 단계가 계측된다 (추측 금지)",
        any(r["stage"] == "selftest.probe" for r in RUNTIME_LOG))
 
+    # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
+    _t(*_vault_integrity_test())
+
+
+def _vault_integrity_test() -> Tuple[str, str, bool, str]:
+    """★ 절대 1원칙 — 기존 캐시·인덱스를 훼손하지 않는다.
+
+    말이 아니라 실행으로 증명한다: 다른 스키마의 테이블 · uid 없는 레거시 인덱스 · 기존 blob
+    이 있는 금고에 대고 **세 번** 새로 실행한 뒤, ① 기존 uid 가 하나도 사라지지 않았는가
+    ② 레거시 행이 실행마다 중복되지 않았는가 ③ 기존 blob 파일이 그대로인가 를 확인한다.
+
+    ②가 특히 중요하다. uid 를 '행 위치'로 만들면 저널이 길어질 때마다 같은 레거시 행이 새 uid
+    를 받아 인덱스가 매 실행 불어난다. 데이터가 사라지진 않지만 인덱스는 망가지고, 그건
+    이 원칙이 막으려던 바로 그 일이다. (실측으로 재현했던 결함)
+    """
+    global VAULT
+    keep = VAULT
+    tmp = tempfile.mkdtemp(prefix="tcd_vault_selftest_")
+    try:
+        V = Vault(tmp, "SELFTEST")
+        VAULT = globals()["VAULT"] = V
+        V.put_table("krx_ohlcv_daily", pd.DataFrame({"code": ["005930"], "close": [55000]}),
+                    scope="shared")
+        V.put_blob("research", "report_pdf", "old-1", b"%PDF-1.4 old", "pdf", scope="shared")
+        V.flush(); V.compact("shared")
+        legacy = os.path.join(V.ns["shared"], "index", "legacy_v1.csv")
+        pd.DataFrame({"uid": ["", "", ""], "key": list("abc")}).to_csv(legacy, index=False)
+        before = V.load_index("shared", force=True)
+        uid0 = set(before["uid"].astype(str))
+        blob0 = {os.path.join(r, f) for r, _d, fs in os.walk(V.blob_dir("shared")) for f in fs}
+
+        n_leg = -1
+        for run in range(3):
+            V2 = Vault(tmp, "SELFTEST")
+            VAULT = globals()["VAULT"] = V2
+            V2.load_index("shared")
+            # 스키마가 다른 새 테이블 + 기존 테이블 교체 + 동일 내용 blob 재기록
+            V2.put_table("krx_marketcap_monthly", pd.DataFrame({"code": ["000660"], "mcap": [1e12]}),
+                         scope="shared")
+            V2.put_table("krx_ohlcv_daily",
+                         pd.DataFrame({"code": ["000660"], "close": [95000], "amount": [1e9]}),
+                         scope="shared")
+            V2.put_blob("research", "report_pdf", "old-1", b"%PDF-1.4 old", "pdf", scope="shared")
+            V2.flush(); V2.compact("shared")
+            after = V2.load_index("shared", force=True)
+            n_leg = int((after.get("_legacy_file", pd.Series(dtype=str)).astype(str)
+                         == "legacy_v1.csv").sum())
+        lost = uid0 - set(after["uid"].astype(str))
+        blob1 = {os.path.join(r, f) for r, _d, fs in os.walk(V2.blob_dir("shared")) for f in fs}
+        lost_blob = blob0 - blob1
+        has_delete = any(k in dir(V2) for k in ("delete", "remove", "purge", "drop"))
+        ok = (not lost) and (not lost_blob) and n_leg == 3 and not has_delete
+        return ("VAULT", "기존 캐시·인덱스 훼손 불가 (절대 1원칙 · 3회 재실행)", ok,
+                f"uid유실 {len(lost)} · blob유실 {len(lost_blob)} · 레거시행 {n_leg}(기대 3) · "
+                f"삭제API {'있음' if has_delete else '없음'}")
+    except Exception as e:                                       # noqa
+        return ("VAULT", "기존 캐시·인덱스 훼손 불가 (절대 1원칙)", False,
+                f"{type(e).__name__}: {str(e)[:60]}")
+    finally:
+        VAULT = globals()["VAULT"] = keep
+        shutil.rmtree(tmp, ignore_errors=True)
+
     n_fail = sum(1 for *_x, ok, _d in [(a, b, c, d) for a, b, c, d in TESTS] if not ok)
     LOG.table([[c, _trunc(n, 46), "✔ PASS" if ok else "✘ FAIL", _trunc(d, 34)]
                for c, n, ok, d in TESTS],

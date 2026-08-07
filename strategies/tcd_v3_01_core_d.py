@@ -1727,11 +1727,24 @@ class Vault:
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
                                         "_legacy_file") if c in idx.columns]
-                idx.loc[miss, "uid"] = [
-                    sha1_str("legacy", i, *[str(idx.iloc[i].get(c, "")) for c in fill_src])
-                    for i in np.where(miss.to_numpy())[0]]
-                LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 uid 를 부여했습니다 "
-                         f"(uid 결측 행이 하나로 뭉개지는 것을 방지 — 기존 기록 보존).")
+                # ★★ uid 는 **행 내용에서만** 유도해야 한다. 예전 구현은 concat 후의 '위치 i' 를
+                #   해시에 넣었는데, 그 위치는 저널이 길어질수록 달라진다. 그러면 같은 레거시
+                #   행이 실행할 때마다 다른 uid 를 받아 drop_duplicates 를 통과하고, 인덱스가
+                #   매 실행 두 배로 불어난다. 데이터가 사라지진 않지만 인덱스는 망가진다 —
+                #   사용자의 절대 1원칙에 정면으로 걸린다.
+                #   (실측: 같은 레거시 CSV 3행이 두 번째 실행에서 6행이 되었다)
+                #   또 idx.iloc[i] 를 행마다 부르면 40만 행 레거시에서 수 분이 걸린다. 벡터화한다.
+                sub = idx.loc[miss, fill_src].astype(str) if fill_src else \
+                    pd.DataFrame(index=idx.index[miss])
+                key = (sub.agg("\x1f".join, axis=1) if len(fill_src)
+                       else pd.Series("", index=sub.index))
+                # 내용이 완전히 같은 행이 여러 개면 파일 내 등장 순서로만 구분한다
+                # (그 순서는 같은 파일을 같은 방식으로 읽는 한 실행 간 재현된다).
+                occ = key.groupby(key).cumcount()
+                idx.loc[miss, "uid"] = [sha1_str("legacy", k, o) for k, o in zip(key, occ)]
+                LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 내용 기반 uid 를 부여했습니다 "
+                         f"(uid 결측 행이 하나로 뭉개지지도, 실행마다 중복되지도 않게 — "
+                         f"기존 기록 보존).")
             idx["uid"] = idx["uid"].astype(str)
             if "collected_at" in idx.columns:
                 idx = idx.sort_values("collected_at", kind="stable")
@@ -6189,9 +6202,19 @@ def build_cells(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
     p["size_bucket"] = np.select([q <= 1 / 3, q <= 2 / 3, q > 2 / 3],
                                  ["S", "M", "L"], default="NA")
     n_cell = p.groupby(CELL_KEYS, observed=True)["code"].transform("size")
+    n_ind = int(p["ind_mid"].nunique())
     LOG.info(f"셀 구성: {p.groupby(CELL_KEYS, observed=True).ngroups:,}개 "
-             f"(중앙 크기 {int(n_cell.median()):,}종목) · 폴백 사다리 "
+             f"(중앙 크기 {int(n_cell.median()):,}종목 · 산업 {n_ind}종) · 폴백 사다리 "
              f"{'>'.join(['+'.join(CELL_KEYS), '+'.join(CELL_FALLBACK), '+'.join(CELL_FALLBACK2)])}")
+    unclassified = float((p["ind_mid"] == "미분류").mean())
+    if n_ind <= 2 or unclassified > 0.5:
+        LOG.warn(f"산업 분류가 사실상 없습니다 (고유 {n_ind}종 · 미분류 {100*unclassified:.0f}%). "
+                 f"KIND 상장법인목록을 못 받으면 이렇게 됩니다 — FDR GitHub 상장목록 CSV 에는 "
+                 f"업종 컬럼이 없는 스냅샷이 있습니다. 이 상태에서는 '셀 내 정규화'가 "
+                 f"'규모버킷 내 정규화'로 퇴화합니다. 예외는 안 나지만 산업 공통충격이 "
+                 f"제거되지 않아 경기민감 업종이 통째로 상·하위를 차지할 수 있습니다. "
+                 f"kind.krx.co.kr 접근을 확인하세요.")
+        PIPE.note("WARN: 산업 분류 부재 — 셀 정규화 퇴화")
     return p
 
 
@@ -6668,11 +6691,11 @@ def assemble_score(P: pd.DataFrame, stage: str = "M3", tp_mode: str = "clip",
                    if len(u_axes) else pd.Series(1.0, index=p.index, dtype="float32"))
 
     # ── V: 거부권 (이진, 상쇄 금지 — C6) ────────────────────────────────────────────────
-    p = apply_vetoes(p, stage=stage, quiet=quiet)
+    p = apply_vetoes(p, stage=stage, quiet=quiet, copy=False)
 
     # ── 하한선 (breadth floor) ──────────────────────────────────────────────────────────
     p, floor_info = apply_breadth_floor(p, stage=stage, tps=tps, floor_pct=floor_pct,
-                                        cell_keys=cell_keys, quiet=quiet)
+                                        cell_keys=cell_keys, quiet=quiet, copy=False)
 
     # ── Signal ──────────────────────────────────────────────────────────────────────────
     p["Signal"] = (p["E_rank"].astype("float64") * p["U_rank"].astype("float64")
@@ -6727,13 +6750,18 @@ VETO_DEFS = [
 ]
 
 
-def apply_vetoes(P: pd.DataFrame, stage: str = "M3", quiet: bool = False) -> pd.DataFrame:
+def apply_vetoes(P: pd.DataFrame, stage: str = "M3", quiet: bool = False,
+                 copy: bool = True) -> pd.DataFrame:
     """각 거부권은 독립 이진이고 곱으로 결합한다. 점수로 환산해 상쇄시키지 않는다(C6).
 
     ★ 결측 = 통과다. 근거 없이 종목을 제외하면 그게 곧 선택편향이다.
       (예: 재무가 없는 종목을 V2 로 자르면 DART 커버리지가 낮은 소형주만 통째로 사라진다)
+
+    copy=False 는 호출자가 이미 소유한 복사본일 때만 쓴다. 실데이터 패널은 300~400MB 라
+    assemble_score 안에서 무조건 복사하면 한 번의 L2 통과에 전체 패널이 3벌 상주하고,
+    R5 절제가 그걸 18회 반복한다.
     """
-    p = P.copy()
+    p = P.copy() if copy else P
     v1 = ~(col(p, "v1_push") > 1.5).fillna(False)
     v2 = ~(col(p, "v2_bad") >= 1.0).fillna(False)
     v3 = ~(col(p, "v3_dilute") > 0).fillna(False) if _stage_ok("M1", stage) else pd.Series(True, index=p.index)
@@ -6763,7 +6791,7 @@ def apply_vetoes(P: pd.DataFrame, stage: str = "M3", quiet: bool = False) -> pd.
 def apply_breadth_floor(P: pd.DataFrame, stage: str, tps: Sequence[str],
                         floor_pct: float = BREADTH_FLOOR_PCT,
                         cell_keys: Sequence[str] = CELL_KEYS,
-                        quiet: bool = False) -> Tuple[pd.DataFrame, dict]:
+                        quiet: bool = False, copy: bool = True) -> Tuple[pd.DataFrame, dict]:
     """활성 센서군 각각의 셀 내 백분위 ≥ floor_pct.
 
     ★ 축 단위가 아니라 '군' 단위다. 7개 축 전부에 50th 를 걸면 독립 가정에서 0.8% 만
@@ -6772,7 +6800,7 @@ def apply_breadth_floor(P: pd.DataFrame, stage: str, tps: Sequence[str],
     ★ 군이 '활성'인지는 단계(STAGE)로 결정한다. 단계에 도달하지 않은 군은 존재하지 않는 것이지
       비어 있는 것이 아니다. 이 구분이 없으면 M0 에서 자본배분군이 없다는 이유로 전 종목이 탈락한다.
     """
-    p = P.copy()
+    p = P.copy() if copy else P
     fb = list(cell_keys[:-1]) or list(cell_keys)
     ok = pd.Series(True, index=p.index)
     info = {"groups": [], "pass_rate": {}}
@@ -8411,6 +8439,68 @@ def run_contract_tests(strict: bool = True) -> bool:
         time.sleep(0.01)
     _t("C10", "모든 단계가 계측된다 (추측 금지)",
        any(r["stage"] == "selftest.probe" for r in RUNTIME_LOG))
+
+    # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
+    _t(*_vault_integrity_test())
+
+
+def _vault_integrity_test() -> Tuple[str, str, bool, str]:
+    """★ 절대 1원칙 — 기존 캐시·인덱스를 훼손하지 않는다.
+
+    말이 아니라 실행으로 증명한다: 다른 스키마의 테이블 · uid 없는 레거시 인덱스 · 기존 blob
+    이 있는 금고에 대고 **세 번** 새로 실행한 뒤, ① 기존 uid 가 하나도 사라지지 않았는가
+    ② 레거시 행이 실행마다 중복되지 않았는가 ③ 기존 blob 파일이 그대로인가 를 확인한다.
+
+    ②가 특히 중요하다. uid 를 '행 위치'로 만들면 저널이 길어질 때마다 같은 레거시 행이 새 uid
+    를 받아 인덱스가 매 실행 불어난다. 데이터가 사라지진 않지만 인덱스는 망가지고, 그건
+    이 원칙이 막으려던 바로 그 일이다. (실측으로 재현했던 결함)
+    """
+    global VAULT
+    keep = VAULT
+    tmp = tempfile.mkdtemp(prefix="tcd_vault_selftest_")
+    try:
+        V = Vault(tmp, "SELFTEST")
+        VAULT = globals()["VAULT"] = V
+        V.put_table("krx_ohlcv_daily", pd.DataFrame({"code": ["005930"], "close": [55000]}),
+                    scope="shared")
+        V.put_blob("research", "report_pdf", "old-1", b"%PDF-1.4 old", "pdf", scope="shared")
+        V.flush(); V.compact("shared")
+        legacy = os.path.join(V.ns["shared"], "index", "legacy_v1.csv")
+        pd.DataFrame({"uid": ["", "", ""], "key": list("abc")}).to_csv(legacy, index=False)
+        before = V.load_index("shared", force=True)
+        uid0 = set(before["uid"].astype(str))
+        blob0 = {os.path.join(r, f) for r, _d, fs in os.walk(V.blob_dir("shared")) for f in fs}
+
+        n_leg = -1
+        for run in range(3):
+            V2 = Vault(tmp, "SELFTEST")
+            VAULT = globals()["VAULT"] = V2
+            V2.load_index("shared")
+            # 스키마가 다른 새 테이블 + 기존 테이블 교체 + 동일 내용 blob 재기록
+            V2.put_table("krx_marketcap_monthly", pd.DataFrame({"code": ["000660"], "mcap": [1e12]}),
+                         scope="shared")
+            V2.put_table("krx_ohlcv_daily",
+                         pd.DataFrame({"code": ["000660"], "close": [95000], "amount": [1e9]}),
+                         scope="shared")
+            V2.put_blob("research", "report_pdf", "old-1", b"%PDF-1.4 old", "pdf", scope="shared")
+            V2.flush(); V2.compact("shared")
+            after = V2.load_index("shared", force=True)
+            n_leg = int((after.get("_legacy_file", pd.Series(dtype=str)).astype(str)
+                         == "legacy_v1.csv").sum())
+        lost = uid0 - set(after["uid"].astype(str))
+        blob1 = {os.path.join(r, f) for r, _d, fs in os.walk(V2.blob_dir("shared")) for f in fs}
+        lost_blob = blob0 - blob1
+        has_delete = any(k in dir(V2) for k in ("delete", "remove", "purge", "drop"))
+        ok = (not lost) and (not lost_blob) and n_leg == 3 and not has_delete
+        return ("VAULT", "기존 캐시·인덱스 훼손 불가 (절대 1원칙 · 3회 재실행)", ok,
+                f"uid유실 {len(lost)} · blob유실 {len(lost_blob)} · 레거시행 {n_leg}(기대 3) · "
+                f"삭제API {'있음' if has_delete else '없음'}")
+    except Exception as e:                                       # noqa
+        return ("VAULT", "기존 캐시·인덱스 훼손 불가 (절대 1원칙)", False,
+                f"{type(e).__name__}: {str(e)[:60]}")
+    finally:
+        VAULT = globals()["VAULT"] = keep
+        shutil.rmtree(tmp, ignore_errors=True)
 
     n_fail = sum(1 for *_x, ok, _d in [(a, b, c, d) for a, b, c, d in TESTS] if not ok)
     LOG.table([[c, _trunc(n, 46), "✔ PASS" if ok else "✘ FAIL", _trunc(d, 34)]
