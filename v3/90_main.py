@@ -298,7 +298,13 @@ def main() -> dict:
         globals()["DBUDGET"] = DBUDGET
 
     with PIPE.stage("L0.CONTRACT", "계약 자동검정", "L0", budget_s=300), Stage("L0.contracts", 2):
-        run_contract_tests(strict=True)
+        # ★ 반환값을 반드시 확인한다. strict=True 가 내부에서 raise 하는 것에만 의존하면,
+        #   리팩터링으로 그 경로가 끊겼을 때(실제로 한 번 그랬다 — 요약/raise 블록이 다른
+        #   함수 안으로 딸려 들어가 함수가 None 을 반환했다) 계약이 전부 실패해도 조용히
+        #   통과한다. None 은 falsy 이므로 이 검사가 그 유형까지 함께 막는다.
+        if not run_contract_tests(strict=True):
+            raise RuntimeError("계약 자동검정이 통과를 보고하지 않았습니다 — "
+                               "실데이터 수집을 시작하지 않습니다.")
 
     with PIPE.stage("L0.SMOKE", "합성 스모크", "L0", budget_s=1800), Stage("L0.smoke", 3):
         run_smoke(full=(RUN_MODE == "SMOKE"))

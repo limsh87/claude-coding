@@ -255,6 +255,16 @@ def run_contract_tests(strict: bool = True) -> bool:
     # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
     _t(*_vault_integrity_test())
 
+    n_fail = sum(1 for _c, _n, ok, _d in TESTS if not ok)
+    LOG.table([[c, _trunc(n, 46), "✔ PASS" if ok else "✘ FAIL", _trunc(d, 34)]
+               for c, n, ok, d in TESTS],
+              ["ID", "계약", "결과", "실측"], ["c", "l", "c", "l"], maxw=48)
+    if n_fail and strict:
+        raise RuntimeError(f"계약 검정 {n_fail}건 실패 — 실데이터 수집을 시작하지 않습니다. "
+                           f"위 표에서 FAIL 항목을 확인하세요.")
+    LOG.ok(f"계약 검정 {len(TESTS) - n_fail}/{len(TESTS)} 통과")
+    return n_fail == 0
+
 
 def _vault_integrity_test() -> Tuple[str, str, bool, str]:
     """★ 절대 1원칙 — 기존 캐시·인덱스를 훼손하지 않는다.
@@ -313,16 +323,6 @@ def _vault_integrity_test() -> Tuple[str, str, bool, str]:
     finally:
         VAULT = globals()["VAULT"] = keep
         shutil.rmtree(tmp, ignore_errors=True)
-
-    n_fail = sum(1 for *_x, ok, _d in [(a, b, c, d) for a, b, c, d in TESTS] if not ok)
-    LOG.table([[c, _trunc(n, 46), "✔ PASS" if ok else "✘ FAIL", _trunc(d, 34)]
-               for c, n, ok, d in TESTS],
-              ["ID", "계약", "결과", "실측"], ["c", "l", "c", "l"], maxw=48)
-    if n_fail and strict:
-        raise RuntimeError(f"계약 검정 {n_fail}건 실패 — 실데이터 수집을 시작하지 않습니다. "
-                           f"위 표에서 FAIL 항목을 확인하세요.")
-    LOG.ok(f"계약 검정 {len(TESTS) - n_fail}/{len(TESTS)} 통과")
-    return n_fail == 0
 
 
 def run_smoke(full: bool = False) -> dict:
