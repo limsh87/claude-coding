@@ -20,6 +20,11 @@
 
 REHEARSAL_RESULTS: List[dict] = []
 
+# 전략별 추가 리허설 훅. 시그니처: fn(G: dict, sec: pd.DataFrame, corps: List[str],
+# months: pd.DatetimeIndex) -> None.  가짜 네트워크가 이미 물려 있는 안쪽에서 호출된다.
+# 코어만 빌드하면 빈 리스트라 동작이 바뀌지 않는다(순수 추가).
+REHEARSAL_HOOKS: List[Callable] = []
+
 
 def _rh(name: str, fn: Callable, expect_rows: bool = True, note: str = ""):
     """리허설 1건 실행. 예외는 실패, 정상응답 0행도 (기대했다면) 실패."""
@@ -435,6 +440,16 @@ def run_rehearsal(strict: bool = True) -> bool:
             if T is not None and len(T):
                 _rh("build_text_similarity", lambda: build_text_similarity(T),
                     expect_rows=False)
+
+        # ── ⑤-b 전략별 추가 리허설 (가짜 네트워크가 물려 있는 상태에서 실행) ──────────────
+        for _hook in list(REHEARSAL_HOOKS):
+            try:
+                _hook(G, sec, corps, months)
+            except Exception as _e:                                  # noqa
+                REHEARSAL_RESULTS.append({
+                    "name": f"[훅] {getattr(_hook, '__name__', 'hook')}", "ok": False,
+                    "rows": -1, "sec": 0.0, "err": f"{type(_e).__name__}: {_e}",
+                    "note": "", "tb": traceback.format_exc()})
 
         # ── ⑥ 이상 응답 내성 (빈/깨짐/컬럼누락) ───────────────────────────────────────────
         for mode, label in (("empty", "빈 응답"), ("broken", "깨진 응답"),

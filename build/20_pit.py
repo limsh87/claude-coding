@@ -250,7 +250,9 @@ class Universe:
         if not self.attrition:
             return
         A = pd.DataFrame(self.attrition)
-        order = ["전체상장", "PIT유니버스", "가격보유", "유동성필터", "거부권통과",
+        # ★ 이 목록에 없는 단계는 표에서 조용히 사라진다(오류도 경고도 없이).
+        #   새 게이트를 추가했다면 반드시 여기에도 넣을 것.
+        order = ["전체상장", "PIT유니버스", "가격보유", "U-MID대역", "유동성필터", "거부권통과",
                  "하한선통과", "최종선정"]
         piv = A.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
         rows = []

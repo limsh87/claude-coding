@@ -368,11 +368,31 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+    # ★★ 공용 캐시 보존 (절대 1원칙) ★★
+    #   반환값은 이번 백테스트 창(+400일 워밍업)으로 자르는 게 맞지만, **그 잘린 프레임을
+    #   공용 테이블에 그대로 써버리면** 창 밖의 과거가 활성 parquet 에서 영구히 사라진다.
+    #   put_table 은 백업을 남기지만 get_table 은 활성 파일만 읽으므로, 다른 전략(또는 더 이른
+    #   시작일로 도는 다음 실행)이 보기에 캐시가 통째로 파괴된 것과 같다.
+    #   → 저장은 '기존 캐시 ∪ 신규'로 하고, 반환만 창으로 자른다.
+    win = (px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)
+    px_out = px[win]
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
+        to_store = px
+        if cached is not None and len(cached):
+            outside = cached[~((cached["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                               (cached["date"] <= end_ts))]
+            if len(outside):
+                to_store = (pd.concat([outside.reindex(columns=px.columns), px],
+                                      ignore_index=True)
+                              .sort_values(["code", "date"])
+                              .drop_duplicates(["code", "date"], keep="last")
+                              .reset_index(drop=True))
+                LOG.info(f"공용 가격 캐시 보존 — 이번 창 밖의 과거 {len(outside):,}행을 "
+                         f"합쳐서 저장합니다(잘라내지 않습니다).")
+        VAULT.put_table("krx_ohlcv_daily", to_store, scope="shared", domain="price",
                         source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+    px = px_out
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
