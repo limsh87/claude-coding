@@ -9,6 +9,7 @@ import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, thread
 import datetime as _dt
 from collections import defaultdict, Counter, OrderedDict
 from dataclasses import dataclass, field, asdict
+import contextlib
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -168,9 +169,17 @@ def _ensure_deps() -> Dict[str, bool]:
 # ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
 #   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
 #   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+#   ★ KRX_ENABLED=False 면 자격증명을 **주입하지 않는다.** pykrx 는 import 시점에
+#     로그인을 시도하므로, 차단된 계정을 넣어 두면 매 실행마다 실패 로그인을 반복하고
+#     계정 상태를 더 악화시킨다. 넣지 않으면 pykrx 는 비인증 모드로 조용히 뜨고,
+#     유니버스·생존자편향 경로는 애초에 KRX 를 쓰지 않으므로 아무 영향이 없다.
+_KRX_ON = str(globals().get("KRX_ENABLED", "auto")).lower() not in ("false", "0", "off", "no")
+if _KRX_ON and KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
     os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
     os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
+elif not _KRX_ON:
+    for _k in ("KRX_ID", "KRX_PW"):
+        os.environ.pop(_k, None)
 if KRX_OPENAPI_KEY:
     os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
     os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
@@ -206,11 +215,22 @@ if OPT.get("FinanceDataReader"):
         import FinanceDataReader as fdr           # type: ignore
     except Exception:
         fdr = None
-if OPT.get("pykrx"):
+# ★ pykrx 는 **import 하는 순간** KRX 로그인을 시도한다(webio.py 가 모듈 로드 시 실행).
+#   KRX 를 끈 실행에서는 import 자체를 하지 않는다. 그러지 않으면
+#   "KRX 로그인 실패: KRX_ID 또는 KRX_PW 환경 변수가 설정되지 않았습니다" 가 매번 찍히고,
+#   차단된 계정이라면 실패 로그인을 반복해 상태를 더 악화시킨다.
+if OPT.get("pykrx") and _KRX_ON:
     try:
-        from pykrx import stock as pykrx_stock    # type: ignore
+        _quiet = io.StringIO()
+        with contextlib.redirect_stdout(_quiet):
+            from pykrx import stock as pykrx_stock    # type: ignore
+        _msg = _quiet.getvalue().strip()
+        if _msg and "실패" in _msg:
+            LOG_BUFFER_KRX = _msg
     except Exception:
         pykrx_stock = None
+elif OPT.get("pykrx"):
+    pykrx_stock = None
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore

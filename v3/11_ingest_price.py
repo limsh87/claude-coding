@@ -60,20 +60,62 @@ class KRXAuth:
                             headers={"X-Requested-With": "XMLHttpRequest"})
             if txt is None:
                 continue
-            if re.search(r"CD011|중복\s*로그인", str(txt)):
+            s = str(txt)
+            # ★ 성공은 _error_code == "CD001" **하나뿐**이다. '오류 문구가 없으면 성공'으로
+            #   판정하면 안 된다 — 미인증 응답은 본문이 그냥 `LOGOUT` 이거나 빈 목록이라
+            #   어떤 오류 단어도 포함하지 않는다. 그러면 상태표에는 LOGIN_OK 가 찍히는데
+            #   이후 모든 KRX 호출이 조용히 빈 값을 돌려주고, 시총·수급이 소리 없이 죽는다.
+            if re.search(r"CD010", s):
+                self.status = "LOGIN_PW_CHANGE_REQUIRED"
+                LOG.warn("KRX 로그인 거부(CD010) — 비밀번호 변경이 필요한 계정입니다. "
+                         "https://www.krx.co.kr 에서 비밀번호를 변경한 뒤 다시 실행하세요. "
+                         "재시도해도 통과되지 않으므로 폴백 경로로 넘어갑니다.")
+                break
+            if re.search(r"CD011|중복\s*로그인", s):
                 LOG.warn("KRX 중복 로그인(CD011) 감지 — 같은 계정이 브라우저나 다른 노트북에서 "
                          "이미 로그인되어 있습니다. skipDup 으로 재시도하면 기존 세션이 강제 종료됩니다. "
                          "두 노트북을 동시에 돌리면 서로를 계속 밀어냅니다.")
                 continue
-            if not re.search(r"(실패|불일치|오류|error|fail|로그인이\s*필요)", str(txt)[:600], re.I):
+            if "CD001" in s:
                 self.session_ok = True
                 self.status = "LOGIN_OK"
-                LOG.ok("KRX 마켓플레이스 로그인 성공.")
+                LOG.ok("KRX 마켓플레이스 로그인 성공(CD001).")
+                return True
+            if s.strip() == "LOGOUT":
+                LOG.warn("KRX 응답이 'LOGOUT' 입니다 — 세션이 서지 않았습니다.")
+                continue
+            # CD001 이 없는데 오류코드도 없으면 스펙이 바뀐 것이다. 성공으로 간주하지 않되,
+            # 실제 조회가 되는지 한 번 찔러 보고 그 결과로만 판정한다(추측 금지).
+            if self._probe_session():
+                self.session_ok = True
+                self.status = "LOGIN_OK_PROBED"
+                LOG.ok("KRX 로그인 응답코드는 확인되지 않았으나 실조회가 성공했습니다.")
                 return True
         self.status = "LOGIN_FAILED"
         LOG.warn("KRX 마켓플레이스 로그인 실패. ID/PW 를 확인하세요. "
                  "로그인 불필요 경로로 폴백하며 백테스트는 정상 진행됩니다.")
         return self.openapi_ok
+
+    def _probe_session(self) -> bool:
+        """세션이 진짜 서 있는지 실조회로 확인한다. 응답코드 해석에 기대지 않는다.
+
+        미인증이면 본문이 그냥 'LOGOUT' 이거나 output 이 빈 배열로 온다 — 둘 다 잡는다.
+        """
+        d = (_dt.date.today() - _dt.timedelta(days=7))
+        while d.weekday() >= 5:
+            d -= _dt.timedelta(days=1)
+        body = {"bld": "dbms/MDC/STAT/standard/MDCSTAT01501", "mktId": "STK",
+                "trdDd": d.strftime("%Y%m%d"), "share": "1", "money": "1",
+                "csvxls_isNo": "false"}
+        txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
+                        headers={"X-Requested-With": "XMLHttpRequest"}, tries=1)
+        if not txt or str(txt).strip() == "LOGOUT":
+            return False
+        try:
+            js = json.loads(txt)
+        except Exception:                                    # noqa
+            return False
+        return bool(js.get("OutBlock_1") or js.get("output") or js.get("block1"))
 
     def _probe_openapi(self) -> bool:
         """AUTH_KEY 를 쿼리로 보내는 구현과 헤더로 보내는 공식 샘플이 공존한다 — 둘 다 시도."""
@@ -101,6 +143,16 @@ class KRXAuth:
         body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
         txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
                         headers={"X-Requested-With": "XMLHttpRequest"})
+        # ★ 세션 만료는 예외가 아니라 본문 'LOGOUT' 으로 온다. 이걸 그냥 None 으로 흘리면
+        #   '데이터가 없는 것'과 구별되지 않아, 만료된 세션으로 수천 번을 헛돈다.
+        #   한 번만 알리고 세션을 죽여서 폴백으로 넘긴다(KRX 는 1시간쯤 뒤 만료된다).
+        if txt is not None and str(txt).strip() == "LOGOUT":
+            if self.session_ok:
+                LOG.warn("KRX 세션이 만료되었거나 다른 곳에서 로그인해 끊겼습니다(LOGOUT). "
+                         "이후 KRX 호출은 폴백 소스로 넘깁니다.")
+            self.session_ok = False
+            self.status = "SESSION_EXPIRED"
+            return None
         if not txt or txt.lstrip()[:1] not in ("{", "["):
             return None
         try:
