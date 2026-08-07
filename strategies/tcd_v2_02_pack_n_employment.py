@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_N"
 STRATEGY_NAME      = "PACK-N 국민연금 고용"
 ACTIVE_PACKS       = ["N"]
-BUILD_VERSION      = "v2.20260807.1316"
+BUILD_VERSION      = "v2.20260807.2128"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -353,6 +353,16 @@ try:
 except Exception:                                             # pragma: no cover
     def tqdm(it=None, **kw):                                  # type: ignore
         return it if it is not None else iter(())
+
+# ★ 서드파티 로거 억제. yfinance 는 종목 하나가 실패할 때마다 여러 줄을 stderr 로 쏟아내
+#   (\"possibly delisted\", \"1 Failed download\"), 2,600종목 폴백 구간에서 로그가 수만 줄
+#   불어나 정작 우리 진단표가 파묻힌다. 실패 자체는 수집부가 집계해 표로 보고한다.
+for _noisy in ("yfinance", "urllib3", "peewee", "requests", "py.warnings", "matplotlib"):
+    try:
+        logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+    except Exception:
+        pass
+logging.captureWarnings(True)
 
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 80)
@@ -558,6 +568,10 @@ class StageRecord:
 
     @property
     def dur(self) -> float:
+        # ★ 아직 시작하지 않은(PENDING) 스테이지는 t_start=0 이라 그대로 빼면
+        #   유닉스 epoch 전체(≈1.7e9초)가 소요시간으로 잡혀 표와 런타임 감사가 망가진다.
+        if not self.t_start:
+            return 0.0
         return (self.t_end or time.time()) - self.t_start
 
 
@@ -836,17 +850,40 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return None
     if getattr(t, "tzinfo", None) is not None:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
-    return t.normalize()
+    t = t.normalize()
+    try:
+        t = t.as_unit("ns")                      # ★ 해상도 통일 — 아래 주석 참조
+    except Exception:
+        pass
+    return t
 
 
 def as_ts_series(s) -> pd.Series:
+    """tz-naive · 자정 정규화 · **datetime64[ns] 고정** Series.
+
+    ★ 해상도(unit)를 ns 로 못박는 이유 — pandas 2.x→3.x 에서 실제로 터진 버그다:
+      pd.to_datetime 은 입력에 따라 해상도를 다르게 추론한다.
+        "2016-09-30" (문자열)        → datetime64[s]
+        pd.date_range(...)           → datetime64[ns]
+      merge 는 해상도가 달라도 붙지만 **merge_asof 는 MergeError 로 거부한다**
+      ("incompatible merge keys dtype('<M8[s]') and dtype('<M8[ns]')").
+      이 프로젝트의 PIT 결합은 전부 merge_asof 이므로, 한쪽이 문자열 출신이면
+      as-of 결합이 통째로 실패하고 → 상위에서 폴백되어 → 그 컬럼이 전부 결측이 되고
+      → 유니버스가 '에러 없이' 0 종목으로 붕괴한다. 로그에는 경고 한 줄만 남는다.
+      해상도를 여기 한 곳에서 고정해 그 사고 경로 자체를 없앤다.
+    """
     out = pd.to_datetime(pd.Series(s), errors="coerce")
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
     except Exception:
         pass
-    return out.dt.normalize()
+    out = out.dt.normalize()
+    try:
+        out = out.astype("datetime64[ns]")
+    except Exception:
+        pass
+    return out
 
 
 def month_end(x) -> Optional[pd.Timestamp]:
@@ -2460,6 +2497,27 @@ def fetch_fdr_delisting() -> pd.DataFrame:
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
     })
     t = t.dropna(subset=["code"])
+
+    # ★ 상장폐지 목록의 절반 이상은 보통주가 아니다.
+    #   실측 구성: 주권 약 2,100 · 신주인수권증서 865 · 수익증권 783 · 투자회사 176 ·
+    #   신주인수권증권 160 · 리츠/선박펀드 등. 신주인수권증서는 수명이 7일짜리이고
+    #   코드도 '4323201G' 같은 8자리라, 그대로 두면 유니버스에 유령 종목이 섞인다.
+    #   ★ 단, 구분값이 비어 있는 행은 버리지 않는다 — '모른다'를 이유로 버리면
+    #     그게 곧 생존자편향의 재유입이다. '명시적으로 보통주가 아닌' 행만 제외한다.
+    n_nonstock = 0
+    if "secugroup" in t.columns and t["secugroup"].astype(str).str.strip().ne("").any():
+        sg = t["secugroup"].astype(str).str.strip()
+        known = sg.ne("") & sg.ne("nan")
+        is_stock = sg.str.contains("주권", na=False) & ~sg.str.contains("신주인수권", na=False)
+        drop = known & ~is_stock
+        n_nonstock = int(drop.sum())
+        if n_nonstock:
+            LOG.info(f"  폐지목록에서 보통주가 아닌 {n_nonstock:,}건 제외 "
+                     f"(신주인수권증서·수익증권·투자회사·리츠 등). 구분값이 비어 있는 행은 "
+                     f"보수적으로 남깁니다 — 모른다는 이유로 버리면 생존자편향이 됩니다. "
+                     f"제외 구분 예시: {sorted(set(sg[drop]))[:6]}")
+            t = t[~drop]
+
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
@@ -3053,6 +3111,37 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
+# ── 서킷브레이커 ────────────────────────────────────────────────────────────────────────────
+#  ★ 없으면 어떤 일이 벌어지는가 (실측):
+#    네트워크가 막힌 환경에서 2,600종목 × 4개 소스 × 재시도를 전부 돌린다. 한 종목당
+#    수 초씩만 걸려도 몇 시간이 그냥 사라지고, 로그에는 같은 실패가 수만 줄 쌓인다.
+#    이 전략의 하드 제약이 '총 4시간 이내'이므로, 이건 성능 문제가 아니라 요구사항 위반이다.
+#  → 연속 N회 전 소스 실패하면 즉시 차단하고, 남은 종목은 캐시/폴백으로 진행한다.
+#    (v2 헤더에는 CIRCUIT_BREAK_N 이 없으므로 기본값으로 안전하게 폴백한다)
+_CB_N = int(globals().get("CIRCUIT_BREAK_N", 15) or 15)
+
+
+class _Circuit:
+    def __init__(self, n: int, name: str):
+        self.n, self.name = max(int(n), 1), name
+        self.streak, self.tripped, self.fails = 0, False, 0
+        self._lk = threading.Lock()
+
+    def ok(self):
+        with self._lk:
+            self.streak = 0
+
+    def fail(self) -> bool:
+        with self._lk:
+            self.streak += 1
+            self.fails += 1
+            if not self.tripped and self.streak >= self.n:
+                self.tripped = True
+                LOG.error(f"서킷브레이커 작동 — {self.name} 연속 {self.streak}회 실패. "
+                          f"남은 대상의 신규 수집을 중단하고 캐시/폴백으로 진행합니다. "
+                          f"(네트워크 차단·소스 구조 변경·차단(403) 이 대표 원인입니다)")
+            return self.tripped
+
 
 def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
@@ -3130,8 +3219,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if todo:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
+        breaker = _Circuit(_CB_N, "일봉 수집")
+
         def _one(job):
             code, st = job
+            if breaker.tripped:                 # 차단 후에는 즉시 반환 — 헛돌지 않는다
+                return None
             for nm, fn in PRICE_CHAIN:
                 try:
                     d = fn(code, st, end)
@@ -3140,10 +3233,16 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 if d is not None and len(d):
                     d = d.dropna(subset=["date"])
                     if len(d):
+                        breaker.ok()
                         return d
+            breaker.fail()
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        if breaker.tripped:
+            LOG.warn(f"서킷브레이커로 일봉 수집을 조기 종료했습니다 (실패 {breaker.fails:,}건). "
+                     f"드라이브 캐시에 있는 분량만으로 백테스트를 진행합니다. "
+                     f"네트워크가 정상인 환경에서 재실행하면 캐시에 이어서 받습니다.")
         failed = []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
@@ -3404,11 +3503,17 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+            LOG.warn(f"DART status=020 (일일 호출한도 초과) — 수집을 중단하고 받은 만큼 "
+                     f"저장합니다. 내일 재실행하면 정확히 이어받습니다.")
+        elif st == "021":
+            # ★ 021 은 '조회 가능한 회사 개수 초과' = 요청 1건의 배치 크기 문제이지
+            #   일일 한도가 아니다. 이걸 exhausted 로 처리하면 그 시점부터 남은 전 종목의
+            #   수집이 중단된다 — 한 번의 배치 실수로 그날 수집 전체가 죽는다.
+            LOG.debug(f"DART status=021 (배치 크기 초과) ep={endpoint} — 이 요청만 실패 처리하고 "
+                      f"나머지는 계속 진행합니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -3689,8 +3794,12 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     L = pd.concat(out_rows, ignore_index=True)
     W = L.pivot_table(index=["corp_code", "bsns_year", "reprt_code"], columns="item",
                       values="amount", aggfunc="first").reset_index()
-    rc = (L.sort_values("rcept_no").groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
-           .first().reset_index())
+    # ★ knowledge_date 는 '실제로 채택된 금액이 공시된 시점' 이상이어야 한다.
+    #   first()(=가장 이른 접수번호)를 쓰면, 정정공시로 바뀐 금액을 채택해 놓고 날짜만
+    #   원공시 날짜를 붙이게 된다 → 그 차이만큼 미래를 미리 아는 셈이다(C1 위반).
+    #   max() 는 채택 후보 중 가장 늦은 접수일이므로 어떤 경우에도 누수가 없다(보수적).
+    rc = (L.groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
+           .max().reset_index())
     W = W.merge(rc, on=["corp_code", "bsns_year", "reprt_code"], how="left")
 
     W["period_end"] = [as_ts(f"{y}-{REPRT_PERIOD_END[r][0]:02d}-{REPRT_PERIOD_END[r][1]:02d}")
@@ -4428,7 +4537,11 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     if len(df) != n_before:
         LOG.warn(f"상세 보강 머지에서 행수가 {n_before:,}→{len(df):,} 로 변했습니다 — "
                  f"중복 detail_url 로 인한 증식입니다.")
-        df = df.drop_duplicates("report_uid", keep="first")
+        # ★ report_uid 는 build_report_master 에서 만들어진다. 이 시점(수집 직후)에는
+        #   아직 없을 수 있으므로 존재하는 키로만 중복을 제거한다.
+        #   (없는 컬럼으로 drop_duplicates 하면 KeyError 로 수집 전체가 죽는다)
+        _dk = next((k for k in ("report_uid", "detail_url", "title") if k in df.columns), None)
+        df = df.drop_duplicates(_dk, keep="first") if _dk else df.drop_duplicates()
     for c in ("target_price", "opinion"):
         if f"{c}_d" in df.columns:
             df[c] = df[c].where(df[c].notna(), df[f"{c}_d"])
@@ -4581,8 +4694,14 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 # 정규화 표: (별칭 정규식 → 정식명). 사명 변경 이력이 핵심이다.
+# 두 소스가 같은 보고서에 서로 다른 목표주가를 줄 때의 병합 규칙. 전략층에서 덮어쓸 수 있다.
+TARGET_PRICE_AGG = "max"
+
 BROKER_CANON: List[Tuple[str, str]] = [
-    (r"미래에셋(대우|증권|생명)?", "미래에셋증권"),          # 미래에셋대우→미래에셋증권(2021)
+    # ★ 순서 주의: '미래에셋생명'(보험사)이 앞 규칙에 먼저 걸리면 증권사로 둔갑해
+    #   애널리스트 소속이 틀어지고 동일인 판정이 깨진다. 비증권 계열을 먼저 걸러낸다.
+    (r"미래에셋생명", "기타"),
+    (r"미래에셋(대우|증권)?", "미래에셋증권"),               # 미래에셋대우→미래에셋증권(2021)
     (r"(대우증권|KDB대우)", "미래에셋증권"),
     (r"NH투자|우리투자증권|NH농협증권", "NH투자증권"),        # 우리투자→NH투자(2014)
     (r"한국투자|한국證|한투증권", "한국투자증권"),
@@ -4775,7 +4894,11 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "broker_name": ("broker_name", "min"),
         "broker_raw": ("broker_raw", _pick_str),
         "analyst_raw": ("analyst_raw", _pick_str),
-        "target_price": ("target_price", "max"),      # 네이티브 max = NaN 무시. 파이썬 람다는 30만건에서 50초.
+        # 목표주가 병합 방식(TARGET_PRICE_AGG). 둘 다 NaN 을 건너뛰므로 "한쪽에만 값이 있는"
+        # 경우의 동작은 같다. 차이는 두 소스가 서로 다른 값을 줄 때다:
+        #   "max"    — 정보를 잃지 않는다는 관점(v2 기본). 단 소스 불일치 시 낙관 편향.
+        #   "median" — 불일치를 중앙값으로 흡수해 리비전 지표의 편향을 없앤다(v3 선택).
+        "target_price": ("target_price", TARGET_PRICE_AGG),
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),

@@ -142,6 +142,10 @@ class StageRecord:
 
     @property
     def dur(self) -> float:
+        # ★ 아직 시작하지 않은(PENDING) 스테이지는 t_start=0 이라 그대로 빼면
+        #   유닉스 epoch 전체(≈1.7e9초)가 소요시간으로 잡혀 표와 런타임 감사가 망가진다.
+        if not self.t_start:
+            return 0.0
         return (self.t_end or time.time()) - self.t_start
 
 

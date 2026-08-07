@@ -188,6 +188,16 @@ except Exception:                                             # pragma: no cover
     def tqdm(it=None, **kw):                                  # type: ignore
         return it if it is not None else iter(())
 
+# ★ 서드파티 로거 억제. yfinance 는 종목 하나가 실패할 때마다 여러 줄을 stderr 로 쏟아내
+#   (\"possibly delisted\", \"1 Failed download\"), 2,600종목 폴백 구간에서 로그가 수만 줄
+#   불어나 정작 우리 진단표가 파묻힌다. 실패 자체는 수집부가 집계해 표로 보고한다.
+for _noisy in ("yfinance", "urllib3", "peewee", "requests", "py.warnings", "matplotlib"):
+    try:
+        logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+    except Exception:
+        pass
+logging.captureWarnings(True)
+
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 80)
 pd.set_option("display.max_colwidth", 60)

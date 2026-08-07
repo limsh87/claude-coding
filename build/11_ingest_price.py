@@ -232,6 +232,37 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
+# ── 서킷브레이커 ────────────────────────────────────────────────────────────────────────────
+#  ★ 없으면 어떤 일이 벌어지는가 (실측):
+#    네트워크가 막힌 환경에서 2,600종목 × 4개 소스 × 재시도를 전부 돌린다. 한 종목당
+#    수 초씩만 걸려도 몇 시간이 그냥 사라지고, 로그에는 같은 실패가 수만 줄 쌓인다.
+#    이 전략의 하드 제약이 '총 4시간 이내'이므로, 이건 성능 문제가 아니라 요구사항 위반이다.
+#  → 연속 N회 전 소스 실패하면 즉시 차단하고, 남은 종목은 캐시/폴백으로 진행한다.
+#    (v2 헤더에는 CIRCUIT_BREAK_N 이 없으므로 기본값으로 안전하게 폴백한다)
+_CB_N = int(globals().get("CIRCUIT_BREAK_N", 15) or 15)
+
+
+class _Circuit:
+    def __init__(self, n: int, name: str):
+        self.n, self.name = max(int(n), 1), name
+        self.streak, self.tripped, self.fails = 0, False, 0
+        self._lk = threading.Lock()
+
+    def ok(self):
+        with self._lk:
+            self.streak = 0
+
+    def fail(self) -> bool:
+        with self._lk:
+            self.streak += 1
+            self.fails += 1
+            if not self.tripped and self.streak >= self.n:
+                self.tripped = True
+                LOG.error(f"서킷브레이커 작동 — {self.name} 연속 {self.streak}회 실패. "
+                          f"남은 대상의 신규 수집을 중단하고 캐시/폴백으로 진행합니다. "
+                          f"(네트워크 차단·소스 구조 변경·차단(403) 이 대표 원인입니다)")
+            return self.tripped
+
 
 def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
@@ -309,8 +340,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if todo:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
+        breaker = _Circuit(_CB_N, "일봉 수집")
+
         def _one(job):
             code, st = job
+            if breaker.tripped:                 # 차단 후에는 즉시 반환 — 헛돌지 않는다
+                return None
             for nm, fn in PRICE_CHAIN:
                 try:
                     d = fn(code, st, end)
@@ -319,10 +354,16 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 if d is not None and len(d):
                     d = d.dropna(subset=["date"])
                     if len(d):
+                        breaker.ok()
                         return d
+            breaker.fail()
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        if breaker.tripped:
+            LOG.warn(f"서킷브레이커로 일봉 수집을 조기 종료했습니다 (실패 {breaker.fails:,}건). "
+                     f"드라이브 캐시에 있는 분량만으로 백테스트를 진행합니다. "
+                     f"네트워크가 정상인 환경에서 재실행하면 캐시에 이어서 받습니다.")
         failed = []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):

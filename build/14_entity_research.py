@@ -13,8 +13,14 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 # 정규화 표: (별칭 정규식 → 정식명). 사명 변경 이력이 핵심이다.
+# 두 소스가 같은 보고서에 서로 다른 목표주가를 줄 때의 병합 규칙. 전략층에서 덮어쓸 수 있다.
+TARGET_PRICE_AGG = "max"
+
 BROKER_CANON: List[Tuple[str, str]] = [
-    (r"미래에셋(대우|증권|생명)?", "미래에셋증권"),          # 미래에셋대우→미래에셋증권(2021)
+    # ★ 순서 주의: '미래에셋생명'(보험사)이 앞 규칙에 먼저 걸리면 증권사로 둔갑해
+    #   애널리스트 소속이 틀어지고 동일인 판정이 깨진다. 비증권 계열을 먼저 걸러낸다.
+    (r"미래에셋생명", "기타"),
+    (r"미래에셋(대우|증권)?", "미래에셋증권"),               # 미래에셋대우→미래에셋증권(2021)
     (r"(대우증권|KDB대우)", "미래에셋증권"),
     (r"NH투자|우리투자증권|NH농협증권", "NH투자증권"),        # 우리투자→NH투자(2014)
     (r"한국투자|한국證|한투증권", "한국투자증권"),
@@ -207,7 +213,11 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "broker_name": ("broker_name", "min"),
         "broker_raw": ("broker_raw", _pick_str),
         "analyst_raw": ("analyst_raw", _pick_str),
-        "target_price": ("target_price", "max"),      # 네이티브 max = NaN 무시. 파이썬 람다는 30만건에서 50초.
+        # 목표주가 병합 방식(TARGET_PRICE_AGG). 둘 다 NaN 을 건너뛰므로 "한쪽에만 값이 있는"
+        # 경우의 동작은 같다. 차이는 두 소스가 서로 다른 값을 줄 때다:
+        #   "max"    — 정보를 잃지 않는다는 관점(v2 기본). 단 소스 불일치 시 낙관 편향.
+        #   "median" — 불일치를 중앙값으로 흡수해 리비전 지표의 편향을 없앤다(v3 선택).
+        "target_price": ("target_price", TARGET_PRICE_AGG),
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),

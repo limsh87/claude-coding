@@ -267,6 +267,27 @@ def fetch_fdr_delisting() -> pd.DataFrame:
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
     })
     t = t.dropna(subset=["code"])
+
+    # ★ 상장폐지 목록의 절반 이상은 보통주가 아니다.
+    #   실측 구성: 주권 약 2,100 · 신주인수권증서 865 · 수익증권 783 · 투자회사 176 ·
+    #   신주인수권증권 160 · 리츠/선박펀드 등. 신주인수권증서는 수명이 7일짜리이고
+    #   코드도 '4323201G' 같은 8자리라, 그대로 두면 유니버스에 유령 종목이 섞인다.
+    #   ★ 단, 구분값이 비어 있는 행은 버리지 않는다 — '모른다'를 이유로 버리면
+    #     그게 곧 생존자편향의 재유입이다. '명시적으로 보통주가 아닌' 행만 제외한다.
+    n_nonstock = 0
+    if "secugroup" in t.columns and t["secugroup"].astype(str).str.strip().ne("").any():
+        sg = t["secugroup"].astype(str).str.strip()
+        known = sg.ne("") & sg.ne("nan")
+        is_stock = sg.str.contains("주권", na=False) & ~sg.str.contains("신주인수권", na=False)
+        drop = known & ~is_stock
+        n_nonstock = int(drop.sum())
+        if n_nonstock:
+            LOG.info(f"  폐지목록에서 보통주가 아닌 {n_nonstock:,}건 제외 "
+                     f"(신주인수권증서·수익증권·투자회사·리츠 등). 구분값이 비어 있는 행은 "
+                     f"보수적으로 남깁니다 — 모른다는 이유로 버리면 생존자편향이 됩니다. "
+                     f"제외 구분 예시: {sorted(set(sg[drop]))[:6]}")
+            t = t[~drop]
+
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)

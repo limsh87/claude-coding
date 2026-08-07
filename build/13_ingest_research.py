@@ -528,7 +528,11 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     if len(df) != n_before:
         LOG.warn(f"상세 보강 머지에서 행수가 {n_before:,}→{len(df):,} 로 변했습니다 — "
                  f"중복 detail_url 로 인한 증식입니다.")
-        df = df.drop_duplicates("report_uid", keep="first")
+        # ★ report_uid 는 build_report_master 에서 만들어진다. 이 시점(수집 직후)에는
+        #   아직 없을 수 있으므로 존재하는 키로만 중복을 제거한다.
+        #   (없는 컬럼으로 drop_duplicates 하면 KeyError 로 수집 전체가 죽는다)
+        _dk = next((k for k in ("report_uid", "detail_url", "title") if k in df.columns), None)
+        df = df.drop_duplicates(_dk, keep="first") if _dk else df.drop_duplicates()
     for c in ("target_price", "opinion"):
         if f"{c}_d" in df.columns:
             df[c] = df[c].where(df[c].notna(), df[f"{c}_d"])

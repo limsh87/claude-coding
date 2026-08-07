@@ -105,11 +105,17 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+            LOG.warn(f"DART status=020 (일일 호출한도 초과) — 수집을 중단하고 받은 만큼 "
+                     f"저장합니다. 내일 재실행하면 정확히 이어받습니다.")
+        elif st == "021":
+            # ★ 021 은 '조회 가능한 회사 개수 초과' = 요청 1건의 배치 크기 문제이지
+            #   일일 한도가 아니다. 이걸 exhausted 로 처리하면 그 시점부터 남은 전 종목의
+            #   수집이 중단된다 — 한 번의 배치 실수로 그날 수집 전체가 죽는다.
+            LOG.debug(f"DART status=021 (배치 크기 초과) ep={endpoint} — 이 요청만 실패 처리하고 "
+                      f"나머지는 계속 진행합니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -390,8 +396,12 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     L = pd.concat(out_rows, ignore_index=True)
     W = L.pivot_table(index=["corp_code", "bsns_year", "reprt_code"], columns="item",
                       values="amount", aggfunc="first").reset_index()
-    rc = (L.sort_values("rcept_no").groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
-           .first().reset_index())
+    # ★ knowledge_date 는 '실제로 채택된 금액이 공시된 시점' 이상이어야 한다.
+    #   first()(=가장 이른 접수번호)를 쓰면, 정정공시로 바뀐 금액을 채택해 놓고 날짜만
+    #   원공시 날짜를 붙이게 된다 → 그 차이만큼 미래를 미리 아는 셈이다(C1 위반).
+    #   max() 는 채택 후보 중 가장 늦은 접수일이므로 어떤 경우에도 누수가 없다(보수적).
+    rc = (L.groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
+           .max().reset_index())
     W = W.merge(rc, on=["corp_code", "bsns_year", "reprt_code"], how="left")
 
     W["period_end"] = [as_ts(f"{y}-{REPRT_PERIOD_END[r][0]:02d}-{REPRT_PERIOD_END[r][1]:02d}")

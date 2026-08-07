@@ -23,17 +23,40 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return None
     if getattr(t, "tzinfo", None) is not None:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
-    return t.normalize()
+    t = t.normalize()
+    try:
+        t = t.as_unit("ns")                      # ★ 해상도 통일 — 아래 주석 참조
+    except Exception:
+        pass
+    return t
 
 
 def as_ts_series(s) -> pd.Series:
+    """tz-naive · 자정 정규화 · **datetime64[ns] 고정** Series.
+
+    ★ 해상도(unit)를 ns 로 못박는 이유 — pandas 2.x→3.x 에서 실제로 터진 버그다:
+      pd.to_datetime 은 입력에 따라 해상도를 다르게 추론한다.
+        "2016-09-30" (문자열)        → datetime64[s]
+        pd.date_range(...)           → datetime64[ns]
+      merge 는 해상도가 달라도 붙지만 **merge_asof 는 MergeError 로 거부한다**
+      ("incompatible merge keys dtype('<M8[s]') and dtype('<M8[ns]')").
+      이 프로젝트의 PIT 결합은 전부 merge_asof 이므로, 한쪽이 문자열 출신이면
+      as-of 결합이 통째로 실패하고 → 상위에서 폴백되어 → 그 컬럼이 전부 결측이 되고
+      → 유니버스가 '에러 없이' 0 종목으로 붕괴한다. 로그에는 경고 한 줄만 남는다.
+      해상도를 여기 한 곳에서 고정해 그 사고 경로 자체를 없앤다.
+    """
     out = pd.to_datetime(pd.Series(s), errors="coerce")
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
     except Exception:
         pass
-    return out.dt.normalize()
+    out = out.dt.normalize()
+    try:
+        out = out.astype("datetime64[ns]")
+    except Exception:
+        pass
+    return out
 
 
 def month_end(x) -> Optional[pd.Timestamp]:
