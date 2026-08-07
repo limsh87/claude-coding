@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_P"
 STRATEGY_NAME      = "PACK-P 조달청 낙찰"
 ACTIVE_PACKS       = ["P"]
-BUILD_VERSION      = "v2.20260807.2128"
+BUILD_VERSION      = "v2.20260807.2154"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -1017,18 +1017,45 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
     return path
 
 
+_CORRUPT_PAT = re.compile(
+    r"ArrowInvalid|ArrowIOError|Parquet magic bytes|not a parquet file|"
+    r"Couldn't deserialize|corrupt|invalid.*footer|Repetition level", re.I)
+
+
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """읽기 실패를 '손상'과 '일시적 IO 오류'로 구분한다.
+
+    ★ 왜 구분이 중요한가 ─────────────────────────────────────────────────────────────
+      예전에는 어떤 예외든 곧바로 파일을 .corrupt 로 개명(os.replace)했다. 그런데 구글드라이브
+      FUSE 마운트는 정상 상태에서도 'Transport endpoint is not connected', 타임아웃, 쿼터
+      스로틀 같은 '일시적' 오류를 낸다. 그러면 멀쩡한 공용 캐시가 격리되고, 곧이어
+      put_table 이 '없는 파일'로 판단해 백업 없이 새로 만들어 버린다.
+      = 잠깐의 네트워크 딸꾹질이 다른 전략의 캐시를 통째로 날린다. 절대 1원칙 위반이다.
+    → ① 3회 재시도(지수 백오프) ② parquet 포맷 오류로 확인될 때만 격리 ③ 그 외에는
+      None 을 돌려줄 뿐 파일에 손대지 않는다(다음 실행에서 다시 읽으면 된다).
+    """
     if not os.path.exists(path):
         return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
+    last = None
+    for attempt in range(3):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                 # noqa
+            last = e
+            if attempt < 2:
+                time.sleep(0.6 * (2 ** attempt))
+    blob = f"{type(last).__name__}: {last}"
+    if not _CORRUPT_PAT.search(blob):
+        LOG.warn(f"parquet 읽기 실패(일시적 오류로 판단) — 파일은 그대로 두고 이번 실행에서만 "
+                 f"건너뜁니다: {os.path.basename(path)} ({type(last).__name__}). "
+                 f"드라이브 마운트가 불안정할 때 흔합니다. 다음 실행에서 다시 읽습니다.")
         return None
+    LOG.warn(f"parquet 손상 확인 — 지우지 않고 격리 보관합니다: {os.path.basename(path)} ({blob[:80]})")
+    try:                                       # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
+        os.replace(path, path + f".corrupt.{int(time.time())}")
+    except Exception:
+        pass
+    return None
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -1788,15 +1815,26 @@ class Vault:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
         if os.path.exists(path):
-            bak = os.path.join(self.ns[scope], "index", "_backup",
-                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            # ★ 백업 파일명은 초 단위였고 shutil.copy2 는 같은 이름을 말없이 덮어쓴다.
+            #   같은 테이블을 1초 안에 두 번 쓰면(security_master 가 실제로 그렇다)
+            #   두 번째 백업이 첫 번째를 덮어써, '교체 직전 원본'의 유일한 사본이 사라진다.
+            #   → 마이크로초 + 내용해시로 이름을 유일화하고, 이미 있으면 절대 덮지 않는다.
             try:
+                _tag = sha1_file(path)[:8]
+            except Exception:
+                _tag = "nohash"
+            bak = os.path.join(self.ns[scope], "index", "_backup",
+                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S_%f}.{_tag}.parquet")
+            try:
+                if os.path.exists(bak):
+                    raise FileExistsError(bak)
                 shutil.copy2(path, bak)
+                self._prune_backups(scope, name)
             except Exception as e:                          # noqa
                 LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
                          f"리비전 파일로 저장합니다: {name}")
                 path = os.path.join(self.table_dir(scope),
-                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S_%f}.parquet")
         try:
             atomic_write_parquet(df, path)
         except Exception as e:                              # noqa
@@ -1811,6 +1849,32 @@ class Vault:
                                  "cols": list(map(str, df.columns))[:80]}, ensure_ascii=False),
         })
         return path
+
+    BACKUP_KEEP = 10
+
+    def _prune_backups(self, scope: str, name: str):
+        """테이블별 백업 보관 개수를 제한한다(최근 N개만 유지).
+
+        ★ 이건 '캐시 삭제'가 아니라 '백업 보존 정책'이다. 원본 테이블·저널·blob 은
+          절대 건드리지 않는다. 정책이 없으면 put_table 마다 수 GB 파일이 통째로 복사돼
+          _backup 이 무한히 커지고, 결국 용량이 차서 put_table 이 조용히 실패한다
+          (예외를 삼키고 None 을 반환하므로 '성공한 실행'처럼 보이면서 아무것도 저장되지 않는다).
+        """
+        try:
+            d = os.path.join(self.ns[scope], "index", "_backup")
+            files = [os.path.join(d, f) for f in os.listdir(d)
+                     if f.startswith(name + ".") and f.endswith(".parquet")]
+            if len(files) <= self.BACKUP_KEEP:
+                return
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for p in files[self.BACKUP_KEEP:]:
+                try:
+                    os.remove(p)
+                    self.stats["backup_pruned"] += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
@@ -1895,6 +1959,18 @@ class Vault:
     def adopt_scan(self, dirs: Sequence[str], max_files: int = 400_000) -> pd.DataFrame:
         """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음."""
         seen, found = set(), []
+        # ★ 볼트 자신의 디렉터리는 스캔하지 않는다.
+        #   GDRIVE_ADOPT_DIRS 의 기본값이 GDRIVE_ROOT 와 같아서, 그대로 두면 _shared/table
+        #   아래의 자기 자신이 만든 parquet(krx_ohlcv_daily 등)을 '기존 캐시'로 다시 등록한다.
+        #   adopt uid 에 파일 크기가 들어가므로 테이블이 커질 때마다 uid 가 바뀌어
+        #   매 실행 새 저널 행이 쌓인다 = 인덱스가 무한히 부풀고 load_index 가 느려진다.
+        _self_dirs = [os.path.realpath(self.root)] + \
+                     [os.path.realpath(p) for p in self.ns.values()]
+
+        def _is_self(p: str) -> bool:
+            rp = os.path.realpath(p)
+            return any(rp == s or rp.startswith(s + os.sep) for s in _self_dirs)
+
         for d in dirs:
             if not d or not os.path.isdir(d):
                 continue
@@ -1905,7 +1981,11 @@ class Vault:
             LOG.info(f"기존 캐시 스캔: {d}")
             n = 0
             for dirpath, dirnames, filenames in os.walk(d):
-                dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
+                dirnames[:] = [x for x in dirnames
+                               if not x.startswith(".") and x != "_backup"
+                               and not _is_self(os.path.join(dirpath, x))]
+                if _is_self(dirpath):
+                    continue
                 for fn in filenames:
                     if n >= max_files:
                         break
@@ -2692,17 +2772,23 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
 
     # ★ 부분 응답 방어: 이웃 시점 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
     #   그대로 쓰면 그 달 유니버스가 조용히 쪼그라들어 선택편향이 된다.
+    # ★ 기준은 '전체 기간 중앙값'이 아니라 '이웃 시점 중앙값'이다.
+    #   상장사 수가 10년간 30% 넘게 늘어서, 전체 중앙값으로 자르면 초기 연도의 정상
+    #   스냅샷이 후반기 증가 때문에 '부분 응답'으로 오인되어 폐기된다.
+    # ★ 그리고 폐기는 '이번 실행의 판단'일 뿐이므로 캐시에는 원본을 그대로 남긴다.
+    #   폐기된 프레임을 저장하면 한 번의 오판이 공용 캐시에서 그 시점을 영구히 지운다.
+    snap_all = snap
     if len(snap):
         size = snap.groupby("snap_date")["code"].size().sort_index()
-        med = float(size.median()) if len(size) else 0.0
-        bad = size[size < med * 0.80]
-        if len(bad) and med > 0:
-            LOG.warn(f"스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만이라 "
-                     f"부분 응답으로 판단하고 폐기합니다: "
-                     f"{[str(x.date()) for x in bad.index[:6]]}")
+        local = size.rolling(5, center=True, min_periods=1).median()
+        bad = size[size < local * 0.80]
+        if len(bad):
+            LOG.warn(f"스냅샷 {len(bad)}개 시점이 이웃 시점 중앙값의 80% 미만이라 "
+                     f"이번 실행에서는 사용하지 않습니다(캐시에는 보존): "
+                     f"{[str(pd.Timestamp(x).date()) for x in bad.index[:6]]}")
             snap = snap[~snap["snap_date"].isin(bad.index)]
     if new_rows:
-        out = snap.copy()
+        out = snap_all.copy()
         out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
         VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
                         source="pykrx", extra={"note": "상장종목 스냅샷 — 전 전략 공용"})
@@ -3288,10 +3374,22 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+
+    # ★★ 저장은 '자르기 전' 전체를, 반환은 '자른' 창만. 순서를 바꾸면 캐시가 파괴된다. ★★
+    #   put_table 은 전체 파일 교체다. 백테스트 창으로 자른 프레임을 그대로 저장하면
+    #   공용 캐시에 있던 창 밖 구간(다른 전략이 모아둔 2010~2016 같은 과거분)이
+    #   이 전략을 한 번 돌렸다는 이유만으로 영구 삭제된다. 신규 수집이 단 1종목만 있어도
+    #   기록이 일어나므로 사고 확률이 낮지도 않다. 사용자의 절대 1원칙 위반이다.
+    px_all = px                                       # 영속화용 — 자르지 않은 합집합
+    px = px_all[(px_all["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                (px_all["date"] <= end_ts)]           # 반환용 — 이 전략의 창
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
+        n_out = int(len(px_all) - len(px))
+        if n_out:
+            LOG.debug(f"공용 캐시에는 창 밖 {n_out:,}행을 포함한 전체를 저장합니다 "
+                      f"(다른 전략의 구간을 지우지 않기 위함).")
+        VAULT.put_table("krx_ohlcv_daily", px_all, scope="shared", domain="price",
                         source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],

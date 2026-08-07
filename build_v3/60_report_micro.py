@@ -27,10 +27,14 @@ def report_performance(bts: Dict[str, dict], bench_ew: dict, bench_idx: Dict[str
         rows.append([k, _trunc(name, 34), _s(bt, "cagr", True), _s(bt, "total", True, 1),
                      _s(bt, "vol", True, 1), _s(bt, "mdd", True, 1), _s(bt, "sharpe"),
                      _s(bt, "calmar"), _s(bt, "hit", True, 1),
-                     _s(bt, "turnover", True, 0), _s(bt, "avg_n", False, 0)])
+                     _s(bt, "turnover", True, 0), _s(bt, "avg_n", False, 0),
+                     _s(bt, "cash", True, 0)])
     LOG.table(rows, ["구성", "정의", "CAGR", "누적", "변동성", "MDD", "Sharpe",
-                     "Calmar", "적중률", "회전율", "종목수"],
-              ["c", "l", "r", "r", "r", "r", "r", "r", "r", "r", "r"], maxw=36)
+                     "Calmar", "적중률", "회전율", "종목수", "현금"],
+              ["c", "l", "r", "r", "r", "r", "r", "r", "r", "r", "r", "r"], maxw=34)
+    LOG.info("현금 = 거래대금 참여율 상한·종목당 최대비중 때문에 채우지 못한 비중입니다. "
+             "소형주 용량 제약이 실제로 얼마나 무는지를 보여줍니다(0% 가 아니면 그만큼 "
+             "자본이 놀고 있다는 뜻입니다).")
     LOG.info("EW = 유니버스 동일가중(이 파일이 같은 데이터·같은 비용모형으로 직접 측정). "
              "벤치마크 수치를 인용하지 않는다는 원칙 5 를 코드로 지킵니다.")
 

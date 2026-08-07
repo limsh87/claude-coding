@@ -462,17 +462,23 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
 
     # ★ 부분 응답 방어: 이웃 시점 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
     #   그대로 쓰면 그 달 유니버스가 조용히 쪼그라들어 선택편향이 된다.
+    # ★ 기준은 '전체 기간 중앙값'이 아니라 '이웃 시점 중앙값'이다.
+    #   상장사 수가 10년간 30% 넘게 늘어서, 전체 중앙값으로 자르면 초기 연도의 정상
+    #   스냅샷이 후반기 증가 때문에 '부분 응답'으로 오인되어 폐기된다.
+    # ★ 그리고 폐기는 '이번 실행의 판단'일 뿐이므로 캐시에는 원본을 그대로 남긴다.
+    #   폐기된 프레임을 저장하면 한 번의 오판이 공용 캐시에서 그 시점을 영구히 지운다.
+    snap_all = snap
     if len(snap):
         size = snap.groupby("snap_date")["code"].size().sort_index()
-        med = float(size.median()) if len(size) else 0.0
-        bad = size[size < med * 0.80]
-        if len(bad) and med > 0:
-            LOG.warn(f"스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만이라 "
-                     f"부분 응답으로 판단하고 폐기합니다: "
-                     f"{[str(x.date()) for x in bad.index[:6]]}")
+        local = size.rolling(5, center=True, min_periods=1).median()
+        bad = size[size < local * 0.80]
+        if len(bad):
+            LOG.warn(f"스냅샷 {len(bad)}개 시점이 이웃 시점 중앙값의 80% 미만이라 "
+                     f"이번 실행에서는 사용하지 않습니다(캐시에는 보존): "
+                     f"{[str(pd.Timestamp(x).date()) for x in bad.index[:6]]}")
             snap = snap[~snap["snap_date"].isin(bad.index)]
     if new_rows:
-        out = snap.copy()
+        out = snap_all.copy()
         out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
         VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
                         source="pykrx", extra={"note": "상장종목 스냅샷 — 전 전략 공용"})

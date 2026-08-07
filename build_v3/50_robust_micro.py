@@ -138,7 +138,7 @@ def _factor_returns(P: pd.DataFrame, name: str, colname: str, high_is_long: bool
     return f.dropna().rename(name)
 
 
-def R3_orthogonal(P: pd.DataFrame, bt: dict):
+def R3_orthogonal(P: pd.DataFrame, bt: dict, bench_ew: Optional[dict] = None):
     """전략 수익률을 퀄리티/밸류/모멘텀 팩터에 회귀해 알파가 남는지 본다.
 
     남지 않으면 이 전략은 '기존 팩터의 재포장'이다. statsmodels 없이 최소제곱 + HAC t 로 푼다.
@@ -150,9 +150,20 @@ def R3_orthogonal(P: pd.DataFrame, bt: dict):
     P = P.copy()
     P["_roa"] = safe_div(col(P, "net_income_ttm"), col(P, "assets").where(col(P, "assets") > 0))
     P["_accq"] = col(P, "i_accr")
-    P["_val"] = -col(P, "pbr")                       # 저PBR 롱
+    P["_val"] = col(P, "bp")                         # 순자산수익률(B/P) 롱 = 저PBR 롱
+    if P["_val"].notna().sum() == 0:
+        P["_val"] = -col(P, "pbr")                   # 폴백(구버전 패널 호환)
     facs = [_factor_returns(P, "QMJ_ROA", "_roa"), _factor_returns(P, "ACCR", "_accq"),
             _factor_returns(P, "VALUE", "_val"), _factor_returns(P, "MOM", "d1_trailing")]
+    # ★ 유니버스(시장) 팩터를 반드시 넣는다.
+    #   위 팩터들은 전부 롱-숏(상위30%−하위30%)이라 구조적으로 시장중립이다. 전략 수익률은
+    #   롱온리인데 회귀식에 시장 요인이 없으면, U-MICRO 유니버스 자체의 수익(베타)이 전부
+    #   절편으로 들어간다. 그러면 '알파가 남았다'는 판정이 사실은 '소형주에 노출됐다'는
+    #   뜻이 되어, R0(동일가중 대비)와 정면으로 모순되는 결론이 나온다.
+    if bench_ew is not None and len(bench_ew.get("returns", [])):
+        bm = bench_ew["returns"].set_index("month")["ret"].rename("UNIVERSE")
+        if len(bm) >= 24:
+            facs.append(bm)
     facs = [f for f in facs if len(f) >= 24]
     if not facs:
         _rec("R3", "퀄리티 팩터 직교화", None, "팩터를 구성할 표본이 부족합니다.")
@@ -180,8 +191,10 @@ def R3_orthogonal(P: pd.DataFrame, bt: dict):
     LOG.table(rows, ["항", "계수", "연율", "유의성"], ["l", "r", "r", "l"],
               title="R3 — 퀄리티/밸류/모멘텀 직교화 후 잔존 알파")
     ok = (ann > 0) and (abs(t) > 1.64)
-    _rec("R3", "퀄리티 팩터 직교화", bool(ok),
-         f"직교화 후 연 알파 {100*ann:.2f}% (t={t:.2f}) — "
+    has_uni = "UNIVERSE" in list(F.columns)
+    _rec("R3", "퀄리티·밸류·모멘텀·유니버스 직교화", bool(ok),
+         f"직교화 후 연 알파 {100*ann:.2f}% (t={t:.2f}) · 유니버스 팩터 "
+         f"{'포함' if has_uni else '미포함(주의: 소형주 베타가 절편에 섞임)'} — "
          f"{'알파 잔존' if ok else '유의한 알파가 남지 않습니다. 기존 팩터의 재포장일 수 있습니다'}")
 
 
@@ -196,10 +209,21 @@ def R5M_ablation(P: pd.DataFrame, months, uni, active: Dict[str, bool], base_bt:
             S = assemble_signal(mod, "D")
             bt = run_backtest_micro(S, months, uni, "D", COST_BASE_SCENARIO,
                                     label=f"ABL:{tag}", quiet=True)
-            return _calmar(bt)
+            v = (bt or {}).get("stats", {}).get("calmar", np.nan)
+            return float(v) if v is not None and np.isfinite(v) else float("nan")
         except Exception as e:                                         # noqa
-            LOG.debug(f"절제 {tag} 실패: {type(e).__name__}")
+            LOG.warn(f"절제 검사 '{tag}' 실행 실패({type(e).__name__}) — 판정불가로 처리합니다.")
             return float("nan")
+
+    def verdict(c: float) -> str:
+        # ★ NaN 을 '해로움'으로 분류하면 안 된다. 실행이 실패한 것과 부품이 해로운 것은
+        #   완전히 다른 사건인데, `c < base-0.05` 와 `abs(c-base) <= 0.05` 가 둘 다
+        #   False 가 되어 자동으로 '해로움'으로 떨어진다(원인과 정반대의 결론).
+        if not np.isfinite(c):
+            return "판정불가"
+        if c < base - 0.05:
+            return "기여"
+        return "무기여" if abs(c - base) <= 0.05 else "해로움"
 
     for key, (name, _b, enabled, _n) in firewall_clause_masks(P, active).items():
         if not enabled:
@@ -209,8 +233,8 @@ def R5M_ablation(P: pd.DataFrame, months, uni, active: Dict[str, bool], base_bt:
         fw, _ = s1_firewall(m, active, skip=[key], quiet=True)
         m["FW"] = fw
         c = run_with(m, key)
-        rows.append([f"방화벽·{name}", f"{c:.2f}", f"{c-base:+.2f}",
-                     "기여" if c < base - 0.05 else ("무기여" if abs(c - base) <= 0.05 else "해로움")])
+        rows.append([f"방화벽·{name}", f"{c:.2f}" if np.isfinite(c) else "—",
+                     f"{c-base:+.2f}" if np.isfinite(c) else "—", verdict(c)])
 
     for tid, a, b in TP_DEFS:
         if tid not in P.columns or col(P, tid).notna().sum() == 0:
@@ -220,8 +244,8 @@ def R5M_ablation(P: pd.DataFrame, months, uni, active: Dict[str, bool], base_bt:
         others = [t for t, _, _ in TP_DEFS if t != tid]
         m["E_micro"] = nanmean_cols(m, others)
         c = run_with(m, tid)
-        rows.append([f"증거층·{tid}", f"{c:.2f}", f"{c-base:+.2f}",
-                     "기여" if c < base - 0.05 else ("무기여" if abs(c - base) <= 0.05 else "해로움")])
+        rows.append([f"증거층·{tid}", f"{c:.2f}" if np.isfinite(c) else "—",
+                     f"{c-base:+.2f}" if np.isfinite(c) else "—", verdict(c)])
 
     for v in ("V1", "V2", "V3", "V6"):
         if v not in P.columns:
@@ -230,16 +254,18 @@ def R5M_ablation(P: pd.DataFrame, months, uni, active: Dict[str, bool], base_bt:
         m[v] = 1.0
         m["VETO"] = m["V1"] * m["V2"] * m["V3"] * m["V6"]
         c = run_with(m, v)
-        rows.append([f"거부권·{v}", f"{c:.2f}", f"{c-base:+.2f}",
-                     "기여" if c < base - 0.05 else ("무기여" if abs(c - base) <= 0.05 else "해로움")])
+        rows.append([f"거부권·{v}", f"{c:.2f}" if np.isfinite(c) else "—",
+                     f"{c-base:+.2f}" if np.isfinite(c) else "—", verdict(c)])
 
     rows.append(["── 원본 (절제 없음)", f"{base:.2f}", "—", ""])
     LOG.table(rows, ["절제 대상", "Calmar", "변화", "판정"], ["l", "r", "r", "c"],
               title="R5-M — 절제 검사. '빼도 그대로'인 부품은 복잡도만 늘리는 장식이다")
     useful = sum(1 for r in rows[:-1] if r[3] == "기여")
+    n_bad = sum(1 for r in rows[:-1] if r[3] == "판정불가")
     _rec("R5M", "절제 (조항·TP·거부권)", useful > 0,
-         f"기여하는 부품 {useful}개 / 검사 {len(rows)-1}개. "
-         f"{'무기여 부품은 제거를 검토하세요.' if useful < len(rows)-1 else ''}")
+         f"기여 {useful}개 / 검사 {len(rows)-1}개"
+         + (f" · 판정불가 {n_bad}개(실행 실패)" if n_bad else "")
+         + (" · 무기여 부품은 제거를 검토하세요." if useful < len(rows)-1-n_bad else ""))
     return pd.DataFrame(rows, columns=["절제 대상", "Calmar", "변화", "판정"])
 
 

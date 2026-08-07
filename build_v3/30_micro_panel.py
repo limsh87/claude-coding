@@ -346,11 +346,33 @@ def apply_umicro_gates(P: pd.DataFrame, uni: "Universe") -> Tuple[pd.DataFrame, 
       분위 기준(상위 55% 밖)으로 교체하고 재측정한다. 상장사 수가 10년간 35% 늘었기 때문에
       절대 랭크를 고정하면 유니버스가 시간에 따라 체계적으로 커지거나 작아진다.
     """
+    # ★ 시총 미상 종목을 '유니버스 밖'으로 조용히 떨어뜨리면 안 된다.
+    #   시총이 결측인 종목은 대개 상장폐지된 종목이다(현재 상장목록에 없으니 주식수를
+    #   못 얻는다). 그대로 두면 U-MICRO 가 '살아남은 종목'만으로 구성되어 C2 가 무너진다.
+    #   → 거래대금 순위를 규모 대리변수로 써서 랭크를 채운다. 소형주 구간에서 시총과
+    #     거래대금은 강하게 함께 움직이므로 근사로 성립하며, 몇 행이 그렇게 채워졌는지
+    #     반드시 표로 보고한다.
+    _pctl_mcap = P.groupby("month", observed=True)["mcap"].rank(ascending=False, pct=True) \
+        if "mcap" in P.columns else pd.Series(np.nan, index=P.index)
+    _pctl_adv = P.groupby("month", observed=True)["adv20"].rank(ascending=False, pct=True) \
+        if "adv20" in P.columns else pd.Series(np.nan, index=P.index)
+    _proxy_used = _pctl_mcap.isna() & _pctl_adv.notna() & P["close"].notna()
+    P = P.copy()
+    P["mcap_pctl_eff"] = _pctl_mcap.where(_pctl_mcap.notna(), _pctl_adv)
+    n_proxy = int(_proxy_used.sum())
+    if n_proxy:
+        LOG.warn(f"시총 미상 {n_proxy:,}종목월은 거래대금 순위를 규모 대리변수로 사용합니다 "
+                 f"(전체의 {100*n_proxy/max(len(P),1):.1f}%). 대부분 상장폐지 종목이며, "
+                 f"여기서 버리면 유니버스가 생존자만 남습니다(C2).")
+
     def gates(use_pctl: bool) -> pd.Series:
         if use_pctl:
-            band = col(P, "mcap_pctl") >= UMICRO_PCTL_MIN
+            band = col(P, "mcap_pctl_eff") >= UMICRO_PCTL_MIN
         else:
-            band = col(P, "mcap_rank") > UMICRO_MCAP_RANK_MIN
+            # 절대 랭크는 시총을 아는 종목에만 적용되고, 대리변수 행은 분위 기준으로 판정한다.
+            band = (col(P, "mcap_rank") > UMICRO_MCAP_RANK_MIN)
+            band = band.where(col(P, "mcap_rank").notna(),
+                              col(P, "mcap_pctl_eff") >= UMICRO_PCTL_MIN)
         return band.fillna(False)
 
     liq = (col(P, "adv20") >= UMICRO_MIN_ADV_KRW).fillna(False)
@@ -436,11 +458,20 @@ def attach_valuation(P: pd.DataFrame) -> pd.DataFrame:
     mcap = col(P, "mcap")
     eq = col(P, "equity")
     ni = col(P, "net_income_ttm")
+    # 표시용 배수 (해석표·진단카드에서 읽는다)
     P["pbr"] = safe_div(mcap, eq.where(eq > 0))
-    per = safe_div(mcap, ni.where(ni > 0))
-    # 적자·결측은 최하위(가장 안 싼 것)로. np.inf 는 rank(pct=True) 에서 자동으로 꼴찌가 된다.
-    P["per_positive"] = per.where(per.notna(), np.inf)
-    P.loc[mcap.isna(), "per_positive"] = np.nan      # 시총 자체를 모르면 '판단 불가'(NaN)
+    P["per_positive"] = safe_div(mcap, ni.where(ni > 0))
+
+    # ★ 랭킹은 '배수'가 아니라 '수익률(역수)' 로 한다. ────────────────────────────────
+    #   배수(PER)는 적자기업에서 정의되지 않아 결측·무한대 같은 센티넬이 필요한데,
+    #   xsec_rank_pct 는 ±inf 를 랭크 전에 NaN 으로 바꾸고 셀의 유효 관측수가 min_n
+    #   미만이면 **셀 전체**를 NaN 으로 만든다. U-MICRO 는 적자기업이 흔해서
+    #   "적자가 많다"는 이유만으로 멀쩡한 흑자기업까지 밸류 판정 불가가 되고,
+    #   방화벽의 딥밸류 조항이 그 셀 전원을 배제해 버린다.
+    #   → 이익수익률(E/P)·순자산수익률(B/P)은 적자·자본잠식에서 자연스럽게 음수가 되어
+    #     센티넬 없이 '비싼 쪽'으로 정렬된다. 결측도 최소화된다.
+    P["ep"] = safe_div(ni, mcap.where(mcap > 0))       # 높을수록 싸다
+    P["bp"] = safe_div(eq, mcap.where(mcap > 0))       # 높을수록 싸다
     n_neg = int(((ni <= 0) & ni.notna()).sum())
     LOG.debug(f"밸류 지표 — PBR 유효 {int(P['pbr'].notna().sum()):,}행 · "
               f"적자기업 {n_neg:,}행은 PER 최하위 처리")

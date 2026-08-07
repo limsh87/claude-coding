@@ -45,6 +45,22 @@ def tp_micro(P: pd.DataFrame, a: str, b: str) -> pd.Series:
     return pd.Series(out, index=P.index).where(ra.notna() & rb.notna()).astype("float32")
 
 
+def value_rank_micro(P: pd.DataFrame) -> pd.Series:
+    """딥밸류 랭크. 0 에 가까울수록 싸다 (방화벽은 하위 30% 만 통과시킨다).
+
+    ★ 이익수익률(E/P)·순자산수익률(B/P)의 셀 내 랭크를 평균한 뒤 뒤집는다.
+      배수(PER/PBR)로 랭크하면 적자·자본잠식에서 정의되지 않아 센티넬이 필요하고,
+      그 센티넬이 셀의 유효 관측수를 무너뜨려 셀 전체를 '판정 불가'로 만든다.
+      수익률 형태는 적자·자본잠식이 자연스럽게 음수가 되어 '비싼 쪽'으로 정렬된다.
+    ★ 한쪽(E/P 또는 B/P)만 관측되면 그 한쪽으로 판정한다. 둘 다 없을 때만 결측이다.
+    """
+    P = P.copy()
+    P["_r_ep"] = cell_rank_micro(P, "ep")
+    P["_r_bp"] = cell_rank_micro(P, "bp")
+    r = nanmean_cols(P, ["_r_ep", "_r_bp"])            # 높을수록 싸다
+    return (1.0 - pd.to_numeric(r, errors="coerce")).astype("float32")
+
+
 def sensor_availability(P: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
     """C14-c/d — 센서 결측률 > 25% 면 증거층에서 자동 제외한다. 0 으로 채우지 않는다.
 
@@ -137,7 +153,7 @@ def firewall_clause_masks(P: pd.DataFrame, active: Dict[str, bool]
     th = col(P, "is_trading_halted")
     streak, icov = col(P, "op_cf_neg_streak"), col(P, "interest_coverage")
     adv = col(P, "adv20")
-    vr = 0.5 * cell_rank_micro(P, "pbr") + 0.5 * cell_rank_micro(P, "per_positive")
+    vr = value_rank_micro(P)
 
     C: "OrderedDict[str, Tuple[str, Optional[pd.Series], bool, str]]" = OrderedDict()
     C["capital"] = ("자본잠식 (자본총계<자본금 또는 ≤0)", ci > 0, bool(ci.notna().any()),
@@ -250,14 +266,11 @@ def _veto_dilution(P: pd.DataFrame, dis: Optional[pd.DataFrame]) -> np.ndarray:
 
     # 보강: 상장주식수 12개월 증가율이 임계를 넘으면 '대규모 희석'으로 본다.
     #       공시목록이 없거나(키 미입력) 공시명이 규정과 달라 못 잡힌 경우를 메운다.
-    if "shares" in P.columns:
-        S = P[["code", "month", "shares"]].copy()
-        S["month"] = as_ts_series(S["month"])
-        prev = S.copy()
-        prev["month"] = (prev["month"] + pd.DateOffset(months=12)) + pd.offsets.MonthEnd(0)
-        prev = prev.rename(columns={"shares": "shares_p12"})[["code", "month", "shares_p12"]]
-        S = S.merge(prev, on=["code", "month"], how="left")
-        gr = safe_div(S["shares"] - S["shares_p12"], S["shares_p12"].where(S["shares_p12"] > 0))
+    #       ★ shares_p12 는 전체 패널에서 미리 결합해 둔다(build_panel). 여기서 U-MICRO
+    #         부분집합만으로 12개월 전 값을 찾으면 과거에 유니버스 밖이던 종목이 전부 결측이 된다.
+    if "shares" in P.columns and "shares_p12" in P.columns:
+        s_now, s_p12 = col(P, "shares"), col(P, "shares_p12")
+        gr = safe_div(s_now - s_p12, s_p12.where(s_p12 > 0))
         hit2 = (gr > max(V3_DILUTION_PCT * 2, 0.20)).fillna(False).to_numpy()
         out = np.where(hit2, 0.0, out)
         used.append(f"주식수급증 {int(hit2.sum()):,}행")
@@ -304,6 +317,15 @@ def assemble_signal(P: pd.DataFrame, variant: str = "D") -> pd.DataFrame:
         sig = sig * (1.0 + 1e-6 * tie)
     P["Signal"] = sig.astype("float32")
     P["Signal_rank"] = P.groupby("month", observed=True)["Signal"].rank(pct=True)
+
+    # ★ 구성에서 뺀 층은 컬럼 자체를 중립화한다.
+    #   백테스트의 보유 유지 판정은 P["FW"]/P["VETO"] 를 직접 읽는다. 신호식에서만 빼고
+    #   컬럼을 그대로 두면, 'V=∅' 로 정의된 B 구성에서도 방화벽·거부권이 강제 청산을
+    #   일으켜 실제로는 C 와 섞인 구성이 된다 → R2-M 비교가 정의대로 성립하지 않는다.
+    if not cfg["FW"]:
+        P["FW"] = 1
+    if not cfg["V"]:
+        P["VETO"] = 1.0
     n_live = int((P["Signal"] > 0).sum())
     LOG.info(f"[{variant}] {cfg['desc']} — 신호>0 {n_live:,}행 "
              f"(월평균 {n_live/max(P['month'].nunique(),1):,.0f}종목)")

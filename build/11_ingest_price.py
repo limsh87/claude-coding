@@ -409,10 +409,22 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+
+    # ★★ 저장은 '자르기 전' 전체를, 반환은 '자른' 창만. 순서를 바꾸면 캐시가 파괴된다. ★★
+    #   put_table 은 전체 파일 교체다. 백테스트 창으로 자른 프레임을 그대로 저장하면
+    #   공용 캐시에 있던 창 밖 구간(다른 전략이 모아둔 2010~2016 같은 과거분)이
+    #   이 전략을 한 번 돌렸다는 이유만으로 영구 삭제된다. 신규 수집이 단 1종목만 있어도
+    #   기록이 일어나므로 사고 확률이 낮지도 않다. 사용자의 절대 1원칙 위반이다.
+    px_all = px                                       # 영속화용 — 자르지 않은 합집합
+    px = px_all[(px_all["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                (px_all["date"] <= end_ts)]           # 반환용 — 이 전략의 창
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
+        n_out = int(len(px_all) - len(px))
+        if n_out:
+            LOG.debug(f"공용 캐시에는 창 밖 {n_out:,}행을 포함한 전체를 저장합니다 "
+                      f"(다른 전략의 구간을 지우지 않기 위함).")
+        VAULT.put_table("krx_ohlcv_daily", px_all, scope="shared", domain="price",
                         source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],

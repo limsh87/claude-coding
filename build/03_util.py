@@ -190,18 +190,45 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
     return path
 
 
+_CORRUPT_PAT = re.compile(
+    r"ArrowInvalid|ArrowIOError|Parquet magic bytes|not a parquet file|"
+    r"Couldn't deserialize|corrupt|invalid.*footer|Repetition level", re.I)
+
+
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """읽기 실패를 '손상'과 '일시적 IO 오류'로 구분한다.
+
+    ★ 왜 구분이 중요한가 ─────────────────────────────────────────────────────────────
+      예전에는 어떤 예외든 곧바로 파일을 .corrupt 로 개명(os.replace)했다. 그런데 구글드라이브
+      FUSE 마운트는 정상 상태에서도 'Transport endpoint is not connected', 타임아웃, 쿼터
+      스로틀 같은 '일시적' 오류를 낸다. 그러면 멀쩡한 공용 캐시가 격리되고, 곧이어
+      put_table 이 '없는 파일'로 판단해 백업 없이 새로 만들어 버린다.
+      = 잠깐의 네트워크 딸꾹질이 다른 전략의 캐시를 통째로 날린다. 절대 1원칙 위반이다.
+    → ① 3회 재시도(지수 백오프) ② parquet 포맷 오류로 확인될 때만 격리 ③ 그 외에는
+      None 을 돌려줄 뿐 파일에 손대지 않는다(다음 실행에서 다시 읽으면 된다).
+    """
     if not os.path.exists(path):
         return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
+    last = None
+    for attempt in range(3):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                 # noqa
+            last = e
+            if attempt < 2:
+                time.sleep(0.6 * (2 ** attempt))
+    blob = f"{type(last).__name__}: {last}"
+    if not _CORRUPT_PAT.search(blob):
+        LOG.warn(f"parquet 읽기 실패(일시적 오류로 판단) — 파일은 그대로 두고 이번 실행에서만 "
+                 f"건너뜁니다: {os.path.basename(path)} ({type(last).__name__}). "
+                 f"드라이브 마운트가 불안정할 때 흔합니다. 다음 실행에서 다시 읽습니다.")
         return None
+    LOG.warn(f"parquet 손상 확인 — 지우지 않고 격리 보관합니다: {os.path.basename(path)} ({blob[:80]})")
+    try:                                       # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
+        os.replace(path, path + f".corrupt.{int(time.time())}")
+    except Exception:
+        pass
+    return None
 
 
 def read_jsonl(path: str) -> List[dict]:

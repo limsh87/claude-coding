@@ -52,17 +52,20 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
         ctx["sec"] = sec
         VAULT.put_table("security_master", sec, scope="shared", domain="universe",
                         source="fdr+kind+dart")
+        VAULT.flush()
 
     with PIPE.stage("L1.PX", "가격·거래대금 (다중소스 폴백)", "L1", budget_s=2400):
         codes = ctx["sec"]["code"].dropna().astype(str).tolist()
         px = fetch_prices(codes, BACKTEST_START, BACKTEST_END)
         ctx["px_daily"] = px
         ctx["panel"] = build_price_panel(px, months)
+        VAULT.flush()
 
     with PIPE.stage("L1.MCAP", "시가총액·상장주식수", "L1", budget_s=1200):
         snap_m = fetch_mcap_snapshots(months, ctx["sec"])
         ctx["mcap_snap"] = snap_m
         ctx["mcap"] = build_mcap_panel(ctx["panel"]["monthly"], snap_m, ctx["sec"], months)
+        VAULT.flush()
 
     with PIPE.stage("L1.DART", "DART 재무 → 분기 센서", "L1", budget_s=3600, critical=False):
         ccs = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
@@ -75,12 +78,15 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
             PIT.register("dart_micro", Q, key_cols=["corp_code"])
             VAULT.put_table(f"micro_sensors_q_{STRATEGY_ID}", Q, scope="private",
                             domain="feature", source="dart tidy + micro sensors")
+        VAULT.flush()
 
     with PIPE.stage("L1.ACT", "관리종목·감사의견·거래정지", "L1", budget_s=1200, critical=False):
         ctx["actions"] = fetch_market_actions(BACKTEST_START, BACKTEST_END)
+        VAULT.flush()
 
     with PIPE.stage("L1.DIS", "공시목록 (희석성 조달 V3)", "L1", budget_s=1800, critical=False):
         ctx["dis"] = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
+        VAULT.flush()
 
     # ★ PIPE.stage(skip_if=...) 는 '표시'만 건너뛸 뿐 with 블록의 본문은 그대로 실행된다
     #   (@contextmanager 는 본문을 건너뛸 수 없다). 부작용이 있는 단계는 반드시 밖에서
@@ -131,6 +137,7 @@ def _collect_research(ctx: dict):
             VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
                             source="entity_resolution")
         ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
+        VAULT.flush()
 
 
 def build_panel(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame, "Universe", dict]:
@@ -170,8 +177,16 @@ def build_panel(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame, "Uni
         LOG.info("애널리스트 연결이 없어 U층 보조신호(목표주가 리비전)를 사용하지 않습니다. "
                  "E층은 리포트에 의존하지 않으므로 백테스트는 정상 진행됩니다.")
 
-    # U-MICRO 밖은 계산에서 제외한다(메모리·시간 절약). 단 '행을 지우는' 것이 아니라
-    # 신호 산출 대상만 좁히는 것이며, 유니버스 감쇠표는 이미 전 단계를 기록했다.
+    # ★ V3(희석성 조달)의 주식수 12개월 증가율은 U-MICRO 부분집합이 아니라 '전체 패널'에서
+    #   계산해야 한다. 12개월 전에 유니버스 밖이었던 종목은 부분집합에서 전 값을 못 찾아
+    #   증가율이 통째로 결측이 되고, 백스톱이 무력화된다.
+    tables["dis"] = ctx.get("dis")
+    if "shares" in P.columns:
+        _S = P[["code", "month", "shares"]].copy()
+        _S["month"] = (as_ts_series(_S["month"]) + pd.DateOffset(months=12)) + pd.offsets.MonthEnd(0)
+        _S = _S.rename(columns={"shares": "shares_p12"})
+        P = P.merge(_S, on=["code", "month"], how="left")
+
     P["FW"] = 0
     P["VETO"] = 0.0
     return P, uni, tables
@@ -192,7 +207,7 @@ def score_and_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
         fw, fwt = s1_firewall(M, tables.get("fw_active", {}))
         M["FW"] = fw
         tables["firewall"] = fwt
-        M = apply_vetoes_micro(M, None)          # 공시 기반 V3 는 아래에서 다시 계산
+        M = apply_vetoes_micro(M, tables.get("dis"))
         PIPE.io("OUT", "MEM", "scored_panel", M)
 
     with PIPE.stage("L3.BT", "백테스트 A/B/C/D + 벤치마크", "L3", budget_s=900):
@@ -202,13 +217,29 @@ def score_and_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
             bts[v] = run_backtest_micro(S, months, uni, v, COST_BASE_SCENARIO, label=v)
             if v == "D":
                 M = S          # 최종안(D)의 신호를 패널에 남긴다 — 해석표·진단카드가 이걸 읽는다
-        bench_ew = benchmark_universe_ew(M, months, COST_BASE_SCENARIO)
+        bench_ew = benchmark_universe_ew(M, months, COST_BASE_SCENARIO, uni=uni)
         bench_idx = benchmark_index(months)
         LOG.ok(f"유니버스 동일가중 기준선 — {_fmt(bench_ew)}")
     return M, bts, bench_ew, bench_idx
 
 
 def main() -> dict:
+    """어떤 종료 경로(킬 기준·스테이지 실패·Ctrl-C)에서도 인덱스 저널은 남긴다."""
+    try:
+        return _main_inner()
+    finally:
+        # ★ _register() 는 메모리(_pending)에만 쌓이고 flush() 에서만 저널에 기록된다.
+        #   실행 끝(L6.OUT)에만 flush 하면, 킬 기준처럼 '예상된 중단'에서 그 실행이
+        #   수집한 모든 등록이 통째로 버려진다 — 파일은 드라이브에 남았는데 인덱스에는
+        #   없는 상태가 되어 다음 실행이 같은 것을 다시 받는다.
+        try:
+            if VAULT is not None:
+                VAULT.flush()
+        except Exception:
+            pass
+
+
+def _main_inner() -> dict:
     t_start = time.time()
     LOG.banner(f"TCD v3 · {STRATEGY_NAME}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · 빌드 {BUILD_VERSION} · 모드 {RUN_MODE}")
@@ -325,6 +356,10 @@ def _report_everything(res: dict, ctx: dict, months: pd.DatetimeIndex, smoke: bo
     P, bts = res["P"], res["bts"]
     bench_ew, bench_idx, tables = res["bench_ew"], res["bench_idx"], res["tables"]
     tag = "(합성 예행연습)" if smoke else ""
+    # ★ 아래 강건성 스테이지는 스모크에서 critical=False 다. 거기서 예외가 나면 스테이지가
+    #   삼키고 통과하는데, 그 뒤 return 이 미할당 지역변수를 참조해 UnboundLocalError 로
+    #   실행 전체를 죽인다 — 원인과 전혀 다른 곳에서 죽는 최악의 형태다. 먼저 초기화한다.
+    abl, r9, verdict = None, None, ""
 
     with PIPE.stage(f"L6.PERF{'.S' if smoke else ''}", f"성과 검증 {tag}", "L6", budget_s=180):
         report_performance(bts, bench_ew, bench_idx)
@@ -340,7 +375,7 @@ def _report_everything(res: dict, ctx: dict, months: pd.DatetimeIndex, smoke: bo
                      "킬 기준을 발동시키지 않습니다(실데이터에서는 발동합니다).")
         R0_benchmark(bts, bench_ew, bench_idx)
         verdict = R2M_fourway(bts, bench_ew)
-        R3_orthogonal(P, bts.get("D"))
+        R3_orthogonal(P, bts.get("D"), bench_ew)
         abl = R5M_ablation(P, months, res["uni"], tables.get("fw_active", {}), bts.get("D"))
         r9 = R9_cost(P, months, res["uni"])
         report_robustness()

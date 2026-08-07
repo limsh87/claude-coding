@@ -285,15 +285,26 @@ class Vault:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
         if os.path.exists(path):
-            bak = os.path.join(self.ns[scope], "index", "_backup",
-                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            # ★ 백업 파일명은 초 단위였고 shutil.copy2 는 같은 이름을 말없이 덮어쓴다.
+            #   같은 테이블을 1초 안에 두 번 쓰면(security_master 가 실제로 그렇다)
+            #   두 번째 백업이 첫 번째를 덮어써, '교체 직전 원본'의 유일한 사본이 사라진다.
+            #   → 마이크로초 + 내용해시로 이름을 유일화하고, 이미 있으면 절대 덮지 않는다.
             try:
+                _tag = sha1_file(path)[:8]
+            except Exception:
+                _tag = "nohash"
+            bak = os.path.join(self.ns[scope], "index", "_backup",
+                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S_%f}.{_tag}.parquet")
+            try:
+                if os.path.exists(bak):
+                    raise FileExistsError(bak)
                 shutil.copy2(path, bak)
+                self._prune_backups(scope, name)
             except Exception as e:                          # noqa
                 LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
                          f"리비전 파일로 저장합니다: {name}")
                 path = os.path.join(self.table_dir(scope),
-                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S_%f}.parquet")
         try:
             atomic_write_parquet(df, path)
         except Exception as e:                              # noqa
@@ -308,6 +319,32 @@ class Vault:
                                  "cols": list(map(str, df.columns))[:80]}, ensure_ascii=False),
         })
         return path
+
+    BACKUP_KEEP = 10
+
+    def _prune_backups(self, scope: str, name: str):
+        """테이블별 백업 보관 개수를 제한한다(최근 N개만 유지).
+
+        ★ 이건 '캐시 삭제'가 아니라 '백업 보존 정책'이다. 원본 테이블·저널·blob 은
+          절대 건드리지 않는다. 정책이 없으면 put_table 마다 수 GB 파일이 통째로 복사돼
+          _backup 이 무한히 커지고, 결국 용량이 차서 put_table 이 조용히 실패한다
+          (예외를 삼키고 None 을 반환하므로 '성공한 실행'처럼 보이면서 아무것도 저장되지 않는다).
+        """
+        try:
+            d = os.path.join(self.ns[scope], "index", "_backup")
+            files = [os.path.join(d, f) for f in os.listdir(d)
+                     if f.startswith(name + ".") and f.endswith(".parquet")]
+            if len(files) <= self.BACKUP_KEEP:
+                return
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for p in files[self.BACKUP_KEEP:]:
+                try:
+                    os.remove(p)
+                    self.stats["backup_pruned"] += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
@@ -392,6 +429,18 @@ class Vault:
     def adopt_scan(self, dirs: Sequence[str], max_files: int = 400_000) -> pd.DataFrame:
         """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음."""
         seen, found = set(), []
+        # ★ 볼트 자신의 디렉터리는 스캔하지 않는다.
+        #   GDRIVE_ADOPT_DIRS 의 기본값이 GDRIVE_ROOT 와 같아서, 그대로 두면 _shared/table
+        #   아래의 자기 자신이 만든 parquet(krx_ohlcv_daily 등)을 '기존 캐시'로 다시 등록한다.
+        #   adopt uid 에 파일 크기가 들어가므로 테이블이 커질 때마다 uid 가 바뀌어
+        #   매 실행 새 저널 행이 쌓인다 = 인덱스가 무한히 부풀고 load_index 가 느려진다.
+        _self_dirs = [os.path.realpath(self.root)] + \
+                     [os.path.realpath(p) for p in self.ns.values()]
+
+        def _is_self(p: str) -> bool:
+            rp = os.path.realpath(p)
+            return any(rp == s or rp.startswith(s + os.sep) for s in _self_dirs)
+
         for d in dirs:
             if not d or not os.path.isdir(d):
                 continue
@@ -402,7 +451,11 @@ class Vault:
             LOG.info(f"기존 캐시 스캔: {d}")
             n = 0
             for dirpath, dirnames, filenames in os.walk(d):
-                dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
+                dirnames[:] = [x for x in dirnames
+                               if not x.startswith(".") and x != "_backup"
+                               and not _is_self(os.path.join(dirpath, x))]
+                if _is_self(dirpath):
+                    continue
                 for fn in filenames:
                     if n >= max_files:
                         break

@@ -37,7 +37,7 @@ def _mcap_from_pykrx(days: Sequence[pd.Timestamp]) -> List[dict]:
     for d in tqdm(days, desc="시총 스냅샷(pykrx)", ncols=88, leave=False):
         bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
                        d.strftime("%Y%m%d"), prev=True) or d.strftime("%Y%m%d")
-        got = False
+        got_mkt, day_rows = set(), []
         for mkt in ("KOSPI", "KOSDAQ"):
             t = KRXG.call(pykrx_stock.get_market_cap_by_ticker, bd, market=mkt)
             if t is None or len(t) == 0:
@@ -49,16 +49,27 @@ def _mcap_from_pykrx(days: Sequence[pd.Timestamp]) -> List[dict]:
                 t = t.rename(columns={t.columns[0]: "code"})
             if "mcap" not in t.columns and "shares" not in t.columns:
                 continue
-            got = True
+            got_mkt.add(mkt)
             for r in t.itertuples(index=False):
                 c = to_code6(getattr(r, "code", None))
                 if not c:
                     continue
-                rows.append({"snap_date": d.strftime("%Y-%m-%d"), "code": c,
-                             "shares": float(getattr(r, "shares", np.nan) or np.nan),
-                             "mcap": float(getattr(r, "mcap", np.nan) or np.nan),
-                             "src": "pykrx"})
-        bad_streak = 0 if got else bad_streak + 1
+                day_rows.append({"snap_date": d.strftime("%Y-%m-%d"), "code": c,
+                                 "shares": float(getattr(r, "shares", np.nan) or np.nan),
+                                 "mcap": float(getattr(r, "mcap", np.nan) or np.nan),
+                                 "src": "pykrx"})
+        # ★ 한쪽 시장만 응답한 날은 통째로 버린다(캐시에도 넣지 않는다).
+        #   코스피만 받힌 스냅샷을 저장하면 그 시점의 시총 랭크가 코스피 종목만으로
+        #   매겨져 U-MICRO(하위권) 판정이 완전히 뒤집힌다. 게다가 그 날짜가 캐시에
+        #   '완료'로 남아 다시는 재수집되지 않는다.
+        if {"KOSPI", "KOSDAQ"} <= got_mkt:
+            rows.extend(day_rows)
+            bad_streak = 0
+        else:
+            if got_mkt:
+                LOG.debug(f"{d:%Y-%m-%d} 시총 스냅샷은 {sorted(got_mkt)} 만 응답 — "
+                          f"부분 스냅샷이므로 저장하지 않고 다음 실행에서 재시도합니다.")
+            bad_streak += 1
         if bad_streak >= 5:
             LOG.warn("시총 스냅샷이 연속 5회 비었습니다 — KRX 세션이 끊겼거나 차단된 상태입니다. "
                      "다음 소스로 폴백합니다(정상 동작).")
@@ -229,13 +240,17 @@ def fetch_mcap_snapshots(months: pd.DatetimeIndex, sec: Optional[pd.DataFrame] =
                 .drop_duplicates(["snap_date", "code"], keep="first")[MCAP_SNAP_COLS])
 
     # 부분 응답 방어 — 이웃 시점 대비 급감한 스냅샷은 진실이 아니라 사고다(유니버스 축소 → 선택편향).
+    # ★ 기준은 '전체 기간 중앙값'이 아니라 '이웃 시점의 중앙값'이어야 한다.
+    #   상장사 수는 10년간 30% 넘게 늘었다. 전체 중앙값으로 자르면 2016년 초기 스냅샷이
+    #   후반기 상장 증가 때문에 '부분 응답'으로 오인되어 통째로 폐기된다.
     if len(snap):
         size = snap.groupby("snap_date")["code"].size().sort_index()
-        med = float(size.median()) if len(size) else 0.0
-        bad = size[size < med * 0.80]
-        if len(bad) and med > 0:
-            LOG.warn(f"시총 스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만이라 "
-                     f"부분 응답으로 판단하고 폐기합니다.")
+        local = size.rolling(5, center=True, min_periods=1).median()
+        bad = size[size < local * 0.80]
+        if len(bad):
+            LOG.warn(f"시총 스냅샷 {len(bad)}개 시점이 이웃 시점 중앙값의 80% 미만이라 "
+                     f"부분 응답으로 판단하고 폐기합니다: "
+                     f"{[str(pd.Timestamp(x).date()) for x in bad.index[:6]]}")
             snap = snap[~snap["snap_date"].isin(bad.index)]
 
     if new_rows:
@@ -301,8 +316,13 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
         yrs = sorted({int(m.year) for m in months})
         D = _shares_from_dart(ccs, yrs)
         if len(D):
-            inv = {v: k for k, v in c2c.items()}
-            D["code"] = D["corp_code"].map(inv)
+            # ★ c2c 는 code→corp_code 로 1:N 이 접힌 map 이다. 뒤집으면(dict 역전) 한 법인의
+            #   종목코드 중 하나만 남아 발행주식총수가 엉뚱한 한 종목에만 붙는다.
+            #   → 역전하지 말고 sec 를 통해 merge 로 펼친다(한 법인 → 그 법인의 전 종목).
+            _link = (sec.dropna(subset=["corp_code"])[["code", "corp_code"]]
+                        .assign(corp_code=lambda x: x["corp_code"].astype(str),
+                                code=lambda x: x["code"].astype(str)).drop_duplicates())
+            D = D.merge(_link, on="corp_code", how="left")
             D = D.dropna(subset=["code", "knowledge_date"]).sort_values("knowledge_date")
             L2 = base.loc[shares.isna(), ["code", "month", "_ord"]].dropna(subset=["month"])
             L2 = L2.sort_values("month", kind="stable")
@@ -331,9 +351,18 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
             if n_add:
                 src_used["FDR 현재값(비PIT 근사)"] = n_add
 
+    # ★ 시총 = 상장주식수(as-of) × '그 달의' 종가.  스냅샷의 mcap 을 그대로 쓰지 않는다.
+    #   스냅샷 격자는 분기(3/6/9/12월)이고 merge_asof 는 그 값을 앞으로 끌고 온다.
+    #   스냅샷 mcap 을 우선하면 3개월 중 2개월의 시총·PBR·PER·시총랭크가 직전 분기말에
+    #   얼어붙는다. 2020-03 처럼 한 달에 30% 빠졌다 반등한 구간에서는 4월·5월의 밸류
+    #   지표가 3월말 시총으로 계산되어 딥밸류 판정이 통째로 틀어진다.
+    #   → 느리게 변하는 것(주식수)만 as-of 로 옮기고, 빠르게 변하는 것(가격)은 당월 값을 쓴다.
     mcap = shares * base["close"]
-    # 스냅샷이 mcap 을 직접 준 행은 그 값을 신뢰한다(우선주 등 복수종목 합산 이슈 회피).
-    mcap = mcap_snap.where(mcap_snap.notna() & (mcap_snap > 0), mcap)
+    # 주식수를 못 얻었지만 스냅샷 mcap 은 있는 행만 보조적으로 사용한다(그마저 없으면 결측).
+    n_stale = int((mcap.isna() & mcap_snap.notna() & (mcap_snap > 0)).sum())
+    mcap = mcap.where(mcap.notna(), mcap_snap.where(mcap_snap > 0))
+    if n_stale:
+        src_used["스냅샷 시총(직전 분기말·근사)"] = n_stale
 
     out = base[["code", "month"]].copy()
     out["shares"] = shares.to_numpy()

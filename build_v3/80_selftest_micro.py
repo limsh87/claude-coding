@@ -64,13 +64,17 @@ def run_contracts() -> bool:
                           "VETO": [1.0], "FW": [1], "close": [1000.0], "d1_trailing": [-0.5]})
         bt = run_backtest_micro(P, pd.DatetimeIndex([pd.Timestamp("2020-01-31")]), uni,
                                 "D", COST_BASE_SCENARIO, label="C2TEST", quiet=True)
-        R = bt["returns"]
-        if len(R) == 0:
-            return False, "백테스트가 아무 행도 만들지 않았습니다."
-        if float(R["ret_gross"].iloc[0]) > -0.99:
-            return False, (f"정리매매가 없는 폐지 종목의 수익률이 "
-                           f"{float(R['ret_gross'].iloc[0]):.3f} 입니다. -100% 여야 합니다.")
-        return True, "폐지 전 포함 · 폐지 후 제외 · 정리매매 없으면 -100% 강제 확인"
+        H = bt["holdings"]
+        if H is None or len(H) == 0:
+            return False, "백테스트가 보유내역을 만들지 않았습니다."
+        # ★ 포트폴리오 수익률이 아니라 '그 종목의' 수익률이 -100% 여야 한다.
+        #   포트폴리오 수익률은 비중(용량 상한·현금)에 좌우되므로 C2 의 판정 대상이 아니다.
+        pos = float(H["fwd_ret"].iloc[0])
+        if pos > -0.999:
+            return False, (f"정리매매가 없는 폐지 종목의 종목수익률이 {pos:.3f} 입니다. "
+                           f"-100% 여야 합니다.")
+        return True, (f"폐지 전 포함 · 폐지 후 제외 · 정리매매 없으면 종목수익률 "
+                      f"{pos:.0%} 강제 확인")
 
     # ── C13: 유니버스는 PIT — 미래 상장 종목이 섞이지 않는다 ──────────────────────────
     def c13():
@@ -193,6 +197,91 @@ def run_contracts() -> bool:
         return True, (f"낙관 {100*a['stats']['cagr']:.2f}% > 비관 "
                       f"{100*b['stats']['cagr']:.2f}% — 비용 모형 단조성 확인")
 
+    # ── 시장조치 상태 복원: 해제가 먼저 관측돼도 이후 지정이 살아야 한다 ──────────────
+    def watchstate():
+        ev = pd.DataFrame({
+            "code": ["000001"] * 3,
+            "rcept_dt": pd.to_datetime(["2017-03-15", "2018-06-20", "2019-02-10"]),
+            "action": ["watch_off", "watch_on", "watch_off"]})
+        S = _step_state(ev, "watch_on", "watch_off", "code")
+        m = dict(zip(S["knowledge_date"], S["state"]))
+        if int(m[pd.Timestamp("2018-06-20")]) != 1:
+            return False, ("이력 시작 전 지정 때문에 이후의 진짜 '관리종목 지정'이 0 으로 "
+                           "읽힙니다 — 누적합 방식의 고질적 버그입니다.")
+        if int(m[pd.Timestamp("2019-02-10")]) != 0:
+            return False, "해제 이벤트가 상태를 끄지 못했습니다."
+        return True, "해제 선행 이력에서도 이후 지정이 정상 복원됨 (최근 이벤트 기준)"
+
+    # ── 단발 사건(감사의견 비적정)의 만료가 나중 사건을 끄면 안 된다 ────────────────────
+    def oneshot():
+        ev = pd.DataFrame({"code": ["000001"] * 2,
+                           "rcept_dt": pd.to_datetime(["2019-03-20", "2020-03-25"]),
+                           "action": ["audit_bad", "audit_bad"]})
+        S = _one_shot_state(ev, "audit_bad", "code", valid_days=400)
+        S = S.sort_values("knowledge_date")
+        probe = pd.Timestamp("2020-06-30")
+        st = S[S["knowledge_date"] <= probe]["state"].iloc[-1]
+        if int(st) != 1:
+            return False, ("2020-03 비적정 이후인데 2019 건의 만료행이 상태를 꺼 버렸습니다 "
+                           "(만료는 누적 최댓값이어야 합니다).")
+        return True, "연속 단발 사건에서 나중 사건이 앞 사건의 만료에 지워지지 않음"
+
+    # ── 거래정지→수개월 뒤 상장폐지 경로도 -100% 여야 한다 ─────────────────────────────
+    def delist_gap():
+        months = pd.date_range("2019-04-30", periods=2, freq="ME")
+        sec = pd.DataFrame({"code": ["000002"], "name": ["b"], "market": ["KOSDAQ"],
+                            "listing_date": [pd.Timestamp("2010-01-01")],
+                            "delisting_date": [pd.Timestamp("2020-03-15")],
+                            "industry": ["X"], "corp_code": ["B"], "src": ["t"]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"code": ["000002"] * 2, "date": months}))
+        P = pd.DataFrame({"code": ["000002"], "month": [months[0]], "Signal": [1.0],
+                          "fwd_ret": [np.nan], "adv20": [1e9], "VETO": [1.0], "FW": [1],
+                          "close": [1000.0], "d1_trailing": [-0.5]})
+        bt = run_backtest_micro(P, pd.DatetimeIndex([months[0]]), uni, "D",
+                                COST_BASE_SCENARIO, label="DGAP", quiet=True)
+        H = bt["holdings"]
+        r = float(H["fwd_ret"].iloc[0]) if H is not None and len(H) else 0.0
+        if r > -0.999:
+            return False, (f"거래정지 후 수개월 뒤 상장폐지되는 종목의 종목수익률이 {r:.3f} "
+                           f"입니다. 폐지월 창만 보면 이 경로가 0% 로 계상되어 생존자편향이 "
+                           f"재유입됩니다.")
+        return True, "거래 중단 시점에 종목수익률 -100% 확정 (폐지일이 몇 달 뒤여도 동일)"
+
+    # ── 적자기업이 많은 셀에서 밸류 랭크가 통째로 무효화되면 안 된다 ────────────────────
+    def valuecell():
+        n = 30
+        # 30종목 중 22개가 적자(E/P 음수). 싼 흑자기업(0번)과 비싼 적자기업(29번)을 비교한다.
+        P = pd.DataFrame({
+            "code": [f"{i:06d}" for i in range(n)], "month": pd.Timestamp("2020-06-30"),
+            "cell": "202006|X", "cell_l2": "202006|X", "cell_l3": "202006|ALL",
+            "bp": np.linspace(3.0, 0.3, n),
+            "ep": [0.30 - 0.02 * i if i < 8 else -0.05 - 0.01 * i for i in range(n)]})
+        vr = value_rank_micro(P)
+        if vr.isna().all():
+            return False, ("셀에 적자기업이 많다는 이유로 밸류 랭크가 전원 NaN 이 되었습니다. "
+                           "그러면 방화벽의 딥밸류 조항이 흑자기업까지 전원 배제합니다.")
+        if not (float(vr.iloc[0]) < float(vr.iloc[n - 1])):
+            return False, "저PBR·흑자 기업이 고PBR·적자 기업보다 싸게 평가되지 않았습니다."
+        return True, (f"적자 {n-8}/{n} 인 셀에서도 밸류 랭크 유효 "
+                      f"(최저 {float(vr.min()):.2f} · 최고 {float(vr.max()):.2f})")
+
+    # ── R2-M 구성 분리: B(증거층만)에는 방화벽·거부권이 남아 있으면 안 된다 ─────────────
+    def variantsep():
+        P = pd.DataFrame({"code": [f"{i:06d}" for i in range(10)],
+                          "month": pd.Timestamp("2020-06-30"),
+                          "E_micro": np.linspace(0, 1, 10), "U_micro": 1.0,
+                          "FW": [0] * 5 + [1] * 5, "VETO": [0.0] * 5 + [1.0] * 5,
+                          "adv20": 1e9})
+        B = assemble_signal(P, "B")
+        if not (B["FW"] == 1).all() or not (B["VETO"] == 1.0).all():
+            return False, ("B 구성에 방화벽/거부권 컬럼이 남아 백테스트의 보유 판정에서 "
+                           "강제 청산을 일으킵니다 — 정의상 B 가 아니라 C 가 됩니다.")
+        D = assemble_signal(P, "D")
+        if int(D["FW"].sum()) != 5:
+            return False, "D 구성에서 방화벽이 중립화되었습니다."
+        return True, "B 는 방화벽·거부권 중립화 · D 는 유지 — 구성 간 분리 확인"
+
     _c("C1", "PIT (미래누수 차단)", c1)
     _c("C2", "생존자편향 제거 · 상폐 -100%", c2)
     _c("C13", "유니버스 PIT · 랭크 시점별 재산출", c13)
@@ -201,6 +290,11 @@ def run_contracts() -> bool:
     _c("V", "거부권 이진 · 곱 · 상쇄불가", veto)
     _c("RANK", "선정 랭크 정합성", rankmono)
     _c("COST", "비용 모형 단조성", costmono)
+    _c("WATCH", "관리종목 상태 복원 (해제 선행)", watchstate)
+    _c("AUDIT", "단발 사건 만료 누적 최댓값", oneshot)
+    _c("DLGAP", "정지→지연 상장폐지 -100%", delist_gap)
+    _c("VALUE", "적자 다수 셀의 밸류 랭크 생존", valuecell)
+    _c("VSEP", "R2-M 구성 분리 (B ≠ C)", variantsep)
 
     LOG.table([[r["id"], r["name"], "✔ 통과" if r["ok"] else "✘ 실패", _trunc(r["detail"], 66)]
                for r in CONTRACTS], ["ID", "계약", "판정", "상세"], ["c", "l", "c", "l"], maxw=70,
