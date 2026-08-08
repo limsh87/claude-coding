@@ -98,6 +98,9 @@ GDRIVE_ADOPT_DIRS = [
     "/content/drive/MyDrive/reports",
     "/content/drive/MyDrive/consensus",
 ]
+#    ▸ 윈도우/로컬 주피터랩이면 여기에 실제 폴더를 적으세요. 드라이브 동기화 폴더를 그대로
+#      가리켜도 됩니다(예: r"D:\Quant\tcd_cache" 또는 r"C:\Users\me\Google Drive\tcd_cache").
+#      ★ 윈도우 경로는 역슬래시가 이스케이프로 해석되므로 반드시 r"..." 형태로 쓰세요.
 LOCAL_CACHE_ROOT  = "./tcd_cache"       # JupyterLab/로컬 폴백 (드라이브 마운트 불가 시 자동)
 
 #    ▸ 신용잔고를 KRX 웹에서 직접 내려받아 두셨다면(CSV/XLSX) 이 폴더에 넣어두세요.
@@ -113,7 +116,11 @@ BACKTEST_END   = "2026-07-31"
 REBAL_DAY      = "W-FRI"          # 주 1회 (일별=회전율 폭증, 월별=소진 시점 놓침 — §8)
 
 # ── ⑤ 성능 / 자원 ───────────────────────────────────────────────────────────────────────────
-N_WORKERS_IO   = 12     # 네트워크 병렬(스레드). 차단 위험을 낮추려면 8 이하로.
+#    ▶ 속도 ↔ 차단 위험은 '동시 스레드 수'가 아니라 '초당 요청수(QPS)'가 결정합니다.
+#      아래 QPS 가 전역 상한이라 스레드를 늘려도 그 이상 빨라지지 않습니다(그래서 안전합니다).
+#      급하면 naver 를 4~5 로 올리세요. 429/403 이 뜨면 즉시 되돌리고 재실행하면
+#      캐시에 쌓인 만큼은 건너뜁니다.
+N_WORKERS_IO   = 12     # 네트워크 병렬(스레드). QPS 상한이 있으므로 12면 충분합니다.
 N_WORKERS_CPU  = 0      # 0 = CPU 코어수 자동
 RATE_LIMIT_QPS = {"dart": 8.0, "hankyung": 2.5, "naver": 3.0, "krx": 2.0,
                   "datagokr": 5.0, "customs": 3.0, "kind": 2.0, "generic": 3.0}
@@ -164,6 +171,13 @@ ACCOUNT_KRW           = 30_000_000
 MIN_ADV_KRW           = 300_000_000       # 유동성 하한 (§7.3 방화벽)
 MCAP_RANK_EXCLUDE_TOP = 250      # 상위 250 대형주 제외 (개인 신용 비중이 낮아 현상 자체가 약함)
 
+#    ▶ 비교군: 스몰캡 전용 유니버스 (시총 하위 N종목)
+#      같은 신호·같은 비용·같은 기간으로 한 번 더 돌려 나란히 출력합니다.
+#      강제매도 현상은 소형주에서 훨씬 강하게 나타나므로, 전체 유니버스 대비 얼마나 더
+#      강한지(또는 비용·유동성에 먹히는지)를 같은 화면에서 판단할 수 있어야 합니다.
+RUN_SMALLCAP_COMPARE = True
+SMALLCAP_BOTTOM_N    = 1000      # 매 시점 시총 하위 N종목 (PIT 재산출)
+
 # ── ⑨ 국면 판정 임계 (§7.1) ─────────────────────────────────────────────────────────────────
 PH_DD_ENTER      = -0.30    # 국면 C 낙폭 조건
 PH_CR_PCTL_ENTER = 0.20     # 강제재고 소진 판정 (자기이력 백분위)
@@ -194,7 +208,7 @@ ACTIVE_PACKS    = ["F"]
 
 STRATEGY_ID   = "TCD_V3_FLP"
 STRATEGY_NAME = "FLP 강제매도 소진 (Forced Liquidation Exhaustion)"
-BUILD_VERSION = "v2.20260808.0325"
+BUILD_VERSION = "v2.20260808.0401"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -366,10 +380,18 @@ def _ensure_deps() -> Dict[str, bool]:
 # ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
 #   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
 #   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+#
+#   ★ 단, KRX_MODE='OFF'(차단 대응) 이면 자격증명을 주입하지도, pykrx 를 import 하지도
+#     않는다. 그러지 않으면 import 시점에 KRX 로그인을 한 번 때리고 "KRX 로그인 시도/실패"
+#     가 찍힌다 — 차단 상태에서 굳이 흔적을 남기는 행동이다.
+_KRX_OFF = str(globals().get("KRX_MODE", "AUTO")).upper() == "OFF"
+if _KRX_OFF:
+    for _v in ("KRX_ID", "KRX_PW", "KRX_OPENAPI_KEY", "KRX_API_KEY"):
+        os.environ.pop(_v, None)
+if (not _KRX_OFF) and KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
     os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
     os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
-if KRX_OPENAPI_KEY:
+if (not _KRX_OFF) and KRX_OPENAPI_KEY:
     os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
     os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
 
@@ -404,11 +426,14 @@ if OPT.get("FinanceDataReader"):
         import FinanceDataReader as fdr           # type: ignore
     except Exception:
         fdr = None
-if OPT.get("pykrx"):
+if OPT.get("pykrx") and not _KRX_OFF:
     try:
         from pykrx import stock as pykrx_stock    # type: ignore
     except Exception:
         pykrx_stock = None
+elif _KRX_OFF:
+    print("[부트스트랩] KRX_MODE='OFF' — pykrx 를 import 하지 않습니다"
+          "(import 시점 로그인 시도 자체를 만들지 않기 위함).")
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
@@ -5266,6 +5291,15 @@ def naver_trend_flows(code: str, start: str, end: str, page_size: int = 300,
         rows.extend(block)
         if len(block) < page_size:
             break
+        # ★ 이미 시작일 이전까지 받았으면 더 넘기지 않는다. 페이지를 끝까지 도는 것은
+        #   종목당 수 회의 불필요한 요청이고, 1,200종목이면 그 자체로 수십 분이다.
+        try:
+            _d = pd.DataFrame(block)
+            _k = _pick_date_col(_d)
+            if _k is not None and as_ts_series(_d[_k]).min() < as_ts(start):
+                break
+        except Exception:
+            pass
     if not rows:
         return None
     d = pd.DataFrame(rows)
@@ -6631,39 +6665,73 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
                  "씁니다. 프록시는 부호가 바뀌는 양이라 비율이 0 근처에서 발산하기 때문입니다 "
                  "— 임계값(PH_CR_CHG_B)의 의미가 등급에 따라 달라진다는 점을 인지하세요.")
 
+    # ★ 청크마다 isin() 으로 전체 일봉을 훑으면 (청크수 × 전체행) 스캔이 된다.
+    #   2,500종목·650만행이면 7회 × 650만 = 4,500만 비교. 코드로 정렬해 두고 위치로 잘라내면
+    #   같은 결과를 한 번의 정렬 비용으로 얻는다. 신용/수급/주식수도 동일하게 처리한다.
+    def _slicer(df: pd.DataFrame):
+        if df is None or not len(df):
+            return None
+        d0 = df.sort_values(["code"], kind="stable").reset_index(drop=True)
+        codes_arr = d0["code"].to_numpy()
+        return d0, codes_arr
+
+    _px_s = _slicer(px)
+    _cr_s = _slicer(cr)
+    _fl_s = _slicer(fl)
+    _sh_s = _slicer(sh)
+
+    def _take(sl, chunk_codes):
+        if sl is None:
+            return None
+        d0, arr = sl
+        lo = np.searchsorted(arr, chunk_codes[0], side="left")
+        hi = np.searchsorted(arr, chunk_codes[-1], side="right")
+        sub = d0.iloc[lo:hi]
+        # 청크 경계가 정확히 맞지 않는 경우(코드 정렬 순서가 다른 프레임)만 보정
+        if len(sub) and (sub["code"].iloc[0] < chunk_codes[0] or
+                         sub["code"].iloc[-1] > chunk_codes[-1]):
+            sub = sub[sub["code"].isin(set(chunk_codes))]
+        return sub
+
     out_parts = []
     for chunk in tqdm(_chunk_codes(all_codes, DAILY_CHUNK_CODES), desc="L1 센서", ncols=88,
                       leave=False):
         cs = set(chunk)
-        d = px[px["code"].isin(cs)].copy()
+        _pxc = _take(_px_s, chunk)
+        d = (_pxc[_pxc["code"].isin(cs)] if _pxc is not None else px.head(0)).copy()
         if d.empty:
             continue
         # ── 원시 입력 결합 ────────────────────────────────────────────────────────────
-        if len(cr):
-            # 중복 (code,date) 가 하나라도 있으면 merge 가 패널 행을 복제해 수익률이 부풀려진다
-            c0 = (cr[cr["code"].isin(cs)][["code", "date", "credit_bal"]]
+        #   중복 (code,date) 가 하나라도 있으면 merge 가 패널 행을 복제해 수익률이 부풀려진다
+        c0 = _take(_cr_s, chunk)
+        if c0 is not None and len(c0):
+            c0 = (c0[c0["code"].isin(cs)][["code", "date", "credit_bal"]]
                   .drop_duplicates(["code", "date"], keep="last"))
             d = d.merge(c0, on=["code", "date"], how="left")
             # 주간 관측이면 그 사이는 forward-fill (★선형보간 금지 — 미래정보 누출)
             d["credit_bal"] = d.groupby("code", observed=True)["credit_bal"].ffill()
-        else:
+        if "credit_bal" not in d.columns:
             d["credit_bal"] = np.nan
-        if len(fl):
-            f0 = (fl[fl["code"].isin(cs)][["code", "date", "retail_net", "inst_net",
-                                          "foreign_net"]]
+
+        f0 = _take(_fl_s, chunk)
+        if f0 is not None and len(f0):
+            f0 = (f0[f0["code"].isin(cs)][["code", "date", "retail_net", "inst_net",
+                                           "foreign_net"]]
                   .drop_duplicates(["code", "date"], keep="last"))
             d = d.merge(f0, on=["code", "date"], how="left")
         for c in ("retail_net", "inst_net", "foreign_net"):
             if c not in d.columns:
                 d[c] = np.nan
-        if len(sh):
-            s0 = (sh[sh["code"].isin(cs)][["code", "knowledge_date", "shares"]]
+
+        s0 = _take(_sh_s, chunk)
+        if s0 is not None and len(s0):
+            s0 = (s0[s0["code"].isin(cs)][["code", "knowledge_date", "shares"]]
                   .drop_duplicates(["code", "knowledge_date"], keep="last")
                   .sort_values("knowledge_date"))
             d = d.sort_values("date")
             d = pd.merge_asof(d, s0, left_on="date", right_on="knowledge_date", by="code",
                               direction="backward")
-        else:
+        if "shares" not in d.columns:
             d["shares"] = np.nan
         d = d.sort_values(["code", "date"])
 
@@ -6822,6 +6890,14 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
     P["mcap_cut"] = cut
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
     P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).fillna(False).astype(int)
+
+    # ── 비교군: 스몰캡 밴드 (매 시점 시총 하위 N) ─────────────────────────────────────
+    #   '작은 쪽에서 N번째까지'를 매 시점 다시 센다. 현재 시총으로 과거를 정의하지 않는다(C13).
+    small_rank = (P.groupby("wk", observed=True)["size_est"]
+                   .rank(ascending=True, method="first"))
+    P["small_rank"] = small_rank
+    P["in_band_small"] = ((small_rank <= SMALLCAP_BOTTOM_N) & (P["V6"] == 1) &
+                          (P["mcap_rank"] > cut)).fillna(False).astype(int)
     return P
 
 
@@ -7070,14 +7146,15 @@ def build_tps(P: pd.DataFrame, method: str = "clip") -> pd.DataFrame:
 
 def assemble_score(P: pd.DataFrame, use_tps: Optional[Sequence[str]] = None,
                    gate_phase: bool = True, gate_firewall: bool = True,
-                   gate_veto: bool = True) -> pd.DataFrame:
+                   gate_veto: bool = True, band_col: str = "in_band",
+                   quiet: bool = False) -> pd.DataFrame:
     P = P.copy()
     if not all(c in P.columns for c in TP_COLS):
         P = build_tps(P)
     cols = list(use_tps) if use_tps else TP_COLS
     P["E"] = nanmean_cols(P, cols)
     P["E_rank"] = P.groupby("wk", observed=True)["E"].rank(pct=True)
-    gate = P["in_band"].astype(float)
+    gate = P[band_col].astype(float) if band_col in P.columns else P["in_band"].astype(float)
     if gate_phase:
         gate = gate * P["PHASE_C"]
     if gate_firewall:
@@ -7086,11 +7163,30 @@ def assemble_score(P: pd.DataFrame, use_tps: Optional[Sequence[str]] = None,
         gate = gate * P["VETO"]
     P["Signal"] = P["E_rank"].fillna(0.0) * gate
     P["Signal_rank"] = P["Signal"].where(P["Signal"] > 0)
-    n_live = int((P["Signal"] > 0).sum())
-    LOG.ok(f"신호 산출 — 발화 {n_live:,}행 / 전체 {len(P):,}행 "
-           f"(국면C {int(P['PHASE_C'].sum()):,} × 방화벽 {int(P['FIREWALL'].sum()):,} × "
-           f"거부권통과 {int(P['VETO'].sum()):,} × 밴드 {int(P['in_band'].sum()):,})")
+    if not quiet:
+        n_live = int((P["Signal"] > 0).sum())
+        LOG.ok(f"신호 산출[{band_col}] — 발화 {n_live:,}행 / 전체 {len(P):,}행 "
+               f"(국면C {int(P['PHASE_C'].sum()):,} × 방화벽 {int(P['FIREWALL'].sum()):,} × "
+               f"거부권통과 {int(P['VETO'].sum()):,} × 밴드 "
+               f"{int(P[band_col].sum()) if band_col in P.columns else 0:,})")
     return P
+
+
+# ── 강건성·비교군용 경량 패널 ───────────────────────────────────────────────────────────
+SLIM_COLS = (["code", "wk", "signal_date", "exec_px", "fwd_ret", "adv20", "mcap", "size_est",
+              "E", "E_rank", "Signal", "Signal_rank",
+              "cell", "cell_l2", "cell_l3", "phase", "PHASE_A", "PHASE_B", "PHASE_C",
+              "FIREWALL", "FIREWALL_HARD", "VETO", "V1", "V3", "V_RS", "in_band",
+              "in_band_small", "V6", "stale_days", "mcap_rank", "small_rank", "equity"]
+             + SENSOR_COLS + TP_COLS)
+
+
+def slim_panel(P: pd.DataFrame) -> pd.DataFrame:
+    """강건성 스위트는 같은 패널을 20여 회 복사한다. 40열 전체를 복사하면 그 자체가
+    수 GB·수십 초의 낭비다 — 백테스트와 재점수화에 실제로 필요한 열만 남긴다."""
+    cols = [c for c in dict.fromkeys(SLIM_COLS) if c in P.columns]
+    out = P[cols].copy()
+    return out
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L1-FLP-C  애널리스트 리포트 오버레이 (한경컨센서스 · 네이버 리서치)                        ║
@@ -7651,22 +7747,23 @@ def _diff_tstat(a: pd.Series, b: pd.Series) -> Tuple[float, float]:
 
 
 # ═══ R2-F — 이 전략의 존재 이유 (§10.1) ═════════════════════════════════════════════════════
-def R2F_exhaustion_vs_drawdown(P: pd.DataFrame, run_fn: Callable) -> dict:
+def R2F_exhaustion_vs_drawdown(P: pd.DataFrame, run_fn: Callable,
+                               band_col: str = "in_band") -> dict:
     """A 낙폭과대 단독 / B 소진조건 단독(낙폭 무시) / C FLP 전체.
     동일 유니버스·동일 비용·동일 기간. 다른 것은 조건뿐이다."""
-    base = P.copy()
+    base = slim_panel(P)
 
     # A: 낙폭 하위 분위 매수 — 신용·수급 조건 없음, 방화벽/밴드만 공통 적용
     A = base.copy()
     A["E_rank"] = A.groupby("wk", observed=True)["f_dd"].rank(pct=True, ascending=True)
     A["Signal"] = (A["E_rank"].fillna(0.0) * (A["f_dd"] < PH_DD_ENTER).astype(int) *
-                   A["FIREWALL"] * A["in_band"])
+                   A["FIREWALL"] * A[band_col])
     A["Signal"] = A["Signal"].where(A["E_rank"] <= 0.20, 0.0)     # 하위 20% 분위만
     A["Signal_rank"] = A["Signal"].where(A["Signal"] > 0)
 
     # B: 소진 조건 단독 (낙폭 조건 제거)
     B = classify_phase(base, use_dd=False)
-    B = assemble_score(B, use_tps=["TP_F2", "TP_F4"])
+    B = assemble_score(B, use_tps=["TP_F2", "TP_F4"], band_col=band_col, quiet=True)
 
     # C: 전체
     C = base
@@ -7754,8 +7851,10 @@ def R0_benchmark(bt: dict, bench: Dict[str, pd.Series]) -> None:
 
 # ═══ R1 — 누수 자가검정 ═════════════════════════════════════════════════════════════════════
 def R1_leakage(P: pd.DataFrame, run_fn: Callable, base_stat: dict) -> None:
+    P = slim_panel(P)
     """두 개의 '고의 오염본'이 뚜렷하게 좋아져야 한다. 안 좋아지면 하네스가 고장난 것이고,
     그 경우 이 실행의 모든 결과는 무효다(§11-5)."""
+
     base_c = base_stat.get("CAGR", np.nan)
 
     # (a) 미래 수익률 직접 주입
@@ -7928,6 +8027,7 @@ def R3_orthogonal(bt: dict, P: pd.DataFrame) -> None:
 
 # ═══ R5 — 절제 ══════════════════════════════════════════════════════════════════════════════
 def R5_ablation(P: pd.DataFrame, run_fn: Callable, base_stat: dict) -> pd.DataFrame:
+    P = slim_panel(P)
     arms = []
 
     def _arm(label: str, pp: pd.DataFrame):
@@ -7938,22 +8038,26 @@ def R5_ablation(P: pd.DataFrame, run_fn: Callable, base_stat: dict) -> pd.DataFr
                      "ΔCAGR": (s.get("CAGR", np.nan) - base_stat.get("CAGR", np.nan))})
 
     # 1) TP 4개 각각 제거
+    _sc = lambda pp, **kw: assemble_score(pp, quiet=True, **kw)
     for c in TP_COLS:
         rest = [x for x in TP_COLS if x != c]
-        _arm(f"TP제거:{c}", assemble_score(P, use_tps=rest))
+        _arm(f"TP제거:{c}", _sc(P, use_tps=rest))
     # 2) f_cr_pctl 임계
     for th in (0.10, 0.20, 0.30):
-        _arm(f"cr_pctl<{th:.2f}", assemble_score(classify_phase(P, cr_enter=th)))
+        _arm(f"cr_pctl<{th:.2f}", _sc(classify_phase(P, cr_enter=th)))
     # 3) f_dd 임계
     for th in (-0.20, -0.30, -0.40):
-        _arm(f"dd<{th:+.2f}", assemble_score(classify_phase(P, dd_enter=th)))
+        _arm(f"dd<{th:+.2f}", _sc(classify_phase(P, dd_enter=th)))
     # 4) 국면 C 게이트 on/off
-    _arm("국면C게이트 off", assemble_score(P, gate_phase=False))
+    _arm("국면C게이트 off", _sc(P, gate_phase=False))
     # 5) 방화벽 off / 거부권 off
-    _arm("방화벽 off", assemble_score(P, gate_firewall=False))
-    _arm("거부권 off", assemble_score(P, gate_veto=False))
+    _arm("방화벽 off", _sc(P, gate_firewall=False))
+    _arm("거부권 off", _sc(P, gate_veto=False))
     # 6) TP 방식: clip vs rank×rank
-    _arm("TP=rank×rank(clip없음)", assemble_score(build_tps(P, method="raw")))
+    _arm("TP=rank×rank(clip없음)", _sc(build_tps(P, method="raw")))
+    # 7) 스몰캡 밴드 (시총 하위 N) — 비교군을 절제표에도 같은 척도로 남긴다
+    if "in_band_small" in P.columns:
+        _arm(f"스몰캡밴드(하위{SMALLCAP_BOTTOM_N})", _sc(P, band_col="in_band_small"))
 
     A = pd.DataFrame(arms)
     if len(A):
@@ -8323,6 +8427,55 @@ def persist_outputs(P: pd.DataFrame, bt: dict, r2f: dict, r12: dict, abl: pd.Dat
     LOG.ok(f"산출물 {len(outs)}건 저장 → {outdir}")
     return outs
 
+
+def report_universe_compare(results: "OrderedDict[str, dict]", bench: Dict[str, pd.Series]):
+    """전체 유니버스 vs 스몰캡(시총 하위 N) 을 같은 표에서 비교한다.
+
+    강제매도 소진은 소형주에서 더 강하게 나타나야 하지만, 동시에 비용·유동성에 더 많이
+    먹힌다. 둘을 따로 보고하면 '어느 쪽이 진짜인지'를 판단할 수 없으므로 나란히 놓는다."""
+    if not results:
+        return
+    rows = []
+    for lab, r in results.items():
+        st = r.get("stat") or {}
+        rows.append([lab,
+                     f"{st.get('CAGR', np.nan):.2%}", f"{st.get('MDD', np.nan):.2%}",
+                     f"{st.get('Sharpe', np.nan):.2f}", f"{st.get('Calmar', np.nan):.2f}",
+                     f"{st.get('승률', np.nan):.1%}",
+                     f"{st.get('평균종목수', np.nan):.1f}",
+                     f"{st.get('평균투자비중', np.nan):.0%}",
+                     f"{st.get('주평균비용', np.nan)*1e4:.1f}bp",
+                     f"{st.get('t통계량(HAC)', np.nan):.2f}"])
+    for name, sr in (bench or {}).items():
+        if sr is None or not len(sr.dropna()):
+            continue
+        b = perf_stats_w(pd.DataFrame({"wk": sr.index, "ret": sr.fillna(0).to_numpy()}))
+        rows.append([f"[벤치] {name}", f"{b.get('CAGR', np.nan):.2%}",
+                     f"{b.get('MDD', np.nan):.2%}", f"{b.get('Sharpe', np.nan):.2f}",
+                     f"{b.get('Calmar', np.nan):.2f}", f"{b.get('승률', np.nan):.1%}",
+                     "-", "-", "-", f"{b.get('t통계량(HAC)', np.nan):.2f}"])
+    LOG.table(rows, ["유니버스", "CAGR", "MDD", "Sharpe", "Calmar", "승률",
+                     "평균종목수", "투자비중", "주평균비용", "t(HAC)"],
+              ["l", "r", "r", "r", "r", "r", "r", "r", "r", "r"],
+              title=f"유니버스 비교 — 전체 vs 스몰캡(시총 하위 {SMALLCAP_BOTTOM_N}) · "
+                    f"같은 신호·같은 비용·같은 기간")
+    labs = list(results)
+    if len(labs) >= 2:
+        a, b2 = results[labs[0]].get("stat", {}), results[labs[1]].get("stat", {})
+        same = (abs((a.get("CAGR", 0) or 0) - (b2.get("CAGR", 0) or 0)) < 1e-12 and
+                abs((a.get("평균종목수", 0) or 0) - (b2.get("평균종목수", 0) or 0)) < 1e-12)
+        if same:
+            LOG.warn(f"두 유니버스의 결과가 완전히 같습니다 — 유니버스 종목수가 "
+                     f"SMALLCAP_BOTTOM_N({SMALLCAP_BOTTOM_N})보다 작아 스몰캡 밴드가 "
+                     f"전체와 동일해진 경우입니다. 비교로서 의미가 없으니 "
+                     f"SMALLCAP_BOTTOM_N 을 낮추거나 유니버스를 넓히세요.")
+        d = (b2.get("CAGR", np.nan) - a.get("CAGR", np.nan))
+        cost_gap = (b2.get("주평균비용", np.nan) - a.get("주평균비용", np.nan)) * 1e4
+        LOG.info(f"스몰캡 − 전체: CAGR {d:+.2%}p · 주평균비용 {cost_gap:+.1f}bp · "
+                 f"MDD {b2.get('MDD', np.nan) - a.get('MDD', np.nan):+.2%}p. "
+                 f"소형주에서 현상이 강하다면 CAGR 이 올라가되 비용·MDD 도 함께 올라가는 것이 "
+                 f"정상이며, 비용 증가분이 초과수익을 잠식하면 실행 가능성이 없는 것입니다.")
+
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L0-C  계약 자동검정 — 협상 불가 규칙을 코드가 스스로 증명한다                              ║
 # ║                                                                                          ║
@@ -8605,6 +8758,45 @@ def run_contract_tests(strict: bool = True) -> bool:
                 f"category/object 혼합 결합 결과 {len(P):,}행 · 주식수 결합 "
                 f"{int(P['shares'].notna().sum()):,}행")
 
+    def c_fixture():
+        """★ 실제로 터졌던 결함의 회귀 방지:
+        합성 픽스처가 '길이에 결합된 상수 경계'(integers(300, n_days-200))를 써서
+        RUN_MODE='FULL' 경로(n_days=500)에서만 ValueError 로 즉사했다.
+        SMOKE 경로(n_days=900)만 검증하던 하네스는 이 경로를 한 번도 실행하지 않았다.
+        → 여러 길이로 실제 생성해 보고, 필수 키와 최소 행수를 확인한다."""
+        need = ("px", "credit", "flows", "sec", "shares", "fin", "disclosures", "links")
+        sizes = []
+        for nd, nc in ((200, 8), (460, 60), (500, 60), (900, 120)):
+            if True:
+                S = make_synthetic_flp(n_codes=nc, n_days=nd, seed=SEED + nd)
+                miss = [k for k in need if k not in S or S[k] is None or not len(S[k])]
+                if miss:
+                    return False, f"n_days={nd}, n_codes={nc} 에서 누락: {miss}"
+                if S["sec"]["delisting_date"].notna().sum() < 1:
+                    return False, f"n_days={nd} 에서 상장폐지 종목이 0개 (C2 경로 미검증)"
+                sizes.append((nd, nc, len(S["px"])))
+        return True, f"{len(sizes)}개 조합 생성 성공 (길이 200~900 · FULL 경로 460일 포함)"
+
+    def c_small():
+        """스몰캡 밴드는 '매 시점 시총 하위 N' 이어야 하고, 전체 밴드의 부분집합이어야 한다."""
+        n = SMALLCAP_BOTTOM_N + 500
+        P = pd.DataFrame({"code": [f"{i:06d}" for i in range(n)],
+                          "wk": pd.Timestamp("2020-01-03"),
+                          "mcap": np.linspace(1e13, 1e9, n),
+                          "adv20": 1e10})
+        Q = apply_universe_bands(P)
+        big, small = Q["in_band"] == 1, Q["in_band_small"] == 1
+        if not small.any():
+            return False, "스몰캡 밴드가 비었습니다"
+        if int((small & ~big).sum()):
+            return False, "스몰캡 밴드가 전체 밴드의 부분집합이 아닙니다"
+        n_small = int(small.sum())
+        max_in = float(Q.loc[small, "mcap"].max())
+        min_out = float(Q.loc[big & ~small, "mcap"].min())
+        return (n_small <= SMALLCAP_BOTTOM_N and max_in <= min_out,
+                f"{n:,}종목 중 스몰캡 {n_small:,}종목(상한 {SMALLCAP_BOTTOM_N:,}) · "
+                f"선택 최대시총 {max_in:.3g} ≤ 제외 최소시총 {min_out:.3g}")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -8671,10 +8863,12 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("TP", "clip(z,0)×clip(z,0) 부호 규약", c_tp)
     _c("VETO", "거부권 이진·상쇄 불가", c_veto)
     _c("EXIT", "청산 규칙(f_cr_pctl 회복) 작동", c_exit)
+    _c("FIXT", "합성 픽스처 길이 무관 생성 (회귀 방지)", c_fixture)
     _c("HALT", "거래정지 중 폐지 = -100% (회귀 방지)", c_halt)
     _c("DEL1", "폐지 손실 이중계상 금지 (회귀 방지)", c_delist_once)
     _c("GAP", "거래정지 구간 손실을 재개 주에 실현 (회귀 방지)", c_halt_gap)
     _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
+    _c("SMALL", "스몰캡 밴드 = 시총 하위 N ∧ 전체 밴드의 부분집합", c_small)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)
@@ -8703,7 +8897,24 @@ def run_contract_tests(strict: bool = True) -> bool:
 # ║  (신호가 한 건도 발화하지 않는 합성으로는 백테스트·강건성 경로를 검증할 수 없다)             ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+def _ri(rng, lo: float, hi: float, floor: int = 0) -> int:
+    """경계가 뒤집혀도 죽지 않는 정수 난수.
+
+    ★ 이 함수가 존재하는 이유(실제 사고): 픽스처가 `rng.integers(300, n_days - 200)` 처럼
+      '길이에 결합된 경계'를 쓰고 있었다. n_days=900 인 SMOKE 경로에서는 통과하지만
+      n_days=500 인 FULL 경로에서는 low==high 가 되어 ValueError 로 즉사한다.
+      경계를 계산하는 모든 지점을 이 한 곳으로 모아, 길이가 얼마든 항상 유효 구간을 만든다."""
+    lo_i, hi_i = int(lo), int(hi)
+    lo_i = max(int(floor), lo_i)
+    if hi_i <= lo_i:
+        hi_i = lo_i + 1
+    return int(rng.integers(lo_i, hi_i))
+
+
 def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) -> dict:
+    """합성 데이터. n_days 가 짧아도(최소 200) 전 구간이 성립해야 한다 — 경계는 전부 비율로."""
+    n_days = max(200, int(n_days))
+    n_codes = max(8, int(n_codes))
     rng = np.random.default_rng(seed)
     days = pd.bdate_range("2020-01-02", periods=n_days)
     codes = [f"{900001+i:06d}" for i in range(n_codes)]
@@ -8714,7 +8925,8 @@ def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) 
         vol = rng.uniform(0.015, 0.035)
         ret = rng.normal(drift, vol, n_days)
         # 강제매도 사이클: 종목마다 다른 시점에 급락 → 신용잔고 급감 → 개인 이탈 → 기관 유입
-        t0 = int(rng.integers(300, n_days - 200))
+        # 급락 시작 시점은 '비율'로 잡는다(길이에 결합된 상수 금지)
+        t0 = _ri(rng, n_days * 0.35, n_days * 0.75, floor=60)
         ret[t0:t0 + 40] -= rng.uniform(0.004, 0.012)
         px = 20000 * np.exp(np.cumsum(ret))
         amount = rng.uniform(3e8, 4e9, n_days) * (1 + 0.5 * np.sin(np.arange(n_days) / 40))
@@ -8741,8 +8953,8 @@ def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) 
     flows = pd.concat(fl_rows, ignore_index=True)
 
     # 상장폐지 종목을 반드시 섞는다 (C2 경로를 스모크에서도 태운다)
-    dead = codes[:6]
-    delist_dates = {c: days[int(rng.integers(600, n_days - 10))] for c in dead}
+    dead = codes[:max(3, n_codes // 20)]
+    delist_dates = {c: days[_ri(rng, n_days * 0.65, n_days - 2, floor=10)] for c in dead}
     sec = pd.DataFrame({
         "code": codes, "name": [f"합성{i:03d}" for i in range(n_codes)],
         "market": ["KOSPI" if i % 3 == 0 else "KOSDAQ" for i in range(n_codes)],
@@ -8774,13 +8986,14 @@ def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) 
 
     dis = pd.DataFrame({
         "corp_code": [f"{i:08d}" for i in range(0, n_codes, 9)],
-        "rcept_dt": [days[int(rng.integers(200, n_days - 1))] for _ in range(0, n_codes, 9)],
+        "rcept_dt": [days[_ri(rng, n_days * 0.2, n_days - 1, floor=5)]
+                     for _ in range(0, n_codes, 9)],
         "report_nm": "유상증자결정", "event": "rights_issue"})
 
     links = pd.DataFrame({
-        "stock_code": [codes[int(rng.integers(0, n_codes))] for _ in range(600)],
-        "pub_date": [days[int(rng.integers(100, n_days - 1))] for _ in range(600)],
-        "analyst_id": [f"an{int(rng.integers(0,40)):03d}" for _ in range(600)],
+        "stock_code": [codes[_ri(rng, 0, n_codes)] for _ in range(600)],
+        "pub_date": [days[_ri(rng, n_days * 0.1, n_days - 1, floor=2)] for _ in range(600)],
+        "analyst_id": [f"an{_ri(rng, 0, 40):03d}" for _ in range(600)],
         "target_price": rng.uniform(10000, 60000, 600),
         "broker_name": "합성증권"})
 
@@ -8792,7 +9005,7 @@ def run_selftest(full_chain: bool = False) -> bool:
     """계산경로 전체(수집 제외)를 합성으로 태운다. 실패하면 실데이터 수집을 시작하지 않는다."""
     t0 = time.time()
     S = make_synthetic_flp(n_codes=(120 if full_chain else 60),
-                           n_days=(900 if full_chain else 500))
+                           n_days=(900 if full_chain else 460))
     px, sec = S["px"], S["sec"]
     PIT.register("dart_financials",
                  pit_frame(S["fin"], "period_end", "knowledge_date", source="synth"),
@@ -8860,6 +9073,15 @@ def run_selftest(full_chain: bool = False) -> bool:
         except KillCriteria as e:
             LOG.warn(f"합성데이터에서 킬 판정 — 합성이므로 무시하고 계속합니다: {e}")
         report_robustness()
+        # 스몰캡 비교 경로도 스모크에서 한 번 태운다(실데이터에서 처음 도는 코드를 없앤다)
+        if RUN_SMALLCAP_COMPARE and "in_band_small" in P.columns:
+            runs = OrderedDict()
+            runs["전체 유니버스"] = {"bt": bt, "stat": s}
+            PS = assemble_score(slim_panel(P), band_col="in_band_small", quiet=True)
+            bs = _run(PS, label="SMOKE_small")
+            runs[f"스몰캡(하위 {SMALLCAP_BOTTOM_N})"] = {"bt": bs,
+                                                         "stat": perf_stats_w(bs["returns"])}
+            report_universe_compare(runs, bench)
         uni.report_attrition()
         report_interpretation(P)
         diagnostic_card(P, bt, sec)
@@ -9110,6 +9332,33 @@ def offer_download(paths: Sequence[str]):
             _safe_print(f"⬇  산출물 경로: {p}")
 
 
+def preflight_estimate(n_codes: int, n_flow_targets: int, n_corps: int, n_years: int) -> None:
+    """수집을 시작하기 '전에' 예상 소요시간을 계산해 보여준다(§9 — 추측 말고 계측).
+
+    4시간 하드 제약을 넘길 것 같으면, 어떤 손잡이를 어떻게 돌려야 하는지까지 같이 출력한다.
+    (실행을 2시간 하고 나서 '아 이거 안 끝나겠다'를 깨닫는 것이 가장 비싼 실패다)"""
+    qps = lambda k: max(0.1, float(RATE_LIMIT_QPS.get(k, 3.0)))
+    est = []
+    px_req = n_codes                      # 종목당 1회(증분이면 그보다 적다)
+    est.append(("가격 일봉", px_req, qps("naver"), px_req / qps("naver") / 60))
+    fl_pages = n_flow_targets * 9         # 10년 ≈ pageSize 300 × 9페이지
+    est.append(("투자자 수급(네이버)", fl_pages, qps("naver"), fl_pages / qps("naver") / 60))
+    ds_req = min(DART_SHARES_MAX_CALLS or 10 ** 9, n_corps * n_years)
+    est.append(("DART 주식총수", ds_req, qps("dart"), ds_req / qps("dart") / 60))
+    total = sum(x[3] for x in est)
+    LOG.table([[n, f"{r:,}", f"{q:.1f}/s", f"{m:.0f}분"] for n, r, q, m in est] +
+              [["── 합계(캐시 미보유 최악)", "", "", f"{total:.0f}분"]],
+              ["수집 단계", "예상 요청수", "속도상한", "예상 소요"], ["l", "r", "r", "r"],
+              title="수집 프리플라이트 — 시작 전에 끝나는지 먼저 계산한다(§9)")
+    if total > 210:
+        LOG.warn(f"예상 {total:.0f}분으로 4시간 예산에 근접/초과합니다. 손잡이는 셋입니다: "
+                 f"① FLOW_MAX_CODES 를 {max(200, n_flow_targets//2):,} 로 낮추기 "
+                 f"② RATE_LIMIT_QPS['naver'] 를 올리기(차단 위험과 교환) "
+                 f"③ 오늘은 여기까지 받고 재실행 — 캐시는 누적되므로 다음 실행이 그만큼 짧아집니다.")
+    else:
+        LOG.ok(f"예상 {total:.0f}분 — 4시간 예산 내입니다(캐시가 있으면 더 짧아집니다).")
+
+
 # ═══ CANARY (§2) ════════════════════════════════════════════════════════════════════════════
 def run_canary(sec: pd.DataFrame, delisted: pd.DataFrame, sample_n: int = 200) -> None:
     """코드가 아니라 '데이터의 등급'을 먼저 확정한다. 여기서 실패한 것은 나중에도 실패한다.
@@ -9245,6 +9494,9 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.FLOW", "투자자유형별 일별 순매수 (M0)", "L1", budget_s=2400, critical=False):
         targets = select_flow_targets(ctx["px"], BACKTEST_START, BACKTEST_END)
         ctx["flow_targets"] = targets
+        _yrs = max(1, as_ts(BACKTEST_END).year - as_ts(BACKTEST_START).year + 3)
+        preflight_estimate(len(ctx["sec"]), len(targets),
+                           int(ctx["sec"]["corp_code"].notna().sum()), _yrs)
         ctx["flows"] = fetch_investor_flows_daily(targets or ctx["sec"]["code"].tolist(),
                                                   BACKTEST_START, BACKTEST_END)
 
@@ -9416,7 +9668,21 @@ def main() -> dict:
         if np.isfinite(free):
             LOG.info(f"여유 공간 {free:.1f} GB")
         VAULT.load_index("shared"); VAULT.load_index("private")
-        VAULT.adopt_scan(GDRIVE_ADOPT_DIRS)
+        # ★ 흡수 경로 자동 확장: 설정값이 다른 OS 의 경로(/content/...)뿐이면 아무것도 못 찾고
+        #   "경로를 확인하세요" 경고만 남는다. 실제로 존재하는 경로만 추리고, 하나도 없으면
+        #   캐시 루트 자신과 그 상위의 흔한 리포트 폴더를 후보로 넣는다.
+        _adopt = [d for d in GDRIVE_ADOPT_DIRS if d and os.path.isdir(d)]
+        _extra = [VAULT.root, os.path.join(VAULT.root, "reports"),
+                  os.path.join(VAULT.root, "research"),
+                  os.path.join(os.path.dirname(VAULT.root), "research"),
+                  os.path.join(os.path.dirname(VAULT.root), "reports")]
+        for _d in _extra:
+            if os.path.isdir(_d) and _d not in _adopt:
+                _adopt.append(_d)
+        if _adopt:
+            LOG.info(f"기존 파일 흡수 대상 {len(_adopt)}개 경로: "
+                     + ", ".join(os.path.basename(d) or d for d in _adopt[:5]))
+        VAULT.adopt_scan(_adopt)
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
@@ -9454,13 +9720,27 @@ def main() -> dict:
         return run_backtest_w(pp, weeks, uni, ctx["sec"], apply_costs=apply_costs,
                               slip_k=slip_k, label=label)
 
-    with PIPE.stage("L3.BT", "주간 백테스트", "L3", budget_s=600):
-        bt = _run(P, label=STRATEGY_ID)
+    universes = OrderedDict([("전체 유니버스(상위250 제외)", "in_band")])
+    if RUN_SMALLCAP_COMPARE and "in_band_small" in P.columns:
+        universes[f"스몰캡(시총 하위 {SMALLCAP_BOTTOM_N})"] = "in_band_small"
+
+    runs: "OrderedDict[str, dict]" = OrderedDict()
+    with PIPE.stage("L3.BT", "주간 백테스트 (유니버스별)", "L3", budget_s=900):
+        for lab, band in universes.items():
+            PP = P if band == "in_band" else assemble_score(slim_panel(P), band_col=band)
+            b = _run(PP, label=f"{STRATEGY_ID}:{band}")
+            runs[lab] = {"panel": PP, "bt": b, "band": band,
+                         "stat": perf_stats_w(b["returns"])}
+            LOG.ok(f"[{lab}] 백테스트 완료 — 평균 {runs[lab]['stat'].get('평균종목수', 0):.1f}종목")
+    bt = runs[list(runs)[0]]["bt"]
 
     with PIPE.stage("L6.PERF", "성과 검증", "L6", budget_s=300):
         report_grade_banner()
         bench = benchmark_returns_w(weeks, P)
         base_stat = report_performance(bt, bench)
+        for lab in list(runs)[1:]:
+            report_performance(runs[lab]["bt"], bench, label=f"({lab})")
+        report_universe_compare(runs, bench)
         uni.report_attrition()
 
     r2f, r12, abl, dist = {}, {}, pd.DataFrame(), pd.DataFrame()
@@ -9468,9 +9748,15 @@ def main() -> dict:
                     budget_s=3600, critical=False):
         try:
             r2f = R2F_exhaustion_vs_drawdown(P, _run)     # ★ 최우선
+            for lab in list(runs)[1:]:
+                LOG.rule(f"R2-F · {lab}")
+                R2F_exhaustion_vs_drawdown(P, _run, band_col=runs[lab]["band"])
             R0_benchmark(bt, bench)
             R1_leakage(P, _run, base_stat)
             r12 = R12_tail_correlation(bt, bench, P)
+            for lab in list(runs)[1:]:
+                LOG.rule(f"R12 · {lab}")
+                R12_tail_correlation(runs[lab]["bt"], bench, runs[lab]["panel"])
             R3_orthogonal(bt, P)
             abl = R5_ablation(P, _run, base_stat)
             R7_regime(bt, bench)
@@ -9489,6 +9775,15 @@ def main() -> dict:
     with PIPE.stage("L0.PERSIST", "산출물 저장 (공용/전용 인덱스)", "L0", budget_s=600,
                     critical=False):
         outs = persist_outputs(P, bt, r2f, r12, abl, dist, uni)
+        for lab, r in list(runs.items())[1:]:
+            tag = "smallcap"
+            VAULT.put_table(f"backtest_returns_{STRATEGY_ID}_{tag}", r["bt"]["returns"],
+                            scope="private", domain="backtest", source=f"{STRATEGY_ID}:{lab}")
+            _p = os.path.join(VAULT.ns["private"], "reports", STRATEGY_ID,
+                              f"returns_{tag}_{_dt.datetime.now():%Y%m%d_%H%M%S}.csv")
+            os.makedirs(os.path.dirname(_p), exist_ok=True)
+            r["bt"]["returns"].to_csv(_p, index=False, encoding="utf-8-sig")
+            outs.append(_p)
         VAULT.flush(); VAULT.compact("shared"); VAULT.compact("private")
         if DBUDGET:
             DBUDGET.close()

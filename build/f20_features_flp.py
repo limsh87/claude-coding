@@ -111,39 +111,73 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
                  "씁니다. 프록시는 부호가 바뀌는 양이라 비율이 0 근처에서 발산하기 때문입니다 "
                  "— 임계값(PH_CR_CHG_B)의 의미가 등급에 따라 달라진다는 점을 인지하세요.")
 
+    # ★ 청크마다 isin() 으로 전체 일봉을 훑으면 (청크수 × 전체행) 스캔이 된다.
+    #   2,500종목·650만행이면 7회 × 650만 = 4,500만 비교. 코드로 정렬해 두고 위치로 잘라내면
+    #   같은 결과를 한 번의 정렬 비용으로 얻는다. 신용/수급/주식수도 동일하게 처리한다.
+    def _slicer(df: pd.DataFrame):
+        if df is None or not len(df):
+            return None
+        d0 = df.sort_values(["code"], kind="stable").reset_index(drop=True)
+        codes_arr = d0["code"].to_numpy()
+        return d0, codes_arr
+
+    _px_s = _slicer(px)
+    _cr_s = _slicer(cr)
+    _fl_s = _slicer(fl)
+    _sh_s = _slicer(sh)
+
+    def _take(sl, chunk_codes):
+        if sl is None:
+            return None
+        d0, arr = sl
+        lo = np.searchsorted(arr, chunk_codes[0], side="left")
+        hi = np.searchsorted(arr, chunk_codes[-1], side="right")
+        sub = d0.iloc[lo:hi]
+        # 청크 경계가 정확히 맞지 않는 경우(코드 정렬 순서가 다른 프레임)만 보정
+        if len(sub) and (sub["code"].iloc[0] < chunk_codes[0] or
+                         sub["code"].iloc[-1] > chunk_codes[-1]):
+            sub = sub[sub["code"].isin(set(chunk_codes))]
+        return sub
+
     out_parts = []
     for chunk in tqdm(_chunk_codes(all_codes, DAILY_CHUNK_CODES), desc="L1 센서", ncols=88,
                       leave=False):
         cs = set(chunk)
-        d = px[px["code"].isin(cs)].copy()
+        _pxc = _take(_px_s, chunk)
+        d = (_pxc[_pxc["code"].isin(cs)] if _pxc is not None else px.head(0)).copy()
         if d.empty:
             continue
         # ── 원시 입력 결합 ────────────────────────────────────────────────────────────
-        if len(cr):
-            # 중복 (code,date) 가 하나라도 있으면 merge 가 패널 행을 복제해 수익률이 부풀려진다
-            c0 = (cr[cr["code"].isin(cs)][["code", "date", "credit_bal"]]
+        #   중복 (code,date) 가 하나라도 있으면 merge 가 패널 행을 복제해 수익률이 부풀려진다
+        c0 = _take(_cr_s, chunk)
+        if c0 is not None and len(c0):
+            c0 = (c0[c0["code"].isin(cs)][["code", "date", "credit_bal"]]
                   .drop_duplicates(["code", "date"], keep="last"))
             d = d.merge(c0, on=["code", "date"], how="left")
             # 주간 관측이면 그 사이는 forward-fill (★선형보간 금지 — 미래정보 누출)
             d["credit_bal"] = d.groupby("code", observed=True)["credit_bal"].ffill()
-        else:
+        if "credit_bal" not in d.columns:
             d["credit_bal"] = np.nan
-        if len(fl):
-            f0 = (fl[fl["code"].isin(cs)][["code", "date", "retail_net", "inst_net",
-                                          "foreign_net"]]
+
+        f0 = _take(_fl_s, chunk)
+        if f0 is not None and len(f0):
+            f0 = (f0[f0["code"].isin(cs)][["code", "date", "retail_net", "inst_net",
+                                           "foreign_net"]]
                   .drop_duplicates(["code", "date"], keep="last"))
             d = d.merge(f0, on=["code", "date"], how="left")
         for c in ("retail_net", "inst_net", "foreign_net"):
             if c not in d.columns:
                 d[c] = np.nan
-        if len(sh):
-            s0 = (sh[sh["code"].isin(cs)][["code", "knowledge_date", "shares"]]
+
+        s0 = _take(_sh_s, chunk)
+        if s0 is not None and len(s0):
+            s0 = (s0[s0["code"].isin(cs)][["code", "knowledge_date", "shares"]]
                   .drop_duplicates(["code", "knowledge_date"], keep="last")
                   .sort_values("knowledge_date"))
             d = d.sort_values("date")
             d = pd.merge_asof(d, s0, left_on="date", right_on="knowledge_date", by="code",
                               direction="backward")
-        else:
+        if "shares" not in d.columns:
             d["shares"] = np.nan
         d = d.sort_values(["code", "date"])
 
@@ -302,6 +336,14 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
     P["mcap_cut"] = cut
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
     P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).fillna(False).astype(int)
+
+    # ── 비교군: 스몰캡 밴드 (매 시점 시총 하위 N) ─────────────────────────────────────
+    #   '작은 쪽에서 N번째까지'를 매 시점 다시 센다. 현재 시총으로 과거를 정의하지 않는다(C13).
+    small_rank = (P.groupby("wk", observed=True)["size_est"]
+                   .rank(ascending=True, method="first"))
+    P["small_rank"] = small_rank
+    P["in_band_small"] = ((small_rank <= SMALLCAP_BOTTOM_N) & (P["V6"] == 1) &
+                          (P["mcap_rank"] > cut)).fillna(False).astype(int)
     return P
 
 
@@ -550,14 +592,15 @@ def build_tps(P: pd.DataFrame, method: str = "clip") -> pd.DataFrame:
 
 def assemble_score(P: pd.DataFrame, use_tps: Optional[Sequence[str]] = None,
                    gate_phase: bool = True, gate_firewall: bool = True,
-                   gate_veto: bool = True) -> pd.DataFrame:
+                   gate_veto: bool = True, band_col: str = "in_band",
+                   quiet: bool = False) -> pd.DataFrame:
     P = P.copy()
     if not all(c in P.columns for c in TP_COLS):
         P = build_tps(P)
     cols = list(use_tps) if use_tps else TP_COLS
     P["E"] = nanmean_cols(P, cols)
     P["E_rank"] = P.groupby("wk", observed=True)["E"].rank(pct=True)
-    gate = P["in_band"].astype(float)
+    gate = P[band_col].astype(float) if band_col in P.columns else P["in_band"].astype(float)
     if gate_phase:
         gate = gate * P["PHASE_C"]
     if gate_firewall:
@@ -566,8 +609,27 @@ def assemble_score(P: pd.DataFrame, use_tps: Optional[Sequence[str]] = None,
         gate = gate * P["VETO"]
     P["Signal"] = P["E_rank"].fillna(0.0) * gate
     P["Signal_rank"] = P["Signal"].where(P["Signal"] > 0)
-    n_live = int((P["Signal"] > 0).sum())
-    LOG.ok(f"신호 산출 — 발화 {n_live:,}행 / 전체 {len(P):,}행 "
-           f"(국면C {int(P['PHASE_C'].sum()):,} × 방화벽 {int(P['FIREWALL'].sum()):,} × "
-           f"거부권통과 {int(P['VETO'].sum()):,} × 밴드 {int(P['in_band'].sum()):,})")
+    if not quiet:
+        n_live = int((P["Signal"] > 0).sum())
+        LOG.ok(f"신호 산출[{band_col}] — 발화 {n_live:,}행 / 전체 {len(P):,}행 "
+               f"(국면C {int(P['PHASE_C'].sum()):,} × 방화벽 {int(P['FIREWALL'].sum()):,} × "
+               f"거부권통과 {int(P['VETO'].sum()):,} × 밴드 "
+               f"{int(P[band_col].sum()) if band_col in P.columns else 0:,})")
     return P
+
+
+# ── 강건성·비교군용 경량 패널 ───────────────────────────────────────────────────────────
+SLIM_COLS = (["code", "wk", "signal_date", "exec_px", "fwd_ret", "adv20", "mcap", "size_est",
+              "E", "E_rank", "Signal", "Signal_rank",
+              "cell", "cell_l2", "cell_l3", "phase", "PHASE_A", "PHASE_B", "PHASE_C",
+              "FIREWALL", "FIREWALL_HARD", "VETO", "V1", "V3", "V_RS", "in_band",
+              "in_band_small", "V6", "stale_days", "mcap_rank", "small_rank", "equity"]
+             + SENSOR_COLS + TP_COLS)
+
+
+def slim_panel(P: pd.DataFrame) -> pd.DataFrame:
+    """강건성 스위트는 같은 패널을 20여 회 복사한다. 40열 전체를 복사하면 그 자체가
+    수 GB·수십 초의 낭비다 — 백테스트와 재점수화에 실제로 필요한 열만 남긴다."""
+    cols = [c for c in dict.fromkeys(SLIM_COLS) if c in P.columns]
+    out = P[cols].copy()
+    return out

@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_N"
 STRATEGY_NAME      = "PACK-N 국민연금 고용"
 ACTIVE_PACKS       = ["N"]
-BUILD_VERSION      = "v2.20260808.0325"
+BUILD_VERSION      = "v2.20260808.0401"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -334,10 +334,18 @@ def _ensure_deps() -> Dict[str, bool]:
 # ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
 #   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
 #   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+#
+#   ★ 단, KRX_MODE='OFF'(차단 대응) 이면 자격증명을 주입하지도, pykrx 를 import 하지도
+#     않는다. 그러지 않으면 import 시점에 KRX 로그인을 한 번 때리고 "KRX 로그인 시도/실패"
+#     가 찍힌다 — 차단 상태에서 굳이 흔적을 남기는 행동이다.
+_KRX_OFF = str(globals().get("KRX_MODE", "AUTO")).upper() == "OFF"
+if _KRX_OFF:
+    for _v in ("KRX_ID", "KRX_PW", "KRX_OPENAPI_KEY", "KRX_API_KEY"):
+        os.environ.pop(_v, None)
+if (not _KRX_OFF) and KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
     os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
     os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
-if KRX_OPENAPI_KEY:
+if (not _KRX_OFF) and KRX_OPENAPI_KEY:
     os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
     os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
 
@@ -372,11 +380,14 @@ if OPT.get("FinanceDataReader"):
         import FinanceDataReader as fdr           # type: ignore
     except Exception:
         fdr = None
-if OPT.get("pykrx"):
+if OPT.get("pykrx") and not _KRX_OFF:
     try:
         from pykrx import stock as pykrx_stock    # type: ignore
     except Exception:
         pykrx_stock = None
+elif _KRX_OFF:
+    print("[부트스트랩] KRX_MODE='OFF' — pykrx 를 import 하지 않습니다"
+          "(import 시점 로그인 시도 자체를 만들지 않기 위함).")
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore

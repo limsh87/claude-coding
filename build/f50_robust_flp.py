@@ -48,22 +48,23 @@ def _diff_tstat(a: pd.Series, b: pd.Series) -> Tuple[float, float]:
 
 
 # ═══ R2-F — 이 전략의 존재 이유 (§10.1) ═════════════════════════════════════════════════════
-def R2F_exhaustion_vs_drawdown(P: pd.DataFrame, run_fn: Callable) -> dict:
+def R2F_exhaustion_vs_drawdown(P: pd.DataFrame, run_fn: Callable,
+                               band_col: str = "in_band") -> dict:
     """A 낙폭과대 단독 / B 소진조건 단독(낙폭 무시) / C FLP 전체.
     동일 유니버스·동일 비용·동일 기간. 다른 것은 조건뿐이다."""
-    base = P.copy()
+    base = slim_panel(P)
 
     # A: 낙폭 하위 분위 매수 — 신용·수급 조건 없음, 방화벽/밴드만 공통 적용
     A = base.copy()
     A["E_rank"] = A.groupby("wk", observed=True)["f_dd"].rank(pct=True, ascending=True)
     A["Signal"] = (A["E_rank"].fillna(0.0) * (A["f_dd"] < PH_DD_ENTER).astype(int) *
-                   A["FIREWALL"] * A["in_band"])
+                   A["FIREWALL"] * A[band_col])
     A["Signal"] = A["Signal"].where(A["E_rank"] <= 0.20, 0.0)     # 하위 20% 분위만
     A["Signal_rank"] = A["Signal"].where(A["Signal"] > 0)
 
     # B: 소진 조건 단독 (낙폭 조건 제거)
     B = classify_phase(base, use_dd=False)
-    B = assemble_score(B, use_tps=["TP_F2", "TP_F4"])
+    B = assemble_score(B, use_tps=["TP_F2", "TP_F4"], band_col=band_col, quiet=True)
 
     # C: 전체
     C = base
@@ -151,8 +152,10 @@ def R0_benchmark(bt: dict, bench: Dict[str, pd.Series]) -> None:
 
 # ═══ R1 — 누수 자가검정 ═════════════════════════════════════════════════════════════════════
 def R1_leakage(P: pd.DataFrame, run_fn: Callable, base_stat: dict) -> None:
+    P = slim_panel(P)
     """두 개의 '고의 오염본'이 뚜렷하게 좋아져야 한다. 안 좋아지면 하네스가 고장난 것이고,
     그 경우 이 실행의 모든 결과는 무효다(§11-5)."""
+
     base_c = base_stat.get("CAGR", np.nan)
 
     # (a) 미래 수익률 직접 주입
@@ -325,6 +328,7 @@ def R3_orthogonal(bt: dict, P: pd.DataFrame) -> None:
 
 # ═══ R5 — 절제 ══════════════════════════════════════════════════════════════════════════════
 def R5_ablation(P: pd.DataFrame, run_fn: Callable, base_stat: dict) -> pd.DataFrame:
+    P = slim_panel(P)
     arms = []
 
     def _arm(label: str, pp: pd.DataFrame):
@@ -335,22 +339,26 @@ def R5_ablation(P: pd.DataFrame, run_fn: Callable, base_stat: dict) -> pd.DataFr
                      "ΔCAGR": (s.get("CAGR", np.nan) - base_stat.get("CAGR", np.nan))})
 
     # 1) TP 4개 각각 제거
+    _sc = lambda pp, **kw: assemble_score(pp, quiet=True, **kw)
     for c in TP_COLS:
         rest = [x for x in TP_COLS if x != c]
-        _arm(f"TP제거:{c}", assemble_score(P, use_tps=rest))
+        _arm(f"TP제거:{c}", _sc(P, use_tps=rest))
     # 2) f_cr_pctl 임계
     for th in (0.10, 0.20, 0.30):
-        _arm(f"cr_pctl<{th:.2f}", assemble_score(classify_phase(P, cr_enter=th)))
+        _arm(f"cr_pctl<{th:.2f}", _sc(classify_phase(P, cr_enter=th)))
     # 3) f_dd 임계
     for th in (-0.20, -0.30, -0.40):
-        _arm(f"dd<{th:+.2f}", assemble_score(classify_phase(P, dd_enter=th)))
+        _arm(f"dd<{th:+.2f}", _sc(classify_phase(P, dd_enter=th)))
     # 4) 국면 C 게이트 on/off
-    _arm("국면C게이트 off", assemble_score(P, gate_phase=False))
+    _arm("국면C게이트 off", _sc(P, gate_phase=False))
     # 5) 방화벽 off / 거부권 off
-    _arm("방화벽 off", assemble_score(P, gate_firewall=False))
-    _arm("거부권 off", assemble_score(P, gate_veto=False))
+    _arm("방화벽 off", _sc(P, gate_firewall=False))
+    _arm("거부권 off", _sc(P, gate_veto=False))
     # 6) TP 방식: clip vs rank×rank
-    _arm("TP=rank×rank(clip없음)", assemble_score(build_tps(P, method="raw")))
+    _arm("TP=rank×rank(clip없음)", _sc(build_tps(P, method="raw")))
+    # 7) 스몰캡 밴드 (시총 하위 N) — 비교군을 절제표에도 같은 척도로 남긴다
+    if "in_band_small" in P.columns:
+        _arm(f"스몰캡밴드(하위{SMALLCAP_BOTTOM_N})", _sc(P, band_col="in_band_small"))
 
     A = pd.DataFrame(arms)
     if len(A):

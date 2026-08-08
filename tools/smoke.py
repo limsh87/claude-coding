@@ -19,6 +19,14 @@ def patch(src: str, cache_dir: str) -> str:
     src = src.replace("def _pip_install(pkgs: List[str], quiet: bool = True) -> Tuple[bool, str]:",
                       "def _pip_install(pkgs: List[str], quiet: bool = True) -> Tuple[bool, str]:\n"
                       "    if os.environ.get('TCD_NO_PIP'): return True, 'skipped'")
+    # ★ RUN_MODE='FULL' 일 때만 도는 '축소 스모크'(full_chain=False)를 반드시 함께 실행한다.
+    #   실제 사고: 축소 경로만 n_days=500 을 쓰는데 픽스처 경계가 그 길이에서 뒤집혀
+    #   사용자의 첫 실행이 즉사했다. 하네스가 SMOKE 경로만 돌면 영원히 못 잡는다.
+    if "run_selftest" in src:
+        src += ("\n\n# ── 하네스 추가 검증: FULL 경로(축소 스모크) ──\n"
+                "_ok_full = run_selftest(full_chain=False)\n"
+                "assert _ok_full, 'FULL 경로 축소 스모크 실패'\n"
+                "_safe_print('FULL경로 스모크 통과')\n")
     return src
 
 
@@ -37,7 +45,9 @@ def run_one(path: str) -> tuple[bool, str, float]:
         r = subprocess.run([sys.executable, tmp], capture_output=True, text=True,
                            timeout=900, env=env, cwd=cache)
         out = (r.stdout or "") + "\n----STDERR----\n" + (r.stderr or "")
-        ok = (r.returncode == 0 and "스모크 통과" in out and "Traceback" not in (r.stderr or ""))
+        ok = (r.returncode == 0 and "스모크 통과" in out
+              and "FULL경로 스모크 통과" in out
+              and "Traceback" not in (r.stderr or ""))
     except subprocess.TimeoutExpired:
         out, ok = "TIMEOUT (900s)", False
     dur = time.time() - t0

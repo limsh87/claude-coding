@@ -42,6 +42,33 @@ def offer_download(paths: Sequence[str]):
             _safe_print(f"⬇  산출물 경로: {p}")
 
 
+def preflight_estimate(n_codes: int, n_flow_targets: int, n_corps: int, n_years: int) -> None:
+    """수집을 시작하기 '전에' 예상 소요시간을 계산해 보여준다(§9 — 추측 말고 계측).
+
+    4시간 하드 제약을 넘길 것 같으면, 어떤 손잡이를 어떻게 돌려야 하는지까지 같이 출력한다.
+    (실행을 2시간 하고 나서 '아 이거 안 끝나겠다'를 깨닫는 것이 가장 비싼 실패다)"""
+    qps = lambda k: max(0.1, float(RATE_LIMIT_QPS.get(k, 3.0)))
+    est = []
+    px_req = n_codes                      # 종목당 1회(증분이면 그보다 적다)
+    est.append(("가격 일봉", px_req, qps("naver"), px_req / qps("naver") / 60))
+    fl_pages = n_flow_targets * 9         # 10년 ≈ pageSize 300 × 9페이지
+    est.append(("투자자 수급(네이버)", fl_pages, qps("naver"), fl_pages / qps("naver") / 60))
+    ds_req = min(DART_SHARES_MAX_CALLS or 10 ** 9, n_corps * n_years)
+    est.append(("DART 주식총수", ds_req, qps("dart"), ds_req / qps("dart") / 60))
+    total = sum(x[3] for x in est)
+    LOG.table([[n, f"{r:,}", f"{q:.1f}/s", f"{m:.0f}분"] for n, r, q, m in est] +
+              [["── 합계(캐시 미보유 최악)", "", "", f"{total:.0f}분"]],
+              ["수집 단계", "예상 요청수", "속도상한", "예상 소요"], ["l", "r", "r", "r"],
+              title="수집 프리플라이트 — 시작 전에 끝나는지 먼저 계산한다(§9)")
+    if total > 210:
+        LOG.warn(f"예상 {total:.0f}분으로 4시간 예산에 근접/초과합니다. 손잡이는 셋입니다: "
+                 f"① FLOW_MAX_CODES 를 {max(200, n_flow_targets//2):,} 로 낮추기 "
+                 f"② RATE_LIMIT_QPS['naver'] 를 올리기(차단 위험과 교환) "
+                 f"③ 오늘은 여기까지 받고 재실행 — 캐시는 누적되므로 다음 실행이 그만큼 짧아집니다.")
+    else:
+        LOG.ok(f"예상 {total:.0f}분 — 4시간 예산 내입니다(캐시가 있으면 더 짧아집니다).")
+
+
 # ═══ CANARY (§2) ════════════════════════════════════════════════════════════════════════════
 def run_canary(sec: pd.DataFrame, delisted: pd.DataFrame, sample_n: int = 200) -> None:
     """코드가 아니라 '데이터의 등급'을 먼저 확정한다. 여기서 실패한 것은 나중에도 실패한다.
@@ -177,6 +204,9 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.FLOW", "투자자유형별 일별 순매수 (M0)", "L1", budget_s=2400, critical=False):
         targets = select_flow_targets(ctx["px"], BACKTEST_START, BACKTEST_END)
         ctx["flow_targets"] = targets
+        _yrs = max(1, as_ts(BACKTEST_END).year - as_ts(BACKTEST_START).year + 3)
+        preflight_estimate(len(ctx["sec"]), len(targets),
+                           int(ctx["sec"]["corp_code"].notna().sum()), _yrs)
         ctx["flows"] = fetch_investor_flows_daily(targets or ctx["sec"]["code"].tolist(),
                                                   BACKTEST_START, BACKTEST_END)
 
@@ -348,7 +378,21 @@ def main() -> dict:
         if np.isfinite(free):
             LOG.info(f"여유 공간 {free:.1f} GB")
         VAULT.load_index("shared"); VAULT.load_index("private")
-        VAULT.adopt_scan(GDRIVE_ADOPT_DIRS)
+        # ★ 흡수 경로 자동 확장: 설정값이 다른 OS 의 경로(/content/...)뿐이면 아무것도 못 찾고
+        #   "경로를 확인하세요" 경고만 남는다. 실제로 존재하는 경로만 추리고, 하나도 없으면
+        #   캐시 루트 자신과 그 상위의 흔한 리포트 폴더를 후보로 넣는다.
+        _adopt = [d for d in GDRIVE_ADOPT_DIRS if d and os.path.isdir(d)]
+        _extra = [VAULT.root, os.path.join(VAULT.root, "reports"),
+                  os.path.join(VAULT.root, "research"),
+                  os.path.join(os.path.dirname(VAULT.root), "research"),
+                  os.path.join(os.path.dirname(VAULT.root), "reports")]
+        for _d in _extra:
+            if os.path.isdir(_d) and _d not in _adopt:
+                _adopt.append(_d)
+        if _adopt:
+            LOG.info(f"기존 파일 흡수 대상 {len(_adopt)}개 경로: "
+                     + ", ".join(os.path.basename(d) or d for d in _adopt[:5]))
+        VAULT.adopt_scan(_adopt)
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
@@ -386,13 +430,27 @@ def main() -> dict:
         return run_backtest_w(pp, weeks, uni, ctx["sec"], apply_costs=apply_costs,
                               slip_k=slip_k, label=label)
 
-    with PIPE.stage("L3.BT", "주간 백테스트", "L3", budget_s=600):
-        bt = _run(P, label=STRATEGY_ID)
+    universes = OrderedDict([("전체 유니버스(상위250 제외)", "in_band")])
+    if RUN_SMALLCAP_COMPARE and "in_band_small" in P.columns:
+        universes[f"스몰캡(시총 하위 {SMALLCAP_BOTTOM_N})"] = "in_band_small"
+
+    runs: "OrderedDict[str, dict]" = OrderedDict()
+    with PIPE.stage("L3.BT", "주간 백테스트 (유니버스별)", "L3", budget_s=900):
+        for lab, band in universes.items():
+            PP = P if band == "in_band" else assemble_score(slim_panel(P), band_col=band)
+            b = _run(PP, label=f"{STRATEGY_ID}:{band}")
+            runs[lab] = {"panel": PP, "bt": b, "band": band,
+                         "stat": perf_stats_w(b["returns"])}
+            LOG.ok(f"[{lab}] 백테스트 완료 — 평균 {runs[lab]['stat'].get('평균종목수', 0):.1f}종목")
+    bt = runs[list(runs)[0]]["bt"]
 
     with PIPE.stage("L6.PERF", "성과 검증", "L6", budget_s=300):
         report_grade_banner()
         bench = benchmark_returns_w(weeks, P)
         base_stat = report_performance(bt, bench)
+        for lab in list(runs)[1:]:
+            report_performance(runs[lab]["bt"], bench, label=f"({lab})")
+        report_universe_compare(runs, bench)
         uni.report_attrition()
 
     r2f, r12, abl, dist = {}, {}, pd.DataFrame(), pd.DataFrame()
@@ -400,9 +458,15 @@ def main() -> dict:
                     budget_s=3600, critical=False):
         try:
             r2f = R2F_exhaustion_vs_drawdown(P, _run)     # ★ 최우선
+            for lab in list(runs)[1:]:
+                LOG.rule(f"R2-F · {lab}")
+                R2F_exhaustion_vs_drawdown(P, _run, band_col=runs[lab]["band"])
             R0_benchmark(bt, bench)
             R1_leakage(P, _run, base_stat)
             r12 = R12_tail_correlation(bt, bench, P)
+            for lab in list(runs)[1:]:
+                LOG.rule(f"R12 · {lab}")
+                R12_tail_correlation(runs[lab]["bt"], bench, runs[lab]["panel"])
             R3_orthogonal(bt, P)
             abl = R5_ablation(P, _run, base_stat)
             R7_regime(bt, bench)
@@ -421,6 +485,15 @@ def main() -> dict:
     with PIPE.stage("L0.PERSIST", "산출물 저장 (공용/전용 인덱스)", "L0", budget_s=600,
                     critical=False):
         outs = persist_outputs(P, bt, r2f, r12, abl, dist, uni)
+        for lab, r in list(runs.items())[1:]:
+            tag = "smallcap"
+            VAULT.put_table(f"backtest_returns_{STRATEGY_ID}_{tag}", r["bt"]["returns"],
+                            scope="private", domain="backtest", source=f"{STRATEGY_ID}:{lab}")
+            _p = os.path.join(VAULT.ns["private"], "reports", STRATEGY_ID,
+                              f"returns_{tag}_{_dt.datetime.now():%Y%m%d_%H%M%S}.csv")
+            os.makedirs(os.path.dirname(_p), exist_ok=True)
+            r["bt"]["returns"].to_csv(_p, index=False, encoding="utf-8-sig")
+            outs.append(_p)
         VAULT.flush(); VAULT.compact("shared"); VAULT.compact("private")
         if DBUDGET:
             DBUDGET.close()

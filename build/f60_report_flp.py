@@ -268,3 +268,52 @@ def persist_outputs(P: pd.DataFrame, bt: dict, r2f: dict, r12: dict, abl: pd.Dat
                     scope="private", domain="robust", source="R-suite")
     LOG.ok(f"산출물 {len(outs)}건 저장 → {outdir}")
     return outs
+
+
+def report_universe_compare(results: "OrderedDict[str, dict]", bench: Dict[str, pd.Series]):
+    """전체 유니버스 vs 스몰캡(시총 하위 N) 을 같은 표에서 비교한다.
+
+    강제매도 소진은 소형주에서 더 강하게 나타나야 하지만, 동시에 비용·유동성에 더 많이
+    먹힌다. 둘을 따로 보고하면 '어느 쪽이 진짜인지'를 판단할 수 없으므로 나란히 놓는다."""
+    if not results:
+        return
+    rows = []
+    for lab, r in results.items():
+        st = r.get("stat") or {}
+        rows.append([lab,
+                     f"{st.get('CAGR', np.nan):.2%}", f"{st.get('MDD', np.nan):.2%}",
+                     f"{st.get('Sharpe', np.nan):.2f}", f"{st.get('Calmar', np.nan):.2f}",
+                     f"{st.get('승률', np.nan):.1%}",
+                     f"{st.get('평균종목수', np.nan):.1f}",
+                     f"{st.get('평균투자비중', np.nan):.0%}",
+                     f"{st.get('주평균비용', np.nan)*1e4:.1f}bp",
+                     f"{st.get('t통계량(HAC)', np.nan):.2f}"])
+    for name, sr in (bench or {}).items():
+        if sr is None or not len(sr.dropna()):
+            continue
+        b = perf_stats_w(pd.DataFrame({"wk": sr.index, "ret": sr.fillna(0).to_numpy()}))
+        rows.append([f"[벤치] {name}", f"{b.get('CAGR', np.nan):.2%}",
+                     f"{b.get('MDD', np.nan):.2%}", f"{b.get('Sharpe', np.nan):.2f}",
+                     f"{b.get('Calmar', np.nan):.2f}", f"{b.get('승률', np.nan):.1%}",
+                     "-", "-", "-", f"{b.get('t통계량(HAC)', np.nan):.2f}"])
+    LOG.table(rows, ["유니버스", "CAGR", "MDD", "Sharpe", "Calmar", "승률",
+                     "평균종목수", "투자비중", "주평균비용", "t(HAC)"],
+              ["l", "r", "r", "r", "r", "r", "r", "r", "r", "r"],
+              title=f"유니버스 비교 — 전체 vs 스몰캡(시총 하위 {SMALLCAP_BOTTOM_N}) · "
+                    f"같은 신호·같은 비용·같은 기간")
+    labs = list(results)
+    if len(labs) >= 2:
+        a, b2 = results[labs[0]].get("stat", {}), results[labs[1]].get("stat", {})
+        same = (abs((a.get("CAGR", 0) or 0) - (b2.get("CAGR", 0) or 0)) < 1e-12 and
+                abs((a.get("평균종목수", 0) or 0) - (b2.get("평균종목수", 0) or 0)) < 1e-12)
+        if same:
+            LOG.warn(f"두 유니버스의 결과가 완전히 같습니다 — 유니버스 종목수가 "
+                     f"SMALLCAP_BOTTOM_N({SMALLCAP_BOTTOM_N})보다 작아 스몰캡 밴드가 "
+                     f"전체와 동일해진 경우입니다. 비교로서 의미가 없으니 "
+                     f"SMALLCAP_BOTTOM_N 을 낮추거나 유니버스를 넓히세요.")
+        d = (b2.get("CAGR", np.nan) - a.get("CAGR", np.nan))
+        cost_gap = (b2.get("주평균비용", np.nan) - a.get("주평균비용", np.nan)) * 1e4
+        LOG.info(f"스몰캡 − 전체: CAGR {d:+.2%}p · 주평균비용 {cost_gap:+.1f}bp · "
+                 f"MDD {b2.get('MDD', np.nan) - a.get('MDD', np.nan):+.2%}p. "
+                 f"소형주에서 현상이 강하다면 CAGR 이 올라가되 비용·MDD 도 함께 올라가는 것이 "
+                 f"정상이며, 비용 증가분이 초과수익을 잠식하면 실행 가능성이 없는 것입니다.")

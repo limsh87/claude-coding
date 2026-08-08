@@ -6,7 +6,24 @@
 # ║  (신호가 한 건도 발화하지 않는 합성으로는 백테스트·강건성 경로를 검증할 수 없다)             ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+def _ri(rng, lo: float, hi: float, floor: int = 0) -> int:
+    """경계가 뒤집혀도 죽지 않는 정수 난수.
+
+    ★ 이 함수가 존재하는 이유(실제 사고): 픽스처가 `rng.integers(300, n_days - 200)` 처럼
+      '길이에 결합된 경계'를 쓰고 있었다. n_days=900 인 SMOKE 경로에서는 통과하지만
+      n_days=500 인 FULL 경로에서는 low==high 가 되어 ValueError 로 즉사한다.
+      경계를 계산하는 모든 지점을 이 한 곳으로 모아, 길이가 얼마든 항상 유효 구간을 만든다."""
+    lo_i, hi_i = int(lo), int(hi)
+    lo_i = max(int(floor), lo_i)
+    if hi_i <= lo_i:
+        hi_i = lo_i + 1
+    return int(rng.integers(lo_i, hi_i))
+
+
 def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) -> dict:
+    """합성 데이터. n_days 가 짧아도(최소 200) 전 구간이 성립해야 한다 — 경계는 전부 비율로."""
+    n_days = max(200, int(n_days))
+    n_codes = max(8, int(n_codes))
     rng = np.random.default_rng(seed)
     days = pd.bdate_range("2020-01-02", periods=n_days)
     codes = [f"{900001+i:06d}" for i in range(n_codes)]
@@ -17,7 +34,8 @@ def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) 
         vol = rng.uniform(0.015, 0.035)
         ret = rng.normal(drift, vol, n_days)
         # 강제매도 사이클: 종목마다 다른 시점에 급락 → 신용잔고 급감 → 개인 이탈 → 기관 유입
-        t0 = int(rng.integers(300, n_days - 200))
+        # 급락 시작 시점은 '비율'로 잡는다(길이에 결합된 상수 금지)
+        t0 = _ri(rng, n_days * 0.35, n_days * 0.75, floor=60)
         ret[t0:t0 + 40] -= rng.uniform(0.004, 0.012)
         px = 20000 * np.exp(np.cumsum(ret))
         amount = rng.uniform(3e8, 4e9, n_days) * (1 + 0.5 * np.sin(np.arange(n_days) / 40))
@@ -44,8 +62,8 @@ def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) 
     flows = pd.concat(fl_rows, ignore_index=True)
 
     # 상장폐지 종목을 반드시 섞는다 (C2 경로를 스모크에서도 태운다)
-    dead = codes[:6]
-    delist_dates = {c: days[int(rng.integers(600, n_days - 10))] for c in dead}
+    dead = codes[:max(3, n_codes // 20)]
+    delist_dates = {c: days[_ri(rng, n_days * 0.65, n_days - 2, floor=10)] for c in dead}
     sec = pd.DataFrame({
         "code": codes, "name": [f"합성{i:03d}" for i in range(n_codes)],
         "market": ["KOSPI" if i % 3 == 0 else "KOSDAQ" for i in range(n_codes)],
@@ -77,13 +95,14 @@ def make_synthetic_flp(n_codes: int = 120, n_days: int = 900, seed: int = SEED) 
 
     dis = pd.DataFrame({
         "corp_code": [f"{i:08d}" for i in range(0, n_codes, 9)],
-        "rcept_dt": [days[int(rng.integers(200, n_days - 1))] for _ in range(0, n_codes, 9)],
+        "rcept_dt": [days[_ri(rng, n_days * 0.2, n_days - 1, floor=5)]
+                     for _ in range(0, n_codes, 9)],
         "report_nm": "유상증자결정", "event": "rights_issue"})
 
     links = pd.DataFrame({
-        "stock_code": [codes[int(rng.integers(0, n_codes))] for _ in range(600)],
-        "pub_date": [days[int(rng.integers(100, n_days - 1))] for _ in range(600)],
-        "analyst_id": [f"an{int(rng.integers(0,40)):03d}" for _ in range(600)],
+        "stock_code": [codes[_ri(rng, 0, n_codes)] for _ in range(600)],
+        "pub_date": [days[_ri(rng, n_days * 0.1, n_days - 1, floor=2)] for _ in range(600)],
+        "analyst_id": [f"an{_ri(rng, 0, 40):03d}" for _ in range(600)],
         "target_price": rng.uniform(10000, 60000, 600),
         "broker_name": "합성증권"})
 
@@ -95,7 +114,7 @@ def run_selftest(full_chain: bool = False) -> bool:
     """계산경로 전체(수집 제외)를 합성으로 태운다. 실패하면 실데이터 수집을 시작하지 않는다."""
     t0 = time.time()
     S = make_synthetic_flp(n_codes=(120 if full_chain else 60),
-                           n_days=(900 if full_chain else 500))
+                           n_days=(900 if full_chain else 460))
     px, sec = S["px"], S["sec"]
     PIT.register("dart_financials",
                  pit_frame(S["fin"], "period_end", "knowledge_date", source="synth"),
@@ -163,6 +182,15 @@ def run_selftest(full_chain: bool = False) -> bool:
         except KillCriteria as e:
             LOG.warn(f"합성데이터에서 킬 판정 — 합성이므로 무시하고 계속합니다: {e}")
         report_robustness()
+        # 스몰캡 비교 경로도 스모크에서 한 번 태운다(실데이터에서 처음 도는 코드를 없앤다)
+        if RUN_SMALLCAP_COMPARE and "in_band_small" in P.columns:
+            runs = OrderedDict()
+            runs["전체 유니버스"] = {"bt": bt, "stat": s}
+            PS = assemble_score(slim_panel(P), band_col="in_band_small", quiet=True)
+            bs = _run(PS, label="SMOKE_small")
+            runs[f"스몰캡(하위 {SMALLCAP_BOTTOM_N})"] = {"bt": bs,
+                                                         "stat": perf_stats_w(bs["returns"])}
+            report_universe_compare(runs, bench)
         uni.report_attrition()
         report_interpretation(P)
         diagnostic_card(P, bt, sec)

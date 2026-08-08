@@ -280,6 +280,45 @@ def run_contract_tests(strict: bool = True) -> bool:
                 f"category/object 혼합 결합 결과 {len(P):,}행 · 주식수 결합 "
                 f"{int(P['shares'].notna().sum()):,}행")
 
+    def c_fixture():
+        """★ 실제로 터졌던 결함의 회귀 방지:
+        합성 픽스처가 '길이에 결합된 상수 경계'(integers(300, n_days-200))를 써서
+        RUN_MODE='FULL' 경로(n_days=500)에서만 ValueError 로 즉사했다.
+        SMOKE 경로(n_days=900)만 검증하던 하네스는 이 경로를 한 번도 실행하지 않았다.
+        → 여러 길이로 실제 생성해 보고, 필수 키와 최소 행수를 확인한다."""
+        need = ("px", "credit", "flows", "sec", "shares", "fin", "disclosures", "links")
+        sizes = []
+        for nd, nc in ((200, 8), (460, 60), (500, 60), (900, 120)):
+            if True:
+                S = make_synthetic_flp(n_codes=nc, n_days=nd, seed=SEED + nd)
+                miss = [k for k in need if k not in S or S[k] is None or not len(S[k])]
+                if miss:
+                    return False, f"n_days={nd}, n_codes={nc} 에서 누락: {miss}"
+                if S["sec"]["delisting_date"].notna().sum() < 1:
+                    return False, f"n_days={nd} 에서 상장폐지 종목이 0개 (C2 경로 미검증)"
+                sizes.append((nd, nc, len(S["px"])))
+        return True, f"{len(sizes)}개 조합 생성 성공 (길이 200~900 · FULL 경로 460일 포함)"
+
+    def c_small():
+        """스몰캡 밴드는 '매 시점 시총 하위 N' 이어야 하고, 전체 밴드의 부분집합이어야 한다."""
+        n = SMALLCAP_BOTTOM_N + 500
+        P = pd.DataFrame({"code": [f"{i:06d}" for i in range(n)],
+                          "wk": pd.Timestamp("2020-01-03"),
+                          "mcap": np.linspace(1e13, 1e9, n),
+                          "adv20": 1e10})
+        Q = apply_universe_bands(P)
+        big, small = Q["in_band"] == 1, Q["in_band_small"] == 1
+        if not small.any():
+            return False, "스몰캡 밴드가 비었습니다"
+        if int((small & ~big).sum()):
+            return False, "스몰캡 밴드가 전체 밴드의 부분집합이 아닙니다"
+        n_small = int(small.sum())
+        max_in = float(Q.loc[small, "mcap"].max())
+        min_out = float(Q.loc[big & ~small, "mcap"].min())
+        return (n_small <= SMALLCAP_BOTTOM_N and max_in <= min_out,
+                f"{n:,}종목 중 스몰캡 {n_small:,}종목(상한 {SMALLCAP_BOTTOM_N:,}) · "
+                f"선택 최대시총 {max_in:.3g} ≤ 제외 최소시총 {min_out:.3g}")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -346,10 +385,12 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("TP", "clip(z,0)×clip(z,0) 부호 규약", c_tp)
     _c("VETO", "거부권 이진·상쇄 불가", c_veto)
     _c("EXIT", "청산 규칙(f_cr_pctl 회복) 작동", c_exit)
+    _c("FIXT", "합성 픽스처 길이 무관 생성 (회귀 방지)", c_fixture)
     _c("HALT", "거래정지 중 폐지 = -100% (회귀 방지)", c_halt)
     _c("DEL1", "폐지 손실 이중계상 금지 (회귀 방지)", c_delist_once)
     _c("GAP", "거래정지 구간 손실을 재개 주에 실현 (회귀 방지)", c_halt_gap)
     _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
+    _c("SMALL", "스몰캡 밴드 = 시총 하위 N ∧ 전체 밴드의 부분집합", c_small)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)

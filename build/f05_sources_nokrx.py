@@ -227,6 +227,15 @@ def naver_trend_flows(code: str, start: str, end: str, page_size: int = 300,
         rows.extend(block)
         if len(block) < page_size:
             break
+        # ★ 이미 시작일 이전까지 받았으면 더 넘기지 않는다. 페이지를 끝까지 도는 것은
+        #   종목당 수 회의 불필요한 요청이고, 1,200종목이면 그 자체로 수십 분이다.
+        try:
+            _d = pd.DataFrame(block)
+            _k = _pick_date_col(_d)
+            if _k is not None and as_ts_series(_d[_k]).min() < as_ts(start):
+                break
+        except Exception:
+            pass
     if not rows:
         return None
     d = pd.DataFrame(rows)
