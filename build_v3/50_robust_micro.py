@@ -97,7 +97,17 @@ def R2M_fourway(bts: Dict[str, dict], bench_ew: dict) -> str:
 
     # ② 결합의 근거가 있는가
     best_ab = max(c.get("A", -np.inf), c.get("B", -np.inf))
-    if c.get("C", -np.inf) <= best_ab:
+    # ★ '표본 없음'과 '실패'를 구분한다. _calmar 는 결측을 -inf 로 바꾸므로, A·B·C 가 전부
+    #   빈 프레임이면 -inf <= -inf 로 참이 되어 "결합 근거가 소멸했습니다 → 폐기" 라는
+    #   킬 판정이 나온다. 운영자는 데이터가 비었을 뿐인데 전략을 버리라는 말을 듣는다.
+    #   4시간을 다시 태워 엉뚱한 곳을 뒤지게 만드는 실패 양식이다.
+    _fin = [v for v in (c.get("A"), c.get("B"), c.get("C")) if v is not None and np.isfinite(v)]
+    if len(_fin) < 3:
+        v2 = ("A/B/C 중 유효한 성과가 3개 미만이라 결합 근거를 판정할 수 없습니다(표본 없음). "
+              "킬 기준을 발동하지 않습니다 — 먼저 백테스트가 왜 비었는지(유니버스·신호 결측) "
+              "위 감쇠 감사표와 센서 가용성표를 확인하세요.")
+        _rec("R2M-C", "결합 근거 (C > max(A,B)) ⭐", None, v2)
+    elif c.get("C", -np.inf) <= best_ab:
         v2 = (f"★C({c.get('C', float('nan')):.2f}) ≤ max(A,B)({best_ab:.2f}) — 결합 근거가 소멸했습니다. "
               f"§12-4 에 따라 더 단순한 쪽"
               f"({'A(방화벽만)' if c.get('A', -np.inf) >= c.get('B', -np.inf) else 'B(증거층만)'})"
@@ -284,12 +294,20 @@ def R9_cost(P: pd.DataFrame, months, uni) -> pd.DataFrame:
               ["c", "r", "r", "r", "r", "r", "r"],
               title="R9 — 비용 시나리오 (§11.2). 비관에서 사라지면 소액계좌라도 실행 불가")
     pes = out.get("비관", {}).get("stats", {})
-    ok = float(pes.get("cagr", -1)) > 0 and float(pes.get("calmar", 0) or 0) > 0.3
-    _rec("R9", "비용 시나리오 (비관) ⭐", bool(ok),
-         f"비관 시나리오 CAGR {100*float(pes.get('cagr', float('nan'))):.2f}% · "
-         f"Calmar {float(pes.get('calmar', float('nan'))):.2f} — "
-         f"{'성과 잔존' if ok else '성과 소멸. 실행 불가이므로 폐기 대상입니다(§12-5)'}",
-         kill=True)
+    # ★ 표본 없음 → 판정 불가. `NaN or 0` 은 NaN(truthy)을 그대로 돌려주고 `NaN > 0.3` 은
+    #   False 라, 빈 백테스트가 "성과 소멸 → 폐기 대상" 이라는 킬 판정으로 둔갑한다.
+    _cg = pd.to_numeric(pd.Series([pes.get("cagr")]), errors="coerce").iloc[0]
+    _cm = pd.to_numeric(pd.Series([pes.get("calmar")]), errors="coerce").iloc[0]
+    if not (np.isfinite(_cg) and np.isfinite(_cm)):
+        _rec("R9", "비용 시나리오 (비관) ⭐", None,
+             "비관 시나리오의 성과지표를 얻지 못했습니다(표본 없음). 킬 기준을 발동하지 "
+             "않습니다 — 비용이 문제가 아니라 백테스트가 비어 있다는 뜻입니다.")
+    else:
+        ok = bool(_cg > 0 and _cm > 0.3)
+        _rec("R9", "비용 시나리오 (비관) ⭐", ok,
+             f"비관 시나리오 CAGR {100*_cg:.2f}% · Calmar {_cm:.2f} — "
+             f"{'성과 잔존' if ok else '성과 소멸. 실행 불가이므로 폐기 대상입니다(§12-5)'}",
+             kill=True)
     return pd.DataFrame(rows, columns=["시나리오", "왕복비용", "참여율상한", "CAGR", "MDD",
                                        "Calmar", "회전율/월"])
 

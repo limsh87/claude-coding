@@ -384,7 +384,11 @@ class Pipeline:
     def report_runtime(self):
         """C10 런타임 감사 — 추측하지 말고 측정한다."""
         LOG.banner("런타임 감사 (C10)", "계층별 실측 소요시간 vs 계약 예산")
-        budgets = {"L1": 30 * 60, "L2": 2 * 60, "L3": 3 * 60, "L5": 4 * 3600}
+        # ★ 계층 예산은 설정에서 읽는다. 하드코딩해 두면 설정과 표가 어긋나서,
+        #   L1 이 배정의 6배를 써도 총계 줄만 보고 '예산 내'라고 읽게 된다(실측 사고).
+        _l1 = float(globals().get("COLLECT_BUDGET_MIN", 30)) * 60
+        _tot = float(globals().get("MAX_WALLCLOCK_MIN", 240)) * 60
+        budgets = {"L1": _l1, "L2": 2 * 60, "L3": 3 * 60, "L5": max(_tot * 0.25, 600)}
         agg: Dict[str, float] = defaultdict(float)
         for r in self.stages.values():
             agg[r.layer] += r.dur
@@ -397,8 +401,16 @@ class Pipeline:
                 verdict = "✔ 예산 내" if spent <= bud else f"❗ 초과 ({spent / bud:.1f}배)"
             rows.append([layer, f"{spent:8.2f}s", f"{spent / 60:6.2f}분",
                          (f"{bud / 60:.0f}분" if bud else "-"), verdict])
-        rows.append(["합계", f"{sum(agg.values()):8.2f}s", f"{sum(agg.values()) / 60:6.2f}분", "4시간",
-                     "✔ 예산 내" if sum(agg.values()) <= 4 * 3600 else "❗ 초과 — 아키텍처 수정 필요"])
+        _sum = sum(agg.values())
+        # ★ 총계 판정은 '총 상한 이내'만으로 내리지 않는다. 어느 계층이든 배정을 넘겼으면
+        #   총계도 초과로 표시한다 — 그러지 않으면 "L1 6.1배 초과"와 "총계 ✔ 예산 내"가
+        #   같은 화면에 나란히 찍히고, 사람은 아래 줄만 본다.
+        _breach = [l for l, b in budgets.items() if b and agg.get(l, 0.0) > b]
+        _ok = (_sum <= _tot) and not _breach
+        rows.append(["합계", f"{_sum:8.2f}s", f"{_sum / 60:6.2f}분", f"{_tot/3600:.0f}시간",
+                     "✔ 예산 내" if _ok else
+                     (f"❗ 계층 초과({','.join(_breach)}) — 총량은 상한 내이나 배분이 무너졌습니다"
+                      if _sum <= _tot else "❗ 초과 — 아키텍처 수정 필요")])
         LOG.table(rows, ["계층", "실측(초)", "실측(분)", "계약예산", "판정"], ["c", "r", "r", "r", "l"])
         LOG.info("계층 정의 — L0:부트/캐시  L1:수집·피처패널  L2:스코어  L3:백테스트  L5:강건성  L6:리포트")
 

@@ -36,11 +36,50 @@ def offer_download(paths: Sequence[str]):
             LOG.info("Colab 다운로드 위젯을 쓸 수 없습니다 — 위 경로에서 직접 받으세요.")
 
 
+@contextmanager
+def l1_stage(sid: str, name: str, critical: bool = True):
+    """L1 단계 = 예산 게이트 + 스테이지 + 실측 기록.
+
+    ★ 세 가지를 한 곳에 묶는 이유: 예산을 '재기만' 하고 강제하지 않으면 아무 의미가 없다.
+      진입 시 배정을 소진했는지 보고(강등), 나갈 때 실측을 적어 감사표가 단계별로
+      배정 대비 실측을 그대로 보여주게 한다.
+    """
+    l1_guard(sid)
+    _t0 = time.time()
+    try:
+        with PIPE.stage(sid, name, "L1",
+                        budget_s=int(float(STAGE_BUDGET_MIN.get(sid, 5)) * 60),
+                        critical=critical):
+            yield
+    finally:
+        if L1BUDGET is not None:
+            L1BUDGET.record(sid, time.time() - _t0)
+
+
+def _umicro_candidate_codes(ctx: dict) -> set:
+    """U-MICRO 에 들어올 법한 종목코드 — 리포트 상세조회 우선순위에 쓴다.
+
+    이 시점엔 아직 시총 패널이 없다. 거래대금 중앙값이 유동성 하한을 넘되 상위권이
+    아닌 구간을 대리로 쓴다(정확할 필요는 없다 — '무엇을 먼저 받을지'의 순서일 뿐이다).
+    """
+    px = ctx.get("px_daily")
+    if px is None or not len(px) or "amount" not in px.columns:
+        return set()
+    try:
+        amt = px.groupby("code", observed=True)["amount"].median()
+        liq = amt[amt >= UMICRO_MIN_ADV_KRW]
+        if len(liq) < 200:
+            liq = amt
+        return set(liq.sort_values(ascending=True).index.astype(str))
+    except Exception:
+        return set()
+
+
 def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
     """수집. 캐시 우선 · 부족분만 신규 · 공용 인덱스에 재적재."""
     ctx: Dict[str, Any] = {}
 
-    with PIPE.stage("L1.SEC", "종목 마스터 (상장·폐지·업종)", "L1", budget_s=900):
+    with l1_stage("L1.SEC", "종목 마스터 (상장·폐지·업종)"):
         snaps = fetch_pykrx_snapshots(months)
         ctx["snapshots"] = snaps
         sec = build_security_master(snaps)
@@ -54,7 +93,7 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
                         source="fdr+kind+dart")
         VAULT.flush()
 
-    with PIPE.stage("L1.PX", "가격·거래대금 (다중소스 폴백)", "L1", budget_s=2400):
+    with l1_stage("L1.PX", "가격·거래대금 (다중소스 폴백)"):
         codes = ctx["sec"]["code"].dropna().astype(str).tolist()
         px = fetch_prices(codes, BACKTEST_START, BACKTEST_END)
         ctx["px_daily"] = px
@@ -62,8 +101,7 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
         VAULT.flush()
 
 
-    with PIPE.stage("L1.DART", "DART 재무 → 분기 센서", "L1",
-                    budget_s=DART_BUDGET_MIN * 60, critical=False):
+    with l1_stage("L1.DART", "DART 재무 → 분기 센서", critical=False):
         # ★ 전 종목×전 연도를 단건 API 로 도는 것은 §5('종목별 루프 금지')와 §10(4시간)을
         #   동시에 어긴다. 예산 견적 → 싼 경로부터 → 남은 예산 안에서만 단건.
         fs = collect_dart_financials_budgeted(ctx["sec"], months, ctx.get("px_daily"),
@@ -80,17 +118,17 @@ def collect_all(months: pd.DatetimeIndex, caps: Dict[str, bool]) -> dict:
     # ★ 시총은 DART 재무 '뒤'에 둔다.
     #   주식총수 보강이 DART 호출을 먼저 태우면, 정작 이 전략의 본체인 재무를 받을
     #   한도가 사라진다. 실제로 그 순서 때문에 재무 시작 시점에 한도가 1,000건 깎여 있었다.
-    with PIPE.stage("L1.MCAP", "시가총액·상장주식수", "L1", budget_s=1200):
+    with l1_stage("L1.MCAP", "시가총액·상장주식수"):
         snap_m = fetch_mcap_snapshots(months, ctx["sec"])
         ctx["mcap_snap"] = snap_m
         ctx["mcap"] = build_mcap_panel(ctx["panel"]["monthly"], snap_m, ctx["sec"], months)
         VAULT.flush()
 
-    with PIPE.stage("L1.ACT", "관리종목·감사의견·거래정지", "L1", budget_s=1200, critical=False):
+    with l1_stage("L1.ACT", "관리종목·감사의견·거래정지", critical=False):
         ctx["actions"] = fetch_market_actions(BACKTEST_START, BACKTEST_END)
         VAULT.flush()
 
-    with PIPE.stage("L1.DIS", "공시목록 (희석성 조달 V3)", "L1", budget_s=1800, critical=False):
+    with l1_stage("L1.DIS", "공시목록 (희석성 조달 V3)", critical=False):
         ctx["dis"] = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         VAULT.flush()
 
@@ -112,21 +150,31 @@ def _collect_research(ctx: dict):
       본문은 그대로 실행된다(@contextmanager 는 본문을 건너뛸 수 없다). 부작용이 있는
       단계는 반드시 호출 자체를 if 로 막아야 한다.
     """
-    with PIPE.stage("L1.RSRCH", "애널리스트 리포트 (한경·네이버 + 드라이브 캐시)", "L1",
-                    budget_s=2400, critical=False):
+    with l1_stage("L1.RSRCH", "애널리스트 리포트 (한경·네이버 + 드라이브 캐시)", critical=False):
         frames = []
         cached = VAULT.get_table("research_report_master", scope="shared")
         if cached is not None and len(cached):
             LOG.ok(f"드라이브 공용 인덱스에서 리포트 원장 {len(cached):,}건 재사용 "
                    f"(이미 모아두신 캐시를 최우선으로 씁니다)")
             frames.append(cached)
+        _t_rs = time.time()
         if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+            # ★ 한경을 먼저 받는다. 목록 표에 작성자(애널리스트)와 적정가격이 그대로 있어
+            #   상세 조회가 필요 없다 — 원장 연결(리포트↔애널리스트↔종목)의 본체다.
             if "hankyung" in RESEARCH_SOURCES:
                 frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
             if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(BACKTEST_START, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
+                frames.append(naver_collect(BACKTEST_START, BACKTEST_END))
+        # ★ 순서가 성능을 결정한다: 병합을 '먼저' 해야 한경이 이미 채워 준 목표주가를
+        #   가진 건이 네이버 상세 조회 대상에서 빠진다. 예전 순서(네이버 보강 → 병합)는
+        #   같은 정보를 한 건당 1회 요청으로 다시 사 오느라 126분을 썼다.
         rep = build_report_master(frames, ctx["sec"])
+        if RUN_MODE != "CACHED" and RESEARCH_COLLECT and "naver" in RESEARCH_SOURCES:
+            _left = max(0.0, RESEARCH_BUDGET_MIN * 60.0 - (time.time() - _t_rs))
+            if DEADLINE is not None:
+                _left = min(_left, DEADLINE.remain_s())
+            rep = naver_enrich_detail(rep, budget_s=_left,
+                                      prio_codes=_umicro_candidate_codes(ctx))
         if len(rep) and RESEARCH_DOWNLOAD_PDF:
             rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
             if "pdf_target" in rep.columns:
@@ -203,10 +251,12 @@ def score_and_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
     with PIPE.stage("L2.SCORE", "센서 가용성 → TP → 방화벽 → 거부권", "L2", budget_s=600):
         M = P[P["u_micro"].astype(bool)].copy() if "u_micro" in P.columns else P.copy()
         if len(M) < 150:
-            raise KillCriteria(
-                f"U-MICRO 유효 종목월이 {len(M):,}건뿐입니다(§12-6: 유효종목 150 미만). "
-                f"통계 검정이 불가능하므로 중단합니다. 위 감쇠 감사표에서 어느 게이트가 "
-                f"표본을 깎았는지 먼저 확인하세요.")
+            _msg = (f"U-MICRO 유효 종목월이 {len(M):,}건뿐입니다(§12-6: 유효종목 150 미만). "
+                    f"통계 검정이 불가능하므로 중단합니다. 위 감쇠 감사표에서 어느 게이트가 "
+                    f"표본을 깎았는지 먼저 확인하세요.")
+            if STOP_ON_KILL_CRITERIA and _KILL_ARMED:
+                raise KillCriteria(_msg)
+            LOG.warn("[킬 비무장] " + _msg)
         active_tp, avail = sensor_availability(M)
         tables["availability"] = avail
         M = build_evidence(M, active_tp)
@@ -250,8 +300,9 @@ def _main_inner() -> dict:
     LOG.banner(f"TCD v3 · {STRATEGY_NAME}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · 빌드 {BUILD_VERSION} · 모드 {RUN_MODE}")
     months = month_range(BACKTEST_START, BACKTEST_END)
-    global DEADLINE
+    global DEADLINE, L1BUDGET
     DEADLINE = Deadline(MAX_WALLCLOCK_MIN)
+    L1BUDGET = LayerBudget(COLLECT_BUDGET_MIN, STAGE_BUDGET_MIN)
     outputs: List[str] = []
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -277,11 +328,16 @@ def _main_inner() -> dict:
     global _KILL_ARMED
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0", budget_s=900):
         sctx = synth_context(months)
-        sm = _run_pipeline_from_ctx(sctx, months, smoke=True)
-        LOG.ok(f"계산 경로 통과 — 합성 CAGR {100*sm['bts']['D']['stats']['cagr']:.2f}% "
-               f"(값 자체는 의미 없습니다. 경로가 끝까지 돈다는 증명입니다)")
-        _KILL_ARMED = False          # 합성 데이터의 판정으로 실행을 죽이지 않는다
+        # ★ 킬 해제를 파이프라인 '앞'에 둔다. score_and_backtest 안의 두 지점
+        #   (유효 종목월 150 미만 · C14-d 활성 TP 부족)이 KillCriteria 를 던지는데,
+        #   해제를 파이프라인 뒤에 두면 그 둘은 합성 데이터에서도 실행을 죽인다.
+        #   "합성 판정으로는 죽이지 않는다"는 약속이 정작 가장 흔한 두 실패 양식에서
+        #   지켜지지 않는다.
+        _KILL_ARMED = False
         try:
+            sm = _run_pipeline_from_ctx(sctx, months, smoke=True)
+            LOG.ok(f"계산 경로 통과 — 합성 CAGR {100*sm['bts']['D']['stats']['cagr']:.2f}% "
+                   f"(값 자체는 의미 없습니다. 경로가 끝까지 돈다는 증명입니다)")
             _report_everything(sm, sctx, months, smoke=True)
         finally:
             _KILL_ARMED = True
@@ -339,6 +395,14 @@ def _main_inner() -> dict:
     PIPE.report_stages()
     PIPE.report_flow(limit=120)
     PIPE.report_runtime()
+    if L1BUDGET is not None:
+        _lb = L1BUDGET.report()
+        LOG.table(_lb.values.tolist(), list(_lb.columns), ["l", "r", "r", "l"],
+                  title=f"수집 예산 감사 (§5) — 단계별 배정 대비 실측 "
+                        f"(총 배정 {COLLECT_BUDGET_MIN}분)")
+        if L1BUDGET.demoted:
+            LOG.warn(f"예산 소진으로 캐시 전용 강등된 단계: {', '.join(L1BUDGET.demoted)}. "
+                     f"이 단계들의 신규 수집분은 다음 실행이 이어받습니다.")
     report_http()
     KRXG.report()
     if DEADLINE is not None:

@@ -226,6 +226,91 @@ def run_contracts() -> bool:
                            "(만료는 누적 최댓값이어야 합니다).")
         return True, "연속 단발 사건에서 나중 사건이 앞 사건의 만료에 지워지지 않음"
 
+    # ── ★ 그 반대 방향이 더 위험하다: 미래 사건이 과거 상태를 켜면 안 된다(C1) ──────────
+    def oneshot_pit():
+        """2017년 사건 + 2024년 사건 → 2019년의 상태는 반드시 0.
+
+        예전 구현은 만료행을 '종목별 마지막 만료' 하나로 접었다. 그러면 2017-03 부터
+        2025-03 까지 97개월이 통째로 켜진다 — 2019년 패널이 '감사의견 비적정'이라고
+        말하는 근거가 5년 뒤에야 존재할 공시다. 방향도 나쁘다(나중에 망할 기업을 미리
+        배제 → 성과 과대). 위 oneshot 검정만으로는 이 실패를 절대 잡지 못한다.
+        """
+        ev = pd.DataFrame({"code": ["000001"] * 2,
+                           "rcept_dt": pd.to_datetime(["2017-03-20", "2024-03-20"]),
+                           "action": ["audit_bad", "audit_bad"]})
+        S = _one_shot_state(ev, "audit_bad", "code", valid_days=400).sort_values("knowledge_date")
+        probe = pd.Timestamp("2019-06-30")
+        prior = S[S["knowledge_date"] <= probe]
+        st = int(prior["state"].iloc[-1]) if len(prior) else 0
+        if st != 0:
+            return False, ("2019-06 시점의 상태가 1 입니다 — 2024년 공시가 과거를 켰습니다. "
+                           "미래누수(C1) 입니다.")
+        after = S[S["knowledge_date"] <= pd.Timestamp("2024-06-30")]
+        if not len(after) or int(after["state"].iloc[-1]) != 1:
+            return False, "2024-03 사건 직후 상태가 1 이 아닙니다(만료 처리가 과했습니다)."
+        return True, "7년 간격 단발 사건: 2019-06=0 · 2024-06=1 — 미래가 과거를 바꾸지 않음"
+
+    # ── DART 전기 비교치 파싱 · 분기금액 누적여부 자동판정 ──────────────────────────────
+    def comparatives():
+        """이 전략의 증거층 전체가 여기에 걸려 있다.
+
+        ① 분기 손익금액이 '3개월 단독'인데 누적으로 오인하면 차분이 음수·양수를 오가며
+           TTM 이 무의미해진다(반대로 오인하면 매출이 계단식으로 튄다). 둘 다 에러 없이
+           값만 틀린다 → 데이터로 판정하는지 검정한다.
+        ② 연 1회만 공시하는 기업(U-MICRO 에 흔하다)의 전기 비교치가 비면 i_sales 가
+           통째로 결측이 되고 C14-c 로 증거층이 죽는다 → 사업보고서 단독 이력으로 검정한다.
+        """
+        FY, Q1, H1, Q3 = (REPRT_CODES["FY"], REPRT_CODES["Q1"],
+                          REPRT_CODES["H1"], REPRT_CODES["Q3"])
+
+        def _row(cc, y, rc, cum, pcum, th, fr):
+            return {"corp_code": cc, "bsns_year": y, "reprt_code": rc, "fs_div": "CFS",
+                    "sj_div": "IS", "account_id": "ifrs-full_Revenue", "account_nm": "매출액",
+                    "thstrm_amount": f"{th:,.0f}",
+                    "thstrm_add_amount": ("" if cum is None else f"{cum:,.0f}"),
+                    "frmtrm_amount": f"{fr:,.0f}",
+                    "frmtrm_q_amount": "", "bfefrmtrm_amount": "",
+                    "frmtrm_add_amount": ("" if pcum is None else f"{pcum:,.0f}"),
+                    "rcept_no": f"{y}0515000001"}
+
+        rows = []
+        for y in (2022, 2023, 2024):
+            ann, prev = 1000.0 * (1.10 ** (y - 2022)), 1000.0 * (1.10 ** (y - 2023))
+            # 분기 제출 기업: 당기금액=3개월 단독, 당기누적=YTD (실제 DART 형식)
+            for q, rc in ((1, Q1), (2, H1), (3, Q3)):
+                rows.append(_row("00000001", y, rc, ann * q / 4, prev * q / 4,
+                                 ann / 4, prev / 4))
+            rows.append(_row("00000001", y, FY, None, None, ann, prev))
+            # 연 1회 제출 기업: 사업보고서만
+            rows.append(_row("00000002", y, FY, None, None, ann, prev))
+        W = tidy_financials(pd.DataFrame(rows))
+        if W is None or not len(W):
+            return False, "tidy_financials 가 빈 프레임을 돌려주었습니다."
+        Q = add_micro_sensors_quarterly(W)
+        exp = float(np.log(1.10))
+        out = []
+        for cc, label in (("00000001", "분기제출"), ("00000002", "연1회제출")):
+            r = Q[(Q["corp_code"] == cc) & (Q["reprt_code"] == FY) & (Q["bsns_year"] == 2024)]
+            if not len(r):
+                return False, f"{label} 기업의 2024 사업보고서 행이 없습니다."
+            v = float(pd.to_numeric(r["i_sales"], errors="coerce").iloc[0])
+            if not np.isfinite(v):
+                return False, (f"{label} 기업의 i_sales 가 결측입니다 — 전기 비교치가 "
+                               f"파싱되지 않았습니다(연 1회 제출 기업이 죽는 경로).")
+            if abs(v - exp) > 0.02:
+                return False, (f"{label} 기업의 i_sales={v:.4f} 이 기대값 {exp:.4f}(=log1.10)과 "
+                               f"다릅니다. 누적/3개월 오인 또는 lag4 가 여러 해를 건너뛴 결과입니다.")
+            out.append(f"{label} {v:.4f}")
+        # 3개월 단독 → 누적 복원이 맞으면 FY 의 TTM 이 연간과 같아야 한다
+        r1 = Q[(Q["corp_code"] == "00000001") & (Q["reprt_code"] == FY) &
+               (Q["bsns_year"] == 2024)]
+        ttm = float(pd.to_numeric(r1["revenue_ttm"], errors="coerce").iloc[0])
+        ann24 = 1000.0 * (1.10 ** 2)
+        if not np.isfinite(ttm) or abs(ttm - ann24) > ann24 * 0.02:
+            return False, (f"3개월 단독 공시의 누적 복원이 틀렸습니다 — TTM {ttm:,.0f} vs "
+                           f"연간 {ann24:,.0f}.")
+        return True, f"i_sales({' · '.join(out)}) = log1.10 · 3개월→TTM 복원 일치"
+
     # ── 거래정지→수개월 뒤 상장폐지 경로도 -100% 여야 한다 ─────────────────────────────
     def delist_gap():
         months = pd.date_range("2019-04-30", periods=2, freq=pd.offsets.MonthEnd())
@@ -330,6 +415,8 @@ def run_contracts() -> bool:
     _c("COST", "비용 모형 단조성", costmono)
     _c("WATCH", "관리종목 상태 복원 (해제 선행)", watchstate)
     _c("AUDIT", "단발 사건 만료 누적 최댓값", oneshot)
+    _c("APIT", "단발 사건 미래→과거 누수 금지", oneshot_pit)
+    _c("COMPAR", "DART 전기 비교치 · 누적 자동판정", comparatives)
     # ── 폐지일을 아예 모르는 종목의 거래중단도 -100% 여야 한다 ──────────────────────────
     def delist_nomap():
         months = pd.date_range("2019-04-30", periods=2, freq=pd.offsets.MonthEnd())
@@ -442,37 +529,82 @@ def synth_context(months: pd.DatetimeIndex, n_codes: int = 140) -> dict:
             ("inventory", "BS", "ifrs-full_Inventories", "재고자산"),
             ("receivable", "BS", "ifrs-full_TradeAndOtherCurrentReceivables", "매출채권"),
             ("assets", "BS", "ifrs-full_Assets", "자산총계"),
+            ("current_assets", "BS", "ifrs-full_CurrentAssets", "유동자산"),
+            ("current_liab", "BS", "ifrs-full_CurrentLiabilities", "유동부채"),
             ("equity", "BS", "ifrs-full_Equity", "자본총계"),
             ("capital_stock", "BS", "ifrs-full_IssuedCapital", "자본금"),
             ("cfo", "CF", "ifrs-full_CashFlowsFromUsedInOperatingActivities", "영업활동현금흐름")]
+    _FLOW_SJ = {"IS", "CIS", "CF"}
     rc_codes = list(REPRT_CODES.values())
+    _FY = REPRT_CODES["FY"]
     fs_rows = []
     y0, y1 = int(months[0].year) - 1, int(months[-1].year)
+
+    def _vals_at(base_rev, grow, c, y, qi):
+        """qi=1..4 시점의 (누적 손익, 기말 잔액). qi=4 는 연간."""
+        rev_y = base_rev * ((1 + grow) ** (y - y0))
+        cum = rev_y * qi / 4.0
+        return rev_y, {
+            "revenue": cum, "cogs": cum * (0.72 - (0.03 if c in good else 0.0)),
+            "op_income": cum * 0.08, "net_income": cum * 0.055,
+            "interest_expense": cum * 0.010, "tax_expense": cum * 0.012,
+            "inventory": rev_y * (0.14 - (0.02 if c in good else 0.0)),
+            "receivable": rev_y * (0.17 - (0.02 if c in good else 0.0)),
+            "assets": rev_y * 1.4, "current_assets": rev_y * (0.62 - (0.05 if c in good else 0)),
+            "current_liab": rev_y * 0.41, "equity": rev_y * 0.65,
+            "capital_stock": rev_y * 0.12,
+            "cfo": cum * (0.070 if c in good else 0.035)}
+
+    def _fmt(x) -> str:
+        return f"{x:,.0f}"
+
     for i, c in enumerate(codes):
         base_rev = float(rng.integers(20_000, 300_000)) * 1e6
         grow = 0.05 + (0.14 if c in good else 0.0) + rng.normal(0, 0.03)
+        # ★ 5곳 중 1곳은 '연 1회만 공시'하는 기업으로 만든다. U-MICRO 에 흔한 형태이고,
+        #   lag4 달력 게이트(shift(4)가 4년 전을 집는 사고)를 스모크가 실제로 밟게 하려면
+        #   합성 데이터에도 반드시 존재해야 한다. 전 기업이 4분기를 다 내면 그 버그는
+        #   합성에서 영원히 드러나지 않는다 — 실데이터에서만 조용히 터진다.
+        annual_only = (i % 5 == 0)
+        my_rcs = [_FY] if annual_only else rc_codes
         for y in range(y0, y1 + 1):
-            rev_y = base_rev * ((1 + grow) ** (y - y0))
             for qi, rc in enumerate(rc_codes, start=1):
-                cum = rev_y * qi / 4.0
-                vals = {
-                    "revenue": cum, "cogs": cum * (0.72 - (0.03 if c in good else 0.0)),
-                    "op_income": cum * 0.08, "net_income": cum * 0.055,
-                    "interest_expense": cum * 0.010, "tax_expense": cum * 0.012,
-                    "inventory": rev_y * (0.14 - (0.02 if c in good else 0.0)),
-                    "receivable": rev_y * (0.17 - (0.02 if c in good else 0.0)),
-                    "assets": rev_y * 1.4, "equity": rev_y * 0.65,
-                    "capital_stock": rev_y * 0.12,
-                    "cfo": cum * (0.070 if c in good else 0.035)}
+                if rc not in my_rcs:
+                    continue
+                _, cur = _vals_at(base_rev, grow, c, y, qi)
+                _, cur_prev_q = _vals_at(base_rev, grow, c, y, qi - 1) if qi > 1 else (0, None)
+                _, pv_same = _vals_at(base_rev, grow, c, y - 1, qi)
+                _, pv_yend = _vals_at(base_rev, grow, c, y - 1, 4)
                 mm, dd_ = REPRT_PERIOD_END[rc]
                 rcpt = (pd.Timestamp(year=y, month=mm, day=dd_)
                         + pd.Timedelta(days=REPRT_DEADLINE_DAYS[rc])).strftime("%Y%m%d")
                 for key, sj, aid, anm in accs:
+                    flow = sj in _FLOW_SJ
+                    if not flow:
+                        # 재무상태표: 당기말 잔액 / 전기말 잔액 (★전년 동분기말이 아니다)
+                        th, th_add = cur[key], ""
+                        fr, fr_add = pv_yend[key], ""
+                    elif rc == _FY:
+                        # 사업보고서: 당기금액 = 연간. 누적 컬럼이 없다(실제 DART 와 동일).
+                        th, th_add = cur[key], ""
+                        fr, fr_add = pv_yend[key], ""
+                    else:
+                        # 분기·반기: 당기금액 = 3개월 단독, 당기누적금액 = YTD (실제 DART 와 동일)
+                        th = cur[key] - (cur_prev_q[key] if cur_prev_q else 0.0)
+                        th_add = cur[key]
+                        fr = pv_same[key] - (_vals_at(base_rev, grow, c, y - 1, qi - 1)[1][key]
+                                             if qi > 1 else 0.0)
+                        fr_add = pv_same[key]
                     fs_rows.append({"corp_code": f"{i+1:08d}", "bsns_year": str(y),
                                     "reprt_code": rc, "rcept_no": rcpt + "000001",
                                     "fs_div": "CFS", "sj_div": sj, "account_id": aid,
                                     "account_nm": anm,
-                                    "thstrm_amount": f"{vals[key]:,.0f}"})
+                                    "thstrm_amount": _fmt(th),
+                                    "thstrm_add_amount": _fmt(th_add) if th_add != "" else "",
+                                    "frmtrm_amount": _fmt(fr),
+                                    "frmtrm_q_amount": "",
+                                    "frmtrm_add_amount": _fmt(fr_add) if fr_add != "" else "",
+                                    "bfefrmtrm_amount": ""})
     fs = pd.DataFrame(fs_rows)
 
     # 시장조치 · 공시 · 리포트

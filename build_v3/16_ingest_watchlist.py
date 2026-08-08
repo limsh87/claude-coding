@@ -24,10 +24,15 @@ MARKET_ACTION_PATTERNS: List[Tuple[str, str]] = [
     ("watch_on",   r"관리종목\s*지정"),
     ("alert_off",  r"투자주의\s*환기종목.*해제"),
     ("alert_on",   r"투자주의\s*환기종목\s*지정"),
-    ("halt_off",   r"매매거래\s*정지\s*해제|거래정지\s*해제"),
-    ("halt_on",    r"매매거래\s*정지|거래정지"),
+    # ★ '정지'류는 해제 공시가 늘 따라오지는 않는다. _step_state 는 마지막 이벤트가
+    #   이기므로, 해제가 안 오면 그 종목은 **백테스트가 끝날 때까지 영구 거래정지**로 남는다.
+    #   조회공시 답변 요구·정지기간 변경처럼 실제 거래정지가 아닌 제목까지 걸리면
+    #   멀쩡한 종목이 통째로 죽는다 → 해제/변경/예고성 제목을 먼저 배제한다.
+    ("halt_off",   r"(매매거래\s*정지|거래정지).*(해제|해지)|정지\s*해제"),
+    ("halt_on",    r"^(?!.*(해제|해지|변경|예고)).*(매매거래\s*정지|거래\s*정지)"),
     ("audit_bad",  r"감사의견\s*(거절|한정|부적정)|의견거절|비적정\s*감사의견"),
-    ("audit_rpt",  r"감사보고서\s*제출|^감사보고서"),
+    # ('audit_rpt' 는 제거했다 — 어떤 조항도 소비하지 않는데 전체 이벤트의 대다수(실측
+    #  189,165건)를 차지해 메모리와 표를 잠식했다. 감사'의견'은 audit_bad 가 잡는다.)
     ("delist_risk", r"상장폐지\s*사유|상장적격성\s*실질심사"),
 ]
 
@@ -204,13 +209,20 @@ def _one_shot_state(ev: pd.DataFrame, act: str, key: str, valid_days: int = 400)
     if on.empty:
         return pd.DataFrame(columns=[key, "knowledge_date", "state"])
     on = on.sort_values([key, "rcept_dt"], kind="stable").copy()
-    exp = on["rcept_dt"] + pd.Timedelta(days=valid_days)
-    # 종목별 만료시점의 누적 최댓값 → 나중 사건이 앞선 사건의 만료를 항상 밀어낸다
-    on["_exp"] = exp.groupby(on[key], observed=True).cummax()
-    # 만료행은 그 종목의 '마지막 만료'만 남긴다(중간 만료행이 켜진 상태를 끄지 않도록)
-    last_exp = on.groupby(key, observed=True)["_exp"].max().reset_index()
+    on["_exp"] = on["rcept_dt"] + pd.Timedelta(days=valid_days)
+    # ★★ 만료행을 '마지막 만료 하나'로 접으면 **미래가 과거를 바꾼다** ★★
+    #   예전 구현은 종목별 cummax 후 max() 하나만 off 행으로 남겼다. 그러면
+    #     2017-03 비적정 + 2024-03 비적정  →  2017-03 부터 2025-03 까지 97개월 내내 on
+    #   이 된다. 2019년 시점의 패널이 "감사의견 비적정"이라고 말하는 근거가 **5년 뒤에야
+    #   존재할 공시**다. merge_asof(backward) 는 이 거짓 상태를 그대로 실어 나른다.
+    #   방향도 나쁘다 — 나중에 문제가 될 기업을 미리 배제하므로 성과가 부풀려진다.
+    #   → 각 사건의 만료를 그대로 두되, 뒤 사건이 덮는 만료만 버린다.
+    #     (다음 on 이 이 만료보다 이르면 그 만료행은 무의미하므로 제거)
+    _nxt_on = on.groupby(key, observed=True)["rcept_dt"].shift(-1)
+    keep_off = _nxt_on.isna() | (_nxt_on > on["_exp"])
+    offs = on.loc[keep_off, [key, "_exp"]].rename(columns={"_exp": "knowledge_date"})
     rows = [on.assign(knowledge_date=on["rcept_dt"], state=np.int8(1))[[key, "knowledge_date", "state"]],
-            last_exp.rename(columns={"_exp": "knowledge_date"}).assign(state=np.int8(0))]
+            offs.assign(state=np.int8(0))]
     E = pd.concat(rows, ignore_index=True)[[key, "knowledge_date", "state"]]
     return (E.sort_values([key, "knowledge_date"], kind="stable")
              .drop_duplicates([key, "knowledge_date"], keep="last"))

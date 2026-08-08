@@ -18,7 +18,45 @@ MICRO_QUARTERLY_COLS = [
     "i_sales", "i_dio", "i_dso", "i_turn", "i_accr",
     "op_cf_neg_streak", "interest_coverage", "capital_impairment",
     "v1_pushout", "v2_bad_3q",
+    "asset_turn", "accr_level",          # 해석표·진단카드가 읽는 원시 수준값
 ]
+
+# 어떤 정의가 채택됐는지 남긴다 — 센서 가용성표 바로 위에 출력된다.
+SENSOR_DEFS_USED: List[list] = []
+
+
+def _pick_sensor(name: str, cands: "Sequence[Tuple[str, pd.Series]]",
+                 combinable: bool = False) -> pd.Series:
+    """센서 정의 사다리 — 결측률이 임계 이하인 첫 정의를 채택한다.
+
+    ★ 이 함수가 존재하는 이유 (실측된 중단 사고) ────────────────────────────────────────
+      한 정의만 고정하면, 그 정의가 요구하는 계정이 공시되지 않는 구간에서 축이 통째로
+      죽는다. 실제로 i_turn 100.0% / i_accr 99.9% 결측 → 활성 TP 0개 → C14-d 중단이
+      났다. 원인은 '데이터가 없어서'가 아니라 **재고·영업CF 를 요구하는 정의만 있었기
+      때문**이다. 같은 경제적 질문("회전이 악화됐나", "이익의 질이 유지되나")에 답하는
+      더 싼 정의가 존재하는데도 쓰지 않았다.
+
+    ★ combinable=False 인 이유가 중요하다.
+      정의가 다르면 단위·척도가 다르다. 한 셀 안에서 어떤 종목은 A 정의로, 어떤 종목은
+      B 정의로 값이 채워지면 **셀 내 랭크가 의미를 잃는다** — 에러 없이 신호만 오염된다.
+      그래서 척도가 동일한 정의(i_sales 의 YTD성장 vs TTM성장)만 보완결합을 허용하고,
+      나머지는 '하나를 고르고 왜 골랐는지 표로 남긴다'.
+    """
+    stats = [(nm, s, (float(s.isna().mean()) if len(s) else 1.0)) for nm, s in cands]
+    thr = RESEARCH_MAX_MISSING_RATE
+    chosen, mode = next(((t, "채택") for t in stats if t[2] <= thr), (None, ""))
+    if chosen is None and combinable:
+        out = stats[0][1].copy()
+        for _, s, _m in stats[1:]:
+            out = out.where(out.notna(), s)
+        chosen, mode = ("+".join(t[0] for t in stats), out,
+                        float(out.isna().mean()) if len(out) else 1.0), "보완결합"
+    if chosen is None:
+        chosen = min(stats, key=lambda t: t[2])
+        mode = "차선(임계초과)"
+    SENSOR_DEFS_USED.append([name, chosen[0], mode, f"{100*chosen[2]:.1f}%",
+                             " · ".join(f"{t[0]}={100*t[2]:.0f}%" for t in stats)])
+    return pd.to_numeric(chosen[1], errors="coerce").astype("float32")
 
 # ── DART 계정 확장 ──────────────────────────────────────────────────────────────────────────
 #   방화벽이 요구하는 두 계정이 v2 코어의 ACCOUNT_PATTERNS 에 없다. 코어 파일을 고치는 대신
@@ -38,7 +76,7 @@ if "interest_expense" not in FLOW_ITEMS:
 # 소스 불일치 시 항상 높은 값을 남겨 상향을 과대·하향을 과소 계상한다.
 TARGET_PRICE_AGG = "median"
 for _c in (["interest_expense", "capital_stock"]
-           + [f"interest_expense{s}" for s in ("_q", "_ttm")]
+           + [f"interest_expense{s}" for s in ("_q", "_ttm", "_cm", "_pv", "_pc")]
            + MICRO_QUARTERLY_COLS):
     if _c not in FUNDAMENTAL_COLS:
         FUNDAMENTAL_COLS.append(_c)
@@ -91,35 +129,93 @@ def add_micro_sensors_quarterly(W: pd.DataFrame) -> pd.DataFrame:
             LOG.ok(f"연 1회 공시 기업 구제 — 사업보고서 누적치로 TTM 최대 {n_fix:,}행을 "
                    f"복원했습니다(반기·연간만 제출하는 소형주가 증거층에서 사라지지 않도록).")
 
-    g = d.groupby("corp_code", observed=True)
+    # ── lag4 달력 연속성 게이트 ★필수 ────────────────────────────────────────────────────
+    #   shift(4) 는 '행 4개 전'이지 '1년 전'이 아니다. 분기보고서를 거르는 기업(U-MICRO 에
+    #   흔하다)에서는 행 4개 전이 2년·4년 전이 된다. 연 1회 공시 기업이면 정확히 4년 전이다.
+    #     · 연 10% 성장 기업의 i_sales 가 0.095 대신 0.378 로 찍힌다(4배 과대).
+    #     · 성장률이 클수록 과대되므로, 그 기업들이 셀 랭크 최상위를 독식한다.
+    #     · 즉 증거층이 "얼마나 자주 공시하지 않는가"를 측정하게 된다. 에러도 로그도 없이.
+    #   → 4행 전의 분기 인덱스가 정확히 4분기 전일 때만 lag4 를 인정한다.
+    if "q" in d.columns:
+        _qidx = (pd.to_numeric(d["bsns_year"], errors="coerce") * 4
+                 + pd.to_numeric(d["q"], errors="coerce"))
+        _lag_ok = (_qidx - _qidx.groupby(d["corp_code"], observed=True).shift(4)) == 4
+    else:
+        _lag_ok = pd.Series(False, index=d.index)
+    _n_lag_bad = int((~_lag_ok).sum())
 
     def lag4(name: str) -> pd.Series:
-        return g[name].shift(4) if name in d.columns else pd.Series(np.nan, index=d.index)
+        """정확히 1년 전(4분기 전) 값. 달력상 4분기 전이 아니면 결측이다.
 
-    rev = col(d, "revenue_ttm")
-    cogs = col(d, "cogs_ttm")
-    inv = col(d, "inventory")
-    rec = col(d, "receivable")
-    ni = col(d, "net_income_ttm")
-    cfo = col(d, "cfo_ttm")
-    ast = col(d, "assets")
+        ★groupby 객체를 캐시하지 않는다 — 컬럼을 추가한 뒤 같은 groupby 를 재사용하는 것은
+        문서화되지 않은 동작에 기대는 것이다."""
+        if name not in d.columns:
+            return pd.Series(np.nan, index=d.index)
+        return d.groupby("corp_code", observed=True)[name].shift(4).where(_lag_ok)
+
+    # ── 재료 ────────────────────────────────────────────────────────────────────────────
+    #   _cm = 당기 누적 · _pv = 전기(말) · _pc = 전기 누적.  전부 '한 행'에 들어 있으므로
+    #   YoY 를 만들려고 분기 체인을 타지 않는다. 이게 이번 개편의 핵심이다.
+    rev_c, rev_p = col(d, "revenue_cm"), col(d, "revenue_pc")
+    cogs_c, cogs_p = col(d, "cogs_cm"), col(d, "cogs_pc")
+    inv_c, inv_p = col(d, "inventory"), col(d, "inventory_pv")
+    rec_c, rec_p = col(d, "receivable"), col(d, "receivable_pv")
+    ni_c, ni_p = col(d, "net_income_cm"), col(d, "net_income_pc")
+    cfo_c, cfo_p = col(d, "cfo_cm"), col(d, "cfo_pc")
+    ast_c, ast_p = col(d, "assets"), col(d, "assets_pv")
+    ca_c, ca_p = col(d, "current_assets"), col(d, "current_assets_pv")
+    cl_c, cl_p = col(d, "current_liab"), col(d, "current_liab_pv")
     opi = col(d, "op_income_ttm")
     inte = col(d, "interest_expense_ttm")
     eq = col(d, "equity")
     cap = col(d, "capital_stock")
+    rev_t = col(d, "revenue_ttm")
 
-    # ── §8 원시 센서 (정규화 금지 — 셀 정규화는 L2 에서 한 번만) ─────────────────────────
-    d["i_sales"] = np.log(rev.where(rev > 0)) - np.log(lag4("revenue_ttm").where(lambda s: s > 0))
-    # 재고회전일수 · 매출채권회전일수. 분모가 0/음수면 무한대가 되므로 결측 처리한다.
-    d["i_dio"] = safe_div(inv, cogs.where(cogs > 0)) * 365.0
-    d["i_dso"] = safe_div(rec, rev.where(rev > 0)) * 365.0
-    d["_cyc"] = d["i_dio"] + d["i_dso"]
-    d["i_turn"] = -(d["_cyc"] - g["_cyc"].shift(4))
+    # ── §8-1  i_sales : 매출 성장 (높을수록 좋다) ────────────────────────────────────────
+    s_row = np.log(rev_c.where(rev_c > 0)) - np.log(rev_p.where(rev_p > 0))
+    s_chain = (np.log(rev_t.where(rev_t > 0))
+               - np.log(lag4("revenue_ttm").where(lambda s: s > 0)))
+    # ★ 두 정의 모두 '로그 매출증가율'로 척도가 같다 → 보완결합이 허용되는 유일한 센서.
+    d["i_sales"] = _pick_sensor("i_sales", [("전기누적 대비(단일행)", s_row),
+                                            ("TTM lag4(분기체인)", s_chain)], combinable=True)
 
-    # Sloan 발생액. 순이익이 음수인 구간에서도 안전하다(비율이 아니라 자산 대비 수준).
-    avg_ast = (ast + lag4("assets")) / 2.0
-    d["_accr"] = safe_div(ni - cfo, avg_ast.where(avg_ast > 0))
-    d["i_accr"] = -(d["_accr"] - g["_accr"].shift(4))
+    # ── §8-2  i_turn : 회전이 악화되지 않았는가 (높을수록 좋다) ──────────────────────────
+    #   회전일수(재고·매출채권)가 §8 의 원안이지만 그 계정은 '전체 재무제표'에만 있다.
+    #   주요계정만으로도 답할 수 있는 같은 질문 = 자산회전율(매출/자산)의 전년 대비 변화.
+    dio_c = safe_div(inv_c, cogs_c.where(cogs_c > 0)) * 365.0
+    dio_p = safe_div(inv_p, cogs_p.where(cogs_p > 0)) * 365.0
+    dso_c = safe_div(rec_c, rev_c.where(rev_c > 0)) * 365.0
+    dso_p = safe_div(rec_p, rev_p.where(rev_p > 0)) * 365.0
+    d["i_dio"], d["i_dso"] = dio_c, dso_c
+    d["_cyc"] = dio_c + dso_c
+    t_cycle = -((dio_c + dso_c) - (dio_p + dso_p))          # 회전일수 단축 = 개선
+    at_c = safe_div(rev_c, ast_c.where(ast_c > 0))
+    at_p = safe_div(rev_p, ast_p.where(ast_p > 0))
+    d["asset_turn"] = at_c.astype("float32")
+    t_asset = at_c - at_p                                    # 자산회전율 상승 = 개선
+    t_chain = -(d["_cyc"] - lag4("_cyc"))
+    d["i_turn"] = _pick_sensor("i_turn", [("재고+매출채권 회전일수 개선(전기비교)", t_cycle),
+                                          ("자산회전율 개선(전기비교)", t_asset),
+                                          ("회전일수 lag4(분기체인)", t_chain)])
+
+    # ── §8-3  i_accr : 이익의 질 (높을수록 좋다 = 발생액이 낮다) ─────────────────────────
+    #   ① 현금흐름표법 (Sloan 1996 이후 표준) — 영업CF 필요
+    #   ② 대차대조표법 (Sloan 1996 원안) — 유동자산·유동부채만으로 성립. 주요계정으로 가능.
+    #      ※ 현금 증감이 유동자산에 섞이므로 현금을 쌓는 기업이 다소 불리하게 잡힌다.
+    #        이 한계는 채택 시 로그에 명시한다. 셀 내 랭크라 체계적 방향편향은 제한적이다.
+    avg_ast = (ast_c + ast_p) / 2.0
+    accr_cf = safe_div(ni_c - cfo_c, avg_ast.where(avg_ast > 0))
+    d["accr_level"] = accr_cf.astype("float32")
+    a_cf = -accr_cf
+    dwc = (ca_c - ca_p) - (cl_c - cl_p)
+    a_bs = -safe_div(dwc, ast_p.where(ast_p > 0))
+    ni_t, cfo_t = col(d, "net_income_ttm"), col(d, "cfo_ttm")
+    avg_t = (ast_c + lag4("assets")) / 2.0
+    d["_accr"] = safe_div(ni_t - cfo_t, avg_t.where(avg_t > 0))
+    a_chain = -(d["_accr"] - lag4("_accr"))
+    d["i_accr"] = _pick_sensor("i_accr", [("발생액 수준 (순이익−영업CF)/평균자산", a_cf),
+                                          ("운전자본 발생액 (Δ유동자산−Δ유동부채)/전기자산", a_bs),
+                                          ("발생액 변화 lag4(분기체인)", a_chain)])
 
     # ── 방화벽 입력 ────────────────────────────────────────────────────────────────────
     #   영업CF 음수 연속 분기수. NaN 은 '음수 아님'으로 보아 연속을 끊는다(근거 없는 배제 금지).
@@ -137,8 +233,9 @@ def add_micro_sensors_quarterly(W: pd.DataFrame) -> pd.DataFrame:
 
     # ── 거부권 입력 ────────────────────────────────────────────────────────────────────
     #   V1 밀어내기: Δ매출>0 인데 Δ(재고+매출채권) 이 Δ매출의 1.5배를 넘는다
-    d_rev = rev - lag4("revenue_ttm")
-    d_wc = (inv - lag4("inventory")) + (rec - lag4("receivable"))
+    #   ★ 전기 비교치로 단일 행에서 계산한다(분기 체인 불필요).
+    d_rev = rev_c - rev_p
+    d_wc = (inv_c - inv_p) + (rec_c - rec_p)
     ratio = safe_div(d_wc, d_rev.where(d_rev > 0))
     d["v1_pushout"] = ((d_rev > 0) & (ratio > V1_PUSH_RATIO)).astype("float32")
     d.loc[d_rev.isna() | d_wc.isna(), "v1_pushout"] = np.nan
@@ -148,9 +245,25 @@ def add_micro_sensors_quarterly(W: pd.DataFrame) -> pd.DataFrame:
         d["v2_bad_3q"] = np.nan
 
     d = d.drop(columns=[c for c in ("_cyc", "_accr") if c in d.columns])
+    for _c2 in MICRO_QUARTERLY_COLS:                       # 스키마 계약
+        if _c2 not in d.columns:
+            d[_c2] = np.nan
+    if SENSOR_DEFS_USED:
+        LOG.table(SENSOR_DEFS_USED,
+                  ["센서", "채택한 정의", "선택", "결측률", "후보별 결측률(분기행 기준)"],
+                  ["l", "l", "c", "r", "l"], maxw=52,
+                  title="센서 정의 선택 (§8) — 같은 질문에 답하는 가장 값싼 정의를 고른다")
+        LOG.info("정의가 다르면 척도도 다르므로 셀 안에서 섞지 않습니다(i_sales 만 예외 — "
+                 "두 정의 모두 '로그 매출증가율'로 척도가 같습니다). "
+                 "여기서 채택된 정의가 곧 아래 센서 가용성표(C14-c)의 판정 대상입니다.")
+    if _n_lag_bad:
+        LOG.info(f"lag4 달력 게이트 — {_n_lag_bad:,}행({100*_n_lag_bad/max(len(d),1):.0f}%)은 "
+                 f"4행 전이 '정확히 4분기 전'이 아니어서 분기체인 정의를 쓸 수 없습니다. "
+                 f"분기보고서를 거르는 기업이며, 전기 비교치 기반 정의는 이 제약을 받지 "
+                 f"않습니다(그래서 그쪽을 1순위로 둡니다).")
     n_ok = int(d["i_sales"].notna().sum())
     LOG.ok(f"L1 센서 계산 {len(d):,}분기행 · i_sales 유효 {n_ok:,}행 "
-           f"({100*n_ok/max(len(d),1):.0f}%) — 분기 프레임에서 lag4 로 산출")
+           f"({100*n_ok/max(len(d),1):.0f}%) — 전기 비교치 기반(분기 체인 의존 제거)")
     PIPE.io("OUT", "MEM", "micro_sensors_quarterly", d)
     return d
 
@@ -266,7 +379,19 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
     cand_fine = ym + "|" + p["ind_major"]
     cand_coarse = ym + "|" + p["ind_l1"]
 
-    med_fine = float(cand_fine.groupby(cand_fine).transform("size").median()) if len(p) else 0.0
+    # ★ 셀 크기는 '쓰이는 모집단'에서 재야 한다.
+    #   셀 규칙은 전체 격자(3,500종목×120개월)에서 정하는데, 실제 랭크는 U-MICRO 부분집합
+    #   (유동성 게이트까지 통과한 40% 남짓)에서 계산된다. 전체에서 25종목이던 셀이 쓰일 때는
+    #   5종목이 되어 xsec_rank 가 NaN 을 내고 폴백 사다리가 조용히 'ALL'까지 내려간다.
+    #   → 로그는 '업종 셀 사용'이라고 말하는데 실제로는 업종 중립화가 사라진 상태가 된다.
+    _gate = (p["u_micro"].astype(bool) if "u_micro" in p.columns
+             else pd.Series(True, index=p.index))
+
+    def _med(cand: pd.Series) -> float:
+        s = cand[_gate]
+        return float(s.groupby(s, observed=True).transform("size").median()) if len(s) else 0.0
+
+    med_fine = _med(cand_fine)
     _crule = str(globals().get("CELL_RULE", "auto")).lower()
     if _crule == "fine":
         p["cell"], p["cell_l2"] = cand_fine, cand_coarse
@@ -275,7 +400,7 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
         p["cell"], p["cell_l2"] = cand_coarse, ym + "|ALL"
         LOG.info("셀 규칙: 상위 업종 고정(CELL_RULE='coarse') — 사전 지정.")
     elif med_fine < min_n:
-        med_coarse = float(cand_coarse.groupby(cand_coarse).transform("size").median()) if len(p) else 0.0
+        med_coarse = _med(cand_coarse)
         LOG.warn(f"C14-b 발동 — 셀당 중앙값 종목수 {med_fine:.0f} < {min_n}. "
                  f"산업분류를 한 단계 상위로 올립니다(상위 기준 중앙값 {med_coarse:.0f}).")
         p["cell"] = cand_coarse
@@ -288,12 +413,15 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
                   "CELL_RULE 로 고정할 수 있습니다.")
     p["cell_l3"] = ym + "|ALL"
 
-    cnt = p.groupby("cell", observed=True)["code"].transform("size")
+    # 셀 크기 판정도 U-MICRO 모집단 기준으로 한다(위 _med 와 같은 이유).
+    _sz = p.loc[_gate].groupby("cell", observed=True)["code"].size()
+    cnt = p["cell"].map(_sz).fillna(0)
     small = cnt < min_n
     n_small = int(small.sum())
     if n_small:
         p.loc[small, "cell"] = p.loc[small, "cell_l2"]
-        cnt2 = p.groupby("cell", observed=True)["code"].transform("size")
+        _sz2 = p.loc[_gate].groupby("cell", observed=True)["code"].size()
+        cnt2 = p["cell"].map(_sz2).fillna(0)
         still = cnt2 < min_n
         if still.any():
             p.loc[still, "cell"] = p.loc[still, "cell_l3"]
@@ -302,8 +430,10 @@ def build_cells_micro(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = 20) -> pd
         PIPE.note(f"셀 폴백 {n_small:,}행")
     for c in ("cell", "cell_l2", "cell_l3"):
         p[c] = p[c].astype("category")
-    LOG.debug(f"셀 구성: 1단계 {p['cell'].nunique():,}개 · 중앙값 "
-              f"{float(p.groupby('cell', observed=True)['code'].transform('size').median()):.0f}종목")
+    _fin_sz = p.loc[_gate].groupby("cell", observed=True)["code"].size()
+    LOG.debug(f"셀 구성: {p['cell'].nunique():,}개 · U-MICRO 기준 셀당 중앙값 "
+              f"{float(_fin_sz.median()) if len(_fin_sz) else 0:.0f}종목 "
+              f"(랭크가 실제로 계산되는 모집단 기준)")
     return p
 
 

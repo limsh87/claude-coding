@@ -143,11 +143,26 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
             d1 = sub.at[c, "d1_trailing"] if "d1_trailing" in sub.columns else np.nan
             if pd.notna(d1) and float(d1) >= 0.0:
                 continue
-            if float(band.get(c, 0.0)) < (1.0 - 2 * PORTFOLIO_TOP_PCT):
-                continue                                       # 신호 밴드 이탈
+            # ★ 위 FW/VETO 와 같은 이유로 여기서도 결측은 '청산'이다.
+            #   `float(nan) < 0.90` 은 False 라, 신호가 사라진 종목이 청산 분기를 그대로
+            #   통과해 최대 24개월 동안 보유된다 — 살 수는 없는데 팔지도 못하는 포지션이다.
+            _b = pd.to_numeric(pd.Series([band.get(c, np.nan)]), errors="coerce").iloc[0]
+            if not (pd.notna(_b) and float(_b) >= (1.0 - 2 * PORTFOLIO_TOP_PCT)):
+                continue                                       # 신호 밴드 이탈/결측 → 청산
+
             keep.append(c)
 
-        chosen = list(dict.fromkeys(keep + tgt_codes))[:PORTFOLIO_MAX_NAMES]
+        # ★ 보유분(keep)을 신규 목표(tgt)보다 무조건 앞세우면 안 된다.
+        #   PORTFOLIO_MAX_NAMES=25 이고 유니버스가 500종목만 넘어도 목표 종목수가 25가 되어,
+        #   keep 이 25개를 채우는 순간 tgt 가 통째로 잘려 나간다. 전략이 조용히
+        #   "한 번 사서 24개월 보유"로 퇴화하고, 그게 A/B/C/D 스프레드를 압착한다.
+        #   → 보유·신규를 합쳐 신호 순으로 상위 N 개를 고른다(보유는 위 게이트를 이미 통과했다).
+        cand = list(dict.fromkeys(keep + tgt_codes))
+        if len(cand) > PORTFOLIO_MAX_NAMES:
+            _sc = (pd.to_numeric(sub.reindex(cand)["Signal"], errors="coerce")
+                     .fillna(-np.inf).sort_values(ascending=False))
+            cand = list(_sc.index[:PORTFOLIO_MAX_NAMES])
+        chosen = cand
         if not chosen:
             # 조건을 만족하는 종목이 없으면 현금. 억지로 채우지 않는다.
             if prev_w:
@@ -185,7 +200,11 @@ def run_backtest_micro(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe
             #   정지 시점부터 가격 행이 끊겨 fwd_ret 이 NaN 이 되는데, 폐지일은 몇 달 뒤라
             #   창 조건이 거짓이 되고, fillna(0.0) 이 그 달을 0% 로 기록한다.
             #   = 전액을 잃은 포지션이 '본전'으로 계상된다(생존자편향 재유입, C2 위반).
-            if has_dd and (dd <= nxt or pd.isna(fr.get(c, np.nan))):
+            # ★ 결측이라는 이유만으로 -100% 를 찍으면 안 된다. 가격 소스가 한 달 비었을 뿐인
+            #   2018년의 종목이, 2025년에 폐지 예정이라는 이유로 2018년에 전액손실 처리된다.
+            #   → 폐지일이 지났거나, 결측이면서 **다음 달 패널에서도 사라졌을 때**만 확정한다.
+            if has_dd and (dd <= nxt or (pd.isna(fr.get(c, np.nan))
+                                         and (nxt_codes is None or c not in nxt_codes))):
                 fr.at[c] = -1.0
                 n_forced += 1
                 continue
@@ -337,6 +356,24 @@ def benchmark_universe_ew(P: pd.DataFrame, months: pd.DatetimeIndex,
                 sub.loc[kill, "fwd_ret"] = -1.0
                 LOG.debug(f"벤치마크(동일가중)에서 상장폐지 {n_kill:,}종목월을 -100% 로 확정했습니다 "
                           f"(전략과 동일한 처리 — 생존자 벤치마크 방지).")
+    # ★ 전략은 '폐지목록에 없는데 다음 달 사라진' 종목도 -100% 로 확정한다(FDR 폐지목록의
+    #   공백을 메우는 규칙). 벤치마크가 그 규칙을 안 쓰면 벤치마크만 그 손실을 면제받아
+    #   '부분 생존자 벤치마크'가 된다 — R0a·R2-M① 이 그 격차만큼 전략에 불리해진다.
+    #   여기서 같은 규칙을 적용해 비교 기준을 대칭으로 맞춘다.
+    if len(sub):
+        _ms = sorted(pd.unique(sub["month"]))
+        _pos = {m: i for i, m in enumerate(_ms)}
+        _inv = {i: m for m, i in _pos.items()}
+        _have = set(zip(sub["code"].astype(str), sub["month"]))
+        _nm = sub["month"].map(_pos).add(1).map(_inv)
+        _gone = pd.Series([(c, m) not in _have for c, m in zip(sub["code"].astype(str), _nm)],
+                          index=sub.index)
+        kill2 = sub["fwd_ret"].isna() & _nm.notna() & _gone
+        n2 = int(kill2.sum())
+        if n2:
+            sub.loc[kill2, "fwd_ret"] = -1.0
+            LOG.debug(f"벤치마크에서 '폐지일 미상이나 다음 달 소멸' {n2:,}종목월도 -100% 로 "
+                      f"확정했습니다 (전략과 동일 규칙).")
     sub = sub[sub["fwd_ret"].notna()]
     if len(sub) == 0:
         return {"label": "유니버스 동일가중", "returns": pd.DataFrame(), "stats": perf_stats(None)}

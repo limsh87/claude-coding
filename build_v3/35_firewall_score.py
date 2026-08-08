@@ -29,7 +29,19 @@ def cell_rank_micro(P: pd.DataFrame, name_or_series, min_n: int = MICRO_MIN_CELL
     return xsec_rank_pct_l(P, name_or_series, min_n=min_n)
 
 
-def tp_micro(P: pd.DataFrame, a: str, b: str) -> pd.Series:
+def _cached_cell_rank(P: pd.DataFrame, name: str, cache: dict) -> pd.Series:
+    """같은 컬럼의 셀 랭크를 한 번만 계산한다.
+
+    i_sales 는 TP_I2·TP_I4 두 쌍의 공통 축이라 매번 두 번 계산됐고, value_rank 는
+    조항 마스크와 s1_firewall 에서 최대 15회까지 중복 계산됐다. 랭크 1회는 셀 사다리
+    3단계 × groupby-rank 이므로 중복이 그대로 벽시계 시간이 된다.
+    """
+    if name not in cache:
+        cache[name] = cell_rank_micro(P, name)
+    return cache[name]
+
+
+def tp_micro(P: pd.DataFrame, a: str, b: str, _cache: Optional[dict] = None) -> pd.Series:
     """트레이드오프 쌍 = clip(랭크z, 0) × clip(랭크z, 0).
 
     랭크 백분위에서 0.5 를 빼 [-0.5, +0.5] 의 z 대용을 만들고, 음수는 0 으로 자른다.
@@ -37,8 +49,9 @@ def tp_micro(P: pd.DataFrame, a: str, b: str) -> pd.Series:
     ★ za*zb (부호 그대로 곱하기) 금지 — 저-저 사분면이 최고점을 받는다.
     한쪽이 결측이면 결과도 결측이다(0 으로 채우면 '대가를 안 치렀다'는 거짓 주장이 된다).
     """
-    ra = cell_rank_micro(P, a)
-    rb = cell_rank_micro(P, b)
+    _cache = {} if _cache is None else _cache
+    ra = _cached_cell_rank(P, a, _cache)
+    rb = _cached_cell_rank(P, b, _cache)
     za = ra - 0.5
     zb = rb - 0.5
     out = np.maximum(za, 0.0) * np.maximum(zb, 0.0)
@@ -86,11 +99,19 @@ def sensor_availability(P: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
     T = pd.DataFrame(rows, columns=["센서", "결측률", "임계", "판정"])
     LOG.table(T.values.tolist(), list(T.columns), ["l", "r", "r", "c"],
               title="센서 가용성 (C14-c/d) — 결측을 0 으로 채우지 않고 축을 통째로 뺀다")
+    LOG.info("※ i_sales 는 TP_I2·TP_I4 두 쌍의 공통 축입니다. i_sales 가 제외되면 활성 TP 는 "
+             "구조적으로 0개가 되어 반드시 중단됩니다(§8 의 TP 정의가 그렇게 생겼습니다). "
+             "위 '센서 정의 선택' 표에서 어떤 정의가 채택됐는지 함께 보십시오.")
     if len(active_tp) < 2:
-        raise KillCriteria(
-            f"활성 TP 가 {len(active_tp)}개로 2개 미만입니다(C14-d). 증거층을 구성할 수 없습니다. "
-            f"임계를 낮춰 통과시키지 마십시오 — 결측률이 높다는 것은 U-MICRO 구간에서 해당 "
-            f"재무항목이 실제로 공시되지 않는다는 뜻이고, 0 으로 채우면 없는 근거를 만들어냅니다.")
+        _msg = (f"활성 TP 가 {len(active_tp)}개로 2개 미만입니다(C14-d). 증거층을 구성할 수 없습니다. "
+                f"임계를 낮춰 통과시키지 마십시오 — 결측률이 높다는 것은 U-MICRO 구간에서 해당 "
+                f"재무항목이 실제로 공시되지 않는다는 뜻이고, 0 으로 채우면 없는 근거를 만듭니다.")
+        # ★ 합성 스모크에서는 죽이지 않는다(형식 확인이 목적). 실데이터에서만 발동한다.
+        if STOP_ON_KILL_CRITERIA and bool(globals().get("_KILL_ARMED", True)):
+            raise KillCriteria(_msg)
+        LOG.warn("[킬 비무장] " + _msg + " — 예행연습이므로 전 TP 를 형식상 활성으로 두고 "
+                 "출력 경로만 확인합니다.")
+        return [t[0] for t in TP_DEFS], T
     return [t[0] for t in active_tp], T
 
 
@@ -98,11 +119,12 @@ def build_evidence(P: pd.DataFrame, active_tp: Sequence[str]) -> pd.DataFrame:
     """TP 조립 → 증거층 E. §9."""
     P = P.copy()
     made = []
+    _rc: dict = {}                      # i_sales 는 두 TP 의 공통 축 — 한 번만 랭크한다
     for tid, a, b in TP_DEFS:
         if tid not in active_tp:
             P[tid] = np.nan
             continue
-        P[tid] = tp_micro(P, a, b)
+        P[tid] = tp_micro(P, a, b, _cache=_rc)
         made.append(tid)
     P["E_micro"] = nanmean_cols(P, made) if made else np.nan
 
@@ -153,7 +175,27 @@ def firewall_clause_masks(P: pd.DataFrame, active: Dict[str, bool]
     th = col(P, "is_trading_halted")
     streak, icov = col(P, "op_cf_neg_streak"), col(P, "interest_coverage")
     adv = col(P, "adv20")
-    vr = value_rank_micro(P)
+    # ★ 이 함수는 R5-M 절제분석에서 조항 수만큼(최대 15회) 다시 불린다. 매번 E/P·B/P 의
+    #   셀 사다리 랭크를 새로 돌면 U-MICRO 패널 전체를 수십 번 훑게 된다 → 패널에 캐시한다.
+    if "_value_rank" in P.columns:
+        vr = pd.to_numeric(P["_value_rank"], errors="coerce")
+    else:
+        vr = value_rank_micro(P)
+        try:
+            P["_value_rank"] = vr        # 호출자 프레임에 남겨 재계산을 막는다
+        except Exception:
+            pass
+    # ★ 딥밸류 조항은 '밸류 판정 불가(vr 결측)'도 배제한다 — 정책으로는 방어적이지만,
+    #   vr 결측의 대부분은 **시총 미상**이고 시총 미상의 대부분은 상장폐지 종목이다.
+    #   그러면 방화벽을 켠 구성(A·C·D)만 폐지 종목을 구조적으로 못 사고, 끈 구성(B)과
+    #   동일가중 벤치마크만 -100% 를 먹는다 → R2-M ①('방화벽이 알파인가 손실회피인가')이
+    #   전략이 아니라 **데이터 커버리지 격차**를 측정하게 된다. 그래서 비율을 표에 남긴다.
+    _vr_na = float(vr.isna().mean()) if len(vr) else 0.0
+    if _vr_na > 0.05:
+        LOG.warn(f"밸류 판정 불가(시총·재무 결측) {100*_vr_na:.1f}% — 딥밸류 조항이 이 행들을 "
+                 f"배제합니다. 이 비율이 크면 A/C/D 만 상장폐지 종목을 피하게 되어 "
+                 f"R2-M ① 판정이 전략이 아니라 커버리지 격차를 측정합니다. "
+                 f"KRX_OPENAPI_KEY 를 넣어 시총 커버리지를 올리면 사라지는 문제입니다.")
 
     C: "OrderedDict[str, Tuple[str, Optional[pd.Series], bool, str]]" = OrderedDict()
     C["capital"] = ("자본잠식 (자본총계<자본금 또는 ≤0)", ci > 0, bool(ci.notna().any()),
@@ -314,8 +356,14 @@ def assemble_signal(P: pd.DataFrame, variant: str = "D") -> pd.DataFrame:
     # E/U 를 쓰지 않는 구성(A)에서는 전 종목이 동점이 된다 → 유동성 순으로 안정적 타이브레이크.
     if not cfg["E"] and not cfg["U"]:
         tie = P.groupby("month", observed=True)["adv20"].rank(pct=True).fillna(0.0)
-        sig = sig * (1.0 + 1e-6 * tie)
-    P["Signal"] = sig.astype("float32")
+        # ★ 1e-6 을 곱해 [1.0, 1.000001] 로 밀어 넣으면 안 된다.
+        #   float32 의 1.0 근방 간격은 1.19e-7 이라 1,000개의 서로 다른 타이값이
+        #   9개 값으로 뭉개진다. 그러면 nlargest 가 한 뭉치에서 '종목코드 오름차순'으로
+        #   25개를 집는다 — A 구성이 사실상 '번호가 작은 종목 25개'가 된다.
+        #   A 는 R0b·R2-M 의 비교 기준이므로 판정 전체가 오염된다.
+        #   → 배수를 [1,2] 로 벌리고 float64 로 유지한다. 순서는 동일하되 뭉개지지 않는다.
+        sig = sig * (1.0 + tie)
+    P["Signal"] = pd.to_numeric(sig, errors="coerce").astype("float64")
     P["Signal_rank"] = P.groupby("month", observed=True)["Signal"].rank(pct=True)
 
     # ★ 구성에서 뺀 층은 컬럼 자체를 중립화한다.

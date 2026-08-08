@@ -27,6 +27,139 @@ MCAP_SNAP_COLS = ["snap_date", "code", "shares", "mcap", "src"]
 # KRX 마켓플레이스 '전종목 시세' bld — 시가총액·상장주식수를 한 번에 준다.
 KRX_BLD_ALLPRICE = "dbms/MDC/STAT/standard/MDCSTAT01501"
 
+# ── ★ KRX Open API (data-dbg.krx.co.kr) — 이 모듈의 1순위 ───────────────────────────────────
+#   · data.krx.co.kr(마켓플레이스)와 **호스트가 다르다**. 마켓플레이스가 차단돼 있어도 별개다.
+#   · 요청 1건 = 그 날짜의 전 종목. 120개월 × 2시장 = 240회면 10년 PIT 시총 패널이 끝난다.
+#     (종목별 루프였다면 3,000종목 × 120개월 = 36만 회다 — 비교가 안 된다)
+#   · 2010-01-04 부터 제공되므로 2016-08 시작 구간을 전부 덮는다.
+#   · 인증: HTTP 헤더 AUTH_KEY. 무료 가입 후 발급.
+KRX_OPENAPI_BASE = "https://data-dbg.krx.co.kr/svc/apis/sto/"
+KRX_OPENAPI_EPS = [("stk_bydd_trd", "KOSPI"), ("ksq_bydd_trd", "KOSDAQ"),
+                   ("knx_bydd_trd", "KONEX")]
+
+# ── 공공데이터포털 금융위원회 주식시세정보 — KRX Open API 가 없을 때의 동급 대체 ────────────
+#   basDt 하루치 전 종목을 mrktTotAmt(시가총액)·lstgStCnt(상장주식수)와 함께 준다.
+DATAGO_STOCK_URL = ("https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/"
+                    "getStockPriceInfo")
+
+# ── FinanceDataReader 정적 캐시 (GitHub raw) ────────────────────────────────────────────────
+#   ★ fdr.StockListing('KRX') 는 내부적으로 data.krx.co.kr 에 '최신 영업일'을 물어본 뒤
+#     GitHub 캐시 CSV 를 읽는다. 그 첫 호출이 차단되면 json.loads 가 깨지고 bare except 가
+#     삼켜 ValueError("Failed to load data from ...") 로 둔갑한다 — 실측된 실패 원인이다.
+#     날짜 문자열 하나 때문에 전체가 죽는 구조이므로, 날짜를 우리가 정해 CSV 를 직접 읽는다.
+FDR_CACHE_RAW = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+                 "refs/heads/master/data/listing/{kind}/{date}.csv")
+
+
+def fdr_cache_csv(kind: str, back_days: int = 12) -> Optional[pd.DataFrame]:
+    """FDR 정적 캐시 CSV 를 KRX 를 거치지 않고 직접 읽는다. kind: krx | delisting | desc."""
+    today = pd.Timestamp.today().normalize()
+    for i in range(back_days):
+        d = (today - pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        url = FDR_CACHE_RAW.format(kind=kind, date=d)
+        try:
+            txt = http_get(url, source="generic", tries=1, timeout=40)
+            if not txt or len(txt) < 512 or "," not in txt[:400]:
+                continue
+            df = pd.read_csv(io.StringIO(txt), dtype=str)
+            if len(df) > 50:
+                LOG.debug(f"FDR 정적 캐시 {kind} — {d} 기준 {len(df):,}행 (KRX 미경유)")
+                return df
+        except Exception:
+            continue
+    return None
+
+
+def _krx_openapi_day(day: pd.Timestamp) -> List[dict]:
+    """하루치 전 종목 시세(시총·상장주식수). 휴장일이면 최대 5일 뒤로 물러선다."""
+    if not KRX_OPENAPI_KEY:
+        return []
+    hdr = {"AUTH_KEY": KRX_OPENAPI_KEY}
+    for back in range(6):
+        bd = (day - pd.Timedelta(days=back)).strftime("%Y%m%d")
+        rows, got = [], 0
+        for ep, mkt in KRX_OPENAPI_EPS:
+            js = http_json(KRX_OPENAPI_BASE + ep, source="krxapi", headers=hdr,
+                           params={"basDd": bd}, tries=2, timeout=45,
+                           referer="https://openapi.krx.co.kr/")
+            blk = (js or {}).get("OutBlock_1") or []
+            if not blk:
+                continue
+            got += 1
+            for r in blk:
+                c = to_code6(r.get("ISU_SRT_CD") or r.get("ISU_CD"))
+                if not c:
+                    continue
+                rows.append({"snap_date": day.strftime("%Y-%m-%d"), "code": c,
+                             "shares": _num(r.get("LIST_SHRS")),
+                             "mcap": _num(r.get("MKTCAP")), "src": "krx_api"})
+        # ★ 코스피·코스닥 두 시장이 모두 와야 인정한다. 한쪽만 저장하면 그 시점의 시총 랭크가
+        #   한 시장만으로 매겨져 U-MICRO(하위권) 판정이 통째로 뒤집힌다.
+        if got >= 2 and rows:
+            return rows
+    return []
+
+
+def _mcap_from_krx_openapi(days: Sequence[pd.Timestamp]) -> List[dict]:
+    if not KRX_OPENAPI_KEY or not days:
+        return []
+    out: List[dict] = []
+    miss = 0
+    for d in tqdm(days, desc="시총 스냅샷(KRX OpenAPI)", ncols=88, leave=False):
+        if DEADLINE is not None and DEADLINE.over():
+            LOG.warn("런타임 예산 초과로 시총 스냅샷 수집을 중단합니다 — 받은 분량은 저장됩니다.")
+            break
+        r = _krx_openapi_day(d)
+        if r:
+            out.extend(r)
+            miss = 0
+        else:
+            miss += 1
+            if miss >= 4:
+                LOG.warn("KRX Open API 가 연속 4회 비었습니다 — 인증키 미승인/한도 소진일 수 "
+                         "있습니다. 다음 소스로 폴백합니다(정상 동작).")
+                break
+    return out
+
+
+def _mcap_from_datagokr(days: Sequence[pd.Timestamp]) -> List[dict]:
+    """공공데이터포털 주식시세정보. 하루치 전 종목을 한 번에(numOfRows 대량) 받는다."""
+    if not DATA_GO_KR_KEY or not days:
+        return []
+    out: List[dict] = []
+    miss = 0
+    for d in tqdm(days, desc="시총 스냅샷(data.go.kr)", ncols=88, leave=False):
+        if DEADLINE is not None and DEADLINE.over():
+            break
+        rows = []
+        for back in range(6):
+            bd = (d - pd.Timedelta(days=back)).strftime("%Y%m%d")
+            js = http_json(DATAGO_STOCK_URL, source="datagokr", tries=2, timeout=45,
+                           params={"serviceKey": DATA_GO_KR_KEY, "numOfRows": 6000,
+                                   "pageNo": 1, "resultType": "json", "basDt": bd})
+            items = (((js or {}).get("response") or {}).get("body") or {}).get("items") or {}
+            lst = items.get("item") if isinstance(items, dict) else None
+            if not lst:
+                continue
+            for r in (lst if isinstance(lst, list) else [lst]):
+                c = to_code6(r.get("srtnCd"))
+                if not c:
+                    continue
+                rows.append({"snap_date": d.strftime("%Y-%m-%d"), "code": c,
+                             "shares": _num(r.get("lstgStCnt")),
+                             "mcap": _num(r.get("mrktTotAmt")), "src": "datagokr"})
+            break
+        if rows:
+            out.extend(rows)
+            miss = 0
+        else:
+            miss += 1
+            if miss >= 4:
+                LOG.warn("공공데이터포털 주식시세정보가 연속 4회 비었습니다 — "
+                         "키 승인 상태 또는 제공 시작일을 확인하세요. 폴백합니다.")
+                break
+    return out
+
 
 def _mcap_from_pykrx(days: Sequence[pd.Timestamp]) -> List[dict]:
     """pykrx 시가총액 스냅샷. 전부 KRXG 게이트를 통과시켜 직렬화한다."""
@@ -161,13 +294,15 @@ def _shares_from_dart(corp_codes: Sequence[str], years: Sequence[int],
 def _shares_from_fdr() -> pd.DataFrame:
     """FDR 상장목록의 현재 상장주식수/시총. ★현재 시점 값이므로 PIT 가 아니다.
     최후수단이며, 쓰였다는 사실을 감사표에 반드시 남긴다."""
-    if fdr is None:
-        return pd.DataFrame(columns=["code", "shares_now", "mcap_now"])
-    try:
-        d = fdr.StockListing("KRX")
-    except Exception as e:                                             # noqa
-        LOG.debug(f"FDR StockListing 실패: {type(e).__name__}")
-        return pd.DataFrame(columns=["code", "shares_now", "mcap_now"])
+    # ① KRX 를 거치지 않는 정적 캐시 먼저. ② 실패 시에만 fdr.StockListing (KRX 를 건드린다)
+    d = fdr_cache_csv("krx")
+    if (d is None or len(d) == 0) and fdr is not None and not krx_blocked():
+        try:
+            d = fdr.StockListing("KRX")
+        except Exception as e:                                         # noqa
+            LOG.debug(f"FDR StockListing 실패: {type(e).__name__} "
+                      f"(내부 KRX 조회 실패가 ValueError 로 둔갑하는 알려진 경로)")
+            d = None
     if d is None or len(d) == 0:
         return pd.DataFrame(columns=["code", "shares_now", "mcap_now"])
     lm = {str(c).lower(): c for c in d.columns}
@@ -205,7 +340,11 @@ def fetch_mcap_snapshots(months: pd.DatetimeIndex, sec: Optional[pd.DataFrame] =
         LOG.ok(f"공용 캐시에서 시총 스냅샷 {len(have)}개 시점 · {len(c):,}행 재사용 "
                f"(다른 전략이 모아둔 것도 그대로 씁니다)")
 
-    grid = _snapshot_grid(months)
+    # ★ 벌크 소스(요청 1건 = 그 날짜 전 종목)가 있으면 격자를 '월'로 올린다.
+    #   월 격자면 스냅샷 시점과 리밸런싱 시점이 정확히 일치해 시총을 가격으로 환산할 필요가
+    #   없어진다(아래 build_mcap_panel 의 액면분할 주의 참조). 240회면 끝나므로 부담도 없다.
+    _bulk = bool(KRX_OPENAPI_KEY) or bool(DATA_GO_KR_KEY)
+    grid = list(months) if _bulk else _snapshot_grid(months)
     todo = [d for d in grid if d.strftime("%Y-%m-%d") not in have]
     if RUN_MODE == "CACHED":
         if todo:
@@ -214,11 +353,31 @@ def fetch_mcap_snapshots(months: pd.DatetimeIndex, sec: Optional[pd.DataFrame] =
 
     new_rows: List[dict] = []
     if todo:
-        KRXG.warmup()
-        new_rows += _mcap_from_pykrx(todo)
+        LOG.info(f"시총 스냅샷 미확보 {len(todo)}개 시점 — 수집 사다리: "
+                 f"KRX OpenAPI{'✔' if KRX_OPENAPI_KEY else '✘(키없음)'} → "
+                 f"공공데이터포털{'✔' if DATA_GO_KR_KEY else '✘(키없음)'} → "
+                 f"pykrx{'✘(차단중)' if krx_blocked() else '✔'} → KRX 마켓플레이스")
+        # ① KRX Open API — 호스트가 달라 마켓플레이스 차단과 무관하다
+        new_rows += _mcap_from_krx_openapi(todo)
         done = {r["snap_date"] for r in new_rows}
         rest = [d for d in todo if d.strftime("%Y-%m-%d") not in done]
+        # ② 공공데이터포털
         if rest:
+            new_rows += _mcap_from_datagokr(rest)
+            done = {r["snap_date"] for r in new_rows}
+            rest = [d for d in todo if d.strftime("%Y-%m-%d") not in done]
+        # ③ pykrx — ★차단 중이면 시도조차 하지 않는다. pykrx 는 내부에서 직접 requests 를
+        #    쓰므로 http_get 의 차단 가드를 우회한다. 여기서 막지 않으면 차단이 연장된다.
+        if rest and not krx_blocked():
+            KRXG.warmup()
+            new_rows += _mcap_from_pykrx(rest)
+            done = {r["snap_date"] for r in new_rows}
+            rest = [d for d in todo if d.strftime("%Y-%m-%d") not in done]
+        elif rest:
+            LOG.warn(f"KRX 차단 표식이 살아 있어 pykrx 시총 스냅샷을 건너뜁니다 "
+                     f"(미확보 {len(rest)}개 시점). 차단 연장을 막기 위한 의도된 동작입니다.")
+        # ④ KRX 마켓플레이스 (로그인 세션)
+        if rest and not krx_blocked():
             new_rows += _mcap_from_krx_marketplace(rest)
 
     if new_rows:
@@ -284,25 +443,36 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
 
     shares = pd.Series(np.nan, index=base.index, dtype="float64")
     mcap_snap = pd.Series(np.nan, index=base.index, dtype="float64")
+    close_at_snap = pd.Series(np.nan, index=base.index, dtype="float64")
 
     # ① 스냅샷 as-of 결합 (backward = 그 시점에 알 수 있었던 마지막 스냅샷)
+    #    ★ 스냅샷 '시점의 종가'도 함께 끌고 온다. 이유는 아래 시총 산식 주석 참조.
     if snap is not None and len(snap):
         R = snap.copy()
         R["snap_date"] = as_ts_series(R["snap_date"])
         R["code"] = R["code"].astype(str)
         for _c in ("shares", "mcap"):
             R[_c] = pd.to_numeric(R[_c], errors="coerce") if _c in R.columns else np.nan
-        R = R.dropna(subset=["snap_date", "code"]).sort_values("snap_date", kind="stable")
+        R = R.dropna(subset=["snap_date", "code"])
+        R = R.merge(base[["code", "month", "close"]]
+                    .rename(columns={"month": "snap_date", "close": "close_snap"}),
+                    on=["code", "snap_date"], how="left")
+        R = R.sort_values("snap_date", kind="stable")
         L = base.dropna(subset=["month"]).sort_values("month", kind="stable")
         try:
-            M = pd.merge_asof(L, R[["snap_date", "code", "shares", "mcap"]],
+            M = pd.merge_asof(L, R[["snap_date", "code", "shares", "mcap", "close_snap"]],
                               left_on="month", right_on="snap_date", by="code",
                               direction="backward")
             M = M.set_index("_ord")
-            shares = M["shares"].reindex(base["_ord"]).to_numpy()
-            mcap_snap = M["mcap"].reindex(base["_ord"]).to_numpy()
-            shares = pd.Series(shares, index=base.index)
-            mcap_snap = pd.Series(mcap_snap, index=base.index)
+            for _name, _tgt in (("shares", "shares"), ("mcap", "mcap_snap"),
+                                ("close_snap", "close_at_snap")):
+                _v = pd.Series(M[_name].reindex(base["_ord"]).to_numpy(), index=base.index)
+                if _tgt == "shares":
+                    shares = _v
+                elif _tgt == "mcap_snap":
+                    mcap_snap = _v
+                else:
+                    close_at_snap = _v
             src_used["스냅샷(PIT)"] = int(pd.notna(shares).sum())
         except Exception as e:                                         # noqa
             LOG.warn(f"시총 스냅샷 as-of 결합 실패({type(e).__name__}) — 폴백으로 진행합니다.")
@@ -356,18 +526,36 @@ def build_mcap_panel(price_m: pd.DataFrame, snap: pd.DataFrame, sec: pd.DataFram
                          f"엄밀한 재현이 필요하면 MCAP_ALLOW_NONPIT_FALLBACK=False 로 두고 "
                          f"시총 미상 행을 거래대금 대리변수로 처리하세요.")
 
-    # ★ 시총 = 상장주식수(as-of) × '그 달의' 종가.  스냅샷의 mcap 을 그대로 쓰지 않는다.
-    #   스냅샷 격자는 분기(3/6/9/12월)이고 merge_asof 는 그 값을 앞으로 끌고 온다.
-    #   스냅샷 mcap 을 우선하면 3개월 중 2개월의 시총·PBR·PER·시총랭크가 직전 분기말에
-    #   얼어붙는다. 2020-03 처럼 한 달에 30% 빠졌다 반등한 구간에서는 4월·5월의 밸류
-    #   지표가 3월말 시총으로 계산되어 딥밸류 판정이 통째로 틀어진다.
-    #   → 느리게 변하는 것(주식수)만 as-of 로 옮기고, 빠르게 변하는 것(가격)은 당월 값을 쓴다.
-    mcap = shares * base["close"]
-    # 주식수를 못 얻었지만 스냅샷 mcap 은 있는 행만 보조적으로 사용한다(그마저 없으면 결측).
-    n_stale = int((mcap.isna() & mcap_snap.notna() & (mcap_snap > 0)).sum())
-    mcap = mcap.where(mcap.notna(), mcap_snap.where(mcap_snap > 0))
-    if n_stale:
-        src_used["스냅샷 시총(직전 분기말·근사)"] = n_stale
+    # ── 시가총액 산식 ────────────────────────────────────────────────────────────────
+    #  ★★ 여기서 '상장주식수 × 종가' 를 쓰면 안 된다 (액면분할 함정) ★★
+    #    FDR·네이버가 주는 종가는 **수정주가**다(FDR 은 KRX 에 adjStkPrc=2 로 요청한다).
+    #    10:1 액면분할이 t 이후에 있었다면
+    #        수정종가_t = 실제종가_t / 10 ,  그리고 as-of 상장주식수_t = 현재주식수 / 10
+    #    이므로 둘을 곱하면 실제 시총의 **1/100** 이 된다. 에러도 경고도 없이,
+    #    액면분할을 한 종목만 시총이 100분의 1로 찍혀 U-MICRO 하위권으로 몰린다.
+    #    (분할은 성장한 기업이 하므로, 하필 이 전략이 찾는 대상을 골라서 오염시킨다)
+    #
+    #  → 벤더가 그날 계산해 준 시가총액(MKTCAP)을 진실로 삼고, 스냅샷 시점과 대상 월의
+    #    **수익률**로만 환산한다. 수익률은 수정 여부에 불변이므로 안전하다.
+    #        시총_t = 시총_스냅샷 × (수정종가_t / 수정종가_스냅샷)
+    #    월 격자 스냅샷(KRX Open API)에서는 스냅샷 시점 = 대상 월이라 비율이 1 —
+    #    즉 벤더 시총이 그대로 쓰인다.
+    ratio = safe_div(base["close"], close_at_snap.where(close_at_snap > 0))
+    mcap = mcap_snap.where(mcap_snap > 0) * ratio
+    n_exact = int((ratio.round(6) == 1.0).sum())
+    n_scaled = int(mcap.notna().sum()) - n_exact
+    if n_exact:
+        src_used["벤더 시총(당월 스냅샷)"] = n_exact
+    if n_scaled > 0:
+        src_used["벤더 시총 × 기간수익률"] = n_scaled
+
+    # 스냅샷 시총이 없을 때만 '상장주식수 × 종가'. 액면분할 위험을 안고 가는 경로이므로
+    # 몇 행이 그렇게 계산됐는지 반드시 표에 남긴다.
+    fallback = shares * base["close"]
+    n_fb = int((mcap.isna() & fallback.notna()).sum())
+    mcap = mcap.where(mcap.notna(), fallback)
+    if n_fb:
+        src_used["상장주식수 × 수정종가(분할위험)"] = n_fb
 
     out = base[["code", "month"]].copy()
     out["shares"] = shares.to_numpy()

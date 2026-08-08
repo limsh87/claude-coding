@@ -490,7 +490,15 @@ def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) 
     """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
     v = pd.to_numeric(values, errors="coerce").astype("float64")
     v = v.replace([np.inf, -np.inf], np.nan)
-    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
+    # ★ astype(object) 로 캐스팅하지 않는다. 셀 컬럼은 일부러 category 로 만들어 두는데
+    #   여기서 파이썬 문자열 20만 개로 되돌려 매 호출마다 해싱한다 — 랭크 호출이 수십 번
+    #   반복되는 경로라 그대로 누적 비용이 된다. category 면 코드 정수로 그룹핑된다.
+    _c = pd.Series(cells)
+    if isinstance(_c.dtype, pd.CategoricalDtype):
+        grp = _c.cat.add_categories(["__NA__"]).fillna("__NA__") if _c.isna().any() else _c
+    else:
+        grp = _c.fillna("__NA__").astype("category")
+    grp = grp.to_numpy() if not isinstance(grp.dtype, pd.CategoricalDtype) else grp.values
     g = v.groupby(grp, observed=True, dropna=False)
     cnt = g.transform("count")
     r = g.rank(pct=True, method="average")

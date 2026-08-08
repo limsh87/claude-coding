@@ -447,8 +447,12 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     체결은 '신호 산출일 다음 거래일 시가'(§10.1). 당일 종가 체결은 미래누수다.
     """
     px = px.sort_values(["code", "date"])
+    # ★ transform(lambda) 는 종목마다 파이썬 호출이 한 번씩 난다. 일별 800만 행 · 3,500종목
+    #   규모에서 그대로 수 분이다. groupby().rolling() 은 C 레벨에서 한 번에 돈다.
     px["adv20"] = (px.groupby("code", observed=True)["amount"]
-                     .transform(lambda s: s.rolling(20, min_periods=10).mean()))
+                     .rolling(20, min_periods=10).mean()
+                     .reset_index(level=0, drop=True)
+                     .reindex(px.index))
     px["ret1d"] = px.groupby("code", observed=True)["close"].pct_change()
 
     # 월말 스냅샷
