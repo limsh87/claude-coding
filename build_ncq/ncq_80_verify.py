@@ -915,6 +915,60 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     ncq_c("N11", "미래누수 하네스 민감도", n11)
 
+    # ── N12. 포트폴리오 회계 정합성 ───────────────────────────────────────────────────────
+    def n12():
+        """returns(월별 수익)와 cohorts(진짜 buy&hold)가 **같은 포트폴리오**를 말하는가.
+
+        ★ 이 검정이 없어서 오래 숨어 있던 버그: 진입 가중치를 고정한 채 매달 dot(w, r) 을
+          더하면 '비용 0짜리 월간 리밸런싱'이 공짜로 섞여(변동성 하베스팅) 누적수익이
+          실현 불가능한 값이 된다. 같은 함수의 두 출력이 어긋나면 둘 다 못 믿는다.
+          손계산으로 답을 아는 두 세계를 만들어 소수점까지 대조한다.
+        """
+        if not ncq_has("run_overlap_backtest"):
+            return None, "run_overlap_backtest 미탑재 — SKIP"
+        ms = month_range("2020-01-01", "2020-05-31")
+
+        # ① 변동성 하베스팅 함정: A[+100%,-50%], B[-50%,+100%] → 진짜 buy&hold 는 정확히 0%
+        pxm1 = pd.DataFrame([
+            {"code": "A", "month": ms[0], "exec_px": 100.0, "adv20": 1e12, "fwd_ret": 1.0},
+            {"code": "A", "month": ms[1], "exec_px": 200.0, "adv20": 1e12, "fwd_ret": -0.5},
+            {"code": "A", "month": ms[2], "exec_px": 100.0, "adv20": 1e12, "fwd_ret": 0.0},
+            {"code": "B", "month": ms[0], "exec_px": 100.0, "adv20": 1e12, "fwd_ret": -0.5},
+            {"code": "B", "month": ms[1], "exec_px": 50.0, "adv20": 1e12, "fwd_ret": 1.0},
+            {"code": "B", "month": ms[2], "exec_px": 100.0, "adv20": 1e12, "fwd_ret": 0.0}])
+        S1 = pd.DataFrame([{"month": ms[0], "code": "A", "selected": True, "z": 1.0},
+                           {"month": ms[0], "code": "B", "selected": True, "z": 0.5}])
+        with ncq_tmp_vault("ncq_n12a_"):
+            B1 = run_overlap_backtest(S1, pxm1, None, None, ms, hold_months=2,
+                                      cost_roundtrip=0.0, adv_cap=False, label="N12a")
+        eq1 = float(B1["returns"]["equity"].iloc[-1]) - 1.0
+        if abs(eq1) > 1e-9:
+            return False, (f"★변동성 하베스팅 누수: 진짜 buy&hold 가 0.000000% 인 구성에서 "
+                           f"누적 {ncq_v_num(eq1,'pct')} 가 나왔습니다. 진입 가중치를 고정한 채 "
+                           f"손익을 더하면 비용 0짜리 월간 리밸런싱이 공짜로 섞입니다.")
+        rh1 = pd.to_numeric(B1["cohorts"]["ret_h"], errors="coerce").to_numpy()
+        if len(rh1) != 2 or np.nanmax(np.abs(rh1)) > 1e-9:
+            return False, f"★cohorts.ret_h 가 returns 와 다른 포트폴리오를 말합니다: {rh1}"
+
+        # ② 복리 정합성: 단일 종목 +10%/월 × 2개월, 슬롯 1/2 → 정확히 0.5·(1.1²−1) = +10.5%
+        pxm2 = pd.DataFrame([{"code": "A", "month": ms[i], "exec_px": 100 * (1.1 ** i),
+                              "adv20": 1e12, "fwd_ret": 0.1} for i in range(3)])
+        S2 = pd.DataFrame([{"month": ms[0], "code": "A", "selected": True, "z": 1.0}])
+        with ncq_tmp_vault("ncq_n12b_"):
+            B2 = run_overlap_backtest(S2, pxm2, None, None, ms, hold_months=2,
+                                      cost_roundtrip=0.0, adv_cap=False, label="N12b")
+        eq2 = float(B2["returns"]["equity"].iloc[-1]) - 1.0
+        want = 0.5 * (1.1 ** 2 - 1.0)
+        if abs(eq2 - want) > 1e-9:
+            return False, (f"★복리 정합성 위반: 기대 {ncq_v_num(want,'pct')} vs 실제 "
+                           f"{ncq_v_num(eq2,'pct')}. 손익을 '초기자본 대비'로 더한 뒤 "
+                           f"'현재 NAV 대비' 수익률로 복리시키면 NAV 가 움직이는 순간 어긋납니다.")
+        return True, (f"변동성 하베스팅 0.000000% 확인 · 복리 정합성 "
+                      f"{ncq_v_num(eq2,'pct')} = 0.5·(1.1²−1) 정확히 일치 · "
+                      f"returns 와 cohorts 가 같은 포트폴리오")
+
+    ncq_c("N12", "포트폴리오 회계 정합성 (buy&hold ↔ NAV 복리)", n12)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = []
     for r in NCQ_CONTRACTS:

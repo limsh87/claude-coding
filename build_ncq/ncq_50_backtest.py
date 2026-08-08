@@ -210,11 +210,24 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
                          hold_months: Optional[int] = None, sel_col: str = "selected",
                          cost_roundtrip: Optional[float] = None, adv_cap: bool = True,
                          label: str = "NCQ") -> dict:
-    """오버랩 코호트 백테스트.
+    """오버랩 코호트 백테스트 — **시간축 순차 포트폴리오 시뮬레이터**.
 
     수익률 인덱싱 규약: 월 t 의 수익률은 'exec_px(t) → exec_px(t+1)' 사이의 실현분이다
     (pxm.fwd_ret 과 동일). 월말 신호 → 익영업일 시가 진입이므로, 월 t 에 편입한 코호트는
     월 t 의 수익률부터 받는다. 이 규약을 벤치마크·플라시보에도 **동일하게** 적용한다.
+
+    ★★ 왜 코호트별 루프가 아니라 시간축 루프인가 — 두 가지 회계 오류를 원천 차단한다
+      ① 진입 가중치를 고정한 채 매달 dot(w, r) 을 더하면 '비용 0짜리 월간 리밸런싱'이
+         공짜로 섞인다(변동성 하베스팅). 손계산: H=2, A[+100%,-50%], B[-50%,+100%] 를
+         25%/25% 로 담으면 진짜 buy&hold 는 0.00% 인데 고정가중은 +26.6% 가 나온다.
+      ② 코호트를 독립적으로 굴린 뒤 손익을 더하면, 그 손익이 '초기 자본 대비' 비율인데
+         equity 는 '현재 NAV 대비' 수익률로 복리시킨다. NAV 가 움직이는 순간 어긋난다.
+      → NAV 를 하나 들고 시간 순으로 진행하며 (진입 → 수익반영 → 청산) 순서를 지킨다.
+        매월 NAV 의 1/H 를 새 코호트에 배분하고, 신호가 없으면 그 슬롯은 현금으로 남는다.
+
+    ★ 거래정지 종목은 팔 수 없다. 보유기간이 끝나도 첫 거래 가능 시점까지 청산이 이연된다.
+    ★ 패널 마지막 달은 fwd_ret 이 정의되지 않으므로 청산하지 않고 시가평가로 남긴다.
+      (거기서 전 코호트에 청산비용을 물리면 결정론적 가짜 손실이 표본에 들어간다)
     """
     H = int(hold_months or NCQ_HOLD_MONTHS)
     cost = float(cost_roundtrip if cost_roundtrip is not None else NCQ_COST_ROUNDTRIP)
@@ -238,83 +251,153 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
     if RM.empty:
         LOG.warn("수익률 행렬이 비어 백테스트를 수행할 수 없습니다(가격 패널 확인).")
         return empty
-    mon_pos = {m: i for i, m in enumerate(months)}
 
     S = SIG[SIG[sel_col].fillna(False).astype(bool)].copy()
     S = S[S["month"].isin(months)]
     if S.empty:
         LOG.warn(f"[{label}] 선정된 이벤트가 없어 전 구간 현금 보유가 됩니다.")
         return empty
+    by_month = {as_ts(mm): gg for mm, gg in S.groupby("month", observed=True)}
 
     n_m = len(months)
-    port_ret = np.zeros(n_m)
-    port_cost = np.zeros(n_m)
-    invested = np.zeros(n_m)         # 실제 투자된 비중(나머지는 현금)
-    n_names = np.zeros(n_m)
-    turnover = np.zeros(n_m)
-    holdings: List[dict] = []
-    cohorts: List[dict] = []
-    slot_w = 1.0 / float(H)          # 코호트 슬롯당 자본 배분 (신호 없으면 현금)
+    slot_frac = 1.0 / float(H)
+    cols = set(map(str, RM.columns))
+    # ★ 현금을 명시적 상태로 든다. nav = cash + Σ(포지션 시가) 라는 항등식이 '구조적으로'
+    #   성립해야 한다. 비용을 NAV 에서만 빼면 포지션 시가 합이 NAV 를 넘어(=암묵적 레버리지)
+    #   가중치 합 > 1 이 되고, 그만큼 성과가 부풀려진다. N6 계약검정이 이걸 잡는다.
+    cash = 1.0
+    nav = 1.0
+    port_ret = np.zeros(n_m); port_cost = np.zeros(n_m)
+    invested = np.zeros(n_m); n_names = np.zeros(n_m); turnover = np.zeros(n_m)
+    holdings: List[dict] = []; cohorts: List[dict] = []
+    open_pos: List[dict] = []
+    n_defer = n_open_at_end = n_cohort = 0
+    adv_bind_n = adv_bind_d = 0
 
-    for c_month, g in S.groupby("month", observed=True):
-        c0 = mon_pos.get(c_month)
-        if c0 is None:
-            continue
-        names = [c for c in g["code"].astype(str).tolist() if c in RM.columns]
-        if not names:
-            continue
-        zs = dict(zip(g["code"].astype(str), pd.to_numeric(g.get("z"), errors="coerce")))
-        k = len(names)
-        w_each = slot_w / k
+    for t, m_t in enumerate(months):
+        r_row = RM.loc[m_t]
+        adv_row = AM.loc[m_t] if (not AM.empty and m_t in AM.index) else None
+        nav_open = cash + float(sum(float(np.sum(p["val"] * p["alive"])) for p in open_pos))
+        nav = nav_open
 
-        # ── 종목당 상한 = 편입 시점 20일 ADV × 참여율. 초과분은 현금으로 남긴다(§10, R4) ──
-        if adv_cap and not AM.empty and c_month in AM.index:
-            adv = pd.to_numeric(AM.loc[c_month].reindex(names), errors="coerce").to_numpy()
-            cap_krw = adv * NCQ_ADV_PARTICIPATION
-            cap_w = np.where(np.isfinite(cap_krw) & (cap_krw > 0),
-                             cap_krw / max(NCQ_ACCOUNT_KRW, 1.0), 0.0)
-            w = np.minimum(np.full(k, w_each), cap_w)
-        else:
-            w = np.full(k, w_each)
-        w = np.where(np.isfinite(w), w, 0.0)
-        if w.sum() <= 0:
-            continue
+        # ── ① 진입 (이번 달 신호로 만든 새 코호트) ────────────────────────────────────────
+        g = by_month.get(as_ts(m_t))
+        if g is not None and len(g):
+            names = [c for c in g["code"].astype(str).tolist() if c in cols]
+            if names:
+                k = len(names)
+                # NAV 의 1/H 를 배분(초기자본이 아니라). 현금이 모자라면 있는 만큼만 — 차입 없음.
+                slot = min(nav_open * slot_frac, max(cash, 0.0))
+                if slot <= 0:
+                    slot = 0.0
+                v_each = slot / k if k else 0.0
+                v = np.full(k, v_each)
+                if adv_cap and adv_row is not None:
+                    adv = pd.to_numeric(adv_row.reindex(names), errors="coerce").to_numpy()
+                    cap_krw = adv * NCQ_ADV_PARTICIPATION
+                    # 상한은 '금액' 기준이므로 가정 계좌규모로 NAV 배수를 환산해 비교한다
+                    cap_v = np.where(np.isfinite(cap_krw) & (cap_krw > 0),
+                                     cap_krw / max(NCQ_ACCOUNT_KRW, 1.0), 0.0)
+                    v = np.minimum(v, cap_v)
+                    adv_bind_n += int(np.sum(v < v_each - 1e-15)); adv_bind_d += k
+                v = np.where(np.isfinite(v) & (v > 0), v, 0.0)
+                if v.sum() > 0:
+                    e_cost, x_cost = ncq_split_cost(
+                        cost, m_t, months[min(t + H, n_m - 1)])
+                    # 총 지출 = 매수대금 + 수수료 = slot. 즉 실제로 사는 금액은 slot/(1+e_cost).
+                    # 이렇게 해야 현금에서 나간 돈과 포지션 시가가 정확히 맞는다.
+                    v = v / (1.0 + e_cost)
+                    outlay = float(v.sum()) * (1.0 + e_cost)
+                    port_cost[t] += float(v.sum()) * e_cost
+                    cash -= outlay
+                    turnover[t] += float(v.sum()) / max(nav_open, 1e-12)
+                    open_pos.append({
+                        "cohort": m_t, "names": names, "val": v.copy(), "v0": v.copy(),
+                        "alive": np.ones(k, dtype=bool), "h": 0, "x_cost": x_cost,
+                        "val_final": np.full(k, np.nan),
+                        "n_held": np.zeros(k, dtype=int),
+                        "exit_i": np.full(k, np.nan),
+                        "z": {c: float(x) for c, x in zip(g["code"].astype(str),
+                                                          pd.to_numeric(g.get("z"),
+                                                                        errors="coerce"))},
+                    })
+                    n_cohort += 1
 
-        e_cost, x_cost = ncq_split_cost(cost, c_month, months[min(c0 + H, n_m - 1)])
-        port_cost[c0] += float(w.sum()) * e_cost
-        turnover[c0] += float(w.sum())
-
-        cum = np.ones(k)
-        n_held = np.zeros(k, dtype=int)
-        for h in range(H):
-            t = c0 + h
-            if t >= n_m:
-                break
-            m_t = months[t]
-            row = RM.loc[m_t].reindex(names)
-            r = pd.to_numeric(row, errors="coerce").to_numpy(dtype=float)
-            # 결측 = 거래정지/데이터 결손 → 정지 직전가로 마킹(0%). 팔 수 없으므로 보유가 이어지고,
-            # 재개 시점의 갭 수익은 ncq_effective_return_matrix 가 이미 그 달에 합성해 두었다.
+        # ── ② 수익 반영 (이번 달에 진입한 코호트도 이 달 수익부터 받는다) ────────────────
+        pnl = 0.0
+        for pos in open_pos:
+            nm, al = pos["names"], pos["alive"]
+            r = pd.to_numeric(r_row.reindex(nm), errors="coerce").to_numpy(dtype=float)
             fin = np.isfinite(r)
-            n_held += fin.astype(int)
-            r = np.where(fin, r, 0.0)
-            port_ret[t] += float(np.dot(w, r))
-            invested[t] += float(w.sum())
-            n_names[t] += float(np.sum(w > 0))
-            cum = cum * (1.0 + r)
-            for j, cd in enumerate(names):
-                holdings.append({"month": m_t, "code": cd, "weight": float(w[j]),
-                                 "ret": float(r[j]), "cohort": c_month,
-                                 "z": float(zs.get(cd, np.nan))})
-            if h == H - 1 or t == n_m - 1:
-                port_cost[t] += float(w.sum()) * x_cost
-                turnover[t] += float(w.sum())
-        ex_i = min(c0 + H, n_m - 1)
-        for j, cd in enumerate(names):
-            cohorts.append({"cohort": c_month, "code": cd, "entry_month": c_month,
-                            "exit_month": months[ex_i], "ret_h": float(cum[j] - 1.0),
-                            "n_months": int(n_held[j]), "weight": float(w[j]),
-                            "z": float(zs.get(cd, np.nan))})
+            r = np.where(fin & al, r, 0.0)          # 정지·결측은 직전가 마킹(0%)
+            pos["n_held"] += (fin & al).astype(int)
+            val_before = pos["val"] * al
+            pnl += float(np.dot(val_before, r))
+            invested[t] += float(val_before.sum())
+            n_names[t] += float(np.sum(al & (val_before > 0)))
+            for j, cd in enumerate(nm):
+                if al[j]:
+                    holdings.append({"month": m_t, "code": cd,
+                                     "weight": float(val_before[j] / max(nav_open, 1e-12)),
+                                     "ret": float(r[j]), "cohort": pos["cohort"],
+                                     "z": float(pos["z"].get(cd, np.nan))})
+            pos["val"] = np.where(al, pos["val"] * (1.0 + r), pos["val"])
+            pos["_fin"] = fin
+
+        # ── ③ 청산 (보유기간 만료 + 거래 가능). 정지 중이면 이연 ─────────────────────────
+        sold_cost = 0.0
+        for pos in open_pos:
+            al, fin = pos["alive"], pos.get("_fin", np.ones(len(pos["names"]), dtype=bool))
+            due = al & (pos["h"] >= H - 1)
+            sell = due & fin
+            if t == n_m - 1:
+                n_open_at_end += int(np.sum(al & ~sell))
+                for j in np.where(al & ~sell)[0]:
+                    pos["exit_i"][j] = t
+                    pos["val_final"][j] = float(pos["val"][j])   # 시가평가로 마감된 값
+                pos["alive"] = al & sell            # 마지막 달: 시가평가로 마감(비용 미부과)
+                al = pos["alive"]
+            if bool((due & ~fin).any()):
+                n_defer += int((due & ~fin).sum())
+            if bool(sell.any()):
+                sv = float(np.sum(pos["val"][sell]))
+                sold_cost += sv * pos["x_cost"]
+                cash += sv * (1.0 - pos["x_cost"])      # 매도대금에서 비용을 뺀 실수령액
+                turnover[t] += sv / max(nav_open, 1e-12)
+                for j in np.where(sell)[0]:
+                    pos["exit_i"][j] = t
+                    pos["val_final"][j] = float(pos["val"][j])   # 청산 시점 시가(비용 차감 전)
+                pos["alive"] = pos["alive"] & ~sell
+            pos["h"] += 1
+        port_cost[t] += sold_cost
+
+        # ── ④ NAV 재계산 (= 현금 + 포지션 시가) · 월 수익률 = ΔNAV / 월초 NAV ─────────────
+        nav = cash + float(sum(float(np.sum(p["val"] * p["alive"])) for p in open_pos))
+        port_cost[t] = port_cost[t] / max(nav_open, 1e-12)
+        port_ret[t] = (nav - nav_open) / max(nav_open, 1e-12) + port_cost[t]
+        invested[t] = invested[t] / max(nav_open, 1e-12)
+
+        # 완전히 청산된 코호트는 원장에 확정하고 목록에서 제거
+        still: List[dict] = []
+        for pos in open_pos:
+            pos["val"] = np.where(pos["alive"], pos["val"], 0.0)
+            if bool(pos["alive"].any()) and t < n_m - 1:
+                still.append(pos)
+            else:
+                for j, cd in enumerate(pos["names"]):
+                    v0 = float(pos["v0"][j])
+                    ei = pos["exit_i"][j]
+                    # ★ 청산 시점의 시가로 계산한다. NAV 계산용으로 0 으로 만든 val 을 쓰면
+                    #   전 종목의 ret_h 가 -100% 로 찍힌다(N12 가 잡아낸 실수).
+                    vf = pos["val_final"][j]
+                    vf = float(vf) if np.isfinite(vf) else float(pos["val"][j])
+                    cohorts.append({
+                        "cohort": pos["cohort"], "code": cd, "entry_month": pos["cohort"],
+                        "exit_month": months[int(ei)] if np.isfinite(ei) else months[t],
+                        "ret_h": float(vf / v0 - 1.0) if v0 > 0 else np.nan,
+                        "n_months": int(pos["n_held"][j]), "weight": v0,
+                        "z": float(pos["z"].get(cd, np.nan))})
+        open_pos = still
 
     R = pd.DataFrame({"month": months, "ret_gross": port_ret, "cost": port_cost,
                       "n": n_names, "turnover": turnover,
@@ -325,11 +408,24 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
         columns=["month", "code", "weight", "ret", "cohort", "z"])
     C_df = pd.DataFrame(cohorts) if cohorts else pd.DataFrame(
         columns=["cohort", "code", "entry_month", "exit_month", "ret_h", "n_months"])
-    # ★ 오버랩 포트폴리오는 앞 H-1 개월이 '램프업' 구간이다(코호트가 아직 다 안 찼다).
-    #   이 구간은 구조적으로 현금 비중이 높아 전액 투자 벤치마크 대비 불리하게 나온다.
-    #   설계상 정상이지만, 모르고 보면 '초기 부진'으로 오독하므로 명시적으로 알린다.
+
+    _bind = (adv_bind_n / adv_bind_d) if adv_bind_d else float("nan")
+    manifest_put(f"adv_cap_binding_frac[{label}]",
+                 None if not np.isfinite(_bind) else round(_bind, 4))
+    if adv_cap and adv_bind_d and adv_bind_n == 0:
+        LOG.warn(f"[{label}] ADV 참여율 상한이 **한 번도 발동하지 않았습니다** — 이 실행에는 "
+                 f"용량 제약이 사실상 없습니다(가정 계좌 {NCQ_ACCOUNT_KRW/1e8:.0f}억이 "
+                 f"ADV 하한 {NCQ_MIN_ADV/1e8:.1f}억 대비 작기 때문). §12 R4 를 실제로 검정하려면 "
+                 f"NCQ_ACCOUNT_KRW 를 키우세요(예: 50억). 지금 상태의 'ADV 제약 적용본'과 "
+                 f"'미적용본'은 동일한 결과입니다.")
+    if n_defer:
+        LOG.info(f"[{label}] 거래정지로 청산이 이연된 (종목×달) {n_defer:,}건 — "
+                 f"정지된 주식은 팔 수 없으므로 첫 거래 가능 시점까지 보유가 연장됩니다.")
+    if n_open_at_end:
+        LOG.info(f"[{label}] 패널 종료 시점에 {n_open_at_end:,}개 포지션이 열려 있어 "
+                 f"청산비용 없이 시가평가로 마감했습니다(마지막 달 가짜 손실 방지).")
     ramp = int((R["cash"] > 0.5).head(max(H - 1, 0)).sum()) if len(R) else 0
-    LOG.info(f"[{label}] 백테스트 완료 — 코호트 {C_df['cohort'].nunique() if len(C_df) else 0}개 · "
+    LOG.info(f"[{label}] 백테스트 완료 — 코호트 {n_cohort}개 · "
              f"연인원 {len(H_df):,} · 평균 현금비중 {100*R['cash'].mean():.0f}% · "
              f"누적 {100*(R['equity'].iloc[-1]-1):+.1f}%"
              + (f" · 램프업 {ramp}개월(코호트 미충전 — 현금비중 50%↑)" if ramp else ""))
