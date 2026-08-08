@@ -374,25 +374,37 @@ def fetch_dart_corpcode() -> pd.DataFrame:
     if cached is not None and len(cached):
         LOG.info(f"공용 캐시에서 DART corpCode {len(cached):,}건 재사용")
         return cached
+    # ★★ 만료 후 다운로드가 실패하면 **빈 프레임이 아니라 낡은 캐시**로 돌아간다 ★★
+    #   예전엔 실패 시 그냥 빈 프레임을 돌려줬다. corp_code 가 전멸하면 그 실행의
+    #   EMP·Tier-2·Tier-1·공시가 **통째로 0건**이 된다 — 이미 받아둔 캐시가 디스크에
+    #   멀쩡히 있는데도 그렇다. 30일마다 한 번씩 열리는 전량 실패 창이었다.
+    #   corpCode 는 기업 식별자 목록이라 며칠 낡아도 기존 기업의 코드는 바뀌지 않는다.
+    def _stale_or_empty(why: str):
+        _old = VAULT.get_table("dart_corpcode", scope="shared")      # max_age 무시
+        if _old is not None and len(_old):
+            LOG.warn(f"{why} — 30일이 지난 corpCode 캐시 {len(_old):,}건을 그대로 씁니다. "
+                     f"기업 식별자는 잘 바뀌지 않으므로 신규 상장분만 누락됩니다. "
+                     f"빈 목록으로 진행하면 이 실행의 DART 수집이 통째로 0건이 됩니다.")
+            return _old
+        LOG.error(f"{why} — 대체할 캐시도 없습니다. 이 실행의 DART 수집은 전부 0건이 됩니다.")
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+
     raw = http_get("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
                    params={"crtfc_key": DART_API_KEY}, as_bytes=True, tries=3)
     if not raw:
-        LOG.warn("DART corpCode.xml 수신 실패 — DART_API_KEY 와 네트워크를 확인하세요.")
-        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+        return _stale_or_empty("DART corpCode.xml 수신 실패(키·네트워크 확인)")
     if raw[:2] != b"PK":
         body = raw[:400].decode("utf-8", "ignore")
         st = re.search(r'"?status"?\s*[:>]\s*"?(\d{3})', body)
         code = st.group(1) if st else "?"
-        LOG.warn(f"corpCode 응답이 ZIP 이 아닙니다 (status={code}: "
-                 f"{DART_STATUS_MSG.get(code, '알 수 없음')}). DART_API_KEY 를 확인하세요.")
-        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+        return _stale_or_empty(f"corpCode 응답이 ZIP 이 아님 (status={code}: "
+                               f"{DART_STATUS_MSG.get(code, '알 수 없음')})")
     try:
         zf = zipfile.ZipFile(io.BytesIO(raw))
         xml = b"".join(zf.read(n) for n in zf.namelist() if n.lower().endswith(".xml")) \
             or zf.read(zf.namelist()[0])
     except Exception as e:                                            # noqa
-        LOG.warn(f"corpCode zip 해제 실패({type(e).__name__}).")
-        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+        return _stale_or_empty(f"corpCode zip 해제 실패({type(e).__name__})")
     txt = _decode(xml, None, "corpcode")
     rows = []
     for m in re.finditer(r"<list>(.*?)</list>", txt, re.S):
@@ -481,22 +493,36 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
     snap = (snap.dropna(subset=["snap_date", "code"])
                 .drop_duplicates(["snap_date", "code"])[cols])
 
+    # ★★ 저장은 필터 **이전**, 폐기는 소비 쪽에서만 ★★
+    #   예전엔 아래 부분응답 폐기 결과를 **저장본에도 반영**했다. 그러면
+    #     ① 폐기된 시점이 다음 실행의 have 에 없으니 다시 수집되고,
+    #     ② 다시 수집하면 new_rows 가 비지 않아 또 저장되고,
+    #     ③ 또 폐기된다 — **자기지속 재수집 루프**다(시점당 3콜, 직렬 3~5초).
+    #   게다가 중앙값은 프레임 내용에 따라 실행마다 달라져, 과거 실행이 저장해 둔 시점이
+    #   나중 실행에서 '나쁨'으로 재판정되어 활성 파케이에서 사라질 수 있다 —
+    #   공용 테이블 **좁혀 덮어쓰기**이자 절대 1원칙 위반이다.
+    if new_rows:
+        _store = snap.copy()
+        _store["snap_date"] = _store["snap_date"].dt.strftime("%Y-%m-%d")
+        if VAULT.put_table("krx_listing_snapshots", _store, scope="shared", domain="universe",
+                           source="pykrx",
+                           extra={"note": "상장종목 스냅샷 — 전 전략 공용 (원본 보존, "
+                                          "부분응답 판정은 소비 시점에만 적용)"}) is None:
+            LOG.error("스냅샷 저장 실패 — 다음 실행이 같은 시점을 다시 수집합니다.")
+
     # ★ 부분 응답 방어: 이웃 시점 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
     #   그대로 쓰면 그 달 유니버스가 조용히 쪼그라들어 선택편향이 된다.
+    #   → **반환값에서만** 걷어낸다. 원본은 드라이브에 그대로 남는다.
     if len(snap):
         size = snap.groupby("snap_date")["code"].size().sort_index()
         med = float(size.median()) if len(size) else 0.0
         bad = size[size < med * 0.80]
         if len(bad) and med > 0:
             LOG.warn(f"스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만이라 "
-                     f"부분 응답으로 판단하고 폐기합니다: "
-                     f"{[str(x.date()) for x in bad.index[:6]]}")
+                     f"부분 응답으로 판단하고 **이번 실행에서만** 제외합니다: "
+                     f"{[str(x.date()) for x in bad.index[:6]]} "
+                     f"(원본은 공용 캐시에 그대로 보존됩니다 — 지우면 매 실행 다시 받게 됩니다)")
             snap = snap[~snap["snap_date"].isin(bad.index)]
-    if new_rows:
-        out = snap.copy()
-        out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
-        VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
-                        source="pykrx", extra={"note": "상장종목 스냅샷 — 전 전략 공용"})
     PIPE.io("OUT", "DRIVE", "krx_listing_snapshots", snap, source="pykrx")
     return snap
 

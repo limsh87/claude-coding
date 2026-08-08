@@ -288,13 +288,28 @@ class Vault:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
         if os.path.exists(path):
-            bak = os.path.join(self.ns[scope], "index", "_backup",
-                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            # ★★ 백업 이름을 타임스탬프에서 **내용해시**로 바꿨다 ★★
+            #   실측: 340MB 짜리 가격 테이블이 신규 1종목만 있어도 매 실행 통째로 복사됐고,
+            #   _backup 에는 개수·용량 상한이 없으며 삭제 API 도 없다(원칙상 있어서도 안 된다).
+            #   일 1회 실행이면 10.2GB/월 · 124GB/년 — 무료 15GB 는 44회, 100GB 는 294회에 찬다.
+            #   내용해시로 이름을 지으면 **같은 내용은 같은 이름**이라 중복 백업이 사라지고,
+            #   내용이 다르면 절대 충돌하지 않는다. 세대는 그대로 보존된다(원칙 유지).
+            #   덤으로 타임스탬프 1초 해상도 때문에 같은 초의 두 저장이 앞 백업을 조용히
+            #   덮어쓰던 구멍도 닫힌다.
             try:
-                shutil.copy2(path, bak)
+                _h = sha1_file(path)[:12]
+            except Exception:                               # noqa
+                _h = f"{_dt.datetime.now():%Y%m%d_%H%M%S}"
+            bak = os.path.join(self.ns[scope], "index", "_backup", f"{name}.{_h}.parquet")
+            try:
+                if not os.path.exists(bak):
+                    shutil.copy2(path, bak)
+                else:
+                    self.stats["backup_dedup"] += 1
             except Exception as e:                          # noqa
                 LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
-                         f"리비전 파일로 저장합니다: {name}")
+                         f"리비전 파일로 저장합니다: {name} "
+                         f"(get_table 은 활성 파일이 없거나 못 읽을 때 이 리비전을 읽습니다)")
                 path = os.path.join(self.table_dir(scope),
                                     f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
         try:
@@ -320,6 +335,16 @@ class Vault:
         })
         return path
 
+    def _latest_revision(self, name: str, scope: str) -> Optional[str]:
+        """{name}.rev*.parquet 중 가장 최근 것. 활성 파일이 없을 때만 쓰인다."""
+        try:
+            d = self.table_dir(scope)
+            cand = [os.path.join(d, f) for f in os.listdir(d)
+                    if f.startswith(f"{name}.rev") and f.endswith(".parquet")]
+            return max(cand, key=os.path.getmtime) if cand else None
+        except Exception:                                   # noqa
+            return None
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         """정제 테이블 읽기. **같은 실행 안에서는 파일을 한 번만 읽는다.**
@@ -342,7 +367,19 @@ class Vault:
             if os.path.exists(path2):
                 path = path2
             else:
-                return None
+                # ★ 마지막 수단: put_table 이 백업 실패로 흘려 둔 리비전 파일.
+                #   예전엔 이걸 아무도 읽지 않아, 워터마크·음성캐시 기록이 통째로 새고
+                #   다음 실행이 같은 헛수고를 그대로 반복했다(실측 900초대).
+                #   ★ 활성 파일이 **있으면** 절대 승격하지 않는다 — 더 넓은 활성본을
+                #     더 좁은 옛 스냅샷으로 덮는 '좁혀 덮어쓰기'가 되기 때문이다.
+                rev = self._latest_revision(name, scope) or self._latest_revision(name, alt)
+                if not rev:
+                    return None
+                LOG.warn(f"활성 테이블 {name}.parquet 이 없어 리비전 파일을 읽습니다: "
+                         f"{os.path.basename(rev)}. 이전 실행에서 백업 복사가 실패해 "
+                         f"활성 파일 대신 리비전으로 저장된 기록입니다 — "
+                         f"드라이브 용량·권한을 확인하세요.")
+                path = rev
         try:
             mt = os.path.getmtime(path)
         except OSError:

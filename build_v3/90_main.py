@@ -471,9 +471,11 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                 np.where(_s.str.contains("KOSDAQ|KSQ|코스닥"), ".KQ", ".KS"))))
         except Exception:
             pass
-        px = fetch_prices(ctx["sec"]["code"].tolist(),
-                          (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
-                          BACKTEST_END, sec=ctx["sec"])
+        px = fetch_prices(ctx["sec"]["code"].tolist(), price_cache_floor(), BACKTEST_END,
+                          sec=ctx["sec"],
+                          market_last_day=(ctx["snapshots"]["snap_date"].max()
+                                           if ctx.get("snapshots") is not None
+                                           and len(ctx["snapshots"]) else None))
         ctx["px"] = px
         ctx["panel"] = build_price_panel(px, months)
 
@@ -482,7 +484,8 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                                    canary_sample(ctx["sec"], ctx["panel"]["monthly"]))
 
     with PIPE.stage("L1.FLOW", "기관·외국인 수급 (U축 d3)", "L1", budget_s=1200, critical=False):
-        ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START, BACKTEST_END)
+        ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START,
+                                            BACKTEST_END, sec=ctx["sec"])
 
     with PIPE.stage("L1.EMP", "DART 직원현황(확장) · C15 한계임금", "L1",
                     budget_s=3600, critical=False):

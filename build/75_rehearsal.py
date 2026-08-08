@@ -380,12 +380,13 @@ def run_rehearsal(strict: bool = True) -> bool:
         # ── ② 가격 ────────────────────────────────────────────────────────────────────────
         codes = sec["code"].dropna().tolist()[:12]
         px = _rh("fetch_prices(네이버 차트 폴백)",
-                 lambda: fetch_prices(codes, "2016-05-01", "2026-07-31"),
+                 lambda: fetch_prices(codes, "2016-05-01", "2026-07-31", sec=sec),
                  note="FDR/pykrx 없이 네이버 경로만으로 동작해야 한다")
         if px is not None and len(px):
             _rh("build_price_panel", lambda: build_price_panel(px, months))
         _rh("fetch_investor_flows(pykrx 없음)",
-            lambda: fetch_investor_flows(codes, "2016-08-01", "2026-07-31"), expect_rows=False)
+            lambda: fetch_investor_flows(codes, "2016-08-01", "2026-07-31", sec=sec),
+            expect_rows=False)
 
         # ── ③ DART ────────────────────────────────────────────────────────────────────────
         corps = sec["corp_code"].dropna().astype(str).tolist()[:6]
