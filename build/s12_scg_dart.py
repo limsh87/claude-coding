@@ -77,9 +77,20 @@ class ScgDartQuota:
         cap = DART_DAILY_LIMIT if DART_DAILY_LIMIT else self.OFFICIAL_LIMIT
         return max(0, int(cap) - self.n - int(DART_RESERVE_CALLS or 0))
 
+    def _roll_day(self):
+        """KST 자정을 넘겼으면 카운터를 리셋한다. 콜드빌드는 몇 시간씩 도므로
+        생성 시점 날짜에 고정해 두면 자정 이후에도 어제 소진 상태를 물고 있게 된다."""
+        today = _dt.datetime.now(SCG_KST).date().isoformat()
+        if today != self.today:
+            LOG.info(f"KST 날짜가 바뀌었습니다 ({self.today} → {today}). "
+                     f"DART 호출 카운터를 리셋하고 계속 진행합니다.")
+            self.today, self.n, self.exhausted, self._dirty = today, 0, False, 0
+            self._save()
+
     def take(self, k: int = 1) -> bool:
         """호출 예약. 최악(재시도 포함)을 먼저 잡고 실제 시도 후 차액을 환급한다."""
         with self._lk:
+            self._roll_day()
             if self.exhausted:
                 return False
             #  사용자가 명시적으로 상한을 정한 경우에만 사전 차단한다. 기본(None)은 무제한.
@@ -417,14 +428,15 @@ def scg_fetch_shares(corp_map: pd.DataFrame, years: Sequence[int],
             v = pd.to_numeric(str(r.get("istc_totqy", "")).replace(",", ""), errors="coerce")
             if pd.notna(v) and v > 0 and ("보통주" in se or tot is None):
                 tot = float(v)
-                p = pd.to_numeric(str(r.get("stlm_dt", "")).replace(",", ""), errors="coerce")
-                par = float(p) if pd.notna(p) else par
                 if "보통주" in se:
                     break
         if not tot:
             return None
+        #  ★ 액면가는 stockTotqySttus 응답에 없다(stlm_dt 는 결산일이다 — 이걸 액면가로
+        #    읽으면 20241231 같은 값이 들어가 주식수 역산이 통째로 망가진다).
+        #    액면가는 scg_shares_panel 에서 자본금/주식수 로 역산한다.
         return {"corp_code": corp, "code": code, "bsns_year": int(y), "shares": tot,
-                "par_value": par, "knowledge_date": _scg_rcept_date(rc)}
+                "par_value": np.nan, "knowledge_date": _scg_rcept_date(rc)}
 
     rows: List[dict] = []
     CH = 3000

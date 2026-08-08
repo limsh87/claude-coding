@@ -214,7 +214,7 @@ STOP_ON_KILL_CRITERIA = False   # SCG 는 '킬'이 아니라 '증분 기여 판�
 STRATEGY_ID        = "SCG_LS_LSA"
 STRATEGY_NAME      = "SCG-LS / SCG-LSA — Smart Consensus Gap + Analyst Leadership"
 ACTIVE_PACKS       = []
-BUILD_VERSION      = "v2.20260808.1002"
+BUILD_VERSION      = "v2.20260808.1100"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -2996,7 +2996,8 @@ def scg_fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame
     legacy = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     if legacy is not None and len(legacy) and "close" in legacy.columns:
         lg = legacy.copy()
-        lg["src"] = lg.get("src", "unknown").astype(str)
+        lg["src"] = (lg["src"].astype(str) if "src" in lg.columns
+                     else pd.Series("unknown", index=lg.index))
         keep = lg["src"].isin(_SCG_ADJ_SRC)
         n_drop = int((~keep).sum())
         lg = lg[keep]
@@ -3312,9 +3313,20 @@ class ScgDartQuota:
         cap = DART_DAILY_LIMIT if DART_DAILY_LIMIT else self.OFFICIAL_LIMIT
         return max(0, int(cap) - self.n - int(DART_RESERVE_CALLS or 0))
 
+    def _roll_day(self):
+        """KST 자정을 넘겼으면 카운터를 리셋한다. 콜드빌드는 몇 시간씩 도므로
+        생성 시점 날짜에 고정해 두면 자정 이후에도 어제 소진 상태를 물고 있게 된다."""
+        today = _dt.datetime.now(SCG_KST).date().isoformat()
+        if today != self.today:
+            LOG.info(f"KST 날짜가 바뀌었습니다 ({self.today} → {today}). "
+                     f"DART 호출 카운터를 리셋하고 계속 진행합니다.")
+            self.today, self.n, self.exhausted, self._dirty = today, 0, False, 0
+            self._save()
+
     def take(self, k: int = 1) -> bool:
         """호출 예약. 최악(재시도 포함)을 먼저 잡고 실제 시도 후 차액을 환급한다."""
         with self._lk:
+            self._roll_day()
             if self.exhausted:
                 return False
             #  사용자가 명시적으로 상한을 정한 경우에만 사전 차단한다. 기본(None)은 무제한.
@@ -3652,14 +3664,15 @@ def scg_fetch_shares(corp_map: pd.DataFrame, years: Sequence[int],
             v = pd.to_numeric(str(r.get("istc_totqy", "")).replace(",", ""), errors="coerce")
             if pd.notna(v) and v > 0 and ("보통주" in se or tot is None):
                 tot = float(v)
-                p = pd.to_numeric(str(r.get("stlm_dt", "")).replace(",", ""), errors="coerce")
-                par = float(p) if pd.notna(p) else par
                 if "보통주" in se:
                     break
         if not tot:
             return None
+        #  ★ 액면가는 stockTotqySttus 응답에 없다(stlm_dt 는 결산일이다 — 이걸 액면가로
+        #    읽으면 20241231 같은 값이 들어가 주식수 역산이 통째로 망가진다).
+        #    액면가는 scg_shares_panel 에서 자본금/주식수 로 역산한다.
         return {"corp_code": corp, "code": code, "bsns_year": int(y), "shares": tot,
-                "par_value": par, "knowledge_date": _scg_rcept_date(rc)}
+                "par_value": np.nan, "knowledge_date": _scg_rcept_date(rc)}
 
     rows: List[dict] = []
     CH = 3000
@@ -7738,10 +7751,14 @@ def scg_diagnostic_card(sig: pd.DataFrame, res: Dict[str, Any], scores: pd.DataF
     ok = sig["status"].eq(STATUS_OK) if "status" in sig.columns else pd.Series(True, index=sig.index)
     d = sig[ok]
     n_an = int(scores["analyst_id"].nunique()) if scores is not None and len(scores) else 0
-    with_acc = int((scores.groupby("analyst_id")["acc_n"].max() > 0).sum()) \
-        if scores is not None and len(scores) else 0
-    with_lead = int((scores.groupby("analyst_id")["lead_n"].max() > 0).sum()) \
-        if scores is not None and len(scores) else 0
+    with_acc = with_lead = neither = 0
+    if scores is not None and len(scores):
+        g = scores.groupby("analyst_id")[["acc_n", "lead_n"]].max()
+        with_acc = int((g["acc_n"] > 0).sum())
+        with_lead = int((g["lead_n"] > 0).sum())
+        #  ★ max(with_acc, with_lead) 로 빼면 '한쪽만 있는' 애널리스트가 둘 다 없는 것으로
+        #    잘못 집계된다. 실제로 둘 다 0 인 사람을 센다.
+        neither = int(((g["acc_n"] == 0) & (g["lead_n"] == 0)).sum())
     LOG.table([
         ["메트릭 트랙", metric], ["유니버스", universe],
         ["신호 시점", f"{d['signal_date'].nunique() if len(d) else 0}개"],
@@ -7751,7 +7768,7 @@ def scg_diagnostic_card(sig: pd.DataFrame, res: Dict[str, Any], scores: pd.DataF
         ["애널리스트", f"{n_an:,}명"],
         ["  ├ Accuracy 이력 보유", f"{with_acc:,}명 ({100*with_acc/max(n_an,1):.0f}%)"],
         ["  └ Leadership 이력 보유", f"{with_lead:,}명 ({100*with_lead/max(n_an,1):.0f}%)"],
-        ["이력 없어 중립(0) 처리", f"{n_an-max(with_acc,with_lead):,}명 — 탈락 아님(§32)"],
+        ["이력 없어 중립(0) 처리", f"{neither:,}명 — 탈락 아님(§32)"],
     ], ["항목", "값"], ["l", "r"],
         title=f"진단 카드 — {metric} / {universe}")
 

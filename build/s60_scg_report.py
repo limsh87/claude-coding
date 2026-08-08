@@ -157,10 +157,14 @@ def scg_diagnostic_card(sig: pd.DataFrame, res: Dict[str, Any], scores: pd.DataF
     ok = sig["status"].eq(STATUS_OK) if "status" in sig.columns else pd.Series(True, index=sig.index)
     d = sig[ok]
     n_an = int(scores["analyst_id"].nunique()) if scores is not None and len(scores) else 0
-    with_acc = int((scores.groupby("analyst_id")["acc_n"].max() > 0).sum()) \
-        if scores is not None and len(scores) else 0
-    with_lead = int((scores.groupby("analyst_id")["lead_n"].max() > 0).sum()) \
-        if scores is not None and len(scores) else 0
+    with_acc = with_lead = neither = 0
+    if scores is not None and len(scores):
+        g = scores.groupby("analyst_id")[["acc_n", "lead_n"]].max()
+        with_acc = int((g["acc_n"] > 0).sum())
+        with_lead = int((g["lead_n"] > 0).sum())
+        #  ★ max(with_acc, with_lead) 로 빼면 '한쪽만 있는' 애널리스트가 둘 다 없는 것으로
+        #    잘못 집계된다. 실제로 둘 다 0 인 사람을 센다.
+        neither = int(((g["acc_n"] == 0) & (g["lead_n"] == 0)).sum())
     LOG.table([
         ["메트릭 트랙", metric], ["유니버스", universe],
         ["신호 시점", f"{d['signal_date'].nunique() if len(d) else 0}개"],
@@ -170,6 +174,6 @@ def scg_diagnostic_card(sig: pd.DataFrame, res: Dict[str, Any], scores: pd.DataF
         ["애널리스트", f"{n_an:,}명"],
         ["  ├ Accuracy 이력 보유", f"{with_acc:,}명 ({100*with_acc/max(n_an,1):.0f}%)"],
         ["  └ Leadership 이력 보유", f"{with_lead:,}명 ({100*with_lead/max(n_an,1):.0f}%)"],
-        ["이력 없어 중립(0) 처리", f"{n_an-max(with_acc,with_lead):,}명 — 탈락 아님(§32)"],
+        ["이력 없어 중립(0) 처리", f"{neither:,}명 — 탈락 아님(§32)"],
     ], ["항목", "값"], ["l", "r"],
         title=f"진단 카드 — {metric} / {universe}")

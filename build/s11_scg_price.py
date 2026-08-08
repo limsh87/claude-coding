@@ -105,7 +105,8 @@ def scg_fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame
     legacy = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     if legacy is not None and len(legacy) and "close" in legacy.columns:
         lg = legacy.copy()
-        lg["src"] = lg.get("src", "unknown").astype(str)
+        lg["src"] = (lg["src"].astype(str) if "src" in lg.columns
+                     else pd.Series("unknown", index=lg.index))
         keep = lg["src"].isin(_SCG_ADJ_SRC)
         n_drop = int((~keep).sum())
         lg = lg[keep]
