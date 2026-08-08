@@ -8,7 +8,7 @@
 # ============================================================================================
 #  ARC-NCQ v1.0 — New Coverage × Qualitative Shift
 #  소형주 「신규 애널리스트 커버리지 × 보고서 텍스트 질적 변화」 탐지 전략
-#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0300
+#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0307
 #
 #  ── 핵심 가설 ───────────────────────────────────────────────────────────────────────────
 #   시총 하위권 소형주에 **처음으로 리서치 보고서가 붙는 순간**은, 커버리지를 정당화할 사건
@@ -217,7 +217,7 @@ STOP_ON_KILL_CRITERIA = True   # 킬 기준 위반 시 즉시 중단하고 보�
 
 STRATEGY_ID   = "ARC_NCQ_V1"
 STRATEGY_NAME = "ARC-NCQ — 신규 커버리지 × 텍스트 질적 변화"
-BUILD_VERSION = "ncq1.20260808.0300"
+BUILD_VERSION = "ncq1.20260808.0307"
 ACTIVE_PACKS  = []          # (TCD 코어 호환용 — 이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # build/10_ingest_universe.py 의 corpCode 오류 진단이 참조하는 표.
@@ -6116,6 +6116,18 @@ IRS_LIST_PATHS = [
 ]
 
 
+def _ncq_http_fail_count(source: str) -> int:
+    """해당 소스의 '실패로 분류되는' HTTP 응답 누적 수. 0건과 차단을 구분하는 근거다."""
+    try:
+        return int(sum(v for k, v in HTTP_STATS.items()
+                       if k.startswith(f"{source}:") and
+                       k.split(":", 1)[1] in ("FAIL", "POSTFAIL", "403", "401", "429", "503",
+                                              "ConnectionError", "Timeout", "ReadTimeout",
+                                              "SSLError", "ProxyError", "HTTPError")))
+    except Exception:
+        return 0
+
+
 class NcqCircuit:
     """소스별 서킷 브레이커 (명세 §3.4).
 
@@ -6323,17 +6335,25 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
             break
         s = m.replace(day=1).strftime("%Y-%m-%d")      # 그 달 1일
         e = m.strftime("%Y-%m-%d")                     # 그 달 말일 (month_end 이므로 그대로)
+        # ★★ 수집 함수들은 접근 실패에도 예외가 아니라 **빈 DataFrame** 을 돌려준다
+        #   (naver_collect / hankyung_collect / ncq_irs_collect 모두). 그래서 'd is None'
+        #   만으로 실패를 판별하면 차단 구간이 통째로 '데이터 없는 달'로 확정되고,
+        #   그 구멍이 가짜 신규 커버리지를 만든다. HTTP 계층이 이미 세고 있는 실패 카운터의
+        #   **증분**을 보고 '0건'과 '접근 실패'를 가른다.
+        _fail_before = _ncq_http_fail_count(source)
         try:
             d = fn(s, e)
         except Exception as ex:                                  # noqa
             LOG.debug(f"[{source}] {ym} 수집 예외 {type(ex).__name__}: {ex}")
             d = None
-        if d is None:
-            # 예외/HTTP 실패 — '데이터가 없는 달'과 구분해서 기록하고 다음 실행에 재시도한다
+        _fail_delta = _ncq_http_fail_count(source) - _fail_before
+        if d is None or (len(d) == 0 and _fail_delta > 0):
+            # 예외이거나, 0건인데 그 사이 HTTP 실패가 있었다 → '접근 실패'로 본다.
+            # 다음 실행에서 재시도하고, 서킷 브레이커도 이 경로에서 정상 동작한다.
             if cb.fail():
                 break
-            ncq_done_mark(f"p1_{source}", ym, n=0, note="fetch_failed", status="failed")
-            pending_ym.append(None)
+            ncq_done_mark(f"p1_{source}", ym, n=0,
+                          note=f"fetch_failed(http_fail+{_fail_delta})", status="failed")
             continue
         if len(d) == 0:
             cb.ok()
@@ -6447,11 +6467,21 @@ def collect_report_index(months: pd.DatetimeIndex, sec: pd.DataFrame) -> pd.Data
         LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. 사용자의 명시적 "
                  "지시에 따라 수집하되 보수적 속도(소스별 QPS 상한·워커 4 이하)로 제한합니다. "
                  "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
+        # ★ 예산을 소스별로 나눈다. 하나의 공유 예산을 순차로 쓰면 첫 소스(네이버)가 120분을
+        #   다 먹고 한경·IRS 는 **0개월** 수집한 채 끝난다. 그러면 다중소스 원장이라는 설계가
+        #   무너지고, 그 사실이 로그에는 '예산 초과'로만 남아 원인이 감춰진다.
+        _srcs = list(RESEARCH_SOURCES)
+        _share = {"naver": 0.55, "hankyung": 0.30, "irs": 0.15}
+        _tot = sum(_share.get(x, 1.0 / max(len(_srcs), 1)) for x in _srcs) or 1.0
         with PhaseBudget("P1", NCQ_PHASE_BUDGET_S["P1"], on_exceed="L3") as B:
-            for src in list(RESEARCH_SOURCES):
+            for src in _srcs:
                 if not B.check():
+                    LOG.warn(f"[P1] 전체 예산 소진 — 남은 소스({src} 이후)는 수집하지 못했습니다.")
                     break
-                d = ncq_collect_source_by_month(src, months, B)
+                _cap = NCQ_PHASE_BUDGET_S["P1"] * (_share.get(src, 1.0 / len(_srcs)) / _tot)
+                _cap = min(_cap, B.remaining())
+                with PhaseBudget(f"P1:{src}", _cap, quiet=True) as Bs:
+                    d = ncq_collect_source_by_month(src, months, Bs)
                 if d is not None and len(d):
                     frames.append(d)
     else:
@@ -7255,12 +7285,26 @@ def collect_event_texts(EV: pd.DataFrame, REP: pd.DataFrame,
         return pd.DataFrame(columns=TXT_COLS)
     R["code"] = R["stock_code"].map(to_code6)
 
-    # 이미 추출해 둔 본문(공용 캐시) 재사용 — 티커 앞 2자리 샤드만 골라 읽는다
+    # 이미 추출해 둔 본문(공용 캐시) 재사용 — 티커 앞 2자리 샤드만 골라 읽는다.
+    # ★★ 읽자마자 **필요한 report_uid 로 즉시 자른다.** 공용 샤드는 다른 전략이 넣은 본문까지
+    #   들어 있고 sec_body 가 건당 10~30KB 다. 캐시가 성숙해 20만 건이 쌓이면 concat 사본만
+    #   수 GB 라 P3 시작 직후 커널이 죽고, 그때까지의 P0·P1(최대 165분)이 통째로 날아간다.
+    #   정작 필요한 건 이벤트 리포트 수천 건뿐이다.
     cached_txt: List[pd.DataFrame] = []
+    _n_scanned = 0
     for pref in sorted({str(c)[:2] for c in R["code"].dropna().astype(str)}):
         d = VAULT.get_table(f"report_text_{pref}", scope="shared")
-        if d is not None and len(d):
-            cached_txt.append(d)
+        if d is None or len(d) == 0:
+            continue
+        _n_scanned += len(d)
+        if "report_uid" in d.columns:
+            d = d[d["report_uid"].astype(str).isin(want)]
+        if len(d):
+            cached_txt.append(d.copy())
+        del d
+    if _n_scanned:
+        LOG.debug(f"본문 샤드 {_n_scanned:,}행을 훑어 이벤트 관련 "
+                  f"{sum(len(x) for x in cached_txt):,}행만 적재했습니다(메모리 보호).")
     if extra_text is not None and len(extra_text):
         # 호출자가 이미 확보한 본문(스모크의 합성 텍스트 · 외부에서 추출해 둔 본문)을 우선 사용.
         # 네트워크 없이도 텍스트 경로 전체를 실제로 검증할 수 있게 하는 통로다.
@@ -7376,8 +7420,13 @@ def _ncq_download_and_extract(todo: pd.DataFrame) -> pd.DataFrame:
 
     rows: List[dict] = []
     CH = 400
-    with PhaseBudget("P3", NCQ_PHASE_BUDGET_S["P3"], on_exceed="L2") as B:
+    with PhaseBudget("P3", NCQ_PHASE_BUDGET_S["P3"]) as B:
         for k0 in range(0, len(jobs), CH):
+            # ★ 열화 L2(앞 6페이지 제한)를 **예산 소진 전에** 발동시킨다. 캡에 도달한 뒤
+            #   발동하면 그 즉시 루프가 끝나 단 한 건에도 적용되지 않는데, 매니페스트와
+            #   리포트에는 "6페이지 제한 적용"이라고 남아 독자를 오도한다.
+            if B.frac() > 0.8 and not is_degraded("L2"):
+                degrade("L2", "P3 예산 80% 소진 — 남은 PDF 를 앞 6페이지만 추출")
             if not B.check():
                 LOG.warn(f"[P3] 예산 소진 — {k0:,}/{len(jobs):,}건까지만 본문을 확보했습니다. "
                          f"나머지는 제목만으로 채점되며 결손율에 반영됩니다.")
@@ -7502,15 +7551,28 @@ def score_texts(TXT: pd.DataFrame) -> pd.DataFrame:
     #   (하한 자체는 구현 결정이므로 그 사실과 값을 여기에 명시하고 매니페스트에도 남긴다)
     denom = (S["n_chars"] / 1000.0).clip(lower=1.0)
     S["doc_score"] = S["doc_raw"] / denom
-    S["title_only"] = (pd.to_numeric(T.get("n_chars"), errors="coerce").fillna(0).to_numpy() <= 0) | \
-                      ((T["sec_headline"].str.len() + T["sec_body"].str.len()).to_numpy() < 100)
+    S["title_only"] = ((T["sec_headline"].str.len() + T["sec_body"].str.len()).to_numpy() < 100)
+
+    # ★★ 본문을 못 읽은 문서는 **채점하지 않는다**(결측으로 남긴다). 이유가 결정적이다.
+    #   감점 그룹 H(기대·전망·예상·추정)와 N(지연·부진·둔화·우려·리스크)은 본문에만 나온다.
+    #   제목은 마케팅 문구라 가점 그룹만 맞는다. 그래서 제목만 남은 문서는 감점이 구조적으로
+    #   0이고, 본문을 제대로 읽은 문서는 H·N 이 수십 번 잡혀 점수가 음수로 내려간다.
+    #   실측: 같은 제목에 대해 제목만 = +22.5점, 본문 확보(중립~긍정 리포트) = -30.5점.
+    #   그대로 두면 상위 tercile 이 '좋은 리포트'가 아니라 **PDF 수집에 실패한 리포트**로
+    #   채워진다 — 신호가 아니라 수집 실패를 사는 것이다. 길이 정규화 하한으로는 못 막는다.
+    #   결측으로 두면 그 이벤트는 텍스트 점수 없음으로 SIG 에서 빠지고, 결손율은 그대로 보고된다.
+    _n_to = int(S["title_only"].sum())
+    S.loc[S["title_only"], "doc_score"] = np.nan
     S["month"] = S["pub_date"] + pd.offsets.MonthEnd(0)
     S = S.dropna(subset=["code", "month"])
-    n_title_only = int(S["title_only"].sum())
-    LOG.ok(f"텍스트 스코어링 {len(S):,}건 — doc_score 평균 {S['doc_score'].mean():.3f} / "
-           f"표준편차 {S['doc_score'].std():.3f} · 길이 정규화 하한 1,000자 "
-           f"(제목만 남은 문서 {n_title_only:,}건 = {100*n_title_only/max(len(S),1):.0f}%)")
-    manifest_put("score_title_only_share", round(n_title_only / max(len(S), 1), 4))
+    LOG.ok(f"텍스트 스코어링 {len(S):,}건 중 채점 {int(S['doc_score'].notna().sum()):,}건 — "
+           f"doc_score 평균 {S['doc_score'].mean():.3f} / 표준편차 {S['doc_score'].std():.3f} · "
+           f"길이 정규화 하한 1,000자")
+    manifest_put("score_title_only_share", round(_n_to / max(len(S), 1), 4))
+    if _n_to:
+        LOG.warn(f"본문을 못 읽은 {_n_to:,}건({100*_n_to/max(len(S),1):.0f}%)은 **채점에서 제외**"
+                 f"했습니다. 제목만으로 채점하면 감점 어휘(H·N)가 본문에만 있어 수집 실패 건이 "
+                 f"상위 tercile 을 구조적으로 점령합니다. 0점이 아니라 결측으로 둡니다.")
     PIPE.io("OUT", "MEM", "text_scores", S)
     return S.reindex(columns=SCORE_COLS + [])
 
@@ -14339,6 +14401,17 @@ def main() -> dict:
     ctx = ncq_phase0(months)
     ctx["canary"] = ctx_canary
     ctx = ncq_phase1(ctx, months)
+
+    # ★ 열화 L3(윈도우 10년→7년)는 P1 **도중에** 발동한다. months 는 그 전에 확정되므로
+    #   전역 BACKTEST_START 만 바꿔서는 계산 경로에 아무 영향이 없다 — 리포트에는 "축소했다"고
+    #   적히는데 실제로는 수집도 안 된 과거 구간이 그대로 백테스트에 들어가고, 그 구간의
+    #   첫 리포트가 전부 가짜 H1 de novo 로 오판된다. 여기서 반드시 다시 계산한다.
+    _months2 = month_range(BACKTEST_START, BACKTEST_END)
+    if len(_months2) != len(months):
+        LOG.warn(f"열화 L3 반영 — 백테스트 윈도우를 {len(months)}개월 → {len(_months2)}개월로 "
+                 f"실제로 축소합니다 ({_months2[0]:%Y-%m} ~ {_months2[-1]:%Y-%m}).")
+        months = _months2
+        manifest_put("months_after_degrade", [str(months[0].date()), str(months[-1].date())])
 
     # ── 유효 윈도우 판정 (명세 §15-2 — 5년 미만이면 중단하고 보고) ────────────────────────
     burn_end = (as_ts(ctx["valid_start"]) +

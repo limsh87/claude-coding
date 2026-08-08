@@ -223,6 +223,17 @@ def main() -> dict:
     ctx["canary"] = ctx_canary
     ctx = ncq_phase1(ctx, months)
 
+    # ★ 열화 L3(윈도우 10년→7년)는 P1 **도중에** 발동한다. months 는 그 전에 확정되므로
+    #   전역 BACKTEST_START 만 바꿔서는 계산 경로에 아무 영향이 없다 — 리포트에는 "축소했다"고
+    #   적히는데 실제로는 수집도 안 된 과거 구간이 그대로 백테스트에 들어가고, 그 구간의
+    #   첫 리포트가 전부 가짜 H1 de novo 로 오판된다. 여기서 반드시 다시 계산한다.
+    _months2 = month_range(BACKTEST_START, BACKTEST_END)
+    if len(_months2) != len(months):
+        LOG.warn(f"열화 L3 반영 — 백테스트 윈도우를 {len(months)}개월 → {len(_months2)}개월로 "
+                 f"실제로 축소합니다 ({_months2[0]:%Y-%m} ~ {_months2[-1]:%Y-%m}).")
+        months = _months2
+        manifest_put("months_after_degrade", [str(months[0].date()), str(months[-1].date())])
+
     # ── 유효 윈도우 판정 (명세 §15-2 — 5년 미만이면 중단하고 보고) ────────────────────────
     burn_end = (as_ts(ctx["valid_start"]) +
                 pd.DateOffset(months=max(NCQ_LOOKBACK_M, NCQ_BURNIN_M))) + pd.offsets.MonthEnd(0)

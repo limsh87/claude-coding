@@ -31,6 +31,18 @@ IRS_LIST_PATHS = [
 ]
 
 
+def _ncq_http_fail_count(source: str) -> int:
+    """해당 소스의 '실패로 분류되는' HTTP 응답 누적 수. 0건과 차단을 구분하는 근거다."""
+    try:
+        return int(sum(v for k, v in HTTP_STATS.items()
+                       if k.startswith(f"{source}:") and
+                       k.split(":", 1)[1] in ("FAIL", "POSTFAIL", "403", "401", "429", "503",
+                                              "ConnectionError", "Timeout", "ReadTimeout",
+                                              "SSLError", "ProxyError", "HTTPError")))
+    except Exception:
+        return 0
+
+
 class NcqCircuit:
     """소스별 서킷 브레이커 (명세 §3.4).
 
@@ -238,17 +250,25 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
             break
         s = m.replace(day=1).strftime("%Y-%m-%d")      # 그 달 1일
         e = m.strftime("%Y-%m-%d")                     # 그 달 말일 (month_end 이므로 그대로)
+        # ★★ 수집 함수들은 접근 실패에도 예외가 아니라 **빈 DataFrame** 을 돌려준다
+        #   (naver_collect / hankyung_collect / ncq_irs_collect 모두). 그래서 'd is None'
+        #   만으로 실패를 판별하면 차단 구간이 통째로 '데이터 없는 달'로 확정되고,
+        #   그 구멍이 가짜 신규 커버리지를 만든다. HTTP 계층이 이미 세고 있는 실패 카운터의
+        #   **증분**을 보고 '0건'과 '접근 실패'를 가른다.
+        _fail_before = _ncq_http_fail_count(source)
         try:
             d = fn(s, e)
         except Exception as ex:                                  # noqa
             LOG.debug(f"[{source}] {ym} 수집 예외 {type(ex).__name__}: {ex}")
             d = None
-        if d is None:
-            # 예외/HTTP 실패 — '데이터가 없는 달'과 구분해서 기록하고 다음 실행에 재시도한다
+        _fail_delta = _ncq_http_fail_count(source) - _fail_before
+        if d is None or (len(d) == 0 and _fail_delta > 0):
+            # 예외이거나, 0건인데 그 사이 HTTP 실패가 있었다 → '접근 실패'로 본다.
+            # 다음 실행에서 재시도하고, 서킷 브레이커도 이 경로에서 정상 동작한다.
             if cb.fail():
                 break
-            ncq_done_mark(f"p1_{source}", ym, n=0, note="fetch_failed", status="failed")
-            pending_ym.append(None)
+            ncq_done_mark(f"p1_{source}", ym, n=0,
+                          note=f"fetch_failed(http_fail+{_fail_delta})", status="failed")
             continue
         if len(d) == 0:
             cb.ok()
@@ -362,11 +382,21 @@ def collect_report_index(months: pd.DatetimeIndex, sec: pd.DataFrame) -> pd.Data
         LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. 사용자의 명시적 "
                  "지시에 따라 수집하되 보수적 속도(소스별 QPS 상한·워커 4 이하)로 제한합니다. "
                  "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
+        # ★ 예산을 소스별로 나눈다. 하나의 공유 예산을 순차로 쓰면 첫 소스(네이버)가 120분을
+        #   다 먹고 한경·IRS 는 **0개월** 수집한 채 끝난다. 그러면 다중소스 원장이라는 설계가
+        #   무너지고, 그 사실이 로그에는 '예산 초과'로만 남아 원인이 감춰진다.
+        _srcs = list(RESEARCH_SOURCES)
+        _share = {"naver": 0.55, "hankyung": 0.30, "irs": 0.15}
+        _tot = sum(_share.get(x, 1.0 / max(len(_srcs), 1)) for x in _srcs) or 1.0
         with PhaseBudget("P1", NCQ_PHASE_BUDGET_S["P1"], on_exceed="L3") as B:
-            for src in list(RESEARCH_SOURCES):
+            for src in _srcs:
                 if not B.check():
+                    LOG.warn(f"[P1] 전체 예산 소진 — 남은 소스({src} 이후)는 수집하지 못했습니다.")
                     break
-                d = ncq_collect_source_by_month(src, months, B)
+                _cap = NCQ_PHASE_BUDGET_S["P1"] * (_share.get(src, 1.0 / len(_srcs)) / _tot)
+                _cap = min(_cap, B.remaining())
+                with PhaseBudget(f"P1:{src}", _cap, quiet=True) as Bs:
+                    d = ncq_collect_source_by_month(src, months, Bs)
                 if d is not None and len(d):
                     frames.append(d)
     else:
