@@ -53,6 +53,23 @@ def ncq_pit_broker_id(broker_raw: Any, pub_date: Any) -> Tuple[str, str]:
     return (bid, canon)
 
 
+def _ncq_join_uids(s, cap: int = 300) -> str:
+    """report_uid 목록을 '|' 로 잇되 **uid 단위**로 자른다.
+
+    ★ 예전엔 문자열을 4000자에서 잘랐는데, uid 가 정확히 40자라 98번째 uid 가 중간에서
+      23자 조각으로 잘렸다. 그 조각은 어떤 uid 와도 같지 않으므로 Phase 3 의 isin() 에서
+      조용히 탈락하고, 그 리포트는 본문 수집 대상에서 경고 없이 빠진다.
+      개수 제한이 필요하면 개수로 자르고 잘린 사실을 로그로 남긴다.
+    """
+    u = sorted(map(str, {x for x in s if x and str(x) != "nan"}))
+    if len(u) > cap:
+        LOG.warn(f"한 (종목,월)에 리포트가 {len(u)}건이라 {cap}건만 본문 대상으로 남깁니다 "
+                 f"({len(u)-cap}건 제외). 이벤트 점수는 최댓값 집계라 영향이 제한적이지만 "
+                 f"이 사실을 숨기지 않습니다.")
+        u = u[:cap]
+    return "|".join(u)
+
+
 def _ncq_mi(months_like) -> pd.Series:
     """월 인덱스(연*12+월)를 정수로. 개월 차이를 뺄셈 한 번으로 구하기 위한 표준화."""
     t = as_ts_series(months_like)
@@ -138,7 +155,7 @@ def build_coverage_events(REP: pd.DataFrame, UNI: pd.DataFrame, months: pd.Datet
                                                                 for t in str(v).split("+") if t}))),
                   broker_ids=("pit_broker_id", lambda s: "|".join(sorted({str(v) for v in s if v}))),
                   first_broker=("pit_broker_name", lambda s: sorted({str(v) for v in s if v})[:1]),
-                  report_uids=("report_uid", lambda s: "|".join(sorted(map(str, set(s))))[:4000]),
+                  report_uids=("report_uid", _ncq_join_uids),
                   n_sponsored=("is_sponsored", "sum"),
                   n_tot=("is_sponsored", "size"))
              .reset_index())

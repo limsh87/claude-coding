@@ -8,7 +8,7 @@
 # ============================================================================================
 #  ARC-NCQ v1.0 — New Coverage × Qualitative Shift
 #  소형주 「신규 애널리스트 커버리지 × 보고서 텍스트 질적 변화」 탐지 전략
-#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0307
+#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0314
 #
 #  ── 핵심 가설 ───────────────────────────────────────────────────────────────────────────
 #   시총 하위권 소형주에 **처음으로 리서치 보고서가 붙는 순간**은, 커버리지를 정당화할 사건
@@ -217,7 +217,7 @@ STOP_ON_KILL_CRITERIA = True   # 킬 기준 위반 시 즉시 중단하고 보�
 
 STRATEGY_ID   = "ARC_NCQ_V1"
 STRATEGY_NAME = "ARC-NCQ — 신규 커버리지 × 텍스트 질적 변화"
-BUILD_VERSION = "ncq1.20260808.0307"
+BUILD_VERSION = "ncq1.20260808.0314"
 ACTIVE_PACKS  = []          # (TCD 코어 호환용 — 이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # build/10_ingest_universe.py 의 corpCode 오류 진단이 참조하는 표.
@@ -6701,6 +6701,23 @@ def ncq_pit_broker_id(broker_raw: Any, pub_date: Any) -> Tuple[str, str]:
     return (bid, canon)
 
 
+def _ncq_join_uids(s, cap: int = 300) -> str:
+    """report_uid 목록을 '|' 로 잇되 **uid 단위**로 자른다.
+
+    ★ 예전엔 문자열을 4000자에서 잘랐는데, uid 가 정확히 40자라 98번째 uid 가 중간에서
+      23자 조각으로 잘렸다. 그 조각은 어떤 uid 와도 같지 않으므로 Phase 3 의 isin() 에서
+      조용히 탈락하고, 그 리포트는 본문 수집 대상에서 경고 없이 빠진다.
+      개수 제한이 필요하면 개수로 자르고 잘린 사실을 로그로 남긴다.
+    """
+    u = sorted(map(str, {x for x in s if x and str(x) != "nan"}))
+    if len(u) > cap:
+        LOG.warn(f"한 (종목,월)에 리포트가 {len(u)}건이라 {cap}건만 본문 대상으로 남깁니다 "
+                 f"({len(u)-cap}건 제외). 이벤트 점수는 최댓값 집계라 영향이 제한적이지만 "
+                 f"이 사실을 숨기지 않습니다.")
+        u = u[:cap]
+    return "|".join(u)
+
+
 def _ncq_mi(months_like) -> pd.Series:
     """월 인덱스(연*12+월)를 정수로. 개월 차이를 뺄셈 한 번으로 구하기 위한 표준화."""
     t = as_ts_series(months_like)
@@ -6786,7 +6803,7 @@ def build_coverage_events(REP: pd.DataFrame, UNI: pd.DataFrame, months: pd.Datet
                                                                 for t in str(v).split("+") if t}))),
                   broker_ids=("pit_broker_id", lambda s: "|".join(sorted({str(v) for v in s if v}))),
                   first_broker=("pit_broker_name", lambda s: sorted({str(v) for v in s if v})[:1]),
-                  report_uids=("report_uid", lambda s: "|".join(sorted(map(str, set(s))))[:4000]),
+                  report_uids=("report_uid", _ncq_join_uids),
                   n_sponsored=("is_sponsored", "sum"),
                   n_tot=("is_sponsored", "size"))
              .reset_index())
@@ -7357,7 +7374,11 @@ def collect_event_texts(EV: pd.DataFrame, REP: pd.DataFrame,
     T["sec_title"] = _tt.where(_tt.astype(str).str.len() > 0, T.get("sec_title", ""))
     T["code"] = T["report_uid"].astype(str).map(cmap).fillna(T.get("code"))
     T["pub_date"] = as_ts_series(T["report_uid"].astype(str).map(dmap))
-    T = T.drop_duplicates("report_uid", keep="first")
+    # ★ 신규 추출본이 캐시의 실패 행보다 항상 우선해야 한다. T_cached(불량) 뒤에 new(양호)를
+    #   붙였으므로 keep="last". keep="first" 면 재시도로 방금 받아온 본문을 버리고 빈 행을
+    #   남겨서, "재시도 대상으로 되돌립니다" 로그가 그 실행에 한해 거짓이 된다.
+    #   (드라이브 샤드는 이미 keep="last" 라 캐시에는 좋은 행이 들어가는데 이번 실행만 손해였다)
+    T = T.drop_duplicates("report_uid", keep="last")
 
     n_ok = int(T["extract_ok"].fillna(False).astype(bool).sum())
     fail = 1.0 - n_ok / max(len(T), 1)
@@ -7692,24 +7713,8 @@ def build_signal_panel(SCORE: pd.DataFrame, EV: pd.DataFrame, UNI: pd.DataFrame,
     if "adv20" not in Z.columns:
         Z["adv20"] = np.nan
 
-    # ★ 선정군이 '본문 추출 실패 문서'로 채워졌는지 확인한다. 이 비율이 높으면 우리가 산 것은
-    #   텍스트 품질이 아니라 수집 실패다 — 조용히 넘어가면 알파를 착각한다.
-    if SCORE is not None and len(SCORE) and "title_only" in SCORE.columns:
-        try:
-            to = (SCORE.groupby(["code", "month"], observed=True)["title_only"]
-                       .min().rename("title_only").reset_index())
-            Z = Z.merge(to, on=["code", "month"], how="left")
-            sel_to = Z.loc[Z["selected"].fillna(False).astype(bool), "title_only"]
-            if len(sel_to):
-                frac = float(pd.to_numeric(sel_to, errors="coerce").fillna(0).mean())
-                manifest_put("selected_title_only_share", round(frac, 4))
-                if frac > 0.5:
-                    LOG.warn(f"★ 선정 종목의 {100*frac:.0f}% 가 '본문 추출에 실패해 제목만 남은' "
-                             f"리포트로 채점됐습니다. 이 상태의 순위는 텍스트 품질이 아니라 "
-                             f"수집 실패를 반영합니다 — P4(텍스트 증분) 검정을 그대로 믿지 마세요.")
-        except Exception as e:                                    # noqa
-            LOG.debug(f"title_only 결합 생략({type(e).__name__})")
-
+    # (본문 없는 문서는 score_texts 에서 이미 결측 처리되므로, 선정군이 '추출 실패 문서'로
+    #  채워지는 경로 자체가 존재하지 않는다. 결손율은 Phase 3 표에 그대로 남는다.)
     n_sel = int(Z["selected"].sum())
     n_pool = int(Z["pooled"].sum())
     LOG.ok(f"신호 패널 {len(Z):,}행 — 편입 {n_sel:,}건(상위 {100*tp:.0f}%) · "
@@ -14283,7 +14288,19 @@ def ncq_phase2to5(ctx: dict, months_eff: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("P3.TEXT", "이벤트 한정 PDF 본문 수집·섹션 추출", "L2",
                     budget_s=NCQ_PHASE_BUDGET_S["P3"] + 600, critical=False):
-        ctx["TXT"] = collect_event_texts(ctx["EV"], ctx["REP"])
+        # ★ 본문은 **유동성 게이트 이전** 이벤트까지 확보한다. 유동성은 '거래 가능성'이지
+        #   '텍스트를 읽을 수 있는가'가 아니다. 게이트된 집합만 채점하면 민감도의 ADV 완화
+        #   축이 이벤트를 늘려도 그 확대분에 점수가 없어 전량 탈락하고, 결국 기본 조합의
+        #   복제본이 '독립 시행'으로 DSR·PBO·Holm 에 들어간다(가짜 시행).
+        _ev_txt = globals().get("NCQ_EV_UNGATED")
+        if not (isinstance(_ev_txt, pd.DataFrame) and len(_ev_txt)):
+            _ev_txt = ctx["EV"]
+        elif len(_ev_txt) > len(ctx["EV"]):
+            LOG.info(f"본문 수집 대상을 유동성 게이트 이전 {len(_ev_txt):,}건으로 확대합니다 "
+                     f"(게이트 후 {len(ctx['EV']):,}건 대비 +{len(_ev_txt)-len(ctx['EV']):,}). "
+                     f"ADV 완화 민감도 축이 실제로 검정되려면 그 구간의 점수가 필요합니다.")
+        ctx["EV_text_scope"] = _ev_txt
+        ctx["TXT"] = collect_event_texts(_ev_txt, ctx["REP"])
 
     with PIPE.stage("P4.SCORE", "동결 렉시콘 텍스트 스코어링", "L2",
                     budget_s=NCQ_PHASE_BUDGET_S["P4"] + 300):
@@ -14327,9 +14344,24 @@ def ncq_make_runners(ctx: dict, months_eff: pd.DatetimeIndex):
             src = base_ev if (isinstance(base_ev, pd.DataFrame) and len(base_ev)) else EV
             keep = [(m, c) in ok for m, c in zip(src["month"].to_numpy(), src["code"].astype(str))]
             E = src[pd.Series(keep, index=src.index)]
-            if len(E) == len(EV) and float(min_adv) < float(NCQ_MIN_ADV):
-                LOG.warn(f"ADV {min_adv/1e8:.1f}억 조합의 이벤트 수가 기본과 같습니다 — "
-                         f"게이트 이전 집합이 없어 이 축이 무동작일 수 있습니다.")
+            # ★ '이벤트가 늘었는가'가 아니라 '**점수가 있는** 이벤트가 늘었는가'를 본다.
+            #   확대분에 텍스트 점수가 없으면 build_signal_panel 이 전부 버리므로 결과가
+            #   기본 조합과 똑같아지고, 그 복제본이 독립 시행으로 계상된다.
+            try:
+                _have = set(zip(SCORE["code"].astype(str),
+                                as_ts_series(SCORE["month"]).to_numpy()))
+                _n_eff = sum(1 for c, m in zip(E["code"].astype(str), E["month"].to_numpy())
+                             if (c, m) in _have)
+                _n_base = sum(1 for c, m in zip(EV["code"].astype(str), EV["month"].to_numpy())
+                              if (c, m) in _have)
+                if _n_eff == _n_base:
+                    LOG.warn(f"ADV {float(min_adv)/1e8:.1f}억 조합이 기본과 동일한 표본을 냅니다 "
+                             f"(점수 보유 이벤트 {_n_eff:,}건으로 동일) — 이 축은 이번 실행에서 "
+                             f"실질적으로 검정되지 않았습니다. 민감도 표에 그대로 표기됩니다.")
+                    manifest_note(f"민감도 ADV {float(min_adv)/1e8:.1f}억 축 무동작 "
+                                  f"(점수 보유 이벤트 {_n_eff:,}건)")
+            except Exception:
+                pass
         return build_signal_panel(SCORE, E, U, pxm, months_eff, top_pct=top_pct)
 
     return run_fn, build_sig_fn

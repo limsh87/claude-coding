@@ -104,7 +104,19 @@ def ncq_phase2to5(ctx: dict, months_eff: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("P3.TEXT", "이벤트 한정 PDF 본문 수집·섹션 추출", "L2",
                     budget_s=NCQ_PHASE_BUDGET_S["P3"] + 600, critical=False):
-        ctx["TXT"] = collect_event_texts(ctx["EV"], ctx["REP"])
+        # ★ 본문은 **유동성 게이트 이전** 이벤트까지 확보한다. 유동성은 '거래 가능성'이지
+        #   '텍스트를 읽을 수 있는가'가 아니다. 게이트된 집합만 채점하면 민감도의 ADV 완화
+        #   축이 이벤트를 늘려도 그 확대분에 점수가 없어 전량 탈락하고, 결국 기본 조합의
+        #   복제본이 '독립 시행'으로 DSR·PBO·Holm 에 들어간다(가짜 시행).
+        _ev_txt = globals().get("NCQ_EV_UNGATED")
+        if not (isinstance(_ev_txt, pd.DataFrame) and len(_ev_txt)):
+            _ev_txt = ctx["EV"]
+        elif len(_ev_txt) > len(ctx["EV"]):
+            LOG.info(f"본문 수집 대상을 유동성 게이트 이전 {len(_ev_txt):,}건으로 확대합니다 "
+                     f"(게이트 후 {len(ctx['EV']):,}건 대비 +{len(_ev_txt)-len(ctx['EV']):,}). "
+                     f"ADV 완화 민감도 축이 실제로 검정되려면 그 구간의 점수가 필요합니다.")
+        ctx["EV_text_scope"] = _ev_txt
+        ctx["TXT"] = collect_event_texts(_ev_txt, ctx["REP"])
 
     with PIPE.stage("P4.SCORE", "동결 렉시콘 텍스트 스코어링", "L2",
                     budget_s=NCQ_PHASE_BUDGET_S["P4"] + 300):
@@ -148,9 +160,24 @@ def ncq_make_runners(ctx: dict, months_eff: pd.DatetimeIndex):
             src = base_ev if (isinstance(base_ev, pd.DataFrame) and len(base_ev)) else EV
             keep = [(m, c) in ok for m, c in zip(src["month"].to_numpy(), src["code"].astype(str))]
             E = src[pd.Series(keep, index=src.index)]
-            if len(E) == len(EV) and float(min_adv) < float(NCQ_MIN_ADV):
-                LOG.warn(f"ADV {min_adv/1e8:.1f}억 조합의 이벤트 수가 기본과 같습니다 — "
-                         f"게이트 이전 집합이 없어 이 축이 무동작일 수 있습니다.")
+            # ★ '이벤트가 늘었는가'가 아니라 '**점수가 있는** 이벤트가 늘었는가'를 본다.
+            #   확대분에 텍스트 점수가 없으면 build_signal_panel 이 전부 버리므로 결과가
+            #   기본 조합과 똑같아지고, 그 복제본이 독립 시행으로 계상된다.
+            try:
+                _have = set(zip(SCORE["code"].astype(str),
+                                as_ts_series(SCORE["month"]).to_numpy()))
+                _n_eff = sum(1 for c, m in zip(E["code"].astype(str), E["month"].to_numpy())
+                             if (c, m) in _have)
+                _n_base = sum(1 for c, m in zip(EV["code"].astype(str), EV["month"].to_numpy())
+                              if (c, m) in _have)
+                if _n_eff == _n_base:
+                    LOG.warn(f"ADV {float(min_adv)/1e8:.1f}억 조합이 기본과 동일한 표본을 냅니다 "
+                             f"(점수 보유 이벤트 {_n_eff:,}건으로 동일) — 이 축은 이번 실행에서 "
+                             f"실질적으로 검정되지 않았습니다. 민감도 표에 그대로 표기됩니다.")
+                    manifest_note(f"민감도 ADV {float(min_adv)/1e8:.1f}억 축 무동작 "
+                                  f"(점수 보유 이벤트 {_n_eff:,}건)")
+            except Exception:
+                pass
         return build_signal_panel(SCORE, E, U, pxm, months_eff, top_pct=top_pct)
 
     return run_fn, build_sig_fn

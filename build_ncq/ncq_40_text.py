@@ -412,7 +412,11 @@ def collect_event_texts(EV: pd.DataFrame, REP: pd.DataFrame,
     T["sec_title"] = _tt.where(_tt.astype(str).str.len() > 0, T.get("sec_title", ""))
     T["code"] = T["report_uid"].astype(str).map(cmap).fillna(T.get("code"))
     T["pub_date"] = as_ts_series(T["report_uid"].astype(str).map(dmap))
-    T = T.drop_duplicates("report_uid", keep="first")
+    # ★ 신규 추출본이 캐시의 실패 행보다 항상 우선해야 한다. T_cached(불량) 뒤에 new(양호)를
+    #   붙였으므로 keep="last". keep="first" 면 재시도로 방금 받아온 본문을 버리고 빈 행을
+    #   남겨서, "재시도 대상으로 되돌립니다" 로그가 그 실행에 한해 거짓이 된다.
+    #   (드라이브 샤드는 이미 keep="last" 라 캐시에는 좋은 행이 들어가는데 이번 실행만 손해였다)
+    T = T.drop_duplicates("report_uid", keep="last")
 
     n_ok = int(T["extract_ok"].fillna(False).astype(bool).sum())
     fail = 1.0 - n_ok / max(len(T), 1)
@@ -747,24 +751,8 @@ def build_signal_panel(SCORE: pd.DataFrame, EV: pd.DataFrame, UNI: pd.DataFrame,
     if "adv20" not in Z.columns:
         Z["adv20"] = np.nan
 
-    # ★ 선정군이 '본문 추출 실패 문서'로 채워졌는지 확인한다. 이 비율이 높으면 우리가 산 것은
-    #   텍스트 품질이 아니라 수집 실패다 — 조용히 넘어가면 알파를 착각한다.
-    if SCORE is not None and len(SCORE) and "title_only" in SCORE.columns:
-        try:
-            to = (SCORE.groupby(["code", "month"], observed=True)["title_only"]
-                       .min().rename("title_only").reset_index())
-            Z = Z.merge(to, on=["code", "month"], how="left")
-            sel_to = Z.loc[Z["selected"].fillna(False).astype(bool), "title_only"]
-            if len(sel_to):
-                frac = float(pd.to_numeric(sel_to, errors="coerce").fillna(0).mean())
-                manifest_put("selected_title_only_share", round(frac, 4))
-                if frac > 0.5:
-                    LOG.warn(f"★ 선정 종목의 {100*frac:.0f}% 가 '본문 추출에 실패해 제목만 남은' "
-                             f"리포트로 채점됐습니다. 이 상태의 순위는 텍스트 품질이 아니라 "
-                             f"수집 실패를 반영합니다 — P4(텍스트 증분) 검정을 그대로 믿지 마세요.")
-        except Exception as e:                                    # noqa
-            LOG.debug(f"title_only 결합 생략({type(e).__name__})")
-
+    # (본문 없는 문서는 score_texts 에서 이미 결측 처리되므로, 선정군이 '추출 실패 문서'로
+    #  채워지는 경로 자체가 존재하지 않는다. 결손율은 Phase 3 표에 그대로 남는다.)
     n_sel = int(Z["selected"].sum())
     n_pool = int(Z["pooled"].sum())
     LOG.ok(f"신호 패널 {len(Z):,}행 — 편입 {n_sel:,}건(상위 {100*tp:.0f}%) · "
