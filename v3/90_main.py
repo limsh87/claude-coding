@@ -10,8 +10,16 @@ def _reband(P: pd.DataFrame, mode: str, lo: float, hi: float) -> pd.DataFrame:
     adtv = col(Q, "adv20")
     seasoned = col(Q, "days_listed") >= UNIVERSE_SEASON_DAYS
     live = Q["listed"].astype(bool) if "listed" in Q.columns else pd.Series(True, index=Q.index)
-    band = (col(Q, "mcap_pct").between(lo, hi) if mode == "pct"
-            else col(Q, "mcap_rank").between(lo, hi))
+    if mode == "pct":
+        band = col(Q, "mcap_pct").between(lo, hi)
+    elif mode == "bottom":
+        # 매 시점 '시총 하위 lo개'. 월마다 상장 종목수가 다르므로 상수 랭크로 자를 수 없다.
+        # mcap_rank 는 1 = 최대시총이므로 그 달의 최대 랭크에서 lo 개를 거꾸로 센다.
+        r = col(Q, "mcap_rank")
+        mx = r.groupby(Q["month"], observed=True).transform("max")
+        band = (r > (mx - float(lo))) & r.notna()
+    else:
+        band = col(Q, "mcap_rank").between(lo, hi)
     Q["u_mid_alt"] = (band.fillna(False) & live & adtv.ge(UNIVERSE_MIN_ADTV).fillna(False)
                       & seasoned.fillna(False))
     return Q
@@ -126,7 +134,7 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         KRX.login()
         px = fetch_prices(ctx["sec"]["code"].tolist(),
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+                          BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
         ctx["pp"] = build_price_panel(px, months)
 
@@ -226,11 +234,42 @@ def collect_research(months: pd.DatetimeIndex, sec: pd.DataFrame) -> dict:
     _g = WALL.gate("리포트 신규 크롤(한경·네이버)")
     if _g:
         LOG.warn(_g + "  → 드라이브 캐시에 이미 있는 리포트만으로 원장을 구성합니다.")
+
+    # ── 증분 크롤: 캐시가 이미 덮고 있는 기간을 다시 긁지 않는다 ──────────────────────
+    #   실측 실패: 캐시 70,440건을 갖고도 company 1,500페이지 + industry 850페이지를
+    #   전부 다시 긁어 15분을 썼다. 새로 얻은 리포트는 **0건**이었다(고유 70,440 그대로).
+    #   리스트는 발행일 역순이므로, 캐시의 마지막 발행일 며칠 전부터만 받으면 충분하다.
+    crawl_from = BACKTEST_START
+    src_from: Dict[str, str] = {}
+    if RESEARCH_INCREMENTAL and nonempty(cached) and "pub_date" in cached.columns:
+        cd = cached.copy()
+        cd["pub_date"] = as_ts_series(cd["pub_date"])
+        for src in RESEARCH_SOURCES:
+            sub = cd[cd["source"].astype(str).str.contains(src, case=False, na=False)] \
+                if "source" in cd.columns else cd
+            mx = sub["pub_date"].max() if nonempty(sub) else pd.NaT
+            if pd.notna(mx):
+                f = max(as_ts(BACKTEST_START),
+                        mx - pd.Timedelta(days=RESEARCH_OVERLAP_DAYS))
+                src_from[src] = min(f, as_ts(BACKTEST_END)).strftime("%Y-%m-%d")
+        if src_from:
+            LOG.table([[k, f"{v} ~ {BACKTEST_END}",
+                        f"캐시 최종발행일 −{RESEARCH_OVERLAP_DAYS}일"] for k, v in src_from.items()],
+                      ["소스", "이번에 크롤할 구간", "근거"], ["l", "l", "l"],
+                      title=f"증분 크롤 — 캐시 {len(cached):,}건이 덮는 기간은 다시 긁지 않습니다 "
+                            f"(RESEARCH_INCREMENTAL=False 로 전 구간 재크롤)")
+
     if RUN_MODE != "CACHED" and RESEARCH_COLLECT and not _g:
         if "hankyung" in RESEARCH_SOURCES:
-            frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+            hk = hankyung_collect(src_from.get("hankyung", crawl_from), BACKTEST_END)
+            if not nonempty(hk):
+                LOG.warn("한경컨센서스에서 0건을 받았습니다. 한경은 사양상 1순위 소스이고 "
+                         "리스트에 작성자·목표주가가 이미 들어 있어 PDF 없이도 원장이 서는 "
+                         "유일한 경로입니다 — 0건이면 애널리스트 연결의 질이 네이버 단독으로 "
+                         "떨어집니다. 사이트 구조 변경 또는 차단을 의심하세요.")
+            frames.append(hk)
         if "naver" in RESEARCH_SOURCES:
-            nv = naver_collect(BACKTEST_START, BACKTEST_END)
+            nv = naver_collect(src_from.get("naver", crawl_from), BACKTEST_END)
             frames.append(naver_enrich_detail(nv))
     if cached is not None and len(cached):
         LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 "
@@ -413,6 +452,19 @@ def main() -> dict:
             LOG.rule(f"{st} 백테스트 결과")
             report_performance(bt, bench if st == stage else {}, title=f"성과 검증 ({st})")
 
+    # ── 대조군: 시총 하위 N 유니버스 (같은 신호·같은 비용·같은 유동성 하한) ──────────
+    #   U-MID 가 정말 최적 구간인지, 아니면 그냥 소형주 프리미엄인지 가르는 실험이다.
+    bt_small = None
+    if SMALLCAP_COMPARE:
+        with PIPE.stage("L3.SMALL", f"비교 백테스트 (시총 하위 {SMALLCAP_BOTTOM_N:,})", "L3",
+                        budget_s=600, critical=False), Stage("L3.smallcap", 6):
+            bt_small = runner(P, label=f"SMALLCAP:bottom{SMALLCAP_BOTTOM_N}",
+                              uni=("bottom", SMALLCAP_BOTTOM_N, 0))
+            LOG.rule(f"스몰캡 비교 백테스트 (시총 하위 {SMALLCAP_BOTTOM_N:,})")
+            report_performance(bt_small, bench,
+                               title=f"성과 검증 (대조군 · 시총 하위 {SMALLCAP_BOTTOM_N:,})")
+            report_universe_compare(results[stage], bt_small)
+
     bt = results[stage]
     S = bt.get("scored")
     if S is None:
@@ -485,6 +537,7 @@ def main() -> dict:
         VAULT.compact("shared")
         VAULT.compact("private")
         if DBUDGET:
+            DBUDGET.report()
             DBUDGET.close()
         VAULT.report()
         ctx["outputs"] = outs

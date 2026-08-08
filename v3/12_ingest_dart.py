@@ -16,7 +16,18 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 DART_BASE = "https://opendart.fss.or.kr/api/"
-DART_DAILY_LIMIT = 19_000                 # 공식 20,000 대비 여유
+DART_DAILY_LIMIT = 20_000                 # OpenDART 공식 일일 한도 (참고용 · 게이트 아님)
+# ★ 로컬 카운터로 스스로를 막지 않는다. 이유는 실측 사고다:
+#   저장된 원장이 "오늘 19,000건 사용"을 가리키자 **단 한 번도 호출해 보지 않고** 가용
+#   0건으로 판정해 수집 전체가 멈췄다. 그런데 그 19,000 은 추정치다 —
+#     · 실제로 나가지 않은 요청까지 최악값으로 선예약(take(tries))하고 환급이 어긋났고,
+#     · 날짜 경계를 로컬 시간으로 봐서 KST 기준 리셋과 어긋날 수 있었으며,
+#     · 중단된 실행이 close() 를 못 해 저장 시점이 들쭉날쭉했다.
+#   잔량을 아는 유일한 권위는 DART 자신이다. status=020 이 그 신호다.
+#   → 로컬 원장은 '보고용 추정치'로 강등하고, 멈추는 것은 DART 가 실제로 020 을
+#     연속으로 돌려줄 때뿐이다. 폭주 방지용 안전선만 실제 한도보다 넉넉히 둔다.
+DART_RUNAWAY_GUARD = 60_000               # 이 수치는 버그 폭주 차단용이지 쿼터가 아니다
+DART_EXHAUST_STREAK = 3                   # 020 이 연속 이만큼 나오면 진짜 소진으로 판정
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
 REPRT_DEADLINE_DAYS = {"11013": 45, "11012": 45, "11014": 45, "11011": 90}
 REPRT_PERIOD_END = {"11013": (3, 31), "11012": (6, 30), "11014": (9, 30), "11011": (12, 31)}
@@ -34,13 +45,28 @@ DART_STATUS_MSG = {
 }
 
 
+def _kst_date() -> str:
+    """DART 쿼터는 한국 날짜로 리셋된다. 실행 머신의 로컬 날짜가 아니다.
+
+    UTC−5 같은 곳에서 돌리면 로컬 자정과 KST 자정이 14시간 어긋나, 이미 리셋된
+    쿼터를 '어제 다 썼다'고 판정하거나 그 반대가 된다.
+    """
+    return (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=9)).date().isoformat()
+
+
 class DartBudget:
-    """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거."""
+    """호출량을 기록한다 — 그러나 이것으로 스스로를 막지는 않는다.
+
+    멈추는 근거는 오직 DART 의 응답(status=020)이다. 로컬 숫자는 추정치이고,
+    추정치로 실제 가용 자원을 차단하면 아무것도 안 하고 하루를 버린다.
+    """
 
     def __init__(self):
-        self.today = _dt.date.today().isoformat()
-        self.n = 0
-        self.exhausted = False
+        self.today = _kst_date()
+        self.n = 0                 # 오늘 사용량 추정치 (보고용)
+        self.exhausted = False     # ★ DART 가 실제로 020 을 연속으로 준 경우에만 True
+        self.streak = 0
+        self.blocked = 0           # 소진 이후 호출하지 않고 넘긴 건수
         self._lk = threading.Lock()
         self._load()
 
@@ -55,7 +81,10 @@ class DartBudget:
         except Exception:
             pass
         if self.n:
-            LOG.info(f"오늘 이미 사용한 DART 호출 {self.n:,}건 (한도 {DART_DAILY_LIMIT:,}) — 이어서 진행합니다.")
+            LOG.info(f"오늘 사용한 DART 호출 추정 {self.n:,}건 (공식 한도 {DART_DAILY_LIMIT:,}, "
+                     f"KST {self.today} 기준). ★ 이 숫자로는 막지 않습니다 — 실제 잔량은 "
+                     f"DART 만 알고 있고, status=020 이 {DART_EXHAUST_STREAK}회 연속 나올 "
+                     f"때까지 계속 호출합니다.")
 
     def _save(self):
         try:
@@ -69,18 +98,53 @@ class DartBudget:
                 self.n = max(0, self.n - k)
 
     def take(self, k: int = 1) -> bool:
+        """호출해도 되는가. 로컬 추정치는 근거가 아니다 — DART 의 실제 응답만이 근거다."""
         with self._lk:
-            if self.n + k > DART_DAILY_LIMIT:
+            if self.exhausted:
+                self.blocked += 1
+                return False
+            if self.n + k > DART_RUNAWAY_GUARD:
                 if not self.exhausted:
                     self.exhausted = True
-                    LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
-                             f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, 내일 같은 "
-                             f"코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
+                    LOG.error(f"폭주 안전선 {DART_RUNAWAY_GUARD:,}건을 넘었습니다. 이건 쿼터가 "
+                              f"아니라 무한루프 차단선입니다 — 호출 루프에 버그가 있는지 "
+                              f"확인하세요. (DART 는 아직 020 을 준 적이 없습니다)")
                 return False
             self.n += k
-            if self.n % 500 == 0:
+            if self.n % 500 < k:
                 self._save()
             return True
+
+    def hit_limit(self) -> bool:
+        """DART 가 020 을 돌려줬다. 연속으로 나올 때만 진짜 소진으로 인정한다.
+
+        020 은 초당 과속에서도 한 번씩 튈 수 있다. 단발성 020 에 수집 전체를 접으면
+        남은 쿼터를 그대로 버리게 된다.
+        """
+        with self._lk:
+            self.streak += 1
+            if self.streak >= DART_EXHAUST_STREAK and not self.exhausted:
+                self.exhausted = True
+                LOG.warn(f"DART 가 요청제한(020)을 {self.streak}회 연속 반환했습니다 — "
+                         f"오늘 쿼터가 실제로 소진됐습니다 (추정 사용량 {self.n:,}건). "
+                         f"여기까지 받은 데이터는 드라이브에 저장돼 있으니, 내일 같은 코드를 "
+                         f"다시 실행하면 정확히 이 지점부터 이어받습니다.")
+            return self.exhausted
+
+    def ok(self):
+        """정상 응답 — 연속 020 카운터를 되돌린다."""
+        if self.streak:
+            with self._lk:
+                self.streak = 0
+
+    def report(self):
+        LOG.table([["오늘 호출 추정", f"{self.n:,}", "선예약/환급이 아니라 실제 시도 횟수"],
+                   ["공식 일일 한도", f"{DART_DAILY_LIMIT:,}", "참고용 — 게이트가 아닙니다"],
+                   ["DART 소진 판정", "예" if self.exhausted else "아니오",
+                    f"status=020 {DART_EXHAUST_STREAK}회 연속 시에만 '예'"],
+                   ["소진 후 미호출", f"{self.blocked:,}", "내일 재실행하면 이어받습니다"]],
+                  ["DART 호출 예산", "값", "설명"], ["l", "r", "l"],
+                  title="DART 호출 감사 — 로컬 추정치로 스스로를 막지 않습니다")
 
     def close(self):
         self._save()
@@ -90,12 +154,17 @@ DBUDGET: Optional[DartBudget] = None
 
 
 def dart_api(endpoint: str, params: dict, source: str = "dart", tries: int = 2) -> Optional[dict]:
-    """★ 예산 계산 주의: http_get 은 내부적으로 최대 tries 회 실제 요청을 보낸다.
-    호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 한도를 넘긴다.
-    → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
+    """★ 계상 원칙: '실제로 나간 요청 수'만 센다.
+
+    예전에는 최악값(tries)을 먼저 예약하고 나중에 환급했다. 환급이 한 건이라도
+    어긋나면 원장이 위로 드리프트하고, 그 원장이 다음 실행을 통째로 막았다
+    (실측: 저장된 19,000 때문에 가용 0건 판정 → 수집 전면 중단).
+    지금은 요청이 나간 뒤 attempts 만큼만 더한다. 과소집계가 나더라도 멈추는 근거는
+    DART 의 020 이지 이 숫자가 아니므로 안전하다.
+    """
     if not DART_API_KEY:
         return None
-    if DBUDGET is not None and not DBUDGET.take(tries):
+    if DBUDGET is not None and not DBUDGET.take(1):
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
@@ -103,23 +172,26 @@ def dart_api(endpoint: str, params: dict, source: str = "dart", tries: int = 2) 
     js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
                    referer="https://opendart.fss.or.kr/",
                    on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
-    if DBUDGET is not None:
-        DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
+    if DBUDGET is not None and attempts["n"] > 1:
+        # 실제로 나간 재시도분만 보탠다 (첫 1회는 위 take(1) 에서 이미 계상됨)
+        DBUDGET.take(attempts["n"] - 1)
     if not isinstance(js, dict):
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
         if st in ("020", "021"):
             if DBUDGET is not None:
-                DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+                DBUDGET.hit_limit()
+            else:
+                LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')})")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
         elif st != "013":
             LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
         return None
+    if DBUDGET is not None:
+        DBUDGET.ok()                      # 정상 응답 → 020 연속 카운터 리셋
     return js
 
 

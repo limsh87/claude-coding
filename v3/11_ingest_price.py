@@ -206,9 +206,39 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+_YF_QUIET = False
+
+
+def _hush_yfinance():
+    """yfinance 의 'invalid symbol' 수다를 끈다.
+
+    버전마다 경로가 다르다 — 자체 로거(get_yf_logger), 'yfinance' 이름의 표준 로거,
+    그리고 일부 버전은 그냥 print 다. 앞의 둘을 막고, print 경로는 애초에 호출하지
+    않는 것(_no_yf)으로 처리한다. 로그 억제만으로는 print 를 막을 수 없기 때문이다.
+    """
+    global _YF_QUIET
+    if _YF_QUIET or yf is None:
+        return
+    _YF_QUIET = True
+    try:
+        import yfinance.utils as _yu
+        lg = _yu.get_yf_logger()
+        lg.disabled = True
+        lg.setLevel(logging.CRITICAL)
+        lg.propagate = False
+    except Exception:                                            # noqa
+        pass
+    for nm in ("yfinance", "yfinance.data", "yfinance.ticker", "peewee"):
+        lg = logging.getLogger(nm)
+        lg.disabled = True
+        lg.setLevel(logging.CRITICAL)
+        lg.propagate = False
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if yf is None:
         return None
+    _hush_yfinance()
     for suf in (".KS", ".KQ"):
         try:
             limiter("generic").wait()
@@ -236,9 +266,28 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장.
+
+    ★ sec(종목 마스터)를 받으면 상장일·폐지일을 알고 계획을 세운다. 이게 없으면
+      "2018년 상장 종목의 2015년치가 캐시에 없다"를 **결손**으로 오해해서 매 실행
+      백필을 반복한다. 없는 데이터를 찾아 헤매는 건 영원히 끝나지 않는다.
+    """
     codes = sorted({c for c in map(to_code6, codes) if c})
+
+    # ── 종목별 '데이터가 존재할 수 있는 구간' ──────────────────────────────────────
+    listing: Dict[str, pd.Timestamp] = {}
+    delist: Dict[str, pd.Timestamp] = {}
+    if nonempty(sec):
+        _s = sec.copy()
+        _s["code"] = _s["code"].map(to_code6)
+        if "listing_date" in _s.columns:
+            _l = _s.dropna(subset=["code"]).assign(d=as_ts_series(_s["listing_date"]))
+            listing = {r.code: r.d for r in _l.dropna(subset=["d"]).itertuples(index=False)}
+        if "delisting_date" in _s.columns:
+            _d = _s.dropna(subset=["code"]).assign(d=as_ts_series(_s["delisting_date"]))
+            delist = {r.code: r.d for r in _d.dropna(subset=["d"]).itertuples(index=False)}
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
     have_min: Dict[str, pd.Timestamp] = {}
@@ -289,31 +338,52 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False            # 이번엔 더 이른 구간을 원한다 → 재시도할 이유가 있다
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip, n_neg = [], 0, 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_neg, n_life = [], 0, 0, 0, 0, 0
+    GRACE = pd.Timedelta(days=10)
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
-        asked = _asked_before(c, start_ts)
+        # 이 종목의 데이터가 존재할 수 있는 구간 [want_from, want_to]
+        ld, dd = listing.get(c), delist.get(c)
+        want_from = max(start_ts, ld) if pd.notna(ld) else start_ts
+        want_to = min(end_ts, dd) if pd.notna(dd) else end_ts
+        if want_from > want_to:
+            n_life += 1                  # 백테스트 구간과 상장기간이 겹치지 않는다
+            continue
+        asked = _asked_before(c, want_from)
         if mx is None:
             if asked:
-                n_neg += 1            # 캐시도 없고 최근에 물어봤다 → 음성 캐시
+                n_neg += 1               # 캐시도 없고 최근에 물어봤다 → 음성 캐시
                 continue
-            todo.append((c, start))
-            continue
-        # 과거 방향 백필. 단 **이미 그 구간을 요청해 본 적이 있으면 다시 묻지 않는다** —
-        # 그때 못 받은 건 소스가 그 이전을 갖고 있지 않다는 뜻이다(상장 전이거나 미제공).
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10) and not asked:
-            todo.append((c, start))
+            todo.append((c, want_from.strftime("%Y-%m-%d")))
             n_back += 1
-        elif mx < end_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
-            n_fwd += 1
+            continue
+        # 과거 방향 백필. 단 **상장일 이전은 애초에 존재하지 않으므로 요청하지 않는다**.
+        # 그리고 이미 그 구간을 요청해 본 적이 있으면 다시 묻지 않는다 — 그때 못 받은 건
+        # 소스가 그 이전을 갖고 있지 않다는 뜻이다.
+        if mn is not None and mn > want_from + GRACE and not asked:
+            todo.append((c, want_from.strftime("%Y-%m-%d")))
+            n_back += 1
+        elif mx < want_to - pd.Timedelta(days=5):
+            # 폐지 종목은 폐지일까지만 있으면 완결이다. 그 뒤를 매달 다시 묻지 않는다.
+            frm = mx + pd.Timedelta(days=1)
+            if _asked_before(c, frm):
+                n_skip += 1
+            else:
+                todo.append((c, frm.strftime("%Y-%m-%d")))
+                n_fwd += 1
         else:
             n_skip += 1
-    if n_back:
-        LOG.info(f"과거 구간이 비어 있고 아직 그 구간을 요청해 본 적 없는 {n_back:,}종목을 "
-                 f"처음부터 받습니다.")
-    LOG.info(f"일봉 계획 — 백필 {n_back:,} · 증분 {n_fwd:,} · 캐시충분 {n_skip:,} · "
-             f"음성캐시(최근 실패) {n_neg:,}  [총 {len(codes):,}종목]")
+    LOG.table([["신규/백필", f"{n_back:,}", "캐시에 없거나 상장일까지 비어 있음 → 받는다"],
+               ["증분", f"{n_fwd:,}", "마지막 캐시일 다음날부터만 받는다"],
+               ["캐시 충분", f"{n_skip:,}", "상장~폐지 구간이 이미 다 차 있음 → 요청 안 함"],
+               ["음성 캐시", f"{n_neg:,}", f"최근 {RETRY_AFTER_DAYS}일 내 전 소스 실패 → 재시도 안 함"],
+               ["기간 밖", f"{n_life:,}", "상장기간이 백테스트 구간과 겹치지 않음 → 요청 안 함"],
+               ["── 합계 ──", f"{len(codes):,}", f"이번에 실제 요청 {len(todo):,}종목"]],
+              ["일봉 수집 계획", "종목수", "근거"], ["l", "r", "l"],
+              title="가격 수집 계획 — 없는 데이터를 찾아 헤매지 않는다 "
+                    "(상장일·폐지일로 존재 가능 구간을 먼저 자릅니다)")
+    if not todo:
+        LOG.ok("새로 받을 일봉이 없습니다 — 캐시만으로 충분합니다.")
     if n_neg:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 데이터를 못 받은 {n_neg:,}종목은 "
                  f"이번엔 건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -344,9 +414,18 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 alive = [(nm, fn) for nm, fn in PRICE_CHAIN if _fail[nm] < _dead_after]
                 return sorted(alive, key=lambda x: -_ok[x[0]])
 
+        # ★ 해외 소스(yfinance)는 국내 상장폐지 종목을 **구조적으로** 갖고 있지 않다.
+        #   지난 실행에서 전 소스 실패 1,499종목이 거의 전부 폐지분이었고, 그 전부가
+        #   yfinance 를 두 번씩(.KS/.KQ) 때리며 종목당 한 줄씩 표준출력을 뱉었다.
+        #   그 출력 폭탄이 Jupyter 의 IOPub 한도를 터뜨려 실행 자체를 방해했다.
+        #   못 줄 게 확실한 소스에 묻지 않는 것이 로그 억제보다 근본적이다.
+        _no_yf = {c for c, d in delist.items() if pd.notna(d)}
+
         def _one(job):
             code, st = job
             for nm, fn in _chain_order():
+                if nm == "yfinance" and code in _no_yf:
+                    continue
                 try:
                     d = fn(code, st, end)
                 except Exception:

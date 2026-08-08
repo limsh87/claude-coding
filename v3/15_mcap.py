@@ -210,9 +210,30 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
     #   TP_P1/TP_P2 가 바로 자본배분 신호이므로, 하필 가장 중요한 종목군에서 틀린다.
     #   → 근사를 쓸 수밖에 없더라도 그 사실과 커버리지를 반드시 표로 남긴다.
     px = px_monthly[["code", "month", "close", "adv20"]].copy()
-    px["month"] = as_ts_series(px["month"])
+    # ★ 조인 키를 양쪽 모두 같은 dtype 으로 못박는다. 실측 실패: 가격 패널은 downcast 를
+    #   거치며 code 가 category, month 가 datetime64[s] 가 되는데, M 은 object/[ns] 다.
+    #   그러면 merge 가 예외 없이 **한 행도 매칭하지 않고** 조용히 전부 NaN 을 만든다.
+    #   그 결과가 지난 실행의 "① pykrx PIT 시총 0.0% / ④ 거래대금 대리 100%" 다.
+    #   C13 이 폐기됐는데 로그에는 경고 한 줄 없었다.
+    px["code"] = px["code"].astype(str)
+    px["month"] = as_ts_series(px["month"]).astype("datetime64[ns]")
+    if len(M):
+        M = M.copy()
+        M["code"] = M["code"].astype(str)
+        M["month"] = as_ts_series(M["month"]).astype("datetime64[ns]")
     base = px.merge(M, on=["code", "month"], how="left")
     n_true = int(base["mcap"].notna().sum())
+
+    # ★ 조인이 실패했으면 '왜' 실패했는지 즉시 실측으로 말한다 (C10 · 추측 금지)
+    if len(M) and n_true == 0:
+        cM, cP = set(M["code"]), set(px["code"])
+        mM, mP = set(M["month"]), set(px["month"])
+        LOG.error(f"PIT 시총 {len(M):,}행을 받았는데 가격 패널과 한 행도 붙지 않았습니다 — "
+                  f"조인 키 불일치입니다. "
+                  f"종목코드 교집합 {len(cM & cP):,} (시총측 {len(cM):,} · 패널측 {len(cP):,}) · "
+                  f"월 교집합 {len(mM & mP):,} (시총측 {len(mM):,} · 패널측 {len(mP):,}). "
+                  f"시총측 예시 {sorted(list(cM))[:3]} / 패널측 예시 {sorted(list(cP))[:3]}")
+        PIPE.note("WARN: PIT 시총 조인 실패 — C13 미충족")
 
     need = base["mcap"].isna()
     if need.any():
@@ -226,16 +247,26 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
         if shares_now.empty and "shares" in sec.columns:
             shares_now = pd.to_numeric(sec.dropna(subset=["shares"]).set_index("code")["shares"],
                                        errors="coerce").dropna()
-        if shares_now.empty and RUN_MODE != "CACHED":
+        # ★ 폴백 판단은 '씨앗이 있느냐'가 아니라 '실제로 붙었느냐'로 한다. 지난 실행에서는
+        #   M 에 shares 가 있어 shares_now 가 비어 있지 않았고, 그래서 네이버 폴백이
+        #   아예 켜지지 않았다. 그런데 코드가 안 맞아 역투영 결과는 전부 NaN 이었다.
+        #   조건이 원인이 아니라 결과를 봐야 하는 이유다.
+        if (shares_now.empty or n_true == 0) and RUN_MODE != "CACHED":
             # pykrx 도 마스터도 주식수를 못 줬다. 여기서 포기하면 전 구간이 ④ 거래대금 대리가
             # 되어 '규모 밴드'가 '유동성 밴드'로 바뀐다 — C13 의 의미 자체가 달라진다.
             LOG.warn("상장주식수를 한 건도 확보하지 못했습니다 — 네이버 스냅샷으로 역투영 씨앗을 "
                      "만듭니다. (현재값 기준 근사이며 자본이벤트를 반영하지 못합니다)")
             try:
-                shares_now = naver_shares_snapshot()
+                nv = naver_shares_snapshot()
+                if not nv.empty:
+                    nv.index = nv.index.astype(str)
+                    # 기존 씨앗(있다면)을 우선하고 빈 자리만 네이버로 메운다
+                    shares_now = (nv if shares_now.empty
+                                  else pd.concat([shares_now, nv[~nv.index.isin(shares_now.index)]]))
             except Exception as e:                                        # noqa
                 LOG.warn(f"네이버 상장주식수 스냅샷 실패({type(e).__name__}: {e})")
         if not shares_now.empty:
+            shares_now.index = shares_now.index.astype(str)
             est = base.loc[need, "code"].map(shares_now) * base.loc[need, "close"]
             base.loc[need, "mcap"] = est.to_numpy()
             base.loc[need & base["mcap"].notna(), "mcap_src"] = "shares_backproj"

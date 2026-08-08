@@ -18,6 +18,50 @@ def _fnum(x, default: float = float("nan")) -> float:
         return default
 
 
+def report_universe_compare(bt_main: dict, bt_alt: dict):
+    """U-MID 와 대조군을 나란히 놓는다.
+
+    ★ 왜 필요한가 — 이 전략의 성과가 '전환 탐지' 때문인지 '그냥 소형주'  때문인지는
+      단독 성과표로는 절대 알 수 없다. 같은 신호·같은 비용으로 밴드만 바꿔 돌려야
+      비로소 갈린다. 대조군이 더 좋으면 U-MID 밴드 가설이 기각된 것이고, 그 사실을
+      숨기지 않고 그대로 적는다.
+    """
+    a, b = perf_stats(bt_main.get("returns")), perf_stats(bt_alt.get("returns"))
+    if not a or not b:
+        LOG.warn("유니버스 대조표를 만들 수 없습니다 (한쪽 수익률 시계열이 비었습니다).")
+        return
+    keys = ["CAGR", "연변동성", "Sharpe", "Sortino", "MDD", "Calmar", "승률",
+            "t통계량(HAC)", "누적수익", "평균보유종목수", "월평균회전율", "월평균비용"]
+    pct = {"CAGR", "연변동성", "MDD", "승률", "누적수익", "월평균비용"}
+    rows = []
+    for k in keys:
+        va, vb = a.get(k, np.nan), b.get(k, np.nan)
+        fmt = (lambda v: f"{v:+.2%}") if k in pct else (lambda v: f"{v:,.3f}")
+        try:
+            d = va - vb
+            ds = fmt(d) if np.isfinite(d) else "—"
+        except (TypeError, ValueError):
+            ds = "—"
+        rows.append([k, fmt(va) if np.isfinite(va) else "—",
+                     fmt(vb) if np.isfinite(vb) else "—", ds])
+    ca, cb = a.get("CAGR", np.nan), b.get("CAGR", np.nan)
+    if np.isfinite(ca) and np.isfinite(cb):
+        if ca > cb:
+            verdict = (f"U-MID 가 대조군을 CAGR {100*(ca-cb):+.2f}%p 앞섭니다 — "
+                       f"밴드 가설이 이 표본에서 지지됩니다.")
+        else:
+            verdict = (f"❗ 대조군(스몰캡)이 U-MID 를 CAGR {100*(cb-ca):+.2f}%p 앞섭니다. "
+                       f"성과의 상당 부분이 '전환 탐지'가 아니라 '소형주 노출'일 수 있습니다. "
+                       f"파라미터를 바꿔 통과시키지 말고 이 결과를 그대로 보고합니다(§15).")
+    else:
+        verdict = "한쪽 CAGR 이 계산되지 않아 판정을 보류합니다."
+    LOG.table(rows, ["지표", f"U-MID ({bt_main.get('label','main')})",
+                     f"대조군 ({bt_alt.get('label','alt')})", "차이(U-MID − 대조군)"],
+              ["l", "r", "r", "r"],
+              title="유니버스 대조 — 같은 신호·같은 비용, 밴드만 다릅니다")
+    (LOG.ok if (np.isfinite(ca) and np.isfinite(cb) and ca > cb) else LOG.warn)(verdict)
+
+
 def report_performance(bt: dict, bench: Dict[str, pd.Series], title: str = "성과 검증"):
     s = perf_stats(bt["returns"])
     if not s:

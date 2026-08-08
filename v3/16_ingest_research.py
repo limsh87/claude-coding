@@ -625,9 +625,20 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
         LOG.warn("PDF 파서(pymupdf/pdfplumber)가 없어 원문 추출을 건너뜁니다. "
                  "한경 리스트의 작성자/목표주가만으로도 애널리스트 연결은 동작합니다.")
     work = df[df["pdf_url"].notna()].copy()
+    n_all = len(work)
+    # ★ 상한을 '월별'만 걸면 120개월 × 무제한 = 무제한이다. 실측 64,190건에서 정지했다.
+    #   최신 리포트가 더 쓸모 있으므로 최근 것부터 채운다.
+    work = work.sort_values("pub_date", ascending=False)
     if cap_per_month and len(work):
         work["_m"] = as_ts_series(work["pub_date"]).dt.to_period("M")
         work = work.groupby("_m", observed=True).head(cap_per_month).drop(columns=["_m"])
+    if RESEARCH_PDF_MAX_TOTAL and len(work) > RESEARCH_PDF_MAX_TOTAL:
+        work = work.head(RESEARCH_PDF_MAX_TOTAL)
+    if n_all > len(work):
+        LOG.warn(f"PDF 원문 대상 {n_all:,}건 중 {len(work):,}건만 받습니다 "
+                 f"(월별 {cap_per_month or '무제한'} · 전체 {RESEARCH_PDF_MAX_TOTAL:,} · "
+                 f"{RESEARCH_PDF_MAX_MIN:.0f}분 상한). 조용히 자르지 않고 여기 남깁니다 — "
+                 f"PDF 는 '리스트에 목표주가가 없는 건'의 보강용이며 신호의 필수 입력이 아닙니다.")
     if work.empty:
         return df
 
@@ -664,7 +675,16 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     PDF_CHUNK = 2000
     rows = []
     ok = 0
+    _t_pdf = time.time()
+    _stopped_at = 0
     for k0 in range(0, len(jobs), PDF_CHUNK):
+        # ★ 벽시계 상한. 청크 경계에서만 끊으므로 이미 받은 건 전부 저장되고 이어받는다.
+        if RESEARCH_PDF_MAX_MIN and (time.time() - _t_pdf) / 60.0 >= RESEARCH_PDF_MAX_MIN:
+            _stopped_at = k0
+            LOG.warn(f"PDF 원문 수집이 {RESEARCH_PDF_MAX_MIN:.0f}분 상한에 도달해 "
+                     f"{k0:,}/{len(jobs):,}건에서 중단합니다. 받은 만큼은 드라이브에 저장돼 "
+                     f"있으니 다음 실행이 정확히 여기서 이어받습니다.")
+            break
         chunk = jobs[k0:k0 + PDF_CHUNK]
         res = pmap_io(_one, chunk, workers=min(N_WORKERS_IO, 10),
                       desc=f"리포트 PDF {k0//PDF_CHUNK + 1}/{(len(jobs)-1)//PDF_CHUNK + 1}")
@@ -685,7 +705,8 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
         del res
         VAULT.flush("shared")
     VAULT.flush("shared")
-    LOG.ok(f"PDF 확보 {ok:,}/{len(jobs):,}건 — 공용 인덱스에 저장(내용해시 중복제거 적용)")
+    LOG.ok(f"PDF 확보 {ok:,}/{len(jobs):,}건 — 공용 인덱스에 저장(내용해시 중복제거 적용)"
+           + (f" · 시간상한으로 {len(jobs)-_stopped_at:,}건 미수집" if _stopped_at else ""))
     if not rows:
         for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target"):
             if c not in df.columns:

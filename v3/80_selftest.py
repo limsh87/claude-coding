@@ -125,6 +125,27 @@ def make_synthetic_panel(n_code: int = 240, n_month: int = 72, seed: int = SEED
     return downcast(P), sec, months
 
 
+_MISSING = object()
+#  계약검정이 몽키패치하는 전역들. 하나라도 되돌아가지 않으면 그 뒤 실행 전체가 오염된다.
+#  실측 사고: MCAP-BD 의 _FakeKrx 가 pykrx_stock 에 남아 CANARY K6 이
+#  "type object '_FakeKrx' has no attribute get_market_trading_value_by_date" 로 죽었다.
+#  검정이 본 실행을 망가뜨리는 건 검정의 존재 이유를 정면으로 배신하는 것이다.
+_PATCH_WATCH = ("pykrx_stock", "VAULT", "RUN_MODE", "PRICE_CHAIN", "dart_api")
+
+
+def _restore(saved: Dict[str, Any]):
+    """저장된 전역을 **무조건** 되돌린다.
+
+    `if v is not None` 로 거르면 원래 None 이던 전역(예: 아직 main() 전의 VAULT)이
+    가짜 객체인 채로 남는다. 되돌리기는 값의 내용과 무관해야 한다.
+    """
+    for k, v in saved.items():
+        if v is _MISSING:
+            globals().pop(k, None)
+        else:
+            globals()[k] = v
+
+
 class _MemVault:
     """상태를 기억하는 인메모리 금고. '두 번째 실행'의 행동을 검증하기 위한 것.
     실제 드라이브는 절대 건드리지 않는다 (절대 1원칙)."""
@@ -154,6 +175,7 @@ class _NullVault:
 def run_contract_tests(strict: bool = True) -> bool:
     LOG.banner("계약 자동검정", "협상 불가 규칙이 코드에 실제로 있는지 실행으로 확인한다")
     rng = np.random.default_rng(SEED)
+    _world = {k: globals().get(k, _MISSING) for k in _PATCH_WATCH}
 
     # ── TP 부호 (§6.5) ★ v3 최우선 교정 ───────────────────────────────────────────────
     cells = pd.Series(["c"] * 400)
@@ -393,7 +415,7 @@ def run_contract_tests(strict: bool = True) -> bool:
                                  "상장주식수": [1e6, 2e6]},
                                 index=pd.Index([f"{base+1:06d}", f"{base+2:06d}"], name="티커"))
 
-    _sv = {k: globals().get(k) for k in ("pykrx_stock", "VAULT", "RUN_MODE")}
+    _sv = {k: globals().get(k, _MISSING) for k in ("pykrx_stock", "VAULT", "RUN_MODE")}
     try:
         mths = pd.date_range("2016-08-31", periods=3, freq="ME")
         # 월말이 휴장일이어도(예: 8/31 이 일요일) 패널은 '실제 체결된 마지막 날'을 안다
@@ -415,16 +437,14 @@ def run_contract_tests(strict: bool = True) -> bool:
     except Exception as e:                                       # noqa
         _t("MCAP-BD", "달력 API 가 막혀도 PIT 시총이 살아남는다", False, f"{type(e).__name__}: {e}")
     finally:
-        for k, v in _sv.items():
-            if v is not None:
-                globals()[k] = v
+        _restore(_sv)
 
     # ── 캐시가 충분한 종목을 두 번째 실행에서 다시 받지 않는다 ──────────────────────
     #   실측 실패: 드라이브에 일봉 697만행이 있는데도 3,497종목을 처음부터 다시 받아 17.5분.
     #   원인은 '실패만 기록하는' 음성 캐시였다. 2018년 상장 종목은 소스가 2015년치를 줄 수
     #   없으므로 min(cache)=2018 > start=2015 조건이 **영원히** 참이고, 성공했으니 실패
     #   원장에도 안 남아 매 실행 백필이 반복된다. 예외도 경고도 없다 — 그냥 매번 느리다.
-    _sv = {k: globals().get(k) for k in ("VAULT", "PRICE_CHAIN", "RUN_MODE")}
+    _sv = {k: globals().get(k, _MISSING) for k in ("VAULT", "PRICE_CHAIN", "RUN_MODE")}
     try:
         asked_codes: List[str] = []
 
@@ -451,13 +471,94 @@ def run_contract_tests(strict: bool = True) -> bool:
     except Exception as e:                                       # noqa
         _t("REFETCH", "캐시가 충분한 종목을 다시 받지 않는다", False, f"{type(e).__name__}: {e}")
     finally:
-        for k, v in _sv.items():
-            if v is not None:
-                globals()[k] = v
+        _restore(_sv)
 
     # ── 벽시계 게이트: 선택 수집만 끊고, 끊었다는 사실을 반드시 남긴다 ──────────────
     #   실측 실패: 수집이 3시간을 먹고도 파이프라인은 계속 진행 → 사용자는 백테스트 결과를
     #   한 번도 못 봤다. 연구 도구로서 '완벽한 무결과'는 부분 결과보다 나쁘다.
+    # ── 상장 전 / 폐지 후 구간을 요청하지 않는다 ────────────────────────────────────
+    #   실측 실패: 2018년 상장 종목의 2015년치가 캐시에 없는 것을 '결손'으로 오해해
+    #   1,159종목을 매 실행 백필했고, 폐지 종목은 폐지일 이후를 매달 다시 물었다.
+    #   존재하지 않는 데이터를 찾아 헤매는 일은 영원히 끝나지 않는다.
+    _sv = {k: globals().get(k, _MISSING) for k in ("VAULT", "PRICE_CHAIN", "RUN_MODE")}
+    try:
+        asked2: List[tuple] = []
+
+        def _src2(code, st, en):
+            asked2.append((code, st))
+            d = pd.date_range(max(as_ts(st), pd.Timestamp("2018-01-02")),
+                              pd.Timestamp("2026-07-31"), freq="B")
+            if not len(d):
+                return None
+            return pd.DataFrame({"date": d, "code": code, "open": 1e3, "high": 1e3,
+                                 "low": 1e3, "close": 1e3, "volume": 1e4,
+                                 "amount": 1e7, "src": "fake"})
+
+        mv = _MemVault()
+        # 캐시: A는 상장(2018-01)~현재, B는 상장~폐지(2019-06) 까지 이미 완결
+        cA = pd.date_range("2018-01-02", "2026-07-30", freq="B")
+        cB = pd.date_range("2016-01-04", "2019-06-28", freq="B")
+        mv.put_table("krx_ohlcv_daily", pd.concat([
+            pd.DataFrame({"date": cA, "code": "000001", "open": 1e3, "high": 1e3, "low": 1e3,
+                          "close": 1e3, "volume": 1e4, "amount": 1e7, "src": "c"}),
+            pd.DataFrame({"date": cB, "code": "000002", "open": 1e3, "high": 1e3, "low": 1e3,
+                          "close": 1e3, "volume": 1e4, "amount": 1e7, "src": "c"})],
+            ignore_index=True))
+        sec2 = pd.DataFrame({
+            "code": ["000001", "000002", "000003", "000004"],
+            "listing_date": [pd.Timestamp("2018-01-02"), pd.Timestamp("2016-01-04"),
+                             pd.Timestamp("2019-03-01"), pd.Timestamp("2030-01-01")],
+            "delisting_date": [pd.NaT, pd.Timestamp("2019-06-28"), pd.NaT, pd.NaT]})
+        globals()["VAULT"] = mv
+        globals()["PRICE_CHAIN"] = [("fake", _src2)]
+        globals()["RUN_MODE"] = "FULL"
+        fetch_prices(sec2["code"].tolist(), "2015-02-01", "2026-07-31", sec=sec2)
+        got = dict(asked2)
+        _t("PX-PLAN", "상장 전·폐지 후 구간을 요청하지 않는다 (없는 데이터를 찾아 헤매지 않음)",
+           "000001" not in got and "000002" not in got
+           and got.get("000003", "") == "2019-03-01" and "000004" not in got,
+           f"상장후 캐시완결 재요청 {'000001' in got} (False 여야) · "
+           f"폐지후 재요청 {'000002' in got} (False 여야) · "
+           f"신규는 상장일부터 요청 {got.get('000003')!r} ('2019-03-01' 이어야) · "
+           f"기간밖 요청 {'000004' in got} (False 여야)")
+    except Exception as e:                                       # noqa
+        _t("PX-PLAN", "상장 전·폐지 후 구간을 요청하지 않는다", False, f"{type(e).__name__}: {e}")
+    finally:
+        _restore(_sv)
+
+    # ── DART 예산: 추정치로 스스로를 막지 않는다 ────────────────────────────────────
+    #   실측 사고: 저장된 원장이 "오늘 19,000건 사용"을 가리키자 **한 번도 호출해 보지 않고**
+    #   가용 0건으로 판정해 재무 수집 전체가 멈췄다. 4시간 예산의 백테스트에서 40분이면
+    #   끝날 호출량인데, 추정치 하나로 하루를 통째로 버린 것이다.
+    #   잔량을 아는 권위는 DART 뿐이고 그 신호는 status=020 이다.
+    try:
+        _b = DartBudget.__new__(DartBudget)
+        _b.today, _b.n, _b.exhausted, _b.streak, _b.blocked = "x", 19_000, False, 0, 0
+        _b._lk = threading.Lock()
+        over_ledger = _b.take(1)                      # 원장이 커도 통과해야 한다
+        single_020 = _b.hit_limit()                   # 단발 020 으로는 멈추지 않는다
+        _b.ok()                                       # 정상 응답이 끼면 연속이 끊긴다
+        after_ok = _b.hit_limit()
+        for _ in range(DART_EXHAUST_STREAK):
+            _b.hit_limit()                            # 연속 020 → 진짜 소진
+        real_stop = _b.exhausted and not _b.take(1)
+        _t("DART-BUDGET", "로컬 추정치가 아니라 DART 의 실제 응답으로만 멈춘다",
+           over_ledger and not single_020 and not after_ok and real_stop,
+           f"원장 19,000 에도 호출 허용 {over_ledger} · 단발 020 으로 중단 안 함 "
+           f"{not single_020} · 정상응답이 연속을 끊음 {not after_ok} · "
+           f"020 {DART_EXHAUST_STREAK}회 연속 시 중단 {real_stop}")
+    except Exception as e:                                       # noqa
+        _t("DART-BUDGET", "DART 예산은 실제 응답으로만 멈춘다", False, f"{type(e).__name__}: {e}")
+
+    # ── 검정이 본 실행을 오염시키지 않았는가 (검정 자신에 대한 계약) ────────────────
+    _leaked = [k for k in _PATCH_WATCH if globals().get(k, _MISSING) is not _world[k]]
+    if _leaked:
+        _restore(_world)                      # 먼저 되돌리고, 그 다음에 실패로 기록한다
+    _t("LEAK", "계약검정이 전역 상태를 오염시킨 채 끝나지 않는다",
+       not _leaked,
+       f"오염된 전역 {_leaked or '없음'} "
+       f"(남으면 CANARY·수집이 가짜 객체를 붙들고 죽습니다 — 실제로 K6 이 그렇게 죽었습니다)")
+
     _w = _WallClock()
     _w.start()
     fresh = _w.gate("테스트-선택수집")
