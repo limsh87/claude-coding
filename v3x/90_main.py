@@ -154,8 +154,28 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     return downcast(P)
 
 
+def _reset_run_state() -> None:
+    """같은 커널에서 두 번째로 실행할 때 지난 실행의 기록이 섞이지 않게 초기화한다.
+
+    ★ 노트북은 한 커널에서 셀을 여러 번 돌린다. 전역 로그가 누적되면 강건성 표에 같은 검사가
+      두 번 찍히고, 감쇠표의 첫 행(=분모)이 지난 실행 값이라 잔존율이 통째로 틀어진다.
+    """
+    for _lst in (ROBUST_LOG, KILL_LOG, CANARY_LOG, CONTRACT_LOG,
+                 ATTRITION_LOG, OUTPUT_FILES, RUNTIME_LOG):
+        try:
+            _lst.clear()
+        except Exception:                                               # noqa
+            pass
+    try:
+        _SRC_CACHE.clear()
+        CELL_FALLBACK_STATS.clear()
+    except Exception:                                                   # noqa
+        pass
+
+
 def main_xcb() -> int:
     t_start = time.time()
+    _reset_run_state()
     LOG.banner(f"{STRATEGY_NAME}  ·  {BUILD_VERSION}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · RUN_MODE={RUN_MODE} · STAGE={STAGE}")
 
@@ -212,7 +232,7 @@ def main_xcb() -> int:
         sec = (build_security_master(snaps) if len(snaps)
                else build_security_master_nokrx())
         attrition("전체 상장(생존+폐지)", sec["code"].nunique(), "C2 상장폐지 포함")
-        surv = audit_survivorship(sec, months)
+        surv = audit_survivorship(sec, months, phase="pre")
 
     with PIPE.stage("L1.PRICE", "가격 · 시가총액", "L1", budget_s=2400), \
             Stage("M0.price", 25.0):
@@ -228,6 +248,10 @@ def main_xcb() -> int:
                 LOG.warn(f"KRX 시총 경로 실패({type(e).__name__}) — 근사 경로로 넘어갑니다.")
         if mcap is None or not len(mcap):
             mcap = mcap_nokrx(months, px_m, sec)
+        # ★ 폐지일이 없는 폐지종목의 폐지일을 '마지막 거래일'로 복원한다.
+        #   가격을 받은 뒤에만 가능하므로 여기서 한다. C2 의 마지막 구멍을 막는 단계다.
+        sec = infer_delisting_from_prices(sec, px_d, months)
+        audit_survivorship(sec, months)
 
     # ── [2] 큐레이션 · 통관 ───────────────────────────────────────────────────────────────
     with PIPE.stage("L1.CURATE", "HS 유니버스 큐레이션", "L1", budget_s=1500), \
@@ -381,12 +405,25 @@ def main_xcb() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def _entrypoint() -> int:
     try:
-        raise SystemExit(main_xcb())
+        return main_xcb()
     except KillCriteria as e:
         LOG.error(f"킬 기준으로 중단: {e}")
-        raise SystemExit(4)
+        return 4
     except StageFailure as e:
         LOG.error(f"스테이지 실패로 중단: {e}")
-        raise SystemExit(5)
+        return 5
+
+
+# ★ 노트북에 통째로 붙여넣어도 __name__ 은 "__main__" 이므로 그대로 실행된다(원셀 실행).
+#   다만 노트북에서 SystemExit 를 던지면 셀이 빨간 트레이스백으로 끝나 '실패한 것처럼' 보인다.
+#   대화형 환경에서는 종료코드를 변수로만 남기고 조용히 끝낸다.
+if __name__ == "__main__":
+    XCB_EXIT_CODE = _entrypoint()
+    if ENV.get("ipython"):
+        if XCB_EXIT_CODE:
+            LOG.warn(f"종료코드 {XCB_EXIT_CODE} — 위 진단을 확인하세요. "
+                     f"(노트북이라 예외를 던지지 않고 XCB_EXIT_CODE 변수로만 남깁니다)")
+    else:
+        raise SystemExit(XCB_EXIT_CODE)

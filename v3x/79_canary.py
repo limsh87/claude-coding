@@ -114,10 +114,17 @@ def run_canary(sample_hs: str = "854370") -> "pd.DataFrame":
     # ── K12: KRX 없이 생존자편향 제거 + PIT 유니버스가 성립하는가 (사용자 요구 확인 항목)
     try:
         sec_probe = build_security_master_nokrx()
-        aud = audit_survivorship(sec_probe, _months())
-        _cn("K12", "KRX 비의존 유니버스·생존자편향", 
-            "PASS" if aud["verdict"] == "PASS" else "FAIL",
-            f"KRX 모드={krx_mode()} · {aud['detail']}", kill=(aud["verdict"] != "PASS"))
+        aud = audit_survivorship(sec_probe, _months(), phase="pre")
+        # 캐너리 시점에는 가격이 없어 폐지일 복원 전이다. '폐지 종목이 마스터에 존재하는가'
+        # 까지만 본다. 폐지일 정확성의 최종 판정은 가격 수집 뒤 L1.PRICE 에서 한다.
+        n_dead = int(sec_probe.get("src", pd.Series("", index=sec_probe.index))
+                     .astype(str).str.contains("delist").sum())
+        _cn("K12", "KRX 비의존 유니버스·생존자편향",
+            "PASS" if (len(sec_probe) > 1000 and n_dead > 200) else "FAIL",
+            f"KRX 모드={krx_mode()} · 마스터 {len(sec_probe):,}종목 · 폐지 종목 {n_dead:,}건 "
+            f"포함 · 상장일 확보율 {aud['listing_known']*100:.0f}% "
+            f"(폐지일은 가격 수집 후 마지막 거래일로 복원)",
+            kill=(len(sec_probe) <= 1000 or n_dead <= 200))
     except Exception as e:                                              # noqa
         _cn("K12", "KRX 비의존 유니버스·생존자편향", "FAIL",
             f"{type(e).__name__}: {e} — 상장/폐지 목록 소스를 확인하세요.", kill=True)

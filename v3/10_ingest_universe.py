@@ -250,8 +250,18 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     if not code_c:
         LOG.warn(f"상장폐지 파일에서 종목코드 컬럼을 찾지 못했습니다: {list(d.columns)[:12]}")
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
-                                  "listingdate") if k in col), None)
+    # ★★ 절대로 'listingdate' 를 폐지일 후보에 넣지 말 것 ★★
+    #   FDR 상장폐지 스냅샷에는 폐지일 컬럼이 아예 없는 판이 있다(실측: 컬럼이
+    #   Symbol/Name/Market/SecuGroup/Kind/**ListingDate** 뿐). 폴백 사슬에 listingdate 를
+    #   두면 **상장일이 폐지일 자리에 들어간다.** 결과는 조용하고 치명적이다:
+    #     · 1985년 상장 → 2019년 폐지된 종목이 '1985년 폐지'로 기록되어 백테스트 전 구간에서
+    #       제외된다. 즉 실패 사례가 사라진다 — 제거했다고 믿은 생존자편향이 그대로 재유입된다.
+    #     · 실측: 2,526건 중 581건이 2000년 이전 '폐지', 최소값 1960-11-21(수도극장).
+    #   폐지일을 못 구하면 결측으로 두고, 뒤에서 **마지막 거래일**로 복원한다(infer 경로).
+    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate",
+                                  "delistdate", "date") if k in col), None)
+    li_c = next((col[k] for k in ("listingdate", "listing_date", "listdate")
+                 if k in col), None)
     name_c = col.get("name") or col.get("isu_nm") or code_c
 
     n_raw = len(d)
@@ -262,15 +272,37 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        # 상장일은 그대로 살려 둔다 — 상장목록 스냅샷에 ListingDate 가 없는 판이 많아서
+        # 폐지목록이 사실상 유일한 상장일 소스인 경우가 있다(C2 시즈닝 정확도에 직결).
+        "listing_date": as_ts_series(d[li_c]) if li_c else pd.NaT,
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
         "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
     })
     t = t.dropna(subset=["code"])
+    # ── 폐지일 타당성 검사: 상장일이 잘못 실려 들어왔는지 데이터로 판정한다.
+    _dd = as_ts_series(t["delisting_date"])
+    _n_old = int((_dd < pd.Timestamp("1995-01-01")).sum())
+    if dl_c is None:
+        LOG.warn("상장폐지 목록에 **폐지일 컬럼이 없습니다**. 폐지 사실만 사용하고 폐지일은 "
+                 "'마지막 거래일'로 복원합니다(뒤 단계). 폐지 종목을 버리지는 않습니다 — "
+                 "버리면 그게 곧 생존자편향입니다.")
+        t["delisting_date"] = pd.NaT
+    elif _dd.notna().any() and _n_old > max(20, 0.05 * int(_dd.notna().sum())):
+        LOG.error(
+            f"상장폐지 목록의 '폐지일' 중 {_n_old:,}건이 1995년 이전입니다 "
+            f"(최소 {_dd.min():%Y-%m-%d}). 폐지일 자리에 **상장일**이 들어왔을 가능성이 큽니다.\n"
+            f"    그대로 두면 '오래전에 상장해 최근 폐지된' 종목이 백테스트 전 구간에서 빠져\n"
+            f"    실패 사례가 사라집니다 — 제거했다고 믿은 생존자편향이 그대로 재유입됩니다.\n"
+            f"    → 이 컬럼을 폐기하고 마지막 거래일로 복원합니다.")
+        t["listing_date"] = t["listing_date"].fillna(_dd)
+        t["delisting_date"] = pd.NaT
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
-    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    # NaT 을 앞으로 보내 'keep="last"' 가 실제 폐지일을 우선 남기게 한다.
+    t = (t.sort_values("delisting_date", na_position="first")
+           .drop_duplicates("code", keep="last"))
     n_nodate = int(t["delisting_date"].isna().sum())
 
     LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
@@ -527,8 +559,13 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market",
+                                   "listing_date"]).copy()
+        # ★ 예전엔 여기서 listing_date 를 NaT 으로 덮어써 폐지목록이 들고 온 상장일을
+        #   통째로 버렸다. 상장목록 스냅샷에 ListingDate 가 없는 판에서는 이게 유일한
+        #   상장일 소스라 C2 시즈닝이 전부 '모름'으로 떨어진다.
+        if "listing_date" not in d2.columns:
+            d2["listing_date"] = pd.NaT
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"

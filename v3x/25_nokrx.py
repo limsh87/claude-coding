@@ -33,7 +33,53 @@ def build_security_master_nokrx() -> "pd.DataFrame":
     return sec
 
 
-def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex") -> dict:
+def infer_delisting_from_prices(sec: "pd.DataFrame", px_d: "pd.DataFrame",
+                                months: "pd.DatetimeIndex") -> "pd.DataFrame":
+    """폐지일이 없는 '폐지 확정' 종목의 폐지일을 **마지막 거래일**로 복원한다.
+
+    ★ 왜 필요한가: FDR 상장폐지 스냅샷에 폐지일 컬럼이 아예 없는 판이 있다.
+      폐지 사실만 알고 날짜를 모르면 두 가지 잘못된 처리가 가능한데 둘 다 치명적이다.
+        ① 그 종목을 통째로 버린다     → 실패 사례가 사라진다 = 생존자편향 재유입
+        ② 폐지일을 NaT 로 두고 방치   → 폐지 후에도 계속 보유 가능(가격이 남아 있으면)
+      마지막 거래일은 관측 가능한 사실이고, '그 이후로 거래가 없다'는 것이 곧 폐지의 정의에
+      가장 가깝다. 데이터가 끝나는 시점(가격 패널의 마지막 날)과 구분해야 하므로,
+      패널 마지막 달에 걸친 종목은 '아직 상장 중'으로 보고 복원하지 않는다.
+    """
+    if sec is None or not len(sec):
+        return sec
+    s = sec.copy()
+    dd = as_ts_series(s.get("delisting_date"))
+    is_dead = s.get("src", pd.Series("", index=s.index)).astype(str).str.contains("delist")
+    need = is_dead & dd.isna()
+    n_need = int(need.sum())
+    if not n_need:
+        return s
+    if px_d is None or not len(px_d):
+        LOG.warn(f"폐지일 미상 {n_need:,}종목의 폐지일을 복원할 가격 데이터가 없습니다. "
+                 f"이 종목들은 폐지일이 없어 '상장 중'으로 취급되며, 그만큼 생존자편향이 남습니다.")
+        return s
+    p = px_d[["code", "date"]].copy()
+    p["code"] = p["code"].astype(str)
+    last = p.groupby("code", observed=True)["date"].max()
+    panel_end = as_ts_series(pd.Series([px_d["date"].max()])).iloc[0]
+    # 패널 마지막 60일 안에 거래가 있으면 '데이터 끝'이지 '폐지'가 아니다.
+    cutoff = panel_end - pd.Timedelta(days=60)
+    inferred = s.loc[need, "code"].astype(str).map(last)
+    inferred = inferred.where(inferred.notna() & (inferred <= cutoff))
+    # 폐지일 = 마지막 거래일의 다음 날(그 달 말 기준으로 유니버스에서 빠진다)
+    s.loc[need, "delisting_date"] = (inferred + pd.Timedelta(days=1)).to_numpy()
+    n_ok = int(as_ts_series(s.loc[need, "delisting_date"]).notna().sum())
+    LOG.ok(f"폐지일 복원: 미상 {n_need:,}종목 중 {n_ok:,}종목을 '마지막 거래일+1'로 확정했습니다 "
+           f"(가격 관측 기반). 나머지 {n_need - n_ok:,}종목은 가격이 없어 복원 불가입니다.")
+    if n_need - n_ok > 0:
+        LOG.warn(f"폐지일을 끝내 못 구한 {n_need - n_ok:,}종목은 유니버스에서 '상장 중'으로 "
+                 f"남습니다. 다만 가격이 없으므로 체결가가 없어 진입 후보에서 자연히 빠집니다 — "
+                 f"성과를 부풀리는 방향은 아닙니다.")
+    return s
+
+
+def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
+                       phase: str = "final") -> dict:
     """생존자편향 제거가 **실제로** 되어 있는지 수치로 검증한다.
 
     ★ '폐지 종목이 마스터에 있다'는 것만으로는 부족하다. 폐지 종목이
@@ -54,19 +100,36 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex") -> dict:
     out["delisted_in_window"] = int(((dd >= lo) & (dd <= hi)).sum())
     out["listing_known"] = float(ld.notna().mean())
 
-    ok = out["delisted_in_window"] >= 50
+    # ★ 타당성: 폐지일이 상장일로 오염되면 아주 오래된 '폐지'가 대량으로 생긴다.
+    #   개수만 세면 이 오염을 통과시켜 버리므로 분포까지 본다.
+    n_ancient = int((dd < pd.Timestamp("1995-01-01")).sum())
+    out["ancient"] = n_ancient
+    ok = (out["delisted_in_window"] >= 50) and (n_ancient <= max(20, 0.05 * max(out["delisted"], 1)))
     out["verdict"] = "PASS" if ok else "FAIL"
     out["detail"] = (
         f"마스터 {out['total']:,}종목 중 폐지일 보유 {out['delisted']:,}종목 · "
         f"백테스트 구간 내 폐지 {out['delisted_in_window']:,}종목 · "
         f"상장일 확보율 {out['listing_known']*100:.0f}%")
-    LOG.banner("생존자편향 제거 감사 (C2) — KRX 비의존 경로",
-               "폐지 종목이 구간 안에서 실제로 들어왔다 빠지는가")
+    # ★ 가격 수집 전(pre)에는 폐지일이 아직 복원되지 않았다. 그 시점의 0건을 FAIL 로 외치면
+    #   진짜 문제와 구분이 안 되는 '늑대야' 경고가 된다. 최종 판정은 가격 수집 뒤에만 한다.
+    pre = (phase == "pre")
+    LOG.banner("생존자편향 제거 감사 (C2) — KRX 비의존 경로"
+               + ("  [중간 점검]" if pre else ""),
+               "폐지 종목이 구간 안에서 실제로 들어왔다 빠지는가"
+               if not pre else
+               "가격 수집 전 중간 점검 — 폐지일은 이후 '마지막 거래일'로 복원됩니다")
     LOG.table([["종목 마스터(생존+폐지)", f"{out['total']:,}"],
                ["폐지일 보유 종목", f"{out['delisted']:,}"],
                ["백테스트 구간 내 폐지", f"{out['delisted_in_window']:,}"],
                ["상장일 확보율", f"{out['listing_known']*100:.1f}%"],
+               ["1995년 이전 '폐지'(오염 지표)", f"{out.get('ancient', 0):,}"],
                ["판정", out["verdict"]]], ["항목", "값"])
+    if out.get("ancient", 0) > max(20, 0.05 * max(out["delisted"], 1)):
+        LOG.error(
+            f"1995년 이전 '폐지'가 {out['ancient']:,}건입니다 — 폐지일 자리에 **상장일**이 "
+            f"들어왔을 때 나타나는 전형적 증상입니다.\n"
+            f"    이 상태로 두면 '오래전 상장 → 최근 폐지' 종목이 백테스트 전 구간에서 빠져\n"
+            f"    실패 사례가 사라집니다(생존자편향 재유입). 폐지일 소스를 먼저 고치세요.")
     if out["listing_known"] < 0.10:
         LOG.warn(
             f"상장일 확보율이 {out['listing_known']*100:.0f}% 입니다 "
@@ -75,7 +138,11 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex") -> dict:
             f"    → 방향이 중요합니다: '모르면 오래된 종목'으로 처리하므로 신규상장 필터가 "
             f"**느슨해질 뿐**이며, 반대로 '모르면 신규상장'으로 처리했다면 패널 앞 구간의 "
             f"유니버스가 통째로 비었을 것입니다. 생존자편향은 폐지일로 제거되므로 영향 없습니다.")
-    if not ok:
+    if pre and not ok:
+        LOG.info("폐지일이 아직 비어 있습니다 — 가격 수집 후 '마지막 거래일'로 복원한 뒤 "
+                 "최종 판정합니다(여기서는 중단하지 않습니다).")
+        out["verdict"] = "PENDING"
+    elif not ok:
         LOG.error("[C2] 구간 내 폐지 종목이 50개 미만입니다. 10년이면 통상 수백 종목이 폐지됩니다. "
                   "상장폐지 목록을 못 받은 상태이며, 이대로 나온 성과는 생존자편향으로 "
                   "부풀려진 값입니다. raw.githubusercontent.com(FDR 캐시) 접근을 확인하세요.")

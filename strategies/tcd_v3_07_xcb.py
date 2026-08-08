@@ -3168,8 +3168,18 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     if not code_c:
         LOG.warn(f"상장폐지 파일에서 종목코드 컬럼을 찾지 못했습니다: {list(d.columns)[:12]}")
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
-                                  "listingdate") if k in col), None)
+    # ★★ 절대로 'listingdate' 를 폐지일 후보에 넣지 말 것 ★★
+    #   FDR 상장폐지 스냅샷에는 폐지일 컬럼이 아예 없는 판이 있다(실측: 컬럼이
+    #   Symbol/Name/Market/SecuGroup/Kind/**ListingDate** 뿐). 폴백 사슬에 listingdate 를
+    #   두면 **상장일이 폐지일 자리에 들어간다.** 결과는 조용하고 치명적이다:
+    #     · 1985년 상장 → 2019년 폐지된 종목이 '1985년 폐지'로 기록되어 백테스트 전 구간에서
+    #       제외된다. 즉 실패 사례가 사라진다 — 제거했다고 믿은 생존자편향이 그대로 재유입된다.
+    #     · 실측: 2,526건 중 581건이 2000년 이전 '폐지', 최소값 1960-11-21(수도극장).
+    #   폐지일을 못 구하면 결측으로 두고, 뒤에서 **마지막 거래일**로 복원한다(infer 경로).
+    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate",
+                                  "delistdate", "date") if k in col), None)
+    li_c = next((col[k] for k in ("listingdate", "listing_date", "listdate")
+                 if k in col), None)
     name_c = col.get("name") or col.get("isu_nm") or code_c
 
     n_raw = len(d)
@@ -3180,15 +3190,37 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        # 상장일은 그대로 살려 둔다 — 상장목록 스냅샷에 ListingDate 가 없는 판이 많아서
+        # 폐지목록이 사실상 유일한 상장일 소스인 경우가 있다(C2 시즈닝 정확도에 직결).
+        "listing_date": as_ts_series(d[li_c]) if li_c else pd.NaT,
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
         "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
     })
     t = t.dropna(subset=["code"])
+    # ── 폐지일 타당성 검사: 상장일이 잘못 실려 들어왔는지 데이터로 판정한다.
+    _dd = as_ts_series(t["delisting_date"])
+    _n_old = int((_dd < pd.Timestamp("1995-01-01")).sum())
+    if dl_c is None:
+        LOG.warn("상장폐지 목록에 **폐지일 컬럼이 없습니다**. 폐지 사실만 사용하고 폐지일은 "
+                 "'마지막 거래일'로 복원합니다(뒤 단계). 폐지 종목을 버리지는 않습니다 — "
+                 "버리면 그게 곧 생존자편향입니다.")
+        t["delisting_date"] = pd.NaT
+    elif _dd.notna().any() and _n_old > max(20, 0.05 * int(_dd.notna().sum())):
+        LOG.error(
+            f"상장폐지 목록의 '폐지일' 중 {_n_old:,}건이 1995년 이전입니다 "
+            f"(최소 {_dd.min():%Y-%m-%d}). 폐지일 자리에 **상장일**이 들어왔을 가능성이 큽니다.\n"
+            f"    그대로 두면 '오래전에 상장해 최근 폐지된' 종목이 백테스트 전 구간에서 빠져\n"
+            f"    실패 사례가 사라집니다 — 제거했다고 믿은 생존자편향이 그대로 재유입됩니다.\n"
+            f"    → 이 컬럼을 폐기하고 마지막 거래일로 복원합니다.")
+        t["listing_date"] = t["listing_date"].fillna(_dd)
+        t["delisting_date"] = pd.NaT
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
-    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    # NaT 을 앞으로 보내 'keep="last"' 가 실제 폐지일을 우선 남기게 한다.
+    t = (t.sort_values("delisting_date", na_position="first")
+           .drop_duplicates("code", keep="last"))
     n_nodate = int(t["delisting_date"].isna().sum())
 
     LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
@@ -3445,8 +3477,13 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market",
+                                   "listing_date"]).copy()
+        # ★ 예전엔 여기서 listing_date 를 NaT 으로 덮어써 폐지목록이 들고 온 상장일을
+        #   통째로 버렸다. 상장목록 스냅샷에 ListingDate 가 없는 판에서는 이게 유일한
+        #   상장일 소스라 C2 시즈닝이 전부 '모름'으로 떨어진다.
+        if "listing_date" not in d2.columns:
+            d2["listing_date"] = pd.NaT
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
@@ -8966,7 +9003,53 @@ def build_security_master_nokrx() -> "pd.DataFrame":
     return sec
 
 
-def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex") -> dict:
+def infer_delisting_from_prices(sec: "pd.DataFrame", px_d: "pd.DataFrame",
+                                months: "pd.DatetimeIndex") -> "pd.DataFrame":
+    """폐지일이 없는 '폐지 확정' 종목의 폐지일을 **마지막 거래일**로 복원한다.
+
+    ★ 왜 필요한가: FDR 상장폐지 스냅샷에 폐지일 컬럼이 아예 없는 판이 있다.
+      폐지 사실만 알고 날짜를 모르면 두 가지 잘못된 처리가 가능한데 둘 다 치명적이다.
+        ① 그 종목을 통째로 버린다     → 실패 사례가 사라진다 = 생존자편향 재유입
+        ② 폐지일을 NaT 로 두고 방치   → 폐지 후에도 계속 보유 가능(가격이 남아 있으면)
+      마지막 거래일은 관측 가능한 사실이고, '그 이후로 거래가 없다'는 것이 곧 폐지의 정의에
+      가장 가깝다. 데이터가 끝나는 시점(가격 패널의 마지막 날)과 구분해야 하므로,
+      패널 마지막 달에 걸친 종목은 '아직 상장 중'으로 보고 복원하지 않는다.
+    """
+    if sec is None or not len(sec):
+        return sec
+    s = sec.copy()
+    dd = as_ts_series(s.get("delisting_date"))
+    is_dead = s.get("src", pd.Series("", index=s.index)).astype(str).str.contains("delist")
+    need = is_dead & dd.isna()
+    n_need = int(need.sum())
+    if not n_need:
+        return s
+    if px_d is None or not len(px_d):
+        LOG.warn(f"폐지일 미상 {n_need:,}종목의 폐지일을 복원할 가격 데이터가 없습니다. "
+                 f"이 종목들은 폐지일이 없어 '상장 중'으로 취급되며, 그만큼 생존자편향이 남습니다.")
+        return s
+    p = px_d[["code", "date"]].copy()
+    p["code"] = p["code"].astype(str)
+    last = p.groupby("code", observed=True)["date"].max()
+    panel_end = as_ts_series(pd.Series([px_d["date"].max()])).iloc[0]
+    # 패널 마지막 60일 안에 거래가 있으면 '데이터 끝'이지 '폐지'가 아니다.
+    cutoff = panel_end - pd.Timedelta(days=60)
+    inferred = s.loc[need, "code"].astype(str).map(last)
+    inferred = inferred.where(inferred.notna() & (inferred <= cutoff))
+    # 폐지일 = 마지막 거래일의 다음 날(그 달 말 기준으로 유니버스에서 빠진다)
+    s.loc[need, "delisting_date"] = (inferred + pd.Timedelta(days=1)).to_numpy()
+    n_ok = int(as_ts_series(s.loc[need, "delisting_date"]).notna().sum())
+    LOG.ok(f"폐지일 복원: 미상 {n_need:,}종목 중 {n_ok:,}종목을 '마지막 거래일+1'로 확정했습니다 "
+           f"(가격 관측 기반). 나머지 {n_need - n_ok:,}종목은 가격이 없어 복원 불가입니다.")
+    if n_need - n_ok > 0:
+        LOG.warn(f"폐지일을 끝내 못 구한 {n_need - n_ok:,}종목은 유니버스에서 '상장 중'으로 "
+                 f"남습니다. 다만 가격이 없으므로 체결가가 없어 진입 후보에서 자연히 빠집니다 — "
+                 f"성과를 부풀리는 방향은 아닙니다.")
+    return s
+
+
+def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
+                       phase: str = "final") -> dict:
     """생존자편향 제거가 **실제로** 되어 있는지 수치로 검증한다.
 
     ★ '폐지 종목이 마스터에 있다'는 것만으로는 부족하다. 폐지 종목이
@@ -8987,19 +9070,36 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex") -> dict:
     out["delisted_in_window"] = int(((dd >= lo) & (dd <= hi)).sum())
     out["listing_known"] = float(ld.notna().mean())
 
-    ok = out["delisted_in_window"] >= 50
+    # ★ 타당성: 폐지일이 상장일로 오염되면 아주 오래된 '폐지'가 대량으로 생긴다.
+    #   개수만 세면 이 오염을 통과시켜 버리므로 분포까지 본다.
+    n_ancient = int((dd < pd.Timestamp("1995-01-01")).sum())
+    out["ancient"] = n_ancient
+    ok = (out["delisted_in_window"] >= 50) and (n_ancient <= max(20, 0.05 * max(out["delisted"], 1)))
     out["verdict"] = "PASS" if ok else "FAIL"
     out["detail"] = (
         f"마스터 {out['total']:,}종목 중 폐지일 보유 {out['delisted']:,}종목 · "
         f"백테스트 구간 내 폐지 {out['delisted_in_window']:,}종목 · "
         f"상장일 확보율 {out['listing_known']*100:.0f}%")
-    LOG.banner("생존자편향 제거 감사 (C2) — KRX 비의존 경로",
-               "폐지 종목이 구간 안에서 실제로 들어왔다 빠지는가")
+    # ★ 가격 수집 전(pre)에는 폐지일이 아직 복원되지 않았다. 그 시점의 0건을 FAIL 로 외치면
+    #   진짜 문제와 구분이 안 되는 '늑대야' 경고가 된다. 최종 판정은 가격 수집 뒤에만 한다.
+    pre = (phase == "pre")
+    LOG.banner("생존자편향 제거 감사 (C2) — KRX 비의존 경로"
+               + ("  [중간 점검]" if pre else ""),
+               "폐지 종목이 구간 안에서 실제로 들어왔다 빠지는가"
+               if not pre else
+               "가격 수집 전 중간 점검 — 폐지일은 이후 '마지막 거래일'로 복원됩니다")
     LOG.table([["종목 마스터(생존+폐지)", f"{out['total']:,}"],
                ["폐지일 보유 종목", f"{out['delisted']:,}"],
                ["백테스트 구간 내 폐지", f"{out['delisted_in_window']:,}"],
                ["상장일 확보율", f"{out['listing_known']*100:.1f}%"],
+               ["1995년 이전 '폐지'(오염 지표)", f"{out.get('ancient', 0):,}"],
                ["판정", out["verdict"]]], ["항목", "값"])
+    if out.get("ancient", 0) > max(20, 0.05 * max(out["delisted"], 1)):
+        LOG.error(
+            f"1995년 이전 '폐지'가 {out['ancient']:,}건입니다 — 폐지일 자리에 **상장일**이 "
+            f"들어왔을 때 나타나는 전형적 증상입니다.\n"
+            f"    이 상태로 두면 '오래전 상장 → 최근 폐지' 종목이 백테스트 전 구간에서 빠져\n"
+            f"    실패 사례가 사라집니다(생존자편향 재유입). 폐지일 소스를 먼저 고치세요.")
     if out["listing_known"] < 0.10:
         LOG.warn(
             f"상장일 확보율이 {out['listing_known']*100:.0f}% 입니다 "
@@ -9008,7 +9108,11 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex") -> dict:
             f"    → 방향이 중요합니다: '모르면 오래된 종목'으로 처리하므로 신규상장 필터가 "
             f"**느슨해질 뿐**이며, 반대로 '모르면 신규상장'으로 처리했다면 패널 앞 구간의 "
             f"유니버스가 통째로 비었을 것입니다. 생존자편향은 폐지일로 제거되므로 영향 없습니다.")
-    if not ok:
+    if pre and not ok:
+        LOG.info("폐지일이 아직 비어 있습니다 — 가격 수집 후 '마지막 거래일'로 복원한 뒤 "
+                 "최종 판정합니다(여기서는 중단하지 않습니다).")
+        out["verdict"] = "PENDING"
+    elif not ok:
         LOG.error("[C2] 구간 내 폐지 종목이 50개 미만입니다. 10년이면 통상 수백 종목이 폐지됩니다. "
                   "상장폐지 목록을 못 받은 상태이며, 이대로 나온 성과는 생존자편향으로 "
                   "부풀려진 값입니다. raw.githubusercontent.com(FDR 캐시) 접근을 확인하세요.")
@@ -10989,10 +11093,17 @@ def run_canary(sample_hs: str = "854370") -> "pd.DataFrame":
     # ── K12: KRX 없이 생존자편향 제거 + PIT 유니버스가 성립하는가 (사용자 요구 확인 항목)
     try:
         sec_probe = build_security_master_nokrx()
-        aud = audit_survivorship(sec_probe, _months())
-        _cn("K12", "KRX 비의존 유니버스·생존자편향", 
-            "PASS" if aud["verdict"] == "PASS" else "FAIL",
-            f"KRX 모드={krx_mode()} · {aud['detail']}", kill=(aud["verdict"] != "PASS"))
+        aud = audit_survivorship(sec_probe, _months(), phase="pre")
+        # 캐너리 시점에는 가격이 없어 폐지일 복원 전이다. '폐지 종목이 마스터에 존재하는가'
+        # 까지만 본다. 폐지일 정확성의 최종 판정은 가격 수집 뒤 L1.PRICE 에서 한다.
+        n_dead = int(sec_probe.get("src", pd.Series("", index=sec_probe.index))
+                     .astype(str).str.contains("delist").sum())
+        _cn("K12", "KRX 비의존 유니버스·생존자편향",
+            "PASS" if (len(sec_probe) > 1000 and n_dead > 200) else "FAIL",
+            f"KRX 모드={krx_mode()} · 마스터 {len(sec_probe):,}종목 · 폐지 종목 {n_dead:,}건 "
+            f"포함 · 상장일 확보율 {aud['listing_known']*100:.0f}% "
+            f"(폐지일은 가격 수집 후 마지막 거래일로 복원)",
+            kill=(len(sec_probe) <= 1000 or n_dead <= 200))
     except Exception as e:                                              # noqa
         _cn("K12", "KRX 비의존 유니버스·생존자편향", "FAIL",
             f"{type(e).__name__}: {e} — 상장/폐지 목록 소스를 확인하세요.", kill=True)
@@ -11471,8 +11582,28 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     return downcast(P)
 
 
+def _reset_run_state() -> None:
+    """같은 커널에서 두 번째로 실행할 때 지난 실행의 기록이 섞이지 않게 초기화한다.
+
+    ★ 노트북은 한 커널에서 셀을 여러 번 돌린다. 전역 로그가 누적되면 강건성 표에 같은 검사가
+      두 번 찍히고, 감쇠표의 첫 행(=분모)이 지난 실행 값이라 잔존율이 통째로 틀어진다.
+    """
+    for _lst in (ROBUST_LOG, KILL_LOG, CANARY_LOG, CONTRACT_LOG,
+                 ATTRITION_LOG, OUTPUT_FILES, RUNTIME_LOG):
+        try:
+            _lst.clear()
+        except Exception:                                               # noqa
+            pass
+    try:
+        _SRC_CACHE.clear()
+        CELL_FALLBACK_STATS.clear()
+    except Exception:                                                   # noqa
+        pass
+
+
 def main_xcb() -> int:
     t_start = time.time()
+    _reset_run_state()
     LOG.banner(f"{STRATEGY_NAME}  ·  {BUILD_VERSION}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · RUN_MODE={RUN_MODE} · STAGE={STAGE}")
 
@@ -11529,7 +11660,7 @@ def main_xcb() -> int:
         sec = (build_security_master(snaps) if len(snaps)
                else build_security_master_nokrx())
         attrition("전체 상장(생존+폐지)", sec["code"].nunique(), "C2 상장폐지 포함")
-        surv = audit_survivorship(sec, months)
+        surv = audit_survivorship(sec, months, phase="pre")
 
     with PIPE.stage("L1.PRICE", "가격 · 시가총액", "L1", budget_s=2400), \
             Stage("M0.price", 25.0):
@@ -11545,6 +11676,10 @@ def main_xcb() -> int:
                 LOG.warn(f"KRX 시총 경로 실패({type(e).__name__}) — 근사 경로로 넘어갑니다.")
         if mcap is None or not len(mcap):
             mcap = mcap_nokrx(months, px_m, sec)
+        # ★ 폐지일이 없는 폐지종목의 폐지일을 '마지막 거래일'로 복원한다.
+        #   가격을 받은 뒤에만 가능하므로 여기서 한다. C2 의 마지막 구멍을 막는 단계다.
+        sec = infer_delisting_from_prices(sec, px_d, months)
+        audit_survivorship(sec, months)
 
     # ── [2] 큐레이션 · 통관 ───────────────────────────────────────────────────────────────
     with PIPE.stage("L1.CURATE", "HS 유니버스 큐레이션", "L1", budget_s=1500), \
@@ -11698,12 +11833,25 @@ def main_xcb() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def _entrypoint() -> int:
     try:
-        raise SystemExit(main_xcb())
+        return main_xcb()
     except KillCriteria as e:
         LOG.error(f"킬 기준으로 중단: {e}")
-        raise SystemExit(4)
+        return 4
     except StageFailure as e:
         LOG.error(f"스테이지 실패로 중단: {e}")
-        raise SystemExit(5)
+        return 5
+
+
+# ★ 노트북에 통째로 붙여넣어도 __name__ 은 "__main__" 이므로 그대로 실행된다(원셀 실행).
+#   다만 노트북에서 SystemExit 를 던지면 셀이 빨간 트레이스백으로 끝나 '실패한 것처럼' 보인다.
+#   대화형 환경에서는 종료코드를 변수로만 남기고 조용히 끝낸다.
+if __name__ == "__main__":
+    XCB_EXIT_CODE = _entrypoint()
+    if ENV.get("ipython"):
+        if XCB_EXIT_CODE:
+            LOG.warn(f"종료코드 {XCB_EXIT_CODE} — 위 진단을 확인하세요. "
+                     f"(노트북이라 예외를 던지지 않고 XCB_EXIT_CODE 변수로만 남깁니다)")
+    else:
+        raise SystemExit(XCB_EXIT_CODE)
