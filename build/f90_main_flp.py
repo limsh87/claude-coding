@@ -264,7 +264,7 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         for _code, (_a, _b) in (CANDIDATE_YEARS or {}).items():
             _cc = _c2c.get(_code)
             if _cc:
-                _cy[_cc] = [y for y in range(_a - 1, _b + 2) if min(_years) <= y <= max(_years)]
+                _cy[_cc] = [y for y in range(_a - 2, _b + 2) if min(_years) <= y <= max(_years)]
         ctx["dart_shares"] = fetch_dart_shares(_corps, _years, corp_years=_cy or None)
         ctx["shares"] = fetch_shares_outstanding(months, sec=ctx["sec"],
                                                  dart_shares=ctx.get("dart_shares"))
@@ -315,15 +315,20 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
             full_reprts = ([REPRT_CODES["FY"]] if DART_FULL_ANNUAL_FIRST
                            else [REPRT_CODES["Q1"], REPRT_CODES["H1"],
                                  REPRT_CODES["Q3"], REPRT_CODES["FY"]])
-            # ★ 회사마다 '후보였던 연도 ±1' 만 받는다. 방화벽은 그 종목을 살 수 있었던
-            #   시점에만 의미가 있으므로, 그 밖의 연도를 받는 것은 그냥 낭비다.
+            # ★ 회사마다 '후보였던 연도' 주변만 받는다. 방화벽은 그 종목을 살 수 있었던
+            #   시점에만 의미가 있으므로 그 밖의 연도는 낭비다.
+            #   ── 마진이 왜 -2 인가 (직접 계산해 확인한 구멍) ────────────────────────────
+            #   사업보고서(FY Y)의 접수는 이듬해 3월 말이다. 후보 연도 a 의 1~3월 신호 시점에서
+            #   '그때 알 수 있었던 최신 재무'는 FY(a-2) 다 (FY(a-1) 은 아직 접수 전).
+            #   마진을 -1 로 두면 그 구간에 붙일 재무가 아예 없어 cfo 가 NaN 이 되고,
+            #   영업CF 방화벽이 경고 없이 비활성화된다. 종목당 1콜 더 쓰고 구멍을 막는다.
             y_lo, y_hi = min(years), max(years)
             corp_years: Dict[str, List[int]] = {}
             for code, (a, b) in (CANDIDATE_YEARS or {}).items():
                 cc = c2c.get(code)
                 if not cc:
                     continue
-                rng = [y for y in range(a - 1, b + 2) if y_lo <= y <= y_hi]
+                rng = [y for y in range(a - 2, b + 2) if y_lo <= y <= y_hi]
                 if rng:
                     corp_years.setdefault(cc, [])
                     corp_years[cc] = sorted(set(corp_years[cc]) | set(rng))

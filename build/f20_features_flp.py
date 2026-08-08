@@ -538,6 +538,25 @@ def apply_firewall(P: pd.DataFrame, watch: pd.DataFrame, ctx: dict) -> pd.DataFr
     audit.append(("유동성(ADV20) ※진입자격 전용", "활성", int((~liq).sum())))
     ok &= liq
 
+    # ★ 방화벽은 '켜져 있다'가 아니라 '살 수 있었던 행에서 실제로 판정됐다'가 중요하다.
+    #   수요기반 수집(후보 연도만)으로 범위를 좁힌 뒤로는, 특정 구간에서 재무가 안 붙어
+    #   조항이 조용히 비활성화될 수 있다. 그 비율을 측정해 표로 낸다.
+    cand_mask = (P["PHASE_C"] == 1) if "PHASE_C" in P.columns else pd.Series(True, index=P.index)
+    n_cand = int(cand_mask.sum())
+    if n_cand:
+        cov = [["자본총계(자본잠식 판정)", float(P.loc[cand_mask, "equity"].notna().mean())],
+               ["영업활동현금흐름(영업CF 판정)", float(P.loc[cand_mask, "cfo_ttm"].notna().mean())],
+               ["영업이익(이자보상 대리)", float(P.loc[cand_mask, "op_income_ttm"].notna().mean())]]
+        LOG.table([[k, f"{v:.1%}"] for k, v in cov],
+                  ["방화벽 입력", "국면C 행 중 판정 가능 비율"], ["l", "r"],
+                  title=f"방화벽 실효 커버리지 — '살 수 있었던' {n_cand:,}행 기준")
+        worst = min(v for _k, v in cov)
+        if worst < 0.7:
+            LOG.warn(f"국면 C 행의 {1-worst:.0%} 에서 방화벽 입력이 결측입니다. 그 행들은 "
+                     f"해당 조항이 사실상 비활성인 채로 매수 후보가 됩니다 — 이 전략의 단일 "
+                     f"실패모드가 그만큼 열려 있습니다. DART 수집 범위(DART_FULL_SCOPE)를 "
+                     f"넓히거나 DART_API_KEY 를 확인하세요.")
+
     P["FIREWALL"] = ok.astype(int)
     FIREWALL_STATUS.clear()
     FIREWALL_STATUS.update({a: b for a, b, _c in audit})
