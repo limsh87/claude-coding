@@ -493,42 +493,67 @@ def audit_survivorship_coverage(sec: pd.DataFrame, px: pd.DataFrame,
 
 def select_flow_targets(px: pd.DataFrame, start: str, end: str,
                         max_codes: int = FLOW_MAX_CODES) -> List[str]:
-    """수급을 '전 종목'이 아니라 '이 전략이 실제로 진입할 수 있는 종목'에만 받는다.
+    """수급을 '전 종목'이 아니라 '이 전략이 실제로 진입할 수 있었던 종목'에만 받는다.
 
-    국면 C 는 f_dd < -0.30 을 요구하므로, 백테스트 구간에 그만한 낙폭을 겪은 적이 없는
-    종목의 수급은 어차피 신호에 쓰이지 않는다. 전 종목을 받으면 4시간 예산을 수급 하나가
-    다 쓴다(§9). 무엇을 왜 제외했는지는 표로 남긴다 — 조용한 축소는 하지 않는다.
+    ★ 이 선별은 반드시 '인과적(causal)'이어야 한다.
+      전 구간 중앙 거래대금이나 전 구간 최대 낙폭 같은 '표본 전체 통계'로 고르면,
+      나중에 거래대금이 말라 죽은 종목(=상장폐지 예비군)이 통째로 제외된다.
+      그건 곧 생존자편향의 재유입이며, 성과를 위로 부풀린다.
+      → 각 시점 t 의 '그 시점까지의 정보'(252일 낙폭·252일 평균거래대금)로 후보를 판정하고,
+        한 번이라도 후보였던 종목을 수집 대상으로 삼는다. 시점 t 의 신호는 시점 t 에
+        이미 존재하던 조건으로만 결정되므로 미래정보가 개입하지 않는다.
+
+    국면 C 는 f_dd < -0.30 을 요구하므로, 그만한 낙폭을 겪은 적이 없는 종목의 수급은
+    어차피 신호에 쓰이지 않는다. 전 종목을 받으면 4시간 예산을 수급 하나가 다 쓴다(§9).
+    제외된 것이 무엇이고 그 대가가 얼마인지는 표로 남긴다 — 조용한 축소는 하지 않는다.
     """
     if px is None or not len(px):
         return []
     d = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
-           (px["date"] <= as_ts(end))].copy()
+           (px["date"] <= as_ts(end))][["code", "date", "close", "amount"]].copy()
     if d.empty:
         return []
     d = d.sort_values(["code", "date"])
     g = d.groupby("code", observed=True)
     roll_max = g["close"].transform(lambda s: s.rolling(252, min_periods=60).max())
-    dd = d["close"] / roll_max - 1.0
-    stat = pd.DataFrame({"code": d["code"], "dd": dd, "amount": d["amount"]})
-    agg = stat.groupby("code", observed=True).agg(min_dd=("dd", "min"),
-                                                  med_amt=("amount", "median"))
-    n_all = len(agg)
-    liq = agg[agg["med_amt"] >= MIN_ADV_KRW]
-    hit = liq[liq["min_dd"] <= FLOW_DD_PREFILTER]
-    ranked = hit.sort_values("med_amt", ascending=False)
+    d["dd"] = d["close"] / roll_max - 1.0
+    d["adv252"] = g["amount"].transform(lambda s: s.rolling(252, min_periods=60).mean())
+
+    # 시점별 후보 여부 — 전부 '그 시점까지'의 정보만 쓴다
+    cand = (d["dd"] <= FLOW_DD_PREFILTER) & (d["adv252"] >= MIN_ADV_KRW)
+    d["cand"] = cand.fillna(False)
+    n_all = int(d["code"].nunique())
+    ever = d.groupby("code", observed=True)["cand"].any()
+    cand_codes = ever[ever].index.astype(str)
+    if not len(cand_codes):
+        LOG.warn("수급 대상 후보가 0종목입니다 — 낙폭/유동성 프리필터가 너무 강하거나 "
+                 "가격 커버리지가 부족합니다. 전 종목으로 진행합니다(느립니다).")
+        return []
+
+    sub = d[d["code"].isin(set(cand_codes))]
+    weeks_per_code = sub.groupby("code", observed=True)["cand"].sum()
+    # 우선순위: '최초 후보 시점의 유동성' — 사후 통계가 아니라 그때의 관측치를 쓴다
+    first_hit = (sub[sub["cand"]].sort_values("date")
+                 .drop_duplicates("code", keep="first").set_index("code")["adv252"])
+    ranked = first_hit.sort_values(ascending=False)
     capped = ranked.head(max_codes) if max_codes and max_codes > 0 else ranked
+    kept = set(capped.index.astype(str))
+
+    tot_w = float(weeks_per_code.sum())
+    lost_w = float(weeks_per_code[~weeks_per_code.index.isin(kept)].sum())
     rows = [["전체 가격 보유 종목", f"{n_all:,}", ""],
-            [f"유동성 통과 (중앙 거래대금 ≥ {MIN_ADV_KRW/1e8:.0f}억)", f"{len(liq):,}",
-             f"{100*len(liq)/max(n_all,1):.0f}%"],
-            [f"낙폭 경험 (min f_dd ≤ {FLOW_DD_PREFILTER:+.0%})", f"{len(hit):,}",
-             f"{100*len(hit)/max(n_all,1):.0f}%"],
-            ["수집 대상(상한 적용)", f"{len(capped):,}",
-             f"상한 {max_codes or '무제한'} · 제외 {len(ranked)-len(capped):,}"]]
-    LOG.table(rows, ["단계", "종목수", "비고"], ["l", "r", "l"],
-              title="수급 수집 대상 선별 — 진입 불가능한 종목은 받지 않는다(런타임 예산 §9)")
-    if len(ranked) > len(capped):
-        LOG.warn(f"수급 대상 {len(ranked)-len(capped):,}종목이 상한(FLOW_MAX_CODES="
-                 f"{max_codes})으로 제외되었습니다. 그 종목들은 f_inst/f_ret_ex 가 결측이 되어 "
-                 f"국면 C 판정에서 자동 탈락합니다 — 성과가 아니라 '커버리지'의 한계입니다. "
-                 f"캐시는 누적되므로 재실행하면 커버리지가 올라갑니다.")
-    return capped.index.astype(str).tolist()
+            [f"후보 경험 (252일 낙폭 ≤ {FLOW_DD_PREFILTER:+.0%} ∧ ADV252 ≥ "
+             f"{MIN_ADV_KRW/1e8:.0f}억, 시점별 판정)", f"{len(cand_codes):,}",
+             f"{100*len(cand_codes)/max(n_all,1):.0f}%"],
+            ["수집 대상(상한 적용)", f"{len(kept):,}",
+             f"상한 {max_codes or '무제한'} · 제외 {len(ranked)-len(capped):,}"],
+            ["★ 상한으로 잃는 후보-일수", f"{lost_w:,.0f}",
+             f"전체 후보-일수의 {100*lost_w/max(tot_w,1):.1f}% — 이만큼이 커버리지 손실"]]
+    LOG.table(rows, ["단계", "종목수/일수", "비고"], ["l", "r", "l"],
+              title="수급 수집 대상 선별 (인과적 판정) — 진입 불가능했던 종목은 받지 않는다(§9)")
+    if lost_w > 0:
+        LOG.warn(f"상한(FLOW_MAX_CODES={max_codes})으로 후보-일수의 "
+                 f"{100*lost_w/max(tot_w,1):.1f}% 가 수급 없이 남습니다. 해당 종목은 f_inst 결측 → "
+                 f"국면 C 판정에서 자동 탈락하므로 '성과'가 아니라 '커버리지'의 한계이며, "
+                 f"캐시가 누적되는 재실행마다 줄어듭니다. 0으로 만들려면 FLOW_MAX_CODES=0.")
+    return sorted(kept)

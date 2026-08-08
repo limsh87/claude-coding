@@ -519,13 +519,17 @@ def fetch_watchlist_halt(sec: pd.DataFrame) -> pd.DataFrame:
     ★ 과거 구간에는 적용하지 않고 '현재 시점 이후'로만 제한한다(미래정보 차단).
     """
     global WATCH_GRADE
-    cols = ["code", "flag", "from_date", "to_date", "src"]
+    cols = ["code", "flag", "from_date", "to_date", "observed_at", "src"]
     cached = VAULT.get_table("krx_watchlist_events", scope="shared")
     if cached is not None and len(cached):
         WATCH_GRADE = "OK"
+        if "observed_at" not in cached.columns:
+            cached["observed_at"] = pd.NaT
         cached["from_date"] = as_ts_series(cached["from_date"])
         cached["to_date"] = as_ts_series(cached["to_date"])
-        LOG.info(f"공용 캐시에서 관리종목/거래정지 이력 {len(cached):,}행 재사용")
+        cached["observed_at"] = as_ts_series(cached["observed_at"])
+        LOG.info(f"공용 캐시에서 관리종목/거래정지 이력 {len(cached):,}행 재사용 "
+                 f"(관측시점 최소 {str(cached['observed_at'].min())[:10]})")
         return cached.reindex(columns=cols)
 
     rows = []
@@ -563,6 +567,7 @@ def fetch_watchlist_halt(sec: pd.DataFrame) -> pd.DataFrame:
                 "flag": flag,
                 "from_date": as_ts_series(t[date_c]) if date_c else pd.NaT,
                 "to_date": pd.NaT,
+                "observed_at": pd.Timestamp.today().normalize(),
                 "src": "kind"}).dropna(subset=["code"]))
 
     if not rows:
@@ -573,9 +578,20 @@ def fetch_watchlist_halt(sec: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     W = pd.concat(rows, ignore_index=True).drop_duplicates(["code", "flag", "from_date"])
-    # 지정일이 없는 스냅샷 행은 '오늘부터'로 처리해 과거를 오염시키지 않는다.
-    W["from_date"] = W["from_date"].fillna(pd.Timestamp.today().normalize())
-    WATCH_GRADE = "PARTIAL" if W["from_date"].isna().any() else "OK"
+    # ★ 이 목록은 '현재 지정 중'인 종목만 담긴 스냅샷이다. 지정일이 2019년이어도,
+    #   2026년에 관측했다는 사실 자체가 "2026년까지 해제되지 않았다"는 미래정보다.
+    #   과거로 소급 적용하면 '끝내 회복하지 못한 종목'만 골라 차단하게 되어 성과가 부풀려진다.
+    #   → 적용 시작일 = max(지정일, 관측일). 즉 과거 구간에는 적용하지 않는다.
+    #   실행할 때마다 스냅샷이 누적되므로, 앞으로의 구간에서는 진짜 PIT 이력이 쌓인다.
+    W["observed_at"] = as_ts_series(W["observed_at"]).fillna(pd.Timestamp.today().normalize())
+    W["from_date"] = as_ts_series(W["from_date"])
+    W["from_date"] = W[["from_date", "observed_at"]].max(axis=1)
+    W["from_date"] = W["from_date"].fillna(W["observed_at"])
+    WATCH_GRADE = "SNAPSHOT_FORWARD_ONLY"
+    LOG.warn("관리종목/거래정지는 '현재 지정 중' 스냅샷이라 과거 구간에 소급 적용하지 않습니다"
+             "(소급하면 '끝내 회복 못한 종목만 차단'하는 미래정보가 됩니다). "
+             "따라서 백테스트 구간에서 이 방화벽 조항은 사실상 비활성이며, "
+             "그 사실을 방화벽 감사표와 등급 카드에 그대로 남깁니다.")
     VAULT.put_table("krx_watchlist_events", W, scope="shared", domain="universe",
                     source="KIND", extra={"note": "관리종목/거래정지/투자주의 — 전 전략 공용"})
     LOG.ok(f"관리종목·거래정지 {len(W):,}행 ({W['code'].nunique():,}종목)")

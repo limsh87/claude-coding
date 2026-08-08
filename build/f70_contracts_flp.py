@@ -183,6 +183,35 @@ def run_contract_tests(strict: bool = True) -> bool:
         return (n[0] == 1 and n[1] == 1 and n[2] == 0,
                 f"주별 보유종목수 {n} — 3주차에 f_cr_pctl=0.9(재취약)이므로 0 이어야 함")
 
+    def c_halt():
+        """★ 실제로 있었던 결함의 회귀 방지:
+        보유 종목이 거래정지로 패널에서 사라진 뒤 상장폐지되면, 예전 구현은 그 종목을
+        '보유 목록에서 조용히 제거'해 총손실(-100%)을 무손실(0%)로 계상했다.
+        한국의 전형 경로(거래정지 → 정리매매 → 폐지)가 통째로 공짜 탈출이 되는 결함이다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=5, freq="W-FRI"))
+        dl = wks[3] + pd.Timedelta(days=2)          # 4주차와 5주차 사이에 폐지
+        rows = []
+        for i, w in enumerate(wks):
+            if i >= 1:
+                continue                             # 2주차부터 패널에서 사라진다(거래정지)
+            rows.append({"code": "A", "wk": w, "exec_px": 1000.0, "fwd_ret": 0.0,
+                         "adv20": 1e10, "FIREWALL": 1, "VETO": 1, "in_band": 1, "V6": 1,
+                         "PHASE_C": 1, "f_dd": -0.4, "f_cr_pctl": 0.1, "Signal_rank": 1.0})
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": ["A"], "name": ["A"], "market": ["KOSDAQ"],
+                            "listing_date": [pd.Timestamp("2015-01-01")],
+                            "delisting_date": [dl]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": wks, "code": "A"}))
+        bt = run_backtest_w(P, wks, uni, sec, apply_costs=False, label="c_halt")
+        H = bt["holdings"]
+        states = list(H["state"]) if "state" in H.columns else []
+        loss = float(H.loc[H["ret"] <= -0.999, "weight"].sum()) if len(H) else 0.0
+        total = float(bt["returns"]["ret"].sum())
+        return (("delisted" in states) and loss > 0 and total < -0.05,
+                f"상태전이={states} · 총손실 반영 {total:.2%} "
+                f"(거래정지 중 폐지를 0% 로 처리하면 여기가 0.00% 로 나온다)")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -249,6 +278,7 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("TP", "clip(z,0)×clip(z,0) 부호 규약", c_tp)
     _c("VETO", "거부권 이진·상쇄 불가", c_veto)
     _c("EXIT", "청산 규칙(f_cr_pctl 회복) 작동", c_exit)
+    _c("HALT", "거래정지 중 폐지 = -100% (회귀 방지)", c_halt)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)

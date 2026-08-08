@@ -238,10 +238,21 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
       지운다(신호 영구 무발화). 이 경우 제외 컷을 그 주 종목수의 30% 로 낮추고, 조용히가
       아니라 로그로 알린다. 실데이터(2,000+종목)에서는 절대 발동하지 않는다."""
     P = P.copy()
-    rank_base = P["mcap"].where(P["mcap"].notna(), P["adv20"])
-    P["mcap_rank"] = (P.assign(_r=rank_base).groupby("wk", observed=True)["_r"]
-                       .rank(ascending=False, method="first"))
+    # ★ 시총(1e11 규모)과 거래대금(1e9 규모)을 한 컬럼에 섞어 랭크하면, 시총을 가진 종목이
+    #   무조건 상위에 몰려 '상위 250 제외'가 '주식수 데이터를 가진 250종목 제외'가 된다.
+    #   → 근거별로 따로 백분위를 매기고, 같은 척도(0~1)에서 컷을 적용한다.
+    has_m = P["mcap"].notna() & (P["mcap"] > 0)
+    pct = pd.Series(np.nan, index=P.index, dtype=float)
+    if has_m.any():
+        pct[has_m] = (P.loc[has_m].groupby("wk", observed=True)["mcap"]
+                      .rank(pct=True, ascending=False))
+    if (~has_m).any():
+        pct[~has_m] = (P.loc[~has_m].groupby("wk", observed=True)["adv20"]
+                       .rank(pct=True, ascending=False))
+    P["size_pct"] = pct
+    P["size_basis"] = np.where(has_m, "mcap", "adv20")
     n_wk = P.groupby("wk", observed=True)["code"].transform("size")
+    P["mcap_rank"] = (P["size_pct"] * n_wk).round().clip(lower=1)
     cut = np.minimum(MCAP_RANK_EXCLUDE_TOP, np.floor(n_wk * MAX_EXCLUDE_FRAC))
     binding = int((cut < MCAP_RANK_EXCLUDE_TOP).sum())
     if binding:
@@ -250,8 +261,13 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
                  f"상위 {MAX_EXCLUDE_FRAC:.0%} 제외로 낮춥니다(안전밸브). "
                  f"실데이터 전 종목 실행에서는 발동하지 않아야 정상입니다.")
     P["mcap_cut"] = cut
+    cut_frac = (cut / n_wk.clip(lower=1)).clip(0.0, 0.95)
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
-    P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).astype(int)
+    P["in_band"] = ((P["size_pct"] > cut_frac) & (P["V6"] == 1)).fillna(False).astype(int)
+    if (~has_m).any():
+        LOG.info(f"규모 랭크 근거 — 시총 {int(has_m.sum()):,}행 / 거래대금 대리 "
+                 f"{int((~has_m).sum()):,}행. 근거별로 백분위를 따로 매겨 같은 컷을 적용합니다"
+                 f"(척도가 다른 두 값을 한 랭크에 섞지 않습니다).")
     return P
 
 
@@ -350,6 +366,7 @@ def attach_fundamentals_flp(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
 
 # ── 방화벽 · 거부권 (§7.3) ──────────────────────────────────────────────────────────────────
 FIREWALL_CLAUSES = ["자본잠식", "관리종목", "거래정지", "영업CF적자+이자보상<1", "유동성"]
+FIREWALL_STATUS: Dict[str, str] = {}          # 조항 → 활성/비활성 사유 (등급 카드에 인쇄)
 
 
 def apply_firewall(P: pd.DataFrame, watch: pd.DataFrame, ctx: dict) -> pd.DataFrame:
@@ -406,6 +423,13 @@ def apply_firewall(P: pd.DataFrame, watch: pd.DataFrame, ctx: dict) -> pd.DataFr
     ok &= liq
 
     P["FIREWALL"] = ok.astype(int)
+    FIREWALL_STATUS.clear()
+    FIREWALL_STATUS.update({a: b for a, b, _c in audit})
+    n_off = sum(1 for _a, b, _c in audit if b.startswith("비활성"))
+    if n_off:
+        LOG.warn(f"방화벽 {n_off}개 조항이 비활성입니다. 이 전략의 단일 실패모드는 "
+                 f"'진짜 죽어가는 회사를 사는 것'이고 방화벽이 유일한 방어입니다 — "
+                 f"DART_API_KEY 입력이 성과보다 먼저입니다.")
     LOG.table([[a, b, f"{c:,}"] for a, b, c in audit],
               ["방화벽 조항", "상태", "차단 행수"], ["l", "l", "r"],
               title=f"방화벽 감사 — 전체 {n:,}행 중 통과 {int(P['FIREWALL'].sum()):,}행 "

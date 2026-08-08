@@ -25,6 +25,9 @@ def report_grade_banner():
                   "'신용잔고 소진'이 아니라 '개인 누적순매수 감소'를 본 것입니다. "
                   "신뢰도를 하향해 해석하세요.")
     LOG.info(f"수급(F2) 등급 = {FLOW_GRADE} · 관리종목/거래정지(K6) 등급 = {WATCH_GRADE}")
+    if FIREWALL_STATUS:
+        LOG.table([[k, v] for k, v in FIREWALL_STATUS.items()], ["방화벽 조항", "상태"], ["l", "l"],
+                  title="방어 가동 현황 — 무엇이 켜져 있고 무엇이 꺼져 있는가 (성과보다 먼저 볼 것)")
 
 
 def report_canary():
@@ -67,6 +70,14 @@ def report_performance(bt: dict, bench: Dict[str, pd.Series], label: str = ""):
         LOG.warn(f"평균 투자비중이 {inv:.0%} 입니다 — 종목당 상한({POS_MAX_WEIGHT:.0%})에 걸려 "
                  f"나머지는 현금으로 남습니다. 이는 '적격 종목이 적다'는 사실의 정직한 반영이며, "
                  f"CAGR 은 그만큼 희석됩니다. 상한을 올리려면 R12 결과를 먼저 보세요(§12-2).")
+
+    inc = bt.get("incidents") or {}
+    if any(inc.values()):
+        LOG.table([["거래정지로 못 판 보유주(주-종목)", f"{inc.get('frozen',0):,}"],
+                   ["폐지 확정 -100% 처리", f"{inc.get('delisted',0):,}"],
+                   ["장기 시세부재 보수적 상각(-100%)", f"{inc.get('stale_writeoff',0):,}"]],
+                  ["보유 중 사고", "건수"], ["l", "r"],
+                  title="보유 중 사고 처리 — 이 숫자가 0 이면 오히려 의심하세요(C2)")
 
     rt = right_tail_contribution(bt)
     if rt:

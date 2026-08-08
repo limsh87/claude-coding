@@ -255,7 +255,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
     #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    # ★ '오늘'은 벽시계 시각이어야 한다. BACKTEST_END 를 쓰면 실패 기록의 나이가 항상 0일이라
+    #   한 번 실패한 종목을 영원히 재시도하지 않는다(= 그 종목이 유니버스에서 영구 탈락).
+    #   폐지 예정 종목이 여기 걸리면 그대로 생존자편향이 된다.
+    _today = as_ts(_dt.date.today())
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):

@@ -194,7 +194,7 @@ ACTIVE_PACKS    = ["F"]
 
 STRATEGY_ID   = "TCD_V3_FLP"
 STRATEGY_NAME = "FLP 강제매도 소진 (Forced Liquidation Exhaustion)"
-BUILD_VERSION = "v2.20260808.0201"
+BUILD_VERSION = "v2.20260808.0211"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -3108,7 +3108,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
     #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    # ★ '오늘'은 벽시계 시각이어야 한다. BACKTEST_END 를 쓰면 실패 기록의 나이가 항상 0일이라
+    #   한 번 실패한 종목을 영원히 재시도하지 않는다(= 그 종목이 유니버스에서 영구 탈락).
+    #   폐지 예정 종목이 여기 걸리면 그대로 생존자편향이 된다.
+    _today = as_ts(_dt.date.today())
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):
@@ -5491,45 +5494,70 @@ def audit_survivorship_coverage(sec: pd.DataFrame, px: pd.DataFrame,
 
 def select_flow_targets(px: pd.DataFrame, start: str, end: str,
                         max_codes: int = FLOW_MAX_CODES) -> List[str]:
-    """수급을 '전 종목'이 아니라 '이 전략이 실제로 진입할 수 있는 종목'에만 받는다.
+    """수급을 '전 종목'이 아니라 '이 전략이 실제로 진입할 수 있었던 종목'에만 받는다.
 
-    국면 C 는 f_dd < -0.30 을 요구하므로, 백테스트 구간에 그만한 낙폭을 겪은 적이 없는
-    종목의 수급은 어차피 신호에 쓰이지 않는다. 전 종목을 받으면 4시간 예산을 수급 하나가
-    다 쓴다(§9). 무엇을 왜 제외했는지는 표로 남긴다 — 조용한 축소는 하지 않는다.
+    ★ 이 선별은 반드시 '인과적(causal)'이어야 한다.
+      전 구간 중앙 거래대금이나 전 구간 최대 낙폭 같은 '표본 전체 통계'로 고르면,
+      나중에 거래대금이 말라 죽은 종목(=상장폐지 예비군)이 통째로 제외된다.
+      그건 곧 생존자편향의 재유입이며, 성과를 위로 부풀린다.
+      → 각 시점 t 의 '그 시점까지의 정보'(252일 낙폭·252일 평균거래대금)로 후보를 판정하고,
+        한 번이라도 후보였던 종목을 수집 대상으로 삼는다. 시점 t 의 신호는 시점 t 에
+        이미 존재하던 조건으로만 결정되므로 미래정보가 개입하지 않는다.
+
+    국면 C 는 f_dd < -0.30 을 요구하므로, 그만한 낙폭을 겪은 적이 없는 종목의 수급은
+    어차피 신호에 쓰이지 않는다. 전 종목을 받으면 4시간 예산을 수급 하나가 다 쓴다(§9).
+    제외된 것이 무엇이고 그 대가가 얼마인지는 표로 남긴다 — 조용한 축소는 하지 않는다.
     """
     if px is None or not len(px):
         return []
     d = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
-           (px["date"] <= as_ts(end))].copy()
+           (px["date"] <= as_ts(end))][["code", "date", "close", "amount"]].copy()
     if d.empty:
         return []
     d = d.sort_values(["code", "date"])
     g = d.groupby("code", observed=True)
     roll_max = g["close"].transform(lambda s: s.rolling(252, min_periods=60).max())
-    dd = d["close"] / roll_max - 1.0
-    stat = pd.DataFrame({"code": d["code"], "dd": dd, "amount": d["amount"]})
-    agg = stat.groupby("code", observed=True).agg(min_dd=("dd", "min"),
-                                                  med_amt=("amount", "median"))
-    n_all = len(agg)
-    liq = agg[agg["med_amt"] >= MIN_ADV_KRW]
-    hit = liq[liq["min_dd"] <= FLOW_DD_PREFILTER]
-    ranked = hit.sort_values("med_amt", ascending=False)
+    d["dd"] = d["close"] / roll_max - 1.0
+    d["adv252"] = g["amount"].transform(lambda s: s.rolling(252, min_periods=60).mean())
+
+    # 시점별 후보 여부 — 전부 '그 시점까지'의 정보만 쓴다
+    cand = (d["dd"] <= FLOW_DD_PREFILTER) & (d["adv252"] >= MIN_ADV_KRW)
+    d["cand"] = cand.fillna(False)
+    n_all = int(d["code"].nunique())
+    ever = d.groupby("code", observed=True)["cand"].any()
+    cand_codes = ever[ever].index.astype(str)
+    if not len(cand_codes):
+        LOG.warn("수급 대상 후보가 0종목입니다 — 낙폭/유동성 프리필터가 너무 강하거나 "
+                 "가격 커버리지가 부족합니다. 전 종목으로 진행합니다(느립니다).")
+        return []
+
+    sub = d[d["code"].isin(set(cand_codes))]
+    weeks_per_code = sub.groupby("code", observed=True)["cand"].sum()
+    # 우선순위: '최초 후보 시점의 유동성' — 사후 통계가 아니라 그때의 관측치를 쓴다
+    first_hit = (sub[sub["cand"]].sort_values("date")
+                 .drop_duplicates("code", keep="first").set_index("code")["adv252"])
+    ranked = first_hit.sort_values(ascending=False)
     capped = ranked.head(max_codes) if max_codes and max_codes > 0 else ranked
+    kept = set(capped.index.astype(str))
+
+    tot_w = float(weeks_per_code.sum())
+    lost_w = float(weeks_per_code[~weeks_per_code.index.isin(kept)].sum())
     rows = [["전체 가격 보유 종목", f"{n_all:,}", ""],
-            [f"유동성 통과 (중앙 거래대금 ≥ {MIN_ADV_KRW/1e8:.0f}억)", f"{len(liq):,}",
-             f"{100*len(liq)/max(n_all,1):.0f}%"],
-            [f"낙폭 경험 (min f_dd ≤ {FLOW_DD_PREFILTER:+.0%})", f"{len(hit):,}",
-             f"{100*len(hit)/max(n_all,1):.0f}%"],
-            ["수집 대상(상한 적용)", f"{len(capped):,}",
-             f"상한 {max_codes or '무제한'} · 제외 {len(ranked)-len(capped):,}"]]
-    LOG.table(rows, ["단계", "종목수", "비고"], ["l", "r", "l"],
-              title="수급 수집 대상 선별 — 진입 불가능한 종목은 받지 않는다(런타임 예산 §9)")
-    if len(ranked) > len(capped):
-        LOG.warn(f"수급 대상 {len(ranked)-len(capped):,}종목이 상한(FLOW_MAX_CODES="
-                 f"{max_codes})으로 제외되었습니다. 그 종목들은 f_inst/f_ret_ex 가 결측이 되어 "
-                 f"국면 C 판정에서 자동 탈락합니다 — 성과가 아니라 '커버리지'의 한계입니다. "
-                 f"캐시는 누적되므로 재실행하면 커버리지가 올라갑니다.")
-    return capped.index.astype(str).tolist()
+            [f"후보 경험 (252일 낙폭 ≤ {FLOW_DD_PREFILTER:+.0%} ∧ ADV252 ≥ "
+             f"{MIN_ADV_KRW/1e8:.0f}억, 시점별 판정)", f"{len(cand_codes):,}",
+             f"{100*len(cand_codes)/max(n_all,1):.0f}%"],
+            ["수집 대상(상한 적용)", f"{len(kept):,}",
+             f"상한 {max_codes or '무제한'} · 제외 {len(ranked)-len(capped):,}"],
+            ["★ 상한으로 잃는 후보-일수", f"{lost_w:,.0f}",
+             f"전체 후보-일수의 {100*lost_w/max(tot_w,1):.1f}% — 이만큼이 커버리지 손실"]]
+    LOG.table(rows, ["단계", "종목수/일수", "비고"], ["l", "r", "l"],
+              title="수급 수집 대상 선별 (인과적 판정) — 진입 불가능했던 종목은 받지 않는다(§9)")
+    if lost_w > 0:
+        LOG.warn(f"상한(FLOW_MAX_CODES={max_codes})으로 후보-일수의 "
+                 f"{100*lost_w/max(tot_w,1):.1f}% 가 수급 없이 남습니다. 해당 종목은 f_inst 결측 → "
+                 f"국면 C 판정에서 자동 탈락하므로 '성과'가 아니라 '커버리지'의 한계이며, "
+                 f"캐시가 누적되는 재실행마다 줄어듭니다. 0으로 만들려면 FLOW_MAX_CODES=0.")
+    return sorted(kept)
 
 
 
@@ -6374,13 +6402,17 @@ def fetch_watchlist_halt(sec: pd.DataFrame) -> pd.DataFrame:
     ★ 과거 구간에는 적용하지 않고 '현재 시점 이후'로만 제한한다(미래정보 차단).
     """
     global WATCH_GRADE
-    cols = ["code", "flag", "from_date", "to_date", "src"]
+    cols = ["code", "flag", "from_date", "to_date", "observed_at", "src"]
     cached = VAULT.get_table("krx_watchlist_events", scope="shared")
     if cached is not None and len(cached):
         WATCH_GRADE = "OK"
+        if "observed_at" not in cached.columns:
+            cached["observed_at"] = pd.NaT
         cached["from_date"] = as_ts_series(cached["from_date"])
         cached["to_date"] = as_ts_series(cached["to_date"])
-        LOG.info(f"공용 캐시에서 관리종목/거래정지 이력 {len(cached):,}행 재사용")
+        cached["observed_at"] = as_ts_series(cached["observed_at"])
+        LOG.info(f"공용 캐시에서 관리종목/거래정지 이력 {len(cached):,}행 재사용 "
+                 f"(관측시점 최소 {str(cached['observed_at'].min())[:10]})")
         return cached.reindex(columns=cols)
 
     rows = []
@@ -6418,6 +6450,7 @@ def fetch_watchlist_halt(sec: pd.DataFrame) -> pd.DataFrame:
                 "flag": flag,
                 "from_date": as_ts_series(t[date_c]) if date_c else pd.NaT,
                 "to_date": pd.NaT,
+                "observed_at": pd.Timestamp.today().normalize(),
                 "src": "kind"}).dropna(subset=["code"]))
 
     if not rows:
@@ -6428,9 +6461,20 @@ def fetch_watchlist_halt(sec: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     W = pd.concat(rows, ignore_index=True).drop_duplicates(["code", "flag", "from_date"])
-    # 지정일이 없는 스냅샷 행은 '오늘부터'로 처리해 과거를 오염시키지 않는다.
-    W["from_date"] = W["from_date"].fillna(pd.Timestamp.today().normalize())
-    WATCH_GRADE = "PARTIAL" if W["from_date"].isna().any() else "OK"
+    # ★ 이 목록은 '현재 지정 중'인 종목만 담긴 스냅샷이다. 지정일이 2019년이어도,
+    #   2026년에 관측했다는 사실 자체가 "2026년까지 해제되지 않았다"는 미래정보다.
+    #   과거로 소급 적용하면 '끝내 회복하지 못한 종목'만 골라 차단하게 되어 성과가 부풀려진다.
+    #   → 적용 시작일 = max(지정일, 관측일). 즉 과거 구간에는 적용하지 않는다.
+    #   실행할 때마다 스냅샷이 누적되므로, 앞으로의 구간에서는 진짜 PIT 이력이 쌓인다.
+    W["observed_at"] = as_ts_series(W["observed_at"]).fillna(pd.Timestamp.today().normalize())
+    W["from_date"] = as_ts_series(W["from_date"])
+    W["from_date"] = W[["from_date", "observed_at"]].max(axis=1)
+    W["from_date"] = W["from_date"].fillna(W["observed_at"])
+    WATCH_GRADE = "SNAPSHOT_FORWARD_ONLY"
+    LOG.warn("관리종목/거래정지는 '현재 지정 중' 스냅샷이라 과거 구간에 소급 적용하지 않습니다"
+             "(소급하면 '끝내 회복 못한 종목만 차단'하는 미래정보가 됩니다). "
+             "따라서 백테스트 구간에서 이 방화벽 조항은 사실상 비활성이며, "
+             "그 사실을 방화벽 감사표와 등급 카드에 그대로 남깁니다.")
     VAULT.put_table("krx_watchlist_events", W, scope="shared", domain="universe",
                     source="KIND", extra={"note": "관리종목/거래정지/투자주의 — 전 전략 공용"})
     LOG.ok(f"관리종목·거래정지 {len(W):,}행 ({W['code'].nunique():,}종목)")
@@ -6676,10 +6720,21 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
       지운다(신호 영구 무발화). 이 경우 제외 컷을 그 주 종목수의 30% 로 낮추고, 조용히가
       아니라 로그로 알린다. 실데이터(2,000+종목)에서는 절대 발동하지 않는다."""
     P = P.copy()
-    rank_base = P["mcap"].where(P["mcap"].notna(), P["adv20"])
-    P["mcap_rank"] = (P.assign(_r=rank_base).groupby("wk", observed=True)["_r"]
-                       .rank(ascending=False, method="first"))
+    # ★ 시총(1e11 규모)과 거래대금(1e9 규모)을 한 컬럼에 섞어 랭크하면, 시총을 가진 종목이
+    #   무조건 상위에 몰려 '상위 250 제외'가 '주식수 데이터를 가진 250종목 제외'가 된다.
+    #   → 근거별로 따로 백분위를 매기고, 같은 척도(0~1)에서 컷을 적용한다.
+    has_m = P["mcap"].notna() & (P["mcap"] > 0)
+    pct = pd.Series(np.nan, index=P.index, dtype=float)
+    if has_m.any():
+        pct[has_m] = (P.loc[has_m].groupby("wk", observed=True)["mcap"]
+                      .rank(pct=True, ascending=False))
+    if (~has_m).any():
+        pct[~has_m] = (P.loc[~has_m].groupby("wk", observed=True)["adv20"]
+                       .rank(pct=True, ascending=False))
+    P["size_pct"] = pct
+    P["size_basis"] = np.where(has_m, "mcap", "adv20")
     n_wk = P.groupby("wk", observed=True)["code"].transform("size")
+    P["mcap_rank"] = (P["size_pct"] * n_wk).round().clip(lower=1)
     cut = np.minimum(MCAP_RANK_EXCLUDE_TOP, np.floor(n_wk * MAX_EXCLUDE_FRAC))
     binding = int((cut < MCAP_RANK_EXCLUDE_TOP).sum())
     if binding:
@@ -6688,8 +6743,13 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
                  f"상위 {MAX_EXCLUDE_FRAC:.0%} 제외로 낮춥니다(안전밸브). "
                  f"실데이터 전 종목 실행에서는 발동하지 않아야 정상입니다.")
     P["mcap_cut"] = cut
+    cut_frac = (cut / n_wk.clip(lower=1)).clip(0.0, 0.95)
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
-    P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).astype(int)
+    P["in_band"] = ((P["size_pct"] > cut_frac) & (P["V6"] == 1)).fillna(False).astype(int)
+    if (~has_m).any():
+        LOG.info(f"규모 랭크 근거 — 시총 {int(has_m.sum()):,}행 / 거래대금 대리 "
+                 f"{int((~has_m).sum()):,}행. 근거별로 백분위를 따로 매겨 같은 컷을 적용합니다"
+                 f"(척도가 다른 두 값을 한 랭크에 섞지 않습니다).")
     return P
 
 
@@ -6788,6 +6848,7 @@ def attach_fundamentals_flp(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
 
 # ── 방화벽 · 거부권 (§7.3) ──────────────────────────────────────────────────────────────────
 FIREWALL_CLAUSES = ["자본잠식", "관리종목", "거래정지", "영업CF적자+이자보상<1", "유동성"]
+FIREWALL_STATUS: Dict[str, str] = {}          # 조항 → 활성/비활성 사유 (등급 카드에 인쇄)
 
 
 def apply_firewall(P: pd.DataFrame, watch: pd.DataFrame, ctx: dict) -> pd.DataFrame:
@@ -6844,6 +6905,13 @@ def apply_firewall(P: pd.DataFrame, watch: pd.DataFrame, ctx: dict) -> pd.DataFr
     ok &= liq
 
     P["FIREWALL"] = ok.astype(int)
+    FIREWALL_STATUS.clear()
+    FIREWALL_STATUS.update({a: b for a, b, _c in audit})
+    n_off = sum(1 for _a, b, _c in audit if b.startswith("비활성"))
+    if n_off:
+        LOG.warn(f"방화벽 {n_off}개 조항이 비활성입니다. 이 전략의 단일 실패모드는 "
+                 f"'진짜 죽어가는 회사를 사는 것'이고 방화벽이 유일한 방어입니다 — "
+                 f"DART_API_KEY 입력이 성과보다 먼저입니다.")
     LOG.table([[a, b, f"{c:,}"] for a, b, c in audit],
               ["방화벽 조항", "상태", "차단 행수"], ["l", "l", "r"],
               title=f"방화벽 감사 — 전체 {n:,}행 중 통과 {int(P['FIREWALL'].sum()):,}행 "
@@ -7155,20 +7223,60 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
     hold: Dict[str, dict] = {}
     prev_w: Dict[str, float] = {}
     rows, holdings_log = [], []
+    n_frozen_events = n_forced_delist = n_stale_writeoff = 0
 
     need = [c for c in ("adv20", "fwd_ret", "FIREWALL", "VETO", "f_cr_pctl", "PHASE_C",
                         signal_col) if c in P.columns]
-    Pw = {w: g for w, g in P.groupby("wk", observed=True)}
+    Pw = {w: g for w, g in P.groupby("wk", observed=True)} if len(P) else {}
 
-    for w in weeks:
+    for i, w in enumerate(weeks):
+        # 다음 리밸런스 시점 — 상장폐지 귀속 창을 '고정 7일'이 아니라 실제 보유구간으로 잡는다
+        w_next = weeks[i + 1] if i + 1 < len(weeks) else w + pd.Timedelta(days=7)
         sub = Pw.get(w)
-        if sub is None or sub.empty:
-            rows.append({"wk": w, "ret": 0.0, "ret_gross": 0.0, "n": 0,
-                         "turnover": 0.0, "cost": 0.0})
-            continue
         rec: Dict[str, dict] = {}
-        for _c, *_v in sub[["code"] + need].itertuples(index=False, name=None):
-            rec[_c] = dict(zip(need, _v))
+        if sub is not None and len(sub):
+            for _c, *_v in sub[["code"] + need].itertuples(index=False, name=None):
+                rec[_c] = dict(zip(need, _v))
+
+        # ── ① 패널에서 사라진 보유분 = 거래정지/폐지. 조용히 0% 로 털어내지 않는다. ──────
+        #   한국의 전형 경로는 거래정지 → 정리매매 → 상장폐지다. 그 사이 종목은 패널에서
+        #   사라지므로, 예전 구현처럼 '보유 목록에서 pop' 하면 총손실이 무손실로 둔갑한다.
+        #   → 팔 수 없는 동안은 비중을 그대로 들고 있고(수익 0), 폐지가 확정되면 -100%.
+        frozen: Dict[str, float] = {}
+        forced: List[Tuple[str, float, float]] = []
+        for c, wt in list(prev_w.items()):
+            if c in rec:
+                continue
+            dl = delist.get(c)
+            h = hold.setdefault(c, {"weeks": 0, "frozen": 0})
+            if dl is not None and pd.notna(dl) and dl <= w_next:
+                forced.append((c, wt, -1.0))          # 정리매매가 없으면 -100% (C2)
+                hold.pop(c, None)
+                n_forced_delist += 1
+            elif h["frozen"] >= hold_max:
+                # 26주 넘게 시세가 없고 폐지일도 확인되지 않는다 → 보수적으로 총손실 처리.
+                # (낙관적으로 0% 처리하면 이 전략의 성과가 구조적으로 부풀려진다)
+                forced.append((c, wt, -1.0))
+                hold.pop(c, None)
+                n_stale_writeoff += 1
+            else:
+                h["frozen"] += 1
+                frozen[c] = wt
+                n_frozen_events += 1
+
+        if sub is None or sub.empty:
+            ret_forced = sum(wt * r for _c, wt, r in forced)
+            for c, wt, r in forced:
+                holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": r,
+                                     "signal": np.nan, "state": "delisted"})
+            for c, wt in frozen.items():
+                holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": 0.0,
+                                     "signal": np.nan, "state": "halted"})
+            rows.append({"wk": w, "ret": ret_forced, "ret_gross": ret_forced,
+                         "n": len(frozen), "turnover": 0.0, "cost": 0.0,
+                         "invested": float(sum(frozen.values()))})
+            prev_w = dict(frozen)
+            continue
 
         elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
                    sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna()]
@@ -7187,12 +7295,14 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         if uni is not None:
             uni.audit_row("최종선정", w, pick["code"].tolist())
 
-        # ── 청산 판정 (진입 논리와 같은 언어로) ─────────────────────────────────────────
+        # ── ② 청산 판정 (진입 논리와 같은 언어로) ──────────────────────────────────────
         keep = []
         for c, h in list(hold.items()):
+            if c in frozen:
+                continue                       # 팔 수 없는 종목은 청산 판단 대상이 아니다
             r0 = rec.get(c)
             if r0 is None:
-                continue                       # 패널에서 사라짐(거래정지·폐지) → 자동 이탈
+                continue
             exited = False
             if r0.get("FIREWALL", 1) == 0 or r0.get("VETO", 1) == 0:
                 exited = True                  # 방화벽/거부권은 즉시 강제청산
@@ -7207,21 +7317,28 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
 
         extra = sub[sub["code"].isin(keep) & ~sub["code"].isin(set(pick["code"]))]
         target = pd.concat([pick, extra], ignore_index=True) if len(extra) else pick
-        if len(target) > PORTFOLIO_MAX_NAMES:
-            # 보유분 우선(회전율 억제) — 신규는 신호순으로 잘라낸다
-            held = target[target["code"].isin(keep)]
+        room = max(0, PORTFOLIO_MAX_NAMES - len(frozen))
+        if len(target) > room:
+            held = target[target["code"].isin(keep)].head(room)
             fresh = _top_n(target[~target["code"].isin(keep)],
-                           max(0, PORTFOLIO_MAX_NAMES - len(held)), signal_col)
+                           max(0, room - len(held)), signal_col)
             target = pd.concat([held, fresh], ignore_index=True)
         target = size_positions(target) if len(target) else target.assign(weight=[])
 
-        w_new = dict(zip(target["code"], target["weight"])) if len(target) else {}
-        turn = sum(abs(w_new.get(c, 0.0) - prev_w.get(c, 0.0))
-                   for c in set(w_new) | set(prev_w))
+        # 정지 종목이 물고 있는 비중만큼 신규 가용 자본이 줄어든다 (팔 수 없으므로)
+        w_frozen = float(sum(frozen.values()))
+        avail = max(0.0, 1.0 - w_frozen)
+        w_new = dict(frozen)
+        if len(target):
+            for c, wt in zip(target["code"], target["weight"]):
+                w_new[c] = float(wt) * avail
+
+        traded = (set(w_new) | set(prev_w)) - {c for c, _wt, _r in forced}
+        turn = sum(abs(w_new.get(c, 0.0) - prev_w.get(c, 0.0)) for c in traded)
 
         cost = 0.0
         if apply_costs:
-            for c in set(w_new) | set(prev_w):
+            for c in traded:
                 dw = w_new.get(c, 0.0) - prev_w.get(c, 0.0)
                 if abs(dw) < 1e-9:
                     continue
@@ -7232,20 +7349,27 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
                 tx = sell_tax(w, mkt.get(c, "OTHER")) if dw < 0 else 0.0
                 cost += abs(dw) * (COMMISSION_BPS / 1e4 + slippage(notional, adv, slip_k) + tx)
 
-        ret = 0.0
+        ret = sum(wt * r for _c, wt, r in forced)
+        for c, wt, r in forced:
+            holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": r,
+                                 "signal": np.nan, "state": "delisted"})
         for c, wt in w_new.items():
+            if c in frozen:
+                holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": 0.0,
+                                     "signal": np.nan, "state": "halted"})
+                continue
             _r = rec.get(c) or {}
             _f = _r.get("fwd_ret")
             fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
             dl = delist.get(c)
-            if dl is not None and pd.notna(dl) and w < dl <= w + pd.Timedelta(days=7):
+            if dl is not None and pd.notna(dl) and w < dl <= w_next:
                 # ★ 상장폐지 주간: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
                 fr = -1.0 if not np.isfinite(fr) else fr
             if not np.isfinite(fr):
                 fr = 0.0
             ret += wt * fr
             holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": fr,
-                                 "signal": _r.get(signal_col)})
+                                 "signal": _r.get(signal_col), "state": "held"})
         rows.append({"wk": w, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost,
                      "invested": float(sum(w_new.values()))})
@@ -7256,13 +7380,20 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             else:
                 hold.pop(c, None)
         for c in w_new:
-            hold.setdefault(c, {"weeks": 0})
+            hold.setdefault(c, {"weeks": 0, "frozen": 0})
         prev_w = w_new
 
     R = pd.DataFrame(rows)
     if len(R):
         R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
-    return {"returns": R, "holdings": pd.DataFrame(holdings_log), "label": label}
+    if n_forced_delist or n_stale_writeoff or n_frozen_events:
+        LOG.info(f"[{label}] 보유 중 사고 처리 — 거래정지 보유주 {n_frozen_events:,}건 · "
+                 f"폐지확정 -100% {n_forced_delist:,}건 · "
+                 f"장기 시세부재 보수적 상각 {n_stale_writeoff:,}건 "
+                 f"(0% 로 조용히 털지 않습니다 — C2)")
+    return {"returns": R, "holdings": pd.DataFrame(holdings_log), "label": label,
+            "incidents": {"frozen": n_frozen_events, "delisted": n_forced_delist,
+                          "stale_writeoff": n_stale_writeoff}}
 
 
 # ── 성과 지표 ───────────────────────────────────────────────────────────────────────────────
@@ -7340,7 +7471,9 @@ def benchmark_returns_w(weeks: pd.DatetimeIndex, P: Optional[pd.DataFrame] = Non
         d["date"] = as_ts_series(d[d.columns[0]])
         s = d.set_index("date")["close"].sort_index()
         s = s.reindex(s.index.union(weeks)).ffill().reindex(weeks)
-        out[name] = s.pct_change()
+        # ★ 전략 수익률은 [w, w+1] 구간의 '선행' 수익률이다. 지수를 후행 pct_change 로 두면
+        #   한 주가 어긋나 R12(꼬리 동시손실)가 '지난주 급락'으로 위기주를 고르게 된다.
+        out[name] = s.pct_change().shift(-1)
     if P is not None and len(P) and "fwd_ret" in P.columns:
         eqw = (P[P["in_band"] == 1].groupby("wk", observed=True)["fwd_ret"].mean()
                if "in_band" in P.columns else P.groupby("wk", observed=True)["fwd_ret"].mean())
@@ -7826,6 +7959,9 @@ def report_grade_banner():
                   "'신용잔고 소진'이 아니라 '개인 누적순매수 감소'를 본 것입니다. "
                   "신뢰도를 하향해 해석하세요.")
     LOG.info(f"수급(F2) 등급 = {FLOW_GRADE} · 관리종목/거래정지(K6) 등급 = {WATCH_GRADE}")
+    if FIREWALL_STATUS:
+        LOG.table([[k, v] for k, v in FIREWALL_STATUS.items()], ["방화벽 조항", "상태"], ["l", "l"],
+                  title="방어 가동 현황 — 무엇이 켜져 있고 무엇이 꺼져 있는가 (성과보다 먼저 볼 것)")
 
 
 def report_canary():
@@ -7868,6 +8004,14 @@ def report_performance(bt: dict, bench: Dict[str, pd.Series], label: str = ""):
         LOG.warn(f"평균 투자비중이 {inv:.0%} 입니다 — 종목당 상한({POS_MAX_WEIGHT:.0%})에 걸려 "
                  f"나머지는 현금으로 남습니다. 이는 '적격 종목이 적다'는 사실의 정직한 반영이며, "
                  f"CAGR 은 그만큼 희석됩니다. 상한을 올리려면 R12 결과를 먼저 보세요(§12-2).")
+
+    inc = bt.get("incidents") or {}
+    if any(inc.values()):
+        LOG.table([["거래정지로 못 판 보유주(주-종목)", f"{inc.get('frozen',0):,}"],
+                   ["폐지 확정 -100% 처리", f"{inc.get('delisted',0):,}"],
+                   ["장기 시세부재 보수적 상각(-100%)", f"{inc.get('stale_writeoff',0):,}"]],
+                  ["보유 중 사고", "건수"], ["l", "r"],
+                  title="보유 중 사고 처리 — 이 숫자가 0 이면 오히려 의심하세요(C2)")
 
     rt = right_tail_contribution(bt)
     if rt:
@@ -8234,6 +8378,35 @@ def run_contract_tests(strict: bool = True) -> bool:
         return (n[0] == 1 and n[1] == 1 and n[2] == 0,
                 f"주별 보유종목수 {n} — 3주차에 f_cr_pctl=0.9(재취약)이므로 0 이어야 함")
 
+    def c_halt():
+        """★ 실제로 있었던 결함의 회귀 방지:
+        보유 종목이 거래정지로 패널에서 사라진 뒤 상장폐지되면, 예전 구현은 그 종목을
+        '보유 목록에서 조용히 제거'해 총손실(-100%)을 무손실(0%)로 계상했다.
+        한국의 전형 경로(거래정지 → 정리매매 → 폐지)가 통째로 공짜 탈출이 되는 결함이다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=5, freq="W-FRI"))
+        dl = wks[3] + pd.Timedelta(days=2)          # 4주차와 5주차 사이에 폐지
+        rows = []
+        for i, w in enumerate(wks):
+            if i >= 1:
+                continue                             # 2주차부터 패널에서 사라진다(거래정지)
+            rows.append({"code": "A", "wk": w, "exec_px": 1000.0, "fwd_ret": 0.0,
+                         "adv20": 1e10, "FIREWALL": 1, "VETO": 1, "in_band": 1, "V6": 1,
+                         "PHASE_C": 1, "f_dd": -0.4, "f_cr_pctl": 0.1, "Signal_rank": 1.0})
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": ["A"], "name": ["A"], "market": ["KOSDAQ"],
+                            "listing_date": [pd.Timestamp("2015-01-01")],
+                            "delisting_date": [dl]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": wks, "code": "A"}))
+        bt = run_backtest_w(P, wks, uni, sec, apply_costs=False, label="c_halt")
+        H = bt["holdings"]
+        states = list(H["state"]) if "state" in H.columns else []
+        loss = float(H.loc[H["ret"] <= -0.999, "weight"].sum()) if len(H) else 0.0
+        total = float(bt["returns"]["ret"].sum())
+        return (("delisted" in states) and loss > 0 and total < -0.05,
+                f"상태전이={states} · 총손실 반영 {total:.2%} "
+                f"(거래정지 중 폐지를 0% 로 처리하면 여기가 0.00% 로 나온다)")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -8300,6 +8473,7 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("TP", "clip(z,0)×clip(z,0) 부호 규약", c_tp)
     _c("VETO", "거부권 이진·상쇄 불가", c_veto)
     _c("EXIT", "청산 규칙(f_cr_pctl 회복) 작동", c_exit)
+    _c("HALT", "거래정지 중 폐지 = -100% (회귀 방지)", c_halt)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)
