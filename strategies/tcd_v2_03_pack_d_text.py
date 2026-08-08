@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_D"
 STRATEGY_NAME      = "PACK-D 공시텍스트 경직성"
 ACTIVE_PACKS       = ["D"]
-BUILD_VERSION      = "v2.20260807.1316"
+BUILD_VERSION      = "v2.20260808.0250"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -1650,8 +1650,16 @@ class Vault:
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
                                         "_legacy_file") if c in idx.columns]
+                # ★ 시드에 행 위치 i 를 넣으면 안 된다. 다음 실행에서 프레임 결합 순서가
+                #   조금만 바뀌어도 같은 물리적 행이 다른 uid 를 받아 drop_duplicates 를
+                #   통과하고, 인덱스가 매 실행 같은 양만큼 불어난다(삭제 API 가 없어 되돌릴 수 없다).
+                #   위치가 아니라 **행 내용**으로만 해시한다.
+                _lf = idx["_legacy_file"] if "_legacy_file" in idx.columns else None
                 idx.loc[miss, "uid"] = [
-                    sha1_str("legacy", i, *[str(idx.iloc[i].get(c, "")) for c in fill_src])
+                    sha1_str("legacy",
+                             (str(_lf.iloc[i]) if _lf is not None else ""),
+                             *[str(idx.iloc[i].get(c, "")) for c in fill_src],
+                             *[f"{c}={idx.iloc[i].get(c, '')}" for c in idx.columns[:12]])
                     for i in np.where(miss.to_numpy())[0]]
                 LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 uid 를 부여했습니다 "
                          f"(uid 결측 행이 하나로 뭉개지는 것을 방지 — 기존 기록 보존).")
@@ -1672,10 +1680,13 @@ class Vault:
         return idx
 
     def has(self, scope: str, uid: str) -> bool:
+        """★ pending 리스트를 선형탐색하지 않는다. _register 가 이미 _uidset 에 uid 를 넣으므로
+        의미는 동일하고, 선형탐색은 adopt_scan 처럼 파일마다 has() 를 부르는 경로를 O(N²) 로
+        만든다. blob 이 20만 개 쌓인 드라이브에서 이 한 줄이 매 실행 수십 분을 태웠다."""
         if scope not in self._uidset:
             self.load_index(scope)
         with self._lk:
-            return uid in self._uidset[scope] or any(r.get("uid") == uid for r in self._pending[scope])
+            return uid in self._uidset.get(scope, set())
 
     def lookup(self, scope: str, **eq) -> pd.DataFrame:
         idx = self.load_index(scope)
@@ -1858,6 +1869,11 @@ class Vault:
     def adopt_scan(self, dirs: Sequence[str], max_files: int = 400_000) -> pd.DataFrame:
         """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음."""
         seen, found = set(), []
+        # ★ 우리가 스스로 만든 blob/table 저장소는 스캔 대상이 아니다. 이미 인덱스에 등록돼
+        #   있는 데다, 실행을 거듭할수록 파일이 수십만 개로 불어나 매 실행 수십 분을 태운다.
+        #   게다가 blob 파일명은 내용해시라 report_uid 재사용에 아무 도움도 되지 않는다.
+        _own = {os.path.realpath(os.path.join(self.ns[sc], sub))
+                for sc in ("shared", "private") for sub in ("blob", "table", "index")}
         for d in dirs:
             if not d or not os.path.isdir(d):
                 continue
@@ -1868,7 +1884,12 @@ class Vault:
             LOG.info(f"기존 캐시 스캔: {d}")
             n = 0
             for dirpath, dirnames, filenames in os.walk(d):
-                dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
+                if os.path.realpath(dirpath) in _own:
+                    dirnames[:] = []
+                    continue
+                dirnames[:] = [x for x in dirnames
+                               if not x.startswith(".") and x != "_backup"
+                               and os.path.realpath(os.path.join(dirpath, x)) not in _own]
                 for fn in filenames:
                     if n >= max_files:
                         break
