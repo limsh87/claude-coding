@@ -125,6 +125,32 @@ def make_synthetic_panel(n_code: int = 240, n_month: int = 72, seed: int = SEED
     return downcast(P), sec, months
 
 
+class _MemVault:
+    """상태를 기억하는 인메모리 금고. '두 번째 실행'의 행동을 검증하기 위한 것.
+    실제 드라이브는 절대 건드리지 않는다 (절대 1원칙)."""
+
+    def __init__(self):
+        self.t: Dict[str, pd.DataFrame] = {}
+
+    def get_table(self, name, *a, **k):
+        v = self.t.get(name)
+        return None if v is None else v.copy()
+
+    def put_table(self, name, df, *a, **k):
+        self.t[name] = df.copy()
+
+
+class _NullVault:
+    """계약검정 전용 무해 금고. 절대 1원칙 — 검정이 실제 드라이브 인덱스를 건드리면 안 된다.
+    읽기는 항상 '없음', 쓰기는 조용히 버린다."""
+
+    def get_table(self, *a, **k):
+        return None
+
+    def put_table(self, *a, **k):
+        return None
+
+
 def run_contract_tests(strict: bool = True) -> bool:
     LOG.banner("계약 자동검정", "협상 불가 규칙이 코드에 실제로 있는지 실행으로 확인한다")
     rng = np.random.default_rng(SEED)
@@ -345,6 +371,102 @@ def run_contract_tests(strict: bool = True) -> bool:
     finally:
         if _saved_api is not None:
             globals()["dart_api"] = _saved_api
+
+    # ── PIT 시총이 '지수 API 차단' 한 방에 조용히 죽지 않는다 ────────────────────────
+    #   실측 실패: pykrx.get_nearest_business_day_in_a_week() 는 지수 OHLCV API 를 친다.
+    #   그게 막히자 매달 IndexError → 정확 시총 0.0% → 전 구간이 거래대금 대리로 대체됐다.
+    #   유니버스 밴드가 '규모'에서 '유동성'으로 바뀌었는데 예외는 한 줄도 안 떴다.
+    #   → 영업일은 가격 패널이 실제로 관측한 거래일에서 만든다. 아래가 그 계약이다.
+    class _FakeKrx:
+        """달력 API 는 무조건 터지고, 시총 API 는 정상인 pykrx."""
+        calendar_calls = 0
+
+        @staticmethod
+        def get_nearest_business_day_in_a_week(*a, **k):
+            _FakeKrx.calendar_calls += 1
+            raise IndexError("index 0 is out of bounds (지수 API 차단 재현)")
+
+        @staticmethod
+        def get_market_cap_by_ticker(date, market="KOSPI"):
+            base = 0 if market == "KOSPI" else 100
+            return pd.DataFrame({"시가총액": [1e11 + base, 2e11 + base],
+                                 "상장주식수": [1e6, 2e6]},
+                                index=pd.Index([f"{base+1:06d}", f"{base+2:06d}"], name="티커"))
+
+    _sv = {k: globals().get(k) for k in ("pykrx_stock", "VAULT", "RUN_MODE")}
+    try:
+        mths = pd.date_range("2016-08-31", periods=3, freq="ME")
+        # 월말이 휴장일이어도(예: 8/31 이 일요일) 패널은 '실제 체결된 마지막 날'을 안다
+        pxm = pd.DataFrame([{"code": f"{c:06d}", "month": m,
+                             "signal_date": m - pd.Timedelta(days=2),
+                             "close": 1000.0, "adv20": 5e8}
+                            for m in mths for c in (1, 2, 101, 102)])
+        globals()["pykrx_stock"] = _FakeKrx
+        globals()["VAULT"] = _NullVault()
+        globals()["RUN_MODE"] = "FULL"
+        _FakeKrx.calendar_calls = 0
+        mc = fetch_pit_marketcap(mths, pxm, pd.DataFrame({"code": [], "shares": []}))
+        n_true = int((mc["mcap_src"] == "pykrx").sum())
+        n_proxy = int((mc["mcap_src"] == "adv_proxy").sum())
+        _t("MCAP-BD", "달력 API 가 막혀도 PIT 시총이 살아남는다 (영업일을 가격 패널에서 구성)",
+           n_true == len(mc) and n_proxy == 0 and _FakeKrx.calendar_calls == 0,
+           f"정확 {n_true}/{len(mc)}행 · 거래대금대리 {n_proxy}행 · "
+           f"달력 API 호출 {_FakeKrx.calendar_calls}회 (0이어야 한다)")
+    except Exception as e:                                       # noqa
+        _t("MCAP-BD", "달력 API 가 막혀도 PIT 시총이 살아남는다", False, f"{type(e).__name__}: {e}")
+    finally:
+        for k, v in _sv.items():
+            if v is not None:
+                globals()[k] = v
+
+    # ── 캐시가 충분한 종목을 두 번째 실행에서 다시 받지 않는다 ──────────────────────
+    #   실측 실패: 드라이브에 일봉 697만행이 있는데도 3,497종목을 처음부터 다시 받아 17.5분.
+    #   원인은 '실패만 기록하는' 음성 캐시였다. 2018년 상장 종목은 소스가 2015년치를 줄 수
+    #   없으므로 min(cache)=2018 > start=2015 조건이 **영원히** 참이고, 성공했으니 실패
+    #   원장에도 안 남아 매 실행 백필이 반복된다. 예외도 경고도 없다 — 그냥 매번 느리다.
+    _sv = {k: globals().get(k) for k in ("VAULT", "PRICE_CHAIN", "RUN_MODE")}
+    try:
+        asked_codes: List[str] = []
+
+        def _fake_src(code, st, en):
+            asked_codes.append(code)
+            d = pd.date_range("2018-01-02", "2026-07-31", freq="B")   # 2018년 상장 종목
+            return pd.DataFrame({"date": d, "code": code, "open": 1e3, "high": 1e3,
+                                 "low": 1e3, "close": 1e3, "volume": 1e4,
+                                 "amount": 1e7, "src": "fake"})
+
+        globals()["VAULT"] = _MemVault()
+        globals()["PRICE_CHAIN"] = [("fake", _fake_src)]
+        globals()["RUN_MODE"] = "FULL"
+        codes = [f"{i:06d}" for i in range(1, 21)]
+        fetch_prices(codes, "2015-02-01", "2026-07-31")
+        n1 = len(asked_codes)
+        asked_codes.clear()
+        fetch_prices(codes, "2015-02-01", "2026-07-31")      # 같은 명령 재실행
+        n2 = len(asked_codes)
+        _t("REFETCH", "캐시가 충분한 종목을 두 번째 실행에서 다시 받지 않는다",
+           n1 == 20 and n2 == 0,
+           f"1회차 {n1}종목 수집 · 2회차 {n2}종목 (0이어야 한다. "
+           f"소스의 최초제공일이 요청 시작일보다 늦어도 무한 백필하면 안 된다)")
+    except Exception as e:                                       # noqa
+        _t("REFETCH", "캐시가 충분한 종목을 다시 받지 않는다", False, f"{type(e).__name__}: {e}")
+    finally:
+        for k, v in _sv.items():
+            if v is not None:
+                globals()[k] = v
+
+    # ── 벽시계 게이트: 선택 수집만 끊고, 끊었다는 사실을 반드시 남긴다 ──────────────
+    #   실측 실패: 수집이 3시간을 먹고도 파이프라인은 계속 진행 → 사용자는 백테스트 결과를
+    #   한 번도 못 봤다. 연구 도구로서 '완벽한 무결과'는 부분 결과보다 나쁘다.
+    _w = _WallClock()
+    _w.start()
+    fresh = _w.gate("테스트-선택수집")
+    _w.t0 = time.time() - (WALL_CLOCK_BUDGET_MIN - WALL_RESERVE_MIN + 1) * 60.0
+    spent = _w.gate("테스트-선택수집")
+    _t("WALL", "벽시계 예산이 소진되면 선택 수집을 끊고 백테스트를 완주시킨다",
+       fresh == "" and bool(spent) and _w.skipped == ["테스트-선택수집"],
+       f"여유 시 통과 {fresh == ''} · 소진 시 차단 {bool(spent)} · "
+       f"건너뛴 항목 기록 {_w.skipped} (조용히 넘어가면 결과 해석이 틀어진다)")
 
     # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
     _t(*_vault_integrity_test())

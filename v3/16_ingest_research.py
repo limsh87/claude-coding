@@ -489,9 +489,20 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     return d
 
 
-def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
-    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다."""
-    if df.empty:
+def naver_enrich_detail(df: pd.DataFrame, limit: Optional[int] = None) -> pd.DataFrame:
+    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다.
+
+    ★ 이 함수가 전체 실행의 최대 병목이었다(실측 20,000건 = 108분, 3 it/s).
+      게다가 얻는 것은 사양 §8.1 의 U(=d1, d3)에 없는 **확장축 d2** 의 입력이다.
+      기본값을 0(끄기)으로 두고, 켜더라도 건수와 **시간** 양쪽에 상한을 건다.
+      한경 리스트는 목표주가를 이미 제공하므로 d2 가 통째로 죽는 것도 아니다.
+    """
+    limit = RESEARCH_ENRICH_MAX if limit is None else limit
+    if df.empty or not limit:
+        if limit == 0:
+            LOG.info("네이버 상세 보강을 건너뜁니다 (RESEARCH_ENRICH_MAX=0). "
+                     "실측 20,000건에 108분이 걸리는 최대 병목이며, 얻는 것은 사양 확장축 d2 의 "
+                     "입력입니다. 목표주가가 필요하면 한경 리스트 쪽이 훨씬 쌉니다.")
         return df
     need = df[(df["source"] == "naver") & (df["category"] == "company") &
               (df["target_price"].isna()) & (df["detail_url"].notna())].copy()
@@ -521,8 +532,21 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
                 "opinion": parse_opinion(op.get_text() if op else None),
                 "_detail_src": an}
 
-    res = pmap_io(_one, need["detail_url"].tolist(), workers=min(8, N_WORKERS_IO),
+    _t0 = time.time()
+    _stop = {"hit": False}
+
+    def _one_capped(u: str):
+        # 시간 상한. 건수만 제한하면 소스가 느려질 때 예측이 통째로 빗나간다.
+        if _stop["hit"] or (time.time() - _t0) > RESEARCH_ENRICH_MAX_MIN * 60:
+            _stop["hit"] = True
+            return None
+        return _one(u)
+
+    res = pmap_io(_one_capped, need["detail_url"].tolist(), workers=min(8, N_WORKERS_IO),
                   desc="네이버 상세(목표주가)")
+    if _stop["hit"]:
+        LOG.warn(f"네이버 상세 보강이 시간 상한({RESEARCH_ENRICH_MAX_MIN:.0f}분)에 걸려 "
+                 f"중단되었습니다. 받은 만큼만 반영합니다 — 조용히 자르지 않고 알립니다.")
     got = pd.DataFrame([r for r in res if r])
     if got.empty:
         return df

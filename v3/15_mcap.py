@@ -22,14 +22,25 @@
 MCAP_COLS = ["code", "month", "mcap", "shares", "mcap_src"]
 
 
-def _mcap_pykrx_month(d: pd.Timestamp) -> Optional[pd.DataFrame]:
-    """특정 월말의 전 종목 시총·상장주식수. KRXG 게이트로 직렬 호출한다."""
+def _mcap_pykrx_month(d: pd.Timestamp, bd: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """특정 월말의 전 종목 시총·상장주식수. KRXG 게이트로 직렬 호출한다.
+
+    ★ bd(영업일)를 **밖에서 받는다**. 실측 실패 사례:
+      pykrx.get_nearest_business_day_in_a_week() 는 내부적으로 '지수 OHLCV' API 를 친다.
+      그 API 가 막히면 `IndexError` 가 나고, 여기서 매달 None 이 되어
+      ① pykrx PIT 시총 0.0% → ④ 거래대금 대리 100% 로 떨어진다.
+      즉 C13(PIT 유니버스)이 조용히 폐기되는데 예외는 한 줄도 안 뜬다.
+      우리는 이미 일봉 패널에서 '그 달에 실제로 거래가 체결된 마지막 날'을 알고 있다.
+      영업일 달력을 남에게 물어볼 이유가 없다.
+    """
     if pykrx_stock is None:
         return None
-    bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
-                   d.strftime("%Y%m%d"), prev=True)
+    if not bd:
+        bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
+                       d.strftime("%Y%m%d"), prev=True)
     if not bd:
         return None
+    bd = str(bd).replace("-", "")[:8]
     frames = []
     for mkt in ("KOSPI", "KOSDAQ"):
         t = KRXG.call(pykrx_stock.get_market_cap_by_ticker, bd, market=mkt)
@@ -59,6 +70,70 @@ def _mcap_pykrx_month(d: pd.Timestamp) -> Optional[pd.DataFrame]:
     return out[MCAP_COLS]
 
 
+def naver_shares_snapshot() -> pd.Series:
+    """네이버 금융 '시가총액' 목록에서 전 종목 상장주식수를 한 번에 긁는다.
+
+    현재값이라 PIT 가 아니다. 오직 ③ 역투영의 '씨앗'으로만 쓴다 — pykrx 가 막혀
+    상장주식수를 한 건도 못 얻었을 때, 시총 자리에 거래대금(유동성)을 넣는 것보다는
+    '주식수 × 과거 종가'가 규모의 대리로서 훨씬 낫기 때문이다.
+    페이지당 50종목 · 시장당 약 20~30페이지 → 총 60회 미만의 요청으로 끝난다.
+    """
+    cached = VAULT.get_table("naver_shares_snapshot", scope="shared")
+    if cached is not None and len(cached):
+        c = cached.copy()
+        c["code"] = c["code"].map(to_code6)
+        c = c.dropna(subset=["code"])
+        LOG.info(f"공용 캐시에서 상장주식수 스냅샷 {len(c):,}종목 재사용")
+        return pd.to_numeric(c.set_index("code")["shares"], errors="coerce").dropna()
+
+    rows: List[tuple] = []
+    for sosok in (0, 1):                       # 0=코스피 1=코스닥
+        empty_streak = 0
+        for page in range(1, 45):
+            html = http_get("https://finance.naver.com/sise/sise_market_sum.naver",
+                            source="naver_mcap", params={"sosok": sosok, "page": page})
+            sp = soup_of(html)
+            tb = sp.find("table", class_="type_2") if sp else None
+            if tb is None:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                continue
+            heads = [th.get_text(strip=True) for th in tb.find_all("th")]
+            try:
+                j_sh = heads.index("상장주식수")
+            except ValueError:
+                j_sh = -1
+            got = 0
+            for tr in tb.find_all("tr"):
+                a = tr.find("a", href=True)
+                if not a or "code=" not in a["href"]:
+                    continue
+                code = to_code6(a["href"].split("code=")[-1][:6])
+                tds = [td.get_text(strip=True).replace(",", "") for td in tr.find_all("td")]
+                if not code or j_sh < 0 or j_sh >= len(tds):
+                    continue
+                try:
+                    sh = float(tds[j_sh]) * 1000.0        # 네이버 표기는 '천주'
+                except ValueError:
+                    continue
+                if sh > 0:
+                    rows.append((code, sh)); got += 1
+            empty_streak = 0 if got else empty_streak + 1
+            if empty_streak >= 2:
+                break
+
+    if not rows:
+        LOG.warn("네이버 상장주식수 스냅샷이 비었습니다 — 역투영 폴백을 쓸 수 없습니다.")
+        return pd.Series(dtype="float64")
+    df = pd.DataFrame(rows, columns=["code", "shares"]).drop_duplicates("code", keep="first")
+    VAULT.put_table("naver_shares_snapshot", df, scope="shared", domain="universe",
+                    source="finance.naver.com/sise/sise_market_sum",
+                    extra={"note": "현재 상장주식수 스냅샷 — PIT 아님. 역투영 근사 전용"})
+    LOG.ok(f"네이버 상장주식수 스냅샷 {len(df):,}종목 확보 (공용 인덱스 저장)")
+    return pd.to_numeric(df.set_index("code")["shares"], errors="coerce").dropna()
+
+
 def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                         sec: pd.DataFrame) -> pd.DataFrame:
     """월말 격자의 PIT 시가총액. 공용 인덱스에 저장 — 다른 전략이 그대로 재사용한다."""
@@ -80,13 +155,28 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
             LOG.warn(f"CACHED 모드 — 시총 미수집 {len(todo)}개월을 건너뜁니다.")
         todo = []
 
+    # ★ 영업일 달력을 '가격 패널이 실제로 관측한 마지막 거래일'에서 만든다.
+    #   지수 API 가 막혀도 이 경로는 절대 막히지 않는다 (이미 손에 든 데이터니까).
+    bd_map: Dict[pd.Timestamp, str] = {}
+    if "signal_date" in px_monthly.columns:
+        try:
+            g = px_monthly.dropna(subset=["signal_date"]).copy()
+            g["month"] = as_ts_series(g["month"])
+            g["signal_date"] = as_ts_series(g["signal_date"])
+            bd_map = {m: d.strftime("%Y%m%d")
+                      for m, d in g.groupby("month")["signal_date"].max().items()}
+            LOG.info(f"영업일 달력을 가격 패널에서 직접 구성 ({len(bd_map)}개월) — "
+                     f"pykrx 지수 API 의존 제거")
+        except Exception as e:                                            # noqa
+            LOG.warn(f"패널에서 영업일 추출 실패({type(e).__name__}) — pykrx 달력으로 폴백합니다.")
+
     got_new = False
     if todo and pykrx_stock is not None:
         KRXG.warmup()
         LOG.info(f"PIT 시가총액 {len(todo)}개월 수집 (직렬 · 월당 2호출)")
         bad_streak = 0
         for d in tqdm(todo, desc="PIT 시가총액", ncols=88, leave=False):
-            t = _mcap_pykrx_month(d)
+            t = _mcap_pykrx_month(d, bd=bd_map.get(d))
             if t is not None and len(t):
                 frames.append(t)
                 got_new = True
@@ -134,7 +224,17 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                           .drop_duplicates("code", keep="first").set_index("code")["shares"])
             shares_now = first_obs
         if shares_now.empty and "shares" in sec.columns:
-            shares_now = sec.dropna(subset=["shares"]).set_index("code")["shares"]
+            shares_now = pd.to_numeric(sec.dropna(subset=["shares"]).set_index("code")["shares"],
+                                       errors="coerce").dropna()
+        if shares_now.empty and RUN_MODE != "CACHED":
+            # pykrx 도 마스터도 주식수를 못 줬다. 여기서 포기하면 전 구간이 ④ 거래대금 대리가
+            # 되어 '규모 밴드'가 '유동성 밴드'로 바뀐다 — C13 의 의미 자체가 달라진다.
+            LOG.warn("상장주식수를 한 건도 확보하지 못했습니다 — 네이버 스냅샷으로 역투영 씨앗을 "
+                     "만듭니다. (현재값 기준 근사이며 자본이벤트를 반영하지 못합니다)")
+            try:
+                shares_now = naver_shares_snapshot()
+            except Exception as e:                                        # noqa
+                LOG.warn(f"네이버 상장주식수 스냅샷 실패({type(e).__name__}: {e})")
         if not shares_now.empty:
             est = base.loc[need, "code"].map(shares_now) * base.loc[need, "close"]
             base.loc[need, "mcap"] = est.to_numpy()

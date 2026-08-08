@@ -258,7 +258,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
     #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    # ★ 여기에 as_ts(end)(=BACKTEST_END, 고정 문자열)를 쓰면 attempted_at 이 매 실행 같은 값이
+    #   되어 (_today - p["at"]).days 가 영원히 0 이다 → 재시도 만료가 영영 오지 않는다.
+    #   즉 한 번 실패한 종목은 소스가 복구돼도 두 번 다시 시도되지 않는 '영구 포기'가 된다.
+    #   음성 캐시는 반드시 실제 벽시계로 늙어야 한다.
+    _today = pd.Timestamp.today().normalize()
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):
@@ -268,40 +272,51 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from}
                     for r in _att.itertuples(index=False)}
 
-    def _recently_failed(c: str, want_from: pd.Timestamp) -> bool:
+    def _asked_before(c: str, want_from: pd.Timestamp) -> bool:
+        """★ 이미 이 구간(또는 더 이른 구간)을 요청해 봤는가.
+
+        예전엔 **실패한 종목만** 원장에 남겼다. 그래서 2018년에 상장한 종목처럼
+        '소스가 줄 수 있는 최초일'이 요청 시작일보다 늦은 경우, 캐시에 데이터가 멀쩡히
+        있는데도 mn(2018) > start(2015-02) 조건에 걸려 **매 실행마다 영원히 재수집**했다.
+        실측: 캐시 697만행을 갖고도 3,497종목을 처음부터 다시 받아 17.5분을 태웠다.
+        → 성공·실패를 가리지 않고 '무엇을 언제 어디서부터 요청했는지'를 남긴다.
+          소스가 더 과거를 줄 수 있게 되면 RETRY_AFTER_DAYS 뒤 자동 재시도된다.
+        """
         p = attempts.get(c)
         if p is None or pd.isna(p["at"]):
             return False
-        # 이번에 더 이른 구간을 원한다면 이전 실패는 근거가 되지 않는다.
-        if pd.notna(p["frm"]) and p["frm"] > want_from:
-            return False
+        if pd.notna(p["frm"]) and p["frm"] > want_from + pd.Timedelta(days=10):
+            return False            # 이번엔 더 이른 구간을 원한다 → 재시도할 이유가 있다
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_neg = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
+        asked = _asked_before(c, start_ts)
         if mx is None:
-            if _recently_failed(c, start_ts):
-                n_skip += 1
+            if asked:
+                n_neg += 1            # 캐시도 없고 최근에 물어봤다 → 음성 캐시
                 continue
             todo.append((c, start))
             continue
-        # ★ 과거 방향 백필을 반드시 함께 본다.
-        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
-        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
-        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+        # 과거 방향 백필. 단 **이미 그 구간을 요청해 본 적이 있으면 다시 묻지 않는다** —
+        # 그때 못 받은 건 소스가 그 이전을 갖고 있지 않다는 뜻이다(상장 전이거나 미제공).
+        if mn is not None and mn > start_ts + pd.Timedelta(days=10) and not asked:
             todo.append((c, start))
             n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
+        else:
+            n_skip += 1
     if n_back:
-        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
-    if n_skip:
-        LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
-                 f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
+        LOG.info(f"과거 구간이 비어 있고 아직 그 구간을 요청해 본 적 없는 {n_back:,}종목을 "
+                 f"처음부터 받습니다.")
+    LOG.info(f"일봉 계획 — 백필 {n_back:,} · 증분 {n_fwd:,} · 캐시충분 {n_skip:,} · "
+             f"음성캐시(최근 실패) {n_neg:,}  [총 {len(codes):,}종목]")
+    if n_neg:
+        LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 데이터를 못 받은 {n_neg:,}종목은 "
+                 f"이번엔 건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
@@ -353,26 +368,31 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             LOG.warn(f"연속 {_dead_after}회 실패로 이번 실행에서 내린 가격 소스: {_dropped}. "
                      f"(고정 순서로 두면 죽은 소스의 비용을 전 종목이 지불합니다) "
                      f"성공 분포: {dict(_ok)}")
-        failed = []
+        failed, tried_all = [], []
         for (c, st), d in zip(todo, res):
+            # ★ 성공도 반드시 기록한다. 실패만 남기면 '소스가 줄 수 있는 최초일'을 배우지
+            #   못해 다음 실행이 같은 백필을 무한히 반복한다(이번 17.5분의 정체).
+            tried_all.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if tried_all:
+            _prev = _att if _att is not None and len(_att) else None
+            _all = pd.concat([_prev, pd.DataFrame(tried_all)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(tried_all)
+            _all = (_all.sort_values("attempted_at")
+                        .drop_duplicates("code", keep="last").reset_index(drop=True))
+            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
+                            source="fetch_prices:attempt_ledger")
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
             # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
             #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
-            _prev = _att if _att is not None and len(_att) else None
-            _new = pd.DataFrame(failed)
-            _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
-            _all = (_all.sort_values("attempted_at")
-                        .drop_duplicates("code", keep="last").reset_index(drop=True))
-            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
-                            source="fetch_prices:negative_cache")
+
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:

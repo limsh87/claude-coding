@@ -186,6 +186,12 @@ RESEARCH_SOURCES      = ["hankyung", "naver"]
 RESEARCH_DOWNLOAD_PDF = True      # PDF 원문까지 받을지 (애널리스트/목표주가 정확도↑, 용량↑)
 RESEARCH_PDF_MAX_PER_MONTH = 0    # 0 = 무제한. 테스트할 땐 50 정도로.
 RESEARCH_TARGET_PER_YEAR = 30000  # 연간 수집 목표. 달성/미달을 감사표에 정직하게 표시합니다.
+#    ⚠ 네이버 '상세 보강'은 목표주가를 얻으려고 리포트를 **한 건씩** 열어봅니다.
+#      실측: 20,000건에 **108분**. 전체 실행 시간의 절반이 여기에 들어갔습니다.
+#      그런데 이건 사양 §8.1 의 U(=d1, d3)에 없는 확장축(d2)용입니다.
+#      0 = 끄기(권장) · 양수 = 그 건수만 조회 · 시간 상한(RESEARCH_ENRICH_MAX_MIN)도 함께 걸립니다.
+RESEARCH_ENRICH_MAX     = 0      # 0 = 상세 보강 안 함 (한경 리스트에는 목표주가가 이미 있습니다)
+RESEARCH_ENRICH_MAX_MIN = 10.0   # 켜더라도 이 시간을 넘기면 중단하고 받은 만큼만 씁니다
 #    ▶ 사양 §8.1 의 U 는 mean(z(d1), z(d3)) 입니다. 아래를 True 로 두면 리포트 기반 축
 #      d2(목표주가 상향 리비전) · d4(커버리지 변화) 를 U 에 추가합니다.
 #      사양 확장이므로 R5 절제에서 기여도를 반드시 확인하세요(기여가 없으면 False 로).
@@ -197,7 +203,11 @@ VERBOSE = True
 STOP_ON_KILL_CRITERIA = False     # §11 킬 기준 위반 시 즉시 중단할지.
                                   # False = 킬을 '기록'하고 남은 검사를 마저 돌려 전체 그림을 보여줌
                                   #         (판정은 그대로 KILL 로 보고합니다 — 통과시키지 않습니다)
-WALL_CLOCK_BUDGET_MIN = 240.0     # §2 하드 제약 4시간. 초과 시 경고(중단 아님)
+WALL_CLOCK_BUDGET_MIN = 240.0     # §2 하드 제약 4시간.
+# ★ 선택 수집(직원현황·수급·리포트 신규크롤)을 끊고 백테스트로 넘어가기 위해 남겨두는 시간.
+#   실측: L1 패널 1.5분 + L2/L3 0.2분 + 강건성 R0~R10 6.1분 + 리포트/저장 2분 ≈ 10분.
+#   여유 3배를 잡았다. "완벽한 무결과"보다 "부분 결과"가 언제나 낫다.
+WALL_RESERVE_MIN      = 30.0
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 #   설정 끝. 아래부터는 수정하지 않아도 됩니다.
@@ -406,6 +416,20 @@ try:
 except Exception:                                             # pragma: no cover
     def tqdm(it=None, **kw):                                  # type: ignore
         return it if it is not None else iter(())
+
+# ★ 서드파티 로거 억제. yfinance 는 종목당 2회(.KS/.KQ) 실패마다 여러 줄을 stderr 로 쏟고,
+#   pdfminer 는 PDF 마다 FontBBox 경고를 낸다. 5,398종목 × 수 줄 = 수만 줄이 되어
+#   **Jupyter 의 IOPub 메시지 한도(1000/s)를 넘겨 서버가 출력을 끊는다** — 실측으로
+#   "IOPub message rate exceeded" 가 떴다. 출력이 실행을 방해하는 상태였다.
+#   우리 로그는 _safe_print 직접 출력이라 영향받지 않는다.
+for _noisy in ("yfinance", "pdfminer", "pdfminer.pdffont", "pdfminer.pdfpage",
+               "urllib3", "requests", "peewee", "fsspec", "matplotlib"):
+    try:
+        logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+        logging.getLogger(_noisy).propagate = False
+    except Exception:
+        pass
+logging.captureWarnings(True)
 
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 80)
@@ -870,6 +894,61 @@ class Pipeline:
 PIPE = Pipeline()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+#  전역 벽시계 예산 게이트 (C10 의 실무 확장)
+#
+#  ★ 왜 필요한가 — 실측으로 확인된 실패 모드다.
+#     스테이지별 예산(budget_s)은 '초과했다'고 경고만 하고 계속 진행한다. 그래서 수집이
+#     3시간을 먹어도 파이프라인은 멈추지 않고, 사용자는 백테스트 결과를 **한 번도 못 본다**.
+#     연구 도구로서 이건 실패다. 부분 결과 > 완벽한 무결과.
+#
+#  규칙: 선택적(critical=False) 수집은 '남은 시간 < 예약분'이면 건너뛴다. 예약분은 L1~L6
+#        (패널·스코어·백테스트·강건성·리포트)를 끝내는 데 실측상 필요한 시간이다.
+#        필수 수집(가격·재무)은 절대 건너뛰지 않는다 — 그건 결과를 만들지 못하게 하니까.
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+class _WallClock:
+    def __init__(self):
+        self.t0 = time.time()
+        self.skipped: List[str] = []
+
+    def start(self):
+        self.t0 = time.time()
+        self.skipped = []
+
+    @property
+    def elapsed_min(self) -> float:
+        return (time.time() - self.t0) / 60.0
+
+    def remaining_min(self, budget_min: Optional[float] = None) -> float:
+        b = WALL_CLOCK_BUDGET_MIN if budget_min is None else budget_min
+        return b - self.elapsed_min
+
+    def exhausted(self, reserve_min: Optional[float] = None) -> bool:
+        r = WALL_RESERVE_MIN if reserve_min is None else reserve_min
+        return self.remaining_min() < r
+
+    def gate(self, what: str, reserve_min: Optional[float] = None) -> str:
+        """건너뛸 이유 문자열을 돌려준다. 진행해도 되면 빈 문자열."""
+        if not self.exhausted(reserve_min):
+            return ""
+        self.skipped.append(what)
+        return (f"벽시계 예산 소진 — 경과 {self.elapsed_min:.0f}분 / 한도 "
+                f"{WALL_CLOCK_BUDGET_MIN:.0f}분. 백테스트·강건성검사를 반드시 완주시키기 "
+                f"위해 선택 수집 '{what}' 을 건너뜁니다. 캐시가 채워진 다음 실행에서 "
+                f"자동으로 이어받습니다.")
+
+    def report(self):
+        if not self.skipped:
+            return
+        LOG.table([[w] for w in self.skipped], ["예산 때문에 건너뛴 선택 수집"], ["l"],
+                  title=f"벽시계 게이트 — 총 {self.elapsed_min:.0f}분 경과 "
+                        f"(한도 {WALL_CLOCK_BUDGET_MIN:.0f}분). "
+                        f"같은 명령을 한 번 더 실행하면 캐시 위에서 이어받습니다")
+
+
+WALL = _WallClock()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 #  [04/22]  03_util.py
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1202,7 +1281,10 @@ def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
         futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
         it_ = as_completed(futs)
         if not quiet:
-            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
+            # mininterval: 진행바 갱신도 IOPub 메시지다. 기본 0.1초면 초당 10줄 × 동시작업
+            # 수만큼 쌓여 노트북 서버가 출력을 끊는다.
+            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88,
+                       mininterval=2.0, miniters=max(1, len(futs) // 200))
         for fu in it_:
             i = futs[fu]
             try:
@@ -3806,7 +3888,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
     #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    # ★ 여기에 as_ts(end)(=BACKTEST_END, 고정 문자열)를 쓰면 attempted_at 이 매 실행 같은 값이
+    #   되어 (_today - p["at"]).days 가 영원히 0 이다 → 재시도 만료가 영영 오지 않는다.
+    #   즉 한 번 실패한 종목은 소스가 복구돼도 두 번 다시 시도되지 않는 '영구 포기'가 된다.
+    #   음성 캐시는 반드시 실제 벽시계로 늙어야 한다.
+    _today = pd.Timestamp.today().normalize()
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):
@@ -3816,40 +3902,51 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from}
                     for r in _att.itertuples(index=False)}
 
-    def _recently_failed(c: str, want_from: pd.Timestamp) -> bool:
+    def _asked_before(c: str, want_from: pd.Timestamp) -> bool:
+        """★ 이미 이 구간(또는 더 이른 구간)을 요청해 봤는가.
+
+        예전엔 **실패한 종목만** 원장에 남겼다. 그래서 2018년에 상장한 종목처럼
+        '소스가 줄 수 있는 최초일'이 요청 시작일보다 늦은 경우, 캐시에 데이터가 멀쩡히
+        있는데도 mn(2018) > start(2015-02) 조건에 걸려 **매 실행마다 영원히 재수집**했다.
+        실측: 캐시 697만행을 갖고도 3,497종목을 처음부터 다시 받아 17.5분을 태웠다.
+        → 성공·실패를 가리지 않고 '무엇을 언제 어디서부터 요청했는지'를 남긴다.
+          소스가 더 과거를 줄 수 있게 되면 RETRY_AFTER_DAYS 뒤 자동 재시도된다.
+        """
         p = attempts.get(c)
         if p is None or pd.isna(p["at"]):
             return False
-        # 이번에 더 이른 구간을 원한다면 이전 실패는 근거가 되지 않는다.
-        if pd.notna(p["frm"]) and p["frm"] > want_from:
-            return False
+        if pd.notna(p["frm"]) and p["frm"] > want_from + pd.Timedelta(days=10):
+            return False            # 이번엔 더 이른 구간을 원한다 → 재시도할 이유가 있다
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_neg = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
+        asked = _asked_before(c, start_ts)
         if mx is None:
-            if _recently_failed(c, start_ts):
-                n_skip += 1
+            if asked:
+                n_neg += 1            # 캐시도 없고 최근에 물어봤다 → 음성 캐시
                 continue
             todo.append((c, start))
             continue
-        # ★ 과거 방향 백필을 반드시 함께 본다.
-        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
-        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
-        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+        # 과거 방향 백필. 단 **이미 그 구간을 요청해 본 적이 있으면 다시 묻지 않는다** —
+        # 그때 못 받은 건 소스가 그 이전을 갖고 있지 않다는 뜻이다(상장 전이거나 미제공).
+        if mn is not None and mn > start_ts + pd.Timedelta(days=10) and not asked:
             todo.append((c, start))
             n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
+        else:
+            n_skip += 1
     if n_back:
-        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
-    if n_skip:
-        LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
-                 f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
+        LOG.info(f"과거 구간이 비어 있고 아직 그 구간을 요청해 본 적 없는 {n_back:,}종목을 "
+                 f"처음부터 받습니다.")
+    LOG.info(f"일봉 계획 — 백필 {n_back:,} · 증분 {n_fwd:,} · 캐시충분 {n_skip:,} · "
+             f"음성캐시(최근 실패) {n_neg:,}  [총 {len(codes):,}종목]")
+    if n_neg:
+        LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 데이터를 못 받은 {n_neg:,}종목은 "
+                 f"이번엔 건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
@@ -3901,26 +3998,31 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             LOG.warn(f"연속 {_dead_after}회 실패로 이번 실행에서 내린 가격 소스: {_dropped}. "
                      f"(고정 순서로 두면 죽은 소스의 비용을 전 종목이 지불합니다) "
                      f"성공 분포: {dict(_ok)}")
-        failed = []
+        failed, tried_all = [], []
         for (c, st), d in zip(todo, res):
+            # ★ 성공도 반드시 기록한다. 실패만 남기면 '소스가 줄 수 있는 최초일'을 배우지
+            #   못해 다음 실행이 같은 백필을 무한히 반복한다(이번 17.5분의 정체).
+            tried_all.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if tried_all:
+            _prev = _att if _att is not None and len(_att) else None
+            _all = pd.concat([_prev, pd.DataFrame(tried_all)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(tried_all)
+            _all = (_all.sort_values("attempted_at")
+                        .drop_duplicates("code", keep="last").reset_index(drop=True))
+            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
+                            source="fetch_prices:attempt_ledger")
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
             # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
             #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
-            _prev = _att if _att is not None and len(_att) else None
-            _new = pd.DataFrame(failed)
-            _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
-            _all = (_all.sort_values("attempted_at")
-                        .drop_duplicates("code", keep="last").reset_index(drop=True))
-            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
-                            source="fetch_prices:negative_cache")
+
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
@@ -5181,14 +5283,25 @@ def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int],
 MCAP_COLS = ["code", "month", "mcap", "shares", "mcap_src"]
 
 
-def _mcap_pykrx_month(d: pd.Timestamp) -> Optional[pd.DataFrame]:
-    """특정 월말의 전 종목 시총·상장주식수. KRXG 게이트로 직렬 호출한다."""
+def _mcap_pykrx_month(d: pd.Timestamp, bd: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """특정 월말의 전 종목 시총·상장주식수. KRXG 게이트로 직렬 호출한다.
+
+    ★ bd(영업일)를 **밖에서 받는다**. 실측 실패 사례:
+      pykrx.get_nearest_business_day_in_a_week() 는 내부적으로 '지수 OHLCV' API 를 친다.
+      그 API 가 막히면 `IndexError` 가 나고, 여기서 매달 None 이 되어
+      ① pykrx PIT 시총 0.0% → ④ 거래대금 대리 100% 로 떨어진다.
+      즉 C13(PIT 유니버스)이 조용히 폐기되는데 예외는 한 줄도 안 뜬다.
+      우리는 이미 일봉 패널에서 '그 달에 실제로 거래가 체결된 마지막 날'을 알고 있다.
+      영업일 달력을 남에게 물어볼 이유가 없다.
+    """
     if pykrx_stock is None:
         return None
-    bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
-                   d.strftime("%Y%m%d"), prev=True)
+    if not bd:
+        bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
+                       d.strftime("%Y%m%d"), prev=True)
     if not bd:
         return None
+    bd = str(bd).replace("-", "")[:8]
     frames = []
     for mkt in ("KOSPI", "KOSDAQ"):
         t = KRXG.call(pykrx_stock.get_market_cap_by_ticker, bd, market=mkt)
@@ -5218,6 +5331,70 @@ def _mcap_pykrx_month(d: pd.Timestamp) -> Optional[pd.DataFrame]:
     return out[MCAP_COLS]
 
 
+def naver_shares_snapshot() -> pd.Series:
+    """네이버 금융 '시가총액' 목록에서 전 종목 상장주식수를 한 번에 긁는다.
+
+    현재값이라 PIT 가 아니다. 오직 ③ 역투영의 '씨앗'으로만 쓴다 — pykrx 가 막혀
+    상장주식수를 한 건도 못 얻었을 때, 시총 자리에 거래대금(유동성)을 넣는 것보다는
+    '주식수 × 과거 종가'가 규모의 대리로서 훨씬 낫기 때문이다.
+    페이지당 50종목 · 시장당 약 20~30페이지 → 총 60회 미만의 요청으로 끝난다.
+    """
+    cached = VAULT.get_table("naver_shares_snapshot", scope="shared")
+    if cached is not None and len(cached):
+        c = cached.copy()
+        c["code"] = c["code"].map(to_code6)
+        c = c.dropna(subset=["code"])
+        LOG.info(f"공용 캐시에서 상장주식수 스냅샷 {len(c):,}종목 재사용")
+        return pd.to_numeric(c.set_index("code")["shares"], errors="coerce").dropna()
+
+    rows: List[tuple] = []
+    for sosok in (0, 1):                       # 0=코스피 1=코스닥
+        empty_streak = 0
+        for page in range(1, 45):
+            html = http_get("https://finance.naver.com/sise/sise_market_sum.naver",
+                            source="naver_mcap", params={"sosok": sosok, "page": page})
+            sp = soup_of(html)
+            tb = sp.find("table", class_="type_2") if sp else None
+            if tb is None:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                continue
+            heads = [th.get_text(strip=True) for th in tb.find_all("th")]
+            try:
+                j_sh = heads.index("상장주식수")
+            except ValueError:
+                j_sh = -1
+            got = 0
+            for tr in tb.find_all("tr"):
+                a = tr.find("a", href=True)
+                if not a or "code=" not in a["href"]:
+                    continue
+                code = to_code6(a["href"].split("code=")[-1][:6])
+                tds = [td.get_text(strip=True).replace(",", "") for td in tr.find_all("td")]
+                if not code or j_sh < 0 or j_sh >= len(tds):
+                    continue
+                try:
+                    sh = float(tds[j_sh]) * 1000.0        # 네이버 표기는 '천주'
+                except ValueError:
+                    continue
+                if sh > 0:
+                    rows.append((code, sh)); got += 1
+            empty_streak = 0 if got else empty_streak + 1
+            if empty_streak >= 2:
+                break
+
+    if not rows:
+        LOG.warn("네이버 상장주식수 스냅샷이 비었습니다 — 역투영 폴백을 쓸 수 없습니다.")
+        return pd.Series(dtype="float64")
+    df = pd.DataFrame(rows, columns=["code", "shares"]).drop_duplicates("code", keep="first")
+    VAULT.put_table("naver_shares_snapshot", df, scope="shared", domain="universe",
+                    source="finance.naver.com/sise/sise_market_sum",
+                    extra={"note": "현재 상장주식수 스냅샷 — PIT 아님. 역투영 근사 전용"})
+    LOG.ok(f"네이버 상장주식수 스냅샷 {len(df):,}종목 확보 (공용 인덱스 저장)")
+    return pd.to_numeric(df.set_index("code")["shares"], errors="coerce").dropna()
+
+
 def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                         sec: pd.DataFrame) -> pd.DataFrame:
     """월말 격자의 PIT 시가총액. 공용 인덱스에 저장 — 다른 전략이 그대로 재사용한다."""
@@ -5239,13 +5416,28 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
             LOG.warn(f"CACHED 모드 — 시총 미수집 {len(todo)}개월을 건너뜁니다.")
         todo = []
 
+    # ★ 영업일 달력을 '가격 패널이 실제로 관측한 마지막 거래일'에서 만든다.
+    #   지수 API 가 막혀도 이 경로는 절대 막히지 않는다 (이미 손에 든 데이터니까).
+    bd_map: Dict[pd.Timestamp, str] = {}
+    if "signal_date" in px_monthly.columns:
+        try:
+            g = px_monthly.dropna(subset=["signal_date"]).copy()
+            g["month"] = as_ts_series(g["month"])
+            g["signal_date"] = as_ts_series(g["signal_date"])
+            bd_map = {m: d.strftime("%Y%m%d")
+                      for m, d in g.groupby("month")["signal_date"].max().items()}
+            LOG.info(f"영업일 달력을 가격 패널에서 직접 구성 ({len(bd_map)}개월) — "
+                     f"pykrx 지수 API 의존 제거")
+        except Exception as e:                                            # noqa
+            LOG.warn(f"패널에서 영업일 추출 실패({type(e).__name__}) — pykrx 달력으로 폴백합니다.")
+
     got_new = False
     if todo and pykrx_stock is not None:
         KRXG.warmup()
         LOG.info(f"PIT 시가총액 {len(todo)}개월 수집 (직렬 · 월당 2호출)")
         bad_streak = 0
         for d in tqdm(todo, desc="PIT 시가총액", ncols=88, leave=False):
-            t = _mcap_pykrx_month(d)
+            t = _mcap_pykrx_month(d, bd=bd_map.get(d))
             if t is not None and len(t):
                 frames.append(t)
                 got_new = True
@@ -5293,7 +5485,17 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                           .drop_duplicates("code", keep="first").set_index("code")["shares"])
             shares_now = first_obs
         if shares_now.empty and "shares" in sec.columns:
-            shares_now = sec.dropna(subset=["shares"]).set_index("code")["shares"]
+            shares_now = pd.to_numeric(sec.dropna(subset=["shares"]).set_index("code")["shares"],
+                                       errors="coerce").dropna()
+        if shares_now.empty and RUN_MODE != "CACHED":
+            # pykrx 도 마스터도 주식수를 못 줬다. 여기서 포기하면 전 구간이 ④ 거래대금 대리가
+            # 되어 '규모 밴드'가 '유동성 밴드'로 바뀐다 — C13 의 의미 자체가 달라진다.
+            LOG.warn("상장주식수를 한 건도 확보하지 못했습니다 — 네이버 스냅샷으로 역투영 씨앗을 "
+                     "만듭니다. (현재값 기준 근사이며 자본이벤트를 반영하지 못합니다)")
+            try:
+                shares_now = naver_shares_snapshot()
+            except Exception as e:                                        # noqa
+                LOG.warn(f"네이버 상장주식수 스냅샷 실패({type(e).__name__}: {e})")
         if not shares_now.empty:
             est = base.loc[need, "code"].map(shares_now) * base.loc[need, "close"]
             base.loc[need, "mcap"] = est.to_numpy()
@@ -5827,9 +6029,20 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     return d
 
 
-def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
-    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다."""
-    if df.empty:
+def naver_enrich_detail(df: pd.DataFrame, limit: Optional[int] = None) -> pd.DataFrame:
+    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다.
+
+    ★ 이 함수가 전체 실행의 최대 병목이었다(실측 20,000건 = 108분, 3 it/s).
+      게다가 얻는 것은 사양 §8.1 의 U(=d1, d3)에 없는 **확장축 d2** 의 입력이다.
+      기본값을 0(끄기)으로 두고, 켜더라도 건수와 **시간** 양쪽에 상한을 건다.
+      한경 리스트는 목표주가를 이미 제공하므로 d2 가 통째로 죽는 것도 아니다.
+    """
+    limit = RESEARCH_ENRICH_MAX if limit is None else limit
+    if df.empty or not limit:
+        if limit == 0:
+            LOG.info("네이버 상세 보강을 건너뜁니다 (RESEARCH_ENRICH_MAX=0). "
+                     "실측 20,000건에 108분이 걸리는 최대 병목이며, 얻는 것은 사양 확장축 d2 의 "
+                     "입력입니다. 목표주가가 필요하면 한경 리스트 쪽이 훨씬 쌉니다.")
         return df
     need = df[(df["source"] == "naver") & (df["category"] == "company") &
               (df["target_price"].isna()) & (df["detail_url"].notna())].copy()
@@ -5859,8 +6072,21 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
                 "opinion": parse_opinion(op.get_text() if op else None),
                 "_detail_src": an}
 
-    res = pmap_io(_one, need["detail_url"].tolist(), workers=min(8, N_WORKERS_IO),
+    _t0 = time.time()
+    _stop = {"hit": False}
+
+    def _one_capped(u: str):
+        # 시간 상한. 건수만 제한하면 소스가 느려질 때 예측이 통째로 빗나간다.
+        if _stop["hit"] or (time.time() - _t0) > RESEARCH_ENRICH_MAX_MIN * 60:
+            _stop["hit"] = True
+            return None
+        return _one(u)
+
+    res = pmap_io(_one_capped, need["detail_url"].tolist(), workers=min(8, N_WORKERS_IO),
                   desc="네이버 상세(목표주가)")
+    if _stop["hit"]:
+        LOG.warn(f"네이버 상세 보강이 시간 상한({RESEARCH_ENRICH_MAX_MIN:.0f}분)에 걸려 "
+                 f"중단되었습니다. 받은 만큼만 반영합니다 — 조용히 자르지 않고 알립니다.")
     got = pd.DataFrame([r for r in res if r])
     if got.empty:
         return df
@@ -8930,6 +9156,32 @@ def make_synthetic_panel(n_code: int = 240, n_month: int = 72, seed: int = SEED
     return downcast(P), sec, months
 
 
+class _MemVault:
+    """상태를 기억하는 인메모리 금고. '두 번째 실행'의 행동을 검증하기 위한 것.
+    실제 드라이브는 절대 건드리지 않는다 (절대 1원칙)."""
+
+    def __init__(self):
+        self.t: Dict[str, pd.DataFrame] = {}
+
+    def get_table(self, name, *a, **k):
+        v = self.t.get(name)
+        return None if v is None else v.copy()
+
+    def put_table(self, name, df, *a, **k):
+        self.t[name] = df.copy()
+
+
+class _NullVault:
+    """계약검정 전용 무해 금고. 절대 1원칙 — 검정이 실제 드라이브 인덱스를 건드리면 안 된다.
+    읽기는 항상 '없음', 쓰기는 조용히 버린다."""
+
+    def get_table(self, *a, **k):
+        return None
+
+    def put_table(self, *a, **k):
+        return None
+
+
 def run_contract_tests(strict: bool = True) -> bool:
     LOG.banner("계약 자동검정", "협상 불가 규칙이 코드에 실제로 있는지 실행으로 확인한다")
     rng = np.random.default_rng(SEED)
@@ -9150,6 +9402,102 @@ def run_contract_tests(strict: bool = True) -> bool:
     finally:
         if _saved_api is not None:
             globals()["dart_api"] = _saved_api
+
+    # ── PIT 시총이 '지수 API 차단' 한 방에 조용히 죽지 않는다 ────────────────────────
+    #   실측 실패: pykrx.get_nearest_business_day_in_a_week() 는 지수 OHLCV API 를 친다.
+    #   그게 막히자 매달 IndexError → 정확 시총 0.0% → 전 구간이 거래대금 대리로 대체됐다.
+    #   유니버스 밴드가 '규모'에서 '유동성'으로 바뀌었는데 예외는 한 줄도 안 떴다.
+    #   → 영업일은 가격 패널이 실제로 관측한 거래일에서 만든다. 아래가 그 계약이다.
+    class _FakeKrx:
+        """달력 API 는 무조건 터지고, 시총 API 는 정상인 pykrx."""
+        calendar_calls = 0
+
+        @staticmethod
+        def get_nearest_business_day_in_a_week(*a, **k):
+            _FakeKrx.calendar_calls += 1
+            raise IndexError("index 0 is out of bounds (지수 API 차단 재현)")
+
+        @staticmethod
+        def get_market_cap_by_ticker(date, market="KOSPI"):
+            base = 0 if market == "KOSPI" else 100
+            return pd.DataFrame({"시가총액": [1e11 + base, 2e11 + base],
+                                 "상장주식수": [1e6, 2e6]},
+                                index=pd.Index([f"{base+1:06d}", f"{base+2:06d}"], name="티커"))
+
+    _sv = {k: globals().get(k) for k in ("pykrx_stock", "VAULT", "RUN_MODE")}
+    try:
+        mths = pd.date_range("2016-08-31", periods=3, freq="ME")
+        # 월말이 휴장일이어도(예: 8/31 이 일요일) 패널은 '실제 체결된 마지막 날'을 안다
+        pxm = pd.DataFrame([{"code": f"{c:06d}", "month": m,
+                             "signal_date": m - pd.Timedelta(days=2),
+                             "close": 1000.0, "adv20": 5e8}
+                            for m in mths for c in (1, 2, 101, 102)])
+        globals()["pykrx_stock"] = _FakeKrx
+        globals()["VAULT"] = _NullVault()
+        globals()["RUN_MODE"] = "FULL"
+        _FakeKrx.calendar_calls = 0
+        mc = fetch_pit_marketcap(mths, pxm, pd.DataFrame({"code": [], "shares": []}))
+        n_true = int((mc["mcap_src"] == "pykrx").sum())
+        n_proxy = int((mc["mcap_src"] == "adv_proxy").sum())
+        _t("MCAP-BD", "달력 API 가 막혀도 PIT 시총이 살아남는다 (영업일을 가격 패널에서 구성)",
+           n_true == len(mc) and n_proxy == 0 and _FakeKrx.calendar_calls == 0,
+           f"정확 {n_true}/{len(mc)}행 · 거래대금대리 {n_proxy}행 · "
+           f"달력 API 호출 {_FakeKrx.calendar_calls}회 (0이어야 한다)")
+    except Exception as e:                                       # noqa
+        _t("MCAP-BD", "달력 API 가 막혀도 PIT 시총이 살아남는다", False, f"{type(e).__name__}: {e}")
+    finally:
+        for k, v in _sv.items():
+            if v is not None:
+                globals()[k] = v
+
+    # ── 캐시가 충분한 종목을 두 번째 실행에서 다시 받지 않는다 ──────────────────────
+    #   실측 실패: 드라이브에 일봉 697만행이 있는데도 3,497종목을 처음부터 다시 받아 17.5분.
+    #   원인은 '실패만 기록하는' 음성 캐시였다. 2018년 상장 종목은 소스가 2015년치를 줄 수
+    #   없으므로 min(cache)=2018 > start=2015 조건이 **영원히** 참이고, 성공했으니 실패
+    #   원장에도 안 남아 매 실행 백필이 반복된다. 예외도 경고도 없다 — 그냥 매번 느리다.
+    _sv = {k: globals().get(k) for k in ("VAULT", "PRICE_CHAIN", "RUN_MODE")}
+    try:
+        asked_codes: List[str] = []
+
+        def _fake_src(code, st, en):
+            asked_codes.append(code)
+            d = pd.date_range("2018-01-02", "2026-07-31", freq="B")   # 2018년 상장 종목
+            return pd.DataFrame({"date": d, "code": code, "open": 1e3, "high": 1e3,
+                                 "low": 1e3, "close": 1e3, "volume": 1e4,
+                                 "amount": 1e7, "src": "fake"})
+
+        globals()["VAULT"] = _MemVault()
+        globals()["PRICE_CHAIN"] = [("fake", _fake_src)]
+        globals()["RUN_MODE"] = "FULL"
+        codes = [f"{i:06d}" for i in range(1, 21)]
+        fetch_prices(codes, "2015-02-01", "2026-07-31")
+        n1 = len(asked_codes)
+        asked_codes.clear()
+        fetch_prices(codes, "2015-02-01", "2026-07-31")      # 같은 명령 재실행
+        n2 = len(asked_codes)
+        _t("REFETCH", "캐시가 충분한 종목을 두 번째 실행에서 다시 받지 않는다",
+           n1 == 20 and n2 == 0,
+           f"1회차 {n1}종목 수집 · 2회차 {n2}종목 (0이어야 한다. "
+           f"소스의 최초제공일이 요청 시작일보다 늦어도 무한 백필하면 안 된다)")
+    except Exception as e:                                       # noqa
+        _t("REFETCH", "캐시가 충분한 종목을 다시 받지 않는다", False, f"{type(e).__name__}: {e}")
+    finally:
+        for k, v in _sv.items():
+            if v is not None:
+                globals()[k] = v
+
+    # ── 벽시계 게이트: 선택 수집만 끊고, 끊었다는 사실을 반드시 남긴다 ──────────────
+    #   실측 실패: 수집이 3시간을 먹고도 파이프라인은 계속 진행 → 사용자는 백테스트 결과를
+    #   한 번도 못 봤다. 연구 도구로서 '완벽한 무결과'는 부분 결과보다 나쁘다.
+    _w = _WallClock()
+    _w.start()
+    fresh = _w.gate("테스트-선택수집")
+    _w.t0 = time.time() - (WALL_CLOCK_BUDGET_MIN - WALL_RESERVE_MIN + 1) * 60.0
+    spent = _w.gate("테스트-선택수집")
+    _t("WALL", "벽시계 예산이 소진되면 선택 수집을 끊고 백테스트를 완주시킨다",
+       fresh == "" and bool(spent) and _w.skipped == ["테스트-선택수집"],
+       f"여유 시 통과 {fresh == ''} · 소진 시 차단 {bool(spent)} · "
+       f"건너뛴 항목 기록 {_w.skipped} (조용히 넘어가면 결과 해석이 틀어진다)")
 
     # ── VAULT: 사용자의 절대 1원칙을 계약으로 강제한다 ────────────────────────────────
     _t(*_vault_integrity_test())
@@ -9435,18 +9783,27 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         t_multi = fetch_dart_multi(corps, years, reprts)
         t_full = pd.DataFrame()
         if not nonempty(t_bulk):
-            LOG.warn("벌크가 비어 Fallback B(fnlttSinglAcntAll)를 가동합니다. 주요계정만으로는 "
-                     "재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽기 때문입니다 — "
-                     "이 경로 없이 나온 성과는 '코어가 빠진 전략'의 성과입니다.")
-            t_full = fetch_dart_full(corps, years, priority=prio)
+            _gf = WALL.gate("DART 단건 전계정(Fallback B)", reserve_min=WALL_RESERVE_MIN + 20.0)
+            if _gf:
+                LOG.warn(_gf + "  → 이번 실행은 주요계정(Tier2)만으로 진행합니다. "
+                               "재고·매출채권·영업CF 의존 TP 는 축소 보고됩니다.")
+            else:
+                LOG.warn("벌크가 비어 Fallback B(fnlttSinglAcntAll)를 가동합니다. 주요계정만으로는 "
+                         "재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽기 때문입니다 — "
+                         "이 경로 없이 나온 성과는 '코어가 빠진 전략'의 성과입니다.")
+                t_full = fetch_dart_full(corps, years, priority=prio)
         raw = merge_financial_tiers(t_bulk, t_full, t_multi)
         ctx["fin"] = tidy_financials(raw, kmap, ctx.get("code_of_corp"))
         ctx["weak_tp"] = report_account_coverage()
 
     if _stage_ok("M2", stage):
-        with PIPE.stage("M2.EMP", "DART 직원현황", "M2", budget_s=2400, critical=False), \
+        _g = WALL.gate("DART 직원현황(TP_I3)")
+        with PIPE.stage("M2.EMP", "DART 직원현황", "M2", budget_s=2400, critical=False,
+                        skip_if=bool(_g), skip_reason=_g), \
                 Stage("M2.employees", 42):
-            if "TP_I3" in DISABLED:
+            if _g:
+                ctx["emp"] = pd.DataFrame()
+            elif "TP_I3" in DISABLED:
                 LOG.warn("CANARY K7 실패로 TP_I3 가 비활성화되어 직원현황 수집을 건너뜁니다.")
                 ctx["emp"] = pd.DataFrame()
             else:
@@ -9456,15 +9813,21 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         ctx["emp"] = pd.DataFrame()
 
     if _stage_ok("M3", stage):
-        with PIPE.stage("M3.FLOW", "기관·외국인 수급 (d3)", "M3", budget_s=900, critical=False), \
+        ctx["flows"] = pd.DataFrame()
+        _g = WALL.gate("기관·외국인 수급(d3)")
+        with PIPE.stage("M3.FLOW", "기관·외국인 수급 (d3)", "M3", budget_s=900, critical=False,
+                        skip_if=bool(_g), skip_reason=_g), \
                 Stage("M3.flows", 12):
-            if "d3" in DISABLED:
+            if _g:
+                pass
+            elif "d3" in DISABLED:
                 LOG.warn("CANARY K6 실패로 d3 를 비활성화합니다 — U 는 d1 단독으로 구성됩니다.")
-                ctx["flows"] = pd.DataFrame()
             else:
                 ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(),
                                                     BACKTEST_START, BACKTEST_END)
 
+        # ★ 리서치는 '수집'만 선택이고 '드라이브 캐시 사용'은 언제나 한다.
+        #   예산이 소진돼도 이미 받아둔 리포트로 원장·컨센서스는 그대로 만든다.
         with PIPE.stage("M3.RESEARCH", "애널리스트 리포트 · 원장", "M3", budget_s=3600,
                         critical=False), Stage("M3.research", 25):
             ctx.update(collect_research(months, ctx["sec"]))
@@ -9482,7 +9845,10 @@ def collect_research(months: pd.DatetimeIndex, sec: pd.DataFrame) -> dict:
              "로컬 분석 용도로만 사용하세요(재배포 금지).")
     cached = VAULT.get_table("research_report_master", scope="shared")
     frames = []
-    if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+    _g = WALL.gate("리포트 신규 크롤(한경·네이버)")
+    if _g:
+        LOG.warn(_g + "  → 드라이브 캐시에 이미 있는 리포트만으로 원장을 구성합니다.")
+    if RUN_MODE != "CACHED" and RESEARCH_COLLECT and not _g:
         if "hankyung" in RESEARCH_SOURCES:
             frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
         if "naver" in RESEARCH_SOURCES:
@@ -9559,6 +9925,7 @@ def build_L1(ctx: dict, months: pd.DatetimeIndex, stage: str) -> Tuple[pd.DataFr
 
 def main() -> dict:
     t0 = time.time()
+    WALL.start()
     global VAULT, DBUDGET
     LOG.banner(f"TCD v3 · {STRATEGY_NAME}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · 단계 {STAGE} · 모드 {RUN_MODE} · 빌드 {BUILD_VERSION}")
@@ -9748,6 +10115,7 @@ def main() -> dict:
     PIPE.report_flow()
     report_http()
     report_dataflow_map()
+    WALL.report()
     report_runtime_v3(WALL_CLOCK_BUDGET_MIN)
     LOG.banner("완료", f"총 소요 {(time.time()-t0)/60:.1f}분 · "
                        f"산출물은 구글드라이브 전용 인덱스에 저장되었습니다")

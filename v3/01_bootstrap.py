@@ -188,6 +188,20 @@ except Exception:                                             # pragma: no cover
     def tqdm(it=None, **kw):                                  # type: ignore
         return it if it is not None else iter(())
 
+# ★ 서드파티 로거 억제. yfinance 는 종목당 2회(.KS/.KQ) 실패마다 여러 줄을 stderr 로 쏟고,
+#   pdfminer 는 PDF 마다 FontBBox 경고를 낸다. 5,398종목 × 수 줄 = 수만 줄이 되어
+#   **Jupyter 의 IOPub 메시지 한도(1000/s)를 넘겨 서버가 출력을 끊는다** — 실측으로
+#   "IOPub message rate exceeded" 가 떴다. 출력이 실행을 방해하는 상태였다.
+#   우리 로그는 _safe_print 직접 출력이라 영향받지 않는다.
+for _noisy in ("yfinance", "pdfminer", "pdfminer.pdffont", "pdfminer.pdfpage",
+               "urllib3", "requests", "peewee", "fsspec", "matplotlib"):
+    try:
+        logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+        logging.getLogger(_noisy).propagate = False
+    except Exception:
+        pass
+logging.captureWarnings(True)
+
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 80)
 pd.set_option("display.max_colwidth", 60)

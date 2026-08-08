@@ -326,7 +326,10 @@ def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
         futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
         it_ = as_completed(futs)
         if not quiet:
-            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
+            # mininterval: 진행바 갱신도 IOPub 메시지다. 기본 0.1초면 초당 10줄 × 동시작업
+            # 수만큼 쌓여 노트북 서버가 출력을 끊는다.
+            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88,
+                       mininterval=2.0, miniters=max(1, len(futs) // 200))
         for fu in it_:
             i = futs[fu]
             try:

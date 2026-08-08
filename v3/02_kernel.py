@@ -394,3 +394,58 @@ class Pipeline:
 
 
 PIPE = Pipeline()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+#  전역 벽시계 예산 게이트 (C10 의 실무 확장)
+#
+#  ★ 왜 필요한가 — 실측으로 확인된 실패 모드다.
+#     스테이지별 예산(budget_s)은 '초과했다'고 경고만 하고 계속 진행한다. 그래서 수집이
+#     3시간을 먹어도 파이프라인은 멈추지 않고, 사용자는 백테스트 결과를 **한 번도 못 본다**.
+#     연구 도구로서 이건 실패다. 부분 결과 > 완벽한 무결과.
+#
+#  규칙: 선택적(critical=False) 수집은 '남은 시간 < 예약분'이면 건너뛴다. 예약분은 L1~L6
+#        (패널·스코어·백테스트·강건성·리포트)를 끝내는 데 실측상 필요한 시간이다.
+#        필수 수집(가격·재무)은 절대 건너뛰지 않는다 — 그건 결과를 만들지 못하게 하니까.
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+class _WallClock:
+    def __init__(self):
+        self.t0 = time.time()
+        self.skipped: List[str] = []
+
+    def start(self):
+        self.t0 = time.time()
+        self.skipped = []
+
+    @property
+    def elapsed_min(self) -> float:
+        return (time.time() - self.t0) / 60.0
+
+    def remaining_min(self, budget_min: Optional[float] = None) -> float:
+        b = WALL_CLOCK_BUDGET_MIN if budget_min is None else budget_min
+        return b - self.elapsed_min
+
+    def exhausted(self, reserve_min: Optional[float] = None) -> bool:
+        r = WALL_RESERVE_MIN if reserve_min is None else reserve_min
+        return self.remaining_min() < r
+
+    def gate(self, what: str, reserve_min: Optional[float] = None) -> str:
+        """건너뛸 이유 문자열을 돌려준다. 진행해도 되면 빈 문자열."""
+        if not self.exhausted(reserve_min):
+            return ""
+        self.skipped.append(what)
+        return (f"벽시계 예산 소진 — 경과 {self.elapsed_min:.0f}분 / 한도 "
+                f"{WALL_CLOCK_BUDGET_MIN:.0f}분. 백테스트·강건성검사를 반드시 완주시키기 "
+                f"위해 선택 수집 '{what}' 을 건너뜁니다. 캐시가 채워진 다음 실행에서 "
+                f"자동으로 이어받습니다.")
+
+    def report(self):
+        if not self.skipped:
+            return
+        LOG.table([[w] for w in self.skipped], ["예산 때문에 건너뛴 선택 수집"], ["l"],
+                  title=f"벽시계 게이트 — 총 {self.elapsed_min:.0f}분 경과 "
+                        f"(한도 {WALL_CLOCK_BUDGET_MIN:.0f}분). "
+                        f"같은 명령을 한 번 더 실행하면 캐시 위에서 이어받습니다")
+
+
+WALL = _WallClock()

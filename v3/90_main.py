@@ -161,18 +161,27 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         t_multi = fetch_dart_multi(corps, years, reprts)
         t_full = pd.DataFrame()
         if not nonempty(t_bulk):
-            LOG.warn("벌크가 비어 Fallback B(fnlttSinglAcntAll)를 가동합니다. 주요계정만으로는 "
-                     "재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽기 때문입니다 — "
-                     "이 경로 없이 나온 성과는 '코어가 빠진 전략'의 성과입니다.")
-            t_full = fetch_dart_full(corps, years, priority=prio)
+            _gf = WALL.gate("DART 단건 전계정(Fallback B)", reserve_min=WALL_RESERVE_MIN + 20.0)
+            if _gf:
+                LOG.warn(_gf + "  → 이번 실행은 주요계정(Tier2)만으로 진행합니다. "
+                               "재고·매출채권·영업CF 의존 TP 는 축소 보고됩니다.")
+            else:
+                LOG.warn("벌크가 비어 Fallback B(fnlttSinglAcntAll)를 가동합니다. 주요계정만으로는 "
+                         "재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽기 때문입니다 — "
+                         "이 경로 없이 나온 성과는 '코어가 빠진 전략'의 성과입니다.")
+                t_full = fetch_dart_full(corps, years, priority=prio)
         raw = merge_financial_tiers(t_bulk, t_full, t_multi)
         ctx["fin"] = tidy_financials(raw, kmap, ctx.get("code_of_corp"))
         ctx["weak_tp"] = report_account_coverage()
 
     if _stage_ok("M2", stage):
-        with PIPE.stage("M2.EMP", "DART 직원현황", "M2", budget_s=2400, critical=False), \
+        _g = WALL.gate("DART 직원현황(TP_I3)")
+        with PIPE.stage("M2.EMP", "DART 직원현황", "M2", budget_s=2400, critical=False,
+                        skip_if=bool(_g), skip_reason=_g), \
                 Stage("M2.employees", 42):
-            if "TP_I3" in DISABLED:
+            if _g:
+                ctx["emp"] = pd.DataFrame()
+            elif "TP_I3" in DISABLED:
                 LOG.warn("CANARY K7 실패로 TP_I3 가 비활성화되어 직원현황 수집을 건너뜁니다.")
                 ctx["emp"] = pd.DataFrame()
             else:
@@ -182,15 +191,21 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         ctx["emp"] = pd.DataFrame()
 
     if _stage_ok("M3", stage):
-        with PIPE.stage("M3.FLOW", "기관·외국인 수급 (d3)", "M3", budget_s=900, critical=False), \
+        ctx["flows"] = pd.DataFrame()
+        _g = WALL.gate("기관·외국인 수급(d3)")
+        with PIPE.stage("M3.FLOW", "기관·외국인 수급 (d3)", "M3", budget_s=900, critical=False,
+                        skip_if=bool(_g), skip_reason=_g), \
                 Stage("M3.flows", 12):
-            if "d3" in DISABLED:
+            if _g:
+                pass
+            elif "d3" in DISABLED:
                 LOG.warn("CANARY K6 실패로 d3 를 비활성화합니다 — U 는 d1 단독으로 구성됩니다.")
-                ctx["flows"] = pd.DataFrame()
             else:
                 ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(),
                                                     BACKTEST_START, BACKTEST_END)
 
+        # ★ 리서치는 '수집'만 선택이고 '드라이브 캐시 사용'은 언제나 한다.
+        #   예산이 소진돼도 이미 받아둔 리포트로 원장·컨센서스는 그대로 만든다.
         with PIPE.stage("M3.RESEARCH", "애널리스트 리포트 · 원장", "M3", budget_s=3600,
                         critical=False), Stage("M3.research", 25):
             ctx.update(collect_research(months, ctx["sec"]))
@@ -208,7 +223,10 @@ def collect_research(months: pd.DatetimeIndex, sec: pd.DataFrame) -> dict:
              "로컬 분석 용도로만 사용하세요(재배포 금지).")
     cached = VAULT.get_table("research_report_master", scope="shared")
     frames = []
-    if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+    _g = WALL.gate("리포트 신규 크롤(한경·네이버)")
+    if _g:
+        LOG.warn(_g + "  → 드라이브 캐시에 이미 있는 리포트만으로 원장을 구성합니다.")
+    if RUN_MODE != "CACHED" and RESEARCH_COLLECT and not _g:
         if "hankyung" in RESEARCH_SOURCES:
             frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
         if "naver" in RESEARCH_SOURCES:
@@ -285,6 +303,7 @@ def build_L1(ctx: dict, months: pd.DatetimeIndex, stage: str) -> Tuple[pd.DataFr
 
 def main() -> dict:
     t0 = time.time()
+    WALL.start()
     global VAULT, DBUDGET
     LOG.banner(f"TCD v3 · {STRATEGY_NAME}",
                f"{BACKTEST_START} ~ {BACKTEST_END} · 단계 {STAGE} · 모드 {RUN_MODE} · 빌드 {BUILD_VERSION}")
@@ -474,6 +493,7 @@ def main() -> dict:
     PIPE.report_flow()
     report_http()
     report_dataflow_map()
+    WALL.report()
     report_runtime_v3(WALL_CLOCK_BUDGET_MIN)
     LOG.banner("완료", f"총 소요 {(time.time()-t0)/60:.1f}분 · "
                        f"산출물은 구글드라이브 전용 인덱스에 저장되었습니다")
