@@ -6,9 +6,11 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 import os, sys, re, io, gc, json, time, math, zipfile, hashlib, logging, textwrap, traceback
 import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, threading, unicodedata
+import xml.etree.ElementTree as _ET
+import socket as _socket
 import datetime as _dt
 from collections import defaultdict, Counter, OrderedDict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -108,7 +110,7 @@ _OPTIONAL = [
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
-    ("fitz",              "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
+    ("pymupdf",           "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
     ("pdfplumber",        "pdfplumber",         "PDF 추출 폴백"),
     ("rapidfuzz",         "rapidfuzz",          "사업장명/애널리스트명 유사도 매칭(고속)"),
     ("statsmodels",       "statsmodels",        "HAC(Newey-West) 표준오차"),
@@ -165,15 +167,52 @@ def _ensure_deps() -> Dict[str, bool]:
     return {mod: (importlib.util.find_spec(mod) is not None) for mod, _pkg, _why in _OPTIONAL}
 
 
+# ═══ 금지 패키지 차단 — '안 부른다'가 아니라 'import 자체가 불가능하다' ══════════════════════
+#   ★ pykrx 는 **import 하는 것만으로** data.krx.co.kr 에 접속한다:
+#     pykrx/website/comm/webio.py 는 모듈 본문에서 build_krx_session() 을 실행하고,
+#     auth.py 는 os.getenv("KRX_ID")/("KRX_PW") 가 있으면 실제 로그인 POST 까지 보낸다.
+#     즉 KRX 를 쓰지 않는 전략이라도 이 import 한 줄이 남아 있으면 금지가 깨진다.
+#     (같은 커널에서 다른 전략을 먼저 돌렸다면 KRX_ID/PW 가 os.environ 에 남아 있다)
+#   → BANNED_PACKAGES 에 올라온 패키지는 설치도, import 도, 자격증명 주입도 하지 않는다.
+#     meta_path 훅으로 제3의 코드가 몰래 import 하는 것까지 막는다.
+BANNED_PACKAGES = [str(x).strip() for x in globals().get("BANNED_PACKAGES", []) if str(x).strip()]
+if BANNED_PACKAGES:
+    _REQUIRED = [t for t in _REQUIRED if t[0] not in BANNED_PACKAGES]
+    _OPTIONAL = [t for t in _OPTIONAL if t[0] not in BANNED_PACKAGES]
+
+    class _BannedImportBlocker:
+        """금지 패키지의 import 를 예외로 막는다 (sys.meta_path 최우선)."""
+
+        def find_module(self, name, path=None):
+            self.find_spec(name, path)
+            return None
+
+        def find_spec(self, name, path=None, target=None):
+            root = str(name).split(".")[0]
+            if root in BANNED_PACKAGES:
+                raise ImportError(
+                    f"'{root}' 는 이 전략에서 금지된 패키지입니다. "
+                    f"(import 만으로 외부 사이트에 접속하기 때문입니다) "
+                    f"BANNED_PACKAGES 를 확인하세요.")
+            return None
+
+    if not any(isinstance(h, _BannedImportBlocker) for h in sys.meta_path):
+        sys.meta_path.insert(0, _BannedImportBlocker())
+    if "pykrx" in BANNED_PACKAGES:
+        #   이미 남아 있는 자격증명도 지운다 — 있으면 로그인 시도가 일어난다
+        for _k in ("KRX_ID", "KRX_PW", "KRX_OPENAPI_KEY", "KRX_API_KEY"):
+            os.environ.pop(_k, None)
+
 # ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
 #   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
 #   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
-    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
-    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
-if KRX_OPENAPI_KEY:
-    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
-    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
+if "pykrx" not in BANNED_PACKAGES:
+    if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+        os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
+        os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
+    if KRX_OPENAPI_KEY:
+        os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
+        os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
 
 OPT = _ensure_deps()
 
@@ -200,42 +239,47 @@ np.random.seed(SEED % (2 ** 32 - 1))
 RNG = np.random.default_rng(SEED)
 
 # 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
+#
+# ★ except 절이 Exception 이 아니라 BaseException 인 이유 — 실제로 겪은 사고다.
+#   pdfplumber → pdfminer.six → cryptography 는 Rust 확장(pyo3)을 쓰는데, 그 바이너리가
+#   런타임의 libffi/_cffi_backend 와 어긋나면 ImportError 가 아니라
+#   `pyo3_runtime.PanicException` 을 던진다. 이건 BaseException 의 직계라
+#   `except Exception` 을 그대로 통과해 실행 전체를 죽인다.
+#   "선택 패키지" 하나가 파이프라인을 죽이는 것은 어떤 경우에도 옳지 않으므로
+#   여기서는 BaseException 을 잡는다. (KeyboardInterrupt/SystemExit 은 아래에서 재전파)
+def _opt_import(name: str, attr: str = ""):
+    try:
+        mod = __import__(name, fromlist=[attr] if attr else [])
+        return getattr(mod, attr) if attr else mod
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:                     # noqa: BLE001 — 위 주석 참조
+        _safe_print(f"  · 선택 패키지 '{name}' 로드 실패({type(e).__name__}) — "
+                    f"해당 기능만 비활성화하고 계속합니다.")
+        return None
+
+
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
 if OPT.get("FinanceDataReader"):
-    try:
-        import FinanceDataReader as fdr           # type: ignore
-    except Exception:
-        fdr = None
+    fdr = _opt_import("FinanceDataReader")
 if OPT.get("pykrx"):
-    try:
-        from pykrx import stock as pykrx_stock    # type: ignore
-    except Exception:
-        pykrx_stock = None
+    pykrx_stock = _opt_import("pykrx", "stock")
 if OPT.get("yfinance"):
-    try:
-        import yfinance as yf                     # type: ignore
-    except Exception:
-        yf = None
-if OPT.get("fitz"):
-    try:
-        import fitz                               # type: ignore  (pymupdf)
-    except Exception:
-        fitz = None
+    yf = _opt_import("yfinance")
+#  ★ pymupdf 1.24+ 의 정식 import 이름은 'pymupdf' 이고 'fitz' 는 제거될 예정인 별칭이다.
+#    실제 실행 로그에서 Python 3.14 / Windows 조합이 `import fitz` 로 ImportError 를 냈다.
+#    → pymupdf 를 먼저 시도하고, 없으면 구버전용 fitz 로 내려간다.
+if OPT.get("pymupdf") or OPT.get("fitz"):
+    fitz = _opt_import("pymupdf") or _opt_import("fitz")
+    if fitz is None:
+        _safe_print("  · PDF 파서를 못 찾았습니다 — EPS 트랙이 비활성화되고 TP 트랙만 씁니다. "
+                    "`pip install pymupdf` 로 되살아납니다.")
 if OPT.get("pdfplumber"):
-    try:
-        import pdfplumber                         # type: ignore
-    except Exception:
-        pdfplumber = None
+    pdfplumber = _opt_import("pdfplumber")
 if OPT.get("rapidfuzz"):
-    try:
-        from rapidfuzz import fuzz as rapidfuzz_fuzz   # type: ignore
-    except Exception:
-        rapidfuzz_fuzz = None
+    rapidfuzz_fuzz = _opt_import("rapidfuzz", "fuzz")
 if OPT.get("statsmodels"):
-    try:
-        import statsmodels.api as smapi           # type: ignore
-    except Exception:
-        smapi = None
+    smapi = _opt_import("statsmodels.api")
 
 # ── 병렬 전략 결정 ──────────────────────────────────────────────────────────────────────────
 #   노트북에서 ProcessPoolExecutor 는 "__main__ 에 정의된 함수를 피클할 수 없음" 으로 자주 죽는다.

@@ -29,6 +29,22 @@ CORE_POST = ["30_policy.py", "40_score.py", "41_backtest.py", "50_robust.py",
              "60_report.py", "70_contracts.py", "75_rehearsal.py", "80_selftest.py",
              "90_main.py"]
 
+# ── SCG-LS / SCG-LSA — 자체 파일 목록 (TCD 코어와 공유하는 조각만 재사용) ────────────────────
+#   KRX 를 호출하는 조각(10_ingest_universe / 11_ingest_price / 12_ingest_dart_fin)은
+#   의도적으로 **포함하지 않는다**. "안 부른다"가 아니라 "코드가 없다"로 만들기 위해서다.
+#   13/14 (리포트 수집·애널리스트 원장)와 20_pit 는 그대로 재사용한다.
+SCG_FILES = [
+    "s00_scg_header.py",      # ← 반드시 첫 번째 (shebang/__future__ 는 index 0 만 보존됨)
+    "01_bootstrap.py", "02_kernel.py", "03_util.py", "04_vault.py", "05_http.py",
+    "s10_scg_universe.py", "s11_scg_price.py", "s12_scg_dart.py",
+    "13_ingest_research.py", "14_entity_research.py",
+    "20_pit.py",
+    "s20_scg_core.py",        # 순수 산식 (§5~§29)
+    "s15_scg_eps.py",         # analyst_forecasts 조립 — s20 의 헬퍼를 쓰므로 뒤에 온다
+    "s30_scg_diag.py", "s40_scg_backtest.py", "s50_scg_robust.py",
+    "s60_scg_report.py", "s70_scg_contracts.py", "s90_scg_main.py",
+]
+
 STRATEGIES = [
     dict(sid="PACK_C", fname="tcd_v2_01_pack_c_capital.py", packs=["C"],
          name="PACK-C 자본배분 체제 전환",
@@ -56,6 +72,14 @@ STRATEGIES = [
          desc="낙찰업체가 사업자등록번호로 직접 식별되므로 매핑 문제가 구조적으로 없다. "
               "낙찰률(q2)은 수출단가와 같은 성질의 순수 가격 지표다. "
               "방산·원전 레짐 편승 위험이 크므로 R7 레짐 분할이 필수 통과 조건이다."),
+    dict(sid="SCG_LS_LSA", fname="scg_ls_lsa.py", packs=[], files=SCG_FILES,
+         name="SCG-LS / SCG-LSA — Smart Consensus Gap + Analyst Leadership",
+         desc="일반 컨센서스보다 최근성이 높고, 과거에 실적을 잘 맞혔으며, 다른 애널리스트의 "
+              "후속 수정에 선행해 온 애널리스트에게 더 큰 가중치를 준 자체 Smart Consensus 를 "
+              "만들고, 그것과 일반 컨센서스의 격차(Smart Gap)를 신호로 쓴다. "
+              "하드게이트로 표본을 깎지 않고 정보가 부족한 애널리스트는 중립값으로 수축시킨다. "
+              "BASE_REV / SCG_0 / SCG_LS / SCG_LSA 네 전략을 동일 유니버스에서 나란히 산출해 "
+              "각 구성요소의 증분 기여를 분리 검증하는 것이 이 연구의 핵심이다."),
     dict(sid="INTEGRATED", fname="tcd_v2_00_integrated_all_packs.py",
          packs=["C", "N", "D", "X", "P"],
          name="통합 (전 센서팩)",
@@ -86,8 +110,11 @@ def strip_shebang_and_future(src: str, keep_header: bool) -> str:
 
 def build_one(spec: dict, version: str) -> str:
     parts = []
-    order = (CORE_PRE + list(CORE_INGEST.values()) + CORE_MID +
-             [PACK_FILES[p] for p in spec["packs"]] + CORE_POST)
+    # spec["files"] 가 있으면 그 목록을 그대로 쓴다(전략별 경량 조립).
+    # 없으면 기존 TCD 조립 순서를 유지한다.
+    order = spec.get("files") or (
+        CORE_PRE + list(CORE_INGEST.values()) + CORE_MID +
+        [PACK_FILES[p] for p in spec["packs"]] + CORE_POST)
     for i, fn in enumerate(order):
         src = read(fn)
         src = strip_shebang_and_future(src, keep_header=(i == 0))

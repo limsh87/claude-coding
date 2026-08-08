@@ -266,7 +266,7 @@ def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, qui
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
 def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
-            desc: str = "", quiet: bool = False) -> List[Any]:
+            desc: str = "", quiet: bool = False, deadline_s: float = 3600.0) -> List[Any]:
     """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다."""
     items = list(items)
     if not items:
@@ -274,18 +274,36 @@ def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
     w = max(1, min(workers or N_WORKERS_IO, len(items)))
     out: List[Any] = [None] * len(items)
     errs: Counter = Counter()
+    #  ★ as_completed 에 반드시 마감을 준다. 없으면 워커 하나가 물리는 순간 메인
+    #    스레드가 영원히 멈추고, 더 나쁜 건 그때 Ctrl-C 도 소용없다는 점이다:
+    #    ThreadPoolExecutor 워커는 데몬이 아니고(3.9 에서 daemon=True 가 제거됐다)
+    #    with-블록 종료가 shutdown(wait=True) 이며 인터프리터 종료조차 atexit 에서
+    #    모든 워커를 join 한다 — SIGKILL 말고는 빠져나올 방법이 없다.
+    #    소켓 계층 마감(http_get/http_get_stream)이 1차 방어이고, 이건 그게 뚫렸을 때
+    #    최소한 '보고하고 계속 가게' 만드는 2차 안전망이다.
     with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
         futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
-        it_ = as_completed(futs)
+        pend = set(futs)
+        it_ = as_completed(futs, timeout=deadline_s)
         if not quiet:
             it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
-        for fu in it_:
-            i = futs[fu]
-            try:
-                out[i] = fu.result()
-            except Exception as e:                       # noqa
-                errs[type(e).__name__] += 1
-                out[i] = None
+        try:
+            for fu in it_:
+                pend.discard(fu)
+                i = futs[fu]
+                try:
+                    out[i] = fu.result(timeout=0)
+                except Exception as e:                   # noqa
+                    errs[type(e).__name__] += 1
+                    out[i] = None
+        except Exception as e:                           # noqa — concurrent TimeoutError
+            if not isinstance(e, TimeoutError) and type(e).__name__ != "TimeoutError":
+                raise
+            LOG.warn(f"{desc or '병렬작업'}: {len(pend):,}건이 {deadline_s/60:.0f}분 안에 "
+                     f"끝나지 않아 그 건들을 포기합니다 (결과는 결측 처리). "
+                     f"해당 스레드는 소켓 마감에 걸려 스스로 끝납니다.")
+            for fu in pend:
+                fu.cancel()
     if errs:
         LOG.warn(f"{desc or '병렬작업'} 중 실패 {sum(errs.values())}/{len(items)}건 — " +
                  ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))
