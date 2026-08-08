@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_C"
 STRATEGY_NAME      = "PACK-C 자본배분 체제 전환"
 ACTIVE_PACKS       = ["C"]
-BUILD_VERSION      = "v2.20260808.0401"
+BUILD_VERSION      = "v2.20260808.0407"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗

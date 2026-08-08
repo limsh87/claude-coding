@@ -208,7 +208,7 @@ ACTIVE_PACKS    = ["F"]
 
 STRATEGY_ID   = "TCD_V3_FLP"
 STRATEGY_NAME = "FLP 강제매도 소진 (Forced Liquidation Exhaustion)"
-BUILD_VERSION = "v2.20260808.0401"
+BUILD_VERSION = "v2.20260808.0407"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -6733,6 +6733,10 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
                               direction="backward")
         if "shares" not in d.columns:
             d["shares"] = np.nan
+        # ★ 과거 세션에서 실제로 죽은 패턴: merge 로 같은 이름의 컬럼이 두 개가 되면
+        #   d[col] 이 Series 가 아니라 DataFrame 이 되고, groupby.agg 가 pandas 내부에서
+        #   'DataFrame object has no attribute name' 으로 터진다. 발생 지점에서 즉시 세운다.
+        assert_no_dup_cols(d, "build_flp_panel:chunk")
         d = d.sort_values(["code", "date"])
 
         g = lambda c: d.groupby("code", observed=True)[c]
@@ -7111,7 +7115,9 @@ def apply_vetoes(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     # V_RS — 애널리스트 목표주가 하향이 지배적이면 '소진'이 아니라 펀더멘털 악화다
     rs = ctx.get("research_panel")
     if rs is not None and len(rs) and {"code", "wk"}.issubset(rs.columns):
-        P = P.merge(rs, on=["code", "wk"], how="left")
+        dupe = [c for c in rs.columns if c in P.columns and c not in ("code", "wk")]
+        P = P.merge(rs.drop(columns=dupe), on=["code", "wk"], how="left")
+        assert_no_dup_cols(P, "apply_vetoes:research_merge")
     if {"rs_cov_90d", "rs_tp_up_ratio"}.issubset(P.columns):
         bad = ((col(P, "rs_cov_90d").fillna(0) >= 3) &
                (col(P, "rs_tp_up_ratio") <= 0.15)).fillna(False)
@@ -7379,8 +7385,13 @@ def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
 def _top_n(df: pd.DataFrame, n: int, signal_col: str) -> pd.DataFrame:
     if df.empty or n <= 0:
         return df.head(0)
-    # 동점 처리: 신호 동률이면 유동성이 큰 쪽을 먼저 — 재현 가능하고 실행 가능한 순서
-    d = df.sort_values([signal_col, "adv20"], ascending=[False, False], kind="mergesort")
+    # 동점 처리: 신호 동률이면 유동성이 큰 쪽 → 그래도 같으면 종목코드 순.
+    # ★ 과거 세션 교훈: 동점을 암묵적 행순서로 깨면 같은 입력이 다른 포트폴리오를 낳는다
+    #   (C8 결정성 위반). 마지막 키까지 명시해 완전히 결정적으로 만든다.
+    keys, asc = [signal_col, "adv20", "code"], [False, False, True]
+    keys = [k for k in keys if k in df.columns]
+    asc = asc[:len(keys)]
+    d = df.sort_values(keys, ascending=asc, kind="mergesort")
     return d.head(n)
 
 

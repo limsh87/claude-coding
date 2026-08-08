@@ -70,8 +70,13 @@ def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
 def _top_n(df: pd.DataFrame, n: int, signal_col: str) -> pd.DataFrame:
     if df.empty or n <= 0:
         return df.head(0)
-    # 동점 처리: 신호 동률이면 유동성이 큰 쪽을 먼저 — 재현 가능하고 실행 가능한 순서
-    d = df.sort_values([signal_col, "adv20"], ascending=[False, False], kind="mergesort")
+    # 동점 처리: 신호 동률이면 유동성이 큰 쪽 → 그래도 같으면 종목코드 순.
+    # ★ 과거 세션 교훈: 동점을 암묵적 행순서로 깨면 같은 입력이 다른 포트폴리오를 낳는다
+    #   (C8 결정성 위반). 마지막 키까지 명시해 완전히 결정적으로 만든다.
+    keys, asc = [signal_col, "adv20", "code"], [False, False, True]
+    keys = [k for k in keys if k in df.columns]
+    asc = asc[:len(keys)]
+    d = df.sort_values(keys, ascending=asc, kind="mergesort")
     return d.head(n)
 
 
