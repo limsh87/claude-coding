@@ -8,7 +8,7 @@
 # ============================================================================================
 #  ARC-NCQ v1.0 — New Coverage × Qualitative Shift
 #  소형주 「신규 애널리스트 커버리지 × 보고서 텍스트 질적 변화」 탐지 전략
-#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0226
+#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0227
 #
 #  ── 핵심 가설 ───────────────────────────────────────────────────────────────────────────
 #   시총 하위권 소형주에 **처음으로 리서치 보고서가 붙는 순간**은, 커버리지를 정당화할 사건
@@ -217,7 +217,7 @@ STOP_ON_KILL_CRITERIA = True   # 킬 기준 위반 시 즉시 중단하고 보�
 
 STRATEGY_ID   = "ARC_NCQ_V1"
 STRATEGY_NAME = "ARC-NCQ — 신규 커버리지 × 텍스트 질적 변화"
-BUILD_VERSION = "ncq1.20260808.0226"
+BUILD_VERSION = "ncq1.20260808.0227"
 ACTIVE_PACKS  = []          # (TCD 코어 호환용 — 이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # build/10_ingest_universe.py 의 corpCode 오류 진단이 참조하는 표.
@@ -6186,6 +6186,7 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
     cb = NcqCircuit(source)
     frames: List[pd.DataFrame] = []
     n_skip = n_new = 0
+    flushed = 0                     # frames 중 이미 샤드로 저장한 개수
 
     todo = [m for m in reversed(list(months))]
     bar = tqdm(todo, desc=f"P1 {source}", ncols=88, leave=False)
@@ -6219,13 +6220,17 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
         n_new += len(d)
         ncq_done_mark(f"p1_{source}", ym, n=int(len(d)))
         # 연 단위 샤딩 저장 (공용 — 다른 전략도 그대로 재사용)
-        if m.month == 1 or m == todo[-1] or len(frames) % 12 == 0:
-            _ncq_flush_index_shard(source, frames)
+        # ★ '아직 저장하지 않은 프레임만' 넘긴다. 누적 리스트를 매번 통째로 넘기면
+        #   ① concat 이 O(n²) 이 되고 ② put_table 이 같은 연도 샤드를 반복 교체하면서
+        #   교체할 때마다 백업 파일을 만들어 드라이브에 백업이 수십 개씩 쌓인다.
+        if m.month == 1 or m == todo[-1] or (len(frames) - flushed) >= 12:
+            _ncq_flush_index_shard(source, frames[flushed:])
+            flushed = len(frames)
     try:
         bar.close()
     except Exception:
         pass
-    _ncq_flush_index_shard(source, frames, final=True)
+    _ncq_flush_index_shard(source, frames[flushed:], final=True)
     LOG.ok(f"[P1/{source}] 신규 {n_new:,}건 · 캐시 스킵 {n_skip}개월 · "
            f"소요 {budget.elapsed()/60:.1f}분")
     if not frames:
@@ -9551,8 +9556,13 @@ def ncq_ascii_chart(series_dict: Dict[str, Any], height: int = 14, width: int = 
     allv = np.concatenate(fin)
     ymin, ymax = float(allv.min()), float(allv.max())
     as_pct = max(abs(ymin), abs(ymax)) <= 50.0        # 수익률 비율값이면 % 로 표시
-    if ymax - ymin < 1e-12:
-        ymax = ymin + 1e-9
+    # ★ 폭 0 가드는 반드시 '스케일 상대값'이어야 한다.
+    #   절대 epsilon(1e-9)은 값이 1e8(원화 ADV)만 돼도 float64 정밀도에 먹혀 ymin+1e-9 == ymin 이 되고,
+    #   span 이 정확히 0 → 아래 (ymax-v)/span 이 ZeroDivisionError / NaN→int 로 터진다.
+    #   상수 시계열(월별 건수·금액)은 실제로 흔하므로 여기서 막지 않으면 리포트가 통째로 사라진다.
+    scale = max(abs(ymin), abs(ymax), 1.0)
+    if not np.isfinite(ymax - ymin) or (ymax - ymin) <= scale * 1e-9:
+        ymin, ymax = ymin - scale * 1e-6, ymax + scale * 1e-6
     span = ymax - ymin
 
     H = max(4, int(height))
@@ -12166,9 +12176,24 @@ def run_contract_tests(strict: bool = True) -> bool:
     def n4():
         if not ncq_has("NCQ_LEXICON", "NCQ_LEXICON_SHA"):
             return None, "NCQ_LEXICON / NCQ_LEXICON_SHA 미탑재 (ncq_40_text) — SKIP"
-        lex, sha = globals()["NCQ_LEXICON"], str(globals()["NCQ_LEXICON_SHA"])
+        sha = str(globals()["NCQ_LEXICON_SHA"] or "")
+        # ★ NCQ_LEXICON_SHA 는 freeze_configs 가 채운다(모듈 로드 시점 초기값은 "").
+        #   아직 동결 전이라면 그것은 '계약 위반'이 아니라 '동결이 아직 안 돌았다'이다.
+        #   여기서 임시 디렉터리에 한 번 동결한 뒤 그 값으로 검정한다 — 그러지 않으면
+        #   run_contract_tests 를 단독으로 부를 때마다 N4 가 가짜 위반을 내고,
+        #   strict=True 면 파이프라인이 시작도 못 하고 죽는다.
+        #   freeze_configs 조차 없는데 SHA 가 비어 있으면 그때가 진짜 위반이다.
+        if (not sha or len(sha) < 8) and ncq_has("freeze_configs"):
+            d0 = tempfile.mkdtemp(prefix="ncq_n4pre_")
+            try:
+                freeze_configs(d0)
+            finally:
+                shutil.rmtree(d0, ignore_errors=True)
+            sha = str(globals()["NCQ_LEXICON_SHA"] or "")
+        lex = globals()["NCQ_LEXICON"]
         if not sha or len(sha) < 8:
-            return False, f"NCQ_LEXICON_SHA 가 비었거나 너무 짧습니다: {sha!r}"
+            return False, (f"NCQ_LEXICON_SHA 가 비었거나 너무 짧습니다: {sha!r} "
+                           f"(freeze_configs 미탑재 — 동결 SHA 를 만들 경로가 없습니다)")
 
         # ① 결정성: freeze_configs 가 있으면 그 경로로 두 번 계산해 동일한지 본다
         if ncq_has("freeze_configs"):

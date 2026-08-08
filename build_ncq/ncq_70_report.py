@@ -429,8 +429,13 @@ def ncq_ascii_chart(series_dict: Dict[str, Any], height: int = 14, width: int = 
     allv = np.concatenate(fin)
     ymin, ymax = float(allv.min()), float(allv.max())
     as_pct = max(abs(ymin), abs(ymax)) <= 50.0        # 수익률 비율값이면 % 로 표시
-    if ymax - ymin < 1e-12:
-        ymax = ymin + 1e-9
+    # ★ 폭 0 가드는 반드시 '스케일 상대값'이어야 한다.
+    #   절대 epsilon(1e-9)은 값이 1e8(원화 ADV)만 돼도 float64 정밀도에 먹혀 ymin+1e-9 == ymin 이 되고,
+    #   span 이 정확히 0 → 아래 (ymax-v)/span 이 ZeroDivisionError / NaN→int 로 터진다.
+    #   상수 시계열(월별 건수·금액)은 실제로 흔하므로 여기서 막지 않으면 리포트가 통째로 사라진다.
+    scale = max(abs(ymin), abs(ymax), 1.0)
+    if not np.isfinite(ymax - ymin) or (ymax - ymin) <= scale * 1e-9:
+        ymin, ymax = ymin - scale * 1e-6, ymax + scale * 1e-6
     span = ymax - ymin
 
     H = max(4, int(height))
@@ -2012,12 +2017,18 @@ def ncq_svg_line(series_dict: Dict[str, Any], width: int = 880, height: int = 30
         cols = [(nm, pd.Series(s).reindex(uni).astype(float).ffill()) for nm, s in items]
     except Exception:
         return ""
-    allv = np.concatenate([c.dropna().to_numpy(dtype=float) for _, c in cols if c.notna().any()])
-    if allv.size == 0:
+    # ★ dropna() 만으로는 ±inf 가 남는다 → ymax=inf → 좌표가 전부 'nan' 인 SVG 가 조용히 생성된다.
+    #   유한값만으로 축을 잡고, inf 점은 아래 polyline 루프의 isfinite 검사에서 자연히 빠진다.
+    finite = [a[np.isfinite(a)] for a in (c.to_numpy(dtype=float) for _, c in cols)]
+    finite = [a for a in finite if a.size]
+    if not finite:
         return ""
+    allv = np.concatenate(finite)
     ymin, ymax = float(allv.min()), float(allv.max())
-    if ymax - ymin < 1e-12:
-        ymax = ymin + 1e-9
+    # ★ 절대 epsilon 은 큰 값(원화 금액·월별 건수)에서 float64 정밀도에 먹혀 span=0 → ZeroDivisionError.
+    scale = max(abs(ymin), abs(ymax), 1.0)
+    if (ymax - ymin) <= scale * 1e-9:
+        ymin, ymax = ymin - scale * 1e-6, ymax + scale * 1e-6
     pad = (ymax - ymin) * 0.06
     ymin, ymax = ymin - pad, ymax + pad
     L, Rr, T, B = 66, 16, 30 if title else 12, 34
@@ -2132,14 +2143,24 @@ def write_html_report(outdir, ctx) -> str:
     H.append("<h2>1. 성과</h2>")
     R = ncq_ret_series(BT)
     pf = ncq_g("perf_stats")
-    s = pf(BT["returns"]) if (callable(pf) and isinstance(BT, dict)
-                              and ncq_has_rows(BT.get("returns"))) else {}
+    # ★ perf_stats 는 이 모듈 밖(ncq_50_backtest)의 함수다. 여기서 예외가 나면 HTML 파일 자체가
+    #   만들어지지 않아 진단 수단이 통째로 사라진다 — 표 하나만 포기하고 나머지는 계속 쓴다.
+    s: Dict[str, Any] = {}
+    s_err = ""
+    if callable(pf) and isinstance(BT, dict) and ncq_has_rows(BT.get("returns")):
+        try:
+            s = pf(BT["returns"]) or {}
+        except Exception as e:                                    # noqa
+            s, s_err = {}, f"{type(e).__name__}: {str(e)[:180]}"
+            LOG.warn(f"[HTML 성과표] perf_stats 실패 — 이 표만 건너뜁니다: {s_err}")
     if s:
         order = [k for k in NCQ_PERF_ORDER if k in s] + [k for k in s if k not in NCQ_PERF_ORDER]
         H.append(ncq_html_table(["지표", "값"], [[k, ncq_fmt_metric(k, s[k])] for k in order],
                                 title="포트폴리오 성과 (비용 차감 후)", left_cols=(0,)))
     else:
-        H.append("<p class='mut'>성과 지표 없음 — BT['returns'] 가 비었습니다.</p>")
+        H.append("<p class='mut'>성과 지표 없음 — " +
+                 (f"perf_stats 호출 실패({ncq_esc(s_err)})" if s_err
+                  else "BT['returns'] 가 비었습니다") + ".</p>")
     brows = ncq_bench_table(R, benches)
     H.append(ncq_html_table(["역할", "벤치마크", "벤치 누적", "전략 누적", "초과",
                              "월평균 초과", "HAC t", "겹친 월"], brows,
@@ -2230,9 +2251,13 @@ def write_html_report(outdir, ctx) -> str:
     rrows = []
     try:
         for rid, d in (rob.items() if hasattr(rob, "items") else []):
+            # ★ pass 는 np.bool_ 로 올라올 수 있다. dict 키 조회나 `is True` 비교에 기대지 말고
+            #   None(판정불가) 만 따로 걸러낸 뒤 파이썬 bool 로 좁힌다.
             p = d.get("pass")
-            rrows.append([("⭐ " if d.get("kill") else "") + str(rid), _trunc(str(d.get("name", "")), 34),
-                          {True: "✔ 통과", False: "✘ 실패", None: "— 판정불가"}.get(p, "—"),
+            p = None if p is None else bool(p)
+            rrows.append([("⭐ " if bool(d.get("kill")) else "") + str(rid),
+                          _trunc(str(d.get("name", "")), 34),
+                          ("— 판정불가" if p is None else ("✔ 통과" if p else "✘ 실패")),
                           _trunc(str(d.get("detail", "")), 160)])
     except Exception:
         rrows = []
@@ -2438,7 +2463,11 @@ def write_manifest(outdir, ctx) -> str:
     # 강건성 요약 (판정만 — 상세는 콘솔/HTML)
     rob = ncq_rpt_ctx_get(ctx, "robust") or ncq_g("NCQ_ROBUST") or {}
     try:
-        man["robust"] = {str(k): {"pass": v.get("pass"), "kill": bool(v.get("kill")),
+        # ★ pass 가 np.bool_ 이면 json 이 직렬화하지 못해 default=str 이 문자열 "False" 로 바꿔 버린다.
+        #   "False" 는 truthy 이므로 매니페스트를 읽는 쪽의 판정이 그대로 뒤집힌다 — 진짜 bool 로 좁힌다.
+        #   None(판정불가)은 null 로 남긴다. 모르는 것을 False 로 채우지 않는다.
+        man["robust"] = {str(k): {"pass": (None if v.get("pass") is None else bool(v.get("pass"))),
+                                  "kill": bool(v.get("kill")),
                                   "name": str(v.get("name", ""))}
                          for k, v in (rob.items() if hasattr(rob, "items") else [])}
     except Exception:

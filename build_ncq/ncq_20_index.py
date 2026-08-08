@@ -202,6 +202,7 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
     cb = NcqCircuit(source)
     frames: List[pd.DataFrame] = []
     n_skip = n_new = 0
+    flushed = 0                     # frames 중 이미 샤드로 저장한 개수
 
     todo = [m for m in reversed(list(months))]
     bar = tqdm(todo, desc=f"P1 {source}", ncols=88, leave=False)
@@ -235,13 +236,17 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
         n_new += len(d)
         ncq_done_mark(f"p1_{source}", ym, n=int(len(d)))
         # 연 단위 샤딩 저장 (공용 — 다른 전략도 그대로 재사용)
-        if m.month == 1 or m == todo[-1] or len(frames) % 12 == 0:
-            _ncq_flush_index_shard(source, frames)
+        # ★ '아직 저장하지 않은 프레임만' 넘긴다. 누적 리스트를 매번 통째로 넘기면
+        #   ① concat 이 O(n²) 이 되고 ② put_table 이 같은 연도 샤드를 반복 교체하면서
+        #   교체할 때마다 백업 파일을 만들어 드라이브에 백업이 수십 개씩 쌓인다.
+        if m.month == 1 or m == todo[-1] or (len(frames) - flushed) >= 12:
+            _ncq_flush_index_shard(source, frames[flushed:])
+            flushed = len(frames)
     try:
         bar.close()
     except Exception:
         pass
-    _ncq_flush_index_shard(source, frames, final=True)
+    _ncq_flush_index_shard(source, frames[flushed:], final=True)
     LOG.ok(f"[P1/{source}] 신규 {n_new:,}건 · 캐시 스킵 {n_skip}개월 · "
            f"소요 {budget.elapsed()/60:.1f}분")
     if not frames:

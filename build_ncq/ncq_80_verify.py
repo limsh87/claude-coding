@@ -526,9 +526,24 @@ def run_contract_tests(strict: bool = True) -> bool:
     def n4():
         if not ncq_has("NCQ_LEXICON", "NCQ_LEXICON_SHA"):
             return None, "NCQ_LEXICON / NCQ_LEXICON_SHA 미탑재 (ncq_40_text) — SKIP"
-        lex, sha = globals()["NCQ_LEXICON"], str(globals()["NCQ_LEXICON_SHA"])
+        sha = str(globals()["NCQ_LEXICON_SHA"] or "")
+        # ★ NCQ_LEXICON_SHA 는 freeze_configs 가 채운다(모듈 로드 시점 초기값은 "").
+        #   아직 동결 전이라면 그것은 '계약 위반'이 아니라 '동결이 아직 안 돌았다'이다.
+        #   여기서 임시 디렉터리에 한 번 동결한 뒤 그 값으로 검정한다 — 그러지 않으면
+        #   run_contract_tests 를 단독으로 부를 때마다 N4 가 가짜 위반을 내고,
+        #   strict=True 면 파이프라인이 시작도 못 하고 죽는다.
+        #   freeze_configs 조차 없는데 SHA 가 비어 있으면 그때가 진짜 위반이다.
+        if (not sha or len(sha) < 8) and ncq_has("freeze_configs"):
+            d0 = tempfile.mkdtemp(prefix="ncq_n4pre_")
+            try:
+                freeze_configs(d0)
+            finally:
+                shutil.rmtree(d0, ignore_errors=True)
+            sha = str(globals()["NCQ_LEXICON_SHA"] or "")
+        lex = globals()["NCQ_LEXICON"]
         if not sha or len(sha) < 8:
-            return False, f"NCQ_LEXICON_SHA 가 비었거나 너무 짧습니다: {sha!r}"
+            return False, (f"NCQ_LEXICON_SHA 가 비었거나 너무 짧습니다: {sha!r} "
+                           f"(freeze_configs 미탑재 — 동결 SHA 를 만들 경로가 없습니다)")
 
         # ① 결정성: freeze_configs 가 있으면 그 경로로 두 번 계산해 동일한지 본다
         if ncq_has("freeze_configs"):
