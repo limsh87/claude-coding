@@ -1,0 +1,283 @@
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L3  주간 백테스트 엔진 + 비용 모델 (§8)                                                   ║
+# ║                                                                                          ║
+# ║  · 주 1회 리밸런싱. 체결 = 신호 산출일의 '다음 거래일 시가'. 당일 종가 체결 금지.           ║
+# ║  · 상장폐지: 정리매매 최종가 반영, 없으면 -100%. 누락 처리 금지(C2).                        ║
+# ║    ★ 이 전략의 표적 집단이 곧 상폐 위험 집단이므로 여기가 성과의 진위를 가른다.             ║
+# ║  · 청산: f_cr_pctl ≥ 0.5 회복(재취약) / 방화벽·거부권 위반 / 26주 상한.                     ║
+# ║    보유 중 '유니버스 밴드 이탈'은 청산 사유가 아니다(C13).                                  ║
+# ║  · 사이징 상수는 헤더에 못박혀 있고, R12 가 그 근거를 사후 검증한다(§12-2).                 ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+TAX_SCHEDULE = [
+    ("2016-01-01", {"KOSPI": 0.0030, "KOSDAQ": 0.0030, "OTHER": 0.0030}),
+    ("2019-06-03", {"KOSPI": 0.0025, "KOSDAQ": 0.0025, "OTHER": 0.0025}),
+    ("2021-01-01", {"KOSPI": 0.0023, "KOSDAQ": 0.0023, "OTHER": 0.0023}),
+    ("2023-01-01", {"KOSPI": 0.0020, "KOSDAQ": 0.0020, "OTHER": 0.0020}),
+    ("2024-01-01", {"KOSPI": 0.0018, "KOSDAQ": 0.0018, "OTHER": 0.0018}),
+    ("2025-01-01", {"KOSPI": 0.0015, "KOSDAQ": 0.0015, "OTHER": 0.0015}),
+]
+COMMISSION_BPS = 1.5           # 편도. 개인 온라인 수수료 가정
+SLIPPAGE_K = 0.10              # 제곱근 충격 계수 (소형주 가중이 여기서 나온다)
+PERIODS_PER_YEAR = 52.0
+
+
+def sell_tax(dt, market: str) -> float:
+    t = as_ts(dt)
+    rate = TAX_SCHEDULE[0][1]
+    for d, r in TAX_SCHEDULE:
+        if t >= as_ts(d):
+            rate = r
+    return rate.get(str(market).upper(), rate["OTHER"])
+
+
+def slippage(trade_krw: float, adv_krw: float, k: float = SLIPPAGE_K) -> float:
+    if not np.isfinite(adv_krw) or adv_krw <= 0:
+        return 0.02
+    part = min(1.0, abs(trade_krw) / adv_krw)
+    return float(k * math.sqrt(part))
+
+
+def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
+    """동일가중 → 종목당 상한 + ADV 참여율 상한 → 잔여를 자유 종목에 재배분.
+    ★ 신호강도 비례 사이징을 쓰지 않는다. 이 전략의 신호는 순위정보이지 기대수익 크기가 아니다."""
+    n = len(sub)
+    if n == 0:
+        return sub.assign(weight=[])
+    w = np.full(n, 1.0 / n)
+    adv = pd.to_numeric(sub.get("adv20"), errors="coerce").to_numpy(dtype=float)
+    cap_adv = np.where(np.isfinite(adv) & (adv > 0),
+                       POS_ADV_PARTICIPATION * adv / max(ACCOUNT_KRW, 1.0), POS_MAX_WEIGHT)
+    cap = np.minimum(np.full(n, POS_MAX_WEIGHT), np.maximum(cap_adv, POS_MIN_WEIGHT))
+    for _ in range(6):
+        over = w > cap
+        if not over.any():
+            break
+        rem = float(np.sum(w[over] - cap[over]))
+        w[over] = cap[over]
+        free = ~over & (w < cap)
+        if rem <= 1e-12 or not free.any():
+            break
+        pool = w[free].sum()
+        w[free] = (w[free] / pool * rem + w[free]) if pool > 1e-12 else (rem / free.sum())
+        w = np.minimum(w, cap)
+    s = w.sum()
+    if s > 1.0 + 1e-9:
+        w = w / s
+    return sub.assign(weight=w)
+
+
+def _top_n(df: pd.DataFrame, n: int, signal_col: str) -> pd.DataFrame:
+    if df.empty or n <= 0:
+        return df.head(0)
+    # 동점 처리: 신호 동률이면 유동성이 큰 쪽을 먼저 — 재현 가능하고 실행 가능한 순서
+    d = df.sort_values([signal_col, "adv20"], ascending=[False, False], kind="mergesort")
+    return d.head(n)
+
+
+def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
+                   sec: pd.DataFrame, signal_col: str = "Signal_rank",
+                   top_pct: float = PORTFOLIO_TOP_PCT, apply_costs: bool = True,
+                   slip_k: float = SLIPPAGE_K, label: str = "FLP",
+                   exit_cr: float = EXIT_CR_PCTL,
+                   hold_max: int = HOLD_MAX_WEEKS) -> dict:
+    mkt = (sec.set_index("code")["market"].astype(str).to_dict()
+           if sec is not None and len(sec) and "market" in sec.columns else {})
+    delist = uni.delisting_map() if uni is not None else {}
+    hold: Dict[str, dict] = {}
+    prev_w: Dict[str, float] = {}
+    rows, holdings_log = [], []
+
+    need = [c for c in ("adv20", "fwd_ret", "FIREWALL", "VETO", "f_cr_pctl", "PHASE_C",
+                        signal_col) if c in P.columns]
+    Pw = {w: g for w, g in P.groupby("wk", observed=True)}
+
+    for w in weeks:
+        sub = Pw.get(w)
+        if sub is None or sub.empty:
+            rows.append({"wk": w, "ret": 0.0, "ret_gross": 0.0, "n": 0,
+                         "turnover": 0.0, "cost": 0.0})
+            continue
+        rec: Dict[str, dict] = {}
+        for _c, *_v in sub[["code"] + need].itertuples(index=False, name=None):
+            rec[_c] = dict(zip(need, _v))
+
+        elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
+                   sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna()]
+        if uni is not None:
+            uni.audit_row("유동성필터", w, sub[sub["V6"] == 1]["code"].tolist())
+            uni.audit_row("낙폭조건", w, sub[(sub["V6"] == 1) &
+                                             (sub["f_dd"] < PH_DD_ENTER)]["code"].tolist())
+            uni.audit_row("국면C", w, sub[(sub["V6"] == 1) & (sub["PHASE_C"] == 1)]["code"].tolist())
+            uni.audit_row("방화벽통과", w, sub[(sub["V6"] == 1) & (sub["PHASE_C"] == 1) &
+                                               (sub["FIREWALL"] == 1)]["code"].tolist())
+            uni.audit_row("거부권통과", w, elig["code"].tolist())
+
+        k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
+                                             round(len(elig) * top_pct))))
+        pick = _top_n(elig, min(k, len(elig)), signal_col)
+        if uni is not None:
+            uni.audit_row("최종선정", w, pick["code"].tolist())
+
+        # ── 청산 판정 (진입 논리와 같은 언어로) ─────────────────────────────────────────
+        keep = []
+        for c, h in list(hold.items()):
+            r0 = rec.get(c)
+            if r0 is None:
+                continue                       # 패널에서 사라짐(거래정지·폐지) → 자동 이탈
+            exited = False
+            if r0.get("FIREWALL", 1) == 0 or r0.get("VETO", 1) == 0:
+                exited = True                  # 방화벽/거부권은 즉시 강제청산
+            elif h["weeks"] >= hold_max:
+                exited = True                  # 6개월 상한
+            else:
+                crp = r0.get("f_cr_pctl")
+                if crp is not None and pd.notna(crp) and float(crp) >= exit_cr:
+                    exited = True              # 신규 신용 유입 = 다시 취약해짐
+            if not exited:
+                keep.append(c)
+
+        extra = sub[sub["code"].isin(keep) & ~sub["code"].isin(set(pick["code"]))]
+        target = pd.concat([pick, extra], ignore_index=True) if len(extra) else pick
+        if len(target) > PORTFOLIO_MAX_NAMES:
+            # 보유분 우선(회전율 억제) — 신규는 신호순으로 잘라낸다
+            held = target[target["code"].isin(keep)]
+            fresh = _top_n(target[~target["code"].isin(keep)],
+                           max(0, PORTFOLIO_MAX_NAMES - len(held)), signal_col)
+            target = pd.concat([held, fresh], ignore_index=True)
+        target = size_positions(target) if len(target) else target.assign(weight=[])
+
+        w_new = dict(zip(target["code"], target["weight"])) if len(target) else {}
+        turn = sum(abs(w_new.get(c, 0.0) - prev_w.get(c, 0.0))
+                   for c in set(w_new) | set(prev_w))
+
+        cost = 0.0
+        if apply_costs:
+            for c in set(w_new) | set(prev_w):
+                dw = w_new.get(c, 0.0) - prev_w.get(c, 0.0)
+                if abs(dw) < 1e-9:
+                    continue
+                _r = rec.get(c) or {}
+                _a = _r.get("adv20")
+                adv = float(_a) if _a is not None and pd.notna(_a) else 0.0
+                notional = abs(dw) * ACCOUNT_KRW
+                tx = sell_tax(w, mkt.get(c, "OTHER")) if dw < 0 else 0.0
+                cost += abs(dw) * (COMMISSION_BPS / 1e4 + slippage(notional, adv, slip_k) + tx)
+
+        ret = 0.0
+        for c, wt in w_new.items():
+            _r = rec.get(c) or {}
+            _f = _r.get("fwd_ret")
+            fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
+            dl = delist.get(c)
+            if dl is not None and pd.notna(dl) and w < dl <= w + pd.Timedelta(days=7):
+                # ★ 상장폐지 주간: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
+                fr = -1.0 if not np.isfinite(fr) else fr
+            if not np.isfinite(fr):
+                fr = 0.0
+            ret += wt * fr
+            holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": fr,
+                                 "signal": _r.get(signal_col)})
+        rows.append({"wk": w, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
+                     "turnover": turn, "cost": cost,
+                     "invested": float(sum(w_new.values()))})
+
+        for c in list(hold):
+            if c in w_new:
+                hold[c]["weeks"] += 1
+            else:
+                hold.pop(c, None)
+        for c in w_new:
+            hold.setdefault(c, {"weeks": 0})
+        prev_w = w_new
+
+    R = pd.DataFrame(rows)
+    if len(R):
+        R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
+    return {"returns": R, "holdings": pd.DataFrame(holdings_log), "label": label}
+
+
+# ── 성과 지표 ───────────────────────────────────────────────────────────────────────────────
+def perf_stats_w(R: pd.DataFrame, rf: float = 0.0) -> dict:
+    if R is None or not len(R):
+        return {}
+    r = R["ret"].fillna(0).to_numpy(dtype=float)
+    n = len(r)
+    eq = np.cumprod(1 + r)
+    years = n / PERIODS_PER_YEAR
+    cagr = eq[-1] ** (1 / years) - 1 if years > 0 and eq[-1] > 0 else np.nan
+    vol = r.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if n > 1 else np.nan
+    dn = r[r < 0]
+    dvol = dn.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if len(dn) > 1 else np.nan
+    peak = np.maximum.accumulate(eq)
+    dd = eq / peak - 1
+    mdd = float(dd.min()) if n else np.nan
+    mx = cur = 0
+    for x in dd:
+        cur = cur + 1 if x < -1e-9 else 0
+        mx = max(mx, cur)
+    _mu, tstat = hac_tstat(r)
+    return {
+        "주수": n, "CAGR": cagr, "연변동성": vol,
+        "Sharpe": (cagr - rf) / vol if vol and np.isfinite(vol) and vol > 0 else np.nan,
+        "Sortino": (cagr - rf) / dvol if dvol and np.isfinite(dvol) and dvol > 0 else np.nan,
+        "MDD": mdd, "Calmar": (cagr / abs(mdd)) if mdd and mdd < 0 else np.nan,
+        "승률": float((r > 0).mean()), "주평균": float(r.mean()),
+        "t통계량(HAC)": tstat, "최장언더워터(주)": int(mx),
+        "누적수익": float(eq[-1] - 1),
+        "평균종목수": float(R["n"].mean()) if "n" in R else np.nan,
+        "평균투자비중": float(R["invested"].mean()) if "invested" in R else np.nan,
+        "주평균회전율": float(R["turnover"].mean()) if "turnover" in R else np.nan,
+        "주평균비용": float(R["cost"].mean()) if "cost" in R else np.nan,
+    }
+
+
+def right_tail_contribution(bt: dict) -> dict:
+    """이 전략은 우측 꼬리 의존적이다. 상위 종목 제외 시 성과가 사라지는지 매번 측정한다."""
+    H = bt.get("holdings")
+    if H is None or H.empty:
+        return {}
+    contrib = (H["weight"] * H["ret"]).groupby(H["code"]).sum().sort_values(ascending=False)
+    n = len(contrib)
+    if n == 0:
+        return {}
+    out = {"총기여": float(contrib.sum())}
+    for q, lab in ((0.01, "상위1%"), (0.05, "상위5%"), (0.10, "상위10%")):
+        k = max(1, int(round(n * q)))
+        out[f"{lab} 종목수"] = k
+        out[f"{lab} 기여"] = float(contrib.iloc[:k].sum())
+        out[f"{lab} 제외 후"] = float(contrib.sum() - contrib.iloc[:k].sum())
+    out["기여 상위5종목"] = ", ".join(f"{c}({v:+.3f})" for c, v in contrib.head(5).items())
+    return out
+
+
+def benchmark_returns_w(weeks: pd.DatetimeIndex, P: Optional[pd.DataFrame] = None
+                        ) -> Dict[str, pd.Series]:
+    """★ 벤치마크 수치를 하드코딩하지 않는다(§1-5). 여기서 직접 재측정한다.
+    KOSPI·KOSDAQ 지수 + '유니버스 동일가중'(이 전략의 진짜 대조군)."""
+    out: Dict[str, pd.Series] = {}
+    for name, sym in (("KOSPI", "KS11"), ("KOSDAQ", "KQ11")):
+        d = None
+        if fdr is not None and len(weeks):
+            try:
+                limiter("krx").wait()
+                d = fdr.DataReader(sym, (weeks[0] - pd.Timedelta(days=30)).strftime("%Y-%m-%d"),
+                                   weeks[-1].strftime("%Y-%m-%d"))
+            except Exception:
+                d = None
+        if d is None or len(d) == 0:
+            continue
+        d = d.reset_index()
+        d.columns = [str(c).lower() for c in d.columns]
+        d["date"] = as_ts_series(d[d.columns[0]])
+        s = d.set_index("date")["close"].sort_index()
+        s = s.reindex(s.index.union(weeks)).ffill().reindex(weeks)
+        out[name] = s.pct_change()
+    if P is not None and len(P) and "fwd_ret" in P.columns:
+        eqw = (P[P["in_band"] == 1].groupby("wk", observed=True)["fwd_ret"].mean()
+               if "in_band" in P.columns else P.groupby("wk", observed=True)["fwd_ret"].mean())
+        out["유니버스 동일가중"] = eqw.reindex(weeks)
+    if not out:
+        LOG.warn("벤치마크를 하나도 받지 못했습니다 — R0 는 유니버스 동일가중만으로 판정합니다. "
+                 "수치를 임의로 채워 넣지 않습니다(§1-5).")
+    return out

@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_X"
 STRATEGY_NAME      = "PACK-X 관세청 수출"
 ACTIVE_PACKS       = ["X"]
-BUILD_VERSION      = "v2.20260807.1316"
+BUILD_VERSION      = "v2.20260808.0201"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
