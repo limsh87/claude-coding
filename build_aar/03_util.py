@@ -847,8 +847,14 @@ def absorb_2way(Y: np.ndarray, X: Optional[np.ndarray], fe_codes: Sequence[np.nd
             keep &= ~bad
             info["n_singleton_dropped"] += int(bad.sum())
     if keep.sum() < 20:
+        # ★ keep 을 그대로 돌려주면 안 된다. 호출자는 resid 를 keep 위치에 되꽂는데,
+        #   resid 는 길이 0 이고 keep 에는 True 가 남아 있어 shape 불일치 ValueError 로
+        #   죽는다(그것도 critical 스테이지에서 = 실행 전체 중단). 아무 행도 쓰지
+        #   않았다는 사실을 keep 으로 정직하게 표현한다.
         info["converged"] = False
-        return (np.zeros(0), np.array([]), keep, np.array([], dtype=bool), info)
+        info["n_used"] = 0
+        return (np.zeros(0), np.array([]), np.zeros(n_all, dtype=bool),
+                np.array([], dtype=bool), info)
 
     y = y0[keep].copy()
     cols: List[np.ndarray] = []

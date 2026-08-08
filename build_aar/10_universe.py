@@ -259,7 +259,13 @@ def build_market_data(y0: int, y1: int) -> Dict[str, "pd.DataFrame"]:
       daily   : code, date, ret (ChangesRatio/100 = KRX 공식 수정등락률)
       sec     : 종목 마스터 (상장일/폐지일/업종/폐지사유)
     """
-    fp = fingerprint_of("marketdata", y0, y1, "v3", BACKTEST_START, BACKTEST_END)
+    # ★ 지문에 '주 단위 시각'을 넣는다. 넣지 않으면 marcap 저장소가 매일 갱신되는데도
+    #   메모 캐시가 첫 실행 시점에 영구 동결되어, 최근 구간이 영원히 낡은 채로 남는다.
+    #   과거 연도 parquet 는 확정 커밋이라 재계산해도 같은 값이 나오고, HTTP 캐시가
+    #   과거분을 그대로 재사용하므로 주 1회 재계산 비용은 거의 없다.
+    _wk = _dt.date.today().isocalendar()
+    fp = fingerprint_of("marketdata", y0, y1, "v3", BACKTEST_START, BACKTEST_END,
+                        f"{_wk[0]}W{_wk[1]}")
 
     def _build() -> "pd.DataFrame":
         m = load_marcap(y0, y1)

@@ -73,9 +73,11 @@ def build_signals(ctx: dict, months: "pd.DatetimeIndex") -> dict:
     mode = ctx.get("phase0", {}).get("mode", "ANALYST")
 
     with PIPE.stage("L2.ATTN", "주의 패널 → 축소추정 → 통제회귀 → VAS", "L2", budget_s=2100):
+        # 지문에 sec(섹터·폐지일)와 uni_all(지수이벤트·상장여부)까지 넣는다.
+        # 빠뜨리면 그 입력만 바뀐 재실행이 낡은 VAS 를 그대로 재사용한다.
         fp = fingerprint_of("vas", mode, LOOKBACK_M, MIN_REPORTS_MON, MIN_LOOKBACK_N,
-                            CTRL_MIN_TRAIN_M, BACKTEST_START, BACKTEST_END, "v3",
-                            frames=[L, ctx.get("ctrl")])
+                            CTRL_MIN_TRAIN_M, BACKTEST_START, BACKTEST_END, "v4",
+                            frames=[L, ctx.get("ctrl"), sec, ctx.get("uni_all")])
 
         def _mk():
             P = build_attention_panel(L, months, sec, unit_mode=mode)
@@ -97,8 +99,9 @@ def build_signals(ctx: dict, months: "pd.DatetimeIndex") -> dict:
                             domain="features", source="L2")
 
     with PIPE.stage("L2.DROPS", "커버리지 철회 인과분해", "L2", budget_s=900):
-        fp = fingerprint_of("drops", W_SIG, D_VER, LAM_MIN, COVER_WINDOW_M, "v3",
-                            frames=[L, A])
+        fp = fingerprint_of("drops", W_SIG, D_VER, LAM_MIN, COVER_WINDOW_M,
+                            NEG_W_VDROP, NEG_W_HEXIT, "v4",
+                            frames=[L, A, sec, ctx.get("uni_all")])
 
         def _mkd():
             d = classify_coverage_drops(L, A, months, sec, ctx["uni_all"])
@@ -128,6 +131,15 @@ def run_universe(ctx: dict, months: "pd.DatetimeIndex", variant: str) -> dict:
                "PIT 전체 상장 유니버스" if variant == "FULL"
                else f"시가총액 하위 {SMALLCAP_N:,} 압축 (기존 전략 대비 비교용)")
     uni = apply_universe_variant(ctx["uni_all"], variant)
+    # ★ 상장 시즈닝을 **실제로 적용**한다. Universe.at() 이 계산만 하고 아무도 쓰지 않으면
+    #   감사표에는 게이트가 찍히는데 포트폴리오는 상장 1개월차 신규상장주를 담는다.
+    #   신규상장 직후는 수익률 분포가 완전히 다르므로 그대로 두면 신호가 아니라 IPO 효과를 잰다.
+    seasoned = {(c, m) for m in months for c in ctx["universe"].at(m)}
+    n0 = len(uni)
+    uni = uni[[(c, m) in seasoned for c, m in zip(as_str_series(uni["code"]), uni["month"])]]
+    if n0 != len(uni):
+        LOG.info(f"[{variant}] 상장 시즈닝(상장일+1년) 적용 — {n0:,} → {len(uni):,} 월행 "
+                 f"(신규상장 직후 구간 제외).")
     key = set(zip(as_str_series(uni["code"]), uni["month"]))
     panel = ctx["panel"][[(c, m) in key for c, m in
                           zip(as_str_series(ctx["panel"]["code"]), ctx["panel"]["month"])]].copy()

@@ -244,6 +244,10 @@ def build_control_panel(months: "pd.DatetimeIndex", disclosures: "pd.DataFrame",
         cnt = (d.groupby(["code", "month"], observed=True)
                 .agg(disclosure_n=("rcept_no", "nunique"),
                      earn=("is_periodic", "max")).reset_index())
+        # ★ P 에 이미 disclosure_n 이 있는 채로 merge 하면 _x/_y 접미사가 붙어
+        #   바로 다음 줄의 P["disclosure_n"] 이 KeyError 로 죽는다(DART 데이터가
+        #   있으면 100% 재현). 자리표시용 열을 먼저 버린다.
+        P = P.drop(columns=[c for c in ("disclosure_n", "earn") if c in P.columns])
         P = P.merge(cnt, on=["code", "month"], how="left")
         P["earnings_month"] = pd.to_numeric(P["earn"], errors="coerce").fillna(0.0)
         P["disclosure_n"] = pd.to_numeric(P["disclosure_n"], errors="coerce").fillna(0.0)

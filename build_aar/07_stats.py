@@ -115,8 +115,13 @@ def pbo_cscv(M, S: int = 10, max_combos: int = 400, seed: int = SEED) -> dict:
         if valid.sum() < 2 or not valid[nstar]:
             continue
         # OOS 상대순위 ω ∈ (0,1). 순위 1등 = 1.0 근처
-        order = np.argsort(np.argsort(np.where(valid, sr_oos, -np.inf)))
-        w = (order[nstar] + 1) / (valid.sum() + 1)
+        # ★ 분자와 분모의 기준을 맞춘다. 무효 열을 -inf 로 밀어 넣고 전체 N 기준 순위를
+        #   쓰면서 분모만 유효 개수로 나누면, 무효 열이 하나만 있어도 ω 가 위로 밀려
+        #   PBO 가 **과소추정**된다(과적합을 놓치는 방향이라 더 위험하다).
+        vidx = np.where(valid)[0]
+        order_v = np.argsort(np.argsort(sr_oos[vidx]))
+        rank_of_star = int(order_v[np.searchsorted(vidx, nstar)])
+        w = (rank_of_star + 1) / (valid.sum() + 1)
         w = min(max(w, 1e-6), 1 - 1e-6)
         ranks.append(w)
         lams.append(math.log(w / (1 - w)))
@@ -162,16 +167,21 @@ def deflated_sharpe(r, n_trials: int, sr_trials: Optional[Sequence[float]] = Non
         return {"dsr": np.nan, "sr": np.nan, "sr_star": np.nan, "verdict": "Sharpe 산출 불가"}
 
     N = max(2, int(n_trials))
+    # ★ 시행 구성들의 실측 분산을 그대로 쓰면 안 되는 경우가 있다. §6.6 격자 12개는
+    #   같은 신호의 변형이라 서로 상관이 0.9 이상이고, 그러면 Var[{SR_n}] 이 붕괴해
+    #   SR* 가 비정상적으로 낮아진다 — 킬 게이트 문턱이 스스로 내려가는 셈이다.
+    #   두 추정치 중 **큰 쪽**을 쓴다. 시행횟수를 적게 세거나 문턱을 낮추는 것은
+    #   언제나 낙관 방향이므로, 보수적인 쪽으로 고정한다.
+    var_theory = (1.0 + 0.5 * sr ** 2) / T
+    var_sr = var_theory
     used_empirical = False
     if sr_trials is not None:
         v = np.asarray([x for x in sr_trials if np.isfinite(x)], dtype=float)
         if len(v) >= 3:
-            var_sr = float(v.var(ddof=1))
-            used_empirical = True
-        else:
-            var_sr = (1.0 + 0.5 * sr ** 2) / T
-    else:
-        var_sr = (1.0 + 0.5 * sr ** 2) / T
+            var_emp = float(v.var(ddof=1))
+            if var_emp > var_theory:
+                var_sr = var_emp
+                used_empirical = True
     var_sr = max(var_sr, 1e-12)
 
     g = 0.5772156649015329
@@ -185,7 +195,8 @@ def deflated_sharpe(r, n_trials: int, sr_trials: Optional[Sequence[float]] = Non
     dsr = float(Phi(z))
     return {"dsr": dsr, "sr": float(sr), "sr_star": float(sr_star), "T": T,
             "n_trials": N, "skew": skew, "kurt": kurt,
-            "var_source": "시행 구성들의 실측 분산" if used_empirical else "이론 근사(1+SR²/2)/T",
+            "var_source": ("시행 구성 실측 분산(이론값보다 큼)" if used_empirical
+                           else "이론 근사(1+SR²/2)/T — 실측 분산이 더 작아 보수적으로 선택"),
             "verdict": ("과적합 보정 후에도 유의 (DSR>0.95)" if dsr > 0.95 else
                         "보정 후 한계적 (0.90<DSR≤0.95)" if dsr > 0.90 else
                         "★ 과적합 보정 후 유의하지 않음")}
@@ -306,6 +317,15 @@ def panel_granger(df: "pd.DataFrame", cause: str, effect: str, entity: str = "co
     d = df[[entity, time, cause, effect]].copy()
     d[time] = as_ts_series(d[time])
     d = d.dropna(subset=[entity, time]).sort_values([entity, time])
+    # ★ groupby.shift(k) 는 **행 위치** 시차다. 이 패널은 관측이 없는 달의 행이 아예
+    #   없으므로(종목마다 커버가 끊기는 달이 다르다) 위치 시차는 종목마다 서로 다른
+    #   달력 간격을 뜻하게 되고, "lag 1~3개월" 이라는 H5 의 주장이 성립하지 않는다.
+    #   달력 격자에 재색인해 **캘린더 시차**로 만든다.
+    g0 = d.groupby([entity, time], observed=True)[[cause, effect]].mean().reset_index()
+    ents = pd.Index(sorted(set(as_str_series(g0[entity]))))
+    tims = pd.DatetimeIndex(sorted(pd.unique(g0[time])))
+    full = pd.MultiIndex.from_product([ents, tims], names=[entity, time])
+    d = (g0.set_index([entity, time]).reindex(full).reset_index())
     g = d.groupby(entity, observed=True)
     cols = []
     for k in range(1, lags + 1):
@@ -324,14 +344,21 @@ def panel_granger(df: "pd.DataFrame", cause: str, effect: str, entity: str = "co
     Xe = d[[f"_e{k}" for k in range(1, lags + 1)]].to_numpy(dtype=float)
 
     # 제한모형(원인 시차 제외) / 비제한모형 각각 FE 흡수 후 RSS 비교
-    r_r, _, _, _ = absorb_fe(y, Xe, [ent_c, tim_c], [ent_k, tim_k])
-    r_u, beta_u, keep_u, info = absorb_fe(y, np.column_stack([Xe, Xc]), [ent_c, tim_c],
-                                          [ent_k, tim_k])
-    rss_r = float(r_r @ r_r)
-    rss_u = float(r_u @ r_u)
-    q = int(np.sum(keep_u[-lags:])) if keep_u.size >= lags else lags
+    # ★ 두 모형이 서로 다른 행을 쓰면 RSS 비교가 통째로 무효다. 싱글턴 제거가
+    #   모형마다 다르게 걸릴 수 있으므로 **공통 표본으로 강제**한 뒤 비교한다.
     n = len(y)
-    dof = n - ent_k - tim_k - int(keep_u.sum()) - 1
+    r_r, _, keep_r, _, _ = absorb_2way(y, Xe, [ent_c, tim_c], [ent_k, tim_k], strict=False)
+    r_u, beta_u, keep_u, keep_cu, info = absorb_2way(
+        y, np.column_stack([Xe, Xc]), [ent_c, tim_c], [ent_k, tim_k], strict=False)
+    if not keep_r.any() or not keep_u.any():
+        return {"F": np.nan, "p": np.nan, "n": n, "verdict": "FE 흡수 후 표본이 남지 않음"}
+    fr = np.full(n, np.nan); fr[keep_r] = r_r
+    fu = np.full(n, np.nan); fu[keep_u] = r_u
+    common = keep_r & keep_u
+    rss_r = float(np.nansum(fr[common] ** 2))
+    rss_u = float(np.nansum(fu[common] ** 2))
+    q = int(np.sum(keep_cu[-lags:])) if keep_cu.size >= lags else lags
+    dof = int(common.sum()) - ent_k - tim_k - int(keep_cu.sum()) - 1
     if q <= 0 or dof <= 10 or rss_u <= 0:
         return {"F": np.nan, "p": np.nan, "n": n, "verdict": "자유도 부족 — 판정 불가"}
     F = ((rss_r - rss_u) / q) / (rss_u / dof)
@@ -383,6 +410,7 @@ def event_study_car(events: "pd.DataFrame", px_daily: "pd.DataFrame", bench_dail
     rows = []
     for grp, gg in ev.groupby(group_col, observed=True):
         mat = np.full((len(gg), horizon), np.nan)
+        navail = np.zeros(len(gg), dtype=int)
         for i, r in enumerate(gg.itertuples(index=False)):
             code = str(getattr(r, "code", ""))
             arr = ex_by_code.get(code)
@@ -394,9 +422,16 @@ def event_study_car(events: "pd.DataFrame", px_daily: "pd.DataFrame", bench_dail
             seg = ex[lo:lo + horizon]
             if len(seg):
                 mat[i, :len(seg)] = seg
-        car = np.nancumsum(np.where(np.isfinite(mat), mat, 0.0), axis=1)
-        valid = np.isfinite(mat).any(axis=1)
-        car = car[valid]
+                navail[i] = len(seg)
+        # ★ 관측이 끊긴 뒤를 '초과수익 0' 으로 메우면 안 된다. 상장폐지·거래정지로 조기
+        #   종료된 사건일수록 CAR 이 0 쪽으로 끌려가고(정확히 우리가 보려는 최악 사건들이다)
+        #   표본수 n 도 부풀려진다. 가용 구간 밖은 NaN 으로 남긴다.
+        filled = np.where(np.isfinite(mat), mat, 0.0)
+        car = np.cumsum(filled, axis=1)
+        hh = np.arange(horizon)[None, :]
+        car = np.where(hh < navail[:, None], car, np.nan)
+        keep = navail > 0
+        car = car[keep]
         if not len(car):
             continue
         for h in range(horizon):

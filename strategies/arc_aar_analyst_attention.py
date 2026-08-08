@@ -232,7 +232,7 @@ STOP_ON_KILL_CRITERIA = True     # §11 KILL 기준 위반 시 즉시 중단하�
 
 STRATEGY_ID   = "ARC_AAR"
 STRATEGY_NAME = "애널리스트 주의 재배분 (양방향 현시선호 신호)"
-BUILD_VERSION = "aar.20260808.0903"
+BUILD_VERSION = "aar.20260808.1101"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -1792,8 +1792,14 @@ def absorb_2way(Y: np.ndarray, X: Optional[np.ndarray], fe_codes: Sequence[np.nd
             keep &= ~bad
             info["n_singleton_dropped"] += int(bad.sum())
     if keep.sum() < 20:
+        # ★ keep 을 그대로 돌려주면 안 된다. 호출자는 resid 를 keep 위치에 되꽂는데,
+        #   resid 는 길이 0 이고 keep 에는 True 가 남아 있어 shape 불일치 ValueError 로
+        #   죽는다(그것도 critical 스테이지에서 = 실행 전체 중단). 아무 행도 쓰지
+        #   않았다는 사실을 keep 으로 정직하게 표현한다.
         info["converged"] = False
-        return (np.zeros(0), np.array([]), keep, np.array([], dtype=bool), info)
+        info["n_used"] = 0
+        return (np.zeros(0), np.array([]), np.zeros(n_all, dtype=bool),
+                np.array([], dtype=bool), info)
 
     y = y0[keep].copy()
     cols: List[np.ndarray] = []
@@ -3357,8 +3363,13 @@ def pbo_cscv(M, S: int = 10, max_combos: int = 400, seed: int = SEED) -> dict:
         if valid.sum() < 2 or not valid[nstar]:
             continue
         # OOS 상대순위 ω ∈ (0,1). 순위 1등 = 1.0 근처
-        order = np.argsort(np.argsort(np.where(valid, sr_oos, -np.inf)))
-        w = (order[nstar] + 1) / (valid.sum() + 1)
+        # ★ 분자와 분모의 기준을 맞춘다. 무효 열을 -inf 로 밀어 넣고 전체 N 기준 순위를
+        #   쓰면서 분모만 유효 개수로 나누면, 무효 열이 하나만 있어도 ω 가 위로 밀려
+        #   PBO 가 **과소추정**된다(과적합을 놓치는 방향이라 더 위험하다).
+        vidx = np.where(valid)[0]
+        order_v = np.argsort(np.argsort(sr_oos[vidx]))
+        rank_of_star = int(order_v[np.searchsorted(vidx, nstar)])
+        w = (rank_of_star + 1) / (valid.sum() + 1)
         w = min(max(w, 1e-6), 1 - 1e-6)
         ranks.append(w)
         lams.append(math.log(w / (1 - w)))
@@ -3404,16 +3415,21 @@ def deflated_sharpe(r, n_trials: int, sr_trials: Optional[Sequence[float]] = Non
         return {"dsr": np.nan, "sr": np.nan, "sr_star": np.nan, "verdict": "Sharpe 산출 불가"}
 
     N = max(2, int(n_trials))
+    # ★ 시행 구성들의 실측 분산을 그대로 쓰면 안 되는 경우가 있다. §6.6 격자 12개는
+    #   같은 신호의 변형이라 서로 상관이 0.9 이상이고, 그러면 Var[{SR_n}] 이 붕괴해
+    #   SR* 가 비정상적으로 낮아진다 — 킬 게이트 문턱이 스스로 내려가는 셈이다.
+    #   두 추정치 중 **큰 쪽**을 쓴다. 시행횟수를 적게 세거나 문턱을 낮추는 것은
+    #   언제나 낙관 방향이므로, 보수적인 쪽으로 고정한다.
+    var_theory = (1.0 + 0.5 * sr ** 2) / T
+    var_sr = var_theory
     used_empirical = False
     if sr_trials is not None:
         v = np.asarray([x for x in sr_trials if np.isfinite(x)], dtype=float)
         if len(v) >= 3:
-            var_sr = float(v.var(ddof=1))
-            used_empirical = True
-        else:
-            var_sr = (1.0 + 0.5 * sr ** 2) / T
-    else:
-        var_sr = (1.0 + 0.5 * sr ** 2) / T
+            var_emp = float(v.var(ddof=1))
+            if var_emp > var_theory:
+                var_sr = var_emp
+                used_empirical = True
     var_sr = max(var_sr, 1e-12)
 
     g = 0.5772156649015329
@@ -3427,7 +3443,8 @@ def deflated_sharpe(r, n_trials: int, sr_trials: Optional[Sequence[float]] = Non
     dsr = float(Phi(z))
     return {"dsr": dsr, "sr": float(sr), "sr_star": float(sr_star), "T": T,
             "n_trials": N, "skew": skew, "kurt": kurt,
-            "var_source": "시행 구성들의 실측 분산" if used_empirical else "이론 근사(1+SR²/2)/T",
+            "var_source": ("시행 구성 실측 분산(이론값보다 큼)" if used_empirical
+                           else "이론 근사(1+SR²/2)/T — 실측 분산이 더 작아 보수적으로 선택"),
             "verdict": ("과적합 보정 후에도 유의 (DSR>0.95)" if dsr > 0.95 else
                         "보정 후 한계적 (0.90<DSR≤0.95)" if dsr > 0.90 else
                         "★ 과적합 보정 후 유의하지 않음")}
@@ -3548,6 +3565,15 @@ def panel_granger(df: "pd.DataFrame", cause: str, effect: str, entity: str = "co
     d = df[[entity, time, cause, effect]].copy()
     d[time] = as_ts_series(d[time])
     d = d.dropna(subset=[entity, time]).sort_values([entity, time])
+    # ★ groupby.shift(k) 는 **행 위치** 시차다. 이 패널은 관측이 없는 달의 행이 아예
+    #   없으므로(종목마다 커버가 끊기는 달이 다르다) 위치 시차는 종목마다 서로 다른
+    #   달력 간격을 뜻하게 되고, "lag 1~3개월" 이라는 H5 의 주장이 성립하지 않는다.
+    #   달력 격자에 재색인해 **캘린더 시차**로 만든다.
+    g0 = d.groupby([entity, time], observed=True)[[cause, effect]].mean().reset_index()
+    ents = pd.Index(sorted(set(as_str_series(g0[entity]))))
+    tims = pd.DatetimeIndex(sorted(pd.unique(g0[time])))
+    full = pd.MultiIndex.from_product([ents, tims], names=[entity, time])
+    d = (g0.set_index([entity, time]).reindex(full).reset_index())
     g = d.groupby(entity, observed=True)
     cols = []
     for k in range(1, lags + 1):
@@ -3566,14 +3592,21 @@ def panel_granger(df: "pd.DataFrame", cause: str, effect: str, entity: str = "co
     Xe = d[[f"_e{k}" for k in range(1, lags + 1)]].to_numpy(dtype=float)
 
     # 제한모형(원인 시차 제외) / 비제한모형 각각 FE 흡수 후 RSS 비교
-    r_r, _, _, _ = absorb_fe(y, Xe, [ent_c, tim_c], [ent_k, tim_k])
-    r_u, beta_u, keep_u, info = absorb_fe(y, np.column_stack([Xe, Xc]), [ent_c, tim_c],
-                                          [ent_k, tim_k])
-    rss_r = float(r_r @ r_r)
-    rss_u = float(r_u @ r_u)
-    q = int(np.sum(keep_u[-lags:])) if keep_u.size >= lags else lags
+    # ★ 두 모형이 서로 다른 행을 쓰면 RSS 비교가 통째로 무효다. 싱글턴 제거가
+    #   모형마다 다르게 걸릴 수 있으므로 **공통 표본으로 강제**한 뒤 비교한다.
     n = len(y)
-    dof = n - ent_k - tim_k - int(keep_u.sum()) - 1
+    r_r, _, keep_r, _, _ = absorb_2way(y, Xe, [ent_c, tim_c], [ent_k, tim_k], strict=False)
+    r_u, beta_u, keep_u, keep_cu, info = absorb_2way(
+        y, np.column_stack([Xe, Xc]), [ent_c, tim_c], [ent_k, tim_k], strict=False)
+    if not keep_r.any() or not keep_u.any():
+        return {"F": np.nan, "p": np.nan, "n": n, "verdict": "FE 흡수 후 표본이 남지 않음"}
+    fr = np.full(n, np.nan); fr[keep_r] = r_r
+    fu = np.full(n, np.nan); fu[keep_u] = r_u
+    common = keep_r & keep_u
+    rss_r = float(np.nansum(fr[common] ** 2))
+    rss_u = float(np.nansum(fu[common] ** 2))
+    q = int(np.sum(keep_cu[-lags:])) if keep_cu.size >= lags else lags
+    dof = int(common.sum()) - ent_k - tim_k - int(keep_cu.sum()) - 1
     if q <= 0 or dof <= 10 or rss_u <= 0:
         return {"F": np.nan, "p": np.nan, "n": n, "verdict": "자유도 부족 — 판정 불가"}
     F = ((rss_r - rss_u) / q) / (rss_u / dof)
@@ -3625,6 +3658,7 @@ def event_study_car(events: "pd.DataFrame", px_daily: "pd.DataFrame", bench_dail
     rows = []
     for grp, gg in ev.groupby(group_col, observed=True):
         mat = np.full((len(gg), horizon), np.nan)
+        navail = np.zeros(len(gg), dtype=int)
         for i, r in enumerate(gg.itertuples(index=False)):
             code = str(getattr(r, "code", ""))
             arr = ex_by_code.get(code)
@@ -3636,9 +3670,16 @@ def event_study_car(events: "pd.DataFrame", px_daily: "pd.DataFrame", bench_dail
             seg = ex[lo:lo + horizon]
             if len(seg):
                 mat[i, :len(seg)] = seg
-        car = np.nancumsum(np.where(np.isfinite(mat), mat, 0.0), axis=1)
-        valid = np.isfinite(mat).any(axis=1)
-        car = car[valid]
+                navail[i] = len(seg)
+        # ★ 관측이 끊긴 뒤를 '초과수익 0' 으로 메우면 안 된다. 상장폐지·거래정지로 조기
+        #   종료된 사건일수록 CAR 이 0 쪽으로 끌려가고(정확히 우리가 보려는 최악 사건들이다)
+        #   표본수 n 도 부풀려진다. 가용 구간 밖은 NaN 으로 남긴다.
+        filled = np.where(np.isfinite(mat), mat, 0.0)
+        car = np.cumsum(filled, axis=1)
+        hh = np.arange(horizon)[None, :]
+        car = np.where(hh < navail[:, None], car, np.nan)
+        keep = navail > 0
+        car = car[keep]
         if not len(car):
             continue
         for h in range(horizon):
@@ -3958,7 +3999,13 @@ def build_market_data(y0: int, y1: int) -> Dict[str, "pd.DataFrame"]:
       daily   : code, date, ret (ChangesRatio/100 = KRX 공식 수정등락률)
       sec     : 종목 마스터 (상장일/폐지일/업종/폐지사유)
     """
-    fp = fingerprint_of("marketdata", y0, y1, "v3", BACKTEST_START, BACKTEST_END)
+    # ★ 지문에 '주 단위 시각'을 넣는다. 넣지 않으면 marcap 저장소가 매일 갱신되는데도
+    #   메모 캐시가 첫 실행 시점에 영구 동결되어, 최근 구간이 영원히 낡은 채로 남는다.
+    #   과거 연도 parquet 는 확정 커밋이라 재계산해도 같은 값이 나오고, HTTP 캐시가
+    #   과거분을 그대로 재사용하므로 주 1회 재계산 비용은 거의 없다.
+    _wk = _dt.date.today().isocalendar()
+    fp = fingerprint_of("marketdata", y0, y1, "v3", BACKTEST_START, BACKTEST_END,
+                        f"{_wk[0]}W{_wk[1]}")
 
     def _build() -> "pd.DataFrame":
         m = load_marcap(y0, y1)
@@ -4348,7 +4395,12 @@ def benchmark_series(months: "pd.DatetimeIndex", daily: "pd.DataFrame",
         d.columns = [str(c).lower() for c in d.columns]
         d["date"] = as_ts_series(d[d.columns[0]])
         d["month"] = d["date"] + pd.offsets.MonthEnd(0)
-        out[name] = d.groupby("month")["close"].last().pct_change().reindex(months)
+        # ★ 전략 수익률과 시점을 맞춘다. run_backtest 의 ret[m] 은 m 말에 진입해
+        #   m+1 말까지 얻는 **forward** 수익이다. 지수의 pct_change()[m] 은 m-1→m 의
+        #   **backward** 수익이라 그대로 비교하면 한 달 어긋난 값을 빼게 된다.
+        #   shift(-1) 로 지수도 forward 로 맞춘다.
+        out[name] = (d.groupby("month")["close"].last().pct_change()
+                      .shift(-1).reindex(months))
     if not out:
         LOG.info("지수(KOSPI/KOSDAQ) 시계열을 받지 못했습니다 — 동일가중 유니버스 벤치마크로 "
                  "비교합니다(§8 의 핵심 벤치마크는 원래 동일가중 유니버스입니다).")
@@ -4611,6 +4663,10 @@ def build_control_panel(months: "pd.DatetimeIndex", disclosures: "pd.DataFrame",
         cnt = (d.groupby(["code", "month"], observed=True)
                 .agg(disclosure_n=("rcept_no", "nunique"),
                      earn=("is_periodic", "max")).reset_index())
+        # ★ P 에 이미 disclosure_n 이 있는 채로 merge 하면 _x/_y 접미사가 붙어
+        #   바로 다음 줄의 P["disclosure_n"] 이 KeyError 로 죽는다(DART 데이터가
+        #   있으면 100% 재현). 자리표시용 열을 먼저 버린다.
+        P = P.drop(columns=[c for c in ("disclosure_n", "earn") if c in P.columns])
         P = P.merge(cnt, on=["code", "month"], how="left")
         P["earnings_month"] = pd.to_numeric(P["earn"], errors="coerce").fillna(0.0)
         P["disclosure_n"] = pd.to_numeric(P["disclosure_n"], errors="coerce").fillna(0.0)
@@ -5749,11 +5805,21 @@ def build_attention_panel(L: "pd.DataFrame", months: "pd.DatetimeIndex",
                      NA["month"].map(mpos).to_numpy(dtype=np.int64)),
               NA["N_t"].to_numpy(dtype=np.float64))
 
-    pair_unit = (pd.Series(pair_key.to_numpy()).str.split("\x1f").str[0]
-                 .map(umap).to_numpy(dtype=np.int64))
     pair_lookup = (pd.DataFrame({"_p": p_codes, "unit_id": CNT["unit_id"].to_numpy(),
                                  "code": CNT["code"].to_numpy()})
                    .drop_duplicates("_p").set_index("_p").sort_index())
+    # ★★ 축 주의 — 여기가 조용히 틀리면 신호 전체가 무의미해진다. ★★
+    #   np.where(Cmat...) 가 돌려주는 sel_p 는 **pair 코드**(0..p_k-1)다.
+    #   그런데 pair_key 로부터 곧바로 만든 배열은 **CNT 행 번호** 축이다. 한 (주체,종목)
+    #   쌍이 여러 달에 걸쳐 여러 행을 갖기 때문에 두 축은 절대 일치하지 않는다.
+    #   그 배열을 pair 코드로 색인하면 관측 대부분이 **다른 애널리스트의 N(a,t)** 를
+    #   분모로 쓰게 되고, 예외는 나지 않는다. 반드시 pair 코드 축에서 만든다.
+    pair_unit = (as_str_series(pair_lookup["unit_id"]).map(umap)
+                 .to_numpy(dtype=np.int64))
+    if len(pair_unit) != p_k:
+        raise KillCriteria(
+            f"주의 패널 축 불일치: pair_unit {len(pair_unit)} vs pair 코드 {p_k}. "
+            f"이 상태로 진행하면 분모가 뒤섞인 신호가 만들어집니다.")
 
     def trailing12(M: np.ndarray) -> np.ndarray:
         """Σ_{s=t-12}^{t-1} — **당월 t 를 포함하지 않는다.** 포함하면 그 자체가 정보 누수다."""
@@ -6245,8 +6311,12 @@ def classify_coverage_drops(L: "pd.DataFrame", A: "pd.DataFrame", months: "pd.Da
               .drop_duplicates("_b").set_index("_b").sort_index())
     bs_index = {(b, c): i for i, (b, c) in enumerate(zip(bs_lut["broker_legal_id"],
                                                         bs_lut["code"]))}
-    HB_after = _roll_sum(HB, 3, 0)          # t-2..t
-    HB_before = _roll_sum(HB, 12, 3)        # t-14..t-3
+    # ★ 두 창의 **길이가 다르므로 합계를 비교하면 안 된다.** 3개월 합 vs 12개월 합을
+    #   비교하면 n_after < n_before 가 거의 항상 참이 되어 1:1 승계(HANDOFF)가 전부
+    #   V-DROP 으로 오분류되고, 가중 0 이어야 할 사건들이 음의 신호에 섞인다.
+    #   창 안의 **최대 동시 커버 인원**을 쓰면 창 길이에 무관해져 비교가 성립한다.
+    HB_after = _roll_max(HB, 3)                        # t-2..t 최대 동시 커버 인원
+    HB_before = _shift_right(_roll_max(HB, 12), 3)     # t-14..t-3 최대 동시 커버 인원
 
     # ── 시장 전체 커버 (H-EXIT-MARKET 판정용) ────────────────────────────────────────
     ms = xs.drop_duplicates(["code", "month", "person_id"])
@@ -6295,7 +6365,10 @@ def classify_coverage_drops(L: "pd.DataFrame", A: "pd.DataFrame", months: "pd.Da
             tally["CENSORED-MA"] += 1
             continue
         d_ = dl.get(code)
-        if pd.notna(d_) and d_ is not None and d_ <= m + pd.offsets.MonthEnd(1):
+        # ★ m + MonthEnd(1) 로 비교하면 '다음 달에 폐지될 것'을 t 시점에 아는 셈이라
+        #   knowledge_date=t 라는 PIT 봉인 주장과 정면으로 모순된다(1개월 선견).
+        #   t 시점에 이미 폐지된 경우만 검열한다.
+        if pd.notna(d_) and d_ is not None and d_ <= m:
             tally["CENSORED-DELIST"] += 1
             continue
         if listed and (code, m) not in listed:
@@ -6417,14 +6490,14 @@ def _classify_verify(S: "pd.DataFrame", all_m) -> "pd.DataFrame":
     return V
 
 
-def _house_grain(HB, bs_lut, all_m) -> "pd.DataFrame":
+def _house_grain(HB, bs_lut, all_m, _roll=None) -> "pd.DataFrame":
     """(증권사, 종목) 그레인의 하우스 철회 패널.
 
     ★ (애널, 종목) 패널과 **배타가 아니라 중첩**이다. 한국 증권사는 섹터 1인 전담이
       일반적이라 단독 커버 애널의 철회는 정의상 하우스 철회이기도 하다. 교차항
       (V-DROP ∧ H-EXIT) 이 최강 신호이므로 강건성 분할에서 이 중첩을 이용한다."""
-    after = _roll_sum(HB, 3, 0)
-    before = _roll_sum(HB, 12, 3)
+    after = _roll_max(HB, 3)
+    before = _shift_right(_roll_max(HB, 12), 3)
     stop = (before > 0) & (after == 0)
     bi, ti = np.where(stop)
     if not len(bi):
@@ -8576,9 +8649,11 @@ def build_signals(ctx: dict, months: "pd.DatetimeIndex") -> dict:
     mode = ctx.get("phase0", {}).get("mode", "ANALYST")
 
     with PIPE.stage("L2.ATTN", "주의 패널 → 축소추정 → 통제회귀 → VAS", "L2", budget_s=2100):
+        # 지문에 sec(섹터·폐지일)와 uni_all(지수이벤트·상장여부)까지 넣는다.
+        # 빠뜨리면 그 입력만 바뀐 재실행이 낡은 VAS 를 그대로 재사용한다.
         fp = fingerprint_of("vas", mode, LOOKBACK_M, MIN_REPORTS_MON, MIN_LOOKBACK_N,
-                            CTRL_MIN_TRAIN_M, BACKTEST_START, BACKTEST_END, "v3",
-                            frames=[L, ctx.get("ctrl")])
+                            CTRL_MIN_TRAIN_M, BACKTEST_START, BACKTEST_END, "v4",
+                            frames=[L, ctx.get("ctrl"), sec, ctx.get("uni_all")])
 
         def _mk():
             P = build_attention_panel(L, months, sec, unit_mode=mode)
@@ -8600,8 +8675,9 @@ def build_signals(ctx: dict, months: "pd.DatetimeIndex") -> dict:
                             domain="features", source="L2")
 
     with PIPE.stage("L2.DROPS", "커버리지 철회 인과분해", "L2", budget_s=900):
-        fp = fingerprint_of("drops", W_SIG, D_VER, LAM_MIN, COVER_WINDOW_M, "v3",
-                            frames=[L, A])
+        fp = fingerprint_of("drops", W_SIG, D_VER, LAM_MIN, COVER_WINDOW_M,
+                            NEG_W_VDROP, NEG_W_HEXIT, "v4",
+                            frames=[L, A, sec, ctx.get("uni_all")])
 
         def _mkd():
             d = classify_coverage_drops(L, A, months, sec, ctx["uni_all"])
@@ -8631,6 +8707,15 @@ def run_universe(ctx: dict, months: "pd.DatetimeIndex", variant: str) -> dict:
                "PIT 전체 상장 유니버스" if variant == "FULL"
                else f"시가총액 하위 {SMALLCAP_N:,} 압축 (기존 전략 대비 비교용)")
     uni = apply_universe_variant(ctx["uni_all"], variant)
+    # ★ 상장 시즈닝을 **실제로 적용**한다. Universe.at() 이 계산만 하고 아무도 쓰지 않으면
+    #   감사표에는 게이트가 찍히는데 포트폴리오는 상장 1개월차 신규상장주를 담는다.
+    #   신규상장 직후는 수익률 분포가 완전히 다르므로 그대로 두면 신호가 아니라 IPO 효과를 잰다.
+    seasoned = {(c, m) for m in months for c in ctx["universe"].at(m)}
+    n0 = len(uni)
+    uni = uni[[(c, m) in seasoned for c, m in zip(as_str_series(uni["code"]), uni["month"])]]
+    if n0 != len(uni):
+        LOG.info(f"[{variant}] 상장 시즈닝(상장일+1년) 적용 — {n0:,} → {len(uni):,} 월행 "
+                 f"(신규상장 직후 구간 제외).")
     key = set(zip(as_str_series(uni["code"]), uni["month"]))
     panel = ctx["panel"][[(c, m) in key for c, m in
                           zip(as_str_series(ctx["panel"]["code"]), ctx["panel"]["month"])]].copy()

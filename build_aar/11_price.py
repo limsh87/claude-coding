@@ -110,7 +110,12 @@ def benchmark_series(months: "pd.DatetimeIndex", daily: "pd.DataFrame",
         d.columns = [str(c).lower() for c in d.columns]
         d["date"] = as_ts_series(d[d.columns[0]])
         d["month"] = d["date"] + pd.offsets.MonthEnd(0)
-        out[name] = d.groupby("month")["close"].last().pct_change().reindex(months)
+        # ★ 전략 수익률과 시점을 맞춘다. run_backtest 의 ret[m] 은 m 말에 진입해
+        #   m+1 말까지 얻는 **forward** 수익이다. 지수의 pct_change()[m] 은 m-1→m 의
+        #   **backward** 수익이라 그대로 비교하면 한 달 어긋난 값을 빼게 된다.
+        #   shift(-1) 로 지수도 forward 로 맞춘다.
+        out[name] = (d.groupby("month")["close"].last().pct_change()
+                      .shift(-1).reindex(months))
     if not out:
         LOG.info("지수(KOSPI/KOSDAQ) 시계열을 받지 못했습니다 — 동일가중 유니버스 벤치마크로 "
                  "비교합니다(§8 의 핵심 벤치마크는 원래 동일가중 유니버스입니다).")

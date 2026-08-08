@@ -176,8 +176,12 @@ def classify_coverage_drops(L: "pd.DataFrame", A: "pd.DataFrame", months: "pd.Da
               .drop_duplicates("_b").set_index("_b").sort_index())
     bs_index = {(b, c): i for i, (b, c) in enumerate(zip(bs_lut["broker_legal_id"],
                                                         bs_lut["code"]))}
-    HB_after = _roll_sum(HB, 3, 0)          # t-2..t
-    HB_before = _roll_sum(HB, 12, 3)        # t-14..t-3
+    # ★ 두 창의 **길이가 다르므로 합계를 비교하면 안 된다.** 3개월 합 vs 12개월 합을
+    #   비교하면 n_after < n_before 가 거의 항상 참이 되어 1:1 승계(HANDOFF)가 전부
+    #   V-DROP 으로 오분류되고, 가중 0 이어야 할 사건들이 음의 신호에 섞인다.
+    #   창 안의 **최대 동시 커버 인원**을 쓰면 창 길이에 무관해져 비교가 성립한다.
+    HB_after = _roll_max(HB, 3)                        # t-2..t 최대 동시 커버 인원
+    HB_before = _shift_right(_roll_max(HB, 12), 3)     # t-14..t-3 최대 동시 커버 인원
 
     # ── 시장 전체 커버 (H-EXIT-MARKET 판정용) ────────────────────────────────────────
     ms = xs.drop_duplicates(["code", "month", "person_id"])
@@ -226,7 +230,10 @@ def classify_coverage_drops(L: "pd.DataFrame", A: "pd.DataFrame", months: "pd.Da
             tally["CENSORED-MA"] += 1
             continue
         d_ = dl.get(code)
-        if pd.notna(d_) and d_ is not None and d_ <= m + pd.offsets.MonthEnd(1):
+        # ★ m + MonthEnd(1) 로 비교하면 '다음 달에 폐지될 것'을 t 시점에 아는 셈이라
+        #   knowledge_date=t 라는 PIT 봉인 주장과 정면으로 모순된다(1개월 선견).
+        #   t 시점에 이미 폐지된 경우만 검열한다.
+        if pd.notna(d_) and d_ is not None and d_ <= m:
             tally["CENSORED-DELIST"] += 1
             continue
         if listed and (code, m) not in listed:
@@ -348,14 +355,14 @@ def _classify_verify(S: "pd.DataFrame", all_m) -> "pd.DataFrame":
     return V
 
 
-def _house_grain(HB, bs_lut, all_m) -> "pd.DataFrame":
+def _house_grain(HB, bs_lut, all_m, _roll=None) -> "pd.DataFrame":
     """(증권사, 종목) 그레인의 하우스 철회 패널.
 
     ★ (애널, 종목) 패널과 **배타가 아니라 중첩**이다. 한국 증권사는 섹터 1인 전담이
       일반적이라 단독 커버 애널의 철회는 정의상 하우스 철회이기도 하다. 교차항
       (V-DROP ∧ H-EXIT) 이 최강 신호이므로 강건성 분할에서 이 중첩을 이용한다."""
-    after = _roll_sum(HB, 3, 0)
-    before = _roll_sum(HB, 12, 3)
+    after = _roll_max(HB, 3)
+    before = _shift_right(_roll_max(HB, 12), 3)
     stop = (before > 0) & (after == 0)
     bi, ti = np.where(stop)
     if not len(bi):

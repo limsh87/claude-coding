@@ -94,11 +94,21 @@ def build_attention_panel(L: "pd.DataFrame", months: "pd.DatetimeIndex",
                      NA["month"].map(mpos).to_numpy(dtype=np.int64)),
               NA["N_t"].to_numpy(dtype=np.float64))
 
-    pair_unit = (pd.Series(pair_key.to_numpy()).str.split("\x1f").str[0]
-                 .map(umap).to_numpy(dtype=np.int64))
     pair_lookup = (pd.DataFrame({"_p": p_codes, "unit_id": CNT["unit_id"].to_numpy(),
                                  "code": CNT["code"].to_numpy()})
                    .drop_duplicates("_p").set_index("_p").sort_index())
+    # ★★ 축 주의 — 여기가 조용히 틀리면 신호 전체가 무의미해진다. ★★
+    #   np.where(Cmat...) 가 돌려주는 sel_p 는 **pair 코드**(0..p_k-1)다.
+    #   그런데 pair_key 로부터 곧바로 만든 배열은 **CNT 행 번호** 축이다. 한 (주체,종목)
+    #   쌍이 여러 달에 걸쳐 여러 행을 갖기 때문에 두 축은 절대 일치하지 않는다.
+    #   그 배열을 pair 코드로 색인하면 관측 대부분이 **다른 애널리스트의 N(a,t)** 를
+    #   분모로 쓰게 되고, 예외는 나지 않는다. 반드시 pair 코드 축에서 만든다.
+    pair_unit = (as_str_series(pair_lookup["unit_id"]).map(umap)
+                 .to_numpy(dtype=np.int64))
+    if len(pair_unit) != p_k:
+        raise KillCriteria(
+            f"주의 패널 축 불일치: pair_unit {len(pair_unit)} vs pair 코드 {p_k}. "
+            f"이 상태로 진행하면 분모가 뒤섞인 신호가 만들어집니다.")
 
     def trailing12(M: np.ndarray) -> np.ndarray:
         """Σ_{s=t-12}^{t-1} — **당월 t 를 포함하지 않는다.** 포함하면 그 자체가 정보 누수다."""
