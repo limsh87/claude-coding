@@ -365,6 +365,41 @@ def run_contract_tests(strict: bool = True) -> bool:
         return (not bad,
                 f"세 arm 모두 스몰캡 밴드 내에서만 선정 (밴드 밖 편입: {bad or '없음'})")
 
+    def c_ablation():
+        """★ 라운드3 리뷰가 잡은 결함의 회귀 방지:
+        엔진이 진입 자격에서 FIREWALL·VETO 를 다시 적용하는 바람에, R5 절제의
+        '방화벽 off'·'거부권 off' arm 이 수학적으로 아무것도 절제하지 못했다
+        (ΔCAGR 이 항상 0 → 절제표가 '방화벽은 기여가 없다'고 거짓 보고)."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=8, freq="W-FRI"))
+        codes = [f"{800000+i:06d}" for i in range(20)]
+        rows = []
+        for w in wks:
+            for i, c in enumerate(codes):
+                rows.append({
+                    "code": c, "wk": w, "exec_px": 1000.0, "fwd_ret": 0.0, "adv20": 1e10,
+                    # 절반은 방화벽 차단 대상인데 TP 점수는 오히려 더 높게 준다
+                    "FIREWALL": 0 if i < 10 else 1, "FIREWALL_HARD": 0 if i < 10 else 1,
+                    "VETO": 1, "in_band": 1, "V6": 1, "PHASE_C": 1, "stale_days": 0,
+                    "f_dd": -0.4, "f_cr_pctl": 0.1,
+                    "cell": "X", "cell_l2": "Y", "cell_l3": "Z",
+                    "TP_F1": 0.9 if i < 10 else 0.1, "TP_F2": 0.9 if i < 10 else 0.1,
+                    "TP_F3": 0.9 if i < 10 else 0.1, "TP_F4": 0.9 if i < 10 else 0.1})
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": codes, "name": codes, "market": "KOSDAQ",
+                            "listing_date": pd.Timestamp("2015-01-01"), "delisting_date": pd.NaT})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": list(wks) * 20, "code": sorted(codes * 8)}))
+        _run = lambda pp: run_backtest_w(pp, wks, uni, sec, apply_costs=False, label="abl")
+        on = _run(assemble_score(P, quiet=True))
+        off = _run(assemble_score(P, gate_firewall=False, quiet=True))
+        h_on = set(on["holdings"]["code"]) if len(on["holdings"]) else set()
+        h_off = set(off["holdings"]["code"]) if len(off["holdings"]) else set()
+        blocked = set(codes[:10])
+        return (not (h_on & blocked) and bool(h_off & blocked),
+                f"방화벽 on 선정 {len(h_on)}종목(차단대상 {len(h_on & blocked)}) · "
+                f"off 선정 {len(h_off)}종목(차단대상 {len(h_off & blocked)}) "
+                f"— off 에서 차단대상이 0이면 절제가 무의미한 것")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -438,6 +473,7 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
     _c("SMALL", "스몰캡 밴드 = 시총 하위 N ∧ 전체 밴드의 부분집합", c_small)
     _c("R2FB", "R2-F 세 비교군이 같은 밴드를 쓴다 (회귀 방지)", c_r2f_band)
+    _c("ABL", "절제 arm 이 실제로 절제한다 (회귀 방지)", c_ablation)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)

@@ -229,7 +229,7 @@ ACTIVE_PACKS    = ["F"]
 
 STRATEGY_ID   = "TCD_V3_FLP"
 STRATEGY_NAME = "FLP 강제매도 소진 (Forced Liquidation Exhaustion)"
-BUILD_VERSION = "v2.20260808.0433"
+BUILD_VERSION = "v2.20260808.0440"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -5867,6 +5867,12 @@ class PITStore:
                             "kd_min": d["knowledge_date"].min(), "kd_max": d["knowledge_date"].max()}
         PIPE.io("OUT", "MEM", f"PIT:{name}", d)
 
+    def drop(self, name: str) -> None:
+        """등록을 되돌린다. 합성 스모크가 남긴 테이블이 실데이터 실행에 섞이면
+        '재무 없음' 경고가 사라진 채 전 종목 결측으로 조용히 진행된다."""
+        self._t.pop(name, None)
+        self._meta.pop(name, None)
+
     def has(self, name: str) -> bool:
         return name in self._t and not self._meta.get(name, {}).get("empty", True)
 
@@ -6163,7 +6169,8 @@ def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N)
 
 CREDIT_GRADE = "UNKNOWN"          # PRIMARY_DAILY / FALLBACK_A_WEEKLY / FALLBACK_B_PROXY / NONE
 CREDIT_SOURCE_NOTE = ""
-FLOW_GRADE = "UNKNOWN"            # FULL(개인/기관/외국인) / PARTIAL(개인 없음) / NONE
+FLOW_GRADE = "UNKNOWN"            # FULL / APPROX(개인=근사) / PARTIAL / NONE
+FLOW_APPROX = False               # 개인이 -(기관+외국인) 근사인가 (퇴화 판정의 근거)
 WATCH_GRADE = "UNKNOWN"           # OK / PARTIAL / NONE
 CANARY: "OrderedDict[str, dict]" = OrderedDict()
 
@@ -6433,6 +6440,7 @@ def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str,
     has_retail = float(F["retail_net"].notna().mean())
     approx = float(F.get("src", pd.Series("", index=F.index)).astype(str)
                     .str.contains("근사").mean())
+    globals()["FLOW_APPROX"] = bool(approx >= 0.5)
     FLOW_GRADE = ("FULL" if (has_retail > 0.5 and approx < 0.5)
                   else ("APPROX" if has_retail > 0.5 else ("PARTIAL" if len(F) else "NONE")))
     if FLOW_GRADE == "APPROX":
@@ -6692,6 +6700,12 @@ def fetch_credit_balance(px: pd.DataFrame, flows: pd.DataFrame,
             LOG.error("신용잔고도, 프록시의 재료인 개인 순매수도 없습니다. f_cr 계열 전부 결측입니다.")
             return pd.DataFrame(columns=CREDIT_COLS)
         CREDIT_GRADE = "FALLBACK_B_PROXY"
+        if FLOW_APPROX:
+            LOG.error("★★ 이중 퇴화 경고: 신용잔고가 프록시(개인 순매수 누적)인데 그 '개인'조차 "
+                      "-(기관+외국인) 근사입니다. 그러면 f_cr · f_ret_ex · f_inst 가 사실상 "
+                      "같은 시계열(기관+외국인 순매수)의 변형이 되고, TP_F2(개인이탈×기관유입)는 "
+                      "자기 자신과의 곱으로 퇴화합니다 — 신호처럼 보이지만 아무 정보가 없습니다. "
+                      "해당 TP 를 산식에서 제외하고 그 사실을 리포트에 남깁니다.")
         LOG.warn("★ 신용잔고를 직접 얻는 방법(권장, 5분): data.krx.co.kr 접속 → [통계] → "
                  "[시장정보] → '신용거래융자 잔고' 화면에서 기간을 지정해 CSV/XLSX 를 내려받아 "
                  f"{CREDIT_MANUAL_DIRS[0]} 폴더에 넣어두세요. 다음 실행에서 자동 인식되어 "
@@ -6811,6 +6825,26 @@ def fetch_watchlist_halt(sec: pd.DataFrame) -> pd.DataFrame:
 SENSOR_COLS = ["f_dd", "f_dd_spd", "f_cr", "f_cr_pctl", "f_cr_chg", "f_cr_chg_slow",
                "f_retail", "f_inst", "f_ret_ex", "f_vol", "f_turn"]
 TP_COLS = ["TP_F1", "TP_F2", "TP_F3", "TP_F4"]
+# 데이터 등급 때문에 '수학적으로 퇴화'한 TP 는 산식에서 뺀다(있는 척하지 않는다).
+EXCLUDED_TPS: List[str] = []
+
+
+def check_tp_degeneracy() -> None:
+    """등급 조합이 특정 TP 를 무의미하게 만드는 경우를 판정한다.
+
+    ★ 실제 위험: 신용잔고가 프록시(개인 순매수 누적)이고 그 '개인'이 -(기관+외국인) 근사이면
+      f_cr, f_ret_ex, f_inst 가 모두 (기관+외국인 순매수)의 부호·창 변형이 된다.
+      그러면 TP_F2 = tp(f_ret_ex, f_inst) 는 사실상 tp(x, x) 이고, 값은 크게 나오지만
+      '소유권 이전'을 전혀 관측하지 않는다. 조용히 두면 그 자체가 가짜 신호다."""
+    EXCLUDED_TPS.clear()
+    if CREDIT_GRADE == "FALLBACK_B_PROXY" and FLOW_APPROX:
+        EXCLUDED_TPS.append("TP_F2")
+        LOG.warn("TP_F2(개인 이탈 × 기관 유입)를 산식에서 제외합니다 — 신용잔고 프록시와 "
+                 "개인 근사가 겹쳐 두 축이 같은 시계열이 되었습니다(자기 자신과의 곱). "
+                 "E 는 남은 TP 들의 평균으로 계산되며, 이 사실은 해석표에도 표기됩니다.")
+    if EXCLUDED_TPS:
+        LOG.table([[c, "제외", "데이터 등급으로 인해 퇴화"] for c in EXCLUDED_TPS],
+                  ["TP", "상태", "사유"], ["l", "c", "l"], title="TP 퇴화 판정")
 
 
 def week_grid(start: str, end: str, px: pd.DataFrame) -> pd.DatetimeIndex:
@@ -6914,11 +6948,16 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
     #   2,500종목·650만행이면 7회 × 650만 = 4,500만 비교. 코드로 정렬해 두고 위치로 잘라내면
     #   같은 결과를 한 번의 정렬 비용으로 얻는다. 신용/수급/주식수도 동일하게 처리한다.
     def _slicer(df: pd.DataFrame):
+        """★ 이미 code 로 정렬된 프레임을 또 정렬하면 전체 복사본이 하나 더 생긴다.
+        650만행 가격 프레임에서 이것만으로 수 GB 가 더 잡혀 청크 처리의 목적을 깨뜨린다.
+        → 정렬 여부를 먼저 확인하고, 필요할 때만 정렬한다."""
         if df is None or not len(df):
             return None
-        d0 = df.sort_values(["code"], kind="stable").reset_index(drop=True)
-        codes_arr = d0["code"].to_numpy()
-        return d0, codes_arr
+        codes_arr = df["code"].to_numpy()
+        if len(codes_arr) > 1 and not pd.Index(codes_arr).is_monotonic_increasing:
+            df = df.sort_values(["code"], kind="stable")
+            codes_arr = df["code"].to_numpy()
+        return df, codes_arr
 
     _px_s = _slicer(px)
     _cr_s = _slicer(cr)
@@ -7408,7 +7447,7 @@ def assemble_score(P: pd.DataFrame, use_tps: Optional[Sequence[str]] = None,
     P = P.copy()
     if not all(c in P.columns for c in TP_COLS):
         P = build_tps(P)
-    cols = list(use_tps) if use_tps else TP_COLS
+    cols = list(use_tps) if use_tps else [c for c in TP_COLS if c not in EXCLUDED_TPS]
     P["E"] = nanmean_cols(P, cols)
     P["E_rank"] = P.groupby("wk", observed=True)["E"].rank(pct=True)
     gate = P[band_col].astype(float) if band_col in P.columns else P["in_band"].astype(float)
@@ -7551,15 +7590,18 @@ def audit_research_wiring(rep: pd.DataFrame, A: pd.DataFrame, L: pd.DataFrame,
          "증권사 사명 정규화 + 동명이인 분리"],
         ["보고서×애널 링크(L)", f"{len(L):,}행" if L is not None else "없음",
          "목표주가 리비전의 유일한 근거"],
-        ["패널 결합 결과", f"{int(panel['rs_cov_90d'].notna().sum()):,}행" if
-         panel is not None and "rs_cov_90d" in panel.columns else "0행",
+        # ★ rs_cov_90d 는 전 행에 0.0 으로 채워지므로 notna() 로 세면 항상 '전체 행수'가 되어
+        #   배선 단절 센티널이 영원히 발화하지 않는다. '실제로 커버리지가 있는' 행을 센다.
+        ["패널 결합 결과(커버리지>0)",
+         f"{int((panel['rs_cov_90d'].fillna(0) > 0).sum()):,}행" if
+         panel is not None and "rs_cov_90d" in getattr(panel, "columns", []) else "0행",
          "여기가 0이면 수집이 아니라 '배선'이 끊긴 것"],
     ]
     LOG.table(rows, ["단계", "규모", "의미"], ["l", "r", "l"],
               title="애널리스트 리포트 → 전략 배선 점검 (다중소스 원장 연결)")
     if (rep is not None and len(rep) > 0 and
             (panel is None or "rs_cov_90d" not in getattr(panel, "columns", []) or
-             int(panel["rs_cov_90d"].notna().sum()) == 0)):
+             int((panel["rs_cov_90d"].fillna(0) > 0).sum()) == 0)):
         LOG.warn("리포트는 수집됐는데 패널에 한 건도 결합되지 않았습니다. "
                  "종목코드 정규화(6자리) 또는 발간일 파싱을 먼저 의심하세요 — "
                  "'데이터 부재'가 아니라 '배선 결함'입니다.")
@@ -7734,10 +7776,15 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             prev_w = dict(frozen)
             continue
 
+        # ★ 진입 자격은 '신호' 하나로만 판단한다.
+        #   assemble_score 가 이미 방화벽·거부권·밴드를 Signal 에 곱해 넣었으므로
+        #   (게이트에 걸리면 Signal 이 정확히 0), 엔진이 같은 게이트를 다시 적용하면
+        #   R5 절제의 "방화벽 off"·"거부권 off" arm 이 수학적으로 무의미해진다
+        #   (게이트를 빼고 채점해도 엔진이 도로 걸러내므로 ΔCAGR 이 항상 0 → 절제표가
+        #    "방화벽은 기여가 없다"고 거짓 보고한다). 청산 쪽 FIREWALL_HARD 는 그대로다.
         fresh_px = (sub["stale_days"] <= 3) if "stale_days" in sub.columns else True
-        elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
-                   sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna() &
-                   fresh_px]
+        elig = sub[sub[signal_col].notna() & (sub[signal_col] > 0) &
+                   sub["exec_px"].notna() & fresh_px]
         if uni is not None and audit:
             uni.audit_row("유동성필터", w, sub[sub["V6"] == 1]["code"].tolist())
             uni.audit_row("낙폭조건", w, sub[(sub["V6"] == 1) &
@@ -7959,9 +8006,13 @@ def benchmark_returns_w(weeks: pd.DatetimeIndex, P: Optional[pd.DataFrame] = Non
         eqw = (P[P["in_band"] == 1].groupby("wk", observed=True)["fwd_ret"].mean()
                if "in_band" in P.columns else P.groupby("wk", observed=True)["fwd_ret"].mean())
         out["유니버스 동일가중"] = eqw.reindex(weeks)
-    if not out:
-        LOG.warn("벤치마크를 하나도 받지 못했습니다 — R0 는 유니버스 동일가중만으로 판정합니다. "
-                 "수치를 임의로 채워 넣지 않습니다(§1-5).")
+    idx_missing = [n for n in ("KOSPI", "KOSDAQ") if n not in out]
+    if idx_missing:
+        # ★ '유니버스 동일가중'이 항상 채워지므로 out 이 비는 일은 없다 → 지수 결측을
+        #   따로 경고하지 않으면 R0·R7·R12 가 조용히 '자기 유니버스와만' 비교하게 된다.
+        LOG.warn(f"지수 벤치마크 {idx_missing} 를 받지 못했습니다 — R0/R7/R12 는 "
+                 f"'유니버스 동일가중'만으로 판정합니다. 전략을 자기 유니버스와 비교하는 것은 "
+                 f"시장 대비 성과가 아니므로 해석에 반드시 반영하세요(수치를 임의로 채우지 않습니다).")
     return out
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -9112,6 +9163,41 @@ def run_contract_tests(strict: bool = True) -> bool:
         return (not bad,
                 f"세 arm 모두 스몰캡 밴드 내에서만 선정 (밴드 밖 편입: {bad or '없음'})")
 
+    def c_ablation():
+        """★ 라운드3 리뷰가 잡은 결함의 회귀 방지:
+        엔진이 진입 자격에서 FIREWALL·VETO 를 다시 적용하는 바람에, R5 절제의
+        '방화벽 off'·'거부권 off' arm 이 수학적으로 아무것도 절제하지 못했다
+        (ΔCAGR 이 항상 0 → 절제표가 '방화벽은 기여가 없다'고 거짓 보고)."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=8, freq="W-FRI"))
+        codes = [f"{800000+i:06d}" for i in range(20)]
+        rows = []
+        for w in wks:
+            for i, c in enumerate(codes):
+                rows.append({
+                    "code": c, "wk": w, "exec_px": 1000.0, "fwd_ret": 0.0, "adv20": 1e10,
+                    # 절반은 방화벽 차단 대상인데 TP 점수는 오히려 더 높게 준다
+                    "FIREWALL": 0 if i < 10 else 1, "FIREWALL_HARD": 0 if i < 10 else 1,
+                    "VETO": 1, "in_band": 1, "V6": 1, "PHASE_C": 1, "stale_days": 0,
+                    "f_dd": -0.4, "f_cr_pctl": 0.1,
+                    "cell": "X", "cell_l2": "Y", "cell_l3": "Z",
+                    "TP_F1": 0.9 if i < 10 else 0.1, "TP_F2": 0.9 if i < 10 else 0.1,
+                    "TP_F3": 0.9 if i < 10 else 0.1, "TP_F4": 0.9 if i < 10 else 0.1})
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": codes, "name": codes, "market": "KOSDAQ",
+                            "listing_date": pd.Timestamp("2015-01-01"), "delisting_date": pd.NaT})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": list(wks) * 20, "code": sorted(codes * 8)}))
+        _run = lambda pp: run_backtest_w(pp, wks, uni, sec, apply_costs=False, label="abl")
+        on = _run(assemble_score(P, quiet=True))
+        off = _run(assemble_score(P, gate_firewall=False, quiet=True))
+        h_on = set(on["holdings"]["code"]) if len(on["holdings"]) else set()
+        h_off = set(off["holdings"]["code"]) if len(off["holdings"]) else set()
+        blocked = set(codes[:10])
+        return (not (h_on & blocked) and bool(h_off & blocked),
+                f"방화벽 on 선정 {len(h_on)}종목(차단대상 {len(h_on & blocked)}) · "
+                f"off 선정 {len(h_off)}종목(차단대상 {len(h_off & blocked)}) "
+                f"— off 에서 차단대상이 0이면 절제가 무의미한 것")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -9185,6 +9271,7 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
     _c("SMALL", "스몰캡 밴드 = 시총 하위 N ∧ 전체 밴드의 부분집합", c_small)
     _c("R2FB", "R2-F 세 비교군이 같은 밴드를 쓴다 (회귀 방지)", c_r2f_band)
+    _c("ABL", "절제 arm 이 실제로 절제한다 (회귀 방지)", c_ablation)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)
@@ -9323,6 +9410,9 @@ def run_selftest(full_chain: bool = False) -> bool:
     S = make_synthetic_flp(n_codes=(120 if full_chain else 60),
                            n_days=(900 if full_chain else 460))
     px, sec = S["px"], S["sec"]
+    # ★ 합성 재무를 전역 PIT 에 올린다. 이 등록은 반드시 끝에서 되돌린다(아래 finally) —
+    #   남겨두면 실데이터 실행에서 PIT.has("dart_financials") 가 True 가 되어
+    #   "DART 재무가 없어 방화벽이 비활성" 경고가 사라지고, 결측인 채로 조용히 진행된다.
     PIT.register("dart_financials",
                  pit_frame(S["fin"], "period_end", "knowledge_date", source="synth"),
                  key_cols=["corp_code"])
@@ -9331,6 +9421,7 @@ def run_selftest(full_chain: bool = False) -> bool:
     P = build_flp_panel(px, S["credit"], S["flows"], S["shares"], weeks, uni)
     if P.empty:
         LOG.error("스모크: 주간 패널이 비었습니다.")
+        PIT.drop("dart_financials")
         return False
     P = apply_universe_bands(P)
     P = build_cells_flp(P, sec)
@@ -9349,17 +9440,19 @@ def run_selftest(full_chain: bool = False) -> bool:
     if n_sig == 0:
         LOG.error(f"스모크: 신호가 한 건도 발화하지 않았습니다 (국면C {n_c}행). "
                   f"게이트 중 하나가 항상 0 이면 실데이터에서도 영구 무발화입니다.")
+        PIT.drop("dart_financials")
         return False
 
-    def _run(pp, label="smoke", apply_costs=True, slip_k=SLIPPAGE_K):
+    def _run(pp, label="smoke", apply_costs=True, slip_k=SLIPPAGE_K, audit=False):
         return run_backtest_w(pp, weeks, uni, sec, apply_costs=apply_costs,
-                              slip_k=slip_k, label=label)
+                              slip_k=slip_k, label=label, audit=audit)
 
-    bt = _run(P, label="SMOKE")
+    bt = _run(P, label="SMOKE", audit=True)      # 대표 실행만 감쇠 원장을 기록
     abl_df, dist_df = pd.DataFrame(), pd.DataFrame()
     s = perf_stats_w(bt["returns"])
     if not s or not np.isfinite(s.get("CAGR", np.nan)):
         LOG.error("스모크: 성과 지표를 계산하지 못했습니다.")
+        PIT.drop("dart_financials")
         return False
 
     if full_chain:
@@ -9415,6 +9508,7 @@ def run_selftest(full_chain: bool = False) -> bool:
             globals()["CREDIT_GRADE"], globals()["FLOW_GRADE"], globals()["WATCH_GRADE"] = _grade_keep
         LOG.info("※ 위 숫자는 전부 '합성데이터'입니다. 실데이터 결과가 아닙니다.")
 
+    PIT.drop("dart_financials")          # ★ 합성 등록 원복 (실데이터 실행 오염 방지)
     LOG.ok(f"스모크 통과 — 국면C {n_c:,}행 · 발화 {n_sig:,}행 · "
            f"CAGR(합성) {s.get('CAGR', float('nan')):.2%} · {time.time()-t0:.1f}s")
     return True
@@ -9874,6 +9968,17 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("L1.FLOW", "투자자유형별 일별 순매수 (M0)", "L1", budget_s=2400, critical=False):
         targets = select_flow_targets(ctx["px"], BACKTEST_START, BACKTEST_END)
+        if not targets:
+            # ★ 후보가 0이면 예전 코드는 `targets or 전 종목` 으로 전 종목을 받았다.
+            #   FLOW_MAX_CODES 상한을 우회하는 경로라, 가장 비싼 수집이 통제 없이 폭주한다.
+            #   대신 유동성 상위로 상한만큼만 받고, 왜 그렇게 됐는지 명시한다.
+            _amt0 = (ctx["px"].groupby("code", observed=True)["amount"].median()
+                     .sort_values(ascending=False))
+            _cap = FLOW_MAX_CODES if FLOW_MAX_CODES and FLOW_MAX_CODES > 0 else 600
+            targets = [str(c) for c in _amt0.index[:_cap]]
+            LOG.warn(f"수급 후보 선별이 0종목을 반환했습니다(가격 커버리지 부족 가능성). "
+                     f"전 종목을 받지 않고 유동성 상위 {len(targets):,}종목으로 제한합니다 — "
+                     f"상한 우회로 수집이 폭주하는 것을 막기 위함입니다.")
         ctx["flow_targets"] = targets
         _yrs = max(1, as_ts(BACKTEST_END).year - as_ts(BACKTEST_START).year + 3)
         _c2c0 = (ctx["sec"].dropna(subset=["corp_code"])
@@ -9882,8 +9987,8 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         preflight_estimate(len(ctx["sec"]), len(targets),
                            int(ctx["sec"]["corp_code"].notna().sum()), _yrs,
                            n_cand_corps=_ncand)
-        ctx["flows"] = fetch_investor_flows_daily(targets or ctx["sec"]["code"].tolist(),
-                                                  BACKTEST_START, BACKTEST_END, sec=ctx["sec"])
+        ctx["flows"] = fetch_investor_flows_daily(targets, BACKTEST_START, BACKTEST_END,
+                                                  sec=ctx["sec"])
 
     with PIPE.stage("L1.SHARES", "상장주식수 (DART 주식총수 우선 · PIT)", "L1", budget_s=1200,
                     critical=False):
@@ -9917,6 +10022,20 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         ctx["dart_shares"] = fetch_dart_shares(_corps, _years, corp_years=_cy or None)
         ctx["shares"] = fetch_shares_outstanding(months, sec=ctx["sec"],
                                                  dart_shares=ctx.get("dart_shares"))
+        _sh = ctx["shares"]
+        _cov = (float(_sh["code"].nunique()) / max(int(ctx["sec"]["code"].nunique()), 1)
+                if _sh is not None and len(_sh) else 0.0)
+        LOG.table([["주식수 확보 종목", f"{0 if _sh is None else _sh['code'].nunique():,}"],
+                   ["전체 종목", f"{ctx['sec']['code'].nunique():,}"],
+                   ["커버리지", f"{_cov:.1%}"]],
+                  ["PIT 시가총액 분모", "값"], ["l", "r"],
+                  title="시총 분모 커버리지 — 낮으면 규모축이 사실상 '유동성축'이 된다")
+        if _cov < 0.5:
+            LOG.warn(f"주식수 커버리지가 {_cov:.0%} 입니다. 나머지 종목의 규모는 거래대금×보정으로 "
+                     f"대리되므로, '상위 250 제외'와 '스몰캡 하위 N' 이 부분적으로 유동성 기준이 "
+                     f"됩니다. 스몰캡 비교 결과를 '소형주 대 대형주'가 아니라 "
+                     f"'비유동 대 유동'으로도 읽힐 수 있다는 점을 감안하세요. "
+                     f"(USE_DART_SHARES=True 와 DART 키가 있으면 후보 종목은 실측치로 채워집니다)")
 
     with PIPE.stage("L1.CREDIT", "신용융자잔고 ★핵심 (M1)", "L1", budget_s=2400, critical=False):
         ctx["credit"] = fetch_credit_balance(ctx["px"], ctx.get("flows", pd.DataFrame()),
@@ -10092,6 +10211,7 @@ def build_signal_panel(ctx: dict, weeks: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         ctx["research_panel"] = build_research_panel(ctx.get("links", pd.DataFrame()), P, weeks)
         P = apply_vetoes(P, ctx)
         P = build_tps(P)
+        check_tp_degeneracy()          # 등급 조합이 특정 TP 를 무의미하게 만들었는지 판정
         P = assemble_score(P)
         P = downcast(P)
         audit_research_wiring(ctx.get("reports", pd.DataFrame()),

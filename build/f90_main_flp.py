@@ -214,6 +214,17 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("L1.FLOW", "투자자유형별 일별 순매수 (M0)", "L1", budget_s=2400, critical=False):
         targets = select_flow_targets(ctx["px"], BACKTEST_START, BACKTEST_END)
+        if not targets:
+            # ★ 후보가 0이면 예전 코드는 `targets or 전 종목` 으로 전 종목을 받았다.
+            #   FLOW_MAX_CODES 상한을 우회하는 경로라, 가장 비싼 수집이 통제 없이 폭주한다.
+            #   대신 유동성 상위로 상한만큼만 받고, 왜 그렇게 됐는지 명시한다.
+            _amt0 = (ctx["px"].groupby("code", observed=True)["amount"].median()
+                     .sort_values(ascending=False))
+            _cap = FLOW_MAX_CODES if FLOW_MAX_CODES and FLOW_MAX_CODES > 0 else 600
+            targets = [str(c) for c in _amt0.index[:_cap]]
+            LOG.warn(f"수급 후보 선별이 0종목을 반환했습니다(가격 커버리지 부족 가능성). "
+                     f"전 종목을 받지 않고 유동성 상위 {len(targets):,}종목으로 제한합니다 — "
+                     f"상한 우회로 수집이 폭주하는 것을 막기 위함입니다.")
         ctx["flow_targets"] = targets
         _yrs = max(1, as_ts(BACKTEST_END).year - as_ts(BACKTEST_START).year + 3)
         _c2c0 = (ctx["sec"].dropna(subset=["corp_code"])
@@ -222,8 +233,8 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         preflight_estimate(len(ctx["sec"]), len(targets),
                            int(ctx["sec"]["corp_code"].notna().sum()), _yrs,
                            n_cand_corps=_ncand)
-        ctx["flows"] = fetch_investor_flows_daily(targets or ctx["sec"]["code"].tolist(),
-                                                  BACKTEST_START, BACKTEST_END, sec=ctx["sec"])
+        ctx["flows"] = fetch_investor_flows_daily(targets, BACKTEST_START, BACKTEST_END,
+                                                  sec=ctx["sec"])
 
     with PIPE.stage("L1.SHARES", "상장주식수 (DART 주식총수 우선 · PIT)", "L1", budget_s=1200,
                     critical=False):
@@ -257,6 +268,20 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         ctx["dart_shares"] = fetch_dart_shares(_corps, _years, corp_years=_cy or None)
         ctx["shares"] = fetch_shares_outstanding(months, sec=ctx["sec"],
                                                  dart_shares=ctx.get("dart_shares"))
+        _sh = ctx["shares"]
+        _cov = (float(_sh["code"].nunique()) / max(int(ctx["sec"]["code"].nunique()), 1)
+                if _sh is not None and len(_sh) else 0.0)
+        LOG.table([["주식수 확보 종목", f"{0 if _sh is None else _sh['code'].nunique():,}"],
+                   ["전체 종목", f"{ctx['sec']['code'].nunique():,}"],
+                   ["커버리지", f"{_cov:.1%}"]],
+                  ["PIT 시가총액 분모", "값"], ["l", "r"],
+                  title="시총 분모 커버리지 — 낮으면 규모축이 사실상 '유동성축'이 된다")
+        if _cov < 0.5:
+            LOG.warn(f"주식수 커버리지가 {_cov:.0%} 입니다. 나머지 종목의 규모는 거래대금×보정으로 "
+                     f"대리되므로, '상위 250 제외'와 '스몰캡 하위 N' 이 부분적으로 유동성 기준이 "
+                     f"됩니다. 스몰캡 비교 결과를 '소형주 대 대형주'가 아니라 "
+                     f"'비유동 대 유동'으로도 읽힐 수 있다는 점을 감안하세요. "
+                     f"(USE_DART_SHARES=True 와 DART 키가 있으면 후보 종목은 실측치로 채워집니다)")
 
     with PIPE.stage("L1.CREDIT", "신용융자잔고 ★핵심 (M1)", "L1", budget_s=2400, critical=False):
         ctx["credit"] = fetch_credit_balance(ctx["px"], ctx.get("flows", pd.DataFrame()),
@@ -432,6 +457,7 @@ def build_signal_panel(ctx: dict, weeks: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         ctx["research_panel"] = build_research_panel(ctx.get("links", pd.DataFrame()), P, weeks)
         P = apply_vetoes(P, ctx)
         P = build_tps(P)
+        check_tp_degeneracy()          # 등급 조합이 특정 TP 를 무의미하게 만들었는지 판정
         P = assemble_score(P)
         P = downcast(P)
         audit_research_wiring(ctx.get("reports", pd.DataFrame()),

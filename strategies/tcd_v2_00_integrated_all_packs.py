@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "INTEGRATED"
 STRATEGY_NAME      = "통합 (전 센서팩)"
 ACTIVE_PACKS       = ["C", "N", "D", "X", "P"]
-BUILD_VERSION      = "v2.20260808.0433"
+BUILD_VERSION      = "v2.20260808.0440"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -5188,6 +5188,12 @@ class PITStore:
         self._meta[name] = {"rows": len(d), "keys": list(key_cols), "empty": False,
                             "kd_min": d["knowledge_date"].min(), "kd_max": d["knowledge_date"].max()}
         PIPE.io("OUT", "MEM", f"PIT:{name}", d)
+
+    def drop(self, name: str) -> None:
+        """등록을 되돌린다. 합성 스모크가 남긴 테이블이 실데이터 실행에 섞이면
+        '재무 없음' 경고가 사라진 채 전 종목 결측으로 조용히 진행된다."""
+        self._t.pop(name, None)
+        self._meta.pop(name, None)
 
     def has(self, name: str) -> bool:
         return name in self._t and not self._meta.get(name, {}).get("empty", True)

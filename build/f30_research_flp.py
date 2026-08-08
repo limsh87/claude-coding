@@ -104,15 +104,18 @@ def audit_research_wiring(rep: pd.DataFrame, A: pd.DataFrame, L: pd.DataFrame,
          "증권사 사명 정규화 + 동명이인 분리"],
         ["보고서×애널 링크(L)", f"{len(L):,}행" if L is not None else "없음",
          "목표주가 리비전의 유일한 근거"],
-        ["패널 결합 결과", f"{int(panel['rs_cov_90d'].notna().sum()):,}행" if
-         panel is not None and "rs_cov_90d" in panel.columns else "0행",
+        # ★ rs_cov_90d 는 전 행에 0.0 으로 채워지므로 notna() 로 세면 항상 '전체 행수'가 되어
+        #   배선 단절 센티널이 영원히 발화하지 않는다. '실제로 커버리지가 있는' 행을 센다.
+        ["패널 결합 결과(커버리지>0)",
+         f"{int((panel['rs_cov_90d'].fillna(0) > 0).sum()):,}행" if
+         panel is not None and "rs_cov_90d" in getattr(panel, "columns", []) else "0행",
          "여기가 0이면 수집이 아니라 '배선'이 끊긴 것"],
     ]
     LOG.table(rows, ["단계", "규모", "의미"], ["l", "r", "l"],
               title="애널리스트 리포트 → 전략 배선 점검 (다중소스 원장 연결)")
     if (rep is not None and len(rep) > 0 and
             (panel is None or "rs_cov_90d" not in getattr(panel, "columns", []) or
-             int(panel["rs_cov_90d"].notna().sum()) == 0)):
+             int((panel["rs_cov_90d"].fillna(0) > 0).sum()) == 0)):
         LOG.warn("리포트는 수집됐는데 패널에 한 건도 결합되지 않았습니다. "
                  "종목코드 정규화(6자리) 또는 발간일 파싱을 먼저 의심하세요 — "
                  "'데이터 부재'가 아니라 '배선 결함'입니다.")

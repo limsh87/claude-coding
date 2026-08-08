@@ -116,6 +116,9 @@ def run_selftest(full_chain: bool = False) -> bool:
     S = make_synthetic_flp(n_codes=(120 if full_chain else 60),
                            n_days=(900 if full_chain else 460))
     px, sec = S["px"], S["sec"]
+    # ★ 합성 재무를 전역 PIT 에 올린다. 이 등록은 반드시 끝에서 되돌린다(아래 finally) —
+    #   남겨두면 실데이터 실행에서 PIT.has("dart_financials") 가 True 가 되어
+    #   "DART 재무가 없어 방화벽이 비활성" 경고가 사라지고, 결측인 채로 조용히 진행된다.
     PIT.register("dart_financials",
                  pit_frame(S["fin"], "period_end", "knowledge_date", source="synth"),
                  key_cols=["corp_code"])
@@ -124,6 +127,7 @@ def run_selftest(full_chain: bool = False) -> bool:
     P = build_flp_panel(px, S["credit"], S["flows"], S["shares"], weeks, uni)
     if P.empty:
         LOG.error("스모크: 주간 패널이 비었습니다.")
+        PIT.drop("dart_financials")
         return False
     P = apply_universe_bands(P)
     P = build_cells_flp(P, sec)
@@ -142,17 +146,19 @@ def run_selftest(full_chain: bool = False) -> bool:
     if n_sig == 0:
         LOG.error(f"스모크: 신호가 한 건도 발화하지 않았습니다 (국면C {n_c}행). "
                   f"게이트 중 하나가 항상 0 이면 실데이터에서도 영구 무발화입니다.")
+        PIT.drop("dart_financials")
         return False
 
-    def _run(pp, label="smoke", apply_costs=True, slip_k=SLIPPAGE_K):
+    def _run(pp, label="smoke", apply_costs=True, slip_k=SLIPPAGE_K, audit=False):
         return run_backtest_w(pp, weeks, uni, sec, apply_costs=apply_costs,
-                              slip_k=slip_k, label=label)
+                              slip_k=slip_k, label=label, audit=audit)
 
-    bt = _run(P, label="SMOKE")
+    bt = _run(P, label="SMOKE", audit=True)      # 대표 실행만 감쇠 원장을 기록
     abl_df, dist_df = pd.DataFrame(), pd.DataFrame()
     s = perf_stats_w(bt["returns"])
     if not s or not np.isfinite(s.get("CAGR", np.nan)):
         LOG.error("스모크: 성과 지표를 계산하지 못했습니다.")
+        PIT.drop("dart_financials")
         return False
 
     if full_chain:
@@ -208,6 +214,7 @@ def run_selftest(full_chain: bool = False) -> bool:
             globals()["CREDIT_GRADE"], globals()["FLOW_GRADE"], globals()["WATCH_GRADE"] = _grade_keep
         LOG.info("※ 위 숫자는 전부 '합성데이터'입니다. 실데이터 결과가 아닙니다.")
 
+    PIT.drop("dart_financials")          # ★ 합성 등록 원복 (실데이터 실행 오염 방지)
     LOG.ok(f"스모크 통과 — 국면C {n_c:,}행 · 발화 {n_sig:,}행 · "
            f"CAGR(합성) {s.get('CAGR', float('nan')):.2%} · {time.time()-t0:.1f}s")
     return True

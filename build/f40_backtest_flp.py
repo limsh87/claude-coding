@@ -168,10 +168,15 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             prev_w = dict(frozen)
             continue
 
+        # ★ 진입 자격은 '신호' 하나로만 판단한다.
+        #   assemble_score 가 이미 방화벽·거부권·밴드를 Signal 에 곱해 넣었으므로
+        #   (게이트에 걸리면 Signal 이 정확히 0), 엔진이 같은 게이트를 다시 적용하면
+        #   R5 절제의 "방화벽 off"·"거부권 off" arm 이 수학적으로 무의미해진다
+        #   (게이트를 빼고 채점해도 엔진이 도로 걸러내므로 ΔCAGR 이 항상 0 → 절제표가
+        #    "방화벽은 기여가 없다"고 거짓 보고한다). 청산 쪽 FIREWALL_HARD 는 그대로다.
         fresh_px = (sub["stale_days"] <= 3) if "stale_days" in sub.columns else True
-        elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
-                   sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna() &
-                   fresh_px]
+        elig = sub[sub[signal_col].notna() & (sub[signal_col] > 0) &
+                   sub["exec_px"].notna() & fresh_px]
         if uni is not None and audit:
             uni.audit_row("유동성필터", w, sub[sub["V6"] == 1]["code"].tolist())
             uni.audit_row("낙폭조건", w, sub[(sub["V6"] == 1) &
@@ -393,7 +398,11 @@ def benchmark_returns_w(weeks: pd.DatetimeIndex, P: Optional[pd.DataFrame] = Non
         eqw = (P[P["in_band"] == 1].groupby("wk", observed=True)["fwd_ret"].mean()
                if "in_band" in P.columns else P.groupby("wk", observed=True)["fwd_ret"].mean())
         out["유니버스 동일가중"] = eqw.reindex(weeks)
-    if not out:
-        LOG.warn("벤치마크를 하나도 받지 못했습니다 — R0 는 유니버스 동일가중만으로 판정합니다. "
-                 "수치를 임의로 채워 넣지 않습니다(§1-5).")
+    idx_missing = [n for n in ("KOSPI", "KOSDAQ") if n not in out]
+    if idx_missing:
+        # ★ '유니버스 동일가중'이 항상 채워지므로 out 이 비는 일은 없다 → 지수 결측을
+        #   따로 경고하지 않으면 R0·R7·R12 가 조용히 '자기 유니버스와만' 비교하게 된다.
+        LOG.warn(f"지수 벤치마크 {idx_missing} 를 받지 못했습니다 — R0/R7/R12 는 "
+                 f"'유니버스 동일가중'만으로 판정합니다. 전략을 자기 유니버스와 비교하는 것은 "
+                 f"시장 대비 성과가 아니므로 해석에 반드시 반영하세요(수치를 임의로 채우지 않습니다).")
     return out

@@ -13,7 +13,8 @@
 
 CREDIT_GRADE = "UNKNOWN"          # PRIMARY_DAILY / FALLBACK_A_WEEKLY / FALLBACK_B_PROXY / NONE
 CREDIT_SOURCE_NOTE = ""
-FLOW_GRADE = "UNKNOWN"            # FULL(개인/기관/외국인) / PARTIAL(개인 없음) / NONE
+FLOW_GRADE = "UNKNOWN"            # FULL / APPROX(개인=근사) / PARTIAL / NONE
+FLOW_APPROX = False               # 개인이 -(기관+외국인) 근사인가 (퇴화 판정의 근거)
 WATCH_GRADE = "UNKNOWN"           # OK / PARTIAL / NONE
 CANARY: "OrderedDict[str, dict]" = OrderedDict()
 
@@ -283,6 +284,7 @@ def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str,
     has_retail = float(F["retail_net"].notna().mean())
     approx = float(F.get("src", pd.Series("", index=F.index)).astype(str)
                     .str.contains("근사").mean())
+    globals()["FLOW_APPROX"] = bool(approx >= 0.5)
     FLOW_GRADE = ("FULL" if (has_retail > 0.5 and approx < 0.5)
                   else ("APPROX" if has_retail > 0.5 else ("PARTIAL" if len(F) else "NONE")))
     if FLOW_GRADE == "APPROX":
@@ -542,6 +544,12 @@ def fetch_credit_balance(px: pd.DataFrame, flows: pd.DataFrame,
             LOG.error("신용잔고도, 프록시의 재료인 개인 순매수도 없습니다. f_cr 계열 전부 결측입니다.")
             return pd.DataFrame(columns=CREDIT_COLS)
         CREDIT_GRADE = "FALLBACK_B_PROXY"
+        if FLOW_APPROX:
+            LOG.error("★★ 이중 퇴화 경고: 신용잔고가 프록시(개인 순매수 누적)인데 그 '개인'조차 "
+                      "-(기관+외국인) 근사입니다. 그러면 f_cr · f_ret_ex · f_inst 가 사실상 "
+                      "같은 시계열(기관+외국인 순매수)의 변형이 되고, TP_F2(개인이탈×기관유입)는 "
+                      "자기 자신과의 곱으로 퇴화합니다 — 신호처럼 보이지만 아무 정보가 없습니다. "
+                      "해당 TP 를 산식에서 제외하고 그 사실을 리포트에 남깁니다.")
         LOG.warn("★ 신용잔고를 직접 얻는 방법(권장, 5분): data.krx.co.kr 접속 → [통계] → "
                  "[시장정보] → '신용거래융자 잔고' 화면에서 기간을 지정해 CSV/XLSX 를 내려받아 "
                  f"{CREDIT_MANUAL_DIRS[0]} 폴더에 넣어두세요. 다음 실행에서 자동 인식되어 "

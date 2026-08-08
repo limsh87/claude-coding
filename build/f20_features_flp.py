@@ -12,6 +12,26 @@
 SENSOR_COLS = ["f_dd", "f_dd_spd", "f_cr", "f_cr_pctl", "f_cr_chg", "f_cr_chg_slow",
                "f_retail", "f_inst", "f_ret_ex", "f_vol", "f_turn"]
 TP_COLS = ["TP_F1", "TP_F2", "TP_F3", "TP_F4"]
+# 데이터 등급 때문에 '수학적으로 퇴화'한 TP 는 산식에서 뺀다(있는 척하지 않는다).
+EXCLUDED_TPS: List[str] = []
+
+
+def check_tp_degeneracy() -> None:
+    """등급 조합이 특정 TP 를 무의미하게 만드는 경우를 판정한다.
+
+    ★ 실제 위험: 신용잔고가 프록시(개인 순매수 누적)이고 그 '개인'이 -(기관+외국인) 근사이면
+      f_cr, f_ret_ex, f_inst 가 모두 (기관+외국인 순매수)의 부호·창 변형이 된다.
+      그러면 TP_F2 = tp(f_ret_ex, f_inst) 는 사실상 tp(x, x) 이고, 값은 크게 나오지만
+      '소유권 이전'을 전혀 관측하지 않는다. 조용히 두면 그 자체가 가짜 신호다."""
+    EXCLUDED_TPS.clear()
+    if CREDIT_GRADE == "FALLBACK_B_PROXY" and FLOW_APPROX:
+        EXCLUDED_TPS.append("TP_F2")
+        LOG.warn("TP_F2(개인 이탈 × 기관 유입)를 산식에서 제외합니다 — 신용잔고 프록시와 "
+                 "개인 근사가 겹쳐 두 축이 같은 시계열이 되었습니다(자기 자신과의 곱). "
+                 "E 는 남은 TP 들의 평균으로 계산되며, 이 사실은 해석표에도 표기됩니다.")
+    if EXCLUDED_TPS:
+        LOG.table([[c, "제외", "데이터 등급으로 인해 퇴화"] for c in EXCLUDED_TPS],
+                  ["TP", "상태", "사유"], ["l", "c", "l"], title="TP 퇴화 판정")
 
 
 def week_grid(start: str, end: str, px: pd.DataFrame) -> pd.DatetimeIndex:
@@ -115,11 +135,16 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
     #   2,500종목·650만행이면 7회 × 650만 = 4,500만 비교. 코드로 정렬해 두고 위치로 잘라내면
     #   같은 결과를 한 번의 정렬 비용으로 얻는다. 신용/수급/주식수도 동일하게 처리한다.
     def _slicer(df: pd.DataFrame):
+        """★ 이미 code 로 정렬된 프레임을 또 정렬하면 전체 복사본이 하나 더 생긴다.
+        650만행 가격 프레임에서 이것만으로 수 GB 가 더 잡혀 청크 처리의 목적을 깨뜨린다.
+        → 정렬 여부를 먼저 확인하고, 필요할 때만 정렬한다."""
         if df is None or not len(df):
             return None
-        d0 = df.sort_values(["code"], kind="stable").reset_index(drop=True)
-        codes_arr = d0["code"].to_numpy()
-        return d0, codes_arr
+        codes_arr = df["code"].to_numpy()
+        if len(codes_arr) > 1 and not pd.Index(codes_arr).is_monotonic_increasing:
+            df = df.sort_values(["code"], kind="stable")
+            codes_arr = df["code"].to_numpy()
+        return df, codes_arr
 
     _px_s = _slicer(px)
     _cr_s = _slicer(cr)
@@ -609,7 +634,7 @@ def assemble_score(P: pd.DataFrame, use_tps: Optional[Sequence[str]] = None,
     P = P.copy()
     if not all(c in P.columns for c in TP_COLS):
         P = build_tps(P)
-    cols = list(use_tps) if use_tps else TP_COLS
+    cols = list(use_tps) if use_tps else [c for c in TP_COLS if c not in EXCLUDED_TPS]
     P["E"] = nanmean_cols(P, cols)
     P["E_rank"] = P.groupby("wk", observed=True)["E"].rank(pct=True)
     gate = P[band_col].astype(float) if band_col in P.columns else P["in_band"].astype(float)
