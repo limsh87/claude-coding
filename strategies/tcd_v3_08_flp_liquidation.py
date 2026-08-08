@@ -208,7 +208,7 @@ ACTIVE_PACKS    = ["F"]
 
 STRATEGY_ID   = "TCD_V3_FLP"
 STRATEGY_NAME = "FLP 강제매도 소진 (Forced Liquidation Exhaustion)"
-BUILD_VERSION = "v2.20260808.0407"
+BUILD_VERSION = "v2.20260808.0415"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -6895,13 +6895,19 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
     P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).fillna(False).astype(int)
 
-    # ── 비교군: 스몰캡 밴드 (매 시점 시총 하위 N) ─────────────────────────────────────
-    #   '작은 쪽에서 N번째까지'를 매 시점 다시 센다. 현재 시총으로 과거를 정의하지 않는다(C13).
-    small_rank = (P.groupby("wk", observed=True)["size_est"]
-                   .rank(ascending=True, method="first"))
+    # ── 비교군: 스몰캡 밴드 (매 시점 '투자 가능한 종목 중' 시총 하위 N) ────────────────
+    #   ★ 전체 단면에서 하위 N 을 세고 나서 유동성 필터를 걸면, 하위 꼬리를 채우는 것이
+    #     대부분 거래대금 미달 종목이라 실제 밴드가 N 보다 훨씬 작아지고 그 폭이 주마다
+    #     들쭉날쭉해진다("하위 1000" 이라는 이름과 실물이 달라진다).
+    #     → 진입 자격(유동성 ∧ 대형주 제외)을 먼저 적용하고, 그 안에서 하위 N 을 센다.
+    elig_small = (P["V6"] == 1) & (P["mcap_rank"] > cut)
+    small_rank = pd.Series(np.nan, index=P.index, dtype=float)
+    if elig_small.any():
+        small_rank[elig_small] = (P.loc[elig_small].groupby("wk", observed=True)["size_est"]
+                                  .rank(ascending=True, method="first"))
     P["small_rank"] = small_rank
-    P["in_band_small"] = ((small_rank <= SMALLCAP_BOTTOM_N) & (P["V6"] == 1) &
-                          (P["mcap_rank"] > cut)).fillna(False).astype(int)
+    P["in_band_small"] = (elig_small & (small_rank <= SMALLCAP_BOTTOM_N)
+                          ).fillna(False).astype(int)
     return P
 
 
@@ -7400,7 +7406,12 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
                    top_pct: float = PORTFOLIO_TOP_PCT, apply_costs: bool = True,
                    slip_k: float = SLIPPAGE_K, label: str = "FLP",
                    exit_cr: float = EXIT_CR_PCTL,
-                   hold_max: int = HOLD_MAX_WEEKS) -> dict:
+                   hold_max: int = HOLD_MAX_WEEKS, audit: bool = False) -> dict:
+    """audit=True 는 '대표 실행' 하나에만 준다.
+
+    ★ 감쇠 원장(uni.attrition)은 append-only 라, 강건성 arm 20여 회와 스몰캡 비교까지
+      전부 기록하면 §10.4 감쇠표가 '여러 전략의 평균'이 되어 아무 것도 뜻하지 않게 된다.
+    """
     mkt = (sec.set_index("code")["market"].astype(str).to_dict()
            if sec is not None and len(sec) and "market" in sec.columns else {})
     delist = uni.delisting_map() if uni is not None else {}
@@ -7482,7 +7493,7 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
                    sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna() &
                    fresh_px]
-        if uni is not None:
+        if uni is not None and audit:
             uni.audit_row("유동성필터", w, sub[sub["V6"] == 1]["code"].tolist())
             uni.audit_row("낙폭조건", w, sub[(sub["V6"] == 1) &
                                              (sub["f_dd"] < PH_DD_ENTER)]["code"].tolist())
@@ -7494,7 +7505,7 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
                                              round(len(elig) * top_pct))))
         pick = _top_n(elig, min(k, len(elig)), signal_col)
-        if uni is not None:
+        if uni is not None and audit:
             uni.audit_row("최종선정", w, pick["code"].tolist())
 
         # ── ② 청산 판정 (진입 논리와 같은 언어로) ──────────────────────────────────────
@@ -7776,8 +7787,10 @@ def R2F_exhaustion_vs_drawdown(P: pd.DataFrame, run_fn: Callable,
     B = classify_phase(base, use_dd=False)
     B = assemble_score(B, use_tps=["TP_F2", "TP_F4"], band_col=band_col, quiet=True)
 
-    # C: 전체
-    C = base
+    # C: 전체 — ★ 반드시 A/B 와 '같은 밴드'로 새로 채점한다.
+    #   호출자가 넘긴 P 의 Signal 은 기본 밴드(in_band)로 매겨진 값이다. 그대로 쓰면
+    #   스몰캡 R2-F 가 '스몰캡 A/B vs 전체 C' 를 비교하게 되어 판정이 통째로 무효가 된다.
+    C = assemble_score(base, band_col=band_col, quiet=True)
 
     bts = {}
     for lab, pp in (("A_낙폭과대단독", A), ("B_소진단독", B), ("C_FLP전체", C)):
@@ -8808,6 +8821,52 @@ def run_contract_tests(strict: bool = True) -> bool:
                 f"{n:,}종목 중 스몰캡 {n_small:,}종목(상한 {SMALLCAP_BOTTOM_N:,}) · "
                 f"선택 최대시총 {max_in:.3g} ≤ 제외 최소시총 {min_out:.3g}")
 
+    def c_r2f_band():
+        """★ 라운드3 리뷰가 잡은 결함의 회귀 방지:
+        R2-F 를 스몰캡 밴드로 호출하면 A·B 는 그 밴드로 재채점되는데 C 만 호출자가
+        이미 매겨둔 '전체 밴드' 신호를 그대로 썼다. 그러면 '스몰캡 A/B vs 전체 C' 를
+        비교하게 되어 판정 자체가 무효다. 세 arm 이 같은 밴드를 쓰는지 검증한다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=12, freq="W-FRI"))
+        codes = [f"{700000+i:06d}" for i in range(30)]
+        rows = []
+        for w in wks:
+            for i, c in enumerate(codes):
+                rows.append({
+                    "code": c, "wk": w, "exec_px": 1000.0 + i, "fwd_ret": 0.001 * (i % 5),
+                    "adv20": 1e10, "FIREWALL": 1, "FIREWALL_HARD": 1, "VETO": 1, "V6": 1,
+                    "in_band": 1, "in_band_small": 1 if i < 10 else 0,   # 작은 10종목만
+                    "f_dd": -0.4, "f_dd_spd": -0.05, "f_cr_pctl": 0.1, "f_cr_chg": 0.0,
+                    "f_cr_chg_slow": 0.0, "f_retail": -1e-4, "f_inst": 1e-4,
+                    "f_ret_ex": 1e-4, "f_vol": -0.01, "f_turn": 1.2,
+                    "cell": "X", "cell_l2": "Y", "cell_l3": "Z",
+                    "TP_F1": 0.2 + i / 100, "TP_F2": 0.2, "TP_F3": 0.2, "TP_F4": 0.2,
+                    "PHASE_C": 1, "stale_days": 0})
+        P = pd.DataFrame(rows)
+        P = assemble_score(P, quiet=True)                 # 전체 밴드로 채점된 상태(호출자 패널)
+        sec = pd.DataFrame({"code": codes, "name": codes, "market": "KOSDAQ",
+                            "listing_date": pd.Timestamp("2015-01-01"), "delisting_date": pd.NaT})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": list(wks) * 30, "code": sorted(codes * 12)}))
+        _run = lambda pp, label="x", **kw: run_backtest_w(pp, wks, uni, sec, apply_costs=False,
+                                                          label=label)
+        keep_stop = globals().get("STOP_ON_KILL_CRITERIA", True)
+        globals()["STOP_ON_KILL_CRITERIA"] = False
+        try:
+            out = R2F_exhaustion_vs_drawdown(P, _run, band_col="in_band_small")
+        finally:
+            globals()["STOP_ON_KILL_CRITERIA"] = keep_stop
+        small = set(codes[:10])
+        bad = {}
+        for lab, bt in (out.get("bts") or {}).items():
+            H = bt.get("holdings")
+            if H is None or H.empty:
+                continue
+            outside = set(H["code"]) - small
+            if outside:
+                bad[lab] = len(outside)
+        return (not bad,
+                f"세 arm 모두 스몰캡 밴드 내에서만 선정 (밴드 밖 편입: {bad or '없음'})")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -8880,6 +8939,7 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("GAP", "거래정지 구간 손실을 재개 주에 실현 (회귀 방지)", c_halt_gap)
     _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
     _c("SMALL", "스몰캡 밴드 = 시총 하위 N ∧ 전체 밴드의 부분집합", c_small)
+    _c("R2FB", "R2-F 세 비교군이 같은 밴드를 쓴다 (회귀 방지)", c_r2f_band)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)
@@ -9727,9 +9787,9 @@ def main() -> dict:
 
     P, uni = build_signal_panel(ctx, weeks)
 
-    def _run(pp, label="run", apply_costs=True, slip_k=SLIPPAGE_K):
+    def _run(pp, label="run", apply_costs=True, slip_k=SLIPPAGE_K, audit=False):
         return run_backtest_w(pp, weeks, uni, ctx["sec"], apply_costs=apply_costs,
-                              slip_k=slip_k, label=label)
+                              slip_k=slip_k, label=label, audit=audit)
 
     universes = OrderedDict([("전체 유니버스(상위250 제외)", "in_band")])
     if RUN_SMALLCAP_COMPARE and "in_band_small" in P.columns:
@@ -9739,7 +9799,7 @@ def main() -> dict:
     with PIPE.stage("L3.BT", "주간 백테스트 (유니버스별)", "L3", budget_s=900):
         for lab, band in universes.items():
             PP = P if band == "in_band" else assemble_score(slim_panel(P), band_col=band)
-            b = _run(PP, label=f"{STRATEGY_ID}:{band}")
+            b = _run(PP, label=f"{STRATEGY_ID}:{band}", audit=(band == "in_band"))
             runs[lab] = {"panel": PP, "bt": b, "band": band,
                          "stat": perf_stats_w(b["returns"])}
             LOG.ok(f"[{lab}] 백테스트 완료 — 평균 {runs[lab]['stat'].get('평균종목수', 0):.1f}종목")

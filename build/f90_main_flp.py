@@ -426,9 +426,9 @@ def main() -> dict:
 
     P, uni = build_signal_panel(ctx, weeks)
 
-    def _run(pp, label="run", apply_costs=True, slip_k=SLIPPAGE_K):
+    def _run(pp, label="run", apply_costs=True, slip_k=SLIPPAGE_K, audit=False):
         return run_backtest_w(pp, weeks, uni, ctx["sec"], apply_costs=apply_costs,
-                              slip_k=slip_k, label=label)
+                              slip_k=slip_k, label=label, audit=audit)
 
     universes = OrderedDict([("전체 유니버스(상위250 제외)", "in_band")])
     if RUN_SMALLCAP_COMPARE and "in_band_small" in P.columns:
@@ -438,7 +438,7 @@ def main() -> dict:
     with PIPE.stage("L3.BT", "주간 백테스트 (유니버스별)", "L3", budget_s=900):
         for lab, band in universes.items():
             PP = P if band == "in_band" else assemble_score(slim_panel(P), band_col=band)
-            b = _run(PP, label=f"{STRATEGY_ID}:{band}")
+            b = _run(PP, label=f"{STRATEGY_ID}:{band}", audit=(band == "in_band"))
             runs[lab] = {"panel": PP, "bt": b, "band": band,
                          "stat": perf_stats_w(b["returns"])}
             LOG.ok(f"[{lab}] 백테스트 완료 — 평균 {runs[lab]['stat'].get('평균종목수', 0):.1f}종목")

@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "INTEGRATED"
 STRATEGY_NAME      = "통합 (전 센서팩)"
 ACTIVE_PACKS       = ["C", "N", "D", "X", "P"]
-BUILD_VERSION      = "v2.20260808.0407"
+BUILD_VERSION      = "v2.20260808.0415"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗

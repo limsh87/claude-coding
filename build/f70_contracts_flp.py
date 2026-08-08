@@ -319,6 +319,52 @@ def run_contract_tests(strict: bool = True) -> bool:
                 f"{n:,}종목 중 스몰캡 {n_small:,}종목(상한 {SMALLCAP_BOTTOM_N:,}) · "
                 f"선택 최대시총 {max_in:.3g} ≤ 제외 최소시총 {min_out:.3g}")
 
+    def c_r2f_band():
+        """★ 라운드3 리뷰가 잡은 결함의 회귀 방지:
+        R2-F 를 스몰캡 밴드로 호출하면 A·B 는 그 밴드로 재채점되는데 C 만 호출자가
+        이미 매겨둔 '전체 밴드' 신호를 그대로 썼다. 그러면 '스몰캡 A/B vs 전체 C' 를
+        비교하게 되어 판정 자체가 무효다. 세 arm 이 같은 밴드를 쓰는지 검증한다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=12, freq="W-FRI"))
+        codes = [f"{700000+i:06d}" for i in range(30)]
+        rows = []
+        for w in wks:
+            for i, c in enumerate(codes):
+                rows.append({
+                    "code": c, "wk": w, "exec_px": 1000.0 + i, "fwd_ret": 0.001 * (i % 5),
+                    "adv20": 1e10, "FIREWALL": 1, "FIREWALL_HARD": 1, "VETO": 1, "V6": 1,
+                    "in_band": 1, "in_band_small": 1 if i < 10 else 0,   # 작은 10종목만
+                    "f_dd": -0.4, "f_dd_spd": -0.05, "f_cr_pctl": 0.1, "f_cr_chg": 0.0,
+                    "f_cr_chg_slow": 0.0, "f_retail": -1e-4, "f_inst": 1e-4,
+                    "f_ret_ex": 1e-4, "f_vol": -0.01, "f_turn": 1.2,
+                    "cell": "X", "cell_l2": "Y", "cell_l3": "Z",
+                    "TP_F1": 0.2 + i / 100, "TP_F2": 0.2, "TP_F3": 0.2, "TP_F4": 0.2,
+                    "PHASE_C": 1, "stale_days": 0})
+        P = pd.DataFrame(rows)
+        P = assemble_score(P, quiet=True)                 # 전체 밴드로 채점된 상태(호출자 패널)
+        sec = pd.DataFrame({"code": codes, "name": codes, "market": "KOSDAQ",
+                            "listing_date": pd.Timestamp("2015-01-01"), "delisting_date": pd.NaT})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": list(wks) * 30, "code": sorted(codes * 12)}))
+        _run = lambda pp, label="x", **kw: run_backtest_w(pp, wks, uni, sec, apply_costs=False,
+                                                          label=label)
+        keep_stop = globals().get("STOP_ON_KILL_CRITERIA", True)
+        globals()["STOP_ON_KILL_CRITERIA"] = False
+        try:
+            out = R2F_exhaustion_vs_drawdown(P, _run, band_col="in_band_small")
+        finally:
+            globals()["STOP_ON_KILL_CRITERIA"] = keep_stop
+        small = set(codes[:10])
+        bad = {}
+        for lab, bt in (out.get("bts") or {}).items():
+            H = bt.get("holdings")
+            if H is None or H.empty:
+                continue
+            outside = set(H["code"]) - small
+            if outside:
+                bad[lab] = len(outside)
+        return (not bad,
+                f"세 arm 모두 스몰캡 밴드 내에서만 선정 (밴드 밖 편입: {bad or '없음'})")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -391,6 +437,7 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("GAP", "거래정지 구간 손실을 재개 주에 실현 (회귀 방지)", c_halt_gap)
     _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
     _c("SMALL", "스몰캡 밴드 = 시총 하위 N ∧ 전체 밴드의 부분집합", c_small)
+    _c("R2FB", "R2-F 세 비교군이 같은 밴드를 쓴다 (회귀 방지)", c_r2f_band)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)

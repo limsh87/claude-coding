@@ -85,7 +85,12 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
                    top_pct: float = PORTFOLIO_TOP_PCT, apply_costs: bool = True,
                    slip_k: float = SLIPPAGE_K, label: str = "FLP",
                    exit_cr: float = EXIT_CR_PCTL,
-                   hold_max: int = HOLD_MAX_WEEKS) -> dict:
+                   hold_max: int = HOLD_MAX_WEEKS, audit: bool = False) -> dict:
+    """audit=True 는 '대표 실행' 하나에만 준다.
+
+    ★ 감쇠 원장(uni.attrition)은 append-only 라, 강건성 arm 20여 회와 스몰캡 비교까지
+      전부 기록하면 §10.4 감쇠표가 '여러 전략의 평균'이 되어 아무 것도 뜻하지 않게 된다.
+    """
     mkt = (sec.set_index("code")["market"].astype(str).to_dict()
            if sec is not None and len(sec) and "market" in sec.columns else {})
     delist = uni.delisting_map() if uni is not None else {}
@@ -167,7 +172,7 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
                    sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna() &
                    fresh_px]
-        if uni is not None:
+        if uni is not None and audit:
             uni.audit_row("유동성필터", w, sub[sub["V6"] == 1]["code"].tolist())
             uni.audit_row("낙폭조건", w, sub[(sub["V6"] == 1) &
                                              (sub["f_dd"] < PH_DD_ENTER)]["code"].tolist())
@@ -179,7 +184,7 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         k = int(max(PORTFOLIO_MIN_NAMES, min(PORTFOLIO_MAX_NAMES,
                                              round(len(elig) * top_pct))))
         pick = _top_n(elig, min(k, len(elig)), signal_col)
-        if uni is not None:
+        if uni is not None and audit:
             uni.audit_row("최종선정", w, pick["code"].tolist())
 
         # ── ② 청산 판정 (진입 논리와 같은 언어로) ──────────────────────────────────────

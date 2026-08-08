@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_D"
 STRATEGY_NAME      = "PACK-D 공시텍스트 경직성"
 ACTIVE_PACKS       = ["D"]
-BUILD_VERSION      = "v2.20260808.0407"
+BUILD_VERSION      = "v2.20260808.0415"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗

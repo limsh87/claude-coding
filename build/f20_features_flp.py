@@ -341,13 +341,19 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
     P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).fillna(False).astype(int)
 
-    # ── 비교군: 스몰캡 밴드 (매 시점 시총 하위 N) ─────────────────────────────────────
-    #   '작은 쪽에서 N번째까지'를 매 시점 다시 센다. 현재 시총으로 과거를 정의하지 않는다(C13).
-    small_rank = (P.groupby("wk", observed=True)["size_est"]
-                   .rank(ascending=True, method="first"))
+    # ── 비교군: 스몰캡 밴드 (매 시점 '투자 가능한 종목 중' 시총 하위 N) ────────────────
+    #   ★ 전체 단면에서 하위 N 을 세고 나서 유동성 필터를 걸면, 하위 꼬리를 채우는 것이
+    #     대부분 거래대금 미달 종목이라 실제 밴드가 N 보다 훨씬 작아지고 그 폭이 주마다
+    #     들쭉날쭉해진다("하위 1000" 이라는 이름과 실물이 달라진다).
+    #     → 진입 자격(유동성 ∧ 대형주 제외)을 먼저 적용하고, 그 안에서 하위 N 을 센다.
+    elig_small = (P["V6"] == 1) & (P["mcap_rank"] > cut)
+    small_rank = pd.Series(np.nan, index=P.index, dtype=float)
+    if elig_small.any():
+        small_rank[elig_small] = (P.loc[elig_small].groupby("wk", observed=True)["size_est"]
+                                  .rank(ascending=True, method="first"))
     P["small_rank"] = small_rank
-    P["in_band_small"] = ((small_rank <= SMALLCAP_BOTTOM_N) & (P["V6"] == 1) &
-                          (P["mcap_rank"] > cut)).fillna(False).astype(int)
+    P["in_band_small"] = (elig_small & (small_rank <= SMALLCAP_BOTTOM_N)
+                          ).fillna(False).astype(int)
     return P
 
 

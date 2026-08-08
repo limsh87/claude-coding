@@ -66,8 +66,10 @@ def R2F_exhaustion_vs_drawdown(P: pd.DataFrame, run_fn: Callable,
     B = classify_phase(base, use_dd=False)
     B = assemble_score(B, use_tps=["TP_F2", "TP_F4"], band_col=band_col, quiet=True)
 
-    # C: 전체
-    C = base
+    # C: 전체 — ★ 반드시 A/B 와 '같은 밴드'로 새로 채점한다.
+    #   호출자가 넘긴 P 의 Signal 은 기본 밴드(in_band)로 매겨진 값이다. 그대로 쓰면
+    #   스몰캡 R2-F 가 '스몰캡 A/B vs 전체 C' 를 비교하게 되어 판정이 통째로 무효가 된다.
+    C = assemble_score(base, band_col=band_col, quiet=True)
 
     bts = {}
     for lab, pp in (("A_낙폭과대단독", A), ("B_소진단독", B), ("C_FLP전체", C)):
