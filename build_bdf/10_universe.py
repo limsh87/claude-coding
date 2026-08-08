@@ -1,0 +1,546 @@
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L1-A  종목 마스터 & PIT 유니버스 (C2 생존자편향 제거)                                     ║
+# ║                                                                                          ║
+# ║  다중 소스 교차 구축 — 우선순위와 역할이 각각 다르다:                                      ║
+# ║    ① FDR GitHub 캐시  listing/krx        상장 종목 + 상장일        ← 로그인 불필요, 1순위  ║
+# ║    ② FDR GitHub 캐시  listing/delisting  상장폐지 + 폐지일         ← ★생존자편향 제거 입력 ║
+# ║    ③ KIND 상장법인목록                   상장일·업종 보강                                  ║
+# ║    ④ 상장종목 스냅샷(드라이브 공용캐시)  "그 날 실제 상장" 검증     ← 있으면 쓰고 없어도 됨 ║
+# ║    ⑤ DART corpCode.xml                   corp_code ↔ 종목코드                              ║
+# ║    ⑥ 네이버 금융                         ①~⑤ 어디에도 이름이 없는 잔여 코드 보강          ║
+# ║                                                                                          ║
+# ║  ★ 설계 원칙: 유니버스의 정확성은 ①②③⑤(상장일·폐지일)만으로 성립해야 한다.                ║
+# ║    ④ 스냅샷은 '검증·보강'이지 '의존'이 아니다. ★ 이 빌드는 KRX 를 아예 쓰지 않는 것이      ║
+# ║    기본이며(KRX_ENABLE=False), 그 상태에서도 생존편향 제거가 완결된다.                     ║
+# ║    스냅샷은 합집합으로만 얹는다 — 부분 응답을 진실로 믿고 교집합을 취하면 그 달 유니버스가 ║
+# ║    조용히 쪼그라들어 곧바로 선택편향이 된다.                                               ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
+                   "corp_code", "industry", "sector_src", "src"]
+
+# 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
+#   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
+#   상장/폐지일이 이미 있으므로 분기 격자(40 × 2 = 80 호출)로도 검증 목적은 충분하다.
+UNIVERSE_SNAPSHOT_FREQ = "Q"   # 스냅샷은 보강용. KRX 미사용이면 자연히 비활성.
+
+
+# ── 중복 컬럼 방어 (이번 크래시의 직접 원인 유형) ────────────────────────────────────────────
+def assert_no_dup_cols(df: pd.DataFrame, where: str) -> pd.DataFrame:
+    """중복 컬럼은 pandas 에서 예외 없이 의미가 바뀐다.
+    df[col] 이 Series 가 아니라 DataFrame 이 되고, groupby.agg 가
+    'DataFrame object has no attribute name' 로 엉뚱한 곳에서 터진다.
+    조용히 지나가면 최악이므로 발생 지점에서 즉시 세운다."""
+    if df is None or df.empty:
+        return df
+    dup = df.columns[df.columns.duplicated()]
+    if len(dup):
+        raise RuntimeError(f"[{where}] 중복 컬럼 {sorted(set(map(str, dup)))} — "
+                           f"pandas 연산의 의미가 바뀌므로 여기서 중단합니다.")
+    return df
+
+
+# ── KRX 세션 게이트 ─────────────────────────────────────────────────────────────────────────
+
+
+# ── 로그인 불필요 경로 ★1순위 ──────────────────────────────────────────────────────────────
+#   FinanceDataReader 가 실제로 읽는 GitHub 캐시. KRX 인증 변경의 영향을 받지 않는다.
+#   FDR 라이브러리 자체는 최신 영업일을 알아내려고 data.krx.co.kr 을 한 번 찌르는데,
+#   그게 로그인 벽에 막히면 CSV 는 멀쩡한데도 ValueError 로 죽는다 → 우리는 CSV 를 직접 읽는다.
+FDR_CACHE = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+             "refs/heads/master/data/{kind}/{date}.csv")
+
+
+def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
+    """영업일 CSV 만 존재하므로 최근 날짜부터 거꾸로 훑는다."""
+    today = _dt.date.today()
+    for i in range(back_days):
+        d = today - _dt.timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        url = FDR_CACHE.format(kind=kind, date=d.isoformat())
+        raw = http_get(url, source="generic", as_bytes=True, tries=1, timeout=25)
+        if not raw or len(raw) < 200 or raw[:15].lstrip().startswith(b"404"):
+            continue
+        try:
+            # ★ index_col=0 을 무조건 주면 안 된다.
+            #   listing CSV 는 이름 없는 인덱스 컬럼이 있지만 delisting CSV 는 없을 수 있고,
+            #   그때 첫 실컬럼(Symbol=종목코드)이 인덱스로 먹혀 통째로 사라진다.
+            #   → 상장폐지 종목이 전부 유실되고 그게 곧 생존자편향이다. 반드시 판별해서 읽는다.
+            df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig",
+                             dtype={"Code": str, "Symbol": str, "ToSymbol": str,
+                                    "MarketId": str, "Market": str, "ISU_CD": str,
+                                    "Unnamed: 0": str})
+            if len(df.columns) and str(df.columns[0]).strip().lower() in (
+                    "", "unnamed: 0", "unnamed:0", "index"):
+                df = df.drop(columns=[df.columns[0]])
+            if len(df):
+                LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} "
+                          f"({len(df):,}행 · 컬럼 {list(df.columns)[:6]})")
+                return df
+        except Exception:
+            continue
+    return None
+
+
+def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
+    return {str(c).strip().lower(): c for c in d.columns}
+
+
+def fetch_fdr_listing() -> pd.DataFrame:
+    d = _fdr_cache_csv("listing/krx")
+    if d is not None and len(d):
+        col = _lower_map(d)
+        code_c = col.get("code") or col.get("symbol") or col.get("isu_cd")
+        name_c = col.get("name") or col.get("korean name") or col.get("isu_nm")
+        if code_c and name_c:
+            t = pd.DataFrame({
+                "code": d[code_c].map(to_code6),
+                "name": d[name_c].astype(str).str.strip(),
+                "market": (d[col["market"]].astype(str) if "market" in col
+                           else d[col["marketid"]].astype(str) if "marketid" in col else "KRX"),
+                "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
+                "industry": (d[col["sector"]].astype(str) if "sector" in col
+                             else d[col["industry"]].astype(str) if "industry" in col else ""),
+            })
+            t["sector_src"], t["src"] = "fdr_cache", "fdr_github_cache"
+            t["delisting_date"] = pd.NaT
+            t["corp_code"] = np.nan
+            n0 = len(t)
+            r = t.dropna(subset=["code"]).drop_duplicates("code")
+            if n0 - len(r):
+                LOG.debug(f"상장목록 정규화 탈락 {n0-len(r):,}건(코드 형식 불일치/중복)")
+            LOG.ok(f"상장목록(로그인 불필요 경로) {len(r):,}건 — KRX 인증 변경 영향을 받지 않습니다.")
+            return r
+
+    if fdr is None:
+        LOG.warn("상장목록을 확보하지 못했습니다 (GitHub 캐시 실패 + FinanceDataReader 없음).")
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    try:
+        d = fdr.StockListing("KRX")
+    except Exception as e:                                            # noqa
+        LOG.warn(f"fdr.StockListing('KRX') 실패({type(e).__name__}) — "
+                 f"FDR 은 최신 영업일 확인차 data.krx.co.kr 를 찌르는데 그게 막히면 "
+                 f"CSV 가 멀쩡해도 죽습니다.")
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    if d is None or len(d) == 0:
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    col = _lower_map(d)
+    code_c = col.get("code") or col.get("symbol")
+    name_c = col.get("name")
+    if not code_c or not name_c:
+        return pd.DataFrame(columns=SEC_MASTER_COLS)
+    t = pd.DataFrame({
+        "code": d[code_c].map(to_code6), "name": d[name_c].astype(str),
+        "market": d[col["market"]].astype(str) if "market" in col else "KRX",
+        "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
+        "industry": d[col["sector"]].astype(str) if "sector" in col else "",
+        "delisting_date": pd.NaT, "corp_code": np.nan,
+        "sector_src": "fdr", "src": "fdr:KRX"})
+    return t.dropna(subset=["code"]).drop_duplicates("code")
+
+
+def fetch_fdr_delisting() -> pd.DataFrame:
+    """★ 생존자편향 제거의 핵심 입력. KRX Open API 에는 상장폐지 엔드포인트가 아예 없어서
+    이 GitHub 캐시가 사실상 유일한 공개 경로다.
+
+    ★ 탈락 사유를 반드시 집계해 로그로 남긴다. 여기서 조용히 버려지는 종목이
+    그대로 생존자편향이 되기 때문이다(운영에서 4,172행 → 2,526행으로 줄었던 구간)."""
+    d = _fdr_cache_csv("listing/delisting")
+    if d is None or len(d) == 0:
+        if fdr is None:
+            LOG.warn("상장폐지 목록을 확보하지 못했습니다 — C2(생존자편향 제거) 미충족 상태입니다. "
+                     "결과 해석 시 반드시 감안하세요.")
+            return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
+        try:
+            d = fdr.StockListing("KRX-DELISTING")
+        except Exception:
+            d = None
+        if d is None or len(d) == 0:
+            return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
+
+    col = _lower_map(d)
+    code_c = col.get("symbol") or col.get("code") or col.get("isu_cd") or col.get("isu_srt_cd")
+    if not code_c:
+        LOG.warn(f"상장폐지 파일에서 종목코드 컬럼을 찾지 못했습니다: {list(d.columns)[:12]}")
+        return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
+    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
+                                  "listingdate") if k in col), None)
+    name_c = col.get("name") or col.get("isu_nm") or code_c
+
+    n_raw = len(d)
+    raw_codes = d[code_c].astype(str)
+    codes = raw_codes.map(to_code6)
+    n_badcode = int(codes.isna().sum())
+    t = pd.DataFrame({
+        "code": codes,
+        "name": d[name_c].astype(str),
+        "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        "market": d[col["market"]].astype(str) if "market" in col else "KRX",
+        "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
+                      else d[col["kind"]].astype(str) if "kind" in col else ""),
+    })
+    t = t.dropna(subset=["code"])
+    n_dupe = int(t["code"].duplicated().sum())
+    # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
+    # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
+    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    n_nodate = int(t["delisting_date"].isna().sum())
+
+    LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
+    if n_raw - len(t):
+        LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
+                 f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
+                 f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
+        if n_badcode > n_raw * 0.25:
+            LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
+                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
+                     f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+    return t
+
+
+def fetch_kind_listing() -> pd.DataFrame:
+    """KIND 상장법인목록 — 상장일·업종 보강.
+    ★ 종목코드가 정수로 와서 앞자리 0 이 날아간다(5930 ← 005930). to_code6 이 복구한다."""
+    urls = [
+        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+        "http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download",
+    ]
+    for u in urls:
+        raw = http_get(u, source="kind", as_bytes=True, tries=2,
+                       referer="https://kind.krx.co.kr/corpgeneral/corpList.do?method=loadInitPage")
+        if not raw or len(raw) < 500:
+            continue
+        for enc in ("euc-kr", "cp949", "utf-8"):
+            tabs = safe_read_html(raw, encoding=enc)
+            if not tabs:
+                continue
+            d = max(tabs, key=len)
+            col = {str(c).strip(): c for c in d.columns}
+            code_c, name_c = col.get("종목코드"), col.get("회사명")
+            if not code_c or not name_c:
+                continue
+            t = pd.DataFrame({
+                "code": d[code_c].map(to_code6),
+                "name": d[name_c].astype(str).str.strip(),
+                "listing_date": as_ts_series(d[col["상장일"]]) if "상장일" in col else pd.NaT,
+                "industry": d[col["업종"]].astype(str) if "업종" in col else "",
+                "sector_src": "kind", "src": "kind", "market": "",
+                "delisting_date": pd.NaT, "corp_code": np.nan,
+            }).dropna(subset=["code"]).drop_duplicates("code")
+            LOG.ok(f"KIND 상장법인목록 {len(t):,}건 (상장일 {int(t['listing_date'].notna().sum()):,}건)")
+            return t
+    LOG.warn("KIND 상장법인목록을 받지 못했습니다 — 상장일은 FDR/스냅샷으로만 채웁니다.")
+    return pd.DataFrame(columns=SEC_MASTER_COLS)
+
+
+def fetch_dart_corpcode() -> pd.DataFrame:
+    """corp_code ↔ 종목코드. DART 의 모든 재무·공시 조회는 corp_code 로만 된다."""
+    if not DART_API_KEY:
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    cached = VAULT.get_table("dart_corpcode", scope="shared", max_age_days=30)
+    if cached is not None and len(cached):
+        LOG.info(f"공용 캐시에서 DART corpCode {len(cached):,}건 재사용")
+        return cached
+    raw = http_get("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
+                   params={"crtfc_key": DART_API_KEY}, as_bytes=True, tries=3)
+    if not raw:
+        LOG.warn("DART corpCode.xml 수신 실패 — DART_API_KEY 와 네트워크를 확인하세요.")
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    if raw[:2] != b"PK":
+        body = raw[:400].decode("utf-8", "ignore")
+        st = re.search(r'"?status"?\s*[:>]\s*"?(\d{3})', body)
+        code = st.group(1) if st else "?"
+        LOG.warn(f"corpCode 응답이 ZIP 이 아닙니다 (status={code}: "
+                 f"{DART_STATUS_MSG.get(code, '알 수 없음')}). DART_API_KEY 를 확인하세요.")
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        xml = b"".join(zf.read(n) for n in zf.namelist() if n.lower().endswith(".xml")) \
+            or zf.read(zf.namelist()[0])
+    except Exception as e:                                            # noqa
+        LOG.warn(f"corpCode zip 해제 실패({type(e).__name__}).")
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+    txt = _decode(xml, None, "corpcode")
+    rows = []
+    for m in re.finditer(r"<list>(.*?)</list>", txt, re.S):
+        blk = m.group(1)
+
+        def g(tag):
+            mm = re.search(rf"<{tag}>(.*?)</{tag}>", blk, re.S)
+            return (mm.group(1).strip() if mm else "")
+        rows.append({"corp_code": g("corp_code"), "corp_name": g("corp_name"),
+                     "code": to_code6(g("stock_code")), "modify_date": g("modify_date")})
+    d = pd.DataFrame(rows)
+    if len(d):
+        VAULT.put_table("dart_corpcode", d, scope="shared", domain="dart", source="opendart")
+    LOG.ok(f"DART corpCode {len(d):,}건 (상장 매칭 {int(d['code'].notna().sum()):,}건)")
+    return d
+
+
+# ── 상장종목 스냅샷 (보조·검증 · KRX 없이도 무해) ────────────────────────────────────────────────────────────────
+def _snapshot_grid(months: pd.DatetimeIndex) -> List[pd.Timestamp]:
+    f = str(UNIVERSE_SNAPSHOT_FREQ).upper()
+    if f in ("OFF", "NONE", ""):
+        return []
+    if f == "M":
+        return list(months)
+    if f == "A":
+        return [m for m in months if m.month == 12] or list(months[::12])
+    return [m for m in months if m.month in (3, 6, 9, 12)] or list(months[::3])   # 기본 Q
+
+
+def fetch_listing_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
+    """상장종목 스냅샷 — '검증·보강' 입력이지 의존 대상이 아니다.
+
+    ★ KRX 를 쓰지 않는 것이 기본이다. 유니버스의 정확성은 상장일(KIND/FDR)과
+      폐지일(FDR delisting) 만으로 성립하도록 설계되어 있고, 스냅샷은 그 위에
+      '합집합으로만' 얹힌다(교집합이 아니다 — SPEC 생존편향 규칙).
+
+    따라서 이 함수는:
+      · 드라이브 공용 캐시에 다른 전략(TCD v2 등)이 남긴 스냅샷이 있으면 그대로 재사용하고
+      · KRX_ENABLE=True 이고 pykrx 가 살아 있을 때만 부족분을 보강하며
+      · 둘 다 없으면 빈 프레임을 돌려준다. 빈 프레임이어도 유니버스는 정상 구성된다.
+    """
+    cols = ["snap_date", "code", "market"]
+    frames: List[pd.DataFrame] = []
+    for tname in ("krx_listing_snapshots", "listing_snapshots"):
+        cached = VAULT.get_table(tname, scope="shared")
+        if cached is not None and len(cached):
+            c = cached.copy()
+            c["snap_date"] = as_ts_series(c["snap_date"])
+            c = c.dropna(subset=["snap_date", "code"])
+            if len(c):
+                frames.append(c.reindex(columns=cols))
+                LOG.info(f"공용 캐시에서 상장 스냅샷 재사용: {tname} "
+                         f"({c['snap_date'].nunique()}개 시점 · {len(c):,}행) — "
+                         f"다른 전략이 남긴 것도 그대로 활용합니다.")
+
+    if KRX_ENABLE and pykrx_stock is not None and RUN_MODE not in ("CACHED", "SMOKE"):
+        have = set()
+        if frames:
+            have = set(pd.concat(frames, ignore_index=True)["snap_date"]
+                       .dt.strftime("%Y-%m-%d"))
+        todo = [d for d in _snapshot_grid(months) if d.strftime("%Y-%m-%d") not in have]
+        if todo:
+            LOG.info(f"KRX 스냅샷 보강 {len(todo)}개 시점 (교차검증 목적 · 실패해도 무해)")
+            new_rows, bad = [], 0
+            for d in tqdm(todo, desc="KRX 스냅샷(선택)", ncols=88, leave=False):
+                got = False
+                for mkt in ("KOSPI", "KOSDAQ"):
+                    try:
+                        limiter("krx").wait()
+                        tk = pykrx_stock.get_market_ticker_list(d.strftime("%Y%m%d"), market=mkt)
+                    except Exception:
+                        tk = None
+                    if not tk:
+                        continue
+                    got = True
+                    for t in tk:
+                        c = to_code6(t)
+                        if c:
+                            new_rows.append({"snap_date": d.strftime("%Y-%m-%d"),
+                                             "code": c, "market": mkt})
+                bad = 0 if got else bad + 1
+                if bad >= 3:
+                    LOG.warn("KRX 스냅샷이 연속 3회 비었습니다 — 차단/세션만료로 보고 즉시 중단합니다. "
+                             "유니버스는 상장일·폐지일 경로로 정상 구성됩니다.")
+                    break
+            if new_rows:
+                frames.append(pd.DataFrame(new_rows).assign(
+                    snap_date=lambda d: as_ts_series(d["snap_date"])))
+
+    if not frames:
+        LOG.info("상장 스냅샷 없음 — 유니버스는 상장일·폐지일 기반으로 구성됩니다(정상 경로). "
+                 "KRX 를 쓰지 않아도 생존편향 제거는 FDR 상장폐지 목록으로 달성됩니다.")
+        return pd.DataFrame(columns=cols)
+
+    snap = pd.concat(frames, ignore_index=True)
+    snap["snap_date"] = as_ts_series(snap["snap_date"])
+    snap = (snap.dropna(subset=["snap_date", "code"])
+                .drop_duplicates(["snap_date", "code"])[cols])
+
+    # 부분 응답 방어: 이웃 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
+    if len(snap):
+        size = snap.groupby("snap_date", observed=True)["code"].size().sort_index()
+        med = float(size.median()) if len(size) else 0.0
+        bad = size[size < med * 0.80]
+        if len(bad) and med > 0:
+            LOG.warn(f"스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만 → 부분응답으로 폐기")
+            snap = snap[~snap["snap_date"].isin(bad.index)]
+        out = snap.copy()
+        out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
+        VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
+                        source="cache+krx_optional",
+                        extra={"note": "상장종목 스냅샷 — 전 전략 공용"})
+    PIPE.io("OUT", "DRIVE", "listing_snapshots", snap, source="cache+krx_optional")
+    return snap
+
+
+def fetch_naver_names(codes: Sequence[str], limit: int = 400) -> Dict[str, str]:
+    """①~⑤ 어디에도 이름이 없는 잔여 코드를 네이버로 보강한다.
+    이름이 비면 국민연금·조달 상호 매칭이 통째로 실패하므로 커버리지에 직접 영향이 있다."""
+    codes = [c for c in codes if c][:limit]
+    if not codes or RUN_MODE == "CACHED":
+        return {}
+
+    def _one(c: str):
+        h = http_get(f"https://finance.naver.com/item/main.naver?code={c}",
+                     source="naver", tries=1, force_enc="euc-kr",
+                     referer="https://finance.naver.com/")
+        if not h:
+            return None
+        m = re.search(r'<div class="wrap_company">\s*<h2>\s*<a[^>]*>([^<]+)</a>', h)
+        if not m:
+            m = re.search(r"<title>\s*([^:<]+?)\s*:", h)
+        return (c, _clean_cell(m.group(1))) if m else None
+
+    res = pmap_io(_one, codes, workers=min(6, N_WORKERS_IO), desc="네이버 종목명 보강")
+    out = {c: n for r in res if r for c, n in [r] if n}
+    if out:
+        LOG.ok(f"네이버로 종목명 {len(out):,}건 보강")
+    return out
+
+
+# ── 종목 마스터 ─────────────────────────────────────────────────────────────────────────────
+def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
+    """모든 소스를 합쳐 종목 마스터를 만든다. 충돌은 우선순위로 해소하고 전부 로깅한다."""
+    parts: List[pd.DataFrame] = []
+    src_stats: List[Tuple[str, int]] = []
+
+    lst = fetch_fdr_listing()
+    if len(lst):
+        parts.append(lst)
+        src_stats.append(("FDR 상장목록", len(lst)))
+        PIPE.io("IN", "HTTP", "fdr:StockListing", lst, source="FinanceDataReader")
+
+    kind = fetch_kind_listing()
+    if len(kind):
+        parts.append(kind)
+        src_stats.append(("KIND 상장법인", len(kind)))
+        PIPE.io("IN", "HTTP", "kind:corpList", kind, source="KIND")
+
+    dead = fetch_fdr_delisting()
+    PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
+            ok=len(dead) > 0, note="생존자편향 제거 입력")
+    if len(dead):
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
+        d2["listing_date"] = pd.NaT
+        d2["industry"] = ""
+        d2["corp_code"] = np.nan
+        d2["sector_src"] = "fdr-del"
+        d2["src"] = "fdr:delisting"
+        parts.append(d2)
+        src_stats.append(("FDR 상장폐지", len(d2)))
+
+    # 스냅샷에만 존재하는 종목(=상장목록·폐지목록 어디에도 없는 종목)도 반드시 살린다
+    if snapshots is not None and len(snapshots):
+        known = set(pd.concat(parts, ignore_index=True)["code"]) if parts else set()
+        extra = sorted(set(snapshots["code"]) - known)
+        if extra:
+            parts.append(pd.DataFrame({
+                "code": extra, "name": "", "market": "", "listing_date": pd.NaT,
+                "delisting_date": pd.NaT, "corp_code": np.nan, "industry": "",
+                "sector_src": "snapshot", "src": "snapshot"}))
+            src_stats.append(("스냅샷 전용", len(extra)))
+            LOG.info(f"스냅샷에만 존재하는 종목 {len(extra):,}건 추가 — 상장/폐지 명단 누락분입니다. "
+                     f"(빠뜨리면 곧바로 생존자편향)")
+
+    if not parts:
+        raise RuntimeError(
+            "종목 마스터를 만들 소스가 하나도 없습니다.\n"
+            "  · 네트워크에서 raw.githubusercontent.com 과 kind.krx.co.kr 에 접근 가능한지\n"
+            "  · FinanceDataReader 가 설치되어 있는지\n"
+            "확인하세요. RUN_MODE='SMOKE' 로는 네트워크 없이 계산경로만 검증할 수 있습니다.")
+
+    # ★ 중복 컬럼 원천 차단: 컬럼 목록을 dict.fromkeys 로 유일화한 뒤 정렬한다.
+    #   (SEC_MASTER_COLS 에 이미 있는 이름을 다시 더하면 m[col] 이 DataFrame 이 되고
+    #    groupby.agg 가 'DataFrame object has no attribute name' 으로 터진다)
+    _cols = list(dict.fromkeys(SEC_MASTER_COLS))
+    m = pd.concat([p.reindex(columns=_cols) for p in parts], ignore_index=True)
+    assert_no_dup_cols(m, "security_master:concat")
+    m["code"] = m["code"].map(to_code6)
+    m = m.dropna(subset=["code"])
+
+    def _first_str(s):
+        for x in s:
+            if isinstance(x, str) and x.strip():
+                return x.strip()
+        return ""
+
+    agg = m.groupby("code", as_index=False, observed=True).agg(
+        name=("name", _first_str),
+        market=("market", _first_str),
+        listing_date=("listing_date", "min"),
+        delisting_date=("delisting_date", "max"),
+        industry=("industry", _first_str),
+        src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
+    )
+    assert_no_dup_cols(agg, "security_master:agg")
+
+    # 스냅샷으로 상장/폐지일 보정 — 소스 날짜가 없을 때만 관측으로 채운다
+    if snapshots is not None and len(snapshots):
+        g = snapshots.groupby("code", observed=True)["snap_date"]
+        agg = agg.merge(g.min().rename("snap_first"), left_on="code", right_index=True, how="left")
+        agg = agg.merge(g.max().rename("snap_last"), left_on="code", right_index=True, how="left")
+        need = agg["listing_date"].isna() & agg["snap_first"].notna()
+        agg.loc[need, "listing_date"] = agg.loc[need, "snap_first"]
+        last_snap = snapshots["snap_date"].max()
+        gone = (agg["delisting_date"].isna() & agg["snap_last"].notna() &
+                (agg["snap_last"] < last_snap - pd.Timedelta(days=200)))
+        agg.loc[gone, "delisting_date"] = agg.loc[gone, "snap_last"] + pd.offsets.MonthEnd(1)
+        if int(gone.sum()):
+            LOG.info(f"스냅샷에서 사라진 {int(gone.sum()):,}종목을 폐지로 추정 "
+                     f"(폐지명단 누락 보완 — 생존자편향 2차 방어)")
+        agg = agg.drop(columns=[c for c in ("snap_first", "snap_last") if c in agg.columns])
+
+    cc = fetch_dart_corpcode()
+    if len(cc):
+        cc2 = cc.dropna(subset=["code"])[["code", "corp_code", "corp_name"]].drop_duplicates("code")
+        agg = agg.merge(cc2, on="code", how="left")
+        blank = agg["name"].astype(str).str.strip() == ""
+        agg.loc[blank, "name"] = agg.loc[blank, "corp_name"].fillna("")
+        agg = agg.drop(columns=["corp_name"])
+    else:
+        agg["corp_code"] = np.nan
+
+    # 네이버로 잔여 무명 종목 보강 (상호 매칭 커버리지에 직결)
+    nameless = agg.loc[agg["name"].astype(str).str.strip() == "", "code"].tolist()
+    if nameless:
+        LOG.info(f"이름이 비어 있는 종목 {len(nameless):,}건 — 네이버로 보강 시도")
+        nm = fetch_naver_names(nameless)
+        if nm:
+            agg["name"] = agg.apply(
+                lambda r: nm.get(r["code"], r["name"]) if not str(r["name"]).strip() else r["name"],
+                axis=1)
+
+    agg["industry"] = agg["industry"].fillna("").astype(str).str.strip().replace("", "미분류")
+    agg["sector_src"] = "merged"
+    assert_no_dup_cols(agg, "security_master:final")
+
+    n_list = int(agg["listing_date"].notna().sum())
+    n_del = int(agg["delisting_date"].notna().sum())
+    n_corp = int(agg["corp_code"].notna().sum()) if "corp_code" in agg.columns else 0
+    n_name = int((agg["name"].astype(str).str.strip() != "").sum())
+    LOG.table([[lab, f"{n:,}"] for lab, n in src_stats] +
+              [["── 병합 결과 ──", ""],
+               ["고유 종목", f"{len(agg):,}"],
+               ["상장일 보유", f"{n_list:,} ({100*n_list/max(len(agg),1):.0f}%)"],
+               ["폐지일 보유", f"{n_del:,} ({100*n_del/max(len(agg),1):.0f}%)"],
+               ["corp_code 보유", f"{n_corp:,} ({100*n_corp/max(len(agg),1):.0f}%)"],
+               ["종목명 보유", f"{n_name:,} ({100*n_name/max(len(agg),1):.0f}%)"]],
+              ["소스 / 항목", "건수"], ["l", "r"], title="종목 마스터 구성 (다중소스 병합)")
+
+    if n_del < 200:
+        LOG.warn("상장폐지 종목이 200건 미만입니다. 10년 구간이면 통상 1,000건 이상이어야 합니다. "
+                 "생존자편향이 남아 있으니 결과 해석 시 반드시 감안하세요. (C2 부분 미충족)")
+        PIPE.note("WARN: 상장폐지 표본 부족 — C2 완전 제거 미달")
+    if n_corp < len(agg) * 0.3:
+        LOG.warn(f"corp_code 매칭률이 {100*n_corp/max(len(agg),1):.0f}% 로 낮습니다. "
+                 f"DART 재무·공시가 그만큼 결측이 되어 B/C축과 PACK-C/D 가 약해집니다. "
+                 f"DART_API_KEY 를 확인하세요.")
+    VAULT.put_table("security_master", agg, scope="shared", domain="universe",
+                    source="fdr+kind+dart+naver")
+    return agg
