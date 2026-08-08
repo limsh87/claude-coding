@@ -303,6 +303,49 @@ def prune_dead(body: str) -> tuple[str, list[str]]:
     return body, removed
 
 
+def check_arity(tree: ast.AST) -> list[str]:
+    """최상위 함수 호출의 **인자 개수·키워드 이름**을 정의와 대조한다.
+
+    ★ 왜 필요한가: RX10_policy(runner) 가 runner(Q, months=..., label=...) 로 부르는데
+      호출부가 months 를 안 받는 러너를 넘겨 TypeError 로 죽었다. 이런 불일치는
+      **수집이 다 끝난 6시간 뒤**에 처음 터진다. 조립 시점에 잡는다.
+    """
+    sigs: dict[str, ast.arguments] = {}
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            sigs[n.name] = n.args
+    errs: list[str] = []
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
+            continue
+        a = sigs.get(n.func.id)
+        if a is None:
+            continue
+        names = [x.arg for x in (a.posonlyargs + a.args)]
+        n_req = len(names) - len(a.defaults)
+        n_pos = len(n.args)
+        if any(isinstance(x, ast.Starred) for x in n.args):
+            continue                                   # *args 전개는 셀 수 없다
+        kw = {k.arg for k in n.keywords if k.arg is not None}
+        if any(k.arg is None for k in n.keywords):
+            continue                                   # **kwargs 전개
+        if n_pos > len(names) and a.vararg is None:
+            errs.append(f"{n.func.id}(): 위치인자 {n_pos}개 > 정의 {len(names)}개 "
+                        f"— 줄 {n.lineno}")
+            continue
+        if a.kwarg is None:
+            valid = set(names) | {x.arg for x in a.kwonlyargs}
+            bad = kw - valid
+            if bad:
+                errs.append(f"{n.func.id}(): 없는 키워드 {sorted(bad)} — 줄 {n.lineno}")
+                continue
+        supplied = set(names[:n_pos]) | kw
+        missing = [x for x in names[:n_req] if x not in supplied]
+        if missing:
+            errs.append(f"{n.func.id}(): 필수인자 {missing} 누락 — 줄 {n.lineno}")
+    return errs
+
+
 def main() -> int:
     items = collect()
     parts, n = [], len(items)
@@ -343,6 +386,13 @@ def main() -> int:
         print("✘ 모듈 실행부에서 미정의 이름 참조:", file=sys.stderr)
         for u in und[:12]:
             print(f"    {u}", file=sys.stderr)
+        fatal += 1
+
+    ar = check_arity(tree)
+    if ar:
+        print("✘ 함수 호출 시그니처 불일치:", file=sys.stderr)
+        for a in ar[:12]:
+            print(f"    {a}", file=sys.stderr)
         fatal += 1
 
     pr = check_principles(body)
