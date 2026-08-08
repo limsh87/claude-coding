@@ -165,6 +165,30 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         #   Tier1 벌크            : 전 계정 · 1회 다운로드 (최선)
         #   Tier3 fnlttSinglAcntAll: 전 계정 · 단건(며칠 소요, 이어받기)
         #   Tier2 fnlttMultiAcnt  : 주요계정 6개 · 배치(즉시) — '바닥'을 싸게 깐다
+        # ── 투자 가능 종목(= 유동성 하한을 한 번이라도 넘은 곳)의 corp_code 집합 ──
+        #   이게 없으면 영원히 살 수 없는 종목의 재무제표까지 받느라 하루 쿼터를 태운다.
+        inv_scope: set = set()
+        try:
+            _pm = ctx["pp"]["monthly"]
+            _liq = (_pm.groupby("code", observed=True)["adv20"].max()
+                    >= UNIVERSE_MIN_ADTV * 0.5)
+            _ok_codes = set(_liq[_liq].index.astype(str))
+            _c2c = (ctx["sec"].dropna(subset=["corp_code"])
+                    .assign(corp_code=lambda d: d["corp_code"].astype(str))
+                    .set_index("code")["corp_code"].to_dict())
+            inv_scope = {_c2c[c] for c in _ok_codes if c in _c2c}
+            LOG.table([["가격 패널 종목", f"{_pm['code'].nunique():,}"],
+                       [f"유동성 하한 절반({UNIVERSE_MIN_ADTV*0.5:,.0f}원) 초과 이력",
+                        f"{len(_ok_codes):,}"],
+                       ["corp_code 매칭", f"{len(inv_scope):,}"],
+                       ["→ 전체재무제표 대상", f"{len(inv_scope):,}사 × {len(years)}년"]],
+                      ["수집 범위 산정", "종목수"], ["l", "r"],
+                      title="DART 전체재무제표 수집 범위 — 살 수 없는 종목은 받지 않습니다 "
+                            "(밴드는 진입 필터이므로 유동성 하한을 한 번도 못 넘으면 매수 불가)")
+        except Exception as e:                                   # noqa
+            LOG.warn(f"투자 가능 종목 판정 실패({type(e).__name__}) — 전 종목을 대상으로 "
+                     f"진행합니다(호출량이 늘어납니다).")
+
         t_bulk = fetch_dart_bulk(years, reprts) if "bulk" not in DISABLED else pd.DataFrame()
         t_multi = fetch_dart_multi(corps, years, reprts)
         t_full = pd.DataFrame()
@@ -177,7 +201,8 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
                 LOG.warn("벌크가 비어 Fallback B(fnlttSinglAcntAll)를 가동합니다. 주요계정만으로는 "
                          "재고·매출채권·영업CF가 없어 TP_I2/TP_I4/TP_I1 이 죽기 때문입니다 — "
                          "이 경로 없이 나온 성과는 '코어가 빠진 전략'의 성과입니다.")
-                t_full = fetch_dart_full(corps, years, priority=prio)
+                t_full = fetch_dart_full(corps, years, priority=prio,
+                                         scope=inv_scope or None)
         raw = merge_financial_tiers(t_bulk, t_full, t_multi)
         ctx["fin"] = tidy_financials(raw, kmap, ctx.get("code_of_corp"))
         ctx["weak_tp"] = report_account_coverage()

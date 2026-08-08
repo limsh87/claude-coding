@@ -259,7 +259,20 @@ def cell_rank(df: pd.DataFrame, col_or_series, keys: Sequence[str],
     n_coarse = gc.transform("count")
 
     out = np.where(n_fine.to_numpy() >= min_n, fine.to_numpy(), coarse.to_numpy())
-    out = np.where(n_coarse.to_numpy() >= min_n, out, np.nan)   # 상위 셀조차 부족하면 결측
+    # ★ 마지막 단: 산업·규모를 못 붙이면 '그 달 전체'로 매긴다.
+    #   예전엔 상위 셀조차 min_n 미달이면 그냥 NaN 이었다. 그러면 값이 멀쩡히 존재하는데도
+    #   랭크가 사라져 신호가 통째로 죽는다(실측: 관측 12건짜리 TP 가 E 를 0% 로 만들었다).
+    #   셀은 산업·규모 효과를 통제하려는 장치일 뿐이고, 통제가 불가능하면 통제를 포기하는 게
+    #   맞지 관측을 버리는 게 맞지는 않다. 포기했다는 사실은 폴백 감사표에 그대로 남는다.
+    if len(keys) and str(keys[0]) not in ("", None):
+        klast = _key([keys[0]])
+        gl = v.groupby(klast, observed=True, dropna=False)
+        last = gl.rank(pct=True, method="average")
+        n_last = gl.transform("count")
+        out = np.where(n_coarse.to_numpy() >= min_n, out, last.to_numpy())
+        out = np.where((n_coarse.to_numpy() >= min_n) | (n_last.to_numpy() >= 2), out, np.nan)
+    else:
+        out = np.where(n_coarse.to_numpy() >= min_n, out, np.nan)
     used_fallback = int(((n_fine < min_n) & (n_coarse >= min_n) & v.notna()).sum())
     n_obs = int(v.notna().sum())
     if n_obs:

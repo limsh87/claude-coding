@@ -284,9 +284,10 @@ def apply_breadth_floor(P: pd.DataFrame, stage: str, tps: Sequence[str],
     """
     p = P.copy() if copy else P
     fb = list(cell_keys[:-1]) or list(cell_keys)
-    ok = pd.Series(True, index=p.index)
-    info = {"groups": [], "pass_rate": {}}
+    info = {"groups": [], "pass_rate": {}, "evid_rate": {}}
     active_groups = 0
+    n_pass = pd.Series(0.0, index=p.index)      # 백분위를 넘긴 '근거 있는' 군 수
+    n_evid = pd.Series(0.0, index=p.index)      # 근거가 있는(관측된) 군 수
     for gname, (members, need) in FLOOR_GROUPS.items():
         if not _stage_ok(need, stage):
             continue
@@ -299,17 +300,57 @@ def apply_breadth_floor(P: pd.DataFrame, stage: str, tps: Sequence[str],
         r_members = [cell_rank(p, col(p, m), cell_keys, fb, tag=f"floor:{m}") for m in have]
         gv = pd.concat(r_members, axis=1).mean(axis=1, skipna=True)
         r = cell_rank(p, gv, cell_keys, fb, tag=f"floor:{gname}")
-        # 관측이 없으면(NaN) '빈 축'이므로 탈락한다 — 이게 §8.1 의 문자 그대로의 의미다.
-        g_ok = (r >= floor_pct).fillna(False)
-        ok &= g_ok
+        # ★★ 여기가 v3 두 번째 조용한 결함이었다.
+        #    예전: g_ok = (r >= floor_pct).fillna(False); ok &= g_ok
+        #    → 관측이 없는 군(r=NaN)이 곧 탈락이고, 그걸 전 군에 AND 로 걸었다.
+        #    실측: 자본투입·자본배분·미인식수요의 관측률이 각각 1.9%/0.2%/1.8% 였으므로
+        #    교집합이 **정확히 0** 이 되어 M1~M3 이 한 종목도 보유하지 못했다.
+        #    데이터가 없다는 이유로 버리는 건 '나쁘다는 증거'가 아니라 '증거가 없음'이다.
+        #    C6-NA 계약이 거부권에 대해 못박은 원칙과 같은 이유로, 하한선도 그러면 안 된다.
+        #    → 근거가 있는 군에 대해서만 판정하고, '근거의 폭'을 따로 요구한다.
+        evid = r.notna()
+        n_evid += evid.astype(float)
+        n_pass += (evid & (r >= floor_pct)).astype(float)
         info["groups"].append(gname)
-        info["pass_rate"][gname] = float(g_ok.mean())
+        info["evid_rate"][gname] = float(evid.mean())
+        info["pass_rate"][gname] = float((evid & (r >= floor_pct)).sum() / max(int(evid.sum()), 1))
+
+    # ★ '요구할 수 있는 군'만 요구한다. 관측률이 바닥인 군을 요구하면 하한선이 전환의 폭이
+    #   아니라 데이터 보유 여부를 재게 된다 — 실측에서 통과율을 0% 로 만든 바로 그 경로다.
+    usable = [g for g in info["groups"] if info["evid_rate"][g] >= FLOOR_GROUP_MIN_COV]
+    info["usable_groups"] = usable
     if active_groups == 0:
         ok = pd.Series(True, index=p.index)
+        need_evid = 0
+    else:
+        need_evid = max(1, min(FLOOR_MIN_EVIDENCE, len(usable)))
+        ok = (n_evid >= need_evid) & (n_pass >= np.ceil(FLOOR_MIN_PASS_FRAC * n_evid))
+    info["need_evid"] = int(need_evid)
+    thin = [g for g in info["groups"] if g not in usable]
+    if thin and not quiet:
+        LOG.warn(f"관측률이 {100*FLOOR_GROUP_MIN_COV:.0f}% 미만이라 '요구'에서 뺀 센서군: "
+                 f"{thin}. 이 군들은 값이 있으면 가산되지만 없다고 탈락시키지 않습니다 — "
+                 f"없는 데이터를 근거로 종목을 버리는 건 선택편향이기 때문입니다. "
+                 f"수집이 채워지면 자동으로 다시 요구 대상이 됩니다.")
     p["FLOOR"] = ok.astype("int8")
     info["n_groups"] = active_groups
     info["overall"] = float(ok.mean())
+    info["n_evid_med"] = float(n_evid.median()) if active_groups else 0.0
+    # 근거 자체가 부족하면 그건 하한선 문제가 아니라 '수집이 덜 됐다'는 뜻이다. 구분해서 말한다.
+    if active_groups and float((n_evid >= min(FLOOR_MIN_EVIDENCE, active_groups)).mean()) < 0.05:
+        LOG.warn(f"근거가 {min(FLOOR_MIN_EVIDENCE, active_groups)}개 군 이상인 종목·월이 "
+                 f"전체의 {100*float((n_evid >= min(FLOOR_MIN_EVIDENCE, active_groups)).mean()):.2f}% "
+                 f"뿐입니다. 하한선이 아니라 **재무 수집이 덜 된 것**이 원인입니다 — "
+                 f"위 'L1 센서 커버리지'와 'TTM 복원 경로' 표를 먼저 보세요.")
+        PIPE.note("WARN: 하한선 근거 부족 — 수집 미완")
     if not quiet and active_groups:
+        LOG.table([[g, f"{100*info['evid_rate'][g]:.1f}%", f"{100*info['pass_rate'][g]:.1f}%"]
+                   for g in info["groups"]],
+                  ["센서군", "근거율(관측)", "근거 있는 것 중 통과율"], ["l", "r", "r"],
+                  title=f"하한선 근거 감사 — 근거 {info['need_evid']}개 군 이상 AND 그중 "
+                        f"{100*FLOOR_MIN_PASS_FRAC:.0f}% 이상 통과 시 편입 · "
+                        f"요구 대상 군 {info['usable_groups']} "
+                        f"(관측이 없는 군은 탈락 사유가 아닙니다)")
         LOG.table([[g, f"{100*info['pass_rate'][g]:.1f}%"] for g in info["groups"]] +
                   [["── 전체 동시통과 ──", f"{100*info['overall']:.1f}%"]],
                   ["센서군", f"백분위 ≥ {floor_pct:.0%} 통과율"], ["l", "r"],

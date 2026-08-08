@@ -176,6 +176,11 @@ def run_contract_tests(strict: bool = True) -> bool:
     LOG.banner("계약 자동검정", "협상 불가 규칙이 코드에 실제로 있는지 실행으로 확인한다")
     rng = np.random.default_rng(SEED)
     _world = {k: globals().get(k, _MISSING) for k in _PATCH_WATCH}
+    # ★ 검정 구간 내내 실제 금고를 읽기전용으로 잠근다. 전역 복원 규율에 의존하지 않는
+    #   구조적 방어다 — 그 규율은 이미 한 번 실패했고 실제 캐시가 오염됐다.
+    _realv = _world.get("VAULT")
+    if _realv is not None and _realv is not _MISSING and hasattr(_realv, "lock_writes"):
+        _realv.lock_writes("계약검정")
 
     # ── TP 부호 (§6.5) ★ v3 최우선 교정 ───────────────────────────────────────────────
     cells = pd.Series(["c"] * 400)
@@ -476,6 +481,131 @@ def run_contract_tests(strict: bool = True) -> bool:
     # ── 벽시계 게이트: 선택 수집만 끊고, 끊었다는 사실을 반드시 남긴다 ──────────────
     #   실측 실패: 수집이 3시간을 먹고도 파이프라인은 계속 진행 → 사용자는 백테스트 결과를
     #   한 번도 못 봤다. 연구 도구로서 '완벽한 무결과'는 부분 결과보다 나쁘다.
+    # ── TTM: 사업보고서 단독(연간 모드)에서도 유량계정이 살아남는다 ─────────────────
+    #   실측 사고: DART_FS_FREQ="annual" 이면 (code, year) 그룹에 행이 하나뿐이라
+    #   누적→분기 차분이 전부 NaN 이 되고, rolling(4, min_periods=4) 도 전부 NaN 이 됐다.
+    #   cogs/cfo/capex/배당 계열이 통째로 죽어 i_dio 2.8%, i_accr 2.5%, i_capex 1.9%,
+    #   p_payout 0.0% 가 되었고, 그 결과 백테스트가 빈 포트폴리오를 돌렸다.
+    #   누적공시에서 TTM 은 항등식으로 정확히 복원된다: 사업보고서 누적 = 그 해의 TTM.
+    try:
+        _R = REPRT_CODES
+
+        def _acc(y, nm, aid, sj, amt):
+            return {"stock_code": "005930", "corp_code": "00126380", "bsns_year": y,
+                    "reprt_code": _R["FY"], "rcept_no": f"{y+1}0315000001",
+                    "account_nm": nm, "sj_div": sj, "fs_div": "CFS",
+                    "thstrm_amount": str(amt), "account_id": aid}
+
+        _rows = []
+        for _i, _y in enumerate(range(2018, 2024)):
+            _rows += [_acc(_y, "매출액", "ifrs-full_Revenue", "IS", 1000 * (_i + 1)),
+                      _acc(_y, "매출원가", "ifrs-full_CostOfSales", "IS", 600 * (_i + 1)),
+                      _acc(_y, "영업활동현금흐름",
+                           "ifrs-full_CashFlowsFromUsedInOperatingActivities", "CF",
+                           200 * (_i + 1))]
+        _fin = tidy_financials(pd.DataFrame(_rows),
+                               pd.DataFrame(columns=["corp_code", "rcept_no", "knowledge_date"]),
+                               None)
+        _need = ["revenue_ttm", "cogs_ttm", "cfo_ttm"]
+        _n = {c: int(_fin[c].notna().sum()) if c in _fin.columns else -1 for c in _need}
+        _val = (float(_fin.sort_values("bsns_year")["revenue_ttm"].iloc[-1])
+                if "revenue_ttm" in _fin.columns and len(_fin) else float("nan"))
+        _t("TTM-ANNUAL", "사업보고서 단독(연간 모드)에서도 TTM 이 복원된다",
+           all(v == len(_fin) and v > 0 for v in _n.values()) and _val == 6000.0,
+           f"유효 {_n} / 전체 {len(_fin)}행 · 최종연도 revenue_ttm {_val:,.0f} (6,000 이어야) "
+           f"— 구 로직은 분기 차분에만 의존해 전부 NaN 이었습니다")
+    except Exception as e:                                       # noqa
+        _t("TTM-ANNUAL", "연간 모드에서 TTM 이 복원된다", False, f"{type(e).__name__}: {e}")
+
+    # ── 하한선: 근거가 없는 군이 탈락 사유가 되지 않는다 ────────────────────────────
+    #   실측 사고: 관측이 없는 군을 fillna(False) 로 탈락시키고 전 군에 AND 를 걸어
+    #   M1~M3 통과율이 정확히 0.0000% 가 됐다. '폭(breadth)'은 관측된 축 중 몇 개가
+    #   좋으냐이지, 모든 축이 관측되었느냐가 아니다. C6-NA 와 같은 원칙이다.
+    try:
+        _m = pd.date_range("2020-01-31", periods=6, freq="ME")
+        _cd = [f"{i:06d}" for i in range(1, 61)]
+        _p = pd.DataFrame([{"code": c, "month": m} for m in _m for c in _cd])
+        _p["ym"] = _p["month"].values.astype("datetime64[M]")
+        _p["ind_mid"] = "IND"
+        _p["size_bucket"] = "S2"
+        _rg = np.random.default_rng(11)
+        # 내부효율군만 전 종목 관측. 나머지 군은 **관측 자체가 없다**.
+        for _c in ("i_sales", "i_turn", "i_accr"):
+            _p[_c] = _rg.normal(size=len(_p))
+        for _c in ("i_capex", "i_roic", "p_payout", "p_invest", "b4_defrev",
+                   "i_emp", "i_vapp"):
+            _p[_c] = np.nan
+        _p.loc[_p.index[:50], "i_capex"] = _rg.normal(size=50)     # 아주 소수만 관측
+        _p.loc[_p.index[:50], "i_roic"] = _rg.normal(size=50)
+        _, _i0 = apply_breadth_floor(_p, stage="M3", tps=[], quiet=True)
+        _pass = _i0["overall"]
+        _t("FLOOR-EVID", "관측이 없는 센서군은 탈락 사유가 아니다 (하한선이 전멸시키지 않는다)",
+           0.05 < _pass < 0.95,
+           f"M3 하한선 통과율 {100*_pass:.2f}% (구 구현은 정확히 0.0000% 였습니다 — "
+           f"관측 없는 군을 AND 로 걸어 교집합이 비었습니다) · 활성군 {_i0['n_groups']}")
+    except Exception as e:                                       # noqa
+        _t("FLOOR-EVID", "관측이 없는 센서군은 탈락 사유가 아니다", False,
+           f"{type(e).__name__}: {e}")
+
+    # ── 금고 쓰기 잠금: 검정 중 실제 캐시로 새어 나갈 수 없다 ───────────────────────
+    #   실측 사고: 가짜 pykrx 가 살아남아 합성 종목 4개 × 120개월을 실제 공용 캐시에 썼다.
+    #   '전역을 잘 복원하자'는 규율은 이미 한 번 실패했다. 구조로 막는다.
+    try:
+        class _V2(Vault):
+            def __init__(self):
+                self._wlock = ""
+        _v = _V2()
+        _v.lock_writes("검정")
+        _blocked_t = _blocked_b = False
+        try:
+            _v.put_table("x", pd.DataFrame({"a": [1]}))
+        except RuntimeError:
+            _blocked_t = True
+        try:
+            _v.put_blob("d", "s", "k", b"x", "bin")
+        except RuntimeError:
+            _blocked_b = True
+        _v.unlock_writes()
+        _unlocked = True
+        try:
+            _v._assert_writable("x")
+        except RuntimeError:
+            _unlocked = False
+        _t("VAULT-LOCK", "검정 구간에는 실제 금고에 한 바이트도 쓸 수 없다",
+           _blocked_t and _blocked_b and _unlocked,
+           f"put_table 차단 {_blocked_t} · put_blob 차단 {_blocked_b} · 해제 후 정상 "
+           f"{_unlocked} (조용히 무시가 아니라 예외여야 합니다 — 조용한 무시는 "
+           f"다음 사고의 씨앗입니다)")
+    except Exception as e:                                       # noqa
+        _t("VAULT-LOCK", "검정 구간에는 실제 금고에 쓸 수 없다", False, f"{type(e).__name__}: {e}")
+
+    # ── 오염된 캐시를 믿지 않는다 (지우지도 않는다) ────────────────────────────────
+    _sv = {k: globals().get(k, _MISSING) for k in ("VAULT", "RUN_MODE", "pykrx_stock")}
+    try:
+        _mv = _MemVault()
+        _mths = pd.date_range("2016-08-31", periods=4, freq="ME")
+        # 오염 캐시: 패널에 없는 합성 종목코드
+        _mv.put_table("krx_marketcap_monthly", pd.DataFrame(
+            [{"code": c, "month": m.strftime("%Y-%m-%d"), "mcap": 1e11, "shares": 1e6,
+              "mcap_src": "pykrx"} for m in _mths for c in ("000001", "000002")]))
+        _pxm = pd.DataFrame([{"code": c, "month": m, "signal_date": m - pd.Timedelta(days=2),
+                              "close": 1000.0, "adv20": 5e8}
+                             for m in _mths for c in ("005930", "000660", "035420")])
+        globals()["VAULT"] = _mv
+        globals()["RUN_MODE"] = "CACHED"          # 신규 수집 없이 캐시 판정만 본다
+        globals()["pykrx_stock"] = None
+        _mc = fetch_pit_marketcap(_mths, _pxm, pd.DataFrame({"code": [], "shares": []}))
+        _used_fake = int((_mc["mcap_src"] == "pykrx").sum())
+        _kept = _mv.get_table("krx_marketcap_monthly")
+        _t("CACHE-QUAR", "종목이 안 맞는 캐시는 쓰지 않는다 — 그러나 지우지도 않는다",
+           _used_fake == 0 and _kept is not None and len(_kept) == 8,
+           f"오염 캐시 사용 {_used_fake}행 (0이어야) · 원본 보존 "
+           f"{0 if _kept is None else len(_kept)}행 (8이어야 — 절대 1원칙상 삭제 금지)")
+    except Exception as e:                                       # noqa
+        _t("CACHE-QUAR", "오염 캐시를 쓰지 않되 지우지도 않는다", False, f"{type(e).__name__}: {e}")
+    finally:
+        _restore(_sv)
+
     # ── 상장 전 / 폐지 후 구간을 요청하지 않는다 ────────────────────────────────────
     #   실측 실패: 2018년 상장 종목의 2015년치가 캐시에 없는 것을 '결손'으로 오해해
     #   1,159종목을 매 실행 백필했고, 폐지 종목은 폐지일 이후를 매달 다시 물었다.
@@ -554,6 +684,8 @@ def run_contract_tests(strict: bool = True) -> bool:
     _leaked = [k for k in _PATCH_WATCH if globals().get(k, _MISSING) is not _world[k]]
     if _leaked:
         _restore(_world)                      # 먼저 되돌리고, 그 다음에 실패로 기록한다
+    if _realv is not None and _realv is not _MISSING and hasattr(_realv, "unlock_writes"):
+        _realv.unlock_writes()
     _t("LEAK", "계약검정이 전역 상태를 오염시킨 채 끝나지 않는다",
        not _leaked,
        f"오염된 전역 {_leaked or '없음'} "

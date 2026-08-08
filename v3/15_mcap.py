@@ -145,9 +145,38 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
         cached["month"] = as_ts_series(cached["month"])
         cached["code"] = cached["code"].map(to_code6)
         cached = cached.dropna(subset=["month", "code"])
-        have = set(cached["month"].dt.strftime("%Y-%m-%d"))
-        frames.append(cached)
-        LOG.info(f"공용 캐시에서 PIT 시가총액 {len(cached):,}행 재사용 ({len(have)}개 월)")
+
+        # ══════════════════════════════════════════════════════════════════════════
+        #  캐시 검역 — 캐시를 무조건 믿지 않는다
+        #
+        #  ★ 실제 사고: 계약검정의 가짜 pykrx 가 복원되지 않은 채 살아남아, 합성 종목코드
+        #    4개("000001","000002","000101","000102") × 120개월 = 480행이 공용 캐시에
+        #    저장됐다. 다음 실행은 그걸 '120개월치 캐시 적중'으로 읽고 진짜 수집을 통째로
+        #    건너뛰었고, 시총 정확도가 0.0% 로 떨어져 유니버스 계약 C13 이 사실상 폐기됐다.
+        #    예외는 나지 않았다 — 성능표만 조용히 무의미해졌다.
+        #
+        #  검역 규칙: 캐시의 종목코드가 가격 패널의 종목코드와 거의 겹치지 않으면 그 캐시는
+        #  이 유니버스의 것이 아니다. **지우지 않는다**(절대 1원칙 — 삭제 API 자체가 없다).
+        #  이번 실행에서 쓰지 않고, 그 사실과 근거를 표로 남기고, 재수집한다.
+        # ══════════════════════════════════════════════════════════════════════════
+        _panel_codes = set(px_monthly["code"].astype(str).unique())
+        _cache_codes = set(cached["code"].astype(str).unique())
+        _ov = len(_cache_codes & _panel_codes) / max(len(_cache_codes), 1)
+        if _panel_codes and _ov < 0.30:
+            LOG.error(f"공용 캐시의 PIT 시총 {len(cached):,}행을 이번 실행에서 사용하지 "
+                      f"않습니다 — 종목코드가 가격 패널과 {100*_ov:.1f}% 밖에 겹치지 "
+                      f"않습니다 (캐시 {len(_cache_codes):,}종목 중 "
+                      f"{len(_cache_codes & _panel_codes):,}개만 일치). "
+                      f"캐시 예시 {sorted(_cache_codes)[:4]} / 패널 예시 "
+                      f"{sorted(_panel_codes)[:4]}. 합성·시험 데이터가 섞였을 가능성이 "
+                      f"큽니다. ★ 파일은 지우지 않습니다 — 이번 실행에서만 무시하고 "
+                      f"새로 수집한 값으로 덮어씁니다(교체 전 자동 백업).")
+            PIPE.note("WARN: PIT 시총 캐시 검역 — 종목코드 불일치")
+            cached = cached.iloc[0:0]
+        if len(cached):
+            have = set(cached["month"].dt.strftime("%Y-%m-%d"))
+            frames.append(cached)
+            LOG.info(f"공용 캐시에서 PIT 시가총액 {len(cached):,}행 재사용 ({len(have)}개 월)")
 
     todo = [m for m in months if m.strftime("%Y-%m-%d") not in have]
     if RUN_MODE == "CACHED":
@@ -194,7 +223,7 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
     if len(M):
         M = (M.sort_values(["code", "month"])
                .drop_duplicates(["code", "month"], keep="last").reset_index(drop=True))
-    if got_new:
+    if got_new and len(M):
         out = M.copy()
         out["month"] = out["month"].dt.strftime("%Y-%m-%d")
         VAULT.put_table("krx_marketcap_monthly", out, scope="shared", domain="universe",

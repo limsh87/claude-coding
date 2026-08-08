@@ -255,6 +255,7 @@ class Vault:
         """원본 바이트를 내용해시 경로에 저장하고 인덱스에 등록. 같은 내용이면 재기록하지 않는다."""
         if not data:
             return None
+        self._assert_writable(f"put_blob({domain}/{subtype}/{key})")
         h = sha1_bytes(data)
         uid = uid or sha1_str(domain, subtype, key, h)
         sub = os.path.join(self.blob_dir(scope), domain, subtype, h[:2], h[2:4])
@@ -296,6 +297,7 @@ class Vault:
         """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다."""
         if df is None:
             return None
+        self._assert_writable(f"put_table({name}, scope={scope})")
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
         if os.path.exists(path):
             bak = os.path.join(self.ns[scope], "index", "_backup",
@@ -321,6 +323,33 @@ class Vault:
                                  "cols": list(map(str, df.columns))[:80]}, ensure_ascii=False),
         })
         return path
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  쓰기 잠금 — 계약검정이 실제 캐시를 오염시키는 사고를 '구조로' 막는다
+    #
+    #  ★ 실제로 일어난 사고다. 계약검정이 pykrx 를 가짜 객체로 바꿔치기한 뒤 복원에
+    #    실패했고, 그 가짜가 살아남아 M0.MCAP 이 합성 종목코드 4개 × 120개월 = 480행을
+    #    사용자의 **실제 공용 드라이브 캐시**(krx_marketcap_monthly)에 써버렸다.
+    #    다음 실행은 그 480행을 캐시 적중으로 읽고 진짜 수집을 통째로 건너뛰었다.
+    #    저널이 append-only 라 '지워지지'는 않았지만, 가짜가 진짜를 가리는 건 훼손과 같다.
+    #
+    #  '전역을 잘 복원하자'는 규율은 이미 한 번 실패했다. 규율이 아니라 구조로 막는다:
+    #  검정 구간에는 금고 자체를 읽기전용으로 잠근다. 잠긴 동안의 쓰기는 조용히 무시되지
+    #  않고 예외로 터진다 — 조용한 무시는 다음 사고의 씨앗이다.
+    # ══════════════════════════════════════════════════════════════════════════════
+    def lock_writes(self, why: str = "계약검정"):
+        self._wlock = why
+
+    def unlock_writes(self):
+        self._wlock = ""
+
+    def _assert_writable(self, what: str):
+        if getattr(self, "_wlock", ""):
+            raise RuntimeError(
+                f"금고가 '{self._wlock}' 때문에 읽기전용으로 잠겨 있는데 쓰기를 시도했습니다: "
+                f"{what}. 이건 방어가 작동한 것입니다 — 검정용 가짜 데이터가 실제 캐시로 "
+                f"새어 나가려던 참이었습니다. 검정 코드에서 VAULT 를 대역으로 교체했는지 "
+                f"확인하세요.")
 
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:

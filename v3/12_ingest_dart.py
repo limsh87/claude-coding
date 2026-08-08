@@ -582,7 +582,8 @@ def _fs_one(job) -> Optional[pd.DataFrame]:
 
 
 def fetch_dart_full(corp_codes: Sequence[str], years: Sequence[int],
-                    priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                    priority: Optional[Sequence[str]] = None,
+                    scope: Optional[set] = None) -> pd.DataFrame:
     """전체 재무제표. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
 
     priority 를 주면 그 순서(유동성 상위)대로 먼저 받는다. 일일 한도로 중간에 끊기는 것이
@@ -601,8 +602,34 @@ def fetch_dart_full(corp_codes: Sequence[str], years: Sequence[int],
 
     reprts = ([REPRT_CODES["FY"]] if DART_FS_FREQ == "annual"
               else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  수집 범위 = '이 전략이 살 수 있는 종목'  (호출량 설계의 핵심)
+    #
+    #  ★ 실측: 3,452종목 × 12년 = 51,753 조합을 큐에 넣고 25.4% 에서 하루 쿼터를 다 썼다.
+    #    그런데 U-MID 유니버스는 월평균 729종목이고, 편입의 필수 조건인 유동성 게이트
+    #    (20일 평균거래대금 ≥ UNIVERSE_MIN_ADTV)를 **단 한 달도** 통과하지 못한 종목은
+    #    정의상 영원히 매수 대상이 아니다. 그 종목의 재무제표를 받는 건 순수한 낭비다.
+    #
+    #  ★ 편향이 생기지 않는 이유: 밴드는 '진입 필터'이고(C13), 진입하려면 어느 시점엔가
+    #    유동성 하한을 넘어야 한다. 한 번도 넘지 못한 종목은 어떤 신호를 줘도 살 수 없다.
+    #    졸업(밴드 이탈)은 보유를 끊지 않으므로 여기서 잘라도 성공사례가 사라지지 않는다.
+    #    안전을 위해 하한의 절반을 기준으로 잡아 경계 종목을 넉넉히 남긴다.
+    # ══════════════════════════════════════════════════════════════════════════════
     order = {str(c): i for i, c in enumerate(priority or [])}
-    corp_sorted = sorted((str(c) for c in corp_codes), key=lambda c: (order.get(c, 10 ** 9), c))
+    corp_all = sorted({str(c) for c in corp_codes})
+    if scope:
+        corp_in = [c for c in corp_all if c in scope]
+        n_out = len(corp_all) - len(corp_in)
+        if corp_in:
+            LOG.info(f"전체재무제표 수집 범위를 투자 가능 종목으로 한정합니다 — "
+                     f"{len(corp_all):,}사 중 {len(corp_in):,}사 ({n_out:,}사 제외). "
+                     f"제외된 곳은 백테스트 전 구간에서 유동성 하한을 한 번도 넘지 못해 "
+                     f"정의상 매수 대상이 아닙니다(C13 진입 필터). 호출량이 "
+                     f"{100*len(corp_in)/max(len(corp_all),1):.0f}% 로 줄어듭니다.")
+            corp_all = corp_in
+        else:
+            LOG.warn("투자 가능 종목 판정이 비어 범위 한정을 적용하지 않습니다 (전 종목 수집).")
+    corp_sorted = sorted(corp_all, key=lambda c: (order.get(c, 10 ** 9), c))
     jobs = [(c, y, r) for y in sorted(years, reverse=True)      # 최근 연도 우선
             for c in corp_sorted for r in reprts
             if int(y) >= DART_MIN_YEAR and (c, int(y), str(r)) not in done]
@@ -1029,18 +1056,87 @@ def tidy_financials(raw: pd.DataFrame, kmap: pd.DataFrame,
     W["q"] = W["reprt_code"].map(order)
     W = W.dropna(subset=["q"]).sort_values(["code", "bsns_year", "q"]).reset_index(drop=True)
     gk = ["code", "bsns_year"]
+    W["bsns_year"] = pd.to_numeric(W["bsns_year"], errors="coerce").astype("Int64")
+    W = W.dropna(subset=["bsns_year"])
+    W["bsns_year"] = W["bsns_year"].astype(int)
     W["_q_prev"] = W.groupby(gk, observed=True)["q"].shift(1)
     contiguous = (W["q"] - W["_q_prev"]) == 1
+
+    # ══════════════════════════════════════════════════════════════════════════════════
+    #  TTM(직전 12개월) — 누적공시에서 정확히 복원한다
+    #
+    #  ★★ 이 블록이 v3 최대의 조용한 결함이었다. 실측 증거:
+    #     DART_FS_FREQ="annual" 이면 Tier3(fnlttSinglAcntAll)는 **사업보고서(q=4)만**
+    #     받는다. 그러면 (code, bsns_year) 그룹에 행이 하나뿐이라
+    #       · shift(1) → NaN  → contiguous = False
+    #       · q == 1 도 아님
+    #       → _q 가 **전 행 NaN**
+    #       → rolling(4, min_periods=4) 도 **전 행 NaN**
+    #     즉 cogs/cfo/capex/배당/R&D 등 Tier3 에서만 오는 유량계정의 _ttm 이 통째로 죽는다.
+    #     실측 로그가 정확히 이 모양이었다 — 계정 커버리지는 inventory 79.9%, cogs 91.0%,
+    #     cfo 93.2% 인데 그걸 쓰는 센서는 i_dio 2.8%, i_accr 2.5%, i_capex 1.9%,
+    #     p_payout 0.0%. 반면 4개 분기를 다 받는 Tier2(fnlttMultiAcnt) 계정만
+    #     살아남아 i_sales 만 63.5% 였다. 예외는 한 줄도 나지 않았다.
+    #
+    #  올바른 항등식 (누적공시 → TTM):
+    #        TTM(y, q) = cum(y, q) + FY(y-1) - cum(y-1, q)
+    #     q=4 면 cum(y,4) = FY(y) 이고 뒤 두 항이 상쇄되어  TTM = FY(y).
+    #     → **연간 단독 모드에서도 TTM 은 원리상 정확히 정의된다.** 분기 차분이 불가능한
+    #       것과 TTM 을 못 만드는 것은 전혀 다른 문제인데, 예전 코드는 둘을 묶어버렸다.
+    #
+    #  PIT 안전성: FY(y-1) 과 cum(y-1,q) 는 **현재 행보다 먼저 제출된** 보고서의 값이다.
+    #     현재 행의 knowledge_date 가 그 둘보다 늦으므로 미래누수가 생길 수 없다.
+    # ══════════════════════════════════════════════════════════════════════════════════
+    have_flow = [c for c in FLOW_ITEMS if c in W.columns]
     for c in FLOW_ITEMS:
         if c not in W.columns:
             W[c] = np.nan
+
+    # 전년 동일분기 누적 / 전년 연간
+    _pq = W[["code", "bsns_year", "q"] + have_flow].copy()
+    _pq["bsns_year"] = _pq["bsns_year"] + 1                     # y-1 의 값을 y 행에 붙인다
+    _pq = _pq.rename(columns={c: f"__pq_{c}" for c in have_flow})
+    _pq = _pq.drop_duplicates(["code", "bsns_year", "q"], keep="last")
+    W = W.merge(_pq, on=["code", "bsns_year", "q"], how="left")
+
+    _fy = W.loc[W["q"] == 4, ["code", "bsns_year"] + have_flow].copy()
+    _fy["bsns_year"] = _fy["bsns_year"] + 1
+    _fy = _fy.rename(columns={c: f"__fy_{c}" for c in have_flow})
+    _fy = _fy.drop_duplicates(["code", "bsns_year"], keep="last")
+    W = W.merge(_fy, on=["code", "bsns_year"], how="left")
+
+    is_fy = (W["q"] == 4).to_numpy()
+    src = Counter()
+    for c in FLOW_ITEMS:
         prev = W.groupby(gk, observed=True)[c].shift(1)
         # ★ 누락된 분기를 0으로 간주하면 반기 누적치가 한 분기 실적으로 둔갑한다. fail-open 금지.
         W[c + "_q"] = np.where(W["q"] == 1, W[c], np.where(contiguous, W[c] - prev, np.nan))
-        # TTM = 4분기 이동합. min_periods=4 — 3개로 TTM 이라 부르면 15~25% 과소계상된다.
-        W[c + "_ttm"] = (W.groupby("code", observed=True)[c + "_q"]
-                          .transform(lambda s: s.rolling(4, min_periods=4).sum()))
-    W = W.drop(columns=["_q_prev"])
+
+        cum = pd.to_numeric(W[c], errors="coerce")
+        # ① 사업보고서 = 그 자체가 TTM (연간 모드에서 유일하게 성립하는 경로)
+        t1 = cum.where(pd.Series(is_fy, index=W.index))
+        # ② 분기 항등식
+        pq = pd.to_numeric(W.get(f"__pq_{c}"), errors="coerce")
+        fy = pd.to_numeric(W.get(f"__fy_{c}"), errors="coerce")
+        t2 = cum + fy - pq
+        # ③ 최후: 분기 단독의 4분기 이동합 (분기 데이터가 온전할 때만 성립)
+        t3 = (W.groupby("code", observed=True)[c + "_q"]
+                .transform(lambda s: s.rolling(4, min_periods=4).sum()))
+        ttm = t1.where(t1.notna(), t2)
+        ttm = ttm.where(ttm.notna(), t3)
+        W[c + "_ttm"] = ttm
+        src[f"①사업보고서"] += int(t1.notna().sum())
+        src["②분기항등식"] += int((t1.isna() & t2.notna()).sum())
+        src["③4분기이동합"] += int((t1.isna() & t2.isna() & t3.notna()).sum())
+        src["미상"] += int(ttm.isna().sum())
+
+    W = W.drop(columns=["_q_prev"] + [c for c in W.columns
+                                      if c.startswith("__pq_") or c.startswith("__fy_")])
+    _tot = max(sum(src.values()), 1)
+    LOG.table([[k, f"{v:,}", f"{100*v/_tot:.1f}%"] for k, v in src.most_common()],
+              ["TTM 산출 경로", "계정×행", "비중"], ["l", "r", "r"],
+              title="TTM 복원 경로 — 연간 단독(FY) 행은 누적값 자체가 TTM 입니다 "
+                    "(예전엔 여기서 유량계정이 전부 결측이 됐습니다)")
 
     for k in ACCOUNT_MAP:
         if k not in W.columns:

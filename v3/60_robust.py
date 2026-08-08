@@ -269,8 +269,40 @@ def R3_orthogonal(P: pd.DataFrame, bt: dict, months) -> None:
     if len(D) < 24:
         _rec("R3", "퀄리티 직교화", "SKIP", f"공통 관측이 {len(D)}개월로 부족합니다.", "")
         return
-    X = np.column_stack([np.ones(len(D))] + [D[c].to_numpy() for c in F.columns])
-    beta, *_ = np.linalg.lstsq(X, D["y"].to_numpy(), rcond=None)
+    # ★ 실측 크래시: LinAlgError "SVD did not converge in Linear Least Squares".
+    #   전략이 빈 포트폴리오를 돌면 y 가 전부 0(또는 상수)이고 팩터 열도 상수/NaN 이 되는데,
+    #   그 상태로 lstsq 를 부르면 LAPACK 이 수렴에 실패해 예외로 죽는다. 강건성 검사가
+    #   '결과가 이상하다'를 보고하는 대신 스스로 죽어버리면 감사 자체가 사라진다.
+    #   → 퇴화 입력을 먼저 판정하고, 숫자를 지어내지 말고 SKIP 사유를 남긴다(C10).
+    Xc = [D[c].to_numpy(dtype="float64") for c in F.columns]
+    yv = D["y"].to_numpy(dtype="float64")
+    bad = [c for c, v in zip(F.columns, Xc)
+           if not np.all(np.isfinite(v)) or float(np.nanstd(v)) < 1e-12]
+    if bad:
+        Xc = [v for c, v in zip(F.columns, Xc) if c not in bad]
+        F = F.drop(columns=list(bad))
+        LOG.warn(f"직교화에서 제외한 상수/비유한 팩터: {list(bad)} "
+                 f"(분산이 0이면 회귀행렬이 특이해져 SVD 가 수렴하지 않습니다)")
+    if not Xc:
+        _rec("R3", "퀄리티 직교화", "SKIP",
+             "설명변수가 전부 상수이거나 비유한이라 회귀를 세울 수 없습니다.", "")
+        return
+    if not np.all(np.isfinite(yv)) or float(np.nanstd(yv)) < 1e-12:
+        _rec("R3", "퀄리티 직교화", "SKIP",
+             f"전략 수익률이 상수(표준편차 {float(np.nanstd(yv)):.2e})입니다 — "
+             f"보유 종목이 없거나 신호가 죽었다는 뜻이고, 직교화로 답할 수 있는 질문이 "
+             f"아닙니다. 먼저 'L1 센서 커버리지'와 '하한선 근거 감사' 표를 보세요.", "")
+        return
+    X = np.column_stack([np.ones(len(D))] + Xc)
+    if np.linalg.matrix_rank(X) < X.shape[1]:
+        _rec("R3", "퀄리티 직교화", "SKIP",
+             f"설명변수가 선형종속입니다 (rank {np.linalg.matrix_rank(X)} < {X.shape[1]}).", "")
+        return
+    try:
+        beta, *_ = np.linalg.lstsq(X, yv, rcond=None)
+    except np.linalg.LinAlgError as e:                               # noqa
+        _rec("R3", "퀄리티 직교화", "SKIP", f"최소자승이 수렴하지 않았습니다: {e}", "")
+        return
     resid = D["y"].to_numpy() - X @ beta
     alpha_m = float(beta[0])
     _, t_a = hac_tstat(resid + alpha_m)
