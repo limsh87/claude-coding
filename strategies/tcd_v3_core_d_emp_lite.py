@@ -406,7 +406,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.1318"
+BUILD_VERSION  = "v3.20260808.1319"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -10795,6 +10795,40 @@ def _suite_ok(rid: str, name: str) -> bool:
     return True
 
 
+def month_lag(P: pd.DataFrame, values, k: int) -> pd.Series:
+    """종목별로 **달력 k개월** 만큼 민 값. 음수 k 는 미래로 당긴다(앞당김).
+
+    ══════════════════════════════════════════════════════════════════════════════════════
+     ★★ 왜 groupby(...).shift(k) 를 쓰면 안 되는가 ★★
+       shift/diff 는 '몇 **행** 전'이지 '몇 **개월** 전'이 아니다. 이 스코어링 패널은
+       유동성·규모 대역으로 이미 잘려 있어서 종목별 행이 월 연속이 아니다 —
+       유동성이 출렁여 두어 달 빠졌던 종목은 12행 전이 실제로는 14~15개월 전이다.
+       · R3 의 모멘텀 통제(f_mom)가 그러면 종목마다 다른 기간의 수익률을 통제하게 되고,
+         직교화가 '무엇을 통제했는지' 말할 수 없어진다.
+       · R1 의 신호 6개월 앞당김도 종목마다 4~9개월로 흔들려, '앞당겨도 개선 없음'이
+         신호의 성질인지 격자의 성질인지 구별되지 않는다.
+       → 월 축으로 피벗해 달력 기준으로 민 뒤 되돌린다. 빠진 달은 결측으로 남는다
+         (없는 관측을 만들어 내지 않는다).
+    ══════════════════════════════════════════════════════════════════════════════════════
+    """
+    v = (col(P, values) if isinstance(values, str)
+         else pd.to_numeric(values, errors="coerce"))
+    D = pd.DataFrame({"code": P["code"].astype(str).to_numpy(),
+                      "month": as_ts_series(P["month"]).to_numpy(),
+                      "v": pd.to_numeric(v, errors="coerce").to_numpy()})
+    try:
+        W = D.pivot_table(index="month", columns="code", values="v", aggfunc="last")
+        W = W.reindex(pd.date_range(W.index.min(), W.index.max(), freq="ME"))
+        S = W.shift(k)
+        out = S.stack(future_stack=True).rename("v").reset_index()
+        out.columns = ["month", "code", "v"]
+        M = D.reset_index().merge(out, on=["code", "month"], how="left", suffixes=("", "_lag"))
+        return pd.Series(M.sort_values("index")["v_lag"].to_numpy(), index=P.index)
+    except Exception as e:                                       # noqa
+        LOG.debug(f"month_lag 실패({type(e).__name__}) — 행 기준 shift 로 폴백합니다.")
+        return pd.Series(v).groupby(P["code"].to_numpy()).shift(k)
+
+
 ALPHA_FLOOR = 0.20      # 이 아래의 Sharpe 는 '알파가 있다'고 말하지 않는다
 
 
@@ -10989,7 +11023,9 @@ def R1_leakage(P: pd.DataFrame, months: pd.DatetimeIndex, run_fn: Callable) -> N
     s_inject = _stat(run_fn(A, label="R1_inject"), "Sharpe")
 
     B = P.sort_values(["code", "month"]).copy()
-    B["Signal_rank"] = B.groupby("code", observed=True)["Signal_rank"].shift(-6)
+    # ★ 달력 6개월 앞당김. 행 기준 shift(-6)은 대역 이탈로 행이 빠진 종목에서 4~9개월이
+    #   되어, '앞당겨도 개선 없음'이 신호의 성질인지 격자의 성질인지 구별되지 않는다.
+    B["Signal_rank"] = month_lag(B, "Signal_rank", -6)
     s_ahead = _stat(run_fn(B, label="R1_ahead"), "Sharpe")
 
     d1 = s_inject - base
@@ -11232,7 +11268,11 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
     Q = P.sort_values(["code", "month"]).copy()
     Q["f_size"] = np.log(col(Q, "assets").where(col(Q, "assets") > 0))
     Q["f_prof"] = safe_div(col(Q, "net_income_ttm"), col(Q, "assets"))
-    Q["f_mom"] = gby(Q, "close").transform(lambda s: dlog(s, 12))
+    # ★ 달력 12개월 모멘텀. 행 기준 diff(12)는 종목마다 다른 기간을 통제하게 되어
+    #   직교화가 '무엇을 통제했는지' 말할 수 없어진다.
+    _c = col(Q, "close")
+    _c12 = month_lag(Q, "close", 12)
+    Q["f_mom"] = (np.log(_c.where(_c > 0)) - np.log(_c12.where(_c12 > 0)))
     Q["f_accr"] = col(Q, "accruals")
     facs = ["f_size", "f_prof", "f_mom", "f_accr"]
     y = col(Q, "E_raw")
