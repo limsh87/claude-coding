@@ -269,6 +269,42 @@ append-only JSONL 저널 · 백업 후 교체 · 내용해시 blob · **삭제 A
 `_shared` 를 **TCD v2 와 같은 루트로 잡아** 기존에 모아둔 리포트·가격을 그대로 재사용한다.
 루트는 하드코딩하지 않고 `resolve_project_root()` 가 런타임에 결정한다 (SPEC §2.1, `/content` 금지).
 
+## L1 수집계층 전면 재작성 — 실측 로그가 시킨 일
+
+첫 배포본을 사용자가 윈도우/JupyterLab(파이썬 3.14, 16코어)에서 실제로 돌린 로그가 근거다.
+L0(계약검정·스모크·리허설)와 계산계층은 전부 정상이었고, **소요시간과 실패의 100%가 L1 수집**에
+몰려 있었다. 그래서 L1 만 전면 재작성하고 L2~L6 은 그대로 보존했다.
+
+| 실측 증상 | 진짜 원인 | 재작성 |
+|---|---|---|
+| `L1.PX` **2,875초**(예산 2,400초 초과) | `_px_fdr` 이 `limiter("krx")`(2 QPS)를 썼다. FDR 은 KRX 를 부르지도 않는데 KRX 예산에 묶였다. **5,398 ÷ 2.0 = 2,699초 ≈ 실측 2,875초** | 버킷을 실제 호스트 기준으로 분리 (`fdr` 8 · `naver_chart` 8 · `naver_detail` 6 · `krx` 2). 워커 수는 QPS 에서 역산 |
+| 일봉 수집 실패 **1,901종목** | 우선주·ETF·ETN·ELW·스팩·KONEX 처럼 §5 에서 어차피 탈락할 종목의 가격을 받으려 했고, 실패할 때마다 4개 소스를 전부 돌렸다 | `price_target_codes()` 로 요청 자체를 줄이고, 사전 프로브로 죽은 소스를 체인에서 제외. 실패는 지수 백오프(30·60·120·240·365일) |
+| yfinance stderr 폭주 → `IOPub message rate exceeded` (출력 정지) | 실패 1건당 `.KS`/`.KQ` 2요청 + 3~4줄 로그 | yfinance 기본 제외. 켜더라도 **별도 패스에서 fd 1·2 를 통째로 봉인**하고 결과만 출력 |
+| `pykrx 없음` → 시총·PBR 전멸 → §5 하한·`log(MktCap)`·**시총하위1000 아암**·BM 동시 사망 | pykrx 단일 의존 | pykrx 가 부르던 `getJsonData.cmd` 를 직접 호출(`krx_all_price` / `krx_all_perpbr`). 체인: pykrx → KRX MDC 벌크 → 근사(현재 상장주식수×과거 종가). 근사분은 `mktcap_is_approx` 로 표시하고 §5 절대하한에는 쓰지 않는다 |
+| **한경컨센서스 0건** (고신뢰 애널리스트 소스 증발) | 엔드포인트 하드코딩 | 후보 조합을 실측으로 두드려 살아 있는 것을 선택(`hankyung_probe`). 그래도 0건이면 도달여부·응답크기·표 유무를 표로 남겨 **"데이터가 없음"과 "코드가 틀림"을 구분** |
+| 네이버 상세 5,733/20,000 (38분에 29%) | 리스트와 같은 `naver` 버킷(2.5 QPS)을 공유 | 전용 버킷 + **nid 키 영구 캐시**(공용 인덱스) → 두 번째 실행부터 0초. 청크마다 저장해 중간에 끊겨도 이어받음 |
+| 상세 상한을 `최신순 head(limit)` 로 자름 | — | ★ **조용한 치명 결함**이었다. 최신 2만건만 받으면 2016~2019 링크가 통째로 비는데 예외가 안 난다. **월별 라운드로빈**으로 교체하고 계약 K15 로 고정 |
+| PDF 대상 **64,190건** (≈19GB, 수 시간) | 기본 ON | 기본 OFF. 켜도 *아직 작성자를 모르는* 리포트만, 디스크 여유의 절반까지만 |
+| 드라이브 못 찾음 → `LOCAL_CREATED`, 스캔대상 0개 | 후보 폴더명 매칭에 의존 | 최상단 `GDRIVE_ROOT` 직접 지정 + **이름이 아니라 구조(`_shared/index` 존재)로 캐시 루트 탐색** + 윈도우 드라이브 문자 A~Z·맥 CloudStorage·WSL |
+| `여유 공간 nan GB` | `os.statvfs` 는 윈도우에 없다 | `shutil.disk_usage`. 표시만이 아니라 PDF 용량 점검이 무력화되고 있었다 |
+| 폐지목록 4,172 → 2,636 (**37% 가 "코드형식 불일치"**) | 진단 부재 | 탈락분을 유형별로 집계하고 *본주가 이미 목록에 있는 파생증권*인지 표로 보여준다. **앞 6자리를 잘라 붙이는 임의 복원은 하지 않는다** — 살아 있는 회사에 폐지일을 심는 사고가 된다 |
+
+## 절대원칙 — 신규 수집물은 전부 저장되고 세션과 무관하게 재호출된다
+
+규율이 아니라 **구조**로 강제한다.
+
+```
+note_new_data(...)     네트워크에서 새로 받은 순간 등록 (영수증)
+persist(...)           유일한 저장 경로. 공용/전용 인덱스에 쓰고 원장에 기록
+cache_audit()          등록됐는데 저장 안 된 것을 찾아냄 → 경고가 아니라 실패로 취급
+cache_manifest()       datasets[].name + recall 코드를 남겨, 다음 세션이 이름을 몰라도 꺼내 씀
+```
+
+실행 끝에 `드라이브 캐시 원장` 표와 `cache_manifest.json` · `cache_ledger.csv` 가 나온다.
+리허설(가짜 네트워크) 중에는 `persist()` 가 쓰기를 **거부**한다 — 합성 데이터가 공용 인덱스에
+남으면 이후 실수집이 "그 달은 이미 있다"며 영원히 건너뛰기 때문이다(절대 1원칙 위반 경로).
+계약 K17 이 이 거부를 실제로 검사한다.
+
 ## 코어에 없어서 새로 만든 것
 
 재사용한 TCD v2 수집 계층에는 다음이 **통째로 없었다.** 확인 후 신규 구현:
@@ -280,7 +316,7 @@ append-only JSONL 저널 · 백업 후 교체 · 내용해시 blob · **삭제 A
 
 ## 산출물 (§10)
 
-`{ROOT}/arc_sacn/outputs/` 에 11종:
+`{ROOT}/arc_sacn/outputs/` 에 11종 (+ 캐시 증빙 `cache_manifest.json` · `cache_ledger.csv`):
 `PHASE0_DATA_FEASIBILITY.md` · `run_summary.json` · `metrics_all_configs.csv` ·
 `equity_curves.parquet` · `trade_log.parquet` · `hypothesis_test_report.md` ·
 `mechanism_tests.md` · `cost_sensitivity.md` · `delisting_sensitivity.md` ·
@@ -301,7 +337,7 @@ append-only JSONL 저널 · 백업 후 교체 · 내용해시 blob · **삭제 A
 
 ```bash
 python3 tools/build_sacn.py    # build_sacn/ 조각 + build/ 코어 → strategies/ 단일 파일
-python3 tools/smoke_sacn.py    # 계약검정 K1~K14 + 합성 스모크 실제 실행
+python3 tools/smoke_sacn.py    # 계약검정 K1~K19 + 합성 스모크 + 실경로 리허설
 python3 tools/itest_sacn.py    # 수집만 합성으로 대체하고 FULL 경로 전체 실행
 ```
 

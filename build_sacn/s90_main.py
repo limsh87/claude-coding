@@ -54,19 +54,30 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
     ctx: Dict[str, Any] = {}
 
     with PIPE.stage("L1.UNI", "종목 마스터 (상장·폐지 이력 포함)", "L1", budget_s=900):
+        KRX.login()
         snaps = fetch_pykrx_snapshots(months)
+        if snaps is None or len(snaps) == 0:
+            # pykrx 가 없으면 위 경로는 통째로 건너뛴다(설계상 정상). 다만 그러면
+            # 생존자편향을 교차검증할 PIT 스냅샷이 사라지므로, KRX 벌크로 복원한다.
+            snaps = krx_listing_snapshots(months)
         sec = build_security_master(snaps)
         ctx["sec"], ctx["snapshots"] = sec, snaps
 
     with PIPE.stage("L1.PX", "일별 가격 · 거래대금", "L1", budget_s=2400):
-        KRX.login()
         start = (as_ts(BACKTEST_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d")
-        px = fetch_prices(ctx["sec"]["code"].tolist(), start, BACKTEST_END)
+        # ★ 받아야 하는 것만 받는다. 우선주·ETF·ETN·ELW·스팩·KONEX 와 구간 밖 종목은
+        #   §5 에서 어차피 전부 제외되므로 가격을 요청할 이유가 없다. 실측에서 이 부류가
+        #   '전 소스 실패 1,901종목'의 큰 덩어리였다 — 받지 못할 것을 받으려다 4개 소스를
+        #   전부 헛돌린 것이다. (상장폐지 종목은 반드시 남긴다 — 생존자편향)
+        px_codes, px_audit = price_target_codes(ctx["sec"])
+        LOG.table(px_audit.values.tolist(), list(px_audit.columns), ["l", "r"],
+                  title="가격 수집 대상 축소 (§5 에서 탈락이 확정된 종목은 요청하지 않음)")
+        px = fetch_prices(px_codes, start, BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
         ctx["panel"] = build_price_panel(px, months)
 
     with PIPE.stage("L1.META", "시가총액 · BM · 제외플래그 · 업종", "L1", budget_s=1800):
-        ctx["mcap"] = fetch_mktcap_monthly(months)
+        ctx["mcap"] = fetch_mktcap_monthly(months, panel=ctx["panel"]["monthly"])
         fund = fetch_fundamental_monthly(months)
         ctx["nonequity"] = fetch_nonequity_tickers(months)
         ctx["flags"] = build_exclusion_flags(ctx["sec"], ctx["nonequity"])
@@ -74,7 +85,7 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
         ctx["fund"] = attach_bm_fallback(fund, ctx["mcap"], ctx["sec"], months)
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 구축", "L1",
-                    budget_s=5400, critical=False):
+                    budget_s=7200, critical=False):
         LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
                  "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
                  "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
@@ -116,6 +127,10 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
 def main() -> dict:
     t_all = time.time()
     global VAULT, DQ, GDRIVE_ROOT, ADOPT_DIRS_RESOLVED
+    # ★ 가장 먼저 서드파티 수다를 끈다. 주피터는 초당 메시지 수가 제한돼 있어서,
+    #   yfinance/pymupdf 가 뱉는 수천 줄이 IOPub 한도를 넘기면 출력이 통째로 멈춘다.
+    #   사용자는 그걸 '멈춤'으로 읽고 커널을 죽인다 — 몇 시간이 그렇게 날아간다.
+    silence_thirdparty()
     LOG.banner(f"ARC-SACN — {STRATEGY_NAME}",
                f"백테스트 {BACKTEST_START} ~ {BACKTEST_END} · 빌드 {BUILD_VERSION} · "
                f"모드 {RUN_MODE}")
@@ -140,9 +155,19 @@ def main() -> dict:
         LOG.table([["캐시 루트", VAULT.root], ["결정 방식", mode],
                    ["공용 인덱스", f"{GDRIVE_SHARED_NS}  (다른 전략과 공유·재사용)"],
                    ["전용 인덱스", f"{GDRIVE_PRIVATE_NS}  (이 전략 고유)"],
-                   ["기존 캐시 스캔 대상", f"{len(adopts)}개 경로"],
-                   ["여유 공간", f"{free_gb(VAULT.root):.1f} GB"]],
+                   ["기존 캐시 스캔 대상", f"{len(adopts)}개 경로" +
+                    (f"  ({adopts[0]})" if adopts else "")],
+                   ["여유 공간", f"{free_gb_safe(VAULT.root):.1f} GB"]],
                   ["항목", "값"], ["l", "l"], title="구글드라이브 캐시")
+        if mode.startswith(("LOCAL", "FALLBACK")):
+            LOG.warn(
+                "구글드라이브를 찾지 못해 로컬 경로를 씁니다. 기존 드라이브 캐시를 한 건도 "
+                "재사용하지 못하는 상태이며, 이번 실행의 수집물도 드라이브가 아니라 이 PC 에만 "
+                "남습니다.\n"
+                "  → 해결: 코드 상단 GDRIVE_ROOT 에 드라이브 폴더 경로를 그대로 붙여넣으세요.\n"
+                "     윈도우 예:  GDRIVE_ROOT = r\"G:\\내 드라이브\\tcd_cache\"\n"
+                "     코랩 예:    GDRIVE_ROOT = \"/content/drive/MyDrive/tcd_cache\"\n"
+                "     (탐색기 주소창에 보이는 경로를 그대로 복사하면 됩니다)")
         VAULT.load_index("shared")
         VAULT.load_index("private")
         VAULT.adopt_scan(adopts)
@@ -150,7 +175,7 @@ def main() -> dict:
         globals()["DQ"] = DQ
         DQ.report()
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K14", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K19", "L0", budget_s=300):
         run_contract_tests(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0", budget_s=900):
@@ -400,6 +425,8 @@ def main() -> dict:
     VAULT.compact("shared")
     VAULT.compact("private")
     VAULT.report()
+    # ★ 절대원칙 점검 — 이번 실행이 새로 받은 것이 전부 드라이브에 남았는지 기계적으로 확인
+    report_cache_ledger()
     LOG.banner("완료", f"총 소요 {(time.time()-t_all)/60:.1f}분 · "
                        f"산출물 {len(OUTPUTS)}개 · 캐시 {VAULT.root}")
     offer_download(OUTPUTS)
@@ -490,8 +517,19 @@ def write_outputs(ctx: dict, ppy: float, t_all: float):
     write_text(f"run_log_{_dt.datetime.now():%Y%m%d_%H%M%S}.txt", "\n".join(LOG.buffer))
     for cid, bt in ctx["allbt"].items():
         if len(bt.get("returns", [])):
-            VAULT.put_table(f"backtest_returns_{STRATEGY_ID}_{cid.replace('|','_')}",
-                            bt["returns"], scope="private", domain="backtest", source=cid)
+            persist(f"backtest_returns_{STRATEGY_ID}_{cid.replace('|', '_')}", bt["returns"],
+                    scope="private", domain="backtest", source=cid)
+    # ★ 절대원칙: 세션이 바뀌어도 '이름을 몰라도' 다시 꺼낼 수 있어야 한다.
+    #   매니페스트에 공용/전용 인덱스의 모든 데이터셋과 그 재호출 코드를 박아 둔다.
+    man = cache_manifest()
+    write_text("cache_manifest.json", json.dumps(man, ensure_ascii=False, indent=2, default=str))
+    led, _viol = cache_audit()
+    write_df("cache_ledger.csv", led)
+    if man.get("datasets"):
+        LOG.table([[d["scope"], d["name"], f"{d['rows']:,}"]
+                   for d in sorted(man["datasets"], key=lambda x: -x["rows"])[:20]],
+                  ["인덱스", "데이터셋", "행수"], ["l", "l", "r"],
+                  title="드라이브 캐시 매니페스트 (cache_manifest.json — 다음 세션 재호출용)")
     LOG.table([[os.path.basename(p), f"{os.path.getsize(p)/1024:.1f}KB"] for p in OUTPUTS
                if os.path.exists(p)], ["산출물", "크기"], ["l", "r"],
               title=f"산출물 (§10) → {os.path.join(GDRIVE_PRIVATE_NS, 'outputs')}")

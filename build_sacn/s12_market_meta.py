@@ -1,53 +1,40 @@
-
-
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-M  시장 메타 — 시가총액 / BM / 제외플래그 / 업종 / 개인비중                            ║
+# ║  L1-M  시장 메타 — 시가총액 / BM / 제외플래그 / 업종 / 개인비중  (전면 재작성)             ║
 # ║                                                                                          ║
-# ║  재사용 코어(가격 조각)에는 이것들이 통째로 없다. 확인된 공백을 여기서 메운다:               ║
-# ║    · 시가총액·상장주식수      → §5 유니버스 하한, §6.3 log(MktCap), 소형주 비교아암          ║
-# ║    · BM(장부/시가)            → §6.3 직교화 4번째 항                                       ║
-# ║    · 관리종목/스팩/우선주/ETF → §5 제외 규칙 (코어에 필터가 하나도 없었다)                   ║
-# ║    · 업종                     → §6.3 SectorRet, H2 교차업종 전용 검정                       ║
-# ║    · 개인 거래비중            → H3 조건부 예측                                              ║
+# ║  ■ 실측에서 무슨 일이 있었나                                                              ║
+# ║      "pykrx 없음 — 시가총액 스냅샷을 건너뜁니다"  (파이썬 3.14 에서 설치 실패)             ║
+# ║      "pykrx 없음 — PBR 스냅샷 불가"                                                       ║
+# ║    라이브러리 하나가 없다는 이유로 아래가 전부 죽었다:                                     ║
+# ║      ⓐ §5 시총 하한 500억      ⓑ §6.3 직교화의 log(MktCap)                                ║
+# ║      ⓒ 시총하위 1000 비교아암  ⓓ §6.3 직교화의 BM  (BM 표가 1행으로 붕괴)                 ║
 # ║                                                                                          ║
-# ║  ★ 호출량 설계: 전부 '날짜 1개 = 전종목 1호출' 스냅샷 API 다.                               ║
-# ║    시총 120호출 + 펀더멘털 120호출 + ETF/ETN 목록 120호출 ≈ 360호출로 10년치가 끝난다.      ║
-# ║    종목별 루프(2,500회)로 짜면 같은 데이터에 20배를 쓴다 — 그렇게 하지 않는다.               ║
+# ║  ■ 재작성 원칙 — 단일 라이브러리 의존을 없앤다                                             ║
+# ║    pykrx 는 결국 data.krx.co.kr 을 부르는 얇은 껍데기다. 그 호출을 우리가 직접 하면        ║
+# ║    (s10b krx_all_price / krx_all_perpbr) pykrx 유무와 무관해진다.                          ║
+# ║    소스 체인:  pykrx → KRX MDC 벌크 → 근사(현재 상장주식수 × 과거 종가)                    ║
+# ║    각 행에 출처(src)를 남겨, 근사분이 얼마나 섞였는지 감사표에서 보이게 한다.               ║
+# ║    ★ 근사는 '조용히' 쓰지 않는다. 비중을 표로 찍고 OPEN_QUESTIONS 에 기록한다.             ║
+# ║                                                                                          ║
+# ║  ★ 호출량: 전부 '날짜 1개 = 전종목 1호출' 이다. 시총 120 + 펀더멘털 120 ≈ 240호출로        ║
+# ║    10년이 끝난다. 종목축 루프(2,500회)로 짜면 같은 데이터에 20배를 쓴다.                   ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
-# ★ 리허설(가짜 네트워크) 중에는 캐시에 절대 쓰지 않는다.
-#   이 플래그가 없으면 리허설이 만들어낸 합성 시총/PBR 이 공용 인덱스에 저장되고,
-#   이후 실수집이 "그 달은 이미 있다"며 영원히 건너뛴다. 사용자의 기존 캐시를 훼손하는
-#   경로이므로(절대 1원칙 위반) 구조로 막는다.
-_REHEARSAL = False
-
-
-def _cache_writable() -> bool:
-    return not _REHEARSAL
-
-
-MKTCAP_COLS = ["code", "month", "mktcap", "shares", "close_m", "amount_m"]
-FUND_COLS = ["code", "month", "bps", "per", "pbr", "eps", "div_yield", "bm"]
-
-_PREF_TAIL = set("5679KLMNkl")          # 우선주 관용 말자리 (구형 5/7/9, 신형 K/L/M)
-_SPAC_PAT = re.compile(r"스팩|기업인수목적")
-_REIT_PAT = re.compile(r"리츠|위탁관리부동산|기업구조조정부동산")
-_ETF_PAT = re.compile(r"KODEX|TIGER|KBSTAR|ARIRANG|HANARO|SOL |ACE |PLUS |RISE |KOSEF|"
-                      r"TIMEFOLIO|파워|마이티|네비게이터|ETN|레버리지|인버스", re.I)
-
-
-def is_preferred(code: str, name: str = "") -> bool:
-    """우선주 판정. 코드 말자리(구형 5/7/9, 신형 K/L/M)와 종목명 '우/우B/2우B' 를 함께 본다."""
-    c = str(code or "")
-    if len(c) == 6 and c[-1] in _PREF_TAIL and c[-1] != "0":
-        return True
-    n = str(name or "").strip()
-    return bool(re.search(r"(\d?우[BC]?)$|우선주$", n))
+MKTCAP_COLS = ["code", "month", "mktcap", "shares", "close_m", "amount_m", "src"]
+FUND_COLS = ["code", "month", "bps", "per", "pbr", "eps", "div_yield", "bm", "src"]
 
 
 def _month_snap_dates(months: pd.DatetimeIndex) -> List[pd.Timestamp]:
-    """각 월의 스냅샷 기준일(월말). pykrx 는 휴장일이면 직전 영업일로 알아서 당겨준다."""
+    """각 월의 스냅샷 기준일(월말). 휴장일이면 소스 쪽에서 직전 영업일로 당겨준다."""
     return [as_ts(m) for m in months]
+
+
+def _have_months(cached: Optional[pd.DataFrame], col: str = "month") -> set:
+    if cached is None or not len(cached) or col not in cached.columns:
+        return set()
+    try:
+        return set(as_ts_series(cached[col]).dt.strftime("%Y-%m").dropna())
+    except Exception:
+        return set()
 
 
 def _krx_snapshot(fn_name: str, day: str) -> Optional[pd.DataFrame]:
@@ -69,78 +56,204 @@ def _krx_snapshot(fn_name: str, day: str) -> Optional[pd.DataFrame]:
     return d
 
 
-def fetch_mktcap_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
-    """월말 시가총액·상장주식수 스냅샷. 1개월 = 1호출."""
-    cached = VAULT.get_table("krx_mktcap_monthly", scope="shared")
-    have = set()
-    if cached is not None and len(cached):
-        try:
-            have = set(as_ts_series(cached["month"]).dt.strftime("%Y-%m"))
-        except Exception:
-            have = set()
+def _mcap_from_pykrx(m: pd.Timestamp) -> Optional[pd.DataFrame]:
+    d = _krx_snapshot("get_market_cap_by_ticker", m.strftime("%Y%m%d"))
+    if d is None:
+        return None
+    t = d.reset_index()
+    pick = {}
+    for c in t.columns:
+        s = str(c)
+        if s in ("티커", "종목코드", "index"):
+            pick["code"] = c
+        elif "시가총액" in s:
+            pick["mktcap"] = c
+        elif "상장주식수" in s:
+            pick["shares"] = c
+        elif s == "종가":
+            pick["close_m"] = c
+        elif "거래대금" in s:
+            pick["amount_m"] = c
+    if "code" not in pick or "mktcap" not in pick:
+        return None
+
+    def _n(k):
+        return (pd.to_numeric(t[pick[k]], errors="coerce") if k in pick
+                else pd.Series(np.nan, index=t.index))
+    g = pd.DataFrame({"code": t[pick["code"]].map(to_code6), "month": m,
+                      "mktcap": _n("mktcap"), "shares": _n("shares"),
+                      "close_m": _n("close_m"), "amount_m": _n("amount_m"), "src": "pykrx"})
+    return g.dropna(subset=["code"])
+
+
+def _mcap_from_krx_bulk(m: pd.Timestamp) -> Optional[pd.DataFrame]:
+    d = krx_all_price(m)
+    if d is None or not len(d):
+        return None
+    g = pd.DataFrame({"code": d["code"], "month": m,
+                      "mktcap": d.get("mktcap"), "shares": d.get("shares"),
+                      "close_m": d.get("close"), "amount_m": d.get("amount"), "src": "krx_bulk"})
+    # 시총이 안 오면 상장주식수 × 종가로 만든다 (같은 응답 안의 값이므로 근사가 아니다)
+    need = g["mktcap"].isna() & g["shares"].notna() & g["close_m"].notna()
+    g.loc[need, "mktcap"] = g.loc[need, "shares"] * g.loc[need, "close_m"]
+    return g.dropna(subset=["code"])
+
+
+def _fdr_shares_snapshot() -> Optional[pd.DataFrame]:
+    """FDR 상장목록의 '현재' 상장주식수. 근사 폴백의 원천 (1회 호출, 캐시)."""
+    cur = globals().get("_FDR_SHARES")
+    if cur is not None:
+        return cur if len(cur) else None
+    out = pd.DataFrame()
+    if fdr is not None:
+        for mkt in ("KRX", "KOSPI", "KOSDAQ"):
+            try:
+                limiter("fdr").wait()
+                d = fdr.StockListing(mkt)
+            except Exception:
+                continue
+            if d is None or not len(d):
+                continue
+            d = d.rename(columns={c: str(c) for c in d.columns})
+            code_c = next((c for c in d.columns if c in ("Code", "Symbol", "종목코드")), None)
+            sh_c = next((c for c in d.columns if c in ("Stocks", "상장주식수", "ListedShares")), None)
+            if code_c is None or sh_c is None:
+                continue
+            out = pd.DataFrame({"code": d[code_c].map(to_code6),
+                                "shares_now": pd.to_numeric(d[sh_c], errors="coerce")})
+            out = out.dropna(subset=["code", "shares_now"]).drop_duplicates("code")
+            break
+    globals()["_FDR_SHARES"] = out
+    return out if len(out) else None
+
+
+def fetch_mktcap_monthly(months: pd.DatetimeIndex,
+                         panel: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """월말 시가총액·상장주식수 스냅샷. 1개월 = 1호출. 소스 체인으로 pykrx 부재를 견딘다."""
+    cached = cache_recall("krx_mktcap_monthly", scope="shared")
+    have = _have_months(cached)
     todo = [m for m in _month_snap_dates(months) if m.strftime("%Y-%m") not in have]
     if not todo:
         LOG.ok(f"시가총액 월말 스냅샷: 캐시 충족 "
                f"({len(cached) if cached is not None else 0:,}행, 신규 호출 0건)")
-        return cached if cached is not None else pd.DataFrame(columns=MKTCAP_COLS)
-    if pykrx_stock is None:
-        LOG.warn("pykrx 없음 — 시가총액 스냅샷을 건너뜁니다. "
-                 "유니버스 시총 하한과 §6.3 log(MktCap) 항이 비활성화됩니다.")
-        return cached if cached is not None else pd.DataFrame(columns=MKTCAP_COLS)
+        return _finalize_mcap(cached, months, panel, wrote=False)
+
+    use_pykrx = pykrx_stock is not None
+    use_bulk = krx_bulk_available()
+    LOG.table([["pykrx", "사용 가능" if use_pykrx else "미설치 → 건너뜀"],
+               ["KRX MDC 벌크", "사용 가능" if use_bulk else "응답 없음"],
+               ["근사 폴백", "FDR 현재 상장주식수 × 과거 종가"]],
+              ["시총 소스", "상태"], ["l", "l"], title="시가총액 소스 체인")
+    if not (use_pykrx or use_bulk):
+        LOG.warn("시가총액 실측 소스가 모두 불가 — 근사 폴백으로만 채웁니다. "
+                 "§5 시총하한과 시총하위1000 아암은 '근사 기준'임이 산출물에 명시됩니다.")
+        return _finalize_mcap(cached, months, panel, wrote=False)
 
     LOG.info(f"시가총액 월말 스냅샷 신규 {len(todo)}개월 (1개월 = 1호출)")
-    rows, fails = [], 0
-    for m in tqdm(todo, desc="시총 스냅샷", disable=not VERBOSE):
-        d = _krx_snapshot("get_market_cap_by_ticker", m.strftime("%Y%m%d"))
-        if d is None:
+    rows, fails, partial = [], 0, 0
+    for m in tqdm(todo, desc="시총 스냅샷", disable=not VERBOSE, mininterval=TQDM_MININTERVAL):
+        g = _mcap_from_pykrx(m) if use_pykrx else None
+        if (g is None or not len(g)) and use_bulk:
+            g = _mcap_from_krx_bulk(m)
+        if g is None or not len(g):
             fails += 1
             if fails >= CIRCUIT_BREAKER_FAILS:
                 LOG.warn(f"연속 실패 {fails}회 — 서킷브레이커 작동, 시총 수집을 중단하고 "
                          f"여기까지 받은 분량을 저장합니다.")
                 break
             continue
+        # ★ 부분 응답 방어. 종목수가 이웃 달 대비 급감한 스냅샷은 '진실'이 아니라 '사고'다.
+        #   그대로 받아들이면 그 달만 유니버스가 훅 줄고(시총하한을 못 넘김) 백테스트가
+        #   조용히 이가 빠진다. 200 종목짜리 응답은 예외를 내지 않으므로 여기서 세야 한다.
+        if rows:
+            med = float(np.median([len(x) for x in rows[-6:]]))
+            if med > 0 and len(g) < 0.5 * med:
+                partial += 1
+                LOG.warn(f"{m:%Y-%m} 시총 스냅샷이 {len(g):,}종목으로 직전 중앙값 "
+                         f"{med:,.0f}종목의 절반 미만입니다 — 부분 응답으로 보고 버립니다.")
+                fails += 1
+                continue
         fails = 0
-        t = d.reset_index()
-        cmap = {c: str(c) for c in t.columns}
-        t = t.rename(columns=cmap)
-        pick = {}
-        for c in t.columns:
-            s = str(c)
-            if s in ("티커", "종목코드", "index"):
-                pick["code"] = c
-            elif "시가총액" in s:
-                pick["mktcap"] = c
-            elif "상장주식수" in s:
-                pick["shares"] = c
-            elif s == "종가":
-                pick["close_m"] = c
-            elif "거래대금" in s:
-                pick["amount_m"] = c
-        if "code" not in pick or "mktcap" not in pick:
-            continue
-        g = pd.DataFrame({
-            "code": t[pick["code"]].map(to_code6),
-            "month": m,
-            "mktcap": pd.to_numeric(t[pick["mktcap"]], errors="coerce"),
-            "shares": pd.to_numeric(t[pick["shares"]], errors="coerce") if "shares" in pick else np.nan,
-            "close_m": pd.to_numeric(t[pick["close_m"]], errors="coerce") if "close_m" in pick else np.nan,
-            "amount_m": pd.to_numeric(t[pick["amount_m"]], errors="coerce") if "amount_m" in pick else np.nan,
-        })
-        rows.append(g.dropna(subset=["code"]))
+        rows.append(g)
+    if partial:
+        LOG.warn(f"부분 응답으로 버린 달 {partial}개 — 다음 실행에서 자동 재시도합니다 "
+                 f"(캐시에 저장되지 않았으므로 '미보유'로 남습니다).")
+
     frames = [f for f in rows if len(f)]
     if cached is not None and len(cached):
         frames.append(cached.reindex(columns=MKTCAP_COLS))
     if not frames:
-        return pd.DataFrame(columns=MKTCAP_COLS)
+        return _finalize_mcap(cached, months, panel, wrote=False)
     out = pd.concat(frames, ignore_index=True)
     out["month"] = as_ts_series(out["month"])
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    if _cache_writable():
-        VAULT.put_table("krx_mktcap_monthly", out, scope="shared", domain="price",
-                        source="pykrx get_market_cap_by_ticker")
-    PIPE.io("OUT", "DRIVE", "krx_mktcap_monthly", out)
-    LOG.ok(f"시가총액 스냅샷 {out['month'].nunique()}개월 × {out['code'].nunique():,}종목 = {len(out):,}행")
-    return out
+    if rows:
+        note_new_data("krx_mktcap_monthly", sum(len(f) for f in rows), "shared", "price", "krx")
+        persist("krx_mktcap_monthly", out, scope="shared", domain="price",
+                source="pykrx/krx_bulk monthly cap snapshot")
+    return _finalize_mcap(out, months, panel, wrote=True)
+
+
+def _finalize_mcap(mc: Optional[pd.DataFrame], months: pd.DatetimeIndex,
+                   panel: Optional[pd.DataFrame], wrote: bool) -> pd.DataFrame:
+    """실측이 못 채운 (code, month) 를 근사로 메우고, 출처 비중을 표로 남긴다.
+
+    근사 = 현재 상장주식수 × 그 달의 종가.  액면분할·유상증자·자사주소각을 반영하지 못하므로
+    과거로 갈수록 오차가 커진다. 그래도 '시총 순위'는 대체로 보존되므로 하위1000 아암의
+    구성에는 쓸 만하다 — 단, 절대 수준(§5 의 500억 하한)에는 쓰면 안 된다.
+    ★ 그래서 근사분에는 mktcap_is_approx=True 를 세우고, 하한 필터는 실측분에만 적용한다.
+    """
+    base = mc.copy() if mc is not None and len(mc) else pd.DataFrame(columns=MKTCAP_COLS)
+    if "src" not in base.columns:
+        base["src"] = "unknown"
+    if panel is not None and len(panel):
+        sh = _fdr_shares_snapshot()
+        if sh is not None and len(sh):
+            p = panel[["code", "month", "close"]].dropna().copy()
+            p["month"] = as_ts_series(p["month"])
+            p = p[p["month"].isin(pd.DatetimeIndex([as_ts(m) for m in months]))]
+            p = p.merge(sh, on="code", how="inner")
+            p["mktcap"] = p["shares_now"] * p["close"]
+            p = p.rename(columns={"shares_now": "shares", "close": "close_m"})
+            p["amount_m"] = np.nan
+            p["src"] = "approx_fdr_shares"
+            if len(base):
+                seen = set(zip(base["code"].astype(str),
+                               as_ts_series(base["month"]).astype("int64")))
+                keep = [(str(c), int(mm.value)) not in seen
+                        for c, mm in zip(p["code"], as_ts_series(p["month"]))]
+                p = p[pd.Series(keep, index=p.index)]
+            if len(p):
+                base = pd.concat([base, p.reindex(columns=MKTCAP_COLS)], ignore_index=True)
+    if not len(base):
+        LOG.error("시가총액을 한 행도 확보하지 못했습니다 — §5 시총하한과 시총하위1000 아암이 "
+                  "비활성화됩니다. 결과 해석 시 이 점을 반드시 감안하세요.")
+        return pd.DataFrame(columns=MKTCAP_COLS + ["mktcap_is_approx"])
+    base["month"] = as_ts_series(base["month"])
+    base = base.drop_duplicates(subset=["code", "month"], keep="first").reset_index(drop=True)
+    base["mktcap_is_approx"] = base["src"].astype(str).str.startswith("approx")
+    n = len(base)
+    tab = base["src"].value_counts()
+    LOG.table([[k, f"{v:,}", f"{100*v/n:.1f}%"] for k, v in tab.items()],
+              ["시총 출처", "행수", "비중"], ["l", "r", "r"], title="시가총액 출처 감사")
+    n_ap = int(base["mktcap_is_approx"].sum())
+    if n_ap:
+        LOG.warn(f"시총 {n_ap:,}행({100*n_ap/n:.1f}%)이 근사치입니다(현재 상장주식수 × 과거 종가). "
+                 f"§5 의 500억 하한은 실측분에만 적용하고, 근사분은 하한 통과로 간주하지 "
+                 f"않습니다. 시총하위1000 순위 산정에는 사용합니다(순위는 대체로 보존됨).")
+        open_question(
+            "MCAP_APPROX", "시가총액 근사 사용",
+            f"실측 시총 소스(pykrx / KRX MDC 벌크)를 확보하지 못해 {n_ap:,}행"
+            f"({100*n_ap/n:.1f}%)을 '현재 상장주식수 × 과거 종가'로 근사했습니다. "
+            f"액면분할·유상증자·자사주소각을 반영하지 못하므로 절대수준이 왜곡될 수 있고, "
+            f"상장폐지 종목은 현재 상장목록에 없어 근사조차 불가합니다.",
+            "가장 보수적인 선택을 적용: 근사분에 대해서는 §5 시총하한(500억)을 '통과'로 "
+            "간주하지 않고 유니버스에서 제외합니다(포함하면 표본이 늘어 성과가 좋아지는 "
+            "방향이므로 제외가 보수적). 순위만 쓰는 시총하위1000 아암에는 사용합니다.",
+            "전체 유니버스 아암의 표본이 줄어듭니다. 실측 시총 소스가 살아나면 자동 해소됩니다.")
+    LOG.ok(f"시가총액 {base['month'].nunique()}개월 × {base['code'].nunique():,}종목 = {len(base):,}행"
+           + ("" if wrote else " (신규 저장 없음)"))
+    return base
 
 
 def fetch_fundamental_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
@@ -149,87 +262,103 @@ def fetch_fundamental_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
     §6.3 직교화의 BM 은 이 경로가 1순위다. DART 재무제표를 사별로 긁는 것보다
     두 자릿수 배 싸고, 시장가 기준이라 정의도 더 정확하다(장부가/시가).
     """
-    cached = VAULT.get_table("krx_fundamental_monthly", scope="shared")
-    have = set()
-    if cached is not None and len(cached):
-        try:
-            have = set(as_ts_series(cached["month"]).dt.strftime("%Y-%m"))
-        except Exception:
-            have = set()
+    cached = cache_recall("krx_fundamental_monthly", scope="shared")
+    have = _have_months(cached)
     todo = [m for m in _month_snap_dates(months) if m.strftime("%Y-%m") not in have]
     if not todo:
         LOG.ok(f"펀더멘털 월말 스냅샷: 캐시 충족 "
                f"({len(cached) if cached is not None else 0:,}행, 신규 호출 0건)")
-        return cached if cached is not None else pd.DataFrame(columns=FUND_COLS)
-    if pykrx_stock is None:
-        LOG.warn("pykrx 없음 — PBR 스냅샷 불가. §6.3 직교화의 BM 항은 DART 폴백 또는 결측 처리됩니다.")
-        return cached if cached is not None else pd.DataFrame(columns=FUND_COLS)
+        return _finalize_fund(cached, wrote=False)
+
+    use_pykrx = pykrx_stock is not None
+    use_bulk = krx_bulk_available()
+    if not (use_pykrx or use_bulk):
+        LOG.warn("PBR 실측 소스가 모두 불가 — §6.3 직교화의 BM 항은 DART 자본총계 폴백으로 "
+                 "보강하며, 그래도 남는 결측은 회귀에서 제외 처리됩니다(0으로 채우지 않습니다).")
+        return _finalize_fund(cached, wrote=False)
 
     LOG.info(f"펀더멘털(PBR/BPS) 월말 스냅샷 신규 {len(todo)}개월 (1개월 = 1호출)")
     rows, fails = [], 0
-    for m in tqdm(todo, desc="펀더멘털 스냅샷", disable=not VERBOSE):
-        d = _krx_snapshot("get_market_fundamental_by_ticker", m.strftime("%Y%m%d"))
-        if d is None:
+    for m in tqdm(todo, desc="펀더멘털 스냅샷", disable=not VERBOSE, mininterval=TQDM_MININTERVAL):
+        g = None
+        if use_pykrx:
+            d = _krx_snapshot("get_market_fundamental_by_ticker", m.strftime("%Y%m%d"))
+            if d is not None:
+                t = d.reset_index()
+                col = {str(c).upper(): c for c in t.columns}
+                code_c = next((c for c in t.columns if str(c) in ("티커", "종목코드", "index")), None)
+                if code_c is not None:
+                    def _num(key, _t=t, _c=col):
+                        c = _c.get(key)
+                        return (pd.to_numeric(_t[c], errors="coerce") if c is not None
+                                else pd.Series(np.nan, index=_t.index))
+                    g = pd.DataFrame({"code": t[code_c].map(to_code6), "month": m,
+                                      "bps": _num("BPS"), "per": _num("PER"), "pbr": _num("PBR"),
+                                      "eps": _num("EPS"), "div_yield": _num("DIV"),
+                                      "src": "pykrx"}).dropna(subset=["code"])
+        if (g is None or not len(g)) and use_bulk:
+            d = krx_all_perpbr(m)
+            if d is not None and len(d):
+                g = pd.DataFrame({"code": d["code"], "month": m, "bps": d.get("bps"),
+                                  "per": d.get("per"), "pbr": d.get("pbr"), "eps": d.get("eps"),
+                                  "div_yield": d.get("div_yield"), "src": "krx_bulk"})
+        if g is None or not len(g):
             fails += 1
             if fails >= CIRCUIT_BREAKER_FAILS:
                 LOG.warn(f"연속 실패 {fails}회 — 서킷브레이커 작동, 펀더멘털 수집 중단.")
                 break
             continue
         fails = 0
-        t = d.reset_index()
-        col = {str(c).upper(): c for c in t.columns}
-        code_c = None
-        for c in t.columns:
-            if str(c) in ("티커", "종목코드", "index"):
-                code_c = c
-                break
-        if code_c is None:
-            continue
+        rows.append(g)
 
-        def _num(key):
-            c = col.get(key)
-            return pd.to_numeric(t[c], errors="coerce") if c is not None else pd.Series(np.nan, index=t.index)
-
-        g = pd.DataFrame({
-            "code": t[code_c].map(to_code6), "month": m,
-            "bps": _num("BPS"), "per": _num("PER"), "pbr": _num("PBR"),
-            "eps": _num("EPS"), "div_yield": _num("DIV"),
-        })
-        rows.append(g.dropna(subset=["code"]))
     frames = [f for f in rows if len(f)]
     if cached is not None and len(cached):
         frames.append(cached.reindex(columns=FUND_COLS))
     if not frames:
-        return pd.DataFrame(columns=FUND_COLS)
+        return _finalize_fund(cached, wrote=False)
     out = pd.concat(frames, ignore_index=True)
     out["month"] = as_ts_series(out["month"])
-    # BM = 장부가/시가 = 1/PBR. PBR<=0 (자본잠식)은 BM 정의가 무너지므로 결측.
-    pbr = pd.to_numeric(out["pbr"], errors="coerce")
-    out["bm"] = np.where(pbr > 0, 1.0 / pbr.replace(0, np.nan), np.nan)
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    if _cache_writable():
-        VAULT.put_table("krx_fundamental_monthly", out, scope="shared", domain="price",
-                        source="pykrx get_market_fundamental_by_ticker")
-    PIPE.io("OUT", "DRIVE", "krx_fundamental_monthly", out)
+    if rows:
+        note_new_data("krx_fundamental_monthly", sum(len(f) for f in rows), "shared",
+                      "price", "krx")
+        persist("krx_fundamental_monthly", out, scope="shared", domain="price",
+                source="pykrx/krx_bulk monthly fundamental snapshot")
+    return _finalize_fund(out, wrote=True)
+
+
+def _finalize_fund(out: Optional[pd.DataFrame], wrote: bool) -> pd.DataFrame:
+    if out is None or not len(out):
+        return pd.DataFrame(columns=FUND_COLS)
+    out = out.copy()
+    # BM = 장부가/시가 = 1/PBR. PBR<=0 (자본잠식)은 BM 정의가 무너지므로 결측.
+    # ★ df.get("pbr") 은 컬럼이 없으면 None 을 돌려주고 pd.to_numeric(None) 은 터진다.
+    #   구버전 스키마 캐시를 물려받는 경로가 실재하므로 반드시 명시 폴백을 둔다.
+    pbr = (pd.to_numeric(out["pbr"], errors="coerce") if "pbr" in out.columns
+           else pd.Series(np.nan, index=out.index))
+    out["bm"] = np.where(pbr > 0, 1.0 / pbr.replace(0, np.nan), np.nan)
     ok = int(out["bm"].notna().sum())
-    LOG.ok(f"펀더멘털 스냅샷 {len(out):,}행 · BM 산출 가능 {ok:,}행 ({100*ok/max(len(out),1):.1f}%)")
+    LOG.ok(f"펀더멘털 스냅샷 {len(out):,}행 · BM 산출 가능 {ok:,}행 "
+           f"({100*ok/max(len(out),1):.1f}%)" + ("" if wrote else " (신규 저장 없음)"))
     return out
 
 
 def fetch_nonequity_tickers(months: pd.DatetimeIndex) -> pd.DataFrame:
-    """ETF/ETN/ELW 티커 목록 스냅샷 (§5 제외). 반기 1회면 충분하므로 호출을 더 줄인다."""
-    cached = VAULT.get_table("krx_nonequity_tickers", scope="shared")
+    """ETF/ETN/ELW 티커 목록 스냅샷 (§5 제외). 반기 1회면 충분하므로 호출을 더 줄인다.
+
+    pykrx 가 없으면 종목명 패턴(classify_security)이 같은 일을 한다 — 정확도는 조금 낮지만
+    '제외 대상을 못 걸러 유니버스가 오염되는' 사고는 나지 않는다.
+    """
+    cached = cache_recall("krx_nonequity_tickers", scope="shared")
     grid = sorted({as_ts(m) for m in months if m.month in (6, 12)}) or list(months[:1])
-    have = set()
-    if cached is not None and len(cached):
-        try:
-            have = set(as_ts_series(cached["snap"]).dt.strftime("%Y-%m"))
-        except Exception:
-            have = set()
+    have = _have_months(cached, "snap")
     todo = [m for m in grid if m.strftime("%Y-%m") not in have]
     if not todo or pykrx_stock is None:
-        if cached is not None:
+        if cached is not None and len(cached):
             return cached
+        if pykrx_stock is None:
+            LOG.info("pykrx 없음 — ETF/ETN/ELW 목록은 종목명 패턴으로 판정합니다 "
+                     "(build_exclusion_flags 의 이름 규칙).")
         return pd.DataFrame(columns=["snap", "code", "kind"])
     rows = []
     for m in todo:
@@ -251,9 +380,9 @@ def fetch_nonequity_tickers(months: pd.DatetimeIndex) -> pd.DataFrame:
         out = pd.concat([out, cached], ignore_index=True)
     out["snap"] = as_ts_series(out["snap"])
     out = out.drop_duplicates(subset=["snap", "code"], keep="last").reset_index(drop=True)
-    if _cache_writable():
-        VAULT.put_table("krx_nonequity_tickers", out, scope="shared", domain="universe",
-                        source="pykrx etf/etn/elw ticker list")
+    note_new_data("krx_nonequity_tickers", len(rows), "shared", "universe", "pykrx")
+    persist("krx_nonequity_tickers", out, scope="shared", domain="universe",
+            source="pykrx etf/etn/elw ticker list")
     LOG.ok(f"비주식 종목(ETF/ETN/ELW) {out['code'].nunique():,}개 식별")
     return out
 
@@ -267,13 +396,16 @@ def build_exclusion_flags(sec: pd.DataFrame, nonequity: pd.DataFrame) -> pd.Data
     s = sec.copy()
     s["code"] = s["code"].map(to_code6)
     s = s.dropna(subset=["code"])
-    nm = s["name"].astype(str).fillna("")
+    nm = s["name"].astype(str).fillna("") if "name" in s.columns else pd.Series("", index=s.index)
+    mkt = s["market"].astype(str) if "market" in s.columns else pd.Series("", index=s.index)
     ne = set(nonequity["code"].astype(str)) if nonequity is not None and len(nonequity) else set()
-    s["is_pref"] = [is_preferred(c, n) for c, n in zip(s["code"], nm)]
-    s["is_spac"] = nm.str.contains(_SPAC_PAT, na=False)
-    s["is_reit"] = nm.str.contains(_REIT_PAT, na=False)
-    s["is_etp"] = s["code"].isin(ne) | nm.str.contains(_ETF_PAT, na=False)
-    s["is_konex"] = s["market"].astype(str).str.upper().str.contains("KONEX", na=False)
+    kind = [classify_security(c, n, m) for c, n, m in zip(s["code"], nm, mkt)]
+    s["kind"] = kind
+    s["is_pref"] = s["kind"].eq("preferred")
+    s["is_spac"] = s["kind"].eq("spac")
+    s["is_reit"] = s["kind"].eq("reit")
+    s["is_etp"] = s["code"].isin(ne) | s["kind"].isin(("etp", "elw"))
+    s["is_konex"] = mkt.str.upper().str.contains("KONEX", na=False)
     s["excluded"] = s[["is_pref", "is_spac", "is_reit", "is_etp", "is_konex"]].any(axis=1)
     out = s[["code", "name", "market", "is_pref", "is_spac", "is_reit", "is_etp",
              "is_konex", "excluded"]].reset_index(drop=True)
@@ -283,6 +415,8 @@ def build_exclusion_flags(sec: pd.DataFrame, nonequity: pd.DataFrame) -> pd.Data
     LOG.info("관리종목·투자주의환기·거래정지는 시점가변 PIT 공개소스가 없어 제외하지 않습니다. "
              "제외하면 성과가 개선되는 방향이므로 '남기는 쪽'이 보수적입니다 "
              "(OPEN_QUESTIONS.md 에 기록됨).")
+    persist(f"exclusion_flags_{STRATEGY_ID}", out, scope="private", domain="universe",
+            source="§5 exclusion rules")
     return out
 
 
@@ -292,7 +426,8 @@ def build_sector_map(sec: pd.DataFrame) -> pd.DataFrame:
     한계: 업종은 현재시점 분류다(PIT 아님). 변경 빈도가 낮아 영향이 제한적이지만
     완전한 PIT 은 아니며, 이 사실을 산출물에 명시한다.
     """
-    s = sec[["code", "industry"]].copy()
+    s = sec[["code", "industry"]].copy() if "industry" in sec.columns else \
+        sec[["code"]].assign(industry="")
     s["code"] = s["code"].map(to_code6)
     s = s.dropna(subset=["code"])
     ind = s["industry"].astype(str).replace({"": "미분류", "nan": "미분류", "None": "미분류"})
@@ -311,23 +446,32 @@ def build_sector_map(sec: pd.DataFrame) -> pd.DataFrame:
                   "H2 교차업종 검정은 '판정불가'로 처리되며, 이를 통과로 오인하면 안 됩니다.")
     LOG.info(f"업종 매핑: {n}개 원분류 → {s['sector'].nunique()}개 사용 분류 "
              f"(5종목 미만 {len(rare)}개는 '기타'로 병합). ※현재시점 분류 — 완전 PIT 아님")
-    return s[["code", "sector"]].drop_duplicates("code").reset_index(drop=True)
+    out = s[["code", "sector"]].drop_duplicates("code").reset_index(drop=True)
+    persist(f"sector_map_{STRATEGY_ID}", out, scope="private", domain="universe",
+            source="industry → sector")
+    return out
 
 
 def fetch_retail_share(codes: Sequence[str], start: str, end: str,
-                       max_codes: int = 2600) -> pd.DataFrame:
-    """종목별 개인 거래대금 비중 (H3 조건부 예측용).
+                       max_codes: int = 0) -> pd.DataFrame:
+    """종목별 개인 거래대금 비중 (H3 조건부 예측의 보조 축).
 
-    종목 1개당 1호출로 전 구간을 받는다(2,500호출, 캐시 후 0). 일자별 루프로 짜면
-    같은 데이터에 250배를 쓴다. 실패해도 전략을 죽이지 않고 H3 를 축소 보고한다.
+    ★ 기본 비활성이다. 종목당 1호출 × 2,600종목 = KRX 버킷 2 QPS 에서 22분이고,
+      H3 는 소형주·저커버리지 축만으로도 판정 가능하다. 있으면 해석표가 풍부해질 뿐이다.
+      켜려면 COLLECT_RETAIL_SHARE = True.
     """
     cols = ["code", "month", "retail_share"]
-    cached = VAULT.get_table("krx_retail_share_monthly", scope="shared")
-    if cached is not None and len(cached):
-        have = set(cached["code"].astype(str))
-    else:
-        have = set()
-    todo = [c for c in dict.fromkeys(codes) if c and c not in have][:max_codes]
+    cached = cache_recall("krx_retail_share_monthly", scope="shared")
+    have = set(cached["code"].astype(str)) if cached is not None and len(cached) else set()
+    if not COLLECT_RETAIL_SHARE:
+        if cached is not None and len(cached):
+            LOG.info(f"개인 거래비중 — 캐시 {len(cached):,}행만 사용(신규 수집 off).")
+            return cached
+        LOG.info("개인 거래비중 수집 비활성(COLLECT_RETAIL_SHARE=False) — "
+                 "H3 는 소형주·저커버리지 축으로 판정합니다.")
+        return pd.DataFrame(columns=cols)
+    cap = int(max_codes or RETAIL_SHARE_MAX_CODES)
+    todo = [c for c in dict.fromkeys(codes) if c and c not in have][:cap]
     if not todo or pykrx_stock is None:
         if cached is None or not len(cached):
             LOG.warn("개인 거래비중 데이터 없음 — H3 는 소형주·저커버리지 축으로만 판정합니다.")
@@ -371,8 +515,9 @@ def fetch_retail_share(codes: Sequence[str], start: str, end: str,
         a["code"] = code
         return a[cols]
 
-    got = pmap_io(_one, todo, workers=min(4, N_WORKERS_IO), desc="개인 거래비중")
+    got = pmap_io(_one, todo, workers=_resolve_workers("krx"), desc="개인 거래비중")
     frames = [d for d in got if d is not None and len(d)]
+    n_new = sum(len(f) for f in frames)
     if cached is not None and len(cached):
         frames.append(cached.reindex(columns=cols))
     if not frames:
@@ -380,9 +525,10 @@ def fetch_retail_share(codes: Sequence[str], start: str, end: str,
     out = pd.concat(frames, ignore_index=True)
     out["month"] = as_ts_series(out["month"])
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    if _cache_writable():
-        VAULT.put_table("krx_retail_share_monthly", out, scope="shared", domain="flow",
-                        source="pykrx get_market_trading_value_by_date(detail=True)")
+    if n_new:
+        note_new_data("krx_retail_share_monthly", n_new, "shared", "flow", "pykrx")
+        persist("krx_retail_share_monthly", out, scope="shared", domain="flow",
+                source="pykrx get_market_trading_value_by_date(detail=True)")
     LOG.ok(f"개인 거래비중 {out['code'].nunique():,}종목 × {out['month'].nunique()}개월 = {len(out):,}행")
     return out
 
@@ -440,4 +586,8 @@ def attach_bm_fallback(fund: pd.DataFrame, mcap: pd.DataFrame,
     fill = base["bm"].isna() & base["bm_dart"].notna()
     base.loc[fill, "bm"] = pd.to_numeric(base.loc[fill, "bm_dart"], errors="coerce").astype("float64")
     LOG.ok(f"DART 자본총계로 BM {int(fill.sum()):,}행 보강 (잔여 결측 {int(base['bm'].isna().sum()):,}행)")
-    return base.drop(columns=["bm_dart"], errors="ignore")
+    out = base.drop(columns=["bm_dart"], errors="ignore")
+    if int(fill.sum()):
+        persist("krx_fundamental_monthly", out.reindex(columns=FUND_COLS), scope="shared",
+                domain="price", source="krx + dart equity fallback")
+    return out

@@ -23,11 +23,13 @@ ORDER = [
     (CORE, "03_util.py"),           # 유틸·PIT·통계          [재사용]
     (CORE, "04_vault.py"),          # 드라이브 캐시(절대1원칙)[재사용]
     (CORE, "05_http.py"),           # HTTP·스로틀·인코딩     [재사용]
+    (SACN, "s07_perf.py"),          # 출력봉인·회로차단·캐시원장 (신규)
     (SACN, "s06_dart.py"),          # DART 실시간 호출량 관리 (교체)
     (CORE, "10_ingest_universe.py"),# 종목마스터·상장폐지     [재사용]
-    (CORE, "11_ingest_price.py"),   # 가격 다중소스          [재사용]
-    (SACN, "s12_market_meta.py"),   # 시총·BM·제외플래그·업종 (신규)
-    (CORE, "13_ingest_research.py"),# 한경·네이버 리포트     [재사용]
+    (SACN, "s10b_krxbulk.py"),      # KRX 인증·MDC 벌크·증권유형 (신규)
+    (SACN, "s11_price.py"),         # 가격 다중소스          (전면 재작성)
+    (SACN, "s12_market_meta.py"),   # 시총·BM·제외플래그·업종 (전면 재작성)
+    (SACN, "s13_research.py"),      # 한경·네이버 리포트     (전면 재작성)
     (CORE, "14_entity_research.py"),# 애널리스트 원장        [재사용]
     (SACN, "s15_analyst.py"),       # 식별 보강·Phase0·IPW   (신규)
     (CORE, "20_pit.py"),            # PIT store · Universe   [재사용]

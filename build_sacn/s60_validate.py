@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-V  계약 자동검정 K1~K14  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
+# ║  L0-V  계약 자동검정 K1~K19  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
 # ║                                                                                          ║
 # ║  세 검증은 서로 다른 것을 본다. 하나로 합칠 수 없다:                                       ║
 # ║   · 계약검정 : 협상 불가 규칙(PIT·생존편향·사전등록)이 코드에 실제로 박혀 있는가            ║
@@ -239,7 +239,7 @@ def run_selftest(full: bool = True) -> bool:
 
 # ── 계약 검정 ───────────────────────────────────────────────────────────────────────────────
 def run_contract_tests(strict: bool = True) -> bool:
-    LOG.banner("계약 자동검정 K1~K14", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
+    LOG.banner("계약 자동검정 K1~K19", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
     CONTRACTS.clear()
 
     def k1():
@@ -330,6 +330,83 @@ def run_contract_tests(strict: bool = True) -> bool:
         k = _beta_binom_k(np.array([5., 30., 2.]), np.array([10., 60., 4.]))
         return bool(np.isfinite(k) and k > 0), f"EB 축소강도 k={k:.0f} > 0 (축소는 필수)"
 
+    def k15():
+        """상세 보강 상한이 시간축을 편식하지 않는가.
+
+        ★ 이 계약이 없어서 조용히 죽을 뻔했다. 최신순 head(limit) 로 자르면 최근 2~3년만
+          채워지고 백테스트 앞 6~7년의 링크가 통째로 비는데, 예외가 하나도 나지 않는다.
+          '균등하게 잘렸는가'를 월 커버리지로 직접 검사한다.
+        """
+        months = pd.period_range("2016-08", "2026-07", freq="M")
+        need = pd.DataFrame({
+            "pub_date": [p.start_time + pd.Timedelta(days=3) for p in months for _ in range(50)],
+            "src_report_id": [f"{i}" for i in range(len(months) * 50)]})
+        picked = _nv_stratified(need, 200)
+        cov = as_ts_series(picked["pub_date"]).dt.to_period("M").nunique()
+        return (cov >= min(len(months), 200)), \
+            f"상한 200건이 {cov}/{len(months)}개월에 고루 배분됨 (최신순 편식 아님)"
+
+    def k16():
+        """가격 수집 대상 축소가 상장폐지 보통주를 절대 버리지 않는가 (생존자편향)."""
+        sec = pd.DataFrame({
+            "code": ["005930", "005935", "069500", "037350", "323230"],
+            "name": ["삼성전자", "삼성전자우", "KODEX 200", "폐지된회사", "대신밸런스제1호스팩"],
+            "market": ["KOSPI"] * 5,
+            "listing_date": [as_ts("2000-01-01")] * 5,
+            "delisting_date": [pd.NaT, pd.NaT, pd.NaT, as_ts("2019-05-01"), pd.NaT]})
+        keep, _aud = price_target_codes(sec)
+        missing = [c for c in ("037350", "005930") if c not in keep]
+        leaked = [c for c in ("005935", "069500", "323230") if c in keep]
+        ok = (not missing) and (not leaked)
+        if not ok:
+            return False, f"누락(생존편향){missing} · 유출(§5위반){leaked} → 대상 {keep}"
+        return ok, f"폐지 보통주 유지 · 우선주/ETF/스팩 제외 → 대상 {len(keep)}종목"
+
+    def k17():
+        """리허설 중에는 어떤 것도 드라이브에 쓰이지 않는가 (절대 1원칙)."""
+        g = globals()
+        before = len(CACHE_LEDGER)
+        g["_REHEARSAL"] = True
+        try:
+            wrote = persist("__contract_probe__", pd.DataFrame({"a": [1]}),
+                            scope="shared", domain="test", source="k17")
+        finally:
+            g["_REHEARSAL"] = False
+        last = CACHE_LEDGER[-1] if len(CACHE_LEDGER) > before else {}
+        return (wrote is False and last.get("action") == "리허설-저장금지"), \
+            "리허설 플래그가 켜지면 persist() 가 쓰기를 거부한다"
+
+    def k18():
+        """레이트 버킷이 실제 호스트와 일치하는가 (구버전 병목의 재발 방지).
+
+        FDR 호출이 krx 버킷(2 QPS)을 쓰면 종목 수 ÷ 2초가 그대로 벽시계가 된다.
+        실측 2,875초의 정체가 이것이었으므로, 소스코드 수준에서 못 돌아가게 못 박는다.
+        """
+        src = _src(_px_fdr)
+        why = []
+        if 'limiter("fdr")' not in src or 'limiter("krx")' in src:
+            why.append("_px_fdr 이 fdr 버킷을 쓰지 않음")
+        if 'source="naver_chart"' not in _src(_px_naver):
+            why.append("_px_naver 가 naver_chart 버킷을 쓰지 않음")
+        if float(RATE_LIMIT_QPS.get("fdr", 0)) <= float(RATE_LIMIT_QPS.get("krx", 99)):
+            why.append("fdr QPS 가 krx QPS 이하")
+        for b in ("fdr", "naver_chart", "naver_detail"):
+            if b not in RATE_LIMIT_QPS:
+                why.append(f"버킷 '{b}' 미정의")
+        return (not why), ("FDR/네이버차트가 KRX 버킷을 쓰지 않고 각자 버킷을 쓴다"
+                           if not why else " · ".join(why))
+
+    def k19():
+        """신규 수집물은 예외 없이 persist() 를 거치는가 (세션 무관 재호출 보장)."""
+        bad = []
+        for fn in (fetch_prices, fetch_mktcap_monthly, fetch_fundamental_monthly,
+                   hankyung_collect, naver_collect, naver_enrich_detail):
+            s = _src(fn)
+            if ("persist(" not in s) and ("put_table" not in s):
+                bad.append(fn.__name__)
+        return (not bad), ("모든 수집 함수가 드라이브 저장 경로를 갖는다"
+                           if not bad else f"저장 경로 없는 수집 함수: {bad}")
+
     for cid, name, fn in [
         ("K1", "미래누수 차단 (PIT 게이트)", k1),
         ("K2", "생존편향 — 폐지 수익률 처리", k2),
@@ -345,6 +422,11 @@ def run_contract_tests(strict: bool = True) -> bool:
         ("K12", "캐시 삭제 API 부재", k12),
         ("K13", "분위 배정 결정성", k13),
         ("K14", "EB 축소추정 실제 적용", k14),
+        ("K15", "상세보강 상한의 시간축 균등성", k15),
+        ("K16", "가격수집 축소가 폐지종목을 안 버림", k16),
+        ("K17", "리허설 중 캐시 쓰기 차단", k17),
+        ("K18", "레이트 버킷 ↔ 실제 호스트 일치", k18),
+        ("K19", "신규 수집물 전량 드라이브 저장", k19),
     ]:
         _k(cid, name, fn)
 
@@ -395,6 +477,31 @@ class _FakePykrx:
         return ["58J123"]
 
 
+def _quiet_roundtrip() -> bool:
+    """quiet_fds 가 봉인 후 stdout/stderr 를 확실히 되돌리는지 확인한다.
+
+    되돌리기에 실패하면 그 뒤 모든 로그가 사라진다 — 실행은 계속되는데 화면은 죽는,
+    가장 진단하기 어려운 고장이다. 그래서 리허설에서 직접 왕복시켜 본다.
+    """
+    try:
+        fd_out, fd_err = os.dup(1), os.dup(2)
+    except Exception:
+        return True                      # fd 복제가 안 되는 환경이면 봉인 자체가 비활성이다
+    try:
+        with quiet_fds():
+            os.write(1, b"this must not appear\n")
+        sys.stdout.write("")
+        sys.stdout.flush()
+        return True
+    finally:
+        for fd, saved in ((1, fd_out), (2, fd_err)):
+            try:
+                os.dup2(saved, fd)
+                os.close(saved)
+            except Exception:
+                pass
+
+
 def run_rehearsal(strict: bool = False) -> bool:
     """새로 만든 수집·정제 함수들을 가짜 네트워크로 '실물 실행'한다.
 
@@ -411,10 +518,34 @@ def run_rehearsal(strict: bool = False) -> bool:
         KRXG.call = lambda fn, *a, **kw: fn(*a, **kw)     # type: ignore
         months = pd.date_range(end=as_ts(BACKTEST_END), periods=3, freq=MONTH_END_ALIAS)
 
+        _sec = pd.DataFrame({
+            "code": ["005930", "000660", "005935", "069500", "111111"],
+            "name": ["삼성전자", "SK하이닉스", "삼성전자우", "KODEX 200", "폐지테스트"],
+            "market": ["KOSPI", "KOSPI", "KOSPI", "KOSPI", "KOSDAQ"],
+            "listing_date": [as_ts("2000-01-01")] * 5,
+            "delisting_date": [pd.NaT, pd.NaT, pd.NaT, pd.NaT, as_ts("2020-03-02")]})
+        _krx_rows_fake = [{"ISU_SRT_CD": "005930", "ISU_ABBRV": "삼성전자", "MKT_NM": "KOSPI",
+                           "TDD_CLSPRC": "71,000", "TDD_OPNPRC": "70,500", "TDD_HGPRC": "71,500",
+                           "TDD_LWPRC": "70,000", "ACC_TRDVOL": "12,345,678",
+                           "ACC_TRDVAL": "876,543,210,000", "MKTCAP": "423,000,000,000,000",
+                           "LIST_SHRS": "5,969,782,550"}]
         for name, fn in [
             ("시가총액 스냅샷", lambda: fetch_mktcap_monthly(months)),
             ("펀더멘털 스냅샷", lambda: fetch_fundamental_monthly(months)),
             ("비주식 종목 목록", lambda: fetch_nonequity_tickers(months)),
+            ("가격수집 대상 축소", lambda: price_target_codes(_sec)[0]),
+            ("종목별 요청창 산정", lambda: _price_windows(["005930", "111111"],
+                                                     BACKTEST_START, BACKTEST_END, _sec)),
+            ("KRX 벌크 응답 매핑", lambda: _krx_map_frame(
+                _krx_rows_fake, ["code", "name", "market", "close", "open", "high", "low",
+                                 "volume", "amount", "mktcap", "shares"])),
+            ("음성캐시 백오프", lambda: [_price_backoff_days(i) for i in (1, 2, 3, 9)]),
+            ("네이버 미보유 구간 산정", lambda: _nv_missing_ranges(
+                pd.DataFrame({"category": ["company"] * 2,
+                              "pub_date": [as_ts("2016-08-15"), as_ts("2016-09-15")]}),
+                "company", "2016-08-01", "2016-12-31")),
+            ("한경 파서(빈 응답 방어)", lambda: str(_hk_parse("<html></html>", "probe") == [])),
+            ("디스크 여유 조회", lambda: f"{free_gb_safe('.'):.1f}GB"),
         ]:
             try:
                 d = fn()
@@ -428,6 +559,11 @@ def run_rehearsal(strict: bool = False) -> bool:
             ("바이라인 파서", lambda: parse_byline("미래에셋증권 리서치센터 홍길동 애널리스트")),
             ("우선주 판정", lambda: str(is_preferred("005935", "삼성전자우"))),
             ("증권거래세", lambda: f"{sell_tax_rate('2022-03-01', 'KOSDAQ'):.4%}"),
+            ("증권유형 분류", lambda: ",".join(
+                classify_security(c, n) for c, n in
+                (("005930", "삼성전자"), ("005935", "삼성전자우"), ("069500", "KODEX 200")))),
+            ("출력 봉인 왕복", lambda: (_quiet_roundtrip() and "stdout 복원 확인")),
+            ("상세 균등추출", lambda: f"{len(_nv_stratified(pd.DataFrame({'pub_date': pd.date_range('2016-08-31', periods=120, freq=MONTH_END_ALIAS), 'x': 1}), 30))}건"),
         ]:
             try:
                 v = fn()

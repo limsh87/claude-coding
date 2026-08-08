@@ -258,6 +258,39 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     raw_codes = d[code_c].astype(str)
     codes = raw_codes.map(to_code6)
     n_badcode = int(codes.isna().sum())
+
+    # ── 탈락분의 정체를 밝힌다 (실측에서 4,172 → 2,636 으로 37% 가 여기서 사라졌다) ──────────
+    #   '코드 형식 불일치'라는 한 줄로는 ⓐ 파서 버그로 진짜 종목을 잃은 것과
+    #   ⓑ 애초에 보통주가 아닌 파생증권(신주인수권증서·ELW 등)이 걸러진 것을 구분할 수 없다.
+    #   생존자편향의 크기가 달라지므로 반드시 갈라 봐야 한다.
+    #   ★ 임의 복원은 하지 않는다. '722011J7' → '722011' 로 잘라 붙이면 멀쩡히 상장돼 있는
+    #     회사에 폐지일을 심어 -70% 수익을 주입하는 사고가 난다. 근거 없는 매핑은 금지다.
+    if n_badcode:
+        bad_raw = raw_codes[codes.isna()].astype(str).str.strip()
+        base6 = bad_raw.str[:6]
+        good6 = set(codes.dropna().astype(str))
+        covered = int(base6.isin(good6).sum())          # 본주가 이미 목록에 있는 파생증권
+        shapes = Counter()
+        for s in bad_raw:
+            if len(s) > 6 and re.fullmatch(r"\d{4,6}[0-9A-Z]{1,4}", s):
+                shapes["6자리 초과(파생·신주인수권류)"] += 1
+            elif not s or s.lower() in ("nan", "none"):
+                shapes["빈 값"] += 1
+            else:
+                shapes["기타 형식"] += 1
+        LOG.table([[k, f"{v:,}"] for k, v in shapes.most_common()] +
+                  [["└ 그중 본주가 폐지목록에 이미 있음", f"{covered:,}"]],
+                  ["정규화 탈락 유형", "건수"], ["l", "r"],
+                  title=f"상장폐지 목록 정규화 탈락 {n_badcode:,}건의 정체")
+        residual = n_badcode - covered
+        LOG.info(
+            f"탈락분 {n_badcode:,}건 중 {covered:,}건은 본주가 이미 폐지목록에 있는 "
+            f"파생증권(신주인수권증서·ELW 등)이라 보통주 유니버스에 영향이 없습니다. "
+            f"나머지 {residual:,}건은 6자리 코드로 환원할 근거가 없어 그대로 둡니다 — "
+            f"임의로 앞 6자리를 잘라 붙이면 살아 있는 회사에 폐지일을 심게 됩니다.")
+        if residual > max(50, int(0.05 * n_raw)):
+            LOG.warn(f"근거 없이 남은 탈락분이 {residual:,}건({100*residual/max(n_raw,1):.1f}%)으로 "
+                     f"적지 않습니다. 잔여 생존자편향이 이 크기만큼 남아 있을 수 있습니다.")
     t = pd.DataFrame({
         "code": codes,
         "name": d[name_c].astype(str),

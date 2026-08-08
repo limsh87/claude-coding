@@ -479,6 +479,14 @@ def _safe_size(p: str) -> int:
 
 
 def free_gb(path: str) -> float:
+    """여유 디스크(GB). ★ os.statvfs 는 윈도우에 없다 — 그러면 nan 이 되어 용량 점검이
+    통째로 무력해진다(실측 로그의 '여유 공간 nan GB'). shutil.disk_usage 는 3개 OS 전부에서
+    동작하므로 그것을 1순위로 쓴다."""
+    for p in (path, os.path.dirname(os.path.abspath(path or ".")) or "."):
+        try:
+            return shutil.disk_usage(p).free / 1e9
+        except Exception:
+            continue
     try:
         st = os.statvfs(path)
         return st.f_bavail * st.f_frsize / 1e9
