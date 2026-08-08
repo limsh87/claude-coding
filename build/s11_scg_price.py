@@ -166,7 +166,12 @@ def scg_fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame
                             source="fdr/naver (KRX 미호출)")
             VAULT.flush("shared")
             got = []
-    n_fail = len([c for c in todo if c not in set(have["code"])])
+    #  ★ set(have["code"]) 를 컴프리헨션 조건 안에 두면 파이썬이 알아서 밖으로 빼주지
+    #    않는다 — todo 원소마다 have 전체(콜드스타트면 수백만 행)로 set 을 새로 만든다.
+    #    9.1M행에서 실측 0.58초/회 × 2,800회 = 27분. 로그 한 줄 없이 조용히 걸린다 —
+    #    이전에 겪은 30분 무출력 정체와 같은 종류의 사고다. 한 번만 만든다.
+    have_codes = set(have["code"].unique()) if len(have) else set()
+    n_fail = sum(1 for c in todo if c not in have_codes)
     if n_fail:
         LOG.info(f"가격을 끝내 못 받은 종목 {n_fail:,}개 — 폐지 직후이거나 소스에 없는 종목입니다. "
                  f"유니버스에는 남지만 수익률이 없어 백테스트 표본에서 자연히 빠집니다.")

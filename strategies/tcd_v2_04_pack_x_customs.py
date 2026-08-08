@@ -163,7 +163,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_X"
 STRATEGY_NAME      = "PACK-X 관세청 수출"
 ACTIVE_PACKS       = ["X"]
-BUILD_VERSION      = "v2.20260808.1118"
+BUILD_VERSION      = "v2.20260808.1147"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -751,6 +751,18 @@ class Pipeline:
         rec.status = "RUNNING"
         rec.t_start = time.time()
         LOG.info(f"▷ {name}")
+        #  ★ 무출력 정체 방지 하트비트. budget_s 는 스테이지가 '끝난 뒤'에만 검사되므로
+        #    스테이지가 통째로 멈추면 그 자체를 감지할 방법이 없었다 — 실제로 30분간
+        #    로그 한 줄 없이 멈춘 사고가 있었다. 60초마다 경과시간만 찍어 침묵을 없앤다.
+        #    데몬 스레드라 프로세스 종료를 막지 않고, finally 에서 반드시 멈춘다.
+        _hb_stop = threading.Event()
+
+        def _heartbeat():
+            while not _hb_stop.wait(60.0):
+                LOG.info(f"    …[{sid}] 진행 중 · {(time.time()-rec.t_start)/60:.1f}분 경과")
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name=f"hb-{sid}")
+        _hb_thread.start()
         try:
             yield rec
             rec.t_end = time.time()
@@ -782,6 +794,7 @@ class Pipeline:
             rec.status = "WARN"
             rec.notes.append(f"WARN: 비필수 스테이지 실패 — {rec.err_type}")
         finally:
+            _hb_stop.set()
             LOG.ctx.pop()
             self.current = prev
 

@@ -216,7 +216,7 @@ STOP_ON_KILL_CRITERIA = False   # SCG 는 '킬'이 아니라 '증분 기여 판�
 STRATEGY_ID        = "SCG_LS_LSA"
 STRATEGY_NAME      = "SCG-LS / SCG-LSA — Smart Consensus Gap + Analyst Leadership"
 ACTIVE_PACKS       = []
-BUILD_VERSION      = "v2.20260808.1118"
+BUILD_VERSION      = "v2.20260808.1147"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -804,6 +804,18 @@ class Pipeline:
         rec.status = "RUNNING"
         rec.t_start = time.time()
         LOG.info(f"▷ {name}")
+        #  ★ 무출력 정체 방지 하트비트. budget_s 는 스테이지가 '끝난 뒤'에만 검사되므로
+        #    스테이지가 통째로 멈추면 그 자체를 감지할 방법이 없었다 — 실제로 30분간
+        #    로그 한 줄 없이 멈춘 사고가 있었다. 60초마다 경과시간만 찍어 침묵을 없앤다.
+        #    데몬 스레드라 프로세스 종료를 막지 않고, finally 에서 반드시 멈춘다.
+        _hb_stop = threading.Event()
+
+        def _heartbeat():
+            while not _hb_stop.wait(60.0):
+                LOG.info(f"    …[{sid}] 진행 중 · {(time.time()-rec.t_start)/60:.1f}분 경과")
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name=f"hb-{sid}")
+        _hb_thread.start()
         try:
             yield rec
             rec.t_end = time.time()
@@ -835,6 +847,7 @@ class Pipeline:
             rec.status = "WARN"
             rec.notes.append(f"WARN: 비필수 스테이지 실패 — {rec.err_type}")
         finally:
+            _hb_stop.set()
             LOG.ctx.pop()
             self.current = prev
 
@@ -3208,7 +3221,12 @@ def scg_fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame
                             source="fdr/naver (KRX 미호출)")
             VAULT.flush("shared")
             got = []
-    n_fail = len([c for c in todo if c not in set(have["code"])])
+    #  ★ set(have["code"]) 를 컴프리헨션 조건 안에 두면 파이썬이 알아서 밖으로 빼주지
+    #    않는다 — todo 원소마다 have 전체(콜드스타트면 수백만 행)로 set 을 새로 만든다.
+    #    9.1M행에서 실측 0.58초/회 × 2,800회 = 27분. 로그 한 줄 없이 조용히 걸린다 —
+    #    이전에 겪은 30분 무출력 정체와 같은 종류의 사고다. 한 번만 만든다.
+    have_codes = set(have["code"].unique()) if len(have) else set()
+    n_fail = sum(1 for c in todo if c not in have_codes)
     if n_fail:
         LOG.info(f"가격을 끝내 못 받은 종목 {n_fail:,}개 — 폐지 직후이거나 소스에 없는 종목입니다. "
                  f"유니버스에는 남지만 수익률이 없어 백테스트 표본에서 자연히 빠집니다.")
