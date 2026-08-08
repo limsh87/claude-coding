@@ -321,16 +321,24 @@ def run_contracts_v3(strict: bool = True) -> bool:
         for fn, arg in ((fetch_dart_financials, "max_calls"), (fetch_emp_status, "max_calls")):
             if arg not in _ins.signature(fn).parameters:
                 return False, f"{fn.__name__} 이 {arg} 인자를 받지 않습니다"
-        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS)
+        # ★ Tier-2 는 잡당 OFS→CFS 로 최대 2회를 던진다. '잡 수'가 아니라 '호출 수'로 센다.
+        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS) * 2 + 2100 + 600
         if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT:
             return False, f"단일 단계 상한이 일일한도({DART_DAILY_LIMIT:,})를 넘습니다"
+        # 예전엔 plan 을 계산해 성공 메시지에 찍기만 하고 **한도와 비교하지 않았다.**
+        # 그래서 26,000건 계획이 "일일한도 19,000 안" 이라는 문구와 함께 PASS 했다.
+        if plan > DART_DAILY_LIMIT:
+            return False, (f"계획 호출 {plan:,}건이 일일한도 {DART_DAILY_LIMIT:,}건을 넘습니다 "
+                           f"(EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,}×2 + "
+                           f"배치·캐너리 ≈2,700). 한 실행이 한도를 넘게 계획하면 "
+                           f"뒤쪽 단계는 반드시 굶습니다 — 상한을 낮추세요")
         # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
         worst_h = (int(EMP_MAX_CALLS) / 8.0 + int(DART_FS_MAX_CALLS) / 5.0) / 3600.0
         if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
             return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
                            f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")
-        return True, (f"EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,} = {plan:,}건 "
-                      f"(≈{worst_h*60:.0f}분) · 일일한도 {DART_DAILY_LIMIT:,} 안")
+        return True, (f"계획 {plan:,}건 (EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,}×2 "
+                      f"+ 배치·캐너리) ≈{worst_h*60:.0f}분 · 일일한도 {DART_DAILY_LIMIT:,} 안")
 
     _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
 
@@ -422,6 +430,53 @@ def run_contracts_v3(strict: bool = True) -> bool:
                       f"부실·사유불명 → -100% 유지 (표본 {len(cases)}건 전부 일치)")
 
     _cc("C2c", "폐지 유형별 청산가 (합병을 전액손실로 계상 금지)", delist_kinds)
+
+    # ── §12-A : 알파 원천 보호 ────────────────────────────────────────────────────────────
+    def alpha_guard():
+        """★ 실행 3회 내내 dart_employees_ext 가 0행이었던 사고를 고정한다.
+
+        원인은 둘이었다.
+          ① 사전점검이 세 테이블을 **합산**해 total>0 이면 진행했다. 재무 146만 행이 있고
+             직원현황이 0행인 상태를 '캐시 충분'으로 읽어, 27분(잠재 2시간)을 태운 뒤에야
+             "EMP-LITE 3개 TP 가 모두 결측"을 선언했다. 테이블은 대체재가 아니다.
+          ② Tier-2 재무가 일일 한도를 먼저 다 써버려 EMP 몫이 남지 않았다. 단계 순서를
+             바꿔도 예산은 날짜별 누적이라 어제 태운 것이 오늘까지 따라온다.
+        이 계약은 (a) 예약 API 가 존재하고 실제로 남의 인출을 막으며 (b) 예약분은 해당
+        용도가 인출할 수 있고 (c) 사전점검이 알파 테이블을 개별로 본다는 것을 강제한다.
+        """
+        for fn in ("reserve", "left", "take"):
+            if not callable(getattr(DartBudget, fn, None)):
+                return False, f"DartBudget.{fn}() 이 없습니다 — 알파 예산을 지킬 수단이 없습니다"
+        b = DartBudget.__new__(DartBudget)          # _load(파일 I/O) 를 타지 않게 직접 구성
+        b.today, b.n, b.exhausted = "T", 0, False
+        b._lk = threading.RLock()
+        b._reserved, b._dirty, b._warned_reserve = {}, 0, False
+        b.reserve("emp", 100)
+        room = DART_DAILY_LIMIT - 100
+        if b.left(None) != room:
+            return False, f"예약 후 일반 잔량이 {b.left(None):,} (기대 {room:,})"
+        if b.left("emp") != DART_DAILY_LIMIT:
+            return False, "예약 당사자가 자기 예약분을 못 봅니다"
+        # 일반 소비자가 예약분까지 먹어치우지 못해야 한다.
+        if b.take(room, purpose=None) is not True:
+            return False, "일반 소비자가 정당한 잔량조차 인출하지 못합니다"
+        if b.take(1, purpose=None) is not False:
+            return False, "★ 일반 소비자가 예약분을 인출했습니다 — 알파가 또 굶습니다"
+        if b.take(1, purpose="emp") is not True:
+            return False, "★ 예약 당사자가 자기 예약분을 인출하지 못합니다"
+        # 사전점검이 알파 테이블을 개별 판정하는가 (합산 판정이면 사고가 재현된다)
+        src = _src_of(preflight_dart_v3) or ""
+        if src:
+            if "dart_employees_ext" not in src:
+                return False, "사전점검이 알파 테이블을 개별로 보지 않습니다"
+            if "sum(have.values())" in src and "dead_alpha" not in src:
+                return False, "사전점검이 여전히 합산으로만 판정합니다"
+        if not REQUIRE_EMP_ALPHA:
+            return True, "예약 동작 확인 · REQUIRE_EMP_ALPHA=False (알파 없이도 진행하도록 설정됨)"
+        return True, (f"예약 {EMP_RESERVED_CALLS:,}건은 EMP 만 인출 가능 · "
+                      f"알파 부재 시 수집 전 중단")
+
+    _cc("§12-A", "알파 원천(직원현황) 예산 보호 · 부재 시 사전 중단", alpha_guard)
 
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 34), "PASS" if r["pass"] else "FAIL",

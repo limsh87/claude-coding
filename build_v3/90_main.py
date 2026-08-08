@@ -167,6 +167,34 @@ def _flush_on_abort_v3():
         pass
 
 
+def _enrich_research_bounded(nv: pd.DataFrame, sec: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """네이버 상세 보강을 시간 상한 안에서, 담을 수 있는 종목부터 수행한다."""
+    if nv is None or nv.empty or not RESEARCH_ENRICH_MAX_MIN:
+        if nv is not None and len(nv) and not RESEARCH_ENRICH_MAX_MIN:
+            LOG.info("RESEARCH_ENRICH_MAX_MIN=0 — 상세 보강을 생략합니다. "
+                     "목표주가는 한경 경로에서만 채워집니다(실측 수율이 0 이었던 단계입니다).")
+        return nv if nv is not None else pd.DataFrame()
+    obs = float(RATE_LIMIT_QPS.get("naver", 3.0)) or 3.0
+    cap = max(0, int(RESEARCH_ENRICH_MAX_MIN * 60 * obs))
+    if "code" in nv.columns and sec is not None and len(sec):
+        try:
+            # 담을 수 있는 종목(=거래대금이 있는 종목)을 앞으로 당긴다. 정렬만 바꾸므로
+            # 상한에 걸려 잘려도 남는 것이 '쓸모 있는 쪽'이 된다.
+            live = set(sec.loc[sec["delisting_date"].isna(), "code"].astype(str)) \
+                if "delisting_date" in sec.columns else set(sec["code"].astype(str))
+            key = (~nv["code"].astype(str).isin(live)).astype(int)
+            nv = nv.assign(_pri=key).sort_values(
+                ["_pri"] + (["date"] if "date" in nv.columns else []),
+                ascending=[True] + ([False] if "date" in nv.columns else [])
+            ).drop(columns=["_pri"]).reset_index(drop=True)
+        except Exception:
+            pass
+    LOG.info(f"네이버 상세 보강 상한 {cap:,}건 (≈{RESEARCH_ENRICH_MAX_MIN}분 · "
+             f"실측 {obs:.1f}건/초). 상장 종목·최신순으로 채웁니다. "
+             f"이 단계는 U축 d1 보조이며 알파(한계임금)와 무관합니다.")
+    return naver_enrich_detail(nv, limit=cap)
+
+
 def announce_budget_v3():
     """수집을 시작하기 전에 '이번 실행이 몇 분짜리인지'를 먼저 못박아 보여준다.
 
@@ -217,22 +245,59 @@ def preflight_dart_v3() -> str:
     if not halt:
         return "LIVE"
 
+    # ★★ 테이블은 서로 대체재가 아니다. ★★
+    #   이 전략의 알파는 오직 한계임금(dart_employees_ext)이고, 재무 두 테이블은 **보조**다.
+    #   예전 판정은 셋을 합산해 total>0 이면 진행했다. 그래서 재무 146만 행이 있고
+    #   직원현황이 0행인 상태를 '캐시 충분'으로 읽고 27분을 태운 뒤, 정작 EMP 단계에서
+    #   "3개 TP 가 모두 결측"을 선언했다. 알파가 없는 백테스트는 돌릴 이유가 없다.
+    #   → 알파 필수(critical)와 보조(support)를 분리해 판정한다.
+    CRITICAL = {"dart_employees_ext": "한계임금 — 이 전략의 유일한 알파 원천 (TP_N1·N2·N3)"}
+    SUPPORT = {"dart_fnltt_raw": "전체재무제표 — TP_I1/I2/I4",
+               "dart_multi_raw": "주요계정 — 유니버스·규모버킷·R3"}
     have = {}
-    for t in ("dart_employees_ext", "dart_fnltt_raw", "dart_multi_raw"):
+    for t in list(CRITICAL) + list(SUPPORT):
         try:
             d = VAULT.get_table(t, scope="shared")
             have[t] = 0 if d is None else len(d)
         except Exception:
             have[t] = 0
-    total = sum(have.values())
 
-    LOG.table([[k, f"{v:,}행", "사용 가능" if v else "비어 있음"] for k, v in have.items()],
-              ["공용 캐시 테이블", "보유", "이번 실행"], ["l", "r", "c"],
+    LOG.table([[t, "★알파" if t in CRITICAL else "보조", f"{have[t]:,}행",
+                "사용 가능" if have[t] else "비어 있음",
+                _trunc({**CRITICAL, **SUPPORT}[t], 44)]
+               for t in list(CRITICAL) + list(SUPPORT)],
+              ["공용 캐시 테이블", "역할", "보유", "이번 실행", "이 테이블이 없으면"],
+              ["l", "c", "r", "c", "l"],
               title=f"DART 사전점검 — 지금 신규 수집 불가: {halt}")
 
-    if total > 0:
+    dead_alpha = [t for t in CRITICAL if not have[t]]
+    if dead_alpha:
+        LOG.error(
+            f"★ 알파 원천이 비어 있습니다 — {dead_alpha} · {halt}\n"
+            f"  재무 캐시가 {sum(have[t] for t in SUPPORT):,}행 있어도 **이 전략은 성립하지 않습니다.**\n"
+            f"  한계임금 = Δ급여총액 / Δ직원수 이고, 그 입력이 empSttus 하나뿐입니다.\n"
+            f"  이대로 진행하면 TP_N1·N2·N3 가 전부 결측이고, 남는 것은 CORE-D 5개 TP 뿐이라\n"
+            f"  '전략 3' 이 아니라 '이름만 같은 다른 전략'의 백테스트가 나옵니다.\n"
+            f"  그래서 가격·리포트 수집(실측 2시간)에 들어가기 전에 **지금** 멈춥니다.\n"
+            f"\n"
+            f"  선택지\n"
+            f"    ① 한도 회복 후 재실행 — DART 한도는 매일 자정(KST)에 초기화됩니다.\n"
+            f"       다음 실행은 EMP 에 예산을 **먼저** 배정하므로 한 번에 {EMP_MAX_CALLS:,}건까지 채웁니다.\n"
+            f"    ② EMP 만 먼저 채우기 — DART_FS_MAX_CALLS=0 으로 두면 Tier-2 가 예산을 쓰지 않아\n"
+            f"       직원현황이 최대 속도로 완성됩니다(권장).\n"
+            f"    ③ CORE-D 단독으로 돌려보려면 REQUIRE_EMP_ALPHA=False 로 두세요.\n"
+            f"       EMP-LITE 없는 축소판임이 모든 산출물에 명시됩니다.")
+        if REQUIRE_EMP_ALPHA:
+            raise KillCriteria(
+                f"알파 원천(dart_employees_ext) 부재 · {halt} — 위 ①~③ 중 하나를 고른 뒤 재실행하세요. "
+                f"2시간을 쓰고 '3개 TP 전부 결측'을 보는 대신 지금 멈춥니다.")
+        LOG.warn("REQUIRE_EMP_ALPHA=False — EMP 없는 CORE-D 축소판으로 진행합니다.")
+        return "CACHE_ONLY"
+
+    if sum(have.values()) > 0:
         LOG.warn(
-            f"DART 신규 수집은 못 하지만 공용 캐시에 {total:,}행이 있어 **그것만으로 진행**합니다.\n"
+            f"DART 신규 수집은 못 하지만 알파 원천이 캐시에 {have['dart_employees_ext']:,}행 있어 "
+            f"**캐시만으로 진행**합니다.\n"
             f"     · 캐시에 없는 (회사×연도)는 결측으로 남습니다 — 0 으로 채우지 않습니다.\n"
             f"     · CANARY 의 DART 항목은 판정 보류(SKIP)로 처리되며 킬 기준을 걸지 않습니다.\n"
             f"     · 내일(또는 한도 회복 후) 재실행하면 정확히 이 지점부터 이어받습니다.")
@@ -299,8 +364,14 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.EMP", "DART 직원현황(확장) · C15 한계임금", "L1",
                     budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-        eyears = list(range(as_ts(BACKTEST_START).year - EMP_YEARS_BACK,
-                            as_ts(BACKTEST_END).year + 1))
+        # ★ 상한을 '아직 제출되지 않은 회계연도' 앞에서 끊는다.
+        #   사업보고서는 다음 해 3~4월에 나오므로 FY(올해)는 존재할 수 없다. 그런데 잡은
+        #   연도 내림차순이라 그 없는 연도가 **큐 맨 앞**에 온다 — 3,366건(상한의 24%)을
+        #   확실히 빈 응답에 먼저 태우고 나서야 쓸 수 있는 연도에 도달했다.
+        _y_max = min(as_ts(BACKTEST_END).year, _dt.date.today().year) - 1
+        eyears = list(range(as_ts(BACKTEST_START).year - EMP_YEARS_BACK, _y_max + 1))
+        LOG.info(f"직원현황 대상 회계연도 {eyears[0]}~{eyears[-1]} "
+                 f"(FY{_y_max + 1} 이후는 아직 제출 전이라 제외 — 없는 연도를 먼저 묻지 않습니다)")
         # ★ 한계임금이 이 전략의 알파 원천이므로 DART 일일예산을 **여기에 먼저** 배정한다.
         #   (Tier-2 전체재무제표는 남는 예산으로 채우고, 부족분은 Tier-1 주요계정이 받친다)
         emp_corps, _, emp_prio = dart_fs_scope_v3(ctx, corps, quiet=True)
@@ -348,16 +419,51 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                     budget_s=3600, critical=False):
         cached = VAULT.get_table("research_report_master", scope="shared")
         frames = []
+        # ★ 캐시를 읽어 놓고도 전 구간을 다시 긁고 있었다. "재수집하지 않습니다" 로그는
+        #   재수집이 **끝난 뒤에** 찍혔다(13분 낭비 × 매 실행). 가격·공시는 이미 증분인데
+        #   리포트만 전량 재수집이었다 → 캐시 최신일 이후만 받는다.
+        r_start = BACKTEST_START
+        if cached is not None and len(cached) and "date" in cached.columns:
+            try:
+                _mx = as_ts_series(cached["date"]).max()
+                if pd.notna(_mx):
+                    # 7일 겹쳐 받는다 — 경계일에 늦게 올라온 리포트를 놓치지 않기 위함.
+                    r_start = max(as_ts(BACKTEST_START),
+                                  _mx - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+                    if r_start != BACKTEST_START:
+                        LOG.info(f"보고서 증분 수집 — 캐시 최신 {_mx:%Y-%m-%d} 이후만 받습니다 "
+                                 f"({r_start} ~). 전 구간 재수집이면 실측 13분이 매번 듭니다.")
+            except Exception:
+                pass
         if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
             LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
                      "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
                      "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
             if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+                _hk = hankyung_collect(r_start, BACKTEST_END)
+                if not len(_hk) and r_start == BACKTEST_START:
+                    # ★ 전 구간을 요청했는데 0건이면 소스 장애다. 예전엔 LOG.ok 로 찍혀
+                    #   초록 체크마크 뒤에 숨었다. 한경은 analyst_raw 의 **유일한** 원천이라
+                    #   0건이면 애널리스트 원장 전체가 빈다.
+                    LOG.error("한경컨센서스 0건 — 전 구간을 요청했는데 한 건도 받지 못했습니다. "
+                              "위 'HTTP 수집 감사' 표에서 hankyung 의 403/404 건수를 확인하세요. "
+                              "403 이면 차단(잠시 뒤 재시도), 404 면 엔드포인트 변경입니다. "
+                              "이 소스가 비면 애널리스트 원장·목표주가가 통째로 비어 "
+                              "다중소스 원장연결 감사가 무의미해집니다.")
+                frames.append(_hk)
             if "naver" in RESEARCH_SOURCES:
-                frames.append(naver_enrich_detail(naver_collect(BACKTEST_START, BACKTEST_END)))
+                nv = naver_collect(r_start, BACKTEST_END)
+                # ★ 상세 보강은 리포트 1건당 1회 요청이라 **이 전략에서 가장 비싼 단계**다.
+                #   실측: 45,000건 대상 → 20,000건만 해도 ETA 1시간 44분(2.99 it/s).
+                #   §10 의 수집 총예산이 95분인데 한 보조축 보강이 그 배를 먹는다.
+                #   게다가 리허설·실행 모두 '목표주가 0건 추가 확보' 였다 — 수율이 0 이다.
+                #   → 시간 상한을 걸고, 그 안에서 **U-MID 대역 종목부터** 보강한다.
+                #     (담을 수 없는 종목의 목표주가는 스코어에 쓰이지 않는다)
+                nv = _enrich_research_bounded(nv, ctx.get("sec"))
+                frames.append(nv)
         if cached is not None and len(cached):
-            LOG.ok(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 — 재수집하지 않습니다")
+            LOG.ok(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 "
+                   f"(신규는 {r_start} 이후만 받았습니다)")
             frames.append(cached)
         rep = build_report_master(frames, ctx["sec"]) if frames else pd.DataFrame()
         if len(rep):
@@ -411,8 +517,12 @@ def build_features_v3(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         P = emp_lite_sensors(P, emp_start)
         P = axis_U_v3(P, ctx.get("flows"))
 
-        # ★ U-MID 밖은 여기서 제외한다. TP 랭크가 '고를 수 있었던 종목' 안에서 매겨져야 한다.
+        # ★ 대역 밖은 여기서 제외한다. TP 랭크가 '고를 수 있었던 종목' 안에서 매겨져야 한다.
         #   (센서 계산은 전 종목으로 끝낸 뒤에 자른다 — 먼저 자르면 12개월 차분이 깨진다)
+        #   ★ 자르기 **직전** 패널을 보관한다. 스몰캡 비교 팔이 같은 센서 위에서 대역만
+        #     바꿔 다시 자르기 위함이다. 센서를 다시 계산하지 않으므로 두 팔의 차이는
+        #     오직 '규모 대역' 하나뿐임이 구조적으로 보장된다.
+        ctx["panel_full"] = P.copy()
         before = len(P)
         P = P[P["u_mid"]].reset_index(drop=True)
         LOG.info(f"U-MID 유니버스로 스코어링 패널 확정 — {before:,} → {len(P):,}행")
@@ -444,6 +554,73 @@ def score_and_backtest_v3(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
         bt = _run(P, label=STRATEGY_ID)
     runtime_mark("L2+L3.백테스트", time.time() - t_l2)
     return P, bt, _run
+
+
+def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
+                        bench: Dict[str, pd.Series]) -> Optional[dict]:
+    """같은 신호·같은 규칙을 **규모 대역만 바꿔** 다시 돌린다.
+
+    ★ 왜 같은 실행 안에서 도는가. 두 팔이 같은 수집물·같은 센서·같은 시드를 쓰므로
+      성과 차이의 원인이 '규모 대역' 하나로 특정된다. 따로 실행하면 수집 시점이 달라
+      무엇 때문에 달라졌는지 말할 수 없게 된다.
+    ★ TP·셀·랭크는 **대역 안에서 다시** 매긴다. 중형주 랭크를 소형주에 그대로 쓰면
+      소형주가 전부 하위권으로 몰려 아무것도 못 고른다.
+    """
+    if not RUN_SMALLCAP_ARM:
+        return None
+    PF = ctx.get("panel_full")
+    if PF is None or PF.empty:
+        LOG.warn("스몰캡 팔 — 전체 패널이 없어 건너뜁니다.")
+        return None
+    with PIPE.stage("L3.SMALL", f"스몰캡 비교 팔 (랭크 [{SMALL_RANK_LO},{SMALL_RANK_HI}])",
+                    "L3", budget_s=600, critical=False):
+        S = apply_umid(PF.copy(), uni, band="SMALL")
+        S = S[S["u_mid"]].reset_index(drop=True)
+        if S.empty or S["month"].nunique() < 24:
+            LOG.warn(f"스몰캡 대역에 남는 행이 부족합니다({len(S):,}행 · "
+                     f"{S['month'].nunique() if len(S) else 0}개월) — 비교 팔을 건너뜁니다. "
+                     f"거래대금 하한 {MIN_ADV_KRW/1e8:.0f}억을 하위 대역이 못 넘기는 것이 "
+                     f"보통이며, 이 사실 자체가 '소형주는 담기 어렵다'는 결과입니다.")
+            return None
+        S = downcast_floats(S)
+        S = build_tps(S)
+        S = apply_vetoes_v3(S, ctx)
+        S = assemble_score_v3(S)
+        bt_s = run_backtest(S, months, uni, ctx["sec"], apply_costs=True,
+                            label=f"{STRATEGY_ID}__SMALLCAP")
+        VAULT.put_table(f"l2_scores_{STRATEGY_ID}_smallcap",
+                        S[[c for c in ("code", "month", "E", "U", "Signal", "Signal_rank",
+                                       "VETO", "FLOOR", "n_tp") if c in S.columns]],
+                        scope="private", domain="scores", source="L3 스몰캡 팔")
+        return {"panel": S, "bt": bt_s}
+
+
+def report_arm_comparison_v3(bt_main: dict, arm: Optional[dict],
+                             bench: Dict[str, pd.Series]) -> None:
+    """메인(U-MID) vs 스몰캡 성과를 나란히 출력한다. 유리하게 해석하지 않는다."""
+    if not arm:
+        return
+    rows = []
+    for name, b, lo, hi in ((f"메인 U-MID", bt_main, UMID_RANK_LO, UMID_RANK_HI),
+                            ("스몰캡", arm["bt"], SMALL_RANK_LO, SMALL_RANK_HI)):
+        R = b.get("returns")
+        if R is None or R.empty:
+            continue
+        st = perf_stats(R)
+        _f = lambda k, fmt: (format(st[k], fmt) if k in st and np.isfinite(st.get(k, np.nan))
+                             else "-")
+        rows.append([name, f"[{lo},{hi}]", _f("CAGR", ".2%"), _f("Sharpe", ".2f"),
+                     _f("MDD", ".1%"), _f("승률", ".0%"), _f("t통계량(HAC)", ".2f"),
+                     _f("평균종목수", ".1f"), f"{len(R)}개월"])
+    if not rows:
+        return
+    LOG.table(rows, ["팔", "규모랭크", "CAGR", "Sharpe", "MDD", "승률", "t(HAC)",
+                     "평균종목", "관측"],
+              ["l", "c", "r", "r", "r", "r", "r", "r", "r"],
+              title="규모 대역 비교 — 같은 신호·같은 규칙, 대역만 다름")
+    LOG.info("두 팔은 동일한 수집물·센서·시드를 씁니다. 따라서 차이의 원인은 규모 대역 하나로 "
+             "특정됩니다. 다만 스몰캡은 거래비용·시장충격이 실제로 더 크므로, 이 표의 "
+             "스몰캡 우위는 비용 가정이 낙관적일 때 과대평가됩니다(R8 비용민감도를 함께 보세요).")
 
 
 # ── 산출물 ──────────────────────────────────────────────────────────────────────────────────
@@ -575,6 +752,12 @@ def main() -> dict:
         VAULT.adopt_scan(adopt)
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
+        # ★ 알파 몫을 먼저 떼어 둔다. 이것이 없어서 Tier-2 재무가 일일 한도를 먼저 다 쓰고
+        #   직원현황이 3회 실행 내내 0행이었다. 예약분은 EMP 만 인출할 수 있다.
+        if EMP_RESERVED_CALLS:
+            DBUDGET.reserve(EMP_PURPOSE, int(EMP_RESERVED_CALLS))
+            LOG.info(f"DART 예산 예약 — 직원현황(알파) {int(EMP_RESERVED_CALLS):,}건. "
+                     f"다른 단계는 나머지({DBUDGET.left(None):,}건)만 씁니다.")
 
     with PIPE.stage("L0.CONTRACT", "계약 자동검정 (C1·C2·C13·C15 · 원칙1~7)", "L0", budget_s=180):
         run_contracts_v3(strict=True)
@@ -603,6 +786,7 @@ def main() -> dict:
 
     P, uni, ctx = build_features_v3(ctx, months)
     P, bt, _run = score_and_backtest_v3(P, ctx, months, uni)
+    arm = run_smallcap_arm_v3(ctx, months, uni, {})
 
     with PIPE.stage("L2.POLICY", "정책 캘린더", "L2", budget_s=60, critical=False):
         cal = build_policy_calendar_v3()
@@ -613,6 +797,7 @@ def main() -> dict:
     with PIPE.stage("L6.PERF", "성과 검증 (자체측정 벤치마크 대비)", "L6", budget_s=300):
         bench = R0_benchmark(P, bt, months)
         report_performance_v3(bt, bench)
+        report_arm_comparison_v3(bt, arm, bench)
         # ★ 감쇠 감사는 강건성 재실행(백테스트 10여 회)이 섞이기 전에 뽑는다.
         uni.report_attrition()
         uni.attrition = []

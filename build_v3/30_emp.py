@@ -22,17 +22,24 @@ _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 
 # 서킷브레이커 — 연속 실패가 이 수를 넘으면 남은 호출을 즉시 포기한다(§3).
 EMP_CIRCUIT_MAX = 15
 
+# 예산 예약 라벨. 이 이름으로 예약된 호출은 직원현황만 인출할 수 있다.
+EMP_PURPOSE = "emp"
+
 # 이번 실행에서 직원현황 수집이 잘렸는가. §6 커버리지 판정이 '미수집'을 'DART 결측'으로
 # 오독하지 않게 하는 근거. dropped>0 이면 자동 창 단축(COVERAGE_AUTO_TRIM)을 걸지 않는다.
 EMP_TRUNCATED: Dict[str, Any] = {"dropped": 0, "why": ""}
 _EMP_CB = {"consec": 0, "tripped": False, "lock": threading.Lock()}
+
+# 미제출(013) 원장 — 답이 존재하지 않는 (회사, 연도). 다음 실행에서 다시 묻지 않는다.
+_EMP_NODATA: List[dict] = []
+EMP_NODATA_TABLE = "dart_emp_nodata"
 
 
 def _emp_cb_ok() -> bool:
     # ★ 예산이 이미 바닥났으면 한 건도 시도하지 않는다. 예전엔 예산 거부(None)를 '실패'로
     #   세어 서킷브레이커가 15건 만에 터질 때까지 헛돌았고, 각 호출마다 0.05~0.15초를
     #   자고 있었다 — 14,000건이면 12스레드로도 2분을 아무 일 없이 태운다.
-    if dart_halt_reason():
+    if dart_halt_reason(EMP_PURPOSE):
         return False
     with _EMP_CB["lock"]:
         return not _EMP_CB["tripped"]
@@ -49,7 +56,7 @@ def _emp_cb_mark(success: bool):
                 # ★ 사유를 추측하지 않는다. 예산 소진·인증 오류는 이미 기록돼 있으므로
                 #   "대개 …입니다" 같은 짐작 대신 실제 사유를 그대로 말한다. 짐작이 틀리면
                 #   사용자는 멀쩡한 키를 의심하거나 IP 차단을 걱정하며 시간을 버린다.
-                why = dart_halt_reason()
+                why = dart_halt_reason(EMP_PURPOSE)
                 LOG.warn(f"직원현황 수집 중단 — 연속 {EMP_CIRCUIT_MAX}건 실패. "
                          f"남은 호출을 포기하고 여기까지 받은 것을 저장합니다. "
                          + (f"사유: {why}. 내일 재실행하면 이어받습니다."
@@ -107,7 +114,8 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     try:
         time.sleep(0.05 + random.random() * 0.10)          # §5 — 0.05~0.15s 지연
         js = dart_api("empSttus.json", {"corp_code": str(corp), "bsns_year": str(int(year)),
-                                        "reprt_code": REPRT_CODES["FY"]}, no_data_ok=True)
+                                        "reprt_code": REPRT_CODES["FY"]}, no_data_ok=True,
+                      purpose=EMP_PURPOSE)
     except Exception:
         _emp_cb_mark(False)
         return None
@@ -118,6 +126,12 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     #   수천 건을 전부 포기하고, 로그에는 '차단당한 것 같다'는 오해를 남긴다.
     if isinstance(js, dict) and str(js.get("status", "")) == "013":
         _emp_cb_mark(True)
+        # ★ '그 해에 제출하지 않았다'는 **영구적 사실**이다. 그런데 흔적을 남기지 않아
+        #   매 실행 다시 물었다. 유니버스가 생존자편향 없이 구성돼 있어 폐지 이후·상장 이전
+        #   연도가 격자의 40% 가까이 되고, 그게 연도 내림차순 큐의 앞쪽에 몰린다.
+        #   → 답이 있을 수 없는 질문에 매일 한도의 대부분을 쓰고 있었다. 기록해 둔다.
+        with _EMP_CB["lock"]:
+            _EMP_NODATA.append({"corp_code": str(corp), "bsns_year": int(year)})
         return None
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
         _emp_cb_mark(False)
@@ -206,6 +220,15 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                    f"이만큼은 API 를 다시 부르지 않습니다")
         except Exception:
             done = set()
+    nod = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
+    if nod is not None and len(nod):
+        try:
+            skip = set(zip(nod["corp_code"].astype(str), nod["bsns_year"].astype(int)))
+            done |= skip
+            LOG.info(f"미제출 원장에서 {len(skip):,} (사×연) 을 제외합니다 — "
+                     f"그 해 사업보고서를 내지 않은 조합이라 다시 물어도 답이 없습니다.")
+        except Exception:
+            pass
     if not DART_API_KEY:
         LOG.warn("DART_API_KEY 미입력 — 직원현황 신규 수집을 건너뜁니다. "
                  "캐시에 있는 것만으로 진행하며, 없으면 EMP-LITE 전 센서가 결측입니다.")
@@ -228,7 +251,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
     if jobs:
         total_needed = len(jobs)
         if max_calls is not None:
-            left = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+            left = dart_budget_left(EMP_PURPOSE)
             cap = max(0, min(total_needed, int(max_calls), left))
             if cap < total_needed:
                 # ★ 절단 사실을 기록해 둔다. §6 커버리지 판정이 이 표를 'DART 의 보유량'으로
@@ -246,11 +269,59 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
                  f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상")
         _EMP_CB.update({"consec": 0, "tripped": False})
-        res = pmap_io(lambda j: _emp_one_raw(j[0], j[1]), jobs,
-                      workers=min(N_WORKERS_IO, 12), desc="DART 직원현황(확장)")
-        got = [r for r in res if r]
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★ 청크 체크포인트 — 예산은 200건마다 영속되는데 **데이터는 맨 끝에 한 번**이었다.
+        #    비대칭이 치명적이다: 28분째에 죽으면 드라이브에는 '14,000건 썼음'만 남고
+        #    dart_employees_ext 는 0행 그대로다. 다음 실행은 예산이 없다며 정당하게 거부한다.
+        #    → 세션 종료·OOM·Ctrl+C 어디서 끊겨도 **받은 만큼은 반드시 남는다.**
+        #    Vault 는 append-only 저널이라 증분 저장이 싸고 안전하다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        got, done_n = [], 0
+        for i in range(0, len(jobs), EMP_CHECKPOINT_EVERY):
+            chunk = jobs[i:i + EMP_CHECKPOINT_EVERY]
+            res = pmap_io(lambda j: _emp_one_raw(j[0], j[1]), chunk,
+                          workers=min(N_WORKERS_IO, 12),
+                          desc=f"DART 직원현황({i//EMP_CHECKPOINT_EVERY + 1}/"
+                               f"{math.ceil(len(jobs)/EMP_CHECKPOINT_EVERY)})")
+            got.extend(r for r in res if r)
+            done_n += len(chunk)
+            _emp_checkpoint(cached, got)
+            if not _emp_cb_ok():          # 예산 소진·브레이커 → 남은 청크는 의미 없다
+                if done_n < len(jobs):
+                    EMP_TRUNCATED.update({
+                        "dropped": len(jobs) - done_n,
+                        "why": dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"})
+                    LOG.warn(f"직원현황 수집을 {done_n:,}/{len(jobs):,}건에서 멈춥니다 — "
+                             f"{EMP_TRUNCATED['why']}. 여기까지는 드라이브에 저장됐습니다. "
+                             f"※ 미수집분이 있으므로 §6 자동 창 단축은 비활성화됩니다.")
+                break
         LOG.info(f"직원현황 신규 확보 {len(got):,}/{len(jobs):,}건")
     return _emp_finalize(cached, got)
+
+
+EMP_CHECKPOINT_EVERY = 1_000
+
+
+def _emp_checkpoint(cached: Optional[pd.DataFrame], got: List[dict]) -> None:
+    """지금까지 받은 것을 공용 인덱스에 즉시 반영한다(실패해도 수집은 계속)."""
+    try:
+        if got:
+            E = pd.concat([f for f in (cached, pd.DataFrame(got)) if f is not None and len(f)],
+                          ignore_index=True)
+            E["corp_code"] = E["corp_code"].astype(str)
+            E = E.drop_duplicates(["corp_code", "bsns_year"], keep="last")
+            VAULT.put_table("dart_employees_ext", E, scope="shared", domain="dart",
+                            source="opendart empSttus 확장 (증분 체크포인트)")
+        if _EMP_NODATA:
+            prev = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
+            N = pd.concat([f for f in (prev, pd.DataFrame(_EMP_NODATA))
+                           if f is not None and len(f)], ignore_index=True)
+            N["corp_code"] = N["corp_code"].astype(str)
+            VAULT.put_table(EMP_NODATA_TABLE, N.drop_duplicates(["corp_code", "bsns_year"]),
+                            scope="shared", domain="dart",
+                            source="empSttus 미제출(013) 원장 — 재요청 방지")
+    except Exception as e:                                          # noqa
+        LOG.debug(f"직원현황 체크포인트 실패({type(e).__name__}) — 수집은 계속합니다.")
 
 
 def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict]) -> pd.DataFrame:

@@ -291,12 +291,17 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
     #   ① 상장일 — 그 이전 봉은 존재하지 않는다.
     #   ② 워터마크 — 전 구간을 요청했는데도 더 이전이 안 온 지점. 소스에 없다는 뜻이다.
     listing_of: Dict[str, pd.Timestamp] = {}
-    if sec is not None and len(sec) and "listing_date" in getattr(sec, "columns", []):
+    delist_of: Dict[str, pd.Timestamp] = {}
+    if sec is not None and len(sec):
         try:
             _s = sec.dropna(subset=["code"]).drop_duplicates("code")
-            listing_of = dict(zip(_s["code"].astype(str), as_ts_series(_s["listing_date"])))
+            _cd = _s["code"].astype(str)
+            if "listing_date" in _s.columns:
+                listing_of = dict(zip(_cd, as_ts_series(_s["listing_date"])))
+            if "delisting_date" in _s.columns:
+                delist_of = dict(zip(_cd, as_ts_series(_s["delisting_date"])))
         except Exception:
-            listing_of = {}
+            listing_of, delist_of = {}, {}
     watermark: Dict[str, pd.Timestamp] = {}
     _wm = VAULT.get_table("price_earliest_available", scope="shared")
     if _wm is not None and len(_wm):
@@ -305,7 +310,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         except Exception:
             watermark = {}
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_done = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
@@ -331,15 +336,31 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         _wm = watermark.get(c)
         if _wm is not None and pd.notna(_wm):
             want = max(want, _wm)          # 이미 '더 이전은 없다'가 확인된 지점
+        # ★ 증분(앞으로) 방향에도 종료 조건이 필요하다.
+        #   폐지 종목의 mx 는 '마지막 거래일'이라 mx < end_ts - 5d 가 **영원히 참**이다.
+        #   그래서 매 실행 존재하지도 않는 구간(mx+1 ~ 오늘)을 4개 소스에 물었고,
+        #   637종목이 100% 실패하며 640초를 태웠다 — 그것도 매번.
+        #   음성캐시는 'mx is None' 가지에서만 조회되므로 이 population 을 못 본다.
+        #   → 폐지일이 있으면 그 이후는 애초에 요청하지 않는다. 사실이지 기억이 아니다.
+        _dd = delist_of.get(c)
+        _closed = (_dd is not None and pd.notna(_dd)
+                   and mx >= as_ts(_dd) - pd.Timedelta(days=5))
         if mn is not None and mn > want + pd.Timedelta(days=10):
             todo.append((c, start))
             n_back += 1
-        elif mx < end_ts - pd.Timedelta(days=5):
+        elif _closed:
+            n_done += 1                      # 폐지까지 이미 다 받음 — 더 받을 것이 없다
+        elif mx < end_ts - pd.Timedelta(days=5) and not _recently_failed(
+                c, mx + pd.Timedelta(days=1)):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
                  f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+    if n_done:
+        LOG.info(f"폐지일까지 이미 확보된 {n_done:,}종목은 증분 요청을 보내지 않습니다 "
+                 f"(폐지 이후 구간은 존재하지 않습니다 — 예전엔 이걸 매 실행 4개 소스에 "
+                 f"물어 전량 실패하며 시간을 태웠습니다).")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")

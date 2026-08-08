@@ -161,8 +161,16 @@ MEM_BUDGET_GB  = 6.0     # 초과가 예상되면 청크 처리로 자동 전환
 #
 #    그래서 Tier-2 는 반드시 상한을 겁니다. 상한 안에서 '투자 가능한 종목의 최근 연도'부터
 #    채우므로, 첫 실행에서도 백테스트는 끝까지 돌아가고 재실행할 때마다 커버리지가 올라갑니다.
-DART_FS_MAX_CALLS   = 12_000   # 이번 실행의 Tier-2 호출 상한. 0 = Tier-2 생략(Tier-1만).
-                               # 실측 5건/초 → 12,000건 ≈ 40분. 일일한도(19,000)보다 낮게 두세요.
+#    ★ 하루 예산은 19,000 이고 **모든 단계가 이 하나를 나눠 씁니다.**
+#      Tier-1 배치 ≈2,100 + CANARY ≈600 은 고정비이고, Tier-2 는 잡당 OFS→CFS 로 최대 2회를
+#      던지므로 실제 호출은 상한의 2배까지 갑니다. 계약 §12-6 이 이 합을 검사합니다.
+#
+#    ▶ 기본값을 0 으로 둔 이유 — 직원현황(알파)이 아직 0행이기 때문입니다.
+#      재무는 이미 공용 캐시에 146만 행이 있고 Tier-1 이 유니버스·규모버킷·R3 를 받쳐 줍니다.
+#      반면 한계임금은 empSttus 없이는 계산 자체가 불가능합니다. 그래서 알파가 찰 때까지
+#      하루 예산을 직원현황에 몰아줍니다. **EMP 커버리지가 충분해지면 6000 정도로 올리세요**
+#      (그때 §12-6 이 합계를 다시 검사해 줍니다).
+DART_FS_MAX_CALLS   = 0        # 0 = Tier-2 생략(Tier-1 주요계정으로 대체). 실측 5건/초.
                                # None 으로 두면 상한 없음 = 며칠짜리 콜드빌드(4시간 계약 밖).
 DART_FS_FREQ        = "annual"  # "annual" = 사업보고서(FY)만 → 호출 1/4. 첫 실행 권장.
                                 # "quarterly" = 분기까지. TTM 정밀도는 오르지만 4배 비쌉니다.
@@ -178,6 +186,11 @@ RESEARCH_SOURCES       = ["hankyung", "naver"]
 RESEARCH_DOWNLOAD_PDF  = False    # v3 기본 False — PDF 는 용량·시간이 크고 U축 기여가 제한적
 RESEARCH_PDF_MAX_PER_MONTH = 0    # 0 = 무제한
 RESEARCH_TARGET_PER_YEAR   = 30000
+#   ▸ ★ 네이버 '상세 보강'(리포트 1건당 1요청)은 이 파이프라인에서 가장 비싼 단계입니다.
+#     실측 45,000건 대상 → 20,000건만 해도 1시간 44분(2.99건/초). §10 수집 총예산이 95분인데
+#     보조축 하나가 그 배를 먹습니다. 게다가 실측 수율이 '목표주가 0건 추가 확보'였습니다.
+#     0 = 생략(권장) · 10 = 10분만 · None 은 쓰지 마세요.
+RESEARCH_ENRICH_MAX_MIN    = 0
 
 # ── ⑧ 포지션 / 사이징  (드로다운 한가운데서 정하지 않도록 상수로 못박음) ────────────────────
 PORTFOLIO_TOP_PCT       = 0.05
@@ -224,6 +237,14 @@ CELL_KEYS_V3   = ["month", "ind_mid", "size_bucket"]   # ★ 3단계 규모버�
 CELL_MIN_N_V3  = 8               # ★ 셀 표본 하한. 미달이면 규모버킷 없는 상위 셀로 폴백
 SIZE_BUCKET_N  = 3               # ★ 규모버킷 3단계
 
+# ── ⑧-b 비교 유니버스 (스몰캡 팔) ───────────────────────────────────────────────────────────
+#    같은 신호·같은 규칙을 **규모 대역만 바꿔** 한 번 더 돌려 나란히 출력합니다.
+#    한계임금 신호가 중형주 고유인지, 소형주에서 더 강한지를 한 실행에서 판정하기 위함입니다.
+#    ▸ 유동성 하한(MIN_ADV_KRW)은 **낮추지 않습니다.** 낮추면 실제로 체결할 수 없는 종목이
+#      섞여 성과가 부풀려지고, 그 순간 비교의 의미가 사라집니다.
+RUN_SMALLCAP_ARM = True          # False = 메인(U-MID)만 실행
+SMALL_RANK_LO, SMALL_RANK_HI = 1401, 2400   # 거래대금 랭크 하위 1,000 구간
+
 # ── §8 증거층(E) 구성 ───────────────────────────────────────────────────────────────────────
 TP_CORE_D = ["TP_I1", "TP_I2", "TP_I4", "TP_P1", "TP_P2"]   # CORE-D 기본 골격
 TP_EMP    = ["TP_N1", "TP_N2", "TP_N3"]                     # EMP-LITE (이 전략의 차별점)
@@ -246,6 +267,15 @@ EMP_MAX_CORPS  = 0               # 0 = 제한 없음. 테스트 시 300 등으�
 EMP_MAX_CALLS  = 14_000          # 실측 8건/초 → ≈30분. None = 상한 없음(4시간 계약 밖).
 EMP_UNIVERSE_ONLY = True         # True = U-MID 대역을 한 번이라도 경험한 종목만 수집.
                                  # 셀 정규화도 U-MID 패널 안에서만 하므로 제외분은 안 쓰입니다.
+#   ▸ ★ 직원현황은 이 전략의 **유일한 알파 원천**입니다(TP_N1·N2·N3).
+#     재무 캐시가 아무리 많아도 이게 비면 '전략 3' 이 아니라 다른 전략이 됩니다.
+#     True = 알파가 비어 있으면 수집을 시작하기 전에 멈춥니다(2시간 낭비 방지).
+#     CORE-D 5개 TP 만으로 축소 실행해 보고 싶을 때만 False 로 두세요.
+REQUIRE_EMP_ALPHA = True
+#   ▸ 직원현황 전용 예산 하한. 다른 단계가 아무리 많이 써도 이만큼은 EMP 몫으로 남깁니다.
+#     이것이 없으면 Tier-2 재무가 일일 한도를 먼저 다 써버려 알파가 영원히 안 모입니다
+#     (실제로 3회 실행 내내 dart_employees_ext 가 0행이었던 이유입니다).
+EMP_RESERVED_CALLS = 14_000
 
 # ── §2 CANARY 임계값 ────────────────────────────────────────────────────────────────────────
 CANARY_SAMPLE_N     = 200        # 표본 종목수 (K3·K4·K7·K8·K9)
@@ -265,7 +295,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.0151"
+BUILD_VERSION  = "v3.20260808.0407"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -3496,12 +3526,17 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
     #   ① 상장일 — 그 이전 봉은 존재하지 않는다.
     #   ② 워터마크 — 전 구간을 요청했는데도 더 이전이 안 온 지점. 소스에 없다는 뜻이다.
     listing_of: Dict[str, pd.Timestamp] = {}
-    if sec is not None and len(sec) and "listing_date" in getattr(sec, "columns", []):
+    delist_of: Dict[str, pd.Timestamp] = {}
+    if sec is not None and len(sec):
         try:
             _s = sec.dropna(subset=["code"]).drop_duplicates("code")
-            listing_of = dict(zip(_s["code"].astype(str), as_ts_series(_s["listing_date"])))
+            _cd = _s["code"].astype(str)
+            if "listing_date" in _s.columns:
+                listing_of = dict(zip(_cd, as_ts_series(_s["listing_date"])))
+            if "delisting_date" in _s.columns:
+                delist_of = dict(zip(_cd, as_ts_series(_s["delisting_date"])))
         except Exception:
-            listing_of = {}
+            listing_of, delist_of = {}, {}
     watermark: Dict[str, pd.Timestamp] = {}
     _wm = VAULT.get_table("price_earliest_available", scope="shared")
     if _wm is not None and len(_wm):
@@ -3510,7 +3545,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         except Exception:
             watermark = {}
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_done = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
@@ -3536,15 +3571,31 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         _wm = watermark.get(c)
         if _wm is not None and pd.notna(_wm):
             want = max(want, _wm)          # 이미 '더 이전은 없다'가 확인된 지점
+        # ★ 증분(앞으로) 방향에도 종료 조건이 필요하다.
+        #   폐지 종목의 mx 는 '마지막 거래일'이라 mx < end_ts - 5d 가 **영원히 참**이다.
+        #   그래서 매 실행 존재하지도 않는 구간(mx+1 ~ 오늘)을 4개 소스에 물었고,
+        #   637종목이 100% 실패하며 640초를 태웠다 — 그것도 매번.
+        #   음성캐시는 'mx is None' 가지에서만 조회되므로 이 population 을 못 본다.
+        #   → 폐지일이 있으면 그 이후는 애초에 요청하지 않는다. 사실이지 기억이 아니다.
+        _dd = delist_of.get(c)
+        _closed = (_dd is not None and pd.notna(_dd)
+                   and mx >= as_ts(_dd) - pd.Timedelta(days=5))
         if mn is not None and mn > want + pd.Timedelta(days=10):
             todo.append((c, start))
             n_back += 1
-        elif mx < end_ts - pd.Timedelta(days=5):
+        elif _closed:
+            n_done += 1                      # 폐지까지 이미 다 받음 — 더 받을 것이 없다
+        elif mx < end_ts - pd.Timedelta(days=5) and not _recently_failed(
+                c, mx + pd.Timedelta(days=1)):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
                  f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+    if n_done:
+        LOG.info(f"폐지일까지 이미 확보된 {n_done:,}종목은 증분 요청을 보내지 않습니다 "
+                 f"(폐지 이후 구간은 존재하지 않습니다 — 예전엔 이걸 매 실행 4개 소스에 "
+                 f"물어 전량 실패하며 시간을 태웠습니다).")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -3810,11 +3861,35 @@ class DartBudget:
     """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다."""
 
     def __init__(self):
-        self.today = _dt.date.today().isoformat()
+        self.today = self._kst_day()
         self.n = 0
         self.exhausted = False
-        self._lk = threading.Lock()
+        self._lk = threading.RLock()
+        self._reserved: Dict[str, int] = {}
+        self._dirty = 0
+        self._warned_reserve = False
         self._load()
+
+    @staticmethod
+    def _kst_day() -> str:
+        """DART 한도의 리셋 경계는 00:00 KST 다. 로컬 날짜를 쓰면 UTC 컨테이너에서
+        하루에 두 번 틀린다: 15~24 UTC 는 이미 리셋된 한도를 소진으로 착각해 9시간을
+        헛차단하고, 그 뒤에는 남아 있다고 믿고 쏘다가 status 020 을 맞는다."""
+        try:
+            from zoneinfo import ZoneInfo
+            return _dt.datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+        except Exception:
+            return (_dt.datetime.utcnow() + _dt.timedelta(hours=9)).date().isoformat()
+
+    def _roll_if_new_day(self):
+        """긴 실행이 자정을 넘으면 한도도 리셋된다. take() 안에서 값싸게 확인한다."""
+        d = self._kst_day()
+        if d != self.today:
+            LOG.info(f"KST 자정 경과 — DART 일일 한도가 초기화됐습니다 "
+                     f"({self.today} → {d}, 직전 사용 {self.n:,}건).")
+            self._save()
+            self.today, self.n, self.exhausted = d, 0, False
+            DART_HALT["reason"] = DART_HALT["detail"] = None
 
     def _path(self) -> str:
         return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
@@ -3835,23 +3910,63 @@ class DartBudget:
         except Exception:
             pass
 
-    def refund(self, k: int = 1):
+    def refund(self, k: int = 1, purpose: Optional[str] = None):
         if k <= 0:
             return
         with self._lk:
             self.n = max(0, self.n - k)
+            # ★ 예약분도 함께 되돌린다. take(2) 후 refund(1) 이 정상 경로이므로,
+            #   되돌리지 않으면 예약이 잡당 2 씩 깎여 14,000 예약이 7,000건만 보호한다.
+            if purpose in self._reserved:
+                self._reserved[purpose] += k
+            self._dirty += k
 
-    def take(self, k: int = 1) -> bool:
+    # ── 예약(reservation) ─────────────────────────────────────────────────────────────
+    #  ★ 이 전략의 알파는 직원현황 하나뿐인데, 실행 3회 내내 dart_employees_ext 가 0행이었다.
+    #    원인은 단순하다 — Tier-2 전체재무제표가 일일 한도를 먼저 다 써버렸다. 단계 순서를
+    #    바꿔도 예산은 '날짜별 누적 카운터'라 어제 태운 것이 오늘까지 따라온다.
+    #    → 특정 용도(purpose)에 호출 수를 **예약**해 두고, 예약분은 그 용도만 인출한다.
+    #      일반 소비자는 (한도 − 예약잔량) 까지만 쓸 수 있다.
+    def reserve(self, purpose: str, k: int):
         with self._lk:
-            if self.n + k > DART_DAILY_LIMIT:
-                if not self.exhausted:
-                    self.exhausted = True
-                    LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
-                             f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
-                             f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
+            self._reserved[purpose] = max(0, int(k))
+
+    def _reserved_for_others(self, purpose: Optional[str]) -> int:
+        return sum(v for p, v in self._reserved.items() if p != purpose)
+
+    def left(self, purpose: Optional[str] = None) -> int:
+        """purpose 가 지금 쓸 수 있는 호출 수. 남의 예약분은 빼고 센다."""
+        with self._lk:
+            return max(0, DART_DAILY_LIMIT - self.n - self._reserved_for_others(purpose))
+
+    def take(self, k: int = 1, purpose: Optional[str] = None) -> bool:
+        with self._lk:
+            self._roll_if_new_day()
+            room = DART_DAILY_LIMIT - self._reserved_for_others(purpose)
+            if self.n + k > room:
+                # 예약 때문에 막힌 것인지, 한도 자체가 끝난 것인지 구별해서 알린다.
+                if self.n + k > DART_DAILY_LIMIT:
+                    if not self.exhausted:
+                        self.exhausted = True
+                        LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
+                                 f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
+                                 f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
+                elif not self._warned_reserve:
+                    self._warned_reserve = True
+                    LOG.info(f"남은 호출은 다른 용도로 예약되어 있습니다 "
+                             f"(예약 {self._reserved}). 이 단계는 여기서 멈춥니다 — "
+                             f"예약분은 알파 원천(직원현황) 몫입니다.")
+                if purpose in self._reserved:
+                    self._reserved[purpose] = max(0, self._reserved[purpose] - k)
                 return False
             self.n += k
-            if self.n % 500 == 0:
+            if purpose in self._reserved:
+                self._reserved[purpose] = max(0, self._reserved[purpose] - k)
+            self._dirty += k
+            # ★ n % 500 은 refund 가 임의 값으로 감산하는 순간 영원히 안 맞을 수 있다.
+            #   '마지막 저장 이후 변동량'으로 세면 어떤 감산 패턴에서도 반드시 저장된다.
+            if self._dirty >= 200:
+                self._dirty = 0
                 self._save()
             return True
 
@@ -3881,37 +3996,49 @@ def dart_note_halt(reason: str, detail: str = ""):
         DART_HALT["reason"], DART_HALT["detail"] = reason, detail
 
 
-def dart_halt_reason() -> Optional[str]:
-    """지금 DART 를 쓸 수 없는 이유. None 이면 정상 — 즉 '응답 0건'은 진짜 데이터 부재다."""
+def dart_halt_reason(purpose: Optional[str] = None) -> Optional[str]:
+    """지금 DART 를 쓸 수 없는 이유. None 이면 정상 — 즉 '응답 0건'은 진짜 데이터 부재다.
+
+    purpose 를 주면 그 용도의 **예약분까지 고려**해서 판정한다. 예약이 남아 있으면
+    전체 잔량이 0 이어도 그 용도는 계속 진행할 수 있다."""
     if not DART_API_KEY:
         return "DART_API_KEY 미입력"
-    if DBUDGET is not None and (DBUDGET.exhausted or DBUDGET.n >= DART_DAILY_LIMIT):
-        return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
+    if DBUDGET is not None:
+        if DBUDGET.left(purpose) <= 0 or DBUDGET.n >= DART_DAILY_LIMIT:
+            return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
+        if purpose is None and DBUDGET.exhausted:
+            return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
     return DART_HALT["reason"]
 
 
-def dart_budget_left() -> int:
-    return max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+def dart_budget_left(purpose: Optional[str] = None) -> int:
+    return DBUDGET.left(purpose) if DBUDGET else DART_DAILY_LIMIT
 
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
-             tries: int = 2, no_data_ok: bool = False) -> Optional[dict]:
+             tries: int = 2, no_data_ok: bool = False,
+             purpose: Optional[str] = None) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
     호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
     → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
     if not DART_API_KEY:
         return None
-    if DBUDGET is not None and not DBUDGET.take(tries):
+    if DBUDGET is not None and not DBUDGET.take(tries, purpose=purpose):
         dart_note_halt(f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})",
                        "내일 재실행하면 정확히 이 지점부터 이어받습니다.")
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
     attempts = {"n": 0}
-    js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
-                   referer="https://opendart.fss.or.kr/", on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
-    if DBUDGET is not None:
-        DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
+    # ★ try/finally 가 없으면 http_json 에서 예외가 새는 순간 tries 만큼이 영구 소실된다.
+    #   EMP 경로는 상위에서 예외를 삼키므로 이 누수가 **완전히 조용하다**.
+    try:
+        js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
+                       referer="https://opendart.fss.or.kr/",
+                       on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
+    finally:
+        if DBUDGET is not None:
+            DBUDGET.refund(max(0, tries - max(1, attempts["n"])), purpose=purpose)
     if not isinstance(js, dict):
         return None
     st = str(js.get("status", ""))
@@ -4389,6 +4516,10 @@ DISCLOSURE_PATTERNS = {
 }
 
 
+# ★ 모듈 스코프여야 한다. 예전엔 fetch_dart_disclosures 안의 지역변수였는데
+#   _disclosure_done_months 가 이를 참조해 NameError 가 잠복해 있었다. 예산이 남아 있는
+#   첫 실행에서 L1.DART 가 통째로 죽는다(critical=False 라 조용한 WARN 으로).
+DISCLOSURE_TYPES = ("A", "B")     # A=정기공시(사업/반기/분기보고서), B=주요사항보고
 DISCLOSURE_LEDGER = "dart_disclosure_months"
 
 
@@ -4503,7 +4634,6 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     #   PACK-D 가 필요로 하는 '사업보고서'는 A(정기공시)라 단 한 건도 안 잡힌다.
     #   그러면 fetch_dart_documents 가 걸러낼 대상이 없어 팩 전체가 조용히 죽는다.
     #   (실경로에서만 드러나는 유형 — 합성 스모크는 dis 를 직접 만들어 넣으므로 못 본다)
-    DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
 
     def _one(m):
         """(월, 행들, 완결여부). 한 페이지라도 못 받으면 그 달은 미완결이다."""
@@ -6447,17 +6577,24 @@ _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 
 # 서킷브레이커 — 연속 실패가 이 수를 넘으면 남은 호출을 즉시 포기한다(§3).
 EMP_CIRCUIT_MAX = 15
 
+# 예산 예약 라벨. 이 이름으로 예약된 호출은 직원현황만 인출할 수 있다.
+EMP_PURPOSE = "emp"
+
 # 이번 실행에서 직원현황 수집이 잘렸는가. §6 커버리지 판정이 '미수집'을 'DART 결측'으로
 # 오독하지 않게 하는 근거. dropped>0 이면 자동 창 단축(COVERAGE_AUTO_TRIM)을 걸지 않는다.
 EMP_TRUNCATED: Dict[str, Any] = {"dropped": 0, "why": ""}
 _EMP_CB = {"consec": 0, "tripped": False, "lock": threading.Lock()}
+
+# 미제출(013) 원장 — 답이 존재하지 않는 (회사, 연도). 다음 실행에서 다시 묻지 않는다.
+_EMP_NODATA: List[dict] = []
+EMP_NODATA_TABLE = "dart_emp_nodata"
 
 
 def _emp_cb_ok() -> bool:
     # ★ 예산이 이미 바닥났으면 한 건도 시도하지 않는다. 예전엔 예산 거부(None)를 '실패'로
     #   세어 서킷브레이커가 15건 만에 터질 때까지 헛돌았고, 각 호출마다 0.05~0.15초를
     #   자고 있었다 — 14,000건이면 12스레드로도 2분을 아무 일 없이 태운다.
-    if dart_halt_reason():
+    if dart_halt_reason(EMP_PURPOSE):
         return False
     with _EMP_CB["lock"]:
         return not _EMP_CB["tripped"]
@@ -6474,7 +6611,7 @@ def _emp_cb_mark(success: bool):
                 # ★ 사유를 추측하지 않는다. 예산 소진·인증 오류는 이미 기록돼 있으므로
                 #   "대개 …입니다" 같은 짐작 대신 실제 사유를 그대로 말한다. 짐작이 틀리면
                 #   사용자는 멀쩡한 키를 의심하거나 IP 차단을 걱정하며 시간을 버린다.
-                why = dart_halt_reason()
+                why = dart_halt_reason(EMP_PURPOSE)
                 LOG.warn(f"직원현황 수집 중단 — 연속 {EMP_CIRCUIT_MAX}건 실패. "
                          f"남은 호출을 포기하고 여기까지 받은 것을 저장합니다. "
                          + (f"사유: {why}. 내일 재실행하면 이어받습니다."
@@ -6532,7 +6669,8 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     try:
         time.sleep(0.05 + random.random() * 0.10)          # §5 — 0.05~0.15s 지연
         js = dart_api("empSttus.json", {"corp_code": str(corp), "bsns_year": str(int(year)),
-                                        "reprt_code": REPRT_CODES["FY"]}, no_data_ok=True)
+                                        "reprt_code": REPRT_CODES["FY"]}, no_data_ok=True,
+                      purpose=EMP_PURPOSE)
     except Exception:
         _emp_cb_mark(False)
         return None
@@ -6543,6 +6681,12 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
     #   수천 건을 전부 포기하고, 로그에는 '차단당한 것 같다'는 오해를 남긴다.
     if isinstance(js, dict) and str(js.get("status", "")) == "013":
         _emp_cb_mark(True)
+        # ★ '그 해에 제출하지 않았다'는 **영구적 사실**이다. 그런데 흔적을 남기지 않아
+        #   매 실행 다시 물었다. 유니버스가 생존자편향 없이 구성돼 있어 폐지 이후·상장 이전
+        #   연도가 격자의 40% 가까이 되고, 그게 연도 내림차순 큐의 앞쪽에 몰린다.
+        #   → 답이 있을 수 없는 질문에 매일 한도의 대부분을 쓰고 있었다. 기록해 둔다.
+        with _EMP_CB["lock"]:
+            _EMP_NODATA.append({"corp_code": str(corp), "bsns_year": int(year)})
         return None
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
         _emp_cb_mark(False)
@@ -6631,6 +6775,15 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                    f"이만큼은 API 를 다시 부르지 않습니다")
         except Exception:
             done = set()
+    nod = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
+    if nod is not None and len(nod):
+        try:
+            skip = set(zip(nod["corp_code"].astype(str), nod["bsns_year"].astype(int)))
+            done |= skip
+            LOG.info(f"미제출 원장에서 {len(skip):,} (사×연) 을 제외합니다 — "
+                     f"그 해 사업보고서를 내지 않은 조합이라 다시 물어도 답이 없습니다.")
+        except Exception:
+            pass
     if not DART_API_KEY:
         LOG.warn("DART_API_KEY 미입력 — 직원현황 신규 수집을 건너뜁니다. "
                  "캐시에 있는 것만으로 진행하며, 없으면 EMP-LITE 전 센서가 결측입니다.")
@@ -6653,7 +6806,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
     if jobs:
         total_needed = len(jobs)
         if max_calls is not None:
-            left = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+            left = dart_budget_left(EMP_PURPOSE)
             cap = max(0, min(total_needed, int(max_calls), left))
             if cap < total_needed:
                 # ★ 절단 사실을 기록해 둔다. §6 커버리지 판정이 이 표를 'DART 의 보유량'으로
@@ -6671,11 +6824,59 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
                  f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상")
         _EMP_CB.update({"consec": 0, "tripped": False})
-        res = pmap_io(lambda j: _emp_one_raw(j[0], j[1]), jobs,
-                      workers=min(N_WORKERS_IO, 12), desc="DART 직원현황(확장)")
-        got = [r for r in res if r]
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★ 청크 체크포인트 — 예산은 200건마다 영속되는데 **데이터는 맨 끝에 한 번**이었다.
+        #    비대칭이 치명적이다: 28분째에 죽으면 드라이브에는 '14,000건 썼음'만 남고
+        #    dart_employees_ext 는 0행 그대로다. 다음 실행은 예산이 없다며 정당하게 거부한다.
+        #    → 세션 종료·OOM·Ctrl+C 어디서 끊겨도 **받은 만큼은 반드시 남는다.**
+        #    Vault 는 append-only 저널이라 증분 저장이 싸고 안전하다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        got, done_n = [], 0
+        for i in range(0, len(jobs), EMP_CHECKPOINT_EVERY):
+            chunk = jobs[i:i + EMP_CHECKPOINT_EVERY]
+            res = pmap_io(lambda j: _emp_one_raw(j[0], j[1]), chunk,
+                          workers=min(N_WORKERS_IO, 12),
+                          desc=f"DART 직원현황({i//EMP_CHECKPOINT_EVERY + 1}/"
+                               f"{math.ceil(len(jobs)/EMP_CHECKPOINT_EVERY)})")
+            got.extend(r for r in res if r)
+            done_n += len(chunk)
+            _emp_checkpoint(cached, got)
+            if not _emp_cb_ok():          # 예산 소진·브레이커 → 남은 청크는 의미 없다
+                if done_n < len(jobs):
+                    EMP_TRUNCATED.update({
+                        "dropped": len(jobs) - done_n,
+                        "why": dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"})
+                    LOG.warn(f"직원현황 수집을 {done_n:,}/{len(jobs):,}건에서 멈춥니다 — "
+                             f"{EMP_TRUNCATED['why']}. 여기까지는 드라이브에 저장됐습니다. "
+                             f"※ 미수집분이 있으므로 §6 자동 창 단축은 비활성화됩니다.")
+                break
         LOG.info(f"직원현황 신규 확보 {len(got):,}/{len(jobs):,}건")
     return _emp_finalize(cached, got)
+
+
+EMP_CHECKPOINT_EVERY = 1_000
+
+
+def _emp_checkpoint(cached: Optional[pd.DataFrame], got: List[dict]) -> None:
+    """지금까지 받은 것을 공용 인덱스에 즉시 반영한다(실패해도 수집은 계속)."""
+    try:
+        if got:
+            E = pd.concat([f for f in (cached, pd.DataFrame(got)) if f is not None and len(f)],
+                          ignore_index=True)
+            E["corp_code"] = E["corp_code"].astype(str)
+            E = E.drop_duplicates(["corp_code", "bsns_year"], keep="last")
+            VAULT.put_table("dart_employees_ext", E, scope="shared", domain="dart",
+                            source="opendart empSttus 확장 (증분 체크포인트)")
+        if _EMP_NODATA:
+            prev = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
+            N = pd.concat([f for f in (prev, pd.DataFrame(_EMP_NODATA))
+                           if f is not None and len(f)], ignore_index=True)
+            N["corp_code"] = N["corp_code"].astype(str)
+            VAULT.put_table(EMP_NODATA_TABLE, N.drop_duplicates(["corp_code", "bsns_year"]),
+                            scope="shared", domain="dart",
+                            source="empSttus 미제출(013) 원장 — 재요청 방지")
+    except Exception as e:                                          # noqa
+        LOG.debug(f"직원현황 체크포인트 실패({type(e).__name__}) — 수집은 계속합니다.")
 
 
 def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict]) -> pd.DataFrame:
@@ -7352,7 +7553,17 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
 UMID_RANK_LO, UMID_RANK_HI = 251, 1400
 
 
-def apply_umid(P: pd.DataFrame, uni: "Universe") -> pd.DataFrame:
+def universe_band(name: str) -> Tuple[int, int, float]:
+    """(랭크 하한, 랭크 상한, 거래대금 하한). 비교용 대역을 한 곳에서 정의한다."""
+    if name == "SMALL":
+        # 시총(대리: 거래대금) 하위 1,000 — U-MID 아래 구간. 유동성 하한은 그대로 두어야
+        # '못 담는 종목으로 만든 성과'가 되지 않는다. 하한을 낮추면 체결 불가능한 종목이
+        # 섞여 성과가 부풀려진다 — 비교의 의미가 사라진다.
+        return SMALL_RANK_LO, SMALL_RANK_HI, MIN_ADV_KRW
+    return UMID_RANK_LO, UMID_RANK_HI, MIN_ADV_KRW
+
+
+def apply_umid(P: pd.DataFrame, uni: "Universe", band: str = "UMID") -> pd.DataFrame:
     """u_mid = 규모랭크 [251,1400] & adtv20 ≥ 3억 & 상장 250거래일 경과.
 
     ★ 규모 대리변수에 관한 정직한 고지: 스펙은 시가총액 랭크를 쓰지만, 이 파이프라인이
@@ -7362,17 +7573,18 @@ def apply_umid(P: pd.DataFrame, uni: "Universe") -> pd.DataFrame:
       순위 상관은 높지만 동일하지 않다 — 이 치환은 결과 해석에 반드시 함께 읽어야 한다.
       (상장 250거래일 시즈닝은 Universe 가 이미 강제하므로 여기서 중복 적용하지 않는다)
     """
+    lo, hi, adv_min = universe_band(band)
     P = P.copy()
     adv = col(P, "adv20")
     rank = adv.groupby(P["month"], observed=True).rank(ascending=False, method="first")
     P["size_rank"] = rank
-    P["u_mid"] = (rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)).fillna(False)
+    P["u_mid"] = (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
     for m, g in P.groupby("month", observed=True):
         uni.audit_row("U-MID대역", m, g.loc[g["u_mid"], "code"].tolist())
     keep = int(P["u_mid"].sum())
-    LOG.info(f"U-MID 유니버스: {keep:,}/{len(P):,}행 "
+    LOG.info(f"{band} 유니버스: {keep:,}/{len(P):,}행 "
              f"(월평균 {keep/max(P['month'].nunique(),1):,.0f}종목) — "
-             f"규모랭크 [{UMID_RANK_LO},{UMID_RANK_HI}] ∩ 거래대금 ≥{MIN_ADV_KRW/1e8:.0f}억. "
+             f"규모랭크 [{lo},{hi}] ∩ 거래대금 ≥{adv_min/1e8:.0f}억. "
              f"규모 대리는 20일 평균거래대금 랭크입니다(시총 PIT 복원 불가에 따른 치환).")
     if keep == 0:
         LOG.warn("U-MID 에 남는 행이 없습니다 — 가격 수집이 실패했거나 유동성 하한이 너무 높습니다. "
@@ -9204,16 +9416,24 @@ def run_contracts_v3(strict: bool = True) -> bool:
         for fn, arg in ((fetch_dart_financials, "max_calls"), (fetch_emp_status, "max_calls")):
             if arg not in _ins.signature(fn).parameters:
                 return False, f"{fn.__name__} 이 {arg} 인자를 받지 않습니다"
-        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS)
+        # ★ Tier-2 는 잡당 OFS→CFS 로 최대 2회를 던진다. '잡 수'가 아니라 '호출 수'로 센다.
+        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS) * 2 + 2100 + 600
         if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT:
             return False, f"단일 단계 상한이 일일한도({DART_DAILY_LIMIT:,})를 넘습니다"
+        # 예전엔 plan 을 계산해 성공 메시지에 찍기만 하고 **한도와 비교하지 않았다.**
+        # 그래서 26,000건 계획이 "일일한도 19,000 안" 이라는 문구와 함께 PASS 했다.
+        if plan > DART_DAILY_LIMIT:
+            return False, (f"계획 호출 {plan:,}건이 일일한도 {DART_DAILY_LIMIT:,}건을 넘습니다 "
+                           f"(EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,}×2 + "
+                           f"배치·캐너리 ≈2,700). 한 실행이 한도를 넘게 계획하면 "
+                           f"뒤쪽 단계는 반드시 굶습니다 — 상한을 낮추세요")
         # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
         worst_h = (int(EMP_MAX_CALLS) / 8.0 + int(DART_FS_MAX_CALLS) / 5.0) / 3600.0
         if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
             return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
                            f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")
-        return True, (f"EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,} = {plan:,}건 "
-                      f"(≈{worst_h*60:.0f}분) · 일일한도 {DART_DAILY_LIMIT:,} 안")
+        return True, (f"계획 {plan:,}건 (EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,}×2 "
+                      f"+ 배치·캐너리) ≈{worst_h*60:.0f}분 · 일일한도 {DART_DAILY_LIMIT:,} 안")
 
     _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
 
@@ -9305,6 +9525,53 @@ def run_contracts_v3(strict: bool = True) -> bool:
                       f"부실·사유불명 → -100% 유지 (표본 {len(cases)}건 전부 일치)")
 
     _cc("C2c", "폐지 유형별 청산가 (합병을 전액손실로 계상 금지)", delist_kinds)
+
+    # ── §12-A : 알파 원천 보호 ────────────────────────────────────────────────────────────
+    def alpha_guard():
+        """★ 실행 3회 내내 dart_employees_ext 가 0행이었던 사고를 고정한다.
+
+        원인은 둘이었다.
+          ① 사전점검이 세 테이블을 **합산**해 total>0 이면 진행했다. 재무 146만 행이 있고
+             직원현황이 0행인 상태를 '캐시 충분'으로 읽어, 27분(잠재 2시간)을 태운 뒤에야
+             "EMP-LITE 3개 TP 가 모두 결측"을 선언했다. 테이블은 대체재가 아니다.
+          ② Tier-2 재무가 일일 한도를 먼저 다 써버려 EMP 몫이 남지 않았다. 단계 순서를
+             바꿔도 예산은 날짜별 누적이라 어제 태운 것이 오늘까지 따라온다.
+        이 계약은 (a) 예약 API 가 존재하고 실제로 남의 인출을 막으며 (b) 예약분은 해당
+        용도가 인출할 수 있고 (c) 사전점검이 알파 테이블을 개별로 본다는 것을 강제한다.
+        """
+        for fn in ("reserve", "left", "take"):
+            if not callable(getattr(DartBudget, fn, None)):
+                return False, f"DartBudget.{fn}() 이 없습니다 — 알파 예산을 지킬 수단이 없습니다"
+        b = DartBudget.__new__(DartBudget)          # _load(파일 I/O) 를 타지 않게 직접 구성
+        b.today, b.n, b.exhausted = "T", 0, False
+        b._lk = threading.RLock()
+        b._reserved, b._dirty, b._warned_reserve = {}, 0, False
+        b.reserve("emp", 100)
+        room = DART_DAILY_LIMIT - 100
+        if b.left(None) != room:
+            return False, f"예약 후 일반 잔량이 {b.left(None):,} (기대 {room:,})"
+        if b.left("emp") != DART_DAILY_LIMIT:
+            return False, "예약 당사자가 자기 예약분을 못 봅니다"
+        # 일반 소비자가 예약분까지 먹어치우지 못해야 한다.
+        if b.take(room, purpose=None) is not True:
+            return False, "일반 소비자가 정당한 잔량조차 인출하지 못합니다"
+        if b.take(1, purpose=None) is not False:
+            return False, "★ 일반 소비자가 예약분을 인출했습니다 — 알파가 또 굶습니다"
+        if b.take(1, purpose="emp") is not True:
+            return False, "★ 예약 당사자가 자기 예약분을 인출하지 못합니다"
+        # 사전점검이 알파 테이블을 개별 판정하는가 (합산 판정이면 사고가 재현된다)
+        src = _src_of(preflight_dart_v3) or ""
+        if src:
+            if "dart_employees_ext" not in src:
+                return False, "사전점검이 알파 테이블을 개별로 보지 않습니다"
+            if "sum(have.values())" in src and "dead_alpha" not in src:
+                return False, "사전점검이 여전히 합산으로만 판정합니다"
+        if not REQUIRE_EMP_ALPHA:
+            return True, "예약 동작 확인 · REQUIRE_EMP_ALPHA=False (알파 없이도 진행하도록 설정됨)"
+        return True, (f"예약 {EMP_RESERVED_CALLS:,}건은 EMP 만 인출 가능 · "
+                      f"알파 부재 시 수집 전 중단")
+
+    _cc("§12-A", "알파 원천(직원현황) 예산 보호 · 부재 시 사전 중단", alpha_guard)
 
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 34), "PASS" if r["pass"] else "FAIL",
@@ -10228,6 +10495,34 @@ def _flush_on_abort_v3():
         pass
 
 
+def _enrich_research_bounded(nv: pd.DataFrame, sec: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """네이버 상세 보강을 시간 상한 안에서, 담을 수 있는 종목부터 수행한다."""
+    if nv is None or nv.empty or not RESEARCH_ENRICH_MAX_MIN:
+        if nv is not None and len(nv) and not RESEARCH_ENRICH_MAX_MIN:
+            LOG.info("RESEARCH_ENRICH_MAX_MIN=0 — 상세 보강을 생략합니다. "
+                     "목표주가는 한경 경로에서만 채워집니다(실측 수율이 0 이었던 단계입니다).")
+        return nv if nv is not None else pd.DataFrame()
+    obs = float(RATE_LIMIT_QPS.get("naver", 3.0)) or 3.0
+    cap = max(0, int(RESEARCH_ENRICH_MAX_MIN * 60 * obs))
+    if "code" in nv.columns and sec is not None and len(sec):
+        try:
+            # 담을 수 있는 종목(=거래대금이 있는 종목)을 앞으로 당긴다. 정렬만 바꾸므로
+            # 상한에 걸려 잘려도 남는 것이 '쓸모 있는 쪽'이 된다.
+            live = set(sec.loc[sec["delisting_date"].isna(), "code"].astype(str)) \
+                if "delisting_date" in sec.columns else set(sec["code"].astype(str))
+            key = (~nv["code"].astype(str).isin(live)).astype(int)
+            nv = nv.assign(_pri=key).sort_values(
+                ["_pri"] + (["date"] if "date" in nv.columns else []),
+                ascending=[True] + ([False] if "date" in nv.columns else [])
+            ).drop(columns=["_pri"]).reset_index(drop=True)
+        except Exception:
+            pass
+    LOG.info(f"네이버 상세 보강 상한 {cap:,}건 (≈{RESEARCH_ENRICH_MAX_MIN}분 · "
+             f"실측 {obs:.1f}건/초). 상장 종목·최신순으로 채웁니다. "
+             f"이 단계는 U축 d1 보조이며 알파(한계임금)와 무관합니다.")
+    return naver_enrich_detail(nv, limit=cap)
+
+
 def announce_budget_v3():
     """수집을 시작하기 전에 '이번 실행이 몇 분짜리인지'를 먼저 못박아 보여준다.
 
@@ -10278,22 +10573,59 @@ def preflight_dart_v3() -> str:
     if not halt:
         return "LIVE"
 
+    # ★★ 테이블은 서로 대체재가 아니다. ★★
+    #   이 전략의 알파는 오직 한계임금(dart_employees_ext)이고, 재무 두 테이블은 **보조**다.
+    #   예전 판정은 셋을 합산해 total>0 이면 진행했다. 그래서 재무 146만 행이 있고
+    #   직원현황이 0행인 상태를 '캐시 충분'으로 읽고 27분을 태운 뒤, 정작 EMP 단계에서
+    #   "3개 TP 가 모두 결측"을 선언했다. 알파가 없는 백테스트는 돌릴 이유가 없다.
+    #   → 알파 필수(critical)와 보조(support)를 분리해 판정한다.
+    CRITICAL = {"dart_employees_ext": "한계임금 — 이 전략의 유일한 알파 원천 (TP_N1·N2·N3)"}
+    SUPPORT = {"dart_fnltt_raw": "전체재무제표 — TP_I1/I2/I4",
+               "dart_multi_raw": "주요계정 — 유니버스·규모버킷·R3"}
     have = {}
-    for t in ("dart_employees_ext", "dart_fnltt_raw", "dart_multi_raw"):
+    for t in list(CRITICAL) + list(SUPPORT):
         try:
             d = VAULT.get_table(t, scope="shared")
             have[t] = 0 if d is None else len(d)
         except Exception:
             have[t] = 0
-    total = sum(have.values())
 
-    LOG.table([[k, f"{v:,}행", "사용 가능" if v else "비어 있음"] for k, v in have.items()],
-              ["공용 캐시 테이블", "보유", "이번 실행"], ["l", "r", "c"],
+    LOG.table([[t, "★알파" if t in CRITICAL else "보조", f"{have[t]:,}행",
+                "사용 가능" if have[t] else "비어 있음",
+                _trunc({**CRITICAL, **SUPPORT}[t], 44)]
+               for t in list(CRITICAL) + list(SUPPORT)],
+              ["공용 캐시 테이블", "역할", "보유", "이번 실행", "이 테이블이 없으면"],
+              ["l", "c", "r", "c", "l"],
               title=f"DART 사전점검 — 지금 신규 수집 불가: {halt}")
 
-    if total > 0:
+    dead_alpha = [t for t in CRITICAL if not have[t]]
+    if dead_alpha:
+        LOG.error(
+            f"★ 알파 원천이 비어 있습니다 — {dead_alpha} · {halt}\n"
+            f"  재무 캐시가 {sum(have[t] for t in SUPPORT):,}행 있어도 **이 전략은 성립하지 않습니다.**\n"
+            f"  한계임금 = Δ급여총액 / Δ직원수 이고, 그 입력이 empSttus 하나뿐입니다.\n"
+            f"  이대로 진행하면 TP_N1·N2·N3 가 전부 결측이고, 남는 것은 CORE-D 5개 TP 뿐이라\n"
+            f"  '전략 3' 이 아니라 '이름만 같은 다른 전략'의 백테스트가 나옵니다.\n"
+            f"  그래서 가격·리포트 수집(실측 2시간)에 들어가기 전에 **지금** 멈춥니다.\n"
+            f"\n"
+            f"  선택지\n"
+            f"    ① 한도 회복 후 재실행 — DART 한도는 매일 자정(KST)에 초기화됩니다.\n"
+            f"       다음 실행은 EMP 에 예산을 **먼저** 배정하므로 한 번에 {EMP_MAX_CALLS:,}건까지 채웁니다.\n"
+            f"    ② EMP 만 먼저 채우기 — DART_FS_MAX_CALLS=0 으로 두면 Tier-2 가 예산을 쓰지 않아\n"
+            f"       직원현황이 최대 속도로 완성됩니다(권장).\n"
+            f"    ③ CORE-D 단독으로 돌려보려면 REQUIRE_EMP_ALPHA=False 로 두세요.\n"
+            f"       EMP-LITE 없는 축소판임이 모든 산출물에 명시됩니다.")
+        if REQUIRE_EMP_ALPHA:
+            raise KillCriteria(
+                f"알파 원천(dart_employees_ext) 부재 · {halt} — 위 ①~③ 중 하나를 고른 뒤 재실행하세요. "
+                f"2시간을 쓰고 '3개 TP 전부 결측'을 보는 대신 지금 멈춥니다.")
+        LOG.warn("REQUIRE_EMP_ALPHA=False — EMP 없는 CORE-D 축소판으로 진행합니다.")
+        return "CACHE_ONLY"
+
+    if sum(have.values()) > 0:
         LOG.warn(
-            f"DART 신규 수집은 못 하지만 공용 캐시에 {total:,}행이 있어 **그것만으로 진행**합니다.\n"
+            f"DART 신규 수집은 못 하지만 알파 원천이 캐시에 {have['dart_employees_ext']:,}행 있어 "
+            f"**캐시만으로 진행**합니다.\n"
             f"     · 캐시에 없는 (회사×연도)는 결측으로 남습니다 — 0 으로 채우지 않습니다.\n"
             f"     · CANARY 의 DART 항목은 판정 보류(SKIP)로 처리되며 킬 기준을 걸지 않습니다.\n"
             f"     · 내일(또는 한도 회복 후) 재실행하면 정확히 이 지점부터 이어받습니다.")
@@ -10360,8 +10692,14 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.EMP", "DART 직원현황(확장) · C15 한계임금", "L1",
                     budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-        eyears = list(range(as_ts(BACKTEST_START).year - EMP_YEARS_BACK,
-                            as_ts(BACKTEST_END).year + 1))
+        # ★ 상한을 '아직 제출되지 않은 회계연도' 앞에서 끊는다.
+        #   사업보고서는 다음 해 3~4월에 나오므로 FY(올해)는 존재할 수 없다. 그런데 잡은
+        #   연도 내림차순이라 그 없는 연도가 **큐 맨 앞**에 온다 — 3,366건(상한의 24%)을
+        #   확실히 빈 응답에 먼저 태우고 나서야 쓸 수 있는 연도에 도달했다.
+        _y_max = min(as_ts(BACKTEST_END).year, _dt.date.today().year) - 1
+        eyears = list(range(as_ts(BACKTEST_START).year - EMP_YEARS_BACK, _y_max + 1))
+        LOG.info(f"직원현황 대상 회계연도 {eyears[0]}~{eyears[-1]} "
+                 f"(FY{_y_max + 1} 이후는 아직 제출 전이라 제외 — 없는 연도를 먼저 묻지 않습니다)")
         # ★ 한계임금이 이 전략의 알파 원천이므로 DART 일일예산을 **여기에 먼저** 배정한다.
         #   (Tier-2 전체재무제표는 남는 예산으로 채우고, 부족분은 Tier-1 주요계정이 받친다)
         emp_corps, _, emp_prio = dart_fs_scope_v3(ctx, corps, quiet=True)
@@ -10409,16 +10747,51 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                     budget_s=3600, critical=False):
         cached = VAULT.get_table("research_report_master", scope="shared")
         frames = []
+        # ★ 캐시를 읽어 놓고도 전 구간을 다시 긁고 있었다. "재수집하지 않습니다" 로그는
+        #   재수집이 **끝난 뒤에** 찍혔다(13분 낭비 × 매 실행). 가격·공시는 이미 증분인데
+        #   리포트만 전량 재수집이었다 → 캐시 최신일 이후만 받는다.
+        r_start = BACKTEST_START
+        if cached is not None and len(cached) and "date" in cached.columns:
+            try:
+                _mx = as_ts_series(cached["date"]).max()
+                if pd.notna(_mx):
+                    # 7일 겹쳐 받는다 — 경계일에 늦게 올라온 리포트를 놓치지 않기 위함.
+                    r_start = max(as_ts(BACKTEST_START),
+                                  _mx - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+                    if r_start != BACKTEST_START:
+                        LOG.info(f"보고서 증분 수집 — 캐시 최신 {_mx:%Y-%m-%d} 이후만 받습니다 "
+                                 f"({r_start} ~). 전 구간 재수집이면 실측 13분이 매번 듭니다.")
+            except Exception:
+                pass
         if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
             LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
                      "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
                      "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
             if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+                _hk = hankyung_collect(r_start, BACKTEST_END)
+                if not len(_hk) and r_start == BACKTEST_START:
+                    # ★ 전 구간을 요청했는데 0건이면 소스 장애다. 예전엔 LOG.ok 로 찍혀
+                    #   초록 체크마크 뒤에 숨었다. 한경은 analyst_raw 의 **유일한** 원천이라
+                    #   0건이면 애널리스트 원장 전체가 빈다.
+                    LOG.error("한경컨센서스 0건 — 전 구간을 요청했는데 한 건도 받지 못했습니다. "
+                              "위 'HTTP 수집 감사' 표에서 hankyung 의 403/404 건수를 확인하세요. "
+                              "403 이면 차단(잠시 뒤 재시도), 404 면 엔드포인트 변경입니다. "
+                              "이 소스가 비면 애널리스트 원장·목표주가가 통째로 비어 "
+                              "다중소스 원장연결 감사가 무의미해집니다.")
+                frames.append(_hk)
             if "naver" in RESEARCH_SOURCES:
-                frames.append(naver_enrich_detail(naver_collect(BACKTEST_START, BACKTEST_END)))
+                nv = naver_collect(r_start, BACKTEST_END)
+                # ★ 상세 보강은 리포트 1건당 1회 요청이라 **이 전략에서 가장 비싼 단계**다.
+                #   실측: 45,000건 대상 → 20,000건만 해도 ETA 1시간 44분(2.99 it/s).
+                #   §10 의 수집 총예산이 95분인데 한 보조축 보강이 그 배를 먹는다.
+                #   게다가 리허설·실행 모두 '목표주가 0건 추가 확보' 였다 — 수율이 0 이다.
+                #   → 시간 상한을 걸고, 그 안에서 **U-MID 대역 종목부터** 보강한다.
+                #     (담을 수 없는 종목의 목표주가는 스코어에 쓰이지 않는다)
+                nv = _enrich_research_bounded(nv, ctx.get("sec"))
+                frames.append(nv)
         if cached is not None and len(cached):
-            LOG.ok(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 — 재수집하지 않습니다")
+            LOG.ok(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 "
+                   f"(신규는 {r_start} 이후만 받았습니다)")
             frames.append(cached)
         rep = build_report_master(frames, ctx["sec"]) if frames else pd.DataFrame()
         if len(rep):
@@ -10472,8 +10845,12 @@ def build_features_v3(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         P = emp_lite_sensors(P, emp_start)
         P = axis_U_v3(P, ctx.get("flows"))
 
-        # ★ U-MID 밖은 여기서 제외한다. TP 랭크가 '고를 수 있었던 종목' 안에서 매겨져야 한다.
+        # ★ 대역 밖은 여기서 제외한다. TP 랭크가 '고를 수 있었던 종목' 안에서 매겨져야 한다.
         #   (센서 계산은 전 종목으로 끝낸 뒤에 자른다 — 먼저 자르면 12개월 차분이 깨진다)
+        #   ★ 자르기 **직전** 패널을 보관한다. 스몰캡 비교 팔이 같은 센서 위에서 대역만
+        #     바꿔 다시 자르기 위함이다. 센서를 다시 계산하지 않으므로 두 팔의 차이는
+        #     오직 '규모 대역' 하나뿐임이 구조적으로 보장된다.
+        ctx["panel_full"] = P.copy()
         before = len(P)
         P = P[P["u_mid"]].reset_index(drop=True)
         LOG.info(f"U-MID 유니버스로 스코어링 패널 확정 — {before:,} → {len(P):,}행")
@@ -10505,6 +10882,73 @@ def score_and_backtest_v3(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
         bt = _run(P, label=STRATEGY_ID)
     runtime_mark("L2+L3.백테스트", time.time() - t_l2)
     return P, bt, _run
+
+
+def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
+                        bench: Dict[str, pd.Series]) -> Optional[dict]:
+    """같은 신호·같은 규칙을 **규모 대역만 바꿔** 다시 돌린다.
+
+    ★ 왜 같은 실행 안에서 도는가. 두 팔이 같은 수집물·같은 센서·같은 시드를 쓰므로
+      성과 차이의 원인이 '규모 대역' 하나로 특정된다. 따로 실행하면 수집 시점이 달라
+      무엇 때문에 달라졌는지 말할 수 없게 된다.
+    ★ TP·셀·랭크는 **대역 안에서 다시** 매긴다. 중형주 랭크를 소형주에 그대로 쓰면
+      소형주가 전부 하위권으로 몰려 아무것도 못 고른다.
+    """
+    if not RUN_SMALLCAP_ARM:
+        return None
+    PF = ctx.get("panel_full")
+    if PF is None or PF.empty:
+        LOG.warn("스몰캡 팔 — 전체 패널이 없어 건너뜁니다.")
+        return None
+    with PIPE.stage("L3.SMALL", f"스몰캡 비교 팔 (랭크 [{SMALL_RANK_LO},{SMALL_RANK_HI}])",
+                    "L3", budget_s=600, critical=False):
+        S = apply_umid(PF.copy(), uni, band="SMALL")
+        S = S[S["u_mid"]].reset_index(drop=True)
+        if S.empty or S["month"].nunique() < 24:
+            LOG.warn(f"스몰캡 대역에 남는 행이 부족합니다({len(S):,}행 · "
+                     f"{S['month'].nunique() if len(S) else 0}개월) — 비교 팔을 건너뜁니다. "
+                     f"거래대금 하한 {MIN_ADV_KRW/1e8:.0f}억을 하위 대역이 못 넘기는 것이 "
+                     f"보통이며, 이 사실 자체가 '소형주는 담기 어렵다'는 결과입니다.")
+            return None
+        S = downcast_floats(S)
+        S = build_tps(S)
+        S = apply_vetoes_v3(S, ctx)
+        S = assemble_score_v3(S)
+        bt_s = run_backtest(S, months, uni, ctx["sec"], apply_costs=True,
+                            label=f"{STRATEGY_ID}__SMALLCAP")
+        VAULT.put_table(f"l2_scores_{STRATEGY_ID}_smallcap",
+                        S[[c for c in ("code", "month", "E", "U", "Signal", "Signal_rank",
+                                       "VETO", "FLOOR", "n_tp") if c in S.columns]],
+                        scope="private", domain="scores", source="L3 스몰캡 팔")
+        return {"panel": S, "bt": bt_s}
+
+
+def report_arm_comparison_v3(bt_main: dict, arm: Optional[dict],
+                             bench: Dict[str, pd.Series]) -> None:
+    """메인(U-MID) vs 스몰캡 성과를 나란히 출력한다. 유리하게 해석하지 않는다."""
+    if not arm:
+        return
+    rows = []
+    for name, b, lo, hi in ((f"메인 U-MID", bt_main, UMID_RANK_LO, UMID_RANK_HI),
+                            ("스몰캡", arm["bt"], SMALL_RANK_LO, SMALL_RANK_HI)):
+        R = b.get("returns")
+        if R is None or R.empty:
+            continue
+        st = perf_stats(R)
+        _f = lambda k, fmt: (format(st[k], fmt) if k in st and np.isfinite(st.get(k, np.nan))
+                             else "-")
+        rows.append([name, f"[{lo},{hi}]", _f("CAGR", ".2%"), _f("Sharpe", ".2f"),
+                     _f("MDD", ".1%"), _f("승률", ".0%"), _f("t통계량(HAC)", ".2f"),
+                     _f("평균종목수", ".1f"), f"{len(R)}개월"])
+    if not rows:
+        return
+    LOG.table(rows, ["팔", "규모랭크", "CAGR", "Sharpe", "MDD", "승률", "t(HAC)",
+                     "평균종목", "관측"],
+              ["l", "c", "r", "r", "r", "r", "r", "r", "r"],
+              title="규모 대역 비교 — 같은 신호·같은 규칙, 대역만 다름")
+    LOG.info("두 팔은 동일한 수집물·센서·시드를 씁니다. 따라서 차이의 원인은 규모 대역 하나로 "
+             "특정됩니다. 다만 스몰캡은 거래비용·시장충격이 실제로 더 크므로, 이 표의 "
+             "스몰캡 우위는 비용 가정이 낙관적일 때 과대평가됩니다(R8 비용민감도를 함께 보세요).")
 
 
 # ── 산출물 ──────────────────────────────────────────────────────────────────────────────────
@@ -10636,6 +11080,12 @@ def main() -> dict:
         VAULT.adopt_scan(adopt)
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
+        # ★ 알파 몫을 먼저 떼어 둔다. 이것이 없어서 Tier-2 재무가 일일 한도를 먼저 다 쓰고
+        #   직원현황이 3회 실행 내내 0행이었다. 예약분은 EMP 만 인출할 수 있다.
+        if EMP_RESERVED_CALLS:
+            DBUDGET.reserve(EMP_PURPOSE, int(EMP_RESERVED_CALLS))
+            LOG.info(f"DART 예산 예약 — 직원현황(알파) {int(EMP_RESERVED_CALLS):,}건. "
+                     f"다른 단계는 나머지({DBUDGET.left(None):,}건)만 씁니다.")
 
     with PIPE.stage("L0.CONTRACT", "계약 자동검정 (C1·C2·C13·C15 · 원칙1~7)", "L0", budget_s=180):
         run_contracts_v3(strict=True)
@@ -10664,6 +11114,7 @@ def main() -> dict:
 
     P, uni, ctx = build_features_v3(ctx, months)
     P, bt, _run = score_and_backtest_v3(P, ctx, months, uni)
+    arm = run_smallcap_arm_v3(ctx, months, uni, {})
 
     with PIPE.stage("L2.POLICY", "정책 캘린더", "L2", budget_s=60, critical=False):
         cal = build_policy_calendar_v3()
@@ -10674,6 +11125,7 @@ def main() -> dict:
     with PIPE.stage("L6.PERF", "성과 검증 (자체측정 벤치마크 대비)", "L6", budget_s=300):
         bench = R0_benchmark(P, bt, months)
         report_performance_v3(bt, bench)
+        report_arm_comparison_v3(bt, arm, bench)
         # ★ 감쇠 감사는 강건성 재실행(백테스트 10여 회)이 섞이기 전에 뽑는다.
         uni.report_attrition()
         uni.attrition = []

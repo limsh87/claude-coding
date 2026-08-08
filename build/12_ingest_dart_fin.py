@@ -33,11 +33,35 @@ class DartBudget:
     """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다."""
 
     def __init__(self):
-        self.today = _dt.date.today().isoformat()
+        self.today = self._kst_day()
         self.n = 0
         self.exhausted = False
-        self._lk = threading.Lock()
+        self._lk = threading.RLock()
+        self._reserved: Dict[str, int] = {}
+        self._dirty = 0
+        self._warned_reserve = False
         self._load()
+
+    @staticmethod
+    def _kst_day() -> str:
+        """DART 한도의 리셋 경계는 00:00 KST 다. 로컬 날짜를 쓰면 UTC 컨테이너에서
+        하루에 두 번 틀린다: 15~24 UTC 는 이미 리셋된 한도를 소진으로 착각해 9시간을
+        헛차단하고, 그 뒤에는 남아 있다고 믿고 쏘다가 status 020 을 맞는다."""
+        try:
+            from zoneinfo import ZoneInfo
+            return _dt.datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+        except Exception:
+            return (_dt.datetime.utcnow() + _dt.timedelta(hours=9)).date().isoformat()
+
+    def _roll_if_new_day(self):
+        """긴 실행이 자정을 넘으면 한도도 리셋된다. take() 안에서 값싸게 확인한다."""
+        d = self._kst_day()
+        if d != self.today:
+            LOG.info(f"KST 자정 경과 — DART 일일 한도가 초기화됐습니다 "
+                     f"({self.today} → {d}, 직전 사용 {self.n:,}건).")
+            self._save()
+            self.today, self.n, self.exhausted = d, 0, False
+            DART_HALT["reason"] = DART_HALT["detail"] = None
 
     def _path(self) -> str:
         return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
@@ -58,23 +82,63 @@ class DartBudget:
         except Exception:
             pass
 
-    def refund(self, k: int = 1):
+    def refund(self, k: int = 1, purpose: Optional[str] = None):
         if k <= 0:
             return
         with self._lk:
             self.n = max(0, self.n - k)
+            # ★ 예약분도 함께 되돌린다. take(2) 후 refund(1) 이 정상 경로이므로,
+            #   되돌리지 않으면 예약이 잡당 2 씩 깎여 14,000 예약이 7,000건만 보호한다.
+            if purpose in self._reserved:
+                self._reserved[purpose] += k
+            self._dirty += k
 
-    def take(self, k: int = 1) -> bool:
+    # ── 예약(reservation) ─────────────────────────────────────────────────────────────
+    #  ★ 이 전략의 알파는 직원현황 하나뿐인데, 실행 3회 내내 dart_employees_ext 가 0행이었다.
+    #    원인은 단순하다 — Tier-2 전체재무제표가 일일 한도를 먼저 다 써버렸다. 단계 순서를
+    #    바꿔도 예산은 '날짜별 누적 카운터'라 어제 태운 것이 오늘까지 따라온다.
+    #    → 특정 용도(purpose)에 호출 수를 **예약**해 두고, 예약분은 그 용도만 인출한다.
+    #      일반 소비자는 (한도 − 예약잔량) 까지만 쓸 수 있다.
+    def reserve(self, purpose: str, k: int):
         with self._lk:
-            if self.n + k > DART_DAILY_LIMIT:
-                if not self.exhausted:
-                    self.exhausted = True
-                    LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
-                             f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
-                             f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
+            self._reserved[purpose] = max(0, int(k))
+
+    def _reserved_for_others(self, purpose: Optional[str]) -> int:
+        return sum(v for p, v in self._reserved.items() if p != purpose)
+
+    def left(self, purpose: Optional[str] = None) -> int:
+        """purpose 가 지금 쓸 수 있는 호출 수. 남의 예약분은 빼고 센다."""
+        with self._lk:
+            return max(0, DART_DAILY_LIMIT - self.n - self._reserved_for_others(purpose))
+
+    def take(self, k: int = 1, purpose: Optional[str] = None) -> bool:
+        with self._lk:
+            self._roll_if_new_day()
+            room = DART_DAILY_LIMIT - self._reserved_for_others(purpose)
+            if self.n + k > room:
+                # 예약 때문에 막힌 것인지, 한도 자체가 끝난 것인지 구별해서 알린다.
+                if self.n + k > DART_DAILY_LIMIT:
+                    if not self.exhausted:
+                        self.exhausted = True
+                        LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
+                                 f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
+                                 f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
+                elif not self._warned_reserve:
+                    self._warned_reserve = True
+                    LOG.info(f"남은 호출은 다른 용도로 예약되어 있습니다 "
+                             f"(예약 {self._reserved}). 이 단계는 여기서 멈춥니다 — "
+                             f"예약분은 알파 원천(직원현황) 몫입니다.")
+                if purpose in self._reserved:
+                    self._reserved[purpose] = max(0, self._reserved[purpose] - k)
                 return False
             self.n += k
-            if self.n % 500 == 0:
+            if purpose in self._reserved:
+                self._reserved[purpose] = max(0, self._reserved[purpose] - k)
+            self._dirty += k
+            # ★ n % 500 은 refund 가 임의 값으로 감산하는 순간 영원히 안 맞을 수 있다.
+            #   '마지막 저장 이후 변동량'으로 세면 어떤 감산 패턴에서도 반드시 저장된다.
+            if self._dirty >= 200:
+                self._dirty = 0
                 self._save()
             return True
 
@@ -104,37 +168,49 @@ def dart_note_halt(reason: str, detail: str = ""):
         DART_HALT["reason"], DART_HALT["detail"] = reason, detail
 
 
-def dart_halt_reason() -> Optional[str]:
-    """지금 DART 를 쓸 수 없는 이유. None 이면 정상 — 즉 '응답 0건'은 진짜 데이터 부재다."""
+def dart_halt_reason(purpose: Optional[str] = None) -> Optional[str]:
+    """지금 DART 를 쓸 수 없는 이유. None 이면 정상 — 즉 '응답 0건'은 진짜 데이터 부재다.
+
+    purpose 를 주면 그 용도의 **예약분까지 고려**해서 판정한다. 예약이 남아 있으면
+    전체 잔량이 0 이어도 그 용도는 계속 진행할 수 있다."""
     if not DART_API_KEY:
         return "DART_API_KEY 미입력"
-    if DBUDGET is not None and (DBUDGET.exhausted or DBUDGET.n >= DART_DAILY_LIMIT):
-        return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
+    if DBUDGET is not None:
+        if DBUDGET.left(purpose) <= 0 or DBUDGET.n >= DART_DAILY_LIMIT:
+            return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
+        if purpose is None and DBUDGET.exhausted:
+            return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
     return DART_HALT["reason"]
 
 
-def dart_budget_left() -> int:
-    return max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+def dart_budget_left(purpose: Optional[str] = None) -> int:
+    return DBUDGET.left(purpose) if DBUDGET else DART_DAILY_LIMIT
 
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
-             tries: int = 2, no_data_ok: bool = False) -> Optional[dict]:
+             tries: int = 2, no_data_ok: bool = False,
+             purpose: Optional[str] = None) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
     호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
     → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
     if not DART_API_KEY:
         return None
-    if DBUDGET is not None and not DBUDGET.take(tries):
+    if DBUDGET is not None and not DBUDGET.take(tries, purpose=purpose):
         dart_note_halt(f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})",
                        "내일 재실행하면 정확히 이 지점부터 이어받습니다.")
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
     attempts = {"n": 0}
-    js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
-                   referer="https://opendart.fss.or.kr/", on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
-    if DBUDGET is not None:
-        DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
+    # ★ try/finally 가 없으면 http_json 에서 예외가 새는 순간 tries 만큼이 영구 소실된다.
+    #   EMP 경로는 상위에서 예외를 삼키므로 이 누수가 **완전히 조용하다**.
+    try:
+        js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
+                       referer="https://opendart.fss.or.kr/",
+                       on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
+    finally:
+        if DBUDGET is not None:
+            DBUDGET.refund(max(0, tries - max(1, attempts["n"])), purpose=purpose)
     if not isinstance(js, dict):
         return None
     st = str(js.get("status", ""))
@@ -612,6 +688,10 @@ DISCLOSURE_PATTERNS = {
 }
 
 
+# ★ 모듈 스코프여야 한다. 예전엔 fetch_dart_disclosures 안의 지역변수였는데
+#   _disclosure_done_months 가 이를 참조해 NameError 가 잠복해 있었다. 예산이 남아 있는
+#   첫 실행에서 L1.DART 가 통째로 죽는다(critical=False 라 조용한 WARN 으로).
+DISCLOSURE_TYPES = ("A", "B")     # A=정기공시(사업/반기/분기보고서), B=주요사항보고
 DISCLOSURE_LEDGER = "dart_disclosure_months"
 
 
@@ -726,7 +806,6 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     #   PACK-D 가 필요로 하는 '사업보고서'는 A(정기공시)라 단 한 건도 안 잡힌다.
     #   그러면 fetch_dart_documents 가 걸러낼 대상이 없어 팩 전체가 조용히 죽는다.
     #   (실경로에서만 드러나는 유형 — 합성 스모크는 dis 를 직접 만들어 넣으므로 못 본다)
-    DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
 
     def _one(m):
         """(월, 행들, 완결여부). 한 페이지라도 못 받으면 그 달은 미완결이다."""

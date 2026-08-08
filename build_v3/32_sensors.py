@@ -301,7 +301,17 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
 UMID_RANK_LO, UMID_RANK_HI = 251, 1400
 
 
-def apply_umid(P: pd.DataFrame, uni: "Universe") -> pd.DataFrame:
+def universe_band(name: str) -> Tuple[int, int, float]:
+    """(랭크 하한, 랭크 상한, 거래대금 하한). 비교용 대역을 한 곳에서 정의한다."""
+    if name == "SMALL":
+        # 시총(대리: 거래대금) 하위 1,000 — U-MID 아래 구간. 유동성 하한은 그대로 두어야
+        # '못 담는 종목으로 만든 성과'가 되지 않는다. 하한을 낮추면 체결 불가능한 종목이
+        # 섞여 성과가 부풀려진다 — 비교의 의미가 사라진다.
+        return SMALL_RANK_LO, SMALL_RANK_HI, MIN_ADV_KRW
+    return UMID_RANK_LO, UMID_RANK_HI, MIN_ADV_KRW
+
+
+def apply_umid(P: pd.DataFrame, uni: "Universe", band: str = "UMID") -> pd.DataFrame:
     """u_mid = 규모랭크 [251,1400] & adtv20 ≥ 3억 & 상장 250거래일 경과.
 
     ★ 규모 대리변수에 관한 정직한 고지: 스펙은 시가총액 랭크를 쓰지만, 이 파이프라인이
@@ -311,17 +321,18 @@ def apply_umid(P: pd.DataFrame, uni: "Universe") -> pd.DataFrame:
       순위 상관은 높지만 동일하지 않다 — 이 치환은 결과 해석에 반드시 함께 읽어야 한다.
       (상장 250거래일 시즈닝은 Universe 가 이미 강제하므로 여기서 중복 적용하지 않는다)
     """
+    lo, hi, adv_min = universe_band(band)
     P = P.copy()
     adv = col(P, "adv20")
     rank = adv.groupby(P["month"], observed=True).rank(ascending=False, method="first")
     P["size_rank"] = rank
-    P["u_mid"] = (rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)).fillna(False)
+    P["u_mid"] = (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
     for m, g in P.groupby("month", observed=True):
         uni.audit_row("U-MID대역", m, g.loc[g["u_mid"], "code"].tolist())
     keep = int(P["u_mid"].sum())
-    LOG.info(f"U-MID 유니버스: {keep:,}/{len(P):,}행 "
+    LOG.info(f"{band} 유니버스: {keep:,}/{len(P):,}행 "
              f"(월평균 {keep/max(P['month'].nunique(),1):,.0f}종목) — "
-             f"규모랭크 [{UMID_RANK_LO},{UMID_RANK_HI}] ∩ 거래대금 ≥{MIN_ADV_KRW/1e8:.0f}억. "
+             f"규모랭크 [{lo},{hi}] ∩ 거래대금 ≥{adv_min/1e8:.0f}억. "
              f"규모 대리는 20일 평균거래대금 랭크입니다(시총 PIT 복원 불가에 따른 치환).")
     if keep == 0:
         LOG.warn("U-MID 에 남는 행이 없습니다 — 가격 수집이 실패했거나 유동성 하한이 너무 높습니다. "
