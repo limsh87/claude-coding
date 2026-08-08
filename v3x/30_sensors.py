@@ -118,7 +118,7 @@ def customs_input_cost(cx: pd.DataFrame, hs_digits: int = 2) -> pd.DataFrame:
         return pd.DataFrame(columns=["hs2", "ym", "input_cost"])
     d = cx.copy()
     d["ym"] = as_ts_series(d["ym"])
-    d["hs2"] = d["hs"].astype(str).str.zfill(6).str[:hs_digits]
+    d["hs2"] = d["hs"].astype(str).str.slice(0, hs_digits)
     has_imp = ("imp_usd" in d.columns) and ("imp_wgt" in d.columns) and \
               (pd.to_numeric(d["imp_wgt"], errors="coerce").fillna(0) > 0).any()
     if has_imp:
@@ -169,7 +169,7 @@ def customs_a2_residual(hsm: pd.DataFrame, cost: pd.DataFrame,
     if hsm is None or not len(hsm):
         return empty
     d = hsm.copy()
-    d["hs2"] = d["hs"].astype(str).str.zfill(6).str[:2]
+    d["hs2"] = d["hs"].astype(str).str.slice(0, 2)
     if cost is not None and len(cost):
         d = d.merge(cost, on=["hs2", "ym"], how="left")
     else:
@@ -208,8 +208,11 @@ def customs_a2_residual(hsm: pd.DataFrame, cost: pd.DataFrame,
     # a2 = mean(ε[t-5:t]) / std(ε)   — 표준편차는 그 HS 의 전체 잔차 산포
     # ★ rolling(axis=1) 은 pandas 2 에서 폐기되고 3 에서 제거됐다. 전치해서 축을 세운다.
     mean_r = (R.T.rolling(recent, min_periods=max(2, recent // 2)).mean()).T
-    sd = R.std(axis=1, skipna=True).replace(0.0, np.nan)
-    a2 = mean_r.div(sd, axis=0)
+    # ★ 분모를 '전체 표본 잔차 표준편차'로 쓰면 **미래 잔차가 오늘의 a2 를 스케일링**한다.
+    #   같은 잔차라도 훗날 변동성이 커질 HS 는 오늘 a2 가 작아진다 — 명백한 미래누수다.
+    #   시점 t 까지만 쓰는 확장 표준편차로 바꾼다(최소 12개월 확보 후부터 산출).
+    sd_exp = (R.T.expanding(min_periods=12).std()).T.replace(0.0, np.nan)
+    a2 = mean_r.div(sd_exp)
 
     beta = rolling_ols_beta_last(y, X, window=window)        # (N, 3) — 진단카드용 β
     # 두 프레임은 index/columns 가 동일하므로 stack 순서가 일치한다.
@@ -253,7 +256,19 @@ def customs_a_sensors(cx: pd.DataFrame) -> pd.DataFrame:
     cost = customs_input_cost(cx)
     a2 = customs_a2_residual(hsm, cost)
 
-    d = hsm.sort_values(["hs", "ym"]).copy()
+    # ★ shift(12)/rolling(12) 는 **행 위치** 기준이다. 통관은 그 달 선적이 없으면 행 자체가
+    #   없으므로, 결측월이 있는 HS 에서는 '12행 전'이 12개월 전이 아니다(예: 2년 전).
+    #   a2 는 피벗으로 균일 격자를 만들어 이 함정을 피하는데 a1/a3/a4/a5 는 그대로였다.
+    #   → 여기서 (hs × 전체월) 완전격자로 펴서 위치=시간이 되도록 만든다.
+    _yms = pd.DatetimeIndex(sorted(pd.unique(as_ts_series(hsm["ym"]).dropna())))
+    _hss = pd.Index(sorted(hsm["hs"].astype(str).unique()), name="hs")
+    _grid = pd.MultiIndex.from_product([_hss, _yms], names=["hs", "ym"]).to_frame(index=False)
+    d = _grid.merge(hsm.assign(hs=hsm["hs"].astype(str)), on=["hs", "ym"], how="left")
+    d = d.sort_values(["hs", "ym"]).reset_index(drop=True)
+    # 선적이 없던 달은 물량 0 이 사실이다(누계·신규세번 판정의 전제).
+    for _c in ("wgt", "usd"):
+        if _c in d.columns:
+            d[_c] = pd.to_numeric(d[_c], errors="coerce").fillna(0.0)
     g = d.groupby("hs", observed=True, sort=False)
 
     # a1: 12개월 누계 중량의 전년동기 대비 로그차. 계절성과 단월 노이즈를 함께 죽인다.
@@ -273,8 +288,11 @@ def customs_a_sensors(cx: pd.DataFrame) -> pd.DataFrame:
     g = d.groupby("hs", observed=True, sort=False)
     d["_streak"] = g["_active"].transform(
         lambda s: s.rolling(A5_STREAK, min_periods=A5_STREAK).sum())
-    prior = g["wgt"].transform(lambda s: s.shift(A5_STREAK).rolling(12, min_periods=6).sum())
-    onset = (d["_streak"] >= A5_STREAK) & (~(prior > 0))
+    # ★ min_periods 로 느슨하게 두면 패널 앞 구간에서 prior 가 NaN 이고 `~(prior>0)` 가 True 라
+    #   **오래된 HS 가 전부 '신규 세번'으로 발화**한다. 12개월 이력이 실제로 관측된 경우에만
+    #   판정한다(이력을 모르면 '신규'라고 주장하지 않는다).
+    prior = g["wgt"].transform(lambda s: s.shift(A5_STREAK).rolling(12, min_periods=12).sum())
+    onset = (d["_streak"] >= A5_STREAK) & prior.notna() & (~(prior > 0))
     # 지수감쇠 더미: 발화 시점부터 12개월간 감쇠하며 남는다.
     lam = 0.5 ** (1.0 / max(A5_DECAY_HALFLIFE, 1e-9))
     d["a5"] = _decay_dummy(onset.to_numpy(), d["hs"].to_numpy(), lam, horizon=12)

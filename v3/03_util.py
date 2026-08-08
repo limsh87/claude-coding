@@ -198,12 +198,22 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
     return path
 
 
-def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+def read_parquet_safe(path: str, quarantine: bool = True) -> Optional[pd.DataFrame]:
+    """★ quarantine=False 는 **남의 파일**을 읽을 때 쓴다.
+
+    os.replace 는 삭제는 아니지만 **개명**이고, 남의 인덱스가 가리키는 경로를 바꿔 버리면
+    그 전략은 다음 실행에서 파일을 잃는다. 읽기 실패의 원인이 우리 쪽(pyarrow 버전 등)일 수도
+    있는데 남의 파일을 건드리는 건 절대1원칙 위반이다. 외부 경로는 읽고 실패하면 그냥 넘어간다.
+    """
     if not os.path.exists(path):
         return None
     try:
         return pd.read_parquet(path)
     except Exception as e:
+        if not quarantine:
+            LOG.debug(f"외부 parquet 읽기 실패(파일은 그대로 둡니다): "
+                      f"{os.path.basename(path)} ({type(e).__name__})")
+            return None
         LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
         try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
             os.replace(path, path + f".corrupt.{int(time.time())}")

@@ -203,12 +203,16 @@ def RX3_orthogonal(P: pd.DataFrame, bt: dict) -> None:
     X = np.column_stack([np.ones(len(y))] + [np.nan_to_num(v) for v in facs.values()])
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
     resid = y - X @ beta
-    t, p = hac_tstat(resid)
-    ok = np.isfinite(p) and p < 0.10 and np.nanmean(resid) > 0
+    # ★ hac_tstat 는 (평균, t통계량) 을 돌려준다. (t, p) 로 받으면 t 자리에 '평균'이,
+    #   p 자리에 't값'이 들어가 p<0.10 비교가 't값<0.10' 이 된다 — 판정이 통째로 뒤집힌다.
+    mu_r, t_r = hac_tstat(resid)
+    # 양측 정규근사 p값 (statsmodels 없이도 성립)
+    p_r = float(math.erfc(abs(t_r) / math.sqrt(2.0))) if np.isfinite(t_r) else float("nan")
+    ok = np.isfinite(p_r) and p_r < 0.10 and mu_r > 0
     _rx("R3", "퀄리티 팩터 직교화", "PASS" if ok else "FAIL",
-        f"직교화 후 잔차 알파 월 {np.nanmean(resid)*100:.3f}% (t={t:.2f}, p={p:.3f}) "
+        f"직교화 후 잔차 알파 월 {mu_r*100:.3f}% (t={t_r:.2f}, p={p_r:.3f}) "
         f"· 통제 {list(facs)}",
-        metric=f"t={t:.2f}", kill=True)
+        metric=f"t={t_r:.2f}", kill=True)
 
 
 def RX4_placebo(gate3: dict) -> None:

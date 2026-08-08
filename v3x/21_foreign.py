@@ -75,7 +75,7 @@ def _foreign_root_variants(root: str) -> "list[str]":
     base = os.path.basename(root.rstrip("/"))
     cands = []
     try:
-        cands.append(os.path.join(str(Path.home()), base))
+        cands.append(os.path.join(os.path.expanduser("~"), base))
         cands.append(os.path.join(os.getcwd(), base))
     except Exception:                                                   # noqa
         pass
@@ -98,7 +98,7 @@ def foreign_remap(path: str, roots: "Sequence[str]") -> Optional[str]:
     norm = str(path).replace("\\", "/")
     # 알려진 마운트 접두사를 벗겨 상대경로를 얻고, 각 루트 후보에 다시 붙여 본다.
     for pref in ("/content/drive/MyDrive/", "/content/drive/Shareddrives/",
-                 str(Path.home()).rstrip("/") + "/", "./"):
+                 os.path.expanduser("~").rstrip("/") + "/", "./"):
         if norm.startswith(pref):
             rel = norm[len(pref):]
             break
@@ -270,7 +270,7 @@ class ForeignCatalog:
                 paths = paths[-max_parts:]
             frames = []
             for p in paths:
-                d = read_parquet_safe(p)
+                d = read_parquet_safe(p, quarantine=False)
                 if d is not None and len(d):
                     frames.append(d)
             if not frames:
@@ -467,7 +467,11 @@ def foreign_publish_common(cat: "ForeignCatalog", dataset: str, df: pd.DataFrame
             raise RuntimeError("재읽기 검증 실패 — 기존 키가 유실되었습니다")
     except Exception as e:                                               # noqa
         try:
-            shutil.copy2(bak, reg)                     # 즉시 롤백
+            # ★ copy2 는 원자적이지 않다. 롤백 도중 죽으면 남의 레지스트리가 잘린 채 남는다.
+            #   임시파일에 쓴 뒤 os.replace 로 교체한다(같은 파일시스템이므로 원자적).
+            _tmp = reg + ".rollback.tmp"
+            shutil.copy2(bak, _tmp)
+            os.replace(_tmp, reg)
             LOG.error(f"공용 레지스트리 갱신 실패({type(e).__name__}) — 백업에서 롤백했습니다.")
         except Exception:                                                # noqa
             LOG.error(f"공용 레지스트리 갱신 및 롤백 실패 — 백업 파일: {bak}")

@@ -73,7 +73,7 @@ def make_cells(P: pd.DataFrame) -> pd.DataFrame:
         d["hs_group"] = "NA"
     else:
         # HS 2자리(章)를 군으로 쓴다. 6자리는 셀이 종목 1개로 쪼개져 랭크가 의미를 잃는다.
-        d["hs_group"] = hs_main.astype(str).str.zfill(6).str[:2].fillna("NA")
+        d["hs_group"] = hs_main.astype(str).str.slice(0, 2).replace("", "NA").fillna("NA")
     mc = pd.to_numeric(d.get("mcap"), errors="coerce")
     if mc.notna().sum() == 0:
         mc = pd.to_numeric(d.get("adtv20"), errors="coerce")
@@ -306,12 +306,35 @@ def compose_signal(P: pd.DataFrame, tps: "Sequence[str]", uaxes: "Sequence[str]"
                (d["breadth_ok"] > 0) & d["E"].notna()
     Emask = d["E"].where(eligible)
     Umask = d["U"].where(eligible)
-    d["E_rank"] = Emask.groupby(key, observed=True).rank(pct=True)
-    d["U_rank"] = Umask.groupby(key, observed=True).rank(pct=True)
-    # U 를 통째로 못 구한 구간에서는 U 를 중립(0.5)으로 두되 그 사실을 표에 남긴다.
-    u_missing = d["U_rank"].isna() & d["E_rank"].notna()
-    d["U_rank"] = d["U_rank"].fillna(0.5)
-    d["u_imputed"] = u_missing.astype(float)
+
+    # ★ 활성축 조합별 분리 랭크의 함정: 조합이 잘게 쪼개지면 **그 달 그 조합에 한 종목**만
+    #   남는 일이 생기고, rank(pct=True) 는 1.0 을 준다. 정보가 가장 적은 종목이 만점을 받고
+    #   매달 편입되는 구조다. 표본이 부족한 조합은 그 달 전체(ym) 랭크로 폴백한다.
+    grp_n = Emask.groupby(key, observed=True).transform("count")
+    key_fb = d["ym"].astype(str)
+    e_fine = Emask.groupby(key, observed=True).rank(pct=True)
+    u_fine = Umask.groupby(key, observed=True).rank(pct=True)
+    e_coarse = Emask.groupby(key_fb, observed=True).rank(pct=True)
+    u_coarse = Umask.groupby(key_fb, observed=True).rank(pct=True)
+    small = grp_n < CELL_MIN_N
+    d["E_rank"] = e_fine.where(~small, e_coarse)
+    d["U_rank"] = u_fine.where(~small, u_coarse)
+    d["rank_fallback"] = small.astype(float)
+
+    # ★ U 결측 처리 — 사양 §8.2 는 "결측 축은 제외 평균, 0으로 채우지 말 것" 이다.
+    #   종목별로 0.5 를 채우면 D축 데이터가 **없는** 종목이 D축이 나쁜 종목을 이겨 버린다.
+    #   구분해서 처리한다:
+    #     · U 를 아무도 못 구한 구간(축 자체가 비활성) → U 를 곱셈 항등원 1.0 으로 두고 명시
+    #     · 일부만 결측 → 그 종목은 비교 불가이므로 결측 유지(그 달 후보에서 빠진다)
+    u_any = bool(Umask.notna().any())
+    if not u_any:
+        d["U_rank"] = 1.0
+        d["u_imputed"] = 1.0
+        LOG.warn("U축(미반영도)을 한 종목도 산출하지 못했습니다 — Signal 을 E 단독으로 냅니다. "
+                 "0.5 로 채우지 않습니다(그러면 '데이터 없음'이 '보통'으로 둔갑합니다). "
+                 "d1 은 net_income_ttm·mcap, d2/d4 는 리포트 원장, d3 는 수급이 필요합니다.")
+    else:
+        d["u_imputed"] = (d["U_rank"].isna() & d["E_rank"].notna()).astype(float)
 
     d["Signal"] = (d["E_rank"] * d["U_rank"]).where(eligible)
     d["Signal_rank"] = d["Signal"].groupby(d["ym"], observed=True).rank(pct=True)

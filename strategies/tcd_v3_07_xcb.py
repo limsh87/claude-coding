@@ -1161,12 +1161,22 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
     return path
 
 
-def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+def read_parquet_safe(path: str, quarantine: bool = True) -> Optional[pd.DataFrame]:
+    """★ quarantine=False 는 **남의 파일**을 읽을 때 쓴다.
+
+    os.replace 는 삭제는 아니지만 **개명**이고, 남의 인덱스가 가리키는 경로를 바꿔 버리면
+    그 전략은 다음 실행에서 파일을 잃는다. 읽기 실패의 원인이 우리 쪽(pyarrow 버전 등)일 수도
+    있는데 남의 파일을 건드리는 건 절대1원칙 위반이다. 외부 경로는 읽고 실패하면 그냥 넘어간다.
+    """
     if not os.path.exists(path):
         return None
     try:
         return pd.read_parquet(path)
     except Exception as e:
+        if not quarantine:
+            LOG.debug(f"외부 parquet 읽기 실패(파일은 그대로 둡니다): "
+                      f"{os.path.basename(path)} ({type(e).__name__})")
+            return None
         LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
         try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
             os.replace(path, path + f".corrupt.{int(time.time())}")
@@ -7291,7 +7301,7 @@ def _foreign_root_variants(root: str) -> "list[str]":
     base = os.path.basename(root.rstrip("/"))
     cands = []
     try:
-        cands.append(os.path.join(str(Path.home()), base))
+        cands.append(os.path.join(os.path.expanduser("~"), base))
         cands.append(os.path.join(os.getcwd(), base))
     except Exception:                                                   # noqa
         pass
@@ -7314,7 +7324,7 @@ def foreign_remap(path: str, roots: "Sequence[str]") -> Optional[str]:
     norm = str(path).replace("\\", "/")
     # 알려진 마운트 접두사를 벗겨 상대경로를 얻고, 각 루트 후보에 다시 붙여 본다.
     for pref in ("/content/drive/MyDrive/", "/content/drive/Shareddrives/",
-                 str(Path.home()).rstrip("/") + "/", "./"):
+                 os.path.expanduser("~").rstrip("/") + "/", "./"):
         if norm.startswith(pref):
             rel = norm[len(pref):]
             break
@@ -7486,7 +7496,7 @@ class ForeignCatalog:
                 paths = paths[-max_parts:]
             frames = []
             for p in paths:
-                d = read_parquet_safe(p)
+                d = read_parquet_safe(p, quarantine=False)
                 if d is not None and len(d):
                     frames.append(d)
             if not frames:
@@ -7683,7 +7693,11 @@ def foreign_publish_common(cat: "ForeignCatalog", dataset: str, df: pd.DataFrame
             raise RuntimeError("재읽기 검증 실패 — 기존 키가 유실되었습니다")
     except Exception as e:                                               # noqa
         try:
-            shutil.copy2(bak, reg)                     # 즉시 롤백
+            # ★ copy2 는 원자적이지 않다. 롤백 도중 죽으면 남의 레지스트리가 잘린 채 남는다.
+            #   임시파일에 쓴 뒤 os.replace 로 교체한다(같은 파일시스템이므로 원자적).
+            _tmp = reg + ".rollback.tmp"
+            shutil.copy2(bak, _tmp)
+            os.replace(_tmp, reg)
             LOG.error(f"공용 레지스트리 갱신 실패({type(e).__name__}) — 백업에서 롤백했습니다.")
         except Exception:                                                # noqa
             LOG.error(f"공용 레지스트리 갱신 및 롤백 실패 — 백업 파일: {bak}")
@@ -8330,14 +8344,26 @@ def curate_hs_universe(cx: pd.DataFrame, sec: pd.DataFrame, conc: pd.DataFrame,
                    f"— 성과를 보고 이 파일을 고치지 마세요(§15.2).")
             return pre
         except Exception as e:                                          # noqa
-            LOG.warn(f"사전등록 파일을 읽지 못했습니다({type(e).__name__}) — 새로 생성합니다.")
+            # ★ 읽기 실패는 '파일이 잘못됐다'는 뜻이 아니라 인코딩·pandas 버전 문제일 수 있다.
+            #   그대로 덮어쓰면 사전등록의 존재 이유(사후 변경 방지)가 무너진다. 백업부터 한다.
+            bak = prereg_path + f".unreadable.{_dt.datetime.now():%Y%m%d_%H%M%S}"
+            try:
+                shutil.copy2(prereg_path, bak)
+                LOG.warn(f"사전등록 파일을 읽지 못했습니다({type(e).__name__}) — "
+                         f"{os.path.basename(bak)} 로 보존한 뒤 새로 생성합니다.")
+            except Exception:                                           # noqa
+                LOG.error(f"사전등록 파일을 읽지도 백업하지도 못했습니다({type(e).__name__}). "
+                          f"덮어쓰지 않고 이번 실행에서만 임시 목록을 씁니다.")
+                prereg_path = prereg_path + f".tmp{_dt.datetime.now():%H%M%S}"
 
     if cx is None or not len(cx):
         return pd.DataFrame(columns=["hs", "n_firms", "months", "cv_dest", "adopted", "reason"])
 
     d = cx.copy()
-    d["hs"] = d["hs"].astype(str).str.zfill(max(digits, 6))
-    d["hs_k"] = d["hs"].str[:digits]
+    d["hs"] = d["hs"].astype(str)
+    # ★ HS 는 **좌측 정렬 계층코드**다. zfill 은 왼쪽을 채워 "85"→"000085" 로 만들고
+    #   그러면 章이 "00" 이 되어 매핑이 통째로 0건이 된다. 절대 zfill 하지 않는다.
+    d["hs_k"] = d["hs"].str.slice(0, digits)
 
     # 관측 개월수 — 롤링 36M OLS 가 돌 수 있어야 한다.
     obs = d.groupby("hs_k", observed=True)["ym"].nunique().rename("months").reset_index()
@@ -8465,7 +8491,8 @@ def gate1_coverage(mapping: pd.DataFrame, cx: pd.DataFrame, fin: pd.DataFrame,
     hs_year = c.groupby(["hs", "year"], observed=True)["exp_usd"].sum().reset_index()
 
     f = fin.copy()
-    f["year"] = as_ts_series(f["period"]).dt.year
+    # tidy_financials 는 'period_end' 를 낸다. 'period' 는 존재하지 않는다(KeyError).
+    f["year"] = as_ts_series(f["period_end"]).dt.year
     fy = f.groupby(["code", "year"], observed=True)["export_rev_sep"].max().reset_index()
 
     j = mapping[["code", "hs", "weight"]].merge(fy, on="code", how="inner")
@@ -8566,7 +8593,7 @@ def gate3_placebo(mapping: pd.DataFrame, a_hs: pd.DataFrame, fin: pd.DataFrame,
     Hm = hs_y.pivot_table(index="hs", columns="year", values="a1")
     # 종목 × 연도 매출 증가율 행렬
     F = fin.copy()
-    F["year"] = as_ts_series(F["period"]).dt.year
+    F["year"] = as_ts_series(F["period_end"]).dt.year
     fy = F.groupby(["code", "year"], observed=True)["b1"].mean().reset_index() \
         if "b1" in F.columns else None
     if fy is None or not len(fy):
@@ -8621,7 +8648,10 @@ def gate3_placebo(mapping: pd.DataFrame, a_hs: pd.DataFrame, fin: pd.DataFrame,
     rng = np.random.default_rng(seed)
     null = np.empty(n_shuffle, dtype=float)
     for i in range(n_shuffle):
-        null[i] = _fit(rng.integers(0, n_h, size=len(cols_)))
+        # ★ rng.integers 는 **복원추출**이라 '한 HS 에 몰림'이 실제 매핑보다 흔해지고
+        #   귀무분포가 왜곡된다. 실제 배정을 **순열**하면 어느 HS 가 몇 번 쓰였는지(주변분포)를
+        #   보존한 채 '누가 어디에 붙었는가'만 무작위가 된다 — 검정하려는 게 정확히 그것이다.
+        null[i] = _fit(rng.permutation(cols_))
     null = null[np.isfinite(null)]
     if not np.isfinite(real) or not len(null):
         out["detail"] = "적합도 산출 불가 — 판정 유보"
@@ -8667,8 +8697,12 @@ def apply_mapping_gates(mapping: pd.DataFrame, cx: pd.DataFrame, fin: pd.DataFra
     m["gate3"] = int(g3.get("pass", 1))
     m["map_gate_fail"] = (1 - (m["gate1"] * m["gate2"] * m["gate3"])).clip(0, 1)
 
-    kept = m[m["map_gate_fail"] == 0].copy()
-    n1 = kept["code"].nunique()
+    # ★ 실패분을 **삭제하지 않는다.** 사양 §9 의 V12 는 '전면 제외'가 아니라 'A축 무효화'다.
+    #   지워 버리면 그 종목은 B·C축 신호까지 잃고 유니버스에서 사라져 표본이 이중으로 줄고,
+    #   V12 는 발동할 대상이 없어 구조적으로 죽은 거부권이 된다.
+    #   플래그만 실어 보내고 실제 무효화는 disable_axes 가 한다.
+    kept = m.copy()
+    n1 = int(m.loc[m["map_gate_fail"] == 0, "code"].nunique())
     info = {"n_before": int(n0), "n_after": int(n1), "gate3": g3,
             "g1_pass": int(g1["gate1"].sum()) if len(g1) else 0,
             "g1_total": int(len(g1)),
@@ -8921,6 +8955,56 @@ def build_subsidy_signal(fin: pd.DataFrame) -> pd.DataFrame:
     r = safe_div(sub, rev)
     d["subsidy_ratio_chg"] = r - r.groupby(fin["code"], observed=True).shift(4)
     return d[cols]
+
+
+def fetch_dart_industry(corp_codes: "Sequence[str]", code_of: "Dict[str, str]") -> pd.DataFrame:
+    """DART 기업개황에서 **KSIC 표준산업분류코드(induty_code)** 를 가져온다.
+
+    ★ 이게 없으면 HS↔KSIC 연계표를 상장사에 붙일 수가 없다. 종목 마스터(FDR/KIND)는
+      자유 텍스트 업종명만 주고 KSIC 코드는 주지 않는다. 예전에는 sec.get("induty_code")
+      가 조용히 빈 값을 돌려줘서 **후보 상장사 수가 전부 0 → 채택 HS 0개 → 매핑 0건 →
+      유니버스 0** 이 되고도 예외가 나지 않았다.
+
+    응답 예: {"status":"000", "corp_code":"00126380", "induty_code":"264", ...}  (3자리 KSIC)
+    """
+    cols = ["code", "corp_code", "induty_code"]
+    if not DART_API_KEY:
+        LOG.warn("DART 키가 없어 KSIC(induty_code)를 가져올 수 없습니다 — "
+                 "HS↔상장사 매핑이 불가능해집니다.")
+        return pd.DataFrame(columns=cols)
+    cached = VAULT.get_table("dart_company_industry", scope="shared")
+    done: set = set()
+    if cached is not None and len(cached):
+        done = set(cached["corp_code"].astype(str))
+        LOG.info(f"공용 캐시에서 KSIC 업종코드 {len(cached):,}건 재사용")
+    todo = [str(c) for c in dict.fromkeys(corp_codes) if str(c) not in done]
+    if RUN_MODE == "CACHED":
+        todo = []
+
+    def _one(cc: str):
+        js = dart_api("company.json", {"corp_code": cc})
+        if not js or str(js.get("status")) != "000":
+            return None
+        ind = str(js.get("induty_code") or "").strip()
+        if not ind:
+            return None
+        return {"code": code_of.get(cc) or to_code6(js.get("stock_code")),
+                "corp_code": cc, "induty_code": ind}
+
+    got = []
+    if todo:
+        got = [r for r in pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8),
+                                  desc="DART 업종코드(KSIC)") if r]
+    frames = [f for f in (cached, pd.DataFrame(got) if got else None)
+              if f is not None and len(f)]
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    out = pd.concat(frames, ignore_index=True).drop_duplicates("corp_code", keep="last")
+    out = out[out["code"].notna()]
+    if got:
+        VAULT.put_table("dart_company_industry", out, scope="shared", source="DART company.json")
+    LOG.ok(f"KSIC 업종코드 {len(out):,}종목 확보 (중분류 {out['induty_code'].str[:2].nunique()}종)")
+    return out.reindex(columns=cols)
 
 
 def build_coverage_panel(reports: pd.DataFrame, months: pd.DatetimeIndex) -> pd.DataFrame:
@@ -9398,7 +9482,7 @@ def customs_input_cost(cx: pd.DataFrame, hs_digits: int = 2) -> pd.DataFrame:
         return pd.DataFrame(columns=["hs2", "ym", "input_cost"])
     d = cx.copy()
     d["ym"] = as_ts_series(d["ym"])
-    d["hs2"] = d["hs"].astype(str).str.zfill(6).str[:hs_digits]
+    d["hs2"] = d["hs"].astype(str).str.slice(0, hs_digits)
     has_imp = ("imp_usd" in d.columns) and ("imp_wgt" in d.columns) and \
               (pd.to_numeric(d["imp_wgt"], errors="coerce").fillna(0) > 0).any()
     if has_imp:
@@ -9449,7 +9533,7 @@ def customs_a2_residual(hsm: pd.DataFrame, cost: pd.DataFrame,
     if hsm is None or not len(hsm):
         return empty
     d = hsm.copy()
-    d["hs2"] = d["hs"].astype(str).str.zfill(6).str[:2]
+    d["hs2"] = d["hs"].astype(str).str.slice(0, 2)
     if cost is not None and len(cost):
         d = d.merge(cost, on=["hs2", "ym"], how="left")
     else:
@@ -9488,8 +9572,11 @@ def customs_a2_residual(hsm: pd.DataFrame, cost: pd.DataFrame,
     # a2 = mean(ε[t-5:t]) / std(ε)   — 표준편차는 그 HS 의 전체 잔차 산포
     # ★ rolling(axis=1) 은 pandas 2 에서 폐기되고 3 에서 제거됐다. 전치해서 축을 세운다.
     mean_r = (R.T.rolling(recent, min_periods=max(2, recent // 2)).mean()).T
-    sd = R.std(axis=1, skipna=True).replace(0.0, np.nan)
-    a2 = mean_r.div(sd, axis=0)
+    # ★ 분모를 '전체 표본 잔차 표준편차'로 쓰면 **미래 잔차가 오늘의 a2 를 스케일링**한다.
+    #   같은 잔차라도 훗날 변동성이 커질 HS 는 오늘 a2 가 작아진다 — 명백한 미래누수다.
+    #   시점 t 까지만 쓰는 확장 표준편차로 바꾼다(최소 12개월 확보 후부터 산출).
+    sd_exp = (R.T.expanding(min_periods=12).std()).T.replace(0.0, np.nan)
+    a2 = mean_r.div(sd_exp)
 
     beta = rolling_ols_beta_last(y, X, window=window)        # (N, 3) — 진단카드용 β
     # 두 프레임은 index/columns 가 동일하므로 stack 순서가 일치한다.
@@ -9533,7 +9620,19 @@ def customs_a_sensors(cx: pd.DataFrame) -> pd.DataFrame:
     cost = customs_input_cost(cx)
     a2 = customs_a2_residual(hsm, cost)
 
-    d = hsm.sort_values(["hs", "ym"]).copy()
+    # ★ shift(12)/rolling(12) 는 **행 위치** 기준이다. 통관은 그 달 선적이 없으면 행 자체가
+    #   없으므로, 결측월이 있는 HS 에서는 '12행 전'이 12개월 전이 아니다(예: 2년 전).
+    #   a2 는 피벗으로 균일 격자를 만들어 이 함정을 피하는데 a1/a3/a4/a5 는 그대로였다.
+    #   → 여기서 (hs × 전체월) 완전격자로 펴서 위치=시간이 되도록 만든다.
+    _yms = pd.DatetimeIndex(sorted(pd.unique(as_ts_series(hsm["ym"]).dropna())))
+    _hss = pd.Index(sorted(hsm["hs"].astype(str).unique()), name="hs")
+    _grid = pd.MultiIndex.from_product([_hss, _yms], names=["hs", "ym"]).to_frame(index=False)
+    d = _grid.merge(hsm.assign(hs=hsm["hs"].astype(str)), on=["hs", "ym"], how="left")
+    d = d.sort_values(["hs", "ym"]).reset_index(drop=True)
+    # 선적이 없던 달은 물량 0 이 사실이다(누계·신규세번 판정의 전제).
+    for _c in ("wgt", "usd"):
+        if _c in d.columns:
+            d[_c] = pd.to_numeric(d[_c], errors="coerce").fillna(0.0)
     g = d.groupby("hs", observed=True, sort=False)
 
     # a1: 12개월 누계 중량의 전년동기 대비 로그차. 계절성과 단월 노이즈를 함께 죽인다.
@@ -9553,8 +9652,11 @@ def customs_a_sensors(cx: pd.DataFrame) -> pd.DataFrame:
     g = d.groupby("hs", observed=True, sort=False)
     d["_streak"] = g["_active"].transform(
         lambda s: s.rolling(A5_STREAK, min_periods=A5_STREAK).sum())
-    prior = g["wgt"].transform(lambda s: s.shift(A5_STREAK).rolling(12, min_periods=6).sum())
-    onset = (d["_streak"] >= A5_STREAK) & (~(prior > 0))
+    # ★ min_periods 로 느슨하게 두면 패널 앞 구간에서 prior 가 NaN 이고 `~(prior>0)` 가 True 라
+    #   **오래된 HS 가 전부 '신규 세번'으로 발화**한다. 12개월 이력이 실제로 관측된 경우에만
+    #   판정한다(이력을 모르면 '신규'라고 주장하지 않는다).
+    prior = g["wgt"].transform(lambda s: s.shift(A5_STREAK).rolling(12, min_periods=12).sum())
+    onset = (d["_streak"] >= A5_STREAK) & prior.notna() & (~(prior > 0))
     # 지수감쇠 더미: 발화 시점부터 12개월간 감쇠하며 남는다.
     lam = 0.5 ** (1.0 / max(A5_DECAY_HALFLIFE, 1e-9))
     d["a5"] = _decay_dummy(onset.to_numpy(), d["hs"].to_numpy(), lam, horizon=12)
@@ -9997,7 +10099,7 @@ def make_cells(P: pd.DataFrame) -> pd.DataFrame:
         d["hs_group"] = "NA"
     else:
         # HS 2자리(章)를 군으로 쓴다. 6자리는 셀이 종목 1개로 쪼개져 랭크가 의미를 잃는다.
-        d["hs_group"] = hs_main.astype(str).str.zfill(6).str[:2].fillna("NA")
+        d["hs_group"] = hs_main.astype(str).str.slice(0, 2).replace("", "NA").fillna("NA")
     mc = pd.to_numeric(d.get("mcap"), errors="coerce")
     if mc.notna().sum() == 0:
         mc = pd.to_numeric(d.get("adtv20"), errors="coerce")
@@ -10230,12 +10332,35 @@ def compose_signal(P: pd.DataFrame, tps: "Sequence[str]", uaxes: "Sequence[str]"
                (d["breadth_ok"] > 0) & d["E"].notna()
     Emask = d["E"].where(eligible)
     Umask = d["U"].where(eligible)
-    d["E_rank"] = Emask.groupby(key, observed=True).rank(pct=True)
-    d["U_rank"] = Umask.groupby(key, observed=True).rank(pct=True)
-    # U 를 통째로 못 구한 구간에서는 U 를 중립(0.5)으로 두되 그 사실을 표에 남긴다.
-    u_missing = d["U_rank"].isna() & d["E_rank"].notna()
-    d["U_rank"] = d["U_rank"].fillna(0.5)
-    d["u_imputed"] = u_missing.astype(float)
+
+    # ★ 활성축 조합별 분리 랭크의 함정: 조합이 잘게 쪼개지면 **그 달 그 조합에 한 종목**만
+    #   남는 일이 생기고, rank(pct=True) 는 1.0 을 준다. 정보가 가장 적은 종목이 만점을 받고
+    #   매달 편입되는 구조다. 표본이 부족한 조합은 그 달 전체(ym) 랭크로 폴백한다.
+    grp_n = Emask.groupby(key, observed=True).transform("count")
+    key_fb = d["ym"].astype(str)
+    e_fine = Emask.groupby(key, observed=True).rank(pct=True)
+    u_fine = Umask.groupby(key, observed=True).rank(pct=True)
+    e_coarse = Emask.groupby(key_fb, observed=True).rank(pct=True)
+    u_coarse = Umask.groupby(key_fb, observed=True).rank(pct=True)
+    small = grp_n < CELL_MIN_N
+    d["E_rank"] = e_fine.where(~small, e_coarse)
+    d["U_rank"] = u_fine.where(~small, u_coarse)
+    d["rank_fallback"] = small.astype(float)
+
+    # ★ U 결측 처리 — 사양 §8.2 는 "결측 축은 제외 평균, 0으로 채우지 말 것" 이다.
+    #   종목별로 0.5 를 채우면 D축 데이터가 **없는** 종목이 D축이 나쁜 종목을 이겨 버린다.
+    #   구분해서 처리한다:
+    #     · U 를 아무도 못 구한 구간(축 자체가 비활성) → U 를 곱셈 항등원 1.0 으로 두고 명시
+    #     · 일부만 결측 → 그 종목은 비교 불가이므로 결측 유지(그 달 후보에서 빠진다)
+    u_any = bool(Umask.notna().any())
+    if not u_any:
+        d["U_rank"] = 1.0
+        d["u_imputed"] = 1.0
+        LOG.warn("U축(미반영도)을 한 종목도 산출하지 못했습니다 — Signal 을 E 단독으로 냅니다. "
+                 "0.5 로 채우지 않습니다(그러면 '데이터 없음'이 '보통'으로 둔갑합니다). "
+                 "d1 은 net_income_ttm·mcap, d2/d4 는 리포트 원장, d3 는 수급이 필요합니다.")
+    else:
+        d["u_imputed"] = (d["U_rank"].isna() & d["E_rank"].notna()).astype(float)
 
     d["Signal"] = (d["E_rank"] * d["U_rank"]).where(eligible)
     d["Signal_rank"] = d["Signal"].groupby(d["ym"], observed=True).rank(pct=True)
@@ -10474,12 +10599,16 @@ def RX3_orthogonal(P: pd.DataFrame, bt: dict) -> None:
     X = np.column_stack([np.ones(len(y))] + [np.nan_to_num(v) for v in facs.values()])
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
     resid = y - X @ beta
-    t, p = hac_tstat(resid)
-    ok = np.isfinite(p) and p < 0.10 and np.nanmean(resid) > 0
+    # ★ hac_tstat 는 (평균, t통계량) 을 돌려준다. (t, p) 로 받으면 t 자리에 '평균'이,
+    #   p 자리에 't값'이 들어가 p<0.10 비교가 't값<0.10' 이 된다 — 판정이 통째로 뒤집힌다.
+    mu_r, t_r = hac_tstat(resid)
+    # 양측 정규근사 p값 (statsmodels 없이도 성립)
+    p_r = float(math.erfc(abs(t_r) / math.sqrt(2.0))) if np.isfinite(t_r) else float("nan")
+    ok = np.isfinite(p_r) and p_r < 0.10 and mu_r > 0
     _rx("R3", "퀄리티 팩터 직교화", "PASS" if ok else "FAIL",
-        f"직교화 후 잔차 알파 월 {np.nanmean(resid)*100:.3f}% (t={t:.2f}, p={p:.3f}) "
+        f"직교화 후 잔차 알파 월 {mu_r*100:.3f}% (t={t_r:.2f}, p={p_r:.3f}) "
         f"· 통제 {list(facs)}",
-        metric=f"t={t:.2f}", kill=True)
+        metric=f"t={t_r:.2f}", kill=True)
 
 
 def RX4_placebo(gate3: dict) -> None:
@@ -11478,7 +11607,15 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     a_corp = map_hs_to_corp(a_hs, mapping, months)
     PIPE.io("OUT", "MEM", "A축 종목센서", a_corp)
     if len(a_corp):
-        P = P.merge(a_corp, on=["code", "ym"], how="left")
+        # ★★ C18 지연을 반드시 통과시킨다 ★★
+        #   센서는 '귀속월' 격자에서 산출되지만, 그 달 실적은 **익월 중순에야 공표**된다.
+        #   귀속월에 직결하면 2018-03 통관을 2018-04-02 시가에 매수하는 셈이 되어
+        #   2주 앞을 보는 미래누수가 된다. assert_c1 은 knowledge_date 컬럼이 없는 소스는
+        #   검사조차 못 하므로 조용히 통과한다 — 그래서 반드시 PIT 결합으로 보낸다.
+        a_pit = a_corp.copy()
+        a_pit["knowledge_date"] = customs_knowledge_date(a_pit["ym"])
+        a_pit = a_pit.drop(columns=["ym"])
+        P = build_pit_panel(P, {"axisA": a_pit}, by="code", left_time="month")
     else:
         for c in ("a1", "a2", "a3", "a4", "a5", "x_wgt", "x_usd", "a2_beta",
                   "hs_main", "hs_n"):
@@ -11552,10 +11689,20 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
         except Exception as e:                                          # noqa
             LOG.warn(f"네이버 수급 폴백 실패({type(e).__name__}) — d3 비활성화(0 채움 금지).")
             flows = None
-    d = d_sensors(P[["code", "ym", "close"]], fin_m, flows, cov)
+    _dcols = ["code", "ym", "close"] + (["mcap"] if "mcap" in P.columns else [])
+    d = d_sensors(P[_dcols], fin_m, flows, cov)
     P = P.merge(d.drop(columns=["close"], errors="ignore"), on=["code", "ym"], how="left")
     if len(cov):
         P = P.merge(cov, on=["code", "ym"], how="left")
+        # ★ 커버리지 패널에는 '리포트가 하나라도 있는' 종목월만 행이 생긴다.
+        #   그래서 무커버리지 종목은 n_analyst 가 결측이 되는데, 사양상 d2 = -(커버리지 수) 이고
+        #   **무커버리지일수록 좋다**. 결측으로 두면 이 전략이 노리는 바로 그 집단이
+        #   D축에서 통째로 빠진다(정확히 반대 방향의 실수).
+        #   원장이 비어 있지 않다면 '리포트 없음'은 관측된 0 이므로 0 으로 채운다.
+        P["n_analyst"] = pd.to_numeric(P.get("n_analyst"), errors="coerce").fillna(0.0)
+        P["coverage_init"] = pd.to_numeric(P.get("coverage_init"), errors="coerce").fillna(0.0)
+        P["d2"] = -P["n_analyst"]
+        P["d4"] = P["coverage_init"]
 
     # ── 거부권 입력
     dil = build_dilution_flags(dis, months)
@@ -11564,12 +11711,28 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     wf = build_watch_flags(dis, months, sec)
     if len(wf):
         P = P.merge(wf, on=["code", "ym"], how="left")
-    P["watch_flag"] = np.maximum(pd.to_numeric(P.get("watch_flag"), errors="coerce").fillna(0),
-                                 pd.to_numeric(P.get("impaired"), errors="coerce").fillna(0))
-    P["theta_x_chg"] = pd.to_numeric(P.get("theta_x"), errors="coerce") - \
-        pd.to_numeric(P.get("theta_x"), errors="coerce").groupby(
-            P["code"], observed=True).shift(12)
-    P["map_gate_fail"] = pd.to_numeric(P.get("map_gate_fail"), errors="coerce").fillna(0.0)
+    # ★ P.get(없는컬럼) 은 None 을 돌려주고 pd.to_numeric(None) 은 **스칼라**가 된다.
+    #   .fillna() 를 부르는 순간 AttributeError 로 L2.PANEL 이 통째로 죽는다.
+    #   '해당 공시를 하나도 못 찾은 경우'가 문서상 정상 경로이므로 반드시 방어한다.
+    def _pcol(name: str) -> pd.Series:
+        if name in P.columns:
+            return pd.to_numeric(P[name], errors="coerce")
+        return pd.Series(np.nan, index=P.index, dtype="float64")
+
+    P["watch_flag"] = np.maximum(_pcol("watch_flag").fillna(0), _pcol("impaired").fillna(0))
+    _th = _pcol("theta_x")
+    P["theta_x_chg"] = _th - _th.groupby(P["code"], observed=True).shift(12)
+    # 매핑 게이트 실패 플래그는 매핑표에서 종목 단위로 들어온다(없으면 0 = 통과).
+    if "map_gate_fail" not in P.columns:
+        gf = (mapping[["code", "map_gate_fail"]].drop_duplicates("code")
+              if mapping is not None and "map_gate_fail" in getattr(mapping, "columns", [])
+              else None)
+        if gf is not None and len(gf):
+            P = P.merge(gf, on="code", how="left")
+    P["map_gate_fail"] = _pcol("map_gate_fail").fillna(0.0)
+    for _v in ("dilution_90d", "subsidy_ratio_chg", "oversea_rev_chg"):
+        if _v not in P.columns:
+            P[_v] = np.nan
 
     # ── 유니버스 플래그: 매핑된 종목 ∧ 상장 ∧ 시즈닝 (§5.1 — 매핑이 곧 유니버스)
     mapped = set(mapping["code"].astype(str)) if mapping is not None and len(mapping) else set()
@@ -11661,6 +11824,23 @@ def main_xcb() -> int:
                else build_security_master_nokrx())
         attrition("전체 상장(생존+폐지)", sec["code"].nunique(), "C2 상장폐지 포함")
         surv = audit_survivorship(sec, months, phase="pre")
+        # ★ KSIC 업종코드는 큐레이션(HS→상장사)의 유일한 연결고리다. 반드시 여기서 확보한다.
+        #   종목 마스터는 자유텍스트 업종명만 주고 KSIC 코드는 주지 않는다.
+        corpmap = fetch_dart_corpcode()
+        code_of = (dict(zip(corpmap["corp_code"].astype(str), corpmap["code"].astype(str)))
+                   if corpmap is not None and len(corpmap) else {})
+        if code_of:
+            ind = fetch_dart_industry(sorted(code_of), code_of)
+            if len(ind):
+                sec = sec.merge(ind[["code", "induty_code"]].drop_duplicates("code"),
+                                on="code", how="left")
+        if "induty_code" not in sec.columns:
+            sec["induty_code"] = ""
+        _cov_ksic = float((sec["induty_code"].astype(str).str.len() > 0).mean())
+        if _cov_ksic < 0.30:
+            LOG.error(f"KSIC 업종코드 확보율 {_cov_ksic*100:.0f}% — HS↔상장사 매핑이 사실상 "
+                      f"불가능합니다. 채택 HS 가 0개가 되어 유니버스가 비게 됩니다. "
+                      f"DART_API_KEY 를 먼저 확인하세요.")
 
     with PIPE.stage("L1.PRICE", "가격 · 시가총액", "L1", budget_s=2400), \
             Stage("M0.price", 25.0):
@@ -11706,9 +11886,6 @@ def main_xcb() -> int:
     # ── [3] DART · 리서치 ────────────────────────────────────────────────────────────────
     with PIPE.stage("L1.DART", "DART 재무 · 직원 · 공시", "L1", budget_s=3000), \
             Stage("M0.dart", 30.0):
-        corpmap = fetch_dart_corpcode()
-        code_of = dict(zip(corpmap["corp_code"].astype(str), corpmap["code"].astype(str))) \
-            if corpmap is not None and len(corpmap) else {}
         years = list(range(pd.Timestamp(BACKTEST_START).year - 1,
                            pd.Timestamp(BACKTEST_END).year + 1))
         raw = fetch_dart_bulk(years, list(REPRT_CODES.values()))
@@ -11728,11 +11905,22 @@ def main_xcb() -> int:
             analysts = foreign_analysts(FOREIGN)
         if RESEARCH_COLLECT and RUN_MODE == "FULL" and len(reports) < 5000:
             try:
-                fresh = fetch_research_all(BACKTEST_START, BACKTEST_END)
-                if fresh is not None and len(fresh):
-                    reports = merge_report_ledger(reports, fresh)
+                frames = [reports] if len(reports) else []
+                if "hankyung" in RESEARCH_SOURCES:
+                    frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+                if "naver" in RESEARCH_SOURCES:
+                    frames.append(naver_collect(BACKTEST_START, BACKTEST_END))
+                frames = [f for f in frames if f is not None and len(f)]
+                if frames:
+                    reports = build_report_master(frames, sec)
             except Exception as e:                                      # noqa
                 LOG.warn(f"리서치 신규 수집 실패({type(e).__name__}) — 캐시분만 사용합니다.")
+        if len(reports):
+            try:
+                analysts, _link = build_analyst_ledger(reports)
+                audit_linkage(reports, analysts, _link)
+            except Exception as e:                                      # noqa
+                LOG.warn(f"애널리스트 원장 구축 실패({type(e).__name__}) — d2 정밀도가 낮아집니다.")
 
     # ── [4] 매핑 게이트 ──────────────────────────────────────────────────────────────────
     with PIPE.stage("L2.MAP", "매핑표 + 4중 게이트", "L2", budget_s=1200), \

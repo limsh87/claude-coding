@@ -156,6 +156,35 @@ def check_undefined(tree: ast.AST) -> list[str]:
                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
                     if n.id not in defined:
                         errs.append(f"{n.id}  (줄 {n.lineno})")
+
+    # 3패스: **함수 본문에서 호출되는 전역 이름**도 검사한다.
+    #   ★ 2패스만으로는 부족하다. `Path.home()` 이나 `fetch_research_all(...)` 처럼
+    #     함수 안에서만 쓰이는 미정의 이름은 조립·문법 검사를 전부 통과하고
+    #     **수집을 두 시간 한 뒤 NameError** 로 죽는다. 실제로 그런 결함을 세 개 만들었다.
+    #   지역 변수와 구분하기 위해 각 함수의 지역 바인딩을 따로 모아 제외한다.
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        local: set[str] = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                local.add(n.id)
+            elif isinstance(n, ast.arg):
+                local.add(n.arg)
+            elif isinstance(n, ast.alias):
+                local.add((n.asname or n.name).split(".")[0])
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                local.add(n.name)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                local.add(n.name)
+            elif isinstance(n, (ast.comprehension,)):
+                for t2 in ast.walk(n.target):
+                    if isinstance(t2, ast.Name):
+                        local.add(t2.id)
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                if n.id not in defined and n.id not in local:
+                    errs.append(f"{n.id}  (함수 {node.name} 내부, 줄 {n.lineno})")
     return sorted(set(errs))
 
 

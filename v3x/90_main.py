@@ -50,7 +50,15 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     a_corp = map_hs_to_corp(a_hs, mapping, months)
     PIPE.io("OUT", "MEM", "A축 종목센서", a_corp)
     if len(a_corp):
-        P = P.merge(a_corp, on=["code", "ym"], how="left")
+        # ★★ C18 지연을 반드시 통과시킨다 ★★
+        #   센서는 '귀속월' 격자에서 산출되지만, 그 달 실적은 **익월 중순에야 공표**된다.
+        #   귀속월에 직결하면 2018-03 통관을 2018-04-02 시가에 매수하는 셈이 되어
+        #   2주 앞을 보는 미래누수가 된다. assert_c1 은 knowledge_date 컬럼이 없는 소스는
+        #   검사조차 못 하므로 조용히 통과한다 — 그래서 반드시 PIT 결합으로 보낸다.
+        a_pit = a_corp.copy()
+        a_pit["knowledge_date"] = customs_knowledge_date(a_pit["ym"])
+        a_pit = a_pit.drop(columns=["ym"])
+        P = build_pit_panel(P, {"axisA": a_pit}, by="code", left_time="month")
     else:
         for c in ("a1", "a2", "a3", "a4", "a5", "x_wgt", "x_usd", "a2_beta",
                   "hs_main", "hs_n"):
@@ -124,10 +132,20 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
         except Exception as e:                                          # noqa
             LOG.warn(f"네이버 수급 폴백 실패({type(e).__name__}) — d3 비활성화(0 채움 금지).")
             flows = None
-    d = d_sensors(P[["code", "ym", "close"]], fin_m, flows, cov)
+    _dcols = ["code", "ym", "close"] + (["mcap"] if "mcap" in P.columns else [])
+    d = d_sensors(P[_dcols], fin_m, flows, cov)
     P = P.merge(d.drop(columns=["close"], errors="ignore"), on=["code", "ym"], how="left")
     if len(cov):
         P = P.merge(cov, on=["code", "ym"], how="left")
+        # ★ 커버리지 패널에는 '리포트가 하나라도 있는' 종목월만 행이 생긴다.
+        #   그래서 무커버리지 종목은 n_analyst 가 결측이 되는데, 사양상 d2 = -(커버리지 수) 이고
+        #   **무커버리지일수록 좋다**. 결측으로 두면 이 전략이 노리는 바로 그 집단이
+        #   D축에서 통째로 빠진다(정확히 반대 방향의 실수).
+        #   원장이 비어 있지 않다면 '리포트 없음'은 관측된 0 이므로 0 으로 채운다.
+        P["n_analyst"] = pd.to_numeric(P.get("n_analyst"), errors="coerce").fillna(0.0)
+        P["coverage_init"] = pd.to_numeric(P.get("coverage_init"), errors="coerce").fillna(0.0)
+        P["d2"] = -P["n_analyst"]
+        P["d4"] = P["coverage_init"]
 
     # ── 거부권 입력
     dil = build_dilution_flags(dis, months)
@@ -136,12 +154,28 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
     wf = build_watch_flags(dis, months, sec)
     if len(wf):
         P = P.merge(wf, on=["code", "ym"], how="left")
-    P["watch_flag"] = np.maximum(pd.to_numeric(P.get("watch_flag"), errors="coerce").fillna(0),
-                                 pd.to_numeric(P.get("impaired"), errors="coerce").fillna(0))
-    P["theta_x_chg"] = pd.to_numeric(P.get("theta_x"), errors="coerce") - \
-        pd.to_numeric(P.get("theta_x"), errors="coerce").groupby(
-            P["code"], observed=True).shift(12)
-    P["map_gate_fail"] = pd.to_numeric(P.get("map_gate_fail"), errors="coerce").fillna(0.0)
+    # ★ P.get(없는컬럼) 은 None 을 돌려주고 pd.to_numeric(None) 은 **스칼라**가 된다.
+    #   .fillna() 를 부르는 순간 AttributeError 로 L2.PANEL 이 통째로 죽는다.
+    #   '해당 공시를 하나도 못 찾은 경우'가 문서상 정상 경로이므로 반드시 방어한다.
+    def _pcol(name: str) -> pd.Series:
+        if name in P.columns:
+            return pd.to_numeric(P[name], errors="coerce")
+        return pd.Series(np.nan, index=P.index, dtype="float64")
+
+    P["watch_flag"] = np.maximum(_pcol("watch_flag").fillna(0), _pcol("impaired").fillna(0))
+    _th = _pcol("theta_x")
+    P["theta_x_chg"] = _th - _th.groupby(P["code"], observed=True).shift(12)
+    # 매핑 게이트 실패 플래그는 매핑표에서 종목 단위로 들어온다(없으면 0 = 통과).
+    if "map_gate_fail" not in P.columns:
+        gf = (mapping[["code", "map_gate_fail"]].drop_duplicates("code")
+              if mapping is not None and "map_gate_fail" in getattr(mapping, "columns", [])
+              else None)
+        if gf is not None and len(gf):
+            P = P.merge(gf, on="code", how="left")
+    P["map_gate_fail"] = _pcol("map_gate_fail").fillna(0.0)
+    for _v in ("dilution_90d", "subsidy_ratio_chg", "oversea_rev_chg"):
+        if _v not in P.columns:
+            P[_v] = np.nan
 
     # ── 유니버스 플래그: 매핑된 종목 ∧ 상장 ∧ 시즈닝 (§5.1 — 매핑이 곧 유니버스)
     mapped = set(mapping["code"].astype(str)) if mapping is not None and len(mapping) else set()
@@ -233,6 +267,23 @@ def main_xcb() -> int:
                else build_security_master_nokrx())
         attrition("전체 상장(생존+폐지)", sec["code"].nunique(), "C2 상장폐지 포함")
         surv = audit_survivorship(sec, months, phase="pre")
+        # ★ KSIC 업종코드는 큐레이션(HS→상장사)의 유일한 연결고리다. 반드시 여기서 확보한다.
+        #   종목 마스터는 자유텍스트 업종명만 주고 KSIC 코드는 주지 않는다.
+        corpmap = fetch_dart_corpcode()
+        code_of = (dict(zip(corpmap["corp_code"].astype(str), corpmap["code"].astype(str)))
+                   if corpmap is not None and len(corpmap) else {})
+        if code_of:
+            ind = fetch_dart_industry(sorted(code_of), code_of)
+            if len(ind):
+                sec = sec.merge(ind[["code", "induty_code"]].drop_duplicates("code"),
+                                on="code", how="left")
+        if "induty_code" not in sec.columns:
+            sec["induty_code"] = ""
+        _cov_ksic = float((sec["induty_code"].astype(str).str.len() > 0).mean())
+        if _cov_ksic < 0.30:
+            LOG.error(f"KSIC 업종코드 확보율 {_cov_ksic*100:.0f}% — HS↔상장사 매핑이 사실상 "
+                      f"불가능합니다. 채택 HS 가 0개가 되어 유니버스가 비게 됩니다. "
+                      f"DART_API_KEY 를 먼저 확인하세요.")
 
     with PIPE.stage("L1.PRICE", "가격 · 시가총액", "L1", budget_s=2400), \
             Stage("M0.price", 25.0):
@@ -278,9 +329,6 @@ def main_xcb() -> int:
     # ── [3] DART · 리서치 ────────────────────────────────────────────────────────────────
     with PIPE.stage("L1.DART", "DART 재무 · 직원 · 공시", "L1", budget_s=3000), \
             Stage("M0.dart", 30.0):
-        corpmap = fetch_dart_corpcode()
-        code_of = dict(zip(corpmap["corp_code"].astype(str), corpmap["code"].astype(str))) \
-            if corpmap is not None and len(corpmap) else {}
         years = list(range(pd.Timestamp(BACKTEST_START).year - 1,
                            pd.Timestamp(BACKTEST_END).year + 1))
         raw = fetch_dart_bulk(years, list(REPRT_CODES.values()))
@@ -300,11 +348,22 @@ def main_xcb() -> int:
             analysts = foreign_analysts(FOREIGN)
         if RESEARCH_COLLECT and RUN_MODE == "FULL" and len(reports) < 5000:
             try:
-                fresh = fetch_research_all(BACKTEST_START, BACKTEST_END)
-                if fresh is not None and len(fresh):
-                    reports = merge_report_ledger(reports, fresh)
+                frames = [reports] if len(reports) else []
+                if "hankyung" in RESEARCH_SOURCES:
+                    frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+                if "naver" in RESEARCH_SOURCES:
+                    frames.append(naver_collect(BACKTEST_START, BACKTEST_END))
+                frames = [f for f in frames if f is not None and len(f)]
+                if frames:
+                    reports = build_report_master(frames, sec)
             except Exception as e:                                      # noqa
                 LOG.warn(f"리서치 신규 수집 실패({type(e).__name__}) — 캐시분만 사용합니다.")
+        if len(reports):
+            try:
+                analysts, _link = build_analyst_ledger(reports)
+                audit_linkage(reports, analysts, _link)
+            except Exception as e:                                      # noqa
+                LOG.warn(f"애널리스트 원장 구축 실패({type(e).__name__}) — d2 정밀도가 낮아집니다.")
 
     # ── [4] 매핑 게이트 ──────────────────────────────────────────────────────────────────
     with PIPE.stage("L2.MAP", "매핑표 + 4중 게이트", "L2", budget_s=1200), \

@@ -92,14 +92,26 @@ def curate_hs_universe(cx: pd.DataFrame, sec: pd.DataFrame, conc: pd.DataFrame,
                    f"— 성과를 보고 이 파일을 고치지 마세요(§15.2).")
             return pre
         except Exception as e:                                          # noqa
-            LOG.warn(f"사전등록 파일을 읽지 못했습니다({type(e).__name__}) — 새로 생성합니다.")
+            # ★ 읽기 실패는 '파일이 잘못됐다'는 뜻이 아니라 인코딩·pandas 버전 문제일 수 있다.
+            #   그대로 덮어쓰면 사전등록의 존재 이유(사후 변경 방지)가 무너진다. 백업부터 한다.
+            bak = prereg_path + f".unreadable.{_dt.datetime.now():%Y%m%d_%H%M%S}"
+            try:
+                shutil.copy2(prereg_path, bak)
+                LOG.warn(f"사전등록 파일을 읽지 못했습니다({type(e).__name__}) — "
+                         f"{os.path.basename(bak)} 로 보존한 뒤 새로 생성합니다.")
+            except Exception:                                           # noqa
+                LOG.error(f"사전등록 파일을 읽지도 백업하지도 못했습니다({type(e).__name__}). "
+                          f"덮어쓰지 않고 이번 실행에서만 임시 목록을 씁니다.")
+                prereg_path = prereg_path + f".tmp{_dt.datetime.now():%H%M%S}"
 
     if cx is None or not len(cx):
         return pd.DataFrame(columns=["hs", "n_firms", "months", "cv_dest", "adopted", "reason"])
 
     d = cx.copy()
-    d["hs"] = d["hs"].astype(str).str.zfill(max(digits, 6))
-    d["hs_k"] = d["hs"].str[:digits]
+    d["hs"] = d["hs"].astype(str)
+    # ★ HS 는 **좌측 정렬 계층코드**다. zfill 은 왼쪽을 채워 "85"→"000085" 로 만들고
+    #   그러면 章이 "00" 이 되어 매핑이 통째로 0건이 된다. 절대 zfill 하지 않는다.
+    d["hs_k"] = d["hs"].str.slice(0, digits)
 
     # 관측 개월수 — 롤링 36M OLS 가 돌 수 있어야 한다.
     obs = d.groupby("hs_k", observed=True)["ym"].nunique().rename("months").reset_index()
@@ -227,7 +239,8 @@ def gate1_coverage(mapping: pd.DataFrame, cx: pd.DataFrame, fin: pd.DataFrame,
     hs_year = c.groupby(["hs", "year"], observed=True)["exp_usd"].sum().reset_index()
 
     f = fin.copy()
-    f["year"] = as_ts_series(f["period"]).dt.year
+    # tidy_financials 는 'period_end' 를 낸다. 'period' 는 존재하지 않는다(KeyError).
+    f["year"] = as_ts_series(f["period_end"]).dt.year
     fy = f.groupby(["code", "year"], observed=True)["export_rev_sep"].max().reset_index()
 
     j = mapping[["code", "hs", "weight"]].merge(fy, on="code", how="inner")
@@ -328,7 +341,7 @@ def gate3_placebo(mapping: pd.DataFrame, a_hs: pd.DataFrame, fin: pd.DataFrame,
     Hm = hs_y.pivot_table(index="hs", columns="year", values="a1")
     # 종목 × 연도 매출 증가율 행렬
     F = fin.copy()
-    F["year"] = as_ts_series(F["period"]).dt.year
+    F["year"] = as_ts_series(F["period_end"]).dt.year
     fy = F.groupby(["code", "year"], observed=True)["b1"].mean().reset_index() \
         if "b1" in F.columns else None
     if fy is None or not len(fy):
@@ -383,7 +396,10 @@ def gate3_placebo(mapping: pd.DataFrame, a_hs: pd.DataFrame, fin: pd.DataFrame,
     rng = np.random.default_rng(seed)
     null = np.empty(n_shuffle, dtype=float)
     for i in range(n_shuffle):
-        null[i] = _fit(rng.integers(0, n_h, size=len(cols_)))
+        # ★ rng.integers 는 **복원추출**이라 '한 HS 에 몰림'이 실제 매핑보다 흔해지고
+        #   귀무분포가 왜곡된다. 실제 배정을 **순열**하면 어느 HS 가 몇 번 쓰였는지(주변분포)를
+        #   보존한 채 '누가 어디에 붙었는가'만 무작위가 된다 — 검정하려는 게 정확히 그것이다.
+        null[i] = _fit(rng.permutation(cols_))
     null = null[np.isfinite(null)]
     if not np.isfinite(real) or not len(null):
         out["detail"] = "적합도 산출 불가 — 판정 유보"
@@ -429,8 +445,12 @@ def apply_mapping_gates(mapping: pd.DataFrame, cx: pd.DataFrame, fin: pd.DataFra
     m["gate3"] = int(g3.get("pass", 1))
     m["map_gate_fail"] = (1 - (m["gate1"] * m["gate2"] * m["gate3"])).clip(0, 1)
 
-    kept = m[m["map_gate_fail"] == 0].copy()
-    n1 = kept["code"].nunique()
+    # ★ 실패분을 **삭제하지 않는다.** 사양 §9 의 V12 는 '전면 제외'가 아니라 'A축 무효화'다.
+    #   지워 버리면 그 종목은 B·C축 신호까지 잃고 유니버스에서 사라져 표본이 이중으로 줄고,
+    #   V12 는 발동할 대상이 없어 구조적으로 죽은 거부권이 된다.
+    #   플래그만 실어 보내고 실제 무효화는 disable_axes 가 한다.
+    kept = m.copy()
+    n1 = int(m.loc[m["map_gate_fail"] == 0, "code"].nunique())
     info = {"n_before": int(n0), "n_after": int(n1), "gate3": g3,
             "g1_pass": int(g1["gate1"].sum()) if len(g1) else 0,
             "g1_total": int(len(g1)),

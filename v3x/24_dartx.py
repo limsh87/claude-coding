@@ -226,6 +226,56 @@ def build_subsidy_signal(fin: pd.DataFrame) -> pd.DataFrame:
     return d[cols]
 
 
+def fetch_dart_industry(corp_codes: "Sequence[str]", code_of: "Dict[str, str]") -> pd.DataFrame:
+    """DART 기업개황에서 **KSIC 표준산업분류코드(induty_code)** 를 가져온다.
+
+    ★ 이게 없으면 HS↔KSIC 연계표를 상장사에 붙일 수가 없다. 종목 마스터(FDR/KIND)는
+      자유 텍스트 업종명만 주고 KSIC 코드는 주지 않는다. 예전에는 sec.get("induty_code")
+      가 조용히 빈 값을 돌려줘서 **후보 상장사 수가 전부 0 → 채택 HS 0개 → 매핑 0건 →
+      유니버스 0** 이 되고도 예외가 나지 않았다.
+
+    응답 예: {"status":"000", "corp_code":"00126380", "induty_code":"264", ...}  (3자리 KSIC)
+    """
+    cols = ["code", "corp_code", "induty_code"]
+    if not DART_API_KEY:
+        LOG.warn("DART 키가 없어 KSIC(induty_code)를 가져올 수 없습니다 — "
+                 "HS↔상장사 매핑이 불가능해집니다.")
+        return pd.DataFrame(columns=cols)
+    cached = VAULT.get_table("dart_company_industry", scope="shared")
+    done: set = set()
+    if cached is not None and len(cached):
+        done = set(cached["corp_code"].astype(str))
+        LOG.info(f"공용 캐시에서 KSIC 업종코드 {len(cached):,}건 재사용")
+    todo = [str(c) for c in dict.fromkeys(corp_codes) if str(c) not in done]
+    if RUN_MODE == "CACHED":
+        todo = []
+
+    def _one(cc: str):
+        js = dart_api("company.json", {"corp_code": cc})
+        if not js or str(js.get("status")) != "000":
+            return None
+        ind = str(js.get("induty_code") or "").strip()
+        if not ind:
+            return None
+        return {"code": code_of.get(cc) or to_code6(js.get("stock_code")),
+                "corp_code": cc, "induty_code": ind}
+
+    got = []
+    if todo:
+        got = [r for r in pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8),
+                                  desc="DART 업종코드(KSIC)") if r]
+    frames = [f for f in (cached, pd.DataFrame(got) if got else None)
+              if f is not None and len(f)]
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    out = pd.concat(frames, ignore_index=True).drop_duplicates("corp_code", keep="last")
+    out = out[out["code"].notna()]
+    if got:
+        VAULT.put_table("dart_company_industry", out, scope="shared", source="DART company.json")
+    LOG.ok(f"KSIC 업종코드 {len(out):,}종목 확보 (중분류 {out['induty_code'].str[:2].nunique()}종)")
+    return out.reindex(columns=cols)
+
+
 def build_coverage_panel(reports: pd.DataFrame, months: pd.DatetimeIndex) -> pd.DataFrame:
     """d2/d4 — 애널리스트 커버리지의 '존재'와 '개시'.
 
