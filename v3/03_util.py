@@ -1,0 +1,866 @@
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-C  유틸 — 해시 / 원자적 IO / 재시도 / 레이트리미터 / 병렬 / 벡터화 통계               ║
+# ║                                                                                          ║
+# ║  · 횡단면 변환 순서(C5)는 여기서 단 한 번 하드코딩된다: winsorize → z → rank_pct          ║
+# ║  · 롤링 회귀는 반드시 벡터화 (칼만 폐기, §3). 종목별 파이썬 루프 금지.                    ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+# ── 날짜 정규화 ─────────────────────────────────────────────────────────────────────────────
+def as_ts(x) -> Optional[pd.Timestamp]:
+    """무엇이 들어오든 tz-naive 로 정규화된 Timestamp. tz 혼재는 이 프로젝트 최빈 버그였다."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    try:
+        t = pd.Timestamp(x)
+    except Exception:
+        try:
+            t = pd.to_datetime(str(x), errors="coerce")
+        except Exception:
+            return None
+    if t is pd.NaT or pd.isna(t):
+        return None
+    if getattr(t, "tzinfo", None) is not None:
+        t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
+    return t.normalize()
+
+
+def as_ts_series(s) -> pd.Series:
+    """★ 혼합 포맷 방어. pandas 2.x 는 **첫 비결측 원소에서 포맷 하나를 추론해 전체에 엄격
+    적용**한다. 그래서 ['2016-01-15 00:00:00', '2016-01-15'] 처럼 섞이면 뒤쪽이 전부 NaT 이
+    되고, errors='coerce' 라 예외도 안 난다.
+
+    이 모양이 나오는 곳이 하필 **재실행 경로**다: 드라이브 캐시에서 읽은 파싱 완료
+    Timestamp + 이번에 새로 수집한 문자열을 concat 하면 정확히 이렇게 된다. 실측으로
+    보고서 원장 1,500건 중 1,000건이 '날짜 무효'로 조용히 탈락했다.
+    → 1차 추론에서 실패한 원소만 골라 mixed 포맷으로, 그래도 안 되면 원소별로 재시도한다.
+      실패분에만 적용하므로 정상 경로의 비용은 0 이다.
+    """
+    ser = pd.Series(s)
+    out = pd.to_datetime(ser, errors="coerce")
+    try:
+        raw_ok = ser.notna() & (ser.astype(str).str.strip().str.lower()
+                                .isin(("", "nan", "none", "nat", "null")) == False)  # noqa: E712
+        bad = out.isna() & raw_ok
+        if bad.any():
+            try:
+                out = out.astype("datetime64[ns]")
+            except Exception:
+                pass
+            try:
+                out.loc[bad] = pd.to_datetime(ser[bad], errors="coerce", format="mixed")
+            except (TypeError, ValueError):
+                pass
+            bad2 = out.isna() & raw_ok
+            if bad2.any():
+                out.loc[bad2] = pd.Series(
+                    [pd.to_datetime(x, errors="coerce") for x in ser[bad2]],
+                    index=ser.index[bad2])
+    except Exception:
+        pass
+    try:
+        if getattr(out.dt, "tz", None) is not None:
+            out = out.dt.tz_localize(None)
+    except Exception:
+        pass
+    return out.dt.normalize()
+
+
+def month_end(x) -> Optional[pd.Timestamp]:
+    t = as_ts(x)
+    return None if t is None else (t + pd.offsets.MonthEnd(0)).normalize()
+
+
+def month_range(start, end) -> pd.DatetimeIndex:
+    return pd.date_range(month_end(start), month_end(end), freq="ME")
+
+
+# ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
+def sha1_str(*parts) -> str:
+    h = hashlib.sha1()
+    for p in parts:
+        h.update(str(p).encode("utf-8", "ignore"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+
+def sha1_file(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def norm_text(s: Any) -> str:
+    """상호/애널리스트명/제목 정규화. 매칭 정확도의 8할이 여기서 결정된다."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = s.replace("​", "").replace("\xa0", " ")
+    s = re.sub(r"[（(\[{][^）)\]}]*[）)\]}]", " ", s)        # 괄호 안 제거
+    s = re.sub(r"[^\w가-힣A-Za-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def norm_corp_name(s: Any) -> str:
+    """법인격 접미어 제거 — 사업장명↔법인명 매칭용."""
+    t = norm_text(s)
+    t = re.sub(r"\b(주식회사|유한회사|합자회사|주|㈜|Co|Ltd|Inc|Corp|Corporation|Company|Limited)\b",
+               " ", t, flags=re.I)
+    t = re.sub(r"(주식회사|유한회사)", " ", t)
+    return re.sub(r"\s+", "", t).strip()
+
+
+# 2024-01-01 종목코드 개편으로 영숫자 코드가 도입되었다.
+# 형식: 앞 4자리 숫자 + 5번째(0-9,A-Z 중 I/O/U 제외) + 6번째(0,K,L,M,N)
+# ★ 단순히 \D 를 제거하면 신형 티커가 조용히 망가진다(예: '09701K' → '009701').
+_TICKER_RE = re.compile(r"^(?:\d{6}|\d{4}[0-9A-HJ-NP-TV-Z][0-9KLMN])$")
+
+
+def to_code6(x: Any) -> Optional[str]:
+    """'005930', 5930, 'A005930', '005930.KS', '09701K' → 정규화 코드.
+    실패하면 None. 조용히 0으로 채워 잘못된 종목을 만들지 않는다."""
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return None
+    s = re.sub(r"\s", "", str(x).strip().upper()).split(".")[0]
+    if len(s) == 7 and s[0] in "AQ" and _TICKER_RE.match(s[1:]):
+        s = s[1:]
+    if _TICKER_RE.match(s):
+        return s
+    d = re.sub(r"\D", "", s)
+    if d and len(d) <= 6:
+        cand = d.zfill(6)
+        return cand if _TICKER_RE.match(cand) else None
+    return None
+
+
+def similarity(a: str, b: str) -> float:
+    """0~100. rapidfuzz 있으면 그걸, 없으면 difflib."""
+    a, b = norm_corp_name(a), norm_corp_name(b)
+    if not a or not b:
+        return 0.0
+    if rapidfuzz_fuzz is not None:
+        return float(rapidfuzz_fuzz.token_set_ratio(a, b))
+    import difflib
+    return 100.0 * difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# ── 원자적 파일 IO (드라이브 FUSE 에서 깨지지 않게) ──────────────────────────────────────────
+def _ensure_dir(path: str):
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _replace_retry(src: str, dst: str, tries: int = 6):
+    """os.replace 는 POSIX 에서 원자적이지만 **Windows 에서는 대상 파일이 열려 있으면
+    PermissionError(WinError 5/32)** 를 낸다. 구글드라이브 동기화 클라이언트와 백신이
+    새로 쓰인 파일을 즉시 여는 것이 정상 동작이라, 이 경합은 드물지 않고 재현도 안 된다.
+    한 번 실패하면 캐시 저장이 통째로 실패하고 다음 실행이 같은 수집을 다시 한다."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.25 * (2 ** i) + random.random() * 0.1)
+
+
+def atomic_write_bytes(path: str, data: bytes) -> str:
+    """임시파일 → flush/fsync → os.replace. 드라이브 마운트에서 중단돼도 원본이 반쪽 나지 않는다."""
+    _ensure_dir(path)
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass                     # 일부 FUSE 는 fsync 미지원 — 실패해도 replace 는 유효
+    _replace_retry(tmp, path)
+    return path
+
+
+def atomic_write_text(path: str, text: str) -> str:
+    return atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd") -> str:
+    _ensure_dir(path)
+    # ★ thread id 가 없으면 같은 프로세스의 두 스레드가 **같은 임시파일**에 동시에 쓰고
+    #   서로의 내용을 덮어쓴다(atomic_write_bytes 에는 있는데 여기만 빠져 있었다).
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    out = df.copy()
+    for c in out.columns:                       # object 컬럼은 arrow 가 종종 거부한다 → 문자열화
+        if out[c].dtype == object:
+            try:
+                pd.api.types.infer_dtype(out[c], skipna=True)
+            except Exception:
+                out[c] = out[c].astype(str)
+    try:
+        out.to_parquet(tmp, index=False, compression=compression)
+    except Exception:
+        out.to_parquet(tmp, index=False, compression="snappy")
+    _replace_retry(tmp, path)
+    return path
+
+
+def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
+        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
+            os.replace(path, path + f".corrupt.{int(time.time())}")
+        except Exception:
+            pass
+        return None
+
+
+def read_jsonl(path: str) -> List[dict]:
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue                        # 반쪽 줄은 건너뛴다 (append-only 저널의 정상 동작)
+    return out
+
+
+def append_jsonl(path: str, rows: Iterable[dict]):
+    _ensure_dir(path)
+    with open(path, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+
+
+# ── 레이트리미터 / 재시도 ───────────────────────────────────────────────────────────────────
+class RateLimiter:
+    """소스별 토큰버킷. 스레드 안전. 차단당하지 않기 위한 최소 장치."""
+
+    def __init__(self, qps: float):
+        self.interval = 1.0 / max(qps, 0.01)
+        self._next = 0.0
+        self._lk = threading.Lock()
+
+    def wait(self):
+        with self._lk:
+            now = time.monotonic()
+            if now < self._next:
+                d = self._next - now
+            else:
+                d = 0.0
+            self._next = max(now, self._next) + self.interval
+        if d > 0:
+            time.sleep(d)
+
+
+_LIMITERS: Dict[str, RateLimiter] = {}
+_LIMITER_LOCK = threading.Lock()
+
+
+def limiter(source: str) -> RateLimiter:
+    with _LIMITER_LOCK:
+        if source not in _LIMITERS:
+            _LIMITERS[source] = RateLimiter(RATE_LIMIT_QPS.get(source, RATE_LIMIT_QPS.get("generic", 3.0)))
+        return _LIMITERS[source]
+
+
+def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, quiet: bool = False):
+    def deco(fn):
+        def wrapped(*a, **kw):
+            last = None
+            for i in range(tries):
+                try:
+                    return fn(*a, **kw)
+                except exc as e:                       # noqa
+                    last = e
+                    if i == tries - 1:
+                        break
+                    slp = (base ** i) + random.random() * 0.4
+                    if not quiet:
+                        LOG.debug(f"재시도 {i+1}/{tries-1} ({type(e).__name__}) — {slp:.1f}s 대기")
+                    time.sleep(slp)
+            if on_fail is not None:
+                return on_fail(last)
+            raise last                                  # type: ignore
+        wrapped.__name__ = getattr(fn, "__name__", "wrapped")
+        return wrapped
+    return deco
+
+
+# ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
+def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
+            desc: str = "", quiet: bool = False) -> List[Any]:
+    """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다."""
+    items = list(items)
+    if not items:
+        return []
+    w = max(1, min(workers or N_WORKERS_IO, len(items)))
+    out: List[Any] = [None] * len(items)
+    errs: Counter = Counter()
+    with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
+        futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
+        it_ = as_completed(futs)
+        if not quiet:
+            # mininterval: 진행바 갱신도 IOPub 메시지다. 기본 0.1초면 초당 10줄 × 동시작업
+            # 수만큼 쌓여 노트북 서버가 출력을 끊는다.
+            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88,
+                       mininterval=2.0, miniters=max(1, len(futs) // 200))
+        for fu in it_:
+            i = futs[fu]
+            try:
+                out[i] = fu.result()
+            except Exception as e:                       # noqa
+                errs[type(e).__name__] += 1
+                out[i] = None
+    if errs:
+        LOG.warn(f"{desc or '병렬작업'} 중 실패 {sum(errs.values())}/{len(items)}건 — " +
+                 ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))
+    return out
+
+
+def pmap_cpu(fn: Callable, items: Sequence, workers: Optional[int] = None, desc: str = "") -> List[Any]:
+    """연산 병렬. fork 가능하면 프로세스, 아니면 스레드로 자동 폴백(결과 동일, 속도만 차이)."""
+    items = list(items)
+    if not items:
+        return []
+    w = max(1, min(workers or N_CPU, len(items)))
+    if w == 1 or not CAN_FORK:
+        if not CAN_FORK:
+            LOG.debug("fork 불가 환경 — 연산 병렬을 스레드로 폴백합니다(결과 동일).")
+        return [fn(x) for x in tqdm(items, desc=desc or "연산", leave=False, ncols=88)]
+    try:
+        ctx = _mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=w, mp_context=ctx) as ex:
+            return list(tqdm(ex.map(fn, items), total=len(items), desc=desc or "연산",
+                             leave=False, ncols=88))
+    except Exception as e:                                # noqa
+        LOG.warn(f"프로세스 병렬 실패({type(e).__name__}) — 순차 실행으로 폴백합니다.")
+        return [fn(x) for x in items]
+
+
+# ── 메모리 ──────────────────────────────────────────────────────────────────────────────────
+def downcast(df: pd.DataFrame, cat_thresh: float = 0.35) -> pd.DataFrame:
+    """float64→float32, 저카디널리티 object→category. 10년 패널 RAM을 3~5배 줄인다."""
+    if df is None or df.empty:
+        return df
+    for c in df.columns:
+        k = df[c].dtype.kind
+        if k == "f":
+            df[c] = pd.to_numeric(df[c], downcast="float")
+        elif k in "iu":
+            df[c] = pd.to_numeric(df[c], downcast="integer")
+        elif k == "O":
+            try:
+                n = df[c].nunique(dropna=True)
+                if n > 0 and n / max(len(df), 1) < cat_thresh:
+                    df[c] = df[c].astype("category")
+            except Exception:
+                pass
+    return df
+
+
+def mem_mb(df: pd.DataFrame) -> float:
+    try:
+        return float(df.memory_usage(deep=True).sum()) / 1e6
+    except Exception:
+        return -1.0
+
+
+# ── PIT 프레임 강제 (C1) ────────────────────────────────────────────────────────────────────
+PIT_COLS = ("event_date", "knowledge_date")
+
+
+def _resolve_dates(df: pd.DataFrame, arg) -> pd.Series:
+    """날짜 인자 해석 규칙 — 딱 세 가지만 허용한다(모호함이 곧 버그다):
+       ① 문자열이고 df 의 컬럼명이면      → 그 컬럼
+       ② Series/배열/리스트이면           → 그대로 (길이 일치 필요)
+       ③ 그 외(스칼라 날짜/문자열 날짜)   → 전 행에 브로드캐스트
+    """
+    if isinstance(arg, str) and arg in df.columns:
+        return as_ts_series(df[arg]).set_axis(df.index)
+    if isinstance(arg, pd.Series):
+        if len(arg) != len(df):
+            raise ValueError(f"날짜 Series 길이 불일치: {len(arg)} vs {len(df)}")
+        return as_ts_series(pd.Series(arg.to_numpy())).set_axis(df.index)
+    if isinstance(arg, (list, tuple, np.ndarray, pd.DatetimeIndex)):
+        if len(arg) != len(df):
+            raise ValueError(f"날짜 배열 길이 불일치: {len(arg)} vs {len(df)}")
+        return as_ts_series(pd.Series(list(arg))).set_axis(df.index)
+    return as_ts_series(pd.Series([arg] * len(df))).set_axis(df.index)
+
+
+def pit_frame(df: pd.DataFrame, event_date, knowledge_date, source: str = "") -> pd.DataFrame:
+    """모든 수집 결과는 이 함수를 통과해야 한다. 통과하지 않은 테이블은 PIT store 가 거부한다."""
+    if df is None or len(df) == 0:
+        base = pd.DataFrame(df if df is not None else None)
+        for c in PIT_COLS:
+            if c not in base.columns:
+                base[c] = pd.Series(dtype="datetime64[ns]")
+        if source:
+            base["_src"] = pd.Series(dtype=object)
+        return base
+    out = df.copy().reset_index(drop=True)
+    out["event_date"] = _resolve_dates(out, event_date)
+    out["knowledge_date"] = _resolve_dates(out, knowledge_date)
+    # knowledge_date 는 event_date 보다 이를 수 없다 — 이를 어기면 그 자체가 미래누수다.
+    bad = out["knowledge_date"] < out["event_date"]
+    if bad.any():
+        out.loc[bad, "knowledge_date"] = out.loc[bad, "event_date"]
+        if PIPE.current:
+            PIPE.note(f"WARN: knowledge_date < event_date 인 {int(bad.sum())}행을 event_date 로 보정")
+    out = out.dropna(subset=["knowledge_date"])
+    if source:
+        out["_src"] = source
+    return out
+
+
+# ── 벡터화 횡단면 통계 (C5 순서 고정) ───────────────────────────────────────────────────────
+WINSOR_SIGMA = 2.0
+CELL_MIN_N = 8
+
+
+def _winsor_np(a: np.ndarray, k: float = WINSOR_SIGMA) -> np.ndarray:
+    m = np.nanmean(a)
+    s = np.nanstd(a)
+    if not np.isfinite(s) or s == 0:
+        return a
+    return np.clip(a, m - k * s, m + k * s)
+
+
+def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N,
+           k: float = WINSOR_SIGMA) -> pd.Series:
+    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다.
+
+    구현 주의 두 가지:
+     ① ±inf 를 반드시 먼저 NaN 으로 바꾼다. np.nanmean 은 NaN 은 무시하지만 inf 는 무시하지
+        않으므로, 셀에 inf 가 단 하나만 있어도 평균이 inf·표준편차가 NaN 이 되어
+        **그 셀 전체의 z-score 가 0으로 뭉개진다.** 비율 지표(diff/log)에서 흔히 발생한다.
+     ② groupby.transform(파이썬 UDF) 대신 네이티브 집계로 벡터화한다.
+        실데이터 규모(30만 행 × 수천 셀)에서 UDF 경로는 호출당 10초 이상이고,
+        파이프라인은 이 함수를 수십 번 부른다.
+    """
+    v = pd.to_numeric(values, errors="coerce").astype("float64")
+    v = v.replace([np.inf, -np.inf], np.nan)
+    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
+
+    g = v.groupby(grp, observed=True, dropna=False)
+    cnt = g.transform("count")
+    mu0 = g.transform("mean")
+    sd0 = g.transform("std", ddof=0)
+    # ★ 클리핑 경계는 **로버스트 추정치**로 잡는다. 평균/표준편차로 잡으면 이상치 자신이
+    #   경계를 부풀려 1회 윈저로는 흡수되지 않는다. 실측: N(0,1) 99개 + 1e6 한 개를 넣으면
+    #   ±2σ 윈저 후에도 z 최대가 9.95 다(윈저를 안 한 것과 거의 같다). 재무 비율은 분모가
+    #   작을 때 이런 값을 일상적으로 만들므로, 그 한 종목이 셀 전체의 z 를 지배하게 된다.
+    #   중앙값 ± k·1.4826·MAD 로 잡으면 정규분포에서는 ±kσ 와 사실상 같고(의미 보존),
+    #   이상치에는 무너지지 않는다. MAD 가 0 인 셀(값의 과반이 동일 — clip TP 에서 흔하다)만
+    #   표준편차로 되돌린다.
+    med = g.transform("median")
+    mad = (v - med).abs().groupby(grp, observed=True, dropna=False).transform("median") * 1.4826
+    scale = mad.where(mad > 0, sd0)
+    w = v.clip(lower=med - k * scale, upper=med + k * scale)      # ① winsorize (로버스트 경계)
+    w = w.where(scale > 0, v)
+
+    gw = w.groupby(grp, observed=True, dropna=False)
+    mu = gw.transform("mean")
+    sd = gw.transform("std", ddof=0)                               # ② z-score
+    z = (w - mu) / sd.where(sd > 0)
+    z = z.mask(sd.notna() & (sd <= 0) & w.notna(), 0.0)            # 셀 내 전원 동일값 → 0
+    return z.where(cnt >= min_n).astype("float32")
+
+
+def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
+    """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
+    v = pd.to_numeric(values, errors="coerce").astype("float64")
+    v = v.replace([np.inf, -np.inf], np.nan)
+    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
+    g = v.groupby(grp, observed=True, dropna=False)
+    cnt = g.transform("count")
+    r = g.rank(pct=True, method="average")
+    return r.where(cnt >= min_n).astype("float32")
+
+
+CELL_LADDER = ("cell", "cell_l2", "cell_l3")
+
+
+def xsec_z_l(P: pd.DataFrame, name: str, min_n: int = CELL_MIN_N) -> pd.Series:
+    """셀 폴백 사다리를 적용한 z-score (C11).
+
+    ★ 왜 필요한가: 셀에 종목이 30개 있어도 '그 센서를 관측한' 종목은 5개뿐일 수 있다.
+      (관세·조달처럼 일부 종목만 커버하는 팩이 정확히 이 경우다)
+      셀 크기만 보고 폴백하면 z-score 는 표본부족으로 전부 NaN 이 되고,
+      그 팩은 아무 신호도 못 내면서 로그에는 아무것도 남지 않는다 — 최악의 조용한 실패다.
+      그래서 '그 센서의 유효 관측 수' 기준으로 산업 상위 → 전체 순으로 단계적 폴백한다.
+    """
+    v = col(P, name)
+    if v.notna().sum() == 0:
+        return pd.Series(np.nan, index=P.index, dtype="float32")
+    z = xsec_z(v, P["cell"], min_n) if "cell" in P.columns else \
+        pd.Series(np.nan, index=P.index, dtype="float32")
+    for lvl in CELL_LADDER[1:]:
+        if not z.isna().any():
+            break
+        if lvl in P.columns:
+            z = z.where(z.notna(), xsec_z(v, P[lvl], min_n))
+    return z
+
+
+def xsec_rank_pct_l(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.Series:
+    v = col(P, name_or_series) if isinstance(name_or_series, str) else \
+        pd.to_numeric(name_or_series, errors="coerce")
+    if v.notna().sum() == 0:
+        return pd.Series(np.nan, index=P.index, dtype="float32")
+    r = xsec_rank_pct(v, P["cell"], min_n) if "cell" in P.columns else \
+        pd.Series(np.nan, index=P.index, dtype="float32")
+    for lvl in CELL_LADDER[1:]:
+        if not r.isna().any():
+            break
+        if lvl in P.columns:
+            r = r.where(r.notna(), xsec_rank_pct(v, P[lvl], min_n))
+    return r
+
+
+def tp_signed_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
+    """★ v2 사양의 원형 — TP = z(a) × z(b). **이 전략은 이것을 쓰지 않는다.**
+
+    보존하는 이유는 R5 절제에서 "부호버그가 있었을 때 무슨 일이 벌어지는가"를 실측으로
+    보여주기 위해서다(§6.5). 실전 경로에서 호출되면 안 되므로 이름을 바꿔 두었다.
+
+    부호버그: z(a)=-2(매출 급감), z(b)=-2(회전 악화) → TP=+4 = 최고점.
+    횡단면 z 이므로 유니버스의 약 25%가 양쪽 음수 → 양의 TP 를 얻는다.
+    결과적으로 상위 분위가 '매출 급감 + 회전 악화' 종목으로 오염된다.
+    """
+    a = pd.to_numeric(z_improve, errors="coerce")
+    b = pd.to_numeric(z_nopay, errors="coerce")
+    return (a * b).astype("float32")
+
+
+def nonempty(x) -> bool:
+    """DataFrame/Series/배열/None 을 안전하게 '내용이 있는가'로 판정한다.
+
+    ★ 왜 함수로 만드는가: `a() or b()` 는 DataFrame 에서
+      "ValueError: The truth value of a DataFrame is ambiguous" 로 죽는다.
+      그런데 이 버그는 **a() 가 None 을 반환하는 환경에서는 숨는다**(None or b 는 합법).
+      즉 '소스가 막힌 개발 환경에서는 통과하고, 소스가 살아 있는 실환경에서만 터진다'.
+      실제로 CANARY K4 가 정확히 그렇게 죽었다 — 네트워크가 차단된 곳에서 전부 통과했다.
+      쓰기 쉬운 잘못된 관용구(`or`)를 대체할 쓰기 쉬운 올바른 관용구가 없으면 재발한다.
+
+    ★ 이 함수 자신이 같은 부류의 버그를 갖고 있었다(적대적 검증에서 실측 적발):
+        nonempty(np.nan) → True     (float 은 len() 이 없어 bool(nan)=True 로 떨어졌다)
+        nonempty(pd.NaT) → True
+        nonempty(pd.NA)  → TypeError
+        nonempty(np.array(5)) → TypeError (0차원 배열은 len() 불가)
+      진리값 버그를 막으려고 만든 헬퍼 안에 진리값 버그가 있으면 방어선이 아니라 확성기다.
+    """
+    if x is None:
+        return False
+    if isinstance(x, (pd.DataFrame, pd.Index)):
+        return len(x) > 0
+    if isinstance(x, (pd.Series, np.ndarray)):
+        # ★ getattr(x, "size", len(x)) 로 쓰면 안 된다 — 파이썬은 기본값 인자를 **먼저**
+        #   평가하므로 len(x) 가 무조건 실행되고, 0차원 배열에서 TypeError 로 죽는다.
+        #   (이 실수를 계약 검정 NONEMPTY 가 즉시 잡았다)
+        return int(x.size if hasattr(x, "size") else len(x)) > 0
+    if x is pd.NaT:
+        return False
+    if isinstance(x, float) and math.isnan(x):
+        return False
+    try:
+        na = pd.isna(x)
+        if na is True:                                    # 스칼라 결측(np.nan/NaT/pd.NA)
+            return False
+    except (TypeError, ValueError):
+        pass
+    try:
+        return bool(len(x))
+    except TypeError:
+        pass
+    try:
+        return bool(x)
+    except (TypeError, ValueError):
+        return True                                       # 판정 불가면 '있다'로 본다(보수적)
+
+
+def first_nonempty(*sources, min_len: int = 1):
+    """폴백 체인. 각 source 는 호출가능(지연평가) 또는 값.
+
+    비어 있지 않은 첫 결과를 돌려주고, 전부 비면 None. 예외는 그 소스만 건너뛴다.
+        d = first_nonempty(lambda: _px_fdr(c, s, e), lambda: _px_naver(c, s, e))
+    """
+    for s in sources:
+        try:
+            v = s() if callable(s) else s
+        except Exception:                                   # noqa — 소스 하나의 실패로 체인을 죽이지 않는다
+            continue
+        if nonempty(v) and (not hasattr(v, "__len__") or len(v) >= min_len):
+            return v
+    return None
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  범용 금고 캐시 — "한 번 만든 것은 두 번 만들지 않는다"                                    ║
+# ║                                                                                          ║
+# ║  ★ 왜 이게 필요한가 (실측):                                                               ║
+# ║    · 재무 정제(tidy_financials)   : 매 실행 2.5분. 입력이 그대로여도 매번 다시 한다.       ║
+# ║    · 월 가격패널(build_price_panel): 700만 행에서 36초. 마찬가지.                          ║
+# ║    · L1 센서 패널                  : 37초.                                                ║
+# ║    비슷한 전략을 여러 개 돌리면 이 시간이 전략 수만큼 곱해진다. 그런데 이 산출물들은        ║
+# ║    대부분 **전략과 무관한 중간 결과**다 — 공용 인덱스에 두면 다른 전략이 그대로 쓴다.      ║
+# ║                                                                                          ║
+# ║  안전 규칙:                                                                               ║
+# ║    · 키는 '입력의 지문'이다. 입력이 한 글자라도 바뀌면 지문이 깨져 자동으로 다시 만든다.    ║
+# ║      낡은 값이 살아남을 수 없다 — 이게 시간 기반 만료(max_age)보다 훨씬 안전하다.          ║
+# ║    · dtype 까지 계산 경로와 일치시킨다. parquet 왕복은 datetime64[ns]→[ms] 로 바꾸는데,    ║
+# ║      그 차이 하나로 하류 merge 가 예외 없이 0행 매칭을 낸 전례가 있다(PIT 시총).           ║
+# ║    · 실패해도 절대 죽지 않는다. 캐시는 최적화지 정답이 아니다.                              ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+def fingerprint(*parts) -> str:
+    """입력의 지문. DataFrame 은 (행수·열이름·시작/끝 값)으로 싸게 요약한다."""
+    bits: List[str] = []
+    for x in parts:
+        if isinstance(x, pd.DataFrame):
+            bits.append(f"df:{len(x)}:{','.join(map(str, x.columns))[:400]}")
+            if len(x):
+                for c in list(x.columns)[:6]:
+                    try:
+                        bits.append(f"{c}={x[c].iloc[0]}|{x[c].iloc[-1]}")
+                    except Exception:                             # noqa
+                        pass
+        elif isinstance(x, (pd.Series, pd.Index)):
+            bits.append(f"s:{len(x)}:{x[0] if len(x) else ''}|{x[-1] if len(x) else ''}")
+        elif isinstance(x, (list, tuple, set)):
+            bits.append(f"seq:{len(x)}:{str(sorted(map(str, x))[:50])[:400]}")
+        elif isinstance(x, dict):
+            bits.append(f"map:{str(sorted((str(k), str(v)) for k, v in x.items()))[:400]}")
+        else:
+            bits.append(str(x))
+    return sha1_str(*bits)
+
+
+def cached_table(name: str, fp_parts: Sequence[Any], build: Callable[[], pd.DataFrame],
+                 scope: str = "shared", domain: str = "table", source: str = "",
+                 note: str = "", date_cols: Sequence[str] = ()) -> pd.DataFrame:
+    """지문이 같으면 금고에서 꺼내고, 다르면 만들어서 넣는다.
+
+    scope="shared"  → 다른 전략도 그대로 재사용한다 (전략과 무관한 중간 결과)
+    scope="private" → 이 전략 고유 산출물
+    """
+    def _norm(df: pd.DataFrame) -> pd.DataFrame:
+        """캐시 경로와 계산 경로에 **똑같이** 적용되는 정규화. 두 경로가 같아야만 캐시다.
+
+        ★ downcast 를 여기서 쓰면 안 된다. float64→float32 는 유효숫자 7자리라
+          원화 금액(수백조 = 3e14)에서 정밀도를 잃는다. 캐시를 켰다고 재무 숫자가
+          달라지면 그건 최적화가 아니라 데이터 손상이다.
+        ★ 실제로 손볼 것은 datetime 해상도뿐이다. parquet 왕복은 [ns]→[ms] 로 바꾸고,
+          그 차이 하나로 하류 merge 가 예외 없이 0행 매칭을 낸 전례가 있다(PIT 시총).
+        """
+        if df is None or not len(df):
+            return df
+        for c in list(date_cols) or []:
+            if c in df.columns:
+                df[c] = as_ts_series(df[c])
+        return df
+
+    key = ""
+    try:
+        key = f"{name}__{fingerprint(*fp_parts)[:14]}"
+        got = VAULT.get_table(key, scope=scope)
+        if nonempty(got):
+            LOG.ok(f"캐시 적중 — '{name}' {len(got):,}행을 다시 만들지 않고 재사용합니다 "
+                   f"({'공용' if scope == 'shared' else '전용'} 인덱스). "
+                   f"입력이 바뀌면 지문이 달라져 자동으로 다시 만듭니다.")
+            return _norm(got)
+    except Exception as e:                                        # noqa
+        LOG.debug(f"캐시 조회 실패({type(e).__name__}) — 새로 만듭니다: {name}")
+
+    out = _norm(build())
+    try:
+        if key and nonempty(out):
+            VAULT.put_table(key, out, scope=scope, domain=domain, source=source or name,
+                            extra={"note": note or f"{name} 지문 캐시 — 입력이 바뀌면 무효화"})
+    except Exception as e:                                        # noqa
+        LOG.debug(f"캐시 저장 실패({type(e).__name__}): {name}")
+    return out
+
+
+def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
+    """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
+
+    ★ df.get("x") 는 컬럼이 없으면 None 을 반환한다. 그러면 `None + Series` 나 `None.abs()`
+      로 TypeError/AttributeError 가 나는데, 하필 그 상황(= 특정 데이터 소스가 통째로 비어
+      해당 계정 컬럼이 아예 생성되지 않은 경우)은 실데이터 실행에서 가장 흔하다.
+      키 미입력·API 한도 소진·소급 데이터 없음 전부 이 경로로 들어온다.
+      그래서 피처 계산부는 df.get 대신 반드시 이 함수를 쓴다.
+    """
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce")
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def gby(df: pd.DataFrame, name: str, key: str = "code"):
+    """col() 의 groupby 판(版). 없는 컬럼도 NaN 으로 만든 뒤 그룹화한다.
+
+    ★ col() 이 막지 못하는 구멍이 정확히 여기였다. 피처 계산부는 결측 컬럼 산술을 col() 로
+      막아 두었지만, `P.groupby("code")[c]` 는 여전히 맨손이라 c 가 없으면 KeyError 로 죽는다.
+      DART 키가 없거나 재무 수집이 부분 실패하면 assets·contract_liab 같은 재무상태표 계정이
+      아예 생성되지 않는데, 이 경로는 critical 스테이지(L1.PANEL)라 그대로 실행 전체가 중단된다.
+      "키 없이도 실행은 된다"는 상단 안내와 정면으로 어긋나므로 groupby 도 안전 접근으로 통일한다.
+    """
+    if name not in df.columns:
+        df[name] = np.nan
+    return df.groupby(key, observed=True)[name]
+
+
+def safe_div(a, b, eps: float = 1e-12):
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    out = a / b.where(b.abs() > eps)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def dlog(s: pd.Series, periods: int = 12) -> pd.Series:
+    """Δlog. 음수/0 은 결측 처리 (log 의 정의역 밖을 0으로 메우는 것이 최빈 버그)."""
+    v = pd.to_numeric(s, errors="coerce")
+    lv = np.log(v.where(v > 0))
+    return lv.diff(periods)
+
+
+def nanmean_cols(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
+    """가용 축만으로 평균. 결측을 0으로 채우지 않는다 (§7.3 지시)."""
+    use = [c for c in cols if c in df.columns]
+    if not use:
+        return pd.Series(np.nan, index=df.index)
+    return df[use].astype("float64").mean(axis=1, skipna=True)
+
+
+# ── 벡터화 롤링 OLS (칼만 대체, §3) ─────────────────────────────────────────────────────────
+def rolling_ols_resid(y: np.ndarray, X: np.ndarray, window: int,
+                      ridge: float = 1e-8, chunk: int = 256) -> np.ndarray:
+    """N개 엔티티 × T기간 패널에 대해 길이 W 롤링 OLS 를 배치로 풀고 창 마지막 시점 잔차를 반환.
+
+    y : (N, T)
+    X : (N, T, K)   — 절편은 호출자가 포함시킬 것
+    반환: (N, T) 잔차. 창이 안 차거나 결측 포함이면 NaN.
+
+    종목별 파이썬 루프로 짜면 15분짜리가 3시간이 된다(§3). 반드시 이 경로를 쓸 것.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    N, T = y.shape
+    K = X.shape[2]
+    out = np.full((N, T), np.nan, dtype=np.float64)
+    if T < window or window < K + 2:
+        return out
+    try:
+        from numpy.lib.stride_tricks import sliding_window_view as _swv
+    except Exception:                                     # numpy<1.20 폴백
+        _swv = None
+
+    for s in range(0, N, chunk):
+        e = min(N, s + chunk)
+        yc, Xc = y[s:e], X[s:e]
+        n = e - s
+        if _swv is not None:
+            yw = _swv(yc, window, axis=1)                 # (n, T-W+1, W)
+            Xw = _swv(Xc, window, axis=1)                 # (n, T-W+1, K, W)
+            Xw = np.moveaxis(Xw, -1, 2)                   # (n, T-W+1, W, K)
+        else:
+            idx = np.arange(window)[None, :] + np.arange(T - window + 1)[:, None]
+            yw = yc[:, idx]
+            Xw = Xc[:, idx, :]
+        finite = np.isfinite(yw).all(axis=2) & np.isfinite(Xw).all(axis=(2, 3))   # (n, M)
+        yw = np.where(np.isfinite(yw), yw, 0.0)
+        Xw = np.where(np.isfinite(Xw), Xw, 0.0)
+        XtX = np.einsum("nmwk,nmwl->nmkl", Xw, Xw, optimize=True)
+        Xty = np.einsum("nmwk,nmw->nmk", Xw, yw, optimize=True)
+        XtX += ridge * np.eye(K)[None, None, :, :] * np.maximum(
+            1.0, np.abs(np.einsum("nmkk->nm", XtX))[..., None, None] / max(K, 1))
+        try:
+            beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]                   # (n, M, K)
+        except np.linalg.LinAlgError:
+            beta = np.einsum("nmkl,nml->nmk", np.linalg.pinv(XtX), Xty)
+        x_last = Xw[:, :, -1, :]                                                  # (n, M, K)
+        resid = yw[:, :, -1] - np.einsum("nmk,nmk->nm", x_last, beta)
+        resid = np.where(finite, resid, np.nan)
+        out[s:e, window - 1:] = resid
+        del yw, Xw, XtX, Xty, beta
+    return out
+
+
+def rolling_ols_beta_last(y: np.ndarray, X: np.ndarray, window: int, ridge: float = 1e-8) -> np.ndarray:
+    """위와 동일하되 마지막 창의 계수만 필요할 때 (R3 직교화 등)."""
+    N, T = y.shape
+    K = X.shape[2]
+    if T < window:
+        return np.full((N, K), np.nan)
+    yw, Xw = y[:, -window:], X[:, -window:, :]
+    ok = np.isfinite(yw).all(axis=1) & np.isfinite(Xw).all(axis=(1, 2))
+    yw = np.nan_to_num(yw); Xw = np.nan_to_num(Xw)
+    XtX = np.einsum("nwk,nwl->nkl", Xw, Xw) + ridge * np.eye(K)[None]
+    Xty = np.einsum("nwk,nw->nk", Xw, yw)
+    beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]
+    beta[~ok] = np.nan
+    return beta
+
+
+def hac_tstat(x: np.ndarray, lags: Optional[int] = None) -> Tuple[float, float]:
+    """Newey-West HAC 평균 t통계량. 월간 초과수익 시계열의 유의성에 쓴다(R2/R3)."""
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 12:
+        return (np.nan, np.nan)
+    mu = x.mean()
+    e = x - mu
+    L = lags if lags is not None else int(np.floor(4 * (n / 100.0) ** (2.0 / 9.0)))
+    L = max(0, min(L, n - 2))
+    g0 = float(e @ e) / n
+    var = g0
+    for l in range(1, L + 1):
+        gl = float(e[l:] @ e[:-l]) / n
+        var += 2.0 * (1.0 - l / (L + 1.0)) * gl
+    var = max(var, 1e-18)
+    se = math.sqrt(var / n)
+    return (float(mu), float(mu / se))
+
+
+def bh_fdr(pvals: Sequence[float], q: float = 0.10) -> np.ndarray:
+    """Benjamini-Hochberg. 강건성 검정을 여러 번 돌리면 다중검정 보정이 필요하다."""
+    p = np.asarray(pvals, dtype=float)
+    ok = np.isfinite(p)
+    out = np.zeros_like(p, dtype=bool)
+    idx = np.where(ok)[0]
+    if len(idx) == 0:
+        return out
+    order = idx[np.argsort(p[idx])]
+    m = len(order)
+    thresh = q * (np.arange(1, m + 1) / m)
+    passed = p[order] <= thresh
+    if passed.any():
+        kmax = np.max(np.where(passed)[0])
+        out[order[:kmax + 1]] = True
+    return out

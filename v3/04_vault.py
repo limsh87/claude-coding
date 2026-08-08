@@ -1,0 +1,674 @@
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-D  캐시 저장소 (VAULT) — 구글드라이브 공용/전용 인덱스                                 ║
+# ║                                                                                          ║
+# ║  ★★★ 절대 1원칙: 기존 캐시·인덱스를 훼손하지 않는다. ★★★                                  ║
+# ║                                                                                          ║
+# ║  훼손 불가능성을 "약속"이 아니라 "구조"로 보장한다:                                        ║
+# ║   1) 인덱스의 진실은 append-only JSONL 저널이다. 기존 줄을 다시 쓰지 않으므로              ║
+# ║      코드가 어떻게 잘못돼도 과거 기록이 사라질 수 없다.                                    ║
+# ║   2) index.parquet 은 저널의 파생물(캐시)일 뿐이다. 재생성 전 항상 타임스탬프 백업.        ║
+# ║   3) 컬럼은 합집합으로만 확장한다. 스키마가 달라도 기존 컬럼을 떨어뜨리지 않는다.          ║
+# ║   4) 원본 blob 은 내용해시 기반 경로에 쓰므로 같은 내용은 재기록조차 하지 않는다.          ║
+# ║      내용이 다르면 새 리비전으로 쓰고, 기존 파일은 건드리지 않는다.                        ║
+# ║   5) 이미 드라이브에 있던 리포트는 "옮기지 않고 경로만 등록"한다(adopt-by-reference).      ║
+# ║   6) 삭제 API 자체가 없다. 손상 파일조차 지우지 않고 .corrupt 로 격리만 한다.              ║
+# ║                                                                                          ║
+# ║  공용 인덱스(_shared) : 다른 전략에서도 그대로 재활용 가능한 원본/정제본                   ║
+# ║  전용 인덱스(tcd_v2)  : 이 전략 고유의 피처·스코어·리포트                                  ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+VAULT_SCHEMA_VER = "2.0"
+
+INDEX_COLUMNS = [
+    "uid", "scope", "domain", "subtype", "key", "path", "abs_path", "fmt",
+    "bytes", "sha1", "event_date", "knowledge_date", "source", "collected_at",
+    "strategy", "adopted", "schema_ver", "extra",
+]
+
+
+def _mount_drive() -> Tuple[str, str]:
+    """(루트경로, 상태문자열). Colab이면 마운트 시도, 아니면 로컬 폴백. 어느 쪽이든 죽지 않는다."""
+    if ENV["colab"]:
+        try:
+            from google.colab import drive as _gdrive      # type: ignore
+            mp = "/content/drive"
+            if not os.path.isdir(os.path.join(mp, "MyDrive")):
+                _gdrive.mount(mp, force_remount=False)
+            if os.path.isdir(os.path.join(mp, "MyDrive")):
+                return GDRIVE_ROOT, "COLAB_DRIVE"
+            return LOCAL_CACHE_ROOT, "COLAB_DRIVE_FAILED→LOCAL"
+        except Exception as e:                             # noqa
+            LOG.warn(f"구글드라이브 마운트 실패({type(e).__name__}) — 로컬 캐시로 폴백합니다.")
+            return LOCAL_CACHE_ROOT, "COLAB_MOUNT_ERROR→LOCAL"
+    # JupyterLab / CLI: 드라이브가 이미 동기화되어 있으면 그 경로를 쓴다.
+    for cand in (GDRIVE_ROOT, os.path.expanduser("~/Google Drive/MyDrive/tcd_cache"),
+                 os.path.expanduser("~/GoogleDrive/MyDrive/tcd_cache")):
+        if cand and os.path.isdir(cand):
+            return cand, "LOCAL_SYNCED_DRIVE"
+    return LOCAL_CACHE_ROOT, "LOCAL"
+
+
+class Vault:
+    def __init__(self, root: str, mode: str):
+        self.root = os.path.abspath(root)
+        self.mode = mode
+        self.ns = {"shared": os.path.join(self.root, GDRIVE_SHARED_NS),
+                   "private": os.path.join(self.root, GDRIVE_PRIVATE_NS)}
+        for p in self.ns.values():
+            os.makedirs(os.path.join(p, "index"), exist_ok=True)
+            os.makedirs(os.path.join(p, "index", "_backup"), exist_ok=True)
+            os.makedirs(os.path.join(p, "blob"), exist_ok=True)
+            os.makedirs(os.path.join(p, "table"), exist_ok=True)
+        os.makedirs(os.path.join(self.root, "_locks"), exist_ok=True)
+        self._idx: Dict[str, pd.DataFrame] = {}
+        self._uidset: Dict[str, set] = {}
+        self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
+        self._lk = threading.RLock()
+        self.stats = Counter()
+
+    # ── 경로 --------------------------------------------------------------------------
+    def journal(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "index", "index.jsonl")
+
+    def idx_parquet(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "index", "index.parquet")
+
+    def blob_dir(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "blob")
+
+    def table_dir(self, scope: str) -> str:
+        return os.path.join(self.ns[scope], "table")
+
+    # ── 잠금 (두 노트북이 동시에 돌아도 저널이 섞이지 않게) -----------------------------
+    @contextmanager
+    def lock(self, name: str, timeout: float = 60.0, stale: float = 900.0):
+        lp = os.path.join(self.root, "_locks", f"{name}.lock")
+        t0 = time.time()
+        acquired = False
+        while time.time() - t0 < timeout:
+            try:
+                fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, json.dumps({"pid": os.getpid(), "host": platform.node(),
+                                         "ts": time.time()}).encode())
+                os.close(fd)
+                acquired = True
+                break
+            except FileExistsError:
+                try:
+                    info = json.loads(open(lp).read() or "{}")
+                    if time.time() - float(info.get("ts", 0)) > stale:
+                        LOG.warn(f"오래된 잠금 해제: {name} (>{stale:.0f}s)")
+                        os.remove(lp)
+                        continue
+                except Exception:
+                    try:
+                        os.remove(lp)
+                    except Exception:
+                        pass
+                time.sleep(0.4)
+        if not acquired:
+            LOG.warn(f"잠금 획득 실패({name}) — 저널 append 는 원자적이므로 그대로 진행합니다.")
+        try:
+            yield
+        finally:
+            if acquired:
+                try:
+                    os.remove(lp)
+                except Exception:
+                    pass
+
+    # ── 인덱스 적재 (기존 것을 절대 건드리지 않고 읽기만) --------------------------------
+    def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:
+        with self._lk:
+            if not force and scope in self._idx:
+                return self._idx[scope]
+        frames: List[pd.DataFrame] = []
+
+        # (a) 정규 parquet 인덱스
+        p = self.idx_parquet(scope)
+        d = read_parquet_safe(p)
+        if d is not None and len(d):
+            frames.append(d)
+
+        # (b) append-only 저널 (진실의 원천)
+        jr = read_jsonl(self.journal(scope))
+        if jr:
+            frames.append(pd.DataFrame(jr))
+
+        # (c) 과거 버전/다른 전략이 남긴 인덱스 파일도 흡수 (읽기 전용, 훼손 없음)
+        legacy_glob = []
+        idx_dir = os.path.join(self.ns[scope], "index")
+        try:
+            for fn in os.listdir(idx_dir):
+                fl = fn.lower()
+                if fn in ("index.parquet", "index.jsonl") or fl.startswith("_"):
+                    continue
+                if fl.endswith((".parquet", ".jsonl", ".json", ".csv")):
+                    legacy_glob.append(os.path.join(idx_dir, fn))
+        except Exception:
+            pass
+        for fp in legacy_glob:
+            try:
+                if fp.endswith(".parquet"):
+                    dd = read_parquet_safe(fp)
+                elif fp.endswith(".csv"):
+                    dd = pd.read_csv(fp)
+                elif fp.endswith(".jsonl"):
+                    dd = pd.DataFrame(read_jsonl(fp))
+                else:
+                    dd = pd.DataFrame(json.loads(open(fp, encoding="utf-8").read()))
+                if dd is not None and len(dd):
+                    dd["_legacy_file"] = os.path.basename(fp)
+                    frames.append(dd)
+                    self.stats[f"legacy_index_absorbed:{os.path.basename(fp)}"] += len(dd)
+            except Exception:
+                continue
+
+        if frames:
+            # 컬럼 합집합 — 기존 컬럼을 절대 떨어뜨리지 않는다
+            allcols: List[str] = []
+            for f in frames:
+                for c in f.columns:
+                    if c not in allcols:
+                        allcols.append(c)
+            frames = [f.reindex(columns=allcols) for f in frames]
+            idx = pd.concat(frames, ignore_index=True)
+            # ★ uid 가 없거나 결측인 레거시 행을 그대로 두면 astype(str) 이 전부 "nan" 이 되고
+            #   drop_duplicates(uid) 가 그 파일 전체를 단 한 줄로 붕괴시킨다 = 인덱스 유실.
+            #   절대 1원칙에 정면으로 반하므로, 결측 uid 는 행 내용 해시로 개별 부여한다.
+            if "uid" not in idx.columns:
+                idx["uid"] = np.nan
+            miss = idx["uid"].isna() | (idx["uid"].astype(str).str.strip().isin(("", "nan", "None")))
+            if miss.any():
+                fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
+                                        "_legacy_file") if c in idx.columns]
+                # ★★ uid 는 **행 내용에서만** 유도해야 한다. 예전 구현은 concat 후의 '위치 i' 를
+                #   해시에 넣었는데, 그 위치는 저널이 길어질수록 달라진다. 그러면 같은 레거시
+                #   행이 실행할 때마다 다른 uid 를 받아 drop_duplicates 를 통과하고, 인덱스가
+                #   매 실행 두 배로 불어난다. 데이터가 사라지진 않지만 인덱스는 망가진다 —
+                #   사용자의 절대 1원칙에 정면으로 걸린다.
+                #   (실측: 같은 레거시 CSV 3행이 두 번째 실행에서 6행이 되었다)
+                #   또 idx.iloc[i] 를 행마다 부르면 40만 행 레거시에서 수 분이 걸린다. 벡터화한다.
+                sub = idx.loc[miss, fill_src].astype(str) if fill_src else \
+                    pd.DataFrame(index=idx.index[miss])
+                key = (sub.agg("\x1f".join, axis=1) if len(fill_src)
+                       else pd.Series("", index=sub.index))
+                # 내용이 완전히 같은 행이 여러 개면 파일 내 등장 순서로만 구분한다
+                # (그 순서는 같은 파일을 같은 방식으로 읽는 한 실행 간 재현된다).
+                occ = key.groupby(key).cumcount()
+                idx.loc[miss, "uid"] = [sha1_str("legacy", k, o) for k, o in zip(key, occ)]
+                LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 내용 기반 uid 를 부여했습니다 "
+                         f"(uid 결측 행이 하나로 뭉개지지도, 실행마다 중복되지도 않게 — "
+                         f"기존 기록 보존).")
+            idx["uid"] = idx["uid"].astype(str)
+            if "collected_at" in idx.columns:
+                idx = idx.sort_values("collected_at", kind="stable")
+            idx = idx.drop_duplicates(subset=["uid"], keep="last").reset_index(drop=True)
+        else:
+            idx = pd.DataFrame(columns=INDEX_COLUMNS)
+
+        for c in INDEX_COLUMNS:
+            if c not in idx.columns:
+                idx[c] = np.nan
+        idx["scope"] = idx["scope"].fillna(scope)
+        with self._lk:
+            self._idx[scope] = idx
+            self._uidset[scope] = set(idx["uid"].astype(str).tolist())
+        return idx
+
+    def has(self, scope: str, uid: str) -> bool:
+        if scope not in self._uidset:
+            self.load_index(scope)
+        with self._lk:
+            return uid in self._uidset[scope] or any(r.get("uid") == uid for r in self._pending[scope])
+
+    def lookup(self, scope: str, **eq) -> pd.DataFrame:
+        idx = self.load_index(scope)
+        if idx.empty:
+            return idx
+        m = pd.Series(True, index=idx.index)
+        for k, v in eq.items():
+            if k not in idx.columns:
+                return idx.iloc[0:0]
+            m &= (idx[k].astype(str) == str(v))
+        return idx[m]
+
+    # ── 기록 --------------------------------------------------------------------------
+    def _register(self, scope: str, rec: dict):
+        rec.setdefault("scope", scope)
+        rec.setdefault("schema_ver", VAULT_SCHEMA_VER)
+        rec.setdefault("collected_at", _dt.datetime.now().isoformat(timespec="seconds"))
+        rec.setdefault("strategy", STRATEGY_ID if scope == "private" else "")
+        for c in INDEX_COLUMNS:
+            rec.setdefault(c, None)
+        with self._lk:
+            self._pending[scope].append(rec)
+            self._uidset.setdefault(scope, set()).add(str(rec["uid"]))
+        self.stats[f"register:{scope}:{rec.get('domain')}"] += 1
+
+    def put_blob(self, domain: str, subtype: str, key: str, data: bytes, fmt: str,
+                 source: str = "", event_date=None, knowledge_date=None,
+                 scope: str = "shared", extra: Optional[dict] = None,
+                 uid: Optional[str] = None) -> Optional[str]:
+        """원본 바이트를 내용해시 경로에 저장하고 인덱스에 등록. 같은 내용이면 재기록하지 않는다."""
+        if not data:
+            return None
+        self._assert_writable(f"put_blob({domain}/{subtype}/{key})")
+        h = sha1_bytes(data)
+        uid = uid or sha1_str(domain, subtype, key, h)
+        sub = os.path.join(self.blob_dir(scope), domain, subtype, h[:2], h[2:4])
+        fn = f"{h}.{fmt.lstrip('.')}"
+        abspath = os.path.join(sub, fn)
+        rel = os.path.relpath(abspath, self.root)
+        if not os.path.exists(abspath):                    # 존재하면 절대 덮어쓰지 않는다
+            try:
+                atomic_write_bytes(abspath, data)
+            except Exception as e:                          # noqa
+                LOG.warn(f"blob 저장 실패({type(e).__name__}) — 인덱스에만 기록하지 않고 건너뜁니다: {key}")
+                return None
+        else:
+            self.stats["blob_dedup_hit"] += 1
+        self._register(scope, {
+            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),
+            "path": rel, "abs_path": abspath, "fmt": fmt, "bytes": len(data), "sha1": h,
+            "event_date": str(as_ts(event_date) or ""), "knowledge_date": str(as_ts(knowledge_date) or ""),
+            "source": source, "adopted": False,
+            "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),
+        })
+        return abspath
+
+    def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:
+        rows = self.lookup(scope, uid=uid)
+        if rows.empty:
+            return None
+        for _, r in rows.iterrows():
+            for cand in (r.get("abs_path"), os.path.join(self.root, str(r.get("path") or ""))):
+                try:
+                    if cand and isinstance(cand, str) and os.path.exists(cand):
+                        return open(cand, "rb").read()
+                except Exception:
+                    continue
+        return None
+
+    def put_table(self, name: str, df: pd.DataFrame, scope: str = "shared",
+                  domain: str = "table", source: str = "", extra: Optional[dict] = None) -> Optional[str]:
+        """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다."""
+        if df is None:
+            return None
+        self._assert_writable(f"put_table({name}, scope={scope})")
+        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        if os.path.exists(path):
+            bak = os.path.join(self.ns[scope], "index", "_backup",
+                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            try:
+                shutil.copy2(path, bak)
+            except Exception as e:                          # noqa
+                LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
+                         f"리비전 파일로 저장합니다: {name}")
+                path = os.path.join(self.table_dir(scope),
+                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+        try:
+            atomic_write_parquet(df, path)
+        except Exception as e:                              # noqa
+            LOG.warn(f"테이블 저장 실패({type(e).__name__}): {name}")
+            return None
+        self._register(scope, {
+            "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
+            "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
+            "fmt": "parquet", "bytes": os.path.getsize(path), "sha1": "",
+            "source": source, "adopted": False,
+            "extra": json.dumps({**(extra or {}), "rows": int(len(df)),
+                                 "cols": list(map(str, df.columns))[:80]}, ensure_ascii=False),
+        })
+        return path
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  쓰기 잠금 — 계약검정이 실제 캐시를 오염시키는 사고를 '구조로' 막는다
+    #
+    #  ★ 실제로 일어난 사고다. 계약검정이 pykrx 를 가짜 객체로 바꿔치기한 뒤 복원에
+    #    실패했고, 그 가짜가 살아남아 M0.MCAP 이 합성 종목코드 4개 × 120개월 = 480행을
+    #    사용자의 **실제 공용 드라이브 캐시**(krx_marketcap_monthly)에 써버렸다.
+    #    다음 실행은 그 480행을 캐시 적중으로 읽고 진짜 수집을 통째로 건너뛰었다.
+    #    저널이 append-only 라 '지워지지'는 않았지만, 가짜가 진짜를 가리는 건 훼손과 같다.
+    #
+    #  '전역을 잘 복원하자'는 규율은 이미 한 번 실패했다. 규율이 아니라 구조로 막는다:
+    #  검정 구간에는 금고 자체를 읽기전용으로 잠근다. 잠긴 동안의 쓰기는 조용히 무시되지
+    #  않고 예외로 터진다 — 조용한 무시는 다음 사고의 씨앗이다.
+    # ══════════════════════════════════════════════════════════════════════════════
+    def lock_writes(self, why: str = "계약검정"):
+        self._wlock = why
+
+    def unlock_writes(self):
+        self._wlock = ""
+
+    def _assert_writable(self, what: str):
+        if getattr(self, "_wlock", ""):
+            raise RuntimeError(
+                f"금고가 '{self._wlock}' 때문에 읽기전용으로 잠겨 있는데 쓰기를 시도했습니다: "
+                f"{what}. 이건 방어가 작동한 것입니다 — 검정용 가짜 데이터가 실제 캐시로 "
+                f"새어 나가려던 참이었습니다. 검정 코드에서 VAULT 를 대역으로 교체했는지 "
+                f"확인하세요.")
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  증분 샤드 저장 — 700만 행을 매 실행 다시 쓰지 않는다
+    #
+    #  ★ 실측 낭비: 일봉 캐시가 697만 행인데 이번 실행에서 새로 받은 건 58종목뿐이었다.
+    #    그런데 put_table 은 전체를 다시 쓰고(2.7초) 교체 전 백업까지 복사한다(2.9초).
+    #    로컬 SSD 에서 5.6초, 구글드라이브 마운트에서는 분 단위다. 매 실행 반복된다.
+    #    새로 받은 58종목만 쓰면 0.04초다.
+    #
+    #  구조: 기존 {name}.parquet 은 **손대지 않는다**(절대 1원칙). 새 데이터는
+    #        {name}.parts/ 아래 새 파일로만 쌓는다. 읽을 때 본체 + 조각을 합친다.
+    #        기존 캐시와 100% 호환된다 — 조각이 없으면 예전과 똑같이 동작한다.
+    #        조각이 많아지면 본체로 합치되(compact), 그때도 백업 후 교체한다.
+    # ══════════════════════════════════════════════════════════════════════════════
+    def _parts_dir(self, name: str, scope: str) -> str:
+        return os.path.join(self.table_dir(scope), f"{name}.parts")
+
+    def _part_files(self, name: str, scope: str) -> List[str]:
+        d = self._parts_dir(name, scope)
+        if not os.path.isdir(d):
+            return []
+        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".parquet"))
+
+    def append_table(self, name: str, new_df: pd.DataFrame, scope: str = "shared",
+                     domain: str = "table", source: str = "",
+                     extra: Optional[dict] = None,
+                     compact_parts: int = 12) -> Optional[str]:
+        """새 행만 조각 파일로 덧붙인다. 본체는 건드리지 않는다."""
+        if new_df is None or not len(new_df):
+            return None
+        self._assert_writable(f"append_table({name}, scope={scope})")
+        d = self._parts_dir(name, scope)
+        os.makedirs(d, exist_ok=True)
+        stamp = f"{_dt.datetime.now():%Y%m%d_%H%M%S}"
+        path = os.path.join(d, f"{stamp}.{sha1_str(name, str(len(new_df)), stamp)[:8]}.parquet")
+        try:
+            atomic_write_parquet(new_df, path)
+        except Exception as e:                              # noqa
+            LOG.warn(f"조각 저장 실패({type(e).__name__}): {name} — 전체 저장으로 폴백합니다.")
+            return self.put_table(name, new_df, scope, domain, source, extra)
+        self._register(scope, {
+            "uid": sha1_str("table_part", scope, name, stamp), "domain": domain,
+            "subtype": "table_part", "key": name,
+            "path": os.path.relpath(path, self.root), "abs_path": path, "fmt": "parquet",
+            "bytes": os.path.getsize(path), "sha1": "", "source": source, "adopted": False,
+            "extra": json.dumps({**(extra or {}), "rows": int(len(new_df))}, ensure_ascii=False),
+        })
+        parts = self._part_files(name, scope)
+        LOG.info(f"'{name}' 증분 {len(new_df):,}행을 조각으로 저장했습니다 "
+                 f"(본체는 그대로 · 조각 {len(parts)}개). 전체 재기록을 하지 않습니다.")
+        if len(parts) >= compact_parts:
+            self.compact_table(name, scope)
+        return path
+
+    def compact_table(self, name: str, scope: str = "shared") -> bool:
+        """조각들을 본체로 합친다. 본체는 백업 후에만 교체하고, 조각은 지우지 않고 보관한다."""
+        parts = self._part_files(name, scope)
+        if not parts:
+            return False
+        base = self.get_table(name, scope=scope)
+        if base is None or not len(base):
+            return False
+        if self.put_table(name, base, scope=scope, source=f"compact:{len(parts)}parts") is None:
+            return False
+        keep = os.path.join(self._parts_dir(name, scope), "_merged")
+        os.makedirs(keep, exist_ok=True)
+        moved = 0
+        for f in parts:
+            try:                       # ★ 삭제가 아니라 이동이다. 삭제 API 는 존재하지 않는다.
+                os.replace(f, os.path.join(keep, os.path.basename(f)))
+                moved += 1
+            except Exception:                                # noqa
+                pass
+        LOG.ok(f"'{name}' 조각 {moved}개를 본체({len(base):,}행)로 합쳤습니다 "
+               f"(조각 원본은 {os.path.relpath(keep, self.root)} 에 그대로 보관).")
+        return True
+
+    def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
+                  ) -> Optional[pd.DataFrame]:
+        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        use_scope = scope
+        if not os.path.exists(path):
+            # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
+            alt = "private" if scope == "shared" else "shared"
+            path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
+            if os.path.exists(path2):
+                path, use_scope = path2, alt
+            elif not self._part_files(name, scope):
+                return None
+            else:
+                path = ""
+        if path and max_age_days is not None:
+            age = (time.time() - os.path.getmtime(path)) / 86400.0
+            if age > max_age_days:
+                return None
+        frames = []
+        d = read_parquet_safe(path) if path else None
+        if d is not None and len(d):
+            frames.append(d)
+        for f in self._part_files(name, use_scope) + (
+                self._part_files(name, scope) if use_scope != scope else []):
+            pf = read_parquet_safe(f)
+            if pf is not None and len(pf):
+                frames.append(pf)
+        if not frames:
+            return d
+        out = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+        PIPE.io("IN", "DRIVE", f"table:{name}", out,
+                source=(os.path.relpath(path, self.root) if path else f"{name}.parts")
+                       + (f" +조각{len(frames)-1}" if len(frames) > 1 else ""))
+        return out
+
+    def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
+              source: str = "", event_date=None, knowledge_date=None,
+              scope: str = "shared", extra: Optional[dict] = None) -> Optional[str]:
+        """이미 드라이브에 있는 파일을 옮기지 않고 '경로만' 등록한다. 파일은 읽기만 한다."""
+        try:
+            sz = os.path.getsize(abs_path)
+        except Exception:
+            return None
+        uid = sha1_str("adopt", domain, subtype, os.path.abspath(abs_path), sz)
+        if self.has(scope, uid):
+            return uid
+        self._register(scope, {
+            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),
+            "path": abs_path, "abs_path": abs_path, "fmt": os.path.splitext(abs_path)[1].lstrip("."),
+            "bytes": sz, "sha1": "", "source": source or "adopted",
+            "event_date": str(as_ts(event_date) or ""), "knowledge_date": str(as_ts(knowledge_date) or ""),
+            "adopted": True, "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),
+        })
+        self.stats["adopted"] += 1
+        return uid
+
+    # ── 커밋 / 컴팩션 ------------------------------------------------------------------
+    def flush(self, scope: Optional[str] = None):
+        """대기 중인 등록을 append-only 저널에 기록. 기존 줄은 건드리지 않는다."""
+        scopes = [scope] if scope else ["shared", "private"]
+        for sc in scopes:
+            with self._lk:
+                rows, self._pending[sc] = self._pending[sc], []
+            if not rows:
+                continue
+            with self.lock(f"journal_{sc}"):
+                append_jsonl(self.journal(sc), rows)
+            self.stats[f"journal_append:{sc}"] += len(rows)
+            LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")
+
+    def compact(self, scope: str):
+        """저널 → index.parquet 재생성. 저널은 남기고, 기존 parquet 은 반드시 백업한 뒤 교체."""
+        self.flush(scope)
+        idx = self.load_index(scope, force=True)
+        p = self.idx_parquet(scope)
+        if os.path.exists(p):
+            bak = os.path.join(self.ns[scope], "index", "_backup",
+                               f"index.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            try:
+                shutil.copy2(p, bak)
+            except Exception as e:                          # noqa
+                LOG.warn(f"인덱스 백업 실패({type(e).__name__}) — 안전을 위해 컴팩션을 건너뜁니다. "
+                         f"저널({os.path.basename(self.journal(scope))})에 모든 기록이 남아 있으므로 "
+                         f"데이터 유실은 없습니다.")
+                return
+        try:
+            atomic_write_parquet(idx.astype({c: str for c in idx.columns if idx[c].dtype == object}), p)
+            LOG.ok(f"인덱스 컴팩션 완료: {scope} — {len(idx):,}행 → {os.path.relpath(p, self.root)}")
+        except Exception as e:                              # noqa
+            LOG.warn(f"인덱스 컴팩션 실패({type(e).__name__}) — 저널이 원천이므로 유실 없음.")
+
+    # ── 사전 스캔 (사용자의 기존 캐시 흡수) --------------------------------------------
+    _PDF_PAT = re.compile(r"\.(pdf)$", re.I)
+    _DATE_PAT = re.compile(r"(20\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])")
+
+    def adopt_scan(self, dirs: Sequence[str], max_files: int = 400_000) -> pd.DataFrame:
+        """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음."""
+        seen, found = set(), []
+        for d in dirs:
+            if not d or not os.path.isdir(d):
+                continue
+            rd = os.path.realpath(d)
+            if rd in seen:
+                continue
+            seen.add(rd)
+            LOG.info(f"기존 캐시 스캔: {d}")
+            n = 0
+            for dirpath, dirnames, filenames in os.walk(d):
+                dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
+                for fn in filenames:
+                    if n >= max_files:
+                        break
+                    fp = os.path.join(dirpath, fn)
+                    low = fn.lower()
+                    if low.endswith(".pdf"):
+                        kind = "report_pdf"
+                    elif low.endswith((".parquet", ".jsonl", ".json", ".csv")) and \
+                            any(t in low for t in ("report", "consensus", "research", "analyst",
+                                                   "hankyung", "naver", "dart", "krx", "nps",
+                                                   "price", "ohlcv", "universe", "fnltt")):
+                        kind = "table_like"
+                    else:
+                        continue
+                    found.append({"abs_path": fp, "kind": kind, "name": fn,
+                                  "dir": dirpath, "bytes": _safe_size(fp)})
+                    n += 1
+            LOG.info(f"  → {n:,}개 후보 발견")
+        if not found:
+            LOG.warn("기존 캐시에서 흡수할 파일을 찾지 못했습니다. "
+                     "GDRIVE_ADOPT_DIRS 경로를 확인하세요(오타/미마운트가 가장 흔합니다).")
+            return pd.DataFrame(columns=["abs_path", "kind", "name"])
+        df = pd.DataFrame(found)
+        for r in df.itertuples(index=False):
+            m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)
+            ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+            self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",
+                       subtype=r.kind, key=r.name, source="preexisting_drive_cache",
+                       event_date=ed, knowledge_date=ed, scope="shared",
+                       extra={"dir": r.dir})
+        self.flush("shared")
+        LOG.ok(f"기존 캐시 {len(df):,}건을 공용 인덱스에 '참조 등록'했습니다 "
+               f"(파일은 원위치 그대로, 이동·삭제 없음).")
+        return df
+
+    # ── 감사 --------------------------------------------------------------------------
+    def report(self):
+        LOG.banner("구글드라이브 캐시 감사", f"루트: {self.root}   모드: {self.mode}")
+        rows = []
+        for sc in ("shared", "private"):
+            idx = self.load_index(sc)
+            nb = 0
+            try:
+                nb = sum(int(x) for x in pd.to_numeric(idx.get("bytes"), errors="coerce").fillna(0))
+            except Exception:
+                pass
+            rows.append([("공용 " + GDRIVE_SHARED_NS) if sc == "shared" else ("전용 " + GDRIVE_PRIVATE_NS),
+                         f"{len(idx):,}",
+                         f"{int(pd.to_numeric(idx.get('adopted'), errors='coerce').fillna(0).sum()):,}"
+                         if "adopted" in idx.columns else "0",
+                         f"{nb / 1e9:.2f} GB",
+                         os.path.relpath(self.journal(sc), self.root)])
+        LOG.table(rows, ["인덱스", "등록 항목", "참조등록(adopt)", "용량", "저널"],
+                  ["l", "r", "r", "r", "l"])
+        idx = self.load_index("shared")
+        if not idx.empty and "domain" in idx.columns:
+            g = (idx.groupby([idx["domain"].astype(str), idx["subtype"].astype(str)])
+                 .size().reset_index(name="n").sort_values("n", ascending=False).head(24))
+            LOG.table([[r.iloc[0], r.iloc[1], f"{int(r.iloc[2]):,}"] for _, r in g.iterrows()],
+                      ["도메인", "서브타입", "건수"], ["l", "l", "r"],
+                      title="공용 인덱스 구성 (다른 전략에서 그대로 재사용 가능)")
+        if self.stats:
+            LOG.table([[k, f"{v:,}"] for k, v in sorted(self.stats.items())][:24],
+                      ["이벤트", "횟수"], ["l", "r"], title="이번 실행의 캐시 이벤트")
+        LOG.info("무결성 원칙: 저널은 append-only(기존 줄 재기록 없음) · index.parquet 은 백업 후 교체 · "
+                 "blob 은 내용해시 경로라 덮어쓰기 자체가 발생하지 않음 · 삭제 API 없음.")
+
+
+def _safe_size(p: str) -> int:
+    try:
+        return os.path.getsize(p)
+    except Exception:
+        return -1
+
+
+def free_gb(path: str) -> float:
+    """여유 디스크(GB). os.statvfs 는 Windows 에 없다 — shutil.disk_usage 가 크로스플랫폼이다."""
+    try:
+        return shutil.disk_usage(path).free / 1e9
+    except Exception:
+        pass
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize / 1e9
+    except Exception:
+        return float("nan")
+
+
+def discover_drive_dirs(cache_root: str) -> List[str]:
+    """플랫폼별 구글드라이브·기존 캐시 후보 경로를 자동 탐지한다.
+
+    ★ 왜 필요한가: GDRIVE_ADOPT_DIRS 기본값이 Colab 경로(/content/...)라, 로컬 주피터에서
+      돌리면 "흡수할 파일을 찾지 못했습니다" 만 뜨고 사용자가 이미 모아둔 리포트가
+      통째로 무시된다. 사용자에게 경로를 손으로 고치라고 요구하는 대신 흔한 위치를 훑는다.
+      (읽기 전용 스캔이며 파일을 옮기거나 지우지 않는다 — adopt-by-reference)
+    """
+    cands: List[str] = []
+    home = os.path.expanduser("~")
+    if cache_root:
+        cands += [cache_root, os.path.dirname(os.path.abspath(cache_root))]
+    if sys.platform.startswith("win"):
+        for drv in "GHIJKDEF":
+            cands += [f"{drv}:\\내 드라이브", f"{drv}:\\My Drive", f"{drv}:\\"]
+        cands += [os.path.join(home, "Google Drive"), os.path.join(home, "GoogleDrive"),
+                  os.path.join(home, "Documents"), os.path.join(home, "Downloads")]
+    elif sys.platform == "darwin":
+        cands += [os.path.join(home, "Google Drive"),
+                  os.path.join(home, "Library/CloudStorage")]
+    else:
+        cands += ["/content/drive/MyDrive", os.path.join(home, "Google Drive"),
+                  os.path.join(home, "GoogleDrive")]
+    out, seen = [], set()
+    for c in cands:
+        try:
+            if not c or not os.path.isdir(c):
+                continue
+            r = os.path.realpath(c)
+            # 드라이브 루트 전체 스캔은 너무 비싸다 — 하위의 그럴듯한 폴더만 고른다
+            if len(r) <= 3:
+                for sub in os.listdir(c)[:60]:
+                    p = os.path.join(c, sub)
+                    if os.path.isdir(p) and any(
+                            k in sub.lower() for k in ("tcd", "research", "report", "consensus",
+                                                       "리서치", "리포트", "컨센서스", "quant", "qunat")):
+                        rp = os.path.realpath(p)
+                        if rp not in seen:
+                            seen.add(rp); out.append(p)
+                continue
+            if r not in seen:
+                seen.add(r); out.append(c)
+        except Exception:
+            continue
+    return out
+
+
+VAULT: Optional[Vault] = None
