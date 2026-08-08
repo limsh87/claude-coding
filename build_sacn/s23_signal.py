@@ -73,6 +73,25 @@ class PriceGrid:
         return px.astype("float32"), as_ts(self.close.index[i])
 
 
+
+def available_month_end(grid: "PriceGrid", t) -> pd.Timestamp:
+    """시점 t 에서 '이미 확정되어 알 수 있는' 월말 스냅샷 날짜.
+
+    월간 리밸런싱의 t 는 달력 월말이 아니라 그 달의 '마지막 거래일'이다(예: 3/29).
+    t == t+MonthEnd(0) 로 판정하면 항상 거짓이 되어 매번 직전 달 유니버스를 쓰게 된다 —
+    미래누수는 아니지만 한 달치 신선도를 공짜로 버리는 셈이다.
+    그 달의 마지막 거래일이 t 이하이면 그 달 월말 스냅샷은 t 시점에 확정된 것이므로 쓴다.
+    """
+    t = as_ts(t)
+    cur = t + pd.offsets.MonthEnd(0)
+    i = grid.pos_at_or_before(cur)
+    # pos_at_or_before 는 격자 끝을 넘어서면 마지막 행으로 클램프된다. 그 경우
+    # '아직 오지 않은 월말'을 확정된 것으로 오인하므로 명시적으로 배제한다.
+    if i >= 0 and cur <= as_ts(grid.close.index[-1]) and as_ts(grid.close.index[i]) <= t:
+        return cur
+    return cur - pd.offsets.MonthEnd(1)
+
+
 def rebalance_dates(months: pd.DatetimeIndex, grid: PriceGrid, freq: str) -> List[pd.Timestamp]:
     """리밸런싱 시점. 'M'=월말, 'W'=주말(각 주의 마지막 거래일)."""
     if freq == "M":
@@ -131,9 +150,8 @@ def compute_sacn(LM: LinkMatrices, grid: PriceGrid, uni_panel: pd.DataFrame,
         W = LM.W.get(m_link)
         if W is None or W.nnz == 0:
             continue
-        # 유니버스도 t 이하 최근 월말 스냅샷 기준
-        m_uni = (t + pd.offsets.MonthEnd(0)) if t == (t + pd.offsets.MonthEnd(0)) \
-            else (t - pd.offsets.MonthEnd(1))
+        # 유니버스도 t 시점에 확정된 최근 월말 스냅샷 기준
+        m_uni = available_month_end(grid, t)
         if m_uni not in uni_by_month:
             cand = [m for m in uni_by_month if m <= t]
             if not cand:
@@ -146,8 +164,14 @@ def compute_sacn(LM: LinkMatrices, grid: PriceGrid, uni_panel: pd.DataFrame,
         ok = g2l >= 0
         r[ok] = r_grid[g2l[ok]]
 
-        mask = np.array([1.0 if c in alive else 0.0 for c in lcodes])
-        mask *= np.isfinite(r).astype(float)
+        # ★ 두 개의 서로 다른 소속 판정을 구분한다.
+        #   own  : 신호를 '받을' 자격 — 초점기업 i 자신이 그 시점 유니버스에 있어야 한다.
+        #   mask : 신호에 '기여할' 자격 — 연결기업 j 가 유니버스에 있고 수익률도 있어야 한다.
+        #   이 둘을 하나로 쓰면, 유니버스 밖 종목도 이웃만 3개 있으면 순위에 들어온다.
+        #   LM.codes 는 전 기간 유니버스의 합집합이므로, 그렇게 되면 2024년에야 하한을
+        #   통과한 종목이 2017년에 편입되는 전표본 선택편의가 된다.
+        own = np.array([1.0 if c in alive else 0.0 for c in lcodes])
+        mask = own * np.isfinite(r).astype(float)
         if mask.sum() < min_links + 1:
             continue
         rr = np.where(np.isfinite(r), r, 0.0) * mask
@@ -158,7 +182,7 @@ def compute_sacn(LM: LinkMatrices, grid: PriceGrid, uni_panel: pd.DataFrame,
         nlink = B @ mask                      # 실제로 쓰인 연결기업 수
 
         with np.errstate(all="ignore"):
-            sig = np.where((den > 0) & (nlink >= min_links), num / den, np.nan)
+            sig = np.where((own > 0) & (den > 0) & (nlink >= min_links), num / den, np.nan)
 
         sel = np.isfinite(sig)
         if not sel.any():
@@ -193,16 +217,17 @@ def orthogonalize(S: pd.DataFrame, uni_panel: pd.DataFrame, grid: PriceGrid,
     """
     if S is None or not len(S):
         return S
-    U = uni_panel[["code", "month", "mktcap", "bm", "sector"]].copy()
+    # (code, month) 가 중복되면 merge 가 신호 패널의 행을 복제한다 → 같은 종목이 분위에
+    # 두 번 들어가고 비중도 두 번 잡힌다. attach_attrs 와 동일하게 여기서도 제거한다.
+    U = uni_panel[["code", "month", "mktcap", "bm", "sector"]].drop_duplicates(
+        ["code", "month"]).copy()
     U["code"] = U["code"].astype(str)
     U["month"] = as_ts_series(U["month"])
 
     d = S.copy()
-    d["month"] = as_ts_series(d["date"]) + pd.offsets.MonthEnd(0)
-    # 주간 리밸런싱은 월말 이전 시점이 있으므로, 그 시점에 '알 수 있던' 직전 월말 속성을 쓴다
-    d["month_attr"] = np.where(as_ts_series(d["date"]) >= d["month"],
-                               d["month"], d["month"] - pd.offsets.MonthEnd(1))
-    d["month_attr"] = as_ts_series(d["month_attr"])
+    # 그 시점에 '확정되어 알 수 있던' 월말 속성만 쓴다 (주간 리밸런싱 포함)
+    _mm = {t: available_month_end(grid, t) for t in as_ts_series(d["date"]).unique()}
+    d["month_attr"] = as_ts_series(as_ts_series(d["date"]).map(_mm))
     d = d.merge(U.rename(columns={"month": "month_attr"}), on=["code", "month_attr"], how="left")
 
     # 업종 수익률: 같은 시점, 같은 업종의 자기수익률 평균 (자기 자신 제외 = leave-one-out)
@@ -272,7 +297,7 @@ def orthogonalize(S: pd.DataFrame, uni_panel: pd.DataFrame, grid: PriceGrid,
     return R.drop(columns=["month_attr"], errors="ignore")
 
 
-def attach_attrs(P: pd.DataFrame, uni_panel: pd.DataFrame,
+def attach_attrs(P: pd.DataFrame, uni_panel: pd.DataFrame, grid: "PriceGrid",
                  cols: Sequence[str] = ("mktcap", "market", "sector", "bm")) -> pd.DataFrame:
     """유니버스 속성을 신호 패널에 붙인다 — 이미 있는 컬럼은 건드리지 않는다.
 
@@ -295,9 +320,8 @@ def attach_attrs(P: pd.DataFrame, uni_panel: pd.DataFrame,
     d = P.copy()
     d["code"] = d["code"].astype(str)
     # 주간 리밸런싱 시점은 월말이 아니므로 '그 시점에 알 수 있던' 직전 월말 속성을 쓴다
-    mm = as_ts_series(d["date"]) + pd.offsets.MonthEnd(0)
-    d["_m"] = np.where(as_ts_series(d["date"]) >= mm, mm, mm - pd.offsets.MonthEnd(1))
-    d["_m"] = as_ts_series(d["_m"])
+    _mm = {t: available_month_end(grid, t) for t in as_ts_series(d["date"]).unique()}
+    d["_m"] = as_ts_series(as_ts_series(d["date"]).map(_mm))
     d = d.merge(U.rename(columns={"month": "_m"}), on=["code", "_m"], how="left")
     return d.drop(columns=["_m"], errors="ignore")
 

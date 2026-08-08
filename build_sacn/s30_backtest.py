@@ -71,13 +71,19 @@ def perf_stats(R: pd.DataFrame, ppy: float = 12.0, rf: float = 0.0) -> dict:
     n = len(r)
     if n == 0:
         return {}
+    rp = rf / ppy                      # 기간 무위험수익률 (rf 를 받아놓고 안 쓰면 안 된다)
+    ex = r - rp
     eq = np.cumprod(1.0 + r)
     years = n / ppy
     cagr = float(eq[-1] ** (1.0 / years) - 1.0) if years > 0 and eq[-1] > 0 else float("nan")
     vol = float(np.std(r, ddof=1) * math.sqrt(ppy)) if n > 1 else float("nan")
-    dn = r[r < 0]
-    dvol = float(np.std(dn, ddof=1) * math.sqrt(ppy)) if len(dn) > 1 else float("nan")
-    dd = eq / np.maximum.accumulate(eq) - 1.0
+    # ★ 하방편차는 '손실의 표준편차'가 아니라 목표 대비 semi-deviation 이다.
+    #   손실을 평균 중심으로 재면, 균일한 손실이 이어질 때 분모가 0에 수렴해 Sortino 가 폭발한다.
+    dvol = float(np.sqrt(np.mean(np.minimum(ex, 0.0) ** 2)) * math.sqrt(ppy)) if n else float("nan")
+    # ★ 최초 자본(1.0)을 기준선에 포함한다. 빼면 '시작하자마자 난 낙폭'이 통째로 안 보이고
+    #   MDD 가 0, Calmar 가 NaN 으로 나온다 — MDD 는 모든 표의 헤드라인 지표다.
+    eqd = np.concatenate(([1.0], eq))
+    dd = (eqd / np.maximum.accumulate(eqd) - 1.0)[1:]
     mdd = float(dd.min()) if n else float("nan")
     mu, tstat = hac_tstat(r)
     uw, best = 0, 0
@@ -86,8 +92,8 @@ def perf_stats(R: pd.DataFrame, ppy: float = 12.0, rf: float = 0.0) -> dict:
         best = max(best, uw)
     out = {
         "기간수": n, "CAGR": cagr, "연변동성": vol,
-        "Sharpe": float(np.mean(r) / np.std(r, ddof=1) * math.sqrt(ppy)) if n > 1 and np.std(r, ddof=1) > 0 else float("nan"),
-        "Sortino": float(np.mean(r) * ppy / dvol) if dvol and dvol > 0 else float("nan"),
+        "Sharpe": float(np.mean(ex) / np.std(r, ddof=1) * math.sqrt(ppy)) if n > 1 and np.std(r, ddof=1) > 0 else float("nan"),
+        "Sortino": float(np.mean(ex) * ppy / dvol) if dvol and np.isfinite(dvol) and dvol > 1e-12 else float("nan"),
         "MDD": mdd, "Calmar": float(cagr / abs(mdd)) if mdd and mdd < 0 else float("nan"),
         "승률": float((r > 0).mean()), "기간평균수익": float(np.mean(r)),
         "t통계량(HAC)": float(tstat), "최장언더워터(기간)": int(best),
@@ -103,14 +109,35 @@ def perf_stats(R: pd.DataFrame, ppy: float = 12.0, rf: float = 0.0) -> dict:
 
 
 def _assign_quantiles(g: pd.DataFrame, col: str, q: int) -> pd.Series:
-    """동점 처리를 결정적으로: 신호 내림차순 → code 오름차순으로 순위를 확정한 뒤 분할."""
+    """분위 배정. 동점은 code 오름차순으로 깨서 입력 행 순서와 무관하게 만든다.
+
+    rank(method="first") 는 '행 위치'로 동점을 깬다. 상류에서 정렬이 바뀌면 같은 데이터인데
+    종목별 분위가 달라진다 — 재현성이 깨지는 지점이고, 합계만 비교하는 검사로는 절대 안 잡힌다.
+    """
     d = g[[col, "code"]].copy()
-    d["_r"] = d[col].rank(method="first", ascending=True)
-    n = int(d["_r"].notna().sum())
+    d["_code"] = d["code"].astype(str)
+    ok = d[col].notna()
+    n = int(ok.sum())
     if n < q:
         return pd.Series(np.nan, index=g.index)
-    lab = np.ceil(d["_r"] / (n / q))
-    return pd.Series(np.clip(lab, 1, q), index=g.index)
+    order = d[ok].sort_values([col, "_code"], kind="mergesort").index
+    rk = pd.Series(np.arange(1, n + 1, dtype=float), index=order)
+    lab = np.ceil(rk / (n / q)).clip(1, q)
+    return lab.reindex(g.index)
+
+
+def _qtile_by_date(d: pd.DataFrame, signal_col: str, q: int) -> pd.Series:
+    """시점별 분위 배정. groupby(...).apply 를 쓰지 않는다.
+
+    pandas 는 그룹이 정확히 1개일 때 같은 인덱스를 가진 Series 반환을 '전치된 DataFrame'
+    으로 감싼다 → `Cannot set a DataFrame with multiple columns to the single column qtile`.
+    표본이 얇아 시점이 하나만 남는 상황은 실데이터 첫 실행에서 충분히 일어나고,
+    그때 L3.BT 는 critical 이라 실행 전체가 죽는다. 명시적 concat 으로 우회한다.
+    """
+    parts = [_assign_quantiles(g, signal_col, q) for _, g in d.groupby("date", sort=False)]
+    if not parts:
+        return pd.Series(np.nan, index=d.index)
+    return pd.concat(parts).reindex(d.index)
 
 
 def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
@@ -138,19 +165,27 @@ def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
             d[c] = pd.to_numeric(d[c], errors="coerce").astype("float64")
 
     # 폐지 수익률 주입 (§0.3) — fwd_ret 이 결측인데 그 구간에 폐지된 종목
-    if delist is not None and len(delist):
-        dl = delist.copy()
+    if delist is not None and len(delist) and "delist_date" in delist.columns:
+        # ★ '폐지된 달의 모든 리밸런싱 시점'에 주입하면 주간 리밸런싱에서 같은 손실이
+        #   한 달에 4~5번 반복 계상된다. 보유 구간 (t, next_t] 안에 폐지일이 들어온
+        #   시점에만 정확히 한 번 주입한다.
+        dl = delist[["code", "delist_date", "delist_ret"]].copy()
         dl["code"] = dl["code"].astype(str)
-        dl["month"] = as_ts_series(dl["month"])
-        d["_m"] = d["date"] + pd.offsets.MonthEnd(0)
-        d = d.merge(dl.rename(columns={"month": "_m"})[["code", "_m", "delist_ret"]],
-                    on=["code", "_m"], how="left")
-        inj = d["fwd_ret"].isna() & d["delist_ret"].notna()
-        d.loc[inj, "fwd_ret"] = d.loc[inj, "delist_ret"]
-        d = d.drop(columns=["_m", "delist_ret"], errors="ignore")
+        dl["delist_date"] = as_ts_series(dl["delist_date"])
+        dl = dl.dropna(subset=["delist_date"]).drop_duplicates("code", keep="last")
+        d = d.merge(dl, on="code", how="left")
+        dd = as_ts_series(d["delist_date"])
+        nxt = (as_ts_series(d["next_date"]) if "next_date" in d.columns
+               else d["date"] + pd.offsets.MonthEnd(1))
+        nxt = nxt.fillna(d["date"] + pd.offsets.MonthEnd(1))
+        inj = d["fwd_ret"].isna() & dd.notna() & (dd > d["date"]) & (dd <= nxt)
+        if inj.any():
+            d.loc[inj, "fwd_ret"] = pd.to_numeric(
+                d.loc[inj, "delist_ret"], errors="coerce").astype("float64")
+            LOG.debug(f"[{label}] 폐지 수익률 {int(inj.sum()):,}건 주입 (보유구간 매칭)")
+        d = d.drop(columns=["delist_date", "delist_ret"], errors="ignore")
 
-    d["qtile"] = d.groupby("date", group_keys=False).apply(
-        lambda g: _assign_quantiles(g, signal_col, q))
+    d["qtile"] = _qtile_by_date(d, signal_col, q)
     d = d[d["qtile"].notna()]
     if not len(d):
         return empty
@@ -193,8 +228,15 @@ def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
         w = min(w, POS_MAX_WEIGHT)
         wmap = {c: w for c in top["code"]}
         # 상한 때문에 남은 비중은 현금으로 둔다 (억지로 종목을 늘리지 않는다)
-        fr = pd.to_numeric(top["fwd_ret"], errors="coerce").fillna(0.0).to_numpy(float)
-        ret_gross = float(np.sum(fr * w))
+        # 전향수익이 결측인 종목을 0%로 계상하면 포트폴리오 수익이 0 쪽으로 희석된다.
+        # 결측은 '수익 0'이 아니라 '관측 없음'이므로, 관측된 종목들로 비중을 재정규화한다.
+        fr_s = pd.to_numeric(top["fwd_ret"], errors="coerce")
+        n_ok = int(fr_s.notna().sum())
+        if n_ok == 0:
+            # 마지막 리밸런싱은 다음 실행가가 없어 전 종목이 결측이다. 이걸 한 기간으로
+            # 계상하면 회전비용만 물린 가짜 기간이 성과·t통계량·스프레드에 섞인다.
+            continue
+        ret_gross = float(np.nanmean(fr_s.to_numpy(float)) * (w * len(top)))
 
         cost, turn = 0.0, 0.0
         allc = set(wmap) | set(prev_w)
@@ -217,7 +259,7 @@ def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
         holds.append(h)
 
         if len(bot) >= min_names:
-            rb = float(pd.to_numeric(bot["fwd_ret"], errors="coerce").fillna(0.0).mean())
+            rb = float(pd.to_numeric(bot["fwd_ret"], errors="coerce").mean())
             spreads.append({"date": t, "q5": ret_gross, "q1": rb, "spread": ret_gross - rb,
                             "n5": len(top), "n1": len(bot)})
         prev_w = wmap
@@ -251,8 +293,7 @@ def quantile_profile(P: pd.DataFrame, signal_col: str, q: int = N_QUANTILES) -> 
     d = P[P[signal_col].notna() & P["fwd_ret"].notna()].copy()
     if not len(d):
         return pd.DataFrame()
-    d["qtile"] = d.groupby("date", group_keys=False).apply(
-        lambda g: _assign_quantiles(g, signal_col, q))
+    d["qtile"] = _qtile_by_date(d, signal_col, q)
     d = d[d["qtile"].notna()]
     per = d.groupby(["date", "qtile"])["fwd_ret"].mean().reset_index()
     out = per.groupby("qtile")["fwd_ret"].agg(["mean", "std", "size"]).reset_index()
@@ -320,10 +361,13 @@ def index_benchmarks(dates: Sequence[pd.Timestamp]) -> Dict[str, pd.Series]:
                 continue
             c = df["Close"].copy()
             c.index = as_ts_series(pd.Series(df.index)).to_numpy()
-            v = c.reindex(c.index.union(idx)).sort_index().ffill().reindex(idx)
+            # FDR 이 같은 날짜를 두 번 돌려주는 경우가 있다. 중복 인덱스에 reindex 하면
+            # ValueError 로 죽고, 위 except 가 삼켜 벤치마크가 조용히 사라진다.
+            c = c[~pd.Index(c.index).duplicated(keep="last")].sort_index()
+            v = c.reindex(pd.Index(c.index).union(idx)).sort_index().ffill().reindex(idx)
             out[name] = v.pct_change()
         except Exception as e:                                   # noqa
-            LOG.debug(f"벤치마크 {name} 수집 실패({type(e).__name__})")
+            LOG.warn(f"벤치마크 {name} 수집 실패({type(e).__name__}) — 이 벤치마크는 표에서 빠집니다.")
     return out
 
 

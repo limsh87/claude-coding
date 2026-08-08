@@ -230,7 +230,7 @@ def main() -> dict:
                     if P is None or not len(P):
                         LOG.warn(f"구성 {cid}: 신호 패널이 비었습니다 — 건너뜁니다.")
                         continue
-                    panels[cid] = attach_attrs(P, U)
+                    panels[cid] = attach_attrs(P, U, grid)
         ctx["panels"] = panels
         if not panels:
             raise RuntimeError("어떤 구성에서도 신호가 만들어지지 않았습니다.")
@@ -287,17 +287,41 @@ def main() -> dict:
         ctx["bt_raw"] = bt_raw
         report_arm_comparison({"직교화(주)": ctx["arm_bt"]["전체 유니버스"], "원신호": bt_raw}, ppy)
 
+    # ★ rob 을 스테이지 밖에서 먼저 채워둔다. L5.STATS 는 critical=False 라 실패해도
+    #   진행되는데, 그때 ctx["rob"] 이 없으면 하류가 KeyError 로 조용히 죽고
+    #   '수 시간 수집 후 산출물 0개'가 된다.
+    ctx["rob"] = {"bootstrap": {}, "pbo": {}, "dsr": {}, "wf": {}}
     with PIPE.stage("L5.STATS", "통계 검증 게이트 (§9)", "L5", budget_s=1500, critical=False):
         base = ctx["arm_bt"]["전체 유니버스"]
         r = base["returns"]["ret"].to_numpy(float) if len(base["returns"]) else np.array([])
-        M = pd.DataFrame({cid: bt["returns"].set_index(as_ts_series(bt["returns"]["date"]))["ret"]
-                          for cid, bt in ctx["allbt"].items()
-                          if len(bt["returns"])}).sort_index()
+        # ★ 주간·월간 구성을 한 행렬에 섞으면 안 된다. 날짜 격자가 달라 dropna(how="any")
+        #   후 교집합(월말∩주말)만 남고, 그 한 행 안에서 '1주 수익'과 '1개월 수익'이
+        #   나란히 비교된다. PBO 는 실력이 아니라 리밸런싱 주기를 고르게 되고,
+        #   워크포워드는 표본 부족으로 아예 실행되지 않는다.
+        mats: Dict[str, pd.DataFrame] = {}
+        for cid, bt in ctx["allbt"].items():
+            R = bt.get("returns")
+            if R is None or not len(R):
+                continue
+            mats.setdefault(cid.split("|")[1], {})[cid] = \
+                R.set_index(as_ts_series(R["date"]))["ret"]
+        mats = {rb: pd.DataFrame(c).sort_index() for rb, c in mats.items()}
+        M = mats.get(PRIMARY_CONFIG["rebal"], pd.DataFrame())
+        # DSR 의 시도 횟수는 12(사전등록 전체)로 유지하되, 시도 간 Sharpe 분산이
+        # 있으면 그것을 쓴다 (귀무 하 표집분산보다 정확하고 덜 관대하다).
+        srv = None
+        if len(M.columns) > 2:
+            _s = (M.mean() / M.std(ddof=1)).replace([np.inf, -np.inf], np.nan).dropna()
+            srv = float(_s.var(ddof=1)) if len(_s) > 2 else None
         rob = {"bootstrap": block_bootstrap(r, ppy=ppy),
                "pbo": cscv_pbo(M, S=8),
-               "dsr": deflated_sharpe(r, n_trials=N_PREREG_CONFIGS, ppy=ppy),
+               "pbo_by_rebal": {rb: cscv_pbo(m, S=8) for rb, m in mats.items()},
+               "dsr": deflated_sharpe(r, n_trials=N_PREREG_CONFIGS, ppy=ppy, sr_variance=srv),
                "wf": walk_forward(M, ppy=ppy)}
         ctx["rob"] = rob
+        LOG.info(f"통계 검증 행렬: 리밸런싱 주기별 분리 — "
+                 f"{', '.join(f'{k}:{v.shape[1]}구성×{v.shape[0]}기간' for k, v in mats.items())} "
+                 f"(주 구성 주기 '{PRIMARY_CONFIG['rebal']}' 기준으로 §11 판정)")
         report_robustness(rob, title=f"{pid} · 전체 유니버스")
 
     with PIPE.stage("L5.HYP", "사전등록 가설 H1~H4 (§3)", "L5", budget_s=900, critical=False):
@@ -305,7 +329,7 @@ def main() -> dict:
         Px = build_signal_panel(ctx["LM_xsec"], ctx["grid"], U, months,
                                 PRIMARY_CONFIG["window"], PRIMARY_CONFIG["rebal"])
         if Px is not None and len(Px):
-            Px = attach_attrs(Px, U)
+            Px = attach_attrs(Px, U, ctx["grid"])
             sp_x = spread_series(Px, PRIMARY_SIGNAL)
         else:
             sp_x = pd.Series(dtype=float)
@@ -352,10 +376,16 @@ def main() -> dict:
         report_interpretation(P0, PRIMARY_SIGNAL, ctx["LMs"][PRIMARY_CONFIG["weight"]],
                               ctx["arm_bt"]["전체 유니버스"], ctx["sec"])
 
-    with PIPE.stage("L6.VERDICT", "§11 기계적 판정 + 산출물", "L6", budget_s=600, critical=False):
+    with PIPE.stage("L6.VERDICT", "§11 기계적 판정", "L6", budget_s=300, critical=False):
         v = final_verdict(ctx["arm_bt"]["전체 유니버스"], ctx["bench"].get("동일가중 유니버스"),
-                          ctx["rob"]["pbo"], ctx["rob"]["dsr"], ppy)
+                          ctx["rob"].get("pbo", {}), ctx["rob"].get("dsr", {}), ppy)
         ctx["verdict"] = v
+    ctx.setdefault("verdict", {"verdict": "NOT_EVALUABLE", "why": "판정 단계 실패",
+                               "criteria": [], "excess_ew": float("nan"),
+                               "pbo": float("nan"), "dsr": float("nan")})
+
+    # 산출물은 판정과 분리한다. 판정이 실패해도 몇 시간짜리 수집 결과는 반드시 남겨야 한다.
+    with PIPE.stage("L6.OUTPUT", "산출물 생성 (§10)", "L6", budget_s=600, critical=False):
         write_outputs(ctx, ppy, t_all)
 
     PIPE.report_stages()

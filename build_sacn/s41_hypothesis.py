@@ -31,8 +31,7 @@ def spread_series(P: pd.DataFrame, signal_col: str, q: int = N_QUANTILES,
     d = P[P[signal_col].notna() & P["fwd_ret"].notna()].copy()
     if not len(d):
         return pd.Series(dtype=float)
-    d["qtile"] = d.groupby("date", group_keys=False).apply(
-        lambda g: _assign_quantiles(g, signal_col, q))
+    d["qtile"] = _qtile_by_date(d, signal_col, q)
     d = d[d["qtile"].notna()]
     g = d.groupby(["date", "qtile"])["fwd_ret"].agg(["mean", "size"]).reset_index()
     piv_m = g.pivot(index="date", columns="qtile", values="mean")

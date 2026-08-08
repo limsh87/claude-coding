@@ -16,8 +16,11 @@
 UNI_GATES = ["① 상장중(PIT)", "② 시장/증권 종류", "③ 가격 보유", "④ 주가 하한",
              "⑤ 시총 하한", "⑥ 유동성 하한", "⑦ 최종 유니버스"]
 
+# ★ exec_px(익영업일 시가)·fwd_ret(차월 수익률)은 '그 월말에 알 수 없는' 값이다.
+#   유니버스 패널에서 쓰이지도 않으면서 universe_YYYYMM.parquet 안에 들어가면,
+#   PIT 스냅샷이라는 이름의 파일에 미래 정보가 담긴 채로 남는다 — 장전된 총이다. 아예 빼둔다.
 UNIVERSE_COLS = ["code", "month", "market", "close_m", "adv20", "mktcap", "shares",
-                 "exec_px", "fwd_ret_m", "sector", "bm", "in_universe"]
+                 "sector", "bm", "in_universe"]
 
 
 class SACNUniverse:
@@ -73,7 +76,7 @@ class SACNUniverse:
 
             idx = pd.MultiIndex.from_product([codes2, [m]], names=["code", "month"])
             g = pd.DataFrame(index=idx)
-            for c in ("close", "adv20", "exec_px", "fwd_ret"):
+            for c in ("close", "adv20"):
                 g[c] = pm[c].reindex(idx) if c in pm.columns else np.nan
             g["mktcap"] = mc["mktcap"].reindex(idx) if "mktcap" in getattr(mc, "columns", []) else np.nan
             g["shares"] = mc["shares"].reindex(idx) if "shares" in getattr(mc, "columns", []) else np.nan
@@ -97,7 +100,7 @@ class SACNUniverse:
 
             g["market"] = g["code"].map(lambda c: mkt.get(c, ""))
             g["sector"] = g["code"].map(lambda c: smap.get(c, "미분류"))
-            g = g.rename(columns={"close": "close_m", "fwd_ret": "fwd_ret_m"})
+            g = g.rename(columns={"close": "close_m"})
             g["in_universe"] = True
             self._mark(m, UNI_GATES[6], len(g))                      # ⑦ 최종
             rows.append(g)
@@ -111,6 +114,10 @@ class SACNUniverse:
                                ("code", "month")] + [c for c in P.columns if c not in UNIVERSE_COLS])
         P["code"] = P["code"].astype(str)
         P["month"] = as_ts_series(P["month"])
+        dup = int(P.duplicated(["code", "month"]).sum()) if len(P) else 0
+        if dup:
+            raise RuntimeError(f"유니버스 패널에 (code, month) 중복 {dup:,}행이 있습니다. "
+                               f"하류 merge 가 행을 복제해 같은 종목이 두 번 편입됩니다.")
         self.panel = P
         PIPE.io("OUT", "MEM", "sacn_universe_panel", P)
         return P
@@ -167,12 +174,15 @@ class SACNUniverse:
         """
         dmap = uni.delisting_map() if hasattr(uni, "delisting_map") else {}
         if not dmap:
-            return pd.DataFrame(columns=["code", "month", "delist_ret", "source"])
+            return pd.DataFrame(columns=["code", "month", "delist_date", "delist_ret", "source"])
         px = px_daily[["code", "date", "close"]].copy()
         px["code"] = px["code"].astype(str)
         px["date"] = as_ts_series(px["date"])
-        last = (px.dropna(subset=["close"]).sort_values("date")
-                .groupby("code", observed=True).tail(1).set_index("code"))
+        px = px.dropna(subset=["close"]).sort_values(["code", "date"])
+        last = px.groupby("code", observed=True).tail(1).set_index("code")
+        # 종목별로 한 번만 그룹핑한다. 폐지 종목 1,500개 × 600만행 전수 스캔은
+        # 스테이지 예산(900초)을 그대로 잡아먹는다.
+        by_code = {c: g for c, g in px.groupby("code", observed=True)}
         rows = []
         mset = set(as_ts(m) for m in months)
         for code, dd in dmap.items():
@@ -182,15 +192,16 @@ class SACNUniverse:
             m_prev = (d - pd.offsets.MonthEnd(1)) + pd.offsets.MonthEnd(0)
             if m_prev not in mset:
                 continue
-            base = px[(px["code"] == str(code)) & (px["date"] <= m_prev)]
-            p0 = base["close"].dropna().iloc[-1] if len(base["close"].dropna()) else np.nan
+            gsub = by_code.get(str(code))
+            base = gsub[gsub["date"] <= m_prev]["close"] if gsub is not None else None
+            p0 = float(base.iloc[-1]) if base is not None and len(base) else np.nan
             p1 = last["close"].get(str(code), np.nan)
             t1 = last["date"].get(str(code), pd.NaT)
             if np.isfinite(p0) and np.isfinite(p1) and p0 > 0 and pd.notna(t1) and t1 > m_prev:
                 r, src = float(p1 / p0 - 1.0), "정리매매 최종가"
             else:
                 r, src = float(default_ret), "확인불가 → 보수적 기본값"
-            rows.append({"code": str(code), "month": m_prev,
+            rows.append({"code": str(code), "month": m_prev, "delist_date": d,
                          "delist_ret": max(-1.0, min(r, 5.0)), "source": src})
         out = pd.DataFrame(rows)
         if len(out):
@@ -217,13 +228,19 @@ def smallcap_subset(P: pd.DataFrame, n: int = SMALLCAP_ARM_N) -> pd.DataFrame:
     """
     if P is None or not len(P):
         return P
+    # 신호 패널의 시점 축은 'date'(리밸런싱일)다. 주간 리밸런싱에서는 한 달에 여러 시점이
+    # 있으므로 month 로 묶으면 순위가 달 단위로 뭉개진다 — 반드시 시점별로 매긴다.
+    key = "date" if "date" in P.columns else "month"
+    if "mktcap" not in P.columns:
+        LOG.warn("시가총액 컬럼이 없어 소형주 비교아암을 만들 수 없습니다 (전체 아암만 보고).")
+        return P.iloc[0:0]
     d = P[P["mktcap"].notna()].copy()
     if not len(d):
         LOG.warn("시가총액이 전부 결측이라 소형주 비교아암을 만들 수 없습니다.")
         return d
-    d["_rk"] = d.groupby("month")["mktcap"].rank(method="first", ascending=True)
+    d["_rk"] = d.groupby(key)["mktcap"].rank(method="first", ascending=True)
     out = d[d["_rk"] <= n].drop(columns=["_rk"]).reset_index(drop=True)
-    LOG.ok(f"소형주 비교아암: 월평균 {out.groupby('month').size().mean():.0f}종목 "
-           f"(시총 하위 {n:,} 기준) · 전체 아암 월평균 "
-           f"{P.groupby('month').size().mean():.0f}종목")
+    LOG.ok(f"소형주 비교아암: 시점평균 {out.groupby(key).size().mean():.0f}종목 "
+           f"(시총 하위 {n:,} 기준) · 전체 아암 시점평균 "
+           f"{P.groupby(key).size().mean():.0f}종목")
     return out

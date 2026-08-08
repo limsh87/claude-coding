@@ -108,7 +108,9 @@ def cscv_pbo(M: pd.DataFrame, S: int = 8) -> dict:
     D = M.dropna(how="any")
     T, N = D.shape
     if T < S * 4:
-        S = max(4, (T // 4) * 2 // 2 * 2)
+        # 표본이 짧으면 블록을 '더 크게' 만들어야 한다. 이전 식은 T 가 줄수록 S 를 키워
+        # 블록 길이를 2로 붕괴시켰다(= 블록 구조 소멸).
+        S = max(4, 2 * (T // 8))
         if S < 4 or T < S * 2:
             out["note"] = f"기간 {T} 이 부족해 CSCV 를 수행할 수 없습니다 (필요 ≥ {4*4})."
             return out
@@ -205,10 +207,10 @@ def walk_forward(M: pd.DataFrame, ppy: float = 12.0, train_years: int = 5,
         if not len(sr):
             s += te
             continue
-        pick = str(sr.idxmax())
+        pick = sr.idxmax()
         rb = B[pick]
         rows.append({"검증구간": f"{as_ts(idx[s+tr]):%Y-%m} ~ {as_ts(idx[s+tr+te-1]):%Y-%m}",
-                     "선택 구성": pick,
+                     "선택 구성": str(pick),
                      "학습 Sharpe": float(sr.max() * math.sqrt(ppy)),
                      "검증 Sharpe": float(rb.mean() / rb.std(ddof=1) * math.sqrt(ppy))
                      if rb.std(ddof=1) > 0 else float("nan"),
@@ -233,7 +235,11 @@ def nw_tstat(x: np.ndarray, ppy: float = 12.0) -> Tuple[float, float, int]:
     x = x[np.isfinite(x)]
     if len(x) < 12:
         return float("nan"), float("nan"), 0
-    lag = max(1, int(round(1.5 * (1 if ppy <= 13 else 4))))
+    # 괄호 안은 '한 달에 몇 기간인가'. SPEC 의 '리밸런싱 주기 × 1.5' 를 보유기간(≈1개월)
+    # 기준으로 읽은 것이다. ppy 를 그대로 1.5배하면 120개월 표본에 lag 18 이 되어
+    # Bartlett 창이 표본의 15%를 덮는다 — HAC 로 성립하지 않는다.
+    per_month = 1 if ppy <= 13 else (4 if ppy <= 60 else 21)
+    lag = max(1, int(round(1.5 * per_month)))
     mu, t = hac_tstat(x, lags=lag)
     return float(mu), float(t), lag
 

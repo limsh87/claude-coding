@@ -33,9 +33,20 @@ def outdir() -> str:
     return d
 
 
-def write_text(name: str, text: str) -> str:
+def write_text(name: str, text: str) -> Optional[str]:
+    """산출물 텍스트 저장. 한 파일이 실패해도 나머지를 포기하지 않는다.
+
+    윈도우에서 os.replace 는 대상 파일에 열린 핸들이 있으면 PermissionError 를 낸다.
+    구글드라이브/원드라이브 동기화 중이거나 사용자가 편집기로 열어둔 경우가 흔하고,
+    감싸지 않으면 그 지점 이후의 산출물이 통째로 사라진다.
+    """
     p = os.path.join(outdir(), name)
-    atomic_write_text(p, text)
+    try:
+        atomic_write_text(p, text)
+    except Exception as e:                                    # noqa
+        LOG.warn(f"산출물 저장 실패({type(e).__name__}): {name} — 파일이 열려 있거나 "
+                 f"드라이브 동기화가 잠그고 있을 수 있습니다. 나머지 산출물은 계속 생성합니다.")
+        return None
     OUTPUTS.append(p)
     return p
 

@@ -333,7 +333,10 @@ def build_link_ledger(rep: pd.DataFrame, L: pd.DataFrame, sec: pd.DataFrame,
         d["analyst_key"] = d["analyst_id"].astype(str) + "@" + d["broker_id"].astype(str)
 
     d["n_analyst_on_report"] = d.groupby("report_uid")["analyst_key"].transform("nunique")
-    d["link_conf"] = pd.to_numeric(d.get("link_conf"), errors="coerce").fillna(0.8)
+    # 컬럼이 없으면 pd.to_numeric(None) 은 스칼라 nan 을 돌려주고, .fillna 결과도 스칼라가
+    # 되어 전 행이 0.8 로 덮인다(=신뢰도 정보 소실). 컬럼 존재를 명시적으로 확인한다.
+    d["link_conf"] = (pd.to_numeric(d["link_conf"], errors="coerce").fillna(0.8)
+                      if "link_conf" in d.columns else 0.8)
     if "target_price" not in d.columns:
         d["target_price"] = np.nan
     d["target_price"] = pd.to_numeric(d["target_price"], errors="coerce")

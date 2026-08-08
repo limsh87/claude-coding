@@ -42,13 +42,35 @@ class LinkMatrices:
         return pd.DataFrame(self.stats)
 
 
-def _cache_path(mode: str) -> str:
+def _cache_key(mode: str, codes: Sequence[str], lookback_m: int,
+               ledger: Optional[pd.DataFrame]) -> str:
+    """캐시 키에 결과를 바꾸는 입력을 '전부' 넣는다.
+
+    이전엔 파일명이 mode 하나뿐이라, 종목 목록·룩백·링크 단위(analyst vs
+    broker×sector_team)·원장 내용이 달라져도 같은 파일을 조용히 재사용했다.
+    LM.codes 는 신호를 받을 종목 집합 그 자체이므로, 이 오재사용은 곧 결과 오염이다.
+    """
+    n = len(ledger) if ledger is not None else 0
+    kmax = ""
+    try:
+        if ledger is not None and len(ledger):
+            kmax = str(as_ts_series(ledger["knowledge_date"]).max())
+            uni_keys = int(ledger["analyst_key"].nunique())
+        else:
+            uni_keys = 0
+    except Exception:
+        uni_keys = 0
+    return sha1_str(mode, str(lookback_m), str(len(codes)),
+                    sha1_str(",".join(map(str, codes))), str(n), kmax, str(uni_keys))[:16]
+
+
+def _cache_path(mode: str, key: str = "") -> str:
     d = os.path.join(VAULT.ns["private"], "features", "linkmat")
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f"link_{mode}.npz")
+    return os.path.join(d, f"link_{mode}_{key}.npz" if key else f"link_{mode}.npz")
 
 
-def _save_links(LM: LinkMatrices):
+def _save_links(LM: LinkMatrices, key: str = ""):
     if _sp is None or not LM.W:
         return
     try:
@@ -63,21 +85,25 @@ def _save_links(LM: LinkMatrices):
         # ★ np.savez_compressed 는 파일명이 .npz 로 끝나지 않으면 '.npz' 를 덧붙인다.
         #   tmp 를 ".tmp" 로 두면 실제 파일은 ".tmp.npz" 가 되고 os.replace 가 매번 실패한다
         #   (그리고 예외를 삼키므로 '캐시가 조용히 전혀 안 되는' 상태가 된다).
-        tmp = _cache_path(LM.mode) + ".tmp.npz"
+        tmp = _cache_path(LM.mode, key) + ".tmp.npz"
         np.savez_compressed(tmp, **payload)
-        os.replace(tmp, _cache_path(LM.mode))
+        os.replace(tmp, _cache_path(LM.mode, key))
         LOG.debug(f"링크 행렬 직렬화: {LM.mode} ({len(LM.W)}개월)")
     except Exception as e:                                    # noqa
         LOG.debug(f"링크 행렬 저장 실패({type(e).__name__}) — 재계산으로 진행합니다.")
 
 
-def _load_links(mode: str, months: pd.DatetimeIndex) -> Optional[LinkMatrices]:
-    p = _cache_path(mode)
+def _load_links(mode: str, months: pd.DatetimeIndex, key: str,
+                expect_codes: Sequence[str]) -> Optional[LinkMatrices]:
+    p = _cache_path(mode, key)
     if _sp is None or not os.path.exists(p):
         return None
     try:
         z = np.load(p, allow_pickle=True)
         codes = [str(x) for x in z["__codes__"]]
+        # 키가 같아도 좌표계는 반드시 재확인한다 (해시 충돌·부분 기록 방어)
+        if list(codes) != [str(c) for c in expect_codes]:
+            return None
         have = {str(x) for x in z["__months__"]}
         want = {str(as_ts(m).date()) for m in months}
         if not want.issubset(have):
@@ -110,8 +136,9 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
       "freq"       : covered = 해당 윈도우 내 발간 건수 (발간빈도 가중)
       "highskill"  : 고스킬 애널리스트(상위 40%)만 사용, covered = 1
     """
+    ck = _cache_key(weight_mode, codes, lookback_m, ledger)
     if use_cache:
-        cached = _load_links(weight_mode, months)
+        cached = _load_links(weight_mode, months, ck, [str(c) for c in dict.fromkeys(codes)])
         if cached is not None:
             return cached
 
@@ -155,6 +182,7 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
     kd = d["knowledge_date"].to_numpy("datetime64[ns]")
 
     t0 = time.time()
+    no_skill_months: List[pd.Timestamp] = []
     for m in tqdm(months, desc=f"링크행렬[{weight_mode}]", disable=not VERBOSE):
         m = as_ts(m)
         lo = m - pd.DateOffset(months=lookback_m)
@@ -163,8 +191,14 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
         i1 = int(np.searchsorted(kd, np.datetime64(m), side="right"))
         win = d.iloc[i0:i1]
         if weight_mode == "highskill" and hs:
-            allow = hs.get(m, set())
-            win = win[win["analyst_key"].astype(str).isin(allow)] if allow else win.iloc[0:0]
+            # '그 달에 스킬 표본이 없음'과 '자격 애널리스트가 0명'은 다른 사건이다.
+            # 전자를 후자로 처리하면 초기 24개월이 통째로 빈 행렬이 되고, H4 비교에서
+            # 그 구간이 조용히 빠진다. 표본이 없으면 비가중과 동일하게 둔다.
+            if m in hs:
+                allow = hs[m]
+                win = win[win["analyst_key"].astype(str).isin(allow)] if allow else win.iloc[0:0]
+            else:
+                no_skill_months.append(m)
         if not len(win):
             LM.W[m] = _csr((n, n), dtype=np.float32)
             LM.stats.append({"month": m, "n_analyst": 0, "n_pair": 0, "n_covered": 0,
@@ -189,6 +223,10 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
                          "median_links": float(np.median(deg[deg > 0])) if (deg > 0).any() else 0.0})
 
     LOG.ok(f"링크 행렬 {len(LM.W)}개월 생성 [{weight_mode}] — {time.time()-t0:.1f}s")
+    if no_skill_months:
+        LOG.warn(f"[highskill] 스킬 표본이 없는 {len(no_skill_months)}개월은 비가중과 동일하게 "
+                 f"처리했습니다 (예: {no_skill_months[0]:%Y-%m} ~ {no_skill_months[-1]:%Y-%m}). "
+                 f"H4 비교 시 이 구간은 두 구성이 같습니다.")
     S = LM.summary()
     if len(S):
         LOG.table([[f"{r['month']:%Y-%m}", f"{int(r['n_analyst']):,}", f"{int(r['n_covered']):,}",
@@ -197,7 +235,7 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
                   ["월", "활동 애널", "연결보유 종목", "링크쌍", "종목당 연결(중위)"],
                   ["l", "r", "r", "r", "r"],
                   title=f"링크 행렬 요약 [{weight_mode}] — 표본 8개월")
-    _save_links(LM)
+    _save_links(LM, ck)
     return LM
 
 

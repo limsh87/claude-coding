@@ -27,7 +27,7 @@ def load(cache: str, mode: str = "FULL"):
         "def _pip_install(pkgs: List[str], quiet: bool = True) -> Tuple[bool, str]:\n"
         "    if os.environ.get('SACN_NO_PIP'): return True, 'skipped'")
     # 짧게 돌리기 위한 축소 (경로는 동일, 규모만 축소)
-    src = re.sub(r'^BACKTEST_START = ".*?"', 'BACKTEST_START = "2021-01-01"', src, flags=re.M)
+    src = re.sub(r'^BACKTEST_START = ".*?"', 'BACKTEST_START = "2016-08-01"', src, flags=re.M)
     src = re.sub(r'^BACKTEST_END   = ".*?"', 'BACKTEST_END   = "2026-07-31"', src, flags=re.M)
     p = os.path.join(cache, "sacn_itest.py")
     with open(p, "w", encoding="utf-8") as f:

@@ -15,6 +15,17 @@
 # ║    종목별 루프(2,500회)로 짜면 같은 데이터에 20배를 쓴다 — 그렇게 하지 않는다.               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+# ★ 리허설(가짜 네트워크) 중에는 캐시에 절대 쓰지 않는다.
+#   이 플래그가 없으면 리허설이 만들어낸 합성 시총/PBR 이 공용 인덱스에 저장되고,
+#   이후 실수집이 "그 달은 이미 있다"며 영원히 건너뛴다. 사용자의 기존 캐시를 훼손하는
+#   경로이므로(절대 1원칙 위반) 구조로 막는다.
+_REHEARSAL = False
+
+
+def _cache_writable() -> bool:
+    return not _REHEARSAL
+
+
 MKTCAP_COLS = ["code", "month", "mktcap", "shares", "close_m", "amount_m"]
 FUND_COLS = ["code", "month", "bps", "per", "pbr", "eps", "div_yield", "bm"]
 
@@ -69,8 +80,9 @@ def fetch_mktcap_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
             have = set()
     todo = [m for m in _month_snap_dates(months) if m.strftime("%Y-%m") not in have]
     if not todo:
-        LOG.ok(f"시가총액 월말 스냅샷: 캐시 충족 ({len(cached):,}행, 신규 호출 0건)")
-        return cached
+        LOG.ok(f"시가총액 월말 스냅샷: 캐시 충족 "
+               f"({len(cached) if cached is not None else 0:,}행, 신규 호출 0건)")
+        return cached if cached is not None else pd.DataFrame(columns=MKTCAP_COLS)
     if pykrx_stock is None:
         LOG.warn("pykrx 없음 — 시가총액 스냅샷을 건너뜁니다. "
                  "유니버스 시총 하한과 §6.3 log(MktCap) 항이 비활성화됩니다.")
@@ -123,8 +135,9 @@ def fetch_mktcap_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
     out = pd.concat(frames, ignore_index=True)
     out["month"] = as_ts_series(out["month"])
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_mktcap_monthly", out, scope="shared", domain="price",
-                    source="pykrx get_market_cap_by_ticker")
+    if _cache_writable():
+        VAULT.put_table("krx_mktcap_monthly", out, scope="shared", domain="price",
+                        source="pykrx get_market_cap_by_ticker")
     PIPE.io("OUT", "DRIVE", "krx_mktcap_monthly", out)
     LOG.ok(f"시가총액 스냅샷 {out['month'].nunique()}개월 × {out['code'].nunique():,}종목 = {len(out):,}행")
     return out
@@ -145,8 +158,9 @@ def fetch_fundamental_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
             have = set()
     todo = [m for m in _month_snap_dates(months) if m.strftime("%Y-%m") not in have]
     if not todo:
-        LOG.ok(f"펀더멘털 월말 스냅샷: 캐시 충족 ({len(cached):,}행, 신규 호출 0건)")
-        return cached
+        LOG.ok(f"펀더멘털 월말 스냅샷: 캐시 충족 "
+               f"({len(cached) if cached is not None else 0:,}행, 신규 호출 0건)")
+        return cached if cached is not None else pd.DataFrame(columns=FUND_COLS)
     if pykrx_stock is None:
         LOG.warn("pykrx 없음 — PBR 스냅샷 불가. §6.3 직교화의 BM 항은 DART 폴백 또는 결측 처리됩니다.")
         return cached if cached is not None else pd.DataFrame(columns=FUND_COLS)
@@ -193,8 +207,9 @@ def fetch_fundamental_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
     pbr = pd.to_numeric(out["pbr"], errors="coerce")
     out["bm"] = np.where(pbr > 0, 1.0 / pbr.replace(0, np.nan), np.nan)
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_fundamental_monthly", out, scope="shared", domain="price",
-                    source="pykrx get_market_fundamental_by_ticker")
+    if _cache_writable():
+        VAULT.put_table("krx_fundamental_monthly", out, scope="shared", domain="price",
+                        source="pykrx get_market_fundamental_by_ticker")
     PIPE.io("OUT", "DRIVE", "krx_fundamental_monthly", out)
     ok = int(out["bm"].notna().sum())
     LOG.ok(f"펀더멘털 스냅샷 {len(out):,}행 · BM 산출 가능 {ok:,}행 ({100*ok/max(len(out),1):.1f}%)")
@@ -236,8 +251,9 @@ def fetch_nonequity_tickers(months: pd.DatetimeIndex) -> pd.DataFrame:
         out = pd.concat([out, cached], ignore_index=True)
     out["snap"] = as_ts_series(out["snap"])
     out = out.drop_duplicates(subset=["snap", "code"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_nonequity_tickers", out, scope="shared", domain="universe",
-                    source="pykrx etf/etn/elw ticker list")
+    if _cache_writable():
+        VAULT.put_table("krx_nonequity_tickers", out, scope="shared", domain="universe",
+                        source="pykrx etf/etn/elw ticker list")
     LOG.ok(f"비주식 종목(ETF/ETN/ELW) {out['code'].nunique():,}개 식별")
     return out
 
@@ -290,6 +306,9 @@ def build_sector_map(sec: pd.DataFrame) -> pd.DataFrame:
     rare = set(small[small < 5].index)
     if rare:
         s.loc[s["sector"].isin(rare), "sector"] = "기타"
+    if s["sector"].nunique() < 2:
+        LOG.error("업종 분류가 단일 클래스로 붕괴했습니다 (sec['industry'] 가 비었을 가능성). "
+                  "H2 교차업종 검정은 '판정불가'로 처리되며, 이를 통과로 오인하면 안 됩니다.")
     LOG.info(f"업종 매핑: {n}개 원분류 → {s['sector'].nunique()}개 사용 분류 "
              f"(5종목 미만 {len(rare)}개는 '기타'로 병합). ※현재시점 분류 — 완전 PIT 아님")
     return s[["code", "sector"]].drop_duplicates("code").reset_index(drop=True)
@@ -361,8 +380,9 @@ def fetch_retail_share(codes: Sequence[str], start: str, end: str,
     out = pd.concat(frames, ignore_index=True)
     out["month"] = as_ts_series(out["month"])
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_retail_share_monthly", out, scope="shared", domain="flow",
-                    source="pykrx get_market_trading_value_by_date(detail=True)")
+    if _cache_writable():
+        VAULT.put_table("krx_retail_share_monthly", out, scope="shared", domain="flow",
+                        source="pykrx get_market_trading_value_by_date(detail=True)")
     LOG.ok(f"개인 거래비중 {out['code'].nunique():,}종목 × {out['month'].nunique()}개월 = {len(out):,}행")
     return out
 

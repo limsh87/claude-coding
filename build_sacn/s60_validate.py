@@ -200,7 +200,7 @@ def run_selftest(full: bool = True) -> bool:
     if P is None or not len(P):
         LOG.error("스모크 실패: 신호 패널이 비었습니다.")
         return False
-    P = attach_attrs(P, U)
+    P = attach_attrs(P, U, grid)
 
     bt = run_quantile_backtest(P, "sacn_raw", "M", label="SMOKE")
     if not len(bt["returns"]):
@@ -312,10 +312,19 @@ def run_contract_tests(strict: bool = True) -> bool:
             "Vault 에 삭제 API 자체가 없다 (기존 캐시 훼손 불가능)"
 
     def k13():
+        # ★ 합계 비교는 어떤 순열에도 불변이라 '검사가 절대 실패할 수 없다'.
+        #   종목별 배정을 직접 비교해야 동점 처리의 결정성을 실제로 검정한다.
         g = pd.DataFrame({"code": list("abcdefghij"), "s": [1.0] * 10})
-        q1 = _assign_quantiles(g, "s", 5).to_numpy()
-        q2 = _assign_quantiles(g.iloc[::-1].reset_index(drop=True), "s", 5).to_numpy()
-        return bool(np.nansum(q1) == np.nansum(q2)), "동점 분위 배정이 입력 순서에 무관"
+        a = dict(zip(g["code"], _assign_quantiles(g, "s", 5)))
+        rev = g.iloc[::-1].reset_index(drop=True)
+        b = dict(zip(rev["code"], _assign_quantiles(rev, "s", 5)))
+        same = a == b
+        # 동점이 아닌 경우의 방향도 함께 확인한다 (최고 신호 = Q5)
+        h = pd.DataFrame({"code": [f"c{i}" for i in range(10)], "s": list(range(10))})
+        qq = _assign_quantiles(h, "s", 5)
+        direction = bool(qq.iloc[-1] == 5 and qq.iloc[0] == 1)
+        return bool(same and direction), \
+            f"동점 배정이 입력 순서에 무관(종목별 비교) · 최고신호=Q5 방향 {direction}"
 
     def k14():
         k = _beta_binom_k(np.array([5., 30., 2.]), np.array([10., 60., 4.]))
@@ -397,6 +406,7 @@ def run_rehearsal(strict: bool = False) -> bool:
     g = globals()
     saved_pykrx, saved_call = g.get("pykrx_stock"), KRXG.call
     try:
+        g["_REHEARSAL"] = True          # ★ 리허설 중에는 캐시 쓰기를 차단한다
         g["pykrx_stock"] = _FakePykrx
         KRXG.call = lambda fn, *a, **kw: fn(*a, **kw)     # type: ignore
         months = pd.date_range(end=as_ts(BACKTEST_END), periods=3, freq=MONTH_END_ALIAS)
@@ -425,10 +435,13 @@ def run_rehearsal(strict: bool = False) -> bool:
             except Exception as e:                        # noqa
                 results.append([name, "✘", f"{type(e).__name__}: {str(e)[:60]}"])
     finally:
+        g["_REHEARSAL"] = False
         g["pykrx_stock"] = saved_pykrx
         KRXG.call = saved_call                            # type: ignore
 
     LOG.table(results, ["수집·정제 함수", "판정", "결과"], ["l", "c", "l"])
+    LOG.info("리허설은 캐시에 쓰지 않습니다(_REHEARSAL 플래그). 가짜 데이터가 공용 인덱스에 "
+             "남아 실수집을 영구히 건너뛰게 만드는 사고를 구조로 차단합니다.")
     bad = [r for r in results if r[1] == "✘"]
     if bad and strict:
         raise RuntimeError(f"리허설 실패 {[r[0] for r in bad]}")

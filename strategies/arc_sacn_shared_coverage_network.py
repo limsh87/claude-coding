@@ -195,7 +195,7 @@ VERBOSE = True
 
 STRATEGY_ID   = "ARC_SACN"
 STRATEGY_NAME = "공동커버리지 네트워크 모멘텀 (Shared Analyst Coverage Network Momentum)"
-BUILD_VERSION = "sacn.20260808.0646"
+BUILD_VERSION = "sacn.20260808.0703"
 
 # 사전등록 하이퍼파라미터 격자 (SPEC §6.4 — 총 12개, 확장 금지) ------------------------------
 #   링크 룩백 12M 고정 × 신호수익률윈도우 2 × 리밸런싱 2 × 링크가중 3 = 12
@@ -3917,6 +3917,17 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
 # ║    종목별 루프(2,500회)로 짜면 같은 데이터에 20배를 쓴다 — 그렇게 하지 않는다.               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+# ★ 리허설(가짜 네트워크) 중에는 캐시에 절대 쓰지 않는다.
+#   이 플래그가 없으면 리허설이 만들어낸 합성 시총/PBR 이 공용 인덱스에 저장되고,
+#   이후 실수집이 "그 달은 이미 있다"며 영원히 건너뛴다. 사용자의 기존 캐시를 훼손하는
+#   경로이므로(절대 1원칙 위반) 구조로 막는다.
+_REHEARSAL = False
+
+
+def _cache_writable() -> bool:
+    return not _REHEARSAL
+
+
 MKTCAP_COLS = ["code", "month", "mktcap", "shares", "close_m", "amount_m"]
 FUND_COLS = ["code", "month", "bps", "per", "pbr", "eps", "div_yield", "bm"]
 
@@ -3971,8 +3982,9 @@ def fetch_mktcap_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
             have = set()
     todo = [m for m in _month_snap_dates(months) if m.strftime("%Y-%m") not in have]
     if not todo:
-        LOG.ok(f"시가총액 월말 스냅샷: 캐시 충족 ({len(cached):,}행, 신규 호출 0건)")
-        return cached
+        LOG.ok(f"시가총액 월말 스냅샷: 캐시 충족 "
+               f"({len(cached) if cached is not None else 0:,}행, 신규 호출 0건)")
+        return cached if cached is not None else pd.DataFrame(columns=MKTCAP_COLS)
     if pykrx_stock is None:
         LOG.warn("pykrx 없음 — 시가총액 스냅샷을 건너뜁니다. "
                  "유니버스 시총 하한과 §6.3 log(MktCap) 항이 비활성화됩니다.")
@@ -4025,8 +4037,9 @@ def fetch_mktcap_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
     out = pd.concat(frames, ignore_index=True)
     out["month"] = as_ts_series(out["month"])
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_mktcap_monthly", out, scope="shared", domain="price",
-                    source="pykrx get_market_cap_by_ticker")
+    if _cache_writable():
+        VAULT.put_table("krx_mktcap_monthly", out, scope="shared", domain="price",
+                        source="pykrx get_market_cap_by_ticker")
     PIPE.io("OUT", "DRIVE", "krx_mktcap_monthly", out)
     LOG.ok(f"시가총액 스냅샷 {out['month'].nunique()}개월 × {out['code'].nunique():,}종목 = {len(out):,}행")
     return out
@@ -4047,8 +4060,9 @@ def fetch_fundamental_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
             have = set()
     todo = [m for m in _month_snap_dates(months) if m.strftime("%Y-%m") not in have]
     if not todo:
-        LOG.ok(f"펀더멘털 월말 스냅샷: 캐시 충족 ({len(cached):,}행, 신규 호출 0건)")
-        return cached
+        LOG.ok(f"펀더멘털 월말 스냅샷: 캐시 충족 "
+               f"({len(cached) if cached is not None else 0:,}행, 신규 호출 0건)")
+        return cached if cached is not None else pd.DataFrame(columns=FUND_COLS)
     if pykrx_stock is None:
         LOG.warn("pykrx 없음 — PBR 스냅샷 불가. §6.3 직교화의 BM 항은 DART 폴백 또는 결측 처리됩니다.")
         return cached if cached is not None else pd.DataFrame(columns=FUND_COLS)
@@ -4095,8 +4109,9 @@ def fetch_fundamental_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
     pbr = pd.to_numeric(out["pbr"], errors="coerce")
     out["bm"] = np.where(pbr > 0, 1.0 / pbr.replace(0, np.nan), np.nan)
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_fundamental_monthly", out, scope="shared", domain="price",
-                    source="pykrx get_market_fundamental_by_ticker")
+    if _cache_writable():
+        VAULT.put_table("krx_fundamental_monthly", out, scope="shared", domain="price",
+                        source="pykrx get_market_fundamental_by_ticker")
     PIPE.io("OUT", "DRIVE", "krx_fundamental_monthly", out)
     ok = int(out["bm"].notna().sum())
     LOG.ok(f"펀더멘털 스냅샷 {len(out):,}행 · BM 산출 가능 {ok:,}행 ({100*ok/max(len(out),1):.1f}%)")
@@ -4138,8 +4153,9 @@ def fetch_nonequity_tickers(months: pd.DatetimeIndex) -> pd.DataFrame:
         out = pd.concat([out, cached], ignore_index=True)
     out["snap"] = as_ts_series(out["snap"])
     out = out.drop_duplicates(subset=["snap", "code"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_nonequity_tickers", out, scope="shared", domain="universe",
-                    source="pykrx etf/etn/elw ticker list")
+    if _cache_writable():
+        VAULT.put_table("krx_nonequity_tickers", out, scope="shared", domain="universe",
+                        source="pykrx etf/etn/elw ticker list")
     LOG.ok(f"비주식 종목(ETF/ETN/ELW) {out['code'].nunique():,}개 식별")
     return out
 
@@ -4192,6 +4208,9 @@ def build_sector_map(sec: pd.DataFrame) -> pd.DataFrame:
     rare = set(small[small < 5].index)
     if rare:
         s.loc[s["sector"].isin(rare), "sector"] = "기타"
+    if s["sector"].nunique() < 2:
+        LOG.error("업종 분류가 단일 클래스로 붕괴했습니다 (sec['industry'] 가 비었을 가능성). "
+                  "H2 교차업종 검정은 '판정불가'로 처리되며, 이를 통과로 오인하면 안 됩니다.")
     LOG.info(f"업종 매핑: {n}개 원분류 → {s['sector'].nunique()}개 사용 분류 "
              f"(5종목 미만 {len(rare)}개는 '기타'로 병합). ※현재시점 분류 — 완전 PIT 아님")
     return s[["code", "sector"]].drop_duplicates("code").reset_index(drop=True)
@@ -4263,8 +4282,9 @@ def fetch_retail_share(codes: Sequence[str], start: str, end: str,
     out = pd.concat(frames, ignore_index=True)
     out["month"] = as_ts_series(out["month"])
     out = out.drop_duplicates(subset=["code", "month"], keep="last").reset_index(drop=True)
-    VAULT.put_table("krx_retail_share_monthly", out, scope="shared", domain="flow",
-                    source="pykrx get_market_trading_value_by_date(detail=True)")
+    if _cache_writable():
+        VAULT.put_table("krx_retail_share_monthly", out, scope="shared", domain="flow",
+                        source="pykrx get_market_trading_value_by_date(detail=True)")
     LOG.ok(f"개인 거래비중 {out['code'].nunique():,}종목 × {out['month'].nunique()}개월 = {len(out):,}행")
     return out
 
@@ -5737,7 +5757,10 @@ def build_link_ledger(rep: pd.DataFrame, L: pd.DataFrame, sec: pd.DataFrame,
         d["analyst_key"] = d["analyst_id"].astype(str) + "@" + d["broker_id"].astype(str)
 
     d["n_analyst_on_report"] = d.groupby("report_uid")["analyst_key"].transform("nunique")
-    d["link_conf"] = pd.to_numeric(d.get("link_conf"), errors="coerce").fillna(0.8)
+    # 컬럼이 없으면 pd.to_numeric(None) 은 스칼라 nan 을 돌려주고, .fillna 결과도 스칼라가
+    # 되어 전 행이 0.8 로 덮인다(=신뢰도 정보 소실). 컬럼 존재를 명시적으로 확인한다.
+    d["link_conf"] = (pd.to_numeric(d["link_conf"], errors="coerce").fillna(0.8)
+                      if "link_conf" in d.columns else 0.8)
     if "target_price" not in d.columns:
         d["target_price"] = np.nan
     d["target_price"] = pd.to_numeric(d["target_price"], errors="coerce")
@@ -6097,8 +6120,11 @@ def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N)
 UNI_GATES = ["① 상장중(PIT)", "② 시장/증권 종류", "③ 가격 보유", "④ 주가 하한",
              "⑤ 시총 하한", "⑥ 유동성 하한", "⑦ 최종 유니버스"]
 
+# ★ exec_px(익영업일 시가)·fwd_ret(차월 수익률)은 '그 월말에 알 수 없는' 값이다.
+#   유니버스 패널에서 쓰이지도 않으면서 universe_YYYYMM.parquet 안에 들어가면,
+#   PIT 스냅샷이라는 이름의 파일에 미래 정보가 담긴 채로 남는다 — 장전된 총이다. 아예 빼둔다.
 UNIVERSE_COLS = ["code", "month", "market", "close_m", "adv20", "mktcap", "shares",
-                 "exec_px", "fwd_ret_m", "sector", "bm", "in_universe"]
+                 "sector", "bm", "in_universe"]
 
 
 class SACNUniverse:
@@ -6154,7 +6180,7 @@ class SACNUniverse:
 
             idx = pd.MultiIndex.from_product([codes2, [m]], names=["code", "month"])
             g = pd.DataFrame(index=idx)
-            for c in ("close", "adv20", "exec_px", "fwd_ret"):
+            for c in ("close", "adv20"):
                 g[c] = pm[c].reindex(idx) if c in pm.columns else np.nan
             g["mktcap"] = mc["mktcap"].reindex(idx) if "mktcap" in getattr(mc, "columns", []) else np.nan
             g["shares"] = mc["shares"].reindex(idx) if "shares" in getattr(mc, "columns", []) else np.nan
@@ -6178,7 +6204,7 @@ class SACNUniverse:
 
             g["market"] = g["code"].map(lambda c: mkt.get(c, ""))
             g["sector"] = g["code"].map(lambda c: smap.get(c, "미분류"))
-            g = g.rename(columns={"close": "close_m", "fwd_ret": "fwd_ret_m"})
+            g = g.rename(columns={"close": "close_m"})
             g["in_universe"] = True
             self._mark(m, UNI_GATES[6], len(g))                      # ⑦ 최종
             rows.append(g)
@@ -6192,6 +6218,10 @@ class SACNUniverse:
                                ("code", "month")] + [c for c in P.columns if c not in UNIVERSE_COLS])
         P["code"] = P["code"].astype(str)
         P["month"] = as_ts_series(P["month"])
+        dup = int(P.duplicated(["code", "month"]).sum()) if len(P) else 0
+        if dup:
+            raise RuntimeError(f"유니버스 패널에 (code, month) 중복 {dup:,}행이 있습니다. "
+                               f"하류 merge 가 행을 복제해 같은 종목이 두 번 편입됩니다.")
         self.panel = P
         PIPE.io("OUT", "MEM", "sacn_universe_panel", P)
         return P
@@ -6248,12 +6278,15 @@ class SACNUniverse:
         """
         dmap = uni.delisting_map() if hasattr(uni, "delisting_map") else {}
         if not dmap:
-            return pd.DataFrame(columns=["code", "month", "delist_ret", "source"])
+            return pd.DataFrame(columns=["code", "month", "delist_date", "delist_ret", "source"])
         px = px_daily[["code", "date", "close"]].copy()
         px["code"] = px["code"].astype(str)
         px["date"] = as_ts_series(px["date"])
-        last = (px.dropna(subset=["close"]).sort_values("date")
-                .groupby("code", observed=True).tail(1).set_index("code"))
+        px = px.dropna(subset=["close"]).sort_values(["code", "date"])
+        last = px.groupby("code", observed=True).tail(1).set_index("code")
+        # 종목별로 한 번만 그룹핑한다. 폐지 종목 1,500개 × 600만행 전수 스캔은
+        # 스테이지 예산(900초)을 그대로 잡아먹는다.
+        by_code = {c: g for c, g in px.groupby("code", observed=True)}
         rows = []
         mset = set(as_ts(m) for m in months)
         for code, dd in dmap.items():
@@ -6263,15 +6296,16 @@ class SACNUniverse:
             m_prev = (d - pd.offsets.MonthEnd(1)) + pd.offsets.MonthEnd(0)
             if m_prev not in mset:
                 continue
-            base = px[(px["code"] == str(code)) & (px["date"] <= m_prev)]
-            p0 = base["close"].dropna().iloc[-1] if len(base["close"].dropna()) else np.nan
+            gsub = by_code.get(str(code))
+            base = gsub[gsub["date"] <= m_prev]["close"] if gsub is not None else None
+            p0 = float(base.iloc[-1]) if base is not None and len(base) else np.nan
             p1 = last["close"].get(str(code), np.nan)
             t1 = last["date"].get(str(code), pd.NaT)
             if np.isfinite(p0) and np.isfinite(p1) and p0 > 0 and pd.notna(t1) and t1 > m_prev:
                 r, src = float(p1 / p0 - 1.0), "정리매매 최종가"
             else:
                 r, src = float(default_ret), "확인불가 → 보수적 기본값"
-            rows.append({"code": str(code), "month": m_prev,
+            rows.append({"code": str(code), "month": m_prev, "delist_date": d,
                          "delist_ret": max(-1.0, min(r, 5.0)), "source": src})
         out = pd.DataFrame(rows)
         if len(out):
@@ -6298,15 +6332,21 @@ def smallcap_subset(P: pd.DataFrame, n: int = SMALLCAP_ARM_N) -> pd.DataFrame:
     """
     if P is None or not len(P):
         return P
+    # 신호 패널의 시점 축은 'date'(리밸런싱일)다. 주간 리밸런싱에서는 한 달에 여러 시점이
+    # 있으므로 month 로 묶으면 순위가 달 단위로 뭉개진다 — 반드시 시점별로 매긴다.
+    key = "date" if "date" in P.columns else "month"
+    if "mktcap" not in P.columns:
+        LOG.warn("시가총액 컬럼이 없어 소형주 비교아암을 만들 수 없습니다 (전체 아암만 보고).")
+        return P.iloc[0:0]
     d = P[P["mktcap"].notna()].copy()
     if not len(d):
         LOG.warn("시가총액이 전부 결측이라 소형주 비교아암을 만들 수 없습니다.")
         return d
-    d["_rk"] = d.groupby("month")["mktcap"].rank(method="first", ascending=True)
+    d["_rk"] = d.groupby(key)["mktcap"].rank(method="first", ascending=True)
     out = d[d["_rk"] <= n].drop(columns=["_rk"]).reset_index(drop=True)
-    LOG.ok(f"소형주 비교아암: 월평균 {out.groupby('month').size().mean():.0f}종목 "
-           f"(시총 하위 {n:,} 기준) · 전체 아암 월평균 "
-           f"{P.groupby('month').size().mean():.0f}종목")
+    LOG.ok(f"소형주 비교아암: 시점평균 {out.groupby(key).size().mean():.0f}종목 "
+           f"(시총 하위 {n:,} 기준) · 전체 아암 시점평균 "
+           f"{P.groupby(key).size().mean():.0f}종목")
     return out
 
 
@@ -6357,13 +6397,35 @@ class LinkMatrices:
         return pd.DataFrame(self.stats)
 
 
-def _cache_path(mode: str) -> str:
+def _cache_key(mode: str, codes: Sequence[str], lookback_m: int,
+               ledger: Optional[pd.DataFrame]) -> str:
+    """캐시 키에 결과를 바꾸는 입력을 '전부' 넣는다.
+
+    이전엔 파일명이 mode 하나뿐이라, 종목 목록·룩백·링크 단위(analyst vs
+    broker×sector_team)·원장 내용이 달라져도 같은 파일을 조용히 재사용했다.
+    LM.codes 는 신호를 받을 종목 집합 그 자체이므로, 이 오재사용은 곧 결과 오염이다.
+    """
+    n = len(ledger) if ledger is not None else 0
+    kmax = ""
+    try:
+        if ledger is not None and len(ledger):
+            kmax = str(as_ts_series(ledger["knowledge_date"]).max())
+            uni_keys = int(ledger["analyst_key"].nunique())
+        else:
+            uni_keys = 0
+    except Exception:
+        uni_keys = 0
+    return sha1_str(mode, str(lookback_m), str(len(codes)),
+                    sha1_str(",".join(map(str, codes))), str(n), kmax, str(uni_keys))[:16]
+
+
+def _cache_path(mode: str, key: str = "") -> str:
     d = os.path.join(VAULT.ns["private"], "features", "linkmat")
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f"link_{mode}.npz")
+    return os.path.join(d, f"link_{mode}_{key}.npz" if key else f"link_{mode}.npz")
 
 
-def _save_links(LM: LinkMatrices):
+def _save_links(LM: LinkMatrices, key: str = ""):
     if _sp is None or not LM.W:
         return
     try:
@@ -6378,21 +6440,25 @@ def _save_links(LM: LinkMatrices):
         # ★ np.savez_compressed 는 파일명이 .npz 로 끝나지 않으면 '.npz' 를 덧붙인다.
         #   tmp 를 ".tmp" 로 두면 실제 파일은 ".tmp.npz" 가 되고 os.replace 가 매번 실패한다
         #   (그리고 예외를 삼키므로 '캐시가 조용히 전혀 안 되는' 상태가 된다).
-        tmp = _cache_path(LM.mode) + ".tmp.npz"
+        tmp = _cache_path(LM.mode, key) + ".tmp.npz"
         np.savez_compressed(tmp, **payload)
-        os.replace(tmp, _cache_path(LM.mode))
+        os.replace(tmp, _cache_path(LM.mode, key))
         LOG.debug(f"링크 행렬 직렬화: {LM.mode} ({len(LM.W)}개월)")
     except Exception as e:                                    # noqa
         LOG.debug(f"링크 행렬 저장 실패({type(e).__name__}) — 재계산으로 진행합니다.")
 
 
-def _load_links(mode: str, months: pd.DatetimeIndex) -> Optional[LinkMatrices]:
-    p = _cache_path(mode)
+def _load_links(mode: str, months: pd.DatetimeIndex, key: str,
+                expect_codes: Sequence[str]) -> Optional[LinkMatrices]:
+    p = _cache_path(mode, key)
     if _sp is None or not os.path.exists(p):
         return None
     try:
         z = np.load(p, allow_pickle=True)
         codes = [str(x) for x in z["__codes__"]]
+        # 키가 같아도 좌표계는 반드시 재확인한다 (해시 충돌·부분 기록 방어)
+        if list(codes) != [str(c) for c in expect_codes]:
+            return None
         have = {str(x) for x in z["__months__"]}
         want = {str(as_ts(m).date()) for m in months}
         if not want.issubset(have):
@@ -6425,8 +6491,9 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
       "freq"       : covered = 해당 윈도우 내 발간 건수 (발간빈도 가중)
       "highskill"  : 고스킬 애널리스트(상위 40%)만 사용, covered = 1
     """
+    ck = _cache_key(weight_mode, codes, lookback_m, ledger)
     if use_cache:
-        cached = _load_links(weight_mode, months)
+        cached = _load_links(weight_mode, months, ck, [str(c) for c in dict.fromkeys(codes)])
         if cached is not None:
             return cached
 
@@ -6470,6 +6537,7 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
     kd = d["knowledge_date"].to_numpy("datetime64[ns]")
 
     t0 = time.time()
+    no_skill_months: List[pd.Timestamp] = []
     for m in tqdm(months, desc=f"링크행렬[{weight_mode}]", disable=not VERBOSE):
         m = as_ts(m)
         lo = m - pd.DateOffset(months=lookback_m)
@@ -6478,8 +6546,14 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
         i1 = int(np.searchsorted(kd, np.datetime64(m), side="right"))
         win = d.iloc[i0:i1]
         if weight_mode == "highskill" and hs:
-            allow = hs.get(m, set())
-            win = win[win["analyst_key"].astype(str).isin(allow)] if allow else win.iloc[0:0]
+            # '그 달에 스킬 표본이 없음'과 '자격 애널리스트가 0명'은 다른 사건이다.
+            # 전자를 후자로 처리하면 초기 24개월이 통째로 빈 행렬이 되고, H4 비교에서
+            # 그 구간이 조용히 빠진다. 표본이 없으면 비가중과 동일하게 둔다.
+            if m in hs:
+                allow = hs[m]
+                win = win[win["analyst_key"].astype(str).isin(allow)] if allow else win.iloc[0:0]
+            else:
+                no_skill_months.append(m)
         if not len(win):
             LM.W[m] = _csr((n, n), dtype=np.float32)
             LM.stats.append({"month": m, "n_analyst": 0, "n_pair": 0, "n_covered": 0,
@@ -6504,6 +6578,10 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
                          "median_links": float(np.median(deg[deg > 0])) if (deg > 0).any() else 0.0})
 
     LOG.ok(f"링크 행렬 {len(LM.W)}개월 생성 [{weight_mode}] — {time.time()-t0:.1f}s")
+    if no_skill_months:
+        LOG.warn(f"[highskill] 스킬 표본이 없는 {len(no_skill_months)}개월은 비가중과 동일하게 "
+                 f"처리했습니다 (예: {no_skill_months[0]:%Y-%m} ~ {no_skill_months[-1]:%Y-%m}). "
+                 f"H4 비교 시 이 구간은 두 구성이 같습니다.")
     S = LM.summary()
     if len(S):
         LOG.table([[f"{r['month']:%Y-%m}", f"{int(r['n_analyst']):,}", f"{int(r['n_covered']):,}",
@@ -6512,7 +6590,7 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
                   ["월", "활동 애널", "연결보유 종목", "링크쌍", "종목당 연결(중위)"],
                   ["l", "r", "r", "r", "r"],
                   title=f"링크 행렬 요약 [{weight_mode}] — 표본 8개월")
-    _save_links(LM)
+    _save_links(LM, ck)
     return LM
 
 
@@ -6750,6 +6828,25 @@ class PriceGrid:
         return px.astype("float32"), as_ts(self.close.index[i])
 
 
+
+def available_month_end(grid: "PriceGrid", t) -> pd.Timestamp:
+    """시점 t 에서 '이미 확정되어 알 수 있는' 월말 스냅샷 날짜.
+
+    월간 리밸런싱의 t 는 달력 월말이 아니라 그 달의 '마지막 거래일'이다(예: 3/29).
+    t == t+MonthEnd(0) 로 판정하면 항상 거짓이 되어 매번 직전 달 유니버스를 쓰게 된다 —
+    미래누수는 아니지만 한 달치 신선도를 공짜로 버리는 셈이다.
+    그 달의 마지막 거래일이 t 이하이면 그 달 월말 스냅샷은 t 시점에 확정된 것이므로 쓴다.
+    """
+    t = as_ts(t)
+    cur = t + pd.offsets.MonthEnd(0)
+    i = grid.pos_at_or_before(cur)
+    # pos_at_or_before 는 격자 끝을 넘어서면 마지막 행으로 클램프된다. 그 경우
+    # '아직 오지 않은 월말'을 확정된 것으로 오인하므로 명시적으로 배제한다.
+    if i >= 0 and cur <= as_ts(grid.close.index[-1]) and as_ts(grid.close.index[i]) <= t:
+        return cur
+    return cur - pd.offsets.MonthEnd(1)
+
+
 def rebalance_dates(months: pd.DatetimeIndex, grid: PriceGrid, freq: str) -> List[pd.Timestamp]:
     """리밸런싱 시점. 'M'=월말, 'W'=주말(각 주의 마지막 거래일)."""
     if freq == "M":
@@ -6808,9 +6905,8 @@ def compute_sacn(LM: LinkMatrices, grid: PriceGrid, uni_panel: pd.DataFrame,
         W = LM.W.get(m_link)
         if W is None or W.nnz == 0:
             continue
-        # 유니버스도 t 이하 최근 월말 스냅샷 기준
-        m_uni = (t + pd.offsets.MonthEnd(0)) if t == (t + pd.offsets.MonthEnd(0)) \
-            else (t - pd.offsets.MonthEnd(1))
+        # 유니버스도 t 시점에 확정된 최근 월말 스냅샷 기준
+        m_uni = available_month_end(grid, t)
         if m_uni not in uni_by_month:
             cand = [m for m in uni_by_month if m <= t]
             if not cand:
@@ -6823,8 +6919,14 @@ def compute_sacn(LM: LinkMatrices, grid: PriceGrid, uni_panel: pd.DataFrame,
         ok = g2l >= 0
         r[ok] = r_grid[g2l[ok]]
 
-        mask = np.array([1.0 if c in alive else 0.0 for c in lcodes])
-        mask *= np.isfinite(r).astype(float)
+        # ★ 두 개의 서로 다른 소속 판정을 구분한다.
+        #   own  : 신호를 '받을' 자격 — 초점기업 i 자신이 그 시점 유니버스에 있어야 한다.
+        #   mask : 신호에 '기여할' 자격 — 연결기업 j 가 유니버스에 있고 수익률도 있어야 한다.
+        #   이 둘을 하나로 쓰면, 유니버스 밖 종목도 이웃만 3개 있으면 순위에 들어온다.
+        #   LM.codes 는 전 기간 유니버스의 합집합이므로, 그렇게 되면 2024년에야 하한을
+        #   통과한 종목이 2017년에 편입되는 전표본 선택편의가 된다.
+        own = np.array([1.0 if c in alive else 0.0 for c in lcodes])
+        mask = own * np.isfinite(r).astype(float)
         if mask.sum() < min_links + 1:
             continue
         rr = np.where(np.isfinite(r), r, 0.0) * mask
@@ -6835,7 +6937,7 @@ def compute_sacn(LM: LinkMatrices, grid: PriceGrid, uni_panel: pd.DataFrame,
         nlink = B @ mask                      # 실제로 쓰인 연결기업 수
 
         with np.errstate(all="ignore"):
-            sig = np.where((den > 0) & (nlink >= min_links), num / den, np.nan)
+            sig = np.where((own > 0) & (den > 0) & (nlink >= min_links), num / den, np.nan)
 
         sel = np.isfinite(sig)
         if not sel.any():
@@ -6870,16 +6972,17 @@ def orthogonalize(S: pd.DataFrame, uni_panel: pd.DataFrame, grid: PriceGrid,
     """
     if S is None or not len(S):
         return S
-    U = uni_panel[["code", "month", "mktcap", "bm", "sector"]].copy()
+    # (code, month) 가 중복되면 merge 가 신호 패널의 행을 복제한다 → 같은 종목이 분위에
+    # 두 번 들어가고 비중도 두 번 잡힌다. attach_attrs 와 동일하게 여기서도 제거한다.
+    U = uni_panel[["code", "month", "mktcap", "bm", "sector"]].drop_duplicates(
+        ["code", "month"]).copy()
     U["code"] = U["code"].astype(str)
     U["month"] = as_ts_series(U["month"])
 
     d = S.copy()
-    d["month"] = as_ts_series(d["date"]) + pd.offsets.MonthEnd(0)
-    # 주간 리밸런싱은 월말 이전 시점이 있으므로, 그 시점에 '알 수 있던' 직전 월말 속성을 쓴다
-    d["month_attr"] = np.where(as_ts_series(d["date"]) >= d["month"],
-                               d["month"], d["month"] - pd.offsets.MonthEnd(1))
-    d["month_attr"] = as_ts_series(d["month_attr"])
+    # 그 시점에 '확정되어 알 수 있던' 월말 속성만 쓴다 (주간 리밸런싱 포함)
+    _mm = {t: available_month_end(grid, t) for t in as_ts_series(d["date"]).unique()}
+    d["month_attr"] = as_ts_series(as_ts_series(d["date"]).map(_mm))
     d = d.merge(U.rename(columns={"month": "month_attr"}), on=["code", "month_attr"], how="left")
 
     # 업종 수익률: 같은 시점, 같은 업종의 자기수익률 평균 (자기 자신 제외 = leave-one-out)
@@ -6949,7 +7052,7 @@ def orthogonalize(S: pd.DataFrame, uni_panel: pd.DataFrame, grid: PriceGrid,
     return R.drop(columns=["month_attr"], errors="ignore")
 
 
-def attach_attrs(P: pd.DataFrame, uni_panel: pd.DataFrame,
+def attach_attrs(P: pd.DataFrame, uni_panel: pd.DataFrame, grid: "PriceGrid",
                  cols: Sequence[str] = ("mktcap", "market", "sector", "bm")) -> pd.DataFrame:
     """유니버스 속성을 신호 패널에 붙인다 — 이미 있는 컬럼은 건드리지 않는다.
 
@@ -6972,9 +7075,8 @@ def attach_attrs(P: pd.DataFrame, uni_panel: pd.DataFrame,
     d = P.copy()
     d["code"] = d["code"].astype(str)
     # 주간 리밸런싱 시점은 월말이 아니므로 '그 시점에 알 수 있던' 직전 월말 속성을 쓴다
-    mm = as_ts_series(d["date"]) + pd.offsets.MonthEnd(0)
-    d["_m"] = np.where(as_ts_series(d["date"]) >= mm, mm, mm - pd.offsets.MonthEnd(1))
-    d["_m"] = as_ts_series(d["_m"])
+    _mm = {t: available_month_end(grid, t) for t in as_ts_series(d["date"]).unique()}
+    d["_m"] = as_ts_series(as_ts_series(d["date"]).map(_mm))
     d = d.merge(U.rename(columns={"month": "_m"}), on=["code", "_m"], how="left")
     return d.drop(columns=["_m"], errors="ignore")
 
@@ -7107,13 +7209,19 @@ def perf_stats(R: pd.DataFrame, ppy: float = 12.0, rf: float = 0.0) -> dict:
     n = len(r)
     if n == 0:
         return {}
+    rp = rf / ppy                      # 기간 무위험수익률 (rf 를 받아놓고 안 쓰면 안 된다)
+    ex = r - rp
     eq = np.cumprod(1.0 + r)
     years = n / ppy
     cagr = float(eq[-1] ** (1.0 / years) - 1.0) if years > 0 and eq[-1] > 0 else float("nan")
     vol = float(np.std(r, ddof=1) * math.sqrt(ppy)) if n > 1 else float("nan")
-    dn = r[r < 0]
-    dvol = float(np.std(dn, ddof=1) * math.sqrt(ppy)) if len(dn) > 1 else float("nan")
-    dd = eq / np.maximum.accumulate(eq) - 1.0
+    # ★ 하방편차는 '손실의 표준편차'가 아니라 목표 대비 semi-deviation 이다.
+    #   손실을 평균 중심으로 재면, 균일한 손실이 이어질 때 분모가 0에 수렴해 Sortino 가 폭발한다.
+    dvol = float(np.sqrt(np.mean(np.minimum(ex, 0.0) ** 2)) * math.sqrt(ppy)) if n else float("nan")
+    # ★ 최초 자본(1.0)을 기준선에 포함한다. 빼면 '시작하자마자 난 낙폭'이 통째로 안 보이고
+    #   MDD 가 0, Calmar 가 NaN 으로 나온다 — MDD 는 모든 표의 헤드라인 지표다.
+    eqd = np.concatenate(([1.0], eq))
+    dd = (eqd / np.maximum.accumulate(eqd) - 1.0)[1:]
     mdd = float(dd.min()) if n else float("nan")
     mu, tstat = hac_tstat(r)
     uw, best = 0, 0
@@ -7122,8 +7230,8 @@ def perf_stats(R: pd.DataFrame, ppy: float = 12.0, rf: float = 0.0) -> dict:
         best = max(best, uw)
     out = {
         "기간수": n, "CAGR": cagr, "연변동성": vol,
-        "Sharpe": float(np.mean(r) / np.std(r, ddof=1) * math.sqrt(ppy)) if n > 1 and np.std(r, ddof=1) > 0 else float("nan"),
-        "Sortino": float(np.mean(r) * ppy / dvol) if dvol and dvol > 0 else float("nan"),
+        "Sharpe": float(np.mean(ex) / np.std(r, ddof=1) * math.sqrt(ppy)) if n > 1 and np.std(r, ddof=1) > 0 else float("nan"),
+        "Sortino": float(np.mean(ex) * ppy / dvol) if dvol and np.isfinite(dvol) and dvol > 1e-12 else float("nan"),
         "MDD": mdd, "Calmar": float(cagr / abs(mdd)) if mdd and mdd < 0 else float("nan"),
         "승률": float((r > 0).mean()), "기간평균수익": float(np.mean(r)),
         "t통계량(HAC)": float(tstat), "최장언더워터(기간)": int(best),
@@ -7139,14 +7247,35 @@ def perf_stats(R: pd.DataFrame, ppy: float = 12.0, rf: float = 0.0) -> dict:
 
 
 def _assign_quantiles(g: pd.DataFrame, col: str, q: int) -> pd.Series:
-    """동점 처리를 결정적으로: 신호 내림차순 → code 오름차순으로 순위를 확정한 뒤 분할."""
+    """분위 배정. 동점은 code 오름차순으로 깨서 입력 행 순서와 무관하게 만든다.
+
+    rank(method="first") 는 '행 위치'로 동점을 깬다. 상류에서 정렬이 바뀌면 같은 데이터인데
+    종목별 분위가 달라진다 — 재현성이 깨지는 지점이고, 합계만 비교하는 검사로는 절대 안 잡힌다.
+    """
     d = g[[col, "code"]].copy()
-    d["_r"] = d[col].rank(method="first", ascending=True)
-    n = int(d["_r"].notna().sum())
+    d["_code"] = d["code"].astype(str)
+    ok = d[col].notna()
+    n = int(ok.sum())
     if n < q:
         return pd.Series(np.nan, index=g.index)
-    lab = np.ceil(d["_r"] / (n / q))
-    return pd.Series(np.clip(lab, 1, q), index=g.index)
+    order = d[ok].sort_values([col, "_code"], kind="mergesort").index
+    rk = pd.Series(np.arange(1, n + 1, dtype=float), index=order)
+    lab = np.ceil(rk / (n / q)).clip(1, q)
+    return lab.reindex(g.index)
+
+
+def _qtile_by_date(d: pd.DataFrame, signal_col: str, q: int) -> pd.Series:
+    """시점별 분위 배정. groupby(...).apply 를 쓰지 않는다.
+
+    pandas 는 그룹이 정확히 1개일 때 같은 인덱스를 가진 Series 반환을 '전치된 DataFrame'
+    으로 감싼다 → `Cannot set a DataFrame with multiple columns to the single column qtile`.
+    표본이 얇아 시점이 하나만 남는 상황은 실데이터 첫 실행에서 충분히 일어나고,
+    그때 L3.BT 는 critical 이라 실행 전체가 죽는다. 명시적 concat 으로 우회한다.
+    """
+    parts = [_assign_quantiles(g, signal_col, q) for _, g in d.groupby("date", sort=False)]
+    if not parts:
+        return pd.Series(np.nan, index=d.index)
+    return pd.concat(parts).reindex(d.index)
 
 
 def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
@@ -7174,19 +7303,27 @@ def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
             d[c] = pd.to_numeric(d[c], errors="coerce").astype("float64")
 
     # 폐지 수익률 주입 (§0.3) — fwd_ret 이 결측인데 그 구간에 폐지된 종목
-    if delist is not None and len(delist):
-        dl = delist.copy()
+    if delist is not None and len(delist) and "delist_date" in delist.columns:
+        # ★ '폐지된 달의 모든 리밸런싱 시점'에 주입하면 주간 리밸런싱에서 같은 손실이
+        #   한 달에 4~5번 반복 계상된다. 보유 구간 (t, next_t] 안에 폐지일이 들어온
+        #   시점에만 정확히 한 번 주입한다.
+        dl = delist[["code", "delist_date", "delist_ret"]].copy()
         dl["code"] = dl["code"].astype(str)
-        dl["month"] = as_ts_series(dl["month"])
-        d["_m"] = d["date"] + pd.offsets.MonthEnd(0)
-        d = d.merge(dl.rename(columns={"month": "_m"})[["code", "_m", "delist_ret"]],
-                    on=["code", "_m"], how="left")
-        inj = d["fwd_ret"].isna() & d["delist_ret"].notna()
-        d.loc[inj, "fwd_ret"] = d.loc[inj, "delist_ret"]
-        d = d.drop(columns=["_m", "delist_ret"], errors="ignore")
+        dl["delist_date"] = as_ts_series(dl["delist_date"])
+        dl = dl.dropna(subset=["delist_date"]).drop_duplicates("code", keep="last")
+        d = d.merge(dl, on="code", how="left")
+        dd = as_ts_series(d["delist_date"])
+        nxt = (as_ts_series(d["next_date"]) if "next_date" in d.columns
+               else d["date"] + pd.offsets.MonthEnd(1))
+        nxt = nxt.fillna(d["date"] + pd.offsets.MonthEnd(1))
+        inj = d["fwd_ret"].isna() & dd.notna() & (dd > d["date"]) & (dd <= nxt)
+        if inj.any():
+            d.loc[inj, "fwd_ret"] = pd.to_numeric(
+                d.loc[inj, "delist_ret"], errors="coerce").astype("float64")
+            LOG.debug(f"[{label}] 폐지 수익률 {int(inj.sum()):,}건 주입 (보유구간 매칭)")
+        d = d.drop(columns=["delist_date", "delist_ret"], errors="ignore")
 
-    d["qtile"] = d.groupby("date", group_keys=False).apply(
-        lambda g: _assign_quantiles(g, signal_col, q))
+    d["qtile"] = _qtile_by_date(d, signal_col, q)
     d = d[d["qtile"].notna()]
     if not len(d):
         return empty
@@ -7229,8 +7366,15 @@ def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
         w = min(w, POS_MAX_WEIGHT)
         wmap = {c: w for c in top["code"]}
         # 상한 때문에 남은 비중은 현금으로 둔다 (억지로 종목을 늘리지 않는다)
-        fr = pd.to_numeric(top["fwd_ret"], errors="coerce").fillna(0.0).to_numpy(float)
-        ret_gross = float(np.sum(fr * w))
+        # 전향수익이 결측인 종목을 0%로 계상하면 포트폴리오 수익이 0 쪽으로 희석된다.
+        # 결측은 '수익 0'이 아니라 '관측 없음'이므로, 관측된 종목들로 비중을 재정규화한다.
+        fr_s = pd.to_numeric(top["fwd_ret"], errors="coerce")
+        n_ok = int(fr_s.notna().sum())
+        if n_ok == 0:
+            # 마지막 리밸런싱은 다음 실행가가 없어 전 종목이 결측이다. 이걸 한 기간으로
+            # 계상하면 회전비용만 물린 가짜 기간이 성과·t통계량·스프레드에 섞인다.
+            continue
+        ret_gross = float(np.nanmean(fr_s.to_numpy(float)) * (w * len(top)))
 
         cost, turn = 0.0, 0.0
         allc = set(wmap) | set(prev_w)
@@ -7253,7 +7397,7 @@ def run_quantile_backtest(P: pd.DataFrame, signal_col: str, rebal: str,
         holds.append(h)
 
         if len(bot) >= min_names:
-            rb = float(pd.to_numeric(bot["fwd_ret"], errors="coerce").fillna(0.0).mean())
+            rb = float(pd.to_numeric(bot["fwd_ret"], errors="coerce").mean())
             spreads.append({"date": t, "q5": ret_gross, "q1": rb, "spread": ret_gross - rb,
                             "n5": len(top), "n1": len(bot)})
         prev_w = wmap
@@ -7287,8 +7431,7 @@ def quantile_profile(P: pd.DataFrame, signal_col: str, q: int = N_QUANTILES) -> 
     d = P[P[signal_col].notna() & P["fwd_ret"].notna()].copy()
     if not len(d):
         return pd.DataFrame()
-    d["qtile"] = d.groupby("date", group_keys=False).apply(
-        lambda g: _assign_quantiles(g, signal_col, q))
+    d["qtile"] = _qtile_by_date(d, signal_col, q)
     d = d[d["qtile"].notna()]
     per = d.groupby(["date", "qtile"])["fwd_ret"].mean().reset_index()
     out = per.groupby("qtile")["fwd_ret"].agg(["mean", "std", "size"]).reset_index()
@@ -7356,10 +7499,13 @@ def index_benchmarks(dates: Sequence[pd.Timestamp]) -> Dict[str, pd.Series]:
                 continue
             c = df["Close"].copy()
             c.index = as_ts_series(pd.Series(df.index)).to_numpy()
-            v = c.reindex(c.index.union(idx)).sort_index().ffill().reindex(idx)
+            # FDR 이 같은 날짜를 두 번 돌려주는 경우가 있다. 중복 인덱스에 reindex 하면
+            # ValueError 로 죽고, 위 except 가 삼켜 벤치마크가 조용히 사라진다.
+            c = c[~pd.Index(c.index).duplicated(keep="last")].sort_index()
+            v = c.reindex(pd.Index(c.index).union(idx)).sort_index().ffill().reindex(idx)
             out[name] = v.pct_change()
         except Exception as e:                                   # noqa
-            LOG.debug(f"벤치마크 {name} 수집 실패({type(e).__name__})")
+            LOG.warn(f"벤치마크 {name} 수집 실패({type(e).__name__}) — 이 벤치마크는 표에서 빠집니다.")
     return out
 
 
@@ -7497,7 +7643,9 @@ def cscv_pbo(M: pd.DataFrame, S: int = 8) -> dict:
     D = M.dropna(how="any")
     T, N = D.shape
     if T < S * 4:
-        S = max(4, (T // 4) * 2 // 2 * 2)
+        # 표본이 짧으면 블록을 '더 크게' 만들어야 한다. 이전 식은 T 가 줄수록 S 를 키워
+        # 블록 길이를 2로 붕괴시켰다(= 블록 구조 소멸).
+        S = max(4, 2 * (T // 8))
         if S < 4 or T < S * 2:
             out["note"] = f"기간 {T} 이 부족해 CSCV 를 수행할 수 없습니다 (필요 ≥ {4*4})."
             return out
@@ -7594,10 +7742,10 @@ def walk_forward(M: pd.DataFrame, ppy: float = 12.0, train_years: int = 5,
         if not len(sr):
             s += te
             continue
-        pick = str(sr.idxmax())
+        pick = sr.idxmax()
         rb = B[pick]
         rows.append({"검증구간": f"{as_ts(idx[s+tr]):%Y-%m} ~ {as_ts(idx[s+tr+te-1]):%Y-%m}",
-                     "선택 구성": pick,
+                     "선택 구성": str(pick),
                      "학습 Sharpe": float(sr.max() * math.sqrt(ppy)),
                      "검증 Sharpe": float(rb.mean() / rb.std(ddof=1) * math.sqrt(ppy))
                      if rb.std(ddof=1) > 0 else float("nan"),
@@ -7622,7 +7770,11 @@ def nw_tstat(x: np.ndarray, ppy: float = 12.0) -> Tuple[float, float, int]:
     x = x[np.isfinite(x)]
     if len(x) < 12:
         return float("nan"), float("nan"), 0
-    lag = max(1, int(round(1.5 * (1 if ppy <= 13 else 4))))
+    # 괄호 안은 '한 달에 몇 기간인가'. SPEC 의 '리밸런싱 주기 × 1.5' 를 보유기간(≈1개월)
+    # 기준으로 읽은 것이다. ppy 를 그대로 1.5배하면 120개월 표본에 lag 18 이 되어
+    # Bartlett 창이 표본의 15%를 덮는다 — HAC 로 성립하지 않는다.
+    per_month = 1 if ppy <= 13 else (4 if ppy <= 60 else 21)
+    lag = max(1, int(round(1.5 * per_month)))
     mu, t = hac_tstat(x, lags=lag)
     return float(mu), float(t), lag
 
@@ -7682,8 +7834,7 @@ def spread_series(P: pd.DataFrame, signal_col: str, q: int = N_QUANTILES,
     d = P[P[signal_col].notna() & P["fwd_ret"].notna()].copy()
     if not len(d):
         return pd.Series(dtype=float)
-    d["qtile"] = d.groupby("date", group_keys=False).apply(
-        lambda g: _assign_quantiles(g, signal_col, q))
+    d["qtile"] = _qtile_by_date(d, signal_col, q)
     d = d[d["qtile"].notna()]
     g = d.groupby(["date", "qtile"])["fwd_ret"].agg(["mean", "size"]).reset_index()
     piv_m = g.pivot(index="date", columns="qtile", values="mean")
@@ -7983,9 +8134,20 @@ def outdir() -> str:
     return d
 
 
-def write_text(name: str, text: str) -> str:
+def write_text(name: str, text: str) -> Optional[str]:
+    """산출물 텍스트 저장. 한 파일이 실패해도 나머지를 포기하지 않는다.
+
+    윈도우에서 os.replace 는 대상 파일에 열린 핸들이 있으면 PermissionError 를 낸다.
+    구글드라이브/원드라이브 동기화 중이거나 사용자가 편집기로 열어둔 경우가 흔하고,
+    감싸지 않으면 그 지점 이후의 산출물이 통째로 사라진다.
+    """
     p = os.path.join(outdir(), name)
-    atomic_write_text(p, text)
+    try:
+        atomic_write_text(p, text)
+    except Exception as e:                                    # noqa
+        LOG.warn(f"산출물 저장 실패({type(e).__name__}): {name} — 파일이 열려 있거나 "
+                 f"드라이브 동기화가 잠그고 있을 수 있습니다. 나머지 산출물은 계속 생성합니다.")
+        return None
     OUTPUTS.append(p)
     return p
 
@@ -8535,7 +8697,7 @@ def run_selftest(full: bool = True) -> bool:
     if P is None or not len(P):
         LOG.error("스모크 실패: 신호 패널이 비었습니다.")
         return False
-    P = attach_attrs(P, U)
+    P = attach_attrs(P, U, grid)
 
     bt = run_quantile_backtest(P, "sacn_raw", "M", label="SMOKE")
     if not len(bt["returns"]):
@@ -8647,10 +8809,19 @@ def run_contract_tests(strict: bool = True) -> bool:
             "Vault 에 삭제 API 자체가 없다 (기존 캐시 훼손 불가능)"
 
     def k13():
+        # ★ 합계 비교는 어떤 순열에도 불변이라 '검사가 절대 실패할 수 없다'.
+        #   종목별 배정을 직접 비교해야 동점 처리의 결정성을 실제로 검정한다.
         g = pd.DataFrame({"code": list("abcdefghij"), "s": [1.0] * 10})
-        q1 = _assign_quantiles(g, "s", 5).to_numpy()
-        q2 = _assign_quantiles(g.iloc[::-1].reset_index(drop=True), "s", 5).to_numpy()
-        return bool(np.nansum(q1) == np.nansum(q2)), "동점 분위 배정이 입력 순서에 무관"
+        a = dict(zip(g["code"], _assign_quantiles(g, "s", 5)))
+        rev = g.iloc[::-1].reset_index(drop=True)
+        b = dict(zip(rev["code"], _assign_quantiles(rev, "s", 5)))
+        same = a == b
+        # 동점이 아닌 경우의 방향도 함께 확인한다 (최고 신호 = Q5)
+        h = pd.DataFrame({"code": [f"c{i}" for i in range(10)], "s": list(range(10))})
+        qq = _assign_quantiles(h, "s", 5)
+        direction = bool(qq.iloc[-1] == 5 and qq.iloc[0] == 1)
+        return bool(same and direction), \
+            f"동점 배정이 입력 순서에 무관(종목별 비교) · 최고신호=Q5 방향 {direction}"
 
     def k14():
         k = _beta_binom_k(np.array([5., 30., 2.]), np.array([10., 60., 4.]))
@@ -8732,6 +8903,7 @@ def run_rehearsal(strict: bool = False) -> bool:
     g = globals()
     saved_pykrx, saved_call = g.get("pykrx_stock"), KRXG.call
     try:
+        g["_REHEARSAL"] = True          # ★ 리허설 중에는 캐시 쓰기를 차단한다
         g["pykrx_stock"] = _FakePykrx
         KRXG.call = lambda fn, *a, **kw: fn(*a, **kw)     # type: ignore
         months = pd.date_range(end=as_ts(BACKTEST_END), periods=3, freq=MONTH_END_ALIAS)
@@ -8760,10 +8932,13 @@ def run_rehearsal(strict: bool = False) -> bool:
             except Exception as e:                        # noqa
                 results.append([name, "✘", f"{type(e).__name__}: {str(e)[:60]}"])
     finally:
+        g["_REHEARSAL"] = False
         g["pykrx_stock"] = saved_pykrx
         KRXG.call = saved_call                            # type: ignore
 
     LOG.table(results, ["수집·정제 함수", "판정", "결과"], ["l", "c", "l"])
+    LOG.info("리허설은 캐시에 쓰지 않습니다(_REHEARSAL 플래그). 가짜 데이터가 공용 인덱스에 "
+             "남아 실수집을 영구히 건너뛰게 만드는 사고를 구조로 차단합니다.")
     bad = [r for r in results if r[1] == "✘"]
     if bad and strict:
         raise RuntimeError(f"리허설 실패 {[r[0] for r in bad]}")
@@ -9009,7 +9184,7 @@ def main() -> dict:
                     if P is None or not len(P):
                         LOG.warn(f"구성 {cid}: 신호 패널이 비었습니다 — 건너뜁니다.")
                         continue
-                    panels[cid] = attach_attrs(P, U)
+                    panels[cid] = attach_attrs(P, U, grid)
         ctx["panels"] = panels
         if not panels:
             raise RuntimeError("어떤 구성에서도 신호가 만들어지지 않았습니다.")
@@ -9066,17 +9241,41 @@ def main() -> dict:
         ctx["bt_raw"] = bt_raw
         report_arm_comparison({"직교화(주)": ctx["arm_bt"]["전체 유니버스"], "원신호": bt_raw}, ppy)
 
+    # ★ rob 을 스테이지 밖에서 먼저 채워둔다. L5.STATS 는 critical=False 라 실패해도
+    #   진행되는데, 그때 ctx["rob"] 이 없으면 하류가 KeyError 로 조용히 죽고
+    #   '수 시간 수집 후 산출물 0개'가 된다.
+    ctx["rob"] = {"bootstrap": {}, "pbo": {}, "dsr": {}, "wf": {}}
     with PIPE.stage("L5.STATS", "통계 검증 게이트 (§9)", "L5", budget_s=1500, critical=False):
         base = ctx["arm_bt"]["전체 유니버스"]
         r = base["returns"]["ret"].to_numpy(float) if len(base["returns"]) else np.array([])
-        M = pd.DataFrame({cid: bt["returns"].set_index(as_ts_series(bt["returns"]["date"]))["ret"]
-                          for cid, bt in ctx["allbt"].items()
-                          if len(bt["returns"])}).sort_index()
+        # ★ 주간·월간 구성을 한 행렬에 섞으면 안 된다. 날짜 격자가 달라 dropna(how="any")
+        #   후 교집합(월말∩주말)만 남고, 그 한 행 안에서 '1주 수익'과 '1개월 수익'이
+        #   나란히 비교된다. PBO 는 실력이 아니라 리밸런싱 주기를 고르게 되고,
+        #   워크포워드는 표본 부족으로 아예 실행되지 않는다.
+        mats: Dict[str, pd.DataFrame] = {}
+        for cid, bt in ctx["allbt"].items():
+            R = bt.get("returns")
+            if R is None or not len(R):
+                continue
+            mats.setdefault(cid.split("|")[1], {})[cid] = \
+                R.set_index(as_ts_series(R["date"]))["ret"]
+        mats = {rb: pd.DataFrame(c).sort_index() for rb, c in mats.items()}
+        M = mats.get(PRIMARY_CONFIG["rebal"], pd.DataFrame())
+        # DSR 의 시도 횟수는 12(사전등록 전체)로 유지하되, 시도 간 Sharpe 분산이
+        # 있으면 그것을 쓴다 (귀무 하 표집분산보다 정확하고 덜 관대하다).
+        srv = None
+        if len(M.columns) > 2:
+            _s = (M.mean() / M.std(ddof=1)).replace([np.inf, -np.inf], np.nan).dropna()
+            srv = float(_s.var(ddof=1)) if len(_s) > 2 else None
         rob = {"bootstrap": block_bootstrap(r, ppy=ppy),
                "pbo": cscv_pbo(M, S=8),
-               "dsr": deflated_sharpe(r, n_trials=N_PREREG_CONFIGS, ppy=ppy),
+               "pbo_by_rebal": {rb: cscv_pbo(m, S=8) for rb, m in mats.items()},
+               "dsr": deflated_sharpe(r, n_trials=N_PREREG_CONFIGS, ppy=ppy, sr_variance=srv),
                "wf": walk_forward(M, ppy=ppy)}
         ctx["rob"] = rob
+        LOG.info(f"통계 검증 행렬: 리밸런싱 주기별 분리 — "
+                 f"{', '.join(f'{k}:{v.shape[1]}구성×{v.shape[0]}기간' for k, v in mats.items())} "
+                 f"(주 구성 주기 '{PRIMARY_CONFIG['rebal']}' 기준으로 §11 판정)")
         report_robustness(rob, title=f"{pid} · 전체 유니버스")
 
     with PIPE.stage("L5.HYP", "사전등록 가설 H1~H4 (§3)", "L5", budget_s=900, critical=False):
@@ -9084,7 +9283,7 @@ def main() -> dict:
         Px = build_signal_panel(ctx["LM_xsec"], ctx["grid"], U, months,
                                 PRIMARY_CONFIG["window"], PRIMARY_CONFIG["rebal"])
         if Px is not None and len(Px):
-            Px = attach_attrs(Px, U)
+            Px = attach_attrs(Px, U, ctx["grid"])
             sp_x = spread_series(Px, PRIMARY_SIGNAL)
         else:
             sp_x = pd.Series(dtype=float)
@@ -9131,10 +9330,16 @@ def main() -> dict:
         report_interpretation(P0, PRIMARY_SIGNAL, ctx["LMs"][PRIMARY_CONFIG["weight"]],
                               ctx["arm_bt"]["전체 유니버스"], ctx["sec"])
 
-    with PIPE.stage("L6.VERDICT", "§11 기계적 판정 + 산출물", "L6", budget_s=600, critical=False):
+    with PIPE.stage("L6.VERDICT", "§11 기계적 판정", "L6", budget_s=300, critical=False):
         v = final_verdict(ctx["arm_bt"]["전체 유니버스"], ctx["bench"].get("동일가중 유니버스"),
-                          ctx["rob"]["pbo"], ctx["rob"]["dsr"], ppy)
+                          ctx["rob"].get("pbo", {}), ctx["rob"].get("dsr", {}), ppy)
         ctx["verdict"] = v
+    ctx.setdefault("verdict", {"verdict": "NOT_EVALUABLE", "why": "판정 단계 실패",
+                               "criteria": [], "excess_ew": float("nan"),
+                               "pbo": float("nan"), "dsr": float("nan")})
+
+    # 산출물은 판정과 분리한다. 판정이 실패해도 몇 시간짜리 수집 결과는 반드시 남겨야 한다.
+    with PIPE.stage("L6.OUTPUT", "산출물 생성 (§10)", "L6", budget_s=600, critical=False):
         write_outputs(ctx, ppy, t_all)
 
     PIPE.report_stages()
