@@ -95,7 +95,7 @@ NCQ_PDF_ENGINE = "auto"          # "auto" | "fitz" | "pdfplumber"
 
 TXT_COLS = ["report_uid", "code", "pub_date", "sec_title", "sec_headline", "sec_body",
             "n_chars", "n_pages", "extract_ok", "extract_method"]
-SCORE_COLS = ["report_uid", "code", "month", "doc_raw", "doc_score", "n_chars",
+SCORE_COLS = ["report_uid", "code", "month", "doc_raw", "doc_score", "n_chars", "title_only",
               "g_A", "g_B", "g_C", "g_D", "g_H", "g_N"]
 SIG_COLS = ["month", "code", "event_score", "z", "pooled", "pool_n", "rank_pct",
             "selected", "placebo", "sponsor_group", "event_type", "exec_px", "adv20", "fwd_ret"]
@@ -561,14 +561,24 @@ def score_texts(TXT: pd.DataFrame) -> pd.DataFrame:
         S[f"g_{g}"] = [c.get(g, 0) for c in out_cnt]
     S["n_chars"] = (T["sec_title"].str.len() + T["sec_headline"].str.len() +
                     T["sec_body"].str.len()).to_numpy()
-    denom = (S["n_chars"] / 1000.0).replace(0, np.nan)
-    # ★ 본문이 아주 짧으면(제목만 있는 건) 분모가 0에 수렴해 점수가 폭발한다. 하한을 둔다.
-    denom = denom.clip(lower=0.25)
+    # ★★ 길이 정규화의 하한을 1.0(=1,000자)으로 둔다. 이유가 있다.
+    #   명세 §9.3 은 doc_raw / (총 문자수/1000) 이라고만 정의하고 하한을 말하지 않는다.
+    #   그런데 PDF 추출이 실패해 '제목만' 남은 문서는 총 문자수가 30자 남짓이라 분모가 0.03 이
+    #   되고, 제목에 어휘가 하나만 있어도 점수가 30배로 폭발한다. 그러면 상위 tercile 이
+    #   '내용이 좋은 리포트'가 아니라 '본문 추출에 실패한 리포트'로 채워진다 — 신호가 아니라
+    #   수집 실패를 사는 셈이다. 하한을 1,000자로 두면 짧은 문서가 공짜 배수를 얻지 못한다.
+    #   (하한 자체는 구현 결정이므로 그 사실과 값을 여기에 명시하고 매니페스트에도 남긴다)
+    denom = (S["n_chars"] / 1000.0).clip(lower=1.0)
     S["doc_score"] = S["doc_raw"] / denom
+    S["title_only"] = (pd.to_numeric(T.get("n_chars"), errors="coerce").fillna(0).to_numpy() <= 0) | \
+                      ((T["sec_headline"].str.len() + T["sec_body"].str.len()).to_numpy() < 100)
     S["month"] = S["pub_date"] + pd.offsets.MonthEnd(0)
     S = S.dropna(subset=["code", "month"])
+    n_title_only = int(S["title_only"].sum())
     LOG.ok(f"텍스트 스코어링 {len(S):,}건 — doc_score 평균 {S['doc_score'].mean():.3f} / "
-           f"표준편차 {S['doc_score'].std():.3f}")
+           f"표준편차 {S['doc_score'].std():.3f} · 길이 정규화 하한 1,000자 "
+           f"(제목만 남은 문서 {n_title_only:,}건 = {100*n_title_only/max(len(S),1):.0f}%)")
+    manifest_put("score_title_only_share", round(n_title_only / max(len(S), 1), 4))
     PIPE.io("OUT", "MEM", "text_scores", S)
     return S.reindex(columns=SCORE_COLS + [])
 
@@ -660,6 +670,24 @@ def build_signal_panel(SCORE: pd.DataFrame, EV: pd.DataFrame, UNI: pd.DataFrame,
             Z[c] = np.nan
     if "adv20" not in Z.columns:
         Z["adv20"] = np.nan
+
+    # ★ 선정군이 '본문 추출 실패 문서'로 채워졌는지 확인한다. 이 비율이 높으면 우리가 산 것은
+    #   텍스트 품질이 아니라 수집 실패다 — 조용히 넘어가면 알파를 착각한다.
+    if SCORE is not None and len(SCORE) and "title_only" in SCORE.columns:
+        try:
+            to = (SCORE.groupby(["code", "month"], observed=True)["title_only"]
+                       .min().rename("title_only").reset_index())
+            Z = Z.merge(to, on=["code", "month"], how="left")
+            sel_to = Z.loc[Z["selected"].fillna(False).astype(bool), "title_only"]
+            if len(sel_to):
+                frac = float(pd.to_numeric(sel_to, errors="coerce").fillna(0).mean())
+                manifest_put("selected_title_only_share", round(frac, 4))
+                if frac > 0.5:
+                    LOG.warn(f"★ 선정 종목의 {100*frac:.0f}% 가 '본문 추출에 실패해 제목만 남은' "
+                             f"리포트로 채점됐습니다. 이 상태의 순위는 텍스트 품질이 아니라 "
+                             f"수집 실패를 반영합니다 — P4(텍스트 증분) 검정을 그대로 믿지 마세요.")
+        except Exception as e:                                    # noqa
+            LOG.debug(f"title_only 결합 생략({type(e).__name__})")
 
     n_sel = int(Z["selected"].sum())
     n_pool = int(Z["pooled"].sum())

@@ -231,9 +231,14 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
         columns=["month", "code", "weight", "ret", "cohort", "z"])
     C_df = pd.DataFrame(cohorts) if cohorts else pd.DataFrame(
         columns=["cohort", "code", "entry_month", "exit_month", "ret_h", "n_months"])
+    # ★ 오버랩 포트폴리오는 앞 H-1 개월이 '램프업' 구간이다(코호트가 아직 다 안 찼다).
+    #   이 구간은 구조적으로 현금 비중이 높아 전액 투자 벤치마크 대비 불리하게 나온다.
+    #   설계상 정상이지만, 모르고 보면 '초기 부진'으로 오독하므로 명시적으로 알린다.
+    ramp = int((R["cash"] > 0.5).head(max(H - 1, 0)).sum()) if len(R) else 0
     LOG.info(f"[{label}] 백테스트 완료 — 코호트 {C_df['cohort'].nunique() if len(C_df) else 0}개 · "
              f"연인원 {len(H_df):,} · 평균 현금비중 {100*R['cash'].mean():.0f}% · "
-             f"누적 {100*(R['equity'].iloc[-1]-1):+.1f}%")
+             f"누적 {100*(R['equity'].iloc[-1]-1):+.1f}%"
+             + (f" · 램프업 {ramp}개월(코호트 미충전 — 현금비중 50%↑)" if ramp else ""))
     return {"returns": R, "holdings": H_df, "cohorts": C_df, "label": label}
 
 

@@ -8,7 +8,7 @@
 # ============================================================================================
 #  ARC-NCQ v1.0 — New Coverage × Qualitative Shift
 #  소형주 「신규 애널리스트 커버리지 × 보고서 텍스트 질적 변화」 탐지 전략
-#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0218
+#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0226
 #
 #  ── 핵심 가설 ───────────────────────────────────────────────────────────────────────────
 #   시총 하위권 소형주에 **처음으로 리서치 보고서가 붙는 순간**은, 커버리지를 정당화할 사건
@@ -217,7 +217,7 @@ STOP_ON_KILL_CRITERIA = True   # 킬 기준 위반 시 즉시 중단하고 보�
 
 STRATEGY_ID   = "ARC_NCQ_V1"
 STRATEGY_NAME = "ARC-NCQ — 신규 커버리지 × 텍스트 질적 변화"
-BUILD_VERSION = "ncq1.20260808.0218"
+BUILD_VERSION = "ncq1.20260808.0226"
 ACTIVE_PACKS  = []          # (TCD 코어 호환용 — 이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # build/10_ingest_universe.py 의 corpCode 오류 진단이 참조하는 표.
@@ -6820,7 +6820,7 @@ NCQ_PDF_ENGINE = "auto"          # "auto" | "fitz" | "pdfplumber"
 
 TXT_COLS = ["report_uid", "code", "pub_date", "sec_title", "sec_headline", "sec_body",
             "n_chars", "n_pages", "extract_ok", "extract_method"]
-SCORE_COLS = ["report_uid", "code", "month", "doc_raw", "doc_score", "n_chars",
+SCORE_COLS = ["report_uid", "code", "month", "doc_raw", "doc_score", "n_chars", "title_only",
               "g_A", "g_B", "g_C", "g_D", "g_H", "g_N"]
 SIG_COLS = ["month", "code", "event_score", "z", "pooled", "pool_n", "rank_pct",
             "selected", "placebo", "sponsor_group", "event_type", "exec_px", "adv20", "fwd_ret"]
@@ -7286,14 +7286,24 @@ def score_texts(TXT: pd.DataFrame) -> pd.DataFrame:
         S[f"g_{g}"] = [c.get(g, 0) for c in out_cnt]
     S["n_chars"] = (T["sec_title"].str.len() + T["sec_headline"].str.len() +
                     T["sec_body"].str.len()).to_numpy()
-    denom = (S["n_chars"] / 1000.0).replace(0, np.nan)
-    # ★ 본문이 아주 짧으면(제목만 있는 건) 분모가 0에 수렴해 점수가 폭발한다. 하한을 둔다.
-    denom = denom.clip(lower=0.25)
+    # ★★ 길이 정규화의 하한을 1.0(=1,000자)으로 둔다. 이유가 있다.
+    #   명세 §9.3 은 doc_raw / (총 문자수/1000) 이라고만 정의하고 하한을 말하지 않는다.
+    #   그런데 PDF 추출이 실패해 '제목만' 남은 문서는 총 문자수가 30자 남짓이라 분모가 0.03 이
+    #   되고, 제목에 어휘가 하나만 있어도 점수가 30배로 폭발한다. 그러면 상위 tercile 이
+    #   '내용이 좋은 리포트'가 아니라 '본문 추출에 실패한 리포트'로 채워진다 — 신호가 아니라
+    #   수집 실패를 사는 셈이다. 하한을 1,000자로 두면 짧은 문서가 공짜 배수를 얻지 못한다.
+    #   (하한 자체는 구현 결정이므로 그 사실과 값을 여기에 명시하고 매니페스트에도 남긴다)
+    denom = (S["n_chars"] / 1000.0).clip(lower=1.0)
     S["doc_score"] = S["doc_raw"] / denom
+    S["title_only"] = (pd.to_numeric(T.get("n_chars"), errors="coerce").fillna(0).to_numpy() <= 0) | \
+                      ((T["sec_headline"].str.len() + T["sec_body"].str.len()).to_numpy() < 100)
     S["month"] = S["pub_date"] + pd.offsets.MonthEnd(0)
     S = S.dropna(subset=["code", "month"])
+    n_title_only = int(S["title_only"].sum())
     LOG.ok(f"텍스트 스코어링 {len(S):,}건 — doc_score 평균 {S['doc_score'].mean():.3f} / "
-           f"표준편차 {S['doc_score'].std():.3f}")
+           f"표준편차 {S['doc_score'].std():.3f} · 길이 정규화 하한 1,000자 "
+           f"(제목만 남은 문서 {n_title_only:,}건 = {100*n_title_only/max(len(S),1):.0f}%)")
+    manifest_put("score_title_only_share", round(n_title_only / max(len(S), 1), 4))
     PIPE.io("OUT", "MEM", "text_scores", S)
     return S.reindex(columns=SCORE_COLS + [])
 
@@ -7385,6 +7395,24 @@ def build_signal_panel(SCORE: pd.DataFrame, EV: pd.DataFrame, UNI: pd.DataFrame,
             Z[c] = np.nan
     if "adv20" not in Z.columns:
         Z["adv20"] = np.nan
+
+    # ★ 선정군이 '본문 추출 실패 문서'로 채워졌는지 확인한다. 이 비율이 높으면 우리가 산 것은
+    #   텍스트 품질이 아니라 수집 실패다 — 조용히 넘어가면 알파를 착각한다.
+    if SCORE is not None and len(SCORE) and "title_only" in SCORE.columns:
+        try:
+            to = (SCORE.groupby(["code", "month"], observed=True)["title_only"]
+                       .min().rename("title_only").reset_index())
+            Z = Z.merge(to, on=["code", "month"], how="left")
+            sel_to = Z.loc[Z["selected"].fillna(False).astype(bool), "title_only"]
+            if len(sel_to):
+                frac = float(pd.to_numeric(sel_to, errors="coerce").fillna(0).mean())
+                manifest_put("selected_title_only_share", round(frac, 4))
+                if frac > 0.5:
+                    LOG.warn(f"★ 선정 종목의 {100*frac:.0f}% 가 '본문 추출에 실패해 제목만 남은' "
+                             f"리포트로 채점됐습니다. 이 상태의 순위는 텍스트 품질이 아니라 "
+                             f"수집 실패를 반영합니다 — P4(텍스트 증분) 검정을 그대로 믿지 마세요.")
+        except Exception as e:                                    # noqa
+            LOG.debug(f"title_only 결합 생략({type(e).__name__})")
 
     n_sel = int(Z["selected"].sum())
     n_pool = int(Z["pooled"].sum())
@@ -7639,9 +7667,14 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
         columns=["month", "code", "weight", "ret", "cohort", "z"])
     C_df = pd.DataFrame(cohorts) if cohorts else pd.DataFrame(
         columns=["cohort", "code", "entry_month", "exit_month", "ret_h", "n_months"])
+    # ★ 오버랩 포트폴리오는 앞 H-1 개월이 '램프업' 구간이다(코호트가 아직 다 안 찼다).
+    #   이 구간은 구조적으로 현금 비중이 높아 전액 투자 벤치마크 대비 불리하게 나온다.
+    #   설계상 정상이지만, 모르고 보면 '초기 부진'으로 오독하므로 명시적으로 알린다.
+    ramp = int((R["cash"] > 0.5).head(max(H - 1, 0)).sum()) if len(R) else 0
     LOG.info(f"[{label}] 백테스트 완료 — 코호트 {C_df['cohort'].nunique() if len(C_df) else 0}개 · "
              f"연인원 {len(H_df):,} · 평균 현금비중 {100*R['cash'].mean():.0f}% · "
-             f"누적 {100*(R['equity'].iloc[-1]-1):+.1f}%")
+             f"누적 {100*(R['equity'].iloc[-1]-1):+.1f}%"
+             + (f" · 램프업 {ramp}개월(코호트 미충전 — 현금비중 50%↑)" if ramp else ""))
     return {"returns": R, "holdings": H_df, "cohorts": C_df, "label": label}
 
 
@@ -11830,6 +11863,11 @@ def ncq_make_synthetic(n_codes: int = 180, n_months: int = 72, seed: int = SEED)
 
     panel = build_price_panel(px, months)
     px_daily, pxm = panel["daily"], panel["monthly"]
+    # ★ 여기가 비면 아래 전부가 KeyError 로 죽는다. 원인을 알아볼 수 있는 메시지로 바꾼다.
+    if pxm is None or len(pxm) == 0 or "close" not in getattr(pxm, "columns", []):
+        raise RuntimeError("합성 월간 패널이 비었습니다 — build_price_panel 이 일봉을 월말로 "
+                           "접지 못했습니다(입력 일봉 %d행). 합성 세계를 만들 수 없습니다."
+                           % (0 if px is None else len(px)))
 
     # ── 시가총액 (PIT 근사 — 합성이므로 주식수는 상수) ─────────────────────────────────────
     shares = pd.Series(np.exp(rng.normal(15.5, 0.7, n_codes)), index=codes)
@@ -11953,8 +11991,14 @@ def ncq_toy_sig(W: dict, rng, top_k: int = 8, oracle: bool = False,
         else:
             score = pd.Series(rng.normal(size=len(g)), index=g.index)
         g["event_score"] = score.astype(float)
-        mu, sd = float(np.nanmean(score)), float(np.nanstd(score))
-        g["z"] = (score - mu) / (sd if sd > 0 else np.nan)
+        # ★ oracle 모드의 마지막 달들은 fwd_ret 이 전부 NaN 이다. nanmean/nanstd 를 그대로
+        #   부르면 All-NaN slice 경고 뒤 NaN 이 나오고, 그 NaN 이 아래 나눗셈으로 새어든다.
+        #   유한값 개수를 먼저 세고, 분모가 0/NaN 이면 z 를 NaN 으로 남긴다(0으로 채우지 않는다).
+        sv = pd.to_numeric(score, errors="coerce").to_numpy(dtype=float)
+        fin = sv[np.isfinite(sv)]
+        mu = float(fin.mean()) if fin.size else np.nan
+        sd = float(fin.std()) if fin.size > 1 else np.nan
+        g["z"] = (score - mu) / (sd if (np.isfinite(sd) and sd > 0) else np.nan)
         g["pooled"] = False
         g["pool_n"] = int(len(g))
         g["rank_pct"] = score.rank(pct=True)
@@ -11989,6 +12033,11 @@ def ncq_c(cid: str, name: str, fn: Callable[[], Tuple[bool, str]]) -> bool:
     except Exception as e:                                          # noqa
         ok, msg = False, f"{type(e).__name__}: {str(e)[:220]}"
         tb = "\n".join(ncq_tail_tb(10))
+    # ★ 판정값을 파이썬 bool/None 으로 못 박는다. 검정 함수가 numpy.bool_ 을 돌려주면
+    #   동일성(identity) 비교가 양쪽 다 거짓이 되어, 표에는 '실패'로 찍히는데 실패 목록에는
+    #   들어가지 않는 상태가 된다 — 위반이 조용히 통과하는 가장 나쁜 형태다.
+    #   아래 집계도 동일성 비교 대신 `None 여부 + bool()` 로만 판단한다.
+    ok = None if ok is None else bool(ok)
     NCQ_CONTRACTS.append({"id": cid, "name": name, "pass": ok, "msg": str(msg),
                           "sec": time.time() - t0, "tb": tb})
     if ok is None:
@@ -12279,6 +12328,8 @@ def run_contract_tests(strict: bool = True) -> bool:
         same = np.isclose(pd.to_numeric(chk["exec_px"], errors="coerce"),
                           pd.to_numeric(chk["open_next"], errors="coerce"),
                           rtol=1e-9, atol=1e-9, equal_nan=False)
+        if len(chk) == 0:
+            return False, "체결가 대조표가 비었습니다 — 일봉과 next_date 가 하나도 매칭되지 않습니다"
         frac = float(np.mean(same)) if len(chk) else 0.0
         if frac < 0.95:
             return False, (f"★exec_px 가 익영업일 시가와 일치하는 비율이 {100*frac:.1f}% 뿐입니다. "
@@ -12347,8 +12398,12 @@ def run_contract_tests(strict: bool = True) -> bool:
             return False, (f"★폐지월 수익이 {ncq_v_num(got,'pct')} 입니다. 명세 §10 은 "
                            f"{ncq_v_num(hair,'pct')}(폐지 직전가 -50% 후 현금화)를 요구합니다")
         after = h[h["month"] > dm]
-        if len(after) and float(np.nanmax(np.abs(pd.to_numeric(after["ret"],
-                                                               errors="coerce")))) > 1e-9:
+        # ★ 전부 NaN 이면 np.nanmax 가 All-NaN slice 경고와 함께 NaN 을 돌려주고,
+        #   NaN > 1e-9 는 False 라 검정이 조용히 통과한다. 유한값만 남겨서 비교한다.
+        av = pd.to_numeric(after["ret"], errors="coerce").to_numpy(dtype=float) \
+            if len(after) else np.array([], dtype=float)
+        av = av[np.isfinite(av)]
+        if av.size and float(np.max(np.abs(av))) > 1e-9:
             return False, ("폐지 이후에도 해당 종목이 0 이 아닌 수익을 내고 있습니다 — "
                            "현금화되지 않았습니다")
         return True, (f"{code} 폐지월 {dm:%Y-%m} 수익 {ncq_v_num(got,'pct')} = 명세값 · "
@@ -12451,8 +12506,11 @@ def run_contract_tests(strict: bool = True) -> bool:
 
         cb, mb = _cum(Bb)
         co, mo = _cum(Bo)
-        if not np.isfinite(co) or not np.isfinite(cb):
-            return False, "누적수익이 계산되지 않았습니다(수익률 시계열 확인 필요)"
+        # ★ 월평균(mo/mb)까지 유한성을 확인한다. 수익률 시계열이 0행이면 mo 가 NaN 이 되는데,
+        #   아래 `mo <= mb + 0.002` 는 NaN 에서 False 라 누수 민감도 검정이 그대로 '통과'한다.
+        if not all(np.isfinite(x) for x in (co, cb, mo, mb)):
+            return False, ("누적/월평균 수익이 계산되지 않았습니다(수익률 시계열이 비었거나 "
+                           "전부 결측입니다 — 하네스 민감도를 판정할 수 없습니다)")
         n_pos = int(pd.to_numeric(Bo["returns"].get("n", pd.Series(dtype=float)),
                                   errors="coerce").fillna(0).sum())
         if n_pos <= 0:
@@ -12472,13 +12530,13 @@ def run_contract_tests(strict: bool = True) -> bool:
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = []
     for r in NCQ_CONTRACTS:
-        icon = "✔ 통과" if r["pass"] is True else ("→ SKIP" if r["pass"] is None else "✘ 실패")
+        icon = "→ SKIP" if r["pass"] is None else ("✔ 통과" if bool(r["pass"]) else "✘ 실패")
         rows.append([r["id"], _trunc(r["name"], 34), icon, f"{r['sec']:.2f}s",
                      _trunc(r["msg"], 78)])
     LOG.table(rows, ["계약", "내용", "판정", "소요", "상세"], ["l", "l", "c", "r", "l"], maxw=82,
               title="계약 자동검정 N1~N11 (협상 대상이 아님 — 우회하지 말고 원인을 고치십시오)")
 
-    failed = [r for r in NCQ_CONTRACTS if r["pass"] is False]
+    failed = [r for r in NCQ_CONTRACTS if r["pass"] is not None and not bool(r["pass"])]
     skipped = [r for r in NCQ_CONTRACTS if r["pass"] is None]
     if skipped:
         LOG.warn(f"스파인 미탑재로 건너뛴 계약 {len(skipped)}건: " +
@@ -12748,9 +12806,9 @@ def run_canaries(strict: bool = True) -> dict:
               title="네트워크 카나리 C1~C7 — 실패는 그대로 표시합니다(좋아 보이게 만들지 않습니다)")
 
     blocking_failed = [r["id"] for r in NCQ_CANARY.values()
-                       if r["blocking"] and r["ok"] is False]
+                       if r["blocking"] and r["ok"] is not None and not bool(r["ok"])]
     soft_failed = [r["id"] for r in NCQ_CANARY.values()
-                   if (not r["blocking"]) and r["ok"] is False]
+                   if (not r["blocking"]) and r["ok"] is not None and not bool(r["ok"])]
     if soft_failed:
         LOG.warn(f"비차단 카나리 실패: {', '.join(soft_failed)} — 해당 소스를 빼고 진행합니다. "
                  f"결손은 완결성 진단과 리포트 최상단에 그대로 표시됩니다.")
@@ -13325,10 +13383,16 @@ def run_selftest(full_chain: bool = False) -> bool:
 
             SCORE = _step("텍스트 스코어링 (score_texts)", lambda: score_texts(TXT),
                           ["score_texts"])
-            if SCORE is not None and len(SCORE):
-                sd = float(pd.to_numeric(SCORE.get("doc_score"), errors="coerce").std())
+            if SCORE is not None and len(SCORE) and "doc_score" not in SCORE.columns:
+                LOG.error("★SCORE 에 doc_score 컬럼이 없습니다 — 계약 §3 의 SCORE 스키마 위반입니다. "
+                          "이 상태에서는 신호 산출이 성립하지 않습니다.")
+                result["score_variance_zero"] = True
+            elif SCORE is not None and len(SCORE):
+                ds = pd.to_numeric(SCORE["doc_score"], errors="coerce").dropna()
+                sd = float(ds.std()) if len(ds) > 1 else float("nan")
                 if not np.isfinite(sd) or sd <= 1e-12:
-                    LOG.error("★doc_score 의 표준편차가 0입니다 — 렉시콘이 텍스트에서 아무것도 "
+                    LOG.error("★doc_score 의 표준편차가 0입니다(또는 유효값이 1건 이하) — "
+                              "렉시콘이 텍스트에서 아무것도 "
                               "잡지 못했습니다. 이 상태에서는 횡단면 z 가 전부 동일값이 되어 "
                               "편입 종목이 0건이 됩니다. 스코어러(정규식 컴파일·섹션 분할)나 "
                               "본문 전달 경로를 먼저 고쳐야 합니다.")
