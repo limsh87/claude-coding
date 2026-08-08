@@ -256,13 +256,22 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """★ yfinance 는 한국 상장폐지 종목을 사실상 못 준다.
+
+    실측(2026-08 로컬 실행): 폐지 종목 위주 1,660개를 돌리며 종목당 `.KS`/`.KQ` 두 번,
+    매번 "possibly delisted; no timezone found" 를 **stderr 로 직접 출력**해 콘솔이 마비되고
+    16분을 태웠다(성공 0건). 로거 레벨 조정으로는 안 잡힌다 — 자체 print 경로가 있다.
+    → 호출 구간 동안 stdout/stderr 를 통째로 삼키고, 실패는 조용히 None 으로 돌린다.
+    """
     if yf is None:
         return None
     for suf in (".KS", ".KQ"):
         try:
             limiter("generic").wait()
-            d = yf.download(code + suf, start=start, end=end, progress=False,
-                            auto_adjust=False, threads=False)
+            _sink = io.StringIO()
+            with contextlib.redirect_stdout(_sink), contextlib.redirect_stderr(_sink):
+                d = yf.download(code + suf, start=start, end=end, progress=False,
+                                auto_adjust=False, threads=False)
         except Exception:
             continue
         if d is None or len(d) == 0:

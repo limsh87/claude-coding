@@ -203,6 +203,10 @@ def _reset_run_state() -> None:
     try:
         _SRC_CACHE.clear()
         CELL_FALLBACK_STATS.clear()
+        HTTP_STATS.clear()
+        PIPE.stages.clear()
+        PIPE.flow.clear()
+        PIPE.failed.clear()
     except Exception:                                                   # noqa
         pass
 
@@ -270,8 +274,20 @@ def main_xcb() -> int:
         # ★ KSIC 업종코드는 큐레이션(HS→상장사)의 유일한 연결고리다. 반드시 여기서 확보한다.
         #   종목 마스터는 자유텍스트 업종명만 주고 KSIC 코드는 주지 않는다.
         corpmap = fetch_dart_corpcode()
-        code_of = (dict(zip(corpmap["corp_code"].astype(str), corpmap["code"].astype(str)))
-                   if corpmap is not None and len(corpmap) else {})
+        # ★★ 여기가 사고 지점이었다 ★★
+        #   fetch_dart_corpcode() 는 **DART 등록 법인 전체**(비상장 포함 약 118,675건)를 준다.
+        #   이걸 그대로 넘기면 직원현황이 118,675 × 12년 = 1,424,100 잡이 되어 48시간이 걸리고
+        #   DART 일일 한도(20,000)를 한참 넘겨 키가 막힌다.
+        #   → 종목 마스터에 실재하는 **상장사**로만 좁힌다(약 4천건).
+        code_of = {}
+        if corpmap is not None and len(corpmap):
+            _live = set(sec["code"].astype(str))
+            _cm = corpmap.copy()
+            _cm["code"] = _cm["code"].map(to_code6)
+            _cm = _cm[_cm["code"].notna() & _cm["code"].isin(_live)]
+            code_of = dict(zip(_cm["corp_code"].astype(str), _cm["code"].astype(str)))
+            LOG.info(f"DART 법인 {len(corpmap):,}건 중 **상장사 {len(code_of):,}건**으로 좁혔습니다 "
+                     f"(비상장 제외 — 이 전략은 상장사만 다룹니다).")
         if code_of:
             ind = fetch_dart_industry(sorted(code_of), code_of)
             if len(ind):
@@ -317,10 +333,20 @@ def main_xcb() -> int:
         adopted = hs_uni[hs_uni["adopted"] == 1]["hs"].astype(str).tolist()
         attrition("과점 HS 매핑 대상", len(adopted), f"HS {len(hs_uni)}개 중 채택")
 
-    with PIPE.stage("L1.CUSTOMS", "관세청 통관 수집", "L1", budget_s=2400), \
+    with PIPE.stage("L1.CUSTOMS", "관세청 통관 (큐레이션 수집분 재사용)", "L1", budget_s=2400), \
             Stage("M0.customs", 20.0):
-        cx = ingest_customs(adopted or seed_hs, BACKTEST_START.replace("-", "")[:6],
-                            BACKTEST_END.replace("-", "")[:6], key=DATA_GO_KR_KEY)
+        # ★ 章 단위 조회는 그 아래 6자리 코드를 **전부** 포함한다. 채택 HS 는 그 부분집합이므로
+        #   다시 받을 이유가 없다. 예전엔 여기서 610콜을 통째로 재실행해 매 실행 6분을 버렸다.
+        cx = cx0
+        if adopted and cx0 is not None and len(cx0):
+            _pref = tuple(sorted(set(str(h) for h in adopted)))
+            _hs = cx0["hs"].astype(str)
+            cx = cx0[_hs.str.startswith(_pref)].copy()
+            LOG.ok(f"큐레이션 수집분에서 채택 HS 만 추림: {len(cx0):,}행 → {len(cx):,}행 "
+                   f"(HS {cx['hs'].nunique():,}개 · 신규 호출 0회)")
+        if cx is None or not len(cx):
+            LOG.warn("채택 HS 로 걸러낸 통관이 비어 큐레이션 수집분 전체를 사용합니다.")
+            cx = cx0
         if cx is None or not len(cx):
             LOG.error("통관 데이터를 확보하지 못했습니다 — A축이 없으면 이 전략은 성립하지 않습니다.")
             PIPE.report_stages()
@@ -332,12 +358,35 @@ def main_xcb() -> int:
         years = list(range(pd.Timestamp(BACKTEST_START).year - 1,
                            pd.Timestamp(BACKTEST_END).year + 1))
         raw = fetch_dart_bulk(years, list(REPRT_CODES.values()))
+        # ★ 벌크는 공개 API 가 아니라 웹 다운로드라 사이트 구조가 바뀌면 통째로 실패한다.
+        #   실측에서 48분기가 전부 실패했는데, 코어는 "폴백으로 전환합니다" 라고 **로그만 찍고**
+        #   실제로는 아무것도 호출하지 않았다 → fin 이 빈 채로 B·C축이 조용히 죽는다.
+        #   여기서 실제로 폴백을 태운다. 배치 API(100사/호출)라 상장사 전체라도 저렴하다.
+        if (raw is None or not len(raw)) and code_of:
+            _corp = sorted(code_of)
+            _n_call = max(1, math.ceil(len(_corp) / max(DART_MULTI_BATCH, 1))) * \
+                len(years) * len(REPRT_CODES)
+            LOG.warn(f"벌크 재무가 비었습니다 — Fallback A(fnlttMultiAcnt)를 **실제로** 실행합니다. "
+                     f"상장사 {len(_corp):,}개 × {len(years)}년 × {len(REPRT_CODES)}보고서 "
+                     f"→ 배치 약 {_n_call:,}회(1회당 {DART_MULTI_BATCH}사).")
+            guard_dart_jobs(_n_call, "재무 폴백(fnlttMultiAcnt) 배치",
+                            "재무는 상장사 전체가 필요하지만 **배치 API** 라 호출 수는 1/100 입니다.")
+            raw = fetch_dart_multi(_corp, years, list(REPRT_CODES.values()))
+            if raw is not None and len(raw):
+                LOG.warn("주요계정만 확보했습니다 — 재고·매출채권·영업CF·유형자산취득이 없어 "
+                         "b2(회전)·b3(발생액)·c1(투자)이 죽습니다. TP_B1·TP_B2·TP_C1 이 그만큼 "
+                         "약해지므로 해석표의 유효관측 수를 반드시 확인하세요.")
+            else:
+                LOG.error("재무를 한 건도 확보하지 못했습니다 — B·C축이 전멸합니다. "
+                          "DART_API_KEY 와 opendart 접근을 확인하세요.")
         dis = fetch_dart_disclosures(BACKTEST_START.replace("-", ""),
                                      BACKTEST_END.replace("-", ""))
         kmap = build_knowledge_map(dis)
         fin = tidy_financials(raw, kmap)
-        emp = fetch_dart_employees(sorted(code_of), years, code_of) \
-            if STAGE in ("M2", "ALL") else None
+        # ★ 직원현황(c3·c4)은 **매핑이 끝난 뒤** 그 종목들만 받는다.
+        #   여기서 받으면 대상이 확정되지 않아 전 상장사 × 12년이 되고, 그중 대부분은
+        #   유니버스에 들어오지도 못해 통째로 버려진다. L2.PANEL 직전으로 옮겼다.
+        emp = None
 
     reports = pd.DataFrame(columns=REPORT_COLS)
     analysts = pd.DataFrame()
@@ -381,6 +430,18 @@ def main_xcb() -> int:
     # ── [5] L1 → L2 → L3 ────────────────────────────────────────────────────────────────
     with PIPE.stage("L2.PANEL", "L1 피처 패널", "L2", budget_s=1800), \
             Stage("M0.panel", 20.0):
+        # ★ 직원현황은 **매핑된 종목만**. 명세 §5.1 의 요지가 '유니버스를 좁혀 비용을 지불한다'인데
+        #   전 상장사를 받으면 그 설계가 무의미해진다.
+        if STAGE in ("M2", "ALL") and mapping is not None and len(mapping):
+            _mapped = set(mapping["code"].astype(str))
+            _emp_corp = sorted(cc for cc, cd in code_of.items() if cd in _mapped)
+            _emp_years = [y for y in years if y >= pd.Timestamp(BACKTEST_START).year - 1]
+            LOG.info(f"직원현황 수집 대상: 매핑된 {len(_mapped):,}종목 중 corp_code 확보 "
+                     f"{len(_emp_corp):,}건 × {len(_emp_years)}년 = "
+                     f"{len(_emp_corp) * len(_emp_years):,}잡")
+            guard_dart_jobs(len(_emp_corp) * len(_emp_years), "직원현황(empSttus) 수집",
+                            "직원현황은 **매핑된 종목만** 필요합니다(TP_C2 의 c3·c4).")
+            emp = fetch_dart_employees(_emp_corp, _emp_years, code_of)
         P = build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
                             fin, emp, dis, reports)
         attrition("유니버스(매핑∧상장∧시즈닝)",

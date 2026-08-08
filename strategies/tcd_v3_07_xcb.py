@@ -3875,13 +3875,22 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """★ yfinance 는 한국 상장폐지 종목을 사실상 못 준다.
+
+    실측(2026-08 로컬 실행): 폐지 종목 위주 1,660개를 돌리며 종목당 `.KS`/`.KQ` 두 번,
+    매번 "possibly delisted; no timezone found" 를 **stderr 로 직접 출력**해 콘솔이 마비되고
+    16분을 태웠다(성공 0건). 로거 레벨 조정으로는 안 잡힌다 — 자체 print 경로가 있다.
+    → 호출 구간 동안 stdout/stderr 를 통째로 삼키고, 실패는 조용히 None 으로 돌린다.
+    """
     if yf is None:
         return None
     for suf in (".KS", ".KQ"):
         try:
             limiter("generic").wait()
-            d = yf.download(code + suf, start=start, end=end, progress=False,
-                            auto_adjust=False, threads=False)
+            _sink = io.StringIO()
+            with contextlib.redirect_stdout(_sink), contextlib.redirect_stderr(_sink):
+                d = yf.download(code + suf, start=start, end=end, progress=False,
+                                auto_adjust=False, threads=False)
         except Exception:
             continue
         if d is None or len(d) == 0:
@@ -7309,6 +7318,15 @@ def _foreign_root_variants(root: str) -> "list[str]":
                  os.environ.get("TCD_DRIVE_PREFIX", "")):
         if pref:
             cands.append(os.path.join(pref, base))
+    # ★ 로컬(Windows/JupyterLab)에서는 드라이브가 D:\Qunat 처럼 전혀 다른 곳에 있다.
+    #   설정된 캐시 루트의 **형제 폴더**를 후보에 넣어 두면 사용자가 경로를 고치지 않아도
+    #   QuantCache/ARC_COMMON_LEDGER 같은 워크스페이스를 찾아낸다.
+    try:
+        for anchor in (GDRIVE_ROOT, LOCAL_CACHE_ROOT):
+            if anchor:
+                cands.append(os.path.join(os.path.dirname(os.path.abspath(anchor)), base))
+    except Exception:                                                   # noqa
+        pass
     for c in cands:
         if c and c not in out:
             out.append(c)
@@ -7555,10 +7573,38 @@ def foreign_normalize(df: pd.DataFrame, alias: dict) -> pd.DataFrame:
     return out
 
 
-def foreign_reports(cat: "ForeignCatalog") -> pd.DataFrame:
-    """외부 리포트 원장을 이 코드의 REPORT_COLS 스키마로 정규화해서 돌려준다."""
-    d = cat.load("report_ledger", "arc_reports", "reports", "raw_reports",
-                 alias=FOREIGN_ALIAS)
+def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
+    """리포트 원장을 REPORT_COLS 스키마로 정규화해서 돌려준다.
+
+    ★ 순서가 중요하다. 예전엔 외부 루트만 봐서, **로컬 금고에 이미 있는 원장**을 통째로
+      놓쳤다(실측: _shared 에 report_pdf 11,295건이 있는데 K11 은 0건으로 보고).
+      ① 로컬 공용 금고의 정제 테이블 → ② 외부 워크스페이스 순으로 찾는다.
+    """
+    d = None
+    for _t in ("research_report_master", "report_ledger", "research_reports",
+               "reports_master"):
+        try:
+            _v = VAULT.get_table(_t, scope="shared")
+        except Exception:                                               # noqa
+            _v = None
+        if _v is not None and len(_v):
+            LOG.ok(f"로컬 공용 금고에서 리포트 원장 재사용: {_t} ({len(_v):,}행)")
+            d = foreign_normalize(_v, FOREIGN_ALIAS)
+            break
+    if (d is None or not len(d)) and cat is not None:
+        d = cat.load("report_ledger", "arc_reports", "reports", "raw_reports",
+                     alias=FOREIGN_ALIAS)
+    if d is None or not len(d):
+        # 정제 테이블은 없지만 PDF 가 등록되어 있을 수 있다 — 그 사실을 알려 준다.
+        try:
+            n_pdf = len(VAULT.lookup("shared", domain="research"))
+        except Exception:                                               # noqa
+            n_pdf = 0
+        if n_pdf:
+            LOG.warn(f"공용 금고에 리포트 원본 {n_pdf:,}건이 등록되어 있으나 **정제 원장 테이블**이 "
+                     f"없습니다. d2/d4 는 목록 레벨 메타데이터가 필요하므로 이번 실행에서는 "
+                     f"신규 수집(한경/네이버 목록)으로 원장을 만듭니다. PDF 자체는 재파싱하지 "
+                     f"않습니다(비용 대비 회수가 낮습니다).")
     if d is None or not len(d):
         return pd.DataFrame(columns=REPORT_COLS)
 
@@ -8140,14 +8186,32 @@ def ingest_customs(hs_list: "Sequence[str]", start: str, end: str,
     if cached is None and FOREIGN is not None:
         cached = FOREIGN.load("customs_hs", "customs_hs_country_monthly", "customs",
                               alias=FOREIGN_ALIAS_CUSTOMS)
-    have: set = set()
+    need = list(hs_list)
     if cached is not None and len(cached):
         cached["hs"] = cached["hs"].astype(str)
         cached["ym"] = as_ts_series(cached["ym"])
-        have = set(cached["hs"].unique())
-        LOG.ok(f"통관 캐시 재사용: {len(cached):,}행 · HS {len(have)}개")
-
-    need = [h for h in hs_list if h not in have]
+        # ★★ 캐시 적중 판정 버그 — 실측으로 확인한 6분/실행 낭비 ★★
+        #   요청 키는 **조회용 HS 접두사**("28" 같은 章)인데, 캐시에 저장된 hs 는 응답으로 온
+        #   **6자리 코드**("280110"…)다. `q in set(cached_hs)` 로 비교하면 영원히 불일치라
+        #   매 실행 전량을 다시 받는다(실측: 610콜 × 2단계 = 12분).
+        #   → HS 는 좌측 정렬 계층코드이므로 **접두사 포함**으로 판정하고, 기간까지 확인한다.
+        cached_hs = cached["hs"].unique().astype(str)
+        lo = pd.Timestamp(f"{start[:4]}-{start[4:6]}-01")
+        hi = pd.Timestamp(f"{end[:4]}-{end[4:6]}-01") + pd.offsets.MonthEnd(0)
+        need = []
+        for q in hs_list:
+            hit = cached_hs[np.char.startswith(cached_hs.astype(str), str(q))]
+            if not len(hit):
+                need.append(q)
+                continue
+            sub_ym = cached.loc[cached["hs"].isin(set(hit)), "ym"]
+            # 요청 구간의 앞뒤가 캐시 범위 안에 들어와야 '이미 받았다'고 본다.
+            if sub_ym.min() > lo + pd.DateOffset(months=1) or \
+               sub_ym.max() < hi - pd.DateOffset(months=2):
+                need.append(q)
+        LOG.ok(f"통관 캐시 재사용: {len(cached):,}행 · HS {len(cached_hs):,}개 "
+               f"(요청 {len(hs_list)}건 중 {len(hs_list) - len(need)}건 적중 · "
+               f"신규 {len(need)}건)")
     fresh = pd.DataFrame(columns=cols)
     if need and RUN_MODE != "CACHED":
         cli = CustomsClient(key or DATA_GO_KR_KEY)
@@ -8385,17 +8449,49 @@ def curate_hs_universe(cx: pd.DataFrame, sec: pd.DataFrame, conc: pd.DataFrame,
     cvd = customs_cv_dest(d.assign(hs=d["hs_k"]))
     out = out.merge(cvd.rename(columns={"hs": "hs_k"}), on="hs_k", how="left")
 
-    # 채택 규칙 — 넷뿐이다. 성과는 보지 않는다.
-    reason = pd.Series("", index=out.index, dtype=object)
-    ok = pd.Series(True, index=out.index)
-    m1 = out["n_firms"].between(1, max_firms)
-    reason = reason.where(m1, reason + f"생산자수({out['n_firms']})가 1~{max_firms} 밖; ")
-    ok &= m1
+    # ── 채택 규칙 — 기준은 넷뿐이고 성과는 보지 않는다.
+    #   ★ 다만 '생산자 1~3개'는 **연계표가 세밀할 때만** 성립하는 기준이다.
+    #     씨앗표(章↔KSIC 중분류)로 떨어지면 한 章에 상장사가 수백 개씩 잡혀 아무도 통과하지
+    #     못하고 유니버스가 0 이 된다(실측: 채택 0/924).
+    #     명세 §12.2 가 "과점 기준 완화 후 재측정"을 명시했으므로, 완화를 **사다리로 자동화하고
+    #     어느 칸을 썼는지 표로 남긴다.** 조용히 완화하면 그게 곧 과적합 통로다.
     m2 = out["months"] >= min_months
+    ladder, chosen, note = [], None, ""
+    for cap in (max_firms, 5, 10, 20, 40, 80):
+        if cap < max_firms:
+            continue
+        n_ok = int((out["n_firms"].between(1, cap) & m2).sum())
+        ladder.append([f"생산자 1~{cap}개", f"{n_ok:,}"])
+        if chosen is None and n_ok >= 20:
+            chosen, note = cap, ("사양 기준" if cap == max_firms else
+                                 f"§12.2 완화 적용 (원 기준 1~{max_firms})")
+    if chosen is None:
+        # 절대 기준으로는 표본이 안 나온다 → **상대 기준**(생산자 수 하위 1/3)으로 내려간다.
+        thr = float(out.loc[m2, "n_firms"].replace(0, np.nan).quantile(0.33)) \
+            if int(m2.sum()) else np.nan
+        chosen = int(thr) if np.isfinite(thr) and thr >= 1 else 0
+        note = (f"절대 기준으로 표본 부족 → **상대 기준**(생산자 수 하위 1/3, 임계 {chosen}개)으로 "
+                f"전환. 이는 사양의 '과점'이 아니라 '상대적 저경쟁'이며, 매핑 귀속력이 그만큼 약합니다.")
+        ladder.append([f"상대기준 하위1/3 (≤{chosen}개)",
+                       f"{int((out['n_firms'].between(1, max(chosen, 1)) & m2).sum()):,}"])
+
+    m1 = out["n_firms"].between(1, max(chosen, 1))
+    reason = pd.Series("", index=out.index, dtype=object)
+    reason = reason.where(m1, reason + f"생산자수({out['n_firms']})가 1~{chosen} 밖; ")
     reason = reason.where(m2, reason + f"관측개월 {out['months']}<{min_months}; ")
-    ok &= m2
+    ok = m1 & m2
     out["adopted"] = ok.astype(int)
     out["reason"] = reason.where(~ok, "채택")
+    out["n_firms_cap"] = chosen
+
+    LOG.banner("HS 채택 기준 사다리 (§12.2 완화 이력)",
+               f"채택 {int(ok.sum()):,}개 · 적용 기준 '생산자 1~{chosen}개' — {note}")
+    LOG.table(ladder, ["기준", "채택 가능 HS"])
+    if chosen > max_firms:
+        LOG.warn(f"과점 기준을 {max_firms} → {chosen} 으로 완화했습니다. HS 하나에 상장사가 여럿이면 "
+                 f"통관 신호를 특정 기업에 귀속시키기 어려워집니다 — 매핑 가중치를 1/n_firms 로 "
+                 f"낮추고, 게이트3(플라시보)이 실제로 이 매핑을 지지하는지 반드시 확인하세요. "
+                 f"연계표(X6)를 세밀한 것으로 교체하면 이 완화가 필요 없어집니다.")
     out = out.rename(columns={"hs_k": "hs"})[
         ["hs", "n_firms", "months", "cv_dest", "adopted", "reason"]]
 
@@ -8740,6 +8836,38 @@ def apply_mapping_gates(mapping: pd.DataFrame, cx: pd.DataFrame, fin: pd.DataFra
 # ║    0 으로 채우면 '해당 없음'이라는 적극적 주장이 되어 거부권이 조용히 무력화된다.            ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════════╝
 
+# ★★ DART 배치 작업 크기 상한 ★★
+#   실제로 겪은 사고: fetch_dart_corpcode() 는 **DART 등록 법인 전체**(비상장 포함 118,675건)를
+#   돌려주는데 그걸 그대로 직원현황 수집에 넘겨 118,675 × 12년 = **1,424,100 잡**이 생성됐다.
+#   초당 8건이면 48시간이고, DART 일일 한도 20,000 을 한참 넘겨 키가 막힌다.
+#   명세 §5.1(과점 200종목으로 좁힌다)·§6.2(전수 파싱 금지)를 정면으로 어기는 상태였다.
+#   → 크기 초과를 **예외로 세운다.** 조용히 줄이면 어느 종목이 빠졌는지 알 수 없고,
+#     조용히 진행하면 하루를 버린다. 어느 쪽도 허용하지 않는다.
+DART_JOB_HARD_CAP = 30_000          # DART 일일 호출 한도(20,000) 대비 안전선
+DART_DAILY_QUOTA = 20_000
+
+
+def guard_dart_jobs(n_jobs: int, what: str, universe_hint: str = "") -> None:
+    """배치 크기를 검사하고, 설계 의도를 벗어나면 즉시 세운다.
+
+    ★ '알아서 잘라 주는' 방어는 쓰지 않는다. 잘리면 어떤 종목이 빠졌는지 모른 채
+      결과가 나오고, 그게 조용한 선택편향이 된다. 세우고 원인을 말한다.
+    """
+    if n_jobs <= DART_JOB_HARD_CAP:
+        if n_jobs > DART_DAILY_QUOTA:
+            LOG.warn(f"{what}: {n_jobs:,}건은 DART 일일 한도 {DART_DAILY_QUOTA:,}건을 넘습니다. "
+                     f"오늘 안에 끝나지 않을 수 있으니 캐시를 활용해 나눠 실행하세요.")
+        return
+    raise RuntimeError(
+        f"[배치 크기 초과] {what} 이(가) {n_jobs:,}건을 요청했습니다 "
+        f"(상한 {DART_JOB_HARD_CAP:,}건 · DART 일일 한도 {DART_DAILY_QUOTA:,}건).\n"
+        f"  이 전략은 **과점 품목에 매핑된 소수 종목**만 다루도록 설계되어 있습니다(§5.1).\n"
+        f"  이 숫자가 나왔다면 대상 목록이 잘못 전달된 것입니다 — 가장 흔한 원인은\n"
+        f"  fetch_dart_corpcode() 의 **전체 법인 목록(비상장 포함 약 12만건)** 을 그대로 넘긴 경우입니다.\n"
+        f"  {universe_hint}\n"
+        f"  → 상장사(그리고 가능하면 매핑된 종목)로 좁혀서 다시 호출하세요.")
+
+
 # 코어 DISCLOSURE_PATTERNS 에 없는, XCB 가 추가로 필요로 하는 공시 유형.
 XCB_DISCLOSURE_PATTERNS = {
     "supply_contract": r"단일판매[·・]?\s*공급계약|공급계약\s*체결",
@@ -8980,6 +9108,8 @@ def fetch_dart_industry(corp_codes: "Sequence[str]", code_of: "Dict[str, str]") 
     todo = [str(c) for c in dict.fromkeys(corp_codes) if str(c) not in done]
     if RUN_MODE == "CACHED":
         todo = []
+    guard_dart_jobs(len(todo), "KSIC 업종코드 수집",
+                    "업종코드는 **상장사에만** 필요합니다(corpmap 에서 stock_code 가 있는 행).")
 
     def _one(cc: str):
         js = dart_api("company.json", {"corp_code": cc})
@@ -11760,6 +11890,10 @@ def _reset_run_state() -> None:
     try:
         _SRC_CACHE.clear()
         CELL_FALLBACK_STATS.clear()
+        HTTP_STATS.clear()
+        PIPE.stages.clear()
+        PIPE.flow.clear()
+        PIPE.failed.clear()
     except Exception:                                                   # noqa
         pass
 
@@ -11827,8 +11961,20 @@ def main_xcb() -> int:
         # ★ KSIC 업종코드는 큐레이션(HS→상장사)의 유일한 연결고리다. 반드시 여기서 확보한다.
         #   종목 마스터는 자유텍스트 업종명만 주고 KSIC 코드는 주지 않는다.
         corpmap = fetch_dart_corpcode()
-        code_of = (dict(zip(corpmap["corp_code"].astype(str), corpmap["code"].astype(str)))
-                   if corpmap is not None and len(corpmap) else {})
+        # ★★ 여기가 사고 지점이었다 ★★
+        #   fetch_dart_corpcode() 는 **DART 등록 법인 전체**(비상장 포함 약 118,675건)를 준다.
+        #   이걸 그대로 넘기면 직원현황이 118,675 × 12년 = 1,424,100 잡이 되어 48시간이 걸리고
+        #   DART 일일 한도(20,000)를 한참 넘겨 키가 막힌다.
+        #   → 종목 마스터에 실재하는 **상장사**로만 좁힌다(약 4천건).
+        code_of = {}
+        if corpmap is not None and len(corpmap):
+            _live = set(sec["code"].astype(str))
+            _cm = corpmap.copy()
+            _cm["code"] = _cm["code"].map(to_code6)
+            _cm = _cm[_cm["code"].notna() & _cm["code"].isin(_live)]
+            code_of = dict(zip(_cm["corp_code"].astype(str), _cm["code"].astype(str)))
+            LOG.info(f"DART 법인 {len(corpmap):,}건 중 **상장사 {len(code_of):,}건**으로 좁혔습니다 "
+                     f"(비상장 제외 — 이 전략은 상장사만 다룹니다).")
         if code_of:
             ind = fetch_dart_industry(sorted(code_of), code_of)
             if len(ind):
@@ -11874,10 +12020,20 @@ def main_xcb() -> int:
         adopted = hs_uni[hs_uni["adopted"] == 1]["hs"].astype(str).tolist()
         attrition("과점 HS 매핑 대상", len(adopted), f"HS {len(hs_uni)}개 중 채택")
 
-    with PIPE.stage("L1.CUSTOMS", "관세청 통관 수집", "L1", budget_s=2400), \
+    with PIPE.stage("L1.CUSTOMS", "관세청 통관 (큐레이션 수집분 재사용)", "L1", budget_s=2400), \
             Stage("M0.customs", 20.0):
-        cx = ingest_customs(adopted or seed_hs, BACKTEST_START.replace("-", "")[:6],
-                            BACKTEST_END.replace("-", "")[:6], key=DATA_GO_KR_KEY)
+        # ★ 章 단위 조회는 그 아래 6자리 코드를 **전부** 포함한다. 채택 HS 는 그 부분집합이므로
+        #   다시 받을 이유가 없다. 예전엔 여기서 610콜을 통째로 재실행해 매 실행 6분을 버렸다.
+        cx = cx0
+        if adopted and cx0 is not None and len(cx0):
+            _pref = tuple(sorted(set(str(h) for h in adopted)))
+            _hs = cx0["hs"].astype(str)
+            cx = cx0[_hs.str.startswith(_pref)].copy()
+            LOG.ok(f"큐레이션 수집분에서 채택 HS 만 추림: {len(cx0):,}행 → {len(cx):,}행 "
+                   f"(HS {cx['hs'].nunique():,}개 · 신규 호출 0회)")
+        if cx is None or not len(cx):
+            LOG.warn("채택 HS 로 걸러낸 통관이 비어 큐레이션 수집분 전체를 사용합니다.")
+            cx = cx0
         if cx is None or not len(cx):
             LOG.error("통관 데이터를 확보하지 못했습니다 — A축이 없으면 이 전략은 성립하지 않습니다.")
             PIPE.report_stages()
@@ -11889,12 +12045,35 @@ def main_xcb() -> int:
         years = list(range(pd.Timestamp(BACKTEST_START).year - 1,
                            pd.Timestamp(BACKTEST_END).year + 1))
         raw = fetch_dart_bulk(years, list(REPRT_CODES.values()))
+        # ★ 벌크는 공개 API 가 아니라 웹 다운로드라 사이트 구조가 바뀌면 통째로 실패한다.
+        #   실측에서 48분기가 전부 실패했는데, 코어는 "폴백으로 전환합니다" 라고 **로그만 찍고**
+        #   실제로는 아무것도 호출하지 않았다 → fin 이 빈 채로 B·C축이 조용히 죽는다.
+        #   여기서 실제로 폴백을 태운다. 배치 API(100사/호출)라 상장사 전체라도 저렴하다.
+        if (raw is None or not len(raw)) and code_of:
+            _corp = sorted(code_of)
+            _n_call = max(1, math.ceil(len(_corp) / max(DART_MULTI_BATCH, 1))) * \
+                len(years) * len(REPRT_CODES)
+            LOG.warn(f"벌크 재무가 비었습니다 — Fallback A(fnlttMultiAcnt)를 **실제로** 실행합니다. "
+                     f"상장사 {len(_corp):,}개 × {len(years)}년 × {len(REPRT_CODES)}보고서 "
+                     f"→ 배치 약 {_n_call:,}회(1회당 {DART_MULTI_BATCH}사).")
+            guard_dart_jobs(_n_call, "재무 폴백(fnlttMultiAcnt) 배치",
+                            "재무는 상장사 전체가 필요하지만 **배치 API** 라 호출 수는 1/100 입니다.")
+            raw = fetch_dart_multi(_corp, years, list(REPRT_CODES.values()))
+            if raw is not None and len(raw):
+                LOG.warn("주요계정만 확보했습니다 — 재고·매출채권·영업CF·유형자산취득이 없어 "
+                         "b2(회전)·b3(발생액)·c1(투자)이 죽습니다. TP_B1·TP_B2·TP_C1 이 그만큼 "
+                         "약해지므로 해석표의 유효관측 수를 반드시 확인하세요.")
+            else:
+                LOG.error("재무를 한 건도 확보하지 못했습니다 — B·C축이 전멸합니다. "
+                          "DART_API_KEY 와 opendart 접근을 확인하세요.")
         dis = fetch_dart_disclosures(BACKTEST_START.replace("-", ""),
                                      BACKTEST_END.replace("-", ""))
         kmap = build_knowledge_map(dis)
         fin = tidy_financials(raw, kmap)
-        emp = fetch_dart_employees(sorted(code_of), years, code_of) \
-            if STAGE in ("M2", "ALL") else None
+        # ★ 직원현황(c3·c4)은 **매핑이 끝난 뒤** 그 종목들만 받는다.
+        #   여기서 받으면 대상이 확정되지 않아 전 상장사 × 12년이 되고, 그중 대부분은
+        #   유니버스에 들어오지도 못해 통째로 버려진다. L2.PANEL 직전으로 옮겼다.
+        emp = None
 
     reports = pd.DataFrame(columns=REPORT_COLS)
     analysts = pd.DataFrame()
@@ -11938,6 +12117,18 @@ def main_xcb() -> int:
     # ── [5] L1 → L2 → L3 ────────────────────────────────────────────────────────────────
     with PIPE.stage("L2.PANEL", "L1 피처 패널", "L2", budget_s=1800), \
             Stage("M0.panel", 20.0):
+        # ★ 직원현황은 **매핑된 종목만**. 명세 §5.1 의 요지가 '유니버스를 좁혀 비용을 지불한다'인데
+        #   전 상장사를 받으면 그 설계가 무의미해진다.
+        if STAGE in ("M2", "ALL") and mapping is not None and len(mapping):
+            _mapped = set(mapping["code"].astype(str))
+            _emp_corp = sorted(cc for cc, cd in code_of.items() if cd in _mapped)
+            _emp_years = [y for y in years if y >= pd.Timestamp(BACKTEST_START).year - 1]
+            LOG.info(f"직원현황 수집 대상: 매핑된 {len(_mapped):,}종목 중 corp_code 확보 "
+                     f"{len(_emp_corp):,}건 × {len(_emp_years)}년 = "
+                     f"{len(_emp_corp) * len(_emp_years):,}잡")
+            guard_dart_jobs(len(_emp_corp) * len(_emp_years), "직원현황(empSttus) 수집",
+                            "직원현황은 **매핑된 종목만** 필요합니다(TP_C2 의 c3·c4).")
+            emp = fetch_dart_employees(_emp_corp, _emp_years, code_of)
         P = build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
                             fin, emp, dis, reports)
         attrition("유니버스(매핑∧상장∧시즈닝)",

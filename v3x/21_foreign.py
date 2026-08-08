@@ -83,6 +83,15 @@ def _foreign_root_variants(root: str) -> "list[str]":
                  os.environ.get("TCD_DRIVE_PREFIX", "")):
         if pref:
             cands.append(os.path.join(pref, base))
+    # ★ 로컬(Windows/JupyterLab)에서는 드라이브가 D:\Qunat 처럼 전혀 다른 곳에 있다.
+    #   설정된 캐시 루트의 **형제 폴더**를 후보에 넣어 두면 사용자가 경로를 고치지 않아도
+    #   QuantCache/ARC_COMMON_LEDGER 같은 워크스페이스를 찾아낸다.
+    try:
+        for anchor in (GDRIVE_ROOT, LOCAL_CACHE_ROOT):
+            if anchor:
+                cands.append(os.path.join(os.path.dirname(os.path.abspath(anchor)), base))
+    except Exception:                                                   # noqa
+        pass
     for c in cands:
         if c and c not in out:
             out.append(c)
@@ -329,10 +338,38 @@ def foreign_normalize(df: pd.DataFrame, alias: dict) -> pd.DataFrame:
     return out
 
 
-def foreign_reports(cat: "ForeignCatalog") -> pd.DataFrame:
-    """외부 리포트 원장을 이 코드의 REPORT_COLS 스키마로 정규화해서 돌려준다."""
-    d = cat.load("report_ledger", "arc_reports", "reports", "raw_reports",
-                 alias=FOREIGN_ALIAS)
+def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
+    """리포트 원장을 REPORT_COLS 스키마로 정규화해서 돌려준다.
+
+    ★ 순서가 중요하다. 예전엔 외부 루트만 봐서, **로컬 금고에 이미 있는 원장**을 통째로
+      놓쳤다(실측: _shared 에 report_pdf 11,295건이 있는데 K11 은 0건으로 보고).
+      ① 로컬 공용 금고의 정제 테이블 → ② 외부 워크스페이스 순으로 찾는다.
+    """
+    d = None
+    for _t in ("research_report_master", "report_ledger", "research_reports",
+               "reports_master"):
+        try:
+            _v = VAULT.get_table(_t, scope="shared")
+        except Exception:                                               # noqa
+            _v = None
+        if _v is not None and len(_v):
+            LOG.ok(f"로컬 공용 금고에서 리포트 원장 재사용: {_t} ({len(_v):,}행)")
+            d = foreign_normalize(_v, FOREIGN_ALIAS)
+            break
+    if (d is None or not len(d)) and cat is not None:
+        d = cat.load("report_ledger", "arc_reports", "reports", "raw_reports",
+                     alias=FOREIGN_ALIAS)
+    if d is None or not len(d):
+        # 정제 테이블은 없지만 PDF 가 등록되어 있을 수 있다 — 그 사실을 알려 준다.
+        try:
+            n_pdf = len(VAULT.lookup("shared", domain="research"))
+        except Exception:                                               # noqa
+            n_pdf = 0
+        if n_pdf:
+            LOG.warn(f"공용 금고에 리포트 원본 {n_pdf:,}건이 등록되어 있으나 **정제 원장 테이블**이 "
+                     f"없습니다. d2/d4 는 목록 레벨 메타데이터가 필요하므로 이번 실행에서는 "
+                     f"신규 수집(한경/네이버 목록)으로 원장을 만듭니다. PDF 자체는 재파싱하지 "
+                     f"않습니다(비용 대비 회수가 낮습니다).")
     if d is None or not len(d):
         return pd.DataFrame(columns=REPORT_COLS)
 

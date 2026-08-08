@@ -9,6 +9,38 @@
 # ║    0 으로 채우면 '해당 없음'이라는 적극적 주장이 되어 거부권이 조용히 무력화된다.            ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════════╝
 
+# ★★ DART 배치 작업 크기 상한 ★★
+#   실제로 겪은 사고: fetch_dart_corpcode() 는 **DART 등록 법인 전체**(비상장 포함 118,675건)를
+#   돌려주는데 그걸 그대로 직원현황 수집에 넘겨 118,675 × 12년 = **1,424,100 잡**이 생성됐다.
+#   초당 8건이면 48시간이고, DART 일일 한도 20,000 을 한참 넘겨 키가 막힌다.
+#   명세 §5.1(과점 200종목으로 좁힌다)·§6.2(전수 파싱 금지)를 정면으로 어기는 상태였다.
+#   → 크기 초과를 **예외로 세운다.** 조용히 줄이면 어느 종목이 빠졌는지 알 수 없고,
+#     조용히 진행하면 하루를 버린다. 어느 쪽도 허용하지 않는다.
+DART_JOB_HARD_CAP = 30_000          # DART 일일 호출 한도(20,000) 대비 안전선
+DART_DAILY_QUOTA = 20_000
+
+
+def guard_dart_jobs(n_jobs: int, what: str, universe_hint: str = "") -> None:
+    """배치 크기를 검사하고, 설계 의도를 벗어나면 즉시 세운다.
+
+    ★ '알아서 잘라 주는' 방어는 쓰지 않는다. 잘리면 어떤 종목이 빠졌는지 모른 채
+      결과가 나오고, 그게 조용한 선택편향이 된다. 세우고 원인을 말한다.
+    """
+    if n_jobs <= DART_JOB_HARD_CAP:
+        if n_jobs > DART_DAILY_QUOTA:
+            LOG.warn(f"{what}: {n_jobs:,}건은 DART 일일 한도 {DART_DAILY_QUOTA:,}건을 넘습니다. "
+                     f"오늘 안에 끝나지 않을 수 있으니 캐시를 활용해 나눠 실행하세요.")
+        return
+    raise RuntimeError(
+        f"[배치 크기 초과] {what} 이(가) {n_jobs:,}건을 요청했습니다 "
+        f"(상한 {DART_JOB_HARD_CAP:,}건 · DART 일일 한도 {DART_DAILY_QUOTA:,}건).\n"
+        f"  이 전략은 **과점 품목에 매핑된 소수 종목**만 다루도록 설계되어 있습니다(§5.1).\n"
+        f"  이 숫자가 나왔다면 대상 목록이 잘못 전달된 것입니다 — 가장 흔한 원인은\n"
+        f"  fetch_dart_corpcode() 의 **전체 법인 목록(비상장 포함 약 12만건)** 을 그대로 넘긴 경우입니다.\n"
+        f"  {universe_hint}\n"
+        f"  → 상장사(그리고 가능하면 매핑된 종목)로 좁혀서 다시 호출하세요.")
+
+
 # 코어 DISCLOSURE_PATTERNS 에 없는, XCB 가 추가로 필요로 하는 공시 유형.
 XCB_DISCLOSURE_PATTERNS = {
     "supply_contract": r"단일판매[·・]?\s*공급계약|공급계약\s*체결",
@@ -249,6 +281,8 @@ def fetch_dart_industry(corp_codes: "Sequence[str]", code_of: "Dict[str, str]") 
     todo = [str(c) for c in dict.fromkeys(corp_codes) if str(c) not in done]
     if RUN_MODE == "CACHED":
         todo = []
+    guard_dart_jobs(len(todo), "KSIC 업종코드 수집",
+                    "업종코드는 **상장사에만** 필요합니다(corpmap 에서 stock_code 가 있는 행).")
 
     def _one(cc: str):
         js = dart_api("company.json", {"corp_code": cc})

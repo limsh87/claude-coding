@@ -392,14 +392,32 @@ def ingest_customs(hs_list: "Sequence[str]", start: str, end: str,
     if cached is None and FOREIGN is not None:
         cached = FOREIGN.load("customs_hs", "customs_hs_country_monthly", "customs",
                               alias=FOREIGN_ALIAS_CUSTOMS)
-    have: set = set()
+    need = list(hs_list)
     if cached is not None and len(cached):
         cached["hs"] = cached["hs"].astype(str)
         cached["ym"] = as_ts_series(cached["ym"])
-        have = set(cached["hs"].unique())
-        LOG.ok(f"통관 캐시 재사용: {len(cached):,}행 · HS {len(have)}개")
-
-    need = [h for h in hs_list if h not in have]
+        # ★★ 캐시 적중 판정 버그 — 실측으로 확인한 6분/실행 낭비 ★★
+        #   요청 키는 **조회용 HS 접두사**("28" 같은 章)인데, 캐시에 저장된 hs 는 응답으로 온
+        #   **6자리 코드**("280110"…)다. `q in set(cached_hs)` 로 비교하면 영원히 불일치라
+        #   매 실행 전량을 다시 받는다(실측: 610콜 × 2단계 = 12분).
+        #   → HS 는 좌측 정렬 계층코드이므로 **접두사 포함**으로 판정하고, 기간까지 확인한다.
+        cached_hs = cached["hs"].unique().astype(str)
+        lo = pd.Timestamp(f"{start[:4]}-{start[4:6]}-01")
+        hi = pd.Timestamp(f"{end[:4]}-{end[4:6]}-01") + pd.offsets.MonthEnd(0)
+        need = []
+        for q in hs_list:
+            hit = cached_hs[np.char.startswith(cached_hs.astype(str), str(q))]
+            if not len(hit):
+                need.append(q)
+                continue
+            sub_ym = cached.loc[cached["hs"].isin(set(hit)), "ym"]
+            # 요청 구간의 앞뒤가 캐시 범위 안에 들어와야 '이미 받았다'고 본다.
+            if sub_ym.min() > lo + pd.DateOffset(months=1) or \
+               sub_ym.max() < hi - pd.DateOffset(months=2):
+                need.append(q)
+        LOG.ok(f"통관 캐시 재사용: {len(cached):,}행 · HS {len(cached_hs):,}개 "
+               f"(요청 {len(hs_list)}건 중 {len(hs_list) - len(need)}건 적중 · "
+               f"신규 {len(need)}건)")
     fresh = pd.DataFrame(columns=cols)
     if need and RUN_MODE != "CACHED":
         cli = CustomsClient(key or DATA_GO_KR_KEY)

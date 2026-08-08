@@ -133,17 +133,49 @@ def curate_hs_universe(cx: pd.DataFrame, sec: pd.DataFrame, conc: pd.DataFrame,
     cvd = customs_cv_dest(d.assign(hs=d["hs_k"]))
     out = out.merge(cvd.rename(columns={"hs": "hs_k"}), on="hs_k", how="left")
 
-    # 채택 규칙 — 넷뿐이다. 성과는 보지 않는다.
-    reason = pd.Series("", index=out.index, dtype=object)
-    ok = pd.Series(True, index=out.index)
-    m1 = out["n_firms"].between(1, max_firms)
-    reason = reason.where(m1, reason + f"생산자수({out['n_firms']})가 1~{max_firms} 밖; ")
-    ok &= m1
+    # ── 채택 규칙 — 기준은 넷뿐이고 성과는 보지 않는다.
+    #   ★ 다만 '생산자 1~3개'는 **연계표가 세밀할 때만** 성립하는 기준이다.
+    #     씨앗표(章↔KSIC 중분류)로 떨어지면 한 章에 상장사가 수백 개씩 잡혀 아무도 통과하지
+    #     못하고 유니버스가 0 이 된다(실측: 채택 0/924).
+    #     명세 §12.2 가 "과점 기준 완화 후 재측정"을 명시했으므로, 완화를 **사다리로 자동화하고
+    #     어느 칸을 썼는지 표로 남긴다.** 조용히 완화하면 그게 곧 과적합 통로다.
     m2 = out["months"] >= min_months
+    ladder, chosen, note = [], None, ""
+    for cap in (max_firms, 5, 10, 20, 40, 80):
+        if cap < max_firms:
+            continue
+        n_ok = int((out["n_firms"].between(1, cap) & m2).sum())
+        ladder.append([f"생산자 1~{cap}개", f"{n_ok:,}"])
+        if chosen is None and n_ok >= 20:
+            chosen, note = cap, ("사양 기준" if cap == max_firms else
+                                 f"§12.2 완화 적용 (원 기준 1~{max_firms})")
+    if chosen is None:
+        # 절대 기준으로는 표본이 안 나온다 → **상대 기준**(생산자 수 하위 1/3)으로 내려간다.
+        thr = float(out.loc[m2, "n_firms"].replace(0, np.nan).quantile(0.33)) \
+            if int(m2.sum()) else np.nan
+        chosen = int(thr) if np.isfinite(thr) and thr >= 1 else 0
+        note = (f"절대 기준으로 표본 부족 → **상대 기준**(생산자 수 하위 1/3, 임계 {chosen}개)으로 "
+                f"전환. 이는 사양의 '과점'이 아니라 '상대적 저경쟁'이며, 매핑 귀속력이 그만큼 약합니다.")
+        ladder.append([f"상대기준 하위1/3 (≤{chosen}개)",
+                       f"{int((out['n_firms'].between(1, max(chosen, 1)) & m2).sum()):,}"])
+
+    m1 = out["n_firms"].between(1, max(chosen, 1))
+    reason = pd.Series("", index=out.index, dtype=object)
+    reason = reason.where(m1, reason + f"생산자수({out['n_firms']})가 1~{chosen} 밖; ")
     reason = reason.where(m2, reason + f"관측개월 {out['months']}<{min_months}; ")
-    ok &= m2
+    ok = m1 & m2
     out["adopted"] = ok.astype(int)
     out["reason"] = reason.where(~ok, "채택")
+    out["n_firms_cap"] = chosen
+
+    LOG.banner("HS 채택 기준 사다리 (§12.2 완화 이력)",
+               f"채택 {int(ok.sum()):,}개 · 적용 기준 '생산자 1~{chosen}개' — {note}")
+    LOG.table(ladder, ["기준", "채택 가능 HS"])
+    if chosen > max_firms:
+        LOG.warn(f"과점 기준을 {max_firms} → {chosen} 으로 완화했습니다. HS 하나에 상장사가 여럿이면 "
+                 f"통관 신호를 특정 기업에 귀속시키기 어려워집니다 — 매핑 가중치를 1/n_firms 로 "
+                 f"낮추고, 게이트3(플라시보)이 실제로 이 매핑을 지지하는지 반드시 확인하세요. "
+                 f"연계표(X6)를 세밀한 것으로 교체하면 이 완화가 필요 없어집니다.")
     out = out.rename(columns={"hs_k": "hs"})[
         ["hs", "n_firms", "months", "cv_dest", "adopted", "reason"]]
 
