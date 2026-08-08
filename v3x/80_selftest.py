@@ -229,6 +229,11 @@ def synth_xcb(n_hs: int = 40, n_firm: int = 90, n_month: int = 120) -> dict:
     grid["d2"] = -rng.integers(0, 6, len(grid))
     grid["d3"] = rng.normal(0, 1, len(grid))
     grid["d4"] = 0.0
+    # R3(직교화)이 통제하는 표준 팩터. 없으면 R3 이 N/A 로 빠져
+    # lstsq·HAC 경로가 스모크에서 한 번도 실행되지 않는다.
+    grid["roic"] = rng.normal(0.08, 0.05, len(grid))
+    grid["gpm"] = rng.normal(0.25, 0.08, len(grid))
+    grid["mom12"] = rng.normal(0.05, 0.25, len(grid))
     grid["n_analyst"] = rng.integers(0, 6, len(grid))
     grid["coverage_init"] = 0.0
 
@@ -298,5 +303,57 @@ def smoke_xcb() -> bool:
         return False
     report_performance_xcb(bt, {}, title="스모크 성과(합성)")
     report_interpretation_xcb(P, bt)
+
+    # ── 강건성 R0~R10 도 여기서 **실제로 돌린다** ────────────────────────────────────────
+    #   R 스위트는 400줄이 넘는데 지금까지 FULL 실행에서만 처음 실행됐다. 즉 6시간짜리
+    #   수집이 끝난 **맨 마지막에** NameError 하나로 전부 날아갈 수 있었다.
+    #   합성으로 2초 안에 같은 코드를 통과시켜, 실행 전에 죽을 코드를 먼저 죽인다.
+    #   ★ 판정값은 **읽지 않는다**. 합성 수익률에 대한 PASS/FAIL 은 아무 의미가 없고,
+    #     화면에 찍히면 실데이터 판정으로 오해된다 → 출력을 삼키고 '몇 건이 돌았는가'만 남긴다.
+    n_rob0, n_kill0 = len(ROBUST_LOG), len(KILL_LOG)
+    _buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_buf):
+            # ★ 프로덕션과 **같은** 러너를 쓴다. 스모크 전용 러너를 따로 만들면
+            #   시그니처가 어긋나도 스모크는 통과하고 FULL 만 죽는다(실제로 그랬다).
+            _runner = _make_runner(months, S["sec"])
+            _bench = {"returns": pd.Series(0.0, index=bt["returns"].index)}
+            RX0_benchmark(bt, _bench, months)
+            RX1_leakage(P, months, S["sec"], _runner, bt)
+            RX2_tp_vs_naive(P, months, S["sec"], _runner, bt)
+            RX3_orthogonal(P, bt)
+            RX4_placebo({"p": 0.5, "detail": "스모크", "n": 0})
+            RX10_policy(P, months, S["sec"], _runner, bt)
+
+            def _rescore(**kw):
+                Q = score_panel(P, stage="ALL", **kw)
+                Q["VETO"] = Q["veto_pass"]
+                Q["FLOOR"] = Q["breadth_ok"]
+                Q["dlog_M"] = Q.get("dlogM")
+                Q["dlog_E"] = Q.get("dlogE")
+                Q["xcb_uni"] = True
+                return Q
+
+            abl = RX5_ablation(P, months, S["sec"], _runner, bt, _rescore)
+            RX6_pbo(abl)
+            RX7_regime(bt, _bench)
+            RX9_capacity(P, months, S["sec"], _runner, bt)
+            report_robustness_xcb()
+        n_ran = len(ROBUST_LOG) - n_rob0
+    except Exception as e:                                                  # noqa
+        _tail = "\n".join(_buf.getvalue().splitlines()[-6:])
+        LOG.error(f"스모크: 강건성 스위트가 {type(e).__name__} 로 죽었습니다 — {e}\n"
+                  f"  FULL 실행에서는 수집이 다 끝난 **맨 마지막**에 같은 지점에서 죽습니다. "
+                  f"먼저 고치세요.\n  ── 직전 출력 ──\n{_tail}\n"
+                  f"{traceback.format_exc()[-900:]}")
+        return False
+    finally:
+        # 합성 판정이 실데이터 강건성 표를 오염시키지 않도록 원장을 되돌린다.
+        del ROBUST_LOG[n_rob0:]
+        del KILL_LOG[n_kill0:]
+    LOG.ok(f"스모크 R스위트: 검사 {n_ran}건 실행 · 출력 "
+           f"{len(_buf.getvalue().splitlines()):,}줄 생성 → 코드경로 전부 살아있음 "
+           f"(합성이라 판정값은 버립니다).")
+
     LOG.ok("스모크 통과 — 계산경로가 전 출력물을 생성합니다.")
     return True

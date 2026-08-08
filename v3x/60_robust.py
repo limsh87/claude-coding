@@ -202,15 +202,18 @@ def RX3_orthogonal(P: pd.DataFrame, bt: dict) -> None:
         return
     X = np.column_stack([np.ones(len(y))] + [np.nan_to_num(v) for v in facs.values()])
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    resid = y - X @ beta
-    # ★ hac_tstat 는 (평균, t통계량) 을 돌려준다. (t, p) 로 받으면 t 자리에 '평균'이,
-    #   p 자리에 't값'이 들어가 p<0.10 비교가 't값<0.10' 이 된다 — 판정이 통째로 뒤집힌다.
-    mu_r, t_r = hac_tstat(resid)
+    # ★★ 절편이 있는 OLS 의 잔차는 **정의상 평균이 정확히 0** 이다.
+    #    잔차의 평균을 알파로 재면 항상 0.000% / t=0.00 이 나와 R3 은 **구조적으로
+    #    영원히 FAIL** 한다(실측: mu=-0.000%, t=-0.00, p=1.000).
+    #    직교화 알파는 잔차 평균이 아니라 **절편 계수 β₀** 다.
+    #    HAC 로 자기상관을 보정하려면 '절편을 되돌린 잔차' 시계열의 평균을 검정한다.
+    alpha_t = beta[0] + (y - X @ beta)       # 평균 = β₀, 변동 = 잔차
+    mu_r, t_r = hac_tstat(alpha_t)
     # 양측 정규근사 p값 (statsmodels 없이도 성립)
     p_r = float(math.erfc(abs(t_r) / math.sqrt(2.0))) if np.isfinite(t_r) else float("nan")
     ok = np.isfinite(p_r) and p_r < 0.10 and mu_r > 0
     _rx("R3", "퀄리티 팩터 직교화", "PASS" if ok else "FAIL",
-        f"직교화 후 잔차 알파 월 {mu_r*100:.3f}% (t={t_r:.2f}, p={p_r:.3f}) "
+        f"직교화 후 알파(절편) 월 {mu_r*100:.3f}% (t={t_r:.2f}, p={p_r:.3f}) "
         f"· 통제 {list(facs)}",
         metric=f"t={t_r:.2f}", kill=True)
 

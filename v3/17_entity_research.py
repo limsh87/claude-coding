@@ -100,9 +100,11 @@ def split_analysts(raw: Any) -> List[str]:
 
 def _name_to_code_map(sec: pd.DataFrame) -> Dict[str, str]:
     m: Dict[str, str] = {}
-    for _, r in sec.iterrows():
-        n = norm_corp_name(r.get("name"))
-        c = r.get("code")
+    if not len(sec) or "name" not in sec.columns or "code" not in sec.columns:
+        return m
+    # iterrows 는 5천 행에 수백 ms 를 쓴다. zip 은 같은 결과를 수 ms 에 만든다.
+    for nm, c in zip(sec["name"].tolist(), sec["code"].tolist()):
+        n = norm_corp_name(nm)
         if n and isinstance(c, str) and n not in m:
             m[n] = c
     return m

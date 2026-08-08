@@ -87,10 +87,25 @@ def curate_hs_universe(cx: pd.DataFrame, sec: pd.DataFrame, conc: pd.DataFrame,
     if os.path.exists(prereg_path):
         try:
             pre = pd.read_csv(prereg_path, dtype={"hs": str})
-            LOG.ok(f"사전등록 HS 유니버스를 따릅니다: {prereg_path} "
-                   f"({int(pre.get('adopted', pd.Series(dtype=float)).sum()):,}개 채택) "
-                   f"— 성과를 보고 이 파일을 고치지 마세요(§15.2).")
-            return pre
+            _n_pre = int(pd.to_numeric(pre.get("adopted"), errors="coerce").fillna(0).sum())
+            # ★★ 실패한 실행을 영구 고정하지 않는다 ★★
+            #   사전등록의 목적은 '성과를 보고 목록을 고치는 것'을 막는 것이지,
+            #   **버그로 0개가 나온 실행을 영원히 박제하는 것**이 아니다.
+            #   실제로 첫 실행이 induty_code 결함으로 0개를 등록했고, 그 뒤로는 무엇을 고쳐도
+            #   이 파일 때문에 계속 0개가 됐다. 사용자가 파일을 지우지 않는 한 회복 불가였다.
+            if _n_pre <= 0:
+                bak = prereg_path + f".empty.{_dt.datetime.now():%Y%m%d_%H%M%S}"
+                try:
+                    shutil.copy2(prereg_path, bak)
+                except Exception:                                       # noqa
+                    pass
+                LOG.warn(f"사전등록 파일의 채택 HS 가 0개입니다 — 실패한 실행이 박제된 상태로 "
+                         f"판단하고 **무시하고 다시 산출**합니다 "
+                         f"(원본은 {os.path.basename(bak)} 로 보존).")
+            else:
+                LOG.ok(f"사전등록 HS 유니버스를 따릅니다: {prereg_path} "
+                       f"({_n_pre:,}개 채택) — 성과를 보고 이 파일을 고치지 마세요(§15.2).")
+                return pre
         except Exception as e:                                          # noqa
             # ★ 읽기 실패는 '파일이 잘못됐다'는 뜻이 아니라 인코딩·pandas 버전 문제일 수 있다.
             #   그대로 덮어쓰면 사전등록의 존재 이유(사후 변경 방지)가 무너진다. 백업부터 한다.
@@ -160,14 +175,33 @@ def curate_hs_universe(cx: pd.DataFrame, sec: pd.DataFrame, conc: pd.DataFrame,
                        f"{int((out['n_firms'].between(1, max(chosen, 1)) & m2).sum()):,}"])
 
     m1 = out["n_firms"].between(1, max(chosen, 1))
+    # ★ f-string 안에 Series 를 넣으면 **모든 행에 Series 전체 repr** 이 박힌다(칸당 수천 자).
+    #   사유는 행마다 달라야 하므로 벡터 연결로 만든다.
     reason = pd.Series("", index=out.index, dtype=object)
-    reason = reason.where(m1, reason + f"생산자수({out['n_firms']})가 1~{chosen} 밖; ")
-    reason = reason.where(m2, reason + f"관측개월 {out['months']}<{min_months}; ")
+    reason = reason.where(m1, reason + "생산자수 " + out["n_firms"].astype(str)
+                          + f" ∉ [1,{chosen}]; ")
+    reason = reason.where(m2, reason + "관측개월 " + out["months"].astype(str)
+                          + f"<{min_months}; ")
     ok = m1 & m2
     out["adopted"] = ok.astype(int)
     out["reason"] = reason.where(~ok, "채택")
     out["n_firms_cap"] = chosen
 
+    # ★ 사다리는 생산자 수만 흔든다. 관측개월이 걸린 경우에도 전부 0 이 찍혀
+    #   '무엇 때문에 0인지' 알 수 없다 → 기준별 단독 통과 수를 함께 낸다.
+    LOG.table([["관측개월 ≥ %d" % min_months, f"{int(m2.sum()):,} / {len(out):,}"],
+               ["생산자 수 1개 이상", f"{int((out['n_firms'] >= 1).sum()):,} / {len(out):,}"],
+               ["생산자 수 중앙값", f"{float(out['n_firms'].median()):.0f}"],
+               ["관측개월 중앙값", f"{float(out['months'].median()):.0f}"]],
+              ["단독 기준", "통과"])
+    if int(m2.sum()) == 0:
+        LOG.error(f"관측개월 {min_months}개월 이상인 HS 가 **하나도 없습니다** — 생산자 기준을 아무리 "
+                  f"완화해도 채택은 0 입니다. 통관 수집 구간이 짧거나(HS_MIN_MONTHS={min_months}) "
+                  f"수집이 실패한 것입니다. 관측개월 중앙값 "
+                  f"{float(out['months'].median()):.0f}개월을 먼저 확인하세요.")
+    if int((out["n_firms"] >= 1).sum()) == 0:
+        LOG.error("생산자(상장사)가 연결된 HS 가 **하나도 없습니다** — KSIC 업종코드(induty_code)를 "
+                  "확보하지 못했거나 연계표가 비어 있습니다. DART_API_KEY 와 CANARY X6 을 확인하세요.")
     LOG.banner("HS 채택 기준 사다리 (§12.2 완화 이력)",
                f"채택 {int(ok.sum()):,}개 · 적용 기준 '생산자 1~{chosen}개' — {note}")
     LOG.table(ladder, ["기준", "채택 가능 HS"])

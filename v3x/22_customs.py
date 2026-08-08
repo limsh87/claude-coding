@@ -392,32 +392,29 @@ def ingest_customs(hs_list: "Sequence[str]", start: str, end: str,
     if cached is None and FOREIGN is not None:
         cached = FOREIGN.load("customs_hs", "customs_hs_country_monthly", "customs",
                               alias=FOREIGN_ALIAS_CUSTOMS)
-    need = list(hs_list)
+    # ★ 캐시 적중 판정은 **"이 (질의, 구간)을 최근에 받았는가"** 로만 한다.
+    #   예전엔 (1) 요청키(章 접두사)와 저장키(6자리 응답코드)를 집합 비교해 영원히 불일치했고,
+    #   교정 후에도 (2) 최근월 미공표(관세청은 익월 중순 공표)를 '불완전'으로 보고 매번
+    #   전량 재수집했다. 둘 다 매 실행 6분을 버리는 결함이다.
+    #   질의 단위 레지스트리는 이 두 함정을 모두 피한다 — 무엇을 요청했는지가 곧 키다.
+    reg = VAULT.get_table("customs_fetch_registry", scope="shared")
+    reg = reg if reg is not None and len(reg) else pd.DataFrame(
+        columns=["hs_query", "start", "end", "fetched_at", "rows"])
+    fresh_days = 20.0                      # 관세청은 월 1회 갱신 → 20일이면 재수집이 의미 있다
+    have_q: set = set()
+    if len(reg):
+        _age = (pd.Timestamp.now() - as_ts_series(reg["fetched_at"])).dt.total_seconds() / 86400.0
+        ok_reg = reg[(reg["start"].astype(str) == str(start)) &
+                     (reg["end"].astype(str) == str(end)) & (_age <= fresh_days)]
+        have_q = set(ok_reg["hs_query"].astype(str))
+    need = [h for h in hs_list if str(h) not in have_q]
     if cached is not None and len(cached):
         cached["hs"] = cached["hs"].astype(str)
         cached["ym"] = as_ts_series(cached["ym"])
-        # ★★ 캐시 적중 판정 버그 — 실측으로 확인한 6분/실행 낭비 ★★
-        #   요청 키는 **조회용 HS 접두사**("28" 같은 章)인데, 캐시에 저장된 hs 는 응답으로 온
-        #   **6자리 코드**("280110"…)다. `q in set(cached_hs)` 로 비교하면 영원히 불일치라
-        #   매 실행 전량을 다시 받는다(실측: 610콜 × 2단계 = 12분).
-        #   → HS 는 좌측 정렬 계층코드이므로 **접두사 포함**으로 판정하고, 기간까지 확인한다.
-        cached_hs = cached["hs"].unique().astype(str)
-        lo = pd.Timestamp(f"{start[:4]}-{start[4:6]}-01")
-        hi = pd.Timestamp(f"{end[:4]}-{end[4:6]}-01") + pd.offsets.MonthEnd(0)
-        need = []
-        for q in hs_list:
-            hit = cached_hs[np.char.startswith(cached_hs.astype(str), str(q))]
-            if not len(hit):
-                need.append(q)
-                continue
-            sub_ym = cached.loc[cached["hs"].isin(set(hit)), "ym"]
-            # 요청 구간의 앞뒤가 캐시 범위 안에 들어와야 '이미 받았다'고 본다.
-            if sub_ym.min() > lo + pd.DateOffset(months=1) or \
-               sub_ym.max() < hi - pd.DateOffset(months=2):
-                need.append(q)
-        LOG.ok(f"통관 캐시 재사용: {len(cached):,}행 · HS {len(cached_hs):,}개 "
-               f"(요청 {len(hs_list)}건 중 {len(hs_list) - len(need)}건 적중 · "
+        LOG.ok(f"통관 캐시: {len(cached):,}행 · HS {cached['hs'].nunique():,}개 "
+               f"(질의 {len(hs_list)}건 중 {len(hs_list) - len(need)}건 최근 수집분 재사용 · "
                f"신규 {len(need)}건)")
+
     fresh = pd.DataFrame(columns=cols)
     if need and RUN_MODE != "CACHED":
         cli = CustomsClient(key or DATA_GO_KR_KEY)
@@ -452,6 +449,17 @@ def ingest_customs(hs_list: "Sequence[str]", start: str, end: str,
     if len(fresh):
         VAULT.put_table("customs_hs_country_monthly", out, scope="shared",
                         source="data.go.kr/관세청")
+        # 질의 단위 레지스트리 갱신 — 다음 실행이 같은 구간을 다시 받지 않게 한다.
+        try:
+            new_reg = pd.DataFrame({"hs_query": [str(h) for h in need],
+                                    "start": str(start), "end": str(end),
+                                    "fetched_at": pd.Timestamp.now(), "rows": int(len(fresh))})
+            allreg = pd.concat([reg, new_reg], ignore_index=True)
+            allreg = allreg.drop_duplicates(["hs_query", "start", "end"], keep="last")
+            VAULT.put_table("customs_fetch_registry", allreg, scope="shared",
+                            source="통관 질의 레지스트리")
+        except Exception as e:                                          # noqa
+            LOG.debug(f"통관 레지스트리 기록 실패(무시): {type(e).__name__}")
         if FOREIGN is not None:
             foreign_publish_common(FOREIGN, "customs_hs_country_monthly", out,
                                    ["hs", "ym", "country"], "TCD_XCB")

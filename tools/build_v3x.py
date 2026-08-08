@@ -232,6 +232,77 @@ def check_principles(body: str) -> list[str]:
     return errs
 
 
+# 사용처가 없어도 **남겨야 하는** 이름. 사용자가 직접 부를 수 있는 진입점과
+# 계약 검정이 이름으로 찾는 것들이다.
+KEEP_UNUSED = {"main", "run_xcb", "smoke_xcb", "contracts_xcb"}
+
+
+def prune_dead(body: str) -> tuple[str, list[str]]:
+    """최상위 def/class 중 **어디에서도 참조되지 않는 것**을 잘라낸다.
+
+    v3 코어는 다른 전략(CORE-D)과 공유하므로 원본 조각을 건드리지 않는다.
+    XCB 가 쓰지 않는 코어 함수는 조립 시점에만 제거한다 — 원본은 그대로 남는다.
+
+    보수적으로만 자른다:
+      · ast 상 Name/Attribute Load 참조가 0회
+      · 이름이 **문자열 리터럴로도** 등장하지 않음 (getattr·디스패치표 방어)
+      · KEEP_UNUSED 에 없음
+    하나를 지우면 그것만 부르던 다른 함수가 죽으므로 고정점까지 반복한다.
+    """
+    removed: list[str] = []
+    for _ in range(12):
+        tree = ast.parse(body)
+        defs = {n.name: n for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        strs: set[str] = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                strs.update(n.value.split())
+        # 자기 자신 안에서만 쓰이는 재귀 호출은 '사용'이 아니다 → 정의 밖 참조만 센다.
+        outside: dict[str, int] = {nm: 0 for nm in defs}
+        for top in tree.body:
+            skip = top.name if isinstance(
+                top, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else None
+            for x in ast.walk(top):
+                nm = None
+                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load):
+                    nm = x.id
+                elif isinstance(x, ast.Attribute):
+                    nm = x.attr
+                if nm in outside and nm != skip:
+                    outside[nm] += 1
+        cand = [(nm, node) for nm, node in defs.items()
+                if nm not in KEEP_UNUSED and not nm.startswith("__")
+                and outside[nm] == 0 and nm not in strs]
+        # ★ 마지막 안전망 — **텍스트 수준**에서 한 번 더 본다.
+        #   getattr("naver_enrich_detail") 처럼 문자열 안에 박힌 호출, 주석 속 참조,
+        #   f-string 조각까지 ast 만으로는 놓칠 수 있다. 이름의 전체 등장 횟수가
+        #   '자기 정의 구간 안에서의 등장 횟수'와 같을 때만 지운다.
+        src_lines = body.split("\n")
+        dead = []
+        for nm, node in cand:
+            pat = re.compile(r"\b" + re.escape(nm) + r"\b")
+            total = len(pat.findall(body))
+            own = len(pat.findall("\n".join(src_lines[node.lineno - 1:node.end_lineno])))
+            if total == own:
+                dead.append(node)
+        if not dead:
+            break
+        lines = body.split("\n")
+        cut: set[int] = set()
+        for node in dead:
+            removed.append(node.name)
+            s = node.lineno - 1
+            for d in getattr(node, "decorator_list", []):
+                s = min(s, d.lineno - 1)
+            # 바로 위에 붙은 주석·데코레이터도 함께 지운다(고아 주석 방지).
+            while s > 0 and lines[s - 1].lstrip().startswith("#"):
+                s -= 1
+            cut.update(range(s, node.end_lineno))
+        body = "\n".join(ln for i, ln in enumerate(lines) if i not in cut)
+    return body, removed
+
+
 def main() -> int:
     items = collect()
     parts, n = [], len(items)
@@ -242,6 +313,14 @@ def main() -> int:
             parts.append(BANNER.format(i=i, n=n, name=name, tag=tag))
         parts.append(txt.rstrip() + "\n")
     body = "\n".join(parts)
+    raw_lines = len(body.splitlines())
+
+    try:
+        ast.parse(body)
+    except SyntaxError as e:
+        print(f"✘ 구문 오류(가지치기 전): 줄 {e.lineno}: {e.msg}", file=sys.stderr)
+        return 2
+    body, pruned = prune_dead(body)
 
     try:
         tree = ast.parse(body)
@@ -286,6 +365,9 @@ def main() -> int:
     print(f"조립 완료: {os.path.relpath(OUT, ROOT)}  {nl:,}줄 / {len(body)/1e3:.0f}KB / sha1:{h}")
     print(f"  XCB 전략층 {sum(1 for _, p, _ in items if p.startswith(SRC))}조각 · "
           f"v3 코어 재사용 {len(CORE_REUSE)}조각")
+    if pruned:
+        print(f"  미사용 정의 {len(pruned)}건 가지치기 (−{raw_lines - nl:,}줄): "
+              + ", ".join(sorted(pruned)[:8]) + (" …" if len(pruned) > 8 else ""))
     print("  검사 통과: 문법 · 중복정의 · 미정의이름 · 원칙1/2/3 · 절대1원칙")
     return 0
 

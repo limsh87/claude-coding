@@ -23,14 +23,96 @@ def krx_mode() -> str:
     return "on" if v in ("true", "1", "on", "yes") else "auto"
 
 
+def ever_listed_from_dart() -> "pd.DataFrame":
+    """**krx.co.kr 을 한 번도 거치지 않고** '한때 상장됐던 전 종목'을 얻는다.
+
+    ★ 왜 이게 필요한가 — 3중화의 마지막 레일.
+      FDR 의 상장/폐지 목록(fetch_fdr_listing·fetch_fdr_delisting)은 결국
+      **data.krx.co.kr** 을 찌른다. 로그인은 안 하지만 호스트는 같다.
+      그 호스트가 IP 단위로 막히면 상장목록도 폐지목록도 동시에 죽고,
+      '한때 상장됐던 종목'을 아는 방법이 사라진다 → 생존자편향이 통째로 재유입된다.
+
+      DART corpCode.xml 은 **opendart.fss.or.kr** 이다. krx 와 완전히 다른 기관·호스트고
+      로그인이 아니라 API 키로만 인증한다. 그리고 결정적으로,
+      **폐지된 회사도 stock_code 를 그대로 달고 남아 있다.**
+      따라서  (DART 에서 종목코드를 가진 전체)  −  (지금 상장 중)  =  폐지 후보
+      가 성립하고, 폐지일은 infer_delisting_from_prices 가 마지막 거래일로 복원한다.
+
+    반환: code, name, corp_code  (한때라도 종목코드를 가졌던 전 법인)
+    """
+    cols = ["code", "name", "corp_code"]
+    cc = fetch_dart_corpcode()
+    if cc is None or not len(cc) or "code" not in cc.columns:
+        return pd.DataFrame(columns=cols)
+    d = cc[cc["code"].notna() & (cc["code"].astype(str).str.len() == 6)].copy()
+    d = d.rename(columns={"corp_name": "name"})[["code", "name", "corp_code"]]
+    d["code"] = d["code"].astype(str)
+    return d.drop_duplicates("code")
+
+
 def build_security_master_nokrx() -> "pd.DataFrame":
     """KRX 없이 종목 마스터를 만든다.  ★ 이 경로가 C2 의 본선이다.
 
-    KRX 스냅샷은 '검증 입력'일 뿐 의존 대상이 아니다. 스냅샷이 없어도
-    상장목록(FDR/KIND) ∪ 상장폐지목록(FDR) 로 마스터가 완성된다.
+    소스 3중화 — 하나가 막혀도 생존자편향 제거가 유지된다:
+      ① FDR 상장목록/상장폐지목록   (data.krx.co.kr · 로그인 불필요)
+      ② KIND 상장법인목록           (kind.krx.co.kr · 다른 호스트)
+      ③ DART corpCode.xml           (opendart.fss.or.kr · **krx 와 무관**)
+    ③ 은 ①②가 전부 막혀도 '한때 상장됐던 종목'을 알려준다.
     """
-    sec = build_security_master(pd.DataFrame(columns=["snap_date", "code", "market"]))
-    return sec
+    # ★ 코어 build_security_master 는 krx 계열 소스가 전부 죽으면 예외를 던진다.
+    #   그게 옳은 기본값이지만, 여기서는 **DART 단독으로도 살아남아야** 한다.
+    #   예외를 삼키지 않고 '3번째 레일이 있는가'를 본 뒤에만 계속한다.
+    sec, core_err = None, None
+    try:
+        sec = build_security_master(pd.DataFrame(columns=["snap_date", "code", "market"]))
+    except Exception as e:                                              # noqa
+        core_err = e
+        LOG.warn(f"krx 계열 상장/폐지 목록이 전부 실패했습니다({type(e).__name__}) — "
+                 f"DART 단독 레일로 마스터를 만듭니다.")
+
+    ever = ever_listed_from_dart()
+    if not len(ever):
+        if sec is None or not len(sec):
+            raise RuntimeError(
+                "종목 마스터를 만들 소스가 하나도 없습니다 — FDR(data.krx.co.kr)·"
+                "KIND(kind.krx.co.kr)·DART(opendart.fss.or.kr) 가 모두 실패했습니다.\n"
+                f"  코어 진단: {core_err}\n"
+                "  ★ DART_API_KEY 만 살아 있어도 생존자편향 제거는 가능합니다. 키를 확인하세요."
+            ) from core_err
+        LOG.warn("DART corpCode 를 얻지 못해 '폐지 3번째 레일'이 없습니다 — "
+                 "FDR 상장폐지 목록이 막히면 생존자편향이 남습니다.")
+        return sec
+
+    if sec is None or not len(sec):
+        # DART 단독. '지금 상장 중'을 구분할 소스가 없으므로 **전 종목을 폐지 후보로 두고**
+        # 마지막 거래일로 판정을 넘긴다. 끝까지 거래된 종목은 그 함수가 '상장 중'으로 남긴다.
+        sec = pd.DataFrame(columns=SEC_MASTER_COLS)
+        LOG.warn(f"DART 단독 모드 — 한때 상장 {len(ever):,}종목 전부를 후보로 싣고, "
+                 f"폐지 여부는 **마지막 거래일 관측**으로 판정합니다. "
+                 f"시장구분·상장일이 없어 시즈닝(C2)이 약해집니다.")
+
+    known = set(sec["code"].astype(str)) if len(sec) else set()
+    extra = ever[~ever["code"].isin(known)].copy()
+    if not len(extra):
+        LOG.ok(f"DART 교차확인: 한때 상장 {len(ever):,}종목이 모두 마스터에 이미 있습니다 "
+               f"(누락 0) — 생존자편향 3중 확인 통과.")
+        return sec
+
+    # ★ DART 에만 있고 상장목록에 없다 = 지금은 상장 중이 아니다 = 폐지(또는 비상장 전환).
+    #   폐지일은 여기서 만들지 않는다. infer_delisting_from_prices 가 마지막 거래일로 정한다.
+    #   src 에 'delist' 를 넣어야 그 함수가 복원 대상으로 잡는다.
+    extra = extra.assign(market="", listing_date=pd.NaT, delisting_date=pd.NaT,
+                         industry="", sector_src="dart", src="dart:delisted-inferred",
+                         corp_code=extra["corp_code"])
+    _cols = list(sec.columns) if len(sec.columns) else list(SEC_MASTER_COLS)
+    out = pd.concat([sec.reindex(columns=_cols), extra.reindex(columns=_cols)],
+                    ignore_index=True)
+    LOG.ok(f"DART corpCode 로 폐지 후보 {len(extra):,}종목을 추가했습니다 "
+           f"(상장목록·폐지목록 어디에도 없던 종목). 마스터 {len(known):,} → "
+           f"{out['code'].nunique():,}종목. ★ 이 경로는 krx.co.kr 을 쓰지 않습니다.")
+    PIPE.io("IN", "HTTP", "dart:corpCode(ever-listed)", extra, source="opendart",
+            note="생존자편향 3번째 레일 · krx 비의존")
+    return out
 
 
 def infer_delisting_from_prices(sec: "pd.DataFrame", px_d: "pd.DataFrame",
@@ -64,17 +146,22 @@ def infer_delisting_from_prices(sec: "pd.DataFrame", px_d: "pd.DataFrame",
     panel_end = as_ts_series(pd.Series([px_d["date"].max()])).iloc[0]
     # 패널 마지막 60일 안에 거래가 있으면 '데이터 끝'이지 '폐지'가 아니다.
     cutoff = panel_end - pd.Timedelta(days=60)
-    inferred = s.loc[need, "code"].astype(str).map(last)
-    inferred = inferred.where(inferred.notna() & (inferred <= cutoff))
+    raw_last = s.loc[need, "code"].astype(str).map(last)
+    inferred = raw_last.where(raw_last.notna() & (raw_last <= cutoff))
     # 폐지일 = 마지막 거래일의 다음 날(그 달 말 기준으로 유니버스에서 빠진다)
     s.loc[need, "delisting_date"] = (inferred + pd.Timedelta(days=1)).to_numpy()
     n_ok = int(as_ts_series(s.loc[need, "delisting_date"]).notna().sum())
-    LOG.ok(f"폐지일 복원: 미상 {n_need:,}종목 중 {n_ok:,}종목을 '마지막 거래일+1'로 확정했습니다 "
-           f"(가격 관측 기반). 나머지 {n_need - n_ok:,}종목은 가격이 없어 복원 불가입니다.")
-    if n_need - n_ok > 0:
-        LOG.warn(f"폐지일을 끝내 못 구한 {n_need - n_ok:,}종목은 유니버스에서 '상장 중'으로 "
-                 f"남습니다. 다만 가격이 없으므로 체결가가 없어 진입 후보에서 자연히 빠집니다 — "
-                 f"성과를 부풀리는 방향은 아닙니다.")
+    # ★ 실패를 한 덩어리로 세면 안 된다. '아직 거래 중'과 '가격이 아예 없음'은 전혀 다르다.
+    #   전자는 정상이고(폐지가 아니다), 후자만 진짜 미복원이다.
+    n_alive = int((raw_last.notna() & (raw_last > cutoff)).sum())
+    n_nopx = int(raw_last.isna().sum())
+    LOG.ok(f"폐지일 복원: 미상 {n_need:,}종목 중 {n_ok:,}종목을 '마지막 거래일+1'로 확정 "
+           f"· {n_alive:,}종목은 최근까지 거래 중이라 **폐지가 아님**(정상) "
+           f"· {n_nopx:,}종목은 가격이 아예 없어 판정 불가.")
+    if n_nopx > 0:
+        LOG.warn(f"가격이 없는 {n_nopx:,}종목은 '상장 중'으로 남습니다. 다만 체결가가 없어 "
+                 f"진입 후보에서 자연히 빠지므로 성과를 부풀리는 방향은 아닙니다. "
+                 f"가격 소스(FDR→네이버→yfinance)가 이 종목들을 못 받은 것입니다.")
     return s
 
 
@@ -279,12 +366,17 @@ def universe_sources_audit(sec: "pd.DataFrame", px_m: "pd.DataFrame",
     """어떤 소스로 무엇을 만들었는지 한눈에. KRX 의존도가 0 임을 표로 증명한다."""
     mode = krx_mode()
     krx_ok = bool(getattr(KRX, "session_ok", False))
+    _src = (sec["src"].astype(str) if sec is not None and "src" in sec.columns
+            else pd.Series(dtype=str))
+    n_dart_rail = int(_src.str.startswith("dart:").sum())
     rows = [
-        ["종목 마스터(상장+폐지)", "FDR 상장목록 + KIND + FDR 상장폐지",
+        ["종목 마스터(상장+폐지)", "FDR 상장목록 + KIND + DART corpCode",
          f"{0 if sec is None else sec['code'].nunique():,}종목", "KRX 불필요 ✔"],
-        ["생존자편향 제거 C2", "FDR 상장폐지 목록(폐지일)",
+        ["생존자편향 제거 C2", "FDR 상장폐지 + DART 교차 + 마지막거래일 복원",
          f"{0 if sec is None else int(as_ts_series(sec.get('delisting_date')).notna().sum()):,}건",
          "KRX 불필요 ✔"],
+        ["└ 3번째 레일(DART 단독)", "opendart.fss.or.kr — krx.co.kr 전면차단시에도 생존",
+         f"{n_dart_rail:,}종목", "krx 호스트 0 ✔"],
         ["PIT 유니버스 C13", "상장일·폐지일 + 가격 관측",
          f"{0 if px_m is None else px_m['code'].nunique():,}종목", "KRX 불필요 ✔"],
         ["가격·거래대금", "FDR → 네이버 → yfinance",
@@ -302,3 +394,20 @@ def universe_sources_audit(sec: "pd.DataFrame", px_m: "pd.DataFrame",
                f"KRX 모드={mode} · 세션={'확보' if krx_ok else '없음'} — "
                f"핵심 4개 항목은 KRX 없이 성립합니다")
     LOG.table(rows, ["항목", "사용 소스", "규모", "KRX 의존"])
+
+    # ★ '로그인'과 '호스트'는 다른 문제다. 마켓플레이스 로그인이 막힌 것과
+    #   data.krx.co.kr 자체가 막힌 것은 대응이 다르므로 호스트 단위로 따로 보여준다.
+    LOG.table([
+        ["marketplace.krx.co.kr", "KRX 마켓플레이스 로그인",
+         "사용 안 함" if mode == "off" else ("확보" if krx_ok else "실패→우회"),
+         "없어도 전 항목 성립 ✔"],
+        ["data.krx.co.kr", "FDR 상장/폐지 목록",
+         "시도", "막히면 DART 레일로 대체 ✔"],
+        ["kind.krx.co.kr", "KIND 상장법인목록", "시도", "보조 — 없어도 성립 ✔"],
+        ["opendart.fss.or.kr", "DART corpCode·재무·공시",
+         "필수", "★ 이것만 살아 있으면 생존자편향 제거 가능"],
+        ["finance.naver.com", "가격·수급 폴백", "폴백", "없어도 FDR/yfinance 로 성립"],
+    ], ["호스트", "무엇에 쓰나", "상태", "차단 시"])
+    if n_dart_rail == 0 and mode == "off":
+        LOG.info("DART 레일이 추가한 폐지 후보가 0건입니다 — FDR 상장폐지 목록이 정상 수신돼 "
+                 "이미 전부 포함됐다는 뜻입니다(정상).")
