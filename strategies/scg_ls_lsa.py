@@ -216,7 +216,7 @@ STOP_ON_KILL_CRITERIA = False   # SCG 는 '킬'이 아니라 '증분 기여 판�
 STRATEGY_ID        = "SCG_LS_LSA"
 STRATEGY_NAME      = "SCG-LS / SCG-LSA — Smart Consensus Gap + Analyst Leadership"
 ACTIVE_PACKS       = []
-BUILD_VERSION      = "v2.20260808.1147"
+BUILD_VERSION      = "v2.20260808.1240"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -226,6 +226,8 @@ BUILD_VERSION      = "v2.20260808.1147"
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 import os, sys, re, io, gc, json, time, math, zipfile, hashlib, logging, textwrap, traceback
 import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, threading, unicodedata
+import xml.etree.ElementTree as _ET
+import socket as _socket
 import datetime as _dt
 from collections import defaultdict, Counter, OrderedDict
 from dataclasses import dataclass, field, asdict, replace
@@ -570,9 +572,11 @@ class _Log:
             return
         el = time.time() - _T0_PROCESS
         stamp = f"{int(el // 60):02d}:{el % 60:05.2f}"
-        scope = ("/".join(self.ctx))[-34:]
-        line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
         with self.lock:
+            #  scope 도 잠금 안에서 읽는다 — 메인 스레드가 finally 에서 ctx.pop() 하는
+            #  사이에 백그라운드 줄이 엉뚱한 스테이지 이름을 달고 나가면 안 된다.
+            scope = ("/".join(self.ctx))[-34:]
+            line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
             self.buffer.append(line)
             _safe_print(line, flush=True)
 
@@ -582,38 +586,46 @@ class _Log:
     def warn(self, m):  self._emit("WARN",  m, "⚠ ")
     def error(self, m): self._emit("ERROR", m, "✘ ")
 
+    #  ★ rule/banner/table 은 '여러 줄이 한 덩어리' 다. 잠금 없이 찍으면 하트비트나
+    #    다운로드 진행률 한 줄이 표의 행 사이에 끼어들어 정렬이 깨진다 — 오류 위치를
+    #    한 화면에서 읽게 하려고 만든 커널인데 그 화면이 망가지는 것이다.
     def rule(self, title: str = "", ch: str = "─", width: int = 104):
-        if title:
-            pre = f"{ch * 3} {title} "
-            _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
-        else:
-            _safe_print(ch * width, flush=True)
+        with self.lock:
+            if title:
+                pre = f"{ch * 3} {title} "
+                _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
+            else:
+                _safe_print(ch * width, flush=True)
 
     def banner(self, title: str, sub: str = "", width: int = 104):
-        _safe_print("", flush=True)
-        _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
-        _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
-        if sub:
-            _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
-        _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
+        with self.lock:
+            _safe_print("", flush=True)
+            _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
+            _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
+            if sub:
+                _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
+            _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
 
     def table(self, rows: List[Sequence[Any]], headers: Sequence[str],
               aligns: Optional[Sequence[str]] = None, maxw: int = 46, title: str = ""):
         """한글 폭 보정 표. 강건성/성과/감사 출력 전부 이걸 쓴다."""
-        if title:
-            _safe_print(f"\n▶ {title}", flush=True)
-        if not rows:
-            _safe_print("   (행 없음)", flush=True)
-            return
-        ncol = len(headers)
-        aligns = list(aligns or ["l"] * ncol)
-        cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r)) for r in rows]
-        widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
-        head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
-        _safe_print(head, flush=True)
-        _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
-        for r in cells:
-            _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
+        with self.lock:
+            if title:
+                _safe_print(f"\n▶ {title}", flush=True)
+            if not rows:
+                _safe_print("   (행 없음)", flush=True)
+                return
+            ncol = len(headers)
+            aligns = list(aligns or ["l"] * ncol)
+            cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r))
+                     for r in rows]
+            widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
+            head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
+            _safe_print(head, flush=True)
+            _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
+            for r in cells:
+                _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i])
+                                              for i in range(ncol)), flush=True)
 
 
 LOG = _Log("DEBUG" if VERBOSE else "INFO")
@@ -812,7 +824,18 @@ class Pipeline:
 
         def _heartbeat():
             while not _hb_stop.wait(60.0):
-                LOG.info(f"    …[{sid}] 진행 중 · {(time.time()-rec.t_start)/60:.1f}분 경과")
+                #  ★ 깨어난 뒤 잠금 안에서 다시 확인한다. wait() 가 돌아오는 순간과
+                #    finally 사이에 스테이지가 끝날 수 있고, 그러면 이미 끝난 스테이지의
+                #    '진행 중' 이 다음 스테이지 출력이나 최종 요약표 한가운데에 찍힌다.
+                with LOG.lock:
+                    if _hb_stop.is_set():
+                        return
+                    el = time.time() - rec.t_start
+                    if budget_s is not None and el > budget_s:
+                        LOG.warn(f"    …[{sid}] {el/60:.1f}분 경과 — 예산 {budget_s:.0f}s 를 "
+                                 f"넘겼는데도 응답이 없습니다. 정체를 의심하세요.")
+                    else:
+                        LOG.info(f"    …[{sid}] 진행 중 · {el/60:.1f}분 경과")
 
         _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name=f"hb-{sid}")
         _hb_thread.start()
@@ -847,7 +870,9 @@ class Pipeline:
             rec.status = "WARN"
             rec.notes.append(f"WARN: 비필수 스테이지 실패 — {rec.err_type}")
         finally:
-            _hb_stop.set()
+            with LOG.lock:
+                _hb_stop.set()
+            _hb_thread.join(timeout=2.0)   # 늦은 한 줄이 다음 스테이지로 새지 않게
             LOG.ctx.pop()
             self.current = prev
 
@@ -1188,7 +1213,7 @@ def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, qui
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
 def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
-            desc: str = "", quiet: bool = False) -> List[Any]:
+            desc: str = "", quiet: bool = False, deadline_s: float = 3600.0) -> List[Any]:
     """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다."""
     items = list(items)
     if not items:
@@ -1196,18 +1221,36 @@ def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
     w = max(1, min(workers or N_WORKERS_IO, len(items)))
     out: List[Any] = [None] * len(items)
     errs: Counter = Counter()
+    #  ★ as_completed 에 반드시 마감을 준다. 없으면 워커 하나가 물리는 순간 메인
+    #    스레드가 영원히 멈추고, 더 나쁜 건 그때 Ctrl-C 도 소용없다는 점이다:
+    #    ThreadPoolExecutor 워커는 데몬이 아니고(3.9 에서 daemon=True 가 제거됐다)
+    #    with-블록 종료가 shutdown(wait=True) 이며 인터프리터 종료조차 atexit 에서
+    #    모든 워커를 join 한다 — SIGKILL 말고는 빠져나올 방법이 없다.
+    #    소켓 계층 마감(http_get/http_get_stream)이 1차 방어이고, 이건 그게 뚫렸을 때
+    #    최소한 '보고하고 계속 가게' 만드는 2차 안전망이다.
     with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
         futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
-        it_ = as_completed(futs)
+        pend = set(futs)
+        it_ = as_completed(futs, timeout=deadline_s)
         if not quiet:
             it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
-        for fu in it_:
-            i = futs[fu]
-            try:
-                out[i] = fu.result()
-            except Exception as e:                       # noqa
-                errs[type(e).__name__] += 1
-                out[i] = None
+        try:
+            for fu in it_:
+                pend.discard(fu)
+                i = futs[fu]
+                try:
+                    out[i] = fu.result(timeout=0)
+                except Exception as e:                   # noqa
+                    errs[type(e).__name__] += 1
+                    out[i] = None
+        except Exception as e:                           # noqa — concurrent TimeoutError
+            if not isinstance(e, TimeoutError) and type(e).__name__ != "TimeoutError":
+                raise
+            LOG.warn(f"{desc or '병렬작업'}: {len(pend):,}건이 {deadline_s/60:.0f}분 안에 "
+                     f"끝나지 않아 그 건들을 포기합니다 (결과는 결측 처리). "
+                     f"해당 스레드는 소켓 마감에 걸려 스스로 끝납니다.")
+            for fu in pend:
+                fu.cancel()
     if errs:
         LOG.warn(f"{desc or '병렬작업'} 중 실패 {sum(errs.values())}/{len(items)}건 — " +
                  ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))
@@ -1637,6 +1680,19 @@ class Vault:
             os.makedirs(os.path.join(p, "blob"), exist_ok=True)
             os.makedirs(os.path.join(p, "table"), exist_ok=True)
         os.makedirs(os.path.join(self.root, "_locks"), exist_ok=True)
+        #  ★ 로컬 미러 — 드라이브와 '양쪽 다' 탐색해서 시간을 아끼기 위한 것이다.
+        #    드라이브(특히 Colab FUSE)는 파케이 한 장 읽는 데도 눈에 띄게 느리다.
+        #    읽기: 로컬 먼저 → 없으면 드라이브 → 드라이브에서 찾으면 로컬로 복사(다음 실행 가속).
+        #    쓰기: 드라이브가 원본(세션 무관 원칙), 로컬은 사본. 드라이브를 훼손하지 않는다.
+        self.mirror = None
+        try:
+            lm = os.path.abspath(LOCAL_CACHE_ROOT)
+            if lm != self.root:
+                self.mirror = lm
+                for _sc, _nsn in (("shared", GDRIVE_SHARED_NS), ("private", GDRIVE_PRIVATE_NS)):
+                    os.makedirs(os.path.join(lm, _nsn, "table"), exist_ok=True)
+        except Exception:
+            self.mirror = None
         self._idx: Dict[str, pd.DataFrame] = {}
         self._uidset: Dict[str, set] = {}
         self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
@@ -1874,6 +1930,9 @@ class Vault:
         except Exception as e:                              # noqa
             LOG.warn(f"테이블 저장 실패({type(e).__name__}): {name}")
             return None
+        #  로컬 미러에도 같이 둔다 — 드라이브가 원본이고 이건 다음 실행 가속용 사본이다.
+        #  실패해도 원본은 이미 드라이브에 있으므로 조용히 넘어간다.
+        self._mirror_up(path, name, scope)
         self._register(scope, {
             "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
             "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
@@ -1884,25 +1943,81 @@ class Vault:
         })
         return path
 
+    def mirror_table_dir(self, scope: str) -> Optional[str]:
+        if not self.mirror:
+            return None
+        return os.path.join(self.mirror,
+                            GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                            "table")
+
+    def _table_candidates(self, name: str, scope: str) -> List[Tuple[str, str]]:
+        """(경로, 출처) 를 **빠른 것 먼저** 돌려준다.
+
+        순서: 로컬미러(요청 scope) → 로컬미러(반대 scope) → 드라이브(요청) → 드라이브(반대).
+        scope 를 교차 탐색하는 이유는 그대로다 — 다른 전략이 공용에 만들어 둔 것을
+        재활용하기 위해서다(절대 1원칙). 여기에 '로컬 먼저' 가 더해진 것뿐이다.
+        """
+        alt = "private" if scope == "shared" else "shared"
+        out: List[Tuple[str, str]] = []
+        for sc in (scope, alt):
+            md = self.mirror_table_dir(sc)
+            if md:
+                out.append((os.path.join(md, f"{name}.parquet"), "LOCAL"))
+        for sc in (scope, alt):
+            out.append((os.path.join(self.table_dir(sc), f"{name}.parquet"), "DRIVE"))
+        return out
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
-        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if not os.path.exists(path):
-            # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
-            alt = "private" if scope == "shared" else "shared"
-            path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
-            if os.path.exists(path2):
-                path = path2
-            else:
-                return None
-        if max_age_days is not None:
-            age = (time.time() - os.path.getmtime(path)) / 86400.0
-            if age > max_age_days:
-                return None
-        d = read_parquet_safe(path)
-        if d is not None:
-            PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
-        return d
+        for path, where in self._table_candidates(name, scope):
+            if not os.path.exists(path):
+                continue
+            if max_age_days is not None:
+                try:
+                    if (time.time() - os.path.getmtime(path)) / 86400.0 > max_age_days:
+                        continue            # 낡았으면 다음 후보(드라이브 쪽이 더 새로울 수 있다)
+                except Exception:
+                    continue
+            d = read_parquet_safe(path)
+            if d is None:
+                continue
+            if where == "DRIVE":
+                self._mirror_down(path, name, scope)     # 다음 실행부터는 로컬에서 즉시 읽는다
+            self.stats[f"table_hit_{where.lower()}"] += 1
+            PIPE.io("IN", where, f"table:{name}", d, source=path)
+            return d
+        return None
+
+    def _mirror_up(self, src: str, name: str, scope: str):
+        md = self.mirror_table_dir(scope)
+        if not md or os.path.dirname(os.path.abspath(src)) == os.path.abspath(md):
+            return
+        try:
+            os.makedirs(md, exist_ok=True)
+            dst = os.path.join(md, f"{os.path.basename(src)}")
+            tmp = dst + f".tmp{os.getpid()}"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            self.stats["table_mirrored_up"] += 1
+        except Exception:
+            pass
+
+    def _mirror_down(self, src: str, name: str, scope: str):
+        """드라이브에서 읽은 표를 로컬 미러에 복사한다. 실패해도 조용히 넘어간다(가속용일 뿐)."""
+        md = self.mirror_table_dir(scope)
+        if not md:
+            return
+        try:
+            dst = os.path.join(md, f"{name}.parquet")
+            if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+                return
+            os.makedirs(md, exist_ok=True)
+            tmp = dst + f".tmp{os.getpid()}"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            self.stats["table_mirrored_down"] += 1
+        except Exception:
+            pass
 
     def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
               source: str = "", event_date=None, knowledge_date=None,
@@ -2181,16 +2296,64 @@ def euckr_q(s: str) -> str:
         return quote(str(s))
 
 
+class _TooBig(Exception):
+    """응답이 상한을 넘었다 — 재시도해도 같은 결과다. 재시도 대상이 아니다."""
+
+
+@contextmanager
+def _deadline(resp, deadline_s: float, label: str):
+    """응답 본문 읽기에 **전체 마감**을 건다.
+
+    ★ requests 의 timeout= 은 연결과 '바이트 사이 간격' 에만 걸린다. 전체 다운로드
+      마감이 아니다. 서버가 timeout 안쪽 간격으로 조금씩 흘려보내면 r.content 는
+      몇 시간이든 매달리고 예외도 로그도 없다 — 파이프라인 전체가 조용히 잠긴다.
+      실제로 OpenDART corpCode.xml(약 20MB)이 정확히 이 방식으로 무한정 멈췄다.
+
+    ★ 그리고 resp.close() / resp.raw.close() 로는 못 푼다. 이미 recv() 에 블록된
+      스레드는 그대로 남는다(재현 확인: 워치독은 발동하는데 프로세스는 계속 매달림).
+      커널에게 FD 를 끊게 하는 socket.shutdown(SHUT_RDWR) 만이 블록된 recv() 를
+      즉시 예외로 되돌린다. 그래서 이 가드는 소켓을 직접 끊는다.
+    """
+    sk = _resp_socket(resp)
+    fired = {"v": False}
+
+    def _kill():
+        fired["v"] = True
+        LOG.warn(f"    ↓ {label} 전체 마감 {deadline_s:.0f}s 초과 — 연결을 끊습니다")
+        for fn in (lambda: sk.shutdown(_socket.SHUT_RDWR), lambda: sk.close(),
+                   lambda: resp.raw.close(), lambda: resp.close()):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    killer = threading.Timer(deadline_s, _kill)
+    killer.daemon = True
+    killer.start()
+    try:
+        yield fired
+    finally:
+        killer.cancel()
+
+
 def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              headers: Optional[dict] = None, timeout: int = 25, tries: int = 4,
              as_bytes: bool = False, allow_status: Sequence[int] = (200,),
              referer: Optional[str] = None, quiet: bool = True,
-             force_enc: Optional[str] = None,
+             force_enc: Optional[str] = None, deadline_s: Optional[float] = None,
              on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
+    """단건 GET. **한 번의 시도는 deadline_s 안에 반드시 끝난다** (기본 timeout×3, 최소 60s).
+
+    마감을 여기 계층에 둔 이유: 호출지점마다 따로 막으면 새 호출지점이 하나 생길 때마다
+    같은 정체가 되살아난다. 감사 결과 실제로 그랬다 — corpCode 만 고쳤더니 marcap 파케이,
+    fdr.DataReader, 리스트 크롤이 전부 같은 성질의 무한대기로 남아 있었다.
+    """
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
         hdr["Referer"] = referer
+    dl = float(deadline_s) if deadline_s else max(60.0, float(timeout) * 3.0)
+    label = url.split("/")[-1][:40] or source
     last_exc = None
     for attempt in range(tries):
         lim.wait()
@@ -2203,11 +2366,15 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
             s = _session()
             if attempt > 0:
                 hdr["User-Agent"] = UA_POOL[attempt % len(UA_POOL)]
-            r = s.get(url, params=params, headers=hdr, timeout=timeout)
+            #  stream=True + 가드 안에서 .content 를 읽는다. 본문 읽기가 마감에 걸리면
+            #  소켓이 끊기면서 예외로 빠져나온다(무한대기 불가).
+            r = s.get(url, params=params, headers=hdr, timeout=timeout, stream=True)
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:{r.status_code}"] += 1
             if r.status_code in allow_status:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                with _deadline(r, dl, label):
+                    body = r.content
+                return body if as_bytes else _decode(body, r.encoding, url, force_enc)
             if r.status_code in (429, 503):
                 time.sleep(min(30.0, 2.0 * (2 ** attempt)) + random.random())
                 last_exc = requests.HTTPError(f"{r.status_code} {url}")
@@ -2226,6 +2393,128 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
         LOG.debug(f"GET 실패({source}) {url[:90]} — {type(last_exc).__name__}")
     with _HTTP_LK:
         HTTP_STATS[f"{source}:FAIL"] += 1
+    return None
+
+
+def _resp_socket(resp):
+    """requests 응답에서 **진짜 소켓 객체**를 캐낸다.
+
+    requests → urllib3.HTTPResponse(raw) → http.client.HTTPResponse(_fp)
+    → socket 의 buffered reader(fp) → SocketIO(raw) → socket(_sock).
+    urllib3 버전마다 경로가 조금씩 달라서 후보를 순서대로 시도한다.
+    못 찾으면 None — 그러면 마감은 못 걸지만 나머지 동작은 그대로다.
+    """
+    for path in (lambda: resp.raw._connection.sock,
+                 lambda: resp.raw._fp.fp.raw._sock,
+                 lambda: resp.raw._fp.fp._sock,
+                 lambda: resp.raw._original_response.fp.raw._sock):
+        try:
+            s = path()
+            if s is not None:
+                return s
+        except Exception:
+            continue
+    return None
+
+
+
+def http_get_stream(url: str, source: str = "generic", params: Optional[dict] = None,
+                    headers: Optional[dict] = None, connect_timeout: int = 15,
+                    read_timeout: int = 30, deadline_s: float = 300.0,
+                    tries: int = 3, referer: Optional[str] = None,
+                    max_bytes: int = 400 * 1024 * 1024,
+                    desc: str = "") -> Optional[bytes]:
+    """대용량 응답 전용 다운로더 — **전체 소요시간 상한**이 있다.
+
+    ★ 왜 http_get 으로 충분하지 않은가 (실제로 겪은 사고다):
+      requests 의 timeout 은 '연결' 과 '바이트 사이 간격' 에만 걸린다. 전체 다운로드
+      마감이 아니다. 서버가 25초 안쪽 간격으로 조금씩 흘려보내면 r.content 는 몇 시간이든
+      매달리고 예외도 나지 않는다 — 로그 한 줄 없이 파이프라인 전체가 잠긴다.
+      실행 로그에서 OpenDART corpCode.xml(약 20MB)이 정확히 이 방식으로 무한정 멈췄다.
+
+    → 그래서 여기서는 stream=True 로 청크를 받으면서 **경과시간을 직접 재고**,
+      deadline_s 를 넘기면 그 자리에서 포기한다. 진행률도 찍으므로 침묵이 없다.
+    """
+    lim = limiter(source)
+    hdr = dict(headers or {})
+    if referer:
+        hdr["Referer"] = referer
+    label = desc or url.split("/")[-1][:40]
+    for attempt in range(max(1, tries)):
+        lim.wait()
+        t0 = time.time()
+        got = bytearray()
+        total = 0
+        prog_stop = threading.Event()
+        try:
+            s_ = _session()
+            if attempt > 0:
+                hdr["User-Agent"] = UA_POOL[attempt % len(UA_POOL)]
+            r = s_.get(url, params=params, headers=hdr, stream=True,
+                       timeout=(connect_timeout, read_timeout))
+            #  ★ 전체 마감의 유일한 집행자: 워치독이 **소켓을 shutdown** 한다.
+            #    - 청크 크기로는 못 막는다. chunk_size 를 크게 주면 그만큼 모일 때까지
+            #      루프 본문이 안 돌고, chunk_size=None 은 urllib3 가 read(None) 으로
+            #      본문 전체를 기다린다.
+            #    - resp.raw.close()/resp.close() 로도 못 막는다. 이미 recv() 에 블록된
+            #      스레드는 풀려나지 않는다 — 워치독은 발동하는데 다운로드는 그대로
+            #      매달린다. 재현 테스트로 확인했다(t_min.py: 워치독 20.0s 발동 후에도
+            #      프로세스가 살아남아 timeout 124 로 강제 종료됨).
+            #    → 커널에게 FD 를 끊게 하는 socket.shutdown(SHUT_RDWR) 만이 블록된
+            #      recv() 를 즉시 예외로 되돌린다. t_min2.py 로 20.0s 정확히 검증.
+            def _progress():                # 15초마다 진행률 — 멈춰 있어도 로그가 난다
+                while not prog_stop.wait(15.0):
+                    n, el = len(got), time.time() - t0
+                    pct = f" / {total/1e6:.0f}MB ({100*n/total:.0f}%)" if total else ""
+                    LOG.info(f"    ↓ {label} {n/1e6:.1f}MB{pct} · {el:.0f}s"
+                             f"{'  (수신 정체)' if n == 0 else ''}")
+            threading.Thread(target=_progress, daemon=True,
+                             name=f"dl-{label[:12]}").start()
+            try:
+                with _HTTP_LK:
+                    HTTP_STATS[f"{source}:{r.status_code}"] += 1
+                if r.status_code != 200:
+                    raise requests.HTTPError(f"{r.status_code} {url}")
+                #  Content-Length 가 중복 헤더로 오면 '123, 123' 이라 int() 가 터진다.
+                #  그건 네트워크 실패가 아니므로 재시도로 낭비하지 않고 0 으로 둔다.
+                try:
+                    total = int(str(r.headers.get("Content-Length") or 0).split(",")[0])
+                except Exception:
+                    total = 0
+                with _deadline(r, deadline_s, label):
+                    for chunk in r.iter_content(chunk_size=1 << 16):
+                        if not chunk:
+                            continue
+                        got.extend(chunk)
+                        if len(got) > max_bytes:
+                            raise _TooBig(f"응답이 {max_bytes/1e6:.0f}MB 를 넘었습니다")
+            finally:
+                prog_stop.set()
+            if total and len(got) < total:
+                raise IOError(f"불완전 수신 {len(got):,}/{total:,}B")
+            if len(got):
+                LOG.debug(f"↓ {label} 완료 {len(got)/1e6:.1f}MB · {time.time()-t0:.1f}s")
+                return bytes(got)
+            raise IOError("빈 응답")
+        except _TooBig as e:
+            prog_stop.set()
+            LOG.warn(f"↓ {label} {e} — 같은 결과가 나올 것이므로 재시도하지 않습니다.")
+            break
+        except BaseException as e:      # noqa — 소켓 절단은 어떤 예외로도 올라올 수 있다
+            prog_stop.set()
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            el = time.time() - t0
+            kind = ("전체 마감 초과" if el >= deadline_s - 1 else f"{type(e).__name__}")
+            with _HTTP_LK:
+                HTTP_STATS[f"{source}:{type(e).__name__}"] += 1
+            LOG.debug(f"↓ {label} 시도 {attempt+1}/{tries} 실패({kind}) · "
+                      f"{len(got)/1e6:.1f}MB 수신 · {el:.0f}s")
+            time.sleep(min(8.0, 1.7 ** attempt))
+    with _HTTP_LK:
+        HTTP_STATS[f"{source}:FAIL"] += 1
+    LOG.warn(f"↓ {label} 다운로드 실패 — 전체 마감 {deadline_s:.0f}s 안에 못 받았습니다. "
+             f"이 호출은 여기서 포기하고 파이프라인은 계속 진행합니다.")
     return None
 
 
@@ -2479,8 +2768,15 @@ def scg_fetch_spine(years: Sequence[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
                 miss.append(y)
                 continue
             t0 = time.time()
-            raw = http_get(_MARCAP_URL.format(y=y), source="fdr", as_bytes=True,
-                           tries=3, timeout=240)
+            #  ★ 여기가 이 프로그램에서 가장 큰 페이로드(연 40MB급)이고 크리티컬
+            #    스테이지다. 일반 http_get 은 전체 마감이 없어서 서버가 조금씩만
+            #    흘려보내면 영원히 매달린다 — corpCode 와 정확히 같은 사고다.
+            #    600s: 정상 회선이면 수 초, 정체 시 연당 600s×3회로 상한이 생긴다.
+            raw = http_get_stream(_MARCAP_URL.format(y=y), source="fdr",
+                                  connect_timeout=15, read_timeout=60,
+                                  deadline_s=600.0, tries=3,
+                                  max_bytes=300 * 1024 * 1024,
+                                  desc=f"marcap-{y}.parquet")
             if not raw or len(raw) < 10_000:
                 miss.append(y)
                 LOG.warn(f"  [{k}/{len(ys)}] {y} 다운로드 실패 — 그 해는 유니버스에서 빠집니다")
@@ -2737,7 +3033,17 @@ def scg_fetch_delisting() -> pd.DataFrame:
 
 
 def scg_fetch_dart_corpcode() -> pd.DataFrame:
-    """DART corpCode.xml — corp_code ↔ stock_code 매핑 (KRX 아님, 금융감독원)."""
+    """DART corpCode.xml — corp_code ↔ stock_code 매핑 (KRX 아님, 금융감독원).
+
+    ★ 이 함수는 유니버스의 **필수 입력이 아니다**. 스파인이 종목 마스터를 만들므로
+      corp_code 는 DART 실적 실측치를 종목에 붙일 때만 필요하다. 그래서 호출부는
+      L1.UNI(크리티컬)가 아니라 L1.DART(비필수)에 있고, 여기서 실패하면 EPS 트랙만
+      degrade 되고 백테스트는 그대로 진행된다.
+
+    ★ 다운로드는 반드시 전체 마감이 있는 스트리밍으로 한다. 이 응답이 파이프라인에서
+      가장 큰 단일 페이로드(약 20MB zip)이고, 일반 http_get 으로 받으면 서버가 느리게
+      흘려보낼 때 몇 시간이든 매달린다(실제로 그렇게 멈췄다).
+    """
     cols = ["corp_code", "corp_name", "code", "modify_date"]
     cached = VAULT.get_table("dart_corpcode", scope="shared", max_age_days=30)
     if cached is not None and len(cached):
@@ -2747,33 +3053,54 @@ def scg_fetch_dart_corpcode() -> pd.DataFrame:
         LOG.info("DART_API_KEY 가 없어 corp_code 매핑을 건너뜁니다 → 실적 실측치(A)가 없어 "
                  "ACC* 는 전부 0 으로 수축됩니다(애널리스트는 유지).")
         return pd.DataFrame(columns=cols)
-    raw = http_get("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
-                   params={"crtfc_key": DART_API_KEY}, as_bytes=True, tries=3,
-                   referer="https://opendart.fss.or.kr/")
+
+    LOG.info("DART corpCode.xml 내려받는 중 (약 20MB · 전체 마감 180초)…")
+    raw = http_get_stream("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
+                          params={"crtfc_key": DART_API_KEY}, deadline_s=180.0, tries=2,
+                          referer="https://opendart.fss.or.kr/", desc="corpCode.xml")
     if not raw or len(raw) < 1000:
-        LOG.warn("corpCode.xml 을 받지 못했습니다. DART_API_KEY 를 확인하세요.")
+        LOG.warn("corpCode.xml 을 받지 못했습니다 → EPS 실측치를 종목에 붙일 수 없어 "
+                 "ACC* 가 0 으로 수축됩니다(애널리스트·종목은 그대로 유지). "
+                 "백테스트는 계속 진행합니다. DART_API_KEY 와 네트워크를 확인하세요.")
         return pd.DataFrame(columns=cols)
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             xml = z.read(z.namelist()[0])
     except Exception as e:
         LOG.warn(f"corpCode.xml 압축 해제 실패({type(e).__name__}) — 응답이 ZIP 이 아닙니다 "
-                 f"(대개 인증키 오류 시 XML 에러문서가 옵니다).")
+                 f"(인증키가 틀리면 XML 에러문서가 200 으로 옵니다). EPS 트랙만 degrade 됩니다.")
         return pd.DataFrame(columns=cols)
-    rows = re.findall(
-        rb"<list>\s*<corp_code>(.*?)</corp_code>\s*<corp_name>(.*?)</corp_name>\s*"
-        rb"<stock_code>(.*?)</stock_code>\s*<modify_date>(.*?)</modify_date>", xml, re.S)
-    if not rows:
+
+    #  ★ 정규식 대신 iterparse. 압축을 풀면 100MB 급이라 DOTALL + 게으른 수량자 조합은
+    #    한 엔트리만 어긋나도 남은 전체를 되짚으며 폭주할 수 있고, findall 은 결과를
+    #    통째로 메모리에 올린다. iterparse 는 선형이고 상수 메모리다.
+    t0 = time.time()
+    recs: List[Tuple[str, str, str, str]] = []
+    try:
+        for _ev, el in _ET.iterparse(io.BytesIO(xml), events=("end",)):
+            if el.tag != "list":
+                continue
+            g = {c.tag: (c.text or "").strip() for c in el}
+            recs.append((g.get("corp_code", ""), g.get("corp_name", ""),
+                         g.get("stock_code", ""), g.get("modify_date", "")))
+            el.clear()
+    except Exception as e:
+        LOG.warn(f"corpCode.xml 파싱 실패({type(e).__name__}) — EPS 트랙만 degrade 됩니다.")
         return pd.DataFrame(columns=cols)
-    t = pd.DataFrame({
-        "corp_code": [r[0].decode("utf-8", "ignore").strip() for r in rows],
-        "corp_name": [r[1].decode("utf-8", "ignore").strip() for r in rows],
-        "code": [to_code6(r[2].decode("utf-8", "ignore").strip()) for r in rows],
-        "modify_date": [r[3].decode("utf-8", "ignore").strip() for r in rows],
-    })
+    if not recs:
+        #  조용히 빈 표를 돌려주면 EPS 트랙이 '실측치 0건' 인 채로 끝까지 굴러가고,
+        #  그 결과가 ★공식 트랙으로 출력된다. 반드시 소리를 낸다.
+        LOG.warn(f"corpCode.xml 에서 <list> 항목을 0건 찾았습니다 (XML {len(xml)/1e6:.1f}MB) — "
+                 f"스키마가 바뀌었거나 오류문서를 받은 것입니다. EPS 트랙이 degrade 됩니다.")
+        return pd.DataFrame(columns=cols)
+    t = pd.DataFrame(recs, columns=["corp_code", "corp_name", "_sc", "modify_date"])
+    t["code"] = t["_sc"].map(to_code6)
+    t = t.drop(columns=["_sc"])
     VAULT.put_table("dart_corpcode", t, scope="shared", domain="dart", source="opendart corpCode")
-    LOG.ok(f"DART corpCode {len(t):,}건 (상장 {int(t['code'].notna().sum()):,}건)")
-    return t
+    VAULT.flush("shared")
+    LOG.ok(f"DART corpCode {len(t):,}건 (상장 {int(t['code'].notna().sum()):,}건) · "
+           f"파싱 {time.time()-t0:.1f}s")
+    return t.reindex(columns=cols)
 
 
 def scg_build_security_master(listing: pd.DataFrame, delisting: pd.DataFrame,
@@ -3078,27 +3405,19 @@ _SCG_ADJ_SRC = ("fdr", "naver", "pykrx")
 
 
 def _scg_px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    """FinanceDataReader — 한국 종목은 네이버 계열 소스라 KRX 로그인과 무관하다."""
-    if fdr is None:
-        return None
-    try:
-        limiter("fdr").wait()
-        d = fdr.DataReader(code, start, end)
-    except Exception:
-        return None
-    if d is None or not len(d):
-        return None
-    d = d.rename(columns={c: str(c).lower() for c in d.columns}).reset_index()
-    dc = next((c for c in d.columns if str(c).lower() in ("date", "index")), None)
-    if dc is None or "close" not in d.columns:
-        return None
-    out = pd.DataFrame({"code": code, "date": as_ts_series(d[dc]),
-                        "close_adj": pd.to_numeric(d["close"], errors="coerce"),
-                        "volume": pd.to_numeric(d.get("volume"), errors="coerce")})
-    out["amount"] = (pd.to_numeric(d["amount"], errors="coerce") if "amount" in d.columns
-                     else out["close_adj"] * out["volume"])
-    out["src"] = "fdr"
-    return out.dropna(subset=["date", "close_adj"])
+    """★ 폐기된 경로다 — 절대 되살리지 마라.
+
+    fdr.DataReader 는 **어떤 타임아웃도 받지 않는다**. 내부적으로
+    pandas.read_csv(<http url>) → urllib.request.urlopen(timeout 인자 없음)
+    으로 내려가고, 그건 socket 기본값(=None, 무한대기)이다. 게다가 호출부가
+    `except Exception: d = None` 으로 감싸고 있어서 멈춰도 예외도 로그도 없다 —
+    우리가 실제로 겪은 '조용한 정체'의 정확한 형태다.
+
+    한국 종목은 _scg_px_naver 가 같은 데이터를 덮고, 그쪽은 http_get(전체 마감 있음)
+    을 쓴다. 그래서 이 경로는 항상 None 을 돌려주고 사다리에서 빠진다.
+    """
+    return None
+
 
 
 def _scg_px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -3196,7 +3515,7 @@ def scg_fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame
         if s > hi:
             return None
         ss, ee = s.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
-        for fn in (_scg_px_fdr, _scg_px_naver):
+        for fn in (_scg_px_naver,):          # _scg_px_fdr 은 무한대기 위험으로 제외
             try:
                 d = fn(code, ss, ee)
             except Exception:
@@ -3329,19 +3648,32 @@ def scg_fetch_unadjusted(codes: Sequence[str], start: str, end: str,
     return have.reindex(columns=SCG_UNADJ_COLS)
 
 
+#  fdr.DataReader("KS11") 이 내부에서 읽는 바로 그 파일. 우리가 직접 마감을 걸고 받는다.
+_KS11_YEAR_CSV = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+                  "refs/heads/master/data/index/year_ks11/{y}.csv")
+
+
 def scg_fetch_benchmark(start: str, end: str) -> pd.DataFrame:
     """KOSPI 지수 — 벤치마크 + 거래일 캘린더의 1순위 원천."""
     cached = VAULT.get_table("benchmark_ks11_daily", scope="shared", max_age_days=3)
     if cached is not None and len(cached):
         cached["date"] = as_ts_series(cached["date"])
         return cached
-    d = None
-    if fdr is not None:
+    #  ★ fdr.DataReader("KS11") 을 쓰지 않는다. 그건 내부에서 연도별 GitHub CSV 를
+    #    pandas.read_csv(<url>) 로 읽는데, 그 경로에는 타임아웃이 없다(urlopen 기본값
+    #    =무한대기). 같은 파일을 우리가 직접, 전체 마감을 걸고 받는다. 결과는 동일하고
+    #    최악의 경우에도 연당 60s×2회로 끝난다.
+    frames = []
+    for y in range(as_ts(start).year, as_ts(end).year + 1):
+        b = http_get_stream(_KS11_YEAR_CSV.format(y=y), source="fdr",
+                            deadline_s=60.0, tries=2, desc=f"ks11-{y}.csv")
+        if not b:
+            continue
         try:
-            limiter("fdr").wait()
-            d = fdr.DataReader("KS11", start, end)
+            frames.append(pd.read_csv(io.BytesIO(b)))
         except Exception:
-            d = None
+            continue
+    d = pd.concat(frames, ignore_index=True) if frames else None
     if (d is None or not len(d)) and yf is not None:
         try:
             limiter("yfinance").wait()
@@ -7254,10 +7586,38 @@ def scg_report_cache_ledger():
                     n = "읽기실패"
             rows.append([name, scope, n or "—",
                          f"{_safe_size(fp)/1e6:.1f}MB" if ok else "—", _trunc(why, 44)])
+    #  테이블만으로는 증거가 불완전하다 — 리포트 PDF 는 blob 으로 저장되므로
+    #  여기서 같이 세어준다. "모든 신규 수집 데이터"에는 원문 PDF 도 포함된다.
+    for scope in ("shared", "private"):
+        try:
+            bidx = VAULT.load_index(scope, force=False)
+        except Exception:
+            bidx = None
+        if bidx is None or not len(bidx) or "subtype" not in bidx.columns:
+            continue
+        #  테이블은 subtype=="table" 로 등록된다. 그 밖은 전부 원문 blob 이다.
+        b = bidx[bidx["subtype"].astype(str) != "table"]
+        if not len(b):
+            continue
+        for (dom, sub), g in b.groupby([b["domain"].astype(str),
+                                        b["subtype"].astype(str)]):
+            sz = pd.to_numeric(g["bytes"], errors="coerce").fillna(0).sum() if "bytes" in g else 0
+            rows.append([f"{dom}/{sub} (원문파일)", scope, f"{len(g):,}건",
+                         f"{sz/1e6:.0f}MB" if sz else "—",
+                         _trunc("수집한 원문 그대로 — 재파싱 시 재다운로드 없음", 44)])
     LOG.table(rows, ["데이터셋", "인덱스", "저장량", "용량", "무엇인가"],
               ["l", "c", "r", "r", "l"],
               title="★ 캐시 원장 — 신규 수집된 모든 데이터는 여기에 저장되고 다음 실행에서 "
                     "네트워크 없이 재호출됩니다 (공용=다른 전략도 재사용 · 전용=이 전략 산출물)")
+    LOG.info(f"저장 위치 — 드라이브(원본): {VAULT.root}")
+    if getattr(VAULT, "mirror", None):
+        hl = VAULT.stats.get("table_hit_local", 0)
+        hd = VAULT.stats.get("table_hit_drive", 0)
+        LOG.info(f"           로컬 미러(가속 사본): {VAULT.mirror} — 이번 실행 캐시 적중 "
+                 f"로컬 {hl:,}회 / 드라이브 {hd:,}회. 읽기는 로컬을 먼저 보고 없으면 "
+                 f"드라이브에서 읽은 뒤 로컬로 되받습니다(다음 실행이 더 빨라집니다).")
+    else:
+        LOG.info("           로컬 미러 없음 — 드라이브 경로가 곧 로컬 경로입니다.")
     miss = [r[0] for r in rows if r[2] in ("—", "")]
     if miss:
         LOG.info(f"아직 비어 있는 항목: {', '.join(miss[:8])}"
@@ -8434,7 +8794,11 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
     with PIPE.stage("L1.UNI", "종목 마스터 · 거래일 캘린더", "L1", budget_s=900):
         listing = scg_fetch_listing()
         delist = scg_fetch_delisting()
-        corpcode = scg_fetch_dart_corpcode()
+        #  ★ corp_code 는 여기서 부르지 않는다. 유니버스는 스파인만으로 완성되고,
+        #    corp_code 는 DART 실적 실측치를 종목에 붙일 때만 필요하다. 20MB 다운로드를
+        #    크리티컬 스테이지에 두면 그 한 번의 지연이 백테스트 전체를 잠근다
+        #    (실제로 이 자리에서 무한정 멈췄다). L1.DART(비필수)로 옮겼다.
+        corpcode = pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
         if len(S):
             sec = scg_spine_master(S, META)
             if len(listing):
@@ -8466,8 +8830,18 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
             cal = pd.DatetimeIndex([])
         ctx["sec"] = sec
 
-    with PIPE.stage("L1.PX", "가격 패널 · 벤치마크", "L1", budget_s=3600):
-        bench = scg_fetch_benchmark(warm_start, BACKTEST_END)
+    with PIPE.stage("L1.BENCH", "벤치마크(KOSPI)", "L1", budget_s=300, critical=False):
+        #  ★ 벤치마크를 크리티컬 스테이지에서 뺀다. 스파인 경로에서 캘린더는 이미
+        #    scg_spine_calendar(S) 가 만들었고, 벤치마크는 초과수익·레짐 분할용 '보강'
+        #    입력일 뿐이다. 보강 하나가 백테스트 전체를 잠그게 두지 않는다.
+        ctx["bench"] = scg_fetch_benchmark(warm_start, BACKTEST_END)
+
+    with PIPE.stage("L1.PX", "가격 패널", "L1", budget_s=3600):
+        bench = ctx.get("bench")
+        if bench is None or not len(bench):
+            bench = pd.DataFrame(columns=["date", "close"])
+            LOG.warn("벤치마크 없이 진행합니다 — 캘린더는 스파인/가격에서 만들고, "
+                     "초과수익·레짐 분할만 생략됩니다.")
         if len(S):
             #  ★ 종목별 가격 수집이 **한 건도** 없다. 스파인의 ChangesRatio 로 수정주가
             #    계열을 만든다(KRX 기준가 기반이라 분할·증자가 이미 보정돼 있다).
@@ -8541,6 +8915,17 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
         years = list(range(as_ts(warm_start).year - 1, as_ts(BACKTEST_END).year + 1))
         scg_report_dart_plan(len(ctx["sec"]), len(years), max(len(covered), 1),
                              have_spine=bool(len(ctx.get("spine", []))))
+        #  corp_code 매핑을 여기서 확보한다(비필수 스테이지). 실패하면 EPS 트랙만
+        #  degrade 되고 유니버스·가격·백테스트는 이미 완성돼 있으므로 그대로 간다.
+        cc = scg_fetch_dart_corpcode()
+        if len(cc):
+            m = cc.dropna(subset=["code"]).drop_duplicates("code")[["code", "corp_code"]]
+            sec2 = ctx["sec"].drop(columns=["corp_code"]).merge(m, on="code", how="left")
+            ctx["sec"] = sec2
+            LOG.ok(f"corp_code 매핑 {int(sec2['corp_code'].notna().sum()):,}/{len(sec2):,}종목")
+        else:
+            LOG.warn("corp_code 매핑이 없어 DART 실적 실측치를 종목에 붙일 수 없습니다 → "
+                     "ACC* 는 0 으로 수축되고 TP 트랙이 공식 트랙이 됩니다. 계속 진행합니다.")
         dis = scg_fetch_periodic_disclosures(warm_start, BACKTEST_END)
         ctx["annual_rcept"] = scg_annual_report_dates(dis)
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
@@ -8858,6 +9243,25 @@ def main() -> dict:
     #    SMALL1000 행까지 분모에 들어가 비율이 흐려진다.
     n_eps, n_tp = cov.get("EPS/ALL", 0), cov.get("TP/ALL", 0)
     eps_share = n_eps / max(n_tp, 1) if n_tp else (1.0 if n_eps else 0.0)
+
+    #  ★ 신호 '수' 만으로 판정하면 가장 위험한 고장을 놓친다.
+    #    DART 실측치(A)나 corp_code 를 통째로 못 받아도 EPS 신호 수는 그대로다.
+    #    그때 acc_star 가 전부 0 이 되고 → quality_multiplier = exp(0.7×0) = 1 →
+    #    smart_consensus_scg0 가 consensus_equal_weight 와 **수치적으로 동일**해진다.
+    #    즉 '스마트 컨센서스' 라는 전략의 전제가 사라진 결과를 ★공식 트랙으로 내보낸다.
+    #    신호 수 게이트는 이 고장에 대해 영원히 발동하지 않는다. 그래서 따로 본다.
+    _ae = (results.get("EPS/ALL") or {}).get("accuracy_events")
+    if primary == "EPS" and (_ae is None or not len(_ae)):
+        LOG.warn("EPS 트랙의 실적 실측 사건(ACC_EVENT)이 0건입니다 — corp_code 또는 DART "
+                 "실측치를 확보하지 못했습니다. acc_star 가 전부 0 이라 SCG0 스마트컨센서스가 "
+                 "equal-weight 컨센서스와 수치적으로 동일합니다(전략의 전제가 사라졌습니다).")
+        if "TP/ALL" in results:
+            LOG.warn("공식 트랙을 TP 로 내립니다. EPS 결과도 대조 트랙으로 그대로 출력합니다.")
+            primary = "TP"
+        else:
+            LOG.warn("TP 트랙도 없어 EPS 를 유지합니다 — 이 결과는 '스마트' 컨센서스가 아니라 "
+                     "단순 컨센서스 갭입니다. 성과표를 반드시 그렇게 읽으세요.")
+
     if primary == "EPS" and "TP/ALL" in results and eps_share < PRIMARY_METRIC_MIN_COVERAGE:
         LOG.warn(f"EPS 트랙의 유효 신호가 {n_eps:,}건으로 TP 트랙({n_tp:,}건) 대비 "
                  f"{100*eps_share:.1f}% 에 불과합니다 (임계 {100*PRIMARY_METRIC_MIN_COVERAGE:.0f}%). "

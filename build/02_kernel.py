@@ -58,9 +58,11 @@ class _Log:
             return
         el = time.time() - _T0_PROCESS
         stamp = f"{int(el // 60):02d}:{el % 60:05.2f}"
-        scope = ("/".join(self.ctx))[-34:]
-        line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
         with self.lock:
+            #  scope 도 잠금 안에서 읽는다 — 메인 스레드가 finally 에서 ctx.pop() 하는
+            #  사이에 백그라운드 줄이 엉뚱한 스테이지 이름을 달고 나가면 안 된다.
+            scope = ("/".join(self.ctx))[-34:]
+            line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
             self.buffer.append(line)
             _safe_print(line, flush=True)
 
@@ -70,38 +72,46 @@ class _Log:
     def warn(self, m):  self._emit("WARN",  m, "⚠ ")
     def error(self, m): self._emit("ERROR", m, "✘ ")
 
+    #  ★ rule/banner/table 은 '여러 줄이 한 덩어리' 다. 잠금 없이 찍으면 하트비트나
+    #    다운로드 진행률 한 줄이 표의 행 사이에 끼어들어 정렬이 깨진다 — 오류 위치를
+    #    한 화면에서 읽게 하려고 만든 커널인데 그 화면이 망가지는 것이다.
     def rule(self, title: str = "", ch: str = "─", width: int = 104):
-        if title:
-            pre = f"{ch * 3} {title} "
-            _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
-        else:
-            _safe_print(ch * width, flush=True)
+        with self.lock:
+            if title:
+                pre = f"{ch * 3} {title} "
+                _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
+            else:
+                _safe_print(ch * width, flush=True)
 
     def banner(self, title: str, sub: str = "", width: int = 104):
-        _safe_print("", flush=True)
-        _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
-        _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
-        if sub:
-            _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
-        _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
+        with self.lock:
+            _safe_print("", flush=True)
+            _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
+            _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
+            if sub:
+                _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
+            _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
 
     def table(self, rows: List[Sequence[Any]], headers: Sequence[str],
               aligns: Optional[Sequence[str]] = None, maxw: int = 46, title: str = ""):
         """한글 폭 보정 표. 강건성/성과/감사 출력 전부 이걸 쓴다."""
-        if title:
-            _safe_print(f"\n▶ {title}", flush=True)
-        if not rows:
-            _safe_print("   (행 없음)", flush=True)
-            return
-        ncol = len(headers)
-        aligns = list(aligns or ["l"] * ncol)
-        cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r)) for r in rows]
-        widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
-        head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
-        _safe_print(head, flush=True)
-        _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
-        for r in cells:
-            _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
+        with self.lock:
+            if title:
+                _safe_print(f"\n▶ {title}", flush=True)
+            if not rows:
+                _safe_print("   (행 없음)", flush=True)
+                return
+            ncol = len(headers)
+            aligns = list(aligns or ["l"] * ncol)
+            cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r))
+                     for r in rows]
+            widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
+            head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
+            _safe_print(head, flush=True)
+            _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
+            for r in cells:
+                _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i])
+                                              for i in range(ncol)), flush=True)
 
 
 LOG = _Log("DEBUG" if VERBOSE else "INFO")
@@ -300,7 +310,18 @@ class Pipeline:
 
         def _heartbeat():
             while not _hb_stop.wait(60.0):
-                LOG.info(f"    …[{sid}] 진행 중 · {(time.time()-rec.t_start)/60:.1f}분 경과")
+                #  ★ 깨어난 뒤 잠금 안에서 다시 확인한다. wait() 가 돌아오는 순간과
+                #    finally 사이에 스테이지가 끝날 수 있고, 그러면 이미 끝난 스테이지의
+                #    '진행 중' 이 다음 스테이지 출력이나 최종 요약표 한가운데에 찍힌다.
+                with LOG.lock:
+                    if _hb_stop.is_set():
+                        return
+                    el = time.time() - rec.t_start
+                    if budget_s is not None and el > budget_s:
+                        LOG.warn(f"    …[{sid}] {el/60:.1f}분 경과 — 예산 {budget_s:.0f}s 를 "
+                                 f"넘겼는데도 응답이 없습니다. 정체를 의심하세요.")
+                    else:
+                        LOG.info(f"    …[{sid}] 진행 중 · {el/60:.1f}분 경과")
 
         _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name=f"hb-{sid}")
         _hb_thread.start()
@@ -335,7 +356,9 @@ class Pipeline:
             rec.status = "WARN"
             rec.notes.append(f"WARN: 비필수 스테이지 실패 — {rec.err_type}")
         finally:
-            _hb_stop.set()
+            with LOG.lock:
+                _hb_stop.set()
+            _hb_thread.join(timeout=2.0)   # 늦은 한 줄이 다음 스테이지로 새지 않게
             LOG.ctx.pop()
             self.current = prev
 

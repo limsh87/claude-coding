@@ -56,7 +56,11 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
     with PIPE.stage("L1.UNI", "종목 마스터 · 거래일 캘린더", "L1", budget_s=900):
         listing = scg_fetch_listing()
         delist = scg_fetch_delisting()
-        corpcode = scg_fetch_dart_corpcode()
+        #  ★ corp_code 는 여기서 부르지 않는다. 유니버스는 스파인만으로 완성되고,
+        #    corp_code 는 DART 실적 실측치를 종목에 붙일 때만 필요하다. 20MB 다운로드를
+        #    크리티컬 스테이지에 두면 그 한 번의 지연이 백테스트 전체를 잠근다
+        #    (실제로 이 자리에서 무한정 멈췄다). L1.DART(비필수)로 옮겼다.
+        corpcode = pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
         if len(S):
             sec = scg_spine_master(S, META)
             if len(listing):
@@ -88,8 +92,18 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
             cal = pd.DatetimeIndex([])
         ctx["sec"] = sec
 
-    with PIPE.stage("L1.PX", "가격 패널 · 벤치마크", "L1", budget_s=3600):
-        bench = scg_fetch_benchmark(warm_start, BACKTEST_END)
+    with PIPE.stage("L1.BENCH", "벤치마크(KOSPI)", "L1", budget_s=300, critical=False):
+        #  ★ 벤치마크를 크리티컬 스테이지에서 뺀다. 스파인 경로에서 캘린더는 이미
+        #    scg_spine_calendar(S) 가 만들었고, 벤치마크는 초과수익·레짐 분할용 '보강'
+        #    입력일 뿐이다. 보강 하나가 백테스트 전체를 잠그게 두지 않는다.
+        ctx["bench"] = scg_fetch_benchmark(warm_start, BACKTEST_END)
+
+    with PIPE.stage("L1.PX", "가격 패널", "L1", budget_s=3600):
+        bench = ctx.get("bench")
+        if bench is None or not len(bench):
+            bench = pd.DataFrame(columns=["date", "close"])
+            LOG.warn("벤치마크 없이 진행합니다 — 캘린더는 스파인/가격에서 만들고, "
+                     "초과수익·레짐 분할만 생략됩니다.")
         if len(S):
             #  ★ 종목별 가격 수집이 **한 건도** 없다. 스파인의 ChangesRatio 로 수정주가
             #    계열을 만든다(KRX 기준가 기반이라 분할·증자가 이미 보정돼 있다).
@@ -163,6 +177,17 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
         years = list(range(as_ts(warm_start).year - 1, as_ts(BACKTEST_END).year + 1))
         scg_report_dart_plan(len(ctx["sec"]), len(years), max(len(covered), 1),
                              have_spine=bool(len(ctx.get("spine", []))))
+        #  corp_code 매핑을 여기서 확보한다(비필수 스테이지). 실패하면 EPS 트랙만
+        #  degrade 되고 유니버스·가격·백테스트는 이미 완성돼 있으므로 그대로 간다.
+        cc = scg_fetch_dart_corpcode()
+        if len(cc):
+            m = cc.dropna(subset=["code"]).drop_duplicates("code")[["code", "corp_code"]]
+            sec2 = ctx["sec"].drop(columns=["corp_code"]).merge(m, on="code", how="left")
+            ctx["sec"] = sec2
+            LOG.ok(f"corp_code 매핑 {int(sec2['corp_code'].notna().sum()):,}/{len(sec2):,}종목")
+        else:
+            LOG.warn("corp_code 매핑이 없어 DART 실적 실측치를 종목에 붙일 수 없습니다 → "
+                     "ACC* 는 0 으로 수축되고 TP 트랙이 공식 트랙이 됩니다. 계속 진행합니다.")
         dis = scg_fetch_periodic_disclosures(warm_start, BACKTEST_END)
         ctx["annual_rcept"] = scg_annual_report_dates(dis)
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
@@ -480,6 +505,25 @@ def main() -> dict:
     #    SMALL1000 행까지 분모에 들어가 비율이 흐려진다.
     n_eps, n_tp = cov.get("EPS/ALL", 0), cov.get("TP/ALL", 0)
     eps_share = n_eps / max(n_tp, 1) if n_tp else (1.0 if n_eps else 0.0)
+
+    #  ★ 신호 '수' 만으로 판정하면 가장 위험한 고장을 놓친다.
+    #    DART 실측치(A)나 corp_code 를 통째로 못 받아도 EPS 신호 수는 그대로다.
+    #    그때 acc_star 가 전부 0 이 되고 → quality_multiplier = exp(0.7×0) = 1 →
+    #    smart_consensus_scg0 가 consensus_equal_weight 와 **수치적으로 동일**해진다.
+    #    즉 '스마트 컨센서스' 라는 전략의 전제가 사라진 결과를 ★공식 트랙으로 내보낸다.
+    #    신호 수 게이트는 이 고장에 대해 영원히 발동하지 않는다. 그래서 따로 본다.
+    _ae = (results.get("EPS/ALL") or {}).get("accuracy_events")
+    if primary == "EPS" and (_ae is None or not len(_ae)):
+        LOG.warn("EPS 트랙의 실적 실측 사건(ACC_EVENT)이 0건입니다 — corp_code 또는 DART "
+                 "실측치를 확보하지 못했습니다. acc_star 가 전부 0 이라 SCG0 스마트컨센서스가 "
+                 "equal-weight 컨센서스와 수치적으로 동일합니다(전략의 전제가 사라졌습니다).")
+        if "TP/ALL" in results:
+            LOG.warn("공식 트랙을 TP 로 내립니다. EPS 결과도 대조 트랙으로 그대로 출력합니다.")
+            primary = "TP"
+        else:
+            LOG.warn("TP 트랙도 없어 EPS 를 유지합니다 — 이 결과는 '스마트' 컨센서스가 아니라 "
+                     "단순 컨센서스 갭입니다. 성과표를 반드시 그렇게 읽으세요.")
+
     if primary == "EPS" and "TP/ALL" in results and eps_share < PRIMARY_METRIC_MIN_COVERAGE:
         LOG.warn(f"EPS 트랙의 유효 신호가 {n_eps:,}건으로 TP 트랙({n_tp:,}건) 대비 "
                  f"{100*eps_share:.1f}% 에 불과합니다 (임계 {100*PRIMARY_METRIC_MIN_COVERAGE:.0f}%). "

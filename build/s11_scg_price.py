@@ -23,27 +23,19 @@ _SCG_ADJ_SRC = ("fdr", "naver", "pykrx")
 
 
 def _scg_px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    """FinanceDataReader — 한국 종목은 네이버 계열 소스라 KRX 로그인과 무관하다."""
-    if fdr is None:
-        return None
-    try:
-        limiter("fdr").wait()
-        d = fdr.DataReader(code, start, end)
-    except Exception:
-        return None
-    if d is None or not len(d):
-        return None
-    d = d.rename(columns={c: str(c).lower() for c in d.columns}).reset_index()
-    dc = next((c for c in d.columns if str(c).lower() in ("date", "index")), None)
-    if dc is None or "close" not in d.columns:
-        return None
-    out = pd.DataFrame({"code": code, "date": as_ts_series(d[dc]),
-                        "close_adj": pd.to_numeric(d["close"], errors="coerce"),
-                        "volume": pd.to_numeric(d.get("volume"), errors="coerce")})
-    out["amount"] = (pd.to_numeric(d["amount"], errors="coerce") if "amount" in d.columns
-                     else out["close_adj"] * out["volume"])
-    out["src"] = "fdr"
-    return out.dropna(subset=["date", "close_adj"])
+    """★ 폐기된 경로다 — 절대 되살리지 마라.
+
+    fdr.DataReader 는 **어떤 타임아웃도 받지 않는다**. 내부적으로
+    pandas.read_csv(<http url>) → urllib.request.urlopen(timeout 인자 없음)
+    으로 내려가고, 그건 socket 기본값(=None, 무한대기)이다. 게다가 호출부가
+    `except Exception: d = None` 으로 감싸고 있어서 멈춰도 예외도 로그도 없다 —
+    우리가 실제로 겪은 '조용한 정체'의 정확한 형태다.
+
+    한국 종목은 _scg_px_naver 가 같은 데이터를 덮고, 그쪽은 http_get(전체 마감 있음)
+    을 쓴다. 그래서 이 경로는 항상 None 을 돌려주고 사다리에서 빠진다.
+    """
+    return None
+
 
 
 def _scg_px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -141,7 +133,7 @@ def scg_fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame
         if s > hi:
             return None
         ss, ee = s.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
-        for fn in (_scg_px_fdr, _scg_px_naver):
+        for fn in (_scg_px_naver,):          # _scg_px_fdr 은 무한대기 위험으로 제외
             try:
                 d = fn(code, ss, ee)
             except Exception:
@@ -274,19 +266,32 @@ def scg_fetch_unadjusted(codes: Sequence[str], start: str, end: str,
     return have.reindex(columns=SCG_UNADJ_COLS)
 
 
+#  fdr.DataReader("KS11") 이 내부에서 읽는 바로 그 파일. 우리가 직접 마감을 걸고 받는다.
+_KS11_YEAR_CSV = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+                  "refs/heads/master/data/index/year_ks11/{y}.csv")
+
+
 def scg_fetch_benchmark(start: str, end: str) -> pd.DataFrame:
     """KOSPI 지수 — 벤치마크 + 거래일 캘린더의 1순위 원천."""
     cached = VAULT.get_table("benchmark_ks11_daily", scope="shared", max_age_days=3)
     if cached is not None and len(cached):
         cached["date"] = as_ts_series(cached["date"])
         return cached
-    d = None
-    if fdr is not None:
+    #  ★ fdr.DataReader("KS11") 을 쓰지 않는다. 그건 내부에서 연도별 GitHub CSV 를
+    #    pandas.read_csv(<url>) 로 읽는데, 그 경로에는 타임아웃이 없다(urlopen 기본값
+    #    =무한대기). 같은 파일을 우리가 직접, 전체 마감을 걸고 받는다. 결과는 동일하고
+    #    최악의 경우에도 연당 60s×2회로 끝난다.
+    frames = []
+    for y in range(as_ts(start).year, as_ts(end).year + 1):
+        b = http_get_stream(_KS11_YEAR_CSV.format(y=y), source="fdr",
+                            deadline_s=60.0, tries=2, desc=f"ks11-{y}.csv")
+        if not b:
+            continue
         try:
-            limiter("fdr").wait()
-            d = fdr.DataReader("KS11", start, end)
+            frames.append(pd.read_csv(io.BytesIO(b)))
         except Exception:
-            d = None
+            continue
+    d = pd.concat(frames, ignore_index=True) if frames else None
     if (d is None or not len(d)) and yf is not None:
         try:
             limiter("yfinance").wait()

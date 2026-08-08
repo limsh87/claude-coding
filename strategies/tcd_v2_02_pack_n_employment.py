@@ -163,7 +163,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_N"
 STRATEGY_NAME      = "PACK-N 국민연금 고용"
 ACTIVE_PACKS       = ["N"]
-BUILD_VERSION      = "v2.20260808.1147"
+BUILD_VERSION      = "v2.20260808.1240"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -173,6 +173,8 @@ BUILD_VERSION      = "v2.20260808.1147"
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 import os, sys, re, io, gc, json, time, math, zipfile, hashlib, logging, textwrap, traceback
 import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, threading, unicodedata
+import xml.etree.ElementTree as _ET
+import socket as _socket
 import datetime as _dt
 from collections import defaultdict, Counter, OrderedDict
 from dataclasses import dataclass, field, asdict, replace
@@ -517,9 +519,11 @@ class _Log:
             return
         el = time.time() - _T0_PROCESS
         stamp = f"{int(el // 60):02d}:{el % 60:05.2f}"
-        scope = ("/".join(self.ctx))[-34:]
-        line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
         with self.lock:
+            #  scope 도 잠금 안에서 읽는다 — 메인 스레드가 finally 에서 ctx.pop() 하는
+            #  사이에 백그라운드 줄이 엉뚱한 스테이지 이름을 달고 나가면 안 된다.
+            scope = ("/".join(self.ctx))[-34:]
+            line = f"[{stamp}] {_pad(scope, 34)} {icon}{msg}"
             self.buffer.append(line)
             _safe_print(line, flush=True)
 
@@ -529,38 +533,46 @@ class _Log:
     def warn(self, m):  self._emit("WARN",  m, "⚠ ")
     def error(self, m): self._emit("ERROR", m, "✘ ")
 
+    #  ★ rule/banner/table 은 '여러 줄이 한 덩어리' 다. 잠금 없이 찍으면 하트비트나
+    #    다운로드 진행률 한 줄이 표의 행 사이에 끼어들어 정렬이 깨진다 — 오류 위치를
+    #    한 화면에서 읽게 하려고 만든 커널인데 그 화면이 망가지는 것이다.
     def rule(self, title: str = "", ch: str = "─", width: int = 104):
-        if title:
-            pre = f"{ch * 3} {title} "
-            _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
-        else:
-            _safe_print(ch * width, flush=True)
+        with self.lock:
+            if title:
+                pre = f"{ch * 3} {title} "
+                _safe_print(pre + ch * max(0, width - _dw(pre)), flush=True)
+            else:
+                _safe_print(ch * width, flush=True)
 
     def banner(self, title: str, sub: str = "", width: int = 104):
-        _safe_print("", flush=True)
-        _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
-        _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
-        if sub:
-            _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
-        _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
+        with self.lock:
+            _safe_print("", flush=True)
+            _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
+            _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
+            if sub:
+                _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
+            _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
 
     def table(self, rows: List[Sequence[Any]], headers: Sequence[str],
               aligns: Optional[Sequence[str]] = None, maxw: int = 46, title: str = ""):
         """한글 폭 보정 표. 강건성/성과/감사 출력 전부 이걸 쓴다."""
-        if title:
-            _safe_print(f"\n▶ {title}", flush=True)
-        if not rows:
-            _safe_print("   (행 없음)", flush=True)
-            return
-        ncol = len(headers)
-        aligns = list(aligns or ["l"] * ncol)
-        cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r)) for r in rows]
-        widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
-        head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
-        _safe_print(head, flush=True)
-        _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
-        for r in cells:
-            _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
+        with self.lock:
+            if title:
+                _safe_print(f"\n▶ {title}", flush=True)
+            if not rows:
+                _safe_print("   (행 없음)", flush=True)
+                return
+            ncol = len(headers)
+            aligns = list(aligns or ["l"] * ncol)
+            cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r))
+                     for r in rows]
+            widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
+            head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
+            _safe_print(head, flush=True)
+            _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
+            for r in cells:
+                _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i])
+                                              for i in range(ncol)), flush=True)
 
 
 LOG = _Log("DEBUG" if VERBOSE else "INFO")
@@ -759,7 +771,18 @@ class Pipeline:
 
         def _heartbeat():
             while not _hb_stop.wait(60.0):
-                LOG.info(f"    …[{sid}] 진행 중 · {(time.time()-rec.t_start)/60:.1f}분 경과")
+                #  ★ 깨어난 뒤 잠금 안에서 다시 확인한다. wait() 가 돌아오는 순간과
+                #    finally 사이에 스테이지가 끝날 수 있고, 그러면 이미 끝난 스테이지의
+                #    '진행 중' 이 다음 스테이지 출력이나 최종 요약표 한가운데에 찍힌다.
+                with LOG.lock:
+                    if _hb_stop.is_set():
+                        return
+                    el = time.time() - rec.t_start
+                    if budget_s is not None and el > budget_s:
+                        LOG.warn(f"    …[{sid}] {el/60:.1f}분 경과 — 예산 {budget_s:.0f}s 를 "
+                                 f"넘겼는데도 응답이 없습니다. 정체를 의심하세요.")
+                    else:
+                        LOG.info(f"    …[{sid}] 진행 중 · {el/60:.1f}분 경과")
 
         _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name=f"hb-{sid}")
         _hb_thread.start()
@@ -794,7 +817,9 @@ class Pipeline:
             rec.status = "WARN"
             rec.notes.append(f"WARN: 비필수 스테이지 실패 — {rec.err_type}")
         finally:
-            _hb_stop.set()
+            with LOG.lock:
+                _hb_stop.set()
+            _hb_thread.join(timeout=2.0)   # 늦은 한 줄이 다음 스테이지로 새지 않게
             LOG.ctx.pop()
             self.current = prev
 
@@ -1135,7 +1160,7 @@ def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, qui
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
 def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
-            desc: str = "", quiet: bool = False) -> List[Any]:
+            desc: str = "", quiet: bool = False, deadline_s: float = 3600.0) -> List[Any]:
     """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다."""
     items = list(items)
     if not items:
@@ -1143,18 +1168,36 @@ def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
     w = max(1, min(workers or N_WORKERS_IO, len(items)))
     out: List[Any] = [None] * len(items)
     errs: Counter = Counter()
+    #  ★ as_completed 에 반드시 마감을 준다. 없으면 워커 하나가 물리는 순간 메인
+    #    스레드가 영원히 멈추고, 더 나쁜 건 그때 Ctrl-C 도 소용없다는 점이다:
+    #    ThreadPoolExecutor 워커는 데몬이 아니고(3.9 에서 daemon=True 가 제거됐다)
+    #    with-블록 종료가 shutdown(wait=True) 이며 인터프리터 종료조차 atexit 에서
+    #    모든 워커를 join 한다 — SIGKILL 말고는 빠져나올 방법이 없다.
+    #    소켓 계층 마감(http_get/http_get_stream)이 1차 방어이고, 이건 그게 뚫렸을 때
+    #    최소한 '보고하고 계속 가게' 만드는 2차 안전망이다.
     with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
         futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
-        it_ = as_completed(futs)
+        pend = set(futs)
+        it_ = as_completed(futs, timeout=deadline_s)
         if not quiet:
             it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
-        for fu in it_:
-            i = futs[fu]
-            try:
-                out[i] = fu.result()
-            except Exception as e:                       # noqa
-                errs[type(e).__name__] += 1
-                out[i] = None
+        try:
+            for fu in it_:
+                pend.discard(fu)
+                i = futs[fu]
+                try:
+                    out[i] = fu.result(timeout=0)
+                except Exception as e:                   # noqa
+                    errs[type(e).__name__] += 1
+                    out[i] = None
+        except Exception as e:                           # noqa — concurrent TimeoutError
+            if not isinstance(e, TimeoutError) and type(e).__name__ != "TimeoutError":
+                raise
+            LOG.warn(f"{desc or '병렬작업'}: {len(pend):,}건이 {deadline_s/60:.0f}분 안에 "
+                     f"끝나지 않아 그 건들을 포기합니다 (결과는 결측 처리). "
+                     f"해당 스레드는 소켓 마감에 걸려 스스로 끝납니다.")
+            for fu in pend:
+                fu.cancel()
     if errs:
         LOG.warn(f"{desc or '병렬작업'} 중 실패 {sum(errs.values())}/{len(items)}건 — " +
                  ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))
@@ -1584,6 +1627,19 @@ class Vault:
             os.makedirs(os.path.join(p, "blob"), exist_ok=True)
             os.makedirs(os.path.join(p, "table"), exist_ok=True)
         os.makedirs(os.path.join(self.root, "_locks"), exist_ok=True)
+        #  ★ 로컬 미러 — 드라이브와 '양쪽 다' 탐색해서 시간을 아끼기 위한 것이다.
+        #    드라이브(특히 Colab FUSE)는 파케이 한 장 읽는 데도 눈에 띄게 느리다.
+        #    읽기: 로컬 먼저 → 없으면 드라이브 → 드라이브에서 찾으면 로컬로 복사(다음 실행 가속).
+        #    쓰기: 드라이브가 원본(세션 무관 원칙), 로컬은 사본. 드라이브를 훼손하지 않는다.
+        self.mirror = None
+        try:
+            lm = os.path.abspath(LOCAL_CACHE_ROOT)
+            if lm != self.root:
+                self.mirror = lm
+                for _sc, _nsn in (("shared", GDRIVE_SHARED_NS), ("private", GDRIVE_PRIVATE_NS)):
+                    os.makedirs(os.path.join(lm, _nsn, "table"), exist_ok=True)
+        except Exception:
+            self.mirror = None
         self._idx: Dict[str, pd.DataFrame] = {}
         self._uidset: Dict[str, set] = {}
         self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
@@ -1821,6 +1877,9 @@ class Vault:
         except Exception as e:                              # noqa
             LOG.warn(f"테이블 저장 실패({type(e).__name__}): {name}")
             return None
+        #  로컬 미러에도 같이 둔다 — 드라이브가 원본이고 이건 다음 실행 가속용 사본이다.
+        #  실패해도 원본은 이미 드라이브에 있으므로 조용히 넘어간다.
+        self._mirror_up(path, name, scope)
         self._register(scope, {
             "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
             "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
@@ -1831,25 +1890,81 @@ class Vault:
         })
         return path
 
+    def mirror_table_dir(self, scope: str) -> Optional[str]:
+        if not self.mirror:
+            return None
+        return os.path.join(self.mirror,
+                            GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                            "table")
+
+    def _table_candidates(self, name: str, scope: str) -> List[Tuple[str, str]]:
+        """(경로, 출처) 를 **빠른 것 먼저** 돌려준다.
+
+        순서: 로컬미러(요청 scope) → 로컬미러(반대 scope) → 드라이브(요청) → 드라이브(반대).
+        scope 를 교차 탐색하는 이유는 그대로다 — 다른 전략이 공용에 만들어 둔 것을
+        재활용하기 위해서다(절대 1원칙). 여기에 '로컬 먼저' 가 더해진 것뿐이다.
+        """
+        alt = "private" if scope == "shared" else "shared"
+        out: List[Tuple[str, str]] = []
+        for sc in (scope, alt):
+            md = self.mirror_table_dir(sc)
+            if md:
+                out.append((os.path.join(md, f"{name}.parquet"), "LOCAL"))
+        for sc in (scope, alt):
+            out.append((os.path.join(self.table_dir(sc), f"{name}.parquet"), "DRIVE"))
+        return out
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
-        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if not os.path.exists(path):
-            # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
-            alt = "private" if scope == "shared" else "shared"
-            path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
-            if os.path.exists(path2):
-                path = path2
-            else:
-                return None
-        if max_age_days is not None:
-            age = (time.time() - os.path.getmtime(path)) / 86400.0
-            if age > max_age_days:
-                return None
-        d = read_parquet_safe(path)
-        if d is not None:
-            PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
-        return d
+        for path, where in self._table_candidates(name, scope):
+            if not os.path.exists(path):
+                continue
+            if max_age_days is not None:
+                try:
+                    if (time.time() - os.path.getmtime(path)) / 86400.0 > max_age_days:
+                        continue            # 낡았으면 다음 후보(드라이브 쪽이 더 새로울 수 있다)
+                except Exception:
+                    continue
+            d = read_parquet_safe(path)
+            if d is None:
+                continue
+            if where == "DRIVE":
+                self._mirror_down(path, name, scope)     # 다음 실행부터는 로컬에서 즉시 읽는다
+            self.stats[f"table_hit_{where.lower()}"] += 1
+            PIPE.io("IN", where, f"table:{name}", d, source=path)
+            return d
+        return None
+
+    def _mirror_up(self, src: str, name: str, scope: str):
+        md = self.mirror_table_dir(scope)
+        if not md or os.path.dirname(os.path.abspath(src)) == os.path.abspath(md):
+            return
+        try:
+            os.makedirs(md, exist_ok=True)
+            dst = os.path.join(md, f"{os.path.basename(src)}")
+            tmp = dst + f".tmp{os.getpid()}"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            self.stats["table_mirrored_up"] += 1
+        except Exception:
+            pass
+
+    def _mirror_down(self, src: str, name: str, scope: str):
+        """드라이브에서 읽은 표를 로컬 미러에 복사한다. 실패해도 조용히 넘어간다(가속용일 뿐)."""
+        md = self.mirror_table_dir(scope)
+        if not md:
+            return
+        try:
+            dst = os.path.join(md, f"{name}.parquet")
+            if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+                return
+            os.makedirs(md, exist_ok=True)
+            tmp = dst + f".tmp{os.getpid()}"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            self.stats["table_mirrored_down"] += 1
+        except Exception:
+            pass
 
     def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
               source: str = "", event_date=None, knowledge_date=None,
@@ -2128,16 +2243,64 @@ def euckr_q(s: str) -> str:
         return quote(str(s))
 
 
+class _TooBig(Exception):
+    """응답이 상한을 넘었다 — 재시도해도 같은 결과다. 재시도 대상이 아니다."""
+
+
+@contextmanager
+def _deadline(resp, deadline_s: float, label: str):
+    """응답 본문 읽기에 **전체 마감**을 건다.
+
+    ★ requests 의 timeout= 은 연결과 '바이트 사이 간격' 에만 걸린다. 전체 다운로드
+      마감이 아니다. 서버가 timeout 안쪽 간격으로 조금씩 흘려보내면 r.content 는
+      몇 시간이든 매달리고 예외도 로그도 없다 — 파이프라인 전체가 조용히 잠긴다.
+      실제로 OpenDART corpCode.xml(약 20MB)이 정확히 이 방식으로 무한정 멈췄다.
+
+    ★ 그리고 resp.close() / resp.raw.close() 로는 못 푼다. 이미 recv() 에 블록된
+      스레드는 그대로 남는다(재현 확인: 워치독은 발동하는데 프로세스는 계속 매달림).
+      커널에게 FD 를 끊게 하는 socket.shutdown(SHUT_RDWR) 만이 블록된 recv() 를
+      즉시 예외로 되돌린다. 그래서 이 가드는 소켓을 직접 끊는다.
+    """
+    sk = _resp_socket(resp)
+    fired = {"v": False}
+
+    def _kill():
+        fired["v"] = True
+        LOG.warn(f"    ↓ {label} 전체 마감 {deadline_s:.0f}s 초과 — 연결을 끊습니다")
+        for fn in (lambda: sk.shutdown(_socket.SHUT_RDWR), lambda: sk.close(),
+                   lambda: resp.raw.close(), lambda: resp.close()):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    killer = threading.Timer(deadline_s, _kill)
+    killer.daemon = True
+    killer.start()
+    try:
+        yield fired
+    finally:
+        killer.cancel()
+
+
 def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              headers: Optional[dict] = None, timeout: int = 25, tries: int = 4,
              as_bytes: bool = False, allow_status: Sequence[int] = (200,),
              referer: Optional[str] = None, quiet: bool = True,
-             force_enc: Optional[str] = None,
+             force_enc: Optional[str] = None, deadline_s: Optional[float] = None,
              on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
+    """단건 GET. **한 번의 시도는 deadline_s 안에 반드시 끝난다** (기본 timeout×3, 최소 60s).
+
+    마감을 여기 계층에 둔 이유: 호출지점마다 따로 막으면 새 호출지점이 하나 생길 때마다
+    같은 정체가 되살아난다. 감사 결과 실제로 그랬다 — corpCode 만 고쳤더니 marcap 파케이,
+    fdr.DataReader, 리스트 크롤이 전부 같은 성질의 무한대기로 남아 있었다.
+    """
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
         hdr["Referer"] = referer
+    dl = float(deadline_s) if deadline_s else max(60.0, float(timeout) * 3.0)
+    label = url.split("/")[-1][:40] or source
     last_exc = None
     for attempt in range(tries):
         lim.wait()
@@ -2150,11 +2313,15 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
             s = _session()
             if attempt > 0:
                 hdr["User-Agent"] = UA_POOL[attempt % len(UA_POOL)]
-            r = s.get(url, params=params, headers=hdr, timeout=timeout)
+            #  stream=True + 가드 안에서 .content 를 읽는다. 본문 읽기가 마감에 걸리면
+            #  소켓이 끊기면서 예외로 빠져나온다(무한대기 불가).
+            r = s.get(url, params=params, headers=hdr, timeout=timeout, stream=True)
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:{r.status_code}"] += 1
             if r.status_code in allow_status:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                with _deadline(r, dl, label):
+                    body = r.content
+                return body if as_bytes else _decode(body, r.encoding, url, force_enc)
             if r.status_code in (429, 503):
                 time.sleep(min(30.0, 2.0 * (2 ** attempt)) + random.random())
                 last_exc = requests.HTTPError(f"{r.status_code} {url}")
@@ -2173,6 +2340,128 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
         LOG.debug(f"GET 실패({source}) {url[:90]} — {type(last_exc).__name__}")
     with _HTTP_LK:
         HTTP_STATS[f"{source}:FAIL"] += 1
+    return None
+
+
+def _resp_socket(resp):
+    """requests 응답에서 **진짜 소켓 객체**를 캐낸다.
+
+    requests → urllib3.HTTPResponse(raw) → http.client.HTTPResponse(_fp)
+    → socket 의 buffered reader(fp) → SocketIO(raw) → socket(_sock).
+    urllib3 버전마다 경로가 조금씩 달라서 후보를 순서대로 시도한다.
+    못 찾으면 None — 그러면 마감은 못 걸지만 나머지 동작은 그대로다.
+    """
+    for path in (lambda: resp.raw._connection.sock,
+                 lambda: resp.raw._fp.fp.raw._sock,
+                 lambda: resp.raw._fp.fp._sock,
+                 lambda: resp.raw._original_response.fp.raw._sock):
+        try:
+            s = path()
+            if s is not None:
+                return s
+        except Exception:
+            continue
+    return None
+
+
+
+def http_get_stream(url: str, source: str = "generic", params: Optional[dict] = None,
+                    headers: Optional[dict] = None, connect_timeout: int = 15,
+                    read_timeout: int = 30, deadline_s: float = 300.0,
+                    tries: int = 3, referer: Optional[str] = None,
+                    max_bytes: int = 400 * 1024 * 1024,
+                    desc: str = "") -> Optional[bytes]:
+    """대용량 응답 전용 다운로더 — **전체 소요시간 상한**이 있다.
+
+    ★ 왜 http_get 으로 충분하지 않은가 (실제로 겪은 사고다):
+      requests 의 timeout 은 '연결' 과 '바이트 사이 간격' 에만 걸린다. 전체 다운로드
+      마감이 아니다. 서버가 25초 안쪽 간격으로 조금씩 흘려보내면 r.content 는 몇 시간이든
+      매달리고 예외도 나지 않는다 — 로그 한 줄 없이 파이프라인 전체가 잠긴다.
+      실행 로그에서 OpenDART corpCode.xml(약 20MB)이 정확히 이 방식으로 무한정 멈췄다.
+
+    → 그래서 여기서는 stream=True 로 청크를 받으면서 **경과시간을 직접 재고**,
+      deadline_s 를 넘기면 그 자리에서 포기한다. 진행률도 찍으므로 침묵이 없다.
+    """
+    lim = limiter(source)
+    hdr = dict(headers or {})
+    if referer:
+        hdr["Referer"] = referer
+    label = desc or url.split("/")[-1][:40]
+    for attempt in range(max(1, tries)):
+        lim.wait()
+        t0 = time.time()
+        got = bytearray()
+        total = 0
+        prog_stop = threading.Event()
+        try:
+            s_ = _session()
+            if attempt > 0:
+                hdr["User-Agent"] = UA_POOL[attempt % len(UA_POOL)]
+            r = s_.get(url, params=params, headers=hdr, stream=True,
+                       timeout=(connect_timeout, read_timeout))
+            #  ★ 전체 마감의 유일한 집행자: 워치독이 **소켓을 shutdown** 한다.
+            #    - 청크 크기로는 못 막는다. chunk_size 를 크게 주면 그만큼 모일 때까지
+            #      루프 본문이 안 돌고, chunk_size=None 은 urllib3 가 read(None) 으로
+            #      본문 전체를 기다린다.
+            #    - resp.raw.close()/resp.close() 로도 못 막는다. 이미 recv() 에 블록된
+            #      스레드는 풀려나지 않는다 — 워치독은 발동하는데 다운로드는 그대로
+            #      매달린다. 재현 테스트로 확인했다(t_min.py: 워치독 20.0s 발동 후에도
+            #      프로세스가 살아남아 timeout 124 로 강제 종료됨).
+            #    → 커널에게 FD 를 끊게 하는 socket.shutdown(SHUT_RDWR) 만이 블록된
+            #      recv() 를 즉시 예외로 되돌린다. t_min2.py 로 20.0s 정확히 검증.
+            def _progress():                # 15초마다 진행률 — 멈춰 있어도 로그가 난다
+                while not prog_stop.wait(15.0):
+                    n, el = len(got), time.time() - t0
+                    pct = f" / {total/1e6:.0f}MB ({100*n/total:.0f}%)" if total else ""
+                    LOG.info(f"    ↓ {label} {n/1e6:.1f}MB{pct} · {el:.0f}s"
+                             f"{'  (수신 정체)' if n == 0 else ''}")
+            threading.Thread(target=_progress, daemon=True,
+                             name=f"dl-{label[:12]}").start()
+            try:
+                with _HTTP_LK:
+                    HTTP_STATS[f"{source}:{r.status_code}"] += 1
+                if r.status_code != 200:
+                    raise requests.HTTPError(f"{r.status_code} {url}")
+                #  Content-Length 가 중복 헤더로 오면 '123, 123' 이라 int() 가 터진다.
+                #  그건 네트워크 실패가 아니므로 재시도로 낭비하지 않고 0 으로 둔다.
+                try:
+                    total = int(str(r.headers.get("Content-Length") or 0).split(",")[0])
+                except Exception:
+                    total = 0
+                with _deadline(r, deadline_s, label):
+                    for chunk in r.iter_content(chunk_size=1 << 16):
+                        if not chunk:
+                            continue
+                        got.extend(chunk)
+                        if len(got) > max_bytes:
+                            raise _TooBig(f"응답이 {max_bytes/1e6:.0f}MB 를 넘었습니다")
+            finally:
+                prog_stop.set()
+            if total and len(got) < total:
+                raise IOError(f"불완전 수신 {len(got):,}/{total:,}B")
+            if len(got):
+                LOG.debug(f"↓ {label} 완료 {len(got)/1e6:.1f}MB · {time.time()-t0:.1f}s")
+                return bytes(got)
+            raise IOError("빈 응답")
+        except _TooBig as e:
+            prog_stop.set()
+            LOG.warn(f"↓ {label} {e} — 같은 결과가 나올 것이므로 재시도하지 않습니다.")
+            break
+        except BaseException as e:      # noqa — 소켓 절단은 어떤 예외로도 올라올 수 있다
+            prog_stop.set()
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            el = time.time() - t0
+            kind = ("전체 마감 초과" if el >= deadline_s - 1 else f"{type(e).__name__}")
+            with _HTTP_LK:
+                HTTP_STATS[f"{source}:{type(e).__name__}"] += 1
+            LOG.debug(f"↓ {label} 시도 {attempt+1}/{tries} 실패({kind}) · "
+                      f"{len(got)/1e6:.1f}MB 수신 · {el:.0f}s")
+            time.sleep(min(8.0, 1.7 ** attempt))
+    with _HTTP_LK:
+        HTTP_STATS[f"{source}:FAIL"] += 1
+    LOG.warn(f"↓ {label} 다운로드 실패 — 전체 마감 {deadline_s:.0f}s 안에 못 받았습니다. "
+             f"이 호출은 여기서 포기하고 파이프라인은 계속 진행합니다.")
     return None
 
 

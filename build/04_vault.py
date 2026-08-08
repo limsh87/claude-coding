@@ -62,6 +62,19 @@ class Vault:
             os.makedirs(os.path.join(p, "blob"), exist_ok=True)
             os.makedirs(os.path.join(p, "table"), exist_ok=True)
         os.makedirs(os.path.join(self.root, "_locks"), exist_ok=True)
+        #  ★ 로컬 미러 — 드라이브와 '양쪽 다' 탐색해서 시간을 아끼기 위한 것이다.
+        #    드라이브(특히 Colab FUSE)는 파케이 한 장 읽는 데도 눈에 띄게 느리다.
+        #    읽기: 로컬 먼저 → 없으면 드라이브 → 드라이브에서 찾으면 로컬로 복사(다음 실행 가속).
+        #    쓰기: 드라이브가 원본(세션 무관 원칙), 로컬은 사본. 드라이브를 훼손하지 않는다.
+        self.mirror = None
+        try:
+            lm = os.path.abspath(LOCAL_CACHE_ROOT)
+            if lm != self.root:
+                self.mirror = lm
+                for _sc, _nsn in (("shared", GDRIVE_SHARED_NS), ("private", GDRIVE_PRIVATE_NS)):
+                    os.makedirs(os.path.join(lm, _nsn, "table"), exist_ok=True)
+        except Exception:
+            self.mirror = None
         self._idx: Dict[str, pd.DataFrame] = {}
         self._uidset: Dict[str, set] = {}
         self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
@@ -299,6 +312,9 @@ class Vault:
         except Exception as e:                              # noqa
             LOG.warn(f"테이블 저장 실패({type(e).__name__}): {name}")
             return None
+        #  로컬 미러에도 같이 둔다 — 드라이브가 원본이고 이건 다음 실행 가속용 사본이다.
+        #  실패해도 원본은 이미 드라이브에 있으므로 조용히 넘어간다.
+        self._mirror_up(path, name, scope)
         self._register(scope, {
             "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
             "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
@@ -309,25 +325,81 @@ class Vault:
         })
         return path
 
+    def mirror_table_dir(self, scope: str) -> Optional[str]:
+        if not self.mirror:
+            return None
+        return os.path.join(self.mirror,
+                            GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                            "table")
+
+    def _table_candidates(self, name: str, scope: str) -> List[Tuple[str, str]]:
+        """(경로, 출처) 를 **빠른 것 먼저** 돌려준다.
+
+        순서: 로컬미러(요청 scope) → 로컬미러(반대 scope) → 드라이브(요청) → 드라이브(반대).
+        scope 를 교차 탐색하는 이유는 그대로다 — 다른 전략이 공용에 만들어 둔 것을
+        재활용하기 위해서다(절대 1원칙). 여기에 '로컬 먼저' 가 더해진 것뿐이다.
+        """
+        alt = "private" if scope == "shared" else "shared"
+        out: List[Tuple[str, str]] = []
+        for sc in (scope, alt):
+            md = self.mirror_table_dir(sc)
+            if md:
+                out.append((os.path.join(md, f"{name}.parquet"), "LOCAL"))
+        for sc in (scope, alt):
+            out.append((os.path.join(self.table_dir(sc), f"{name}.parquet"), "DRIVE"))
+        return out
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
-        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if not os.path.exists(path):
-            # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
-            alt = "private" if scope == "shared" else "shared"
-            path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
-            if os.path.exists(path2):
-                path = path2
-            else:
-                return None
-        if max_age_days is not None:
-            age = (time.time() - os.path.getmtime(path)) / 86400.0
-            if age > max_age_days:
-                return None
-        d = read_parquet_safe(path)
-        if d is not None:
-            PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
-        return d
+        for path, where in self._table_candidates(name, scope):
+            if not os.path.exists(path):
+                continue
+            if max_age_days is not None:
+                try:
+                    if (time.time() - os.path.getmtime(path)) / 86400.0 > max_age_days:
+                        continue            # 낡았으면 다음 후보(드라이브 쪽이 더 새로울 수 있다)
+                except Exception:
+                    continue
+            d = read_parquet_safe(path)
+            if d is None:
+                continue
+            if where == "DRIVE":
+                self._mirror_down(path, name, scope)     # 다음 실행부터는 로컬에서 즉시 읽는다
+            self.stats[f"table_hit_{where.lower()}"] += 1
+            PIPE.io("IN", where, f"table:{name}", d, source=path)
+            return d
+        return None
+
+    def _mirror_up(self, src: str, name: str, scope: str):
+        md = self.mirror_table_dir(scope)
+        if not md or os.path.dirname(os.path.abspath(src)) == os.path.abspath(md):
+            return
+        try:
+            os.makedirs(md, exist_ok=True)
+            dst = os.path.join(md, f"{os.path.basename(src)}")
+            tmp = dst + f".tmp{os.getpid()}"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            self.stats["table_mirrored_up"] += 1
+        except Exception:
+            pass
+
+    def _mirror_down(self, src: str, name: str, scope: str):
+        """드라이브에서 읽은 표를 로컬 미러에 복사한다. 실패해도 조용히 넘어간다(가속용일 뿐)."""
+        md = self.mirror_table_dir(scope)
+        if not md:
+            return
+        try:
+            dst = os.path.join(md, f"{name}.parquet")
+            if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+                return
+            os.makedirs(md, exist_ok=True)
+            tmp = dst + f".tmp{os.getpid()}"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            self.stats["table_mirrored_down"] += 1
+        except Exception:
+            pass
 
     def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
               source: str = "", event_date=None, knowledge_date=None,

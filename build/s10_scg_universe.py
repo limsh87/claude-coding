@@ -177,8 +177,15 @@ def scg_fetch_spine(years: Sequence[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
                 miss.append(y)
                 continue
             t0 = time.time()
-            raw = http_get(_MARCAP_URL.format(y=y), source="fdr", as_bytes=True,
-                           tries=3, timeout=240)
+            #  ★ 여기가 이 프로그램에서 가장 큰 페이로드(연 40MB급)이고 크리티컬
+            #    스테이지다. 일반 http_get 은 전체 마감이 없어서 서버가 조금씩만
+            #    흘려보내면 영원히 매달린다 — corpCode 와 정확히 같은 사고다.
+            #    600s: 정상 회선이면 수 초, 정체 시 연당 600s×3회로 상한이 생긴다.
+            raw = http_get_stream(_MARCAP_URL.format(y=y), source="fdr",
+                                  connect_timeout=15, read_timeout=60,
+                                  deadline_s=600.0, tries=3,
+                                  max_bytes=300 * 1024 * 1024,
+                                  desc=f"marcap-{y}.parquet")
             if not raw or len(raw) < 10_000:
                 miss.append(y)
                 LOG.warn(f"  [{k}/{len(ys)}] {y} 다운로드 실패 — 그 해는 유니버스에서 빠집니다")
@@ -435,7 +442,17 @@ def scg_fetch_delisting() -> pd.DataFrame:
 
 
 def scg_fetch_dart_corpcode() -> pd.DataFrame:
-    """DART corpCode.xml — corp_code ↔ stock_code 매핑 (KRX 아님, 금융감독원)."""
+    """DART corpCode.xml — corp_code ↔ stock_code 매핑 (KRX 아님, 금융감독원).
+
+    ★ 이 함수는 유니버스의 **필수 입력이 아니다**. 스파인이 종목 마스터를 만들므로
+      corp_code 는 DART 실적 실측치를 종목에 붙일 때만 필요하다. 그래서 호출부는
+      L1.UNI(크리티컬)가 아니라 L1.DART(비필수)에 있고, 여기서 실패하면 EPS 트랙만
+      degrade 되고 백테스트는 그대로 진행된다.
+
+    ★ 다운로드는 반드시 전체 마감이 있는 스트리밍으로 한다. 이 응답이 파이프라인에서
+      가장 큰 단일 페이로드(약 20MB zip)이고, 일반 http_get 으로 받으면 서버가 느리게
+      흘려보낼 때 몇 시간이든 매달린다(실제로 그렇게 멈췄다).
+    """
     cols = ["corp_code", "corp_name", "code", "modify_date"]
     cached = VAULT.get_table("dart_corpcode", scope="shared", max_age_days=30)
     if cached is not None and len(cached):
@@ -445,33 +462,54 @@ def scg_fetch_dart_corpcode() -> pd.DataFrame:
         LOG.info("DART_API_KEY 가 없어 corp_code 매핑을 건너뜁니다 → 실적 실측치(A)가 없어 "
                  "ACC* 는 전부 0 으로 수축됩니다(애널리스트는 유지).")
         return pd.DataFrame(columns=cols)
-    raw = http_get("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
-                   params={"crtfc_key": DART_API_KEY}, as_bytes=True, tries=3,
-                   referer="https://opendart.fss.or.kr/")
+
+    LOG.info("DART corpCode.xml 내려받는 중 (약 20MB · 전체 마감 180초)…")
+    raw = http_get_stream("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
+                          params={"crtfc_key": DART_API_KEY}, deadline_s=180.0, tries=2,
+                          referer="https://opendart.fss.or.kr/", desc="corpCode.xml")
     if not raw or len(raw) < 1000:
-        LOG.warn("corpCode.xml 을 받지 못했습니다. DART_API_KEY 를 확인하세요.")
+        LOG.warn("corpCode.xml 을 받지 못했습니다 → EPS 실측치를 종목에 붙일 수 없어 "
+                 "ACC* 가 0 으로 수축됩니다(애널리스트·종목은 그대로 유지). "
+                 "백테스트는 계속 진행합니다. DART_API_KEY 와 네트워크를 확인하세요.")
         return pd.DataFrame(columns=cols)
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             xml = z.read(z.namelist()[0])
     except Exception as e:
         LOG.warn(f"corpCode.xml 압축 해제 실패({type(e).__name__}) — 응답이 ZIP 이 아닙니다 "
-                 f"(대개 인증키 오류 시 XML 에러문서가 옵니다).")
+                 f"(인증키가 틀리면 XML 에러문서가 200 으로 옵니다). EPS 트랙만 degrade 됩니다.")
         return pd.DataFrame(columns=cols)
-    rows = re.findall(
-        rb"<list>\s*<corp_code>(.*?)</corp_code>\s*<corp_name>(.*?)</corp_name>\s*"
-        rb"<stock_code>(.*?)</stock_code>\s*<modify_date>(.*?)</modify_date>", xml, re.S)
-    if not rows:
+
+    #  ★ 정규식 대신 iterparse. 압축을 풀면 100MB 급이라 DOTALL + 게으른 수량자 조합은
+    #    한 엔트리만 어긋나도 남은 전체를 되짚으며 폭주할 수 있고, findall 은 결과를
+    #    통째로 메모리에 올린다. iterparse 는 선형이고 상수 메모리다.
+    t0 = time.time()
+    recs: List[Tuple[str, str, str, str]] = []
+    try:
+        for _ev, el in _ET.iterparse(io.BytesIO(xml), events=("end",)):
+            if el.tag != "list":
+                continue
+            g = {c.tag: (c.text or "").strip() for c in el}
+            recs.append((g.get("corp_code", ""), g.get("corp_name", ""),
+                         g.get("stock_code", ""), g.get("modify_date", "")))
+            el.clear()
+    except Exception as e:
+        LOG.warn(f"corpCode.xml 파싱 실패({type(e).__name__}) — EPS 트랙만 degrade 됩니다.")
         return pd.DataFrame(columns=cols)
-    t = pd.DataFrame({
-        "corp_code": [r[0].decode("utf-8", "ignore").strip() for r in rows],
-        "corp_name": [r[1].decode("utf-8", "ignore").strip() for r in rows],
-        "code": [to_code6(r[2].decode("utf-8", "ignore").strip()) for r in rows],
-        "modify_date": [r[3].decode("utf-8", "ignore").strip() for r in rows],
-    })
+    if not recs:
+        #  조용히 빈 표를 돌려주면 EPS 트랙이 '실측치 0건' 인 채로 끝까지 굴러가고,
+        #  그 결과가 ★공식 트랙으로 출력된다. 반드시 소리를 낸다.
+        LOG.warn(f"corpCode.xml 에서 <list> 항목을 0건 찾았습니다 (XML {len(xml)/1e6:.1f}MB) — "
+                 f"스키마가 바뀌었거나 오류문서를 받은 것입니다. EPS 트랙이 degrade 됩니다.")
+        return pd.DataFrame(columns=cols)
+    t = pd.DataFrame(recs, columns=["corp_code", "corp_name", "_sc", "modify_date"])
+    t["code"] = t["_sc"].map(to_code6)
+    t = t.drop(columns=["_sc"])
     VAULT.put_table("dart_corpcode", t, scope="shared", domain="dart", source="opendart corpCode")
-    LOG.ok(f"DART corpCode {len(t):,}건 (상장 {int(t['code'].notna().sum()):,}건)")
-    return t
+    VAULT.flush("shared")
+    LOG.ok(f"DART corpCode {len(t):,}건 (상장 {int(t['code'].notna().sum()):,}건) · "
+           f"파싱 {time.time()-t0:.1f}s")
+    return t.reindex(columns=cols)
 
 
 def scg_build_security_master(listing: pd.DataFrame, delisting: pd.DataFrame,

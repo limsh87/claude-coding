@@ -280,10 +280,38 @@ def scg_report_cache_ledger():
                     n = "읽기실패"
             rows.append([name, scope, n or "—",
                          f"{_safe_size(fp)/1e6:.1f}MB" if ok else "—", _trunc(why, 44)])
+    #  테이블만으로는 증거가 불완전하다 — 리포트 PDF 는 blob 으로 저장되므로
+    #  여기서 같이 세어준다. "모든 신규 수집 데이터"에는 원문 PDF 도 포함된다.
+    for scope in ("shared", "private"):
+        try:
+            bidx = VAULT.load_index(scope, force=False)
+        except Exception:
+            bidx = None
+        if bidx is None or not len(bidx) or "subtype" not in bidx.columns:
+            continue
+        #  테이블은 subtype=="table" 로 등록된다. 그 밖은 전부 원문 blob 이다.
+        b = bidx[bidx["subtype"].astype(str) != "table"]
+        if not len(b):
+            continue
+        for (dom, sub), g in b.groupby([b["domain"].astype(str),
+                                        b["subtype"].astype(str)]):
+            sz = pd.to_numeric(g["bytes"], errors="coerce").fillna(0).sum() if "bytes" in g else 0
+            rows.append([f"{dom}/{sub} (원문파일)", scope, f"{len(g):,}건",
+                         f"{sz/1e6:.0f}MB" if sz else "—",
+                         _trunc("수집한 원문 그대로 — 재파싱 시 재다운로드 없음", 44)])
     LOG.table(rows, ["데이터셋", "인덱스", "저장량", "용량", "무엇인가"],
               ["l", "c", "r", "r", "l"],
               title="★ 캐시 원장 — 신규 수집된 모든 데이터는 여기에 저장되고 다음 실행에서 "
                     "네트워크 없이 재호출됩니다 (공용=다른 전략도 재사용 · 전용=이 전략 산출물)")
+    LOG.info(f"저장 위치 — 드라이브(원본): {VAULT.root}")
+    if getattr(VAULT, "mirror", None):
+        hl = VAULT.stats.get("table_hit_local", 0)
+        hd = VAULT.stats.get("table_hit_drive", 0)
+        LOG.info(f"           로컬 미러(가속 사본): {VAULT.mirror} — 이번 실행 캐시 적중 "
+                 f"로컬 {hl:,}회 / 드라이브 {hd:,}회. 읽기는 로컬을 먼저 보고 없으면 "
+                 f"드라이브에서 읽은 뒤 로컬로 되받습니다(다음 실행이 더 빨라집니다).")
+    else:
+        LOG.info("           로컬 미러 없음 — 드라이브 경로가 곧 로컬 경로입니다.")
     miss = [r[0] for r in rows if r[2] in ("—", "")]
     if miss:
         LOG.info(f"아직 비어 있는 항목: {', '.join(miss[:8])}"

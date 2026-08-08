@@ -6,6 +6,8 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 import os, sys, re, io, gc, json, time, math, zipfile, hashlib, logging, textwrap, traceback
 import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, threading, unicodedata
+import xml.etree.ElementTree as _ET
+import socket as _socket
 import datetime as _dt
 from collections import defaultdict, Counter, OrderedDict
 from dataclasses import dataclass, field, asdict, replace
