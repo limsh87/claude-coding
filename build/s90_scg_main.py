@@ -445,8 +445,7 @@ def main() -> dict:
             key = f"{metric}/{uname}"
             with PIPE.stage(f"L2.{metric}.{uname}", f"SCG 산출 {key}", "L2", budget_s=3600,
                             critical=False):
-                tr = scg_run_track(ctx, metric, fc, t.get("actuals"),
-                                   uni if uname != "ALL" else uni, uname)
+                tr = scg_run_track(ctx, metric, fc, t.get("actuals"), uni, uname)
                 sig = tr.get("signals")
                 if sig is None or sig.empty:
                     LOG.warn(f"[{key}] 신호가 비었습니다.")
@@ -463,12 +462,15 @@ def main() -> dict:
             "어느 고리가 끊겼는지 확인하세요 (리포트 → 애널리스트 → 종목코드 → 추정치).")
 
     #  ★ EPS 커버리지가 무너졌으면 공식 트랙을 TP 로 승격한다 — 단, 조용히 하지 않는다.
-    tot = max(1, sum(cov.values()))
-    eps_share = cov.get(f"EPS/ALL", 0) / tot
-    if primary == "EPS" and f"EPS/ALL" in results and eps_share < PRIMARY_METRIC_MIN_COVERAGE:
-        LOG.warn(f"EPS 트랙의 유효 신호가 전체의 {100*eps_share:.1f}% 에 불과합니다 "
-                 f"(임계 {100*PRIMARY_METRIC_MIN_COVERAGE:.0f}%). 공식 트랙을 TP 로 승격합니다. "
-                 f"EPS 결과도 아래에 그대로 출력하니 반드시 함께 읽으세요.")
+    #  ★ 두 트랙의 '같은 유니버스에서의' 신호 수를 직접 비교한다. 전체 합계로 나누면
+    #    SMALL1000 행까지 분모에 들어가 비율이 흐려진다.
+    n_eps, n_tp = cov.get("EPS/ALL", 0), cov.get("TP/ALL", 0)
+    eps_share = n_eps / max(n_tp, 1) if n_tp else (1.0 if n_eps else 0.0)
+    if primary == "EPS" and "TP/ALL" in results and eps_share < PRIMARY_METRIC_MIN_COVERAGE:
+        LOG.warn(f"EPS 트랙의 유효 신호가 {n_eps:,}건으로 TP 트랙({n_tp:,}건) 대비 "
+                 f"{100*eps_share:.1f}% 에 불과합니다 (임계 {100*PRIMARY_METRIC_MIN_COVERAGE:.0f}%). "
+                 f"공식 트랙을 TP 로 승격합니다. EPS 결과도 아래에 그대로 출력하니 "
+                 f"반드시 함께 읽으세요 — 조용히 바꾸지 않습니다.")
         primary = "TP"
     if f"{primary}/ALL" not in results:
         primary = list(results)[0].split("/")[0]
