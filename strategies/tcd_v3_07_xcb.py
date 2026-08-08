@@ -8575,12 +8575,28 @@ def gate3_placebo(mapping: pd.DataFrame, a_hs: pd.DataFrame, fin: pd.DataFrame,
         out["pass"] = 1
         return out
     p = float((null >= real).mean())
-    out.update(stat=real, p=p, n=int(len(null)),
+    # ★ 검정력을 함께 보고한다. 이 게이트의 탈락은 V12 를 통해 **A축 전체를 끈다** —
+    #   전략의 존재 이유를 없애는 결정이다. 그런데 표본이 22종목·5개 HS 수준이면
+    #   상관 추정 자체가 잡음이라 PASS 든 FAIL 이든 신뢰할 수 없다.
+    #   그래도 FAIL 을 통과로 바꾸지는 않는다(fail-open 이 더 나쁘다). 대신 그 판정이
+    #   무엇에 근거했는지를 숫자로 남겨 사람이 판단할 수 있게 한다.
+    low_power = (n_f < 30) or (n_h < 10) or (len(years) < 6)
+    out.update(stat=real, p=p, n=int(len(null)), n_firms=int(n_f), n_hs=int(n_h),
+               n_years=int(len(years)), low_power=bool(low_power),
                **{"pass": int(p < alpha)},
                detail=f"실제 {real:+.4f} vs 귀무 평균 {np.mean(null):+.4f} "
-                      f"(셔플 {len(null)}회, p={p:.4f})")
+                      f"(셔플 {len(null)}회, p={p:.4f} · 종목 {n_f} × HS {n_h} × "
+                      f"연도 {len(years)})")
     LOG.info(f"게이트3 플라시보: {out['detail']} → "
              f"{'통과' if out['pass'] else '탈락(매핑이 무작위와 구분 안 됨)'}")
+    if low_power:
+        LOG.warn(
+            f"게이트3 검정력 부족: 종목 {n_f}개 × HS {n_h}개 × 연도 {len(years)}개.\n"
+            f"    이 규모에서는 상관 추정이 잡음이라 통과든 탈락이든 신뢰 구간이 매우 넓습니다.\n"
+            f"    그런데 이 게이트의 탈락은 V12 를 통해 **A축(통관) 전체를 끕니다** — "
+            f"전략의 존재 이유가 사라집니다.\n"
+            f"    → 판정을 뒤집지는 않습니다(통과시키면 검증 없이 매핑을 믿는 셈). "
+            f"대신 HS↔KSIC 연계표(CANARY X6)를 개선해 표본을 키운 뒤 재측정하세요.")
     return out
 
 
