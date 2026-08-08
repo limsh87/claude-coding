@@ -195,6 +195,9 @@ N_WORKERS_IO   = 12      # 네트워크 병렬(스레드). 403/429 가 뜨면 8 
 N_WORKERS_CPU  = 0       # 연산 병렬(프로세스). 0 = CPU 코어수 자동(-1)
 RATE_LIMIT_QPS = {       # 소스별 초당 요청 상한 — 차단 방지. 낮출수록 안전/느림.
     "dart":      8.0,
+    # company.json 은 응답이 수백 바이트짜리 단건 조회라 재무·공시와 부하가 다르다.
+    # 같은 버킷에 두면 3,981건 ÷ 8QPS = 498초가 통째로 대기시간이 된다(실측 508초).
+    "dart_company": 20.0,
     "customs":   4.0,    # data.go.kr. 일 트래픽 한도가 있으므로 보수적으로.
     "hankyung":  2.5,
     "naver":     3.0,
@@ -1243,6 +1246,39 @@ def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, qui
         wrapped.__name__ = getattr(fn, "__name__", "wrapped")
         return wrapped
     return deco
+
+
+# ── 실행 1회 메모 ───────────────────────────────────────────────────────────────────────────
+_ONCE_CACHE: Dict[str, Any] = {}
+
+
+def once(fn: Callable) -> Callable:
+    """무인자 수집 함수를 **프로세스 1회**만 실제 실행한다.
+
+    ★ 왜: 실측 로그에서 상장폐지 목록이 3회, KIND 상장법인목록이 2회, DART corpCode 가
+      4회 수집됐다. CANARY(K5·K12)와 L1.UNIVERSE 가 각자 마스터를 다시 세우기 때문이다.
+      같은 날 같은 무인자 호출은 같은 결과를 준다 — 네트워크·파싱·파케이 재적재가 통째로 낭비다.
+
+    안전 조건(전부 확인함): 대상 함수는 무인자이며, 호출자가 반환 프레임을 제자리에서
+    수정하지 않는다(모두 .copy()/reindex 로 받는다). 노트북에서 두 번째 실행을 하면
+    reset_once() 로 비워야 아침 스냅샷을 재사용하는 사고가 없다.
+    """
+    key = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+
+    def wrapped(*a, **kw):
+        if a or kw:                       # 인자가 붙으면 메모하지 않는다(정의상 무인자용)
+            return fn(*a, **kw)
+        if key not in _ONCE_CACHE:
+            _ONCE_CACHE[key] = fn()
+        return _ONCE_CACHE[key]
+    wrapped.__name__ = getattr(fn, "__name__", "wrapped")
+    wrapped.__qualname__ = key
+    return wrapped
+
+
+def reset_once() -> None:
+    """같은 커널에서 재실행할 때 호출. 안 비우면 지난 실행의 스냅샷을 그대로 쓴다."""
+    _ONCE_CACHE.clear()
 
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
@@ -2811,6 +2847,7 @@ def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
     return {str(c).strip().lower(): c for c in d.columns}
 
 
+@once
 def fetch_fdr_listing() -> pd.DataFrame:
     d = _fdr_cache_csv("listing/krx")
     if d is not None and len(d):
@@ -2865,6 +2902,7 @@ def fetch_fdr_listing() -> pd.DataFrame:
     return t.dropna(subset=["code"]).drop_duplicates("code")
 
 
+@once
 def fetch_fdr_delisting() -> pd.DataFrame:
     """★ 생존자편향 제거의 핵심 입력. KRX Open API 에는 상장폐지 엔드포인트가 아예 없어서
     이 GitHub 캐시가 사실상 유일한 공개 경로다.
@@ -2920,23 +2958,50 @@ def fetch_fdr_delisting() -> pd.DataFrame:
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
     })
     t = t.dropna(subset=["code"])
-    # ── 폐지일 타당성 검사: 상장일이 잘못 실려 들어왔는지 데이터로 판정한다.
+    # ── 폐지일 타당성 검사 ────────────────────────────────────────────────────────────────
+    #  ★★ '오래된 날짜가 많다'를 증거로 쓰면 안 된다 ★★
+    #    한국거래소는 1956년에 열렸고 이 목록은 70년치를 담는다. 30년 이전 폐지가 6%쯤
+    #    있는 것은 **정상**이다. 예전 판정식(1995년 이전이 5% 초과 → 컬럼 폐기)은
+    #    실측 165/2,526(6.5%)에서 발동해 **진짜 폐지일 2,526건을 통째로 버렸다.**
+    #    그 결과 폐지일 보유가 428건(8%)까지 떨어져 C2 가 사실상 무너졌고,
+    #    폐지 종목이 '상장 중'으로 남아 가격 수집이 없는 데이터를 15분간 뒤졌다.
+    #
+    #    상장일 오적재는 '나이'가 아니라 **논리적 모순**으로 판정한다:
+    #      ① 폐지일 < 상장일        — 상장 전에 폐지될 수 없다
+    #      ② 폐지일 == 상장일       — 같은 컬럼을 두 번 읽었다
+    #      ③ 폐지일 < 1956-03-03    — 거래소 개장 전. 물리적으로 불가능
+    #    ①②는 상장일이 실려온 경우 거의 전량에서 성립하고, 진짜 폐지일에서는 0 에 가깝다.
     _dd = as_ts_series(t["delisting_date"])
-    _n_old = int((_dd < pd.Timestamp("1995-01-01")).sum())
+    _ld = as_ts_series(t["listing_date"])
+    _n_dd = int(_dd.notna().sum())
+    _both = _dd.notna() & _ld.notna()
+    n_before = int((_both & (_dd < _ld)).sum())
+    n_equal = int((_both & (_dd == _ld)).sum())
+    n_impossible = int((_dd < pd.Timestamp("1956-03-03")).sum())
+    _den = max(int(_both.sum()), 1)
+    bad = (n_before + n_equal) / _den
     if dl_c is None:
         LOG.warn("상장폐지 목록에 **폐지일 컬럼이 없습니다**. 폐지 사실만 사용하고 폐지일은 "
                  "'마지막 거래일'로 복원합니다(뒤 단계). 폐지 종목을 버리지는 않습니다 — "
                  "버리면 그게 곧 생존자편향입니다.")
         t["delisting_date"] = pd.NaT
-    elif _dd.notna().any() and _n_old > max(20, 0.05 * int(_dd.notna().sum())):
+    elif _n_dd and (bad > 0.5 or n_impossible > max(5, 0.02 * _n_dd)):
         LOG.error(
-            f"상장폐지 목록의 '폐지일' 중 {_n_old:,}건이 1995년 이전입니다 "
-            f"(최소 {_dd.min():%Y-%m-%d}). 폐지일 자리에 **상장일**이 들어왔을 가능성이 큽니다.\n"
-            f"    그대로 두면 '오래전에 상장해 최근 폐지된' 종목이 백테스트 전 구간에서 빠져\n"
-            f"    실패 사례가 사라집니다 — 제거했다고 믿은 생존자편향이 그대로 재유입됩니다.\n"
-            f"    → 이 컬럼을 폐기하고 마지막 거래일로 복원합니다.")
+            f"'{dl_c}' 컬럼을 폐지일로 쓸 수 없습니다 — 상장일이 실려온 것으로 판정합니다.\n"
+            f"    폐지일<상장일 {n_before:,}건 · 폐지일==상장일 {n_equal:,}건 "
+            f"(대조 {int(_both.sum()):,}건 중 {bad*100:.0f}%) · 거래소 개장(1956) 이전 "
+            f"{n_impossible:,}건.\n"
+            f"    → 이 컬럼을 폐기하고 '마지막 거래일'로 복원합니다.")
         t["listing_date"] = t["listing_date"].fillna(_dd)
         t["delisting_date"] = pd.NaT
+    else:
+        _old = int((_dd < pd.Timestamp("1995-01-01")).sum())
+        LOG.ok(f"폐지일 컬럼 '{dl_c}' 채택 — {_n_dd:,}건 "
+               f"(모순 검사: 폐지일<상장일 {n_before:,}건 · 동일 {n_equal:,}건 · "
+               f"1956년 이전 {n_impossible:,}건).")
+        if _old:
+            LOG.info(f"  1995년 이전 폐지 {_old:,}건({_old/max(_n_dd,1)*100:.1f}%)은 "
+                     f"70년치 목록에서 정상입니다 — 백테스트 구간 밖이라 자동으로 제외됩니다.")
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
@@ -2978,6 +3043,7 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     return t
 
 
+@once
 def fetch_kind_listing() -> pd.DataFrame:
     """KIND 상장법인목록 — 상장일·업종 보강.
     ★ 종목코드가 정수로 와서 앞자리 0 이 날아간다(5930 ← 005930). to_code6 이 복구한다."""
@@ -3017,6 +3083,7 @@ def fetch_kind_listing() -> pd.DataFrame:
     return pd.DataFrame(columns=SEC_MASTER_COLS)
 
 
+@once
 def fetch_dart_corpcode() -> pd.DataFrame:
     """corp_code ↔ 종목코드. DART 의 모든 재무·공시 조회는 corp_code 로만 된다."""
     if not DART_API_KEY:
@@ -3586,23 +3653,56 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+_YF_MUTED = False
+
+
+def _mute_yfinance() -> None:
+    """yfinance 의 'possibly delisted' 잡음을 **스레드 안전하게** 끈다. 프로세스 1회.
+
+    ★★ redirect_stdout/redirect_stderr 를 쓰면 안 된다 ★★
+      그 둘은 sys.stdout/sys.stderr 를 **전역으로** 갈아끼운다. 그런데 가격 수집은
+      스레드풀(pmap_io)에서 돈다. A 스레드가 싱크를 꽂고 있는 동안 B 스레드의 tqdm
+      출력이 싱크로 빨려 들어가고, A 가 원복하면서 B 가 꽂아둔 것을 덮어쓴다.
+      실측 증상: 진행바가 깨지고 콘솔이 잠기며 노트북이 멈춘 것처럼 보인다.
+      → 전역 상태를 건드리지 않는 **로거 차단**으로 바꾼다. logging 은 스레드 안전하다.
+    """
+    global _YF_MUTED
+    if _YF_MUTED or yf is None:
+        return
+    for nm in ("yfinance", "yfinance.ticker", "yfinance.data", "yfinance.utils",
+               "yfinance.scrapers", "peewee", "urllib3.connectionpool"):
+        lg = logging.getLogger(nm)
+        lg.setLevel(logging.CRITICAL)
+        lg.propagate = False
+        lg.addHandler(logging.NullHandler())
+    try:                                   # 신버전은 전용 로거 설정 API 를 준다
+        yf.utils.get_yf_logger().setLevel(logging.CRITICAL)
+    except Exception:                                                   # noqa
+        pass
+    try:                                   # tz 캐시를 로컬에 두면 매 호출 조회가 사라진다
+        yf.set_tz_cache_location(os.path.join(LOCAL_CACHE_ROOT, "yf_tz"))
+    except Exception:                                                   # noqa
+        pass
+    _YF_MUTED = True
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """★ yfinance 는 한국 상장폐지 종목을 사실상 못 준다.
 
     실측(2026-08 로컬 실행): 폐지 종목 위주 1,660개를 돌리며 종목당 `.KS`/`.KQ` 두 번,
-    매번 "possibly delisted; no timezone found" 를 **stderr 로 직접 출력**해 콘솔이 마비되고
-    16분을 태웠다(성공 0건). 로거 레벨 조정으로는 안 잡힌다 — 자체 print 경로가 있다.
-    → 호출 구간 동안 stdout/stderr 를 통째로 삼키고, 실패는 조용히 None 으로 돌린다.
+    매번 "possibly delisted; no price data found" 를 출력해 콘솔이 마비되고 15분을
+    태웠다(성공 0건). 그래서 두 가지를 함께 한다:
+      ① 폐지 표시가 있는 종목은 fetch_prices 가 **애초에 이 함수를 부르지 않는다**.
+      ② 그래도 남는 잡음은 로거 차단으로 끈다(스레드 안전).
     """
     if yf is None:
         return None
+    _mute_yfinance()
     for suf in (".KS", ".KQ"):
         try:
             limiter("generic").wait()
-            _sink = io.StringIO()
-            with contextlib.redirect_stdout(_sink), contextlib.redirect_stderr(_sink):
-                d = yf.download(code + suf, start=start, end=end, progress=False,
-                                auto_adjust=False, threads=False)
+            d = yf.download(code + suf, start=start, end=end, progress=False,
+                            auto_adjust=False, threads=False, timeout=20)
         except Exception:
             continue
         if d is None or len(d) == 0:
@@ -3625,9 +3725,33 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장.
+
+    ★ sec(종목 마스터)를 받는 이유는 두 가지다. 없어도 동작하지만 둘 다 손해다:
+      ① 상장일 — 2020년 상장주는 캐시가 2020부터인 게 **정상**인데, 상장일을 모르면
+         '앞 구간 결손'으로 오판해 매 실행 전 구간을 다시 받는다. 그런데 받아도 여전히
+         2020부터라 캐시 최소일이 안 변한다 → **영원히 수렴하지 않는 재수집 루프**.
+         실측 1,256종목이 매 실행 이 루프에 걸렸다.
+      ② 폐지 여부 — yfinance 에는 폐지된 한국 종목이 없다. 폐지 종목에까지 체인 끝의
+         yfinance 를 태우면 종목당 2회(.KS/.KQ) 헛호출이다. 실측 1.8it/s × 1,646 = 15분.
+    """
     codes = sorted({c for c in map(to_code6, codes) if c})
+    # ── 마스터에서 상장일·폐지여부를 뽑는다(없으면 빈 dict — 동작은 유지) ─────────────
+    listing_of: Dict[str, pd.Timestamp] = {}
+    dead_set: set = set()
+    if sec is not None and len(sec) and "code" in sec.columns:
+        _s = sec.copy()
+        _s["code"] = _s["code"].astype(str)
+        if "listing_date" in _s.columns:
+            _ld = as_ts_series(_s["listing_date"])
+            listing_of = {c: d for c, d in zip(_s["code"], _ld) if pd.notna(d)}
+        if "delisting_date" in _s.columns:
+            _dd = as_ts_series(_s["delisting_date"])
+            dead_set = set(_s.loc[_dd.notna(), "code"])
+        if "src" in _s.columns:
+            dead_set |= set(_s.loc[_s["src"].astype(str).str.contains("delist"), "code"])
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
     have_min: Dict[str, pd.Timestamp] = {}
@@ -3666,7 +3790,16 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    def _want_from(c: str) -> pd.Timestamp:
+        """이 종목에 대해 **실제로 존재할 수 있는** 가장 이른 날짜.
+
+        상장 전 구간은 아무리 요청해도 영원히 비어 있다. 그걸 '결손'으로 세면
+        매 실행 같은 구간을 다시 받고, 받아도 캐시 최소일이 안 변해 무한 반복이 된다.
+        """
+        ld = listing_of.get(c)
+        return max(start_ts, ld) if ld is not None and pd.notna(ld) else start_ts
+
+    todo, n_back, n_fwd, n_skip, n_settled = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
@@ -3679,15 +3812,30 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
         #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
         #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+        wf = _want_from(c)
+        if mn is not None and mn > wf + pd.Timedelta(days=10):
+            # 상장일 기준으로도 앞이 빈다 → 진짜 결손. 단, 이미 같은 구간을 요청해 본 적이
+            # 있으면(시도 원장) 다시 조르지 않는다. 소스에 없는 걸 계속 묻는 셈이라서다.
+            if _recently_failed(c, start_ts):
+                n_settled += 1
+                continue
             todo.append((c, start))
             n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
     if n_back:
-        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 다시 받습니다 "
+                 f"(상장일 대비 앞 구간 결손 — 상장 전 구간은 세지 않습니다).")
+    if n_settled:
+        LOG.info(f"앞 구간이 비지만 최근 {RETRY_AFTER_DAYS}일 내 같은 구간을 이미 요청해 본 "
+                 f"{n_settled:,}종목은 건너뜁니다 (소스에 없는 구간을 반복 조회하지 않습니다).")
+    if listing_of:
+        LOG.debug(f"상장일 {len(listing_of):,}종목 · 폐지 표시 {len(dead_set):,}종목을 "
+                  f"수집 계획에 반영했습니다.")
+    else:
+        LOG.warn("종목 마스터를 못 받아 상장일을 모릅니다 — 상장 전 구간을 '결손'으로 "
+                 "오판해 매 실행 재수집할 수 있습니다. fetch_prices(..., sec=sec) 로 부르세요.")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -3718,9 +3866,21 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 alive = [(nm, fn) for nm, fn in PRICE_CHAIN if _fail[nm] < _dead_after]
                 return sorted(alive, key=lambda x: -_ok[x[0]])
 
+        # ★ yfinance 는 **폐지된 한국 종목을 갖고 있지 않다.** 그런데 체인 끝에 있어서
+        #   FDR·네이버가 못 준 종목 = 대부분 폐지분이 전부 yfinance 로 흘러든다.
+        #   종목당 .KS/.KQ 두 번씩, 실측 1.8it/s × 1,646종목 = 15분을 성공 0건으로 태웠다.
+        #   폐지가 표시된 종목에서는 아예 빼고 부른다. 표시가 없으면 종전대로 시도한다.
+        _n_dead_job = sum(1 for c, _ in todo if c in dead_set)
+        if _n_dead_job and yf is not None:
+            LOG.info(f"수집 대상 중 {_n_dead_job:,}종목은 폐지 표시가 있어 yfinance 를 "
+                     f"건너뜁니다 (yfinance 에는 폐지된 한국 종목이 없습니다).")
+
         def _one(job):
             code, st = job
-            for nm, fn in _chain_order():
+            chain = _chain_order()
+            if code in dead_set:
+                chain = [(nm, fn) for nm, fn in chain if nm != "yfinance"]
+            for nm, fn in chain:
                 try:
                     d = fn(code, st, end)
                 except Exception:
@@ -3742,26 +3902,37 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             LOG.warn(f"연속 {_dead_after}회 실패로 이번 실행에서 내린 가격 소스: {_dropped}. "
                      f"(고정 순서로 두면 죽은 소스의 비용을 전 종목이 지불합니다) "
                      f"성공 분포: {dict(_ok)}")
-        failed = []
+        failed, marks = [], []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
+                # ★ 전 구간을 요청한 건은 **성공해도** 시도 원장에 남긴다.
+                #   2020년 상장주에 2015년부터 달라고 하면 2020년치만 온다. 그건 정상인데,
+                #   기록이 없으면 다음 실행이 "앞이 비었다"며 똑같이 또 요청한다.
+                #   받아도 캐시 최소일이 안 변하므로 **영원히 반복**된다(실측 1,256종목).
+                if as_ts(st) <= start_ts:
+                    marks.append({"code": c, "requested_from": as_ts(st),
+                                  "attempted_at": _today})
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
-            # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
-            #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
+        # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
+        #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
+        if failed or marks:
             _prev = _att if _att is not None and len(_att) else None
-            _new = pd.DataFrame(failed)
+            _new = pd.DataFrame(failed + marks)
             _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
             _all = (_all.sort_values("attempted_at")
                         .drop_duplicates("code", keep="last").reset_index(drop=True))
             VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
                             source="fetch_prices:negative_cache")
+            if marks:
+                LOG.info(f"전 구간 요청 {len(marks):,}종목의 요청 수위선을 기록했습니다 — "
+                         f"다음 실행이 같은 구간을 다시 조르지 않습니다(재수집 루프 차단).")
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
@@ -6756,6 +6927,204 @@ def foreign_normalize(df: pd.DataFrame, alias: dict) -> pd.DataFrame:
     return out
 
 
+# 파일명에서 날짜를 뽑는다. 2016~2026 캐시에서 실제로 쓰이는 표기를 모두 받는다.
+_FN_DATE = re.compile(r"(20\d{2})[.\-_/]?(0[1-9]|1[0-2])[.\-_/]?(0[1-9]|[12]\d|3[01])")
+_FN_DATE_YY = re.compile(r"(?<!\d)(\d{2})[.\-_](0[1-9]|1[0-2])[.\-_](0[1-9]|[12]\d|3[01])(?!\d)")
+_FN_CODE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+_FN_SPLIT = re.compile(r"[_\-\[\]()【】\s]+")
+
+
+def _fn_date(*texts: str) -> "Optional[pd.Timestamp]":
+    """파일명·폴더명에서 발행일을 뽑는다. 4자리 연도 우선, 없으면 2자리(20YY)."""
+    for t in texts:
+        t = str(t or "")
+        m = _FN_DATE.search(t)
+        if m:
+            try:
+                return pd.Timestamp(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
+            except Exception:                                           # noqa
+                pass
+        m = _FN_DATE_YY.search(t)
+        if m:
+            try:
+                return pd.Timestamp(f"20{m.group(1)}-{m.group(2)}-{m.group(3)}")
+            except Exception:                                           # noqa
+                pass
+    return None
+
+
+def reports_from_vault_index() -> pd.DataFrame:
+    """★ 드라이브에 등록된 리포트 PDF 의 **색인 메타데이터만으로** 원장을 만든다.
+
+    왜 이게 필요한가 — 실측에서 공용 금고에 리포트 13,295건이 등록돼 있는데도
+    K11 이 0건으로 보고했다. 정제 원장 '테이블'이 없다는 이유였다. 그래서 d2/d4 가
+    죽고, 이미 가진 13,295건이 통째로 낭비됐다.
+
+    그런데 XCB 의 d2(커버리지 애널리스트 수)·d4(커버리지 개시)가 실제로 요구하는 건
+    **종목 · 날짜 · 발행주체** 셋뿐이다. 목표주가나 투자의견은 쓰지 않는다(§8.2).
+    그리고 셋 다 파일명과 색인에 이미 들어 있다 — PDF 를 한 장도 열지 않는다.
+
+    한계는 숨기지 않고 표로 남긴다:
+      · 애널리스트명은 파일명에 거의 없다 → d2 는 '증권사 수'로 격하된다(0 채움 아님).
+      · put_blob 으로 저장된 행은 key 가 해시라 파일명이 없다 → 복원 불가.
+      · 종목코드는 파일명에 6자리가 있으면 직결, 없으면 종목명 매칭은 sec 확보 후.
+    """
+    try:
+        idx = VAULT.lookup("shared", domain="research")
+    except Exception:                                                   # noqa
+        return pd.DataFrame(columns=REPORT_COLS)
+    if idx is None or not len(idx):
+        return pd.DataFrame(columns=REPORT_COLS)
+
+    n_all = len(idx)
+    x = idx.copy()
+    x["key"] = x.get("key", pd.Series("", index=x.index)).astype(str)
+    # put_blob 행은 key 가 sha1 해시다(파일명 아님) — 파일명 파싱 대상에서 제외한다.
+    is_hash = x["key"].str.fullmatch(r"[0-9a-f]{16,}")
+    parseable = x[~is_hash.fillna(False)].copy()
+    n_hash = int(is_hash.fillna(False).sum())
+    if not len(parseable):
+        LOG.warn(f"등록된 리포트 {n_all:,}건이 전부 해시키(put_blob) 라 파일명이 없습니다 — "
+                 f"색인만으로는 원장을 만들 수 없습니다.")
+        return pd.DataFrame(columns=REPORT_COLS)
+
+    # 폴더명도 같이 본다(날짜가 폴더에만 있는 캐시가 흔하다).
+    def _dirof(e):
+        try:
+            return str(json.loads(e).get("dir", "")) if e else ""
+        except Exception:                                               # noqa
+            return ""
+    parseable["_dir"] = parseable.get("extra", pd.Series("", index=parseable.index)).map(_dirof)
+
+    # ① 날짜 — 색인이 이미 뽑아둔 event_date 를 우선 쓰고, 없으면 파일명/폴더명에서.
+    ed = as_ts_series(parseable.get("event_date"))
+    fn_dt = [ _fn_date(k, d) for k, d in zip(parseable["key"], parseable["_dir"]) ]
+    pub = ed.where(ed.notna(), pd.Series(fn_dt, index=parseable.index))
+    parseable["pub_date"] = as_ts_series(pub)
+
+    # ② 종목코드 — 파일명에 6자리 숫자가 있으면 그대로. 없으면 종목명 매칭(뒤 단계).
+    parseable["stock_code"] = [
+        (m.group(1) if (m := _FN_CODE.search(k)) else None) for k in parseable["key"]]
+    parseable["stock_code"] = parseable["stock_code"].map(to_code6)
+
+    # ③ 발행주체 — 파일명/폴더명 토큰에서 증권사를 찾는다.
+    known = MAJOR_BROKERS + MINOR_BROKERS
+    def _broker(k: str, dr: str) -> str:
+        blob = f"{k} {dr}"
+        for b in known:
+            if b in blob:
+                return b
+            stem = b.replace("증권", "").replace("투자", "").replace("금융", "")
+            if len(stem) >= 2 and stem in blob:
+                return b
+        for tok in _FN_SPLIT.split(k):
+            if tok.endswith("증권") and 3 <= len(tok) <= 12:
+                return tok
+        return ""
+    parseable["broker_raw"] = [_broker(k, d)
+                               for k, d in zip(parseable["key"], parseable["_dir"])]
+    _bn = [normalize_broker(b) for b in parseable["broker_raw"]]
+    parseable["broker_id"] = [a for a, _ in _bn]
+    parseable["broker_name"] = [b for _, b in _bn]
+    # 종목명 후보(파일명에서 코드·날짜·증권사·확장자를 걷어낸 나머지)
+    def _stem(k: str, b: str) -> str:
+        s = re.sub(r"\.(pdf|PDF)$", "", str(k))
+        s = _FN_DATE.sub(" ", s)
+        s = _FN_DATE_YY.sub(" ", s)
+        s = _FN_CODE.sub(" ", s)
+        if b:
+            s = s.replace(b, " ")
+        return " ".join(t for t in _FN_SPLIT.split(s) if t)[:60]
+    parseable["stock_name"] = [_stem(k, b) for k, b in
+                               zip(parseable["key"], parseable["broker_raw"])]
+
+    out = pd.DataFrame(index=parseable.index)
+    out["report_uid"] = parseable.get("uid", pd.Series("", index=parseable.index)).astype(str)
+    out["source"] = "drive_cache"
+    out["src_report_id"] = out["report_uid"]
+    out["title"] = parseable["key"]
+    out["stock_code"] = parseable["stock_code"]
+    out["stock_name"] = parseable["stock_name"]
+    out["broker_raw"] = parseable["broker_raw"]
+    out["broker_id"] = parseable["broker_id"]
+    out["broker_name"] = parseable["broker_name"]
+    out["analyst_raw"] = ""            # 파일명에 거의 없다 — 0 이 아니라 '없음'으로 둔다
+    out["target_price"] = np.nan       # XCB d2/d4 는 쓰지 않는다
+    out["opinion"] = ""
+    out["category"] = ""
+    out["pdf_url"] = ""
+    out["pdf_uid"] = parseable.get("uid", pd.Series("", index=parseable.index)).astype(str)
+    out["detail_url"] = ""
+    out["views"] = np.nan
+    out["pub_date"] = parseable["pub_date"]
+    out = out[out["pub_date"].notna()].copy()
+    out["event_date"] = out["pub_date"]
+    out["knowledge_date"] = out["pub_date"]
+    out = out.reindex(columns=REPORT_COLS)
+
+    n_date = len(out)
+    n_code = int(out["stock_code"].notna().sum())
+    n_brok = int((out["broker_name"].astype(str).str.len() > 0).sum())
+    LOG.ok(f"드라이브 색인만으로 리포트 원장 복원: {n_date:,}건 (PDF 재파싱 0건)")
+    LOG.table([
+        ["등록 리포트 총계", f"{n_all:,}"],
+        ["해시키(파일명 없음) 제외", f"{n_hash:,}"],
+        ["발행일 확보", f"{n_date:,} / {len(parseable):,}"],
+        ["종목코드 파일명 직결", f"{n_code:,} ({n_code/max(n_date,1)*100:.0f}%)"],
+        ["증권사 식별", f"{n_brok:,} ({n_brok/max(n_date,1)*100:.0f}%)"],
+        ["애널리스트명", "0 — 파일명에 없음 (d2 는 '증권사 수'로 격하)"],
+    ], ["항목", "실측"])
+    if n_code < n_date * 0.2:
+        LOG.warn(f"파일명에서 종목코드를 직접 얻은 건 {n_code:,}건뿐입니다 — 나머지는 "
+                 f"종목명 매칭으로 붙입니다(마스터 확보 후). 매칭 실패분은 d2/d4 에서 "
+                 f"제외되며 0 으로 채우지 않습니다.")
+    return out
+
+
+def resolve_report_codes(reports: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
+    """종목코드가 빈 리포트를 **종목명 매칭**으로 채운다. 마스터 확보 후에만 가능하다.
+
+    ★ 못 붙인 리포트는 버리지 않고 코드 없이 남긴다. d2/d4 계산에서 자연히 빠지며,
+      0 으로 채우지 않는다(0 은 '커버리지가 없었다'는 적극적 주장이라 신호를 왜곡한다).
+    """
+    if reports is None or not len(reports) or sec is None or not len(sec):
+        return reports
+    need = reports["stock_code"].isna()
+    n_need = int(need.sum())
+    if not n_need:
+        return reports
+    n2c = _name_to_code_map(sec)
+    if not n2c:
+        return reports
+    # 종목명 후보를 길이순으로 훑어 가장 긴 일치를 택한다(‘한화’ 가 ‘한화솔루션’을 먹지 않게).
+    names = sorted(n2c, key=len, reverse=True)
+    cache: Dict[str, Optional[str]] = {}
+
+    def _match(stem: str) -> Optional[str]:
+        s = norm_corp_name(stem)
+        if not s:
+            return None
+        if s in cache:
+            return cache[s]
+        hit = n2c.get(s)
+        if hit is None:
+            for nm in names:
+                if len(nm) >= 2 and nm in s:
+                    hit = n2c[nm]
+                    break
+        cache[s] = hit
+        return hit
+
+    out = reports.copy()
+    filled = [_match(x) for x in out.loc[need, "stock_name"].astype(str)]
+    out.loc[need, "stock_code"] = filled
+    n_ok = int(out["stock_code"].notna().sum()) - (len(out) - n_need)
+    LOG.ok(f"리포트 종목명 매칭: {n_need:,}건 중 {n_ok:,}건에 종목코드를 붙였습니다 "
+           f"(최종 코드 보유 {int(out['stock_code'].notna().sum()):,}/{len(out):,}). "
+           f"미매칭분은 코드 없이 남기며 d2/d4 에서 제외됩니다(0 채움 아님).")
+    return out
+
+
 def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
     """리포트 원장을 REPORT_COLS 스키마로 정규화해서 돌려준다.
 
@@ -6778,16 +7147,12 @@ def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
         d = cat.load("report_ledger", "arc_reports", "reports", "raw_reports",
                      alias=FOREIGN_ALIAS)
     if d is None or not len(d):
-        # 정제 테이블은 없지만 PDF 가 등록되어 있을 수 있다 — 그 사실을 알려 준다.
-        try:
-            n_pdf = len(VAULT.lookup("shared", domain="research"))
-        except Exception:                                               # noqa
-            n_pdf = 0
-        if n_pdf:
-            LOG.warn(f"공용 금고에 리포트 원본 {n_pdf:,}건이 등록되어 있으나 **정제 원장 테이블**이 "
-                     f"없습니다. d2/d4 는 목록 레벨 메타데이터가 필요하므로 이번 실행에서는 "
-                     f"신규 수집(한경/네이버 목록)으로 원장을 만듭니다. PDF 자체는 재파싱하지 "
-                     f"않습니다(비용 대비 회수가 낮습니다).")
+        # ★ 정제 테이블이 없다고 포기하면 안 된다 — 13,295건이 그냥 버려진다.
+        #   XCB 의 d2/d4 가 실제로 요구하는 건 세 가지뿐이다: 종목 · 날짜 · 발행주체.
+        #   셋 다 **파일명과 색인 메타데이터**에 이미 들어 있다(PDF 재파싱 불필요).
+        d = reports_from_vault_index()
+        if d is not None and len(d):
+            return d
     if d is None or not len(d):
         return pd.DataFrame(columns=REPORT_COLS)
 
@@ -8337,29 +8702,43 @@ def fetch_dart_industry(corp_codes: "Sequence[str]", code_of: "Dict[str, str]") 
                     "업종코드는 **상장사에만** 필요합니다(corpmap 에서 stock_code 가 있는 행).")
 
     def _one(cc: str):
-        js = dart_api("company.json", {"corp_code": cc})
-        if not js or str(js.get("status")) != "000":
-            return None
-        ind = str(js.get("induty_code") or "").strip()
-        if not ind:
-            return None
-        return {"code": code_of.get(cc) or to_code6(js.get("stock_code")),
-                "corp_code": cc, "induty_code": ind}
+        # ★ 전용 레이트 버킷을 쓴다. 공유 'dart' 버킷은 8 QPS 라 3,981건 ÷ 8 = 498초 —
+        #   실측 508초의 정체가 스레드가 아니라 **토큰버킷**이었다. 재무·공시 수집이 쓰는
+        #   'dart' 버킷은 그대로 두고, 가벼운 company.json 만 따로 뺀다.
+        #   ⚠ RATE_LIMIT_QPS 에 'dart_company' 가 없으면 generic(3.0)으로 떨어져 **더 느려진다.**
+        js = dart_api("company.json", {"corp_code": cc}, source="dart_company")
+        st = str((js or {}).get("status"))
+        ind = str((js or {}).get("induty_code") or "").strip() if js else ""
+        # ★★ 실패·빈값도 반드시 기록한다 ★★
+        #   예전엔 None 을 돌려 캐시에 아무것도 안 남겼다. todo 는 '캐시에 없는 corp'이므로
+        #   업종코드가 없는 법인은 **매 실행 영원히 재조회**된다. 잔여 재수집의 정체다.
+        #   빈 문자열 센티넬로 남기면 '물어봤고 없었다'가 기록된다.
+        return {"code": code_of.get(cc) or to_code6((js or {}).get("stock_code")),
+                "corp_code": cc, "induty_code": ind if st == "000" else ""}
 
     got = []
     if todo:
-        got = [r for r in pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8),
+        got = [r for r in pmap_io(_one, todo, workers=min(N_WORKERS_IO, 16),
                                   desc="DART 업종코드(KSIC)") if r]
     frames = [f for f in (cached, pd.DataFrame(got) if got else None)
               if f is not None and len(f)]
     if not frames:
         return pd.DataFrame(columns=cols)
     out = pd.concat(frames, ignore_index=True).drop_duplicates("corp_code", keep="last")
-    out = out[out["code"].notna()]
+    out["induty_code"] = out.get("induty_code", "").fillna("").astype(str)
+    # ★ 저장은 센티넬 포함 전량. 걸러내기는 **소비 시점**에만 한다.
+    #   예전엔 code 결측 행을 저장 전에 버려서, 그 법인들이 매 실행 다시 조회됐다.
     if got:
-        VAULT.put_table("dart_company_industry", out, scope="shared", source="DART company.json")
-    LOG.ok(f"KSIC 업종코드 {len(out):,}종목 확보 (중분류 {out['induty_code'].str[:2].nunique()}종)")
-    return out.reindex(columns=cols)
+        VAULT.put_table("dart_company_industry", out, scope="shared",
+                        source="DART company.json")
+    usable = out[out["code"].notna() & (out["induty_code"].str.len() > 0)]
+    n_empty = len(out) - len(usable)
+    LOG.ok(f"KSIC 업종코드 {len(usable):,}종목 확보 "
+           f"(중분류 {usable['induty_code'].str[:2].nunique()}종)")
+    if n_empty:
+        LOG.info(f"  업종코드가 없거나 종목코드가 안 붙는 {n_empty:,}건도 캐시에 "
+                 f"'조회함' 표시로 저장했습니다 — 다음 실행에서 다시 묻지 않습니다.")
+    return usable.reindex(columns=cols)
 
 
 def build_coverage_panel(reports: pd.DataFrame, months: pd.DatetimeIndex) -> pd.DataFrame:
@@ -11283,6 +11662,8 @@ def _reset_run_state() -> None:
             pass
     try:
         _SRC_CACHE.clear()
+        # ★ 같은 커널에서 두 번째 실행 시 지난 실행의 상장/폐지 스냅샷을 재사용하지 않는다.
+        reset_once()
         CELL_FALLBACK_STATS.clear()
         HTTP_STATS.clear()
         PIPE.stages.clear()
@@ -11385,7 +11766,8 @@ def main_xcb() -> int:
     with PIPE.stage("L1.PRICE", "가격 · 시가총액", "L1", budget_s=2400), \
             Stage("M0.price", 25.0):
         codes = sorted(sec["code"].astype(str).unique())
-        px_d = fetch_prices(codes, BACKTEST_START, BACKTEST_END)
+        # ★ sec 를 넘겨야 상장일(재수집 루프 차단)과 폐지표시(yfinance 회피)가 반영된다.
+        px_d = fetch_prices(codes, BACKTEST_START, BACKTEST_END, sec=sec)
         pxp = build_price_panel(px_d, months)
         px_m = pxp["monthly"] if isinstance(pxp, dict) else pxp
         mcap = None
@@ -11476,6 +11858,9 @@ def main_xcb() -> int:
         if FOREIGN is not None:
             reports = foreign_reports(FOREIGN)
             analysts = foreign_analysts(FOREIGN)
+        # ★ 색인 복원 원장은 파일명에 6자리 코드가 없는 건이 많다. 마스터가 준비된
+        #   지금 종목명으로 붙인다(이 단계 전에는 sec 가 없어 불가능하다).
+        reports = resolve_report_codes(reports, sec)
         if RESEARCH_COLLECT and RUN_MODE == "FULL" and len(reports) < 5000:
             try:
                 frames = [reports] if len(reports) else []

@@ -305,6 +305,39 @@ def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, qui
     return deco
 
 
+# ── 실행 1회 메모 ───────────────────────────────────────────────────────────────────────────
+_ONCE_CACHE: Dict[str, Any] = {}
+
+
+def once(fn: Callable) -> Callable:
+    """무인자 수집 함수를 **프로세스 1회**만 실제 실행한다.
+
+    ★ 왜: 실측 로그에서 상장폐지 목록이 3회, KIND 상장법인목록이 2회, DART corpCode 가
+      4회 수집됐다. CANARY(K5·K12)와 L1.UNIVERSE 가 각자 마스터를 다시 세우기 때문이다.
+      같은 날 같은 무인자 호출은 같은 결과를 준다 — 네트워크·파싱·파케이 재적재가 통째로 낭비다.
+
+    안전 조건(전부 확인함): 대상 함수는 무인자이며, 호출자가 반환 프레임을 제자리에서
+    수정하지 않는다(모두 .copy()/reindex 로 받는다). 노트북에서 두 번째 실행을 하면
+    reset_once() 로 비워야 아침 스냅샷을 재사용하는 사고가 없다.
+    """
+    key = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+
+    def wrapped(*a, **kw):
+        if a or kw:                       # 인자가 붙으면 메모하지 않는다(정의상 무인자용)
+            return fn(*a, **kw)
+        if key not in _ONCE_CACHE:
+            _ONCE_CACHE[key] = fn()
+        return _ONCE_CACHE[key]
+    wrapped.__name__ = getattr(fn, "__name__", "wrapped")
+    wrapped.__qualname__ = key
+    return wrapped
+
+
+def reset_once() -> None:
+    """같은 커널에서 재실행할 때 호출. 안 비우면 지난 실행의 스냅샷을 그대로 쓴다."""
+    _ONCE_CACHE.clear()
+
+
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
 def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
             desc: str = "", quiet: bool = False) -> List[Any]:

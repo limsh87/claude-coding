@@ -285,29 +285,43 @@ def fetch_dart_industry(corp_codes: "Sequence[str]", code_of: "Dict[str, str]") 
                     "업종코드는 **상장사에만** 필요합니다(corpmap 에서 stock_code 가 있는 행).")
 
     def _one(cc: str):
-        js = dart_api("company.json", {"corp_code": cc})
-        if not js or str(js.get("status")) != "000":
-            return None
-        ind = str(js.get("induty_code") or "").strip()
-        if not ind:
-            return None
-        return {"code": code_of.get(cc) or to_code6(js.get("stock_code")),
-                "corp_code": cc, "induty_code": ind}
+        # ★ 전용 레이트 버킷을 쓴다. 공유 'dart' 버킷은 8 QPS 라 3,981건 ÷ 8 = 498초 —
+        #   실측 508초의 정체가 스레드가 아니라 **토큰버킷**이었다. 재무·공시 수집이 쓰는
+        #   'dart' 버킷은 그대로 두고, 가벼운 company.json 만 따로 뺀다.
+        #   ⚠ RATE_LIMIT_QPS 에 'dart_company' 가 없으면 generic(3.0)으로 떨어져 **더 느려진다.**
+        js = dart_api("company.json", {"corp_code": cc}, source="dart_company")
+        st = str((js or {}).get("status"))
+        ind = str((js or {}).get("induty_code") or "").strip() if js else ""
+        # ★★ 실패·빈값도 반드시 기록한다 ★★
+        #   예전엔 None 을 돌려 캐시에 아무것도 안 남겼다. todo 는 '캐시에 없는 corp'이므로
+        #   업종코드가 없는 법인은 **매 실행 영원히 재조회**된다. 잔여 재수집의 정체다.
+        #   빈 문자열 센티넬로 남기면 '물어봤고 없었다'가 기록된다.
+        return {"code": code_of.get(cc) or to_code6((js or {}).get("stock_code")),
+                "corp_code": cc, "induty_code": ind if st == "000" else ""}
 
     got = []
     if todo:
-        got = [r for r in pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8),
+        got = [r for r in pmap_io(_one, todo, workers=min(N_WORKERS_IO, 16),
                                   desc="DART 업종코드(KSIC)") if r]
     frames = [f for f in (cached, pd.DataFrame(got) if got else None)
               if f is not None and len(f)]
     if not frames:
         return pd.DataFrame(columns=cols)
     out = pd.concat(frames, ignore_index=True).drop_duplicates("corp_code", keep="last")
-    out = out[out["code"].notna()]
+    out["induty_code"] = out.get("induty_code", "").fillna("").astype(str)
+    # ★ 저장은 센티넬 포함 전량. 걸러내기는 **소비 시점**에만 한다.
+    #   예전엔 code 결측 행을 저장 전에 버려서, 그 법인들이 매 실행 다시 조회됐다.
     if got:
-        VAULT.put_table("dart_company_industry", out, scope="shared", source="DART company.json")
-    LOG.ok(f"KSIC 업종코드 {len(out):,}종목 확보 (중분류 {out['induty_code'].str[:2].nunique()}종)")
-    return out.reindex(columns=cols)
+        VAULT.put_table("dart_company_industry", out, scope="shared",
+                        source="DART company.json")
+    usable = out[out["code"].notna() & (out["induty_code"].str.len() > 0)]
+    n_empty = len(out) - len(usable)
+    LOG.ok(f"KSIC 업종코드 {len(usable):,}종목 확보 "
+           f"(중분류 {usable['induty_code'].str[:2].nunique()}종)")
+    if n_empty:
+        LOG.info(f"  업종코드가 없거나 종목코드가 안 붙는 {n_empty:,}건도 캐시에 "
+                 f"'조회함' 표시로 저장했습니다 — 다음 실행에서 다시 묻지 않습니다.")
+    return usable.reindex(columns=cols)
 
 
 def build_coverage_panel(reports: pd.DataFrame, months: pd.DatetimeIndex) -> pd.DataFrame:

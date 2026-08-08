@@ -171,6 +171,7 @@ def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
     return {str(c).strip().lower(): c for c in d.columns}
 
 
+@once
 def fetch_fdr_listing() -> pd.DataFrame:
     d = _fdr_cache_csv("listing/krx")
     if d is not None and len(d):
@@ -225,6 +226,7 @@ def fetch_fdr_listing() -> pd.DataFrame:
     return t.dropna(subset=["code"]).drop_duplicates("code")
 
 
+@once
 def fetch_fdr_delisting() -> pd.DataFrame:
     """★ 생존자편향 제거의 핵심 입력. KRX Open API 에는 상장폐지 엔드포인트가 아예 없어서
     이 GitHub 캐시가 사실상 유일한 공개 경로다.
@@ -280,23 +282,50 @@ def fetch_fdr_delisting() -> pd.DataFrame:
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
     })
     t = t.dropna(subset=["code"])
-    # ── 폐지일 타당성 검사: 상장일이 잘못 실려 들어왔는지 데이터로 판정한다.
+    # ── 폐지일 타당성 검사 ────────────────────────────────────────────────────────────────
+    #  ★★ '오래된 날짜가 많다'를 증거로 쓰면 안 된다 ★★
+    #    한국거래소는 1956년에 열렸고 이 목록은 70년치를 담는다. 30년 이전 폐지가 6%쯤
+    #    있는 것은 **정상**이다. 예전 판정식(1995년 이전이 5% 초과 → 컬럼 폐기)은
+    #    실측 165/2,526(6.5%)에서 발동해 **진짜 폐지일 2,526건을 통째로 버렸다.**
+    #    그 결과 폐지일 보유가 428건(8%)까지 떨어져 C2 가 사실상 무너졌고,
+    #    폐지 종목이 '상장 중'으로 남아 가격 수집이 없는 데이터를 15분간 뒤졌다.
+    #
+    #    상장일 오적재는 '나이'가 아니라 **논리적 모순**으로 판정한다:
+    #      ① 폐지일 < 상장일        — 상장 전에 폐지될 수 없다
+    #      ② 폐지일 == 상장일       — 같은 컬럼을 두 번 읽었다
+    #      ③ 폐지일 < 1956-03-03    — 거래소 개장 전. 물리적으로 불가능
+    #    ①②는 상장일이 실려온 경우 거의 전량에서 성립하고, 진짜 폐지일에서는 0 에 가깝다.
     _dd = as_ts_series(t["delisting_date"])
-    _n_old = int((_dd < pd.Timestamp("1995-01-01")).sum())
+    _ld = as_ts_series(t["listing_date"])
+    _n_dd = int(_dd.notna().sum())
+    _both = _dd.notna() & _ld.notna()
+    n_before = int((_both & (_dd < _ld)).sum())
+    n_equal = int((_both & (_dd == _ld)).sum())
+    n_impossible = int((_dd < pd.Timestamp("1956-03-03")).sum())
+    _den = max(int(_both.sum()), 1)
+    bad = (n_before + n_equal) / _den
     if dl_c is None:
         LOG.warn("상장폐지 목록에 **폐지일 컬럼이 없습니다**. 폐지 사실만 사용하고 폐지일은 "
                  "'마지막 거래일'로 복원합니다(뒤 단계). 폐지 종목을 버리지는 않습니다 — "
                  "버리면 그게 곧 생존자편향입니다.")
         t["delisting_date"] = pd.NaT
-    elif _dd.notna().any() and _n_old > max(20, 0.05 * int(_dd.notna().sum())):
+    elif _n_dd and (bad > 0.5 or n_impossible > max(5, 0.02 * _n_dd)):
         LOG.error(
-            f"상장폐지 목록의 '폐지일' 중 {_n_old:,}건이 1995년 이전입니다 "
-            f"(최소 {_dd.min():%Y-%m-%d}). 폐지일 자리에 **상장일**이 들어왔을 가능성이 큽니다.\n"
-            f"    그대로 두면 '오래전에 상장해 최근 폐지된' 종목이 백테스트 전 구간에서 빠져\n"
-            f"    실패 사례가 사라집니다 — 제거했다고 믿은 생존자편향이 그대로 재유입됩니다.\n"
-            f"    → 이 컬럼을 폐기하고 마지막 거래일로 복원합니다.")
+            f"'{dl_c}' 컬럼을 폐지일로 쓸 수 없습니다 — 상장일이 실려온 것으로 판정합니다.\n"
+            f"    폐지일<상장일 {n_before:,}건 · 폐지일==상장일 {n_equal:,}건 "
+            f"(대조 {int(_both.sum()):,}건 중 {bad*100:.0f}%) · 거래소 개장(1956) 이전 "
+            f"{n_impossible:,}건.\n"
+            f"    → 이 컬럼을 폐기하고 '마지막 거래일'로 복원합니다.")
         t["listing_date"] = t["listing_date"].fillna(_dd)
         t["delisting_date"] = pd.NaT
+    else:
+        _old = int((_dd < pd.Timestamp("1995-01-01")).sum())
+        LOG.ok(f"폐지일 컬럼 '{dl_c}' 채택 — {_n_dd:,}건 "
+               f"(모순 검사: 폐지일<상장일 {n_before:,}건 · 동일 {n_equal:,}건 · "
+               f"1956년 이전 {n_impossible:,}건).")
+        if _old:
+            LOG.info(f"  1995년 이전 폐지 {_old:,}건({_old/max(_n_dd,1)*100:.1f}%)은 "
+                     f"70년치 목록에서 정상입니다 — 백테스트 구간 밖이라 자동으로 제외됩니다.")
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
@@ -338,6 +367,7 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     return t
 
 
+@once
 def fetch_kind_listing() -> pd.DataFrame:
     """KIND 상장법인목록 — 상장일·업종 보강.
     ★ 종목코드가 정수로 와서 앞자리 0 이 날아간다(5930 ← 005930). to_code6 이 복구한다."""
@@ -377,6 +407,7 @@ def fetch_kind_listing() -> pd.DataFrame:
     return pd.DataFrame(columns=SEC_MASTER_COLS)
 
 
+@once
 def fetch_dart_corpcode() -> pd.DataFrame:
     """corp_code ↔ 종목코드. DART 의 모든 재무·공시 조회는 corp_code 로만 된다."""
     if not DART_API_KEY:

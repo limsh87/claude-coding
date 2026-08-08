@@ -255,23 +255,56 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+_YF_MUTED = False
+
+
+def _mute_yfinance() -> None:
+    """yfinance 의 'possibly delisted' 잡음을 **스레드 안전하게** 끈다. 프로세스 1회.
+
+    ★★ redirect_stdout/redirect_stderr 를 쓰면 안 된다 ★★
+      그 둘은 sys.stdout/sys.stderr 를 **전역으로** 갈아끼운다. 그런데 가격 수집은
+      스레드풀(pmap_io)에서 돈다. A 스레드가 싱크를 꽂고 있는 동안 B 스레드의 tqdm
+      출력이 싱크로 빨려 들어가고, A 가 원복하면서 B 가 꽂아둔 것을 덮어쓴다.
+      실측 증상: 진행바가 깨지고 콘솔이 잠기며 노트북이 멈춘 것처럼 보인다.
+      → 전역 상태를 건드리지 않는 **로거 차단**으로 바꾼다. logging 은 스레드 안전하다.
+    """
+    global _YF_MUTED
+    if _YF_MUTED or yf is None:
+        return
+    for nm in ("yfinance", "yfinance.ticker", "yfinance.data", "yfinance.utils",
+               "yfinance.scrapers", "peewee", "urllib3.connectionpool"):
+        lg = logging.getLogger(nm)
+        lg.setLevel(logging.CRITICAL)
+        lg.propagate = False
+        lg.addHandler(logging.NullHandler())
+    try:                                   # 신버전은 전용 로거 설정 API 를 준다
+        yf.utils.get_yf_logger().setLevel(logging.CRITICAL)
+    except Exception:                                                   # noqa
+        pass
+    try:                                   # tz 캐시를 로컬에 두면 매 호출 조회가 사라진다
+        yf.set_tz_cache_location(os.path.join(LOCAL_CACHE_ROOT, "yf_tz"))
+    except Exception:                                                   # noqa
+        pass
+    _YF_MUTED = True
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """★ yfinance 는 한국 상장폐지 종목을 사실상 못 준다.
 
     실측(2026-08 로컬 실행): 폐지 종목 위주 1,660개를 돌리며 종목당 `.KS`/`.KQ` 두 번,
-    매번 "possibly delisted; no timezone found" 를 **stderr 로 직접 출력**해 콘솔이 마비되고
-    16분을 태웠다(성공 0건). 로거 레벨 조정으로는 안 잡힌다 — 자체 print 경로가 있다.
-    → 호출 구간 동안 stdout/stderr 를 통째로 삼키고, 실패는 조용히 None 으로 돌린다.
+    매번 "possibly delisted; no price data found" 를 출력해 콘솔이 마비되고 15분을
+    태웠다(성공 0건). 그래서 두 가지를 함께 한다:
+      ① 폐지 표시가 있는 종목은 fetch_prices 가 **애초에 이 함수를 부르지 않는다**.
+      ② 그래도 남는 잡음은 로거 차단으로 끈다(스레드 안전).
     """
     if yf is None:
         return None
+    _mute_yfinance()
     for suf in (".KS", ".KQ"):
         try:
             limiter("generic").wait()
-            _sink = io.StringIO()
-            with contextlib.redirect_stdout(_sink), contextlib.redirect_stderr(_sink):
-                d = yf.download(code + suf, start=start, end=end, progress=False,
-                                auto_adjust=False, threads=False)
+            d = yf.download(code + suf, start=start, end=end, progress=False,
+                            auto_adjust=False, threads=False, timeout=20)
         except Exception:
             continue
         if d is None or len(d) == 0:
@@ -294,9 +327,33 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장.
+
+    ★ sec(종목 마스터)를 받는 이유는 두 가지다. 없어도 동작하지만 둘 다 손해다:
+      ① 상장일 — 2020년 상장주는 캐시가 2020부터인 게 **정상**인데, 상장일을 모르면
+         '앞 구간 결손'으로 오판해 매 실행 전 구간을 다시 받는다. 그런데 받아도 여전히
+         2020부터라 캐시 최소일이 안 변한다 → **영원히 수렴하지 않는 재수집 루프**.
+         실측 1,256종목이 매 실행 이 루프에 걸렸다.
+      ② 폐지 여부 — yfinance 에는 폐지된 한국 종목이 없다. 폐지 종목에까지 체인 끝의
+         yfinance 를 태우면 종목당 2회(.KS/.KQ) 헛호출이다. 실측 1.8it/s × 1,646 = 15분.
+    """
     codes = sorted({c for c in map(to_code6, codes) if c})
+    # ── 마스터에서 상장일·폐지여부를 뽑는다(없으면 빈 dict — 동작은 유지) ─────────────
+    listing_of: Dict[str, pd.Timestamp] = {}
+    dead_set: set = set()
+    if sec is not None and len(sec) and "code" in sec.columns:
+        _s = sec.copy()
+        _s["code"] = _s["code"].astype(str)
+        if "listing_date" in _s.columns:
+            _ld = as_ts_series(_s["listing_date"])
+            listing_of = {c: d for c, d in zip(_s["code"], _ld) if pd.notna(d)}
+        if "delisting_date" in _s.columns:
+            _dd = as_ts_series(_s["delisting_date"])
+            dead_set = set(_s.loc[_dd.notna(), "code"])
+        if "src" in _s.columns:
+            dead_set |= set(_s.loc[_s["src"].astype(str).str.contains("delist"), "code"])
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
     have_min: Dict[str, pd.Timestamp] = {}
@@ -335,7 +392,16 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    def _want_from(c: str) -> pd.Timestamp:
+        """이 종목에 대해 **실제로 존재할 수 있는** 가장 이른 날짜.
+
+        상장 전 구간은 아무리 요청해도 영원히 비어 있다. 그걸 '결손'으로 세면
+        매 실행 같은 구간을 다시 받고, 받아도 캐시 최소일이 안 변해 무한 반복이 된다.
+        """
+        ld = listing_of.get(c)
+        return max(start_ts, ld) if ld is not None and pd.notna(ld) else start_ts
+
+    todo, n_back, n_fwd, n_skip, n_settled = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
@@ -348,15 +414,30 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
         #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
         #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+        wf = _want_from(c)
+        if mn is not None and mn > wf + pd.Timedelta(days=10):
+            # 상장일 기준으로도 앞이 빈다 → 진짜 결손. 단, 이미 같은 구간을 요청해 본 적이
+            # 있으면(시도 원장) 다시 조르지 않는다. 소스에 없는 걸 계속 묻는 셈이라서다.
+            if _recently_failed(c, start_ts):
+                n_settled += 1
+                continue
             todo.append((c, start))
             n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
     if n_back:
-        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 다시 받습니다 "
+                 f"(상장일 대비 앞 구간 결손 — 상장 전 구간은 세지 않습니다).")
+    if n_settled:
+        LOG.info(f"앞 구간이 비지만 최근 {RETRY_AFTER_DAYS}일 내 같은 구간을 이미 요청해 본 "
+                 f"{n_settled:,}종목은 건너뜁니다 (소스에 없는 구간을 반복 조회하지 않습니다).")
+    if listing_of:
+        LOG.debug(f"상장일 {len(listing_of):,}종목 · 폐지 표시 {len(dead_set):,}종목을 "
+                  f"수집 계획에 반영했습니다.")
+    else:
+        LOG.warn("종목 마스터를 못 받아 상장일을 모릅니다 — 상장 전 구간을 '결손'으로 "
+                 "오판해 매 실행 재수집할 수 있습니다. fetch_prices(..., sec=sec) 로 부르세요.")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -387,9 +468,21 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 alive = [(nm, fn) for nm, fn in PRICE_CHAIN if _fail[nm] < _dead_after]
                 return sorted(alive, key=lambda x: -_ok[x[0]])
 
+        # ★ yfinance 는 **폐지된 한국 종목을 갖고 있지 않다.** 그런데 체인 끝에 있어서
+        #   FDR·네이버가 못 준 종목 = 대부분 폐지분이 전부 yfinance 로 흘러든다.
+        #   종목당 .KS/.KQ 두 번씩, 실측 1.8it/s × 1,646종목 = 15분을 성공 0건으로 태웠다.
+        #   폐지가 표시된 종목에서는 아예 빼고 부른다. 표시가 없으면 종전대로 시도한다.
+        _n_dead_job = sum(1 for c, _ in todo if c in dead_set)
+        if _n_dead_job and yf is not None:
+            LOG.info(f"수집 대상 중 {_n_dead_job:,}종목은 폐지 표시가 있어 yfinance 를 "
+                     f"건너뜁니다 (yfinance 에는 폐지된 한국 종목이 없습니다).")
+
         def _one(job):
             code, st = job
-            for nm, fn in _chain_order():
+            chain = _chain_order()
+            if code in dead_set:
+                chain = [(nm, fn) for nm, fn in chain if nm != "yfinance"]
+            for nm, fn in chain:
                 try:
                     d = fn(code, st, end)
                 except Exception:
@@ -411,26 +504,37 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             LOG.warn(f"연속 {_dead_after}회 실패로 이번 실행에서 내린 가격 소스: {_dropped}. "
                      f"(고정 순서로 두면 죽은 소스의 비용을 전 종목이 지불합니다) "
                      f"성공 분포: {dict(_ok)}")
-        failed = []
+        failed, marks = [], []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
+                # ★ 전 구간을 요청한 건은 **성공해도** 시도 원장에 남긴다.
+                #   2020년 상장주에 2015년부터 달라고 하면 2020년치만 온다. 그건 정상인데,
+                #   기록이 없으면 다음 실행이 "앞이 비었다"며 똑같이 또 요청한다.
+                #   받아도 캐시 최소일이 안 변하므로 **영원히 반복**된다(실측 1,256종목).
+                if as_ts(st) <= start_ts:
+                    marks.append({"code": c, "requested_from": as_ts(st),
+                                  "attempted_at": _today})
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
-            # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
-            #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
+        # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
+        #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
+        if failed or marks:
             _prev = _att if _att is not None and len(_att) else None
-            _new = pd.DataFrame(failed)
+            _new = pd.DataFrame(failed + marks)
             _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
             _all = (_all.sort_values("attempted_at")
                         .drop_duplicates("code", keep="last").reset_index(drop=True))
             VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
                             source="fetch_prices:negative_cache")
+            if marks:
+                LOG.info(f"전 구간 요청 {len(marks):,}종목의 요청 수위선을 기록했습니다 — "
+                         f"다음 실행이 같은 구간을 다시 조르지 않습니다(재수집 루프 차단).")
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:

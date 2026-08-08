@@ -202,6 +202,8 @@ def _reset_run_state() -> None:
             pass
     try:
         _SRC_CACHE.clear()
+        # ★ 같은 커널에서 두 번째 실행 시 지난 실행의 상장/폐지 스냅샷을 재사용하지 않는다.
+        reset_once()
         CELL_FALLBACK_STATS.clear()
         HTTP_STATS.clear()
         PIPE.stages.clear()
@@ -304,7 +306,8 @@ def main_xcb() -> int:
     with PIPE.stage("L1.PRICE", "가격 · 시가총액", "L1", budget_s=2400), \
             Stage("M0.price", 25.0):
         codes = sorted(sec["code"].astype(str).unique())
-        px_d = fetch_prices(codes, BACKTEST_START, BACKTEST_END)
+        # ★ sec 를 넘겨야 상장일(재수집 루프 차단)과 폐지표시(yfinance 회피)가 반영된다.
+        px_d = fetch_prices(codes, BACKTEST_START, BACKTEST_END, sec=sec)
         pxp = build_price_panel(px_d, months)
         px_m = pxp["monthly"] if isinstance(pxp, dict) else pxp
         mcap = None
@@ -395,6 +398,9 @@ def main_xcb() -> int:
         if FOREIGN is not None:
             reports = foreign_reports(FOREIGN)
             analysts = foreign_analysts(FOREIGN)
+        # ★ 색인 복원 원장은 파일명에 6자리 코드가 없는 건이 많다. 마스터가 준비된
+        #   지금 종목명으로 붙인다(이 단계 전에는 sec 가 없어 불가능하다).
+        reports = resolve_report_codes(reports, sec)
         if RESEARCH_COLLECT and RUN_MODE == "FULL" and len(reports) < 5000:
             try:
                 frames = [reports] if len(reports) else []

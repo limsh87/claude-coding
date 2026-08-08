@@ -338,6 +338,204 @@ def foreign_normalize(df: pd.DataFrame, alias: dict) -> pd.DataFrame:
     return out
 
 
+# 파일명에서 날짜를 뽑는다. 2016~2026 캐시에서 실제로 쓰이는 표기를 모두 받는다.
+_FN_DATE = re.compile(r"(20\d{2})[.\-_/]?(0[1-9]|1[0-2])[.\-_/]?(0[1-9]|[12]\d|3[01])")
+_FN_DATE_YY = re.compile(r"(?<!\d)(\d{2})[.\-_](0[1-9]|1[0-2])[.\-_](0[1-9]|[12]\d|3[01])(?!\d)")
+_FN_CODE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+_FN_SPLIT = re.compile(r"[_\-\[\]()【】\s]+")
+
+
+def _fn_date(*texts: str) -> "Optional[pd.Timestamp]":
+    """파일명·폴더명에서 발행일을 뽑는다. 4자리 연도 우선, 없으면 2자리(20YY)."""
+    for t in texts:
+        t = str(t or "")
+        m = _FN_DATE.search(t)
+        if m:
+            try:
+                return pd.Timestamp(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
+            except Exception:                                           # noqa
+                pass
+        m = _FN_DATE_YY.search(t)
+        if m:
+            try:
+                return pd.Timestamp(f"20{m.group(1)}-{m.group(2)}-{m.group(3)}")
+            except Exception:                                           # noqa
+                pass
+    return None
+
+
+def reports_from_vault_index() -> pd.DataFrame:
+    """★ 드라이브에 등록된 리포트 PDF 의 **색인 메타데이터만으로** 원장을 만든다.
+
+    왜 이게 필요한가 — 실측에서 공용 금고에 리포트 13,295건이 등록돼 있는데도
+    K11 이 0건으로 보고했다. 정제 원장 '테이블'이 없다는 이유였다. 그래서 d2/d4 가
+    죽고, 이미 가진 13,295건이 통째로 낭비됐다.
+
+    그런데 XCB 의 d2(커버리지 애널리스트 수)·d4(커버리지 개시)가 실제로 요구하는 건
+    **종목 · 날짜 · 발행주체** 셋뿐이다. 목표주가나 투자의견은 쓰지 않는다(§8.2).
+    그리고 셋 다 파일명과 색인에 이미 들어 있다 — PDF 를 한 장도 열지 않는다.
+
+    한계는 숨기지 않고 표로 남긴다:
+      · 애널리스트명은 파일명에 거의 없다 → d2 는 '증권사 수'로 격하된다(0 채움 아님).
+      · put_blob 으로 저장된 행은 key 가 해시라 파일명이 없다 → 복원 불가.
+      · 종목코드는 파일명에 6자리가 있으면 직결, 없으면 종목명 매칭은 sec 확보 후.
+    """
+    try:
+        idx = VAULT.lookup("shared", domain="research")
+    except Exception:                                                   # noqa
+        return pd.DataFrame(columns=REPORT_COLS)
+    if idx is None or not len(idx):
+        return pd.DataFrame(columns=REPORT_COLS)
+
+    n_all = len(idx)
+    x = idx.copy()
+    x["key"] = x.get("key", pd.Series("", index=x.index)).astype(str)
+    # put_blob 행은 key 가 sha1 해시다(파일명 아님) — 파일명 파싱 대상에서 제외한다.
+    is_hash = x["key"].str.fullmatch(r"[0-9a-f]{16,}")
+    parseable = x[~is_hash.fillna(False)].copy()
+    n_hash = int(is_hash.fillna(False).sum())
+    if not len(parseable):
+        LOG.warn(f"등록된 리포트 {n_all:,}건이 전부 해시키(put_blob) 라 파일명이 없습니다 — "
+                 f"색인만으로는 원장을 만들 수 없습니다.")
+        return pd.DataFrame(columns=REPORT_COLS)
+
+    # 폴더명도 같이 본다(날짜가 폴더에만 있는 캐시가 흔하다).
+    def _dirof(e):
+        try:
+            return str(json.loads(e).get("dir", "")) if e else ""
+        except Exception:                                               # noqa
+            return ""
+    parseable["_dir"] = parseable.get("extra", pd.Series("", index=parseable.index)).map(_dirof)
+
+    # ① 날짜 — 색인이 이미 뽑아둔 event_date 를 우선 쓰고, 없으면 파일명/폴더명에서.
+    ed = as_ts_series(parseable.get("event_date"))
+    fn_dt = [ _fn_date(k, d) for k, d in zip(parseable["key"], parseable["_dir"]) ]
+    pub = ed.where(ed.notna(), pd.Series(fn_dt, index=parseable.index))
+    parseable["pub_date"] = as_ts_series(pub)
+
+    # ② 종목코드 — 파일명에 6자리 숫자가 있으면 그대로. 없으면 종목명 매칭(뒤 단계).
+    parseable["stock_code"] = [
+        (m.group(1) if (m := _FN_CODE.search(k)) else None) for k in parseable["key"]]
+    parseable["stock_code"] = parseable["stock_code"].map(to_code6)
+
+    # ③ 발행주체 — 파일명/폴더명 토큰에서 증권사를 찾는다.
+    known = MAJOR_BROKERS + MINOR_BROKERS
+    def _broker(k: str, dr: str) -> str:
+        blob = f"{k} {dr}"
+        for b in known:
+            if b in blob:
+                return b
+            stem = b.replace("증권", "").replace("투자", "").replace("금융", "")
+            if len(stem) >= 2 and stem in blob:
+                return b
+        for tok in _FN_SPLIT.split(k):
+            if tok.endswith("증권") and 3 <= len(tok) <= 12:
+                return tok
+        return ""
+    parseable["broker_raw"] = [_broker(k, d)
+                               for k, d in zip(parseable["key"], parseable["_dir"])]
+    _bn = [normalize_broker(b) for b in parseable["broker_raw"]]
+    parseable["broker_id"] = [a for a, _ in _bn]
+    parseable["broker_name"] = [b for _, b in _bn]
+    # 종목명 후보(파일명에서 코드·날짜·증권사·확장자를 걷어낸 나머지)
+    def _stem(k: str, b: str) -> str:
+        s = re.sub(r"\.(pdf|PDF)$", "", str(k))
+        s = _FN_DATE.sub(" ", s)
+        s = _FN_DATE_YY.sub(" ", s)
+        s = _FN_CODE.sub(" ", s)
+        if b:
+            s = s.replace(b, " ")
+        return " ".join(t for t in _FN_SPLIT.split(s) if t)[:60]
+    parseable["stock_name"] = [_stem(k, b) for k, b in
+                               zip(parseable["key"], parseable["broker_raw"])]
+
+    out = pd.DataFrame(index=parseable.index)
+    out["report_uid"] = parseable.get("uid", pd.Series("", index=parseable.index)).astype(str)
+    out["source"] = "drive_cache"
+    out["src_report_id"] = out["report_uid"]
+    out["title"] = parseable["key"]
+    out["stock_code"] = parseable["stock_code"]
+    out["stock_name"] = parseable["stock_name"]
+    out["broker_raw"] = parseable["broker_raw"]
+    out["broker_id"] = parseable["broker_id"]
+    out["broker_name"] = parseable["broker_name"]
+    out["analyst_raw"] = ""            # 파일명에 거의 없다 — 0 이 아니라 '없음'으로 둔다
+    out["target_price"] = np.nan       # XCB d2/d4 는 쓰지 않는다
+    out["opinion"] = ""
+    out["category"] = ""
+    out["pdf_url"] = ""
+    out["pdf_uid"] = parseable.get("uid", pd.Series("", index=parseable.index)).astype(str)
+    out["detail_url"] = ""
+    out["views"] = np.nan
+    out["pub_date"] = parseable["pub_date"]
+    out = out[out["pub_date"].notna()].copy()
+    out["event_date"] = out["pub_date"]
+    out["knowledge_date"] = out["pub_date"]
+    out = out.reindex(columns=REPORT_COLS)
+
+    n_date = len(out)
+    n_code = int(out["stock_code"].notna().sum())
+    n_brok = int((out["broker_name"].astype(str).str.len() > 0).sum())
+    LOG.ok(f"드라이브 색인만으로 리포트 원장 복원: {n_date:,}건 (PDF 재파싱 0건)")
+    LOG.table([
+        ["등록 리포트 총계", f"{n_all:,}"],
+        ["해시키(파일명 없음) 제외", f"{n_hash:,}"],
+        ["발행일 확보", f"{n_date:,} / {len(parseable):,}"],
+        ["종목코드 파일명 직결", f"{n_code:,} ({n_code/max(n_date,1)*100:.0f}%)"],
+        ["증권사 식별", f"{n_brok:,} ({n_brok/max(n_date,1)*100:.0f}%)"],
+        ["애널리스트명", "0 — 파일명에 없음 (d2 는 '증권사 수'로 격하)"],
+    ], ["항목", "실측"])
+    if n_code < n_date * 0.2:
+        LOG.warn(f"파일명에서 종목코드를 직접 얻은 건 {n_code:,}건뿐입니다 — 나머지는 "
+                 f"종목명 매칭으로 붙입니다(마스터 확보 후). 매칭 실패분은 d2/d4 에서 "
+                 f"제외되며 0 으로 채우지 않습니다.")
+    return out
+
+
+def resolve_report_codes(reports: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
+    """종목코드가 빈 리포트를 **종목명 매칭**으로 채운다. 마스터 확보 후에만 가능하다.
+
+    ★ 못 붙인 리포트는 버리지 않고 코드 없이 남긴다. d2/d4 계산에서 자연히 빠지며,
+      0 으로 채우지 않는다(0 은 '커버리지가 없었다'는 적극적 주장이라 신호를 왜곡한다).
+    """
+    if reports is None or not len(reports) or sec is None or not len(sec):
+        return reports
+    need = reports["stock_code"].isna()
+    n_need = int(need.sum())
+    if not n_need:
+        return reports
+    n2c = _name_to_code_map(sec)
+    if not n2c:
+        return reports
+    # 종목명 후보를 길이순으로 훑어 가장 긴 일치를 택한다(‘한화’ 가 ‘한화솔루션’을 먹지 않게).
+    names = sorted(n2c, key=len, reverse=True)
+    cache: Dict[str, Optional[str]] = {}
+
+    def _match(stem: str) -> Optional[str]:
+        s = norm_corp_name(stem)
+        if not s:
+            return None
+        if s in cache:
+            return cache[s]
+        hit = n2c.get(s)
+        if hit is None:
+            for nm in names:
+                if len(nm) >= 2 and nm in s:
+                    hit = n2c[nm]
+                    break
+        cache[s] = hit
+        return hit
+
+    out = reports.copy()
+    filled = [_match(x) for x in out.loc[need, "stock_name"].astype(str)]
+    out.loc[need, "stock_code"] = filled
+    n_ok = int(out["stock_code"].notna().sum()) - (len(out) - n_need)
+    LOG.ok(f"리포트 종목명 매칭: {n_need:,}건 중 {n_ok:,}건에 종목코드를 붙였습니다 "
+           f"(최종 코드 보유 {int(out['stock_code'].notna().sum()):,}/{len(out):,}). "
+           f"미매칭분은 코드 없이 남기며 d2/d4 에서 제외됩니다(0 채움 아님).")
+    return out
+
+
 def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
     """리포트 원장을 REPORT_COLS 스키마로 정규화해서 돌려준다.
 
@@ -360,16 +558,12 @@ def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
         d = cat.load("report_ledger", "arc_reports", "reports", "raw_reports",
                      alias=FOREIGN_ALIAS)
     if d is None or not len(d):
-        # 정제 테이블은 없지만 PDF 가 등록되어 있을 수 있다 — 그 사실을 알려 준다.
-        try:
-            n_pdf = len(VAULT.lookup("shared", domain="research"))
-        except Exception:                                               # noqa
-            n_pdf = 0
-        if n_pdf:
-            LOG.warn(f"공용 금고에 리포트 원본 {n_pdf:,}건이 등록되어 있으나 **정제 원장 테이블**이 "
-                     f"없습니다. d2/d4 는 목록 레벨 메타데이터가 필요하므로 이번 실행에서는 "
-                     f"신규 수집(한경/네이버 목록)으로 원장을 만듭니다. PDF 자체는 재파싱하지 "
-                     f"않습니다(비용 대비 회수가 낮습니다).")
+        # ★ 정제 테이블이 없다고 포기하면 안 된다 — 13,295건이 그냥 버려진다.
+        #   XCB 의 d2/d4 가 실제로 요구하는 건 세 가지뿐이다: 종목 · 날짜 · 발행주체.
+        #   셋 다 **파일명과 색인 메타데이터**에 이미 들어 있다(PDF 재파싱 불필요).
+        d = reports_from_vault_index()
+        if d is not None and len(d):
+            return d
     if d is None or not len(d):
         return pd.DataFrame(columns=REPORT_COLS)
 
