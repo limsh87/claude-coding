@@ -4032,7 +4032,16 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     # 그 가격으로 체결했다고 가정할 수 없으므로 종가로 폴백한다.
     gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
     monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
-    monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
+    # ★★ 종가 폴백을 하면 안 된다 ★★
+    #   여기서 close 로 채우면 **신호 산출일 당일 종가로 체결**한 것이 된다 — 이 파일이
+    #   맨 위에서 금지한 바로 그 미래누수다. 게다가 이 폴백이 발동하는 모집단은
+    #   거래정지·상폐 직전 종목이라, 하필 가장 위험한 종목에 '공짜 체결'을 주는 셈이다.
+    #   체결가를 모르면 그 종목월은 진입 후보에서 빠져야 한다(엔진의 exec_px.notna() 게이트).
+    _n_noexec = int(monthly["exec_px"].isna().sum())
+    if _n_noexec:
+        LOG.info(f"다음 거래일 시가를 얻지 못한 {_n_noexec:,} 종목월은 체결가 없음으로 "
+                 f"두어 진입 후보에서 제외합니다 (당일 종가 체결로 대체하지 않습니다 — "
+                 f"그건 미래누수이고 하필 거래정지·상폐 직전 종목에 유리하게 작용합니다).")
 
     # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
     #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
@@ -6589,13 +6598,17 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
     hold: Dict[str, int] = {}
     rows, holdings_log, gates = [], [], []
     prev_w: Dict[str, float] = {}
+    charged: set = set()          # 폐지 -100% 를 이미 계상한 종목 (이중 계상 방지)
+    n_unresolved, w_unresolved = 0, 0.0   # 결과 미관측 보유 — 0% 로 계상한 건수·가중치
 
     for m in months:
         sub = Pm.get(m)
         if sub is None or sub.empty:
+            # ★ prev_w 를 비우면 그 달에 보유 종목이 **비용 없이 증발**하고, 그 사이에 폐지된
+            #   종목의 -100% 도 영원히 계상되지 않는다(생존자편향 재유입).
+            #   패널에 그 달 행이 없는 건 데이터 공백이지 청산이 아니다 — 보유를 이월한다.
             rows.append({"month": m, "ret": 0.0, "ret_gross": 0.0, "n": 0,
-                         "turnover": 0.0, "cost": 0.0})
-            prev_w = {}
+                         "turnover": 0.0, "cost": 0.0, "invested": 0.0, "empty": 1})
             continue
         sub = sub.copy()
         rec = {c: dict(zip(sub["code"], sub[c])) for c in need if c in sub.columns}
@@ -6663,11 +6676,19 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
             f = rec.get("fwd_ret", {}).get(c)
             fr = float(f) if f is not None and pd.notna(f) else np.nan
             dl = delist.get(c)
-            if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
+            if (dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1)
+                    and c not in charged):
                 # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
-                fr = -1.0 if not np.isfinite(fr) else fr
+                if not np.isfinite(fr):
+                    fr = -1.0
+                    charged.add(c)          # 같은 폐지를 두 번 계상하지 않는다
             if not np.isfinite(fr):
+                # ★ 결과를 관측하지 못한 보유(거래정지·가격결손·마지막 달).
+                #   0% 는 '아무 일도 없었다'는 적극적 주장이라 **성과를 부풀리는 방향**이다.
+                #   여기서 임의로 -100% 를 때리면 반대로 과도하다 → 0 으로 두되 **세어서 보고**한다.
                 fr = 0.0
+                n_unresolved += 1
+                w_unresolved += float(w)
             ret += w * fr
             holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
                                  "signal": rec.get(signal_col, {}).get(c, np.nan)})
@@ -6676,13 +6697,24 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
             if c in w_new or c in rec.get("exec_px", {}):
                 continue
             dl = delist.get(c)
-            if dl is not None and pd.notna(dl) and dl <= m + pd.offsets.MonthEnd(1):
+            # ★★ 이중 계상 방지 ★★ 위 루프와 달리 하한(m < dl)이 없어서, 직전 달에 이미
+            #   -100% 를 맞은 종목이 이번 달에 **또** -100% 를 맞았다.
+            #   (마지막 거래가 m-1 월, 폐지일이 m 월인 한국의 전형적 관리→정지→상폐 경로에서
+            #    항상 발생한다) 12% 비중이면 -12% 가 아니라 -24% 가 계상된다.
+            #   실측 누적 -18.2% 는 이런 사건 두 건만으로 만들어질 수 있는 크기다.
+            if (dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1)
+                    and c not in charged):
                 ret += w * (-1.0)
+                charged.add(c)
                 holdings_log.append({"month": m, "code": c, "weight": w, "ret": -1.0,
                                      "signal": np.nan})
 
+        # invested = 실제 투자 비중. 종목별 상한(POS_MAX_WEIGHT)에 걸려 남은 잔여는 현금이다.
+        #   1종목만 잡히면 12% 만 투자되고 88% 가 무이자 현금이라, CAGR·변동성·MDD 가
+        #   전부 1/8 로 압축된다. 그 사실을 숫자로 남겨야 성과표를 옳게 읽을 수 있다.
         rows.append({"month": m, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
-                     "turnover": turn, "cost": cost})
+                     "turnover": turn, "cost": cost,
+                     "invested": float(sum(w_new.values())), "empty": 0})
         hold = {c: (hold.get(c, 0) + 1) for c in w_new}
         prev_w = w_new
 
@@ -6695,7 +6727,39 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
                    for i, g in enumerate([c for c in G.columns if c != "month"])],
                   ["게이트", "월평균", "최소", "최대", "U-MID 대비"], ["l", "r", "r", "r", "r"],
                   title="선정 깔때기 — 어느 게이트에서 후보가 사라지는지")
-    return {"returns": R, "holdings": pd.DataFrame(holdings_log), "gates": G, "label": label}
+    # ── 성과표를 읽는 데 필요한 '노출' 진단 ────────────────────────────────────────────
+    #   종목당 상한 때문에 소수 종목만 잡히면 대부분이 현금이다. 그 상태의 CAGR·변동성·MDD 는
+    #   전략의 것이 아니라 '전략 × 노출비중'의 것이다. 비교 가능한 형태로 함께 남긴다.
+    inv = pd.to_numeric(R.get("invested", pd.Series(1.0, index=R.index)),
+                        errors="coerce").fillna(0.0)
+    n_empty = int((pd.to_numeric(R.get("n", 0), errors="coerce").fillna(0) <= 0).sum())
+    diag = {"n_months": int(len(R)), "n_empty": n_empty,
+            "mean_invested": float(inv.mean()),
+            "mean_invested_active": float(inv[inv > 0].mean()) if (inv > 0).any() else 0.0,
+            "n_unresolved": int(n_unresolved), "w_unresolved": float(w_unresolved),
+            "n_delist_charged": int(len(charged))}
+    # 투자자본 기준 수익률 — 현금 희석을 걷어낸 계열. 해석용이며 실제 성과가 아니다.
+    R["ret_invested"] = np.where(inv > 1e-9, R["ret"] / inv.where(inv > 1e-9), np.nan)
+    if not quiet:
+        LOG.table([
+            ["관측 개월", f"{diag['n_months']}"],
+            ["포지션 없던 달", f"{n_empty} ({100*n_empty/max(len(R),1):.0f}%)"],
+            ["평균 투자비중(전체)", f"{diag['mean_invested']*100:.1f}%"],
+            ["평균 투자비중(보유월)", f"{diag['mean_invested_active']*100:.1f}%"],
+            ["폐지 -100% 계상", f"{diag['n_delist_charged']}종목 (중복 계상 없음)"],
+            ["결과 미관측 보유", f"{n_unresolved}건 · 누적가중 {w_unresolved:.2f} "
+                                 f"(0% 로 계상 — 성과를 부풀리는 방향)"],
+        ], ["노출·계상 진단", "실측"], title=f"백테스트 노출 진단 · {label}")
+        if diag["mean_invested_active"] < 0.5 and (inv > 0).any():
+            LOG.warn(
+                f"보유월 평균 투자비중이 {diag['mean_invested_active']*100:.0f}% 입니다 — "
+                f"나머지는 무이자 현금입니다.\n"
+                f"    이 상태의 CAGR·연변동성·MDD 는 전부 그 비중만큼 압축된 값이라 "
+                f"전략의 성과로 읽으면 안 됩니다(Sharpe 는 비중에 불변, 다만 빈 달 0% 로 "
+                f"√(보유월/전체월) 만큼 축소됩니다).\n"
+                f"    → 'ret_invested' 계열(투자자본 기준)을 함께 보세요.")
+    return {"returns": R, "holdings": pd.DataFrame(holdings_log), "gates": G,
+            "label": label, "exposure": diag}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -10503,7 +10567,11 @@ def apply_vetoes(P: pd.DataFrame, vetoes: "Sequence[str]",
     d["V9"] = _f("V9", theta_drop & oversea)
     # V10 커모디티: cv_dest 하위 N% → a2 무효화
     if "cv_dest" in d.columns and pd.to_numeric(d["cv_dest"], errors="coerce").notna().any():
-        cvr = _num("cv_dest").rank(pct=True)
+        # ★ 전 패널 풀링 랭크는 **미래 정보**다. 2016년의 V10 판정에 2026년 관측치가
+        #   섞여 순위가 정해진다. 랭크는 반드시 그 달 안에서만 매긴다.
+        #   (cv_dest 자체가 전 구간 집계값이라는 한계는 남지만, 랭크만이라도 월별로 자르면
+        #    '그 시점 단면에서 하위 N%'라는 정의가 성립한다.)
+        cvr = _num("cv_dest").groupby(d["ym"], observed=True).rank(pct=True)
         d["V10"] = _f("V10", cvr <= cv_thresh_pct)
     else:
         d["V10"] = zero

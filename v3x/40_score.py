@@ -190,7 +190,11 @@ def apply_vetoes(P: pd.DataFrame, vetoes: "Sequence[str]",
     d["V9"] = _f("V9", theta_drop & oversea)
     # V10 커모디티: cv_dest 하위 N% → a2 무효화
     if "cv_dest" in d.columns and pd.to_numeric(d["cv_dest"], errors="coerce").notna().any():
-        cvr = _num("cv_dest").rank(pct=True)
+        # ★ 전 패널 풀링 랭크는 **미래 정보**다. 2016년의 V10 판정에 2026년 관측치가
+        #   섞여 순위가 정해진다. 랭크는 반드시 그 달 안에서만 매긴다.
+        #   (cv_dest 자체가 전 구간 집계값이라는 한계는 남지만, 랭크만이라도 월별로 자르면
+        #    '그 시점 단면에서 하위 N%'라는 정의가 성립한다.)
+        cvr = _num("cv_dest").groupby(d["ym"], observed=True).rank(pct=True)
         d["V10"] = _f("V10", cvr <= cv_thresh_pct)
     else:
         d["V10"] = zero

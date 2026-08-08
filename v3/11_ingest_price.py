@@ -613,7 +613,16 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     # 그 가격으로 체결했다고 가정할 수 없으므로 종가로 폴백한다.
     gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
     monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
-    monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
+    # ★★ 종가 폴백을 하면 안 된다 ★★
+    #   여기서 close 로 채우면 **신호 산출일 당일 종가로 체결**한 것이 된다 — 이 파일이
+    #   맨 위에서 금지한 바로 그 미래누수다. 게다가 이 폴백이 발동하는 모집단은
+    #   거래정지·상폐 직전 종목이라, 하필 가장 위험한 종목에 '공짜 체결'을 주는 셈이다.
+    #   체결가를 모르면 그 종목월은 진입 후보에서 빠져야 한다(엔진의 exec_px.notna() 게이트).
+    _n_noexec = int(monthly["exec_px"].isna().sum())
+    if _n_noexec:
+        LOG.info(f"다음 거래일 시가를 얻지 못한 {_n_noexec:,} 종목월은 체결가 없음으로 "
+                 f"두어 진입 후보에서 제외합니다 (당일 종가 체결로 대체하지 않습니다 — "
+                 f"그건 미래누수이고 하필 거래정지·상폐 직전 종목에 유리하게 작용합니다).")
 
     # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
     #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
