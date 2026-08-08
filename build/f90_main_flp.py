@@ -200,10 +200,11 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
             _corps = _corps[:keep_n]
         ctx["dart_shares"] = fetch_dart_shares(_corps, _years)
         ctx["shares"] = fetch_shares_outstanding(months, sec=ctx["sec"],
-                                                 dart_shares=ctx["dart_shares"])
+                                                 dart_shares=ctx.get("dart_shares"))
 
     with PIPE.stage("L1.CREDIT", "신용융자잔고 ★핵심 (M1)", "L1", budget_s=2400, critical=False):
-        ctx["credit"] = fetch_credit_balance(ctx["px"], ctx["flows"], BACKTEST_START, BACKTEST_END)
+        ctx["credit"] = fetch_credit_balance(ctx["px"], ctx.get("flows", pd.DataFrame()),
+                                             BACKTEST_START, BACKTEST_END)
         # F1/F3 카나리를 실측으로 갱신한다(추측 금지)
         canary("F1", "종목별 신용융자잔고 ★이 전략의 핵심",
                CREDIT_GRADE in ("PRIMARY_DAILY", "FALLBACK_A_WEEKLY"),
@@ -222,46 +223,73 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
             ctx["fin"] = fin
             ctx["disclosures"] = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         else:
-            LOG.warn("DART_API_KEY 미입력 — 방화벽(자본잠식·영업CF)과 V1/V3 거부권이 비활성화됩니다. "
-                     "이 전략의 단일 실패모드가 그대로 노출되므로 키 입력을 강력히 권합니다.")
-            ctx["fin"], ctx["disclosures"] = pd.DataFrame(), pd.DataFrame()
+            # ★ 키가 없다고 '드라이브에 이미 있는 DART 캐시'까지 버리면 안 된다.
+            #   v2 전략들이 공용 인덱스에 쌓아둔 재무·공시가 그대로 재사용 가능하다.
+            #   (수집 함수는 키 검사에서 먼저 빠져나가므로 여기서 직접 읽는다)
+            cf = VAULT.get_table("dart_financials", scope="shared")
+            cd = VAULT.get_table("dart_disclosures", scope="shared")
+            if cf is not None and len(cf):
+                need_pit = [c for c in ("event_date", "knowledge_date") if c not in cf.columns]
+                if not need_pit:
+                    PIT.register("dart_financials", cf, key_cols=["corp_code"])
+                    LOG.ok(f"★ DART 키가 없지만 공용 인덱스의 재무 캐시 {len(cf):,}행을 "
+                           f"재사용합니다 — 방화벽이 살아납니다.")
+                else:
+                    LOG.warn(f"공용 재무 캐시에 PIT 컬럼 {need_pit} 이 없어 사용할 수 없습니다.")
+            if cd is not None and len(cd):
+                LOG.ok(f"★ 공용 인덱스의 공시 캐시 {len(cd):,}행 재사용 — V1 거부권이 살아납니다.")
+            ctx["fin"] = cf if cf is not None else pd.DataFrame()
+            ctx["disclosures"] = cd if cd is not None else pd.DataFrame()
+            if (cf is None or not len(cf)) and (cd is None or not len(cd)):
+                LOG.warn("DART_API_KEY 미입력 + 공용 캐시도 비어 있음 — 방화벽(자본잠식·영업CF)과 "
+                         "V1/V3 거부권이 비활성화됩니다. 이 전략의 단일 실패모드가 그대로 "
+                         "노출되므로 키 입력을 강력히 권합니다.")
 
     with PIPE.stage("L1.WATCH", "관리종목 · 거래정지 (K6)", "L1", budget_s=300, critical=False):
         ctx["watch"] = fetch_watchlist_halt(ctx["sec"])
 
-    with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장 (한경/네이버)", "L1",
-                    budget_s=3600, critical=False,
-                    skip_if=(not RESEARCH_USE), skip_reason="RESEARCH_USE=False"):
-        LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. 사용자의 명시적 "
-                 "지시에 따라 수집하되 보수적 속도로 제한합니다. 원문은 로컬 분석 용도로만.")
-        cached = VAULT.get_table("research_report_master", scope="shared")
-        frames = []
-        if cached is not None and len(cached):
-            LOG.ok(f"★ 구글드라이브 공용 인덱스에서 리포트 원장 {len(cached):,}건 재사용 "
-                   f"(재수집하지 않습니다)")
-            frames.append(cached)
-        if RUN_MODE == "FULL" and RESEARCH_COLLECT:
-            if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
-            if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(BACKTEST_START, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
-        rep = build_report_master(frames, ctx["sec"])
-        if len(rep):
-            if RESEARCH_DOWNLOAD_PDF:
-                rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
-            VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
-                            source="hankyung+naver")
-        A, L = build_analyst_ledger(rep)
-        if len(A):
-            VAULT.put_table("analyst_master", A, scope="shared", domain="research",
-                            source="entity_resolution")
-            VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
-                            source="entity_resolution")
-        ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
-    ctx.setdefault("reports", pd.DataFrame())
-    ctx.setdefault("analysts", pd.DataFrame())
-    ctx.setdefault("links", pd.DataFrame())
+    # ※ PIPE.stage(skip_if=...) 는 스테이지를 SKIP 으로 기록하지만 본문 실행까지 막지는
+    #    못한다(컨텍스트매니저가 yield 하므로 with 본문은 그대로 돈다).
+    #    그래서 '끄기'는 반드시 호출부의 조건 분기로 구현한다.
+    if RESEARCH_USE:
+        with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장 (한경/네이버)", "L1",
+                        budget_s=3600, critical=False):
+            LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. 사용자의 명시적 "
+                     "지시에 따라 수집하되 보수적 속도로 제한합니다. 원문은 로컬 분석 용도로만.")
+            cached = VAULT.get_table("research_report_master", scope="shared")
+            frames = []
+            if cached is not None and len(cached):
+                LOG.ok(f"★ 구글드라이브 공용 인덱스에서 리포트 원장 {len(cached):,}건 재사용 "
+                       f"(재수집하지 않습니다)")
+                frames.append(cached)
+            if RUN_MODE == "FULL" and RESEARCH_COLLECT:
+                if "hankyung" in RESEARCH_SOURCES:
+                    frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+                if "naver" in RESEARCH_SOURCES:
+                    nv = naver_collect(BACKTEST_START, BACKTEST_END)
+                    frames.append(naver_enrich_detail(nv))
+            rep = build_report_master(frames, ctx["sec"])
+            if len(rep):
+                if RESEARCH_DOWNLOAD_PDF:
+                    rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+                VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
+                                source="hankyung+naver")
+            A, L = build_analyst_ledger(rep)
+            if len(A):
+                VAULT.put_table("analyst_master", A, scope="shared", domain="research",
+                                source="entity_resolution")
+                VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
+                                source="entity_resolution")
+            ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
+    else:
+        LOG.warn("RESEARCH_USE=False — 애널리스트 리포트 오버레이(V_RS 거부권·해석표 커버리지)를 "
+                 "사용하지 않습니다. 드라이브에 캐시가 있어도 읽지 않습니다.")
+    # ★ 비필수(critical=False) 스테이지가 실패하면 그 산출물 키가 없다. 하류에서
+    #   ctx["flows"] 로 읽으면 '수급 실패'가 엉뚱하게 '신용잔고 스테이지의 KeyError' 로
+    #   보고된다 — 실패 지점이 흐려지는 것이 가장 나쁘다. 여기서 한 번에 기본값을 못박는다.
+    for _k in ("flows", "shares", "credit", "watch", "disclosures", "fin", "dart_shares",
+               "reports", "analysts", "links"):
+        ctx.setdefault(_k, pd.DataFrame())
     return ctx
 
 

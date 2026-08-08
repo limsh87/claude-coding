@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_N"
 STRATEGY_NAME      = "PACK-N 국민연금 고용"
 ACTIVE_PACKS       = ["N"]
-BUILD_VERSION      = "v2.20260808.0211"
+BUILD_VERSION      = "v2.20260808.0325"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -981,17 +981,31 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
 
 
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """★ 읽기 실패 시에도 원본을 '원래 자리에' 남긴다.
+
+    예전 구현은 어떤 예외든 즉시 os.replace 로 파일을 .corrupt 로 옮겼다. 그런데 드라이브
+    FUSE 는 일시적 I/O 오류를 흔히 낸다. 원본이 자리에서 사라지면 put_table 이 백업할 대상을
+    찾지 못해 '백업 없이' 새 파일을 쓰게 되고, 그건 "백업 없이는 절대 교체하지 않는다"는
+    절대 1원칙을 정확히 뒤집는다. → 1회 재시도 후에도 실패하면 '복사본'만 격리하고
+    원본은 그대로 둔다(다음 put_table 이 그 원본을 백업할 수 있도록)."""
     if not os.path.exists(path):
         return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
-        return None
+    for attempt in range(2):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                                          # noqa
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            LOG.warn(f"parquet 읽기 실패 — 원본은 자리에 두고 사본만 격리합니다: "
+                     f"{os.path.basename(path)} ({type(e).__name__}). "
+                     f"다음 쓰기 때 이 원본이 백업된 뒤 교체됩니다(무백업 교체 방지).")
+            try:
+                shutil.copy2(path, path + f".corrupt.{int(time.time())}")
+            except Exception:
+                pass
+            return None
+    return None
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -1775,9 +1789,21 @@ class Vault:
         })
         return path
 
+    def _latest_revision(self, scope: str, name: str) -> Optional[str]:
+        """put_table 이 백업 실패로 {name}.rev<ts>.parquet 에 쓴 경우를 읽어낸다.
+        이 폴백이 없으면 그 순간부터 모든 쓰기가 영원히 도달 불가가 된다(캐시 동결)."""
+        import glob as _glob
+        cands = sorted(_glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
+        return cands[-1] if cands else None
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        if not os.path.exists(path):
+            rev = self._latest_revision(scope, name)
+            if rev:
+                LOG.info(f"정규 테이블이 없어 리비전 파일을 읽습니다: {os.path.basename(rev)}")
+                path = rev
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
@@ -1791,6 +1817,12 @@ class Vault:
             if age > max_age_days:
                 return None
         d = read_parquet_safe(path)
+        if d is None:
+            rev = self._latest_revision(scope, name)
+            if rev and rev != path:
+                LOG.warn(f"{os.path.basename(path)} 를 읽지 못해 리비전으로 폴백합니다.")
+                d = read_parquet_safe(rev)
+                path = rev
         if d is not None:
             PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
         return d
@@ -3192,11 +3224,17 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+    # ★ 공용 캐시에는 '전체 합집합'을 쓰고, 이번 실행에는 구간을 잘라 쓴다.
+    #   잘린 프레임을 그대로 덮어쓰면, 더 긴 구간을 쓰는 다른 전략의 캐시 이력이 사라진다
+    #   (다른 전략의 캐시를 훼손하지 않는다는 절대 1원칙에 걸린다).
+    px_all = px
+    px = px_all[(px_all["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                (px_all["date"] <= end_ts)]
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
-                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+        VAULT.put_table("krx_ohlcv_daily", px_all, scope="shared", domain="price",
+                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()),
+                        extra={"note": "전 구간 합집합 — 전략별 구간으로 자르지 않음"})
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")

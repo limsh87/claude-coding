@@ -211,7 +211,13 @@ def persist_outputs(P: pd.DataFrame, bt: dict, r2f: dict, r12: dict, abl: pd.Dat
     _csv("canary", pd.DataFrame(list(CANARY.values())))
 
     # r2f_verdict.md — ★ 최우선 산출물
-    v = r2f.get("verdict", "측정되지 않음")
+    #  R2-F 가 킬을 발동하면 main 의 try 가 거기서 끊기므로 r2f 딕셔너리는 비어 있다.
+    #  그때 '측정되지 않음'을 찍으면 가장 중요한 판정이 산출물에서 지워진다 →
+    #  ROBUST_RESULTS 에 이미 기록된 판정문으로 폴백한다.
+    v = r2f.get("verdict")
+    if not v:
+        _rr = next((x for x in ROBUST_RESULTS if x["id"] == "R2-F"), None)
+        v = (f"(킬 발동으로 스위트 중단) {_rr['detail']}" if _rr else "측정되지 않음")
     _txt("r2f_verdict",
          f"# R2-F 판정 — 소진 조건 vs 단순 낙폭과대\n\n"
          f"- 신용잔고 등급: **{CREDIT_GRADE}** ({CREDIT_SOURCE_NOTE})\n"
@@ -219,11 +225,15 @@ def persist_outputs(P: pd.DataFrame, bt: dict, r2f: dict, r12: dict, abl: pd.Dat
          f"- B 소진조건 단독 CAGR: {r2f.get('B', {}).get('CAGR', float('nan')):.4%}\n"
          f"- C FLP 전체 CAGR: {r2f.get('C', {}).get('CAGR', float('nan')):.4%}\n"
          f"- C−A HAC t: {r2f.get('t_CA', float('nan')):.2f}\n\n## 판정\n\n{v}\n")
+    _rec = ((f"- R12 권고: **{r12['recommended_pos_max']:.1%}**\n")
+            if r12 and "recommended_pos_max" in r12
+            else "- R12 권고: **미측정** (앞 단계 킬로 스위트가 중단되었습니다 — "
+                 "아래 현재 상한은 '권고치'가 아니라 '출하 기본값'입니다)\n")
     _txt("r12_tail_correlation",
          "# R12 꼬리 동시손실\n\n" +
-         "\n".join(f"- {k}: {v}" for k, v in (r12 or {}).items()) +
-         f"\n\n## 확정된 사이징\n\n- 종목당 최대비중(코드 상수): **{POS_MAX_WEIGHT:.0%}**\n"
-         f"- R12 권고: **{(r12 or {}).get('recommended_pos_max', POS_MAX_WEIGHT):.1%}**\n"
+         ("\n".join(f"- {k}: {v}" for k, v in r12.items()) if r12 else "- 미실행") +
+         f"\n\n## 사이징\n\n- 종목당 최대비중(코드 상수): **{POS_MAX_WEIGHT:.0%}**\n"
+         + _rec +
          f"- 동시보유 상한: {PORTFOLIO_MAX_NAMES}종목 · ADV 참여율 {POS_ADV_PARTICIPATION:.0%}\n")
     _txt("robustness",
          "# 강건성 결과 (R0~R12)\n\n" +

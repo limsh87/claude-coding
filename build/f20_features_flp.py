@@ -59,7 +59,12 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
     if px is None or not len(px):
         return pd.DataFrame(columns=["code", "date"] + SENSOR_COLS)
 
-    px = px.copy()
+    # ★ 결합키 dtype 정규화. downcast() 를 지난 가격 패널의 code 는 category 인데
+    #   신용잔고/수급/주식수 프레임의 code 는 object 다. merge_asof(by="code") 는 dtype 이
+    #   다르면 MergeError 로 죽는다 — 몇 시간짜리 수집이 끝난 직후 L2 에서 터진다.
+    #   (합성 스모크는 downcast 를 타지 않아 이 경로를 못 본다)
+    _as_code = lambda d: d.assign(code=d["code"].astype(str))
+    px = _as_code(px.copy())
     px["date"] = as_ts_series(px["date"])
     px = px.dropna(subset=["code", "date"]).sort_values(["code", "date"])
     for c in ("close", "open", "amount", "volume"):
@@ -68,15 +73,18 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
 
     cr = credit.copy() if credit is not None and len(credit) else pd.DataFrame(columns=CREDIT_COLS)
     if len(cr):
+        cr = _as_code(cr)
         cr["date"] = as_ts_series(cr["date"])
         cr = cr.dropna(subset=["code", "date"]).sort_values(["code", "date"])
     fl = flows.copy() if flows is not None and len(flows) else pd.DataFrame(columns=FLOW_COLS)
     if len(fl):
+        fl = _as_code(fl)
         fl["date"] = as_ts_series(fl["date"])
         fl = fl.dropna(subset=["code", "date"]).sort_values(["code", "date"])
     sh = shares.copy() if shares is not None and len(shares) else pd.DataFrame(
         columns=["snap_date", "code", "shares", "mcap_snap"])
     if len(sh):
+        sh = _as_code(sh)
         sh["snap_date"] = as_ts_series(sh["snap_date"])
         # ★ 상장주식수 스냅샷도 PIT: 스냅샷일 +1영업일 이후에만 알 수 있다.
         sh["knowledge_date"] = next_bday(sh["snap_date"])
@@ -89,6 +97,8 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
         uni.audit_row("PIT유니버스", w, codes)
         grid_rows.append(pd.DataFrame({"code": codes, "week": w}))
     G = pd.concat(grid_rows, ignore_index=True) if grid_rows else pd.DataFrame(columns=["code", "week"])
+    if len(G):
+        G["code"] = G["code"].astype(str)
     if G.empty:
         LOG.error("주간 격자가 비었습니다 — 유니버스가 전 구간에서 0종목입니다.")
         return pd.DataFrame(columns=["code", "date"] + SENSOR_COLS)
@@ -219,7 +229,15 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
         LOG.info(f"주 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
                  f"(건너뛴 구간 수익을 1주 수익으로 계상하지 않기 위함). "
                  f"상장폐지는 백테스트 엔진이 -100% 로 별도 처리합니다.")
+    # ★ 신호일이 격자일보다 며칠 앞선 행 = 최근 거래가 없었다는 뜻(거래정지 진입 구간).
+    #   보유 연속성을 위해 행 자체는 남기되, '그 가격으로 신규 진입'은 막아야 한다
+    #   (이미 존재하지 않는 가격에 새로 사는 셈이 된다).
+    P["stale_days"] = (P["wk"] - P["signal_date"]).dt.days
     P = P[P["signal_date"].notna()].reset_index(drop=True)
+    n_stale = int((P["stale_days"] > 3).sum())
+    if n_stale:
+        LOG.info(f"신호일이 3일 이상 지연된 행 {n_stale:,}건 — 최근 시세가 없는 구간입니다. "
+                 f"보유 연속성 판단에는 쓰되 신규 진입 자격에서는 제외합니다.")
     LOG.ok(f"주간 패널 {len(P):,}행 × {P.shape[1]}열 · {mem_mb(P):.0f}MB "
            f"({P['code'].nunique():,}종목 × {P['wk'].nunique():,}주)")
     PIPE.io("OUT", "MEM", "flp_weekly_panel", P)
@@ -227,6 +245,37 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
 
 
 # ── 유니버스 밴드 (C13) ─────────────────────────────────────────────────────────────────────
+def build_size_estimate(P: pd.DataFrame) -> pd.DataFrame:
+    """규모 척도를 '하나'로 만든다.
+
+    시총(≈1e11)과 거래대금(≈1e9)은 스케일이 100배 다르다. 둘을 한 컬럼에 coalesce 해서
+    랭크하면 '상위 250 제외'가 사실상 '주식수 데이터를 가진 250종목 제외'가 되고,
+    셀의 규모 축과 R3 의 규모 팩터도 똑같이 오염된다.
+    → 주별로 둘 다 관측된 종목에서 mcap/adv20 의 중앙 배율을 구해 거래대금을 시총 스케일로
+      보정한 뒤, 전 종목을 '한 랭크'에서 비교한다. 보정 계수를 못 구하면 전역 중앙값을 쓴다.
+    """
+    P = P.copy()
+    mcap = pd.to_numeric(P.get("mcap"), errors="coerce")
+    adv = pd.to_numeric(P.get("adv20"), errors="coerce")
+    both = mcap.notna() & (mcap > 0) & adv.notna() & (adv > 0)
+    est = mcap.where(mcap > 0)
+    if both.any():
+        ratio = (mcap[both] / adv[both])
+        k_wk = ratio.groupby(P.loc[both, "wk"]).median()
+        k = P["wk"].map(k_wk)
+        k = k.fillna(float(ratio.median()))
+    else:
+        k = pd.Series(20.0, index=P.index)      # 관측이 없으면 보수적 상수 (스케일만 맞춘다)
+    P["size_est"] = est.where(est.notna(), adv * k)
+    P["size_basis"] = np.where(mcap.notna() & (mcap > 0), "mcap", "adv20×보정")
+    n_proxy = int((P["size_basis"] == "adv20×보정").sum())
+    if n_proxy:
+        LOG.info(f"규모 척도 — 시총 {len(P)-n_proxy:,}행 / 거래대금×보정 {n_proxy:,}행. "
+                 f"주별 중앙 배율로 스케일을 맞춰 '한 랭크'에서 비교합니다 "
+                 f"(척도가 다른 두 값을 섞어 랭크하지 않습니다).")
+    return P
+
+
 MAX_EXCLUDE_FRAC = 0.30      # 안전밸브: 어떤 주에도 유니버스의 30% 넘게 잘라내지 않는다
 
 
@@ -238,21 +287,11 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
       지운다(신호 영구 무발화). 이 경우 제외 컷을 그 주 종목수의 30% 로 낮추고, 조용히가
       아니라 로그로 알린다. 실데이터(2,000+종목)에서는 절대 발동하지 않는다."""
     P = P.copy()
-    # ★ 시총(1e11 규모)과 거래대금(1e9 규모)을 한 컬럼에 섞어 랭크하면, 시총을 가진 종목이
-    #   무조건 상위에 몰려 '상위 250 제외'가 '주식수 데이터를 가진 250종목 제외'가 된다.
-    #   → 근거별로 따로 백분위를 매기고, 같은 척도(0~1)에서 컷을 적용한다.
-    has_m = P["mcap"].notna() & (P["mcap"] > 0)
-    pct = pd.Series(np.nan, index=P.index, dtype=float)
-    if has_m.any():
-        pct[has_m] = (P.loc[has_m].groupby("wk", observed=True)["mcap"]
-                      .rank(pct=True, ascending=False))
-    if (~has_m).any():
-        pct[~has_m] = (P.loc[~has_m].groupby("wk", observed=True)["adv20"]
-                       .rank(pct=True, ascending=False))
-    P["size_pct"] = pct
-    P["size_basis"] = np.where(has_m, "mcap", "adv20")
+    P = build_size_estimate(P)
+    P["mcap_rank"] = (P.groupby("wk", observed=True)["size_est"]
+                       .rank(ascending=False, method="first"))
+    P["size_pct"] = P.groupby("wk", observed=True)["size_est"].rank(pct=True, ascending=False)
     n_wk = P.groupby("wk", observed=True)["code"].transform("size")
-    P["mcap_rank"] = (P["size_pct"] * n_wk).round().clip(lower=1)
     cut = np.minimum(MCAP_RANK_EXCLUDE_TOP, np.floor(n_wk * MAX_EXCLUDE_FRAC))
     binding = int((cut < MCAP_RANK_EXCLUDE_TOP).sum())
     if binding:
@@ -261,13 +300,8 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
                  f"상위 {MAX_EXCLUDE_FRAC:.0%} 제외로 낮춥니다(안전밸브). "
                  f"실데이터 전 종목 실행에서는 발동하지 않아야 정상입니다.")
     P["mcap_cut"] = cut
-    cut_frac = (cut / n_wk.clip(lower=1)).clip(0.0, 0.95)
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
-    P["in_band"] = ((P["size_pct"] > cut_frac) & (P["V6"] == 1)).fillna(False).astype(int)
-    if (~has_m).any():
-        LOG.info(f"규모 랭크 근거 — 시총 {int(has_m.sum()):,}행 / 거래대금 대리 "
-                 f"{int((~has_m).sum()):,}행. 근거별로 백분위를 따로 매겨 같은 컷을 적용합니다"
-                 f"(척도가 다른 두 값을 한 랭크에 섞지 않습니다).")
+    P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).fillna(False).astype(int)
     return P
 
 
@@ -278,7 +312,8 @@ def build_cells_flp(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
     P = P.copy()
     P["industry"] = P["code"].map(ind).fillna("미분류").astype(str)
     P["ind_mid"] = P["industry"].str.slice(0, 4).replace("", "미분류")
-    base = P["mcap"].where(P["mcap"].notna(), P["adv20"])
+    base = P["size_est"] if "size_est" in P.columns else \
+        build_size_estimate(P)["size_est"]
     P["size_bucket"] = (base.groupby(P["wk"]).rank(pct=True)
                         .mul(5).clip(0, 4.999).fillna(-1).astype(int).astype(str))
     ws = P["wk"].dt.strftime("%Y%m%d")
@@ -417,9 +452,13 @@ def apply_firewall(P: pd.DataFrame, watch: pd.DataFrame, ctx: dict) -> pd.DataFr
     else:
         audit.append(("영업CF적자+이자보상<1", "비활성(재무 없음)", 0))
 
-    # ⑤ 유동성
+    # ★ 여기까지가 '기업 소멸' 방어 = 보유 중에도 즉시 청산해야 하는 하드 조항이다.
+    P["FIREWALL_HARD"] = ok.astype(int)
+
+    # ⑤ 유동성 — 이건 유니버스 밴드의 일부다. 진입 자격에는 쓰되,
+    #    보유 중 유동성이 말랐다는 이유로 강제청산하지 않는다(§4.3 "밴드 이탈은 청산 사유가 아니다").
     liq = (P["adv20"] >= MIN_ADV_KRW).fillna(False)
-    audit.append(("유동성(ADV20)", "활성", int((~liq).sum())))
+    audit.append(("유동성(ADV20) ※진입자격 전용", "활성", int((~liq).sum())))
     ok &= liq
 
     P["FIREWALL"] = ok.astype(int)

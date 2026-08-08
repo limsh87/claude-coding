@@ -273,7 +273,9 @@ def _factor_returns(P: pd.DataFrame) -> pd.DataFrame:
     if "fwd_ret" not in d.columns or d.empty:
         return pd.DataFrame()
     d["mom"] = d["f_dd"]                    # 252일 고점 대비 낙폭 = 모멘텀의 부호 있는 대리
-    d["size"] = -d["mcap"].where(d["mcap"].notna(), d["adv20"])   # 소형주일수록 큰 값
+    if "size_est" not in d.columns:
+        d = build_size_estimate(d)
+    d["size"] = -d["size_est"]                # 소형주일수록 큰 값 (밴드·셀과 동일 척도)
     d["value"] = safe_div(col(d, "equity"), d["mcap"])            # 장부/시가 (B/M)
     d["lowvol"] = d["f_vol"]                # f_vol = -표준편차 → 클수록 저변동
     facs = {}

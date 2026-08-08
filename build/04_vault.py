@@ -309,9 +309,21 @@ class Vault:
         })
         return path
 
+    def _latest_revision(self, scope: str, name: str) -> Optional[str]:
+        """put_table 이 백업 실패로 {name}.rev<ts>.parquet 에 쓴 경우를 읽어낸다.
+        이 폴백이 없으면 그 순간부터 모든 쓰기가 영원히 도달 불가가 된다(캐시 동결)."""
+        import glob as _glob
+        cands = sorted(_glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
+        return cands[-1] if cands else None
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        if not os.path.exists(path):
+            rev = self._latest_revision(scope, name)
+            if rev:
+                LOG.info(f"정규 테이블이 없어 리비전 파일을 읽습니다: {os.path.basename(rev)}")
+                path = rev
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
@@ -325,6 +337,12 @@ class Vault:
             if age > max_age_days:
                 return None
         d = read_parquet_safe(path)
+        if d is None:
+            rev = self._latest_revision(scope, name)
+            if rev and rev != path:
+                LOG.warn(f"{os.path.basename(path)} 를 읽지 못해 리비전으로 폴백합니다.")
+                d = read_parquet_safe(rev)
+                path = rev
         if d is not None:
             PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
         return d

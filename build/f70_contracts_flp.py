@@ -212,6 +212,74 @@ def run_contract_tests(strict: bool = True) -> bool:
                 f"상태전이={states} · 총손실 반영 {total:.2%} "
                 f"(거래정지 중 폐지를 0% 로 처리하면 여기가 0.00% 로 나온다)")
 
+    def c_delist_once():
+        """폐지 -100% 이중계상 방지: 손실은 정확히 한 번만 계상되어야 한다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=4, freq="W-FRI"))
+        dl = wks[1] + pd.Timedelta(days=2)
+        rows = [{"code": "A", "wk": wks[0], "exec_px": 1000.0, "fwd_ret": 0.0, "adv20": 1e10,
+                 "FIREWALL": 1, "FIREWALL_HARD": 1, "VETO": 1, "in_band": 1, "V6": 1,
+                 "PHASE_C": 1, "f_dd": -0.4, "f_cr_pctl": 0.1, "Signal_rank": 1.0},
+                # 폐지 주간: 다음 주 체결가가 없으므로 fwd_ret 은 결측이다(= 정리매매 미확보)
+                {"code": "A", "wk": wks[1], "exec_px": 1000.0, "fwd_ret": np.nan, "adv20": 1e10,
+                 "FIREWALL": 1, "FIREWALL_HARD": 1, "VETO": 1, "in_band": 1, "V6": 1,
+                 "PHASE_C": 1, "f_dd": -0.4, "f_cr_pctl": 0.1, "Signal_rank": 1.0}]
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": ["A"], "name": ["A"], "market": ["KOSDAQ"],
+                            "listing_date": [pd.Timestamp("2015-01-01")], "delisting_date": [dl]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": wks, "code": "A"}))
+        bt = run_backtest_w(P, wks, uni, sec, apply_costs=False, label="c_del1")
+        H = bt["holdings"]
+        n_total = int((H["ret"] <= -0.999).sum()) if len(H) else 0
+        tot = float(bt["returns"]["ret"].sum())
+        return (n_total == 1 and tot < -0.05,
+                f"-100% 계상 {n_total}회 · 누적 {tot:.2%} "
+                f"(0회면 미계상, 2회면 폐지 손실을 두 번 반영한 것)")
+
+    def c_halt_gap():
+        """거래정지 구간의 가격 붕괴가 재개 주에 실현되는가.
+        정지 중 0%, 재개 후 새 가격에서 재시작하면 그 손실이 어디에도 계상되지 않는다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=4, freq="W-FRI"))
+        base = dict(adv20=1e10, FIREWALL=1, FIREWALL_HARD=1, VETO=1, in_band=1, V6=1,
+                    PHASE_C=1, f_dd=-0.4, f_cr_pctl=0.1)
+        rows = [{"code": "A", "wk": wks[0], "exec_px": 1000.0, "fwd_ret": 0.0,
+                 "Signal_rank": 1.0, **base},
+                # wks[1], wks[2] 는 패널에 없음(거래정지) → wks[3] 에 반토막으로 재개
+                {"code": "A", "wk": wks[3], "exec_px": 500.0, "fwd_ret": 0.0,
+                 "Signal_rank": np.nan, **base}]
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": ["A"], "name": ["A"], "market": ["KOSDAQ"],
+                            "listing_date": [pd.Timestamp("2015-01-01")],
+                            "delisting_date": [pd.NaT]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": wks, "code": "A"}))
+        bt = run_backtest_w(P, wks, uni, sec, apply_costs=False, label="c_gap")
+        H = bt["holdings"]
+        got = float(H.loc[H["state"] == "resumed", "ret"].sum()) if "state" in H.columns else 0.0
+        return (got <= -0.49,
+                f"재개 주 실현수익률 {got:.1%} (정지 중 -50% 붕괴가 반영되면 -50% 근처)")
+
+    def c_dtype():
+        """★ 실제 실행에서만 나타나던 결함: 가격 패널은 downcast 로 code 가 category 가 되고
+        신용/수급/주식수는 object 다. merge_asof(by='code') 는 dtype 이 다르면 죽는다."""
+        px = downcast(_synth_daily(3, 200))
+        if str(px["code"].dtype) != "category":
+            px["code"] = px["code"].astype("category")
+        codes = [str(c) for c in px["code"].unique()]
+        cr = pd.DataFrame({"code": codes * 10, "date": list(px["date"].unique())[:10] * 3,
+                           "credit_bal": 1e8, "src": "t"})
+        sh = pd.DataFrame({"snap_date": [px["date"].min()] * 3, "code": codes,
+                           "shares": 1e6, "mcap_snap": np.nan})
+        sec = pd.DataFrame({"code": codes, "name": codes, "market": "KOSPI",
+                            "listing_date": pd.Timestamp("2015-01-01"),
+                            "delisting_date": pd.NaT, "industry": "T", "corp_code": None})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+        weeks = week_grid(str(px["date"].min().date()), str(px["date"].max().date()), px)
+        P = build_flp_panel(px, cr, pd.DataFrame(), sh, weeks, uni)
+        return (len(P) > 0 and P["shares"].notna().any(),
+                f"category/object 혼합 결합 결과 {len(P):,}행 · 주식수 결합 "
+                f"{int(P['shares'].notna().sum()):,}행")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -279,6 +347,9 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("VETO", "거부권 이진·상쇄 불가", c_veto)
     _c("EXIT", "청산 규칙(f_cr_pctl 회복) 작동", c_exit)
     _c("HALT", "거래정지 중 폐지 = -100% (회귀 방지)", c_halt)
+    _c("DEL1", "폐지 손실 이중계상 금지 (회귀 방지)", c_delist_once)
+    _c("GAP", "거래정지 구간 손실을 재개 주에 실현 (회귀 방지)", c_halt_gap)
+    _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)

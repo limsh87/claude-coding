@@ -89,8 +89,8 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
     rows, holdings_log = [], []
     n_frozen_events = n_forced_delist = n_stale_writeoff = 0
 
-    need = [c for c in ("adv20", "fwd_ret", "FIREWALL", "VETO", "f_cr_pctl", "PHASE_C",
-                        signal_col) if c in P.columns]
+    need = [c for c in ("adv20", "fwd_ret", "FIREWALL", "FIREWALL_HARD", "VETO", "f_cr_pctl",
+                        "PHASE_C", "exec_px", signal_col) if c in P.columns]
     Pw = {w: g for w, g in P.groupby("wk", observed=True)} if len(P) else {}
 
     for i, w in enumerate(weeks):
@@ -108,11 +108,27 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         #   → 팔 수 없는 동안은 비중을 그대로 들고 있고(수익 0), 폐지가 확정되면 -100%.
         frozen: Dict[str, float] = {}
         forced: List[Tuple[str, float, float]] = []
+        gap_ret: Dict[str, float] = {}
         for c, wt in list(prev_w.items()):
             if c in rec:
+                # ★ 거래재개: 정지 구간의 가격 변화를 이번 주에 실현한다.
+                #   정지 중 0% 로 두고 재개 후 새 가격에서 다시 시작하면, 정지 기간에
+                #   무너진 가격이 어디에도 계상되지 않는다(이 전략에서 가장 흔한 손실 경로다).
+                h0 = hold.get(c)
+                if h0 and h0.get("frozen", 0) > 0:
+                    last_px = h0.get("last_exec")
+                    now_px = (rec[c] or {}).get("exec_px")
+                    if (last_px and now_px and np.isfinite(float(last_px))
+                            and np.isfinite(float(now_px)) and float(last_px) > 0):
+                        gap_ret[c] = float(now_px) / float(last_px) - 1.0
+                    h0["frozen"] = 0                 # 재개했으므로 동결 카운터 리셋
+                if h0 is not None:
+                    _px = (rec[c] or {}).get("exec_px")
+                    if _px is not None and pd.notna(_px):
+                        h0["last_exec"] = float(_px)
                 continue
             dl = delist.get(c)
-            h = hold.setdefault(c, {"weeks": 0, "frozen": 0})
+            h = hold.setdefault(c, {"weeks": 0, "frozen": 0, "last_exec": np.nan})
             if dl is not None and pd.notna(dl) and dl <= w_next:
                 forced.append((c, wt, -1.0))          # 정리매매가 없으면 -100% (C2)
                 hold.pop(c, None)
@@ -142,8 +158,10 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             prev_w = dict(frozen)
             continue
 
+        fresh_px = (sub["stale_days"] <= 3) if "stale_days" in sub.columns else True
         elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
-                   sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna()]
+                   sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna() &
+                   fresh_px]
         if uni is not None:
             uni.audit_row("유동성필터", w, sub[sub["V6"] == 1]["code"].tolist())
             uni.audit_row("낙폭조건", w, sub[(sub["V6"] == 1) &
@@ -168,8 +186,9 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             if r0 is None:
                 continue
             exited = False
-            if r0.get("FIREWALL", 1) == 0 or r0.get("VETO", 1) == 0:
-                exited = True                  # 방화벽/거부권은 즉시 강제청산
+            fw_hard = r0.get("FIREWALL_HARD", r0.get("FIREWALL", 1))
+            if fw_hard == 0 or r0.get("VETO", 1) == 0:
+                exited = True                  # 기업 소멸 방어·거부권은 즉시 강제청산
             elif h["weeks"] >= hold_max:
                 exited = True                  # 6개월 상한
             else:
@@ -179,6 +198,10 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             if not exited:
                 keep.append(c)
 
+        exited = {c for c in hold if c not in keep and c not in frozen}
+        if exited:
+            # 청산 사유가 발생한 종목을 같은 주에 다시 사면 보유상한·청산규칙이 무의미해진다
+            pick = pick[~pick["code"].isin(exited)]
         extra = sub[sub["code"].isin(keep) & ~sub["code"].isin(set(pick["code"]))]
         target = pd.concat([pick, extra], ignore_index=True) if len(extra) else pick
         room = max(0, PORTFOLIO_MAX_NAMES - len(frozen))
@@ -217,6 +240,7 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         for c, wt, r in forced:
             holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": r,
                                  "signal": np.nan, "state": "delisted"})
+        dead_now: List[str] = []
         for c, wt in w_new.items():
             if c in frozen:
                 holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": 0.0,
@@ -225,26 +249,40 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             _r = rec.get(c) or {}
             _f = _r.get("fwd_ret")
             fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
+            state = "held"
             dl = delist.get(c)
             if dl is not None and pd.notna(dl) and w < dl <= w_next:
                 # ★ 상장폐지 주간: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
                 fr = -1.0 if not np.isfinite(fr) else fr
+                state = "delisted"
+                dead_now.append(c)             # 여기서 손실을 확정했으므로 다음 주에 또 세지 않는다
             if not np.isfinite(fr):
                 fr = 0.0
-            ret += wt * fr
-            holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": fr,
-                                 "signal": _r.get(signal_col), "state": "held"})
+            g = gap_ret.pop(c, 0.0)            # 거래정지 구간의 가격 변화(재개 주에 실현)
+            if g:
+                state = "resumed"
+            ret += wt * (fr + g)
+            holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": fr + g,
+                                 "signal": _r.get(signal_col), "state": state})
+            h = hold.setdefault(c, {"weeks": 0, "frozen": 0, "last_exec": np.nan})
+            _px = _r.get("exec_px")
+            if _px is not None and pd.notna(_px):
+                h["last_exec"] = float(_px)
         rows.append({"wk": w, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost,
                      "invested": float(sum(w_new.values()))})
 
+        for c in dead_now:                     # 폐지 확정분은 포지션을 여기서 종료한다
+            w_new.pop(c, None)
+            hold.pop(c, None)
+            n_forced_delist += 1
         for c in list(hold):
             if c in w_new:
                 hold[c]["weeks"] += 1
             else:
                 hold.pop(c, None)
         for c in w_new:
-            hold.setdefault(c, {"weeks": 0, "frozen": 0})
+            hold.setdefault(c, {"weeks": 0, "frozen": 0, "last_exec": np.nan})
         prev_w = w_new
 
     R = pd.DataFrame(rows)
@@ -272,8 +310,11 @@ def perf_stats_w(R: pd.DataFrame, rf: float = 0.0) -> dict:
     vol = r.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if n > 1 else np.nan
     dn = r[r < 0]
     dvol = dn.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if len(dn) > 1 else np.nan
-    peak = np.maximum.accumulate(eq)
-    dd = eq / peak - 1
+    # ★ 최고점 후보에 초기자본 1.0 을 포함한다. 빼면 시작부터 내리 하락한 구간의
+    #   낙폭이 '1주차 종가 대비'로 측정되어 MDD 가 과소평가된다.
+    eq_full = np.concatenate([[1.0], eq])
+    peak = np.maximum.accumulate(eq_full)
+    dd = (eq_full / peak - 1)[1:]
     mdd = float(dd.min()) if n else np.nan
     mx = cur = 0
     for x in dd:

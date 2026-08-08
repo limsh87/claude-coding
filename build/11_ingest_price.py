@@ -371,11 +371,17 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+    # ★ 공용 캐시에는 '전체 합집합'을 쓰고, 이번 실행에는 구간을 잘라 쓴다.
+    #   잘린 프레임을 그대로 덮어쓰면, 더 긴 구간을 쓰는 다른 전략의 캐시 이력이 사라진다
+    #   (다른 전략의 캐시를 훼손하지 않는다는 절대 1원칙에 걸린다).
+    px_all = px
+    px = px_all[(px_all["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                (px_all["date"] <= end_ts)]
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
-                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+        VAULT.put_table("krx_ohlcv_daily", px_all, scope="shared", domain="price",
+                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()),
+                        extra={"note": "전 구간 합집합 — 전략별 구간으로 자르지 않음"})
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")

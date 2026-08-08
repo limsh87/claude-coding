@@ -194,7 +194,7 @@ ACTIVE_PACKS    = ["F"]
 
 STRATEGY_ID   = "TCD_V3_FLP"
 STRATEGY_NAME = "FLP 강제매도 소진 (Forced Liquidation Exhaustion)"
-BUILD_VERSION = "v2.20260808.0211"
+BUILD_VERSION = "v2.20260808.0325"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -1013,17 +1013,31 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
 
 
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """★ 읽기 실패 시에도 원본을 '원래 자리에' 남긴다.
+
+    예전 구현은 어떤 예외든 즉시 os.replace 로 파일을 .corrupt 로 옮겼다. 그런데 드라이브
+    FUSE 는 일시적 I/O 오류를 흔히 낸다. 원본이 자리에서 사라지면 put_table 이 백업할 대상을
+    찾지 못해 '백업 없이' 새 파일을 쓰게 되고, 그건 "백업 없이는 절대 교체하지 않는다"는
+    절대 1원칙을 정확히 뒤집는다. → 1회 재시도 후에도 실패하면 '복사본'만 격리하고
+    원본은 그대로 둔다(다음 put_table 이 그 원본을 백업할 수 있도록)."""
     if not os.path.exists(path):
         return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
-        return None
+    for attempt in range(2):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                                          # noqa
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            LOG.warn(f"parquet 읽기 실패 — 원본은 자리에 두고 사본만 격리합니다: "
+                     f"{os.path.basename(path)} ({type(e).__name__}). "
+                     f"다음 쓰기 때 이 원본이 백업된 뒤 교체됩니다(무백업 교체 방지).")
+            try:
+                shutil.copy2(path, path + f".corrupt.{int(time.time())}")
+            except Exception:
+                pass
+            return None
+    return None
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -1807,9 +1821,21 @@ class Vault:
         })
         return path
 
+    def _latest_revision(self, scope: str, name: str) -> Optional[str]:
+        """put_table 이 백업 실패로 {name}.rev<ts>.parquet 에 쓴 경우를 읽어낸다.
+        이 폴백이 없으면 그 순간부터 모든 쓰기가 영원히 도달 불가가 된다(캐시 동결)."""
+        import glob as _glob
+        cands = sorted(_glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
+        return cands[-1] if cands else None
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        if not os.path.exists(path):
+            rev = self._latest_revision(scope, name)
+            if rev:
+                LOG.info(f"정규 테이블이 없어 리비전 파일을 읽습니다: {os.path.basename(rev)}")
+                path = rev
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
@@ -1823,6 +1849,12 @@ class Vault:
             if age > max_age_days:
                 return None
         d = read_parquet_safe(path)
+        if d is None:
+            rev = self._latest_revision(scope, name)
+            if rev and rev != path:
+                LOG.warn(f"{os.path.basename(path)} 를 읽지 못해 리비전으로 폴백합니다.")
+                d = read_parquet_safe(rev)
+                path = rev
         if d is not None:
             PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
         return d
@@ -3224,11 +3256,17 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+    # ★ 공용 캐시에는 '전체 합집합'을 쓰고, 이번 실행에는 구간을 잘라 쓴다.
+    #   잘린 프레임을 그대로 덮어쓰면, 더 긴 구간을 쓰는 다른 전략의 캐시 이력이 사라진다
+    #   (다른 전략의 캐시를 훼손하지 않는다는 절대 1원칙에 걸린다).
+    px_all = px
+    px = px_all[(px_all["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                (px_all["date"] <= end_ts)]
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
-                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+        VAULT.put_table("krx_ohlcv_daily", px_all, scope="shared", domain="price",
+                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()),
+                        extra={"note": "전 구간 합집합 — 전략별 구간으로 자르지 않음"})
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
@@ -6541,7 +6579,12 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
     if px is None or not len(px):
         return pd.DataFrame(columns=["code", "date"] + SENSOR_COLS)
 
-    px = px.copy()
+    # ★ 결합키 dtype 정규화. downcast() 를 지난 가격 패널의 code 는 category 인데
+    #   신용잔고/수급/주식수 프레임의 code 는 object 다. merge_asof(by="code") 는 dtype 이
+    #   다르면 MergeError 로 죽는다 — 몇 시간짜리 수집이 끝난 직후 L2 에서 터진다.
+    #   (합성 스모크는 downcast 를 타지 않아 이 경로를 못 본다)
+    _as_code = lambda d: d.assign(code=d["code"].astype(str))
+    px = _as_code(px.copy())
     px["date"] = as_ts_series(px["date"])
     px = px.dropna(subset=["code", "date"]).sort_values(["code", "date"])
     for c in ("close", "open", "amount", "volume"):
@@ -6550,15 +6593,18 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
 
     cr = credit.copy() if credit is not None and len(credit) else pd.DataFrame(columns=CREDIT_COLS)
     if len(cr):
+        cr = _as_code(cr)
         cr["date"] = as_ts_series(cr["date"])
         cr = cr.dropna(subset=["code", "date"]).sort_values(["code", "date"])
     fl = flows.copy() if flows is not None and len(flows) else pd.DataFrame(columns=FLOW_COLS)
     if len(fl):
+        fl = _as_code(fl)
         fl["date"] = as_ts_series(fl["date"])
         fl = fl.dropna(subset=["code", "date"]).sort_values(["code", "date"])
     sh = shares.copy() if shares is not None and len(shares) else pd.DataFrame(
         columns=["snap_date", "code", "shares", "mcap_snap"])
     if len(sh):
+        sh = _as_code(sh)
         sh["snap_date"] = as_ts_series(sh["snap_date"])
         # ★ 상장주식수 스냅샷도 PIT: 스냅샷일 +1영업일 이후에만 알 수 있다.
         sh["knowledge_date"] = next_bday(sh["snap_date"])
@@ -6571,6 +6617,8 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
         uni.audit_row("PIT유니버스", w, codes)
         grid_rows.append(pd.DataFrame({"code": codes, "week": w}))
     G = pd.concat(grid_rows, ignore_index=True) if grid_rows else pd.DataFrame(columns=["code", "week"])
+    if len(G):
+        G["code"] = G["code"].astype(str)
     if G.empty:
         LOG.error("주간 격자가 비었습니다 — 유니버스가 전 구간에서 0종목입니다.")
         return pd.DataFrame(columns=["code", "date"] + SENSOR_COLS)
@@ -6701,7 +6749,15 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
         LOG.info(f"주 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
                  f"(건너뛴 구간 수익을 1주 수익으로 계상하지 않기 위함). "
                  f"상장폐지는 백테스트 엔진이 -100% 로 별도 처리합니다.")
+    # ★ 신호일이 격자일보다 며칠 앞선 행 = 최근 거래가 없었다는 뜻(거래정지 진입 구간).
+    #   보유 연속성을 위해 행 자체는 남기되, '그 가격으로 신규 진입'은 막아야 한다
+    #   (이미 존재하지 않는 가격에 새로 사는 셈이 된다).
+    P["stale_days"] = (P["wk"] - P["signal_date"]).dt.days
     P = P[P["signal_date"].notna()].reset_index(drop=True)
+    n_stale = int((P["stale_days"] > 3).sum())
+    if n_stale:
+        LOG.info(f"신호일이 3일 이상 지연된 행 {n_stale:,}건 — 최근 시세가 없는 구간입니다. "
+                 f"보유 연속성 판단에는 쓰되 신규 진입 자격에서는 제외합니다.")
     LOG.ok(f"주간 패널 {len(P):,}행 × {P.shape[1]}열 · {mem_mb(P):.0f}MB "
            f"({P['code'].nunique():,}종목 × {P['wk'].nunique():,}주)")
     PIPE.io("OUT", "MEM", "flp_weekly_panel", P)
@@ -6709,6 +6765,37 @@ def build_flp_panel(px: pd.DataFrame, credit: pd.DataFrame, flows: pd.DataFrame,
 
 
 # ── 유니버스 밴드 (C13) ─────────────────────────────────────────────────────────────────────
+def build_size_estimate(P: pd.DataFrame) -> pd.DataFrame:
+    """규모 척도를 '하나'로 만든다.
+
+    시총(≈1e11)과 거래대금(≈1e9)은 스케일이 100배 다르다. 둘을 한 컬럼에 coalesce 해서
+    랭크하면 '상위 250 제외'가 사실상 '주식수 데이터를 가진 250종목 제외'가 되고,
+    셀의 규모 축과 R3 의 규모 팩터도 똑같이 오염된다.
+    → 주별로 둘 다 관측된 종목에서 mcap/adv20 의 중앙 배율을 구해 거래대금을 시총 스케일로
+      보정한 뒤, 전 종목을 '한 랭크'에서 비교한다. 보정 계수를 못 구하면 전역 중앙값을 쓴다.
+    """
+    P = P.copy()
+    mcap = pd.to_numeric(P.get("mcap"), errors="coerce")
+    adv = pd.to_numeric(P.get("adv20"), errors="coerce")
+    both = mcap.notna() & (mcap > 0) & adv.notna() & (adv > 0)
+    est = mcap.where(mcap > 0)
+    if both.any():
+        ratio = (mcap[both] / adv[both])
+        k_wk = ratio.groupby(P.loc[both, "wk"]).median()
+        k = P["wk"].map(k_wk)
+        k = k.fillna(float(ratio.median()))
+    else:
+        k = pd.Series(20.0, index=P.index)      # 관측이 없으면 보수적 상수 (스케일만 맞춘다)
+    P["size_est"] = est.where(est.notna(), adv * k)
+    P["size_basis"] = np.where(mcap.notna() & (mcap > 0), "mcap", "adv20×보정")
+    n_proxy = int((P["size_basis"] == "adv20×보정").sum())
+    if n_proxy:
+        LOG.info(f"규모 척도 — 시총 {len(P)-n_proxy:,}행 / 거래대금×보정 {n_proxy:,}행. "
+                 f"주별 중앙 배율로 스케일을 맞춰 '한 랭크'에서 비교합니다 "
+                 f"(척도가 다른 두 값을 섞어 랭크하지 않습니다).")
+    return P
+
+
 MAX_EXCLUDE_FRAC = 0.30      # 안전밸브: 어떤 주에도 유니버스의 30% 넘게 잘라내지 않는다
 
 
@@ -6720,21 +6807,11 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
       지운다(신호 영구 무발화). 이 경우 제외 컷을 그 주 종목수의 30% 로 낮추고, 조용히가
       아니라 로그로 알린다. 실데이터(2,000+종목)에서는 절대 발동하지 않는다."""
     P = P.copy()
-    # ★ 시총(1e11 규모)과 거래대금(1e9 규모)을 한 컬럼에 섞어 랭크하면, 시총을 가진 종목이
-    #   무조건 상위에 몰려 '상위 250 제외'가 '주식수 데이터를 가진 250종목 제외'가 된다.
-    #   → 근거별로 따로 백분위를 매기고, 같은 척도(0~1)에서 컷을 적용한다.
-    has_m = P["mcap"].notna() & (P["mcap"] > 0)
-    pct = pd.Series(np.nan, index=P.index, dtype=float)
-    if has_m.any():
-        pct[has_m] = (P.loc[has_m].groupby("wk", observed=True)["mcap"]
-                      .rank(pct=True, ascending=False))
-    if (~has_m).any():
-        pct[~has_m] = (P.loc[~has_m].groupby("wk", observed=True)["adv20"]
-                       .rank(pct=True, ascending=False))
-    P["size_pct"] = pct
-    P["size_basis"] = np.where(has_m, "mcap", "adv20")
+    P = build_size_estimate(P)
+    P["mcap_rank"] = (P.groupby("wk", observed=True)["size_est"]
+                       .rank(ascending=False, method="first"))
+    P["size_pct"] = P.groupby("wk", observed=True)["size_est"].rank(pct=True, ascending=False)
     n_wk = P.groupby("wk", observed=True)["code"].transform("size")
-    P["mcap_rank"] = (P["size_pct"] * n_wk).round().clip(lower=1)
     cut = np.minimum(MCAP_RANK_EXCLUDE_TOP, np.floor(n_wk * MAX_EXCLUDE_FRAC))
     binding = int((cut < MCAP_RANK_EXCLUDE_TOP).sum())
     if binding:
@@ -6743,13 +6820,8 @@ def apply_universe_bands(P: pd.DataFrame) -> pd.DataFrame:
                  f"상위 {MAX_EXCLUDE_FRAC:.0%} 제외로 낮춥니다(안전밸브). "
                  f"실데이터 전 종목 실행에서는 발동하지 않아야 정상입니다.")
     P["mcap_cut"] = cut
-    cut_frac = (cut / n_wk.clip(lower=1)).clip(0.0, 0.95)
     P["V6"] = (P["adv20"] >= MIN_ADV_KRW).fillna(False).astype(int)
-    P["in_band"] = ((P["size_pct"] > cut_frac) & (P["V6"] == 1)).fillna(False).astype(int)
-    if (~has_m).any():
-        LOG.info(f"규모 랭크 근거 — 시총 {int(has_m.sum()):,}행 / 거래대금 대리 "
-                 f"{int((~has_m).sum()):,}행. 근거별로 백분위를 따로 매겨 같은 컷을 적용합니다"
-                 f"(척도가 다른 두 값을 한 랭크에 섞지 않습니다).")
+    P["in_band"] = ((P["mcap_rank"] > cut) & (P["V6"] == 1)).fillna(False).astype(int)
     return P
 
 
@@ -6760,7 +6832,8 @@ def build_cells_flp(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
     P = P.copy()
     P["industry"] = P["code"].map(ind).fillna("미분류").astype(str)
     P["ind_mid"] = P["industry"].str.slice(0, 4).replace("", "미분류")
-    base = P["mcap"].where(P["mcap"].notna(), P["adv20"])
+    base = P["size_est"] if "size_est" in P.columns else \
+        build_size_estimate(P)["size_est"]
     P["size_bucket"] = (base.groupby(P["wk"]).rank(pct=True)
                         .mul(5).clip(0, 4.999).fillna(-1).astype(int).astype(str))
     ws = P["wk"].dt.strftime("%Y%m%d")
@@ -6899,9 +6972,13 @@ def apply_firewall(P: pd.DataFrame, watch: pd.DataFrame, ctx: dict) -> pd.DataFr
     else:
         audit.append(("영업CF적자+이자보상<1", "비활성(재무 없음)", 0))
 
-    # ⑤ 유동성
+    # ★ 여기까지가 '기업 소멸' 방어 = 보유 중에도 즉시 청산해야 하는 하드 조항이다.
+    P["FIREWALL_HARD"] = ok.astype(int)
+
+    # ⑤ 유동성 — 이건 유니버스 밴드의 일부다. 진입 자격에는 쓰되,
+    #    보유 중 유동성이 말랐다는 이유로 강제청산하지 않는다(§4.3 "밴드 이탈은 청산 사유가 아니다").
     liq = (P["adv20"] >= MIN_ADV_KRW).fillna(False)
-    audit.append(("유동성(ADV20)", "활성", int((~liq).sum())))
+    audit.append(("유동성(ADV20) ※진입자격 전용", "활성", int((~liq).sum())))
     ok &= liq
 
     P["FIREWALL"] = ok.astype(int)
@@ -7225,8 +7302,8 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
     rows, holdings_log = [], []
     n_frozen_events = n_forced_delist = n_stale_writeoff = 0
 
-    need = [c for c in ("adv20", "fwd_ret", "FIREWALL", "VETO", "f_cr_pctl", "PHASE_C",
-                        signal_col) if c in P.columns]
+    need = [c for c in ("adv20", "fwd_ret", "FIREWALL", "FIREWALL_HARD", "VETO", "f_cr_pctl",
+                        "PHASE_C", "exec_px", signal_col) if c in P.columns]
     Pw = {w: g for w, g in P.groupby("wk", observed=True)} if len(P) else {}
 
     for i, w in enumerate(weeks):
@@ -7244,11 +7321,27 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         #   → 팔 수 없는 동안은 비중을 그대로 들고 있고(수익 0), 폐지가 확정되면 -100%.
         frozen: Dict[str, float] = {}
         forced: List[Tuple[str, float, float]] = []
+        gap_ret: Dict[str, float] = {}
         for c, wt in list(prev_w.items()):
             if c in rec:
+                # ★ 거래재개: 정지 구간의 가격 변화를 이번 주에 실현한다.
+                #   정지 중 0% 로 두고 재개 후 새 가격에서 다시 시작하면, 정지 기간에
+                #   무너진 가격이 어디에도 계상되지 않는다(이 전략에서 가장 흔한 손실 경로다).
+                h0 = hold.get(c)
+                if h0 and h0.get("frozen", 0) > 0:
+                    last_px = h0.get("last_exec")
+                    now_px = (rec[c] or {}).get("exec_px")
+                    if (last_px and now_px and np.isfinite(float(last_px))
+                            and np.isfinite(float(now_px)) and float(last_px) > 0):
+                        gap_ret[c] = float(now_px) / float(last_px) - 1.0
+                    h0["frozen"] = 0                 # 재개했으므로 동결 카운터 리셋
+                if h0 is not None:
+                    _px = (rec[c] or {}).get("exec_px")
+                    if _px is not None and pd.notna(_px):
+                        h0["last_exec"] = float(_px)
                 continue
             dl = delist.get(c)
-            h = hold.setdefault(c, {"weeks": 0, "frozen": 0})
+            h = hold.setdefault(c, {"weeks": 0, "frozen": 0, "last_exec": np.nan})
             if dl is not None and pd.notna(dl) and dl <= w_next:
                 forced.append((c, wt, -1.0))          # 정리매매가 없으면 -100% (C2)
                 hold.pop(c, None)
@@ -7278,8 +7371,10 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             prev_w = dict(frozen)
             continue
 
+        fresh_px = (sub["stale_days"] <= 3) if "stale_days" in sub.columns else True
         elig = sub[(sub["FIREWALL"] == 1) & (sub["VETO"] == 1) & (sub["in_band"] == 1) &
-                   sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna()]
+                   sub[signal_col].notna() & (sub[signal_col] > 0) & sub["exec_px"].notna() &
+                   fresh_px]
         if uni is not None:
             uni.audit_row("유동성필터", w, sub[sub["V6"] == 1]["code"].tolist())
             uni.audit_row("낙폭조건", w, sub[(sub["V6"] == 1) &
@@ -7304,8 +7399,9 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             if r0 is None:
                 continue
             exited = False
-            if r0.get("FIREWALL", 1) == 0 or r0.get("VETO", 1) == 0:
-                exited = True                  # 방화벽/거부권은 즉시 강제청산
+            fw_hard = r0.get("FIREWALL_HARD", r0.get("FIREWALL", 1))
+            if fw_hard == 0 or r0.get("VETO", 1) == 0:
+                exited = True                  # 기업 소멸 방어·거부권은 즉시 강제청산
             elif h["weeks"] >= hold_max:
                 exited = True                  # 6개월 상한
             else:
@@ -7315,6 +7411,10 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             if not exited:
                 keep.append(c)
 
+        exited = {c for c in hold if c not in keep and c not in frozen}
+        if exited:
+            # 청산 사유가 발생한 종목을 같은 주에 다시 사면 보유상한·청산규칙이 무의미해진다
+            pick = pick[~pick["code"].isin(exited)]
         extra = sub[sub["code"].isin(keep) & ~sub["code"].isin(set(pick["code"]))]
         target = pd.concat([pick, extra], ignore_index=True) if len(extra) else pick
         room = max(0, PORTFOLIO_MAX_NAMES - len(frozen))
@@ -7353,6 +7453,7 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
         for c, wt, r in forced:
             holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": r,
                                  "signal": np.nan, "state": "delisted"})
+        dead_now: List[str] = []
         for c, wt in w_new.items():
             if c in frozen:
                 holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": 0.0,
@@ -7361,26 +7462,40 @@ def run_backtest_w(P: pd.DataFrame, weeks: pd.DatetimeIndex, uni: "Universe",
             _r = rec.get(c) or {}
             _f = _r.get("fwd_ret")
             fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
+            state = "held"
             dl = delist.get(c)
             if dl is not None and pd.notna(dl) and w < dl <= w_next:
                 # ★ 상장폐지 주간: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
                 fr = -1.0 if not np.isfinite(fr) else fr
+                state = "delisted"
+                dead_now.append(c)             # 여기서 손실을 확정했으므로 다음 주에 또 세지 않는다
             if not np.isfinite(fr):
                 fr = 0.0
-            ret += wt * fr
-            holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": fr,
-                                 "signal": _r.get(signal_col), "state": "held"})
+            g = gap_ret.pop(c, 0.0)            # 거래정지 구간의 가격 변화(재개 주에 실현)
+            if g:
+                state = "resumed"
+            ret += wt * (fr + g)
+            holdings_log.append({"wk": w, "code": c, "weight": wt, "ret": fr + g,
+                                 "signal": _r.get(signal_col), "state": state})
+            h = hold.setdefault(c, {"weeks": 0, "frozen": 0, "last_exec": np.nan})
+            _px = _r.get("exec_px")
+            if _px is not None and pd.notna(_px):
+                h["last_exec"] = float(_px)
         rows.append({"wk": w, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
                      "turnover": turn, "cost": cost,
                      "invested": float(sum(w_new.values()))})
 
+        for c in dead_now:                     # 폐지 확정분은 포지션을 여기서 종료한다
+            w_new.pop(c, None)
+            hold.pop(c, None)
+            n_forced_delist += 1
         for c in list(hold):
             if c in w_new:
                 hold[c]["weeks"] += 1
             else:
                 hold.pop(c, None)
         for c in w_new:
-            hold.setdefault(c, {"weeks": 0, "frozen": 0})
+            hold.setdefault(c, {"weeks": 0, "frozen": 0, "last_exec": np.nan})
         prev_w = w_new
 
     R = pd.DataFrame(rows)
@@ -7408,8 +7523,11 @@ def perf_stats_w(R: pd.DataFrame, rf: float = 0.0) -> dict:
     vol = r.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if n > 1 else np.nan
     dn = r[r < 0]
     dvol = dn.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if len(dn) > 1 else np.nan
-    peak = np.maximum.accumulate(eq)
-    dd = eq / peak - 1
+    # ★ 최고점 후보에 초기자본 1.0 을 포함한다. 빼면 시작부터 내리 하락한 구간의
+    #   낙폭이 '1주차 종가 대비'로 측정되어 MDD 가 과소평가된다.
+    eq_full = np.concatenate([[1.0], eq])
+    peak = np.maximum.accumulate(eq_full)
+    dd = (eq_full / peak - 1)[1:]
     mdd = float(dd.min()) if n else np.nan
     mx = cur = 0
     for x in dd:
@@ -7758,7 +7876,9 @@ def _factor_returns(P: pd.DataFrame) -> pd.DataFrame:
     if "fwd_ret" not in d.columns or d.empty:
         return pd.DataFrame()
     d["mom"] = d["f_dd"]                    # 252일 고점 대비 낙폭 = 모멘텀의 부호 있는 대리
-    d["size"] = -d["mcap"].where(d["mcap"].notna(), d["adv20"])   # 소형주일수록 큰 값
+    if "size_est" not in d.columns:
+        d = build_size_estimate(d)
+    d["size"] = -d["size_est"]                # 소형주일수록 큰 값 (밴드·셀과 동일 척도)
     d["value"] = safe_div(col(d, "equity"), d["mcap"])            # 장부/시가 (B/M)
     d["lowvol"] = d["f_vol"]                # f_vol = -표준편차 → 클수록 저변동
     facs = {}
@@ -8145,7 +8265,13 @@ def persist_outputs(P: pd.DataFrame, bt: dict, r2f: dict, r12: dict, abl: pd.Dat
     _csv("canary", pd.DataFrame(list(CANARY.values())))
 
     # r2f_verdict.md — ★ 최우선 산출물
-    v = r2f.get("verdict", "측정되지 않음")
+    #  R2-F 가 킬을 발동하면 main 의 try 가 거기서 끊기므로 r2f 딕셔너리는 비어 있다.
+    #  그때 '측정되지 않음'을 찍으면 가장 중요한 판정이 산출물에서 지워진다 →
+    #  ROBUST_RESULTS 에 이미 기록된 판정문으로 폴백한다.
+    v = r2f.get("verdict")
+    if not v:
+        _rr = next((x for x in ROBUST_RESULTS if x["id"] == "R2-F"), None)
+        v = (f"(킬 발동으로 스위트 중단) {_rr['detail']}" if _rr else "측정되지 않음")
     _txt("r2f_verdict",
          f"# R2-F 판정 — 소진 조건 vs 단순 낙폭과대\n\n"
          f"- 신용잔고 등급: **{CREDIT_GRADE}** ({CREDIT_SOURCE_NOTE})\n"
@@ -8153,11 +8279,15 @@ def persist_outputs(P: pd.DataFrame, bt: dict, r2f: dict, r12: dict, abl: pd.Dat
          f"- B 소진조건 단독 CAGR: {r2f.get('B', {}).get('CAGR', float('nan')):.4%}\n"
          f"- C FLP 전체 CAGR: {r2f.get('C', {}).get('CAGR', float('nan')):.4%}\n"
          f"- C−A HAC t: {r2f.get('t_CA', float('nan')):.2f}\n\n## 판정\n\n{v}\n")
+    _rec = ((f"- R12 권고: **{r12['recommended_pos_max']:.1%}**\n")
+            if r12 and "recommended_pos_max" in r12
+            else "- R12 권고: **미측정** (앞 단계 킬로 스위트가 중단되었습니다 — "
+                 "아래 현재 상한은 '권고치'가 아니라 '출하 기본값'입니다)\n")
     _txt("r12_tail_correlation",
          "# R12 꼬리 동시손실\n\n" +
-         "\n".join(f"- {k}: {v}" for k, v in (r12 or {}).items()) +
-         f"\n\n## 확정된 사이징\n\n- 종목당 최대비중(코드 상수): **{POS_MAX_WEIGHT:.0%}**\n"
-         f"- R12 권고: **{(r12 or {}).get('recommended_pos_max', POS_MAX_WEIGHT):.1%}**\n"
+         ("\n".join(f"- {k}: {v}" for k, v in r12.items()) if r12 else "- 미실행") +
+         f"\n\n## 사이징\n\n- 종목당 최대비중(코드 상수): **{POS_MAX_WEIGHT:.0%}**\n"
+         + _rec +
          f"- 동시보유 상한: {PORTFOLIO_MAX_NAMES}종목 · ADV 참여율 {POS_ADV_PARTICIPATION:.0%}\n")
     _txt("robustness",
          "# 강건성 결과 (R0~R12)\n\n" +
@@ -8407,6 +8537,74 @@ def run_contract_tests(strict: bool = True) -> bool:
                 f"상태전이={states} · 총손실 반영 {total:.2%} "
                 f"(거래정지 중 폐지를 0% 로 처리하면 여기가 0.00% 로 나온다)")
 
+    def c_delist_once():
+        """폐지 -100% 이중계상 방지: 손실은 정확히 한 번만 계상되어야 한다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=4, freq="W-FRI"))
+        dl = wks[1] + pd.Timedelta(days=2)
+        rows = [{"code": "A", "wk": wks[0], "exec_px": 1000.0, "fwd_ret": 0.0, "adv20": 1e10,
+                 "FIREWALL": 1, "FIREWALL_HARD": 1, "VETO": 1, "in_band": 1, "V6": 1,
+                 "PHASE_C": 1, "f_dd": -0.4, "f_cr_pctl": 0.1, "Signal_rank": 1.0},
+                # 폐지 주간: 다음 주 체결가가 없으므로 fwd_ret 은 결측이다(= 정리매매 미확보)
+                {"code": "A", "wk": wks[1], "exec_px": 1000.0, "fwd_ret": np.nan, "adv20": 1e10,
+                 "FIREWALL": 1, "FIREWALL_HARD": 1, "VETO": 1, "in_band": 1, "V6": 1,
+                 "PHASE_C": 1, "f_dd": -0.4, "f_cr_pctl": 0.1, "Signal_rank": 1.0}]
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": ["A"], "name": ["A"], "market": ["KOSDAQ"],
+                            "listing_date": [pd.Timestamp("2015-01-01")], "delisting_date": [dl]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": wks, "code": "A"}))
+        bt = run_backtest_w(P, wks, uni, sec, apply_costs=False, label="c_del1")
+        H = bt["holdings"]
+        n_total = int((H["ret"] <= -0.999).sum()) if len(H) else 0
+        tot = float(bt["returns"]["ret"].sum())
+        return (n_total == 1 and tot < -0.05,
+                f"-100% 계상 {n_total}회 · 누적 {tot:.2%} "
+                f"(0회면 미계상, 2회면 폐지 손실을 두 번 반영한 것)")
+
+    def c_halt_gap():
+        """거래정지 구간의 가격 붕괴가 재개 주에 실현되는가.
+        정지 중 0%, 재개 후 새 가격에서 재시작하면 그 손실이 어디에도 계상되지 않는다."""
+        wks = pd.DatetimeIndex(pd.bdate_range("2020-01-03", periods=4, freq="W-FRI"))
+        base = dict(adv20=1e10, FIREWALL=1, FIREWALL_HARD=1, VETO=1, in_band=1, V6=1,
+                    PHASE_C=1, f_dd=-0.4, f_cr_pctl=0.1)
+        rows = [{"code": "A", "wk": wks[0], "exec_px": 1000.0, "fwd_ret": 0.0,
+                 "Signal_rank": 1.0, **base},
+                # wks[1], wks[2] 는 패널에 없음(거래정지) → wks[3] 에 반토막으로 재개
+                {"code": "A", "wk": wks[3], "exec_px": 500.0, "fwd_ret": 0.0,
+                 "Signal_rank": np.nan, **base}]
+        P = pd.DataFrame(rows)
+        sec = pd.DataFrame({"code": ["A"], "name": ["A"], "market": ["KOSDAQ"],
+                            "listing_date": [pd.Timestamp("2015-01-01")],
+                            "delisting_date": [pd.NaT]})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]),
+                       pd.DataFrame({"date": wks, "code": "A"}))
+        bt = run_backtest_w(P, wks, uni, sec, apply_costs=False, label="c_gap")
+        H = bt["holdings"]
+        got = float(H.loc[H["state"] == "resumed", "ret"].sum()) if "state" in H.columns else 0.0
+        return (got <= -0.49,
+                f"재개 주 실현수익률 {got:.1%} (정지 중 -50% 붕괴가 반영되면 -50% 근처)")
+
+    def c_dtype():
+        """★ 실제 실행에서만 나타나던 결함: 가격 패널은 downcast 로 code 가 category 가 되고
+        신용/수급/주식수는 object 다. merge_asof(by='code') 는 dtype 이 다르면 죽는다."""
+        px = downcast(_synth_daily(3, 200))
+        if str(px["code"].dtype) != "category":
+            px["code"] = px["code"].astype("category")
+        codes = [str(c) for c in px["code"].unique()]
+        cr = pd.DataFrame({"code": codes * 10, "date": list(px["date"].unique())[:10] * 3,
+                           "credit_bal": 1e8, "src": "t"})
+        sh = pd.DataFrame({"snap_date": [px["date"].min()] * 3, "code": codes,
+                           "shares": 1e6, "mcap_snap": np.nan})
+        sec = pd.DataFrame({"code": codes, "name": codes, "market": "KOSPI",
+                            "listing_date": pd.Timestamp("2015-01-01"),
+                            "delisting_date": pd.NaT, "industry": "T", "corp_code": None})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+        weeks = week_grid(str(px["date"].min().date()), str(px["date"].max().date()), px)
+        P = build_flp_panel(px, cr, pd.DataFrame(), sh, weeks, uni)
+        return (len(P) > 0 and P["shares"].notna().any(),
+                f"category/object 혼합 결합 결과 {len(P):,}행 · 주식수 결합 "
+                f"{int(P['shares'].notna().sum()):,}행")
+
     def c_size():
         sub = pd.DataFrame({"code": [f"c{i}" for i in range(30)], "adv20": [1e12] * 30})
         w = size_positions(sub)["weight"]
@@ -8474,6 +8672,9 @@ def run_contract_tests(strict: bool = True) -> bool:
     _c("VETO", "거부권 이진·상쇄 불가", c_veto)
     _c("EXIT", "청산 규칙(f_cr_pctl 회복) 작동", c_exit)
     _c("HALT", "거래정지 중 폐지 = -100% (회귀 방지)", c_halt)
+    _c("DEL1", "폐지 손실 이중계상 금지 (회귀 방지)", c_delist_once)
+    _c("GAP", "거래정지 구간 손실을 재개 주에 실현 (회귀 방지)", c_halt_gap)
+    _c("DTYPE", "category/object 결합키 혼합 내성 (회귀 방지)", c_dtype)
     _c("SIZE", "사이징 상한·합계", c_size)
     _c("FWD", "주 연속성 끊김 시 fwd_ret 결측", c_fwd)
     _c("CELL", "셀 폴백 사다리", c_cell)
@@ -9067,10 +9268,11 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
             _corps = _corps[:keep_n]
         ctx["dart_shares"] = fetch_dart_shares(_corps, _years)
         ctx["shares"] = fetch_shares_outstanding(months, sec=ctx["sec"],
-                                                 dart_shares=ctx["dart_shares"])
+                                                 dart_shares=ctx.get("dart_shares"))
 
     with PIPE.stage("L1.CREDIT", "신용융자잔고 ★핵심 (M1)", "L1", budget_s=2400, critical=False):
-        ctx["credit"] = fetch_credit_balance(ctx["px"], ctx["flows"], BACKTEST_START, BACKTEST_END)
+        ctx["credit"] = fetch_credit_balance(ctx["px"], ctx.get("flows", pd.DataFrame()),
+                                             BACKTEST_START, BACKTEST_END)
         # F1/F3 카나리를 실측으로 갱신한다(추측 금지)
         canary("F1", "종목별 신용융자잔고 ★이 전략의 핵심",
                CREDIT_GRADE in ("PRIMARY_DAILY", "FALLBACK_A_WEEKLY"),
@@ -9089,46 +9291,73 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
             ctx["fin"] = fin
             ctx["disclosures"] = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         else:
-            LOG.warn("DART_API_KEY 미입력 — 방화벽(자본잠식·영업CF)과 V1/V3 거부권이 비활성화됩니다. "
-                     "이 전략의 단일 실패모드가 그대로 노출되므로 키 입력을 강력히 권합니다.")
-            ctx["fin"], ctx["disclosures"] = pd.DataFrame(), pd.DataFrame()
+            # ★ 키가 없다고 '드라이브에 이미 있는 DART 캐시'까지 버리면 안 된다.
+            #   v2 전략들이 공용 인덱스에 쌓아둔 재무·공시가 그대로 재사용 가능하다.
+            #   (수집 함수는 키 검사에서 먼저 빠져나가므로 여기서 직접 읽는다)
+            cf = VAULT.get_table("dart_financials", scope="shared")
+            cd = VAULT.get_table("dart_disclosures", scope="shared")
+            if cf is not None and len(cf):
+                need_pit = [c for c in ("event_date", "knowledge_date") if c not in cf.columns]
+                if not need_pit:
+                    PIT.register("dart_financials", cf, key_cols=["corp_code"])
+                    LOG.ok(f"★ DART 키가 없지만 공용 인덱스의 재무 캐시 {len(cf):,}행을 "
+                           f"재사용합니다 — 방화벽이 살아납니다.")
+                else:
+                    LOG.warn(f"공용 재무 캐시에 PIT 컬럼 {need_pit} 이 없어 사용할 수 없습니다.")
+            if cd is not None and len(cd):
+                LOG.ok(f"★ 공용 인덱스의 공시 캐시 {len(cd):,}행 재사용 — V1 거부권이 살아납니다.")
+            ctx["fin"] = cf if cf is not None else pd.DataFrame()
+            ctx["disclosures"] = cd if cd is not None else pd.DataFrame()
+            if (cf is None or not len(cf)) and (cd is None or not len(cd)):
+                LOG.warn("DART_API_KEY 미입력 + 공용 캐시도 비어 있음 — 방화벽(자본잠식·영업CF)과 "
+                         "V1/V3 거부권이 비활성화됩니다. 이 전략의 단일 실패모드가 그대로 "
+                         "노출되므로 키 입력을 강력히 권합니다.")
 
     with PIPE.stage("L1.WATCH", "관리종목 · 거래정지 (K6)", "L1", budget_s=300, critical=False):
         ctx["watch"] = fetch_watchlist_halt(ctx["sec"])
 
-    with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장 (한경/네이버)", "L1",
-                    budget_s=3600, critical=False,
-                    skip_if=(not RESEARCH_USE), skip_reason="RESEARCH_USE=False"):
-        LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. 사용자의 명시적 "
-                 "지시에 따라 수집하되 보수적 속도로 제한합니다. 원문은 로컬 분석 용도로만.")
-        cached = VAULT.get_table("research_report_master", scope="shared")
-        frames = []
-        if cached is not None and len(cached):
-            LOG.ok(f"★ 구글드라이브 공용 인덱스에서 리포트 원장 {len(cached):,}건 재사용 "
-                   f"(재수집하지 않습니다)")
-            frames.append(cached)
-        if RUN_MODE == "FULL" and RESEARCH_COLLECT:
-            if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
-            if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(BACKTEST_START, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
-        rep = build_report_master(frames, ctx["sec"])
-        if len(rep):
-            if RESEARCH_DOWNLOAD_PDF:
-                rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
-            VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
-                            source="hankyung+naver")
-        A, L = build_analyst_ledger(rep)
-        if len(A):
-            VAULT.put_table("analyst_master", A, scope="shared", domain="research",
-                            source="entity_resolution")
-            VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
-                            source="entity_resolution")
-        ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
-    ctx.setdefault("reports", pd.DataFrame())
-    ctx.setdefault("analysts", pd.DataFrame())
-    ctx.setdefault("links", pd.DataFrame())
+    # ※ PIPE.stage(skip_if=...) 는 스테이지를 SKIP 으로 기록하지만 본문 실행까지 막지는
+    #    못한다(컨텍스트매니저가 yield 하므로 with 본문은 그대로 돈다).
+    #    그래서 '끄기'는 반드시 호출부의 조건 분기로 구현한다.
+    if RESEARCH_USE:
+        with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장 (한경/네이버)", "L1",
+                        budget_s=3600, critical=False):
+            LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. 사용자의 명시적 "
+                     "지시에 따라 수집하되 보수적 속도로 제한합니다. 원문은 로컬 분석 용도로만.")
+            cached = VAULT.get_table("research_report_master", scope="shared")
+            frames = []
+            if cached is not None and len(cached):
+                LOG.ok(f"★ 구글드라이브 공용 인덱스에서 리포트 원장 {len(cached):,}건 재사용 "
+                       f"(재수집하지 않습니다)")
+                frames.append(cached)
+            if RUN_MODE == "FULL" and RESEARCH_COLLECT:
+                if "hankyung" in RESEARCH_SOURCES:
+                    frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+                if "naver" in RESEARCH_SOURCES:
+                    nv = naver_collect(BACKTEST_START, BACKTEST_END)
+                    frames.append(naver_enrich_detail(nv))
+            rep = build_report_master(frames, ctx["sec"])
+            if len(rep):
+                if RESEARCH_DOWNLOAD_PDF:
+                    rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+                VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
+                                source="hankyung+naver")
+            A, L = build_analyst_ledger(rep)
+            if len(A):
+                VAULT.put_table("analyst_master", A, scope="shared", domain="research",
+                                source="entity_resolution")
+                VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
+                                source="entity_resolution")
+            ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
+    else:
+        LOG.warn("RESEARCH_USE=False — 애널리스트 리포트 오버레이(V_RS 거부권·해석표 커버리지)를 "
+                 "사용하지 않습니다. 드라이브에 캐시가 있어도 읽지 않습니다.")
+    # ★ 비필수(critical=False) 스테이지가 실패하면 그 산출물 키가 없다. 하류에서
+    #   ctx["flows"] 로 읽으면 '수급 실패'가 엉뚱하게 '신용잔고 스테이지의 KeyError' 로
+    #   보고된다 — 실패 지점이 흐려지는 것이 가장 나쁘다. 여기서 한 번에 기본값을 못박는다.
+    for _k in ("flows", "shares", "credit", "watch", "disclosures", "fin", "dart_shares",
+               "reports", "analysts", "links"):
+        ctx.setdefault(_k, pd.DataFrame())
     return ctx
 
 
