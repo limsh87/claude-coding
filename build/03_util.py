@@ -23,17 +23,40 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return None
     if getattr(t, "tzinfo", None) is not None:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
-    return t.normalize()
+    t = t.normalize()
+    try:
+        t = t.as_unit("ns")                      # ★ 해상도 통일 — 아래 주석 참조
+    except Exception:
+        pass
+    return t
 
 
 def as_ts_series(s) -> pd.Series:
+    """tz-naive · 자정 정규화 · **datetime64[ns] 고정** Series.
+
+    ★ 해상도(unit)를 ns 로 못박는 이유 — pandas 2.x→3.x 에서 실제로 터진 버그다:
+      pd.to_datetime 은 입력에 따라 해상도를 다르게 추론한다.
+        "2016-09-30" (문자열)        → datetime64[s]
+        pd.date_range(...)           → datetime64[ns]
+      merge 는 해상도가 달라도 붙지만 **merge_asof 는 MergeError 로 거부한다**
+      ("incompatible merge keys dtype('<M8[s]') and dtype('<M8[ns]')").
+      이 프로젝트의 PIT 결합은 전부 merge_asof 이므로, 한쪽이 문자열 출신이면
+      as-of 결합이 통째로 실패하고 → 상위에서 폴백되어 → 그 컬럼이 전부 결측이 되고
+      → 유니버스가 '에러 없이' 0 종목으로 붕괴한다. 로그에는 경고 한 줄만 남는다.
+      해상도를 여기 한 곳에서 고정해 그 사고 경로 자체를 없앤다.
+    """
     out = pd.to_datetime(pd.Series(s), errors="coerce")
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
     except Exception:
         pass
-    return out.dt.normalize()
+    out = out.dt.normalize()
+    try:
+        out = out.astype("datetime64[ns]")
+    except Exception:
+        pass
+    return out
 
 
 def month_end(x) -> Optional[pd.Timestamp]:
@@ -42,7 +65,9 @@ def month_end(x) -> Optional[pd.Timestamp]:
 
 
 def month_range(start, end) -> pd.DatetimeIndex:
-    return pd.date_range(month_end(start), month_end(end), freq="ME")
+    # ★ "ME" 별칭은 pandas 2.2 이상에서만 유효하다. offset 객체는 1.x~3.x 전부에서 동작한다.
+    #   (Colab 의 pandas 가 2.0/2.1 이면 이 한 줄 때문에 실행이 시작도 못 하고 죽는다)
+    return pd.date_range(month_end(start), month_end(end), freq=pd.offsets.MonthEnd())
 
 
 # ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
@@ -167,18 +192,45 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
     return path
 
 
+_CORRUPT_PAT = re.compile(
+    r"ArrowInvalid|ArrowIOError|Parquet magic bytes|not a parquet file|"
+    r"Couldn't deserialize|corrupt|invalid.*footer|Repetition level", re.I)
+
+
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """읽기 실패를 '손상'과 '일시적 IO 오류'로 구분한다.
+
+    ★ 왜 구분이 중요한가 ─────────────────────────────────────────────────────────────
+      예전에는 어떤 예외든 곧바로 파일을 .corrupt 로 개명(os.replace)했다. 그런데 구글드라이브
+      FUSE 마운트는 정상 상태에서도 'Transport endpoint is not connected', 타임아웃, 쿼터
+      스로틀 같은 '일시적' 오류를 낸다. 그러면 멀쩡한 공용 캐시가 격리되고, 곧이어
+      put_table 이 '없는 파일'로 판단해 백업 없이 새로 만들어 버린다.
+      = 잠깐의 네트워크 딸꾹질이 다른 전략의 캐시를 통째로 날린다. 절대 1원칙 위반이다.
+    → ① 3회 재시도(지수 백오프) ② parquet 포맷 오류로 확인될 때만 격리 ③ 그 외에는
+      None 을 돌려줄 뿐 파일에 손대지 않는다(다음 실행에서 다시 읽으면 된다).
+    """
     if not os.path.exists(path):
         return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
+    last = None
+    for attempt in range(3):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                 # noqa
+            last = e
+            if attempt < 2:
+                time.sleep(0.6 * (2 ** attempt))
+    blob = f"{type(last).__name__}: {last}"
+    if not _CORRUPT_PAT.search(blob):
+        LOG.warn(f"parquet 읽기 실패(일시적 오류로 판단) — 파일은 그대로 두고 이번 실행에서만 "
+                 f"건너뜁니다: {os.path.basename(path)} ({type(last).__name__}). "
+                 f"드라이브 마운트가 불안정할 때 흔합니다. 다음 실행에서 다시 읽습니다.")
         return None
+    LOG.warn(f"parquet 손상 확인 — 지우지 않고 격리 보관합니다: {os.path.basename(path)} ({blob[:80]})")
+    try:                                       # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
+        os.replace(path, path + f".corrupt.{int(time.time())}")
+    except Exception:
+        pass
+    return None
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -199,9 +251,12 @@ def read_jsonl(path: str) -> List[dict]:
 
 def append_jsonl(path: str, rows: Iterable[dict]):
     _ensure_dir(path)
+    # ★ 줄마다 write 하면 기본 8KiB 버퍼가 임의 지점에서 flush 되어, 두 노트북이 동시에
+    #   append 할 때 한 줄이 반토막 난 채 섞인다(read_jsonl 이 그 줄을 조용히 버린다).
+    #   한 번의 write 로 넘기면 대부분의 경우 원자적으로 처리된다.
+    blob = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows)
     with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        f.write(blob)
         f.flush()
         try:
             os.fsync(f.fileno())
@@ -435,7 +490,15 @@ def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) 
     """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
     v = pd.to_numeric(values, errors="coerce").astype("float64")
     v = v.replace([np.inf, -np.inf], np.nan)
-    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
+    # ★ astype(object) 로 캐스팅하지 않는다. 셀 컬럼은 일부러 category 로 만들어 두는데
+    #   여기서 파이썬 문자열 20만 개로 되돌려 매 호출마다 해싱한다 — 랭크 호출이 수십 번
+    #   반복되는 경로라 그대로 누적 비용이 된다. category 면 코드 정수로 그룹핑된다.
+    _c = pd.Series(cells)
+    if isinstance(_c.dtype, pd.CategoricalDtype):
+        grp = _c.cat.add_categories(["__NA__"]).fillna("__NA__") if _c.isna().any() else _c
+    else:
+        grp = _c.fillna("__NA__").astype("category")
+    grp = grp.to_numpy() if not isinstance(grp.dtype, pd.CategoricalDtype) else grp.values
     g = v.groupby(grp, observed=True, dropna=False)
     cnt = g.transform("count")
     r = g.rank(pct=True, method="average")

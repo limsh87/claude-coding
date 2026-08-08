@@ -155,6 +155,7 @@ def _pick(rowmap: Dict[str, Any], *names) -> Optional[Any]:
 
 # ── 한경컨센서스 ────────────────────────────────────────────────────────────────────────────
 _HK_LAYOUT_LOGGED = set()
+_HK_IDX_RE = re.compile(r"report_idx=\d+")
 
 
 def _hk_parse(html: str, category: str) -> List[dict]:
@@ -169,7 +170,13 @@ def _hk_parse(html: str, category: str) -> List[dict]:
             break
     if table is None:
         return []
-    if soup.select_one("td.no_data") or "데이터가 없습니다" in html:
+    # ★★ 실측된 '0건' 사고의 원인이 바로 이 줄이었다 ★★
+    #   예전 구현은 `"데이터가 없습니다" in html` 로 **문서 전체**를 훑었다. 그 문구는
+    #   빈 결과 템플릿·인접 탭 마크업·인라인 스크립트 어디에나 들어 있을 수 있고, 그러면
+    #   실제 행이 몇 개든 상관없이 매 페이지가 빈 목록을 돌려준다. 결정적이라서 11년 ×
+    #   2스킨이 전부 0건이 되고, HTTP 오류가 없으니 로그에는 초록색 ✔ 만 남는다.
+    #   → 빈 상태 판정은 '표 안에 실제 행이 있는가'로만 한다. 문서 전체 문자열 검색 금지.
+    if table.select_one("td.no_data") is not None and table.find("a", href=_HK_IDX_RE) is None:
         return []
     headers = _table_headers(table)
     if category not in _HK_LAYOUT_LOGGED:
@@ -240,16 +247,22 @@ def _hk_parse(html: str, category: str) -> List[dict]:
 
 
 def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
-                     page_size: int = 80, max_pages: int = 400) -> pd.DataFrame:
-    """연도 단위로 쪼개서 수집. 한 번에 10년을 요청하면 서버 페이지 상한에 걸린다."""
+                     page_size: int = 80, max_pages: int = 200) -> pd.DataFrame:
+    """분기 단위로 쪼개서 수집.
+
+    ★ 연 단위(1년 = 365일)로 요청하면 서버가 조회기간 상한에 걸려 **HTTP 200 에 빈 표**를
+      돌려준다. 현재 동작이 확인된 호출은 전부 수 일~3개월 범위다. 분기로 쪼개면 요청 수는
+      4배지만 한 요청의 페이지 수가 줄어 총 페이지 수는 오히려 비슷하다.
+    """
     rows: List[dict] = []
-    years = list(range(as_ts(start).year, as_ts(end).year + 1))
     jobs = []
+    _q = pd.period_range(as_ts(start), as_ts(end), freq="Q")
     for skin in skins:
-        for y in years:
-            sd = max(as_ts(f"{y}-01-01"), as_ts(start))
-            ed = min(as_ts(f"{y}-12-31"), as_ts(end))
-            jobs.append((skin, sd, ed))
+        for p in _q:
+            sd = max(pd.Timestamp(p.start_time), as_ts(start))
+            ed = min(pd.Timestamp(p.end_time).normalize(), as_ts(end))
+            if sd <= ed:
+                jobs.append((skin, sd, ed))
 
     def _sweep(job):
         skin, sd, ed = job
@@ -260,7 +273,9 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
             params = {
                 "skinType": skin, "sdate": sd.strftime("%Y-%m-%d"), "edate": ed.strftime("%Y-%m-%d"),
                 "now_page": page, "pagenum": page_size, "order_type": "",
-                "report_type": "CO" if skin == "business" else "",
+                # ★ report_type 은 구 컨트롤러(/apps.analysis/analysis.list)의 인자다.
+                #   현재 경로(skinType)와 함께 보내면 서버가 조건을 겹쳐 해석해 빈 표를
+                #   돌려줄 수 있다. 동작이 확인된 호출은 전부 skinType 단독이다.
                 "search_text": "", "search_value": "", "business_code": "",
             }
             html = http_get(HK_LIST, source="hankyung", params=params, tries=3,
@@ -268,8 +283,14 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
             if not html:
                 break
             batch = _hk_parse(html, skin)
+            # ★ 첫 페이지가 비었다고 즉시 끊지 않는다. 아래 empty_streak(2회 연속) 규칙과
+            #   같은 이유다 — 일시적 빈 응답 하나로 그 분기 전체가 조용히 사라지면
+            #   전 구간이 0건이 되어도 아무 신호가 남지 않는다.
             if not batch:
-                break
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                continue
             fresh = [b for b in batch if b["src_report_id"] not in seen_ids]
             for b in fresh:
                 seen_ids.add(b["src_report_id"])
@@ -483,18 +504,48 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     return d
 
 
-def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
-    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다."""
+def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000,
+                        budget_s: Optional[float] = None,
+                        prio_codes: Optional[set] = None) -> pd.DataFrame:
+    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다.
+
+    ★ 이 단계가 실측 126분(7,555초)을 먹은 최대 병목이었다 ─────────────────────────────
+      원인은 동시성이 아니라 **산수**다. 네이버 레이트리밋 3 QPS 는 소스 단위 공유 버킷이라
+      워커를 8개로 늘려도 전부 같은 버킷에서 대기한다. 20,000건 ÷ 3 = 6,667초 —
+      워커 수와 무관하게 정해지는 값이다. 줄일 수 있는 건 **요청 수 자체**뿐이다.
+        ① 한경을 먼저 병합해 목표주가가 이미 채워진 건은 대상에서 빠진다(호출자 책임).
+        ② 남은 예산(초)으로 상한을 계산해 그 안에서만 돈다 — 예산을 넘길 걸 알면서
+           시작하지 않는다(§10).
+        ③ U-MICRO 후보 종목의 리포트를 먼저 받는다. 이 전략이 실제로 쓰는 건 그쪽뿐이다.
+      받지 못한 건은 다음 실행이 이어받는다(보강 결과가 공용 인덱스에 저장되므로
+      이미 채운 건은 두 번 조회하지 않는다).
+    """
     if df.empty:
         return df
     need = df[(df["source"] == "naver") & (df["category"] == "company") &
               (df["target_price"].isna()) & (df["detail_url"].notna())].copy()
     if need.empty:
         return df
-    if len(need) > limit:
-        LOG.warn(f"네이버 상세 보강 대상 {len(need):,}건 중 최신 {limit:,}건만 조회합니다 "
-                 f"(RESEARCH 설정으로 조절 가능). 나머지는 목표주가 결측으로 남습니다.")
-        need = need.sort_values("pub_date", ascending=False).head(limit)
+    n_all = len(need)
+    if budget_s is not None:
+        qps = float(RATE_LIMIT_QPS.get("naver", 3.0))
+        limit = min(limit, max(0, int(qps * max(0.0, float(budget_s)) * 0.85)))
+    if limit <= 0:
+        LOG.warn(f"네이버 상세 보강에 배정할 남은 시간이 없습니다 — 대상 {n_all:,}건을 "
+                 f"통째로 건너뜁니다. 목표주가는 결측으로 남고 다음 실행이 이어받습니다.")
+        return df
+    # 우선순위: ① U-MICRO 후보 종목  ② 최신순
+    need["_p"] = (0 if not prio_codes
+                  else (~need["stock_code"].astype(str).isin(prio_codes)).astype(int))
+    need = need.sort_values(["_p", "pub_date"], ascending=[True, False])
+    if n_all > limit:
+        _in_band = int((need["_p"].iloc[:limit] == 0).sum()) if len(need) else 0
+        LOG.warn(f"네이버 상세 보강 대상 {n_all:,}건 중 {limit:,}건만 조회합니다 "
+                 f"(남은 예산 {0 if budget_s is None else budget_s/60:.0f}분 · "
+                 f"{RATE_LIMIT_QPS.get('naver', 3.0):.1f} QPS 기준). "
+                 f"그중 U-MICRO 후보 종목분 {_in_band:,}건을 우선했습니다. "
+                 f"나머지는 다음 실행이 이어받습니다(이번에 채운 건은 공용 인덱스에 남습니다).")
+        need = need.head(limit)
 
     def _one(u: str):
         h = http_get(u, source="naver", referer=NV_BASE, force_enc="euc-kr", tries=2)
@@ -528,7 +579,11 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     if len(df) != n_before:
         LOG.warn(f"상세 보강 머지에서 행수가 {n_before:,}→{len(df):,} 로 변했습니다 — "
                  f"중복 detail_url 로 인한 증식입니다.")
-        df = df.drop_duplicates("report_uid", keep="first")
+        # ★ report_uid 는 build_report_master 에서 만들어진다. 이 시점(수집 직후)에는
+        #   아직 없을 수 있으므로 존재하는 키로만 중복을 제거한다.
+        #   (없는 컬럼으로 drop_duplicates 하면 KeyError 로 수집 전체가 죽는다)
+        _dk = next((k for k in ("report_uid", "detail_url", "title") if k in df.columns), None)
+        df = df.drop_duplicates(_dk, keep="first") if _dk else df.drop_duplicates()
     for c in ("target_price", "opinion"):
         if f"{c}_d" in df.columns:
             df[c] = df[c].where(df[c].notna(), df[f"{c}_d"])

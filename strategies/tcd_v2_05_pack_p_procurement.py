@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_P"
 STRATEGY_NAME      = "PACK-P 조달청 낙찰"
 ACTIVE_PACKS       = ["P"]
-BUILD_VERSION      = "v2.20260807.1316"
+BUILD_VERSION      = "v2.20260807.2321"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -264,13 +264,17 @@ _REQUIRED = [
     ("numpy",     "numpy",              True,  "모든 수치연산"),
     ("pandas",    "pandas",             True,  "모든 패널 처리"),
     ("pyarrow",   "pyarrow",            True,  "parquet 캐시(L1 영속화)"),
-    ("scipy",     "scipy",              True,  "통계검정 / 회귀"),
+    # scipy 는 이 파일에서 직접 import 하지 않는다(HAC t·회귀는 numpy 로 구현).
+    # 필수로 두면 설치 실패 시 SystemExit 로 실행 자체가 막히므로 선택으로 내린다.
+    # 단 pandas 의 corr(method="spearman") 은 내부적으로 scipy 를 요구하므로, 그 경로를
+    # 쓰는 코드를 추가한다면 여기서 다시 필수로 올려야 한다.
     ("requests",  "requests",           True,  "모든 HTTP 수집"),
     ("bs4",       "beautifulsoup4",     True,  "리서치 리스트 파싱"),
     ("lxml",      "lxml",               True,  "HTML/XML 고속 파서"),
     ("tqdm",      "tqdm",               True,  "진행률 표시"),
 ]
 _OPTIONAL = [
+    ("scipy",     "scipy",              "통계검정(현재 미사용 — pandas spearman 사용 시 필요)"),
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
@@ -353,6 +357,16 @@ try:
 except Exception:                                             # pragma: no cover
     def tqdm(it=None, **kw):                                  # type: ignore
         return it if it is not None else iter(())
+
+# ★ 서드파티 로거 억제. yfinance 는 종목 하나가 실패할 때마다 여러 줄을 stderr 로 쏟아내
+#   (\"possibly delisted\", \"1 Failed download\"), 2,600종목 폴백 구간에서 로그가 수만 줄
+#   불어나 정작 우리 진단표가 파묻힌다. 실패 자체는 수집부가 집계해 표로 보고한다.
+for _noisy in ("yfinance", "urllib3", "peewee", "requests", "py.warnings", "matplotlib"):
+    try:
+        logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+    except Exception:
+        pass
+logging.captureWarnings(True)
 
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 80)
@@ -558,6 +572,10 @@ class StageRecord:
 
     @property
     def dur(self) -> float:
+        # ★ 아직 시작하지 않은(PENDING) 스테이지는 t_start=0 이라 그대로 빼면
+        #   유닉스 epoch 전체(≈1.7e9초)가 소요시간으로 잡혀 표와 런타임 감사가 망가진다.
+        if not self.t_start:
+            return 0.0
         return (self.t_end or time.time()) - self.t_start
 
 
@@ -628,6 +646,12 @@ _DIAG_RULES: List[Tuple[str, str]] = [
     (r"empty|EmptyDataError|No objects to concatenate|zero-size",
      "수집 결과가 비었습니다. 대개 ① 키 미입력 ② 조회구간에 데이터 없음 ③ 소스 구조 변경입니다. "
      "바로 위 FLOW 원장에서 어느 소스가 0행을 반환했는지 확인하세요."),
+    (r"가격 데이터를 한 종목도|서킷브레이커",
+     "가격 소스에 전혀 도달하지 못했습니다. ① 방화벽/프록시 환경이면 "
+     "raw.githubusercontent.com · fchart.stock.naver.com · data.krx.co.kr 접근을 확인하세요. "
+     "② 드라이브 캐시(krx_ohlcv_daily)가 있으면 RUN_MODE='CACHED' 로 두면 네트워크 없이 "
+     "백테스트가 됩니다. ③ 서킷브레이커는 '연속 실패'를 감지해 조기 종료한 것이므로, "
+     "네트워크가 정상인 환경에서 재실행하면 캐시에 정확히 이어서 받습니다."),
     (r"ModuleNotFoundError|ImportError",
      "패키지 누락입니다. 위 부트스트랩 로그에서 어떤 설치가 실패했는지 확인하고 수동 설치하세요."),
     (r"tz-aware|tz-naive|Cannot compare",
@@ -836,17 +860,40 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return None
     if getattr(t, "tzinfo", None) is not None:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
-    return t.normalize()
+    t = t.normalize()
+    try:
+        t = t.as_unit("ns")                      # ★ 해상도 통일 — 아래 주석 참조
+    except Exception:
+        pass
+    return t
 
 
 def as_ts_series(s) -> pd.Series:
+    """tz-naive · 자정 정규화 · **datetime64[ns] 고정** Series.
+
+    ★ 해상도(unit)를 ns 로 못박는 이유 — pandas 2.x→3.x 에서 실제로 터진 버그다:
+      pd.to_datetime 은 입력에 따라 해상도를 다르게 추론한다.
+        "2016-09-30" (문자열)        → datetime64[s]
+        pd.date_range(...)           → datetime64[ns]
+      merge 는 해상도가 달라도 붙지만 **merge_asof 는 MergeError 로 거부한다**
+      ("incompatible merge keys dtype('<M8[s]') and dtype('<M8[ns]')").
+      이 프로젝트의 PIT 결합은 전부 merge_asof 이므로, 한쪽이 문자열 출신이면
+      as-of 결합이 통째로 실패하고 → 상위에서 폴백되어 → 그 컬럼이 전부 결측이 되고
+      → 유니버스가 '에러 없이' 0 종목으로 붕괴한다. 로그에는 경고 한 줄만 남는다.
+      해상도를 여기 한 곳에서 고정해 그 사고 경로 자체를 없앤다.
+    """
     out = pd.to_datetime(pd.Series(s), errors="coerce")
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
     except Exception:
         pass
-    return out.dt.normalize()
+    out = out.dt.normalize()
+    try:
+        out = out.astype("datetime64[ns]")
+    except Exception:
+        pass
+    return out
 
 
 def month_end(x) -> Optional[pd.Timestamp]:
@@ -855,7 +902,9 @@ def month_end(x) -> Optional[pd.Timestamp]:
 
 
 def month_range(start, end) -> pd.DatetimeIndex:
-    return pd.date_range(month_end(start), month_end(end), freq="ME")
+    # ★ "ME" 별칭은 pandas 2.2 이상에서만 유효하다. offset 객체는 1.x~3.x 전부에서 동작한다.
+    #   (Colab 의 pandas 가 2.0/2.1 이면 이 한 줄 때문에 실행이 시작도 못 하고 죽는다)
+    return pd.date_range(month_end(start), month_end(end), freq=pd.offsets.MonthEnd())
 
 
 # ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
@@ -980,18 +1029,45 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
     return path
 
 
+_CORRUPT_PAT = re.compile(
+    r"ArrowInvalid|ArrowIOError|Parquet magic bytes|not a parquet file|"
+    r"Couldn't deserialize|corrupt|invalid.*footer|Repetition level", re.I)
+
+
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """읽기 실패를 '손상'과 '일시적 IO 오류'로 구분한다.
+
+    ★ 왜 구분이 중요한가 ─────────────────────────────────────────────────────────────
+      예전에는 어떤 예외든 곧바로 파일을 .corrupt 로 개명(os.replace)했다. 그런데 구글드라이브
+      FUSE 마운트는 정상 상태에서도 'Transport endpoint is not connected', 타임아웃, 쿼터
+      스로틀 같은 '일시적' 오류를 낸다. 그러면 멀쩡한 공용 캐시가 격리되고, 곧이어
+      put_table 이 '없는 파일'로 판단해 백업 없이 새로 만들어 버린다.
+      = 잠깐의 네트워크 딸꾹질이 다른 전략의 캐시를 통째로 날린다. 절대 1원칙 위반이다.
+    → ① 3회 재시도(지수 백오프) ② parquet 포맷 오류로 확인될 때만 격리 ③ 그 외에는
+      None 을 돌려줄 뿐 파일에 손대지 않는다(다음 실행에서 다시 읽으면 된다).
+    """
     if not os.path.exists(path):
         return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
+    last = None
+    for attempt in range(3):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                 # noqa
+            last = e
+            if attempt < 2:
+                time.sleep(0.6 * (2 ** attempt))
+    blob = f"{type(last).__name__}: {last}"
+    if not _CORRUPT_PAT.search(blob):
+        LOG.warn(f"parquet 읽기 실패(일시적 오류로 판단) — 파일은 그대로 두고 이번 실행에서만 "
+                 f"건너뜁니다: {os.path.basename(path)} ({type(last).__name__}). "
+                 f"드라이브 마운트가 불안정할 때 흔합니다. 다음 실행에서 다시 읽습니다.")
         return None
+    LOG.warn(f"parquet 손상 확인 — 지우지 않고 격리 보관합니다: {os.path.basename(path)} ({blob[:80]})")
+    try:                                       # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
+        os.replace(path, path + f".corrupt.{int(time.time())}")
+    except Exception:
+        pass
+    return None
 
 
 def read_jsonl(path: str) -> List[dict]:
@@ -1012,9 +1088,12 @@ def read_jsonl(path: str) -> List[dict]:
 
 def append_jsonl(path: str, rows: Iterable[dict]):
     _ensure_dir(path)
+    # ★ 줄마다 write 하면 기본 8KiB 버퍼가 임의 지점에서 flush 되어, 두 노트북이 동시에
+    #   append 할 때 한 줄이 반토막 난 채 섞인다(read_jsonl 이 그 줄을 조용히 버린다).
+    #   한 번의 write 로 넘기면 대부분의 경우 원자적으로 처리된다.
+    blob = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows)
     with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+        f.write(blob)
         f.flush()
         try:
             os.fsync(f.fileno())
@@ -1645,7 +1724,12 @@ class Vault:
             #   drop_duplicates(uid) 가 그 파일 전체를 단 한 줄로 붕괴시킨다 = 인덱스 유실.
             #   절대 1원칙에 정면으로 반하므로, 결측 uid 는 행 내용 해시로 개별 부여한다.
             if "uid" not in idx.columns:
-                idx["uid"] = np.nan
+                # ★ dtype 주의: np.nan 으로 만들면 float64 컬럼이 되고, 아래에서 sha1 문자열을
+                #   .loc 로 넣는 순간 pandas 2.x 는 FutureWarning, **pandas 3.0 은 TypeError** 다.
+                #   그런데 이 코드는 critical 스테이지(L0.VAULT) 안이라 실행 전체가 죽는다.
+                #   트리거도 흔하다 — uid 컬럼이 없는 레거시 인덱스 파일 하나면 충분하고,
+                #   이 파일은 v2 캐시 루트를 그대로 재사용하라고 안내한다.
+                idx["uid"] = pd.Series(np.nan, index=idx.index, dtype=object)
             miss = idx["uid"].isna() | (idx["uid"].astype(str).str.strip().isin(("", "nan", "None")))
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
@@ -1664,7 +1748,8 @@ class Vault:
 
         for c in INDEX_COLUMNS:
             if c not in idx.columns:
-                idx[c] = np.nan
+                # 같은 이유로 object 로 만든다 — INDEX_COLUMNS 는 대부분 문자열 컬럼이다.
+                idx[c] = pd.Series(np.nan, index=idx.index, dtype=object)
         idx["scope"] = idx["scope"].fillna(scope)
         with self._lk:
             self._idx[scope] = idx
@@ -1751,15 +1836,26 @@ class Vault:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
         if os.path.exists(path):
-            bak = os.path.join(self.ns[scope], "index", "_backup",
-                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+            # ★ 백업 파일명은 초 단위였고 shutil.copy2 는 같은 이름을 말없이 덮어쓴다.
+            #   같은 테이블을 1초 안에 두 번 쓰면(security_master 가 실제로 그렇다)
+            #   두 번째 백업이 첫 번째를 덮어써, '교체 직전 원본'의 유일한 사본이 사라진다.
+            #   → 마이크로초 + 내용해시로 이름을 유일화하고, 이미 있으면 절대 덮지 않는다.
             try:
+                _tag = sha1_file(path)[:8]
+            except Exception:
+                _tag = "nohash"
+            bak = os.path.join(self.ns[scope], "index", "_backup",
+                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S_%f}.{_tag}.parquet")
+            try:
+                if os.path.exists(bak):
+                    raise FileExistsError(bak)
                 shutil.copy2(path, bak)
+                self._prune_backups(scope, name)
             except Exception as e:                          # noqa
                 LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
                          f"리비전 파일로 저장합니다: {name}")
                 path = os.path.join(self.table_dir(scope),
-                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S_%f}.parquet")
         try:
             atomic_write_parquet(df, path)
         except Exception as e:                              # noqa
@@ -1774,6 +1870,32 @@ class Vault:
                                  "cols": list(map(str, df.columns))[:80]}, ensure_ascii=False),
         })
         return path
+
+    BACKUP_KEEP = 10
+
+    def _prune_backups(self, scope: str, name: str):
+        """테이블별 백업 보관 개수를 제한한다(최근 N개만 유지).
+
+        ★ 이건 '캐시 삭제'가 아니라 '백업 보존 정책'이다. 원본 테이블·저널·blob 은
+          절대 건드리지 않는다. 정책이 없으면 put_table 마다 수 GB 파일이 통째로 복사돼
+          _backup 이 무한히 커지고, 결국 용량이 차서 put_table 이 조용히 실패한다
+          (예외를 삼키고 None 을 반환하므로 '성공한 실행'처럼 보이면서 아무것도 저장되지 않는다).
+        """
+        try:
+            d = os.path.join(self.ns[scope], "index", "_backup")
+            files = [os.path.join(d, f) for f in os.listdir(d)
+                     if f.startswith(name + ".") and f.endswith(".parquet")]
+            if len(files) <= self.BACKUP_KEEP:
+                return
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for p in files[self.BACKUP_KEEP:]:
+                try:
+                    os.remove(p)
+                    self.stats["backup_pruned"] += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
@@ -1858,6 +1980,18 @@ class Vault:
     def adopt_scan(self, dirs: Sequence[str], max_files: int = 400_000) -> pd.DataFrame:
         """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음."""
         seen, found = set(), []
+        # ★ 볼트 자신의 디렉터리는 스캔하지 않는다.
+        #   GDRIVE_ADOPT_DIRS 의 기본값이 GDRIVE_ROOT 와 같아서, 그대로 두면 _shared/table
+        #   아래의 자기 자신이 만든 parquet(krx_ohlcv_daily 등)을 '기존 캐시'로 다시 등록한다.
+        #   adopt uid 에 파일 크기가 들어가므로 테이블이 커질 때마다 uid 가 바뀌어
+        #   매 실행 새 저널 행이 쌓인다 = 인덱스가 무한히 부풀고 load_index 가 느려진다.
+        _self_dirs = [os.path.realpath(self.root)] + \
+                     [os.path.realpath(p) for p in self.ns.values()]
+
+        def _is_self(p: str) -> bool:
+            rp = os.path.realpath(p)
+            return any(rp == s or rp.startswith(s + os.sep) for s in _self_dirs)
+
         for d in dirs:
             if not d or not os.path.isdir(d):
                 continue
@@ -1868,7 +2002,11 @@ class Vault:
             LOG.info(f"기존 캐시 스캔: {d}")
             n = 0
             for dirpath, dirnames, filenames in os.walk(d):
-                dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
+                dirnames[:] = [x for x in dirnames
+                               if not x.startswith(".") and x != "_backup"
+                               and not _is_self(os.path.join(dirpath, x))]
+                if _is_self(dirpath):
+                    continue
                 for fn in filenames:
                     if n >= max_files:
                         break
@@ -2078,6 +2216,8 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              referer: Optional[str] = None, quiet: bool = True,
              force_enc: Optional[str] = None,
              on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
+    if source == "krx" and krx_blocked():
+        return None                       # 차단 중에는 요청 자체를 보내지 않는다(연장 방지)
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -2098,7 +2238,12 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:{r.status_code}"] += 1
             if r.status_code in allow_status:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                out = r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
+                # ★ 차단은 200 OK 로 온다. 안내 페이지를 데이터로 착각하면 계속 때리게 된다.
+                if _check_krx_block(source, out if isinstance(out, str) else
+                                    (out[:4000].decode("utf-8", "ignore") if out else "")):
+                    return None
+                return out
             if r.status_code in (429, 503):
                 time.sleep(min(30.0, 2.0 * (2 ** attempt)) + random.random())
                 last_exc = requests.HTTPError(f"{r.status_code} {url}")
@@ -2124,6 +2269,8 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
               json_body: Optional[dict] = None, headers: Optional[dict] = None,
               timeout: int = 30, tries: int = 3, as_bytes: bool = False,
               referer: Optional[str] = None) -> Optional[Union[str, bytes]]:
+    if source == "krx" and krx_blocked():
+        return None
     lim = limiter(source)
     hdr = dict(headers or {})
     if referer:
@@ -2135,7 +2282,10 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:POST{r.status_code}"] += 1
             if r.status_code == 200:
-                return r.content if as_bytes else _decode(r.content, r.encoding, url)
+                out = r.content if as_bytes else _decode(r.content, r.encoding, url)
+                if _check_krx_block(source, out if isinstance(out, str) else ""):
+                    return None
+                return out
             time.sleep(1.5 * (attempt + 1))
         except Exception as e:                                # noqa
             with _HTTP_LK:
@@ -2144,6 +2294,90 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
     with _HTTP_LK:
         HTTP_STATS[f"{source}:POSTFAIL"] += 1
     return None
+
+
+# ── KRX 접속 차단 감지 ──────────────────────────────────────────────────────────────────────
+#  ★ 실제 사고: 자동화 대량 조회로 판단되어 사용자 IP 가 1일 차단됐다.
+#    KRX Data Marketplace 는 차단 시 200 OK 로 '이용 제한 안내' HTML 을 준다. 그래서
+#    코드는 실패로 인식하지 못하고 계속 때렸고, 그게 차단을 연장시킬 수 있다.
+#    → 차단 페이지를 감지하면 즉시 이번 실행의 KRX 경로를 전부 끄고, 마커를 남겨
+#      다음 실행에서도 해제 시각까지 KRX 를 건드리지 않는다. 재시도는 하지 않는다.
+_KRX_BLOCK_PAT = re.compile(
+    r"이용\s*제한|비정상\s*대량\s*조회|ip-block-page|자동화\s*수단", re.I)
+KRX_BLOCK = {"blocked": False, "until": 0.0, "logged": False}
+KRX_BLOCK_HOURS = 24.0
+
+
+def _krx_marker_path() -> Optional[str]:
+    root = None
+    try:
+        v = globals().get("VAULT")
+        root = getattr(v, "root", None) if v is not None else None
+    except Exception:
+        root = None
+    root = root or globals().get("LOCAL_CACHE_ROOT")
+    if not root:
+        return None
+    return os.path.join(str(root), "_locks", "krx_block.json")
+
+
+def krx_block_load():
+    """이전 실행에서 남긴 차단 마커를 읽는다. 해제 시각 전이면 이번에도 KRX 를 쓰지 않는다."""
+    p = _krx_marker_path()
+    if not p or not os.path.exists(p):
+        return
+    try:
+        info = json.loads(open(p, encoding="utf-8").read() or "{}")
+        until = float(info.get("until", 0))
+    except Exception:
+        return
+    if until > time.time():
+        KRX_BLOCK["blocked"], KRX_BLOCK["until"] = True, until
+        LOG.warn(f"이전 실행에서 KRX 접속 제한이 감지되었습니다. 해제 예정 "
+                 f"{_dt.datetime.fromtimestamp(until):%Y-%m-%d %H:%M} 까지 KRX 경로를 "
+                 f"사용하지 않습니다. 유니버스·가격은 FDR/네이버 경로로 정상 동작합니다.")
+
+
+def krx_mark_blocked():
+    KRX_BLOCK["blocked"] = True
+    KRX_BLOCK["until"] = time.time() + KRX_BLOCK_HOURS * 3600
+    if not KRX_BLOCK["logged"]:
+        KRX_BLOCK["logged"] = True
+        LOG.error(
+            "KRX 접속 제한 감지 — 이번 실행의 KRX 경로를 전부 중단합니다.\n"
+            "   KRX Data Marketplace 가 '자동화 수단을 통한 비정상 대량 조회'로 판단해\n"
+            "   해당 IP 를 약 1일간 제한했습니다(차단 시에도 HTTP 200 으로 안내 페이지를 줍니다).\n"
+            "   · 이번 실행: 시총 스냅샷 등 KRX 의존 단계를 건너뛰고 FDR/네이버/DART 로 진행합니다.\n"
+            "   · 다음 실행: 해제 시각까지 KRX 를 아예 건드리지 않습니다(마커 저장).\n"
+            "   · 권장: KRX_MARKETPLACE_ID/PW 를 비우고 돌리거나, 공식 경로인\n"
+            "     KRX Open API(openapi.krx.co.kr)의 인증키를 KRX_OPENAPI_KEY 에 넣으세요.")
+    p = _krx_marker_path()
+    if p:
+        try:
+            _ensure_dir(p)
+            atomic_write_text(p, json.dumps({"until": KRX_BLOCK["until"],
+                                             "at": _dt.datetime.now().isoformat()}))
+        except Exception:
+            pass
+
+
+def krx_blocked() -> bool:
+    if KRX_BLOCK["blocked"] and KRX_BLOCK["until"] > time.time():
+        return True
+    if KRX_BLOCK["blocked"] and KRX_BLOCK["until"] <= time.time():
+        KRX_BLOCK["blocked"] = False
+    return KRX_BLOCK["blocked"]
+
+
+def _check_krx_block(source: str, text: Optional[str]) -> bool:
+    """차단 안내 페이지인지 확인. 맞으면 True(=이 응답은 데이터가 아니다)."""
+    if not text or source != "krx":
+        return False
+    head = text[:4000]
+    if _KRX_BLOCK_PAT.search(head) and ("KRX" in head or "krx" in head):
+        krx_mark_blocked()
+        return True
+    return False
 
 
 def soup_of(html: Optional[str]) -> Optional[BeautifulSoup]:
@@ -2261,6 +2495,9 @@ class KRXGate:
     def warmup(self) -> bool:
         if pykrx_stock is None:
             return False
+        if krx_blocked():
+            self._warm, self._authed = True, False
+            return False
         with self._lk:
             if self._warm:
                 return self._authed
@@ -2299,6 +2536,8 @@ class KRXGate:
     def call(self, fn: Callable, *a, **kw):
         """모든 pykrx 호출의 유일한 통로. 직렬화 + 스로틀 + 예외 흡수."""
         if pykrx_stock is None:
+            return None
+        if krx_blocked():          # 차단 중에는 pykrx 도 KRX 를 때린다 → 전면 중단
             return None
         with self._lk:
             self._refresh_if_stale()
@@ -2460,6 +2699,27 @@ def fetch_fdr_delisting() -> pd.DataFrame:
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
     })
     t = t.dropna(subset=["code"])
+
+    # ★ 상장폐지 목록의 절반 이상은 보통주가 아니다.
+    #   실측 구성: 주권 약 2,100 · 신주인수권증서 865 · 수익증권 783 · 투자회사 176 ·
+    #   신주인수권증권 160 · 리츠/선박펀드 등. 신주인수권증서는 수명이 7일짜리이고
+    #   코드도 '4323201G' 같은 8자리라, 그대로 두면 유니버스에 유령 종목이 섞인다.
+    #   ★ 단, 구분값이 비어 있는 행은 버리지 않는다 — '모른다'를 이유로 버리면
+    #     그게 곧 생존자편향의 재유입이다. '명시적으로 보통주가 아닌' 행만 제외한다.
+    n_nonstock = 0
+    if "secugroup" in t.columns and t["secugroup"].astype(str).str.strip().ne("").any():
+        sg = t["secugroup"].astype(str).str.strip()
+        known = sg.ne("") & sg.ne("nan")
+        is_stock = sg.str.contains("주권", na=False) & ~sg.str.contains("신주인수권", na=False)
+        drop = known & ~is_stock
+        n_nonstock = int(drop.sum())
+        if n_nonstock:
+            LOG.info(f"  폐지목록에서 보통주가 아닌 {n_nonstock:,}건 제외 "
+                     f"(신주인수권증서·수익증권·투자회사·리츠 등). 구분값이 비어 있는 행은 "
+                     f"보수적으로 남깁니다 — 모른다는 이유로 버리면 생존자편향이 됩니다. "
+                     f"제외 구분 예시: {sorted(set(sg[drop]))[:6]}")
+            t = t[~drop]
+
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
@@ -2634,17 +2894,23 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
 
     # ★ 부분 응답 방어: 이웃 시점 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
     #   그대로 쓰면 그 달 유니버스가 조용히 쪼그라들어 선택편향이 된다.
+    # ★ 기준은 '전체 기간 중앙값'이 아니라 '이웃 시점 중앙값'이다.
+    #   상장사 수가 10년간 30% 넘게 늘어서, 전체 중앙값으로 자르면 초기 연도의 정상
+    #   스냅샷이 후반기 증가 때문에 '부분 응답'으로 오인되어 폐기된다.
+    # ★ 그리고 폐기는 '이번 실행의 판단'일 뿐이므로 캐시에는 원본을 그대로 남긴다.
+    #   폐기된 프레임을 저장하면 한 번의 오판이 공용 캐시에서 그 시점을 영구히 지운다.
+    snap_all = snap
     if len(snap):
         size = snap.groupby("snap_date")["code"].size().sort_index()
-        med = float(size.median()) if len(size) else 0.0
-        bad = size[size < med * 0.80]
-        if len(bad) and med > 0:
-            LOG.warn(f"스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만이라 "
-                     f"부분 응답으로 판단하고 폐기합니다: "
-                     f"{[str(x.date()) for x in bad.index[:6]]}")
+        local = size.rolling(5, center=True, min_periods=1).median()
+        bad = size[size < local * 0.80]
+        if len(bad):
+            LOG.warn(f"스냅샷 {len(bad)}개 시점이 이웃 시점 중앙값의 80% 미만이라 "
+                     f"이번 실행에서는 사용하지 않습니다(캐시에는 보존): "
+                     f"{[str(pd.Timestamp(x).date()) for x in bad.index[:6]]}")
             snap = snap[~snap["snap_date"].isin(bad.index)]
     if new_rows:
-        out = snap.copy()
+        out = snap_all.copy()
         out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
         VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
                         source="pykrx", extra={"note": "상장종목 스냅샷 — 전 전략 공용"})
@@ -2857,6 +3123,11 @@ class KRXAuth:
         self.openapi_ok = False
 
     def login(self) -> bool:
+        if krx_blocked():
+            self.status = "BLOCKED"
+            LOG.warn("KRX 접속 제한 상태이므로 로그인을 시도하지 않습니다 "
+                     "(재시도가 제한을 연장시킬 수 있습니다).")
+            return False
         if self.apikey:
             self.openapi_ok = self._probe_openapi()
             self.status = "OPENAPI_OK" if self.openapi_ok else "OPENAPI_KEY_UNAUTHORIZED"
@@ -2917,7 +3188,7 @@ class KRXAuth:
     def json_data(self, bld: str, **params) -> Optional[dict]:
         """마켓플레이스 bld 조회. 세션이 없으면 JSON 대신 로그인 HTML 이 와서
         엉뚱한 곳에서 JSONDecodeError 가 난다 → 여기서 미리 막는다."""
-        if not self.session_ok:
+        if not self.session_ok or krx_blocked():
             return None
         body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
         txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
@@ -3053,6 +3324,37 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
+# ── 서킷브레이커 ────────────────────────────────────────────────────────────────────────────
+#  ★ 없으면 어떤 일이 벌어지는가 (실측):
+#    네트워크가 막힌 환경에서 2,600종목 × 4개 소스 × 재시도를 전부 돌린다. 한 종목당
+#    수 초씩만 걸려도 몇 시간이 그냥 사라지고, 로그에는 같은 실패가 수만 줄 쌓인다.
+#    이 전략의 하드 제약이 '총 4시간 이내'이므로, 이건 성능 문제가 아니라 요구사항 위반이다.
+#  → 연속 N회 전 소스 실패하면 즉시 차단하고, 남은 종목은 캐시/폴백으로 진행한다.
+#    (v2 헤더에는 CIRCUIT_BREAK_N 이 없으므로 기본값으로 안전하게 폴백한다)
+_CB_N = int(globals().get("CIRCUIT_BREAK_N", 15) or 15)
+
+
+class _Circuit:
+    def __init__(self, n: int, name: str):
+        self.n, self.name = max(int(n), 1), name
+        self.streak, self.tripped, self.fails = 0, False, 0
+        self._lk = threading.Lock()
+
+    def ok(self):
+        with self._lk:
+            self.streak = 0
+
+    def fail(self) -> bool:
+        with self._lk:
+            self.streak += 1
+            self.fails += 1
+            if not self.tripped and self.streak >= self.n:
+                self.tripped = True
+                LOG.error(f"서킷브레이커 작동 — {self.name} 연속 {self.streak}회 실패. "
+                          f"남은 대상의 신규 수집을 중단하고 캐시/폴백으로 진행합니다. "
+                          f"(네트워크 차단·소스 구조 변경·차단(403) 이 대표 원인입니다)")
+            return self.tripped
+
 
 def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
@@ -3130,8 +3432,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if todo:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
+        breaker = _Circuit(_CB_N, "일봉 수집")
+
         def _one(job):
             code, st = job
+            if breaker.tripped:                 # 차단 후에는 즉시 반환 — 헛돌지 않는다
+                return None
             for nm, fn in PRICE_CHAIN:
                 try:
                     d = fn(code, st, end)
@@ -3140,10 +3446,16 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 if d is not None and len(d):
                     d = d.dropna(subset=["date"])
                     if len(d):
+                        breaker.ok()
                         return d
+            breaker.fail()
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        if breaker.tripped:
+            LOG.warn(f"서킷브레이커로 일봉 수집을 조기 종료했습니다 (실패 {breaker.fails:,}건). "
+                     f"드라이브 캐시에 있는 분량만으로 백테스트를 진행합니다. "
+                     f"네트워크가 정상인 환경에서 재실행하면 캐시에 이어서 받습니다.")
         failed = []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
@@ -3189,10 +3501,22 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+
+    # ★★ 저장은 '자르기 전' 전체를, 반환은 '자른' 창만. 순서를 바꾸면 캐시가 파괴된다. ★★
+    #   put_table 은 전체 파일 교체다. 백테스트 창으로 자른 프레임을 그대로 저장하면
+    #   공용 캐시에 있던 창 밖 구간(다른 전략이 모아둔 2010~2016 같은 과거분)이
+    #   이 전략을 한 번 돌렸다는 이유만으로 영구 삭제된다. 신규 수집이 단 1종목만 있어도
+    #   기록이 일어나므로 사고 확률이 낮지도 않다. 사용자의 절대 1원칙 위반이다.
+    px_all = px                                       # 영속화용 — 자르지 않은 합집합
+    px = px_all[(px_all["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                (px_all["date"] <= end_ts)]           # 반환용 — 이 전략의 창
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
+        n_out = int(len(px_all) - len(px))
+        if n_out:
+            LOG.debug(f"공용 캐시에는 창 밖 {n_out:,}행을 포함한 전체를 저장합니다 "
+                      f"(다른 전략의 구간을 지우지 않기 위함).")
+        VAULT.put_table("krx_ohlcv_daily", px_all, scope="shared", domain="price",
                         source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
@@ -3404,11 +3728,17 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+            LOG.warn(f"DART status=020 (일일 호출한도 초과) — 수집을 중단하고 받은 만큼 "
+                     f"저장합니다. 내일 재실행하면 정확히 이어받습니다.")
+        elif st == "021":
+            # ★ 021 은 '조회 가능한 회사 개수 초과' = 요청 1건의 배치 크기 문제이지
+            #   일일 한도가 아니다. 이걸 exhausted 로 처리하면 그 시점부터 남은 전 종목의
+            #   수집이 중단된다 — 한 번의 배치 실수로 그날 수집 전체가 죽는다.
+            LOG.debug(f"DART status=021 (배치 크기 초과) ep={endpoint} — 이 요청만 실패 처리하고 "
+                      f"나머지는 계속 진행합니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -3689,8 +4019,12 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     L = pd.concat(out_rows, ignore_index=True)
     W = L.pivot_table(index=["corp_code", "bsns_year", "reprt_code"], columns="item",
                       values="amount", aggfunc="first").reset_index()
-    rc = (L.sort_values("rcept_no").groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
-           .first().reset_index())
+    # ★ knowledge_date 는 '실제로 채택된 금액이 공시된 시점' 이상이어야 한다.
+    #   first()(=가장 이른 접수번호)를 쓰면, 정정공시로 바뀐 금액을 채택해 놓고 날짜만
+    #   원공시 날짜를 붙이게 된다 → 그 차이만큼 미래를 미리 아는 셈이다(C1 위반).
+    #   max() 는 채택 후보 중 가장 늦은 접수일이므로 어떤 경우에도 누수가 없다(보수적).
+    rc = (L.groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
+           .max().reset_index())
     W = W.merge(rc, on=["corp_code", "bsns_year", "reprt_code"], how="left")
 
     W["period_end"] = [as_ts(f"{y}-{REPRT_PERIOD_END[r][0]:02d}-{REPRT_PERIOD_END[r][1]:02d}")
@@ -4428,7 +4762,11 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     if len(df) != n_before:
         LOG.warn(f"상세 보강 머지에서 행수가 {n_before:,}→{len(df):,} 로 변했습니다 — "
                  f"중복 detail_url 로 인한 증식입니다.")
-        df = df.drop_duplicates("report_uid", keep="first")
+        # ★ report_uid 는 build_report_master 에서 만들어진다. 이 시점(수집 직후)에는
+        #   아직 없을 수 있으므로 존재하는 키로만 중복을 제거한다.
+        #   (없는 컬럼으로 drop_duplicates 하면 KeyError 로 수집 전체가 죽는다)
+        _dk = next((k for k in ("report_uid", "detail_url", "title") if k in df.columns), None)
+        df = df.drop_duplicates(_dk, keep="first") if _dk else df.drop_duplicates()
     for c in ("target_price", "opinion"):
         if f"{c}_d" in df.columns:
             df[c] = df[c].where(df[c].notna(), df[f"{c}_d"])
@@ -4581,8 +4919,14 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 # 정규화 표: (별칭 정규식 → 정식명). 사명 변경 이력이 핵심이다.
+# 두 소스가 같은 보고서에 서로 다른 목표주가를 줄 때의 병합 규칙. 전략층에서 덮어쓸 수 있다.
+TARGET_PRICE_AGG = "max"
+
 BROKER_CANON: List[Tuple[str, str]] = [
-    (r"미래에셋(대우|증권|생명)?", "미래에셋증권"),          # 미래에셋대우→미래에셋증권(2021)
+    # ★ 순서 주의: '미래에셋생명'(보험사)이 앞 규칙에 먼저 걸리면 증권사로 둔갑해
+    #   애널리스트 소속이 틀어지고 동일인 판정이 깨진다. 비증권 계열을 먼저 걸러낸다.
+    (r"미래에셋생명", "기타"),
+    (r"미래에셋(대우|증권)?", "미래에셋증권"),               # 미래에셋대우→미래에셋증권(2021)
     (r"(대우증권|KDB대우)", "미래에셋증권"),
     (r"NH투자|우리투자증권|NH농협증권", "NH투자증권"),        # 우리투자→NH투자(2014)
     (r"한국투자|한국證|한투증권", "한국투자증권"),
@@ -4775,7 +5119,11 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "broker_name": ("broker_name", "min"),
         "broker_raw": ("broker_raw", _pick_str),
         "analyst_raw": ("analyst_raw", _pick_str),
-        "target_price": ("target_price", "max"),      # 네이티브 max = NaN 무시. 파이썬 람다는 30만건에서 50초.
+        # 목표주가 병합 방식(TARGET_PRICE_AGG). 둘 다 NaN 을 건너뛰므로 "한쪽에만 값이 있는"
+        # 경우의 동작은 같다. 차이는 두 소스가 서로 다른 값을 줄 때다:
+        #   "max"    — 정보를 잃지 않는다는 관점(v2 기본). 단 소스 불일치 시 낙관 편향.
+        #   "median" — 불일치를 중앙값으로 흡수해 리비전 지표의 편향을 없앤다(v3 선택).
+        "target_price": ("target_price", TARGET_PRICE_AGG),
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
@@ -8107,7 +8455,7 @@ def run_rehearsal(strict: bool = True) -> bool:
 def make_synthetic(n_codes: int = 160, n_months: int = 60, seed: int = SEED) -> dict:
     rng = np.random.default_rng(seed)
     months = pd.date_range(as_ts(BACKTEST_END) - pd.DateOffset(months=n_months - 1),
-                           as_ts(BACKTEST_END), freq="ME")
+                           as_ts(BACKTEST_END), freq=pd.offsets.MonthEnd())
     codes = [f"{i+1:06d}" for i in range(n_codes)]
     inds = rng.choice(["화학", "전자부품", "건설", "기계", "소프트웨어"], n_codes)
 

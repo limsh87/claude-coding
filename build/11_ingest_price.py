@@ -36,6 +36,11 @@ class KRXAuth:
         self.openapi_ok = False
 
     def login(self) -> bool:
+        if krx_blocked():
+            self.status = "BLOCKED"
+            LOG.warn("KRX 접속 제한 상태이므로 로그인을 시도하지 않습니다 "
+                     "(재시도가 제한을 연장시킬 수 있습니다).")
+            return False
         if self.apikey:
             self.openapi_ok = self._probe_openapi()
             self.status = "OPENAPI_OK" if self.openapi_ok else "OPENAPI_KEY_UNAUTHORIZED"
@@ -96,7 +101,7 @@ class KRXAuth:
     def json_data(self, bld: str, **params) -> Optional[dict]:
         """마켓플레이스 bld 조회. 세션이 없으면 JSON 대신 로그인 HTML 이 와서
         엉뚱한 곳에서 JSONDecodeError 가 난다 → 여기서 미리 막는다."""
-        if not self.session_ok:
+        if not self.session_ok or krx_blocked():
             return None
         body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
         txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
@@ -232,6 +237,37 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
+# ── 서킷브레이커 ────────────────────────────────────────────────────────────────────────────
+#  ★ 없으면 어떤 일이 벌어지는가 (실측):
+#    네트워크가 막힌 환경에서 2,600종목 × 4개 소스 × 재시도를 전부 돌린다. 한 종목당
+#    수 초씩만 걸려도 몇 시간이 그냥 사라지고, 로그에는 같은 실패가 수만 줄 쌓인다.
+#    이 전략의 하드 제약이 '총 4시간 이내'이므로, 이건 성능 문제가 아니라 요구사항 위반이다.
+#  → 연속 N회 전 소스 실패하면 즉시 차단하고, 남은 종목은 캐시/폴백으로 진행한다.
+#    (v2 헤더에는 CIRCUIT_BREAK_N 이 없으므로 기본값으로 안전하게 폴백한다)
+_CB_N = int(globals().get("CIRCUIT_BREAK_N", 15) or 15)
+
+
+class _Circuit:
+    def __init__(self, n: int, name: str):
+        self.n, self.name = max(int(n), 1), name
+        self.streak, self.tripped, self.fails = 0, False, 0
+        self._lk = threading.Lock()
+
+    def ok(self):
+        with self._lk:
+            self.streak = 0
+
+    def fail(self) -> bool:
+        with self._lk:
+            self.streak += 1
+            self.fails += 1
+            if not self.tripped and self.streak >= self.n:
+                self.tripped = True
+                LOG.error(f"서킷브레이커 작동 — {self.name} 연속 {self.streak}회 실패. "
+                          f"남은 대상의 신규 수집을 중단하고 캐시/폴백으로 진행합니다. "
+                          f"(네트워크 차단·소스 구조 변경·차단(403) 이 대표 원인입니다)")
+            return self.tripped
+
 
 def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
@@ -309,8 +345,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if todo:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
+        breaker = _Circuit(_CB_N, "일봉 수집")
+
         def _one(job):
             code, st = job
+            if breaker.tripped:                 # 차단 후에는 즉시 반환 — 헛돌지 않는다
+                return None
             for nm, fn in PRICE_CHAIN:
                 try:
                     d = fn(code, st, end)
@@ -319,10 +359,16 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 if d is not None and len(d):
                     d = d.dropna(subset=["date"])
                     if len(d):
+                        breaker.ok()
                         return d
+            breaker.fail()
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        if breaker.tripped:
+            LOG.warn(f"서킷브레이커로 일봉 수집을 조기 종료했습니다 (실패 {breaker.fails:,}건). "
+                     f"드라이브 캐시에 있는 분량만으로 백테스트를 진행합니다. "
+                     f"네트워크가 정상인 환경에서 재실행하면 캐시에 이어서 받습니다.")
         failed = []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
@@ -368,10 +414,22 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+
+    # ★★ 저장은 '자르기 전' 전체를, 반환은 '자른' 창만. 순서를 바꾸면 캐시가 파괴된다. ★★
+    #   put_table 은 전체 파일 교체다. 백테스트 창으로 자른 프레임을 그대로 저장하면
+    #   공용 캐시에 있던 창 밖 구간(다른 전략이 모아둔 2010~2016 같은 과거분)이
+    #   이 전략을 한 번 돌렸다는 이유만으로 영구 삭제된다. 신규 수집이 단 1종목만 있어도
+    #   기록이 일어나므로 사고 확률이 낮지도 않다. 사용자의 절대 1원칙 위반이다.
+    px_all = px                                       # 영속화용 — 자르지 않은 합집합
+    px = px_all[(px_all["date"] >= as_ts(start) - pd.Timedelta(days=400)) &
+                (px_all["date"] <= end_ts)]           # 반환용 — 이 전략의 창
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
+        n_out = int(len(px_all) - len(px))
+        if n_out:
+            LOG.debug(f"공용 캐시에는 창 밖 {n_out:,}행을 포함한 전체를 저장합니다 "
+                      f"(다른 전략의 구간을 지우지 않기 위함).")
+        VAULT.put_table("krx_ohlcv_daily", px_all, scope="shared", domain="price",
                         source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
@@ -389,8 +447,12 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     체결은 '신호 산출일 다음 거래일 시가'(§10.1). 당일 종가 체결은 미래누수다.
     """
     px = px.sort_values(["code", "date"])
+    # ★ transform(lambda) 는 종목마다 파이썬 호출이 한 번씩 난다. 일별 800만 행 · 3,500종목
+    #   규모에서 그대로 수 분이다. groupby().rolling() 은 C 레벨에서 한 번에 돈다.
     px["adv20"] = (px.groupby("code", observed=True)["amount"]
-                     .transform(lambda s: s.rolling(20, min_periods=10).mean()))
+                     .rolling(20, min_periods=10).mean()
+                     .reset_index(level=0, drop=True)
+                     .reindex(px.index))
     px["ret1d"] = px.groupby("code", observed=True)["close"].pct_change()
 
     # 월말 스냅샷

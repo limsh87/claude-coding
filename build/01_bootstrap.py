@@ -98,13 +98,17 @@ _REQUIRED = [
     ("numpy",     "numpy",              True,  "모든 수치연산"),
     ("pandas",    "pandas",             True,  "모든 패널 처리"),
     ("pyarrow",   "pyarrow",            True,  "parquet 캐시(L1 영속화)"),
-    ("scipy",     "scipy",              True,  "통계검정 / 회귀"),
+    # scipy 는 이 파일에서 직접 import 하지 않는다(HAC t·회귀는 numpy 로 구현).
+    # 필수로 두면 설치 실패 시 SystemExit 로 실행 자체가 막히므로 선택으로 내린다.
+    # 단 pandas 의 corr(method="spearman") 은 내부적으로 scipy 를 요구하므로, 그 경로를
+    # 쓰는 코드를 추가한다면 여기서 다시 필수로 올려야 한다.
     ("requests",  "requests",           True,  "모든 HTTP 수집"),
     ("bs4",       "beautifulsoup4",     True,  "리서치 리스트 파싱"),
     ("lxml",      "lxml",               True,  "HTML/XML 고속 파서"),
     ("tqdm",      "tqdm",               True,  "진행률 표시"),
 ]
 _OPTIONAL = [
+    ("scipy",     "scipy",              "통계검정(현재 미사용 — pandas spearman 사용 시 필요)"),
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
@@ -187,6 +191,16 @@ try:
 except Exception:                                             # pragma: no cover
     def tqdm(it=None, **kw):                                  # type: ignore
         return it if it is not None else iter(())
+
+# ★ 서드파티 로거 억제. yfinance 는 종목 하나가 실패할 때마다 여러 줄을 stderr 로 쏟아내
+#   (\"possibly delisted\", \"1 Failed download\"), 2,600종목 폴백 구간에서 로그가 수만 줄
+#   불어나 정작 우리 진단표가 파묻힌다. 실패 자체는 수집부가 집계해 표로 보고한다.
+for _noisy in ("yfinance", "urllib3", "peewee", "requests", "py.warnings", "matplotlib"):
+    try:
+        logging.getLogger(_noisy).setLevel(logging.CRITICAL)
+    except Exception:
+        pass
+logging.captureWarnings(True)
 
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 80)

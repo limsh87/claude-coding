@@ -105,11 +105,17 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+            LOG.warn(f"DART status=020 (일일 호출한도 초과) — 수집을 중단하고 받은 만큼 "
+                     f"저장합니다. 내일 재실행하면 정확히 이어받습니다.")
+        elif st == "021":
+            # ★ 021 은 '조회 가능한 회사 개수 초과' = 요청 1건의 배치 크기 문제이지
+            #   일일 한도가 아니다. 이걸 exhausted 로 처리하면 그 시점부터 남은 전 종목의
+            #   수집이 중단된다 — 한 번의 배치 실수로 그날 수집 전체가 죽는다.
+            LOG.debug(f"DART status=021 (배치 크기 초과) ep={endpoint} — 이 요청만 실패 처리하고 "
+                      f"나머지는 계속 진행합니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -131,8 +137,19 @@ def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Times
 
 
 # ── 전체 재무제표 ───────────────────────────────────────────────────────────────────────────
+#  ★ 비교치(전기·전전기) 컬럼을 반드시 함께 보관한다 — 이 전략의 생사가 여기 걸려 있다.
+#    DART 는 어떤 재무 응답에서도 '당기'와 함께 '전기 동기'를 같이 준다.
+#      · 재무상태표(BS): frmtrm_amount = 전기말 잔액
+#      · 손익/현금흐름(IS/CF): thstrm_add_amount = 당기 누적, frmtrm_add_amount = 전기 누적
+#    이걸 읽으면 매출증가율·자산회전율변화·운전자본발생액이 **단일 행에서** 산출된다.
+#    반대로 당기금액만 읽으면 YoY 를 만들려고 'TTM(연속 4분기) → lag4' 체인을 타야 하고,
+#    그 순간 연속 8분기 공시를 요구하게 된다. 분기보고서를 거르는 소형주가 흔한
+#    U-MICRO 에서는 그 체인만으로 결측률이 26% 를 넘어 C14-c 로 축이 통째로 죽는다.
+#    (실측 사고: i_sales 26.1% 결측 → 임계 25% 초과 → 활성 TP 0개 → C14-d 중단)
 _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
-            "account_id", "account_nm", "thstrm_amount", "rcept_no"]
+            "account_id", "account_nm", "thstrm_amount", "thstrm_add_amount",
+            "frmtrm_amount", "frmtrm_q_amount", "frmtrm_add_amount",
+            "bfefrmtrm_amount", "rcept_no"]
 
 
 def _fs_one(job) -> Optional[pd.DataFrame]:
@@ -167,16 +184,47 @@ _MULTI_ACCOUNT_MAP = {
 }
 
 
+def _done_keys(cached: Optional[pd.DataFrame], label: str) -> set:
+    """이미 받은 (회사, 연도, 보고서) 조합. ★비교치가 없는 옛 캐시는 '미완'으로 본다.
+
+    ★ 왜 이 구분이 필요한가 ─────────────────────────────────────────────────────────────
+      예전 버전은 당기금액만 저장했다. 그 캐시를 '완료'로 처리하면 전기 비교치가 영원히
+      비고, YoY 센서가 분기 체인(연속 8분기)에 의존하게 되어 결측률이 25% 를 넘는다.
+      → 비교치가 없는 조합은 재수집 대상으로 되돌린다. 단 **기존 행은 지우지 않는다**
+        (드라이브 캐시 불훼손 원칙). 재수집분이 keep="last" 로 덮어쓸 뿐이다.
+      배치 경로는 재수집 비용이 수백 회에 불과해 이 업그레이드가 몇 분이면 끝난다.
+    """
+    if cached is None or not len(cached):
+        return set()
+    c = cached
+    key = ["corp_code", "bsns_year", "reprt_code"]
+    if any(k not in c.columns for k in key):
+        return set()
+    if "frmtrm_amount" not in c.columns:
+        LOG.warn(f"{label} 캐시 {len(c):,}행에 전기 비교치가 없습니다(구버전 형식). "
+                 f"당기금액은 그대로 재사용하고, 비교치는 이번 실행에서 보강합니다.")
+        return set()
+    ok = c.groupby(key, observed=True)["frmtrm_amount"].transform(
+        lambda s: s.notna().any() if len(s) else False)
+    good = c[ok.fillna(False).astype(bool)]
+    n_old = c.groupby(key, observed=True).ngroups - good.groupby(key, observed=True).ngroups \
+        if len(good) else c.groupby(key, observed=True).ngroups
+    if n_old > 0:
+        LOG.info(f"{label} — 비교치가 없는 {n_old:,}개 조합은 재수집 대상입니다"
+                 f"(기존 행은 보존됩니다).")
+    return set(zip(good["corp_code"].astype(str), good["bsns_year"].astype(int),
+                   good["reprt_code"].astype(str)))
+
+
 def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
     """주요계정 배치 수집. 전체 재무제표의 '바닥'을 싸게 깔아둔다."""
     if not DART_API_KEY:
         return pd.DataFrame(columns=_FS_KEEP)
     cached = VAULT.get_table("dart_multi_raw", scope="shared")
-    done = set()
+    done = _done_keys(cached, "DART 주요계정")
     if cached is not None and len(cached):
-        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
-                       cached["reprt_code"].astype(str)))
-        LOG.info(f"공용 캐시에서 DART 주요계정 {len(cached):,}행 재사용")
+        LOG.info(f"공용 캐시에서 DART 주요계정 {len(cached):,}행 재사용 "
+                 f"(비교치 확보 {len(done):,} 조합)")
 
     reprts = [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]]
     corps = [str(c) for c in corp_codes]
@@ -237,10 +285,8 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         return pd.DataFrame(columns=_FS_KEEP)
 
     cached = VAULT.get_table("dart_fnltt_raw", scope="shared")
-    done = set()
+    done = _done_keys(cached, "DART 전체 재무제표")
     if cached is not None and len(cached):
-        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
-                       cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
     reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
@@ -318,7 +364,7 @@ ACCOUNT_PATTERNS: Dict[str, Tuple[str, List[str]]] = {
     "sgna":          ("IS", [r"SellingGeneralAndAdministrativeExpense", r"^판매비와관리비$"]),
     "rnd":           ("IS", [r"ResearchAndDevelopmentExpense", r"경상(연구)?개발비", r"^연구개발비"]),
     "tax_expense":   ("IS", [r"IncomeTaxExpense", r"법인세비용"]),
-    "pretax_income": ("IS", [r"ProfitLossBeforeTax", r"법인세비용차감전"]),
+    "pretax_income": ("IS", [r"ProfitLossBeforeTax", r"법인세(비용)?차감전"]),
     "other_income":  ("IS", [r"OtherIncome$", r"^기타수익$", r"^영업외수익$"]),
     "op_income":     ("IS", [r"OperatingIncomeLoss", r"^영업이익"]),
     "net_income":    ("IS", [r"ProfitLoss$", r"^당기순이익"]),
@@ -328,6 +374,15 @@ ACCOUNT_PATTERNS: Dict[str, Tuple[str, List[str]]] = {
     "assets":        ("BS", [r"ifrs-full_Assets$", r"^자산총계$"]),
     "liabilities":   ("BS", [r"ifrs-full_Liabilities$", r"^부채총계$"]),
     "equity":        ("BS", [r"ifrs-full_Equity$", r"^자본총계$"]),
+    # ★ 아래 5개는 '다중회사 주요계정(fnlttMultiAcnt)' 이 주는 전부다. 배치 1회로 100사가
+    #   오므로 전 종목·전 분기를 예산 안에서 확보할 수 있는 유일한 계정군이다.
+    #   운전자본 발생액(유동자산−유동부채 변화)과 자본잠식 판정이 여기서 나온다.
+    "current_assets":  ("BS", [r"ifrs-full_CurrentAssets$", r"^유동자산$"]),
+    "noncur_assets":   ("BS", [r"ifrs-full_NoncurrentAssets$", r"^비유동자산$"]),
+    "current_liab":    ("BS", [r"ifrs-full_CurrentLiabilities$", r"^유동부채$"]),
+    "noncur_liab":     ("BS", [r"ifrs-full_NoncurrentLiabilities$", r"^비유동부채$"]),
+    "retained":        ("BS", [r"ifrs-full_RetainedEarnings", r"^이익잉여금", r"^결손금"]),
+    "capital_stock":   ("BS", [r"ifrs-full_IssuedCapital$", r"^자본금$"]),
     "ppe":           ("BS", [r"PropertyPlantAndEquipment", r"^유형자산$"]),
     "intangible":    ("BS", [r"IntangibleAssetsOtherThanGoodwill", r"^무형자산$"]),
     "cash":          ("BS", [r"CashAndCashEquivalents", r"^현금및현금성자산$"]),
@@ -352,23 +407,84 @@ FLOW_ITEMS = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "ne
 # 패널의 컬럼 집합은 항상 같아야 한다. 그래야 "어떤 실행에선 있고 어떤 실행엔 없는" 축이
 # 사라지고, 결측은 결측대로 조용히가 아니라 표로 드러난다.
 FUNDAMENTAL_COLS = (list(ACCOUNT_PATTERNS)
+                    + [f"{k}{s}" for k in ACCOUNT_PATTERNS for s in ("_cm", "_pv", "_pc")]
                     + [f"{c}{s}" for c in FLOW_ITEMS for s in ("_q", "_ttm")]
                     + ["employees", "payroll", "v2_bad_3q"])
 
 
+#  값 필드 → 컬럼 접미사.  <항목> = 당기금액 · <항목>_cm = 당기누적 · <항목>_pv = 전기
+#  · <항목>_pc = 전기누적.   BS 는 누적 개념이 없으므로 _cm 은 당기말, _pv 는 전기말이다.
+_AMT_FIELDS = {"_cur": "thstrm_amount",     "_cum": "thstrm_add_amount",
+               "_pv":  "frmtrm_amount",     "_pq":  "frmtrm_q_amount",
+               "_pc":  "frmtrm_add_amount"}
+_AMT_SUFFIX = {"_cur": "", "_cum": "_cm", "_pv": "_pv", "_pq": "_pq", "_pc": "_pc"}
+# 비교치까지 포함한 계약 스키마. 어떤 실행에서도 이 컬럼들은 반드시 존재해야 한다.
+COMPARATIVE_SUFFIXES = ["_cm", "_pv", "_pq", "_pc"]
+
+
+def _detect_cumulative(W: pd.DataFrame) -> Tuple[bool, float, int]:
+    """분기보고서의 손익금액이 '누적'인지 '3개월 단독'인지 데이터로 판정한다.
+
+    ★ 추측하지 않는 이유 ────────────────────────────────────────────────────────────────
+      DART 응답은 엔드포인트(단건/다중)와 회사에 따라 당기금액이 누적일 수도, 3개월
+      단독일 수도 있다. 코드가 한쪽을 가정하면 다른 쪽에서 **에러 없이 값만 틀린다**.
+      누적을 3개월로 오인하면 매출이 계단식으로 튀어 성장률이 통째로 가짜가 되고,
+      3개월을 누적으로 오인하면 차분이 음수·양수를 오가며 TTM 이 무의미해진다.
+    판별식: 사업보고서(연간) 대비 반기보고서 금액의 비율 중앙값.
+      · 누적이면 반기 ≈ 연간의 0.5
+      · 3개월 단독이면 반기(=2분기 단독) ≈ 연간의 0.25
+    """
+    try:
+        r = W[["corp_code", "bsns_year", "reprt_code", "revenue"]].dropna(subset=["revenue"])
+        piv = r.pivot_table(index=["corp_code", "bsns_year"], columns="reprt_code",
+                            values="revenue", aggfunc="first")
+        h1, fy = REPRT_CODES["H1"], REPRT_CODES["FY"]
+        if h1 not in piv.columns or fy not in piv.columns:
+            return True, float("nan"), 0
+        a, b = piv[h1], piv[fy]
+        ratio = (a / b).where((b > 0) & (a > 0))
+        ratio = ratio[(ratio > 0.05) & (ratio < 1.5)]
+        n = int(ratio.notna().sum())
+        if n < 50:
+            return True, (float(ratio.median()) if n else float("nan")), n
+        med = float(ratio.median())
+        return (med > 0.375), med, n
+    except Exception:
+        return True, float("nan"), 0
+
+
 def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
-    """원시 계정 → (corp_code, period, 항목) 와이드 테이블. knowledge_date 를 여기서 확정한다."""
+    """원시 계정 → (corp_code, period, 항목) 와이드 테이블. knowledge_date 를 여기서 확정한다.
+
+    ★ 당기금액뿐 아니라 **전기 비교치**까지 함께 실어 나른다. YoY 를 만들려고 분기 체인을
+      타지 않아도 되게 하기 위해서다(_FS_KEEP 주석 참조).
+    """
     if fs.empty:
         return pd.DataFrame(columns=["corp_code", "period_end", "knowledge_date"])
     d = fs.copy()
-    d["amount"] = pd.to_numeric(
-        d["thstrm_amount"].astype(str).str.replace(",", "", regex=False).str.replace("−", "-", regex=False),
-        errors="coerce")
-    d = d.dropna(subset=["amount"])
+
+    def _num(name: str) -> pd.Series:
+        if name not in d.columns:
+            return pd.Series(np.nan, index=d.index, dtype="float64")
+        s = (d[name].astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.replace("−", "-", regex=False)
+                    .str.strip())
+        s = s.where(~s.isin(["", "-", "nan", "None", "NaN"]))
+        return pd.to_numeric(s, errors="coerce")
+
+    for k, src in _AMT_FIELDS.items():
+        d[k] = _num(src)
+    # 당기금액이 비어 있고 누적만 있는 행(일부 CF 계정)을 버리지 않는다.
+    d["_cur"] = d["_cur"].where(d["_cur"].notna(), d["_cum"])
+    d = d.dropna(subset=["_cur"])
+    if d.empty:
+        return pd.DataFrame(columns=["corp_code", "period_end", "knowledge_date"])
     d["account_id"] = d["account_id"].astype(str)
     d["account_nm"] = d["account_nm"].astype(str).str.replace(r"\s+", "", regex=True)
 
     out_rows = []
+    _vals = list(_AMT_FIELDS)
     for key, (sj, pats) in ACCOUNT_PATTERNS.items():
         sjs = _SJ_MAP.get(sj, (sj,))
         sub = d[d["sj_div"].astype(str).isin(sjs)]
@@ -379,19 +495,47 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
                   sub["account_nm"].str.contains(rx, na=False)]
         if hit.empty:
             continue
-        # 같은 항목에 여러 계정이 걸리면 절대값이 큰 쪽(=대표 계정)을 취한다
-        hit = (hit.assign(_a=hit["amount"].abs())
+        # 같은 항목·같은 연결범위에 여러 계정이 걸리면 절대값이 큰 쪽(=대표 계정)을 취한다.
+        hit = (hit.assign(_a=hit["_cur"].abs())
                   .sort_values("_a", ascending=False)
-                  .drop_duplicates(["corp_code", "bsns_year", "reprt_code"], keep="first"))
+                  .drop_duplicates(["corp_code", "bsns_year", "reprt_code", "fs_div"],
+                                   keep="first"))
         out_rows.append(hit.assign(item=key)[["corp_code", "bsns_year", "reprt_code",
-                                              "rcept_no", "item", "amount"]])
+                                              "fs_div", "rcept_no", "item"] + _vals])
     if not out_rows:
         return pd.DataFrame(columns=["corp_code", "period_end", "knowledge_date"])
     L = pd.concat(out_rows, ignore_index=True)
+
+    # ── ★ 연결범위(연결/별도) 고정 — 보고서 단위로 하나만 쓴다 ──────────────────────────
+    #   고정하지 않으면 항목마다 연결범위가 뒤섞인다. 실제로 일어나는 조합이다:
+    #     매출액 → 배치(주요계정)의 연결(CFS),  재고자산 → 단건(전체 재무제표)의 별도(OFS)
+    #   이러면 매출채권회전일수 = 별도 매출채권 ÷ 연결 매출 이 되어 **의미가 없는 수**가 된다.
+    #   지주회사·자회사 비중이 큰 기업일수록 오차가 크고, 그 오차가 해마다 바뀌면
+    #   i_sales 가 그 변화를 '성장'으로 읽는다. 에러는 나지 않는다 — 값만 조용히 틀린다.
+    #   → (회사, 연도, 보고서)별로 **항목을 가장 많이 채우는 연결범위**를 골라 그것만 쓴다.
+    #     동수면 연결(CFS) 우선. 단건이 전체 계정을 준 보고서는 자연히 그쪽이 이긴다.
+    _key = ["corp_code", "bsns_year", "reprt_code"]
+    L["fs_div"] = L["fs_div"].astype(str)
+    _cov = (L.groupby(_key + ["fs_div"], observed=True)["item"].nunique()
+             .reset_index(name="_n"))
+    _cov["_pref"] = (_cov["fs_div"] != "CFS").astype(int)
+    _cov = _cov.sort_values(_key + ["_n", "_pref"], ascending=[True] * 3 + [False, True])
+    _win = _cov.drop_duplicates(_key, keep="first")[_key + ["fs_div"]]
+    _n0 = len(L)
+    L = L.merge(_win, on=_key + ["fs_div"], how="inner")
+    if _n0 - len(L) > 0:
+        LOG.debug(f"연결범위 고정 — 보고서당 한 기준만 채택해 {_n0-len(L):,}행을 제외했습니다 "
+                  f"(연결/별도 혼용 방지).")
     W = L.pivot_table(index=["corp_code", "bsns_year", "reprt_code"], columns="item",
-                      values="amount", aggfunc="first").reset_index()
-    rc = (L.sort_values("rcept_no").groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
-           .first().reset_index())
+                      values=_vals, aggfunc="first")
+    W.columns = [f"{item}{_AMT_SUFFIX[val]}" for val, item in W.columns]
+    W = W.reset_index()
+    # ★ knowledge_date 는 '실제로 채택된 금액이 공시된 시점' 이상이어야 한다.
+    #   first()(=가장 이른 접수번호)를 쓰면, 정정공시로 바뀐 금액을 채택해 놓고 날짜만
+    #   원공시 날짜를 붙이게 된다 → 그 차이만큼 미래를 미리 아는 셈이다(C1 위반).
+    #   max() 는 채택 후보 중 가장 늦은 접수일이므로 어떤 경우에도 누수가 없다(보수적).
+    rc = (L.groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"]
+           .max().reset_index())
     W = W.merge(rc, on=["corp_code", "bsns_year", "reprt_code"], how="left")
 
     W["period_end"] = [as_ts(f"{y}-{REPRT_PERIOD_END[r][0]:02d}-{REPRT_PERIOD_END[r][1]:02d}")
@@ -399,33 +543,75 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     W["knowledge_date"] = [_knowledge_from_rcept(rn, r, int(y))
                            for rn, r, y in zip(W["rcept_no"], W["reprt_code"], W["bsns_year"])]
 
-    # 누적치 → 분기 단독치 (Q1/H1/Q3/FY 는 누적 공시다. 차분하지 않으면 계절성이 곧 신호가 된다)
     order = {REPRT_CODES["Q1"]: 1, REPRT_CODES["H1"]: 2, REPRT_CODES["Q3"]: 3, REPRT_CODES["FY"]: 4}
     W["q"] = W["reprt_code"].map(order)
-    W = W.sort_values(["corp_code", "bsns_year", "q"]).reset_index(drop=True)
-    flow_items = FLOW_ITEMS
-    # 누적 → 분기 단독. 직전 분기가 실제로 존재할 때만 차분한다.
-    # (누락된 분기를 0으로 간주하면 반기 누적치가 한 분기 실적으로 둔갑한다 — fail-open 금지)
+    W = W.sort_values(["corp_code", "bsns_year", "q"], kind="stable").reset_index(drop=True)
+
+    # ★ 계약 스키마 — 당기·당기누적·전기·전기누적 네 벌이 항상 존재해야 한다.
+    #   pivot 결과에 그 계정이 없으면 컬럼 자체가 안 생겨 실행마다 축이 달라진다.
+    for _k in ACCOUNT_PATTERNS:
+        for _s in [""] + COMPARATIVE_SUFFIXES:
+            if _k + _s not in W.columns:
+                W[_k + _s] = np.nan
+
+    # ── 분기 공시금액이 누적인지 3개월 단독인지 '데이터로' 판정 ──────────────────────────
+    is_cum, med_ratio, n_ratio = _detect_cumulative(W)
+    LOG.table([["분기 손익금액", "누적(YTD)" if is_cum else "3개월 단독",
+                (f"{med_ratio:.3f}" if med_ratio == med_ratio else "표본없음"),
+                f"{n_ratio:,}건", "반기/연간 ≈0.5 이면 누적, ≈0.25 면 3개월"]],
+              ["판정 대상", "결론", "비율 중앙값", "표본", "판별 근거"],
+              ["l", "c", "r", "r", "l"],
+              title="분기 공시금액 누적여부 자동판정 — 가정하지 않고 실측으로 정한다")
+    if n_ratio < 50:
+        LOG.info("표본이 적어 기본값(누적)을 씁니다. 사업보고서·분기보고서가 함께 쌓이면 "
+                 "다음 실행에서 실측으로 재판정합니다.")
+
     gk = ["corp_code", "bsns_year"]
+    # 연내 누적합을 인정하는 조건: q 가 1..k 로 빠짐없이 이어지고, 값도 전부 존재할 것.
+    seq_ok = (W.groupby(gk, observed=True).cumcount() + 1) == W["q"]
+    # 전기금액을 '전기 누적'으로 대체해도 되는 행 (스칼라 bool 을 where 에 넘기면
+    # "Array conditional must be same shape as self" 로 죽는다 — 계약검정이 잡아냈다)
+    _pv_usable = (pd.Series(True, index=W.index) if is_cum else (W["q"] >= 4))
+    for c in FLOW_ITEMS:
+        cm, pc, pv = f"{c}_cm", f"{c}_pc", f"{c}_pv"
+        cur = W[c]
+        if is_cum:
+            cum = cur
+        else:
+            # 3개월 단독 → 연내 누적합. 단 사업보고서(q=4)는 언제나 '연간' 이므로 그대로 쓴다.
+            run = W.groupby(gk, observed=True)[c].cumsum()
+            nn = W[c].notna().groupby([W["corp_code"], W["bsns_year"]], observed=True).cumsum()
+            ok = seq_ok & (nn == W["q"])
+            cum = pd.Series(np.where(W["q"] >= 4, cur, run.where(ok)), index=W.index)
+        W[cm] = W[cm].where(W[cm].notna(), cum)
+        # 전기 누적: 명시 컬럼(frmtrm_add_amount) 우선.
+        # ★ 없을 때 전기금액으로 대체할 수 있는 조건이 두 가지다:
+        #     ① 분기 공시가 누적 형식이면 전기금액도 누적이다.
+        #     ② **사업보고서(q=4)는 형식과 무관하게 전기금액이 곧 '전기 연간'이다.**
+        #   ②를 빠뜨리면 연 1회만 공시하는 기업(U-MICRO 에 흔하다)의 전기 매출이 통째로
+        #   비어 i_sales 가 결측이 된다 — 실제로 합성 스모크에서 i_sales 31.4% 결측으로
+        #   C14-c 에 걸렸다. 데이터가 아니라 이 한 줄이 원인이었다.
+        W[pc] = W[pc].where(W[pc].notna(), W[pv].where(_pv_usable))
+    # 재무상태표 항목은 누적 개념이 없다 — 당기말 잔액이 곧 _cm 이다.
+    for _k in ACCOUNT_PATTERNS:
+        if _k not in FLOW_ITEMS:
+            W[f"{_k}_cm"] = W[f"{_k}_cm"].where(W[f"{_k}_cm"].notna(), W[_k])
+            W[f"{_k}_pc"] = W[f"{_k}_pc"].where(W[f"{_k}_pc"].notna(), W[f"{_k}_pv"])
+
+    # ── 누적 → 분기 단독 → TTM ────────────────────────────────────────────────────────
+    #   직전 분기가 실제로 존재할 때만 차분한다.
+    #   (누락된 분기를 0으로 간주하면 반기 누적치가 한 분기 실적으로 둔갑한다 — fail-open 금지)
     W["_q_prev"] = W.groupby(gk, observed=True)["q"].shift(1)
     contiguous = (W["q"] - W["_q_prev"]) == 1
-    for c in flow_items:
-        if c not in W.columns:
-            W[c] = np.nan
-        prev = W.groupby(gk, observed=True)[c].shift(1)
-        q_val = np.where(W["q"] == 1, W[c],
-                         np.where(contiguous, W[c] - prev, np.nan))
-        W[c + "_q"] = q_val
+    for c in FLOW_ITEMS:
+        cm = f"{c}_cm"
+        prev = W.groupby(gk, observed=True)[cm].shift(1)
+        W[c + "_q"] = np.where(W["q"] == 1, W[cm],
+                               np.where(contiguous, W[cm] - prev, np.nan))
         # TTM = 4분기 이동합. min_periods=4 — 3개만으로 TTM 이라 부르면 15~25% 과소계상된다.
         W[c + "_ttm"] = (W.groupby("corp_code", observed=True)[c + "_q"]
                           .transform(lambda s: s.rolling(4, min_periods=4).sum()))
     W = W.drop(columns=["_q_prev"])
-    # ★ 재무상태표 항목(재고·매출채권·자산·자본 등)은 pivot 결과에 그 계정이 없으면
-    #   컬럼 자체가 생성되지 않는다. 그러면 패널 스키마가 실행마다 달라져
-    #   "어떤 날은 있고 어떤 날은 없는" 축이 생긴다. 여기서 전 항목을 계약적으로 보장한다.
-    for _k in ACCOUNT_PATTERNS:
-        if _k not in W.columns:
-            W[_k] = np.nan
     # ── V2 거부권용 '이익-현금 괴리 3분기 연속' 플래그 ─────────────────────────────────────
     #   ★ 여기서 만드는 이유: 연속성은 분기 관측을 세야 하는데, 월 패널에서 세면
     #     같은 분기값이 1~4개월 반복되므로 어떤 고정 개월수도 정답이 아니다. 분기 프레임은
