@@ -17,7 +17,10 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
-                   "corp_code", "industry", "sector_src", "src"]
+                   "corp_code", "industry", "sector_src", "src",
+                   # 폐지 사유 — 백테스트가 청산가를 정할 때 쓴다. 흡수합병·완전자회사화·
+                   # 스팩해산을 -100% 로 처리하면 없는 손실을 매년 지어낸다(41_backtest).
+                   "delist_reason", "to_code"]
 
 # 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
 #   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
@@ -159,8 +162,11 @@ def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
                     "", "unnamed: 0", "unnamed:0", "index"):
                 df = df.drop(columns=[df.columns[0]])
             if len(df):
+                # ★ 컬럼 목록을 자르지 않는다. [:6] 으로 자른 로그가 delisting CSV 의
+                #   DelistingDate(7번째)를 가려, '상장일을 폐지일로 읽고 있다'는 오진을
+                #   유발했다. 진단 출력이 진단을 방해하면 없느니만 못하다.
                 LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} "
-                          f"({len(df):,}행 · 컬럼 {list(df.columns)[:6]})")
+                          f"({len(df):,}행 · 컬럼 {list(df.columns)})")
                 return df
         except Exception:
             continue
@@ -169,6 +175,48 @@ def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
 
 def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
     return {str(c).strip().lower(): c for c in d.columns}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★★ 절대원칙 — 신규 수집물은 **무조건** 인덱스에 남는다 ★★★
+#    루트가 구글드라이브든 로컬이든, 한 번 받은 것은 다음 세션이 그대로 재호출한다.
+#    유니버스 3종(FDR 상장·FDR 폐지·KIND 상장법인)은 매 실행 네트워크로 나가고 있었다.
+#    작아 보여도 (a) 네트워크가 죽으면 그날 실행이 통째로 무의미해지고
+#    (b) 소스가 스키마를 바꾸면 어제까지 되던 실행이 오늘 실패한다.
+#    캐시가 있으면 신선도만 확인하고, 신규 수집이 성공했을 때만 갱신한다(좁혀 덮어쓰기 금지).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+UNIVERSE_CACHE_MAX_DAYS = 1.0        # 이보다 낡으면 새로 받아 본다(실패하면 낡은 것을 쓴다)
+
+
+def _cached_or_fetch(name: str, fetch_fn: Callable[[], pd.DataFrame],
+                     max_age_days: float = UNIVERSE_CACHE_MAX_DAYS) -> pd.DataFrame:
+    """캐시 우선 → 신선하지 않으면 수집 → 성공하면 저장, 실패하면 낡은 캐시로 폴백.
+
+    ★ 신규 수집이 **0행이면 저장하지 않는다.** 소스 장애로 빈 응답이 온 날
+      멀쩡한 캐시를 빈 프레임으로 덮으면 그 다음 실행부터 전부 무너진다.
+    """
+    fresh = VAULT.get_table(name, scope="shared", max_age_days=max_age_days)
+    if fresh is not None and len(fresh):
+        LOG.info(f"공용 캐시에서 {name} {len(fresh):,}행 재사용 "
+                 f"({max_age_days:g}일 이내) — 네트워크로 나가지 않습니다.")
+        return fresh
+    try:
+        got = fetch_fn()
+    except Exception as e:                                          # noqa
+        got = None
+        LOG.warn(f"{name} 수집 실패({type(e).__name__}).")
+    if got is not None and len(got):
+        if VAULT.put_table(name, got, scope="shared", domain="universe",
+                           source="자동 캐시 — 신규 수집물은 무조건 인덱스에 남긴다") is None:
+            LOG.error(f"{name} 저장 실패 — 다음 실행이 같은 것을 다시 받습니다.")
+        return got
+    stale = VAULT.get_table(name, scope="shared")          # 신선도 무시
+    if stale is not None and len(stale):
+        LOG.warn(f"{name} 신규 수집이 비었습니다 — 낡은 공용 캐시 {len(stale):,}행을 씁니다. "
+                 f"빈 결과로 캐시를 덮지 않습니다(그러면 다음 실행까지 무너집니다).")
+        return stale
+    return got if got is not None else pd.DataFrame()
 
 
 def fetch_fdr_listing() -> pd.DataFrame:
@@ -257,15 +305,49 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_raw = len(d)
     raw_codes = d[code_c].astype(str)
     codes = raw_codes.map(to_code6)
-    n_badcode = int(codes.isna().sum())
+    # ★ dl_c 폴백 목록에 "listingdate" 가 들어 있다. 업스트림이 DelistingDate 컬럼명을
+    #   바꾸는 순간 상장일이 폐지일로 읽히고, 모든 종목이 상장 첫날 폐지된 것으로 처리되어
+    #   유니버스가 통째로 비워진다 — 예외가 아니라 '그럴듯한 숫자'로 실패한다. 방어한다.
+    if dl_c and str(dl_c).strip().lower().replace("_", "") == "listingdate":
+        LOG.error("폐지목록에 폐지일 컬럼이 없어 상장일 컬럼을 쓸 뻔했습니다 — "
+                  f"상장일을 폐지일로 읽으면 전 종목이 즉시 폐지 처리됩니다. "
+                  f"폐지일 없이 진행합니다. 원본 컬럼: {list(d.columns)}")
+        dl_c = None
+    lst_c = next((col[k] for k in ("listingdate", "listing_date", "listdate") if k in col), None)
     t = pd.DataFrame({
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        # 폐지 종목의 상장일 — 상장 전 달에 유니버스로 새는 것(C13)과 시즈닝 면제를 막는다.
+        "listing_date": as_ts_series(d[lst_c]) if lst_c else pd.NaT,
+        # 폐지 '사유'. 흡수합병·완전자회사화·스팩해산은 -100% 가 아니다(41_backtest 가 소비).
+        "delist_reason": (d[col["reason"]].astype(str).str.strip() if "reason" in col else ""),
+        "to_code": (d[col["tosymbol"]].map(to_code6) if "tosymbol" in col else None),
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
-        "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
-                      else d[col["kind"]].astype(str) if "kind" in col else ""),
+        "secugroup": (d[col["secugroup"]].astype(str).str.strip() if "secugroup" in col
+                      else d[col["kind"]].astype(str).str.strip() if "kind" in col else ""),
     })
+    # ★ 탈락분의 정체를 반드시 증권종류로 분류한다.
+    #   업스트림 원본(4,172행)을 직접 확인한 결과, to_code6 이 떨어뜨리는 1,536행은
+    #   전부 신주인수권증서(857)·수익증권(521)·신주인수권증권(158)이고 **주권은 0건**이다.
+    #   그런데 예전 코드는 이를 "코드형식 불일치 → 생존자편향이 그만큼 남습니다"로 경고했다.
+    #   주식 전략의 유니버스가 아닌 파생·펀드 상품이 빠진 것을 편향으로 보고하면,
+    #   ① 멀쩡한 결과를 의심하게 만들고 ② 진짜 편향 경고까지 같이 무시하게 만든다.
+    #   → '정책적 제외'와 '진짜 유실'을 분리해서 세고, 주권이 유실될 때만 경고한다.
+    _EQUITY_SG = ("주권", "외국주권", "주식예탁증권")
+    sg = t["secugroup"].fillna("")
+    is_equity = sg.isin(_EQUITY_SG) if sg.str.len().gt(0).any() else pd.Series(True, index=t.index)
+    bad = t["code"].isna()
+    n_badcode = int(bad.sum())
+    n_lost_equity = int((bad & is_equity).sum())
+    n_nonequity = int((~bad & ~is_equity).sum())
+    if sg.str.len().gt(0).any() and n_badcode:
+        LOG.info(f"  코드 정규화 탈락 {n_badcode:,}건의 증권종류: "
+                 f"{dict(sg[bad].value_counts().head(5))} → 이 중 주권계열 {n_lost_equity:,}건")
+    # ★ 비주권(수익증권·리츠·투자회사 등)은 여기서 **버리지 않는다.**
+    #   폐지 기록을 지우면 그 종목이 유니버스에서 영원히 살아있는 것으로 보인다 — 제거하려던
+    #   생존자편향을 오히려 만드는 방향이다. 담을 수 없는 종목은 U-MID 의 유동성·규모 조건이
+    #   이미 걸러내므로, 여기서는 '분류해서 보고'만 하고 기록은 보존한다.
     t = t.dropna(subset=["code"])
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
@@ -273,15 +355,17 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
     n_nodate = int(t["delisting_date"].isna().sum())
 
-    LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
+    LOG.ok(f"상장폐지 목록 {len(t):,}건 (주권계열 {int(t['secugroup'].isin(_EQUITY_SG).sum()):,} · "
+           f"비주권 {n_nonequity:,}) — 생존자편향 제거 입력 확보")
     if n_raw - len(t):
         LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
-                 f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
+                 f"(증권종류상 코드체계가 다른 {n_badcode:,}건 제외 · 동일코드 중복 {n_dupe:,} 병합) · "
                  f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
-        if n_badcode > n_raw * 0.25:
-            LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
-                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
-                     f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+    # ★ 경고는 '주권이 유실됐을 때'만 띄운다. 비주권 제외는 편향이 아니라 유니버스 정의다.
+    if n_lost_equity:
+        LOG.warn(f"폐지목록에서 **주권** {n_lost_equity:,}건이 코드 정규화에 실패했습니다 — "
+                 f"이만큼은 실제로 생존자편향으로 남습니다. "
+                 f"원본 코드 예시: {raw_codes[codes.isna() & is_equity].head(5).tolist()}")
     return t
 
 
@@ -326,31 +410,43 @@ def fetch_kind_listing() -> pd.DataFrame:
 
 def fetch_dart_corpcode() -> pd.DataFrame:
     """corp_code ↔ 종목코드. DART 의 모든 재무·공시 조회는 corp_code 로만 된다."""
-    if not DART_API_KEY:
+    if not dart_has_key():
         return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
     cached = VAULT.get_table("dart_corpcode", scope="shared", max_age_days=30)
     if cached is not None and len(cached):
         LOG.info(f"공용 캐시에서 DART corpCode {len(cached):,}건 재사용")
         return cached
+    # ★★ 만료 후 다운로드가 실패하면 **빈 프레임이 아니라 낡은 캐시**로 돌아간다 ★★
+    #   예전엔 실패 시 그냥 빈 프레임을 돌려줬다. corp_code 가 전멸하면 그 실행의
+    #   EMP·Tier-2·Tier-1·공시가 **통째로 0건**이 된다 — 이미 받아둔 캐시가 디스크에
+    #   멀쩡히 있는데도 그렇다. 30일마다 한 번씩 열리는 전량 실패 창이었다.
+    #   corpCode 는 기업 식별자 목록이라 며칠 낡아도 기존 기업의 코드는 바뀌지 않는다.
+    def _stale_or_empty(why: str):
+        _old = VAULT.get_table("dart_corpcode", scope="shared")      # max_age 무시
+        if _old is not None and len(_old):
+            LOG.warn(f"{why} — 30일이 지난 corpCode 캐시 {len(_old):,}건을 그대로 씁니다. "
+                     f"기업 식별자는 잘 바뀌지 않으므로 신규 상장분만 누락됩니다. "
+                     f"빈 목록으로 진행하면 이 실행의 DART 수집이 통째로 0건이 됩니다.")
+            return _old
+        LOG.error(f"{why} — 대체할 캐시도 없습니다. 이 실행의 DART 수집은 전부 0건이 됩니다.")
+        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+
     raw = http_get("https://opendart.fss.or.kr/api/corpCode.xml", source="dart",
                    params={"crtfc_key": DART_API_KEY}, as_bytes=True, tries=3)
     if not raw:
-        LOG.warn("DART corpCode.xml 수신 실패 — DART_API_KEY 와 네트워크를 확인하세요.")
-        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+        return _stale_or_empty("DART corpCode.xml 수신 실패(키·네트워크 확인)")
     if raw[:2] != b"PK":
         body = raw[:400].decode("utf-8", "ignore")
         st = re.search(r'"?status"?\s*[:>]\s*"?(\d{3})', body)
         code = st.group(1) if st else "?"
-        LOG.warn(f"corpCode 응답이 ZIP 이 아닙니다 (status={code}: "
-                 f"{DART_STATUS_MSG.get(code, '알 수 없음')}). DART_API_KEY 를 확인하세요.")
-        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+        return _stale_or_empty(f"corpCode 응답이 ZIP 이 아님 (status={code}: "
+                               f"{DART_STATUS_MSG.get(code, '알 수 없음')})")
     try:
         zf = zipfile.ZipFile(io.BytesIO(raw))
         xml = b"".join(zf.read(n) for n in zf.namelist() if n.lower().endswith(".xml")) \
             or zf.read(zf.namelist()[0])
     except Exception as e:                                            # noqa
-        LOG.warn(f"corpCode zip 해제 실패({type(e).__name__}).")
-        return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
+        return _stale_or_empty(f"corpCode zip 해제 실패({type(e).__name__})")
     txt = _decode(xml, None, "corpcode")
     rows = []
     for m in re.finditer(r"<list>(.*?)</list>", txt, re.S):
@@ -439,22 +535,36 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
     snap = (snap.dropna(subset=["snap_date", "code"])
                 .drop_duplicates(["snap_date", "code"])[cols])
 
+    # ★★ 저장은 필터 **이전**, 폐기는 소비 쪽에서만 ★★
+    #   예전엔 아래 부분응답 폐기 결과를 **저장본에도 반영**했다. 그러면
+    #     ① 폐기된 시점이 다음 실행의 have 에 없으니 다시 수집되고,
+    #     ② 다시 수집하면 new_rows 가 비지 않아 또 저장되고,
+    #     ③ 또 폐기된다 — **자기지속 재수집 루프**다(시점당 3콜, 직렬 3~5초).
+    #   게다가 중앙값은 프레임 내용에 따라 실행마다 달라져, 과거 실행이 저장해 둔 시점이
+    #   나중 실행에서 '나쁨'으로 재판정되어 활성 파케이에서 사라질 수 있다 —
+    #   공용 테이블 **좁혀 덮어쓰기**이자 절대 1원칙 위반이다.
+    if new_rows:
+        _store = snap.copy()
+        _store["snap_date"] = _store["snap_date"].dt.strftime("%Y-%m-%d")
+        if VAULT.put_table("krx_listing_snapshots", _store, scope="shared", domain="universe",
+                           source="pykrx",
+                           extra={"note": "상장종목 스냅샷 — 전 전략 공용 (원본 보존, "
+                                          "부분응답 판정은 소비 시점에만 적용)"}) is None:
+            LOG.error("스냅샷 저장 실패 — 다음 실행이 같은 시점을 다시 수집합니다.")
+
     # ★ 부분 응답 방어: 이웃 시점 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
     #   그대로 쓰면 그 달 유니버스가 조용히 쪼그라들어 선택편향이 된다.
+    #   → **반환값에서만** 걷어낸다. 원본은 드라이브에 그대로 남는다.
     if len(snap):
         size = snap.groupby("snap_date")["code"].size().sort_index()
         med = float(size.median()) if len(size) else 0.0
         bad = size[size < med * 0.80]
         if len(bad) and med > 0:
             LOG.warn(f"스냅샷 {len(bad)}개 시점이 중앙값({med:,.0f}종목)의 80% 미만이라 "
-                     f"부분 응답으로 판단하고 폐기합니다: "
-                     f"{[str(x.date()) for x in bad.index[:6]]}")
+                     f"부분 응답으로 판단하고 **이번 실행에서만** 제외합니다: "
+                     f"{[str(x.date()) for x in bad.index[:6]]} "
+                     f"(원본은 공용 캐시에 그대로 보존됩니다 — 지우면 매 실행 다시 받게 됩니다)")
             snap = snap[~snap["snap_date"].isin(bad.index)]
-    if new_rows:
-        out = snap.copy()
-        out["snap_date"] = out["snap_date"].dt.strftime("%Y-%m-%d")
-        VAULT.put_table("krx_listing_snapshots", out, scope="shared", domain="universe",
-                        source="pykrx", extra={"note": "상장종목 스냅샷 — 전 전략 공용"})
     PIPE.io("OUT", "DRIVE", "krx_listing_snapshots", snap, source="pykrx")
     return snap
 
@@ -490,24 +600,31 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     parts: List[pd.DataFrame] = []
     src_stats: List[Tuple[str, int]] = []
 
-    lst = fetch_fdr_listing()
+    lst = _cached_or_fetch("src_fdr_listing", fetch_fdr_listing)
     if len(lst):
         parts.append(lst)
         src_stats.append(("FDR 상장목록", len(lst)))
         PIPE.io("IN", "HTTP", "fdr:StockListing", lst, source="FinanceDataReader")
 
-    kind = fetch_kind_listing()
+    kind = _cached_or_fetch("src_kind_listing", fetch_kind_listing)
     if len(kind):
         parts.append(kind)
         src_stats.append(("KIND 상장법인", len(kind)))
         PIPE.io("IN", "HTTP", "kind:corpList", kind, source="KIND")
 
-    dead = fetch_fdr_delisting()
+    dead = _cached_or_fetch("src_fdr_delisting", fetch_fdr_delisting)
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market",
+                                   "listing_date", "delist_reason", "to_code"]).copy()
+        # ★ 예전엔 여기서 listing_date 를 pd.NaT 로 못박았다. 그런데 폐지목록 원본에는
+        #   ListingDate 가 4,172건 **전부** 들어 있다. 버리면 두 가지가 동시에 깨진다:
+        #     ① Universe.at 는 listing_date 결측을 '태초부터 상장'으로 읽는다 →
+        #        2016년 이후 상장했다가 폐지된 292종목이 상장 전 달의 유니버스에 낀다(C13 위반).
+        #     ② 250일 시즈닝 게이트는 listing_date 가 있을 때만 걸린다 → 결측인 종목만
+        #        면제된다. 그 면제 대상이 하필 '나중에 폐지된 종목'이라, 어느 종목이 게이트를
+        #        건너뛰는지가 **그 종목의 미래로 결정**된다. 실거래로는 재현 불가능한 유니버스다.
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
@@ -556,6 +673,8 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         listing_date=("listing_date", "min"),
         delisting_date=("delisting_date", "max"),
         industry=("industry", _first_str),
+        delist_reason=("delist_reason", _first_str),
+        to_code=("to_code", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
     )
     assert_no_dup_cols(agg, "security_master:agg")

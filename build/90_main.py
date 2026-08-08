@@ -53,14 +53,20 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("L1.PX", "가격 · 거래대금", "L1", budget_s=1200):
         KRX.login()
-        px = fetch_prices(ctx["sec"]["code"].tolist(),
-                          (as_ts(BACKTEST_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+        # ★ sec= 를 넘기지 않으면 listing_of/delist_of 가 빈 dict 가 되어 상장일 하한과
+        #   폐지 종료조건이 통째로 사라진다. 그 상태로 v2 가 만든 워터마크·음성캐시를
+        #   v3 가 그대로 물려받아 같은 낭비를 반복한다 — 캐시가 공용이라 오염도 공용이다.
+        px = fetch_prices(ctx["sec"]["code"].tolist(), price_cache_floor(), BACKTEST_END,
+                          sec=ctx["sec"],
+                          market_last_day=(ctx["snapshots"]["snap_date"].max()
+                                           if ctx.get("snapshots") is not None
+                                           and len(ctx["snapshots"]) else None))
         ctx["px"] = px
         ctx["panel"] = build_price_panel(px, months)
 
     with PIPE.stage("L1.FLOW", "기관·외국인 수급 (D축 d3)", "L1", budget_s=900, critical=False):
-        ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START, BACKTEST_END)
+        ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START,
+                                            BACKTEST_END, sec=ctx["sec"])
 
     with PIPE.stage("L1.DART", "DART 재무 · 직원 · 공시", "L1", budget_s=1800, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()

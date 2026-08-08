@@ -130,6 +130,39 @@ def _pick_str(vals) -> str:
     return c[0] if c else ""
 
 
+_MERGE_WHITELIST = {
+    "report_uid", "src_report_id", "source", "category", "pub_date", "title",
+    "stock_code", "stock_name", "broker_id", "broker_name", "broker_raw",
+    "analyst_raw", "target_price", "opinion", "pdf_url", "detail_url",
+    "dedup_key",                       # 그룹 키 자체는 인덱스로 나온다
+}
+
+
+def _carry_extra_cols(d: pd.DataFrame) -> dict:
+    """화이트리스트 밖의 컬럼을 병합에서 **떨어뜨리지 않고** 실어 나른다.
+
+    ★★ 절대 1원칙 위반이었다 ★★
+      이 함수의 출력은 공용 캐시 research_report_master 로 **덮어써진다.** 그런데
+      병합 agg 가 출력 컬럼을 화이트리스트로 열거하고 있어서, 입력에 있던
+      pdf_uid·pdf_analysts·pdf_emails·pdf_target·views 같은 컬럼이 왕복 한 번마다
+      조용히 사라졌다. 즉 PDF 를 한 번 받아 채워 넣어도 다음 실행에서 그 정보가
+      공용 캐시에서 영구히 지워지고, 다른 전략도 그 손실을 그대로 물려받는다.
+      "삭제 API 가 없다"는 원칙은 파일 단위로는 지켜졌지만 **컬럼 단위로는 새고 있었다.**
+
+    숫자는 max(결측 무시), 그 외는 '비지 않은 첫 값'으로 접는다 — 둘 다 순서에 무관해
+    재실행 멱등성을 깨지 않는다.
+    """
+    out = {}
+    for c in d.columns:
+        if c in _MERGE_WHITELIST:
+            continue
+        if pd.api.types.is_numeric_dtype(d[c]) or pd.api.types.is_datetime64_any_dtype(d[c]):
+            out[c] = (c, "max")
+        else:
+            out[c] = (c, _pick_str)
+    return out
+
+
 def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd.DataFrame:
     """다중 소스 병합 → 보고서 원장. 중복 제거가 아니라 '병합'이다(정보를 버리지 않는다)."""
     frames = [f for f in frames if f is not None and len(f)]
@@ -211,6 +244,7 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
+        **_carry_extra_cols(d),
     })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")

@@ -9,6 +9,13 @@
 # ║  C11: 셀 = (date, industry, size_bucket). 다른 그룹키 금지.                                ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+# ★ as-of 결합에서 '마지막으로 알려진 값'을 며칠까지 실어 나를 것인가.
+#   연간 공시 주기(365일) + 제출 지연 여유. 이보다 오래된 것은 결측으로 둔다 —
+#   무한 이월은 결측을 가짜 0.0 차분으로 둔갑시켜 증거층 게이트를 속인다.
+#   0 이면 제한 없음(예전 동작). 바꾸지 마십시오.
+PIT_ASOF_MAX_DAYS = 550
+
+
 class PITStore:
     """유일한 데이터 게이트웨이. 등록된 테이블은 knowledge_date 로 정렬되어 보관되고,
     as_of 조회는 항상 knowledge_date <= as_of 를 강제한다. 예외 경로는 존재하지 않는다."""
@@ -105,9 +112,16 @@ class PITStore:
         R[by] = R[by].astype(str)
         L[by] = L[by].astype(str)
         L = L.sort_values(left_time, kind="stable")
+        # ★★ tolerance ★★ 이게 없으면 '마지막으로 알려진 행'이 **무한히 미래로 이월**된다.
+        #   격자가 불완전해 중간 연도가 빈 회사에서, 2019년 재무가 2024년 달에 그대로 붙고
+        #   diff(12) 가 결측이 아니라 **정확히 0.0** 이 된다. 그 가짜 관측이 FLOOR
+        #   (MIN_TP_OBSERVED)를 통과해 '커버리지가 있는 것처럼' 보인다 — 조용히 틀리는
+        #   방향이라 크래시보다 나쁘다. 알 수 없는 것은 끝까지 결측으로 둔다.
+        _tol = pd.Timedelta(days=int(PIT_ASOF_MAX_DAYS)) if PIT_ASOF_MAX_DAYS else None
         try:
             M = pd.merge_asof(L, R, left_on=left_time, right_on="knowledge_date",
-                              by=by, direction="backward", suffixes=("", suffix or "_r"))
+                              by=by, direction="backward", tolerance=_tol,
+                              suffixes=("", suffix or "_r"))
         except Exception as e:                                     # noqa
             LOG.warn(f"asof_join 실패({type(e).__name__}) — '{name}' 결합을 건너뜁니다. "
                      f"대개 정렬/타입 문제입니다.")
@@ -138,6 +152,59 @@ PIT = PITStore()
 
 # ── 유니버스 (C2) ───────────────────────────────────────────────────────────────────────────
 LISTING_SEASONING_DAYS = 250          # 상장일 + 250거래일 ≈ 1년
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  상장폐지 '유형' 분류 — 청산가를 -100% 로 둘지 직전가로 둘지 가른다
+#
+#  ★ 왜 필요한가. 예전엔 모든 폐지를 -100% 로 처리했다. 그런데 폐지목록 원본의 Reason 을
+#    실측해 보면 2016년 이후 폐지된 주권 561건 중
+#      · 피흡수합병 60 · 스팩소멸합병 53 · 지주회사 완전자회사화 29 · 타법인 완전자회사 편입 14
+#        → 합병 대가로 인수기업 주식을 받는다. 0% 도 아니고 보통 프리미엄이 붙는다.
+#      · 스팩 예심청구서 미제출·해산 ~110  → 예치금이 공모가 + 이자로 반환된다(사실상 원금).
+#    즉 **절반 이상이 전액손실이 아닌데 전액손실로 계상**되고 있었다.
+#    U-MID 대역의 연 폐지율(~4.9%)과 25종목 포트폴리오로 환산하면 연 -2%p 안팎의
+#    '있지도 않은 손실'이다. 게다가 이것은 보수적인 방향이 아니라 **틀린** 방향이다.
+#
+#  ★ 그렇다고 프리미엄을 지어내지 않는다. 합병·해산 건은 **직전 관측가로 청산**한다.
+#    한국 시장의 합병 스프레드는 좁아 직전가가 편향 없는 추정치이고, 실제 프리미엄보다
+#    낮으므로 여전히 보수적이다. 부실 폐지(감사의견 거절·자본잠식·부도)는 종전대로
+#    정리매매가가 없으면 -100% 다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+DELIST_TRANSFER_PAT = (
+    r"흡수합병|피흡수|합병으로|완전자회사|지주회사|주식교환|주식의\s*포괄적|"
+    r"신청에\s*의한\s*상장폐지|상장폐지\s*신청|자진|공개매수|이전상장|재상장|시장이전")
+DELIST_SPAC_PAT = (
+    # 스팩 특유의 사유들. '청구서'와 '신청서'가 혼용되고, '존속기간 만료'는 스팩의
+    # 3년 존속기간이 끝나 예치금을 반환하고 해산하는 경우다(부실이 아니다).
+    r"스팩|기업인수목적|예비심사\s*(청구서|신청서)\s*미제출|합병상장예비심사신청서\s*미제출|"
+    r"해산\s*사유|존속기간\s*만료")
+DELIST_DISTRESS_PAT = (
+    # ★ '자본잠식' 을 그대로 쓰면 실제 표기인 '자본전액잠식'(전액이 사이에 낀다)을 놓친다.
+    #   계약 C2c 가 이 누락을 잡아냈다 — 사유 문자열은 KRX 표기 그대로 검증해야 한다.
+    r"감사의견|의견거절|부적정|자본\S*잠식|부도|파산|회생|영업정지|계속기업|"
+    r"상장폐지\s*기준에\s*해당|횡령|배임|사업보고서\s*미제출|주식\S*분산\s*미달|"
+    r"매출액\s*미달|시가총액\s*미달|거래량\s*미달")
+
+
+def classify_delisting(reason: Any) -> str:
+    """'transfer'(합병·자진) | 'spac'(스팩 해산) | 'distress'(부실) | 'unknown'"""
+    s = str(reason or "").strip()
+    if not s:
+        return "unknown"
+    # 부실을 먼저 본다. '스팩소멸합병'처럼 두 패턴이 겹칠 때 관대한 쪽으로 새지 않게
+    # 하려는 것이 아니라, 반대로 부실 신호가 있으면 무조건 부실로 보내기 위함이다.
+    if re.search(DELIST_DISTRESS_PAT, s):
+        return "distress"
+    if re.search(DELIST_TRANSFER_PAT, s):
+        return "transfer"
+    if re.search(DELIST_SPAC_PAT, s):
+        return "spac"
+    return "unknown"
+
+
+# 직전가 청산으로 볼 유형. 'unknown' 은 포함하지 않는다 — 모르면 보수적으로 -100%.
+DELIST_NOT_WIPEOUT = ("transfer", "spac")
 
 
 class Universe:
@@ -243,31 +310,82 @@ class Universe:
         return {r.code: r.delisting_date for r in self.sec.itertuples(index=False)
                 if pd.notna(r.delisting_date)}
 
-    def audit_row(self, stage: str, t, codes: Sequence[str]):
-        self.attrition.append({"month": as_ts(t), "stage": stage, "n": len(codes)})
+    def delist_kind_map(self) -> Dict[str, str]:
+        """종목 → 폐지 유형. 청산가를 -100% 로 둘지 직전가로 둘지 가른다."""
+        if "delist_reason" not in self.sec.columns:
+            return {}
+        return {r.code: classify_delisting(getattr(r, "delist_reason", ""))
+                for r in self.sec.itertuples(index=False)
+                if pd.notna(r.delisting_date)}
 
-    def report_attrition(self):
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  감쇠 원장 — 팔(arm) 태그와 기록 스위치
+    #
+    #  ★★ 왜 필요한가 (7회차 리포트에 '잔존율 113.7%' 라는 불가능한 숫자가 찍힌 자리) ★★
+    #    이 리스트는 전역 하나였고 태그가 없었다. 그런데 여기에 쓰는 주체가 셋이다:
+    #      ① 전체(ALL) 팔의 apply_umid  ② 하위1000(SMALL) 팔의 apply_umid
+    #      ③ run_backtest — 그리고 강건성 스위트가 백테스트를 **10여 회 재실행**한다.
+    #    report_attrition 은 stage 별 단순 평균을 내므로,
+    #      '유동성필터' = ALL 패널에서 잰 월평균(≈1,500)
+    #      'U-MID대역'  = ALL 과 SMALL 을 섞은 월평균(≈1,300)
+    #    처럼 **서로 다른 모집단의 평균**이 한 깔때기에 세로로 놓인다. 뒤 단계가 앞 단계보다
+    #    커지는 순간 잔존율이 100%를 넘는다. 숫자가 이상해서 눈에 띈 것이 다행이었다 —
+    #    조금만 덜 이상했으면 '어느 게이트에서 표본이 붕괴하는가'를 통째로 오독했을 것이다.
+    #  → ① 모든 기록에 arm 태그를 단다. ② 팔별로 표를 따로 낸다.
+    #    ③ 강건성 재실행은 audit_on=False 로 아예 기록하지 않는다(같은 달을 10번 세면
+    #       평균은 같지만 min/max 가 의미를 잃고, 팔 태그도 뒤섞인다).
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    audit_arm: str = "MAIN"
+    audit_on: bool = True
+
+    def set_audit_arm(self, arm: str, on: bool = True):
+        self.audit_arm, self.audit_on = str(arm), bool(on)
+
+    def audit_row(self, stage: str, t, codes: Sequence[str], arm: Optional[str] = None):
+        if not self.audit_on:
+            return
+        self.attrition.append({"arm": str(arm or self.audit_arm), "month": as_ts(t),
+                               "stage": stage, "n": len(codes)})
+
+    def report_attrition(self, title_suffix: str = ""):
         if not self.attrition:
             return
         A = pd.DataFrame(self.attrition)
-        order = ["전체상장", "PIT유니버스", "가격보유", "유동성필터", "거부권통과",
+        if "arm" not in A.columns:
+            A["arm"] = "MAIN"
+        # ★ 같은 (팔, 단계, 달) 이 두 번 기록되면 평균이 바뀌진 않지만 min/max·표본수가
+        #   왜곡된다. 마지막 기록을 진실로 본다(재실행이 있었다면 그쪽이 최신이다).
+        A = A.drop_duplicates(["arm", "stage", "month"], keep="last")
+        # ★ 이 목록에 없는 단계는 표에서 조용히 사라진다(오류도 경고도 없이).
+        #   새 게이트를 추가했다면 반드시 여기에도 넣을 것.
+        order = ["전체상장", "PIT유니버스", "가격보유", "U-MID대역", "유동성필터", "거부권통과",
                  "하한선통과", "최종선정"]
-        piv = A.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
-        rows = []
-        prev = None
-        for s in order:
-            if s not in piv.index:
+        for arm in sorted(A["arm"].unique(), key=lambda x: (x != "MAIN", x)):
+            sub = A[A["arm"] == arm]
+            piv = sub.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
+            rows, prev = [], None
+            for s in order:
+                if s not in piv.index:
+                    continue
+                m = piv.loc[s]
+                keep = "" if prev is None else f"{100*m['mean']/prev:.1f}%"
+                # 100% 초과는 이제 구조적으로 나올 수 없지만, 나오면 그 사실을 표에 적는다.
+                if prev is not None and m["mean"] > prev * 1.001:
+                    keep += " ⚠모집단불일치"
+                rows.append([s, f"{m['mean']:,.0f}", f"{m['min']:,.0f}", f"{m['max']:,.0f}",
+                             f"{int(m['size']):,}", keep])
+                prev = m["mean"]
+            if not rows:
                 continue
-            m = piv.loc[s]
-            keep = "" if prev is None else f"{100*m['mean']/prev:.1f}%"
-            rows.append([s, f"{m['mean']:,.0f}", f"{m['min']:,.0f}", f"{m['max']:,.0f}", keep])
-            prev = m["mean"]
-        LOG.table(rows, ["게이트", "월평균 종목수", "최소", "최대", "직전 대비 잔존율"],
-                  ["l", "r", "r", "r", "r"],
-                  title="유니버스 감쇠 감사 (§10.4) — 어느 게이트에서 표본이 붕괴하는지")
-        if rows and float(str(rows[-1][1]).replace(",", "")) < 5:
-            LOG.warn("최종 선정 종목이 월평균 5개 미만입니다. 통계적 판단이 불가능한 수준이므로 "
-                     "임계값을 낮추기 전에 어느 게이트가 원인인지 위 표에서 먼저 확인하세요.")
+            LOG.table(rows, ["게이트", "월평균 종목수", "최소", "최대", "관측월", "직전 대비 잔존율"],
+                      ["l", "r", "r", "r", "r", "r"],
+                      title=f"유니버스 감쇠 감사 (§10.4) · 팔={arm}{title_suffix} "
+                            f"— 어느 게이트에서 표본이 붕괴하는지")
+            if float(str(rows[-1][1]).replace(",", "")) < PORTFOLIO_MIN_NAMES:
+                LOG.warn(f"[{arm}] 최종 선정 종목이 월평균 {rows[-1][1]}개로 "
+                         f"PORTFOLIO_MIN_NAMES={PORTFOLIO_MIN_NAMES} 에 못 미칩니다. "
+                         f"이 수준에서는 성과가 종목 몇 개의 함수이지 전략의 함수가 아닙니다 — "
+                         f"임계값을 낮추기 전에 위 표에서 어느 게이트가 원인인지 확인하세요.")
 
 
 # ── 셀 (C11) ────────────────────────────────────────────────────────────────────────────────

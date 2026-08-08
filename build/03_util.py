@@ -318,8 +318,16 @@ def downcast(df: pd.DataFrame, cat_thresh: float = 0.35) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     for c in df.columns:
-        k = df[c].dtype.kind
+        dt = df[c].dtype
+        # ★ category 의 dtype.kind 는 "O" 다. 그래서 아래 object 분기가 **이미 category 인
+        #   컬럼에도 매번 들어가** nunique() 를 다시 돌았다. 7.09M 행에서 실측 수 초.
+        #   이 함수는 매 실행 같은 결론에 도달하므로 그냥 넘긴다.
+        if isinstance(dt, pd.CategoricalDtype):
+            continue
+        k = dt.kind
         if k == "f":
+            if dt.itemsize <= 4:          # 이미 float32 이하 — 다시 재지 않는다
+                continue
             df[c] = pd.to_numeric(df[c], downcast="float")
         elif k in "iu":
             df[c] = pd.to_numeric(df[c], downcast="integer")

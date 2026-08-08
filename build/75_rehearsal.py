@@ -20,6 +20,11 @@
 
 REHEARSAL_RESULTS: List[dict] = []
 
+# 전략별 추가 리허설 훅. 시그니처: fn(G: dict, sec: pd.DataFrame, corps: List[str],
+# months: pd.DatetimeIndex) -> None.  가짜 네트워크가 이미 물려 있는 안쪽에서 호출된다.
+# 코어만 빌드하면 빈 리스트라 동작이 바뀌지 않는다(순수 추가).
+REHEARSAL_HOOKS: List[Callable] = []
+
 
 def _rh(name: str, fn: Callable, expect_rows: bool = True, note: str = ""):
     """리허설 1건 실행. 예외는 실패, 정상응답 0행도 (기대했다면) 실패."""
@@ -375,12 +380,13 @@ def run_rehearsal(strict: bool = True) -> bool:
         # ── ② 가격 ────────────────────────────────────────────────────────────────────────
         codes = sec["code"].dropna().tolist()[:12]
         px = _rh("fetch_prices(네이버 차트 폴백)",
-                 lambda: fetch_prices(codes, "2016-05-01", "2026-07-31"),
+                 lambda: fetch_prices(codes, "2016-05-01", "2026-07-31", sec=sec),
                  note="FDR/pykrx 없이 네이버 경로만으로 동작해야 한다")
         if px is not None and len(px):
             _rh("build_price_panel", lambda: build_price_panel(px, months))
         _rh("fetch_investor_flows(pykrx 없음)",
-            lambda: fetch_investor_flows(codes, "2016-08-01", "2026-07-31"), expect_rows=False)
+            lambda: fetch_investor_flows(codes, "2016-08-01", "2026-07-31", sec=sec),
+            expect_rows=False)
 
         # ── ③ DART ────────────────────────────────────────────────────────────────────────
         corps = sec["corp_code"].dropna().astype(str).tolist()[:6]
@@ -435,6 +441,16 @@ def run_rehearsal(strict: bool = True) -> bool:
             if T is not None and len(T):
                 _rh("build_text_similarity", lambda: build_text_similarity(T),
                     expect_rows=False)
+
+        # ── ⑤-b 전략별 추가 리허설 (가짜 네트워크가 물려 있는 상태에서 실행) ──────────────
+        for _hook in list(REHEARSAL_HOOKS):
+            try:
+                _hook(G, sec, corps, months)
+            except Exception as _e:                                  # noqa
+                REHEARSAL_RESULTS.append({
+                    "name": f"[훅] {getattr(_hook, '__name__', 'hook')}", "ok": False,
+                    "rows": -1, "sec": 0.0, "err": f"{type(_e).__name__}: {_e}",
+                    "note": "", "tb": traceback.format_exc()})
 
         # ── ⑥ 이상 응답 내성 (빈/깨짐/컬럼누락) ───────────────────────────────────────────
         for mode, label in (("empty", "빈 응답"), ("broken", "깨진 응답"),

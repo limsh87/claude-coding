@@ -214,6 +214,16 @@ if OPT.get("pykrx"):
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
+        # ★ yfinance 는 실패 종목마다 ERROR 한 줄을 직접 찍는다. 한국 폐지종목은 .KS/.KQ 양쪽이
+        #   모두 없으므로 종목당 2줄 — 1,800종목이면 3,600줄이 진단 로그를 덮어버린다.
+        #   실패 사실은 fetch_prices 의 시도 원장(price_fetch_attempts)에 이미 남으므로
+        #   여기서는 라이브러리 자체 출력만 CRITICAL 로 올려 침묵시킨다(예외는 그대로 전파).
+        for _n in ("yfinance", "yfinance.data", "yfinance.utils", "peewee", "urllib3"):
+            logging.getLogger(_n).setLevel(logging.CRITICAL)
+        try:
+            yf.set_tz_cache_location(os.path.join(tempfile.gettempdir(), "py-yfinance"))
+        except Exception:
+            pass
     except Exception:
         yf = None
 if OPT.get("fitz"):

@@ -144,6 +144,22 @@ class StageRecord:
     def dur(self) -> float:
         return (self.t_end or time.time()) - self.t_start
 
+    @property
+    def active(self) -> bool:
+        """이 스테이지의 본문을 실제로 수행해야 하는가.
+
+        ★★ 왜 이 속성이 필요한가 — skip_if 의 함정 ★★
+          `PIPE.stage(..., skip_if=True)` 는 **본문을 건너뛰지 못한다.**
+          @contextmanager 로 만든 컨텍스트 매니저는 yield 하는 순간 with 블록의 본문이
+          반드시 실행된다 — 파이썬에 '본문을 안 돌리는 with' 는 없다.
+          그래서 skip_if 는 지금까지 상태 표시(SKIP)와 경고 한 줄만 남기고,
+          정작 건너뛰려던 수집은 그대로 수행돼 왔다. 로그에는 '건너뜀' 이라고 찍히고
+          네트워크로는 나가는, 가장 헷갈리는 형태의 조용한 실패다.
+        → 호출부가 `with PIPE.stage(...) as st: if st.active:` 로 명시적으로 가른다.
+          컨텍스트 매니저가 못 하는 일을 하는 척하지 않는다.
+        """
+        return self.status != "SKIP"
+
 
 class KillCriteria(Exception):
     """§15 킬 기준 위반. 우회하지 말고 사용자에게 보고하고 멈춘다."""
@@ -283,6 +299,8 @@ class Pipeline:
         prev, self.current = self.current, rec
         LOG.ctx.append(sid)
         if skip_if:
+            # ★ 여기서 yield 하면 with 본문은 **그대로 실행된다**(위 StageRecord.active 참조).
+            #   호출부가 `if st.active:` 로 가르지 않으면 '건너뜀' 이라고 찍고도 수집이 돈다.
             rec.status, rec.t_start, rec.t_end = "SKIP", time.time(), time.time()
             rec.notes.append(skip_reason or "조건 미충족")
             LOG.warn(f"건너뜀 — {skip_reason}")

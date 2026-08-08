@@ -57,7 +57,7 @@ def fetch_dart_documents(dis: pd.DataFrame, sec: pd.DataFrame,
                          max_docs: int = 40000) -> pd.DataFrame:
     """사업보고서 원문(document.xml, zip) 수집 → 섹션별 bag-of-words 저장.
     원문은 공용 인덱스에 blob 으로, 토큰 카운트는 전용 인덱스에 테이블로 남긴다."""
-    if not DART_API_KEY:
+    if not dart_has_key():
         LOG.warn("DART_API_KEY 미입력 — PACK-D(공시텍스트)를 구동할 수 없습니다.")
         return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "section", "tokens"])
     cached = VAULT.get_table("dart_doc_tokens", scope="private")
