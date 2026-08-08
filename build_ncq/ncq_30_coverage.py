@@ -13,6 +13,9 @@
 # ║  ★ 브로커 합병은 PIT 로 다룬다. 합병 후 ID 로 과거를 소급 통합하면 '신규'가 조용히 사라진다.║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+# 유동성 게이트 이전(유니버스 통과분) 이벤트 집합 — 민감도 ADV 축이 이걸 다시 거른다.
+NCQ_EV_UNGATED: Optional[pd.DataFrame] = None
+
 EV_COLS = ["month", "code", "event_type", "n_reports", "n_brokers", "sources", "broker_ids",
            "sponsor_group", "report_uids", "first_broker", "analyst_new", "is_denovo"]
 
@@ -181,6 +184,12 @@ def build_coverage_events(REP: pd.DataFrame, UNI: pd.DataFrame, months: pd.Datet
         E["in_uni"] = E["in_uni"].fillna(False).astype(bool)
         E["liq_pass"] = E["liq_pass"].fillna(False).astype(bool)
         n_uni = int(E["in_uni"].sum())
+        # ★★ 유동성 게이트 **이전** 집합을 따로 보존한다.
+        #   민감도의 ADV 축은 이 집합에서 다시 걸러야 의미가 있다. 게이트가 이미 적용된
+        #   EV 에서 ADV 를 낮추면 상위집합이라 아무것도 바뀌지 않아(no-op) 기본 조합과
+        #   비트 단위로 같은 결과가 '독립 시행'으로 계상되고, 그게 Holm/PBO/DSR 의 시행
+        #   횟수를 오염시킨다. ADV 완화 강건성이 한 번도 검정되지 않는 셈이다.
+        globals()["NCQ_EV_UNGATED"] = E[E["in_uni"]].copy()
         E = E[E["liq_pass"]]
     else:
         n_uni = len(E)

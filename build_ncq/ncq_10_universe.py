@@ -192,7 +192,10 @@ def ncq_shares_asof(px_m: pd.DataFrame, shares_hist: pd.DataFrame) -> pd.DataFra
     L = L.sort_values("month", kind="stable")
     R = R.sort_values("knowledge_date", kind="stable")
     try:
-        M = pd.merge_asof(L, R[["code", "knowledge_date", "shares", "shares_src"]],
+        _rcols = ["code", "knowledge_date", "shares", "shares_src"]
+        if "shares_eff" in R.columns:
+            _rcols.append("shares_eff")
+        M = pd.merge_asof(L, R[_rcols],
                           left_on="month", right_on="knowledge_date",
                           by="code", direction="backward")
     except Exception as e:                                        # noqa
@@ -204,6 +207,13 @@ def ncq_shares_asof(px_m: pd.DataFrame, shares_hist: pd.DataFrame) -> pd.DataFra
         return L
     M = M.drop(columns=[c for c in ("knowledge_date",) if c in M.columns])
     M["shares_src"] = M["shares_src"].fillna("")
+    # ★ 시가총액에는 '수정주가와 단위를 맞춘' shares_eff 를 쓴다(액면분할 보정).
+    #   보정이 없는 소스는 shares 를 그대로 쓴다.
+    if "shares_eff" not in M.columns:
+        M["shares_eff"] = np.nan
+    M["shares_eff"] = pd.to_numeric(M["shares_eff"], errors="coerce").where(
+        pd.to_numeric(M["shares_eff"], errors="coerce").notna(),
+        pd.to_numeric(M["shares"], errors="coerce"))
     return M
 
 
@@ -276,8 +286,11 @@ def build_marketcap_panel(codes: Sequence[str], months: pd.DatetimeIndex,
             base = base[pd.Series(keep, index=base.index)]
         base = base.dropna(subset=["shares"])
         if len(base):
-            base["mcap"] = pd.to_numeric(base["close"], errors="coerce") * \
-                pd.to_numeric(base["shares"], errors="coerce")
+            # 수정종가 × '수정주가 단위로 환산한' 주식수. 두 계열의 단위가 어긋나면
+            # 액면분할 종목의 시총이 배수만큼 틀리고 하위 N 경계가 통째로 오염된다.
+            _sh = pd.to_numeric(base.get("shares_eff"), errors="coerce")
+            _sh = _sh.where(_sh.notna(), pd.to_numeric(base["shares"], errors="coerce"))
+            base["mcap"] = pd.to_numeric(base["close"], errors="coerce") * _sh
             base["mcap_src"] = base["shares_src"].replace("", "unknown")
             M = pd.concat([M, base[MCAP_COLS]], ignore_index=True)
 

@@ -627,20 +627,47 @@ def build_signal_panel(SCORE: pd.DataFrame, EV: pd.DataFrame, UNI: pd.DataFrame,
             pooled = len(pool) > len(g)
         v = pd.to_numeric(pool["event_score"], errors="coerce")
         mu, sd = float(v.mean()), float(v.std(ddof=0))
-        z = (pd.to_numeric(g["event_score"], errors="coerce") - mu) / (sd if sd > 0 else np.nan)
+        own = pd.to_numeric(g["event_score"], errors="coerce")
+        z = (own - mu) / (sd if sd > 0 else np.nan)
         # 표준편차가 0(전원 동일 점수)이면 변별이 불가능하다. 0으로 두고 선정에서 전원 동률 처리.
         z = z.fillna(0.0) if (not np.isfinite(sd) or sd <= 0) else z
+
+        # ★★ 백분위는 **z 를 만든 그 풀** 안에서 매긴다(당월이 아니라).
+        #   과거에는 랭크를 당월 안에서만 매겼는데, rank(pct=True) 의 최솟값이 1/n 이라
+        #   이벤트가 1~2건인 달은 하위 tercile(placebo)이 **구조적으로 공집합**이 된다.
+        #   그러면 그 달 전략 팔은 종목을 담고 placebo 팔은 현금이 되어, P2·채택조건③ 의
+        #   '스프레드'에 선별력과 무관한 시장 베타가 그대로 얹힌다. 선별력이 0인 전략도
+        #   상승장이면 통과할 수 있다는 뜻이다. 풀 기준 경험분포로 매기면 이벤트가 1건인
+        #   달도 그 풀 안에서 상·하위가 정의되어 두 팔이 대칭을 유지한다.
+        pv = v.dropna().to_numpy()
+        if len(pv) >= 2 and np.nanstd(pv) > 0:
+            rp = np.array([float((pv <= x).mean()) if np.isfinite(x) else np.nan
+                           for x in own.to_numpy()], dtype=float)
+        else:
+            rp = np.full(len(g), 0.5)      # 변별 불가 → 어느 tercile 에도 넣지 않는다
         t = g.copy()
         t["z"] = z.to_numpy()
+        t["rank_pct"] = rp
         t["pooled"] = pooled
         t["pool_n"] = int(len(pool))
         rows.append(t)
     Z = pd.concat(rows, ignore_index=True) if rows else E
+    if "rank_pct" not in Z.columns:
+        Z["rank_pct"] = np.nan
 
-    # 월별 백분위 랭크 → 상·하위 tercile
-    Z["rank_pct"] = Z.groupby("month", observed=True)["z"].rank(pct=True, method="average")
+    # 상·하위 tercile (풀 기준 경험 백분위)
     Z["selected"] = Z["rank_pct"] >= (1.0 - tp)
     Z["placebo"] = Z["rank_pct"] <= tp
+    # 두 팔의 대칭성을 실제로 확인한다 — 비대칭이면 P2 가 베타를 재게 되므로 그대로 보고한다.
+    _bal = Z.groupby("month", observed=True).agg(
+        s=("selected", "sum"), p=("placebo", "sum")).reset_index()
+    _bad = _bal[(_bal["s"] > 0) & (_bal["p"] <= 0)]
+    if len(_bad):
+        LOG.warn(f"선정군은 있는데 대조군(placebo)이 비는 달이 {len(_bad)}개 있습니다 "
+                 f"(예: {', '.join(str(x)[:7] for x in _bad['month'].head(4))}). "
+                 f"그 달의 P2 스프레드에는 선별력이 아니라 시장 베타가 섞입니다 — "
+                 f"이벤트 수가 너무 적은 구간이니 결과 해석 시 감안하세요.")
+        manifest_put("months_placebo_empty", int(len(_bad)))
 
     # 월 신규 편입 상한 (§10 — 초과 시 z 상위 N 으로 절단)
     if NCQ_MAX_NEW_PER_MONTH and NCQ_MAX_NEW_PER_MONTH > 0:

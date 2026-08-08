@@ -764,15 +764,28 @@ def run_contract_tests(strict: bool = True) -> bool:
             return False, f"폐지 종목 {code} 이 한 번도 보유되지 않았습니다(선정 로직 확인)"
         h["month"] = as_ts_series(h["month"])
         h = h.sort_values("month")
-        at = h[h["month"] == dm]
+        # ★ 어느 '인덱스'에 손실이 찍혀야 하는가 — 수익률 인덱싱 규약에서 유도된다.
+        #   fwd_ret(m) = exec_px(m)→exec_px(m+1) 이고 exec_px(m) 은 월 m 말일 다음 영업일
+        #   시가이므로, **월 m 라벨의 수익은 달력 m+1 을 덮는다.** 따라서 달력 D 월에 일어난
+        #   폐지는 fwd_ret(D-1) 창 안에서 실현된다. 라벨 D 에 찍으면 종목이 이미 사라진 달의
+        #   수익으로 계상되고, 백테스트 창이 D 에서 끝나면 손실이 아예 사라진다(절단 누락).
+        _mlist = [as_ts(x) for x in ms]
+        _di = _mlist.index(dm)
+        exp_m = _mlist[max(0, _di - 1)]
+        at = h[h["month"] == exp_m]
         if len(at) == 0:
-            return False, (f"★폐지월 {dm:%Y-%m} 에 해당 종목의 보유 기록이 없습니다. "
-                           f"폐지 손실을 계상하지 않고 조용히 사라지면 성과가 부풀려집니다")
+            return False, (f"★폐지({dm:%Y-%m})를 포함하는 선도수익 창 {exp_m:%Y-%m} 에 해당 종목의 "
+                           f"보유 기록이 없습니다. 폐지 손실을 계상하지 않고 조용히 사라지면 "
+                           f"성과가 부풀려집니다")
         got = float(pd.to_numeric(at["ret"], errors="coerce").iloc[0])
         if not np.isfinite(got) or abs(got - hair) > 1e-6:
-            return False, (f"★폐지월 수익이 {ncq_v_num(got,'pct')} 입니다. 명세 §10 은 "
+            return False, (f"★폐지 창({exp_m:%Y-%m}) 수익이 {ncq_v_num(got,'pct')} 입니다. 명세 §10 은 "
                            f"{ncq_v_num(hair,'pct')}(폐지 직전가 -50% 후 현금화)를 요구합니다")
-        after = h[h["month"] > dm]
+        # 해어컷은 정확히 한 번만 — 두 번 찍히면 손실이 이중 계상된다
+        _n_hair = int((np.abs(pd.to_numeric(h["ret"], errors="coerce").to_numpy() - hair) < 1e-6).sum())
+        if _n_hair != 1:
+            return False, f"★폐지 해어컷이 {_n_hair}회 적용됐습니다(정확히 1회여야 합니다)"
+        after = h[h["month"] > exp_m]
         # ★ 전부 NaN 이면 np.nanmax 가 All-NaN slice 경고와 함께 NaN 을 돌려주고,
         #   NaN > 1e-9 는 False 라 검정이 조용히 통과한다. 유한값만 남겨서 비교한다.
         av = pd.to_numeric(after["ret"], errors="coerce").to_numpy(dtype=float) \
@@ -1834,7 +1847,7 @@ def run_selftest(full_chain: bool = False) -> bool:
             ew = None
             if ncq_has("bench_universe_ew"):
                 try:
-                    ew = bench_universe_ew(UNI, pxm, months)
+                    ew = bench_universe_ew(UNI, pxm, months, uni_obj)
                 except Exception as e:                              # noqa
                     LOG.warn(f"합성 벤치마크 생성 실패({type(e).__name__}) — 폴백을 씁니다.")
             if ew is None or len(ew) == 0:

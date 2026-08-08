@@ -142,8 +142,15 @@ def ncq_make_runners(ctx: dict, months_eff: pd.DatetimeIndex):
             U["liq_pass"] = U["in_uni"] & (pd.to_numeric(U["adv20"], errors="coerce") >= float(min_adv))
             ok = set(zip(U.loc[U["liq_pass"], "month"].to_numpy(),
                          U.loc[U["liq_pass"], "code"].astype(str)))
-            keep = [(m, c) in ok for m, c in zip(EV["month"].to_numpy(), EV["code"].astype(str))]
-            E = EV[pd.Series(keep, index=EV.index)]
+            # ★ 반드시 '게이트 이전' 집합에서 다시 거른다. EV 는 기본 ADV 로 이미 걸러진
+            #   상태라 ADV 를 낮춰도 아무것도 늘지 않는다(무동작 → 중복 시행).
+            base_ev = globals().get("NCQ_EV_UNGATED")
+            src = base_ev if (isinstance(base_ev, pd.DataFrame) and len(base_ev)) else EV
+            keep = [(m, c) in ok for m, c in zip(src["month"].to_numpy(), src["code"].astype(str))]
+            E = src[pd.Series(keep, index=src.index)]
+            if len(E) == len(EV) and float(min_adv) < float(NCQ_MIN_ADV):
+                LOG.warn(f"ADV {min_adv/1e8:.1f}억 조합의 이벤트 수가 기본과 같습니다 — "
+                         f"게이트 이전 집합이 없어 이 축이 무동작일 수 있습니다.")
         return build_signal_panel(SCORE, E, U, pxm, months_eff, top_pct=top_pct)
 
     return run_fn, build_sig_fn
@@ -217,12 +224,21 @@ def main() -> dict:
     ctx = ncq_phase1(ctx, months)
 
     # ── 유효 윈도우 판정 (명세 §15-2 — 5년 미만이면 중단하고 보고) ────────────────────────
-    yrs = float(MANIFEST.get("valid_backtest_years", 0.0) or 0.0)
     burn_end = (as_ts(ctx["valid_start"]) +
                 pd.DateOffset(months=max(NCQ_LOOKBACK_M, NCQ_BURNIN_M))) + pd.offsets.MonthEnd(0)
     months_eff = months[months >= burn_end]
     manifest_put("months_effective", [str(months_eff[0].date()), str(months_eff[-1].date())]
                  if len(months_eff) else [])
+    # ★★ 5년 게이트는 valid_start 가 아니라 **실제로 매매하는 구간** 기준으로 판정한다.
+    #   valid_start 기준으로 재면 burn-in 24개월이 그대로 부풀려져, "유효 5.8년" 이라고
+    #   적힌 채 3.9년짜리 백테스트가 채택 심사에 올라간다(명세가 금지한 구간).
+    yrs_declared = float(MANIFEST.get("valid_backtest_years", 0.0) or 0.0)
+    yrs = len(months_eff) / 12.0
+    manifest_put("valid_backtest_years_effective", round(yrs, 2))
+    if abs(yrs - yrs_declared) > 0.05:
+        LOG.info(f"유효 윈도우 — 완결성 진단 기준 {yrs_declared:.1f}년, "
+                 f"burn-in {max(NCQ_LOOKBACK_M, NCQ_BURNIN_M)}개월을 뺀 **실매매 구간 "
+                 f"{yrs:.1f}년**. 게이트 판정은 실매매 구간으로 합니다.")
     if yrs < NCQ_MIN_VALID_YEARS and NCQ_STOP_IF_SHORT_WINDOW:
         LOG.banner("⛔ 중단 — 유효 백테스트 윈도우 부족",
                    f"유효 {yrs:.1f}년 < 최소 {NCQ_MIN_VALID_YEARS:.0f}년 (명세 §15-2)")
@@ -259,7 +275,7 @@ def main() -> dict:
             ctx["BT_nocap"] = run_fn(ctx["SIG"], adv_cap=False, label="ADV 제약 미적용")
 
         with PIPE.stage("P6.BENCH", "벤치마크 구성", "L3", budget_s=300, critical=False):
-            bench_ew = bench_universe_ew(ctx["UNI"], ctx["pxm"], months_eff)
+            bench_ew = bench_universe_ew(ctx["UNI"], ctx["pxm"], months_eff, ctx["uni_obj"])
             benches: Dict[str, pd.Series] = {"Bottom-N EW(주)": bench_ew}
             benches.update(bench_index(months_eff))
             benches["Placebo(z 하위)"] = ctx["BT_placebo"]["returns"].set_index("month")["ret"]

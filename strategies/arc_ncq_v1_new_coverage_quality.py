@@ -8,7 +8,7 @@
 # ============================================================================================
 #  ARC-NCQ v1.0 — New Coverage × Qualitative Shift
 #  소형주 「신규 애널리스트 커버리지 × 보고서 텍스트 질적 변화」 탐지 전략
-#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0229
+#  백테스트 구간: 2016-08 ~ 2026-07 (10년)   빌드: ncq1.20260808.0240
 #
 #  ── 핵심 가설 ───────────────────────────────────────────────────────────────────────────
 #   시총 하위권 소형주에 **처음으로 리서치 보고서가 붙는 순간**은, 커버리지를 정당화할 사건
@@ -217,7 +217,7 @@ STOP_ON_KILL_CRITERIA = True   # 킬 기준 위반 시 즉시 중단하고 보�
 
 STRATEGY_ID   = "ARC_NCQ_V1"
 STRATEGY_NAME = "ARC-NCQ — 신규 커버리지 × 텍스트 질적 변화"
-BUILD_VERSION = "ncq1.20260808.0229"
+BUILD_VERSION = "ncq1.20260808.0240"
 ACTIVE_PACKS  = []          # (TCD 코어 호환용 — 이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # build/10_ingest_universe.py 의 corpCode 오류 진단이 참조하는 표.
@@ -5513,14 +5513,81 @@ def ncq_build_shares_history(sec: pd.DataFrame, dart_shares: pd.DataFrame,
            .drop(columns=["_p"])
            .sort_values("knowledge_date", kind="stable")
            .reset_index(drop=True))
+    S = ncq_split_adjust_shares(S)
     mix = Counter(S["shares_src"])
-    LOG.table([[k, f"{v:,}", {"dart_pit": "진짜 PIT (접수일자 기준)",
+    LOG.table([[k, f"{v:,}", {"dart_pit": "진짜 PIT (접수일자 기준) · 액면분할 보정 적용",
                               "delist_registry": "폐지원장 상장주식수(생애 상수)",
-                              "approx_const_shares": "현재 주식수(과거 적용 시 근사)"}.get(k, "")]
+                              "approx_const_shares": "현재 주식수(증자 미반영 근사)"}.get(k, "")]
                for k, v in mix.most_common()],
               ["주식수 소스", "행수", "성질"], ["l", "r", "l"],
               title="PIT 상장주식수 소스 구성 — 시가총액의 분모")
     return S
+
+
+def ncq_split_adjust_shares(S: pd.DataFrame) -> pd.DataFrame:
+    """상장주식수를 **수정주가와 같은 단위**로 맞춘다 (shares_eff).
+
+    ★★ 이게 없으면 시가총액이 액면분할 배수만큼 틀린다 — 조용히, 그리고 계통적으로.
+      우리가 곱하는 종가는 전 소스가 **수정주가**다(네이버 siseJson · FDR · pykrx 모두).
+      반면 DART 주식총수현황이 주는 주식수는 **그 시점의 실제(미수정) 주식수**다.
+      1:5 액면분할한 종목의 2018년을 보자.
+        실제:   50,000원 × 100만주 = 500억   (참 시총)
+        계산:   10,000원(수정) × 100만주(PIT) = 100억   ← 1/5 로 축소
+      이 종목은 '시총 하위 1000' 에 부당 편입되고, 분할은 대개 주가 강세 뒤에 일어나므로
+      **사후 성과가 좋은 종목이 계통적으로 소형주 풀에 섞인다.** 정확히 우리가 피해야 할 편향.
+      역설적으로 '현재 주식수 × 과거 수정종가'(approx) 는 분할에 대해서는 정확하다.
+
+    보정 방법: 주식수 시계열의 연속 비율에서 **분할로 보이는 것만** 골라 소급 반영한다.
+      · 비율이 1.8배 이상이면서 정수배에 가까우면 분할(반대는 병합)로 본다.
+      · 유상증자·자사주 소각 같은 '실제 자본 변동'은 수정주가가 반영하지 않으므로 건드리지 않는다.
+        (분할만 걸러내는 이유가 이것이다 — 둘을 같이 처리하면 반대 방향으로 또 틀린다)
+      · 판정이 애매하면 보정하지 않는다. 잘못된 보정이 미보정보다 위험하다.
+    """
+    if S is None or S.empty:
+        return S
+    out = S.copy()
+    out["shares_eff"] = pd.to_numeric(out["shares"], errors="coerce")
+    dart = out["shares_src"].astype(str) == "dart_pit"
+    if not bool(dart.any()):
+        return out
+
+    n_split = 0
+    n_code = 0
+    for code, g in out[dart].groupby("code", observed=True):
+        g = g.sort_values("knowledge_date")
+        v = pd.to_numeric(g["shares"], errors="coerce").to_numpy(dtype=float)
+        if len(v) < 2 or not np.all(np.isfinite(v)) or np.any(v <= 0):
+            continue
+        ratios = v[1:] / v[:-1]
+        split_k = np.ones(len(ratios))
+        for i, r in enumerate(ratios):
+            k = None
+            if r >= 1.8:
+                k = round(float(r))
+                if k < 2 or abs(r - k) > 0.05 * k:
+                    k = None
+            elif 0 < r <= (1.0 / 1.8):
+                inv = round(1.0 / float(r))
+                if inv < 2 or abs((1.0 / r) - inv) > 0.05 * inv:
+                    k = None
+                else:
+                    k = 1.0 / inv
+            if k is not None:
+                split_k[i] = float(k)
+                n_split += 1
+        if np.allclose(split_k, 1.0):
+            continue
+        # 관측 i 이후에 일어난 분할들의 누적 배수를 소급 적용 → 오늘의 단위로 환산
+        cum_after = np.ones(len(v))
+        for i in range(len(v) - 1):
+            cum_after[i] = float(np.prod(split_k[i:]))
+        out.loc[g.index, "shares_eff"] = v * cum_after
+        n_code += 1
+    if n_split:
+        LOG.ok(f"액면분할/병합 {n_split:,}건({n_code:,}종목)을 상장주식수에 소급 반영했습니다 — "
+               f"수정주가와 단위를 맞춰야 시가총액이 배수만큼 틀리지 않습니다.")
+        manifest_put("split_adjusted_codes", int(n_code))
+    return out
 
 
 def ncq_report_sources():
@@ -5743,7 +5810,10 @@ def ncq_shares_asof(px_m: pd.DataFrame, shares_hist: pd.DataFrame) -> pd.DataFra
     L = L.sort_values("month", kind="stable")
     R = R.sort_values("knowledge_date", kind="stable")
     try:
-        M = pd.merge_asof(L, R[["code", "knowledge_date", "shares", "shares_src"]],
+        _rcols = ["code", "knowledge_date", "shares", "shares_src"]
+        if "shares_eff" in R.columns:
+            _rcols.append("shares_eff")
+        M = pd.merge_asof(L, R[_rcols],
                           left_on="month", right_on="knowledge_date",
                           by="code", direction="backward")
     except Exception as e:                                        # noqa
@@ -5755,6 +5825,13 @@ def ncq_shares_asof(px_m: pd.DataFrame, shares_hist: pd.DataFrame) -> pd.DataFra
         return L
     M = M.drop(columns=[c for c in ("knowledge_date",) if c in M.columns])
     M["shares_src"] = M["shares_src"].fillna("")
+    # ★ 시가총액에는 '수정주가와 단위를 맞춘' shares_eff 를 쓴다(액면분할 보정).
+    #   보정이 없는 소스는 shares 를 그대로 쓴다.
+    if "shares_eff" not in M.columns:
+        M["shares_eff"] = np.nan
+    M["shares_eff"] = pd.to_numeric(M["shares_eff"], errors="coerce").where(
+        pd.to_numeric(M["shares_eff"], errors="coerce").notna(),
+        pd.to_numeric(M["shares"], errors="coerce"))
     return M
 
 
@@ -5827,8 +5904,11 @@ def build_marketcap_panel(codes: Sequence[str], months: pd.DatetimeIndex,
             base = base[pd.Series(keep, index=base.index)]
         base = base.dropna(subset=["shares"])
         if len(base):
-            base["mcap"] = pd.to_numeric(base["close"], errors="coerce") * \
-                pd.to_numeric(base["shares"], errors="coerce")
+            # 수정종가 × '수정주가 단위로 환산한' 주식수. 두 계열의 단위가 어긋나면
+            # 액면분할 종목의 시총이 배수만큼 틀리고 하위 N 경계가 통째로 오염된다.
+            _sh = pd.to_numeric(base.get("shares_eff"), errors="coerce")
+            _sh = _sh.where(_sh.notna(), pd.to_numeric(base["shares"], errors="coerce"))
+            base["mcap"] = pd.to_numeric(base["close"], errors="coerce") * _sh
             base["mcap_src"] = base["shares_src"].replace("", "unknown")
             M = pd.concat([M, base[MCAP_COLS]], ignore_index=True)
 
@@ -6455,6 +6535,9 @@ def coverage_completeness(REP: pd.DataFrame, months: pd.DatetimeIndex
 # ║  ★ 브로커 합병은 PIT 로 다룬다. 합병 후 ID 로 과거를 소급 통합하면 '신규'가 조용히 사라진다.║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+# 유동성 게이트 이전(유니버스 통과분) 이벤트 집합 — 민감도 ADV 축이 이걸 다시 거른다.
+NCQ_EV_UNGATED: Optional[pd.DataFrame] = None
+
 EV_COLS = ["month", "code", "event_type", "n_reports", "n_brokers", "sources", "broker_ids",
            "sponsor_group", "report_uids", "first_broker", "analyst_new", "is_denovo"]
 
@@ -6623,6 +6706,12 @@ def build_coverage_events(REP: pd.DataFrame, UNI: pd.DataFrame, months: pd.Datet
         E["in_uni"] = E["in_uni"].fillna(False).astype(bool)
         E["liq_pass"] = E["liq_pass"].fillna(False).astype(bool)
         n_uni = int(E["in_uni"].sum())
+        # ★★ 유동성 게이트 **이전** 집합을 따로 보존한다.
+        #   민감도의 ADV 축은 이 집합에서 다시 걸러야 의미가 있다. 게이트가 이미 적용된
+        #   EV 에서 ADV 를 낮추면 상위집합이라 아무것도 바뀌지 않아(no-op) 기본 조합과
+        #   비트 단위로 같은 결과가 '독립 시행'으로 계상되고, 그게 Holm/PBO/DSR 의 시행
+        #   횟수를 오염시킨다. ADV 완화 강건성이 한 번도 검정되지 않는 셈이다.
+        globals()["NCQ_EV_UNGATED"] = E[E["in_uni"]].copy()
         E = E[E["liq_pass"]]
     else:
         n_uni = len(E)
@@ -7357,20 +7446,47 @@ def build_signal_panel(SCORE: pd.DataFrame, EV: pd.DataFrame, UNI: pd.DataFrame,
             pooled = len(pool) > len(g)
         v = pd.to_numeric(pool["event_score"], errors="coerce")
         mu, sd = float(v.mean()), float(v.std(ddof=0))
-        z = (pd.to_numeric(g["event_score"], errors="coerce") - mu) / (sd if sd > 0 else np.nan)
+        own = pd.to_numeric(g["event_score"], errors="coerce")
+        z = (own - mu) / (sd if sd > 0 else np.nan)
         # 표준편차가 0(전원 동일 점수)이면 변별이 불가능하다. 0으로 두고 선정에서 전원 동률 처리.
         z = z.fillna(0.0) if (not np.isfinite(sd) or sd <= 0) else z
+
+        # ★★ 백분위는 **z 를 만든 그 풀** 안에서 매긴다(당월이 아니라).
+        #   과거에는 랭크를 당월 안에서만 매겼는데, rank(pct=True) 의 최솟값이 1/n 이라
+        #   이벤트가 1~2건인 달은 하위 tercile(placebo)이 **구조적으로 공집합**이 된다.
+        #   그러면 그 달 전략 팔은 종목을 담고 placebo 팔은 현금이 되어, P2·채택조건③ 의
+        #   '스프레드'에 선별력과 무관한 시장 베타가 그대로 얹힌다. 선별력이 0인 전략도
+        #   상승장이면 통과할 수 있다는 뜻이다. 풀 기준 경험분포로 매기면 이벤트가 1건인
+        #   달도 그 풀 안에서 상·하위가 정의되어 두 팔이 대칭을 유지한다.
+        pv = v.dropna().to_numpy()
+        if len(pv) >= 2 and np.nanstd(pv) > 0:
+            rp = np.array([float((pv <= x).mean()) if np.isfinite(x) else np.nan
+                           for x in own.to_numpy()], dtype=float)
+        else:
+            rp = np.full(len(g), 0.5)      # 변별 불가 → 어느 tercile 에도 넣지 않는다
         t = g.copy()
         t["z"] = z.to_numpy()
+        t["rank_pct"] = rp
         t["pooled"] = pooled
         t["pool_n"] = int(len(pool))
         rows.append(t)
     Z = pd.concat(rows, ignore_index=True) if rows else E
+    if "rank_pct" not in Z.columns:
+        Z["rank_pct"] = np.nan
 
-    # 월별 백분위 랭크 → 상·하위 tercile
-    Z["rank_pct"] = Z.groupby("month", observed=True)["z"].rank(pct=True, method="average")
+    # 상·하위 tercile (풀 기준 경험 백분위)
     Z["selected"] = Z["rank_pct"] >= (1.0 - tp)
     Z["placebo"] = Z["rank_pct"] <= tp
+    # 두 팔의 대칭성을 실제로 확인한다 — 비대칭이면 P2 가 베타를 재게 되므로 그대로 보고한다.
+    _bal = Z.groupby("month", observed=True).agg(
+        s=("selected", "sum"), p=("placebo", "sum")).reset_index()
+    _bad = _bal[(_bal["s"] > 0) & (_bal["p"] <= 0)]
+    if len(_bad):
+        LOG.warn(f"선정군은 있는데 대조군(placebo)이 비는 달이 {len(_bad)}개 있습니다 "
+                 f"(예: {', '.join(str(x)[:7] for x in _bad['month'].head(4))}). "
+                 f"그 달의 P2 스프레드에는 선별력이 아니라 시장 베타가 섞입니다 — "
+                 f"이벤트 수가 너무 적은 구간이니 결과 해석 시 감안하세요.")
+        manifest_put("months_placebo_empty", int(len(_bad)))
 
     # 월 신규 편입 상한 (§10 — 초과 시 z 상위 N 으로 절단)
     if NCQ_MAX_NEW_PER_MONTH and NCQ_MAX_NEW_PER_MONTH > 0:
@@ -7538,6 +7654,114 @@ def _ncq_ret_matrix(pxm: pd.DataFrame, months: pd.DatetimeIndex) -> Tuple[pd.Dat
     return RM, AM
 
 
+def ncq_gap_return_matrix(pxm: pd.DataFrame, months: pd.DatetimeIndex) -> pd.DataFrame:
+    """거래정지 구간의 '갭 수익'을 재개월에 계상하기 위한 행렬 (월 × 종목).
+
+    ★ 왜 필요한가 — 조용히 사라지던 손실
+      build_price_panel 은 월 연속성이 끊기면 fwd_ret 을 NaN 으로 만든다(건너뛴 달의 수익을
+      한 달 수익으로 계상하지 않기 위함). 그런데 백테스트는 NaN 을 '정지 마킹 = 0%' 로 처리한다.
+      두 방어가 겹치면 **정지 직전 → 재개 사이의 갭 수익이 어느 쪽에도 계상되지 않는다.**
+      7개월 정지 후 -80% 로 재개한 종목의 -80% 가 통째로 증발하고 코호트 수익이 과대계상된다.
+      폐지원장에 없는 '정지→재개' 종목이라 -50% 해어컷 경로도 타지 않는다.
+
+    ★ 모델링 원칙: **정지된 주식은 팔 수 없다.** 그래서 정지 구간은 0% 로 두되, 재개 시점에
+      exec_px(재개) / exec_px(정지직전) - 1 을 한 번에 계상한다. 보유기간이 정지 중에 끝나면
+      청산이 재개월로 이연된다(현실과 같다).
+
+    반환: 재개월(month) × 종목(code) 행렬. 값은 갭 수익. 갭이 없으면 NaN.
+    """
+    empty = pd.DataFrame(index=months)
+    if pxm is None or pxm.empty or "exec_px" not in pxm.columns:
+        return empty
+    p = (pxm.dropna(subset=["code", "month", "exec_px"])
+            .drop_duplicates(["code", "month"], keep="last")
+            .sort_values(["code", "month"]))
+    if p.empty:
+        return empty
+    mi = (as_ts_series(p["month"]).dt.year * 12 + as_ts_series(p["month"]).dt.month)
+    p = p.assign(_mi=mi.to_numpy())
+    g = p.groupby("code", observed=True)
+    prev_px = g["exec_px"].shift(1)
+    prev_mi = g["_mi"].shift(1)
+    gap_m = p["_mi"] - prev_mi
+    is_gap = gap_m.notna() & (gap_m > 1) & prev_px.notna() & (prev_px > 0)
+    if not bool(is_gap.any()):
+        return empty
+    r = pd.DataFrame({
+        "month": as_ts_series(p.loc[is_gap, "month"]),
+        "code": p.loc[is_gap, "code"].astype(str),
+        "gap_ret": (pd.to_numeric(p.loc[is_gap, "exec_px"], errors="coerce") /
+                    pd.to_numeric(prev_px[is_gap], errors="coerce") - 1.0),
+        "gap_months": gap_m[is_gap].astype(float),
+    }).dropna(subset=["gap_ret"])
+    if r.empty:
+        return empty
+    GM = r.drop_duplicates(["month", "code"], keep="last").pivot(
+        index="month", columns="code", values="gap_ret").reindex(months)
+    LOG.info(f"거래정지 갭 {len(r):,}건을 재개월 수익으로 계상합니다 "
+             f"(평균 {r['gap_months'].mean():.1f}개월 정지 · 평균 갭수익 "
+             f"{100*r['gap_ret'].mean():+.1f}%). 계상하지 않으면 정지 중 손실이 증발합니다.")
+    return GM
+
+
+def ncq_effective_return_matrix(pxm: pd.DataFrame, months: pd.DatetimeIndex,
+                                delist_map: Optional[dict] = None
+                                ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """전략과 벤치마크가 **똑같이** 쓰는 실효 수익률 행렬을 한 번만 만든다.
+
+    ★ 왜 공유해야 하는가 — 비대칭이 곧 가짜 알파다
+      예전에는 전략만 상장폐지 -50% 와 정지 마킹 0% 를 짊어지고, 주 벤치마크(Bottom-N EW)는
+      `mean(skipna=True)` 로 그 종목들을 **평균에서 조용히 빼** 버렸다. 그러면 벤치마크는
+      생존자편향이 걸린 채 위로 뜨고, 전략은 아래로 눌린다. 부호가 어느 쪽으로 틀리든
+      "같은 규약으로 비교했다"는 주장이 성립하지 않는다. 한 행렬을 공유해 원천 차단한다.
+
+    적용 순서:
+      ① 거래정지 갭 수익을 재개월에 곱셈으로 합성 (ncq_gap_return_matrix)
+      ② 상장폐지: 폐지일을 포함하는 **선도 수익 창**의 달에 -50%, 그 이후는 0 (명세 §10)
+         (fwd_ret(m) 은 exec_px(m)→exec_px(m+1) 구간이므로 폐지월의 한 달 **전** 인덱스다)
+      ③ 나머지 결측은 소비자가 0(정지 마킹)으로 채운다 — 여기서 채우지 않는다.
+
+    반환: (E 실효수익행렬, AM 거래대금행렬)
+    """
+    RM, AM = _ncq_ret_matrix(pxm, months)
+    if RM.empty:
+        return RM, AM
+    E = RM.copy()
+
+    GM = ncq_gap_return_matrix(pxm, months)
+    if not GM.empty:
+        GM = GM.reindex(index=E.index, columns=E.columns)
+        m = GM.notna()
+        if bool(m.to_numpy().any()):
+            E = E.where(~m, (1.0 + GM.fillna(0.0)) * (1.0 + E.fillna(0.0)) - 1.0)
+
+    n_del = 0
+    if delist_map:
+        pos = {mm: i for i, mm in enumerate(months)}
+        cols = set(map(str, E.columns))
+        for code, dd in delist_map.items():
+            c = str(code)
+            if c not in cols or dd is None or pd.isna(dd):
+                continue
+            d = as_ts(dd)
+            # 폐지일이 속한 달의 한 달 전 인덱스 = 그 폐지를 포함하는 선도수익 창
+            hit = None
+            for mm, i in pos.items():
+                if mm >= d:
+                    hit = i - 1
+                    break
+            if hit is None or hit < 0:
+                continue
+            E.iloc[hit, E.columns.get_loc(c)] = NCQ_DELIST_HAIRCUT
+            if hit + 1 < len(months):
+                E.iloc[hit + 1:, E.columns.get_loc(c)] = 0.0
+            n_del += 1
+    if n_del:
+        LOG.info(f"상장폐지 {n_del:,}종목에 폐지 직전가 {100*NCQ_DELIST_HAIRCUT:+.0f}% 후 현금화를 "
+                 f"적용했습니다 — **전략과 벤치마크 양쪽에 동일하게** 반영됩니다(생존자편향 차단).")
+    return E, AM
+
+
 def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame,
                          uni_obj: Optional["Universe"], months: pd.DatetimeIndex,
                          hold_months: Optional[int] = None, sel_col: str = "selected",
@@ -7560,17 +7784,18 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
     if SIG is None or SIG.empty or sel_col not in SIG.columns:
         return empty
 
-    RM, AM = _ncq_ret_matrix(pxm, months)
-    if RM.empty:
-        LOG.warn("수익률 행렬이 비어 백테스트를 수행할 수 없습니다(가격 패널 확인).")
-        return empty
-    mon_pos = {m: i for i, m in enumerate(months)}
     delist = {}
     if uni_obj is not None:
         try:
             delist = uni_obj.delisting_map()
         except Exception:
             delist = {}
+    # ★ 벤치마크와 **동일한** 실효 수익률 행렬을 쓴다(폐지·정지 처리 비대칭 차단).
+    RM, AM = ncq_effective_return_matrix(pxm, months, delist)
+    if RM.empty:
+        LOG.warn("수익률 행렬이 비어 백테스트를 수행할 수 없습니다(가격 패널 확인).")
+        return empty
+    mon_pos = {m: i for i, m in enumerate(months)}
 
     S = SIG[SIG[sel_col].fillna(False).astype(bool)].copy()
     S = S[S["month"].isin(months)]
@@ -7616,8 +7841,6 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
         port_cost[c0] += float(w.sum()) * e_cost
         turnover[c0] += float(w.sum())
 
-        alive = np.ones(k, dtype=bool)
-        haircut_done = np.zeros(k, dtype=bool)
         cum = np.ones(k)
         n_held = np.zeros(k, dtype=int)
         for h in range(H):
@@ -7627,24 +7850,11 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
             m_t = months[t]
             row = RM.loc[m_t].reindex(names)
             r = pd.to_numeric(row, errors="coerce").to_numpy(dtype=float)
-            for j, cd in enumerate(names):
-                if not alive[j]:
-                    r[j] = 0.0
-                    continue
-                dl = delist.get(cd)
-                if dl is not None and pd.notna(dl) and as_ts(dl) <= m_t + pd.offsets.MonthEnd(0):
-                    # 상장폐지: 폐지 직전가 -50% 적용 후 현금화 (명세 §10)
-                    if not haircut_done[j]:
-                        r[j] = NCQ_DELIST_HAIRCUT
-                        haircut_done[j] = True
-                    else:
-                        r[j] = 0.0
-                    alive[j] = False
-                elif not np.isfinite(r[j]):
-                    # 거래정지·데이터 결손 → 정지 직전가로 마킹(수익 0). 재개 시 실가가 들어온다.
-                    r[j] = 0.0
-                else:
-                    n_held[j] += 1
+            # 결측 = 거래정지/데이터 결손 → 정지 직전가로 마킹(0%). 팔 수 없으므로 보유가 이어지고,
+            # 재개 시점의 갭 수익은 ncq_effective_return_matrix 가 이미 그 달에 합성해 두었다.
+            fin = np.isfinite(r)
+            n_held += fin.astype(int)
+            r = np.where(fin, r, 0.0)
             port_ret[t] += float(np.dot(w, r))
             invested[t] += float(w.sum())
             n_names[t] += float(np.sum(w > 0))
@@ -7684,22 +7894,44 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
 
 
 # ── 벤치마크 ────────────────────────────────────────────────────────────────────────────────
-def bench_universe_ew(UNI: pd.DataFrame, pxm: pd.DataFrame,
-                      months: pd.DatetimeIndex) -> pd.Series:
+def bench_universe_ew(UNI: pd.DataFrame, pxm: pd.DataFrame, months: pd.DatetimeIndex,
+                      uni_obj: Optional["Universe"] = None) -> pd.Series:
     """주 벤치마크 — 동일 유니버스 동일가중(Bottom-N EW).
 
     ★ 이것이 진짜 비교 대상이다. KOSDAQ 지수와 비교하면 '소형주 프리미엄'을 알파로 착각한다.
-      같은 유니버스, 같은 유동성 필터, 같은 체결 규약에서 동일가중으로 담았을 때와 비교해야
+      같은 유니버스, 같은 유동성 필터, **같은 실효 수익률 행렬**로 담았을 때와 비교해야
       신호의 순수 기여가 드러난다.
+
+    ★★ 과거 버그: `mean(skipna=True)` 로 결측을 평균에서 빼면, 상장폐지·거래정지 종목이
+       벤치마크에서만 조용히 사라져 벤치마크에 생존자편향이 생긴다(전략은 -50%/0% 를 짊어짐).
+       그 비대칭은 그대로 가짜 알파(또는 가짜 부진)가 된다. 이제 전략과 **같은 행렬**을 쓰고
+       결측은 양쪽 모두 0(정지 마킹)으로 채운다.
     """
     if UNI is None or UNI.empty or pxm is None or pxm.empty:
         return pd.Series(np.nan, index=months, name="Bottom-N EW")
-    u = UNI[UNI["liq_pass"].fillna(False).astype(bool)][["month", "code"]]
-    j = u.merge(pxm[["month", "code", "fwd_ret"]], on=["month", "code"], how="left")
-    s = j.groupby("month", observed=True)["fwd_ret"].mean().reindex(months)
-    s.name = "Bottom-N EW"
-    n = j.groupby("month", observed=True)["code"].size().reindex(months)
-    LOG.info(f"주 벤치마크(Bottom-N EW) 구성 — 월평균 {float(n.mean() or 0):,.0f}종목 동일가중")
+    delist = {}
+    if uni_obj is not None:
+        try:
+            delist = uni_obj.delisting_map()
+        except Exception:
+            delist = {}
+    E, _ = ncq_effective_return_matrix(pxm, months, delist)
+    if E.empty:
+        return pd.Series(np.nan, index=months, name="Bottom-N EW")
+    u = UNI[UNI["liq_pass"].fillna(False).astype(bool)][["month", "code"]].copy()
+    u["code"] = u["code"].astype(str)
+    vals, cnts = [], []
+    cols = set(map(str, E.columns))
+    for m in months:
+        names = [c for c in u.loc[u["month"] == m, "code"].tolist() if c in cols]
+        if not names:
+            vals.append(np.nan); cnts.append(0); continue
+        r = pd.to_numeric(E.loc[m].reindex(names), errors="coerce").to_numpy(dtype=float)
+        r = np.where(np.isfinite(r), r, 0.0)      # 전략과 동일한 '정지 마킹' 규약
+        vals.append(float(r.mean())); cnts.append(len(names))
+    s = pd.Series(vals, index=months, name="Bottom-N EW")
+    LOG.info(f"주 벤치마크(Bottom-N EW) 구성 — 월평균 {np.mean(cnts):,.0f}종목 동일가중 · "
+             f"전략과 동일한 실효 수익률 행렬 사용(폐지 -50%·정지 0% 동일 적용)")
     return s
 
 
@@ -7734,7 +7966,12 @@ def bench_index(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
         d.columns = [str(c).lower() for c in d.columns]
         d["date"] = as_ts_series(d[d.columns[0]])
         d["month"] = d["date"] + pd.offsets.MonthEnd(0)
-        s = d.groupby("month")["close"].last().pct_change().reindex(months)
+        # ★★ 인덱싱 규약을 전략과 맞춘다. 전략·주벤치의 fwd_ret(m) 은 exec_px(m)→exec_px(m+1),
+        #    즉 '월 m 라벨 = 달력 m+1 수익'이다. 반면 pct_change() 는 close(m-1)→close(m),
+        #    즉 '월 m 라벨 = 달력 m 수익'이라 **한 달 어긋난다.** shift(-1) 로 맞추지 않으면
+        #    2020-02 라벨에서 전략의 3월(코로나 폭락)과 지수의 2월을 빼는 일이 벌어지고,
+        #    지수 대비 초과·HAC t 가 통째로 다른 달끼리 뺀 값이 된다.
+        s = d.groupby("month")["close"].last().pct_change().shift(-1).reindex(months)
         s.name = name
         out[name] = s
     if out:
@@ -12438,15 +12675,28 @@ def run_contract_tests(strict: bool = True) -> bool:
             return False, f"폐지 종목 {code} 이 한 번도 보유되지 않았습니다(선정 로직 확인)"
         h["month"] = as_ts_series(h["month"])
         h = h.sort_values("month")
-        at = h[h["month"] == dm]
+        # ★ 어느 '인덱스'에 손실이 찍혀야 하는가 — 수익률 인덱싱 규약에서 유도된다.
+        #   fwd_ret(m) = exec_px(m)→exec_px(m+1) 이고 exec_px(m) 은 월 m 말일 다음 영업일
+        #   시가이므로, **월 m 라벨의 수익은 달력 m+1 을 덮는다.** 따라서 달력 D 월에 일어난
+        #   폐지는 fwd_ret(D-1) 창 안에서 실현된다. 라벨 D 에 찍으면 종목이 이미 사라진 달의
+        #   수익으로 계상되고, 백테스트 창이 D 에서 끝나면 손실이 아예 사라진다(절단 누락).
+        _mlist = [as_ts(x) for x in ms]
+        _di = _mlist.index(dm)
+        exp_m = _mlist[max(0, _di - 1)]
+        at = h[h["month"] == exp_m]
         if len(at) == 0:
-            return False, (f"★폐지월 {dm:%Y-%m} 에 해당 종목의 보유 기록이 없습니다. "
-                           f"폐지 손실을 계상하지 않고 조용히 사라지면 성과가 부풀려집니다")
+            return False, (f"★폐지({dm:%Y-%m})를 포함하는 선도수익 창 {exp_m:%Y-%m} 에 해당 종목의 "
+                           f"보유 기록이 없습니다. 폐지 손실을 계상하지 않고 조용히 사라지면 "
+                           f"성과가 부풀려집니다")
         got = float(pd.to_numeric(at["ret"], errors="coerce").iloc[0])
         if not np.isfinite(got) or abs(got - hair) > 1e-6:
-            return False, (f"★폐지월 수익이 {ncq_v_num(got,'pct')} 입니다. 명세 §10 은 "
+            return False, (f"★폐지 창({exp_m:%Y-%m}) 수익이 {ncq_v_num(got,'pct')} 입니다. 명세 §10 은 "
                            f"{ncq_v_num(hair,'pct')}(폐지 직전가 -50% 후 현금화)를 요구합니다")
-        after = h[h["month"] > dm]
+        # 해어컷은 정확히 한 번만 — 두 번 찍히면 손실이 이중 계상된다
+        _n_hair = int((np.abs(pd.to_numeric(h["ret"], errors="coerce").to_numpy() - hair) < 1e-6).sum())
+        if _n_hair != 1:
+            return False, f"★폐지 해어컷이 {_n_hair}회 적용됐습니다(정확히 1회여야 합니다)"
+        after = h[h["month"] > exp_m]
         # ★ 전부 NaN 이면 np.nanmax 가 All-NaN slice 경고와 함께 NaN 을 돌려주고,
         #   NaN > 1e-9 는 False 라 검정이 조용히 통과한다. 유한값만 남겨서 비교한다.
         av = pd.to_numeric(after["ret"], errors="coerce").to_numpy(dtype=float) \
@@ -13508,7 +13758,7 @@ def run_selftest(full_chain: bool = False) -> bool:
             ew = None
             if ncq_has("bench_universe_ew"):
                 try:
-                    ew = bench_universe_ew(UNI, pxm, months)
+                    ew = bench_universe_ew(UNI, pxm, months, uni_obj)
                 except Exception as e:                              # noqa
                     LOG.warn(f"합성 벤치마크 생성 실패({type(e).__name__}) — 폴백을 씁니다.")
             if ew is None or len(ew) == 0:
@@ -13746,8 +13996,15 @@ def ncq_make_runners(ctx: dict, months_eff: pd.DatetimeIndex):
             U["liq_pass"] = U["in_uni"] & (pd.to_numeric(U["adv20"], errors="coerce") >= float(min_adv))
             ok = set(zip(U.loc[U["liq_pass"], "month"].to_numpy(),
                          U.loc[U["liq_pass"], "code"].astype(str)))
-            keep = [(m, c) in ok for m, c in zip(EV["month"].to_numpy(), EV["code"].astype(str))]
-            E = EV[pd.Series(keep, index=EV.index)]
+            # ★ 반드시 '게이트 이전' 집합에서 다시 거른다. EV 는 기본 ADV 로 이미 걸러진
+            #   상태라 ADV 를 낮춰도 아무것도 늘지 않는다(무동작 → 중복 시행).
+            base_ev = globals().get("NCQ_EV_UNGATED")
+            src = base_ev if (isinstance(base_ev, pd.DataFrame) and len(base_ev)) else EV
+            keep = [(m, c) in ok for m, c in zip(src["month"].to_numpy(), src["code"].astype(str))]
+            E = src[pd.Series(keep, index=src.index)]
+            if len(E) == len(EV) and float(min_adv) < float(NCQ_MIN_ADV):
+                LOG.warn(f"ADV {min_adv/1e8:.1f}억 조합의 이벤트 수가 기본과 같습니다 — "
+                         f"게이트 이전 집합이 없어 이 축이 무동작일 수 있습니다.")
         return build_signal_panel(SCORE, E, U, pxm, months_eff, top_pct=top_pct)
 
     return run_fn, build_sig_fn
@@ -13821,12 +14078,21 @@ def main() -> dict:
     ctx = ncq_phase1(ctx, months)
 
     # ── 유효 윈도우 판정 (명세 §15-2 — 5년 미만이면 중단하고 보고) ────────────────────────
-    yrs = float(MANIFEST.get("valid_backtest_years", 0.0) or 0.0)
     burn_end = (as_ts(ctx["valid_start"]) +
                 pd.DateOffset(months=max(NCQ_LOOKBACK_M, NCQ_BURNIN_M))) + pd.offsets.MonthEnd(0)
     months_eff = months[months >= burn_end]
     manifest_put("months_effective", [str(months_eff[0].date()), str(months_eff[-1].date())]
                  if len(months_eff) else [])
+    # ★★ 5년 게이트는 valid_start 가 아니라 **실제로 매매하는 구간** 기준으로 판정한다.
+    #   valid_start 기준으로 재면 burn-in 24개월이 그대로 부풀려져, "유효 5.8년" 이라고
+    #   적힌 채 3.9년짜리 백테스트가 채택 심사에 올라간다(명세가 금지한 구간).
+    yrs_declared = float(MANIFEST.get("valid_backtest_years", 0.0) or 0.0)
+    yrs = len(months_eff) / 12.0
+    manifest_put("valid_backtest_years_effective", round(yrs, 2))
+    if abs(yrs - yrs_declared) > 0.05:
+        LOG.info(f"유효 윈도우 — 완결성 진단 기준 {yrs_declared:.1f}년, "
+                 f"burn-in {max(NCQ_LOOKBACK_M, NCQ_BURNIN_M)}개월을 뺀 **실매매 구간 "
+                 f"{yrs:.1f}년**. 게이트 판정은 실매매 구간으로 합니다.")
     if yrs < NCQ_MIN_VALID_YEARS and NCQ_STOP_IF_SHORT_WINDOW:
         LOG.banner("⛔ 중단 — 유효 백테스트 윈도우 부족",
                    f"유효 {yrs:.1f}년 < 최소 {NCQ_MIN_VALID_YEARS:.0f}년 (명세 §15-2)")
@@ -13863,7 +14129,7 @@ def main() -> dict:
             ctx["BT_nocap"] = run_fn(ctx["SIG"], adv_cap=False, label="ADV 제약 미적용")
 
         with PIPE.stage("P6.BENCH", "벤치마크 구성", "L3", budget_s=300, critical=False):
-            bench_ew = bench_universe_ew(ctx["UNI"], ctx["pxm"], months_eff)
+            bench_ew = bench_universe_ew(ctx["UNI"], ctx["pxm"], months_eff, ctx["uni_obj"])
             benches: Dict[str, pd.Series] = {"Bottom-N EW(주)": bench_ew}
             benches.update(bench_index(months_eff))
             benches["Placebo(z 하위)"] = ctx["BT_placebo"]["returns"].set_index("month")["ret"]

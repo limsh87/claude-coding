@@ -411,14 +411,81 @@ def ncq_build_shares_history(sec: pd.DataFrame, dart_shares: pd.DataFrame,
            .drop(columns=["_p"])
            .sort_values("knowledge_date", kind="stable")
            .reset_index(drop=True))
+    S = ncq_split_adjust_shares(S)
     mix = Counter(S["shares_src"])
-    LOG.table([[k, f"{v:,}", {"dart_pit": "진짜 PIT (접수일자 기준)",
+    LOG.table([[k, f"{v:,}", {"dart_pit": "진짜 PIT (접수일자 기준) · 액면분할 보정 적용",
                               "delist_registry": "폐지원장 상장주식수(생애 상수)",
-                              "approx_const_shares": "현재 주식수(과거 적용 시 근사)"}.get(k, "")]
+                              "approx_const_shares": "현재 주식수(증자 미반영 근사)"}.get(k, "")]
                for k, v in mix.most_common()],
               ["주식수 소스", "행수", "성질"], ["l", "r", "l"],
               title="PIT 상장주식수 소스 구성 — 시가총액의 분모")
     return S
+
+
+def ncq_split_adjust_shares(S: pd.DataFrame) -> pd.DataFrame:
+    """상장주식수를 **수정주가와 같은 단위**로 맞춘다 (shares_eff).
+
+    ★★ 이게 없으면 시가총액이 액면분할 배수만큼 틀린다 — 조용히, 그리고 계통적으로.
+      우리가 곱하는 종가는 전 소스가 **수정주가**다(네이버 siseJson · FDR · pykrx 모두).
+      반면 DART 주식총수현황이 주는 주식수는 **그 시점의 실제(미수정) 주식수**다.
+      1:5 액면분할한 종목의 2018년을 보자.
+        실제:   50,000원 × 100만주 = 500억   (참 시총)
+        계산:   10,000원(수정) × 100만주(PIT) = 100억   ← 1/5 로 축소
+      이 종목은 '시총 하위 1000' 에 부당 편입되고, 분할은 대개 주가 강세 뒤에 일어나므로
+      **사후 성과가 좋은 종목이 계통적으로 소형주 풀에 섞인다.** 정확히 우리가 피해야 할 편향.
+      역설적으로 '현재 주식수 × 과거 수정종가'(approx) 는 분할에 대해서는 정확하다.
+
+    보정 방법: 주식수 시계열의 연속 비율에서 **분할로 보이는 것만** 골라 소급 반영한다.
+      · 비율이 1.8배 이상이면서 정수배에 가까우면 분할(반대는 병합)로 본다.
+      · 유상증자·자사주 소각 같은 '실제 자본 변동'은 수정주가가 반영하지 않으므로 건드리지 않는다.
+        (분할만 걸러내는 이유가 이것이다 — 둘을 같이 처리하면 반대 방향으로 또 틀린다)
+      · 판정이 애매하면 보정하지 않는다. 잘못된 보정이 미보정보다 위험하다.
+    """
+    if S is None or S.empty:
+        return S
+    out = S.copy()
+    out["shares_eff"] = pd.to_numeric(out["shares"], errors="coerce")
+    dart = out["shares_src"].astype(str) == "dart_pit"
+    if not bool(dart.any()):
+        return out
+
+    n_split = 0
+    n_code = 0
+    for code, g in out[dart].groupby("code", observed=True):
+        g = g.sort_values("knowledge_date")
+        v = pd.to_numeric(g["shares"], errors="coerce").to_numpy(dtype=float)
+        if len(v) < 2 or not np.all(np.isfinite(v)) or np.any(v <= 0):
+            continue
+        ratios = v[1:] / v[:-1]
+        split_k = np.ones(len(ratios))
+        for i, r in enumerate(ratios):
+            k = None
+            if r >= 1.8:
+                k = round(float(r))
+                if k < 2 or abs(r - k) > 0.05 * k:
+                    k = None
+            elif 0 < r <= (1.0 / 1.8):
+                inv = round(1.0 / float(r))
+                if inv < 2 or abs((1.0 / r) - inv) > 0.05 * inv:
+                    k = None
+                else:
+                    k = 1.0 / inv
+            if k is not None:
+                split_k[i] = float(k)
+                n_split += 1
+        if np.allclose(split_k, 1.0):
+            continue
+        # 관측 i 이후에 일어난 분할들의 누적 배수를 소급 적용 → 오늘의 단위로 환산
+        cum_after = np.ones(len(v))
+        for i in range(len(v) - 1):
+            cum_after[i] = float(np.prod(split_k[i:]))
+        out.loc[g.index, "shares_eff"] = v * cum_after
+        n_code += 1
+    if n_split:
+        LOG.ok(f"액면분할/병합 {n_split:,}건({n_code:,}종목)을 상장주식수에 소급 반영했습니다 — "
+               f"수정주가와 단위를 맞춰야 시가총액이 배수만큼 틀리지 않습니다.")
+        manifest_put("split_adjusted_codes", int(n_code))
+    return out
 
 
 def ncq_report_sources():
