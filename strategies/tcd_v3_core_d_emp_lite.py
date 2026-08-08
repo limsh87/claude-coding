@@ -406,7 +406,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.1319"
+BUILD_VERSION  = "v3.20260808.1321"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -13942,7 +13942,10 @@ def preflight_dart_v3() -> str:
         f"    ③ RUN_MODE='CACHED' — 신규 수집 없이 캐시만으로 재현합니다.\n"
         f"    ④ 키가 문제라면 상단 DART_API_KEY 를 확인하세요 "
         f"(https://opendart.fss.or.kr → 인증키 신청/관리).")
-    if (DART_FS_MAX_CALLS or 0) == 0 and (EMP_MAX_CALLS or 0) == 0:
+    # ★ None(무제한)과 0(수집 안 함)은 정반대 의도인데 `(v or 0) == 0` 은 둘을 같게 만든다.
+    #   그대로 두면 상한을 안 걸어 둔 실행이 'DART 를 안 쓰는 실행'으로 오인돼 조용히
+    #   CACHE_ONLY 로 빠진다 — 기본값이 무제한이 된 지금은 **모든 실행**이 그렇게 된다.
+    if DART_FS_MAX_CALLS == 0 and EMP_MAX_CALLS == 0:
         LOG.warn("DART 상한이 둘 다 0 이므로 애초에 DART 를 쓰지 않는 실행입니다 — 계속합니다.")
         return "CACHE_ONLY"
     raise KillCriteria(

@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_P"
 STRATEGY_NAME      = "PACK-P 조달청 낙찰"
 ACTIVE_PACKS       = ["P"]
-BUILD_VERSION      = "v2.20260808.1305"
+BUILD_VERSION      = "v2.20260808.1322"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -570,6 +570,22 @@ class StageRecord:
     def dur(self) -> float:
         return (self.t_end or time.time()) - self.t_start
 
+    @property
+    def active(self) -> bool:
+        """이 스테이지의 본문을 실제로 수행해야 하는가.
+
+        ★★ 왜 이 속성이 필요한가 — skip_if 의 함정 ★★
+          `PIPE.stage(..., skip_if=True)` 는 **본문을 건너뛰지 못한다.**
+          @contextmanager 로 만든 컨텍스트 매니저는 yield 하는 순간 with 블록의 본문이
+          반드시 실행된다 — 파이썬에 '본문을 안 돌리는 with' 는 없다.
+          그래서 skip_if 는 지금까지 상태 표시(SKIP)와 경고 한 줄만 남기고,
+          정작 건너뛰려던 수집은 그대로 수행돼 왔다. 로그에는 '건너뜀' 이라고 찍히고
+          네트워크로는 나가는, 가장 헷갈리는 형태의 조용한 실패다.
+        → 호출부가 `with PIPE.stage(...) as st: if st.active:` 로 명시적으로 가른다.
+          컨텍스트 매니저가 못 하는 일을 하는 척하지 않는다.
+        """
+        return self.status != "SKIP"
+
 
 class KillCriteria(Exception):
     """§15 킬 기준 위반. 우회하지 말고 사용자에게 보고하고 멈춘다."""
@@ -709,6 +725,8 @@ class Pipeline:
         prev, self.current = self.current, rec
         LOG.ctx.append(sid)
         if skip_if:
+            # ★ 여기서 yield 하면 with 본문은 **그대로 실행된다**(위 StageRecord.active 참조).
+            #   호출부가 `if st.active:` 로 가르지 않으면 '건너뜀' 이라고 찍고도 수집이 돈다.
             rec.status, rec.t_start, rec.t_end = "SKIP", time.time(), time.time()
             rec.notes.append(skip_reason or "조건 미충족")
             LOG.warn(f"건너뜀 — {skip_reason}")
@@ -8009,8 +8027,18 @@ def _run_backtest_inner(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Univers
     last_seen = (_pm.groupby("code", observed=True)["month"].max().to_dict()
                  if len(_pm) else {})
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 월별 인덱스를 **한 번만** 만든다. 예전엔 매달 `P[P["month"] == m].copy()` 로
+    #    전체 패널에 불리언 마스크를 걸고 복사했다 — 120개월이면 패널을 120번 완주하고
+    #    120번 복사한다. 그리고 이 함수는 강건성 스위트에서 26번 재실행되므로
+    #    그 비용이 그대로 26배가 된다. 실측상 L5 의 지배적 병목이었다.
+    #    groupby(...).indices 는 한 번의 패스로 월→행위치 배열을 만들어 준다(원칙 3).
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _midx = P.groupby("month", observed=True).indices if len(P) else {}
     for i, m in enumerate(months):
-        sub = P[(P["month"] == m)].copy()
+        _rows_i = _midx.get(m)
+        sub = (P.take(np.asarray(_rows_i)) if _rows_i is not None and len(_rows_i)
+               else P.iloc[0:0])
         if sub.empty:
             rows.append({"month": m, "ret": 0.0, "n": 0, "turnover": 0.0, "cost": 0.0})
             continue
