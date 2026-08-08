@@ -83,7 +83,8 @@ PRICE_CHAIN = [("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf),
 
 
 # ═══ 상장주식수 — DART 주식총수현황 (비KRX · PIT 완전) ═══════════════════════════════════════
-def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
+def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int],
+                      corp_years: Optional[Dict[str, Sequence[int]]] = None) -> pd.DataFrame:
     """DART '주식의 총수 현황'. 접수일(rcept_dt) 기준이라 PIT 가 구조적으로 보장된다.
     KRX 시가총액 스냅샷의 완전한 대체재이며, 오히려 PIT 관점에서는 더 낫다."""
     cols = ["corp_code", "period_end", "knowledge_date", "shares_total"]
@@ -115,7 +116,9 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Dat
         if len(miss):
             LOG.info(f"DART 주식총수 '자료없음' 원장 {len(miss):,}건은 {MISS_RETRY_DAYS}일간 "
                      f"재조회하지 않습니다(빈 응답 반복 방지).")
-    jobs = [(c, y) for c in corp_codes for y in years
+    #   corp_years 를 주면 '그 회사가 실제로 필요한 연도'만 받는다(수요 기반).
+    jobs = [(c, y) for c in corp_codes
+            for y in (corp_years.get(str(c), years) if corp_years else years)
             if (str(c), str(y)) not in have and (str(c), str(y)) not in miss]
     if RUN_MODE == "CACHED":
         jobs = []
@@ -355,6 +358,9 @@ def naver_frgn_flows(code: str, start: str, end: str, max_pages: int = 40
 
 # ═══ 다중소스 코드 발굴 · 상장/폐지 창 재구성 (KRX 없이 C2·C13 성립) ══════════════════════════
 UNIV_SRC_LEDGER: List[dict] = []
+# 종목별 '후보였던 연도 구간' — DART 처럼 비싼 수집의 범위를 여기에 맞춘다.
+# (전 종목 × 전 연도로 받으면 11만 콜이지만, 살 수 있었던 종목의 그 시기만 받으면 수천 콜이다)
+CANDIDATE_YEARS: Dict[str, Tuple[int, int]] = {}
 
 
 def discover_codes_multi(sec: pd.DataFrame) -> pd.DataFrame:
@@ -574,6 +580,15 @@ def select_flow_targets(px: pd.DataFrame, start: str, end: str,
     ranked = first_hit.sort_values(ascending=False)
     capped = ranked.head(max_codes) if max_codes and max_codes > 0 else ranked
     kept = set(capped.index.astype(str))
+
+    # 후보였던 연도 구간을 기록 (DART 수집 범위의 근거)
+    CANDIDATE_YEARS.clear()
+    _hit = sub[sub["cand"]]
+    if len(_hit):
+        _yr = _hit.groupby("code", observed=True)["date"].agg(["min", "max"])
+        for c, r in _yr.iterrows():
+            CANDIDATE_YEARS[str(c)] = (int(pd.Timestamp(r["min"]).year),
+                                       int(pd.Timestamp(r["max"]).year))
 
     tot_w = float(weeks_per_code.sum())
     lost_w = float(weeks_per_code[~weeks_per_code.index.isin(kept)].sum())

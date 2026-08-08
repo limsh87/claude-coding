@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_C"
 STRATEGY_NAME      = "PACK-C 자본배분 체제 전환"
 ACTIVE_PACKS       = ["C"]
-BUILD_VERSION      = "v2.20260808.0422"
+BUILD_VERSION      = "v2.20260808.0433"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -3456,7 +3456,11 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 DART_BASE = "https://opendart.fss.or.kr/api/"
-DART_DAILY_LIMIT = 19_000                 # 공식 20,000 대비 여유
+# ★ 하드코딩 상한을 두지 않는다. DART 는 '남은 호출량' 조회 API 를 제공하지 않으므로,
+#   실시간 잔여를 아는 유일한 방법은 '한도 초과(status=020)를 받을 때까지 쓰는 것'이다.
+#   0 = 적응형(권장): 020 이 올 때까지 쓰고, 그 순간 멈춰 받은 만큼 저장한다.
+#   양수 = 사용자가 직접 정한 상한(키를 다른 프로그램과 공유할 때만 의미가 있다).
+DART_DAILY_LIMIT = 0
 DART_STATEMENT_FREQ = "quarterly"         # "quarterly" | "annual"
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
 REPRT_DEADLINE_DAYS = {"11013": 45, "11012": 45, "11014": 45, "11011": 90}
@@ -3472,12 +3476,20 @@ DART_STATUS_MSG = {
 
 
 class DartBudget:
-    """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다."""
+    """호출량을 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다.
+
+    ★ 설계 원칙: 상한을 미리 정하지 않는다.
+      DART OpenAPI 에는 '오늘 남은 호출수' 를 알려주는 엔드포인트가 없다. 그래서 예전처럼
+      19,000 같은 숫자를 박아두면 (a) 실제 한도보다 적게 쓰거나 (b) 다른 프로그램이 같은
+      키를 쓰면 넘겨버린다. 둘 다 추측이다.
+      → 실시간 잔여를 아는 유일한 방법은 'status=020(한도초과)이 올 때까지 쓰는 것'이다.
+        020 을 받으면 그 날짜를 기록해 같은 날 재실행이 헛되이 두드리지 않게 한다."""
 
     def __init__(self):
         self.today = _dt.date.today().isoformat()
         self.n = 0
         self.exhausted = False
+        self.adaptive = (not DART_DAILY_LIMIT) or DART_DAILY_LIMIT <= 0
         self._lk = threading.Lock()
         self._load()
 
@@ -3489,16 +3501,41 @@ class DartBudget:
             j = json.loads(open(self._path()).read())
             if j.get("date") == self.today:
                 self.n = int(j.get("n", 0))
+                self.exhausted = bool(j.get("exhausted", False))
         except Exception:
             pass
-        if self.n:
-            LOG.info(f"오늘 이미 사용한 DART 호출 {self.n:,}건 (한도 {DART_DAILY_LIMIT:,}) — 이어서 진행합니다.")
+        if self.exhausted:
+            LOG.warn("오늘 이미 DART 일일 한도(status=020)를 받았습니다 — 이번 실행에서는 "
+                     "DART 를 호출하지 않고 캐시로만 진행합니다. 자정 이후 재실행하면 이어받습니다.")
+        elif self.n:
+            LOG.info(f"오늘 이미 사용한 DART 호출 {self.n:,}건 "
+                     f"({'적응형: 한도 도달 시 자동 중단' if self.adaptive else f'사용자 상한 {DART_DAILY_LIMIT:,}'})"
+                     f" — 이어서 진행합니다.")
 
     def _save(self):
         try:
-            atomic_write_text(self._path(), json.dumps({"date": self.today, "n": self.n}))
+            atomic_write_text(self._path(), json.dumps(
+                {"date": self.today, "n": self.n, "exhausted": self.exhausted}))
         except Exception:
             pass
+
+    def mark_exhausted(self):
+        """API 가 020 을 반환한 순간 = 진짜 잔여 0. 이 사실을 그 날짜로 못박는다."""
+        with self._lk:
+            if not self.exhausted:
+                self.exhausted = True
+                LOG.warn(f"DART 일일 한도 도달(status=020) — 오늘 {self.n:,}건 사용했습니다. "
+                         f"여기까지 받은 데이터는 드라이브에 저장되어 있고, 자정 이후 재실행하면 "
+                         f"정확히 이 지점부터 이어받습니다.")
+                self._save()
+
+    def report(self):
+        LOG.table([["오늘 사용", f"{self.n:,}건"],
+                   ["모드", "적응형(한도 도달 시 자동 중단)" if self.adaptive
+                    else f"사용자 상한 {DART_DAILY_LIMIT:,}"],
+                   ["한도 도달", "예 — 자정 이후 재실행" if self.exhausted else "아니오"]],
+                  ["DART 호출 예산", "값"], ["l", "r"],
+                  title="DART 호출 사용량 (잔여 조회 API 가 없어 '실사용량'으로 관리합니다)")
 
     def refund(self, k: int = 1):
         if k <= 0:
@@ -3508,12 +3545,13 @@ class DartBudget:
 
     def take(self, k: int = 1) -> bool:
         with self._lk:
-            if self.n + k > DART_DAILY_LIMIT:
-                if not self.exhausted:
-                    self.exhausted = True
-                    LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
-                             f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
-                             f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
+            if self.exhausted:
+                return False                     # 020 을 이미 받았다 = 진짜 잔여 0
+            if (not self.adaptive) and self.n + k > DART_DAILY_LIMIT:
+                self.exhausted = True
+                LOG.warn(f"사용자 지정 상한({DART_DAILY_LIMIT:,})에 도달했습니다. "
+                         f"적응형으로 쓰려면 DART_DAILY_LIMIT=0 으로 두세요.")
+                self._save()
                 return False
             self.n += k
             if self.n % 500 == 0:
@@ -3547,11 +3585,11 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             if DBUDGET is not None:
-                DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+                DBUDGET.mark_exhausted()
+        elif st == "021":
+            LOG.warn("DART status=021 (조회 가능 회사 개수 초과) — 배치 크기를 줄여 재시도하세요.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -3668,7 +3706,9 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
 
 def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
-                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                          priority: Optional[Sequence[str]] = None,
+                          reprt_codes: Optional[Sequence[str]] = None,
+                          corp_years: Optional[Dict[str, Sequence[int]]] = None) -> pd.DataFrame:
     """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
 
     priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
@@ -3685,27 +3725,28 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
-    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
-              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    reprts = list(reprt_codes) if reprt_codes else (
+        [REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
+        else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
     # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
     corp_sorted = sorted((str(c) for c in corp_codes),
                          key=lambda c: (order.get(c, 10 ** 9), c))
-    jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
-            if (c, int(y), str(r)) not in done]
+    #   corp_years 를 주면 회사마다 '필요한 연도'만 받는다. 전 종목 × 전 연도는 11만 콜이고
+    #   그 대부분은 '살 수도 없었던 종목의 현금흐름'이다(수요 기반 수집).
+    def _yrs_for(c: str) -> Sequence[int]:
+        return corp_years.get(str(c), years) if corp_years else years
+    jobs = [(c, y, r) for c in corp_sorted for y in sorted(_yrs_for(c), reverse=True)
+            for r in reprts if (c, int(y), str(r)) not in done]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
         total_needed = len(jobs)
-        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
-                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
-        if total_needed > DART_DAILY_LIMIT:
-            LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
-                     f"오늘 받을 수 있는 만큼 받고 저장합니다. "
-                     f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
-                     f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
+        LOG.info(f"DART 전체 재무제표 신규 수집 대상 {total_needed:,}건 "
+                 f"(대상 {len(corp_sorted):,}사 × {len(years)}년 × {len(reprts)}보고서 · "
+                 f"오늘 사용 {DBUDGET.n if DBUDGET else 0:,}건)")
         res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
         got = [d for d in res if d is not None and len(d)]
     else:

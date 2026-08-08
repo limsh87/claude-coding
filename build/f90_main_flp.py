@@ -42,7 +42,8 @@ def offer_download(paths: Sequence[str]):
             _safe_print(f"⬇  산출물 경로: {p}")
 
 
-def preflight_estimate(n_codes: int, n_flow_targets: int, n_corps: int, n_years: int) -> None:
+def preflight_estimate(n_codes: int, n_flow_targets: int, n_corps: int, n_years: int,
+                       n_cand_corps: int = 0) -> None:
     """수집을 시작하기 '전에' 예상 소요시간을 계산해 보여준다(§9 — 추측 말고 계측).
 
     4시간 하드 제약을 넘길 것 같으면, 어떤 손잡이를 어떻게 돌려야 하는지까지 같이 출력한다.
@@ -53,7 +54,17 @@ def preflight_estimate(n_codes: int, n_flow_targets: int, n_corps: int, n_years:
     est.append(("가격 일봉", px_req, qps("naver"), px_req / qps("naver") / 60))
     fl_pages = n_flow_targets * 9         # 10년 ≈ pageSize 300 × 9페이지
     est.append(("투자자 수급(네이버)", fl_pages, qps("naver"), fl_pages / qps("naver") / 60))
-    ds_req = min(DART_SHARES_MAX_CALLS or 10 ** 9, n_corps * n_years)
+    # DART 는 '수요 기반' 이다 — 전 종목 × 전 분기가 아니라, 배치 + 후보 종목만.
+    batch_req = (n_corps // max(DART_MULTI_BATCH, 1) + 1) * n_years * 4
+    est.append(("DART 주요계정(100사/콜)", batch_req, qps("dart"), batch_req / qps("dart") / 60))
+    scope_corps = (n_corps if DART_FULL_SCOPE == "all"
+                   else (n_cand_corps if DART_FULL_SCOPE == "candidates" else 0))
+    full_req = scope_corps * n_years * (1 if DART_FULL_ANNUAL_FIRST else 4)
+    est.append((f"DART 전체 재무제표[{DART_FULL_SCOPE}]", full_req, qps("dart"),
+                full_req / qps("dart") / 60))
+    ds_req = (n_cand_corps or n_corps) * n_years if USE_DART_SHARES else 0
+    if DART_SHARES_MAX_CALLS:
+        ds_req = min(ds_req, DART_SHARES_MAX_CALLS)
     est.append(("DART 주식총수", ds_req, qps("dart"), ds_req / qps("dart") / 60))
     total = sum(x[3] for x in est)
     LOG.table([[n, f"{r:,}", f"{q:.1f}/s", f"{m:.0f}분"] for n, r, q, m in est] +
@@ -205,8 +216,12 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         targets = select_flow_targets(ctx["px"], BACKTEST_START, BACKTEST_END)
         ctx["flow_targets"] = targets
         _yrs = max(1, as_ts(BACKTEST_END).year - as_ts(BACKTEST_START).year + 3)
+        _c2c0 = (ctx["sec"].dropna(subset=["corp_code"])
+                 .set_index("code")["corp_code"].astype(str).to_dict())
+        _ncand = len({_c2c0[c] for c in targets if c in _c2c0})
         preflight_estimate(len(ctx["sec"]), len(targets),
-                           int(ctx["sec"]["corp_code"].notna().sum()), _yrs)
+                           int(ctx["sec"]["corp_code"].notna().sum()), _yrs,
+                           n_cand_corps=_ncand)
         ctx["flows"] = fetch_investor_flows_daily(targets or ctx["sec"]["code"].tolist(),
                                                   BACKTEST_START, BACKTEST_END, sec=ctx["sec"])
 
@@ -218,9 +233,15 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
                 .sort_values(ascending=False))
         _c2c = (ctx["sec"].dropna(subset=["corp_code"])
                 .set_index("code")["corp_code"].astype(str).to_dict())
-        _corps = [_c2c[c] for c in _amt.index if c in _c2c]
-        _corps += [c for c in ctx["sec"]["corp_code"].dropna().astype(str).unique()
-                   if c not in set(_corps)]
+        _cand = set(ctx.get("flow_targets") or [])
+        _corps = [_c2c[c] for c in _amt.index if c in _c2c and (not _cand or c in _cand)]
+        if not USE_DART_SHARES:
+            _corps = []
+            LOG.info("USE_DART_SHARES=False — PIT 시총 분모를 받지 않고 거래대금 대리로 갑니다 "
+                     "(f_cr 은 자기이력 백분위라 스케일 차이에 둔감합니다).")
+        elif _cand:
+            LOG.info(f"주식총수는 후보 종목 {len(_corps):,}사만 받습니다 "
+                     f"(전 종목이면 {int(ctx['sec']['corp_code'].notna().sum()) * len(_years):,}콜).")
         if DART_SHARES_MAX_CALLS and len(_corps) * len(_years) > DART_SHARES_MAX_CALLS:
             keep_n = max(1, DART_SHARES_MAX_CALLS // max(len(_years), 1))
             LOG.warn(f"DART 주식총수 호출 예상 {len(_corps)*len(_years):,}건이 상한 "
@@ -228,7 +249,12 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
                      f"나머지 종목의 시총 분모는 '거래대금 20일합' 대리로 대체되며, "
                      f"f_cr 은 자기이력 백분위라 스케일 차이에 둔감합니다.")
             _corps = _corps[:keep_n]
-        ctx["dart_shares"] = fetch_dart_shares(_corps, _years)
+        _cy: Dict[str, List[int]] = {}
+        for _code, (_a, _b) in (CANDIDATE_YEARS or {}).items():
+            _cc = _c2c.get(_code)
+            if _cc:
+                _cy[_cc] = [y for y in range(_a - 1, _b + 2) if min(_years) <= y <= max(_years)]
+        ctx["dart_shares"] = fetch_dart_shares(_corps, _years, corp_years=_cy or None)
         ctx["shares"] = fetch_shares_outstanding(months, sec=ctx["sec"],
                                                  dart_shares=ctx.get("dart_shares"))
 
@@ -241,21 +267,88 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
                f"등급 {CREDIT_GRADE} · {CREDIT_SOURCE_NOTE}",
                "PRIMARY 아니면 결과 해석 시 신뢰도 하향")
 
-    with PIPE.stage("L1.DART", "DART 재무 · 공시 (M2 방화벽)", "L1", budget_s=2400, critical=False):
-        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+    with PIPE.stage("L1.DART", "DART 재무 · 공시 (M2 방화벽)", "L1", budget_s=3600, critical=False):
+        corps_all = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
-        if corps and DART_API_KEY:
-            multi = fetch_dart_multi_accounts(corps, years)
-            fs = fetch_dart_financials(corps, years)
+        if corps_all and DART_API_KEY:
+            # ── 호출 계획을 먼저 세우고 표로 보여준다 ──────────────────────────────────
+            #   ★ 이 전략이 DART 에서 실제로 쓰는 것:
+            #      자본총계·부채총계·자산총계·매출액·영업이익·당기순이익 → 주요계정 배치(100사/콜)
+            #      영업활동현금흐름                                    → 전체 재무제표(1사/콜) ★유일
+            #   전 종목 × 11년 × 4분기로 전체 재무제표를 받으면 11만 콜(≈6일)인데,
+            #   그 대부분은 '살 수도 없는 종목의 현금흐름'이다. 후보 종목으로 좁힌다.
+            c2c = (ctx["sec"].dropna(subset=["corp_code"])
+                   .set_index("code")["corp_code"].astype(str).to_dict())
+            cand_codes = ctx.get("flow_targets") or []
+            cand_corps = [c2c[c] for c in cand_codes if c in c2c]
+            if DART_FULL_SCOPE == "all":
+                full_corps = corps_all
+            elif DART_FULL_SCOPE == "off":
+                full_corps = []
+            else:
+                full_corps = cand_corps or corps_all[:0]
+            full_reprts = ([REPRT_CODES["FY"]] if DART_FULL_ANNUAL_FIRST
+                           else [REPRT_CODES["Q1"], REPRT_CODES["H1"],
+                                 REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+            # ★ 회사마다 '후보였던 연도 ±1' 만 받는다. 방화벽은 그 종목을 살 수 있었던
+            #   시점에만 의미가 있으므로, 그 밖의 연도를 받는 것은 그냥 낭비다.
+            y_lo, y_hi = min(years), max(years)
+            corp_years: Dict[str, List[int]] = {}
+            for code, (a, b) in (CANDIDATE_YEARS or {}).items():
+                cc = c2c.get(code)
+                if not cc:
+                    continue
+                rng = [y for y in range(a - 1, b + 2) if y_lo <= y <= y_hi]
+                if rng:
+                    corp_years.setdefault(cc, [])
+                    corp_years[cc] = sorted(set(corp_years[cc]) | set(rng))
+            _yrs_of = lambda c: corp_years.get(c, years)
+            n_batch = (len(corps_all) // DART_MULTI_BATCH + 1) * len(years) * 4
+            n_full = sum(len(_yrs_of(c)) for c in full_corps) * len(full_reprts)
+            n_share = (sum(len(_yrs_of(c)) for c in (cand_corps or corps_all))
+                       if USE_DART_SHARES else 0)
+            LOG.table([
+                ["주요계정 배치(100사/콜)", f"{len(corps_all):,}사 전체", f"{n_batch:,}",
+                 "자본·부채·자산·매출·영업이익·순이익"],
+                [f"전체 재무제표(1사/콜) [{DART_FULL_SCOPE}]", f"{len(full_corps):,}사",
+                 f"{n_full:,}", "영업활동현금흐름 (이것 하나 때문에 씁니다)"],
+                ["주식총수(1사·년/콜)", f"{len(cand_corps or corps_all):,}사" if USE_DART_SHARES
+                 else "off", f"{n_share:,}", "PIT 시총 분모 (없으면 거래대금 대리)"],
+                ["── 합계(캐시 미보유 최악)", "", f"{n_batch + n_full + n_share:,}", ""]],
+                ["DART 수집 계획", "대상", "예상 콜", "쓰이는 곳"], ["l", "r", "r", "l"],
+                title="DART 호출 계획 — 전 종목 × 전 분기 전체 재무제표는 11만 콜입니다. "
+                      "필요한 종목만 받습니다")
+            if DART_FULL_SCOPE == "candidates" and not cand_corps:
+                LOG.warn("후보 종목이 아직 없어(수급 선별 실패) 전체 재무제표를 건너뜁니다 — "
+                         "영업CF 방화벽과 V3 거부권이 비활성화됩니다.")
+
+            multi = fetch_dart_multi_accounts(corps_all, years)      # 전 종목 바닥 (싸다)
+            fs = pd.DataFrame()
+            if len(full_corps):
+                fs = fetch_dart_financials(full_corps, years, priority=full_corps,
+                                           reprt_codes=full_reprts, corp_years=corp_years)
+                # 연간을 다 채우고도 예산이 남아 있으면 분기까지 이어서 받는다
+                if (DART_FULL_ANNUAL_FIRST and DBUDGET is not None
+                        and not DBUDGET.exhausted):
+                    LOG.info("연간 재무제표를 다 받고도 호출 여유가 있어 분기까지 이어받습니다.")
+                    fs_q = fetch_dart_financials(
+                        full_corps, years, priority=full_corps,
+                        reprt_codes=[REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"]],
+                        corp_years=corp_years)
+                    if len(fs_q):
+                        fs = pd.concat([fs, fs_q], ignore_index=True).drop_duplicates(
+                            ["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id",
+                             "account_nm"], keep="last")
             fin = tidy_financials(merge_financial_tiers(fs, multi))
             if len(fin):
                 PIT.register("dart_financials", fin, key_cols=["corp_code"])
             ctx["fin"] = fin
+            ctx["dart_cand_corps"] = cand_corps
+            ctx["dart_corp_years"] = corp_years
             ctx["disclosures"] = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         else:
             # ★ 키가 없다고 '드라이브에 이미 있는 DART 캐시'까지 버리면 안 된다.
             #   v2 전략들이 공용 인덱스에 쌓아둔 재무·공시가 그대로 재사용 가능하다.
-            #   (수집 함수는 키 검사에서 먼저 빠져나가므로 여기서 직접 읽는다)
             cf = VAULT.get_table("dart_financials", scope="shared")
             cd = VAULT.get_table("dart_disclosures", scope="shared")
             if cf is not None and len(cf):
@@ -272,8 +365,7 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
             ctx["disclosures"] = cd if cd is not None else pd.DataFrame()
             if (cf is None or not len(cf)) and (cd is None or not len(cd)):
                 LOG.warn("DART_API_KEY 미입력 + 공용 캐시도 비어 있음 — 방화벽(자본잠식·영업CF)과 "
-                         "V1/V3 거부권이 비활성화됩니다. 이 전략의 단일 실패모드가 그대로 "
-                         "노출되므로 키 입력을 강력히 권합니다.")
+                         "V1/V3 거부권이 비활성화됩니다.")
 
     with PIPE.stage("L1.WATCH", "관리종목 · 거래정지 (K6)", "L1", budget_s=300, critical=False):
         ctx["watch"] = fetch_watchlist_halt(ctx["sec"])
@@ -496,6 +588,7 @@ def main() -> dict:
             outs.append(_p)
         VAULT.flush(); VAULT.compact("shared"); VAULT.compact("private")
         if DBUDGET:
+            DBUDGET.report()
             DBUDGET.close()
         VAULT.report()
         ctx["outputs"] = outs

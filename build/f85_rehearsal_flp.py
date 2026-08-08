@@ -194,6 +194,24 @@ def run_rehearsal(strict: bool = False) -> bool:
         return [("1차", len(todo)), ("2차", len(todo2))]
     _rh("가격 재수집 판정(IPO·폐지·미증가 유예)", _plan)
 
+    # ⑧-c DART 수요기반 수집의 근거 — '후보였던 연도' 가 실제로 기록되는가
+    def _cand_years():
+        px = _synth_daily(40, 500)
+        c0 = px["code"].iloc[0]
+        # 한 종목만 중반에 급락시켜 후보로 만든다
+        m = (px["code"] == c0) & (px["date"] >= px["date"].iloc[250])
+        px.loc[m, "close"] = px.loc[m, "close"] * 0.4
+        select_flow_targets(px, str(px["date"].min().date()),
+                            str(px["date"].max().date()), max_codes=50)
+        if not CANDIDATE_YEARS:
+            raise RuntimeError("후보 연도 구간이 기록되지 않았습니다 — DART 수집 범위의 근거가 없어져 "
+                               "전 종목 × 전 연도(11만 콜)로 되돌아갑니다")
+        y0, y1 = next(iter(CANDIDATE_YEARS.values()))
+        if not (2000 < y0 <= y1 < 2100):
+            raise RuntimeError(f"후보 연도 구간이 비정상: {(y0, y1)}")
+        return [(k, v) for k, v in list(CANDIDATE_YEARS.items())[:3]]
+    _rh("DART 수요기반 범위(후보 연도 구간 기록)", _cand_years)
+
     # ⑨ 드라이브 인덱스 왕복 + adopt (원본을 옮기지 않고 등록만)
     def _vault():
         tmp = os.path.join(VAULT.root, "_rehearsal_adopt")
