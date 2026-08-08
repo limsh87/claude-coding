@@ -26,8 +26,27 @@ def size_bucket_v3(n_emp: float) -> str:
     return SIZE_BUCKETS_V3[-1][2]
 
 
-def build_cells_v3(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
-    """cell = month|ind_mid|size_bucket, 폴백 사다리 = month|ind_mid|ALL → month|ALL|ALL.
+def build_cells_v3(P: pd.DataFrame, sec: pd.DataFrame, tag: str = "") -> pd.DataFrame:
+    """cell = month|ind_mid|size_bucket. 폴백 사다리 4단.
+
+      1단 month|ind_mid|size_bucket   ← 산업·규모 둘 다 중립화
+      2단 month|ind_mid|ALL           ← 규모만 접는다 (큰 산업에서만 성립)
+      3단 month|ind_l1|ALL            ← 산업을 묶는다 (★ 새로 생긴 계단)
+      4단 month|ALL|ALL               ← 전체 시장
+
+    ★★ 왜 3단이 새로 필요한가 — 실측된 사고 ★★
+      v2 는 2단을 거친 산업(industry_l1)으로 내렸는데(build/20_pit.py:363), v3 포팅에서
+      ind_l1 을 계산해 놓고도 2단에 ind_mid 를 그대로 넣어 **1단과 2단이 같이 무너졌다.**
+      스코어링 패널 135,953행 ÷ 120개월 = 월 1,133행인데 업종이 154개라
+      (월 × 업종) 셀이 평균 7.4행 — CELL_MIN_N_V3=8 에 못 미친다.
+      결과: 전 행이 곧바로 '전체 시장' 으로 떨어져 **산업·규모 중립화가 한 번도 일어나지
+      않았는데** 로그와 리포트는 여전히 '셀 = month × ind_mid × size_bucket' 이라고 말했다.
+
+    ★ ind_l1 을 만드는 방법. 업종명 앞 N글자를 자르는 방식은 '반도체와관련장비'와
+      '반도체소재'를 여전히 다른 문자열로 남긴다 — 자른다고 줄어든다는 보장이 없다.
+      그래서 접두 병합 뒤에 **빈도 기반으로 한 번 더 접는다**: 그 그룹이 월평균
+      CELL_MIN_N_V3 행을 못 채우면 '기타'로 합친다. 이러면 3단이 반드시 유효해진다.
+      결과 카디널리티와 셀당 행수를 아래에서 로그로 찍어 검증 가능하게 남긴다.
 
     ★ 직원수가 없으면 규모를 매출 3분위로 대신한다. '미상' 한 덩어리로 두면 그 셀 안에서
       대기업과 소형주가 같은 분포에 섞여 규모효과가 신호로 둔갑한다.
@@ -35,7 +54,13 @@ def build_cells_v3(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
     ind = sec.dropna(subset=["code"]).set_index("code")["industry"].astype(str).to_dict()
     p = P.copy()
     p["ind_mid"] = p["code"].map(ind).fillna("미분류").astype(str).replace("", "미분류")
-    p["ind_l1"] = p["ind_mid"].str.slice(0, 4).replace("", "미분류")
+    # 1차 접기: 업종명 앞 2글자(금융/화학/전기/운수/도매/반도 …). 한국 업종명은 앞머리가 대분류다.
+    _l1 = p["ind_mid"].str.slice(0, 2).replace("", "미분류")
+    # 2차 접기: 그래도 표본이 안 나오는 그룹은 '기타'로 합친다 — 계단이 있어도 못 밟으면 없는 것과 같다.
+    _n_months = max(1, int(p["month"].nunique()))
+    _need = CELL_MIN_N_V3 * _n_months
+    _cnt = _l1.map(_l1.value_counts())
+    p["ind_l1"] = _l1.where(_cnt >= _need, "기타")
 
     # 벡터화(pd.cut). 14만 행 파이썬 루프를 돌 이유가 없다 — 원칙 3 의 취지가 여기에도 적용된다.
     emp = col(p, "employees")
@@ -57,12 +82,30 @@ def build_cells_v3(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
     ym = p["month"].dt.strftime("%Y%m")
     p["cell"] = ym + "|" + p["ind_mid"] + "|" + p["size_bucket"]
     p["cell_l2"] = ym + "|" + p["ind_mid"] + "|ALL"
-    p["cell_l3"] = ym + "|ALL|ALL"
+    p["cell_l3"] = ym + "|" + p["ind_l1"] + "|ALL"
+    p["cell_l4"] = ym + "|ALL|ALL"
 
-    n_small = int((p.groupby("cell", observed=True)["code"].transform("size") < CELL_MIN_N_V3).sum())
-    LOG.info(f"셀 구성 — 1단계 {p['cell'].nunique():,}개 / 2단계 {p['cell_l2'].nunique():,}개 "
-             f"· 표본 {CELL_MIN_N_V3}개 미만 셀에 속한 {n_small:,}행은 조회 시 상위 셀로 폴백")
-    for c in ("cell", "cell_l2", "cell_l3"):
+    # ★ 사다리가 실제로 밟히는지를 숫자로 남긴다. 예전 로그는 셀 **개수**만 찍었는데,
+    #   정작 중요한 것은 '셀당 몇 행이냐'다 — 그게 임계치를 넘어야 그 계단이 존재한다.
+    #   이 표가 없어서 '1단계 45,128개'라는 숫자가 붕괴 신호인 줄 아무도 몰랐다.
+    rows = []
+    for lvl, desc in ((c, d) for c, d in zip(CELL_LADDER_V3,
+                                             ("month|업종|규모", "month|업종|ALL",
+                                              "month|업종군|ALL", "month|ALL|ALL"))):
+        cnt = p.groupby(lvl, observed=True)["code"].transform("count")
+        rows.append([desc, f"{p[lvl].nunique():,}", f"{cnt.median():.1f}",
+                     f"{100 * (cnt >= CELL_MIN_N_V3).mean():.0f}%"])
+    LOG.table(rows, ["폴백 단계", "셀 수", "셀당 행(중앙값)", f"표본≥{CELL_MIN_N_V3} 비율"],
+              ["l", "r", "r", "r"],
+              title=f"셀 사다리 {tag}— {len(p):,}행 · 업종 {p['ind_mid'].nunique():,}개 → "
+                    f"업종군 {p['ind_l1'].nunique():,}개")
+    _usable = [d for (d, _n, _m, r) in rows if float(str(r).rstrip('%')) >= 50.0]
+    if len(_usable) <= 1:
+        LOG.warn(f"셀 사다리에서 실제로 쓸 수 있는 계단이 {len(_usable)}개뿐입니다 "
+                 f"— 산업·규모 중립화가 사실상 전체시장 랭크로 퇴화합니다. "
+                 f"모집단({len(p):,}행 / {p['month'].nunique():,}개월)이 너무 얇거나 "
+                 f"업종 카디널리티가 과도합니다.")
+    for c in CELL_LADDER_V3:
         p[c] = p[c].astype("category")
     return p
 
@@ -182,9 +225,17 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["i_capex"] = safe_div(capex_abs, base3)
 
     # i_ic / i_roic — 투하자본과 그 수익률
+    # ★ 구성항목을 각각 fillna(0) 한 뒤 더하면, 계정이 **하나도 없는** 회사의 IC 가
+    #   결측이 아니라 정확히 0.0 이 된다. 그러면 avg_ic=0 → safe_div 가 정의역 밖으로
+    #   밀어내 ROIC 가 조용히 NaN 이 되고, '왜 0% 인지' 는 어디에도 안 남는다.
+    #   → 하나라도 관측된 행에서만 합성한다(원칙 6 · 이 파일 머리말의 '0 채움 금지').
+    #     관측된 항목만 더하는 것은 여전히 필요하다 — 매입채무만 없는 회사를 통째로
+    #     버릴 이유는 없기 때문이다. 다만 **전부 없는 행은 결측으로 남긴다.**
+    _ic_parts = ["receivable", "inventory", "payable", "ppe", "intangible"]
+    _ic_obs = pd.concat([col(P, c).notna() for c in _ic_parts], axis=1).any(axis=1)
     nwc = (col(P, "receivable").fillna(0) + col(P, "inventory").fillna(0)
            - col(P, "payable").fillna(0))
-    P["IC"] = nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)
+    P["IC"] = (nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)).where(_ic_obs)
     P["i_ic"] = g("IC").transform(lambda s: dlog(s, 12))
     #   NOPAT: 실효세율이 관측되면 그걸 쓰고, 아니면 22% 가정. 셀 내 상대값이라 수준은 무해.
     eff = safe_div(col(P, "tax_expense_ttm"), col(P, "pretax_income_ttm"))
@@ -195,10 +246,18 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["i_roic"] = g("ROIC").diff(12)
 
     # p_payout / p_invest — 자본배분
-    payout = col(P, "dividend_paid_ttm").abs().fillna(0) + col(P, "treasury_buy_ttm").abs().fillna(0)
+    # ★ 같은 함정이 여기 두 번 더 있었다. capex_ttm·rnd_ttm 이 **통째로 없는** 실행에서
+    #   invest 가 0.0 이 되고, revenue_ttm 은 살아 있으니 invest_ratio 가
+    #   '전 종목 정확히 0' 인 **관측된 것처럼 보이는 무의미 센서**가 됐다.
+    #   결측이면 결측인 게 낫다 — 가짜 관측은 MIN_TP_OBSERVED 게이트까지 속인다.
+    _payout_obs = col(P, "dividend_paid_ttm").notna() | col(P, "treasury_buy_ttm").notna()
+    payout = (col(P, "dividend_paid_ttm").abs().fillna(0)
+              + col(P, "treasury_buy_ttm").abs().fillna(0)).where(_payout_obs)
     P["payout_ratio"] = safe_div(payout, col(P, "cfo_ttm"))
     P["p_payout"] = g("payout_ratio").diff(12)
-    invest = col(P, "capex_ttm").abs().fillna(0) + col(P, "rnd_ttm").abs().fillna(0)
+    _invest_obs = col(P, "capex_ttm").notna() | col(P, "rnd_ttm").notna()
+    invest = (col(P, "capex_ttm").abs().fillna(0)
+              + col(P, "rnd_ttm").abs().fillna(0)).where(_invest_obs)
     P["invest_ratio"] = safe_div(invest, col(P, "revenue_ttm"))
     P["p_invest"] = g("invest_ratio").diff(12)
 
@@ -335,9 +394,20 @@ def apply_umid(P: pd.DataFrame, uni: "Universe", band: str = "UMID") -> pd.DataF
              f"규모랭크 [{lo},{hi}] ∩ 거래대금 ≥{adv_min/1e8:.0f}억. "
              f"규모 대리는 20일 평균거래대금 랭크입니다(시총 PIT 복원 불가에 따른 치환).")
     if keep == 0:
-        LOG.warn("U-MID 에 남는 행이 없습니다 — 가격 수집이 실패했거나 유동성 하한이 너무 높습니다. "
-                 "u_mid 필터를 적용하지 않고 전 종목으로 진행합니다(조용히 빈 결과를 내지 않기 위함).")
-        P["u_mid"] = True
+        # ★ 이 폴백은 **본선(UMID)에서만** 정당하다. 비교 대역(SMALL 등)에서 전 행을 True 로
+        #   깔면 '스몰캡 팔'이 조용히 전 종목 팔로 둔갑해, 두 팔이 같은 모집단을 돌면서
+        #   '대역 차이'라는 이름의 결과를 보고하게 된다 — 결론을 만들어내는 실패다.
+        #   호출자(run_smallcap_arm_v3)의 빈-대역 가드는 이 폴백 때문에 영원히 발동하지 않았다.
+        if band == "UMID":
+            LOG.warn("U-MID 에 남는 행이 없습니다 — 가격 수집이 실패했거나 유동성 하한이 너무 높습니다. "
+                     "u_mid 필터를 적용하지 않고 전 종목으로 진행합니다"
+                     "(본선이 조용히 빈 결과를 내지 않기 위함).")
+            P["u_mid"] = True
+        else:
+            LOG.warn(f"{band} 대역에 남는 행이 0 입니다 — 이 대역은 **비어 있는 것이 결과**이므로 "
+                     f"전 종목으로 되돌리지 않습니다. 비교 팔은 건너뜁니다. "
+                     f"(유동성 하한 {adv_min/1e8:.0f}억을 하위 대역이 못 넘긴다는 사실 자체가 "
+                     f"'소형주는 담기 어렵다'는 발견입니다 — 하한을 낮춰 만들어내지 않습니다)")
     return P
 
 

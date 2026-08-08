@@ -67,6 +67,9 @@ class Vault:
         self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
         self._lk = threading.RLock()
         self.stats = Counter()
+        # (파일경로, mtime) → 디코딩된 프레임. 같은 실행에서 같은 테이블을 다시 읽지 않는다.
+        # 드라이브 동기화 폴더에서 수백 MB 파케이 재읽기는 수십 초짜리 비용이다.
+        self._tbl_memo: Dict[tuple, pd.DataFrame] = {}
 
     # ── 경로 --------------------------------------------------------------------------
     def journal(self, scope: str) -> str:
@@ -299,6 +302,14 @@ class Vault:
         except Exception as e:                              # noqa
             LOG.warn(f"테이블 저장 실패({type(e).__name__}): {name}")
             return None
+        # 방금 쓴 내용을 세션 메모에 심어 둔다 — 바로 뒤에 get_table 하는 코드가
+        # 드라이브에서 같은 것을 다시 읽지 않게 한다(수백 MB 파케이면 수십 초다).
+        try:
+            with self._lk:
+                self._tbl_memo = {k: v for k, v in self._tbl_memo.items() if k[0] != path}
+                self._tbl_memo[(path, os.path.getmtime(path))] = df
+        except Exception:                                   # noqa
+            pass
         self._register(scope, {
             "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
             "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
@@ -311,6 +322,18 @@ class Vault:
 
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
+        """정제 테이블 읽기. **같은 실행 안에서는 파일을 한 번만 읽는다.**
+
+        ★ 왜 메모이제이션이 필요한가. 이 파이프라인은 같은 테이블을 한 실행에서 여러 번
+          읽는다 — 예: price_earliest_available 은 fetch_prices 안에서만 2회,
+          dart_employees_ext 는 사전점검·수집·마감에서 3회. 구글드라이브 동기화 폴더는
+          로컬 디스크가 아니라 네트워크 파일시스템에 가까워서, 수백 MB 파케이 한 번 읽기가
+          수십 초다. 그걸 실행마다 중복으로 냈다.
+        ★ 무효화는 mtime 으로 한다. 같은 실행에서 put_table 이 파일을 바꾸면 mtime 이
+          달라지므로 자동으로 다시 읽는다 — 오래된 값을 붙들고 있을 수 없다.
+        ★ 반환은 얕은 복사다. 호출자가 `d["date"] = ...` 처럼 컬럼을 갈아끼워도
+          캐시 원본이 오염되지 않는다(공용 캐시를 제자리에서 고치는 것은 절대1원칙 위반이다).
+        """
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
@@ -320,13 +343,35 @@ class Vault:
                 path = path2
             else:
                 return None
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return None
         if max_age_days is not None:
-            age = (time.time() - os.path.getmtime(path)) / 86400.0
-            if age > max_age_days:
+            if (time.time() - mt) / 86400.0 > max_age_days:
                 return None
+        ck = (path, mt)
+        with self._lk:
+            hit = self._tbl_memo.get(ck)
+        if hit is not None:
+            self.stats["table_memo_hit"] += 1
+            PIPE.io("IN", "MEM", f"table:{name}", hit, source="세션 내 재사용(파일 재읽기 없음)")
+            return hit.copy(deep=False)
+        t0 = time.time()
         d = read_parquet_safe(path)
         if d is not None:
+            with self._lk:
+                # 메모는 (경로, mtime) 키라 무한히 자라지 않는다. 그래도 상한을 둔다.
+                if len(self._tbl_memo) > 64:
+                    self._tbl_memo.clear()
+                self._tbl_memo[ck] = d
+            self.stats["table_read"] += 1
+            _el = time.time() - t0
             PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
+            if _el > 5.0:
+                LOG.info(f"드라이브에서 {name} {len(d):,}행 읽는 데 {_el:.1f}초 — "
+                         f"이번 실행에서 다시 읽지 않습니다(세션 메모).")
+            return d.copy(deep=False)
         return d
 
     def adopt(self, abs_path: str, domain: str, subtype: str, key: str,

@@ -12,6 +12,39 @@
 # ║    를 재게 된다. 아무것도 빼지 않은 널-절제가 ΔSharpe +2.08 로 나온 전례가 있다.            ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+# ★ 셀 랭크 진단 원장. '왜 이 센서가 0% 인가'에 답하기 위한 유일한 기록이다.
+#   예전엔 입력이 통째로 비어 있어도, 표본 미달로 걸려도 결과가 똑같이 NaN 이라
+#   L2 에서 'TP 커버리지 0.0%' 만 보이고 원인은 어디에도 남지 않았다.
+CELL_RANK_DIAG: List[dict] = []
+
+
+def _diag_name(name_or_series) -> str:
+    if isinstance(name_or_series, str):
+        return name_or_series
+    return str(getattr(name_or_series, "name", None) or "<식>")
+
+
+def report_cell_rank_diag(top: int = 24):
+    """센서별 '관측 → 랭크 해결' 표. 어느 계단에서 해결됐는지까지 보여준다."""
+    if not CELL_RANK_DIAG:
+        return
+    seen, rows = set(), []
+    for d in CELL_RANK_DIAG:
+        if d["name"] in seen:
+            continue
+        seen.add(d["name"])
+        lv = d["by_level"]
+        rows.append([d["name"], f"{d['obs']:,}", f"{d['resolved']:,}",
+                     " / ".join(f"{k[-2:] if k != 'cell' else '1단'}:{v:,}"
+                                for k, v in lv.items() if v) or "—",
+                     "입력 없음" if d["obs"] == 0 else
+                     ("표본 미달" if d["resolved"] == 0 else "")])
+    rows = rows[:top]
+    LOG.table(rows, ["센서", "유효관측", "랭크산출", "해결 단계", "비고"],
+              ["l", "r", "r", "l", "l"],
+              title="셀 랭크 진단 — '입력이 없어서'와 '표본이 모자라서'를 구별합니다")
+
+
 def _clean_num(P: pd.DataFrame, name_or_series) -> pd.Series:
     v = col(P, name_or_series) if isinstance(name_or_series, str) else \
         pd.to_numeric(name_or_series, errors="coerce")
@@ -41,16 +74,25 @@ def cell_rank(P: pd.DataFrame, name_or_series, min_n: int = None) -> pd.Series:
     min_n = CELL_MIN_N_V3 if min_n is None else min_n
     v = _clean_num(P, name_or_series)
     if v.notna().sum() == 0:
+        # ★ 입력이 통째로 비었는지, 임계치에 걸려 NaN 이 됐는지는 하류에서 구별할 수 없다.
+        #   둘 다 조용히 NaN 이라 'TP 커버리지 0%' 만 남고 원인이 사라진다 → 여기서 남긴다.
+        CELL_RANK_DIAG.append({"name": _diag_name(name_or_series), "obs": 0,
+                               "resolved": 0, "by_level": {}})
         return pd.Series(np.nan, index=P.index, dtype="float32")
     out = pd.Series(np.nan, index=P.index, dtype="float64")
-    for lvl in ("cell", "cell_l2", "cell_l3"):
+    _by_lvl = {}
+    for lvl in CELL_LADDER_V3:
         if lvl not in P.columns:
             continue
         need = out.isna() & v.notna()
         if not need.any():
             break
         r, n = _rank_in(v, P[lvl], min_n)
-        out = out.where(~need, r.where(n >= min_n))
+        got = r.where(n >= min_n)
+        _by_lvl[lvl] = int((need & got.notna()).sum())
+        out = out.where(~need, got)
+    CELL_RANK_DIAG.append({"name": _diag_name(name_or_series), "obs": int(v.notna().sum()),
+                           "resolved": int(out.notna().sum()), "by_level": _by_lvl})
     return out.astype("float32")
 
 
@@ -61,7 +103,7 @@ def cell_z(P: pd.DataFrame, name_or_series, min_n: int = None) -> pd.Series:
     if v.notna().sum() == 0:
         return pd.Series(np.nan, index=P.index, dtype="float32")
     out = pd.Series(np.nan, index=P.index, dtype="float64")
-    for lvl in ("cell", "cell_l2", "cell_l3"):
+    for lvl in CELL_LADDER_V3:
         if lvl not in P.columns:
             continue
         need = out.isna() & v.notna()
@@ -91,6 +133,25 @@ def tp(P: pd.DataFrame, a, b) -> pd.Series:
     return pd.Series(out, index=P.index).where(za.notna() & zb.notna()).astype("float32")
 
 
+# ★ 센서 → 그 센서를 만들려면 무엇을 받아야 하는가. 결손 진단 로그가 원인을 지목할 때 쓴다.
+#   이 표가 없어서 '증거층 8개 전부 0%' 라는 결과만 보이고 "Tier-2 를 안 받아서" 라는
+#   한 줄짜리 원인이 27분 뒤 RuntimeError 로만 드러났다.
+SENSOR_SOURCE_HINT = {
+    "i_sales":    "DART Tier-1 주요계정(매출액)",
+    "i_turn":     "DART Tier-2 전체재무제표(재고·매출채권·매출원가)",
+    "i_accr":     "DART Tier-2 현금흐름표(영업활동현금흐름)",
+    "i_capex":    "DART Tier-2 현금흐름표(유형자산 취득)",
+    "i_roic":     "DART Tier-2 재무상태표(재고·매출채권·매입채무·유형/무형자산)",
+    "p_payout":   "DART Tier-2 현금흐름표(배당금지급·자기주식취득·영업CF)",
+    "p_invest":   "DART Tier-2 현금흐름표(유형자산취득·연구개발비)",
+    "acq_size":   "DART Tier-2 현금흐름표(자기주식 취득)",
+    "p_cancel":   "DART 공시목록(자기주식 소각)",
+    "nl_emp":     "DART 직원현황 empSttus (알파 원천)",
+    "nl_premium": "DART 직원현황 empSttus (연간급여총액 · 한계임금)",
+    "nl_vapp":    "DART 직원현황 empSttus + Tier-1 손익",
+    "nl_regular": "DART 직원현황 empSttus (정규직 수)",
+}
+
 # ── TP 정의표 (스펙 §8) ─────────────────────────────────────────────────────────────────────
 TP_DEFS = [
     ("TP_I1", "i_capex",  "i_roic",    "확장하는데 수익성 유지"),
@@ -114,9 +175,29 @@ def build_tps(P: pd.DataFrame) -> pd.DataFrame:
         rows.append([name, f"{a} × {b}", _trunc(desc, 30), f"{cov*100:.1f}%", f"{pos*100:.1f}%"])
     LOG.table(rows, ["TP", "구성 (개선 × 대가회피)", "의미", "관측 커버리지", "양(>0) 비율"],
               ["l", "l", "l", "r", "r"], title="트레이드오프 쌍 (clip×clip · 음수 불가)")
+    report_cell_rank_diag()
     dead = [n for n, *_ in TP_DEFS if P[n].notna().sum() == 0]
     if dead:
-        LOG.warn(f"관측이 한 건도 없는 TP: {dead} — 해당 원천 데이터가 비었습니다. "
+        # ★ 어느 '다리'가 죽었는지, 그 다리가 어느 원천을 요구하는지까지 지목한다.
+        #   예전엔 죽은 TP 이름만 나열해서, 8개가 전부 죽었을 때조차 원인이 안 보였다.
+        #   실제로 그 상태로 27분을 더 돌다가 백테스트 직전에 RuntimeError 로 죽었다.
+        drows = []
+        for n, a, b, _d in TP_DEFS:
+            if n not in dead:
+                continue
+            legs = []
+            for leg in (a, b):
+                obs = int(col(P, leg).notna().sum()) if leg in P.columns else 0
+                legs.append(f"{leg}={obs:,}")
+            culprit = [leg for leg in (a, b)
+                       if leg not in P.columns or col(P, leg).notna().sum() == 0]
+            drows.append([n, " · ".join(legs),
+                          ", ".join(culprit) or "둘 다 있으나 겹치는 행이 없음",
+                          " / ".join(sorted({SENSOR_SOURCE_HINT.get(c, "?") for c in culprit}))])
+        LOG.table(drows, ["죽은 TP", "다리별 유효관측", "비어 있는 다리", "그 다리가 요구하는 원천"],
+                  ["l", "l", "l", "l"],
+                  title=f"증거층 결손 진단 — {len(dead)}/{len(TP_DEFS)}개 TP 가 관측 0")
+        LOG.warn(f"관측이 한 건도 없는 TP: {dead} — 위 표의 '요구하는 원천'을 먼저 확보하세요. "
                  f"E 는 나머지 TP 의 결측 제외 평균으로 계산되며, 이 사실은 리포트에 남습니다.")
     return P
 
@@ -223,9 +304,31 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
     """
     tp_cols = [c for c in tp_cols if c in P.columns]
     min_tp = MIN_TP_OBSERVED if min_tp is None else min_tp
-    if not tp_cols:
-        raise RuntimeError("증거층(TP) 컬럼이 하나도 없습니다. 위 수집 로그에서 "
-                           "어떤 원천이 비었는지 확인하세요.")
+    if len(tp_cols) < MIN_TP_ARMS:
+        # ★ 예전 메시지는 사실을 잘못 말했다 — "컬럼이 하나도 없습니다" 라고 했지만
+        #   컬럼 8개는 전부 존재했고, 전량 NaN 이라 호출자가 직전 줄에서 걸러낸 것이었다.
+        #   그래서 사용자는 있지도 않은 컬럼 생성 버그를 찾게 됐다. 원인을 지목해서 말한다.
+        need = sorted({SENSOR_SOURCE_HINT.get(leg, leg)
+                       for n, a, b, _ in TP_DEFS if n not in tp_cols for leg in (a, b)
+                       if leg not in P.columns or col(P, leg).notna().sum() == 0})
+        raise RuntimeError(
+            f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {MIN_TP_ARMS}개 필요). "
+            f"컬럼은 만들어졌지만 관측이 0이라 제외됐습니다 — 계산 버그가 아니라 원천 결손입니다.\n"
+            f"  · 살아 있는 TP : {tp_cols or '없음'}\n"
+            f"  · 비어 있는 원천 : {chr(10) + '      - ' + (chr(10) + '      - ').join(need) if need else '판별 불가'}\n"
+            f"  처방:\n"
+            f"    ① 'DART Tier-2' 가 목록에 있으면 DART_FS_MAX_CALLS 가 0 이 아닌지 확인하세요.\n"
+            f"       Tier-1(주요계정)에는 현금흐름표가 통째로 없어 CORE-D 5개 TP 가 전부 죽습니다.\n"
+            f"    ② 'empSttus' 가 목록에 있으면 직원현황 수집이 0건이었다는 뜻입니다.\n"
+            f"       위 L1.EMP 로그에서 '신규 확보 N/M건' 을 확인하세요.\n"
+            f"    ③ DART_API_KEYS 에 키를 추가하면 하루 한도가 키 개수만큼 곱해집니다.\n"
+            f"    캐시는 append-only 라 재실행하면 정확히 이어받습니다 — 처음부터 다시 받지 않습니다.")
+    if len(tp_cols) < min_tp:
+        # ★ FLOOR = n_obs >= min(min_tp, len(tp_cols)) 이므로, 살아 있는 TP 가 min_tp 보다
+        #   적으면 문턱이 자동으로 낮아져 '증거 없이도 통과' 하게 된다. 조용히 넘기지 않는다.
+        LOG.warn(f"살아 있는 TP 가 {len(tp_cols)}개로 MIN_TP_OBSERVED={min_tp} 보다 적습니다 — "
+                 f"최소 TP 조건이 {len(tp_cols)}개로 자동 완화됩니다. 즉 이번 실행의 종목 선정은 "
+                 f"트레이드오프 증거가 아니라 사실상 단일 축에 의존합니다. 결과 해석에 반드시 반영하세요.")
     T = P[tp_cols].astype("float64")
     n_obs = T.notna().sum(axis=1)
     E_raw = T.mean(axis=1, skipna=True)                       # 결측 제외 동일가중 (C7)

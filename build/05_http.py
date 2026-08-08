@@ -21,6 +21,40 @@ _TLS = threading.local()
 HTTP_STATS: Counter = Counter()
 _HTTP_LK = threading.Lock()
 
+# ── 소스 단위 서킷브레이커 (403/401 연속) ──────────────────────────────────────────────────
+#   차단당한 소스를 계속 두드리면 시간만 태우고 차단을 더 오래 끌게 만든다.
+#   실측: 한경컨센서스가 (skinType × 연도) 잡마다 tries=3 을 독립 소진해 403 을 33회 맞았다.
+#   ★ 접은 사실은 반드시 감사표에 남긴다 — '0건'이 '데이터가 없다'로 오독되면 안 된다.
+HTTP_DENY_TRIP_N = 12          # 이만큼 연속 거부되면 이번 실행에서 그 소스를 접는다
+_DENIED: Counter = Counter()
+_TRIPPED: set = set()
+
+
+def _note_denied(source: str):
+    with _HTTP_LK:
+        _DENIED[source] += 1
+        if _DENIED[source] >= HTTP_DENY_TRIP_N and source not in _TRIPPED:
+            _TRIPPED.add(source)
+            LOG.error(f"'{source}' 가 403/401 을 {_DENIED[source]}회 연속 반환했습니다 — "
+                      f"이번 실행에서는 이 소스를 더 호출하지 않습니다(서킷브레이커). "
+                      f"차단된 상태에서 계속 두드려도 받지 못하고 차단만 길어집니다. "
+                      f"※ 이 소스의 산출물이 0건인 것은 '데이터가 없어서'가 아니라 "
+                      f"'요청을 거부당해서'입니다 — 감사표에 그대로 남습니다.")
+
+
+def _note_ok(source: str):
+    if _DENIED.get(source):
+        with _HTTP_LK:
+            _DENIED[source] = 0
+
+
+def _source_tripped(source: str) -> bool:
+    return source in _TRIPPED
+
+
+def http_tripped_sources() -> List[str]:
+    return sorted(_TRIPPED)
+
 
 def _session() -> "requests.Session":
     s = getattr(_TLS, "sess", None)
@@ -123,6 +157,15 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              force_enc: Optional[str] = None,
              on_attempt: Optional[Callable[[], None]] = None) -> Optional[Union[str, bytes]]:
     lim = limiter(source)
+    # ★ 소스 단위 서킷브레이커 — 403/401 이 연속되면 그 소스를 이번 실행에서 접는다.
+    #   한경컨센서스는 (skinType × 연도) 잡마다 독립적으로 tries=3 을 소진했고,
+    #   실측 로그의 '403 × 33회' 가 정확히 이 구조에서 나왔다. 차단당한 뒤에도 계속
+    #   두드리는 것은 시간 낭비일 뿐 아니라 차단을 더 오래 끌게 만든다.
+    #   ※ '데이터가 없다'로 오판하지 않도록, 접었다는 사실은 감사표에 남는다.
+    if _source_tripped(source):
+        with _HTTP_LK:
+            HTTP_STATS[f"{source}:SKIPPED_TRIPPED"] += 1
+        return None
     hdr = dict(headers or {})
     if referer:
         hdr["Referer"] = referer
@@ -142,12 +185,14 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
             with _HTTP_LK:
                 HTTP_STATS[f"{source}:{r.status_code}"] += 1
             if r.status_code in allow_status:
+                _note_ok(source)          # 한 번이라도 통하면 연속 카운터를 되돌린다
                 return r.content if as_bytes else _decode(r.content, r.encoding, url, force_enc)
             if r.status_code in (429, 503):
                 time.sleep(min(30.0, 2.0 * (2 ** attempt)) + random.random())
                 last_exc = requests.HTTPError(f"{r.status_code} {url}")
                 continue
             if r.status_code in (403, 401):
+                _note_denied(source)
                 time.sleep(1.5 * (attempt + 1))
                 last_exc = requests.HTTPError(f"{r.status_code} {url}")
                 continue
@@ -234,3 +279,8 @@ def report_http():
                      _trunc(", ".join(f"{k}×{v}" for k, v in c.most_common(5)), 44)])
     LOG.table(rows, ["소스", "요청", "성공", "성공률", "차단/실패", "상세"],
               ["l", "r", "r", "r", "r", "l"])
+    if _TRIPPED:
+        LOG.error(f"서킷브레이커로 접힌 소스: {sorted(_TRIPPED)} — "
+                  f"이 소스들의 산출물이 0건인 것은 **데이터가 없어서가 아니라 "
+                  f"요청을 거부당해서**입니다. 결측으로 처리되며, 그 사실이 리포트에 남습니다. "
+                  f"잠시 뒤(수십 분~수 시간) 재실행하면 캐시에 이어받습니다.")

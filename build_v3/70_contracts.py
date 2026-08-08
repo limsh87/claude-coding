@@ -97,7 +97,7 @@ def run_contracts_v3(strict: bool = True) -> bool:
     def c2b():
         src = _src_of(run_backtest)
         if not src:
-            return True, "소스 조회 불가 — 검사 생략 (한 셀 실행 환경)"
+            return None, "소스 조회 불가 — 검사하지 못했습니다(통과 아님)"
         if "-1.0" not in src or "delist" not in src:
             return False, "백테스트 엔진에 상장폐지 -100% 처리가 보이지 않습니다"
         return True, "정리매매가 없으면 -100% (누락 처리 금지) 가 엔진에 존재"
@@ -130,7 +130,10 @@ def run_contracts_v3(strict: bool = True) -> bool:
         if tp(P2, "a", "b").iloc[:10].notna().any():
             return False, "한쪽이 결측인데 TP 가 값을 가졌습니다 (0 채움 금지 위반)"
         src = _src_of(tp)
-        if src and "maximum" not in src:
+        if not src:
+            # 수치 검정(위 표본)은 이미 끝났다. 소스 정규식만 못 돌린 것이므로 그 사실을 남긴다.
+            return None, f"수치 검정은 통과({n}표본)했으나 소스 정규식은 조회 불가"
+        if "maximum" not in src:
             return False, "tp() 소스에 clip(np.maximum) 이 보이지 않습니다"
         return True, f"음수 불가 · 최악사분면=0 · 결측 전파 (표본 {n})"
 
@@ -185,7 +188,7 @@ def run_contracts_v3(strict: bool = True) -> bool:
     def p3():
         src = _src_of(cell_rank, cell_z, _rank_in)
         if not src:
-            return True, "소스 조회 불가 — 검사 생략"
+            return None, "소스 조회 불가 — 검사하지 못했습니다(통과 아님)"
         if re.search(r"groupby\([^)]*\)\s*\.\s*apply\s*\(", src):
             return False, "셀 정규화에 groupby.apply 가 있습니다 (수십 배 느립니다)"
         if "rank(pct=True" not in src.replace(" ", "") and "rank(pct=True)" not in src:
@@ -199,7 +202,7 @@ def run_contracts_v3(strict: bool = True) -> bool:
     def p5():
         src = _src_of(R0_benchmark, report_performance_v3)
         if not src:
-            return True, "소스 조회 불가 — 검사 생략"
+            return None, "소스 조회 불가 — 검사하지 못했습니다(통과 아님)"
         # 성과 수치를 리터럴로 박아 둔 흔적(예: CAGR=0.23 같은 상수 비교)이 없어야 한다
         if re.search(r"(CAGR|Sharpe|Calmar)\s*=\s*-?\d+\.\d+", src):
             return False, "벤치마크/성과 수치가 소스에 하드코딩되어 있습니다"
@@ -453,6 +456,7 @@ def run_contracts_v3(strict: bool = True) -> bool:
                 return False, f"DartBudget.{fn}() 이 없습니다 — 알파 예산을 지킬 수단이 없습니다"
         b = DartBudget.__new__(DartBudget)          # _load(파일 I/O) 를 타지 않게 직접 구성
         b.today, b.n, b.exhausted = "T", 0, False
+        b._ephemeral = True                         # ★ 프로덕션 dart_budget.json 을 건드리지 않는다
         b._lk = threading.RLock()
         b.keys = ["k1", "k2"]
         b._kid_of = {k: DartBudget._make_kid(k) for k in b.keys}
@@ -477,6 +481,7 @@ def run_contracts_v3(strict: bool = True) -> bool:
         # ③ ★ 로컬 카운터로는 절대 차단하지 않는다 (이 계약의 핵심)
         b2 = DartBudget.__new__(DartBudget)
         b2.today, b2.n, b2.exhausted = "T", DART_DAILY_LIMIT * 99, False
+        b2._ephemeral = True
         b2._lk = threading.RLock()
         b2.keys = ["k1"]
         b2._kid_of = {"k1": DartBudget._make_kid("k1")}
@@ -486,7 +491,34 @@ def run_contracts_v3(strict: bool = True) -> bool:
             return False, ("★ 로컬 카운터가 한도를 넘었다는 이유로 호출을 막습니다 — "
                            "진짜 잔여량은 서버만 압니다. 추정으로 우리를 막으면 "
                            "서버가 답해 줄 수 있는 상태에서 한 건도 안 쏘게 됩니다")
-        # 사전점검이 알파 테이블을 개별 판정하는가 (합산 판정이면 사고가 재현된다)
+        # ④ ★★ 이 계약이 놓쳤던 바로 그 구멍 ★★
+        #    pick_key() 만 검사했더니, 정작 **작업 큐를 0 으로 자르는** 경로가 무사통과했다.
+        #      fetch_emp_status : cap = min(total, max_calls, dart_budget_left("emp"))
+        #      fetch_dart_financials : cap = min(cap, max_calls, DART_DAILY_LIMIT - DBUDGET.n)
+        #    서버가 020 을 한 번도 주지 않았는데 직원현황이 0행으로 끝난 실행의 직접 원인이다.
+        #    → 수집 함수 소스에서 'left/limit 추정치가 jobs 상한 min() 안에 들어가는' 패턴을 금지한다.
+        _csrc = _src_of(fetch_emp_status, fetch_dart_financials)
+        if not _csrc:
+            _cut_note = " (수집부 소스 정규식은 조회 불가 — 미검사)"
+        else:
+            _cut_note = ""
+            # ★ 주석은 검사 대상이 아니다. '예전엔 이랬다'를 설명하는 주석까지 잡으면
+            #   결함을 고친 사실을 기록하는 것 자체가 계약 위반이 된다(실제로 그렇게 터졌다).
+            _csrc = "\n".join(re.sub(r"#.*$", "", ln) for ln in _csrc.splitlines())
+            for _pat, _why in (
+                    (r"min\([^)]*dart_budget_left[^)]*\)",
+                     "dart_budget_left() 가 잡 수 상한 min() 안에 들어가 있습니다"),
+                    (r"min\([^)]*left_today[^)]*\)",
+                     "left_today(로컬 추정 잔량) 가 잡 수 상한 min() 안에 들어가 있습니다"),
+                    (r"min\([^)]*DBUDGET\.n[^)]*\)",
+                     "DBUDGET.n(사용 추정치) 가 잡 수 상한 min() 안에 들어가 있습니다")):
+                if re.search(_pat, _csrc):
+                    return False, ("★ 로컬 추정치가 작업 큐를 자릅니다 — " + _why +
+                                   ". 추정 잔량이 0 이 되는 순간 서버가 멀쩡한데도 "
+                                   "한 건도 시도하지 않고 알파가 0행으로 끝납니다. "
+                                   "상한은 의도한 작업량(EMP_MAX_CALLS 등)뿐이어야 하고, "
+                                   "하드 차단은 서버 020/021 로만 해야 합니다.")
+        # ⑤ 사전점검이 알파 테이블을 개별 판정하는가 (합산 판정이면 사고가 재현된다)
         src = _src_of(preflight_dart_v3) or ""
         if src:
             if "dart_employees_ext" not in src:
@@ -494,18 +526,128 @@ def run_contracts_v3(strict: bool = True) -> bool:
             if "sum(have.values())" in src and "dead_alpha" not in src:
                 return False, "사전점검이 여전히 합산으로만 판정합니다"
         if not REQUIRE_EMP_ALPHA:
-            return True, "예약 동작 확인 · REQUIRE_EMP_ALPHA=False (알파 없이도 진행하도록 설정됨)"
+            return True, ("예약 동작 확인 · REQUIRE_EMP_ALPHA=False "
+                          "(알파 없이도 진행하도록 설정됨)" + _cut_note)
         return True, (f"키 로테이션 · 서버 거부만 하드 차단 · 로컬 카운터는 계획용 · "
-                      f"예약 {EMP_RESERVED_CALLS:,}건 · 알파 부재 시 수집 전 중단")
+                      f"수집부가 추정치로 큐를 자르지 않음 · "
+                      f"예약 {EMP_RESERVED_CALLS:,}건 · 알파 부재 시 수집 전 중단" + _cut_note)
 
     _cc("§12-A", "알파 원천(직원현황) 예산 보호 · 부재 시 사전 중단", alpha_guard)
 
+    # ── C-CELL : 셀 사다리가 **실제 밀도에서** 동작하는가 ─────────────────────────────────
+    def c_cell():
+        """★ 4차 실행에서 산업·규모 중립화가 통째로 무력화된 사고를 고정한다.
+
+        예전 계약(원칙3)은 P["cell"]=P["cell_l2"]=P["cell_l3"]="C" 로 **모든 행을 한 셀에**
+        넣고 검사했다. 그래서 사다리를 한 번도 밟지 않았고, 산업 카디널리티가 커지는 순간
+        1·2단이 동시에 무너지는 결함이 구조적으로 검출 불가능했다.
+        여기서는 프로덕션과 같은 밀도(월 1,100행 / 업종 150개)를 만들어 실제로 밟게 한다.
+        """
+        # ★ 업종명은 **실제 한국 업종명처럼** 앞머리가 대분류여야 한다.
+        #   "업종000".."업종149" 처럼 접두가 전부 같으면 접두 병합 경로를 검정하지 못하고
+        #   폴백(전부 '기타')만 재게 된다 — 검정 같아 보이지만 아무것도 안 재는 테스트다.
+        _HEADS = ["화학", "전기", "반도", "운수", "도매", "금융", "건설", "식료",
+                  "의약", "기계", "철강", "섬유", "통신", "소프", "자동", "조선",
+                  "비금", "종이", "고무", "유통"]
+        n_m, n_ind, per_m = 12, 150, 1100
+        rows = []
+        for mi in range(n_m):
+            m = pd.Timestamp("2020-01-31") + pd.offsets.MonthEnd(mi)
+            for j in range(per_m):
+                k = j % n_ind
+                rows.append({"code": f"{j:06d}", "month": m,
+                             "industry": f"{_HEADS[k % len(_HEADS)]}제품및부품{k:03d}",
+                             "employees": float(50 + (j % 900)),
+                             "revenue_ttm": float(1e9 + j)})
+        P = pd.DataFrame(rows)
+        sec = (P[["code", "industry"]].drop_duplicates("code").reset_index(drop=True))
+        P["x"] = rng.normal(size=len(P))
+        C = build_cells_v3(P, sec, tag="(계약검정) ")
+        for lvl in CELL_LADDER_V3:
+            if lvl not in C.columns:
+                return False, f"폴백 사다리 단계 {lvl} 가 없습니다"
+        r = cell_rank(C, "x")
+        cov = float(r.notna().mean())
+        if cov < 0.999:
+            return False, (f"★ 사다리가 관측을 못 살렸습니다 — 유효관측 100% 인데 "
+                           f"랭크 산출은 {cov*100:.1f}% 뿐입니다. 하위 계단이 전부 "
+                           f"표본 미달이라는 뜻이며, 이 상태가 프로덕션에서 TP 0% 를 만듭니다")
+        # 1단만으로 다 풀리면 이 검정이 사다리를 재지 못한 것이다(밀도 설정이 잘못됨)
+        d = CELL_RANK_DIAG[-1]["by_level"] if CELL_RANK_DIAG else {}
+        if d.get("cell", 0) >= len(C):
+            return False, "1단계에서 전부 해결됐습니다 — 이 검정이 사다리를 밟지 않았습니다"
+        # 3단(업종군)이 실제로 존재하고 임계치를 넘는가 — 여기가 v3 에서 빠져 있던 계단이다
+        n3 = C.groupby("cell_l3", observed=True)["code"].transform("count")
+        if float((n3 >= CELL_MIN_N_V3).mean()) < 0.9:
+            return False, (f"3단계(month|업종군|ALL)조차 표본 미달입니다 "
+                           f"({100*float((n3 >= CELL_MIN_N_V3).mean()):.0f}%) — "
+                           f"업종 병합이 카디널리티를 못 줄였습니다")
+        return True, (f"월 {per_m}행 × 업종 {n_ind}개 밀도에서 랭크 산출 {cov*100:.1f}% · "
+                      f"해결 단계 {dict(d)} · 업종군 {C['ind_l1'].nunique()}개로 병합")
+
+    _cc("C-CELL", "셀 폴백 사다리 — 실제 밀도에서 중립화가 살아 있는가", c_cell)
+
+    # ── C-TP0 : 증거층 전멸을 백테스트 **전에** 잡는가 ────────────────────────────────────
+    def c_tp0():
+        """★ 4차 실행은 TP 8개가 전부 0% 인 채로 27분을 더 돌다가 백테스트 직전에
+        맨 RuntimeError 로 죽었다. 그 전까지 그 사실을 판정하는 게이트가 하나도 없었고,
+        메시지는 '컬럼이 하나도 없습니다' 라고 사실을 잘못 말해 엉뚱한 곳을 찾게 만들었다.
+        """
+        P = pd.DataFrame({"code": [f"{i:06d}" for i in range(40)],
+                          "month": pd.Timestamp("2020-06-30"),
+                          "cell": "C", "cell_l2": "C", "cell_l3": "C", "cell_l4": "C",
+                          "U": 1.0, "VETO": 1.0})
+        for n, *_ in TP_DEFS:
+            P[n] = np.nan                      # 컬럼은 있는데 전량 결측 — 실제로 났던 상태
+        for leg in {a for _n, a, _b, _d in TP_DEFS} | {b for _n, _a, b, _d in TP_DEFS}:
+            P[leg] = np.nan
+        live = [c for c, *_ in TP_DEFS if P[c].notna().sum() > 0]
+        try:
+            score_arm(P, live)
+            return False, ("★ 증거층이 0개인데 score_arm 이 통과했습니다 — "
+                           "증거 없이 종목을 고르고 리포트는 그럴듯하게 나옵니다")
+        except RuntimeError as e:
+            msg = str(e)
+        if "컬럼이 하나도 없습니다" in msg:
+            return False, "메시지가 사실을 잘못 말합니다 — 컬럼은 존재하고 관측이 0입니다"
+        if "원천" not in msg:
+            return False, "메시지가 '어떤 원천이 비었는지'를 지목하지 않습니다"
+        # 살아 있는 TP 가 1개뿐이어도 막아야 한다 (단일 팩터로 도는 것이 크래시보다 나쁘다)
+        P2 = P.copy()
+        P2["TP_I2"] = 0.3
+        try:
+            score_arm(P2, ["TP_I2"])
+            if MIN_TP_ARMS > 1:
+                return False, (f"★ 증거층 TP 가 1개뿐인데 통과했습니다 — 트레이드오프가 아니라 "
+                               f"단일 팩터입니다(MIN_TP_ARMS={MIN_TP_ARMS})")
+        except RuntimeError:
+            pass
+        return True, (f"관측 0 → 백테스트 전 중단 · 원인 원천 지목 · "
+                      f"TP<{MIN_TP_ARMS}개면 단일팩터 실행 차단")
+
+    _cc("C-TP0", "증거층 전멸을 백테스트 전에 판정 (원인 지목 포함)", c_tp0)
+
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
-    rows = [[r["id"], _trunc(r["name"], 34), "PASS" if r["pass"] else "FAIL",
+    _verdict = lambda p: "SKIP" if p is None else ("PASS" if p else "FAIL")
+    rows = [[r["id"], _trunc(r["name"], 34), _verdict(r["pass"]),
              _trunc(r["msg"], 60)] for r in CONTRACT_V3]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["c", "l", "c", "l"],
               title="계약 자동검정 (주석이 아니라 테스트로 강제)", maxw=62)
-    fails = [r for r in CONTRACT_V3 if not r["pass"]]
+    fails = [r for r in CONTRACT_V3 if r["pass"] is False]
+    skips = [r for r in CONTRACT_V3 if r["pass"] is None]
+    if skips:
+        # ★★ 예전엔 이 상태가 PASS 로 집계됐다 ★★
+        #   소스 조회(inspect.getsource)가 안 되는 환경 — 즉 문서가 권장하는
+        #   '노트북 한 셀 붙여넣기' 실행 — 에서는 소스 정규식 계약 5건이 아무것도 재지 않고
+        #   True 를 돌려줬는데, 최종 로그는 "16건 전부 통과" 라고 단언했다.
+        #   검사하지 않은 것을 통과했다고 말하는 것은 계약층 자체를 무효로 만든다.
+        LOG.warn(f"계약 {len(skips)}건은 **검사하지 못했습니다**(통과가 아닙니다): "
+                 + ", ".join(r["id"] for r in skips))
+        for r in skips:
+            LOG.warn(f"  · [{r['id']}] {r['name']} — {r['msg']}")
+        LOG.warn("  소스 조회가 불가능한 실행(노트북 한 셀 붙여넣기 등)에서는 소스 기반 계약이 "
+                 "동작하지 않습니다. 파일로 저장해 `python tcd_v3_core_d_emp_lite.py` 로 "
+                 "한 번 돌리면 전부 실제로 검정됩니다.")
     if fails:
         LOG.error(f"계약 위반 {len(fails)}건: " + ", ".join(r["id"] for r in fails))
         for r in fails:
@@ -515,5 +657,9 @@ def run_contracts_v3(strict: bool = True) -> bool:
                 f"계약 검정 {len(fails)}건 실패 — 실행을 중단합니다. "
                 f"이 계약들은 협상 대상이 아닙니다. 임계값을 바꿔 통과시키지 마십시오.")
         return False
-    LOG.ok(f"계약 검정 {len(CONTRACT_V3)}건 전부 통과")
+    n_ok = len(CONTRACT_V3) - len(skips)
+    if skips:
+        LOG.ok(f"계약 검정 {n_ok}/{len(CONTRACT_V3)}건 통과 · {len(skips)}건 검사 불가(SKIP)")
+    else:
+        LOG.ok(f"계약 검정 {len(CONTRACT_V3)}건 전부 통과")
     return True

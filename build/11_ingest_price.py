@@ -426,6 +426,22 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
             VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
                             source="fetch_prices:negative_cache")
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 받을 것이 없으면 아무 일도 하지 않는다 ★★
+    #    예전엔 todo 가 비어 있어도(=신규 심볼 0개) 아래 무조건 경로를 통과했다:
+    #      concat(700만 행) → code.map(to_code6)(행마다 파이썬 함수 + 정규식 2회)
+    #      → to_numeric ×6 → sort_values(2키) → drop_duplicates(2키)
+    #    실측 51.6초. **한 종목도 새로 받지 않은 실행에서** 매번 그만큼 태웠다.
+    #    캐시는 바로 이 함수가 정규화해서 쓴 것이므로 다시 정규화할 이유가 없다.
+    if not new_frames and cached is not None and len(cached):
+        px = cached
+        win = (px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)
+        px_out = px[win]
+        LOG.ok(f"일봉 신규 수집 0건 — 공용 캐시 {len(px):,}행을 그대로 재사용합니다 "
+               f"(재정규화·재정렬·재저장 없음). 창 적용 후 {len(px_out):,}행.")
+        PIPE.io("IN", "DRIVE", "krx_ohlcv_daily", px_out, source="cache only (no refetch)")
+        return downcast(px_out)
+
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
         avail = [nm for nm, _fn in PRICE_CHAIN
@@ -537,36 +553,61 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
 
 def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """d3(기관+외국인 누적순매수) 입력. 없으면 D축은 가용 축 평균으로 자동 축소된다."""
+    need_lo, need_hi = as_ts(start), as_ts(end)
     cached = VAULT.get_table("krx_investor_flows", scope="shared")
+    have_hi: Dict[str, pd.Timestamp] = {}
+    have_lo: Dict[str, pd.Timestamp] = {}
     if cached is not None and len(cached):
         cached = cached.copy()                      # 공용 캐시 객체를 제자리에서 고치지 않는다
         cached["date"] = as_ts_series(cached["date"])
+        cached = cached.dropna(subset=["date", "code"])
         lo, hi = cached["date"].min(), cached["date"].max()
+        _g = cached.groupby("code")["date"]
+        have_hi, have_lo = _g.max().to_dict(), _g.min().to_dict()
         LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용 "
                  f"({lo:%Y-%m} ~ {hi:%Y-%m} · {cached['code'].nunique():,}종목)")
-        # ★ 이 캐시는 증분 갱신 경로가 없다(있으면 통째로 재사용). 다른 전략이 더 짧은 구간으로
-        #   만들어 둔 캐시를 물려받으면 요청 구간의 뒷부분 d3 가 조용히 전부 결측이 된다.
-        #   조용히 두지 않고 '어디까지 덮는지'를 명시한다.
-        need_lo, need_hi = as_ts(start), as_ts(end)
-        if pd.notna(lo) and pd.notna(hi) and (lo > need_lo + pd.Timedelta(days=45) or
-                                              hi < need_hi - pd.Timedelta(days=45)):
-            LOG.warn(f"수급 캐시가 요청 구간({need_lo:%Y-%m}~{need_hi:%Y-%m})을 다 덮지 못합니다 "
-                     f"— 덮이지 않는 달의 d3 는 결측이 되고 U 는 d1 단독으로 계산됩니다. "
-                     f"(이 캐시는 증분 갱신 경로가 없어 전체를 다시 받아야 넓어집니다. "
-                     f"공용 캐시를 지우지 않는 것이 원칙이므로 자동 삭제하지 않습니다)")
-        return cached
     if pykrx_stock is None or RUN_MODE == "CACHED":
+        if cached is not None and len(cached):
+            _lo, _hi = cached["date"].min(), cached["date"].max()
+            if pd.notna(_lo) and pd.notna(_hi) and (_lo > need_lo + pd.Timedelta(days=45) or
+                                                    _hi < need_hi - pd.Timedelta(days=45)):
+                LOG.warn(f"수급 캐시가 요청 구간({need_lo:%Y-%m}~{need_hi:%Y-%m})을 다 덮지 "
+                         f"못하고, 이번 실행에서는 넓힐 수단이 없습니다"
+                         f"(pykrx 미설치 또는 CACHED 모드) — 덮이지 않는 달의 d3 는 결측이 되고 "
+                         f"U 는 d1 단독으로 계산됩니다. 0으로 채우지 않습니다.")
+            return cached
         LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "
                  "U 는 가용 축 평균으로 계산됩니다. 0으로 채우지 않습니다.")
         return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
 
     codes = sorted({c for c in map(to_code6, codes) if c})
+    # ★★ 증분 수집 ★★
+    #   예전엔 캐시가 있으면 **무조건 통째로 반환**하고 끝이었다. 그래서 다른 전략이 더 짧은
+    #   구간으로 만들어 둔 캐시를 물려받으면 요청 구간의 뒷부분 d3 가 조용히 전부 결측이 됐고,
+    #   넓히려면 전체를 다시 받는 수밖에 없었다(그래서 아무도 안 넓혔다).
+    #   → 종목별로 '캐시가 못 덮는 구간'만 받는다. 캐시는 그대로 두고 합집합으로 저장한다.
+    jobs: List[Tuple[str, str, str]] = []
+    for c in codes:
+        hi_c, lo_c = have_hi.get(c), have_lo.get(c)
+        if hi_c is None:
+            jobs.append((c, start, end))
+            continue
+        if lo_c is not None and lo_c > need_lo + pd.Timedelta(days=10):
+            jobs.append((c, start, (lo_c - pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+        if hi_c < need_hi - pd.Timedelta(days=10):
+            jobs.append((c, (hi_c + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), end))
+    if not jobs:
+        LOG.ok(f"수급 신규 수집 0건 — 공용 캐시가 요청 구간을 전부 덮습니다({len(cached):,}행).")
+        return downcast(cached) if cached is not None else pd.DataFrame(
+            columns=["code", "date", "inst_net", "foreign_net"])
+    LOG.info(f"수급 증분 수집 {len(jobs):,}건 (전 종목 재수집이면 {len(codes):,}건)")
 
-    def _one(code: str):
+    def _one(job):
+        code, st, en = job
         try:
             limiter("krx").wait()
             d = pykrx_stock.get_market_trading_value_by_date(
-                as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
+                as_ts(st).strftime("%Y%m%d"), as_ts(en).strftime("%Y%m%d"), code)
         except Exception:
             return None
         if d is None or len(d) == 0:
@@ -581,12 +622,20 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
                              "inst_net": pd.to_numeric(d[inst], errors="coerce") if inst else np.nan,
                              "foreign_net": pd.to_numeric(d[forg], errors="coerce") if forg else np.nan})
 
-    res = pmap_io(_one, codes, workers=min(N_WORKERS_IO, 8), desc="수급 수집")
+    res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="수급 증분 수집")
     got = [d for d in res if d is not None and len(d)]
     if not got:
-        LOG.warn("수급 데이터를 받지 못했습니다 — d3 결측 처리.")
-        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
-    fl = pd.concat(got, ignore_index=True)
+        LOG.warn("수급 신규분을 받지 못했습니다 — 캐시분만 사용합니다(d3 부분 결측).")
+        return downcast(cached) if cached is not None and len(cached) else pd.DataFrame(
+            columns=["code", "date", "inst_net", "foreign_net"])
+    # ★ 저장은 '기존 캐시 ∪ 신규'. 잘라서 덮어쓰면 다른 전략이 쌓아 둔 과거가 사라진다(절대1원칙).
+    fl = pd.concat(([cached] if cached is not None and len(cached) else []) + got,
+                   ignore_index=True)
+    fl["date"] = as_ts_series(fl["date"])
+    fl = (fl.dropna(subset=["code", "date"])
+            .sort_values(["code", "date"])
+            .drop_duplicates(["code", "date"], keep="last")
+            .reset_index(drop=True))
     VAULT.put_table("krx_investor_flows", fl, scope="shared", domain="flow", source="pykrx")
     PIPE.io("OUT", "DRIVE", "krx_investor_flows", fl, source="pykrx")
     return downcast(fl)

@@ -480,10 +480,25 @@ def R10_policy_falsify(P: pd.DataFrame, cal: pd.DataFrame, months: pd.DatetimeIn
              f"제외 대상 정책이 10년을 거의 덮고 있다는 사실 자체를 결론에 명시하세요.")
         runtime_mark("R10", time.time() - t0)
         return
-    base = _stat(run_fn(P, label="R10_base", months_override=months), "Sharpe")
-    off = _stat(run_fn(P, label="R10_clean", months_override=clean), "Sharpe")
+    # ★★ 불연속 월 인덱스를 백테스트에 그대로 넘기지 않는다 ★★
+    #   clean 은 정책창을 도려낸 결과라 중간에 수십 개월짜리 구멍이 있다. 그것을
+    #   months_override 로 넘기면 포지션·보유개월·회전율·복리가 **구멍을 건너뛰며 이어져**
+    #   존재한 적 없는 연속 시계열이 만들어진다. 그 위에서 'TP_N1 폐기' 를 판정하고 있었다.
+    #   → 백테스트는 실제 연속 구간에서 한 번만 돌리고, **성과 통계만** 정책창 밖 달로
+    #     제한한다. 포지션은 진짜 역사 위에서 형성되고, 판정은 '알파가 정책창에서만
+    #     나왔는가'라는 원래 질문에 정확히 답한다.
+    bt_full = run_fn(P, label="R10_base", months_override=months)
+    base = _stat(bt_full, "Sharpe")
+    try:
+        _r = _ret_series(bt_full, pd.DatetimeIndex(months))
+        _sub = _r.reindex(clean).dropna()
+        off = float(perf_stats(pd.DataFrame({"month": _sub.index, "ret": _sub.to_numpy()}))
+                    .get("Sharpe", np.nan)) if len(_sub) >= 18 else np.nan
+    except Exception as e:                                          # noqa
+        LOG.warn(f"R10 정책제외 구간 통계 산출 실패({type(e).__name__}) — 판정을 유보합니다.")
+        off = np.nan
     nums = (f"전체 {len(months)}개월 Sharpe {base:.2f} → "
-            f"정책제외 {len(clean)}개월 {off:.2f}")
+            f"정책제외 {len(clean)}개월 {off:.2f} (같은 백테스트의 부분표본)")
     if _no_alpha_to_test(base):
         _rec("R10", "정책반증 (고용정책 ±6M 제외)", None,
              f"전체 구간에 반증할 알파가 없습니다(Sharpe {base:.2f} ≤ {ALPHA_FLOOR}). "

@@ -260,23 +260,31 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
     if jobs:
         total_needed = len(jobs)
         if max_calls is not None:
-            left = dart_budget_left(EMP_PURPOSE)
-            cap = max(0, min(total_needed, int(max_calls), left))
+            # ★★ 로컬 추정 잔량으로 알파 수집을 자르지 않는다 ★★
+            #   예전엔 `cap = min(total, max_calls, dart_budget_left("emp"))` 였다.
+            #   left 는 dart_budget.json 에서 복원한 **KST 같은 날 누적 추정치**일 뿐인데,
+            #   그 값이 19,000 에 닿는 순간 cap=0 → jobs[:0] → 호출 0건 → 직원현황 0행이 됐다.
+            #   서버는 같은 실행에서 3,740 요청에 100% 응답했고 020 을 한 번도 주지 않았다.
+            #   즉 우리가 스스로 알파를 포기한 것이다. 이 전략에서 직원현황이 비면
+            #   '전략 3' 이 아니라 이름만 같은 다른 전략이 된다.
+            #   → 상한은 '이번 실행에서 의도적으로 정한 작업량'(EMP_MAX_CALLS)뿐이고,
+            #     진짜 중단은 아래 청크 루프의 _emp_cb_ok() → 서버 020/021 로만 일어난다.
+            cap = max(0, min(total_needed, int(max_calls)))
             if cap < total_needed:
                 # ★ 절단 사실을 기록해 둔다. §6 커버리지 판정이 이 표를 'DART 의 보유량'으로
                 #   오독해 백테스트 창을 영구히 잘라내는 것을 막기 위한 유일한 근거다.
                 EMP_TRUNCATED.update({
                     "dropped": total_needed - cap,
-                    "why": (f"오늘 남은 DART 호출 {left:,}건" if left < int(max_calls)
-                            else f"상한 EMP_MAX_CALLS={int(max_calls):,}")})
+                    "why": f"상한 EMP_MAX_CALLS={int(max_calls):,}"})
                 jobs = jobs[:cap]
                 LOG.warn(f"직원현황 {total_needed:,}건 중 이번 실행은 {cap:,}건만 받습니다 "
-                         f"(오늘 남은 DART 호출 {left:,}건 · 상한 EMP_MAX_CALLS={max_calls:,}). "
+                         f"(상한 EMP_MAX_CALLS={max_calls:,}). "
                          f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다. "
                          f"※ 미수집분이 있으므로 §6 커버리지 기반 자동 창 단축은 비활성화됩니다.")
         LOG.info(f"직원현황 신규 수집 {len(jobs):,}건 "
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
-                 f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상")
+                 f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상 "
+                 f"· 계획 기준선 {dart_budget_left(EMP_PURPOSE):,}건(추정, 차단 기준 아님)")
         _EMP_CB.update({"consec": 0, "tripped": False})
         # ══════════════════════════════════════════════════════════════════════════════════
         #  ★ 청크 체크포인트 — 예산은 200건마다 영속되는데 **데이터는 맨 끝에 한 번**이었다.
