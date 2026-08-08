@@ -50,10 +50,52 @@ def _mount_drive() -> Tuple[str, str]:
     return LOCAL_CACHE_ROOT, "LOCAL"
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★ 2단 캐시 — 로컬 미러 + 드라이브 원본
+#
+#  구글드라이브(Colab 마운트든 데스크톱 동기화든)는 로컬 디스크가 아니라 네트워크
+#  파일시스템에 가깝다. 실측으로 340MB 짜리 일봉 테이블 한 번 읽기가 수십 초다.
+#  같은 실행 안에서의 중복 읽기는 세션 메모가 이미 막고 있지만, **실행이 바뀌면**
+#  다시 처음부터 드라이브를 읽는다 — 재실행이 잦은 이 파이프라인에서 그 비용이 크다.
+#
+#  → 드라이브에서 읽은 테이블을 로컬 디스크에 그대로 미러링한다. 다음 실행은
+#    ① 세션 메모 → ② 로컬 미러 → ③ 드라이브 순으로 찾는다.
+#    미러 유효성은 사이드카(.meta.json)에 적어 둔 드라이브 파일의 (mtime, size) 와
+#    대조해 판정한다. stat 한 번은 FUSE 에서도 싸고, 읽기는 수십 초다.
+#
+#  ★ 진실의 원천은 언제나 드라이브다. 미러는 순수한 읽기 가속이며,
+#    미러가 없거나 깨져도 결과는 동일하다(그냥 느려질 뿐). 미러는 삭제해도 안전하다.
+#  ★ 반대로 **드라이브를 못 쓰는 실행**(마운트 실패·네트워크 단절)에서는 미러가
+#    마지막 보루가 된다. 그때는 미러에서 읽고 그 사실을 로그에 남긴다.
+#  ★ 미러는 절대 드라이브를 덮어쓰지 않는다. 방향은 항상 드라이브 → 로컬 한쪽뿐이고,
+#    put_table 은 드라이브에 먼저 쓴 뒤 그 결과를 미러에 복사한다(절대1원칙).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+def _default_mirror_root() -> str:
+    v = globals().get("LOCAL_MIRROR_ROOT")
+    if v:
+        return os.path.abspath(str(v))
+    if ENV.get("colab"):
+        return "/content/tcd_cache_mirror"          # Colab 컨테이너 로컬 SSD
+    return os.path.join(os.path.expanduser("~"), ".cache", "tcd_cache_mirror")
+
+
 class Vault:
-    def __init__(self, root: str, mode: str):
+    def __init__(self, root: str, mode: str, mirror_root: Optional[str] = None):
         self.root = os.path.abspath(root)
         self.mode = mode
+        # 루트가 이미 로컬이면 미러는 무의미하다(같은 디스크를 두 번 쓰는 낭비).
+        _mr = os.path.abspath(mirror_root or _default_mirror_root())
+        _is_net = ("drive" in self.root.lower() or "clouddrive" in self.root.lower()
+                   or "cloudstorage" in self.root.lower() or mode.endswith("DRIVE")
+                   or mode == "LOCAL_SYNCED_DRIVE")
+        self.mirror_root = _mr if (_is_net and os.path.normpath(_mr) !=
+                                   os.path.normpath(self.root)) else None
+        self.mirror_stats = Counter()
+        if self.mirror_root:
+            try:
+                os.makedirs(self.mirror_root, exist_ok=True)
+            except Exception:                                    # noqa
+                self.mirror_root = None
         self.ns = {"shared": os.path.join(self.root, GDRIVE_SHARED_NS),
                    "private": os.path.join(self.root, GDRIVE_PRIVATE_NS)}
         for p in self.ns.values():
@@ -83,6 +125,47 @@ class Vault:
 
     def table_dir(self, scope: str) -> str:
         return os.path.join(self.ns[scope], "table")
+
+    # ── 로컬 미러 -----------------------------------------------------------------------
+    def _mirror_paths(self, scope: str, name: str) -> Optional[Tuple[str, str]]:
+        if not self.mirror_root:
+            return None
+        d = os.path.join(self.mirror_root, scope, "table")
+        return os.path.join(d, f"{name}.parquet"), os.path.join(d, f"{name}.meta.json")
+
+    def _mirror_valid(self, mp: str, meta_p: str, src: str) -> bool:
+        """미러가 드라이브 원본과 같은 세대인가. stat 두 번으로 판정한다(읽지 않는다)."""
+        try:
+            if not (os.path.exists(mp) and os.path.exists(meta_p)):
+                return False
+            st = os.stat(src)
+            m = json.loads(open(meta_p, encoding="utf-8").read() or "{}")
+            return (abs(float(m.get("src_mtime", -1)) - st.st_mtime) < 1e-6
+                    and int(m.get("src_size", -1)) == int(st.st_size))
+        except Exception:                                        # noqa
+            return False
+
+    def _mirror_write(self, scope: str, name: str, src: str) -> None:
+        """드라이브 원본을 로컬로 복사하고 세대 정보를 사이드카에 남긴다. 실패해도 무해하다."""
+        mpz = self._mirror_paths(scope, name)
+        if not mpz:
+            return
+        mp, meta_p = mpz
+        try:
+            st = os.stat(src)
+            os.makedirs(os.path.dirname(mp), exist_ok=True)
+            tmp = mp + f".tmp{os.getpid()}"
+            shutil.copy2(src, tmp)
+            os.replace(tmp, mp)
+            atomic_write_text(meta_p, json.dumps(
+                {"src": src, "src_mtime": st.st_mtime, "src_size": int(st.st_size),
+                 "mirrored_at": _dt.datetime.now().isoformat(timespec="seconds")},
+                ensure_ascii=False))
+            self.mirror_stats["mirror_write"] += 1
+        except Exception as e:                                   # noqa
+            # 미러는 순수 가속이다. 실패하면 그냥 다음 실행에 드라이브를 읽으면 된다.
+            self.mirror_stats["mirror_write_fail"] += 1
+            LOG.debug(f"로컬 미러 기록 실패({type(e).__name__}) — 결과에는 영향 없습니다: {name}")
 
     # ── 잠금 (두 노트북이 동시에 돌아도 저널이 섞이지 않게) -----------------------------
     @contextmanager
@@ -325,6 +408,9 @@ class Vault:
                 self._tbl_memo[(path, os.path.getmtime(path))] = df
         except Exception:                                   # noqa
             pass
+        # 드라이브에 쓴 그 파일을 로컬로도 복사한다. 방향은 항상 드라이브 → 로컬 한쪽이며,
+        # 미러가 드라이브를 덮는 경로는 존재하지 않는다(절대1원칙).
+        self._mirror_write(scope, name, path)
         self._register(scope, {
             "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
             "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
@@ -360,12 +446,53 @@ class Vault:
           캐시 원본이 오염되지 않는다(공용 캐시를 제자리에서 고치는 것은 절대1원칙 위반이다).
         """
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        # ── 0단계: 로컬 미러가 드라이브와 같은 세대면 **드라이브를 읽지 않는다** ────────────
+        #    stat 두 번(≈ms) 으로 판정하고, 유효하면 로컬 디스크에서 읽는다(수십 초 절약).
+        _mz = self._mirror_paths(scope, name)
+        if _mz and os.path.exists(path) and self._mirror_valid(_mz[0], _mz[1], path):
+            try:
+                _mt = os.path.getmtime(_mz[0])
+                if max_age_days is None or (time.time() - os.path.getmtime(path)
+                                            ) / 86400.0 <= max_age_days:
+                    _ck = (_mz[0], _mt)
+                    with self._lk:
+                        _hit = self._tbl_memo.get(_ck)
+                    if _hit is not None:
+                        self.stats["table_memo_hit"] += 1
+                        return _hit.copy(deep=False)
+                    _t0 = time.time()
+                    _d = read_parquet_safe(_mz[0])
+                    if _d is not None:
+                        with self._lk:
+                            if len(self._tbl_memo) > 64:
+                                self._tbl_memo.clear()
+                            self._tbl_memo[_ck] = _d
+                        self.mirror_stats["mirror_hit"] += 1
+                        self.stats["table_read_mirror"] += 1
+                        PIPE.io("IN", "PARQUET", f"table:{name}", _d,
+                                source=f"로컬 미러 ({time.time()-_t0:.1f}s · 드라이브 재읽기 없음)")
+                        return _d.copy(deep=False)
+            except Exception:                                    # noqa
+                pass                                             # 미러가 깨졌으면 원본으로 간다
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
             path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
             if os.path.exists(path2):
                 path = path2
+            elif _mz and os.path.exists(_mz[0]):
+                # ★ 드라이브에 원본이 아예 없다 = 이번 실행에서 드라이브를 못 붙였거나
+                #   다른 머신에서 돈 실행이다. 그럴 때 미러는 마지막 보루다 —
+                #   "캐시가 있는데도 다시 수집" 하는 것보다 낫다. 사실을 로그로 남긴다.
+                LOG.warn(f"드라이브에 {name}.parquet 이 없어 **로컬 미러**에서 읽습니다 "
+                         f"({os.path.relpath(_mz[0], self.mirror_root)}). "
+                         f"드라이브 마운트를 확인하세요 — 이번 실행의 신규 수집물은 "
+                         f"드라이브에 저장되지 못할 수 있습니다.")
+                d0 = read_parquet_safe(_mz[0])
+                if d0 is not None:
+                    self.mirror_stats["mirror_rescue"] += 1
+                    return d0.copy(deep=False)
+                return None
             else:
                 # ★ 마지막 수단: put_table 이 백업 실패로 흘려 둔 리비전 파일.
                 #   예전엔 이걸 아무도 읽지 않아, 워터마크·음성캐시 기록이 통째로 새고
@@ -405,9 +532,12 @@ class Vault:
             self.stats["table_read"] += 1
             _el = time.time() - t0
             PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
+            # 드라이브에서 읽었으니 로컬로 미러링해 둔다 — **다음 실행**이 이 비용을 안 낸다.
+            self._mirror_write(scope, name, path)
             if _el > 5.0:
                 LOG.info(f"드라이브에서 {name} {len(d):,}행 읽는 데 {_el:.1f}초 — "
-                         f"이번 실행에서 다시 읽지 않습니다(세션 메모).")
+                         f"이번 실행에서 다시 읽지 않고(세션 메모), 로컬 미러에 복사해 "
+                         f"다음 실행도 다시 읽지 않습니다.")
             return d.copy(deep=False)
         return d
 
@@ -549,6 +679,23 @@ class Vault:
         if self.stats:
             LOG.table([[k, f"{v:,}"] for k, v in sorted(self.stats.items())][:24],
                       ["이벤트", "횟수"], ["l", "r"], title="이번 실행의 캐시 이벤트")
+        if self.mirror_root:
+            _n = self.mirror_stats
+            _sz = 0.0
+            try:
+                for dp, _dn, fns in os.walk(self.mirror_root):
+                    _sz += sum(_safe_size(os.path.join(dp, f)) for f in fns if f.endswith(".parquet"))
+            except Exception:
+                pass
+            LOG.table([["로컬 미러 경로", self.mirror_root],
+                       ["미러에서 읽음(드라이브 생략)", f"{_n.get('mirror_hit', 0):,}회"],
+                       ["미러로 복사", f"{_n.get('mirror_write', 0):,}회"],
+                       ["드라이브 부재 시 미러 구제", f"{_n.get('mirror_rescue', 0):,}회"],
+                       ["미러 용량", f"{max(_sz,0)/1e9:.2f} GB"]],
+                      ["2단 캐시", "값"], ["l", "r"],
+                      title="로컬 미러 — 드라이브는 진실의 원천, 로컬은 읽기 가속")
+            LOG.info("로컬 미러는 언제 지워도 안전합니다(다음 실행에서 드라이브로부터 다시 만듭니다). "
+                     "미러가 드라이브를 덮어쓰는 경로는 존재하지 않습니다.")
         LOG.info("무결성 원칙: 저널은 append-only(기존 줄 재기록 없음) · index.parquet 은 백업 후 교체 · "
                  "blob 은 내용해시 경로라 덮어쓰기 자체가 발생하지 않음 · 삭제 API 없음.")
 

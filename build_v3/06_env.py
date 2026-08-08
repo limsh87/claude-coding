@@ -192,7 +192,64 @@ _RUNTIME_BUDGET_MIN = {
     "L0.준비": 3, "CANARY": 25, "수집": 95, "L1.센서+커버리지": 5,
     "L2+L3.백테스트": 2, "R-SUITE": 26,
 }
-WALL_CLOCK_LIMIT_H = 4.0        # §12-6 — 초과하면 구조 재점검 경고를 띄운다
+WALL_CLOCK_LIMIT_H = 4.0        # §12-6 — 이 안에 끝나야 한다
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★ 4시간 계약을 '경고'가 아니라 '강제'로 바꾸는 장치 ★★
+#
+#  예전 구조에서 이 상수는 **끝난 뒤에** 한 번 비교되는 데 쓰였다. PIPE.stage 의 budget_s 도
+#  마찬가지로 컨텍스트가 닫힐 때 초과를 경고할 뿐, 진행 중인 수집을 멈추지 못한다.
+#  즉 4시간 계약을 지키는 코드가 어디에도 없었다 — 계약서만 있고 집행자가 없었다.
+#
+#  → 실행 시작 시각에서 **역산한 데드라인**을 하나 만들고, 잡이 곱셈으로 늘어나는 수집
+#    루프(직원현황·Tier-2 재무·가격·리서치)가 회사/청크 경계마다 이걸 확인해 스스로 멈춘다.
+#    경계에서 멈추므로 받은 것은 전부 온전하고, 캐시는 append-only 라 다음 실행이 이어받는다.
+#
+#  ★ 왜 '건수'가 아니라 '시간'인가. 사용자 요구가 그것이다 —
+#    "키호출량을 처음부터 19000이나 2만회로 정하지 말고 남은 호출량을 실시간으로 체크해서
+#     그만큼 쓰게 하라." 건수 상한은 우리의 추정이고, 진짜 잔여량은 서버만 안다.
+#    그러니 멈추는 조건은 두 개뿐이어야 한다:
+#      ① 서버가 020/021 로 거부했다(진짜 한도 소진)   ② 시계가 다 됐다(4시간 계약)
+#    그 사이에서는 남은 만큼 계속 쏜다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+POST_COLLECT_RESERVE_MIN = 60.0     # 수집 이후(피처·스코어·백테스트·강건성·리포트) 몫
+
+
+def run_elapsed_s() -> float:
+    return time.time() - _T0_PROCESS
+
+
+def collect_deadline_ts() -> float:
+    """수집 단계가 넘으면 안 되는 절대 시각(epoch)."""
+    return _T0_PROCESS + WALL_CLOCK_LIMIT_H * 3600.0 - POST_COLLECT_RESERVE_MIN * 60.0
+
+
+def collect_time_left() -> float:
+    """수집에 남은 초. 음수면 이미 넘긴 것이다."""
+    return collect_deadline_ts() - time.time()
+
+
+def deadline_hit(margin_s: float = 0.0) -> bool:
+    return collect_time_left() <= margin_s
+
+
+def deadline_note() -> str:
+    left = collect_time_left()
+    if left <= 0:
+        return (f"4시간 계약의 수집 몫을 모두 썼습니다"
+                f"(경과 {run_elapsed_s()/60:.0f}분 · 후속 단계 몫 "
+                f"{POST_COLLECT_RESERVE_MIN:.0f}분 확보).")
+    return f"수집 잔여 {left/60:.0f}분"
+
+
+def stage_time_budget(share: float, floor_s: float = 60.0) -> float:
+    """남은 수집시간 중 이 단계가 쓸 몫(초). share 는 0~1.
+
+    ★ 고정 상수(예전 FS_TIME_BUDGET_S=1200)를 쓰지 않는 이유: 앞 단계가 빨리 끝나면
+      그만큼을 뒤 단계가 써야 하고, 앞 단계가 늦어지면 뒤 단계가 줄어야 한다.
+      고정 상수는 둘 다 못 한다 — 합이 4시간을 넘거나, 남는 시간을 버린다.
+    """
+    return max(floor_s, collect_time_left() * float(share))
 
 
 def runtime_mark(phase: str, seconds: float, note: str = ""):

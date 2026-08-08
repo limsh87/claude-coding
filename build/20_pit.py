@@ -318,33 +318,74 @@ class Universe:
                 for r in self.sec.itertuples(index=False)
                 if pd.notna(r.delisting_date)}
 
-    def audit_row(self, stage: str, t, codes: Sequence[str]):
-        self.attrition.append({"month": as_ts(t), "stage": stage, "n": len(codes)})
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  감쇠 원장 — 팔(arm) 태그와 기록 스위치
+    #
+    #  ★★ 왜 필요한가 (7회차 리포트에 '잔존율 113.7%' 라는 불가능한 숫자가 찍힌 자리) ★★
+    #    이 리스트는 전역 하나였고 태그가 없었다. 그런데 여기에 쓰는 주체가 셋이다:
+    #      ① 전체(ALL) 팔의 apply_umid  ② 하위1000(SMALL) 팔의 apply_umid
+    #      ③ run_backtest — 그리고 강건성 스위트가 백테스트를 **10여 회 재실행**한다.
+    #    report_attrition 은 stage 별 단순 평균을 내므로,
+    #      '유동성필터' = ALL 패널에서 잰 월평균(≈1,500)
+    #      'U-MID대역'  = ALL 과 SMALL 을 섞은 월평균(≈1,300)
+    #    처럼 **서로 다른 모집단의 평균**이 한 깔때기에 세로로 놓인다. 뒤 단계가 앞 단계보다
+    #    커지는 순간 잔존율이 100%를 넘는다. 숫자가 이상해서 눈에 띈 것이 다행이었다 —
+    #    조금만 덜 이상했으면 '어느 게이트에서 표본이 붕괴하는가'를 통째로 오독했을 것이다.
+    #  → ① 모든 기록에 arm 태그를 단다. ② 팔별로 표를 따로 낸다.
+    #    ③ 강건성 재실행은 audit_on=False 로 아예 기록하지 않는다(같은 달을 10번 세면
+    #       평균은 같지만 min/max 가 의미를 잃고, 팔 태그도 뒤섞인다).
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    audit_arm: str = "MAIN"
+    audit_on: bool = True
 
-    def report_attrition(self):
+    def set_audit_arm(self, arm: str, on: bool = True):
+        self.audit_arm, self.audit_on = str(arm), bool(on)
+
+    def audit_row(self, stage: str, t, codes: Sequence[str], arm: Optional[str] = None):
+        if not self.audit_on:
+            return
+        self.attrition.append({"arm": str(arm or self.audit_arm), "month": as_ts(t),
+                               "stage": stage, "n": len(codes)})
+
+    def report_attrition(self, title_suffix: str = ""):
         if not self.attrition:
             return
         A = pd.DataFrame(self.attrition)
+        if "arm" not in A.columns:
+            A["arm"] = "MAIN"
+        # ★ 같은 (팔, 단계, 달) 이 두 번 기록되면 평균이 바뀌진 않지만 min/max·표본수가
+        #   왜곡된다. 마지막 기록을 진실로 본다(재실행이 있었다면 그쪽이 최신이다).
+        A = A.drop_duplicates(["arm", "stage", "month"], keep="last")
         # ★ 이 목록에 없는 단계는 표에서 조용히 사라진다(오류도 경고도 없이).
         #   새 게이트를 추가했다면 반드시 여기에도 넣을 것.
         order = ["전체상장", "PIT유니버스", "가격보유", "U-MID대역", "유동성필터", "거부권통과",
                  "하한선통과", "최종선정"]
-        piv = A.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
-        rows = []
-        prev = None
-        for s in order:
-            if s not in piv.index:
+        for arm in sorted(A["arm"].unique(), key=lambda x: (x != "MAIN", x)):
+            sub = A[A["arm"] == arm]
+            piv = sub.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
+            rows, prev = [], None
+            for s in order:
+                if s not in piv.index:
+                    continue
+                m = piv.loc[s]
+                keep = "" if prev is None else f"{100*m['mean']/prev:.1f}%"
+                # 100% 초과는 이제 구조적으로 나올 수 없지만, 나오면 그 사실을 표에 적는다.
+                if prev is not None and m["mean"] > prev * 1.001:
+                    keep += " ⚠모집단불일치"
+                rows.append([s, f"{m['mean']:,.0f}", f"{m['min']:,.0f}", f"{m['max']:,.0f}",
+                             f"{int(m['size']):,}", keep])
+                prev = m["mean"]
+            if not rows:
                 continue
-            m = piv.loc[s]
-            keep = "" if prev is None else f"{100*m['mean']/prev:.1f}%"
-            rows.append([s, f"{m['mean']:,.0f}", f"{m['min']:,.0f}", f"{m['max']:,.0f}", keep])
-            prev = m["mean"]
-        LOG.table(rows, ["게이트", "월평균 종목수", "최소", "최대", "직전 대비 잔존율"],
-                  ["l", "r", "r", "r", "r"],
-                  title="유니버스 감쇠 감사 (§10.4) — 어느 게이트에서 표본이 붕괴하는지")
-        if rows and float(str(rows[-1][1]).replace(",", "")) < 5:
-            LOG.warn("최종 선정 종목이 월평균 5개 미만입니다. 통계적 판단이 불가능한 수준이므로 "
-                     "임계값을 낮추기 전에 어느 게이트가 원인인지 위 표에서 먼저 확인하세요.")
+            LOG.table(rows, ["게이트", "월평균 종목수", "최소", "최대", "관측월", "직전 대비 잔존율"],
+                      ["l", "r", "r", "r", "r", "r"],
+                      title=f"유니버스 감쇠 감사 (§10.4) · 팔={arm}{title_suffix} "
+                            f"— 어느 게이트에서 표본이 붕괴하는지")
+            if float(str(rows[-1][1]).replace(",", "")) < PORTFOLIO_MIN_NAMES:
+                LOG.warn(f"[{arm}] 최종 선정 종목이 월평균 {rows[-1][1]}개로 "
+                         f"PORTFOLIO_MIN_NAMES={PORTFOLIO_MIN_NAMES} 에 못 미칩니다. "
+                         f"이 수준에서는 성과가 종목 몇 개의 함수이지 전략의 함수가 아닙니다 — "
+                         f"임계값을 낮추기 전에 위 표에서 어느 게이트가 원인인지 확인하세요.")
 
 
 # ── 셀 (C11) ────────────────────────────────────────────────────────────────────────────────

@@ -301,17 +301,30 @@ def apply_vetoes_v3(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
 # ── 스코어 조립 — 본선·비교팔이 공유하는 유일한 경로 ────────────────────────────────────────
 def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
-              use_u: bool = True, use_veto: bool = True) -> Dict[str, pd.Series]:
+              use_u: bool = True, use_veto: bool = True,
+              min_arms: int = None) -> Dict[str, pd.Series]:
     """주어진 TP 집합 하나로 E → Signal → Signal_rank 를 만든다.
 
     Signal = rank_pct(E) × rank_pct(U) × ∏V        (스펙 §8)
 
-    min_tp: 관측된 TP 가 이보다 적으면 제외(FLOOR). 스펙에 없는 우리 쪽 안전장치이므로
-            R5 절제검사에서 이 경계값의 민감도를 반드시 함께 출력한다.
+    min_tp:   관측된 TP 가 이보다 적으면 제외(FLOOR). 스펙에 없는 우리 쪽 안전장치이므로
+              R5 절제검사에서 이 경계값의 민감도를 반드시 함께 출력한다.
+    min_arms: 증거층으로 인정할 최소 TP **개수**. 기본값은 MIN_TP_ARMS(=2) 이고,
+              본선이 단일 팩터로 조용히 퇴화하는 것을 막는 장치다.
+
+      ★★ 왜 파라미터가 되어야 하는가 (7회차에서 이 전략의 존재이유가 죽은 자리) ★★
+        R2-N 킬게이트는 설계상 **단일 센서 팔**(A: nl_emp 단독, B: nl_premium 단독)을
+        만들어 트레이드오프 팔(C)과 비교한다. 단일 팔인 것이 검정의 목적 그 자체다.
+        그런데 이 함수가 MIN_TP_ARMS 를 전역 상수로 강제하고 있어서,
+        R2-N 이 A 팔을 만들려는 순간 "TP 가 1개뿐입니다" 로 RuntimeError 가 났다.
+        그래서 이 파일의 존재 이유인 검정이 **한 번도 실행되지 못했다.**
+        본선의 안전장치가 검정을 죽인 것이다 — 안전장치는 호출자가 의도를 말할 수
+        있어야 한다. 본선은 기본값(2)을 그대로 쓰고, 단일팔 비교만 1 을 명시한다.
     """
     tp_cols = [c for c in tp_cols if c in P.columns]
     min_tp = MIN_TP_OBSERVED if min_tp is None else min_tp
-    if len(tp_cols) < MIN_TP_ARMS:
+    min_arms = MIN_TP_ARMS if min_arms is None else max(1, int(min_arms))
+    if len(tp_cols) < min_arms:
         # ★ 예전 메시지는 사실을 잘못 말했다 — "컬럼이 하나도 없습니다" 라고 했지만
         #   컬럼 8개는 전부 존재했고, 전량 NaN 이라 호출자가 직전 줄에서 걸러낸 것이었다.
         #   그래서 사용자는 있지도 않은 컬럼 생성 버그를 찾게 됐다. 원인을 지목해서 말한다.
@@ -329,7 +342,7 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
             _halt = None
         if _halt:
             raise RuntimeError(
-                f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {MIN_TP_ARMS}개 필요).\n"
+                f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {min_arms}개 필요).\n"
                 f"  원인은 **수집 설정이 아니라 자원**입니다 — {_halt}\n"
                 f"  · 살아 있는 TP : {tp_cols or '없음'}\n"
                 f"  · 이번 실행에서 채우지 못한 원천 :"
@@ -342,7 +355,7 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
                 f"       (opendart.fss.or.kr 에서 무료·즉시 발급).\n"
                 f"    설정을 바꾸지 마세요 — 이번 실행의 설정에는 문제가 없었습니다.")
         raise RuntimeError(
-            f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {MIN_TP_ARMS}개 필요). "
+            f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {min_arms}개 필요). "
             f"컬럼은 만들어졌지만 관측이 0이라 제외됐습니다 — 계산 버그가 아니라 원천 결손입니다.\n"
             f"  · 살아 있는 TP : {tp_cols or '없음'}\n"
             f"  · 비어 있는 원천 : {chr(10) + '      - ' + (chr(10) + '      - ').join(need) if need else '판별 불가'}\n"

@@ -92,6 +92,25 @@ _DART_N_KEYS   = max(1, len({str(k).strip() for k in ([DART_API_KEY] + list(DART
 _DART_FIXED    = 2_700                                   # Tier-1 배치 + CANARY + 공시 탐침
 _DART_ROOM     = max(2_000, 19_000 * _DART_N_KEYS - _DART_FIXED)
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★ 무엇이 수집을 멈추는가 — 딱 두 가지뿐입니다 ★★
+#
+#    ① 서버가 020/021 을 응답한 키 (= 진짜 한도 소진. 잔여량은 서버만 압니다)
+#    ② 시계 (= 4시간 계약. 아래 시간 몫)
+#
+#  아래 EMP_MAX_CALLS / DART_FS_MAX_CALLS 는 **허가권이 아니라 계획용 상한**입니다.
+#  ETA 표시와 우선순위 정렬에 쓰이며, 이 숫자에 닿았다고 해서 서버가 막은 것은 아닙니다.
+#  (예전 판은 로컬 추정 카운터가 19,000 에 닿으면 **한 건도 시도하지 않고** 한도 소진을
+#   선언했습니다. 파일엔 19,000/19,000 인데 서버는 멀쩡히 응답하는 상태였습니다 —
+#   우리 추정으로 우리를 막은 것입니다. 그 경로는 제거됐습니다.)
+#
+#  ▶ 시간 몫은 **남은 시간의 비율**입니다. 앞 단계가 빨리 끝나면 뒤 단계가 더 씁니다.
+#    고정 분(分)을 박으면 합이 4시간을 넘거나, 남는 시간을 그냥 버립니다.
+#  ▶ 직원현황이 먼저입니다. 이 전략의 알파 원천이고, 비면 '전략 3' 이 아니게 됩니다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+EMP_TIME_SHARE = 0.50    # 수집 잔여시간 중 직원현황(알파) 몫
+FS_TIME_SHARE  = 0.75    # 그 다음, 남은 잔여시간 중 Tier-2 재무 몫
+
 # ── ② KRX 데이터 마켓플레이스  (2025-12 인증방식 변경 대응) ─────────────────────────────────
 #
 #    가입 경로 : https://data.krx.co.kr → 우측 상단 [회원가입] (무료)
@@ -157,6 +176,20 @@ GDRIVE_ADOPT_DIRS = [
 #      None 이면 Path.home()/tcd_cache 를 씁니다. /content 를 하드코딩하지 않습니다.
 LOCAL_CACHE_ROOT  = None
 
+#    ▸ ★ 2단 캐시 — 로컬 미러 (읽기 가속 전용) ─────────────────────────────────────────────
+#      구글드라이브는 로컬 디스크가 아니라 네트워크 파일시스템에 가깝습니다. 실측으로
+#      340MB 일봉 테이블 한 번 읽기가 수십 초입니다. 이 코드는 드라이브에서 읽은 테이블을
+#      로컬 디스크에 미러링해 두고, **다음 실행부터는 로컬에서 먼저 찾습니다**.
+#        조회 순서 :  ① 세션 메모  →  ② 로컬 미러  →  ③ 구글드라이브
+#      유효성은 사이드카(.meta.json)에 적어 둔 드라이브 파일의 (mtime, size) 로 판정합니다.
+#      stat 한 번은 싸고, 파일 읽기는 수십 초이므로 이 비교가 시간을 벌어 줍니다.
+#      ▸ 진실의 원천은 언제나 드라이브입니다. 미러는 언제 지워도 안전하며(다음 실행에서
+#        다시 만듭니다), 미러가 드라이브를 덮어쓰는 경로는 코드에 존재하지 않습니다.
+#      ▸ 반대로 드라이브를 못 붙인 실행에서는 미러가 마지막 보루가 됩니다 —
+#        "캐시가 있는데도 다시 수집" 하는 일이 없습니다.
+#      None = 자동 (Colab: /content/tcd_cache_mirror · 그 외: ~/.cache/tcd_cache_mirror)
+LOCAL_MIRROR_ROOT = None
+
 # ── ⑤ 백테스트 구간 ─────────────────────────────────────────────────────────────────────────
 BACKTEST_START = "2016-08-01"
 BACKTEST_END   = "2026-07-31"
@@ -208,7 +241,7 @@ MEM_BUDGET_GB  = 6.0     # 초과가 예상되면 청크 처리로 자동 전환
 #           축소가 실효 0 이었습니다 — 로그엔 '제외 0사'가 찍히고 있었습니다).
 #      → 연간(annual) × 좁혀진 모집단이면 키 하나로도 몇 번의 실행에 걸쳐 채워집니다.
 #        캐시는 append-only 라 재실행할 때마다 정확히 이어받습니다.
-DART_FS_MAX_CALLS   = int(_DART_ROOM * 0.45 / 2)   # 키 1개면 ≈3,667 · 2개면 ≈7,942 잡.
+DART_FS_MAX_CALLS   = int(_DART_ROOM * 0.40 / 2)   # 키 1개면 ≈3,260 · 2개면 ≈7,060 잡.
                                # 잡당 OFS→CFS 최대 2회이므로 2로 나눕니다.
                                # 0 = Tier-2 생략 → CORE-D 전멸. 특별한 이유 없으면 쓰지 마세요.
                                # None = 상한 없음 = 며칠짜리 콜드빌드(4시간 계약 밖).
@@ -320,8 +353,17 @@ EMP_MAX_CORPS  = 0               # 0 = 제한 없음. 테스트 시 300 등으�
 #   ▸ empSttus 도 |기업| × |연도| 로 곱해집니다(3,981사 × 13년 = 51,753 > 일일한도 19,000).
 #     한계임금은 이 전략의 알파 원천이라 DART 일일예산을 **Tier-2 재무보다 먼저** 여기에 씁니다.
 #     상한에 걸리면 '담길 확률이 높은 종목 × 최근 연도'부터 채우고 재실행 시 이어받습니다.
-EMP_MAX_CALLS  = int(_DART_ROOM * 0.55)   # 키 1개면 ≈8,965 · 2개면 ≈19,415. 실측 8건/초.
-                                 # None = 상한 없음(4시간 계약 밖). 키를 늘리면 자동으로 커집니다.
+EMP_MAX_CALLS  = int(_DART_ROOM * 0.60)   # 키 1개면 ≈9,780 · 2개면 ≈21,180. 실측 8건/초.
+                                 # None = 계획 상한 없음(그래도 시간·서버가 멈춥니다).
+#   ▸ ★★ 격자는 **회사 우선**입니다 (7회차 사고를 고정한 설계 결정) ★★
+#     예전엔 연도 우선이라, 상한에 걸리면 항상 '오래된 연도'가 통째로 잘렸습니다.
+#     실측 결과가 2,536사 × 3.4년이었고 — 백테스트 120개월 중 **앞 80개월에 EMP 신호가
+#     한 건도 없었습니다.** 그건 10년 전략이 아니라 'CORE-D 80개월 + CORE-D+EMP 40개월'
+#     을 이어 붙인 것입니다.
+#     회사 우선이면 확보한 회사는 **10년 전 구간이 완성**됩니다. 회사 수는 줄지만
+#     (키 1개 ≈ 780사) 모든 달에 신호가 존재합니다. 12개월 차분 센서는 연속 2개년이
+#     없으면 산출조차 되지 않으므로, 이 전략에서는 폭보다 깊이가 결정적입니다.
+#     재실행하면 append-only 캐시가 정확히 다음 회사부터 이어받습니다.
 EMP_UNIVERSE_ONLY = True         # True = U-MID 대역을 한 번이라도 경험한 종목만 수집.
                                  # 셀 정규화도 U-MID 패널 안에서만 하므로 제외분은 안 쓰입니다.
 #   ▸ ★ 직원현황은 이 전략의 **유일한 알파 원천**입니다(TP_N1·N2·N3).
@@ -352,7 +394,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.1119"
+BUILD_VERSION  = "v3.20260808.1246"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -1725,10 +1767,52 @@ def _mount_drive() -> Tuple[str, str]:
     return LOCAL_CACHE_ROOT, "LOCAL"
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★ 2단 캐시 — 로컬 미러 + 드라이브 원본
+#
+#  구글드라이브(Colab 마운트든 데스크톱 동기화든)는 로컬 디스크가 아니라 네트워크
+#  파일시스템에 가깝다. 실측으로 340MB 짜리 일봉 테이블 한 번 읽기가 수십 초다.
+#  같은 실행 안에서의 중복 읽기는 세션 메모가 이미 막고 있지만, **실행이 바뀌면**
+#  다시 처음부터 드라이브를 읽는다 — 재실행이 잦은 이 파이프라인에서 그 비용이 크다.
+#
+#  → 드라이브에서 읽은 테이블을 로컬 디스크에 그대로 미러링한다. 다음 실행은
+#    ① 세션 메모 → ② 로컬 미러 → ③ 드라이브 순으로 찾는다.
+#    미러 유효성은 사이드카(.meta.json)에 적어 둔 드라이브 파일의 (mtime, size) 와
+#    대조해 판정한다. stat 한 번은 FUSE 에서도 싸고, 읽기는 수십 초다.
+#
+#  ★ 진실의 원천은 언제나 드라이브다. 미러는 순수한 읽기 가속이며,
+#    미러가 없거나 깨져도 결과는 동일하다(그냥 느려질 뿐). 미러는 삭제해도 안전하다.
+#  ★ 반대로 **드라이브를 못 쓰는 실행**(마운트 실패·네트워크 단절)에서는 미러가
+#    마지막 보루가 된다. 그때는 미러에서 읽고 그 사실을 로그에 남긴다.
+#  ★ 미러는 절대 드라이브를 덮어쓰지 않는다. 방향은 항상 드라이브 → 로컬 한쪽뿐이고,
+#    put_table 은 드라이브에 먼저 쓴 뒤 그 결과를 미러에 복사한다(절대1원칙).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+def _default_mirror_root() -> str:
+    v = globals().get("LOCAL_MIRROR_ROOT")
+    if v:
+        return os.path.abspath(str(v))
+    if ENV.get("colab"):
+        return "/content/tcd_cache_mirror"          # Colab 컨테이너 로컬 SSD
+    return os.path.join(os.path.expanduser("~"), ".cache", "tcd_cache_mirror")
+
+
 class Vault:
-    def __init__(self, root: str, mode: str):
+    def __init__(self, root: str, mode: str, mirror_root: Optional[str] = None):
         self.root = os.path.abspath(root)
         self.mode = mode
+        # 루트가 이미 로컬이면 미러는 무의미하다(같은 디스크를 두 번 쓰는 낭비).
+        _mr = os.path.abspath(mirror_root or _default_mirror_root())
+        _is_net = ("drive" in self.root.lower() or "clouddrive" in self.root.lower()
+                   or "cloudstorage" in self.root.lower() or mode.endswith("DRIVE")
+                   or mode == "LOCAL_SYNCED_DRIVE")
+        self.mirror_root = _mr if (_is_net and os.path.normpath(_mr) !=
+                                   os.path.normpath(self.root)) else None
+        self.mirror_stats = Counter()
+        if self.mirror_root:
+            try:
+                os.makedirs(self.mirror_root, exist_ok=True)
+            except Exception:                                    # noqa
+                self.mirror_root = None
         self.ns = {"shared": os.path.join(self.root, GDRIVE_SHARED_NS),
                    "private": os.path.join(self.root, GDRIVE_PRIVATE_NS)}
         for p in self.ns.values():
@@ -1758,6 +1842,47 @@ class Vault:
 
     def table_dir(self, scope: str) -> str:
         return os.path.join(self.ns[scope], "table")
+
+    # ── 로컬 미러 -----------------------------------------------------------------------
+    def _mirror_paths(self, scope: str, name: str) -> Optional[Tuple[str, str]]:
+        if not self.mirror_root:
+            return None
+        d = os.path.join(self.mirror_root, scope, "table")
+        return os.path.join(d, f"{name}.parquet"), os.path.join(d, f"{name}.meta.json")
+
+    def _mirror_valid(self, mp: str, meta_p: str, src: str) -> bool:
+        """미러가 드라이브 원본과 같은 세대인가. stat 두 번으로 판정한다(읽지 않는다)."""
+        try:
+            if not (os.path.exists(mp) and os.path.exists(meta_p)):
+                return False
+            st = os.stat(src)
+            m = json.loads(open(meta_p, encoding="utf-8").read() or "{}")
+            return (abs(float(m.get("src_mtime", -1)) - st.st_mtime) < 1e-6
+                    and int(m.get("src_size", -1)) == int(st.st_size))
+        except Exception:                                        # noqa
+            return False
+
+    def _mirror_write(self, scope: str, name: str, src: str) -> None:
+        """드라이브 원본을 로컬로 복사하고 세대 정보를 사이드카에 남긴다. 실패해도 무해하다."""
+        mpz = self._mirror_paths(scope, name)
+        if not mpz:
+            return
+        mp, meta_p = mpz
+        try:
+            st = os.stat(src)
+            os.makedirs(os.path.dirname(mp), exist_ok=True)
+            tmp = mp + f".tmp{os.getpid()}"
+            shutil.copy2(src, tmp)
+            os.replace(tmp, mp)
+            atomic_write_text(meta_p, json.dumps(
+                {"src": src, "src_mtime": st.st_mtime, "src_size": int(st.st_size),
+                 "mirrored_at": _dt.datetime.now().isoformat(timespec="seconds")},
+                ensure_ascii=False))
+            self.mirror_stats["mirror_write"] += 1
+        except Exception as e:                                   # noqa
+            # 미러는 순수 가속이다. 실패하면 그냥 다음 실행에 드라이브를 읽으면 된다.
+            self.mirror_stats["mirror_write_fail"] += 1
+            LOG.debug(f"로컬 미러 기록 실패({type(e).__name__}) — 결과에는 영향 없습니다: {name}")
 
     # ── 잠금 (두 노트북이 동시에 돌아도 저널이 섞이지 않게) -----------------------------
     @contextmanager
@@ -2000,6 +2125,9 @@ class Vault:
                 self._tbl_memo[(path, os.path.getmtime(path))] = df
         except Exception:                                   # noqa
             pass
+        # 드라이브에 쓴 그 파일을 로컬로도 복사한다. 방향은 항상 드라이브 → 로컬 한쪽이며,
+        # 미러가 드라이브를 덮는 경로는 존재하지 않는다(절대1원칙).
+        self._mirror_write(scope, name, path)
         self._register(scope, {
             "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",
             "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,
@@ -2035,12 +2163,53 @@ class Vault:
           캐시 원본이 오염되지 않는다(공용 캐시를 제자리에서 고치는 것은 절대1원칙 위반이다).
         """
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        # ── 0단계: 로컬 미러가 드라이브와 같은 세대면 **드라이브를 읽지 않는다** ────────────
+        #    stat 두 번(≈ms) 으로 판정하고, 유효하면 로컬 디스크에서 읽는다(수십 초 절약).
+        _mz = self._mirror_paths(scope, name)
+        if _mz and os.path.exists(path) and self._mirror_valid(_mz[0], _mz[1], path):
+            try:
+                _mt = os.path.getmtime(_mz[0])
+                if max_age_days is None or (time.time() - os.path.getmtime(path)
+                                            ) / 86400.0 <= max_age_days:
+                    _ck = (_mz[0], _mt)
+                    with self._lk:
+                        _hit = self._tbl_memo.get(_ck)
+                    if _hit is not None:
+                        self.stats["table_memo_hit"] += 1
+                        return _hit.copy(deep=False)
+                    _t0 = time.time()
+                    _d = read_parquet_safe(_mz[0])
+                    if _d is not None:
+                        with self._lk:
+                            if len(self._tbl_memo) > 64:
+                                self._tbl_memo.clear()
+                            self._tbl_memo[_ck] = _d
+                        self.mirror_stats["mirror_hit"] += 1
+                        self.stats["table_read_mirror"] += 1
+                        PIPE.io("IN", "PARQUET", f"table:{name}", _d,
+                                source=f"로컬 미러 ({time.time()-_t0:.1f}s · 드라이브 재읽기 없음)")
+                        return _d.copy(deep=False)
+            except Exception:                                    # noqa
+                pass                                             # 미러가 깨졌으면 원본으로 간다
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
             path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
             if os.path.exists(path2):
                 path = path2
+            elif _mz and os.path.exists(_mz[0]):
+                # ★ 드라이브에 원본이 아예 없다 = 이번 실행에서 드라이브를 못 붙였거나
+                #   다른 머신에서 돈 실행이다. 그럴 때 미러는 마지막 보루다 —
+                #   "캐시가 있는데도 다시 수집" 하는 것보다 낫다. 사실을 로그로 남긴다.
+                LOG.warn(f"드라이브에 {name}.parquet 이 없어 **로컬 미러**에서 읽습니다 "
+                         f"({os.path.relpath(_mz[0], self.mirror_root)}). "
+                         f"드라이브 마운트를 확인하세요 — 이번 실행의 신규 수집물은 "
+                         f"드라이브에 저장되지 못할 수 있습니다.")
+                d0 = read_parquet_safe(_mz[0])
+                if d0 is not None:
+                    self.mirror_stats["mirror_rescue"] += 1
+                    return d0.copy(deep=False)
+                return None
             else:
                 # ★ 마지막 수단: put_table 이 백업 실패로 흘려 둔 리비전 파일.
                 #   예전엔 이걸 아무도 읽지 않아, 워터마크·음성캐시 기록이 통째로 새고
@@ -2080,9 +2249,12 @@ class Vault:
             self.stats["table_read"] += 1
             _el = time.time() - t0
             PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
+            # 드라이브에서 읽었으니 로컬로 미러링해 둔다 — **다음 실행**이 이 비용을 안 낸다.
+            self._mirror_write(scope, name, path)
             if _el > 5.0:
                 LOG.info(f"드라이브에서 {name} {len(d):,}행 읽는 데 {_el:.1f}초 — "
-                         f"이번 실행에서 다시 읽지 않습니다(세션 메모).")
+                         f"이번 실행에서 다시 읽지 않고(세션 메모), 로컬 미러에 복사해 "
+                         f"다음 실행도 다시 읽지 않습니다.")
             return d.copy(deep=False)
         return d
 
@@ -2224,6 +2396,23 @@ class Vault:
         if self.stats:
             LOG.table([[k, f"{v:,}"] for k, v in sorted(self.stats.items())][:24],
                       ["이벤트", "횟수"], ["l", "r"], title="이번 실행의 캐시 이벤트")
+        if self.mirror_root:
+            _n = self.mirror_stats
+            _sz = 0.0
+            try:
+                for dp, _dn, fns in os.walk(self.mirror_root):
+                    _sz += sum(_safe_size(os.path.join(dp, f)) for f in fns if f.endswith(".parquet"))
+            except Exception:
+                pass
+            LOG.table([["로컬 미러 경로", self.mirror_root],
+                       ["미러에서 읽음(드라이브 생략)", f"{_n.get('mirror_hit', 0):,}회"],
+                       ["미러로 복사", f"{_n.get('mirror_write', 0):,}회"],
+                       ["드라이브 부재 시 미러 구제", f"{_n.get('mirror_rescue', 0):,}회"],
+                       ["미러 용량", f"{max(_sz,0)/1e9:.2f} GB"]],
+                      ["2단 캐시", "값"], ["l", "r"],
+                      title="로컬 미러 — 드라이브는 진실의 원천, 로컬은 읽기 가속")
+            LOG.info("로컬 미러는 언제 지워도 안전합니다(다음 실행에서 드라이브로부터 다시 만듭니다). "
+                     "미러가 드라이브를 덮어쓰는 경로는 존재하지 않습니다.")
         LOG.info("무결성 원칙: 저널은 append-only(기존 줄 재기록 없음) · index.parquet 은 백업 후 교체 · "
                  "blob 은 내용해시 경로라 덮어쓰기 자체가 발생하지 않음 · 삭제 API 없음.")
 
@@ -2726,7 +2915,64 @@ _RUNTIME_BUDGET_MIN = {
     "L0.준비": 3, "CANARY": 25, "수집": 95, "L1.센서+커버리지": 5,
     "L2+L3.백테스트": 2, "R-SUITE": 26,
 }
-WALL_CLOCK_LIMIT_H = 4.0        # §12-6 — 초과하면 구조 재점검 경고를 띄운다
+WALL_CLOCK_LIMIT_H = 4.0        # §12-6 — 이 안에 끝나야 한다
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★ 4시간 계약을 '경고'가 아니라 '강제'로 바꾸는 장치 ★★
+#
+#  예전 구조에서 이 상수는 **끝난 뒤에** 한 번 비교되는 데 쓰였다. PIPE.stage 의 budget_s 도
+#  마찬가지로 컨텍스트가 닫힐 때 초과를 경고할 뿐, 진행 중인 수집을 멈추지 못한다.
+#  즉 4시간 계약을 지키는 코드가 어디에도 없었다 — 계약서만 있고 집행자가 없었다.
+#
+#  → 실행 시작 시각에서 **역산한 데드라인**을 하나 만들고, 잡이 곱셈으로 늘어나는 수집
+#    루프(직원현황·Tier-2 재무·가격·리서치)가 회사/청크 경계마다 이걸 확인해 스스로 멈춘다.
+#    경계에서 멈추므로 받은 것은 전부 온전하고, 캐시는 append-only 라 다음 실행이 이어받는다.
+#
+#  ★ 왜 '건수'가 아니라 '시간'인가. 사용자 요구가 그것이다 —
+#    "키호출량을 처음부터 19000이나 2만회로 정하지 말고 남은 호출량을 실시간으로 체크해서
+#     그만큼 쓰게 하라." 건수 상한은 우리의 추정이고, 진짜 잔여량은 서버만 안다.
+#    그러니 멈추는 조건은 두 개뿐이어야 한다:
+#      ① 서버가 020/021 로 거부했다(진짜 한도 소진)   ② 시계가 다 됐다(4시간 계약)
+#    그 사이에서는 남은 만큼 계속 쏜다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+POST_COLLECT_RESERVE_MIN = 60.0     # 수집 이후(피처·스코어·백테스트·강건성·리포트) 몫
+
+
+def run_elapsed_s() -> float:
+    return time.time() - _T0_PROCESS
+
+
+def collect_deadline_ts() -> float:
+    """수집 단계가 넘으면 안 되는 절대 시각(epoch)."""
+    return _T0_PROCESS + WALL_CLOCK_LIMIT_H * 3600.0 - POST_COLLECT_RESERVE_MIN * 60.0
+
+
+def collect_time_left() -> float:
+    """수집에 남은 초. 음수면 이미 넘긴 것이다."""
+    return collect_deadline_ts() - time.time()
+
+
+def deadline_hit(margin_s: float = 0.0) -> bool:
+    return collect_time_left() <= margin_s
+
+
+def deadline_note() -> str:
+    left = collect_time_left()
+    if left <= 0:
+        return (f"4시간 계약의 수집 몫을 모두 썼습니다"
+                f"(경과 {run_elapsed_s()/60:.0f}분 · 후속 단계 몫 "
+                f"{POST_COLLECT_RESERVE_MIN:.0f}분 확보).")
+    return f"수집 잔여 {left/60:.0f}분"
+
+
+def stage_time_budget(share: float, floor_s: float = 60.0) -> float:
+    """남은 수집시간 중 이 단계가 쓸 몫(초). share 는 0~1.
+
+    ★ 고정 상수(예전 FS_TIME_BUDGET_S=1200)를 쓰지 않는 이유: 앞 단계가 빨리 끝나면
+      그만큼을 뒤 단계가 써야 하고, 앞 단계가 늦어지면 뒤 단계가 줄어야 한다.
+      고정 상수는 둘 다 못 한다 — 합이 4시간을 넘거나, 남는 시간을 버린다.
+    """
+    return max(floor_s, collect_time_left() * float(share))
 
 
 def runtime_mark(phase: str, seconds: float, note: str = ""):
@@ -3518,6 +3764,54 @@ RETRY_AFTER_DAYS = 30
 #   시계를 실제 날짜로 고치는 순간 1,000종목이 동시에 만료될 수 있다(≈28분).
 PRICE_RETRY_BUDGET_PER_RUN = 200
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★ 수익률 무결성 (7회차 실행에서 두 개의 증상으로 동시에 드러난 하나의 결함) ★★
+#
+#  증상 ①  R0 벤치마크가 CAGR inf% / MDD nan% 를 출력했다.
+#  증상 ②  보유종목 상위 5%(20종목)가 총기여의 180% 를 만들었다.
+#
+#  두 증상의 원인은 같다 — fwd_ret 에 **가격으로는 불가능한 값**이 섞여 있었다.
+#    fwd_ret = 다음달 체결가 / 이번달 체결가 − 1
+#  분모(exec_px)는 next_open 이 없으면 close 로 폴백하는데, 소스가 0 이나 결측을 0 으로
+#  준 종목에서 이 값이 **0** 이 된다. 0 으로 나누면 +inf 다. inf 한 개가 월 평균에
+#  들어가면 동일가중 벤치마크의 cumprod 가 그 달에 inf 로 발산하고, 그 다음부터
+#  eq/peak = inf/inf = nan 이라 MDD·Calmar 가 통째로 nan 이 된다. 판정식은
+#  isfinite(nan)=False 라 **조용히 FAIL** 로 떨어진다 — 벤치마크가 없는데 '벤치마크에
+#  졌다'고 보고하는 최악의 형태다.
+#
+#  분모가 0 이 아니어도 문제는 남는다. 이 파이프라인은 pykrx·FDR·네이버·yfinance 를
+#  종목 단위로 섞어 쓰고(캐시도 여러 실행에 걸쳐 섞인다), 소스마다 수정주가 기준이
+#  다르다. 액면분할·감자가 한쪽에만 반영돼 있으면 경계 달에서 ±90% 나 +900% 같은
+#  '수익률'이 만들어진다. 그 종목이 우연히 선정되면 그 한 종목이 10년 성과를 만든다.
+#
+#  ▶ 방어는 두 겹이다. 지어내지 않고, 조용히 버리지도 않는다.
+#    ① 불가능 판정 — KRX 가격제한(±30%/일)상 물리적으로 나올 수 없는 배율은
+#       가격 움직임이 아니라 기업행위(분할·병합·감자) 또는 데이터 오류다. 결측 처리하고
+#       **몇 건을 왜 버렸는지 표로 남긴다.** 임계는 실제 거래일 간격으로 계산한다.
+#    ② 나머지 꼬리는 절대 손대지 않는다. 대신 상위 |수익률| 분포를 표로 출력해
+#       "이 성과가 몇 종목·몇 달에 의존하는가"를 사용자가 직접 보게 한다.
+#
+#  ★ 벤치마크(R0)만은 절사평균을 함께 쓴다. 1,500종목 동일가중에서 한 종목의
+#    +900% 는 월 +0.6%p 를 만든다 — 실제로 담을 수 없는 수익이 기준선을 밀어 올린다.
+#    전략 수익률에는 절사를 적용하지 않는다(그건 성과를 지어내는 것이다).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+KRX_DAILY_LIMIT = 0.30        # KRX 일일 가격제한폭 (2015-06-15 이후 ±30%)
+RET_LIMIT_SLACK = 1.10        # 시가 갭·정리매매·거래일 계산 오차 여유
+RET_SANITY_LEDGER: List[dict] = []     # 무엇을 왜 버렸는지 — 표로 출력하고 드라이브에 남긴다
+
+
+def _price_limit_envelope(n_days: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    """n 거래일 동안 가격제한만으로 도달 가능한 배율의 [하한, 상한].
+
+    n 이 결측이면 한 달치(20거래일)로 본다. 이 봉투는 매우 관대하다(20일이면 [8e-4, 190]) —
+    의도적이다. 실제 수익을 자르는 것이 아니라 **물리적으로 불가능한 값만** 걷어내는 것이
+    목적이다. 좁히고 싶다면 그건 별개의 결정이며 리포트에 명시해야 한다.
+    """
+    n = pd.to_numeric(n_days, errors="coerce").fillna(20.0).clip(lower=1.0, upper=45.0)
+    up = np.power(1.0 + KRX_DAILY_LIMIT, n) * RET_LIMIT_SLACK
+    dn = np.power(1.0 - KRX_DAILY_LIMIT, n) / RET_LIMIT_SLACK
+    return dn, up
+
 
 def price_cache_floor() -> str:
     """일봉 수집 하한일. **v2·v3 가 반드시 같은 값을 써야 한다.**
@@ -4158,21 +4452,114 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
     monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
     monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
+    # ★★ 분모 위생 ★★ 0 이나 음수, ±inf 는 '가격'이 아니라 소스가 결측을 0 으로 준 것이다.
+    #   이걸 그대로 두면 아래 나눗셈이 +inf 를 만들고, 그 inf 한 개가 벤치마크의 복리를
+    #   통째로 발산시킨다(7회차의 CAGR inf% / MDD nan%). 값을 지어내지 않고 결측으로 둔다.
+    _px_bad = int((~np.isfinite(monthly["exec_px"].to_numpy(dtype="float64"))
+                   ) .sum() + int((monthly["exec_px"] <= 0).sum()))
+    monthly["exec_px"] = monthly["exec_px"].replace([np.inf, -np.inf], np.nan)
+    monthly["exec_px"] = monthly["exec_px"].where(monthly["exec_px"] > 0)
 
     # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
     #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
-    nxt_px = monthly.groupby("code", observed=True)["exec_px"].shift(-1)
-    nxt_m = monthly.groupby("code", observed=True)["month"].shift(-1)
+    _g = monthly.groupby("code", observed=True)
+    nxt_px = _g["exec_px"].shift(-1)
+    nxt_m = _g["month"].shift(-1)
+    nxt_sd = _g["signal_date"].shift(-1)
     adjacent = (((nxt_m.dt.year - monthly["month"].dt.year) * 12 +
                  (nxt_m.dt.month - monthly["month"].dt.month)) == 1)
-    monthly["fwd_ret"] = (nxt_px / monthly["exec_px"] - 1.0).where(adjacent)
+    ratio = safe_div(nxt_px, monthly["exec_px"])
+    monthly["fwd_ret"] = (ratio - 1.0).where(adjacent)
     n_gap = int((nxt_m.notna() & ~adjacent).sum())
     if n_gap:
         LOG.info(f"월 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
                  f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
                  f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
+
+    # ── 무결성 게이트 ────────────────────────────────────────────────────────────────────
+    #  ① 비유한값 : inf/-inf/NaN 배율. 분모 위생을 거쳤어도 소스가 이상값을 주면 남는다.
+    #  ② 가격제한 불가능 : 실제 거래일 간격으로 계산한 봉투 밖. 분할·감자·데이터 오류다.
+    fr = monthly["fwd_ret"]
+    n_td = _trading_day_gap(px, monthly["signal_date"], nxt_sd)
+    lo_env, hi_env = _price_limit_envelope(n_td)
+    bad_inf = fr.notna() & ~np.isfinite(fr.to_numpy(dtype="float64"))
+    bad_env = fr.notna() & np.isfinite(fr.to_numpy(dtype="float64")) & (
+        (ratio > hi_env) | (ratio < lo_env))
+    n_inf, n_env = int(bad_inf.sum()), int(bad_env.sum())
+    if n_inf or n_env:
+        monthly.loc[bad_inf | bad_env, "fwd_ret"] = np.nan
+        _ex = monthly.loc[bad_env, ["code", "month"]].copy()
+        _ex["ratio"] = ratio[bad_env].to_numpy()
+        _ex["n_days"] = n_td[bad_env].to_numpy()
+        RET_SANITY_LEDGER.extend(_ex.head(500).to_dict("records"))
+        LOG.warn(
+            f"★ 수익률 무결성 게이트 — 비유한 {n_inf:,}건 · 가격제한상 불가능 {n_env:,}건을 "
+            f"결측 처리했습니다(총 {n_inf+n_env:,}/{int(fr.notna().sum()):,}행). "
+            f"이 값들은 주가 움직임이 아니라 **기업행위(액면분할·병합·감자) 미반영 또는 "
+            f"소스 혼용에 따른 수정주가 불일치**입니다. 그대로 두면 벤치마크 복리가 발산하고"
+            f"(7회차 CAGR inf%), 그 종목 하나가 10년 성과를 만듭니다.")
+        if n_env:
+            _t = _ex.reindex(_ex["ratio"].abs().sort_values(ascending=False).index).head(10)
+            LOG.table([[r.code, f"{as_ts(r.month):%Y-%m}", f"{r.ratio:,.1f}배",
+                        f"{int(r.n_days)}일" if np.isfinite(r.n_days) else "-",
+                        f"{(1.0+KRX_DAILY_LIMIT)**max(int(r.n_days),1):,.0f}배"
+                        if np.isfinite(r.n_days) else "-"]
+                       for r in _t.itertuples(index=False)],
+                      ["종목", "달", "관측 배율", "거래일", "가격제한상 최대"],
+                      ["c", "c", "r", "r", "r"],
+                      title="버려진 관측 상위 10건 — 왜 '수익률'이 아닌지 근거")
+    if _px_bad:
+        LOG.warn(f"체결가가 0 이하이거나 비유한값인 {_px_bad:,}행을 결측 처리했습니다 "
+                 f"(소스가 결측을 0 으로 반환한 경우). 0 으로 나눈 +inf 가 하류로 흐르는 "
+                 f"경로를 여기서 끊습니다.")
+
+    # ③ 남은 꼬리는 **자르지 않는다.** 대신 보이게 만든다 — 성과가 몇 건에 의존하는지를
+    #    사용자가 직접 판단해야 한다. 조용히 winsorize 하면 그건 성과를 지어내는 것이다.
+    _report_return_tail(monthly)
+    # ★ 원장은 공용 인덱스에 남긴다(절대1원칙: 신규 산출물도 반드시 캐시·재호출 가능).
+    if RET_SANITY_LEDGER:
+        try:
+            VAULT.put_table("price_return_sanity_ledger", pd.DataFrame(RET_SANITY_LEDGER),
+                            scope="shared", domain="price",
+                            source="build_price_panel: 가격제한 초과·비유한 수익률 폐기 원장")
+        except Exception as e:                                       # noqa
+            LOG.debug(f"수익률 무결성 원장 저장 실패({type(e).__name__}) — 계산에는 영향 없음")
+
     PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
     return {"daily": px, "monthly": downcast(monthly)}
+
+
+def _trading_day_gap(px: pd.DataFrame, d0: pd.Series, d1: pd.Series) -> pd.Series:
+    """두 날짜 사이의 **실제 거래일 수**. 달력일이 아니라 거래일이어야 가격제한 봉투가 맞다.
+
+    시장 전체의 거래일 배열에 searchsorted 를 두 번 하면 끝난다 — 종목 루프 없음(원칙 3).
+    """
+    try:
+        td = np.sort(pd.unique(as_ts_series(px["date"]).values))
+        if not len(td):
+            return pd.Series(np.nan, index=d0.index, dtype="float64")
+        a = np.searchsorted(td, as_ts_series(d0).values, side="left")
+        b = np.searchsorted(td, as_ts_series(d1).values, side="left")
+        out = (b - a).astype("float64")
+        out[~np.isfinite(pd.to_numeric(as_ts_series(d1), errors="coerce").to_numpy())] = np.nan
+        return pd.Series(out, index=d0.index)
+    except Exception:                                                # noqa
+        return pd.Series(np.nan, index=d0.index, dtype="float64")
+
+
+def _report_return_tail(monthly: pd.DataFrame) -> None:
+    """월수익 분포의 꼬리를 표로 남긴다. 자르지 않고 **보이게** 하는 것이 목적이다."""
+    r = pd.to_numeric(monthly.get("fwd_ret"), errors="coerce").dropna()
+    if len(r) < 100:
+        return
+    qs = [0.001, 0.01, 0.05, 0.50, 0.95, 0.99, 0.999]
+    v = r.quantile(qs)
+    LOG.table([[f"{q*100:g}%", f"{v.loc[q]:+.1%}"] for q in qs] +
+              [["최소", f"{r.min():+.1%}"], ["최대", f"{r.max():+.1%}"],
+               [">+100% 건수", f"{int((r > 1.0).sum()):,}"],
+               ["<-50% 건수", f"{int((r < -0.5).sum()):,}"]],
+              ["분위", "월수익률"], ["c", "r"],
+              title=f"월수익률 분포 ({len(r):,}행) — 극단 꼬리가 성과를 만드는지 확인용")
 
 
 def fetch_investor_flows(codes: Sequence[str], start: str, end: str,
@@ -4352,8 +4739,23 @@ MULTI_NODATA_TABLE = "dart_multi_nodata"
 FS_NODATA_TABLE = "dart_fnltt_nodata"      # 전체재무제표(단건) 쪽 같은 원장
 # ★ Tier-2 는 호출 수가 아니라 **시간**으로 자른다. 4시간 계약을 지키는 것은 개수가 아니라
 #   벽시계다 — 개수 상한은 서버가 먼저 막으면 아무것도 보호하지 못한다(5차 실행에서 실증).
-FS_TIME_BUDGET_S = 20 * 60                 # 0 이면 시간 제한 없음
+FS_TIME_BUDGET_S = 20 * 60                 # 폴백값. 실제로는 아래 _fs_time_budget_s() 가 쓰인다
 FS_CHECKPOINT_CORPS = 40                   # 이만큼 회사를 완성할 때마다 드라이브에 저장
+
+
+def _fs_time_budget_s() -> float:
+    """Tier-2 가 이번 실행에서 쓸 수 있는 초. **남은 시간의 비율**로 계산한다.
+
+    ★ 왜 고정 상수가 아닌가. 20분을 박아 두면 두 방향으로 다 틀린다:
+      · 앞 단계(가격·직원현황)가 빨리 끝나 2시간이 남아도 20분만 쓰고 멈춘다 → 커버리지를
+        올릴 기회를 그냥 버린다(7회차 Tier-2 13.5%).
+      · 앞 단계가 늦어져 10분밖에 안 남았는데도 20분을 쓴다 → 4시간 계약을 넘긴다.
+    v3 조각(06_env)이 데드라인을 제공하면 그것을 쓰고, 없으면(v2 단독 실행) 상수로 돌아간다.
+    """
+    try:
+        return float(stage_time_budget(FS_TIME_SHARE, floor_s=120.0))
+    except Exception:                                       # noqa
+        return float(FS_TIME_BUDGET_S or 0.0)
 MULTI_NODATA_RECENT_DAYS = 30     # 최근 2개 회계연도 — 나중에 제출될 수 있으므로 짧게
 MULTI_NODATA_OLD_DAYS = 365       # 그 이전 — 이제 와서 새로 제출될 일은 사실상 없다
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
@@ -5051,7 +5453,12 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         #    회사 경계로 자른 청크마다 저장하므로, 어디서 끊겨도 '완성된 회사'는 남는다.
         #    EMP 는 이미 이 구조였는데 Tier-2 에만 없었다.
         # ══════════════════════════════════════════════════════════════════════════════════
-        got, _deadline = [], (time.time() + FS_TIME_BUDGET_S if FS_TIME_BUDGET_S else None)
+        # ★ 시간 몫은 **남은 수집시간의 비율**이다. 고정 상수(예전 20분)를 쓰면 앞 단계가
+        #   빨리 끝났을 때 남는 시간을 그냥 버리고, 앞 단계가 늦어졌을 때 4시간을 넘긴다.
+        _budget_s = _fs_time_budget_s()
+        got, _deadline = [], (time.time() + _budget_s if _budget_s else None)
+        LOG.info(f"  Tier-2 시간 몫 {_budget_s/60:.0f}분 배정 — 멈추는 조건은 "
+                 f"①서버 020/021 ②시계 둘뿐입니다(로컬 추정 잔량으로 자르지 않습니다).")
         _chunk = max(_per_corp, (FS_CHECKPOINT_CORPS * _per_corp))
         for _i in range(0, len(jobs), _chunk):
             if dart_halt_reason():
@@ -5059,10 +5466,10 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                          f"여기까지는 드라이브에 저장됐습니다.")
                 break
             if _deadline and time.time() > _deadline:
-                LOG.warn(f"Tier-2 시간 예산 {FS_TIME_BUDGET_S/60:.0f}분을 다 썼습니다 — "
-                         f"{_i:,}/{len(jobs):,}건에서 멈춥니다. 받은 만큼은 저장됐고, "
-                         f"재실행하면 다음 회사부터 이어받습니다. "
-                         f"(호출 수가 아니라 **시간**으로 4시간 계약을 지킵니다)")
+                LOG.warn(f"Tier-2 시간 몫 {_budget_s/60:.0f}분을 다 썼습니다 — "
+                         f"{_i:,}/{len(jobs):,}건(회사 {_i//max(_per_corp,1):,}사)에서 멈춥니다. "
+                         f"받은 만큼은 드라이브 공용 인덱스에 저장됐고, 재실행하면 다음 회사부터 "
+                         f"이어받습니다. (호출 수가 아니라 **시간**으로 4시간 계약을 지킵니다)")
                 break
             _res = pmap_io(_fs_one, jobs[_i:_i + _chunk], workers=min(N_WORKERS_IO, 12),
                            desc=f"DART 재무제표({_i//_chunk + 1}/{math.ceil(len(jobs)/_chunk)})")
@@ -7025,33 +7432,74 @@ class Universe:
                 for r in self.sec.itertuples(index=False)
                 if pd.notna(r.delisting_date)}
 
-    def audit_row(self, stage: str, t, codes: Sequence[str]):
-        self.attrition.append({"month": as_ts(t), "stage": stage, "n": len(codes)})
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  감쇠 원장 — 팔(arm) 태그와 기록 스위치
+    #
+    #  ★★ 왜 필요한가 (7회차 리포트에 '잔존율 113.7%' 라는 불가능한 숫자가 찍힌 자리) ★★
+    #    이 리스트는 전역 하나였고 태그가 없었다. 그런데 여기에 쓰는 주체가 셋이다:
+    #      ① 전체(ALL) 팔의 apply_umid  ② 하위1000(SMALL) 팔의 apply_umid
+    #      ③ run_backtest — 그리고 강건성 스위트가 백테스트를 **10여 회 재실행**한다.
+    #    report_attrition 은 stage 별 단순 평균을 내므로,
+    #      '유동성필터' = ALL 패널에서 잰 월평균(≈1,500)
+    #      'U-MID대역'  = ALL 과 SMALL 을 섞은 월평균(≈1,300)
+    #    처럼 **서로 다른 모집단의 평균**이 한 깔때기에 세로로 놓인다. 뒤 단계가 앞 단계보다
+    #    커지는 순간 잔존율이 100%를 넘는다. 숫자가 이상해서 눈에 띈 것이 다행이었다 —
+    #    조금만 덜 이상했으면 '어느 게이트에서 표본이 붕괴하는가'를 통째로 오독했을 것이다.
+    #  → ① 모든 기록에 arm 태그를 단다. ② 팔별로 표를 따로 낸다.
+    #    ③ 강건성 재실행은 audit_on=False 로 아예 기록하지 않는다(같은 달을 10번 세면
+    #       평균은 같지만 min/max 가 의미를 잃고, 팔 태그도 뒤섞인다).
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    audit_arm: str = "MAIN"
+    audit_on: bool = True
 
-    def report_attrition(self):
+    def set_audit_arm(self, arm: str, on: bool = True):
+        self.audit_arm, self.audit_on = str(arm), bool(on)
+
+    def audit_row(self, stage: str, t, codes: Sequence[str], arm: Optional[str] = None):
+        if not self.audit_on:
+            return
+        self.attrition.append({"arm": str(arm or self.audit_arm), "month": as_ts(t),
+                               "stage": stage, "n": len(codes)})
+
+    def report_attrition(self, title_suffix: str = ""):
         if not self.attrition:
             return
         A = pd.DataFrame(self.attrition)
+        if "arm" not in A.columns:
+            A["arm"] = "MAIN"
+        # ★ 같은 (팔, 단계, 달) 이 두 번 기록되면 평균이 바뀌진 않지만 min/max·표본수가
+        #   왜곡된다. 마지막 기록을 진실로 본다(재실행이 있었다면 그쪽이 최신이다).
+        A = A.drop_duplicates(["arm", "stage", "month"], keep="last")
         # ★ 이 목록에 없는 단계는 표에서 조용히 사라진다(오류도 경고도 없이).
         #   새 게이트를 추가했다면 반드시 여기에도 넣을 것.
         order = ["전체상장", "PIT유니버스", "가격보유", "U-MID대역", "유동성필터", "거부권통과",
                  "하한선통과", "최종선정"]
-        piv = A.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
-        rows = []
-        prev = None
-        for s in order:
-            if s not in piv.index:
+        for arm in sorted(A["arm"].unique(), key=lambda x: (x != "MAIN", x)):
+            sub = A[A["arm"] == arm]
+            piv = sub.groupby("stage")["n"].agg(["mean", "min", "max", "size"])
+            rows, prev = [], None
+            for s in order:
+                if s not in piv.index:
+                    continue
+                m = piv.loc[s]
+                keep = "" if prev is None else f"{100*m['mean']/prev:.1f}%"
+                # 100% 초과는 이제 구조적으로 나올 수 없지만, 나오면 그 사실을 표에 적는다.
+                if prev is not None and m["mean"] > prev * 1.001:
+                    keep += " ⚠모집단불일치"
+                rows.append([s, f"{m['mean']:,.0f}", f"{m['min']:,.0f}", f"{m['max']:,.0f}",
+                             f"{int(m['size']):,}", keep])
+                prev = m["mean"]
+            if not rows:
                 continue
-            m = piv.loc[s]
-            keep = "" if prev is None else f"{100*m['mean']/prev:.1f}%"
-            rows.append([s, f"{m['mean']:,.0f}", f"{m['min']:,.0f}", f"{m['max']:,.0f}", keep])
-            prev = m["mean"]
-        LOG.table(rows, ["게이트", "월평균 종목수", "최소", "최대", "직전 대비 잔존율"],
-                  ["l", "r", "r", "r", "r"],
-                  title="유니버스 감쇠 감사 (§10.4) — 어느 게이트에서 표본이 붕괴하는지")
-        if rows and float(str(rows[-1][1]).replace(",", "")) < 5:
-            LOG.warn("최종 선정 종목이 월평균 5개 미만입니다. 통계적 판단이 불가능한 수준이므로 "
-                     "임계값을 낮추기 전에 어느 게이트가 원인인지 위 표에서 먼저 확인하세요.")
+            LOG.table(rows, ["게이트", "월평균 종목수", "최소", "최대", "관측월", "직전 대비 잔존율"],
+                      ["l", "r", "r", "r", "r", "r"],
+                      title=f"유니버스 감쇠 감사 (§10.4) · 팔={arm}{title_suffix} "
+                            f"— 어느 게이트에서 표본이 붕괴하는지")
+            if float(str(rows[-1][1]).replace(",", "")) < PORTFOLIO_MIN_NAMES:
+                LOG.warn(f"[{arm}] 최종 선정 종목이 월평균 {rows[-1][1]}개로 "
+                         f"PORTFOLIO_MIN_NAMES={PORTFOLIO_MIN_NAMES} 에 못 미칩니다. "
+                         f"이 수준에서는 성과가 종목 몇 개의 함수이지 전략의 함수가 아닙니다 — "
+                         f"임계값을 낮추기 전에 위 표에서 어느 게이트가 원인인지 확인하세요.")
 
 
 # ── 셀 (C11) ────────────────────────────────────────────────────────────────────────────────
@@ -7821,8 +8269,24 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
     # 담길 확률이 높은 종목 먼저 — 예산에 걸려 잘려도 '쓸 수 있는' 한계임금이 먼저 완성된다.
     _ord = {str(c): i for i, c in enumerate(priority or [])}
     corps = sorted(corps, key=lambda c: (_ord.get(c, 10 ** 9), c))
-    # 최근 연도 우선. 차분에 t-1 이 필요하므로 연도는 내림차순으로 촘촘히 채운다.
-    jobs = [(c, y) for y in sorted(years, reverse=True) for c in corps if (c, int(y)) not in done]
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 회사 우선(company-first) 격자 — 7회차에 EMP 가 4개년(2022~2025)뿐이던 원인 ★★
+    #
+    #    예전: for y in years(내림차순) for c in corps   ← **연도 우선**
+    #    잡이 잘리면 항상 '오래된 연도'가 통째로 버려진다. 실측 결과가 정확히 그랬다:
+    #    2,536사 × 3.4년. 그런데 이 전략의 백테스트는 120개월이다 —
+    #    **앞 80개월에 EMP 신호가 한 건도 없는 채로** 10년 성과를 보고하고 있었다.
+    #    그건 'CORE-D 단독 80개월 + CORE-D+EMP 40개월'을 이어 붙인 것이지 10년 전략이 아니다.
+    #
+    #    지금: for c in corps(우선순위) for y in years(내림차순)   ← **회사 우선**
+    #    잘리면 '뒤쪽 회사'가 버려진다. 즉 확보한 회사는 **10년 전 구간이 완성**된다.
+    #    커버리지 폭(회사 수)은 줄지만 커버리지 **깊이**(연도)가 생긴다. 이 전략에서는
+    #    깊이가 훨씬 중요하다 — 12개월 차분 센서(nl_emp·nl_premium)는 연속 2개년이 없으면
+    #    아예 산출되지 않고, 앞 구간이 비면 백테스트의 3분의 2가 무증거 구간이 된다.
+    #    재실행하면 append-only 캐시가 이어받아 회사 수가 매번 늘어난다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _years_desc = sorted({int(y) for y in years}, reverse=True)
+    jobs = [(c, y) for c in corps for y in _years_desc if (c, int(y)) not in done]
     # ★ 호출자가 '실제로 쓰이는 조합'을 주면 그것만 남긴다. 데카르트 곱은 담길 수 없었던
     #   해까지 묻느라 한도의 대부분을 태운다 — 부족한 건 한도가 아니라 격자 설계였다.
     if pairs:
@@ -7850,6 +8314,11 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
             #   → 상한은 '이번 실행에서 의도적으로 정한 작업량'(EMP_MAX_CALLS)뿐이고,
             #     진짜 중단은 아래 청크 루프의 _emp_cb_ok() → 서버 020/021 로만 일어난다.
             cap = max(0, min(total_needed, int(max_calls)))
+            # ★ 잘라야 한다면 **회사 경계**에서 자른다. 회사 중간에서 끊으면 그 회사만
+            #   연도가 뚫린 채 남고, 12개월 차분 센서는 뚫린 구간에서 산출되지 않는다.
+            _per = max(1, len(_years_desc))
+            if 0 < cap < total_needed:
+                cap = max(_per, (cap // _per) * _per)
             if cap < total_needed:
                 # ★ 절단 사실을 기록해 둔다. §6 커버리지 판정이 이 표를 'DART 의 보유량'으로
                 #   오독해 백테스트 창을 영구히 잘라내는 것을 막기 위한 유일한 근거다.
@@ -7858,8 +8327,9 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                     "why": f"상한 EMP_MAX_CALLS={int(max_calls):,}"})
                 jobs = jobs[:cap]
                 LOG.warn(f"직원현황 {total_needed:,}건 중 이번 실행은 {cap:,}건만 받습니다 "
-                         f"(상한 EMP_MAX_CALLS={max_calls:,}). "
-                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다. "
+                         f"(상한 EMP_MAX_CALLS={max_calls:,} · 회사 {cap//_per:,}사의 전 기간). "
+                         f"회사 우선이므로 확보한 회사는 {_years_desc[-1]}~{_years_desc[0]}년이 "
+                         f"모두 채워집니다 — 재실행하면 다음 회사부터 이어받습니다. "
                          f"※ 미수집분이 있으므로 §6 커버리지 기반 자동 창 단축은 비활성화됩니다.")
         LOG.info(f"직원현황 신규 수집 {len(jobs):,}건 "
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
@@ -7873,23 +8343,37 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
         #    → 세션 종료·OOM·Ctrl+C 어디서 끊겨도 **받은 만큼은 반드시 남는다.**
         #    Vault 는 append-only 저널이라 증분 저장이 싸고 안전하다.
         # ══════════════════════════════════════════════════════════════════════════════════
+        # ★ 시간 몫. 직원현황은 이 전략의 알파 원천이므로 남은 수집시간의 절반 가까이를
+        #   먼저 배정한다(Tier-2 재무는 그 다음). 고정 상수를 쓰지 않는 이유는 06_env 참조.
+        _deadline = time.time() + stage_time_budget(EMP_TIME_SHARE, floor_s=120.0)
+        LOG.info(f"  시간 몫 {max(0.0, _deadline-time.time())/60:.0f}분 배정 · {deadline_note()} "
+                 f"— 멈추는 조건은 ①서버 020/021 ②시계 둘뿐입니다(로컬 추정 잔량으로는 "
+                 f"자르지 않습니다).")
         got, done_n = [], 0
-        for i in range(0, len(jobs), EMP_CHECKPOINT_EVERY):
-            chunk = jobs[i:i + EMP_CHECKPOINT_EVERY]
+        # 청크를 회사 경계의 배수로 맞춘다 — 중단해도 반쪽짜리 회사가 남지 않는다.
+        _per = max(1, len(_years_desc))
+        _chunk_n = max(_per, (EMP_CHECKPOINT_EVERY // _per) * _per)
+        for i in range(0, len(jobs), _chunk_n):
+            chunk = jobs[i:i + _chunk_n]
             res = pmap_io(lambda j: _emp_one_raw(j[0], j[1]), chunk,
                           workers=min(N_WORKERS_IO, 12),
-                          desc=f"DART 직원현황({i//EMP_CHECKPOINT_EVERY + 1}/"
-                               f"{math.ceil(len(jobs)/EMP_CHECKPOINT_EVERY)})")
+                          desc=f"DART 직원현황({i//_chunk_n + 1}/"
+                               f"{math.ceil(len(jobs)/_chunk_n)})")
             got.extend(r for r in res if r)
             done_n += len(chunk)
             _emp_checkpoint(cached, got)
-            if not _emp_cb_ok():          # 예산 소진·브레이커 → 남은 청크는 의미 없다
+            _halt = (None if _emp_cb_ok() else
+                     (dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"))
+            if _halt is None and time.time() >= _deadline:
+                _halt = (f"4시간 계약의 직원현황 시간 몫 소진 — {deadline_note()}. "
+                         f"회사 경계에서 멈췄으므로 받은 회사는 전 기간이 온전합니다")
+            if _halt:
                 if done_n < len(jobs):
-                    EMP_TRUNCATED.update({
-                        "dropped": len(jobs) - done_n,
-                        "why": dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"})
-                    LOG.warn(f"직원현황 수집을 {done_n:,}/{len(jobs):,}건에서 멈춥니다 — "
-                             f"{EMP_TRUNCATED['why']}. 여기까지는 드라이브에 저장됐습니다. "
+                    EMP_TRUNCATED.update({"dropped": len(jobs) - done_n, "why": _halt})
+                    LOG.warn(f"직원현황 수집을 {done_n:,}/{len(jobs):,}건"
+                             f"(회사 {done_n//_per:,}사)에서 멈춥니다 — {_halt}. "
+                             f"여기까지는 드라이브 공용 인덱스에 저장됐고 재실행 시 정확히 "
+                             f"이 지점부터 이어받습니다. "
                              f"※ 미수집분이 있으므로 §6 자동 창 단축은 비활성화됩니다.")
                 break
         LOG.info(f"직원현황 신규 확보 {len(got):,}/{len(jobs):,}건")
@@ -8685,8 +9169,10 @@ def apply_umid(P: pd.DataFrame, uni: "Universe", band: str = "UMID") -> pd.DataF
     rank = adv.groupby(P["month"], observed=True).rank(ascending=False, method="first")
     P["size_rank"] = rank
     P["u_mid"] = (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
+    # ★ 감쇠 원장에 **어느 팔인지** 를 함께 남긴다. 전체(ALL)와 하위1000(SMALL)이
+    #   같은 태그로 섞이면 뒤 단계가 앞 단계보다 커져 잔존율이 100%를 넘는다(7회차 113.7%).
     for m, g in P.groupby("month", observed=True):
-        uni.audit_row("U-MID대역", m, g.loc[g["u_mid"], "code"].tolist())
+        uni.audit_row("U-MID대역", m, g.loc[g["u_mid"], "code"].tolist(), arm=band)
     keep = int(P["u_mid"].sum())
     LOG.info(f"{band} 유니버스: {keep:,}/{len(P):,}행 "
              f"(월평균 {keep/max(P['month'].nunique(),1):,.0f}종목) — "
@@ -9103,17 +9589,30 @@ def apply_vetoes_v3(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
 # ── 스코어 조립 — 본선·비교팔이 공유하는 유일한 경로 ────────────────────────────────────────
 def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
-              use_u: bool = True, use_veto: bool = True) -> Dict[str, pd.Series]:
+              use_u: bool = True, use_veto: bool = True,
+              min_arms: int = None) -> Dict[str, pd.Series]:
     """주어진 TP 집합 하나로 E → Signal → Signal_rank 를 만든다.
 
     Signal = rank_pct(E) × rank_pct(U) × ∏V        (스펙 §8)
 
-    min_tp: 관측된 TP 가 이보다 적으면 제외(FLOOR). 스펙에 없는 우리 쪽 안전장치이므로
-            R5 절제검사에서 이 경계값의 민감도를 반드시 함께 출력한다.
+    min_tp:   관측된 TP 가 이보다 적으면 제외(FLOOR). 스펙에 없는 우리 쪽 안전장치이므로
+              R5 절제검사에서 이 경계값의 민감도를 반드시 함께 출력한다.
+    min_arms: 증거층으로 인정할 최소 TP **개수**. 기본값은 MIN_TP_ARMS(=2) 이고,
+              본선이 단일 팩터로 조용히 퇴화하는 것을 막는 장치다.
+
+      ★★ 왜 파라미터가 되어야 하는가 (7회차에서 이 전략의 존재이유가 죽은 자리) ★★
+        R2-N 킬게이트는 설계상 **단일 센서 팔**(A: nl_emp 단독, B: nl_premium 단독)을
+        만들어 트레이드오프 팔(C)과 비교한다. 단일 팔인 것이 검정의 목적 그 자체다.
+        그런데 이 함수가 MIN_TP_ARMS 를 전역 상수로 강제하고 있어서,
+        R2-N 이 A 팔을 만들려는 순간 "TP 가 1개뿐입니다" 로 RuntimeError 가 났다.
+        그래서 이 파일의 존재 이유인 검정이 **한 번도 실행되지 못했다.**
+        본선의 안전장치가 검정을 죽인 것이다 — 안전장치는 호출자가 의도를 말할 수
+        있어야 한다. 본선은 기본값(2)을 그대로 쓰고, 단일팔 비교만 1 을 명시한다.
     """
     tp_cols = [c for c in tp_cols if c in P.columns]
     min_tp = MIN_TP_OBSERVED if min_tp is None else min_tp
-    if len(tp_cols) < MIN_TP_ARMS:
+    min_arms = MIN_TP_ARMS if min_arms is None else max(1, int(min_arms))
+    if len(tp_cols) < min_arms:
         # ★ 예전 메시지는 사실을 잘못 말했다 — "컬럼이 하나도 없습니다" 라고 했지만
         #   컬럼 8개는 전부 존재했고, 전량 NaN 이라 호출자가 직전 줄에서 걸러낸 것이었다.
         #   그래서 사용자는 있지도 않은 컬럼 생성 버그를 찾게 됐다. 원인을 지목해서 말한다.
@@ -9131,7 +9630,7 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
             _halt = None
         if _halt:
             raise RuntimeError(
-                f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {MIN_TP_ARMS}개 필요).\n"
+                f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {min_arms}개 필요).\n"
                 f"  원인은 **수집 설정이 아니라 자원**입니다 — {_halt}\n"
                 f"  · 살아 있는 TP : {tp_cols or '없음'}\n"
                 f"  · 이번 실행에서 채우지 못한 원천 :"
@@ -9144,7 +9643,7 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
                 f"       (opendart.fss.or.kr 에서 무료·즉시 발급).\n"
                 f"    설정을 바꾸지 마세요 — 이번 실행의 설정에는 문제가 없었습니다.")
         raise RuntimeError(
-            f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {MIN_TP_ARMS}개 필요). "
+            f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {min_arms}개 필요). "
             f"컬럼은 만들어졌지만 관측이 0이라 제외됐습니다 — 계산 버그가 아니라 원천 결손입니다.\n"
             f"  · 살아 있는 TP : {tp_cols or '없음'}\n"
             f"  · 비어 있는 원천 : {chr(10) + '      - ' + (chr(10) + '      - ').join(need) if need else '판별 불가'}\n"
@@ -9332,13 +9831,49 @@ def size_positions(sub: pd.DataFrame) -> pd.DataFrame:
         w[free] = (w[free] / pool * rem) if pool > 1e-12 else (rem / free.sum())
     if w.sum() > 1.0 + 1e-9:                 # 전 종목이 상한에 걸리면 현금을 남긴다
         w = w * (1.0 / w.sum())
-    return sub.assign(weight=w)
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 종목수가 적으면 이 함수는 조용히 '현금 70% 펀드'를 만든다 ★★
+    #    cap 은 실질적으로 언제나 POS_MAX_WEIGHT(0.12) 다. liq_cap = adv×0.10/3천만원 인데
+    #    패널에 남으려면 adv ≥ 3억이므로 liq_cap ≥ 1.0 — 유동성 상한은 전 구간 사문화다.
+    #    그래서 종목이 n 개면 Σw ≤ 0.12n 이고, n=3 이면 **자동으로 현금 64%** 가 된다.
+    #    7회차 스몰캡 팔이 월평균 2.5종목이었다 → 사실상 현금 70% 포트폴리오였는데,
+    #    그것을 100% 투자된 전체 팔과 나란히 놓고 "차이는 규모 대역 하나" 라고 보고했다.
+    #    현금 비중이 성과 차이의 지배적 원인인데 표 어디에도 그 말이 없었다.
+    #  → 현금 비중을 **명시적으로 계산해 돌려준다.** 임의로 채워 넣지 않는다(그건 상한을
+    #    뚫는 것이다). 대신 호출자가 이 사실을 표에 쓰게 만든다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    out = sub.assign(weight=w)
+    out.attrs["cash"] = float(max(0.0, 1.0 - float(np.nansum(w))))
+    return out
 
 
 def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                  sec: pd.DataFrame, signal_col: str = "Signal_rank",
                  top_pct: float = PORTFOLIO_TOP_PCT, apply_costs: bool = True,
-                 label: str = "TCD") -> dict:
+                 label: str = "TCD", audit: bool = True) -> dict:
+    # ★ audit=False 는 강건성 스위트의 재실행용이다. 같은 달을 10여 번 다시 세면
+    #   감쇠 원장의 min/max·관측월이 무의미해지고, 팔 태그까지 뒤섞인다(잔존율 113.7%).
+    #   본선·비교팔만 원장에 남긴다.
+    _audit_saved = getattr(uni, "audit_on", True)
+    if not audit:
+        uni.audit_on = False
+    try:
+        # ★ 진단 경고는 **본선·비교팔에서만** 낸다. 강건성 스위트는 같은 엔진을 20여 회
+        #   재실행하므로, 그대로 두면 같은 경고가 20번 반복되어 정작 읽어야 할 표가
+        #   스크롤 밖으로 밀려난다. 로그가 시끄러우면 아무도 읽지 않고, 안 읽히는 경고는
+        #   없는 경고와 같다. 재실행분은 DEBUG 로 내린다(사실은 그대로 남는다).
+        return _run_backtest_inner(P, months, uni, sec, signal_col, top_pct,
+                                   apply_costs, label, verbose=bool(audit))
+    finally:
+        uni.audit_on = _audit_saved
+
+
+def _run_backtest_inner(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
+                        sec: pd.DataFrame, signal_col: str = "Signal_rank",
+                        top_pct: float = PORTFOLIO_TOP_PCT, apply_costs: bool = True,
+                        label: str = "TCD", verbose: bool = True) -> dict:
+    _say = LOG.warn if verbose else LOG.debug
+    _tbl = LOG.table if verbose else (lambda *a, **k: None)
     mkt = sec.set_index("code")["market"].astype(str).to_dict()
     delist = uni.delisting_map()
     # 폐지 '유형' — 흡수합병·스팩해산은 -100% 가 아니다. 없으면 전부 -100%(종전 동작).
@@ -9349,6 +9884,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     # 폐지 손실을 이미 반영한 종목 — 같은 종목에 -100% 를 두 번 물리지 않기 위한 장부
     delist_realized: set = set()
     vanished_delisted = vanished_other = vanished_transfer = 0
+    unknown_ret_n, unknown_ret_w = 0, 0.0        # 수익을 알 수 없어 보유하지 않은 것으로 둔 건수
     # 종목별 '패널에 마지막으로 등장한 달'. 사라진 종목이 나중에 돌아오는지(유동성 회복 등)를
     # 판별해야 '거래정지→폐지'와 '일시적 유니버스 이탈'을 가를 수 있다.
     _pm = P[P["month"].isin(months)] if len(P) else P
@@ -9386,7 +9922,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
 
         # 청산 게이트: Δlog M 이 Δlog E 수준까지 확장 완료 / 보유상한 / 거부권
         keep = []
-        vanished_loss = 0.0
+        vanished_w = 0.0          # 이달 상각(회수 불가)된 자본 비중 — 장부에서 자리를 차지한다
         for c, h in list(hold.items()):
             r0 = rec.get(c)
             if r0 is None:
@@ -9414,8 +9950,11 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                     if kind in DELIST_NOT_WIPEOUT:
                         vanished_transfer += 1      # 직전가 청산 = 그 달 수익 0%
                     else:
-                        vanished_loss += w_prev * -1.0
+                        vanished_w += float(w_prev)     # 전액손실 — 그만큼의 자본이 사라진다
                         vanished_delisted += 1
+                        holdings_log.append({"month": m, "code": c, "weight": float(w_prev),
+                                             "ret": -1.0, "signal": np.nan,
+                                             "event": "delist_vanished"})
                     delist_realized.add(c)
                 elif w_prev > 0:
                     vanished_other += 1
@@ -9437,11 +9976,17 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         target = size_positions(target) if len(target) else target.assign(weight=[])
 
         w_new = dict(zip(target["code"], target["weight"])) if len(target) else {}
-        turn = sum(abs(w_new.get(c, 0) - prev_w.get(c, 0)) for c in set(w_new) | set(prev_w))
+        cash_w = float(target.attrs.get("cash", 0.0)) if len(target) else 1.0
+        # ★ 이미 -100% 로 상각한 종목(=체결 자체가 불가능하다)에 매도비용을 다시 물리지 않는다.
+        #   prev_w 에는 남아 있으므로 비용 루프가 '매도'로 잡고, rec 에 행이 없어 adv=0 →
+        #   기본 슬리피지 2% + 증권거래세까지 부과했다. 존재하지 않는 거래에 대한 비용이다.
+        _no_trade = {c for c in prev_w if c not in w_new and c in delist_realized}
+        _cost_codes = (set(w_new) | set(prev_w)) - _no_trade
+        turn = sum(abs(w_new.get(c, 0) - prev_w.get(c, 0)) for c in _cost_codes)
 
         cost = 0.0
         if apply_costs:
-            for c in set(w_new) | set(prev_w):
+            for c in _cost_codes:
                 dw = w_new.get(c, 0) - prev_w.get(c, 0)
                 if abs(dw) < 1e-9:
                     continue
@@ -9454,13 +9999,27 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 tx = sell_tax(m, mkt.get(c, "OTHER")) if dw < 0 else 0.0
                 cost += abs(dw) * (c_bps + sl + tx)
 
-        # 다음 달 수익
-        ret = 0.0
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  다음 달 수익 — **비중 장부가 하나로 닫혀야 한다**
+        #
+        #  ★★ 예전 구조의 결함 ★★  ret 은 w_new(합 ≈ 1) 위에서 계산한 뒤,
+        #    `ret += vanished_loss` 로 지난달 비중 w_prev 기반 손실을 **덧붙였다.**
+        #    그 달의 총노출이 1 + Σw_van 이 되어, 폐지가 난 달마다 없는 자본으로 손실을
+        #    추가로 낸 셈이다. 상각된 종목의 자본은 이미 사라졌으므로 신규 배분의 분모에서
+        #    빠져야 한다 — 더하는 것이 아니라 **자리를 차지해야** 한다.
+        #  → 장부를 하나로 닫는다:  1 = Σ(폐지상각분) + (1−Σ폐지상각분) × [Σw_new + 현금]
+        # ══════════════════════════════════════════════════════════════════════════════════
+        w_van = float(min(1.0, max(0.0, vanished_w)))     # 이달 상각된(회수 불가) 자본 비중
+        alive = max(0.0, 1.0 - w_van)
+        ret_alive = 0.0
+        unknown_w_m = 0.0                      # 수익을 몰라 보유하지 않은 자본(현금으로 남는다)
+        _is_last = (i == len(months) - 1)      # 마지막 달의 fwd_ret 결측은 결함이 아니다
         for c, w in w_new.items():
             _r = rec.get(c) or {}
             _f = _r.get("fwd_ret")
             fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
             dl = delist.get(c)
+            _ev = ""
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
                 # ★ 상장폐지: 정리매매 최종가가 있으면 그것을 쓴다. 없을 때만 유형을 본다.
                 #   부실·사유불명 → -100%(C2 원칙7). 합병·스팩해산 → 직전가 청산(0%).
@@ -9472,16 +10031,45 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                     else:
                         fr = -1.0
                 delist_realized.add(c)      # 이 종목의 폐지 손익은 여기서 확정 — 재차감 금지
+                _ev = "delist"
             if not np.isfinite(fr):
-                fr = 0.0
-            ret += w * fr
+                # ★★ '수익을 모른다'와 '수익이 0%'는 다른 사실이다 ★★
+                #   여기 걸리는 행은 ① 무결성 게이트가 버린 가격제한 밖 관측 ② 월 연속성이
+                #   끊긴 구간 ③ 체결가 결측이다. 셋 다 **그 달 그 종목을 보유했다고 말할 수
+                #   없는** 상태다. 0% 로 덮으면 우측꼬리 의존 전략에서 가장 큰 상승·하락이
+                #   정확히 사라지고, 그 자리에 '무사고'라는 없는 사실이 들어간다.
+                #   → 보유하지 않은 것으로 처리하고(비중 0) 그 자본은 현금으로 남긴다.
+                #     지어내지 않고, 조용히 0 으로 만들지도 않는다. 건수는 아래에서 보고한다.
+                # ★ 마지막 달은 '다음 달'이 존재하지 않으므로 fwd_ret 이 결측인 것이 정상이다.
+                #   그것을 데이터 결함처럼 세면 매 실행 마지막 달의 전 종목이 경고에 잡힌다.
+                if not _is_last:
+                    unknown_ret_n += 1
+                    unknown_ret_w += float(w)
+                unknown_w_m += float(w)          # 이 달의 미투자 자본(현금으로 남는다)
+                holdings_log.append({"month": m, "code": c, "weight": 0.0, "ret": np.nan,
+                                     "signal": np.nan, "event": "ret_unknown"})
+                continue
+            ret_alive += w * fr
             _s = _r.get(signal_col)
-            holdings_log.append({"month": m, "code": c, "weight": w, "ret": fr,
-                                 "signal": float(_s) if _s is not None and pd.notna(_s) else np.nan})
-        ret += vanished_loss                 # 패널에서 사라진 폐지 종목의 -100% 를 이달에 반영
+            holdings_log.append({"month": m, "code": c, "weight": w * alive, "ret": fr,
+                                 "signal": float(_s) if _s is not None and pd.notna(_s) else np.nan,
+                                 "event": _ev})
+        # 상각분은 -100%. 살아남은 자본만 신규 배분의 수익을 받는다.
+        ret = alive * ret_alive + w_van * (-1.0)
+        # ★ 롱온리 한 달 손실의 하한은 −100% 다(장부가 닫혀 있으면 구조적으로 성립하지만,
+        #   부동소수점·데이터 이상까지 감안해 마지막 방어선을 남긴다).
+        ret = max(-1.0, float(ret)) if np.isfinite(ret) else 0.0
         ret_net = ret - cost
         rows.append({"month": m, "ret": ret_net, "ret_gross": ret, "n": len(w_new),
-                     "turnover": turn, "cost": cost})
+                     "turnover": turn, "cost": cost,
+                     # ★ 현금 비중을 반드시 기록한다. 종목이 9개 미만이면 상한(0.12) 때문에
+                     #   자동으로 현금이 생기는데, 그 사실이 표에 없으면 '규모 대역 차이'로
+                     #   읽히는 것이 실은 '현금 70% vs 현금 0%' 의 차이가 된다.
+                     # cash 는 ① 비중상한 때문에 못 채운 몫 ② 수익을 몰라 보유하지 않은 몫
+                     #   둘을 합친 값이다. ②를 빼놓으면 "현금으로 남겼다"는 로그와 표가
+                     #   서로 다른 말을 하게 된다.
+                     "cash": float(min(1.0, max(0.0, cash_w + unknown_w_m))),
+                     "invested": float(alive * max(0.0, 1.0 - cash_w - unknown_w_m))})
         for c in list(hold):
             if c in w_new:
                 hold[c]["months"] += 1
@@ -9492,52 +10080,141 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
         prev_w = w_new
 
     R = pd.DataFrame(rows)
-    R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
+    R["equity"] = (1.0 + R["ret"].fillna(0).clip(lower=-1.0)).cumprod()
     H = pd.DataFrame(holdings_log)
     if vanished_delisted or vanished_other or vanished_transfer:
-        LOG.info(f"[{label}] 보유 중 청산된 종목 — 부실·사유불명 폐지 {vanished_delisted}건은 "
+        (LOG.info if verbose else LOG.debug)(f"[{label}] 보유 중 청산된 종목 — 부실·사유불명 폐지 {vanished_delisted}건은 "
                  f"-100%, 합병·완전자회사화·스팩해산 {vanished_transfer}건은 직전가 청산(0%), "
                  f"그 외 유니버스 이탈 {vanished_other}건도 직전가 청산. "
                  f"조용히 사라지게 두지 않습니다(C2).")
-        if not dkind:
-            LOG.warn(f"[{label}] 폐지 사유 정보가 없어 **모든** 폐지를 -100% 로 계상했습니다. "
+        # ★★ 이 경고는 3년 내내 침묵하고 있었다 ★★
+        #   `if not dkind` 는 **컬럼이 없을 때**만 참이다. 그런데 종목마스터 수집부는
+        #   원본에 사유가 없어도 delist_reason 을 **빈 문자열 컬럼으로 항상 만든다**
+        #   (10_ingest_universe.py:324). 그러면 dkind = {코드: "unknown"} 로 채워져
+        #   비어 있지 않고, 모든 폐지가 조용히 -100% 로 계상되면서 경고는 뜨지 않는다.
+        #   → 사유가 실제로 분류됐는지를 **값으로** 판정한다.
+        _kinds = Counter(dkind.values()) if dkind else Counter()
+        _unk = _kinds.get("unknown", 0)
+        _tot = max(1, sum(_kinds.values()))
+        if _kinds:
+            _tbl([[k, f"{v:,}", f"{100*v/_tot:.0f}%",
+                        "직전가 청산(0%)" if k in DELIST_NOT_WIPEOUT else "전액손실(-100%)"]
+                       for k, v in _kinds.most_common()],
+                      ["폐지 유형", "종목수", "비율", "청산 처리"], ["l", "r", "r", "l"],
+                      title=f"[{label}] 상장폐지 사유 분류 — 청산가를 가르는 유일한 근거")
+        if (not dkind) or _unk / _tot > 0.30:
+            _say(f"[{label}] 폐지 사유를 분류하지 못한 종목이 {_unk:,}/{_tot:,}"
+                     f"({100*_unk/_tot:.0f}%)이라 그만큼을 **전액손실(-100%)** 로 계상했습니다. "
                      f"실측상 폐지의 절반가량(흡수합병·스팩해산)은 전액손실이 아니므로 "
-                     f"성과가 과소평가됩니다 — 종목마스터에 delist_reason 이 실렸는지 확인하세요.")
+                     f"성과가 **과소평가**됩니다(U-MID 대역 기준 연 -2%p 안팎). "
+                     f"종목마스터의 delist_reason 이 빈 문자열이 아닌지 확인하세요 — "
+                     f"컬럼은 항상 만들어지므로 '컬럼 존재'만으로는 판정할 수 없습니다.")
+    if unknown_ret_n:
+        _say(f"[{label}] 다음 달 수익을 알 수 없는 보유 {unknown_ret_n:,}건"
+                 f"(비중 합계 {unknown_ret_w:.2f})을 **보유하지 않은 것으로** 처리했습니다. "
+                 f"가격 무결성 게이트가 버린 관측·월 연속성 단절·체결가 결측이 원인입니다. "
+                 f"0% 로 덮으면 '무사고'라는 없는 사실이 장부에 들어갑니다 — "
+                 f"그 자본은 현금으로 남겼고, 이 사실은 성과표의 현금비중에 반영됩니다.")
+    _cash = float(R["cash"].mean()) if "cash" in R.columns and len(R) else 0.0
+    if _cash > 0.05:
+        _say(f"[{label}] 월평균 현금 비중이 {_cash:.0%} 입니다. 종목별 비중 상한"
+                 f"(POS_MAX_WEIGHT={POS_MAX_WEIGHT:.0%})과 선정 종목수의 곱이 1 에 못 미치면 "
+                 f"나머지는 자동으로 현금이 됩니다 — 종목이 "
+                 f"{math.ceil(1/POS_MAX_WEIGHT)}개 미만인 달이 그렇습니다. "
+                 f"이 팔의 성과를 다른 팔과 비교할 때 **현금 비중 차이**를 먼저 보세요. "
+                 f"규모 대역의 효과로 읽으면 틀립니다.")
     return {"returns": R, "holdings": H, "label": label,
-            "vanished_delisted": vanished_delisted, "vanished_other": vanished_other}
+            "vanished_delisted": vanished_delisted, "vanished_other": vanished_other,
+            "unknown_ret_n": unknown_ret_n, "cash_mean": _cash,
+            "delist_kinds": dict(Counter(dkind.values()) if dkind else Counter())}
 
 
 # ── 성과 지표 ───────────────────────────────────────────────────────────────────────────────
 def perf_stats(R: pd.DataFrame, rf: float = 0.0) -> dict:
-    r = R["ret"].fillna(0).to_numpy(dtype=float)
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 이 함수가 nan 을 돌려주면 강건성 판정이 '조용히 FAIL' 로 떨어진다 ★★
+    #    R0 은 `isfinite(cal_s) and isfinite(cal_b) and cal_s > cal_b` 로 판정한다.
+    #    벤치마크가 nan 이면 세 조건 중 둘째가 거짓이라 **'Calmar 미달 — 폐기 대상'** 이
+    #    출력된다. 실제로는 비교조차 못 한 것인데 '졌다'고 보고한 셈이다(7회차).
+    #    → 여기서 세 가지를 강제한다:
+    #      ① 비유한 수익률은 계산에서 제외한다(0 으로 바꾸지 않는다 — 그건 '수익 0'이라는
+    #         없는 사실을 만든다). 몇 개를 제외했는지 반환값에 남긴다.
+    #      ② 롱온리 월수익의 하한은 −100% 다. 보유분을 전부 잃어도 그 이상은 잃을 수 없다.
+    #         (폐지 −100% 를 여러 종목에 동시에 물리면 합계가 −1 밑으로 내려가 자본이
+    #          음수가 되고, 그 뒤 복리·MDD 가 전부 무의미해진다)
+    #      ③ 자본이 0 이하로 떨어지면 CAGR 은 nan 이 아니라 **−100%** 다. 전액손실은
+    #         '알 수 없음'이 아니라 확정된 사실이다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 선택 컬럼을 필수처럼 읽지 않는다 (R10 이 100% 확률로 오판정하던 자리) ★★
+    #    반환 dict 리터럴이 `float(R["n"].mean())` 을 **무조건** 평가했다. 그런데 호출자
+    #    중에는 수익률만 가진 프레임을 넘기는 곳이 있다 — R10 의 정책제외 구간 통계가
+    #    그렇다(build_v3/50_robust.py). 그러면 KeyError 가 나고, 호출부의 넓은 except 가
+    #    그것을 삼켜 off=nan 이 된다. 그 nan 은 `ok = isfinite(off) and ...` 에서 False 가
+    #    되어 **"정책 구간을 빼면 알파가 사라짐 — TP_N1 폐기 대상"** 으로 출력됐다.
+    #    측정에 실패한 것을 확정된 반증으로 보고한 것이고, 데이터와 무관하게 항상 그랬다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    def _opt(colname: str) -> float:
+        try:
+            return float(pd.to_numeric(R[colname], errors="coerce").mean())
+        except Exception:                                        # noqa
+            return np.nan
+    raw = pd.to_numeric(R["ret"], errors="coerce").to_numpy(dtype=float)
+    n_bad = int((~np.isfinite(raw)).sum())
+    r = np.where(np.isfinite(raw), raw, 0.0)
+    r = np.clip(r, -1.0, None)
     n = len(r)
     if n == 0:
         return {}
     eq = np.cumprod(1 + r)
+    # 자본이 한 번 0 이하가 되면 그 뒤는 존재하지 않는다 — 0 으로 고정해 복리를 끊는다.
+    if (eq <= 0).any():
+        first = int(np.argmax(eq <= 0))
+        eq[first:] = 0.0
+    eq = np.where(np.isfinite(eq), eq, 0.0)
     years = n / 12.0
-    cagr = eq[-1] ** (1 / years) - 1 if years > 0 and eq[-1] > 0 else np.nan
+    if years <= 0:
+        cagr = np.nan
+    elif eq[-1] > 0:
+        cagr = eq[-1] ** (1 / years) - 1
+    else:
+        cagr = -1.0                       # 전액손실 — 판정 유보가 아니라 확정된 사실
     vol = r.std(ddof=1) * math.sqrt(12) if n > 1 else np.nan
     dn = r[r < 0]
     dvol = dn.std(ddof=1) * math.sqrt(12) if len(dn) > 1 else np.nan
     peak = np.maximum.accumulate(eq)
-    dd = eq / peak - 1
-    mdd = float(dd.min()) if n else np.nan
+    # peak 가 0 이 될 수 있다(첫 달 −100%). 0 나눗셈은 nan 을 만들고 MDD 가 통째로 사라진다.
+    dd = np.where(peak > 0, eq / np.where(peak > 0, peak, 1.0) - 1.0, -1.0)
+    mdd = float(np.nanmin(dd)) if n else np.nan
+    if not np.isfinite(mdd):
+        mdd = np.nan
     uw, mx, cur = 0, 0, 0
     for x in dd:
         cur = cur + 1 if x < -1e-9 else 0
         mx = max(mx, cur)
     mu, tstat = hac_tstat(r)
-    return {
+    _cal = (cagr / abs(mdd)) if (np.isfinite(cagr) and np.isfinite(mdd) and mdd < 0) else np.nan
+    out = {
         "월수": n, "CAGR": cagr, "연변동성": vol,
-        "Sharpe": (cagr - rf) / vol if vol and np.isfinite(vol) and vol > 0 else np.nan,
-        "Sortino": (cagr - rf) / dvol if dvol and np.isfinite(dvol) and dvol > 0 else np.nan,
-        "MDD": mdd, "Calmar": (cagr / abs(mdd)) if mdd and mdd < 0 else np.nan,
+        "Sharpe": ((cagr - rf) / vol if np.isfinite(cagr) and vol and np.isfinite(vol)
+                   and vol > 0 else np.nan),
+        "Sortino": ((cagr - rf) / dvol if np.isfinite(cagr) and dvol and np.isfinite(dvol)
+                    and dvol > 0 else np.nan),
+        "MDD": mdd, "Calmar": _cal,
         "승률": float((r > 0).mean()), "월평균": float(r.mean()),
         "t통계량(HAC)": tstat, "최장언더워터(월)": int(mx),
-        "누적수익": float(eq[-1] - 1), "평균종목수": float(R["n"].mean()),
-        "월평균회전율": float(R["turnover"].mean()) if "turnover" in R else np.nan,
-        "월평균비용": float(R["cost"].mean()) if "cost" in R else np.nan,
+        "누적수익": float(eq[-1] - 1), "평균종목수": _opt("n"),
+        "월평균회전율": _opt("turnover"), "월평균비용": _opt("cost"),
+        # ★ 현금 비중은 선택 지표가 아니라 **비교의 전제**다. 종목수가 적으면 비중 상한
+        #   때문에 자동으로 현금이 쌓이는데, 그 사실 없이 두 팔의 CAGR 을 나란히 놓으면
+        #   '규모 대역의 효과'로 읽히는 것이 실은 '투자비중의 차이'가 된다.
+        "월평균현금비중": _opt("cash"),
     }
+    # ★ 몇 개를 제외했는지 숨기지 않는다. 0 이 아니면 그 시계열은 이미 손상된 것이고,
+    #   그 사실이 지표보다 먼저 읽혀야 한다.
+    if n_bad:
+        out["비유한수익률제외"] = n_bad
+    return out
 
 
 def right_tail_contribution(bt: dict) -> dict:
@@ -9545,6 +10222,13 @@ def right_tail_contribution(bt: dict) -> dict:
     반드시 측정하고 리포트에 명시한다(§10.2)."""
     H = bt.get("holdings")
     if H is None or H.empty:
+        return {}
+    # ★ 분모(총기여)가 실제 누적수익과 다르면 '상위 5%가 총기여의 180%' 같은 수치가 나온다.
+    #   두 가지를 맞춘다: ① 폐지 상각(-100%)도 보유 기록에 들어가 있어야 한다
+    #   (delist_vanished 이벤트로 append 하도록 고쳤다) ② 수익을 알 수 없어 보유하지 않은
+    #   것으로 처리한 행(ret_unknown)은 비중 0·수익 NaN 이므로 기여에서 자동 제외된다.
+    H = H[pd.to_numeric(H["ret"], errors="coerce").notna()]
+    if H.empty:
         return {}
     contrib = (H["weight"] * H["ret"]).groupby(H["code"]).sum().sort_values(ascending=False)
     n = len(contrib)
@@ -9562,23 +10246,74 @@ def right_tail_contribution(bt: dict) -> dict:
     return out
 
 
+INDEX_TABLE = "index_ohlcv_daily"          # 공용 인덱스 — 다른 전략도 그대로 재사용한다
+
+
+def _index_daily(sym: str, lo: pd.Timestamp, hi: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """지수 일봉을 **공용 캐시 우선**으로 확보한다.
+
+    ★★ 절대1원칙 ★★ 신규로 수집되는 데이터는 예외 없이 구글드라이브 공용/전용 인덱스에
+      저장돼 재호출 가능해야 한다. 예전 이 함수는 매 실행 FDR 에서 KS11/KQ11 을 새로 받고
+      **어디에도 저장하지 않았다** — 이 모듈에는 VAULT 참조가 한 줄도 없었다.
+      강건성 스위트가 R0 을 부를 때마다 같은 네트워크 왕복이 반복됐고,
+      네트워크가 막힌 환경에서는 지수 벤치마크가 통째로 사라졌다(그리고 조용히 넘어갔다).
+    """
+    cached = None
+    try:
+        cached = VAULT.get_table(INDEX_TABLE, scope="shared")
+    except Exception:                                            # noqa
+        cached = None
+    have = None
+    if cached is not None and len(cached) and "symbol" in cached.columns:
+        have = cached[cached["symbol"].astype(str) == sym].copy()
+        if len(have):
+            have["date"] = as_ts_series(have["date"])
+            have = have.dropna(subset=["date"])
+            if len(have) and have["date"].min() <= lo and have["date"].max() >= hi:
+                return have.sort_values("date")                  # 캐시가 구간을 덮는다 → 호출 없음
+    fresh = None
+    if fdr is not None:
+        try:
+            limiter("naver").wait()
+            r = fdr.DataReader(sym, lo, hi)
+            if r is not None and len(r):
+                r = r.reset_index()
+                r.columns = [str(c).lower() for c in r.columns]
+                r["date"] = as_ts_series(r[r.columns[0]])
+                r["symbol"] = sym
+                fresh = r[["symbol", "date"] + [c for c in ("open", "high", "low", "close",
+                                                            "volume") if c in r.columns]]
+        except Exception as e:                                   # noqa
+            LOG.debug(f"지수 {sym} 수집 실패({type(e).__name__}) — 캐시분으로 진행합니다.")
+    if fresh is None or not len(fresh):
+        return have if (have is not None and len(have)) else None
+    # 캐시와 합쳐 **넓어지는 방향으로만** 저장한다(좁혀 덮어쓰기 금지 — 절대1원칙).
+    parts = [p for p in (cached, fresh) if p is not None and len(p)]
+    merged = pd.concat(parts, ignore_index=True)
+    merged["date"] = as_ts_series(merged["date"])
+    merged = (merged.dropna(subset=["date", "symbol"])
+                    .drop_duplicates(["symbol", "date"], keep="last")
+                    .sort_values(["symbol", "date"]).reset_index(drop=True))
+    try:
+        VAULT.put_table(INDEX_TABLE, merged, scope="shared", domain="price",
+                        source="fdr: KS11/KQ11 지수 일봉 (R0 벤치마크 · 타 전략 재사용 가능)")
+    except Exception as e:                                       # noqa
+        LOG.debug(f"지수 캐시 저장 실패({type(e).__name__}) — 계산에는 영향 없음")
+    return merged[merged["symbol"].astype(str) == sym]
+
+
 def benchmark_returns(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
     out = {}
+    # ★ 끝을 2개월 늘린다. 아래 shift(-1) 때문에 마지막 달이 NaN 이 되면
+    #   비교표의 dropna 에서 그 달이 조용히 빠진다.
+    _lo = months[0] - pd.offsets.MonthEnd(2)
+    _hi = months[-1] + pd.offsets.MonthEnd(2)
     for name, sym in (("KOSPI", "KS11"), ("KOSDAQ", "KQ11")):
-        d = None
-        if fdr is not None:
-            try:
-                # ★ 끝을 2개월 늘린다. 아래 shift(-1) 때문에 마지막 달이 NaN 이 되면
-                #   비교표의 dropna 에서 그 달이 조용히 빠진다.
-                d = fdr.DataReader(sym, months[0] - pd.offsets.MonthEnd(2),
-                                   months[-1] + pd.offsets.MonthEnd(2))
-            except Exception:
-                d = None
+        d = _index_daily(sym, _lo, _hi)
         if d is None or len(d) == 0:
             continue
-        d = d.reset_index()
-        d.columns = [str(c).lower() for c in d.columns]
-        d["date"] = as_ts_series(d[d.columns[0]])
+        d = d.copy()
+        d["date"] = as_ts_series(d["date"])
         d["month"] = d["date"] + pd.offsets.MonthEnd(0)
         # ★★ 위상 정렬 ★★ 전략 수익률은 '월 m 행 = 월 m+1 에 실현된 수익'(fwd_ret) 규약이다.
         #   지수를 pct_change() 그대로 두면 한 달 어긋난 채로 차분되어, 시장요인이 상쇄되기는
@@ -9653,30 +10388,123 @@ def R0_benchmark(P: pd.DataFrame, bt: dict, months: pd.DatetimeIndex) -> Dict[st
       지수와 비교하면 유니버스 선택(중형주 편중)의 효과가 알파로 둔갑한다.
     """
     t0 = time.time()
-    elig = P[(col(P, "V6") == 1) & col(P, "fwd_ret").notna()]
+    _liq = P[col(P, "V6") == 1]
+    elig = _liq[col(_liq, "fwd_ret").notna()]
     if elig.empty:
         _rec("R0", "자체측정 벤치마크(유니버스 동일가중)", None, "유효 표본 없음")
         return {}
-    ew = elig.groupby("month", observed=True)["fwd_ret"].mean().reindex(months).fillna(0.0)
+    # ★★ 기준선의 비대칭을 숨기지 않는다 ★★
+    #   벤치마크는 fwd_ret 이 있는 행만 평균한다. 그런데 거래정지·상장폐지로 다음 달 행이
+    #   사라지면 그 달 fwd_ret 이 정확히 NaN 이다 — 즉 **벤치마크는 폐지 손실을 구조적으로
+    #   먹지 않는다.** 반면 전략은 백테스트 엔진에서 -100% 를 그대로 맞는다.
+    #   이 비대칭은 기준선을 위로 밀어 전략을 부당하게 탈락시키는 방향이다.
+    #   완전한 교정은 벤치마크에도 같은 폐지 규약을 적용하는 것이지만, 그러려면 R0 가
+    #   Universe 를 받아야 한다. 지금은 **크기를 재서 보고**한다 — 모르는 채로 두지 않는다.
+    _drop_n = int(len(_liq) - len(elig))
+    _drop_r = _drop_n / max(len(_liq), 1)
+
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 왜 단순 평균을 쓰지 않는가 (7회차에서 CAGR inf% / MDD nan% 를 낸 자리) ★★
+    #    ARM_MAIN="ALL" 이면 유동성 하한만 남고 규모 상한이 없어 월 1,500종목 안팎이 들어온다.
+    #    그 중 한 종목이라도 수정주가 불일치로 +900% 를 기록하면 동일가중 평균에 +0.6%p 가
+    #    실린다. 그런 달이 몇 번 겹치면 복리가 발산하고, 발산한 뒤에는 eq/peak = inf/inf = nan
+    #    이라 MDD·Calmar 가 통째로 사라진다. 그런데 판정식은 isfinite 하나로 되어 있어
+    #    **'벤치마크에 졌다'** 고 출력됐다 — 비교조차 못 했는데.
+    #
+    #    가격 쪽 무결성 게이트(build_price_panel)가 물리적으로 불가능한 값을 이미 걷어내지만,
+    #    여기서 한 겹 더 둔다. 이유는 두 가지다.
+    #      · 게이트를 통과한 '가능하지만 담을 수 없는' 수익(상한가 연속 잡주)이 남는다.
+    #        1,500종목 동일가중 지수는 그런 종목을 실제로 담지 못한다 — 기준선이 과대해진다.
+    #      · 기준선은 전략이 **이겨야 하는 선**이다. 과대한 기준선은 전략을 부당하게 탈락시키고,
+    #        발산한 기준선은 판정 자체를 불가능하게 만든다. 둘 다 틀린 결론을 만든다.
+    #    → 월별 횡단면 1%/99% 절사평균을 기본 기준선으로 쓰고, **원시 평균과 중앙값을 나란히
+    #      출력**해 절사가 얼마나 바꿨는지 사용자가 직접 보게 한다. 숨기지 않는다.
+    #    ★ 전략 수익률에는 절사를 적용하지 않는다. 그건 성과를 지어내는 것이다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _fr = pd.to_numeric(elig["fwd_ret"], errors="coerce")
+    _fr = _fr.where(np.isfinite(_fr.to_numpy(dtype="float64")))
+    E = pd.DataFrame({"month": elig["month"].to_numpy(), "r": _fr.to_numpy()}).dropna()
+    if E.empty:
+        _rec("R0", "자체측정 벤치마크(유니버스 동일가중)", None,
+             "유효한(유한한) fwd_ret 이 한 건도 없습니다 — 가격 무결성 게이트 로그를 확인하세요")
+        return {}
+    _g = E.groupby("month", observed=True)["r"]
+    lo_q = _g.transform(lambda s: s.quantile(0.01))
+    hi_q = _g.transform(lambda s: s.quantile(0.99))
+    E["rw"] = E["r"].clip(lower=lo_q, upper=hi_q)
+    ew_raw = _g.mean().reindex(months)
+    ew = E.groupby("month", observed=True)["rw"].mean().reindex(months)
+    ew_med = _g.median().reindex(months)
+    n_by_m = _g.size().reindex(months)
+
+    def _fin(s: pd.Series) -> pd.Series:
+        v = pd.to_numeric(s, errors="coerce")
+        return v.where(np.isfinite(v.to_numpy(dtype="float64"))).fillna(0.0)
+
+    ew, ew_raw, ew_med = _fin(ew), _fin(ew_raw), _fin(ew_med)
     bench = {"유니버스 동일가중": ew}
     try:
         for k, v in benchmark_returns(months).items():
             if v is not None and v.notna().any():
-                bench[k] = v.reindex(months)
+                bench[k] = _fin(v.reindex(months))
     except Exception as e:                                       # noqa
         LOG.debug(f"지수 벤치마크 수집 실패({type(e).__name__}) — 자체측정만 사용합니다.")
 
-    bR = pd.DataFrame({"month": months, "ret": ew.to_numpy(), "n": 0,
-                       "turnover": 0.0, "cost": 0.0})
-    bs = perf_stats(bR)
+    def _mk(s: pd.Series) -> pd.DataFrame:
+        return pd.DataFrame({"month": months, "ret": s.to_numpy(dtype=float), "n": 0,
+                             "turnover": 0.0, "cost": 0.0})
+
+    bs = perf_stats(_mk(ew))
+    bs_raw = perf_stats(_mk(ew_raw))
+    bs_med = perf_stats(_mk(ew_med))
     ss = perf_stats(bt["returns"])
+
+    _f = lambda d, k, fmt: (format(d[k], fmt)
+                            if k in d and np.isfinite(d.get(k, np.nan)) else "산출불가")
+    LOG.table([["전략", _f(ss, "CAGR", ".2%"), _f(ss, "MDD", ".1%"), _f(ss, "Calmar", ".2f"),
+                _f(ss, "Sharpe", ".2f"), "-"],
+               ["유니버스 동일가중 (1%절사) ★판정기준", _f(bs, "CAGR", ".2%"),
+                _f(bs, "MDD", ".1%"), _f(bs, "Calmar", ".2f"), _f(bs, "Sharpe", ".2f"),
+                f"월 {n_by_m.mean():,.0f}종목"],
+               ["유니버스 동일가중 (원시 평균, 참고)", _f(bs_raw, "CAGR", ".2%"),
+                _f(bs_raw, "MDD", ".1%"), _f(bs_raw, "Calmar", ".2f"),
+                _f(bs_raw, "Sharpe", ".2f"), "절사 전"],
+               ["유니버스 중앙값 (참고)", _f(bs_med, "CAGR", ".2%"), _f(bs_med, "MDD", ".1%"),
+                _f(bs_med, "Calmar", ".2f"), _f(bs_med, "Sharpe", ".2f"), "꼬리 무관"]],
+              ["기준선", "CAGR", "MDD", "Calmar", "Sharpe", "비고"],
+              ["l", "r", "r", "r", "r", "l"],
+              title="R0 자체측정 벤치마크 — 절사 전/후를 나란히 둡니다(절사가 결론을 바꾸는지 보세요)")
+    if not np.isfinite(bs_raw.get("CAGR", np.nan)):
+        LOG.warn("★ 원시 평균 기준선이 발산했습니다(비유한). 유니버스에 가격으로 설명되지 않는 "
+                 "극단 수익률이 남아 있다는 뜻입니다 — 위 '월수익률 분포' 표와 무결성 원장"
+                 "(price_return_sanity_ledger)을 확인하세요. 판정은 절사 기준선으로 합니다.")
+    if _drop_r > 0.005:
+        LOG.warn(f"★ 기준선의 비대칭 고지 — 유동성 통과 {len(_liq):,}행 중 {_drop_n:,}행"
+                 f"({_drop_r:.1%})은 다음 달 수익을 알 수 없어(거래정지·상장폐지·월 연속성 단절) "
+                 f"벤치마크 평균에서 빠졌습니다. 즉 **벤치마크는 폐지 손실을 먹지 않고 전략만 "
+                 f"먹습니다.** 이 비대칭은 기준선을 위로 밀어 전략을 불리하게 만드는 방향이므로, "
+                 f"R0 에서 지더라도 그 차이의 일부는 신호가 아니라 이 규약 차이입니다.")
+
     cal_s, cal_b = ss.get("Calmar", np.nan), bs.get("Calmar", np.nan)
-    ok = np.isfinite(cal_s) and np.isfinite(cal_b) and cal_s > cal_b
-    _rec("R0", "자체측정 벤치마크(유니버스 동일가중) 대비", bool(ok),
-         "Calmar 상회" if ok else "Calmar 미달 — 스펙 §11 기준상 폐기 대상",
-         f"전략 Calmar {cal_s:.2f} / 벤치 {cal_b:.2f} · "
-         f"CAGR {ss.get('CAGR', np.nan):.2%} vs {bs.get('CAGR', np.nan):.2%} · "
-         f"MDD {ss.get('MDD', np.nan):.1%} vs {bs.get('MDD', np.nan):.1%}")
+    nums = (f"전략 Calmar {_f(ss,'Calmar','.2f')} / 벤치 {_f(bs,'Calmar','.2f')} · "
+            f"CAGR {_f(ss,'CAGR','.2%')} vs {_f(bs,'CAGR','.2%')} · "
+            f"MDD {_f(ss,'MDD','.1%')} vs {_f(bs,'MDD','.1%')}")
+    # ★★ 비교가 불가능한 것과 비교해서 진 것은 다른 사건이다 ★★
+    #   예전엔 둘 다 FAIL 이었다. 지표가 nan 이면 '미달'이 아니라 **판정불가(N/A)** 다.
+    if not (np.isfinite(cal_s) and np.isfinite(cal_b)):
+        why = []
+        if not np.isfinite(cal_s):
+            why.append("전략 Calmar 산출불가(MDD 가 0 이거나 수익 시계열이 손상)")
+        if not np.isfinite(cal_b):
+            why.append("벤치 Calmar 산출불가")
+        _rec("R0", "자체측정 벤치마크(유니버스 동일가중) 대비", None,
+             "비교 지표를 산출할 수 없어 판정을 유보합니다 — " + " · ".join(why) +
+             ". '벤치마크에 미달'이라고 쓰지 않습니다(비교 자체가 성립하지 않았습니다).", nums)
+        runtime_mark("R0", time.time() - t0)
+        return bench
+    ok = bool(cal_s > cal_b)
+    _rec("R0", "자체측정 벤치마크(유니버스 동일가중) 대비", ok,
+         "Calmar 상회" if ok else "Calmar 미달 — 스펙 §11 기준상 폐기 대상", nums)
     runtime_mark("R0", time.time() - t0)
     return bench
 
@@ -9756,6 +10584,35 @@ def R2N_kill_gate(P: pd.DataFrame, run_fn: Callable) -> None:
     # ── 공통 행 집합: 두 센서가 모두 관측된 행만 ───────────────────────────────────────────
     common = P["nl_emp"].notna() & P["nl_premium"].notna()
     n_common = int(common.sum())
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 여섯 팔을 **같은 기간**에서 비교한다 ★★
+    #    A·B·C 는 nl_emp·nl_premium 동시관측 행에서만 신호가 산다. EMP 커버리지가 얇으면
+    #    앞 구간 전체가 FLOOR=0 이라 선정이 0건이고, 그 달은 수익 0% 로 기록된다.
+    #    반면 D·CORE-D 는 재무만으로 전 구간을 돈다. 그 둘의 Sharpe·CAGR 을 한 표에 나란히
+    #    놓으면 '트레이드오프의 기여'가 아니라 **'몇 개월을 실제로 운용했는가'** 를 재게 된다.
+    #    → EMP 관측이 존재하는 달로 창을 좁혀 모든 팔을 같은 창에서 돌린다.
+    #      좁힌 사실과 개월 수는 판정문에 그대로 적는다(숨기고 좁히면 그게 더 나쁘다).
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _emp_months = pd.DatetimeIndex(sorted(pd.unique(P.loc[common, "month"])))
+    _all_months = pd.DatetimeIndex(sorted(pd.unique(P["month"])))
+    _win = _all_months[(_all_months >= _emp_months.min()) &
+                       (_all_months <= _emp_months.max())] if len(_emp_months) else _all_months
+    if len(_win) < 18:
+        _rec("R2-N", "한계임금 킬게이트 ⭐⭐", None,
+             f"EMP 관측이 존재하는 구간이 {len(_win)}개월뿐이라(최소 18개월) 검정할 수 없습니다. "
+             f"직원현황 수집을 더 채운 뒤 재판정하세요 — 회사 우선 격자라 재실행할수록 "
+             f"과거 구간이 함께 채워집니다.",
+             f"공통표본 {n_common:,}행 · EMP 구간 "
+             f"{(_emp_months.min() if len(_emp_months) else pd.NaT)}~"
+             f"{(_emp_months.max() if len(_emp_months) else pd.NaT)}")
+        R2N_VERDICT.update({"verdict": "검정불가", "reason": "EMP 유효 구간 부족",
+                            "n_common": n_common, "emp_months": len(_win)})
+        runtime_mark("R2N", time.time() - t0)
+        return
+    if len(_win) < len(_all_months):
+        LOG.info(f"R2-N 은 EMP 관측 구간 {_win[0]:%Y-%m}~{_win[-1]:%Y-%m} "
+                 f"({len(_win)}/{len(_all_months)}개월)에서만 비교합니다 — 여섯 팔이 같은 "
+                 f"기간을 돌아야 차이가 '기간'이 아니라 '신호'에서 나옵니다.")
     Q = P.copy()
     Q["ARM_A"] = np.maximum(cell_rank(Q, "nl_emp") - 0.5, 0.0)
     Q["ARM_B"] = np.maximum(cell_rank(Q, "nl_premium") - 0.5, 0.0)
@@ -9764,16 +10621,21 @@ def R2N_kill_gate(P: pd.DataFrame, run_fn: Callable) -> None:
         Q[c] = pd.to_numeric(Q[c], errors="coerce").where(common)
 
     arms = {}
+    # ★★ min_arms=1 이 이 검정의 핵심이다 ★★
+    #   A·B 는 **단일 센서 팔**이고, 단일인 것이 검정의 목적이다("트레이드오프 곱이
+    #   나이브 단독보다 나은가"). 본선용 안전장치(MIN_TP_ARMS=2)를 그대로 적용하면
+    #   A 팔을 만드는 첫 줄에서 RuntimeError 가 나고 — 7회차에 실제로 그랬다 —
+    #   이 파일의 존재 이유인 킬게이트가 한 번도 실행되지 못한다.
     for lab, cols in (("A. nl_emp 단독(나이브)", ["ARM_A"]),
                       ("B. nl_premium 단독", ["ARM_B"]),
                       ("C. TP_N1 = clip×clip", ["ARM_C"])):
-        S = score_arm(Q, cols, min_tp=1)
+        S = score_arm(Q, cols, min_tp=1, min_arms=1)
         Z = Q.copy()
         for k, v in S.items():
             Z[k] = v
-        arms[lab] = run_fn(Z, label=f"R2N_{lab[:1]}")
+        arms[lab] = run_fn(Z, label=f"R2N_{lab[:1]}", months_override=_win)
 
-    months = pd.DatetimeIndex(sorted(P["month"].unique()))
+    months = _win
     rs = {k: _ret_series(v, months) for k, v in arms.items()}
     sh = {k: _stat(v, "Sharpe") for k, v in arms.items()}
     cg = {k: _stat(v, "CAGR") for k, v in arms.items()}
@@ -9789,26 +10651,56 @@ def R2N_kill_gate(P: pd.DataFrame, run_fn: Callable) -> None:
     live_core = [c for c in TP_CORE_D if c in P.columns and P[c].notna().any()]
     dD = dC = None
     if live_core:
-        for lab, cols in (("D. 전체 E (8TP)", live_all), ("CORE-D 단독 (5TP)", live_core)):
-            S = score_arm(P, cols)
-            Z = P.copy()
-            for k, v in S.items():
-                Z[k] = v
-            arms[lab] = run_fn(Z, label=f"R2N_{lab[:1]}")
-            rs[lab] = _ret_series(arms[lab], months)
-            sh[lab] = _stat(arms[lab], "Sharpe")
-            cg[lab] = _stat(arms[lab], "CAGR")
-            ca[lab] = _stat(arms[lab], "Calmar")
-        dD, dC = "D. 전체 E (8TP)", "CORE-D 단독 (5TP)"
+        # ★ D 비교는 '전체 E 가 CORE-D 단독보다 나은가'를 잰다. 살아 있는 TP 개수는
+        #   이번 실행의 수집 결과에 따라 달라지므로 개수 자체를 라벨에 넣는다 —
+        #   '8TP' 라고 써 놓고 실제로는 2개인 표를 만들면 그 표가 사용자를 속인다.
+        _labD = f"D. 전체 E ({len(live_all)}TP)"
+        _labC = f"CORE-D 단독 ({len(live_core)}TP)"
+        try:
+            for lab, cols in ((_labD, live_all), (_labC, live_core)):
+                S = score_arm(P, cols, min_arms=1)
+                Z = P.copy()
+                for k, v in S.items():
+                    Z[k] = v
+                arms[lab] = run_fn(Z, label=f"R2N_{lab[:1]}", months_override=_win)
+                rs[lab] = _ret_series(arms[lab], months)
+                sh[lab] = _stat(arms[lab], "Sharpe")
+                cg[lab] = _stat(arms[lab], "CAGR")
+                ca[lab] = _stat(arms[lab], "Calmar")
+            dD, dC = _labD, _labC
+        except Exception as e:                                      # noqa
+            LOG.warn(f"R2-N 의 D 비교(전체 E vs CORE-D)를 실행하지 못했습니다 "
+                     f"({type(e).__name__}: {str(e)[:120]}) — A·B·C 판정은 그대로 진행합니다.")
+            arms.pop(_labD, None); arms.pop(_labC, None)
+            dD = dC = None
 
     LOG.table([[k, f"{cg.get(k, np.nan):.2%}", f"{sh.get(k, np.nan):.2f}",
                 f"{ca.get(k, np.nan):.2f}", f"{_stat(arms[k],'MDD'):.1%}",
                 f"{_stat(arms[k],'평균종목수'):.0f}"] for k in arms],
               ["비교팔", "CAGR", "Sharpe", "Calmar", "MDD", "평균종목"],
               ["l", "r", "r", "r", "r", "r"],
-              title=f"R2-N 한계임금 킬게이트 (A·B·C 는 공통 {n_common:,}행에서 비교)")
+              title=f"R2-N 한계임금 킬게이트 — 여섯 팔 모두 {_win[0]:%Y-%m}~{_win[-1]:%Y-%m} ({len(_win)}개월) 동일 창 · A·B·C 는 공통 {n_common:,}행")
 
     # ── 판정 (유리하게 해석하지 않는다) ───────────────────────────────────────────────────
+    # ★★ 측정 실패를 결론으로 쓰지 않는다 ★★
+    #   hac_tstat 은 유효 표본이 12개월 미만이면 (nan, nan) 을 돌려준다. 그런데 예전 코드는
+    #   `sig = isfinite(tstat) and tstat > 1.65` 하나로 판정해서, 표본이 없어 재지 못한
+    #   경우와 재서 졌을 경우를 구별하지 않고 둘 다 **"무기여"** 라고 확정했다.
+    #   EMP 커버리지가 얇으면 A·B·C 팔이 아예 종목을 못 고르는데, 그 결과가
+    #   'NPS 정밀화 투자의 근거가 확보되지 않았다'는 결론으로 리포트에 박혔다.
+    _n_eff = int((rs[kC] - rs[best_naive]).replace(0.0, np.nan).notna().sum())
+    if not np.isfinite(tstat) or _n_eff < 12:
+        _rec("R2-N", "한계임금 킬게이트 ⭐⭐", None,
+             f"비교 가능한 달이 {_n_eff}개월뿐이라(최소 12개월) 검정할 수 없습니다. "
+             f"A·B·C 팔이 종목을 고르지 못했거나 EMP 관측 구간이 너무 짧습니다 — "
+             f"'무기여'라고 쓰지 않습니다. 위 EMP 커버리지 감사표를 먼저 보세요.",
+             f"공통표본 {n_common:,}행 · 유효 비교 {_n_eff}개월 · "
+             f"C 평균종목 {_stat(arms[kC],'평균종목수'):.1f} / "
+             f"{best_naive[:1]} 평균종목 {_stat(arms[best_naive],'평균종목수'):.1f}")
+        R2N_VERDICT.update({"verdict": "검정불가", "reason": "유효 비교 개월 부족",
+                            "n_common": n_common, "n_eff_months": _n_eff})
+        runtime_mark("R2N", time.time() - t0)
+        return
     if sig:
         verdict = "PASS"
         msg = ("한계임금 트레이드오프 신호가 나이브 지표를 유의하게 이겼습니다. "
@@ -9936,19 +10828,36 @@ def R5_ablation(P: pd.DataFrame, run_fn: Callable) -> None:
     live = [c for c in TP_ALL if c in P.columns and P[c].notna().any()]
     base_bt = run_fn(P, label="R5_base")
     base = _stat(base_bt, "Sharpe")
+    # ★★ 알파가 없으면 절제 안정성은 판정할 수 없다 ★★
+    #   판정식이 `spread < 1.5` 라서, 어느 TP 를 빼도 Sharpe 가 똑같이 무의미하면
+    #   Δ가 전부 0 근처가 되어 spread≈0 → **PASS**. '단일 요소에 종속되지 않음' 이라는
+    #   문구가 출력되지만 실제로 성립하는 것은 '뺄 것이 없었다' 뿐이다.
+    #   _no_alpha_to_test 가 R3·R7·R10 에만 걸려 있어 R5·R8 이 이 구멍으로 새고 있었다.
+    if _no_alpha_to_test(base):
+        _rec("R5", "절제 안정성", None,
+             f"기준선에 절제로 검정할 알파가 없습니다(Sharpe {base:.2f} ≤ {ALPHA_FLOOR}). "
+             f"'단일 요소에 종속되지 않음'이라고 쓰지 않습니다 — 뺄 것이 없었습니다.",
+             f"살아 있는 TP {len(live)}개")
+        runtime_mark("R5", time.time() - t0)
+        return
     rows = [["(기준) 전체", f"{base:.2f}", "0.00", f"{len(live)}개 TP"]]
+    # ★ 판정은 **표시용 문자열이 아니라 원시 수치**로 한다. 예전엔 float(r[2]) 로 표를
+    #   다시 파싱했는데, Sharpe 가 nan 인 절제팔은 "+nan" 으로 찍히고 float("+nan")=nan 이다.
+    #   내장 max/min 은 nan 을 순서에 따라 건너뛰므로 spread 가 작게 나와 **조용히 PASS** 했다.
+    deltas: List[float] = []
 
     # ① TP 하나씩 제거
     for c in live:
         cols = [x for x in live if x != c]
         if not cols:
             continue
-        S = score_arm(P, cols)
+        S = score_arm(P, cols, min_arms=1)
         Z = P.copy()
         for k, v in S.items():
             Z[k] = v
         s = _stat(run_fn(Z, label=f"R5_-{c}"), "Sharpe")
         rows.append([f"− {c}", f"{s:.2f}", f"{s-base:+.2f}", "TP 제거"])
+        deltas.append(float(s - base))
         if not _budget_ok("R5", t0):
             rows.append(["(예산 초과로 이후 절제 생략)", "-", "-", ""])
             break
@@ -9956,13 +10865,14 @@ def R5_ablation(P: pd.DataFrame, run_fn: Callable) -> None:
     # ② 경계: 최소 TP 관측 수
     if _budget_ok("R5", t0):
         for k in (2, 4):
-            S = score_arm(P, live, min_tp=k)
+            S = score_arm(P, live, min_tp=k, min_arms=1)
             Z = P.copy()
             for kk, v in S.items():
                 Z[kk] = v
             s = _stat(run_fn(Z, label=f"R5_mintp{k}"), "Sharpe")
             rows.append([f"MIN_TP_OBSERVED={k}", f"{s:.2f}", f"{s-base:+.2f}",
                          f"기본값 {MIN_TP_OBSERVED}"])
+            deltas.append(float(s - base))
 
     # ③ C15 분모 임계값 — 한계임금을 실제로 재계산해서 본다
     if _budget_ok("R5", t0) and {"dn", "emp_prev", "d_pay", "avg_prev"} <= set(P.columns):
@@ -9981,16 +10891,28 @@ def R5_ablation(P: pd.DataFrame, run_fn: Callable) -> None:
             s = _stat(run_fn(Z, label=f"R5_c15_{thr}"), "Sharpe")
             rows.append([f"C15 분모임계 {thr:.0%}", f"{s:.2f}", f"{s-base:+.2f}",
                          f"기본값 {C15_MIN_REL_DN:.0%}"])
+            deltas.append(float(s - base))
 
     LOG.table(rows, ["절제 조건", "Sharpe", "Δ", "비고"], ["l", "r", "r", "l"],
               title="R5 절제 검사 (TP별 · 경계 · 분모임계)")
-    deltas = [float(r[2]) for r in rows[1:] if r[2] not in ("-",)]
-    spread = (max(deltas) - min(deltas)) if deltas else np.nan
+    vals = [d for d in deltas if np.isfinite(d)]
+    n_bad = len(deltas) - len(vals)
+    if n_bad:
+        # 측정 불가한 절제팔이 하나라도 있으면 '안정적'이라고 말할 수 없다.
+        _rec("R5", "절제 안정성", None,
+             f"절제팔 {n_bad}/{len(deltas)}개에서 Sharpe 를 산출하지 못했습니다"
+             f"(표본 전멸 또는 선정 0종목). 측정되지 못한 절제를 '변화 없음'으로 읽으면 "
+             f"안정성을 지어내는 것이라 판정을 유보합니다.",
+             f"측정 성공 {len(vals)}종 · ΔSharpe 폭 "
+             f"{(max(vals)-min(vals)) if vals else float('nan'):.2f}")
+        runtime_mark("R5", time.time() - t0)
+        return
+    spread = (max(vals) - min(vals)) if vals else np.nan
     ok = np.isfinite(spread) and spread < 1.5
     _rec("R5", "절제 안정성", bool(ok),
          "단일 TP·단일 임계값에 성과가 종속되지 않음" if ok else
          "특정 절제에서 성과가 급변 — 결과가 한 요소에 종속되어 있습니다(재설계 검토)",
-         f"ΔSharpe 폭 {spread:.2f} (기준 <1.5) · 절제 {len(rows)-1}종")
+         f"ΔSharpe 폭 {spread:.2f} (기준 <1.5) · 절제 {len(vals)}종")
     runtime_mark("R5", time.time() - t0)
 
 
@@ -10050,6 +10972,16 @@ def R8_subperiod(bt: dict) -> None:
     LOG.table(rows, ["연도", "월수", "연수익", "월평균", "승률", "평균종목"],
               ["c", "r", "r", "r", "r", "r"], title="R8 하위기간 (연도별)")
     ratio = pos / max(len(yrs), 1)
+    # ★ R5 와 같은 구멍이 여기에도 있었다. 알파가 없는데 우연히 절반 넘는 해가 양수면
+    #   '일관성 있음'으로 PASS 한다 — 일관되게 무의미한 것을 일관성이라 부르는 셈이다.
+    _full = perf_stats(R.reset_index(drop=True)).get("Sharpe", np.nan)
+    if _no_alpha_to_test(_full):
+        _rec("R8", "하위기간 일관성", None,
+             f"전체 구간 알파가 없어(Sharpe {_full:.2f} ≤ {ALPHA_FLOOR}) 연도별 일관성을 "
+             f"논할 단계가 아닙니다. 양수 연도 비율만으로 '일관성 있음'이라고 쓰지 않습니다.",
+             f"{pos}/{len(yrs)}개 연도 양수 ({ratio:.0%})")
+        runtime_mark("R8", time.time() - t0)
+        return
     ok = ratio >= 0.6
     _rec("R8", "하위기간 일관성", bool(ok),
          "대부분의 연도에서 양(+)" if ok else "특정 연도에 성과가 몰려 있음 — 일관성 부족",
@@ -10081,11 +11013,25 @@ def R10_policy_falsify(P: pd.DataFrame, cal: pd.DataFrame, months: pd.DatetimeIn
     try:
         _r = _ret_series(bt_full, pd.DatetimeIndex(months))
         _sub = _r.reindex(clean).dropna()
-        off = float(perf_stats(pd.DataFrame({"month": _sub.index, "ret": _sub.to_numpy()}))
+        # ★ perf_stats 는 n/turnover/cost 를 선택 컬럼으로 다루도록 고쳤지만, 호출 규약은
+        #   R0 과 똑같이 맞춰 둔다. 예전엔 month·ret 두 열만 넘겨 KeyError('n') 가 났고,
+        #   아래 except 가 그것을 삼켜 off=nan → **항상 FAIL** 이었다.
+        #   즉 이 검사는 데이터와 무관하게 100% 확률로 'TP_N1 폐기 대상' 을 출력했다.
+        off = float(perf_stats(pd.DataFrame({"month": _sub.index, "ret": _sub.to_numpy(),
+                                             "n": 0, "turnover": 0.0, "cost": 0.0}))
                     .get("Sharpe", np.nan)) if len(_sub) >= 18 else np.nan
     except Exception as e:                                          # noqa
-        LOG.warn(f"R10 정책제외 구간 통계 산출 실패({type(e).__name__}) — 판정을 유보합니다.")
+        LOG.warn(f"R10 정책제외 구간 통계 산출 실패({type(e).__name__}: {str(e)[:120]}) — "
+                 f"판정을 유보합니다.")
         off = np.nan
+    if not np.isfinite(off):
+        _rec("R10", "정책반증 (고용정책 ±6M 제외)", None,
+             f"정책제외 구간의 Sharpe 를 산출하지 못해 판정을 유보합니다"
+             f"(유효 {len(clean)}개월). '알파가 사라졌다'고 쓰지 않습니다 — "
+             f"측정에 실패한 것과 반증된 것은 다른 사건입니다.",
+             f"전체 {len(months)}개월 Sharpe {base:.2f}")
+        runtime_mark("R10", time.time() - t0)
+        return
     nums = (f"전체 {len(months)}개월 Sharpe {base:.2f} → "
             f"정책제외 {len(clean)}개월 {off:.2f} (같은 백테스트의 부분표본)")
     if _no_alpha_to_test(base):
@@ -10458,7 +11404,9 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     # ── C2b : 상장폐지 -100% 강제 ─────────────────────────────────────────────────────────
     def c2b():
-        src = _src_of(run_backtest)
+        # ★ run_backtest 는 감사 스위치만 다루는 얇은 래퍼이고 실제 엔진은 _run_backtest_inner
+        #   에 있다. 래퍼만 읽으면 '-100% 처리가 사라졌다'는 오탐이 난다 — 둘을 함께 읽는다.
+        src = _src_of(run_backtest, _run_backtest_inner)
         if not src:
             return None, "소스 조회 불가 — 검사하지 못했습니다(통과 아님)"
         if "-1.0" not in src or "delist" not in src:
@@ -10679,52 +11627,66 @@ def run_contracts_v3(strict: bool = True) -> bool:
         이 계약은 (a) 두 단계 모두 상한을 갖고 (b) 그 상한이 DART 일일한도 안에 들고
         (c) 수집 함수가 상한 인자를 실제로 받는지를 강제한다.
         """
-        caps = {"EMP_MAX_CALLS": EMP_MAX_CALLS, "DART_FS_MAX_CALLS": DART_FS_MAX_CALLS}
-        missing = [k for k, v in caps.items() if v is None]
-        if missing:
-            return False, f"{missing} 에 상한이 없습니다 — 콜드빌드가 4시간 계약을 벗어납니다"
         import inspect as _ins
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★★ 4시간 계약을 지키는 것은 '개수'가 아니라 '시간'이다 ★★
+        #    개수 상한만 검정하던 예전 판은 두 번 무력화됐다.
+        #      ① 상수를 유도식(ROOM×0.55 등)으로 바꾼 순간 `plan > room` 이 **항등식**이 되어
+        #         절대 발동하지 않았다. 26,000건 사고를 고정한다던 회귀 테스트가 죽은 코드였다.
+        #      ② 서버가 먼저 020 을 주면 개수 상한은 아무것도 보호하지 못한다(5차 실행 실증).
+        #    → 이제 수집을 멈추는 조건은 딱 둘이다: **서버 020/021** 과 **시계**.
+        #      이 계약은 그 둘이 코드에 실재하는지를 검정한다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        shares = {"EMP_TIME_SHARE": EMP_TIME_SHARE, "FS_TIME_SHARE": FS_TIME_SHARE}
+        bad = [k for k, v in shares.items() if not (isinstance(v, (int, float)) and 0 < v <= 1)]
+        if bad:
+            return False, f"{bad} 의 시간 몫이 (0,1] 범위가 아닙니다 — 4시간 계약을 배분할 수 없습니다"
+        # 수집 데드라인이 전체 예산 **안쪽**에 있어야 후속 단계(강건성·리포트) 몫이 남는다.
+        _budget_s = WALL_CLOCK_LIMIT_H * 3600.0
+        if not (0 < POST_COLLECT_RESERVE_MIN * 60.0 < _budget_s * 0.5):
+            return False, (f"수집 이후 몫(POST_COLLECT_RESERVE_MIN="
+                           f"{POST_COLLECT_RESERVE_MIN}분)이 전체 예산의 절반을 넘거나 0 입니다")
+        if collect_deadline_ts() >= _T0_PROCESS + _budget_s:
+            return False, "수집 데드라인이 전체 예산 밖입니다 — 계약이 집행되지 않습니다"
+        # 수집 루프가 실제로 데드라인을 확인하는가 (주석이 아니라 코드로)
+        for fn, need in ((fetch_emp_status, ("stage_time_budget", "_deadline")),
+                         (fetch_dart_financials, ("_fs_time_budget_s", "_deadline"))):
+            src = _src_of(fn)
+            if not src:
+                return None, f"{fn.__name__} 소스를 읽을 수 없어 데드라인 배선을 확인하지 못했습니다"
+            miss = [t for t in need if t not in src]
+            if miss:
+                return False, (f"{fn.__name__} 이 시간 데드라인을 확인하지 않습니다({miss}) — "
+                               f"개수 상한만으로는 4시간 계약을 지킬 수 없습니다")
+        # 개수 상한은 **선택**이다(None = 계획 상한 없음). 다만 있으면 전체 한도 안이어야 한다.
+        caps = {"EMP_MAX_CALLS": EMP_MAX_CALLS, "DART_FS_MAX_CALLS": DART_FS_MAX_CALLS}
         for fn, arg in ((fetch_dart_financials, "max_calls"), (fetch_emp_status, "max_calls")):
             if arg not in _ins.signature(fn).parameters:
                 return False, f"{fn.__name__} 이 {arg} 인자를 받지 않습니다"
-        # ★ Tier-2 는 잡당 OFS→CFS 로 최대 2회를 던진다. '잡 수'가 아니라 '호출 수'로 센다.
-        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS) * 2 + 2100 + 600
-        _nk = max(1, len([k for k in ([DART_API_KEY] + list(DART_API_KEYS)) if str(k).strip()]))
-        # ★ 한도는 **키 하나당**이다. 예전엔 단일 단계 상한을 키 1개분과 비교해서,
-        #   키를 3개 넣으면(헤더와 이 계약의 오류 메시지가 둘 다 권하는 처방이다)
-        #   유도된 EMP_MAX_CALLS 가 19,000 을 넘어 **실행 자체를 거부**했다 — 자살 스위치다.
-        if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT * _nk:
-            return False, (f"단일 단계 상한이 전체 한도({DART_DAILY_LIMIT * _nk:,} "
-                           f"= 키 {_nk}개 × {DART_DAILY_LIMIT:,})를 넘습니다")
-        # 예전엔 plan 을 계산해 성공 메시지에 찍기만 하고 **한도와 비교하지 않았다.**
-        # 그래서 26,000건 계획이 "일일한도 19,000 안" 이라는 문구와 함께 PASS 했다.
-        # ★ 한도는 **키 하나당**이다. 키를 여러 개 넣으면 그만큼 곱해진다.
-        n_keys = max(1, len([k for k in ([DART_API_KEY] + list(DART_API_KEYS))
-                             if str(k).strip()]))
+        n_keys = max(1, len({str(k).strip() for k in ([DART_API_KEY] + list(DART_API_KEYS))
+                             if str(k).strip()}))
         room = DART_DAILY_LIMIT * n_keys
-        if plan > room:
-            return False, (f"계획 호출 {plan:,}건이 하루 한도 {room:,}건"
-                           f"(키 {n_keys}개 × {DART_DAILY_LIMIT:,})을 넘습니다. "
-                           f"상한을 낮추거나 DART_API_KEYS 에 키를 추가하세요 — "
-                           f"키는 opendart.fss.or.kr 에서 무료·즉시 발급됩니다")
-        # ★★ 개수 비교는 **항등식**이라 절대 발동하지 않는다 ★★
-        #   EMP=ROOM×0.55, FS×2=ROOM×0.45, ROOM=19,000n−2,700 이므로
-        #   plan = ROOM + 2,700 = 19,000n = room. 즉 위 `plan > room` 은 언제나 거짓이다.
-        #   26,000건 사고를 고정한다던 회귀 테스트가 상수를 유도식으로 바꾼 순간 무력화됐다.
-        #   → 4시간 계약을 실제로 지키는 것은 개수가 아니라 **시간**이다. 시간으로 검정한다.
-        if not FS_TIME_BUDGET_S:
-            return False, ("Tier-2 에 시간 예산(FS_TIME_BUDGET_S)이 없습니다 — "
-                           "개수 상한만으로는 4시간 계약을 지킬 수 없습니다. "
-                           "서버가 먼저 막으면 개수 상한은 아무것도 보호하지 못합니다.")
-        # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
-        #   Tier-2 는 시간 데드라인이 있으므로 그 값으로 계상한다(개수는 상한일 뿐이다).
-        worst_h = (int(EMP_MAX_CALLS) / 8.0 + min(int(DART_FS_MAX_CALLS) / 5.0,
-                                                  float(FS_TIME_BUDGET_S))) / 3600.0
-        if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
-            return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
-                           f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")
-        return True, (f"계획 {plan:,}건 ≈{worst_h*60:.0f}분 · "
-                      f"하루 한도 {room:,}(키 {n_keys}개) 안")
+        for k, v in caps.items():
+            if v is not None and int(v) > room:
+                return False, (f"{k}={int(v):,} 가 전체 한도 {room:,}건"
+                               f"(키 {n_keys}개 × {DART_DAILY_LIMIT:,})을 넘습니다")
+        # ★ 로컬 추정 잔량으로 작업 큐를 자르는 경로가 되살아나지 않았는지도 여기서 본다.
+        #   (§12-A 가 같은 검사를 하지만, 4시간 계약과 한 몸이라 중복해서 못 박는다)
+        # ★★ 주석을 먼저 벗긴다 ★★ 그 함수에는 '예전엔 이렇게 틀렸다' 는 설명이 코드와
+        #   똑같은 모양(`cap = min(total, max_calls, dart_budget_left("emp"))`)으로 적혀 있다.
+        #   벗기지 않으면 계약이 **자기 설명문을 결함으로 오인**해 실행을 거부한다.
+        _emp_src = "\n".join(ln.split("#", 1)[0] for ln in (_src_of(fetch_emp_status) or "")
+                             .split("\n"))
+        if re.search(r"cap\s*=\s*[^\n]*min\([^\n]*dart_budget_left", _emp_src):
+            return False, ("직원현황 작업 큐를 로컬 추정 잔량으로 자르고 있습니다 — "
+                           "잔여량은 서버만 압니다. 이 경로가 3회 실행 내내 알파를 0행으로 만들었습니다")
+        _plan = " · ".join(f"{k}={'무제한' if v is None else format(int(v), ',')}"
+                           for k, v in caps.items())
+        return True, (f"시간으로 집행 — 수집 몫 "
+                      f"{(WALL_CLOCK_LIMIT_H*60 - POST_COLLECT_RESERVE_MIN):.0f}분"
+                      f"(EMP {EMP_TIME_SHARE:.0%} → Tier-2 {FS_TIME_SHARE:.0%}) · "
+                      f"후속 {POST_COLLECT_RESERVE_MIN:.0f}분 · 계획상한 {_plan} · "
+                      f"하루 한도 {room:,}(키 {n_keys}개)")
 
     _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
 
@@ -10807,7 +11769,7 @@ def run_contracts_v3(strict: bool = True) -> bool:
         # 모르면 전액손실이어야 한다 — 관대한 쪽으로 새면 성과가 부풀려진다.
         if "unknown" in DELIST_NOT_WIPEOUT:
             return False, "'unknown' 이 직전가 청산으로 분류돼 있습니다 — 모르면 -100% 여야 합니다"
-        src = _src_of(run_backtest) or ""
+        src = _src_of(run_backtest, _run_backtest_inner) or ""
         if src and "DELIST_NOT_WIPEOUT" not in src:
             return False, "백테스트 엔진이 폐지 유형을 쓰지 않습니다 — 전부 -100% 로 계상됩니다"
         if src and "-1.0" not in src:
@@ -12546,6 +13508,10 @@ def build_features_v3(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         uni = Universe(ctx["sec"],
                        ctx.get("snapshots", pd.DataFrame(columns=["snap_date", "code", "market"])),
                        ctx["panel"]["daily"])
+        # 감쇠 원장의 기본 태그를 본선 대역 이름으로 맞춘다. 기본값("MAIN")을 그대로 두면
+        # 앞단(PIT유니버스·가격보유)과 뒷단(U-MID대역·최종선정)이 다른 팔로 나뉘어
+        # 깔때기가 두 조각으로 끊긴다 — 표는 나오지만 잔존율은 계산되지 않는다.
+        uni.set_audit_arm(ARM_MAIN, on=True)
         P = build_base_panel_v3(uni, months, ctx["panel"]["monthly"])
         P = attach_pit_sources(P, ctx["sec"])
         P = apply_umid(P, uni, band=ARM_MAIN)
@@ -12599,11 +13565,16 @@ def score_and_backtest_v3(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
                         scope="private", domain="scores", source="L2")
 
     def _run(pp, label="run", apply_costs=True, months_override=None):
+        # ★ 강건성 스위트가 부르는 경로다. 감쇠 원장에는 기록하지 않는다 —
+        #   R1·R3·R5·R10 이 백테스트를 10여 회 재실행하므로 같은 달이 10번 세어진다.
         return run_backtest(pp, months_override if months_override is not None else months,
-                            uni, ctx["sec"], apply_costs=apply_costs, label=label)
+                            uni, ctx["sec"], apply_costs=apply_costs, label=label,
+                            audit=False)
 
     with PIPE.stage("L3.BT", "백테스트", "L3", budget_s=300):
-        bt = _run(P, label=STRATEGY_ID)
+        uni.set_audit_arm(ARM_MAIN, on=True)
+        bt = run_backtest(P, months, uni, ctx["sec"], apply_costs=True,
+                          label=STRATEGY_ID, audit=True)
     runtime_mark("L2+L3.백테스트", time.time() - t_l2)
     return P, bt, _run
 
@@ -12626,6 +13597,7 @@ def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
         return None
     with PIPE.stage("L3.SMALL", f"스몰캡 비교 팔 (랭크 [{SMALL_RANK_LO},{SMALL_RANK_HI}])",
                     "L3", budget_s=600, critical=False):
+        uni.set_audit_arm(ARM_COMPARE, on=True)
         S = apply_umid(PF.copy(), uni, band=ARM_COMPARE)
         S = S[S["u_mid"]].reset_index(drop=True)
         if S.empty or S["month"].nunique() < 24:
@@ -12650,7 +13622,8 @@ def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
         finally:
             globals()["ACTIVE_TP_COLS"] = _saved_active
         bt_s = run_backtest(S, months, uni, ctx["sec"], apply_costs=True,
-                            label=f"{STRATEGY_ID}__SMALLCAP")
+                            label=f"{STRATEGY_ID}__SMALLCAP", audit=True)
+        uni.set_audit_arm(ARM_MAIN, on=True)      # 원장 태그를 본선으로 되돌린다
         VAULT.put_table(f"l2_scores_{STRATEGY_ID}_smallcap",
                         S[[c for c in ("code", "month", "E", "U", "Signal", "Signal_rank",
                                        "VETO", "FLOOR", "n_tp") if c in S.columns]],
@@ -12660,12 +13633,20 @@ def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
 
 def report_arm_comparison_v3(bt_main: dict, arm: Optional[dict],
                              bench: Dict[str, pd.Series]) -> None:
-    """메인(U-MID) vs 스몰캡 성과를 나란히 출력한다. 유리하게 해석하지 않는다."""
+    """메인 대역 vs 비교 대역 성과를 나란히 출력한다. 유리하게 해석하지 않는다.
+
+    ★ 라벨은 **실제로 쓴 대역**에서 유도한다. 예전엔 'U-MID [251,1400]' 이 하드코딩돼
+      있었는데 ARM_MAIN 은 "ALL"(랭크 제한 없음)이었다 — 표가 돌지 않은 설정을 보고했다.
+    """
     if not arm:
         return
+    _mlo, _mhi, _ = universe_band(ARM_MAIN)
+    _clo, _chi, _ = universe_band(ARM_COMPARE)
+    _nm = {"ALL": "전체 종목", "SMALL": "시총하위 1000", "UMID": "U-MID 중형주"}
     rows = []
-    for name, b, lo, hi in ((f"메인 U-MID", bt_main, UMID_RANK_LO, UMID_RANK_HI),
-                            ("스몰캡", arm["bt"], SMALL_RANK_LO, SMALL_RANK_HI)):
+    for name, b, lo, hi in ((f"메인 · {_nm.get(ARM_MAIN, ARM_MAIN)}", bt_main, _mlo, _mhi),
+                            (f"비교 · {_nm.get(ARM_COMPARE, ARM_COMPARE)}", arm["bt"],
+                             _clo, _chi)):
         R = b.get("returns")
         if R is None or R.empty:
             continue

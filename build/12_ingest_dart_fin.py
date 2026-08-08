@@ -26,8 +26,23 @@ MULTI_NODATA_TABLE = "dart_multi_nodata"
 FS_NODATA_TABLE = "dart_fnltt_nodata"      # 전체재무제표(단건) 쪽 같은 원장
 # ★ Tier-2 는 호출 수가 아니라 **시간**으로 자른다. 4시간 계약을 지키는 것은 개수가 아니라
 #   벽시계다 — 개수 상한은 서버가 먼저 막으면 아무것도 보호하지 못한다(5차 실행에서 실증).
-FS_TIME_BUDGET_S = 20 * 60                 # 0 이면 시간 제한 없음
+FS_TIME_BUDGET_S = 20 * 60                 # 폴백값. 실제로는 아래 _fs_time_budget_s() 가 쓰인다
 FS_CHECKPOINT_CORPS = 40                   # 이만큼 회사를 완성할 때마다 드라이브에 저장
+
+
+def _fs_time_budget_s() -> float:
+    """Tier-2 가 이번 실행에서 쓸 수 있는 초. **남은 시간의 비율**로 계산한다.
+
+    ★ 왜 고정 상수가 아닌가. 20분을 박아 두면 두 방향으로 다 틀린다:
+      · 앞 단계(가격·직원현황)가 빨리 끝나 2시간이 남아도 20분만 쓰고 멈춘다 → 커버리지를
+        올릴 기회를 그냥 버린다(7회차 Tier-2 13.5%).
+      · 앞 단계가 늦어져 10분밖에 안 남았는데도 20분을 쓴다 → 4시간 계약을 넘긴다.
+    v3 조각(06_env)이 데드라인을 제공하면 그것을 쓰고, 없으면(v2 단독 실행) 상수로 돌아간다.
+    """
+    try:
+        return float(stage_time_budget(FS_TIME_SHARE, floor_s=120.0))
+    except Exception:                                       # noqa
+        return float(FS_TIME_BUDGET_S or 0.0)
 MULTI_NODATA_RECENT_DAYS = 30     # 최근 2개 회계연도 — 나중에 제출될 수 있으므로 짧게
 MULTI_NODATA_OLD_DAYS = 365       # 그 이전 — 이제 와서 새로 제출될 일은 사실상 없다
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
@@ -725,7 +740,12 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         #    회사 경계로 자른 청크마다 저장하므로, 어디서 끊겨도 '완성된 회사'는 남는다.
         #    EMP 는 이미 이 구조였는데 Tier-2 에만 없었다.
         # ══════════════════════════════════════════════════════════════════════════════════
-        got, _deadline = [], (time.time() + FS_TIME_BUDGET_S if FS_TIME_BUDGET_S else None)
+        # ★ 시간 몫은 **남은 수집시간의 비율**이다. 고정 상수(예전 20분)를 쓰면 앞 단계가
+        #   빨리 끝났을 때 남는 시간을 그냥 버리고, 앞 단계가 늦어졌을 때 4시간을 넘긴다.
+        _budget_s = _fs_time_budget_s()
+        got, _deadline = [], (time.time() + _budget_s if _budget_s else None)
+        LOG.info(f"  Tier-2 시간 몫 {_budget_s/60:.0f}분 배정 — 멈추는 조건은 "
+                 f"①서버 020/021 ②시계 둘뿐입니다(로컬 추정 잔량으로 자르지 않습니다).")
         _chunk = max(_per_corp, (FS_CHECKPOINT_CORPS * _per_corp))
         for _i in range(0, len(jobs), _chunk):
             if dart_halt_reason():
@@ -733,10 +753,10 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                          f"여기까지는 드라이브에 저장됐습니다.")
                 break
             if _deadline and time.time() > _deadline:
-                LOG.warn(f"Tier-2 시간 예산 {FS_TIME_BUDGET_S/60:.0f}분을 다 썼습니다 — "
-                         f"{_i:,}/{len(jobs):,}건에서 멈춥니다. 받은 만큼은 저장됐고, "
-                         f"재실행하면 다음 회사부터 이어받습니다. "
-                         f"(호출 수가 아니라 **시간**으로 4시간 계약을 지킵니다)")
+                LOG.warn(f"Tier-2 시간 몫 {_budget_s/60:.0f}분을 다 썼습니다 — "
+                         f"{_i:,}/{len(jobs):,}건(회사 {_i//max(_per_corp,1):,}사)에서 멈춥니다. "
+                         f"받은 만큼은 드라이브 공용 인덱스에 저장됐고, 재실행하면 다음 회사부터 "
+                         f"이어받습니다. (호출 수가 아니라 **시간**으로 4시간 계약을 지킵니다)")
                 break
             _res = pmap_io(_fs_one, jobs[_i:_i + _chunk], workers=min(N_WORKERS_IO, 12),
                            desc=f"DART 재무제표({_i//_chunk + 1}/{math.ceil(len(jobs)/_chunk)})")

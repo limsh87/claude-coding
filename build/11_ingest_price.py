@@ -18,6 +18,54 @@ RETRY_AFTER_DAYS = 30
 #   시계를 실제 날짜로 고치는 순간 1,000종목이 동시에 만료될 수 있다(≈28분).
 PRICE_RETRY_BUDGET_PER_RUN = 200
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★ 수익률 무결성 (7회차 실행에서 두 개의 증상으로 동시에 드러난 하나의 결함) ★★
+#
+#  증상 ①  R0 벤치마크가 CAGR inf% / MDD nan% 를 출력했다.
+#  증상 ②  보유종목 상위 5%(20종목)가 총기여의 180% 를 만들었다.
+#
+#  두 증상의 원인은 같다 — fwd_ret 에 **가격으로는 불가능한 값**이 섞여 있었다.
+#    fwd_ret = 다음달 체결가 / 이번달 체결가 − 1
+#  분모(exec_px)는 next_open 이 없으면 close 로 폴백하는데, 소스가 0 이나 결측을 0 으로
+#  준 종목에서 이 값이 **0** 이 된다. 0 으로 나누면 +inf 다. inf 한 개가 월 평균에
+#  들어가면 동일가중 벤치마크의 cumprod 가 그 달에 inf 로 발산하고, 그 다음부터
+#  eq/peak = inf/inf = nan 이라 MDD·Calmar 가 통째로 nan 이 된다. 판정식은
+#  isfinite(nan)=False 라 **조용히 FAIL** 로 떨어진다 — 벤치마크가 없는데 '벤치마크에
+#  졌다'고 보고하는 최악의 형태다.
+#
+#  분모가 0 이 아니어도 문제는 남는다. 이 파이프라인은 pykrx·FDR·네이버·yfinance 를
+#  종목 단위로 섞어 쓰고(캐시도 여러 실행에 걸쳐 섞인다), 소스마다 수정주가 기준이
+#  다르다. 액면분할·감자가 한쪽에만 반영돼 있으면 경계 달에서 ±90% 나 +900% 같은
+#  '수익률'이 만들어진다. 그 종목이 우연히 선정되면 그 한 종목이 10년 성과를 만든다.
+#
+#  ▶ 방어는 두 겹이다. 지어내지 않고, 조용히 버리지도 않는다.
+#    ① 불가능 판정 — KRX 가격제한(±30%/일)상 물리적으로 나올 수 없는 배율은
+#       가격 움직임이 아니라 기업행위(분할·병합·감자) 또는 데이터 오류다. 결측 처리하고
+#       **몇 건을 왜 버렸는지 표로 남긴다.** 임계는 실제 거래일 간격으로 계산한다.
+#    ② 나머지 꼬리는 절대 손대지 않는다. 대신 상위 |수익률| 분포를 표로 출력해
+#       "이 성과가 몇 종목·몇 달에 의존하는가"를 사용자가 직접 보게 한다.
+#
+#  ★ 벤치마크(R0)만은 절사평균을 함께 쓴다. 1,500종목 동일가중에서 한 종목의
+#    +900% 는 월 +0.6%p 를 만든다 — 실제로 담을 수 없는 수익이 기준선을 밀어 올린다.
+#    전략 수익률에는 절사를 적용하지 않는다(그건 성과를 지어내는 것이다).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+KRX_DAILY_LIMIT = 0.30        # KRX 일일 가격제한폭 (2015-06-15 이후 ±30%)
+RET_LIMIT_SLACK = 1.10        # 시가 갭·정리매매·거래일 계산 오차 여유
+RET_SANITY_LEDGER: List[dict] = []     # 무엇을 왜 버렸는지 — 표로 출력하고 드라이브에 남긴다
+
+
+def _price_limit_envelope(n_days: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    """n 거래일 동안 가격제한만으로 도달 가능한 배율의 [하한, 상한].
+
+    n 이 결측이면 한 달치(20거래일)로 본다. 이 봉투는 매우 관대하다(20일이면 [8e-4, 190]) —
+    의도적이다. 실제 수익을 자르는 것이 아니라 **물리적으로 불가능한 값만** 걷어내는 것이
+    목적이다. 좁히고 싶다면 그건 별개의 결정이며 리포트에 명시해야 한다.
+    """
+    n = pd.to_numeric(n_days, errors="coerce").fillna(20.0).clip(lower=1.0, upper=45.0)
+    up = np.power(1.0 + KRX_DAILY_LIMIT, n) * RET_LIMIT_SLACK
+    dn = np.power(1.0 - KRX_DAILY_LIMIT, n) / RET_LIMIT_SLACK
+    return dn, up
+
 
 def price_cache_floor() -> str:
     """일봉 수집 하한일. **v2·v3 가 반드시 같은 값을 써야 한다.**
@@ -658,21 +706,114 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
     monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
     monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
+    # ★★ 분모 위생 ★★ 0 이나 음수, ±inf 는 '가격'이 아니라 소스가 결측을 0 으로 준 것이다.
+    #   이걸 그대로 두면 아래 나눗셈이 +inf 를 만들고, 그 inf 한 개가 벤치마크의 복리를
+    #   통째로 발산시킨다(7회차의 CAGR inf% / MDD nan%). 값을 지어내지 않고 결측으로 둔다.
+    _px_bad = int((~np.isfinite(monthly["exec_px"].to_numpy(dtype="float64"))
+                   ) .sum() + int((monthly["exec_px"] <= 0).sum()))
+    monthly["exec_px"] = monthly["exec_px"].replace([np.inf, -np.inf], np.nan)
+    monthly["exec_px"] = monthly["exec_px"].where(monthly["exec_px"] > 0)
 
     # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
     #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
-    nxt_px = monthly.groupby("code", observed=True)["exec_px"].shift(-1)
-    nxt_m = monthly.groupby("code", observed=True)["month"].shift(-1)
+    _g = monthly.groupby("code", observed=True)
+    nxt_px = _g["exec_px"].shift(-1)
+    nxt_m = _g["month"].shift(-1)
+    nxt_sd = _g["signal_date"].shift(-1)
     adjacent = (((nxt_m.dt.year - monthly["month"].dt.year) * 12 +
                  (nxt_m.dt.month - monthly["month"].dt.month)) == 1)
-    monthly["fwd_ret"] = (nxt_px / monthly["exec_px"] - 1.0).where(adjacent)
+    ratio = safe_div(nxt_px, monthly["exec_px"])
+    monthly["fwd_ret"] = (ratio - 1.0).where(adjacent)
     n_gap = int((nxt_m.notna() & ~adjacent).sum())
     if n_gap:
         LOG.info(f"월 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
                  f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
                  f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
+
+    # ── 무결성 게이트 ────────────────────────────────────────────────────────────────────
+    #  ① 비유한값 : inf/-inf/NaN 배율. 분모 위생을 거쳤어도 소스가 이상값을 주면 남는다.
+    #  ② 가격제한 불가능 : 실제 거래일 간격으로 계산한 봉투 밖. 분할·감자·데이터 오류다.
+    fr = monthly["fwd_ret"]
+    n_td = _trading_day_gap(px, monthly["signal_date"], nxt_sd)
+    lo_env, hi_env = _price_limit_envelope(n_td)
+    bad_inf = fr.notna() & ~np.isfinite(fr.to_numpy(dtype="float64"))
+    bad_env = fr.notna() & np.isfinite(fr.to_numpy(dtype="float64")) & (
+        (ratio > hi_env) | (ratio < lo_env))
+    n_inf, n_env = int(bad_inf.sum()), int(bad_env.sum())
+    if n_inf or n_env:
+        monthly.loc[bad_inf | bad_env, "fwd_ret"] = np.nan
+        _ex = monthly.loc[bad_env, ["code", "month"]].copy()
+        _ex["ratio"] = ratio[bad_env].to_numpy()
+        _ex["n_days"] = n_td[bad_env].to_numpy()
+        RET_SANITY_LEDGER.extend(_ex.head(500).to_dict("records"))
+        LOG.warn(
+            f"★ 수익률 무결성 게이트 — 비유한 {n_inf:,}건 · 가격제한상 불가능 {n_env:,}건을 "
+            f"결측 처리했습니다(총 {n_inf+n_env:,}/{int(fr.notna().sum()):,}행). "
+            f"이 값들은 주가 움직임이 아니라 **기업행위(액면분할·병합·감자) 미반영 또는 "
+            f"소스 혼용에 따른 수정주가 불일치**입니다. 그대로 두면 벤치마크 복리가 발산하고"
+            f"(7회차 CAGR inf%), 그 종목 하나가 10년 성과를 만듭니다.")
+        if n_env:
+            _t = _ex.reindex(_ex["ratio"].abs().sort_values(ascending=False).index).head(10)
+            LOG.table([[r.code, f"{as_ts(r.month):%Y-%m}", f"{r.ratio:,.1f}배",
+                        f"{int(r.n_days)}일" if np.isfinite(r.n_days) else "-",
+                        f"{(1.0+KRX_DAILY_LIMIT)**max(int(r.n_days),1):,.0f}배"
+                        if np.isfinite(r.n_days) else "-"]
+                       for r in _t.itertuples(index=False)],
+                      ["종목", "달", "관측 배율", "거래일", "가격제한상 최대"],
+                      ["c", "c", "r", "r", "r"],
+                      title="버려진 관측 상위 10건 — 왜 '수익률'이 아닌지 근거")
+    if _px_bad:
+        LOG.warn(f"체결가가 0 이하이거나 비유한값인 {_px_bad:,}행을 결측 처리했습니다 "
+                 f"(소스가 결측을 0 으로 반환한 경우). 0 으로 나눈 +inf 가 하류로 흐르는 "
+                 f"경로를 여기서 끊습니다.")
+
+    # ③ 남은 꼬리는 **자르지 않는다.** 대신 보이게 만든다 — 성과가 몇 건에 의존하는지를
+    #    사용자가 직접 판단해야 한다. 조용히 winsorize 하면 그건 성과를 지어내는 것이다.
+    _report_return_tail(monthly)
+    # ★ 원장은 공용 인덱스에 남긴다(절대1원칙: 신규 산출물도 반드시 캐시·재호출 가능).
+    if RET_SANITY_LEDGER:
+        try:
+            VAULT.put_table("price_return_sanity_ledger", pd.DataFrame(RET_SANITY_LEDGER),
+                            scope="shared", domain="price",
+                            source="build_price_panel: 가격제한 초과·비유한 수익률 폐기 원장")
+        except Exception as e:                                       # noqa
+            LOG.debug(f"수익률 무결성 원장 저장 실패({type(e).__name__}) — 계산에는 영향 없음")
+
     PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
     return {"daily": px, "monthly": downcast(monthly)}
+
+
+def _trading_day_gap(px: pd.DataFrame, d0: pd.Series, d1: pd.Series) -> pd.Series:
+    """두 날짜 사이의 **실제 거래일 수**. 달력일이 아니라 거래일이어야 가격제한 봉투가 맞다.
+
+    시장 전체의 거래일 배열에 searchsorted 를 두 번 하면 끝난다 — 종목 루프 없음(원칙 3).
+    """
+    try:
+        td = np.sort(pd.unique(as_ts_series(px["date"]).values))
+        if not len(td):
+            return pd.Series(np.nan, index=d0.index, dtype="float64")
+        a = np.searchsorted(td, as_ts_series(d0).values, side="left")
+        b = np.searchsorted(td, as_ts_series(d1).values, side="left")
+        out = (b - a).astype("float64")
+        out[~np.isfinite(pd.to_numeric(as_ts_series(d1), errors="coerce").to_numpy())] = np.nan
+        return pd.Series(out, index=d0.index)
+    except Exception:                                                # noqa
+        return pd.Series(np.nan, index=d0.index, dtype="float64")
+
+
+def _report_return_tail(monthly: pd.DataFrame) -> None:
+    """월수익 분포의 꼬리를 표로 남긴다. 자르지 않고 **보이게** 하는 것이 목적이다."""
+    r = pd.to_numeric(monthly.get("fwd_ret"), errors="coerce").dropna()
+    if len(r) < 100:
+        return
+    qs = [0.001, 0.01, 0.05, 0.50, 0.95, 0.99, 0.999]
+    v = r.quantile(qs)
+    LOG.table([[f"{q*100:g}%", f"{v.loc[q]:+.1%}"] for q in qs] +
+              [["최소", f"{r.min():+.1%}"], ["최대", f"{r.max():+.1%}"],
+               [">+100% 건수", f"{int((r > 1.0).sum()):,}"],
+               ["<-50% 건수", f"{int((r < -0.5).sum()):,}"]],
+              ["분위", "월수익률"], ["c", "r"],
+              title=f"월수익률 분포 ({len(r):,}행) — 극단 꼬리가 성과를 만드는지 확인용")
 
 
 def fetch_investor_flows(codes: Sequence[str], start: str, end: str,

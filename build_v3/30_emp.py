@@ -315,8 +315,24 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
     # 담길 확률이 높은 종목 먼저 — 예산에 걸려 잘려도 '쓸 수 있는' 한계임금이 먼저 완성된다.
     _ord = {str(c): i for i, c in enumerate(priority or [])}
     corps = sorted(corps, key=lambda c: (_ord.get(c, 10 ** 9), c))
-    # 최근 연도 우선. 차분에 t-1 이 필요하므로 연도는 내림차순으로 촘촘히 채운다.
-    jobs = [(c, y) for y in sorted(years, reverse=True) for c in corps if (c, int(y)) not in done]
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 회사 우선(company-first) 격자 — 7회차에 EMP 가 4개년(2022~2025)뿐이던 원인 ★★
+    #
+    #    예전: for y in years(내림차순) for c in corps   ← **연도 우선**
+    #    잡이 잘리면 항상 '오래된 연도'가 통째로 버려진다. 실측 결과가 정확히 그랬다:
+    #    2,536사 × 3.4년. 그런데 이 전략의 백테스트는 120개월이다 —
+    #    **앞 80개월에 EMP 신호가 한 건도 없는 채로** 10년 성과를 보고하고 있었다.
+    #    그건 'CORE-D 단독 80개월 + CORE-D+EMP 40개월'을 이어 붙인 것이지 10년 전략이 아니다.
+    #
+    #    지금: for c in corps(우선순위) for y in years(내림차순)   ← **회사 우선**
+    #    잘리면 '뒤쪽 회사'가 버려진다. 즉 확보한 회사는 **10년 전 구간이 완성**된다.
+    #    커버리지 폭(회사 수)은 줄지만 커버리지 **깊이**(연도)가 생긴다. 이 전략에서는
+    #    깊이가 훨씬 중요하다 — 12개월 차분 센서(nl_emp·nl_premium)는 연속 2개년이 없으면
+    #    아예 산출되지 않고, 앞 구간이 비면 백테스트의 3분의 2가 무증거 구간이 된다.
+    #    재실행하면 append-only 캐시가 이어받아 회사 수가 매번 늘어난다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _years_desc = sorted({int(y) for y in years}, reverse=True)
+    jobs = [(c, y) for c in corps for y in _years_desc if (c, int(y)) not in done]
     # ★ 호출자가 '실제로 쓰이는 조합'을 주면 그것만 남긴다. 데카르트 곱은 담길 수 없었던
     #   해까지 묻느라 한도의 대부분을 태운다 — 부족한 건 한도가 아니라 격자 설계였다.
     if pairs:
@@ -344,6 +360,11 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
             #   → 상한은 '이번 실행에서 의도적으로 정한 작업량'(EMP_MAX_CALLS)뿐이고,
             #     진짜 중단은 아래 청크 루프의 _emp_cb_ok() → 서버 020/021 로만 일어난다.
             cap = max(0, min(total_needed, int(max_calls)))
+            # ★ 잘라야 한다면 **회사 경계**에서 자른다. 회사 중간에서 끊으면 그 회사만
+            #   연도가 뚫린 채 남고, 12개월 차분 센서는 뚫린 구간에서 산출되지 않는다.
+            _per = max(1, len(_years_desc))
+            if 0 < cap < total_needed:
+                cap = max(_per, (cap // _per) * _per)
             if cap < total_needed:
                 # ★ 절단 사실을 기록해 둔다. §6 커버리지 판정이 이 표를 'DART 의 보유량'으로
                 #   오독해 백테스트 창을 영구히 잘라내는 것을 막기 위한 유일한 근거다.
@@ -352,8 +373,9 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                     "why": f"상한 EMP_MAX_CALLS={int(max_calls):,}"})
                 jobs = jobs[:cap]
                 LOG.warn(f"직원현황 {total_needed:,}건 중 이번 실행은 {cap:,}건만 받습니다 "
-                         f"(상한 EMP_MAX_CALLS={max_calls:,}). "
-                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다. "
+                         f"(상한 EMP_MAX_CALLS={max_calls:,} · 회사 {cap//_per:,}사의 전 기간). "
+                         f"회사 우선이므로 확보한 회사는 {_years_desc[-1]}~{_years_desc[0]}년이 "
+                         f"모두 채워집니다 — 재실행하면 다음 회사부터 이어받습니다. "
                          f"※ 미수집분이 있으므로 §6 커버리지 기반 자동 창 단축은 비활성화됩니다.")
         LOG.info(f"직원현황 신규 수집 {len(jobs):,}건 "
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
@@ -367,23 +389,37 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
         #    → 세션 종료·OOM·Ctrl+C 어디서 끊겨도 **받은 만큼은 반드시 남는다.**
         #    Vault 는 append-only 저널이라 증분 저장이 싸고 안전하다.
         # ══════════════════════════════════════════════════════════════════════════════════
+        # ★ 시간 몫. 직원현황은 이 전략의 알파 원천이므로 남은 수집시간의 절반 가까이를
+        #   먼저 배정한다(Tier-2 재무는 그 다음). 고정 상수를 쓰지 않는 이유는 06_env 참조.
+        _deadline = time.time() + stage_time_budget(EMP_TIME_SHARE, floor_s=120.0)
+        LOG.info(f"  시간 몫 {max(0.0, _deadline-time.time())/60:.0f}분 배정 · {deadline_note()} "
+                 f"— 멈추는 조건은 ①서버 020/021 ②시계 둘뿐입니다(로컬 추정 잔량으로는 "
+                 f"자르지 않습니다).")
         got, done_n = [], 0
-        for i in range(0, len(jobs), EMP_CHECKPOINT_EVERY):
-            chunk = jobs[i:i + EMP_CHECKPOINT_EVERY]
+        # 청크를 회사 경계의 배수로 맞춘다 — 중단해도 반쪽짜리 회사가 남지 않는다.
+        _per = max(1, len(_years_desc))
+        _chunk_n = max(_per, (EMP_CHECKPOINT_EVERY // _per) * _per)
+        for i in range(0, len(jobs), _chunk_n):
+            chunk = jobs[i:i + _chunk_n]
             res = pmap_io(lambda j: _emp_one_raw(j[0], j[1]), chunk,
                           workers=min(N_WORKERS_IO, 12),
-                          desc=f"DART 직원현황({i//EMP_CHECKPOINT_EVERY + 1}/"
-                               f"{math.ceil(len(jobs)/EMP_CHECKPOINT_EVERY)})")
+                          desc=f"DART 직원현황({i//_chunk_n + 1}/"
+                               f"{math.ceil(len(jobs)/_chunk_n)})")
             got.extend(r for r in res if r)
             done_n += len(chunk)
             _emp_checkpoint(cached, got)
-            if not _emp_cb_ok():          # 예산 소진·브레이커 → 남은 청크는 의미 없다
+            _halt = (None if _emp_cb_ok() else
+                     (dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"))
+            if _halt is None and time.time() >= _deadline:
+                _halt = (f"4시간 계약의 직원현황 시간 몫 소진 — {deadline_note()}. "
+                         f"회사 경계에서 멈췄으므로 받은 회사는 전 기간이 온전합니다")
+            if _halt:
                 if done_n < len(jobs):
-                    EMP_TRUNCATED.update({
-                        "dropped": len(jobs) - done_n,
-                        "why": dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"})
-                    LOG.warn(f"직원현황 수집을 {done_n:,}/{len(jobs):,}건에서 멈춥니다 — "
-                             f"{EMP_TRUNCATED['why']}. 여기까지는 드라이브에 저장됐습니다. "
+                    EMP_TRUNCATED.update({"dropped": len(jobs) - done_n, "why": _halt})
+                    LOG.warn(f"직원현황 수집을 {done_n:,}/{len(jobs):,}건"
+                             f"(회사 {done_n//_per:,}사)에서 멈춥니다 — {_halt}. "
+                             f"여기까지는 드라이브 공용 인덱스에 저장됐고 재실행 시 정확히 "
+                             f"이 지점부터 이어받습니다. "
                              f"※ 미수집분이 있으므로 §6 자동 창 단축은 비활성화됩니다.")
                 break
         LOG.info(f"직원현황 신규 확보 {len(got):,}/{len(jobs):,}건")

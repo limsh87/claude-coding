@@ -95,7 +95,9 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     # ── C2b : 상장폐지 -100% 강제 ─────────────────────────────────────────────────────────
     def c2b():
-        src = _src_of(run_backtest)
+        # ★ run_backtest 는 감사 스위치만 다루는 얇은 래퍼이고 실제 엔진은 _run_backtest_inner
+        #   에 있다. 래퍼만 읽으면 '-100% 처리가 사라졌다'는 오탐이 난다 — 둘을 함께 읽는다.
+        src = _src_of(run_backtest, _run_backtest_inner)
         if not src:
             return None, "소스 조회 불가 — 검사하지 못했습니다(통과 아님)"
         if "-1.0" not in src or "delist" not in src:
@@ -316,52 +318,66 @@ def run_contracts_v3(strict: bool = True) -> bool:
         이 계약은 (a) 두 단계 모두 상한을 갖고 (b) 그 상한이 DART 일일한도 안에 들고
         (c) 수집 함수가 상한 인자를 실제로 받는지를 강제한다.
         """
-        caps = {"EMP_MAX_CALLS": EMP_MAX_CALLS, "DART_FS_MAX_CALLS": DART_FS_MAX_CALLS}
-        missing = [k for k, v in caps.items() if v is None]
-        if missing:
-            return False, f"{missing} 에 상한이 없습니다 — 콜드빌드가 4시간 계약을 벗어납니다"
         import inspect as _ins
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★★ 4시간 계약을 지키는 것은 '개수'가 아니라 '시간'이다 ★★
+        #    개수 상한만 검정하던 예전 판은 두 번 무력화됐다.
+        #      ① 상수를 유도식(ROOM×0.55 등)으로 바꾼 순간 `plan > room` 이 **항등식**이 되어
+        #         절대 발동하지 않았다. 26,000건 사고를 고정한다던 회귀 테스트가 죽은 코드였다.
+        #      ② 서버가 먼저 020 을 주면 개수 상한은 아무것도 보호하지 못한다(5차 실행 실증).
+        #    → 이제 수집을 멈추는 조건은 딱 둘이다: **서버 020/021** 과 **시계**.
+        #      이 계약은 그 둘이 코드에 실재하는지를 검정한다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        shares = {"EMP_TIME_SHARE": EMP_TIME_SHARE, "FS_TIME_SHARE": FS_TIME_SHARE}
+        bad = [k for k, v in shares.items() if not (isinstance(v, (int, float)) and 0 < v <= 1)]
+        if bad:
+            return False, f"{bad} 의 시간 몫이 (0,1] 범위가 아닙니다 — 4시간 계약을 배분할 수 없습니다"
+        # 수집 데드라인이 전체 예산 **안쪽**에 있어야 후속 단계(강건성·리포트) 몫이 남는다.
+        _budget_s = WALL_CLOCK_LIMIT_H * 3600.0
+        if not (0 < POST_COLLECT_RESERVE_MIN * 60.0 < _budget_s * 0.5):
+            return False, (f"수집 이후 몫(POST_COLLECT_RESERVE_MIN="
+                           f"{POST_COLLECT_RESERVE_MIN}분)이 전체 예산의 절반을 넘거나 0 입니다")
+        if collect_deadline_ts() >= _T0_PROCESS + _budget_s:
+            return False, "수집 데드라인이 전체 예산 밖입니다 — 계약이 집행되지 않습니다"
+        # 수집 루프가 실제로 데드라인을 확인하는가 (주석이 아니라 코드로)
+        for fn, need in ((fetch_emp_status, ("stage_time_budget", "_deadline")),
+                         (fetch_dart_financials, ("_fs_time_budget_s", "_deadline"))):
+            src = _src_of(fn)
+            if not src:
+                return None, f"{fn.__name__} 소스를 읽을 수 없어 데드라인 배선을 확인하지 못했습니다"
+            miss = [t for t in need if t not in src]
+            if miss:
+                return False, (f"{fn.__name__} 이 시간 데드라인을 확인하지 않습니다({miss}) — "
+                               f"개수 상한만으로는 4시간 계약을 지킬 수 없습니다")
+        # 개수 상한은 **선택**이다(None = 계획 상한 없음). 다만 있으면 전체 한도 안이어야 한다.
+        caps = {"EMP_MAX_CALLS": EMP_MAX_CALLS, "DART_FS_MAX_CALLS": DART_FS_MAX_CALLS}
         for fn, arg in ((fetch_dart_financials, "max_calls"), (fetch_emp_status, "max_calls")):
             if arg not in _ins.signature(fn).parameters:
                 return False, f"{fn.__name__} 이 {arg} 인자를 받지 않습니다"
-        # ★ Tier-2 는 잡당 OFS→CFS 로 최대 2회를 던진다. '잡 수'가 아니라 '호출 수'로 센다.
-        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS) * 2 + 2100 + 600
-        _nk = max(1, len([k for k in ([DART_API_KEY] + list(DART_API_KEYS)) if str(k).strip()]))
-        # ★ 한도는 **키 하나당**이다. 예전엔 단일 단계 상한을 키 1개분과 비교해서,
-        #   키를 3개 넣으면(헤더와 이 계약의 오류 메시지가 둘 다 권하는 처방이다)
-        #   유도된 EMP_MAX_CALLS 가 19,000 을 넘어 **실행 자체를 거부**했다 — 자살 스위치다.
-        if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT * _nk:
-            return False, (f"단일 단계 상한이 전체 한도({DART_DAILY_LIMIT * _nk:,} "
-                           f"= 키 {_nk}개 × {DART_DAILY_LIMIT:,})를 넘습니다")
-        # 예전엔 plan 을 계산해 성공 메시지에 찍기만 하고 **한도와 비교하지 않았다.**
-        # 그래서 26,000건 계획이 "일일한도 19,000 안" 이라는 문구와 함께 PASS 했다.
-        # ★ 한도는 **키 하나당**이다. 키를 여러 개 넣으면 그만큼 곱해진다.
-        n_keys = max(1, len([k for k in ([DART_API_KEY] + list(DART_API_KEYS))
-                             if str(k).strip()]))
+        n_keys = max(1, len({str(k).strip() for k in ([DART_API_KEY] + list(DART_API_KEYS))
+                             if str(k).strip()}))
         room = DART_DAILY_LIMIT * n_keys
-        if plan > room:
-            return False, (f"계획 호출 {plan:,}건이 하루 한도 {room:,}건"
-                           f"(키 {n_keys}개 × {DART_DAILY_LIMIT:,})을 넘습니다. "
-                           f"상한을 낮추거나 DART_API_KEYS 에 키를 추가하세요 — "
-                           f"키는 opendart.fss.or.kr 에서 무료·즉시 발급됩니다")
-        # ★★ 개수 비교는 **항등식**이라 절대 발동하지 않는다 ★★
-        #   EMP=ROOM×0.55, FS×2=ROOM×0.45, ROOM=19,000n−2,700 이므로
-        #   plan = ROOM + 2,700 = 19,000n = room. 즉 위 `plan > room` 은 언제나 거짓이다.
-        #   26,000건 사고를 고정한다던 회귀 테스트가 상수를 유도식으로 바꾼 순간 무력화됐다.
-        #   → 4시간 계약을 실제로 지키는 것은 개수가 아니라 **시간**이다. 시간으로 검정한다.
-        if not FS_TIME_BUDGET_S:
-            return False, ("Tier-2 에 시간 예산(FS_TIME_BUDGET_S)이 없습니다 — "
-                           "개수 상한만으로는 4시간 계약을 지킬 수 없습니다. "
-                           "서버가 먼저 막으면 개수 상한은 아무것도 보호하지 못합니다.")
-        # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
-        #   Tier-2 는 시간 데드라인이 있으므로 그 값으로 계상한다(개수는 상한일 뿐이다).
-        worst_h = (int(EMP_MAX_CALLS) / 8.0 + min(int(DART_FS_MAX_CALLS) / 5.0,
-                                                  float(FS_TIME_BUDGET_S))) / 3600.0
-        if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
-            return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
-                           f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")
-        return True, (f"계획 {plan:,}건 ≈{worst_h*60:.0f}분 · "
-                      f"하루 한도 {room:,}(키 {n_keys}개) 안")
+        for k, v in caps.items():
+            if v is not None and int(v) > room:
+                return False, (f"{k}={int(v):,} 가 전체 한도 {room:,}건"
+                               f"(키 {n_keys}개 × {DART_DAILY_LIMIT:,})을 넘습니다")
+        # ★ 로컬 추정 잔량으로 작업 큐를 자르는 경로가 되살아나지 않았는지도 여기서 본다.
+        #   (§12-A 가 같은 검사를 하지만, 4시간 계약과 한 몸이라 중복해서 못 박는다)
+        # ★★ 주석을 먼저 벗긴다 ★★ 그 함수에는 '예전엔 이렇게 틀렸다' 는 설명이 코드와
+        #   똑같은 모양(`cap = min(total, max_calls, dart_budget_left("emp"))`)으로 적혀 있다.
+        #   벗기지 않으면 계약이 **자기 설명문을 결함으로 오인**해 실행을 거부한다.
+        _emp_src = "\n".join(ln.split("#", 1)[0] for ln in (_src_of(fetch_emp_status) or "")
+                             .split("\n"))
+        if re.search(r"cap\s*=\s*[^\n]*min\([^\n]*dart_budget_left", _emp_src):
+            return False, ("직원현황 작업 큐를 로컬 추정 잔량으로 자르고 있습니다 — "
+                           "잔여량은 서버만 압니다. 이 경로가 3회 실행 내내 알파를 0행으로 만들었습니다")
+        _plan = " · ".join(f"{k}={'무제한' if v is None else format(int(v), ',')}"
+                           for k, v in caps.items())
+        return True, (f"시간으로 집행 — 수집 몫 "
+                      f"{(WALL_CLOCK_LIMIT_H*60 - POST_COLLECT_RESERVE_MIN):.0f}분"
+                      f"(EMP {EMP_TIME_SHARE:.0%} → Tier-2 {FS_TIME_SHARE:.0%}) · "
+                      f"후속 {POST_COLLECT_RESERVE_MIN:.0f}분 · 계획상한 {_plan} · "
+                      f"하루 한도 {room:,}(키 {n_keys}개)")
 
     _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
 
@@ -444,7 +460,7 @@ def run_contracts_v3(strict: bool = True) -> bool:
         # 모르면 전액손실이어야 한다 — 관대한 쪽으로 새면 성과가 부풀려진다.
         if "unknown" in DELIST_NOT_WIPEOUT:
             return False, "'unknown' 이 직전가 청산으로 분류돼 있습니다 — 모르면 -100% 여야 합니다"
-        src = _src_of(run_backtest) or ""
+        src = _src_of(run_backtest, _run_backtest_inner) or ""
         if src and "DELIST_NOT_WIPEOUT" not in src:
             return False, "백테스트 엔진이 폐지 유형을 쓰지 않습니다 — 전부 -100% 로 계상됩니다"
         if src and "-1.0" not in src:

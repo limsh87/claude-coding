@@ -717,6 +717,10 @@ def build_features_v3(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame
         uni = Universe(ctx["sec"],
                        ctx.get("snapshots", pd.DataFrame(columns=["snap_date", "code", "market"])),
                        ctx["panel"]["daily"])
+        # 감쇠 원장의 기본 태그를 본선 대역 이름으로 맞춘다. 기본값("MAIN")을 그대로 두면
+        # 앞단(PIT유니버스·가격보유)과 뒷단(U-MID대역·최종선정)이 다른 팔로 나뉘어
+        # 깔때기가 두 조각으로 끊긴다 — 표는 나오지만 잔존율은 계산되지 않는다.
+        uni.set_audit_arm(ARM_MAIN, on=True)
         P = build_base_panel_v3(uni, months, ctx["panel"]["monthly"])
         P = attach_pit_sources(P, ctx["sec"])
         P = apply_umid(P, uni, band=ARM_MAIN)
@@ -770,11 +774,16 @@ def score_and_backtest_v3(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
                         scope="private", domain="scores", source="L2")
 
     def _run(pp, label="run", apply_costs=True, months_override=None):
+        # ★ 강건성 스위트가 부르는 경로다. 감쇠 원장에는 기록하지 않는다 —
+        #   R1·R3·R5·R10 이 백테스트를 10여 회 재실행하므로 같은 달이 10번 세어진다.
         return run_backtest(pp, months_override if months_override is not None else months,
-                            uni, ctx["sec"], apply_costs=apply_costs, label=label)
+                            uni, ctx["sec"], apply_costs=apply_costs, label=label,
+                            audit=False)
 
     with PIPE.stage("L3.BT", "백테스트", "L3", budget_s=300):
-        bt = _run(P, label=STRATEGY_ID)
+        uni.set_audit_arm(ARM_MAIN, on=True)
+        bt = run_backtest(P, months, uni, ctx["sec"], apply_costs=True,
+                          label=STRATEGY_ID, audit=True)
     runtime_mark("L2+L3.백테스트", time.time() - t_l2)
     return P, bt, _run
 
@@ -797,6 +806,7 @@ def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
         return None
     with PIPE.stage("L3.SMALL", f"스몰캡 비교 팔 (랭크 [{SMALL_RANK_LO},{SMALL_RANK_HI}])",
                     "L3", budget_s=600, critical=False):
+        uni.set_audit_arm(ARM_COMPARE, on=True)
         S = apply_umid(PF.copy(), uni, band=ARM_COMPARE)
         S = S[S["u_mid"]].reset_index(drop=True)
         if S.empty or S["month"].nunique() < 24:
@@ -821,7 +831,8 @@ def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
         finally:
             globals()["ACTIVE_TP_COLS"] = _saved_active
         bt_s = run_backtest(S, months, uni, ctx["sec"], apply_costs=True,
-                            label=f"{STRATEGY_ID}__SMALLCAP")
+                            label=f"{STRATEGY_ID}__SMALLCAP", audit=True)
+        uni.set_audit_arm(ARM_MAIN, on=True)      # 원장 태그를 본선으로 되돌린다
         VAULT.put_table(f"l2_scores_{STRATEGY_ID}_smallcap",
                         S[[c for c in ("code", "month", "E", "U", "Signal", "Signal_rank",
                                        "VETO", "FLOOR", "n_tp") if c in S.columns]],
@@ -831,12 +842,20 @@ def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
 
 def report_arm_comparison_v3(bt_main: dict, arm: Optional[dict],
                              bench: Dict[str, pd.Series]) -> None:
-    """메인(U-MID) vs 스몰캡 성과를 나란히 출력한다. 유리하게 해석하지 않는다."""
+    """메인 대역 vs 비교 대역 성과를 나란히 출력한다. 유리하게 해석하지 않는다.
+
+    ★ 라벨은 **실제로 쓴 대역**에서 유도한다. 예전엔 'U-MID [251,1400]' 이 하드코딩돼
+      있었는데 ARM_MAIN 은 "ALL"(랭크 제한 없음)이었다 — 표가 돌지 않은 설정을 보고했다.
+    """
     if not arm:
         return
+    _mlo, _mhi, _ = universe_band(ARM_MAIN)
+    _clo, _chi, _ = universe_band(ARM_COMPARE)
+    _nm = {"ALL": "전체 종목", "SMALL": "시총하위 1000", "UMID": "U-MID 중형주"}
     rows = []
-    for name, b, lo, hi in ((f"메인 U-MID", bt_main, UMID_RANK_LO, UMID_RANK_HI),
-                            ("스몰캡", arm["bt"], SMALL_RANK_LO, SMALL_RANK_HI)):
+    for name, b, lo, hi in ((f"메인 · {_nm.get(ARM_MAIN, ARM_MAIN)}", bt_main, _mlo, _mhi),
+                            (f"비교 · {_nm.get(ARM_COMPARE, ARM_COMPARE)}", arm["bt"],
+                             _clo, _chi)):
         R = b.get("returns")
         if R is None or R.empty:
             continue

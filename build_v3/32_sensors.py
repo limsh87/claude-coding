@@ -391,8 +391,10 @@ def apply_umid(P: pd.DataFrame, uni: "Universe", band: str = "UMID") -> pd.DataF
     rank = adv.groupby(P["month"], observed=True).rank(ascending=False, method="first")
     P["size_rank"] = rank
     P["u_mid"] = (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
+    # ★ 감쇠 원장에 **어느 팔인지** 를 함께 남긴다. 전체(ALL)와 하위1000(SMALL)이
+    #   같은 태그로 섞이면 뒤 단계가 앞 단계보다 커져 잔존율이 100%를 넘는다(7회차 113.7%).
     for m, g in P.groupby("month", observed=True):
-        uni.audit_row("U-MID대역", m, g.loc[g["u_mid"], "code"].tolist())
+        uni.audit_row("U-MID대역", m, g.loc[g["u_mid"], "code"].tolist(), arm=band)
     keep = int(P["u_mid"].sum())
     LOG.info(f"{band} 유니버스: {keep:,}/{len(P):,}행 "
              f"(월평균 {keep/max(P['month'].nunique(),1):,.0f}종목) — "
