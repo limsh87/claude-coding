@@ -98,12 +98,14 @@ GDRIVE_PRIVATE_NS = "scg_ls"           # → {GDRIVE_ROOT}/scg_ls      (전용)
 
 #    ▸ 리포트를 다른 폴더에도 모아두셨다면 여기에 추가하세요. 재귀 스캔해 "등록만" 합니다.
 #      (파일을 옮기거나 지우지 않습니다. 경로/해시만 인덱스에 기록합니다)
+#      ▸ Colab 이 아니면 이 경로들은 존재하지 않는 게 정상입니다(경고가 아닙니다).
+#        로컬(Windows/Mac/Linux)에서는 LOCAL_CACHE_ROOT 아래를 자동으로 함께 스캔합니다.
 GDRIVE_ADOPT_DIRS = [
     "/content/drive/MyDrive/tcd_cache",
     "/content/drive/MyDrive/research",
     "/content/drive/MyDrive/reports",
     "/content/drive/MyDrive/consensus",
-    # "/content/drive/MyDrive/내가/모아둔/리포트폴더",
+    # 로컬 예시:  r"D:\Qunat\reports",   r"D:\Qunat\consensus",
 ]
 
 #    ▸ 예전 버전이 다른 루트에 캐시를 만들어 두었다면 여기에 적으세요. 그 루트의

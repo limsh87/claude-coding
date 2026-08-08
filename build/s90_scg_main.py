@@ -48,57 +48,70 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """L1 수집 — 각 단계는 실패해도 파이프라인을 죽이지 않고 '무엇이 없는지'를 남긴다."""
     warm_start = (as_ts(BACKTEST_START) - pd.DateOffset(years=HISTORY_WARMUP_YEARS)).strftime("%Y-%m-%d")
 
-    with PIPE.stage("L1.UNI", "종목 마스터 · PIT 스파인 (KRX 미호출)", "L1", budget_s=1800):
+    with PIPE.stage("L1.SPINE", "일별 전종목시세 스파인 (KRX 미호출)", "L1", budget_s=3600):
         years = list(range(as_ts(warm_start).year, as_ts(BACKTEST_END).year + 1))
-        #  ① 1순위: 일별 전종목시세 스파인. '그날 행이 있다 = 그날 상장돼 있었다'.
-        M = scg_fetch_marcap(years)
+        S, META = scg_fetch_spine(years)
+        ctx["spine_meta"] = META
+
+    with PIPE.stage("L1.UNI", "종목 마스터 · 거래일 캘린더", "L1", budget_s=900):
         listing = scg_fetch_listing()
         delist = scg_fetch_delisting()
         corpcode = scg_fetch_dart_corpcode()
-        if len(M):
-            #  ② 스파인이 있으면 그것으로 마스터를 만들고, 상장/폐지목록으로 이름·업종만 보강한다
-            sec = scg_master_from_marcap(M)
+        if len(S):
+            sec = scg_spine_master(S, META)
             if len(listing):
                 add = listing[["code", "industry"]].drop_duplicates("code")
                 sec = sec.drop(columns=["industry"]).merge(add, on="code", how="left")
                 sec["industry"] = sec["industry"].fillna("")
             if len(delist):
                 dl = delist[["code", "delisting_date"]].dropna().drop_duplicates("code")
-                sec = sec.merge(dl.rename(columns={"delisting_date": "_dl2"}),
-                                on="code", how="left")
+                sec = sec.merge(dl.rename(columns={"delisting_date": "_dl2"}), on="code", how="left")
                 #  두 근거가 다르면 **이른 쪽**을 쓴다(늦게 빼면 없는 종목을 들고 있게 된다)
                 sec["delisting_date"] = sec[["delisting_date", "_dl2"]].min(axis=1)
                 sec = sec.drop(columns=["_dl2"])
             if len(corpcode):
                 cc = corpcode.dropna(subset=["code"]).drop_duplicates("code")
-                sec = sec.drop(columns=["corp_code"]).merge(
-                    cc[["code", "corp_code"]], on="code", how="left")
+                sec = sec.drop(columns=["corp_code"]).merge(cc[["code", "corp_code"]],
+                                                            on="code", how="left")
             n0 = len(sec)
             is_common = sec["code"].str.len().eq(6) & sec["code"].str[5].eq("0")
             bad = sec["name"].astype(str).str.contains(_SCG_NONEQUITY_NAME, na=False)
             sec = sec[is_common & ~bad].copy()
-            LOG.info(f"marcap 스파인 기준 종목 마스터 {n0:,} → 보통주 {len(sec):,}건 "
-                     f"(우선주 {int((~is_common).sum()):,} · 스팩/ETF/리츠 {int(bad.sum()):,} 제외) · "
+            LOG.info(f"종목 마스터 {n0:,} → 보통주 {len(sec):,}건 "
+                     f"(우선주 등 {int((~is_common).sum()):,} · 스팩/ETF/리츠 {int(bad.sum()):,} 제외) · "
                      f"폐지 이력 {int(sec['delisting_date'].notna().sum()):,}건")
+            cal = scg_spine_calendar(S)
         else:
-            LOG.warn("marcap 스파인이 없어 상장/폐지목록 기반 경로로 폴백합니다 "
+            LOG.warn("스파인이 없어 상장/폐지목록 기반 경로로 폴백합니다 "
                      "(정확도가 낮고 폐지목록 누락분만큼 생존자편향이 남습니다).")
             sec = scg_build_security_master(listing, delist, corpcode)
+            cal = pd.DatetimeIndex([])
         ctx["sec"] = sec
-        ctx["marcap"] = M
 
-    with PIPE.stage("L1.PX", "가격 (FDR/네이버) · 벤치마크", "L1", budget_s=3600):
-        codes = ctx["sec"]["code"].dropna().astype(str).tolist()
-        px = scg_fetch_prices(codes, warm_start, BACKTEST_END)
+    with PIPE.stage("L1.PX", "가격 패널 · 벤치마크", "L1", budget_s=3600):
         bench = scg_fetch_benchmark(warm_start, BACKTEST_END)
-        #  거래일 캘린더는 marcap 스파인이 있으면 그것이 가장 정확하다(전종목 관측일 집합)
-        M = ctx.get("marcap")
-        cal = scg_build_calendar(
-            M[["code", "date"]].rename(columns={"date": "date"}) if M is not None and len(M) else px,
-            bench)
-        sec = scg_first_trade_dates(ctx["sec"], px)
-        sec = scg_infer_delisting_from_prices(sec, px, cal.values.astype("datetime64[ns]"))
-        ctx.update(px=px, bench=bench, calendar=cal, sec=sec)
+        if len(S):
+            #  ★ 종목별 가격 수집이 **한 건도** 없다. 스파인의 ChangesRatio 로 수정주가
+            #    계열을 만든다(KRX 기준가 기반이라 분할·증자가 이미 보정돼 있다).
+            #    이전 구조는 여기서 2,800종목을 하나씩 HTTP 로 다시 긁었다.
+            S = scg_spine_close_adj(S)
+            px = scg_spine_prices(S)
+            ctx["px_unadj"] = S[["code", "date", "close_unadj"]].assign(
+                adj_factor=(S["close_adj"] / S["close_unadj"].replace(0, np.nan)).astype("float32"),
+                src="marcap")
+            ctx["px_unadj"]["code"] = ctx["px_unadj"]["code"].astype(str)
+            LOG.ok(f"가격 패널 {len(px):,}행 · {px['code'].nunique():,}종목 — "
+                   f"스파인에서 파생(종목별 HTTP 0회)")
+            if not len(cal):
+                cal = scg_build_calendar(px, bench)
+        else:
+            codes = ctx["sec"]["code"].dropna().astype(str).tolist()
+            px = scg_fetch_prices(codes, warm_start, BACKTEST_END)
+            cal = scg_build_calendar(px, bench)
+            ctx["px_unadj"] = scg_fetch_unadjusted(codes, warm_start, BACKTEST_END, px_adj=px)
+            ctx["sec"] = scg_infer_delisting_from_prices(
+                scg_first_trade_dates(ctx["sec"], px), px, cal.values.astype("datetime64[ns]"))
+        ctx.update(px=px, bench=bench, calendar=cal, spine=S)
         ctx["signal_dates"] = scg_signal_dates(cal, SIGNAL_FREQ)
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장", "L1", budget_s=7200, critical=False):
@@ -107,12 +120,19 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
                  "로컬 분석 용도로만 사용하세요.")
         cached = VAULT.get_table("research_report_master", scope="shared")
         frames = []
-        if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
-            if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(warm_start, BACKTEST_END))
-            if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(warm_start, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
+        #  ★ 증분 수집 — 캐시에 이미 있는 구간은 다시 긁지 않는다.
+        #    이전 구조는 매 실행 15년치 리스트 페이지를 통째로 재크롤했다. 시간 낭비이자
+        #    차단 위험이고, 무엇보다 이미 드라이브에 있는 것을 다시 받는 짓이다.
+        need = scg_research_windows(cached, warm_start, BACKTEST_END)
+        if RUN_MODE != "CACHED" and RESEARCH_COLLECT and need:
+            for w0, w1 in need:
+                LOG.info(f"리포트 수집 구간 {w0} ~ {w1} (캐시에 없는 구간만)")
+                if "hankyung" in RESEARCH_SOURCES:
+                    frames.append(hankyung_collect(w0, w1))
+                if "naver" in RESEARCH_SOURCES:
+                    frames.append(naver_enrich_detail(naver_collect(w0, w1)))
+        elif RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+            LOG.ok("리포트 원장이 요청 구간을 이미 전부 덮고 있습니다 — 신규 크롤 0회.")
         if cached is not None and len(cached):
             LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 "
                      f"— 이전 전략이 모아둔 것을 그대로 씁니다")
@@ -141,19 +161,21 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
         covered = (sorted(set(ctx["links"]["stock_code"].dropna().astype(str)))
                    if len(ctx.get("links", [])) else [])
         years = list(range(as_ts(warm_start).year - 1, as_ts(BACKTEST_END).year + 1))
-        scg_report_dart_plan(len(ctx["sec"]), len(years), max(len(covered), 1))
+        scg_report_dart_plan(len(ctx["sec"]), len(years), max(len(covered), 1),
+                             have_spine=bool(len(ctx.get("spine", []))))
         dis = scg_fetch_periodic_disclosures(warm_start, BACKTEST_END)
         ctx["annual_rcept"] = scg_annual_report_dates(dis)
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         multi = scg_fetch_multi_accounts(corps, years)
         tidy = scg_tidy_multi(multi)
-        M = ctx.get("marcap")
+        M = ctx.get("spine")
         if M is not None and len(M):
-            #  ★ marcap 이 그날의 상장주식수를 이미 준다 → stockTotqySttus 회사×연도 호출
+            #  ★ 스파인이 그날의 상장주식수를 이미 준다 → stockTotqySttus 회사×연도 호출
             #    (약 12,000회 = 하루치 예산의 절반)이 통째로 불필요해진다.
             #    회계연도말 기준 주식수를 그 연도의 EPS 분모로 쓴다.
-            m = M[["code", "date", "shares"]].dropna()
-            m = m.assign(bsns_year=m["date"].dt.year)
+            m = M[["code", "date", "shares"]].dropna().copy()
+            m["code"] = m["code"].astype(str)
+            m["bsns_year"] = m["date"].dt.year
             shares = (m.sort_values("date").groupby(["code", "bsns_year"], observed=True)
                        .agg(shares=("shares", "last"), _d=("date", "last")).reset_index())
             #  실적 발표 전에는 알 수 없으므로 knowledge_date 는 사업보고서 접수일로 둔다
@@ -171,27 +193,6 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
         if SCG_QUOTA is not None:
             SCG_QUOTA.report()
 
-    with PIPE.stage("L1.UNADJ", "무수정 주가 · 분할보정계수", "L1", budget_s=3600,
-                    critical=False):
-        M = ctx.get("marcap")
-        if M is not None and len(M):
-            #  marcap 이 무수정 종가를 이미 준다 → yfinance 2,800종목 수집이 통째로 불필요하다.
-            #  수정주가(FDR)와 나란히 놓아 adj_factor = 수정/무수정 을 그날의 두 관측값에서 얻는다.
-            u = M[["code", "date", "close_unadj"]].dropna()
-            j = u.merge(ctx["px"][["code", "date", "close_adj"]], on=["code", "date"], how="inner")
-            j["adj_factor"] = j["close_adj"] / j["close_unadj"].replace(0, np.nan)
-            j["src"] = "marcap+fdr"
-            ctx["px_unadj"] = j[["code", "date", "close_unadj", "adj_factor", "src"]]
-            moved = float((j["adj_factor"].sub(1).abs() > 0.01).mean()) if len(j) else np.nan
-            LOG.ok(f"무수정 주가 {len(u):,}행 (marcap) · 수정/무수정 대조 {len(j):,}행 중 "
-                   f"1% 초과 괴리 {100*moved:.1f}% (액면분할·유상증자 구간) — "
-                   f"yfinance 수집을 건너뜁니다")
-            if len(j) and not np.isfinite(moved):
-                LOG.warn("분할보정계수를 계산하지 못했습니다 — 목표주가 환산이 원 단위로 남습니다.")
-        else:
-            ctx["px_unadj"] = scg_fetch_unadjusted(
-                ctx["sec"]["code"].dropna().astype(str).tolist(), warm_start, BACKTEST_END,
-                px_adj=ctx["px"])
     return ctx
 
 
@@ -404,16 +405,19 @@ def main() -> dict:
     with PIPE.stage("L2.UNIV", "유니버스 변형 (ALL / 시총 하위1000)", "L2", budget_s=900):
         sd = ctx["signal_dates"]
         calv = ctx["calendar"].values.astype("datetime64[ns]")
-        M = ctx.get("marcap")
-        if M is not None and len(M):
-            base_u = scg_universe_from_marcap(M, sd, ctx["sec"])
-            mcap = scg_marketcap_from_marcap(M, sd)
-            mcap = mcap[mcap["stock_id"].isin(set(ctx["sec"]["code"].astype(str)))]
+        S = ctx.get("spine")
+        if S is not None and len(S):
+            base_u = scg_spine_universe(S, sd, ctx["sec"])
+            keep = set(ctx["sec"]["code"].astype(str))
+            mcap = scg_spine_marketcap(S, sd)
+            mcap = mcap[mcap["stock_id"].isin(keep)]
+            adv = scg_spine_adv(S, sd)
+            adv = adv[adv["stock_id"].isin(keep)]
         else:
             base_u = scg_universe_at(ctx["sec"], sd)
             mcap = scg_build_marketcap(ctx.get("px_unadj", pd.DataFrame()),
                                        ctx.get("shares", pd.DataFrame()), sd, calv)
-        adv = scg_adv_panel(ctx.get("px", pd.DataFrame()), sd)
+            adv = scg_adv_panel(ctx.get("px", pd.DataFrame()), sd)
         small = scg_small_universe(mcap, SMALL_UNIVERSE_N, adv)
         #  하위1000 은 항상 ALL 의 부분집합이어야 한다(다른 종목이 끼면 비교가 성립하지 않음)
         if len(small) and len(base_u):
@@ -555,6 +559,7 @@ def main() -> dict:
             SCG_QUOTA.report()
         VAULT.report()
 
+    scg_report_cache_ledger()
     PIPE.report_stages(); PIPE.report_flow(); PIT.report(); report_http(); PIPE.report_runtime()
     LOG.banner("완료", f"총 소요 {(time.time()-t_all)/60:.1f}분 · "
                        f"산출물은 구글드라이브 전용 인덱스에 저장되었습니다")

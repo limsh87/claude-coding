@@ -98,12 +98,14 @@ GDRIVE_PRIVATE_NS = "scg_ls"           # → {GDRIVE_ROOT}/scg_ls      (전용)
 
 #    ▸ 리포트를 다른 폴더에도 모아두셨다면 여기에 추가하세요. 재귀 스캔해 "등록만" 합니다.
 #      (파일을 옮기거나 지우지 않습니다. 경로/해시만 인덱스에 기록합니다)
+#      ▸ Colab 이 아니면 이 경로들은 존재하지 않는 게 정상입니다(경고가 아닙니다).
+#        로컬(Windows/Mac/Linux)에서는 LOCAL_CACHE_ROOT 아래를 자동으로 함께 스캔합니다.
 GDRIVE_ADOPT_DIRS = [
     "/content/drive/MyDrive/tcd_cache",
     "/content/drive/MyDrive/research",
     "/content/drive/MyDrive/reports",
     "/content/drive/MyDrive/consensus",
-    # "/content/drive/MyDrive/내가/모아둔/리포트폴더",
+    # 로컬 예시:  r"D:\Qunat\reports",   r"D:\Qunat\consensus",
 ]
 
 #    ▸ 예전 버전이 다른 루트에 캐시를 만들어 두었다면 여기에 적으세요. 그 루트의
@@ -214,7 +216,7 @@ STOP_ON_KILL_CRITERIA = False   # SCG 는 '킬'이 아니라 '증분 기여 판�
 STRATEGY_ID        = "SCG_LS_LSA"
 STRATEGY_NAME      = "SCG-LS / SCG-LSA — Smart Consensus Gap + Analyst Leadership"
 ACTIVE_PACKS       = []
-BUILD_VERSION      = "v2.20260808.1100"
+BUILD_VERSION      = "v2.20260808.1118"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -326,7 +328,7 @@ _OPTIONAL = [
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
-    ("fitz",              "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
+    ("pymupdf",           "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
     ("pdfplumber",        "pdfplumber",         "PDF 추출 폴백"),
     ("rapidfuzz",         "rapidfuzz",          "사업장명/애널리스트명 유사도 매칭(고속)"),
     ("statsmodels",       "statsmodels",        "HAC(Newey-West) 표준오차"),
@@ -482,8 +484,14 @@ if OPT.get("pykrx"):
     pykrx_stock = _opt_import("pykrx", "stock")
 if OPT.get("yfinance"):
     yf = _opt_import("yfinance")
-if OPT.get("fitz"):
-    fitz = _opt_import("fitz")
+#  ★ pymupdf 1.24+ 의 정식 import 이름은 'pymupdf' 이고 'fitz' 는 제거될 예정인 별칭이다.
+#    실제 실행 로그에서 Python 3.14 / Windows 조합이 `import fitz` 로 ImportError 를 냈다.
+#    → pymupdf 를 먼저 시도하고, 없으면 구버전용 fitz 로 내려간다.
+if OPT.get("pymupdf") or OPT.get("fitz"):
+    fitz = _opt_import("pymupdf") or _opt_import("fitz")
+    if fitz is None:
+        _safe_print("  · PDF 파서를 못 찾았습니다 — EPS 트랙이 비활성화되고 TP 트랙만 씁니다. "
+                    "`pip install pymupdf` 로 되살아납니다.")
 if OPT.get("pdfplumber"):
     pdfplumber = _opt_import("pdfplumber")
 if OPT.get("rapidfuzz"):
@@ -2377,131 +2385,267 @@ def _scg_fdr_cache_csv(kind: str, back_days: int = 21) -> Optional[pd.DataFrame]
 
 MARCAP_ENABLED = True
 _MARCAP_URL = "https://raw.githubusercontent.com/FinanceData/marcap/master/data/marcap-{y}.parquet"
-MARCAP_COLS = ["code", "date", "name", "market", "close_unadj", "volume", "amount",
-               "marketcap", "shares"]
+
+#  ★ parquet 에서 **읽을 컬럼만** 지정한다. 이게 이 파일에서 가장 중요한 한 줄이다.
+#    전체 18컬럼을 읽으면 1년치가 274MB 이고 그중 222MB 가 쓰지도 않는 object 컬럼
+#    (Name 48.7 · Dept 42.9 · Code 33.9 · Market 33.6 · MarketId 32.3 · ChangeCode 31.2 MB)이다.
+#    16년을 concat 하면 4.4GB, pd.concat 피크는 그 두 배 — 실제로 여기서 30분 정체가 났다.
+_MARCAP_READ = ["Date", "Code", "Name", "Close", "ChangesRatio", "Amount",
+                "Marcap", "Stocks", "Market"]
+#  슬림 스파인 스키마. 9M행 기준 약 270MB (원본 4.4GB 대비 1/16).
+SPINE_COLS = ["code", "date", "close_unadj", "ret_adj", "amount", "marketcap", "shares"]
+SPINE_TABLE = "marcap_spine_{y}"        # 공용 인덱스 — 다른 전략도 그대로 재사용
 
 
-def scg_fetch_marcap(years: Sequence[int]) -> pd.DataFrame:
-    """연도별 일별 전종목시세. 연 단위로 드라이브 공용 인덱스에 캐시한다.
+def _scg_slim_marcap(d: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """원본 연도 프레임 → (슬림 스파인, 종목메타). 원본은 즉시 버린다.
 
-    ★ 과거 연도 파일은 사실상 불변이므로 한 번 받으면 다시 받지 않는다.
-      올해 파일만 매 실행 갱신한다 (그래서 max_age_days 를 연도별로 다르게 준다).
+    ★ 메타를 DataFrame.attrs 에 실어 보내지 않는다. attrs 에 DataFrame 을 넣으면
+      pd.concat 이 attrs 동일성 검사에서 DataFrame == DataFrame 를 평가하다 ValueError 로
+      죽고, parquet 저장도 TypeError 가 난다. (실제로 두 곳 다 터졌다)
     """
+    cm = {str(c).strip().lower(): c for c in d.columns}
+    need = ("code", "date", "close", "marcap", "stocks")
+    if not all(k in cm for k in need):
+        return pd.DataFrame(columns=SPINE_COLS), pd.DataFrame(columns=["code", "name", "market"])
+    out = pd.DataFrame({
+        "code": d[cm["code"]].astype(str).str.zfill(6),
+        "date": pd.to_datetime(d[cm["date"]], errors="coerce").astype("datetime64[ns]"),
+        "close_unadj": pd.to_numeric(d[cm["close"]], errors="coerce").astype("float32"),
+        #  ★ ChangesRatio 는 KRX 기준가 기반 등락률이라 액면분할·유무상증자가 이미 보정돼 있다.
+        #    (삼성전자 2018-05-04 분할일: 종가 pct_change 는 -98.04% 인데 ChangesRatio 는 -2.08%)
+        #    → 이 한 컬럼으로 수정주가 계열을 만들 수 있어 종목별 가격 재수집이 통째로 불필요해진다.
+        #    단 현금배당은 반영되지 않는다(가격수익률이지 총수익률이 아니다). 명시해 둔다.
+        "ret_adj": (pd.to_numeric(d[cm["changesratio"]], errors="coerce").astype("float32") / 100.0
+                    if "changesratio" in cm else np.float32(np.nan)),
+        "amount": (pd.to_numeric(d[cm["amount"]], errors="coerce").astype("float32")
+                   if "amount" in cm else np.float32(np.nan)),
+        "marketcap": pd.to_numeric(d[cm["marcap"]], errors="coerce").astype("float64"),
+        "shares": pd.to_numeric(d[cm["stocks"]], errors="coerce").astype("float64"),
+    })
+    #  종목명/시장은 마스터를 만들 때만 필요하므로 (code → 값) 한 줄짜리 사전으로 따로 뺀다.
+    #  이것만 빼도 연도당 115MB(Name 48.7 + Market 33.6 + MarketId 32.3)가 사라진다.
+    meta = pd.DataFrame({
+        "code": out["code"],
+        "name": d[cm["name"]].astype(str) if "name" in cm else "",
+        "market": d[cm["market"]].astype(str) if "market" in cm else "KRX",
+    }).drop_duplicates("code", keep="last").reset_index(drop=True)
+    return out.dropna(subset=["code", "date"]).reset_index(drop=True), meta
+
+
+def scg_fetch_spine(years: Sequence[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """★ 이 전략의 단일 데이터 스파인 — 일별 전종목시세.
+
+    여기서 나오는 것: 거래일 캘린더 · PIT 유니버스 · 수정주가(수익률) · 무수정 종가 ·
+    PIT 시가총액 · 상장주식수 · 거래대금. 전부 한 소스에서 나오므로 종목별 가격 재수집이
+    **한 건도** 필요 없다(이전 구조는 여기서 2,800회를 더 긁었다).
+
+    ★ 접근 경로는 raw.githubusercontent.com 이다 — data.krx.co.kr 을 거치지 않는다.
+      (원 데이터 계보는 KRX 공시자료다. 계보 자체가 금지 대상이라면 MARCAP_ENABLED=False
+       로 끄면 상장/폐지목록 + 종목별 가격수집 경로로 자동 폴백한다)
+
+    ★ 메모리: 연도별로 받아 **즉시 슬림화**하고 원본을 버린다. 원본을 다 모으면 4.4GB 이고
+      그게 이전 실행이 30분간 멈춘 이유다. 슬림 스파인은 9M행에 약 270MB 다.
+    """
+    empty = (pd.DataFrame(columns=SPINE_COLS), pd.DataFrame(columns=["code", "name", "market"]))
     if not MARCAP_ENABLED:
-        return pd.DataFrame(columns=MARCAP_COLS)
+        return empty
     this_year = _dt.datetime.now(_dt.timezone.utc).year
-    frames, got, miss = [], [], []
-    for y in sorted({int(x) for x in years}):
-        tbl = f"marcap_{y}"
-        age = 1.0 if y >= this_year else None      # 과거 연도는 영구 캐시
-        d = VAULT.get_table(tbl, scope="shared", max_age_days=age)
-        if d is None or not len(d):
+    ys = sorted({int(x) for x in years})
+    frames, metas, got, miss = [], [], [], []
+    LOG.info(f"일별 전종목시세 스파인 {ys[0]}~{ys[-1]} ({len(ys)}개 연도) 준비 — "
+             f"연도별로 받아 즉시 슬림화합니다(원본을 모으지 않습니다)")
+    for k, y in enumerate(ys, 1):
+        tbl = SPINE_TABLE.format(y=y)
+        #  과거 연도 파일은 사실상 불변 → 영구 캐시. 올해 파일만 매일 갱신된다.
+        d = VAULT.get_table(tbl, scope="shared", max_age_days=(1.0 if y >= this_year else None))
+        if d is not None and len(d):
+            LOG.debug(f"  [{k}/{len(ys)}] {y} 캐시 재사용 {len(d):,}행")
+        else:
             if RUN_MODE == "CACHED":
                 miss.append(y)
                 continue
+            t0 = time.time()
             raw = http_get(_MARCAP_URL.format(y=y), source="fdr", as_bytes=True,
-                           tries=3, timeout=180)
+                           tries=3, timeout=240)
             if not raw or len(raw) < 10_000:
                 miss.append(y)
+                LOG.warn(f"  [{k}/{len(ys)}] {y} 다운로드 실패 — 그 해는 유니버스에서 빠집니다")
                 continue
             try:
-                d = pd.read_parquet(io.BytesIO(raw))
-            except Exception as e:
-                LOG.debug(f"marcap-{y}.parquet 파싱 실패({type(e).__name__})")
+                #  ★ columns= 로 필요한 컬럼만 읽는다. 읽고 나서 버리면 이미 메모리를 먹은 뒤다.
+                rawdf = pd.read_parquet(io.BytesIO(raw), columns=_MARCAP_READ)
+            except Exception:
+                try:
+                    rawdf = pd.read_parquet(io.BytesIO(raw))
+                except Exception as e:
+                    LOG.warn(f"  [{k}/{len(ys)}] {y} parquet 파싱 실패({type(e).__name__})")
+                    miss.append(y)
+                    continue
+            d, meta = _scg_slim_marcap(rawdf)
+            del rawdf, raw
+            if not len(d):
                 miss.append(y)
                 continue
-            cm = {str(c).strip().lower(): c for c in d.columns}
-            need = ("code", "date", "close", "marcap", "stocks")
-            if not all(k in cm for k in need):
-                LOG.warn(f"marcap-{y} 스키마가 예상과 다릅니다: {list(d.columns)[:12]}")
-                miss.append(y)
-                continue
-            d = pd.DataFrame({
-                "code": d[cm["code"]].map(to_code6),
-                "date": as_ts_series(d[cm["date"]]),
-                "name": d[cm["name"]].astype(str) if "name" in cm else "",
-                "market": d[cm["market"]].astype(str) if "market" in cm else "KRX",
-                "close_unadj": pd.to_numeric(d[cm["close"]], errors="coerce"),
-                "volume": pd.to_numeric(d[cm["volume"]], errors="coerce") if "volume" in cm else np.nan,
-                "amount": pd.to_numeric(d[cm["amount"]], errors="coerce") if "amount" in cm else np.nan,
-                "marketcap": pd.to_numeric(d[cm["marcap"]], errors="coerce"),
-                "shares": pd.to_numeric(d[cm["stocks"]], errors="coerce"),
-            }).dropna(subset=["code", "date"])
             VAULT.put_table(tbl, d, scope="shared", domain="universe",
                             source="FinanceData/marcap (github)")
+            if meta is not None and len(meta):
+                VAULT.put_table(f"marcap_meta_{y}", meta, scope="shared", domain="universe",
+                                source="FinanceData/marcap (github)")
             got.append(y)
-        frames.append(d.reindex(columns=MARCAP_COLS))
+            LOG.info(f"  [{k}/{len(ys)}] {y} 수집 {len(d):,}행 · {mem_mb(d):.0f}MB · "
+                     f"{time.time()-t0:.1f}s")
+        m = VAULT.get_table(f"marcap_meta_{y}", scope="shared")
+        if m is not None and len(m):
+            metas.append(m)
+        frames.append(d.reindex(columns=SPINE_COLS))
     if got:
         VAULT.flush("shared")
     if not frames:
-        LOG.warn("marcap 스파인을 확보하지 못했습니다 — 상장/폐지목록 기반 경로로 폴백합니다.")
-        return pd.DataFrame(columns=MARCAP_COLS)
-    M = pd.concat(frames, ignore_index=True)
-    M["date"] = _scg_ns(M["date"])
-    LOG.ok(f"marcap 스파인 {len(M):,}행 · {M['code'].nunique():,}종목 × "
-           f"{M['date'].nunique():,}거래일 (신규 수집 {len(got)}개 연도 · 캐시 {len(frames)-len(got)}개"
+        LOG.warn("스파인을 확보하지 못했습니다 — 상장/폐지목록 + 종목별 가격수집 경로로 폴백합니다.")
+        return empty
+
+    for f in frames:
+        f.attrs.clear()                      # concat 의 attrs 동일성 검사를 원천 차단
+    S = pd.concat(frames, ignore_index=True, copy=False)
+    del frames
+    S["date"] = S["date"].astype("datetime64[ns]")
+    #  code 를 category 로 접으면 9M행 object(500MB) → int16 코드(18MB) 가 된다
+    S["code"] = S["code"].astype("category")
+    META = (pd.concat(metas, ignore_index=True).drop_duplicates("code", keep="last")
+            if metas else pd.DataFrame(columns=["code", "name", "market"]))
+    LOG.ok(f"스파인 {len(S):,}행 · {S['code'].nunique():,}종목 × {S['date'].nunique():,}거래일 · "
+           f"{mem_mb(S):.0f}MB (신규 {len(got)}개 연도 · 캐시 {len(ys)-len(got)-len(miss)}개"
            + (f" · 누락 {miss}" if miss else "") + ")")
-    PIPE.io("IN", "DRIVE", "marcap", M, source="FinanceData/marcap")
-    return M
+    PIPE.io("IN", "DRIVE", "marcap_spine", S, source="FinanceData/marcap")
+    return S, META
 
 
-def scg_universe_from_marcap(M: pd.DataFrame, signal_dates: pd.DatetimeIndex,
-                             sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def scg_spine_close_adj(S: pd.DataFrame) -> pd.DataFrame:
+    """수정주가 계열을 스파인에서 직접 만든다 — 종목별 HTTP 0회.
+
+    close_adj = 1000 × Π(1 + ret_adj).  절대 수준은 의미가 없고 비율만 쓰이므로
+    기준값 1000 이면 충분하다(수익률·IC·백테스트가 전부 비율 연산이다).
+    ★ ret_adj 는 KRX 기준가 기반이라 액면분할·증자가 이미 보정돼 있다. 대신 현금배당은
+      빠져 있다 — 가격수익률이며, 한국 주식 백테스트의 통상적 관행이다.
+    """
+    if S is None or S.empty:
+        return S
+    S = S.sort_values(["code", "date"], kind="mergesort")
+    r = S["ret_adj"].to_numpy("float64")
+    #  첫 관측일의 등락률은 전일 기준가가 없어 의미가 없다 → 0 으로 두고 1.0 에서 출발한다.
+    first = ~S["code"].duplicated().to_numpy()
+    r = np.where(first | ~np.isfinite(r), 0.0, r)
+    #  ±60% 를 넘는 일간 등락률은 한국 시장에 존재하지 않는다(상하한 ±30%).
+    #  데이터 오류가 누적수익률을 통째로 날리는 것을 막는다.
+    bad = np.abs(r) > 0.6
+    if bad.any():
+        LOG.info(f"일간 등락률 이상치 {int(bad.sum()):,}건을 0 으로 대체했습니다 "
+                 f"(한국 시장 상하한 ±30% 초과 — 데이터 오류로 봅니다)")
+        r = np.where(bad, 0.0, r)
+    S = S.copy()
+    S["close_adj"] = (1000.0 * pd.Series(1.0 + r, index=S.index)
+                      .groupby(S["code"], observed=True).cumprod()).astype("float32")
+    return S
+
+
+def scg_spine_calendar(S: pd.DataFrame) -> pd.DatetimeIndex:
+    """거래일 캘린더 — 전종목시세에 행이 있는 날이 곧 거래일이다(KRX 휴장일 API 불필요)."""
+    if S is None or S.empty:
+        return pd.DatetimeIndex([])
+    cal = pd.DatetimeIndex(sorted(pd.unique(S["date"]))).normalize()
+    LOG.ok(f"거래일 캘린더 {len(cal):,}일 ({cal.min().date()} ~ {cal.max().date()})")
+    return cal
+
+
+def scg_spine_master(S: pd.DataFrame, META: pd.DataFrame) -> pd.DataFrame:
+    """종목 마스터 — 최초/최종 거래일. 폐지목록이 없어도 성립한다."""
+    if S is None or S.empty:
+        return pd.DataFrame(columns=SCG_SEC_COLS)
+    g = S.groupby("code", observed=True)["date"]
+    t = pd.DataFrame({"first_seen": g.min(), "last_seen": g.max()}).reset_index()
+    t["code"] = t["code"].astype(str)
+    end = pd.Timestamp(S["date"].max())
+    #  마지막 거래일이 데이터 끝에서 30일 이상 앞서면 그때 사라진 종목이다
+    gone = (end - t["last_seen"]).dt.days > 30
+    t["delisting_date"] = pd.to_datetime(np.where(gone, t["last_seen"] + pd.Timedelta(days=1),
+                                                  pd.NaT))
+    if META is not None and len(META):
+        t = t.merge(META.assign(code=META["code"].astype(str)), on="code", how="left")
+    for c, v in (("name", ""), ("market", "KRX")):
+        if c not in t.columns:
+            t[c] = v
+        t[c] = t[c].fillna(v)
+    t["listing_date"] = t["first_seen"]
+    t["corp_code"] = np.nan
+    t["industry"] = ""
+    t["src"] = "marcap"
+    t["delist_src"] = np.where(gone, "marcap_last_seen", "")
+    return t.reindex(columns=SCG_SEC_COLS)
+
+
+def scg_spine_universe(S: pd.DataFrame, signal_dates, sec: Optional[pd.DataFrame] = None
+                       ) -> pd.DataFrame:
     """★ 생존자편향이 정의상 불가능한 유니버스: '그날 시세표에 행이 있었는가'.
 
     상장일·폐지일을 추정할 필요가 없다. 그날의 시세표가 곧 그날의 유니버스다.
     """
-    if M is None or M.empty:
+    if S is None or S.empty:
         return pd.DataFrame(columns=["signal_date", "stock_id"])
     sd = pd.DatetimeIndex(signal_dates)
-    U = M[M["date"].isin(sd)][["date", "code"]].rename(
-        columns={"date": "signal_date", "code": "stock_id"}).drop_duplicates()
+    U = S.loc[S["date"].isin(sd), ["date", "code"]].rename(
+        columns={"date": "signal_date", "code": "stock_id"})
+    U["stock_id"] = U["stock_id"].astype(str)
+    U = U.drop_duplicates()
     if sec is not None and len(sec):
         keep = set(sec["code"].astype(str))
         n0 = U["stock_id"].nunique()
         U = U[U["stock_id"].isin(keep)]
         LOG.debug(f"보통주 필터: {n0:,} → {U['stock_id'].nunique():,}종목")
     per = U.groupby("signal_date").size()
-    LOG.ok(f"PIT 유니버스(marcap 기준) {len(U):,}행 · 시점당 평균 {per.mean():.0f}종목 "
+    LOG.ok(f"PIT 유니버스 {len(U):,}행 · 시점당 평균 {per.mean():.0f}종목 "
            f"(최소 {per.min():,} · 최대 {per.max():,}) — 폐지 종목이 그 시절엔 포함됩니다")
     return U.reset_index(drop=True)
 
 
-def scg_marketcap_from_marcap(M: pd.DataFrame, signal_dates: pd.DatetimeIndex) -> pd.DataFrame:
-    """PIT 시가총액 — marcap 의 Marcap 컬럼을 그대로 쓴다(그날 관측된 값이므로 PIT 그 자체)."""
+def scg_spine_marketcap(S: pd.DataFrame, signal_dates) -> pd.DataFrame:
+    """PIT 시가총액 — 그날 관측된 Marcap 을 그대로 쓴다(정의상 PIT 이다)."""
     cols = ["signal_date", "stock_id", "close_unadj", "shares", "marketcap", "mcap_src"]
-    if M is None or M.empty:
+    if S is None or S.empty:
         return pd.DataFrame(columns=cols)
     sd = pd.DatetimeIndex(signal_dates)
-    d = M[M["date"].isin(sd)]
-    out = pd.DataFrame({
-        "signal_date": d["date"].values, "stock_id": d["code"].values,
-        "close_unadj": d["close_unadj"].values, "shares": d["shares"].values,
-        "marketcap": d["marketcap"].values, "mcap_src": "marcap"})
+    d = S.loc[S["date"].isin(sd), ["date", "code", "close_unadj", "shares", "marketcap"]]
+    out = d.rename(columns={"date": "signal_date", "code": "stock_id"}).copy()
+    out["stock_id"] = out["stock_id"].astype(str)
+    out["mcap_src"] = "marcap"
     out = out.dropna(subset=["marketcap"])
-    LOG.ok(f"PIT 시가총액(marcap) {len(out):,}행 · 커버리지 "
-           f"{100*len(out)/max(len(d),1):.1f}% — DART 주식총수 호출 없이 확보")
-    return out.reset_index(drop=True)
+    LOG.ok(f"PIT 시가총액 {len(out):,}행 — DART 주식총수 호출 없이 확보")
+    return out.reindex(columns=cols).reset_index(drop=True)
 
 
-def scg_master_from_marcap(M: pd.DataFrame) -> pd.DataFrame:
-    """marcap 관측만으로 종목 마스터(최초/최종 거래일)를 만든다. 폐지목록이 없어도 성립한다."""
-    if M is None or M.empty:
-        return pd.DataFrame(columns=SCG_SEC_COLS)
-    g = M.groupby("code", observed=True)
-    t = g.agg(first_seen=("date", "min"), last_seen=("date", "max"),
-              name=("name", "last"), market=("market", "last")).reset_index()
-    end = pd.Timestamp(M["date"].max())
-    #  마지막 거래일이 데이터 끝에서 30일 이상 앞서면 그 종목은 그때 사라진 것이다
-    t["delisting_date"] = np.where((end - t["last_seen"]).dt.days > 30,
-                                   t["last_seen"] + pd.Timedelta(days=1), pd.NaT)
-    t["delisting_date"] = pd.to_datetime(t["delisting_date"])
-    return pd.DataFrame({
-        "code": t["code"].astype(str), "name": t["name"], "market": t["market"],
-        "listing_date": t["first_seen"], "delisting_date": t["delisting_date"],
-        "corp_code": np.nan, "industry": "", "src": "marcap",
-        "delist_src": np.where(t["delisting_date"].notna(), "marcap_last_seen", "")
-    }).reindex(columns=SCG_SEC_COLS)
+def scg_spine_adv(S: pd.DataFrame, signal_dates) -> pd.DataFrame:
+    """20거래일 평균 거래대금 — 용량 진단용(하드게이트 아님). 스파인에서 바로 만든다."""
+    cols = ["signal_date", "stock_id", "adv20"]
+    if S is None or S.empty or "amount" not in S.columns:
+        return pd.DataFrame(columns=cols)
+    d = S[["code", "date", "amount"]].sort_values(["code", "date"], kind="mergesort")
+    d["adv20"] = (d.groupby("code", observed=True)["amount"]
+                   .transform(lambda s: s.rolling(20, min_periods=5).mean()))
+    sd = pd.DatetimeIndex(signal_dates)
+    out = d.loc[d["date"].isin(sd) & d["adv20"].notna(), ["date", "code", "adv20"]]
+    out = out.rename(columns={"date": "signal_date", "code": "stock_id"})
+    out["stock_id"] = out["stock_id"].astype(str)
+    return out.reindex(columns=cols).reset_index(drop=True)
+
+
+def scg_spine_prices(S: pd.DataFrame) -> pd.DataFrame:
+    """백테스트가 쓰는 (code, date, close_adj) 패널. 스파인의 뷰일 뿐 새 수집이 아니다."""
+    if S is None or S.empty or "close_adj" not in S.columns:
+        return pd.DataFrame(columns=["code", "date", "close_adj", "amount", "src"])
+    out = S[["code", "date", "close_adj", "amount"]].copy()
+    out["code"] = out["code"].astype(str)
+    out["src"] = "marcap"
+    return out
 
 
 def scg_fetch_listing() -> pd.DataFrame:
@@ -2564,11 +2708,18 @@ def scg_fetch_delisting() -> pd.DataFrame:
     #  재상장/재폐지가 있으면 '가장 늦은 폐지일'을 남긴다(가장 이른 것을 남기면 재상장
     #  구간이 통째로 유니버스에서 빠져 표본이 줄어든다)
     t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    #  ★ 탈락분을 '코드 형식 오류'로 뭉뚱그리면 오경보가 난다. 폐지목록에는 ELW·신주인수권
+    #    (8자리, 예: 722011J7)이 대량으로 섞여 있고 그건 보통주가 아니므로 빼는 게 맞다.
+    #    진짜 문제는 '6자리인데 파싱 실패한' 건이다. 둘을 갈라서 보고한다.
+    failed = raw_codes[codes.isna()]
     n_bad = int(codes.isna().sum())
-    LOG.ok(f"상장폐지 목록 {len(t):,}건 (원본 {n_raw:,} · 코드형식 탈락 {n_bad:,})")
-    if n_bad > n_raw * 0.25:
-        LOG.warn(f"폐지목록의 {100*n_bad/max(n_raw,1):.0f}% 가 코드 형식 불일치로 탈락했습니다. "
-                 f"그만큼 생존자편향이 남습니다. 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+    n_nonequity = int(failed.str.len().ne(6).sum())
+    n_real = n_bad - n_nonequity
+    LOG.ok(f"상장폐지 목록 {len(t):,}건 (원본 {n_raw:,} · 보통주 아님 {n_nonequity:,} "
+           f"[ELW·신주인수권 등, 제외가 정상] · 코드형식 실패 {n_real:,})")
+    if n_real > n_raw * 0.02:
+        LOG.warn(f"6자리인데 파싱에 실패한 폐지종목이 {n_real:,}건입니다 — 그만큼 생존자편향이 "
+                 f"남습니다. 예시: {failed[failed.str.len().eq(6)].head(5).tolist()}")
     return t
 
 
@@ -3784,22 +3935,35 @@ def scg_build_eps_actuals(tidy_multi: pd.DataFrame, shares_panel: pd.DataFrame,
     return out.reset_index(drop=True)
 
 
-def scg_report_dart_plan(n_corps: int, n_years: int, n_covered: int):
-    """★ 사용자가 요구한 '호출량 산술' 을 그대로 표로 낸다."""
+def scg_report_dart_plan(n_corps: int, n_years: int, n_covered: int,
+                         have_spine: bool = True):
+    """★ 사용자가 요구한 '호출량 산술' 을 그대로 표로 낸다.
+
+    스파인(일별 전종목시세)이 상장주식수·시가총액을 이미 주므로, DART 에 남는 일은
+    **실적 실측치(순이익) + 발표일** 둘뿐이다. 주식총수 조회 12,000회가 통째로 사라진다.
+    """
     naive = n_corps * n_years * 4
     sweep = max(1, int(n_corps * n_years * 4 / 100))
     multi = max(1, int(np.ceil(n_corps / SCG_DART_MULTI_BATCH)) * n_years)
-    shr = n_covered * n_years
-    LOG.table([
+    shr = 0 if have_spine else n_covered * n_years
+    total = 1 + sweep + multi + shr
+    rows = [
         ["① corpCode.xml (1회)", "1", "회사 ↔ 종목코드 매핑"],
-        ["② 정기공시 날짜스윕 (100건/페이지)", f"~{sweep:,}", "실적 발표일 — 회사별 호출 대비 100배 절약"],
-        ["③ 다중회사 주요계정 (100사/호출)", f"~{multi:,}", "순이익·자본금 — 단건 대비 100배 절약"],
-        ["④ 주식총수 (회사×연도)", f"~{shr:,}", "커버리지 있는 종목 우선 · 자본금/액면가 역산으로 보완"],
-        ["합계 (최초 콜드빌드)", f"~{1+sweep+multi+shr:,}", "일 20,000 한도 기준 1~2일"],
+        ["② 정기공시 날짜스윕 (100건/페이지)", f"~{sweep:,}",
+         "실적 발표일 = PIT 의 근거. 회사별 호출 대비 100배 절약"],
+        ["③ 다중회사 주요계정 (100사/호출)", f"~{multi:,}",
+         "순이익 = Accuracy 의 A. 단건 대비 100배 절약"],
+        ["④ 주식총수 (회사×연도)", "0" if have_spine else f"~{shr:,}",
+         "스파인이 상장주식수를 이미 제공 → 호출 불필요" if have_spine
+         else "스파인 없음 → DART 로 대체 수집"],
+        ["합계 (최초 콜드빌드)", f"~{total:,}",
+         f"일 20,000 한도의 {100*total/20000:.0f}% — 하루 안에 끝납니다"],
         ["순진한 방식이었다면", f"~{naive:,}", "회사×연도×분기 단건 호출 = 7일"],
         ["두 번째 실행부터", "0", "전부 드라이브 공용 캐시에서 재사용"],
-    ], ["항목", "호출 수", "설명"], ["l", "r", "l"],
-        title="DART 호출 예산 산술 — 상한을 미리 정하지 않고, 설계로 호출을 줄인다")
+    ]
+    LOG.table(rows, ["항목", "호출 수", "설명"], ["l", "r", "l"],
+              title="DART 호출 예산 산술 — 상한을 미리 정하지 않는다. 한도 판정은 서버의 020 이 하고, "
+                    "우리는 설계로 호출을 줄인다")
 
 
 
@@ -7011,6 +7175,106 @@ def scg_report_universe_attrition(stages: Sequence[Tuple[str, int, str]]):
               title="유니버스 감쇠 — §31 이 금지한 하드게이트가 몰래 들어오면 여기서 표본이 꺾입니다")
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════
+#  캐시 원장 — "모든 신규수집은 드라이브에 저장되고 재호출된다"를 매 실행 증명한다
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+#  (데이터셋, 인덱스, 무엇인가)  — 이 목록이 곧 이 전략이 네트워크에서 가져오는 것 전부다.
+SCG_CACHE_MANIFEST = [
+    ("marcap_spine_*",             "shared",  "일별 전종목시세(연도별) — 유니버스·가격·시총·캘린더의 단일 원천"),
+    ("marcap_meta_*",              "shared",  "종목명/시장 (연도별)"),
+    ("fdr_cache_listing_krx",      "shared",  "상장목록"),
+    ("fdr_cache_listing_delisting", "shared", "상장폐지목록 — 생존자편향 제거 입력"),
+    ("dart_corpcode",              "shared",  "회사 ↔ 종목코드 매핑"),
+    ("benchmark_ks11_daily",       "shared",  "KOSPI 지수"),
+    ("dart_periodic_disclosures",  "shared",  "정기공시 접수일 — 실적 발표일(PIT 근거)"),
+    ("dart_multi_annual",          "shared",  "다중회사 주요계정 — 순이익(Accuracy 의 A)"),
+    ("dart_shares_outstanding",    "shared",  "주식총수 (스파인 없을 때만)"),
+    ("research_report_master",     "shared",  "애널리스트 리포트 원장"),
+    ("analyst_master",             "shared",  "애널리스트 원장"),
+    ("report_analyst_link",        "shared",  "보고서 ↔ 애널리스트 연결표"),
+    ("analyst_eps_forecasts",      "shared",  "리포트 PDF 에서 추출한 EPS 추정치"),
+    ("analyst_eps_extract_status", "shared",  "EPS 추출 상태(이어받기 근거)"),
+    ("price_daily_adj",            "shared",  "수정주가 (스파인 없을 때만)"),
+    ("price_daily_unadj",          "shared",  "무수정 주가 (스파인 없을 때만)"),
+]
+
+
+def scg_report_cache_ledger():
+    """★ 절대 1원칙의 증거표 — 무엇이 어느 인덱스에 몇 행으로 저장되어 있는가.
+
+    이 표에 행수가 찍혀 있으면 다음 실행은 그것을 네트워크 없이 재사용한다.
+    (세션·머신과 무관하다 — 드라이브 파일이 원천이기 때문이다)
+    """
+    rows = []
+    try:
+        idx = VAULT.load_index("shared", force=True)
+    except Exception:
+        idx = pd.DataFrame()
+    tdir_s, tdir_p = VAULT.table_dir("shared"), VAULT.table_dir("private")
+    for name, scope, why in SCG_CACHE_MANIFEST:
+        base = tdir_s if scope == "shared" else tdir_p
+        if name.endswith("*"):
+            pre = name[:-1]
+            try:
+                files = [f for f in os.listdir(base) if f.startswith(pre) and f.endswith(".parquet")]
+            except Exception:
+                files = []
+            n_files = len(files)
+            size = sum(_safe_size(os.path.join(base, f)) for f in files)
+            rows.append([name, scope, f"{n_files}개 파일" if n_files else "—",
+                         f"{size/1e6:.0f}MB" if size else "—", _trunc(why, 44)])
+        else:
+            fp = os.path.join(base, f"{name}.parquet")
+            ok = os.path.exists(fp)
+            n = ""
+            if ok:
+                try:
+                    d = VAULT.get_table(name, scope=scope)
+                    n = f"{len(d):,}행" if d is not None else "—"
+                except Exception:
+                    n = "읽기실패"
+            rows.append([name, scope, n or "—",
+                         f"{_safe_size(fp)/1e6:.1f}MB" if ok else "—", _trunc(why, 44)])
+    LOG.table(rows, ["데이터셋", "인덱스", "저장량", "용량", "무엇인가"],
+              ["l", "c", "r", "r", "l"],
+              title="★ 캐시 원장 — 신규 수집된 모든 데이터는 여기에 저장되고 다음 실행에서 "
+                    "네트워크 없이 재호출됩니다 (공용=다른 전략도 재사용 · 전용=이 전략 산출물)")
+    miss = [r[0] for r in rows if r[2] in ("—", "")]
+    if miss:
+        LOG.info(f"아직 비어 있는 항목: {', '.join(miss[:8])}"
+                 f"{' 외' if len(miss) > 8 else ''} — 해당 소스를 수집하지 않았거나 "
+                 f"키가 없어 건너뛴 것입니다. 다음 실행에서 채워집니다.")
+
+
+def scg_research_windows(cached: Optional[pd.DataFrame], start: str, end: str,
+                         edge_days: int = 45) -> List[Tuple[str, str]]:
+    """리포트 원장이 아직 덮지 못한 기간만 돌려준다 (증분 크롤).
+
+    ★ 매 실행 15년치를 재크롤하지 않기 위한 것이다. 캐시가 [c0, c1] 을 덮고 있으면
+      요청구간에서 그 앞뒤만 새로 긁는다. 최근 edge_days 는 항상 다시 긁는다 —
+      뒤늦게 등록되는 리포트가 있기 때문이다(그래야 최신 구간이 비지 않는다).
+    """
+    lo, hi = as_ts(start), as_ts(end)
+    if cached is None or not len(cached) or "pub_date" not in cached.columns:
+        return [(lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"))]
+    d = as_ts_series(cached["pub_date"]).dropna()
+    if d.empty:
+        return [(lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"))]
+    c0, c1 = d.min(), d.max()
+    out: List[Tuple[str, str]] = []
+    if lo < c0:
+        out.append((lo.strftime("%Y-%m-%d"),
+                    min(c0 - pd.Timedelta(days=1), hi).strftime("%Y-%m-%d")))
+    tail = max(c1 - pd.Timedelta(days=edge_days), lo)
+    if tail <= hi:
+        out.append((tail.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")))
+    n_cached = len(cached)
+    LOG.info(f"리포트 원장 캐시 {n_cached:,}건이 {c0.date()}~{c1.date()} 를 덮고 있습니다 → "
+             f"신규 크롤 구간 {len(out)}개 {out}")
+    return out
+
+
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L3  백테스트 · 성과검증 (§36~§40)                                                        ║
@@ -8144,57 +8408,70 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """L1 수집 — 각 단계는 실패해도 파이프라인을 죽이지 않고 '무엇이 없는지'를 남긴다."""
     warm_start = (as_ts(BACKTEST_START) - pd.DateOffset(years=HISTORY_WARMUP_YEARS)).strftime("%Y-%m-%d")
 
-    with PIPE.stage("L1.UNI", "종목 마스터 · PIT 스파인 (KRX 미호출)", "L1", budget_s=1800):
+    with PIPE.stage("L1.SPINE", "일별 전종목시세 스파인 (KRX 미호출)", "L1", budget_s=3600):
         years = list(range(as_ts(warm_start).year, as_ts(BACKTEST_END).year + 1))
-        #  ① 1순위: 일별 전종목시세 스파인. '그날 행이 있다 = 그날 상장돼 있었다'.
-        M = scg_fetch_marcap(years)
+        S, META = scg_fetch_spine(years)
+        ctx["spine_meta"] = META
+
+    with PIPE.stage("L1.UNI", "종목 마스터 · 거래일 캘린더", "L1", budget_s=900):
         listing = scg_fetch_listing()
         delist = scg_fetch_delisting()
         corpcode = scg_fetch_dart_corpcode()
-        if len(M):
-            #  ② 스파인이 있으면 그것으로 마스터를 만들고, 상장/폐지목록으로 이름·업종만 보강한다
-            sec = scg_master_from_marcap(M)
+        if len(S):
+            sec = scg_spine_master(S, META)
             if len(listing):
                 add = listing[["code", "industry"]].drop_duplicates("code")
                 sec = sec.drop(columns=["industry"]).merge(add, on="code", how="left")
                 sec["industry"] = sec["industry"].fillna("")
             if len(delist):
                 dl = delist[["code", "delisting_date"]].dropna().drop_duplicates("code")
-                sec = sec.merge(dl.rename(columns={"delisting_date": "_dl2"}),
-                                on="code", how="left")
+                sec = sec.merge(dl.rename(columns={"delisting_date": "_dl2"}), on="code", how="left")
                 #  두 근거가 다르면 **이른 쪽**을 쓴다(늦게 빼면 없는 종목을 들고 있게 된다)
                 sec["delisting_date"] = sec[["delisting_date", "_dl2"]].min(axis=1)
                 sec = sec.drop(columns=["_dl2"])
             if len(corpcode):
                 cc = corpcode.dropna(subset=["code"]).drop_duplicates("code")
-                sec = sec.drop(columns=["corp_code"]).merge(
-                    cc[["code", "corp_code"]], on="code", how="left")
+                sec = sec.drop(columns=["corp_code"]).merge(cc[["code", "corp_code"]],
+                                                            on="code", how="left")
             n0 = len(sec)
             is_common = sec["code"].str.len().eq(6) & sec["code"].str[5].eq("0")
             bad = sec["name"].astype(str).str.contains(_SCG_NONEQUITY_NAME, na=False)
             sec = sec[is_common & ~bad].copy()
-            LOG.info(f"marcap 스파인 기준 종목 마스터 {n0:,} → 보통주 {len(sec):,}건 "
-                     f"(우선주 {int((~is_common).sum()):,} · 스팩/ETF/리츠 {int(bad.sum()):,} 제외) · "
+            LOG.info(f"종목 마스터 {n0:,} → 보통주 {len(sec):,}건 "
+                     f"(우선주 등 {int((~is_common).sum()):,} · 스팩/ETF/리츠 {int(bad.sum()):,} 제외) · "
                      f"폐지 이력 {int(sec['delisting_date'].notna().sum()):,}건")
+            cal = scg_spine_calendar(S)
         else:
-            LOG.warn("marcap 스파인이 없어 상장/폐지목록 기반 경로로 폴백합니다 "
+            LOG.warn("스파인이 없어 상장/폐지목록 기반 경로로 폴백합니다 "
                      "(정확도가 낮고 폐지목록 누락분만큼 생존자편향이 남습니다).")
             sec = scg_build_security_master(listing, delist, corpcode)
+            cal = pd.DatetimeIndex([])
         ctx["sec"] = sec
-        ctx["marcap"] = M
 
-    with PIPE.stage("L1.PX", "가격 (FDR/네이버) · 벤치마크", "L1", budget_s=3600):
-        codes = ctx["sec"]["code"].dropna().astype(str).tolist()
-        px = scg_fetch_prices(codes, warm_start, BACKTEST_END)
+    with PIPE.stage("L1.PX", "가격 패널 · 벤치마크", "L1", budget_s=3600):
         bench = scg_fetch_benchmark(warm_start, BACKTEST_END)
-        #  거래일 캘린더는 marcap 스파인이 있으면 그것이 가장 정확하다(전종목 관측일 집합)
-        M = ctx.get("marcap")
-        cal = scg_build_calendar(
-            M[["code", "date"]].rename(columns={"date": "date"}) if M is not None and len(M) else px,
-            bench)
-        sec = scg_first_trade_dates(ctx["sec"], px)
-        sec = scg_infer_delisting_from_prices(sec, px, cal.values.astype("datetime64[ns]"))
-        ctx.update(px=px, bench=bench, calendar=cal, sec=sec)
+        if len(S):
+            #  ★ 종목별 가격 수집이 **한 건도** 없다. 스파인의 ChangesRatio 로 수정주가
+            #    계열을 만든다(KRX 기준가 기반이라 분할·증자가 이미 보정돼 있다).
+            #    이전 구조는 여기서 2,800종목을 하나씩 HTTP 로 다시 긁었다.
+            S = scg_spine_close_adj(S)
+            px = scg_spine_prices(S)
+            ctx["px_unadj"] = S[["code", "date", "close_unadj"]].assign(
+                adj_factor=(S["close_adj"] / S["close_unadj"].replace(0, np.nan)).astype("float32"),
+                src="marcap")
+            ctx["px_unadj"]["code"] = ctx["px_unadj"]["code"].astype(str)
+            LOG.ok(f"가격 패널 {len(px):,}행 · {px['code'].nunique():,}종목 — "
+                   f"스파인에서 파생(종목별 HTTP 0회)")
+            if not len(cal):
+                cal = scg_build_calendar(px, bench)
+        else:
+            codes = ctx["sec"]["code"].dropna().astype(str).tolist()
+            px = scg_fetch_prices(codes, warm_start, BACKTEST_END)
+            cal = scg_build_calendar(px, bench)
+            ctx["px_unadj"] = scg_fetch_unadjusted(codes, warm_start, BACKTEST_END, px_adj=px)
+            ctx["sec"] = scg_infer_delisting_from_prices(
+                scg_first_trade_dates(ctx["sec"], px), px, cal.values.astype("datetime64[ns]"))
+        ctx.update(px=px, bench=bench, calendar=cal, spine=S)
         ctx["signal_dates"] = scg_signal_dates(cal, SIGNAL_FREQ)
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장", "L1", budget_s=7200, critical=False):
@@ -8203,12 +8480,19 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
                  "로컬 분석 용도로만 사용하세요.")
         cached = VAULT.get_table("research_report_master", scope="shared")
         frames = []
-        if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
-            if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(warm_start, BACKTEST_END))
-            if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(warm_start, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
+        #  ★ 증분 수집 — 캐시에 이미 있는 구간은 다시 긁지 않는다.
+        #    이전 구조는 매 실행 15년치 리스트 페이지를 통째로 재크롤했다. 시간 낭비이자
+        #    차단 위험이고, 무엇보다 이미 드라이브에 있는 것을 다시 받는 짓이다.
+        need = scg_research_windows(cached, warm_start, BACKTEST_END)
+        if RUN_MODE != "CACHED" and RESEARCH_COLLECT and need:
+            for w0, w1 in need:
+                LOG.info(f"리포트 수집 구간 {w0} ~ {w1} (캐시에 없는 구간만)")
+                if "hankyung" in RESEARCH_SOURCES:
+                    frames.append(hankyung_collect(w0, w1))
+                if "naver" in RESEARCH_SOURCES:
+                    frames.append(naver_enrich_detail(naver_collect(w0, w1)))
+        elif RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+            LOG.ok("리포트 원장이 요청 구간을 이미 전부 덮고 있습니다 — 신규 크롤 0회.")
         if cached is not None and len(cached):
             LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 "
                      f"— 이전 전략이 모아둔 것을 그대로 씁니다")
@@ -8237,19 +8521,21 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
         covered = (sorted(set(ctx["links"]["stock_code"].dropna().astype(str)))
                    if len(ctx.get("links", [])) else [])
         years = list(range(as_ts(warm_start).year - 1, as_ts(BACKTEST_END).year + 1))
-        scg_report_dart_plan(len(ctx["sec"]), len(years), max(len(covered), 1))
+        scg_report_dart_plan(len(ctx["sec"]), len(years), max(len(covered), 1),
+                             have_spine=bool(len(ctx.get("spine", []))))
         dis = scg_fetch_periodic_disclosures(warm_start, BACKTEST_END)
         ctx["annual_rcept"] = scg_annual_report_dates(dis)
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         multi = scg_fetch_multi_accounts(corps, years)
         tidy = scg_tidy_multi(multi)
-        M = ctx.get("marcap")
+        M = ctx.get("spine")
         if M is not None and len(M):
-            #  ★ marcap 이 그날의 상장주식수를 이미 준다 → stockTotqySttus 회사×연도 호출
+            #  ★ 스파인이 그날의 상장주식수를 이미 준다 → stockTotqySttus 회사×연도 호출
             #    (약 12,000회 = 하루치 예산의 절반)이 통째로 불필요해진다.
             #    회계연도말 기준 주식수를 그 연도의 EPS 분모로 쓴다.
-            m = M[["code", "date", "shares"]].dropna()
-            m = m.assign(bsns_year=m["date"].dt.year)
+            m = M[["code", "date", "shares"]].dropna().copy()
+            m["code"] = m["code"].astype(str)
+            m["bsns_year"] = m["date"].dt.year
             shares = (m.sort_values("date").groupby(["code", "bsns_year"], observed=True)
                        .agg(shares=("shares", "last"), _d=("date", "last")).reset_index())
             #  실적 발표 전에는 알 수 없으므로 knowledge_date 는 사업보고서 접수일로 둔다
@@ -8267,27 +8553,6 @@ def scg_collect(ctx: Dict[str, Any]) -> Dict[str, Any]:
         if SCG_QUOTA is not None:
             SCG_QUOTA.report()
 
-    with PIPE.stage("L1.UNADJ", "무수정 주가 · 분할보정계수", "L1", budget_s=3600,
-                    critical=False):
-        M = ctx.get("marcap")
-        if M is not None and len(M):
-            #  marcap 이 무수정 종가를 이미 준다 → yfinance 2,800종목 수집이 통째로 불필요하다.
-            #  수정주가(FDR)와 나란히 놓아 adj_factor = 수정/무수정 을 그날의 두 관측값에서 얻는다.
-            u = M[["code", "date", "close_unadj"]].dropna()
-            j = u.merge(ctx["px"][["code", "date", "close_adj"]], on=["code", "date"], how="inner")
-            j["adj_factor"] = j["close_adj"] / j["close_unadj"].replace(0, np.nan)
-            j["src"] = "marcap+fdr"
-            ctx["px_unadj"] = j[["code", "date", "close_unadj", "adj_factor", "src"]]
-            moved = float((j["adj_factor"].sub(1).abs() > 0.01).mean()) if len(j) else np.nan
-            LOG.ok(f"무수정 주가 {len(u):,}행 (marcap) · 수정/무수정 대조 {len(j):,}행 중 "
-                   f"1% 초과 괴리 {100*moved:.1f}% (액면분할·유상증자 구간) — "
-                   f"yfinance 수집을 건너뜁니다")
-            if len(j) and not np.isfinite(moved):
-                LOG.warn("분할보정계수를 계산하지 못했습니다 — 목표주가 환산이 원 단위로 남습니다.")
-        else:
-            ctx["px_unadj"] = scg_fetch_unadjusted(
-                ctx["sec"]["code"].dropna().astype(str).tolist(), warm_start, BACKTEST_END,
-                px_adj=ctx["px"])
     return ctx
 
 
@@ -8500,16 +8765,19 @@ def main() -> dict:
     with PIPE.stage("L2.UNIV", "유니버스 변형 (ALL / 시총 하위1000)", "L2", budget_s=900):
         sd = ctx["signal_dates"]
         calv = ctx["calendar"].values.astype("datetime64[ns]")
-        M = ctx.get("marcap")
-        if M is not None and len(M):
-            base_u = scg_universe_from_marcap(M, sd, ctx["sec"])
-            mcap = scg_marketcap_from_marcap(M, sd)
-            mcap = mcap[mcap["stock_id"].isin(set(ctx["sec"]["code"].astype(str)))]
+        S = ctx.get("spine")
+        if S is not None and len(S):
+            base_u = scg_spine_universe(S, sd, ctx["sec"])
+            keep = set(ctx["sec"]["code"].astype(str))
+            mcap = scg_spine_marketcap(S, sd)
+            mcap = mcap[mcap["stock_id"].isin(keep)]
+            adv = scg_spine_adv(S, sd)
+            adv = adv[adv["stock_id"].isin(keep)]
         else:
             base_u = scg_universe_at(ctx["sec"], sd)
             mcap = scg_build_marketcap(ctx.get("px_unadj", pd.DataFrame()),
                                        ctx.get("shares", pd.DataFrame()), sd, calv)
-        adv = scg_adv_panel(ctx.get("px", pd.DataFrame()), sd)
+            adv = scg_adv_panel(ctx.get("px", pd.DataFrame()), sd)
         small = scg_small_universe(mcap, SMALL_UNIVERSE_N, adv)
         #  하위1000 은 항상 ALL 의 부분집합이어야 한다(다른 종목이 끼면 비교가 성립하지 않음)
         if len(small) and len(base_u):
@@ -8651,6 +8919,7 @@ def main() -> dict:
             SCG_QUOTA.report()
         VAULT.report()
 
+    scg_report_cache_ledger()
     PIPE.report_stages(); PIPE.report_flow(); PIT.report(); report_http(); PIPE.report_runtime()
     LOG.banner("완료", f"총 소요 {(time.time()-t_all)/60:.1f}분 · "
                        f"산출물은 구글드라이브 전용 인덱스에 저장되었습니다")

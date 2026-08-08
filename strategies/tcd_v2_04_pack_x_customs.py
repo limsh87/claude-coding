@@ -163,7 +163,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_X"
 STRATEGY_NAME      = "PACK-X 관세청 수출"
 ACTIVE_PACKS       = ["X"]
-BUILD_VERSION      = "v2.20260808.1100"
+BUILD_VERSION      = "v2.20260808.1118"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -275,7 +275,7 @@ _OPTIONAL = [
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
-    ("fitz",              "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
+    ("pymupdf",           "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
     ("pdfplumber",        "pdfplumber",         "PDF 추출 폴백"),
     ("rapidfuzz",         "rapidfuzz",          "사업장명/애널리스트명 유사도 매칭(고속)"),
     ("statsmodels",       "statsmodels",        "HAC(Newey-West) 표준오차"),
@@ -431,8 +431,14 @@ if OPT.get("pykrx"):
     pykrx_stock = _opt_import("pykrx", "stock")
 if OPT.get("yfinance"):
     yf = _opt_import("yfinance")
-if OPT.get("fitz"):
-    fitz = _opt_import("fitz")
+#  ★ pymupdf 1.24+ 의 정식 import 이름은 'pymupdf' 이고 'fitz' 는 제거될 예정인 별칭이다.
+#    실제 실행 로그에서 Python 3.14 / Windows 조합이 `import fitz` 로 ImportError 를 냈다.
+#    → pymupdf 를 먼저 시도하고, 없으면 구버전용 fitz 로 내려간다.
+if OPT.get("pymupdf") or OPT.get("fitz"):
+    fitz = _opt_import("pymupdf") or _opt_import("fitz")
+    if fitz is None:
+        _safe_print("  · PDF 파서를 못 찾았습니다 — EPS 트랙이 비활성화되고 TP 트랙만 씁니다. "
+                    "`pip install pymupdf` 로 되살아납니다.")
 if OPT.get("pdfplumber"):
     pdfplumber = _opt_import("pdfplumber")
 if OPT.get("rapidfuzz"):

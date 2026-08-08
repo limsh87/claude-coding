@@ -548,19 +548,32 @@ def scg_build_eps_actuals(tidy_multi: pd.DataFrame, shares_panel: pd.DataFrame,
     return out.reset_index(drop=True)
 
 
-def scg_report_dart_plan(n_corps: int, n_years: int, n_covered: int):
-    """★ 사용자가 요구한 '호출량 산술' 을 그대로 표로 낸다."""
+def scg_report_dart_plan(n_corps: int, n_years: int, n_covered: int,
+                         have_spine: bool = True):
+    """★ 사용자가 요구한 '호출량 산술' 을 그대로 표로 낸다.
+
+    스파인(일별 전종목시세)이 상장주식수·시가총액을 이미 주므로, DART 에 남는 일은
+    **실적 실측치(순이익) + 발표일** 둘뿐이다. 주식총수 조회 12,000회가 통째로 사라진다.
+    """
     naive = n_corps * n_years * 4
     sweep = max(1, int(n_corps * n_years * 4 / 100))
     multi = max(1, int(np.ceil(n_corps / SCG_DART_MULTI_BATCH)) * n_years)
-    shr = n_covered * n_years
-    LOG.table([
+    shr = 0 if have_spine else n_covered * n_years
+    total = 1 + sweep + multi + shr
+    rows = [
         ["① corpCode.xml (1회)", "1", "회사 ↔ 종목코드 매핑"],
-        ["② 정기공시 날짜스윕 (100건/페이지)", f"~{sweep:,}", "실적 발표일 — 회사별 호출 대비 100배 절약"],
-        ["③ 다중회사 주요계정 (100사/호출)", f"~{multi:,}", "순이익·자본금 — 단건 대비 100배 절약"],
-        ["④ 주식총수 (회사×연도)", f"~{shr:,}", "커버리지 있는 종목 우선 · 자본금/액면가 역산으로 보완"],
-        ["합계 (최초 콜드빌드)", f"~{1+sweep+multi+shr:,}", "일 20,000 한도 기준 1~2일"],
+        ["② 정기공시 날짜스윕 (100건/페이지)", f"~{sweep:,}",
+         "실적 발표일 = PIT 의 근거. 회사별 호출 대비 100배 절약"],
+        ["③ 다중회사 주요계정 (100사/호출)", f"~{multi:,}",
+         "순이익 = Accuracy 의 A. 단건 대비 100배 절약"],
+        ["④ 주식총수 (회사×연도)", "0" if have_spine else f"~{shr:,}",
+         "스파인이 상장주식수를 이미 제공 → 호출 불필요" if have_spine
+         else "스파인 없음 → DART 로 대체 수집"],
+        ["합계 (최초 콜드빌드)", f"~{total:,}",
+         f"일 20,000 한도의 {100*total/20000:.0f}% — 하루 안에 끝납니다"],
         ["순진한 방식이었다면", f"~{naive:,}", "회사×연도×분기 단건 호출 = 7일"],
         ["두 번째 실행부터", "0", "전부 드라이브 공용 캐시에서 재사용"],
-    ], ["항목", "호출 수", "설명"], ["l", "r", "l"],
-        title="DART 호출 예산 산술 — 상한을 미리 정하지 않고, 설계로 호출을 줄인다")
+    ]
+    LOG.table(rows, ["항목", "호출 수", "설명"], ["l", "r", "l"],
+              title="DART 호출 예산 산술 — 상한을 미리 정하지 않는다. 한도 판정은 서버의 020 이 하고, "
+                    "우리는 설계로 호출을 줄인다")

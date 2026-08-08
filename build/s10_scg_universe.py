@@ -96,131 +96,267 @@ def _scg_fdr_cache_csv(kind: str, back_days: int = 21) -> Optional[pd.DataFrame]
 
 MARCAP_ENABLED = True
 _MARCAP_URL = "https://raw.githubusercontent.com/FinanceData/marcap/master/data/marcap-{y}.parquet"
-MARCAP_COLS = ["code", "date", "name", "market", "close_unadj", "volume", "amount",
-               "marketcap", "shares"]
+
+#  ★ parquet 에서 **읽을 컬럼만** 지정한다. 이게 이 파일에서 가장 중요한 한 줄이다.
+#    전체 18컬럼을 읽으면 1년치가 274MB 이고 그중 222MB 가 쓰지도 않는 object 컬럼
+#    (Name 48.7 · Dept 42.9 · Code 33.9 · Market 33.6 · MarketId 32.3 · ChangeCode 31.2 MB)이다.
+#    16년을 concat 하면 4.4GB, pd.concat 피크는 그 두 배 — 실제로 여기서 30분 정체가 났다.
+_MARCAP_READ = ["Date", "Code", "Name", "Close", "ChangesRatio", "Amount",
+                "Marcap", "Stocks", "Market"]
+#  슬림 스파인 스키마. 9M행 기준 약 270MB (원본 4.4GB 대비 1/16).
+SPINE_COLS = ["code", "date", "close_unadj", "ret_adj", "amount", "marketcap", "shares"]
+SPINE_TABLE = "marcap_spine_{y}"        # 공용 인덱스 — 다른 전략도 그대로 재사용
 
 
-def scg_fetch_marcap(years: Sequence[int]) -> pd.DataFrame:
-    """연도별 일별 전종목시세. 연 단위로 드라이브 공용 인덱스에 캐시한다.
+def _scg_slim_marcap(d: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """원본 연도 프레임 → (슬림 스파인, 종목메타). 원본은 즉시 버린다.
 
-    ★ 과거 연도 파일은 사실상 불변이므로 한 번 받으면 다시 받지 않는다.
-      올해 파일만 매 실행 갱신한다 (그래서 max_age_days 를 연도별로 다르게 준다).
+    ★ 메타를 DataFrame.attrs 에 실어 보내지 않는다. attrs 에 DataFrame 을 넣으면
+      pd.concat 이 attrs 동일성 검사에서 DataFrame == DataFrame 를 평가하다 ValueError 로
+      죽고, parquet 저장도 TypeError 가 난다. (실제로 두 곳 다 터졌다)
     """
+    cm = {str(c).strip().lower(): c for c in d.columns}
+    need = ("code", "date", "close", "marcap", "stocks")
+    if not all(k in cm for k in need):
+        return pd.DataFrame(columns=SPINE_COLS), pd.DataFrame(columns=["code", "name", "market"])
+    out = pd.DataFrame({
+        "code": d[cm["code"]].astype(str).str.zfill(6),
+        "date": pd.to_datetime(d[cm["date"]], errors="coerce").astype("datetime64[ns]"),
+        "close_unadj": pd.to_numeric(d[cm["close"]], errors="coerce").astype("float32"),
+        #  ★ ChangesRatio 는 KRX 기준가 기반 등락률이라 액면분할·유무상증자가 이미 보정돼 있다.
+        #    (삼성전자 2018-05-04 분할일: 종가 pct_change 는 -98.04% 인데 ChangesRatio 는 -2.08%)
+        #    → 이 한 컬럼으로 수정주가 계열을 만들 수 있어 종목별 가격 재수집이 통째로 불필요해진다.
+        #    단 현금배당은 반영되지 않는다(가격수익률이지 총수익률이 아니다). 명시해 둔다.
+        "ret_adj": (pd.to_numeric(d[cm["changesratio"]], errors="coerce").astype("float32") / 100.0
+                    if "changesratio" in cm else np.float32(np.nan)),
+        "amount": (pd.to_numeric(d[cm["amount"]], errors="coerce").astype("float32")
+                   if "amount" in cm else np.float32(np.nan)),
+        "marketcap": pd.to_numeric(d[cm["marcap"]], errors="coerce").astype("float64"),
+        "shares": pd.to_numeric(d[cm["stocks"]], errors="coerce").astype("float64"),
+    })
+    #  종목명/시장은 마스터를 만들 때만 필요하므로 (code → 값) 한 줄짜리 사전으로 따로 뺀다.
+    #  이것만 빼도 연도당 115MB(Name 48.7 + Market 33.6 + MarketId 32.3)가 사라진다.
+    meta = pd.DataFrame({
+        "code": out["code"],
+        "name": d[cm["name"]].astype(str) if "name" in cm else "",
+        "market": d[cm["market"]].astype(str) if "market" in cm else "KRX",
+    }).drop_duplicates("code", keep="last").reset_index(drop=True)
+    return out.dropna(subset=["code", "date"]).reset_index(drop=True), meta
+
+
+def scg_fetch_spine(years: Sequence[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """★ 이 전략의 단일 데이터 스파인 — 일별 전종목시세.
+
+    여기서 나오는 것: 거래일 캘린더 · PIT 유니버스 · 수정주가(수익률) · 무수정 종가 ·
+    PIT 시가총액 · 상장주식수 · 거래대금. 전부 한 소스에서 나오므로 종목별 가격 재수집이
+    **한 건도** 필요 없다(이전 구조는 여기서 2,800회를 더 긁었다).
+
+    ★ 접근 경로는 raw.githubusercontent.com 이다 — data.krx.co.kr 을 거치지 않는다.
+      (원 데이터 계보는 KRX 공시자료다. 계보 자체가 금지 대상이라면 MARCAP_ENABLED=False
+       로 끄면 상장/폐지목록 + 종목별 가격수집 경로로 자동 폴백한다)
+
+    ★ 메모리: 연도별로 받아 **즉시 슬림화**하고 원본을 버린다. 원본을 다 모으면 4.4GB 이고
+      그게 이전 실행이 30분간 멈춘 이유다. 슬림 스파인은 9M행에 약 270MB 다.
+    """
+    empty = (pd.DataFrame(columns=SPINE_COLS), pd.DataFrame(columns=["code", "name", "market"]))
     if not MARCAP_ENABLED:
-        return pd.DataFrame(columns=MARCAP_COLS)
+        return empty
     this_year = _dt.datetime.now(_dt.timezone.utc).year
-    frames, got, miss = [], [], []
-    for y in sorted({int(x) for x in years}):
-        tbl = f"marcap_{y}"
-        age = 1.0 if y >= this_year else None      # 과거 연도는 영구 캐시
-        d = VAULT.get_table(tbl, scope="shared", max_age_days=age)
-        if d is None or not len(d):
+    ys = sorted({int(x) for x in years})
+    frames, metas, got, miss = [], [], [], []
+    LOG.info(f"일별 전종목시세 스파인 {ys[0]}~{ys[-1]} ({len(ys)}개 연도) 준비 — "
+             f"연도별로 받아 즉시 슬림화합니다(원본을 모으지 않습니다)")
+    for k, y in enumerate(ys, 1):
+        tbl = SPINE_TABLE.format(y=y)
+        #  과거 연도 파일은 사실상 불변 → 영구 캐시. 올해 파일만 매일 갱신된다.
+        d = VAULT.get_table(tbl, scope="shared", max_age_days=(1.0 if y >= this_year else None))
+        if d is not None and len(d):
+            LOG.debug(f"  [{k}/{len(ys)}] {y} 캐시 재사용 {len(d):,}행")
+        else:
             if RUN_MODE == "CACHED":
                 miss.append(y)
                 continue
+            t0 = time.time()
             raw = http_get(_MARCAP_URL.format(y=y), source="fdr", as_bytes=True,
-                           tries=3, timeout=180)
+                           tries=3, timeout=240)
             if not raw or len(raw) < 10_000:
                 miss.append(y)
+                LOG.warn(f"  [{k}/{len(ys)}] {y} 다운로드 실패 — 그 해는 유니버스에서 빠집니다")
                 continue
             try:
-                d = pd.read_parquet(io.BytesIO(raw))
-            except Exception as e:
-                LOG.debug(f"marcap-{y}.parquet 파싱 실패({type(e).__name__})")
+                #  ★ columns= 로 필요한 컬럼만 읽는다. 읽고 나서 버리면 이미 메모리를 먹은 뒤다.
+                rawdf = pd.read_parquet(io.BytesIO(raw), columns=_MARCAP_READ)
+            except Exception:
+                try:
+                    rawdf = pd.read_parquet(io.BytesIO(raw))
+                except Exception as e:
+                    LOG.warn(f"  [{k}/{len(ys)}] {y} parquet 파싱 실패({type(e).__name__})")
+                    miss.append(y)
+                    continue
+            d, meta = _scg_slim_marcap(rawdf)
+            del rawdf, raw
+            if not len(d):
                 miss.append(y)
                 continue
-            cm = {str(c).strip().lower(): c for c in d.columns}
-            need = ("code", "date", "close", "marcap", "stocks")
-            if not all(k in cm for k in need):
-                LOG.warn(f"marcap-{y} 스키마가 예상과 다릅니다: {list(d.columns)[:12]}")
-                miss.append(y)
-                continue
-            d = pd.DataFrame({
-                "code": d[cm["code"]].map(to_code6),
-                "date": as_ts_series(d[cm["date"]]),
-                "name": d[cm["name"]].astype(str) if "name" in cm else "",
-                "market": d[cm["market"]].astype(str) if "market" in cm else "KRX",
-                "close_unadj": pd.to_numeric(d[cm["close"]], errors="coerce"),
-                "volume": pd.to_numeric(d[cm["volume"]], errors="coerce") if "volume" in cm else np.nan,
-                "amount": pd.to_numeric(d[cm["amount"]], errors="coerce") if "amount" in cm else np.nan,
-                "marketcap": pd.to_numeric(d[cm["marcap"]], errors="coerce"),
-                "shares": pd.to_numeric(d[cm["stocks"]], errors="coerce"),
-            }).dropna(subset=["code", "date"])
             VAULT.put_table(tbl, d, scope="shared", domain="universe",
                             source="FinanceData/marcap (github)")
+            if meta is not None and len(meta):
+                VAULT.put_table(f"marcap_meta_{y}", meta, scope="shared", domain="universe",
+                                source="FinanceData/marcap (github)")
             got.append(y)
-        frames.append(d.reindex(columns=MARCAP_COLS))
+            LOG.info(f"  [{k}/{len(ys)}] {y} 수집 {len(d):,}행 · {mem_mb(d):.0f}MB · "
+                     f"{time.time()-t0:.1f}s")
+        m = VAULT.get_table(f"marcap_meta_{y}", scope="shared")
+        if m is not None and len(m):
+            metas.append(m)
+        frames.append(d.reindex(columns=SPINE_COLS))
     if got:
         VAULT.flush("shared")
     if not frames:
-        LOG.warn("marcap 스파인을 확보하지 못했습니다 — 상장/폐지목록 기반 경로로 폴백합니다.")
-        return pd.DataFrame(columns=MARCAP_COLS)
-    M = pd.concat(frames, ignore_index=True)
-    M["date"] = _scg_ns(M["date"])
-    LOG.ok(f"marcap 스파인 {len(M):,}행 · {M['code'].nunique():,}종목 × "
-           f"{M['date'].nunique():,}거래일 (신규 수집 {len(got)}개 연도 · 캐시 {len(frames)-len(got)}개"
+        LOG.warn("스파인을 확보하지 못했습니다 — 상장/폐지목록 + 종목별 가격수집 경로로 폴백합니다.")
+        return empty
+
+    for f in frames:
+        f.attrs.clear()                      # concat 의 attrs 동일성 검사를 원천 차단
+    S = pd.concat(frames, ignore_index=True, copy=False)
+    del frames
+    S["date"] = S["date"].astype("datetime64[ns]")
+    #  code 를 category 로 접으면 9M행 object(500MB) → int16 코드(18MB) 가 된다
+    S["code"] = S["code"].astype("category")
+    META = (pd.concat(metas, ignore_index=True).drop_duplicates("code", keep="last")
+            if metas else pd.DataFrame(columns=["code", "name", "market"]))
+    LOG.ok(f"스파인 {len(S):,}행 · {S['code'].nunique():,}종목 × {S['date'].nunique():,}거래일 · "
+           f"{mem_mb(S):.0f}MB (신규 {len(got)}개 연도 · 캐시 {len(ys)-len(got)-len(miss)}개"
            + (f" · 누락 {miss}" if miss else "") + ")")
-    PIPE.io("IN", "DRIVE", "marcap", M, source="FinanceData/marcap")
-    return M
+    PIPE.io("IN", "DRIVE", "marcap_spine", S, source="FinanceData/marcap")
+    return S, META
 
 
-def scg_universe_from_marcap(M: pd.DataFrame, signal_dates: pd.DatetimeIndex,
-                             sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def scg_spine_close_adj(S: pd.DataFrame) -> pd.DataFrame:
+    """수정주가 계열을 스파인에서 직접 만든다 — 종목별 HTTP 0회.
+
+    close_adj = 1000 × Π(1 + ret_adj).  절대 수준은 의미가 없고 비율만 쓰이므로
+    기준값 1000 이면 충분하다(수익률·IC·백테스트가 전부 비율 연산이다).
+    ★ ret_adj 는 KRX 기준가 기반이라 액면분할·증자가 이미 보정돼 있다. 대신 현금배당은
+      빠져 있다 — 가격수익률이며, 한국 주식 백테스트의 통상적 관행이다.
+    """
+    if S is None or S.empty:
+        return S
+    S = S.sort_values(["code", "date"], kind="mergesort")
+    r = S["ret_adj"].to_numpy("float64")
+    #  첫 관측일의 등락률은 전일 기준가가 없어 의미가 없다 → 0 으로 두고 1.0 에서 출발한다.
+    first = ~S["code"].duplicated().to_numpy()
+    r = np.where(first | ~np.isfinite(r), 0.0, r)
+    #  ±60% 를 넘는 일간 등락률은 한국 시장에 존재하지 않는다(상하한 ±30%).
+    #  데이터 오류가 누적수익률을 통째로 날리는 것을 막는다.
+    bad = np.abs(r) > 0.6
+    if bad.any():
+        LOG.info(f"일간 등락률 이상치 {int(bad.sum()):,}건을 0 으로 대체했습니다 "
+                 f"(한국 시장 상하한 ±30% 초과 — 데이터 오류로 봅니다)")
+        r = np.where(bad, 0.0, r)
+    S = S.copy()
+    S["close_adj"] = (1000.0 * pd.Series(1.0 + r, index=S.index)
+                      .groupby(S["code"], observed=True).cumprod()).astype("float32")
+    return S
+
+
+def scg_spine_calendar(S: pd.DataFrame) -> pd.DatetimeIndex:
+    """거래일 캘린더 — 전종목시세에 행이 있는 날이 곧 거래일이다(KRX 휴장일 API 불필요)."""
+    if S is None or S.empty:
+        return pd.DatetimeIndex([])
+    cal = pd.DatetimeIndex(sorted(pd.unique(S["date"]))).normalize()
+    LOG.ok(f"거래일 캘린더 {len(cal):,}일 ({cal.min().date()} ~ {cal.max().date()})")
+    return cal
+
+
+def scg_spine_master(S: pd.DataFrame, META: pd.DataFrame) -> pd.DataFrame:
+    """종목 마스터 — 최초/최종 거래일. 폐지목록이 없어도 성립한다."""
+    if S is None or S.empty:
+        return pd.DataFrame(columns=SCG_SEC_COLS)
+    g = S.groupby("code", observed=True)["date"]
+    t = pd.DataFrame({"first_seen": g.min(), "last_seen": g.max()}).reset_index()
+    t["code"] = t["code"].astype(str)
+    end = pd.Timestamp(S["date"].max())
+    #  마지막 거래일이 데이터 끝에서 30일 이상 앞서면 그때 사라진 종목이다
+    gone = (end - t["last_seen"]).dt.days > 30
+    t["delisting_date"] = pd.to_datetime(np.where(gone, t["last_seen"] + pd.Timedelta(days=1),
+                                                  pd.NaT))
+    if META is not None and len(META):
+        t = t.merge(META.assign(code=META["code"].astype(str)), on="code", how="left")
+    for c, v in (("name", ""), ("market", "KRX")):
+        if c not in t.columns:
+            t[c] = v
+        t[c] = t[c].fillna(v)
+    t["listing_date"] = t["first_seen"]
+    t["corp_code"] = np.nan
+    t["industry"] = ""
+    t["src"] = "marcap"
+    t["delist_src"] = np.where(gone, "marcap_last_seen", "")
+    return t.reindex(columns=SCG_SEC_COLS)
+
+
+def scg_spine_universe(S: pd.DataFrame, signal_dates, sec: Optional[pd.DataFrame] = None
+                       ) -> pd.DataFrame:
     """★ 생존자편향이 정의상 불가능한 유니버스: '그날 시세표에 행이 있었는가'.
 
     상장일·폐지일을 추정할 필요가 없다. 그날의 시세표가 곧 그날의 유니버스다.
     """
-    if M is None or M.empty:
+    if S is None or S.empty:
         return pd.DataFrame(columns=["signal_date", "stock_id"])
     sd = pd.DatetimeIndex(signal_dates)
-    U = M[M["date"].isin(sd)][["date", "code"]].rename(
-        columns={"date": "signal_date", "code": "stock_id"}).drop_duplicates()
+    U = S.loc[S["date"].isin(sd), ["date", "code"]].rename(
+        columns={"date": "signal_date", "code": "stock_id"})
+    U["stock_id"] = U["stock_id"].astype(str)
+    U = U.drop_duplicates()
     if sec is not None and len(sec):
         keep = set(sec["code"].astype(str))
         n0 = U["stock_id"].nunique()
         U = U[U["stock_id"].isin(keep)]
         LOG.debug(f"보통주 필터: {n0:,} → {U['stock_id'].nunique():,}종목")
     per = U.groupby("signal_date").size()
-    LOG.ok(f"PIT 유니버스(marcap 기준) {len(U):,}행 · 시점당 평균 {per.mean():.0f}종목 "
+    LOG.ok(f"PIT 유니버스 {len(U):,}행 · 시점당 평균 {per.mean():.0f}종목 "
            f"(최소 {per.min():,} · 최대 {per.max():,}) — 폐지 종목이 그 시절엔 포함됩니다")
     return U.reset_index(drop=True)
 
 
-def scg_marketcap_from_marcap(M: pd.DataFrame, signal_dates: pd.DatetimeIndex) -> pd.DataFrame:
-    """PIT 시가총액 — marcap 의 Marcap 컬럼을 그대로 쓴다(그날 관측된 값이므로 PIT 그 자체)."""
+def scg_spine_marketcap(S: pd.DataFrame, signal_dates) -> pd.DataFrame:
+    """PIT 시가총액 — 그날 관측된 Marcap 을 그대로 쓴다(정의상 PIT 이다)."""
     cols = ["signal_date", "stock_id", "close_unadj", "shares", "marketcap", "mcap_src"]
-    if M is None or M.empty:
+    if S is None or S.empty:
         return pd.DataFrame(columns=cols)
     sd = pd.DatetimeIndex(signal_dates)
-    d = M[M["date"].isin(sd)]
-    out = pd.DataFrame({
-        "signal_date": d["date"].values, "stock_id": d["code"].values,
-        "close_unadj": d["close_unadj"].values, "shares": d["shares"].values,
-        "marketcap": d["marketcap"].values, "mcap_src": "marcap"})
+    d = S.loc[S["date"].isin(sd), ["date", "code", "close_unadj", "shares", "marketcap"]]
+    out = d.rename(columns={"date": "signal_date", "code": "stock_id"}).copy()
+    out["stock_id"] = out["stock_id"].astype(str)
+    out["mcap_src"] = "marcap"
     out = out.dropna(subset=["marketcap"])
-    LOG.ok(f"PIT 시가총액(marcap) {len(out):,}행 · 커버리지 "
-           f"{100*len(out)/max(len(d),1):.1f}% — DART 주식총수 호출 없이 확보")
-    return out.reset_index(drop=True)
+    LOG.ok(f"PIT 시가총액 {len(out):,}행 — DART 주식총수 호출 없이 확보")
+    return out.reindex(columns=cols).reset_index(drop=True)
 
 
-def scg_master_from_marcap(M: pd.DataFrame) -> pd.DataFrame:
-    """marcap 관측만으로 종목 마스터(최초/최종 거래일)를 만든다. 폐지목록이 없어도 성립한다."""
-    if M is None or M.empty:
-        return pd.DataFrame(columns=SCG_SEC_COLS)
-    g = M.groupby("code", observed=True)
-    t = g.agg(first_seen=("date", "min"), last_seen=("date", "max"),
-              name=("name", "last"), market=("market", "last")).reset_index()
-    end = pd.Timestamp(M["date"].max())
-    #  마지막 거래일이 데이터 끝에서 30일 이상 앞서면 그 종목은 그때 사라진 것이다
-    t["delisting_date"] = np.where((end - t["last_seen"]).dt.days > 30,
-                                   t["last_seen"] + pd.Timedelta(days=1), pd.NaT)
-    t["delisting_date"] = pd.to_datetime(t["delisting_date"])
-    return pd.DataFrame({
-        "code": t["code"].astype(str), "name": t["name"], "market": t["market"],
-        "listing_date": t["first_seen"], "delisting_date": t["delisting_date"],
-        "corp_code": np.nan, "industry": "", "src": "marcap",
-        "delist_src": np.where(t["delisting_date"].notna(), "marcap_last_seen", "")
-    }).reindex(columns=SCG_SEC_COLS)
+def scg_spine_adv(S: pd.DataFrame, signal_dates) -> pd.DataFrame:
+    """20거래일 평균 거래대금 — 용량 진단용(하드게이트 아님). 스파인에서 바로 만든다."""
+    cols = ["signal_date", "stock_id", "adv20"]
+    if S is None or S.empty or "amount" not in S.columns:
+        return pd.DataFrame(columns=cols)
+    d = S[["code", "date", "amount"]].sort_values(["code", "date"], kind="mergesort")
+    d["adv20"] = (d.groupby("code", observed=True)["amount"]
+                   .transform(lambda s: s.rolling(20, min_periods=5).mean()))
+    sd = pd.DatetimeIndex(signal_dates)
+    out = d.loc[d["date"].isin(sd) & d["adv20"].notna(), ["date", "code", "adv20"]]
+    out = out.rename(columns={"date": "signal_date", "code": "stock_id"})
+    out["stock_id"] = out["stock_id"].astype(str)
+    return out.reindex(columns=cols).reset_index(drop=True)
+
+
+def scg_spine_prices(S: pd.DataFrame) -> pd.DataFrame:
+    """백테스트가 쓰는 (code, date, close_adj) 패널. 스파인의 뷰일 뿐 새 수집이 아니다."""
+    if S is None or S.empty or "close_adj" not in S.columns:
+        return pd.DataFrame(columns=["code", "date", "close_adj", "amount", "src"])
+    out = S[["code", "date", "close_adj", "amount"]].copy()
+    out["code"] = out["code"].astype(str)
+    out["src"] = "marcap"
+    return out
 
 
 def scg_fetch_listing() -> pd.DataFrame:
@@ -283,11 +419,18 @@ def scg_fetch_delisting() -> pd.DataFrame:
     #  재상장/재폐지가 있으면 '가장 늦은 폐지일'을 남긴다(가장 이른 것을 남기면 재상장
     #  구간이 통째로 유니버스에서 빠져 표본이 줄어든다)
     t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    #  ★ 탈락분을 '코드 형식 오류'로 뭉뚱그리면 오경보가 난다. 폐지목록에는 ELW·신주인수권
+    #    (8자리, 예: 722011J7)이 대량으로 섞여 있고 그건 보통주가 아니므로 빼는 게 맞다.
+    #    진짜 문제는 '6자리인데 파싱 실패한' 건이다. 둘을 갈라서 보고한다.
+    failed = raw_codes[codes.isna()]
     n_bad = int(codes.isna().sum())
-    LOG.ok(f"상장폐지 목록 {len(t):,}건 (원본 {n_raw:,} · 코드형식 탈락 {n_bad:,})")
-    if n_bad > n_raw * 0.25:
-        LOG.warn(f"폐지목록의 {100*n_bad/max(n_raw,1):.0f}% 가 코드 형식 불일치로 탈락했습니다. "
-                 f"그만큼 생존자편향이 남습니다. 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+    n_nonequity = int(failed.str.len().ne(6).sum())
+    n_real = n_bad - n_nonequity
+    LOG.ok(f"상장폐지 목록 {len(t):,}건 (원본 {n_raw:,} · 보통주 아님 {n_nonequity:,} "
+           f"[ELW·신주인수권 등, 제외가 정상] · 코드형식 실패 {n_real:,})")
+    if n_real > n_raw * 0.02:
+        LOG.warn(f"6자리인데 파싱에 실패한 폐지종목이 {n_real:,}건입니다 — 그만큼 생존자편향이 "
+                 f"남습니다. 예시: {failed[failed.str.len().eq(6)].head(5).tolist()}")
     return t
 
 

@@ -217,3 +217,103 @@ def scg_report_universe_attrition(stages: Sequence[Tuple[str, int, str]]):
     LOG.table(rows, ["단계", "종목수", "잔존율", "증감", "근거"],
               ["l", "r", "r", "r", "l"],
               title="유니버스 감쇠 — §31 이 금지한 하드게이트가 몰래 들어오면 여기서 표본이 꺾입니다")
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+#  캐시 원장 — "모든 신규수집은 드라이브에 저장되고 재호출된다"를 매 실행 증명한다
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+#  (데이터셋, 인덱스, 무엇인가)  — 이 목록이 곧 이 전략이 네트워크에서 가져오는 것 전부다.
+SCG_CACHE_MANIFEST = [
+    ("marcap_spine_*",             "shared",  "일별 전종목시세(연도별) — 유니버스·가격·시총·캘린더의 단일 원천"),
+    ("marcap_meta_*",              "shared",  "종목명/시장 (연도별)"),
+    ("fdr_cache_listing_krx",      "shared",  "상장목록"),
+    ("fdr_cache_listing_delisting", "shared", "상장폐지목록 — 생존자편향 제거 입력"),
+    ("dart_corpcode",              "shared",  "회사 ↔ 종목코드 매핑"),
+    ("benchmark_ks11_daily",       "shared",  "KOSPI 지수"),
+    ("dart_periodic_disclosures",  "shared",  "정기공시 접수일 — 실적 발표일(PIT 근거)"),
+    ("dart_multi_annual",          "shared",  "다중회사 주요계정 — 순이익(Accuracy 의 A)"),
+    ("dart_shares_outstanding",    "shared",  "주식총수 (스파인 없을 때만)"),
+    ("research_report_master",     "shared",  "애널리스트 리포트 원장"),
+    ("analyst_master",             "shared",  "애널리스트 원장"),
+    ("report_analyst_link",        "shared",  "보고서 ↔ 애널리스트 연결표"),
+    ("analyst_eps_forecasts",      "shared",  "리포트 PDF 에서 추출한 EPS 추정치"),
+    ("analyst_eps_extract_status", "shared",  "EPS 추출 상태(이어받기 근거)"),
+    ("price_daily_adj",            "shared",  "수정주가 (스파인 없을 때만)"),
+    ("price_daily_unadj",          "shared",  "무수정 주가 (스파인 없을 때만)"),
+]
+
+
+def scg_report_cache_ledger():
+    """★ 절대 1원칙의 증거표 — 무엇이 어느 인덱스에 몇 행으로 저장되어 있는가.
+
+    이 표에 행수가 찍혀 있으면 다음 실행은 그것을 네트워크 없이 재사용한다.
+    (세션·머신과 무관하다 — 드라이브 파일이 원천이기 때문이다)
+    """
+    rows = []
+    try:
+        idx = VAULT.load_index("shared", force=True)
+    except Exception:
+        idx = pd.DataFrame()
+    tdir_s, tdir_p = VAULT.table_dir("shared"), VAULT.table_dir("private")
+    for name, scope, why in SCG_CACHE_MANIFEST:
+        base = tdir_s if scope == "shared" else tdir_p
+        if name.endswith("*"):
+            pre = name[:-1]
+            try:
+                files = [f for f in os.listdir(base) if f.startswith(pre) and f.endswith(".parquet")]
+            except Exception:
+                files = []
+            n_files = len(files)
+            size = sum(_safe_size(os.path.join(base, f)) for f in files)
+            rows.append([name, scope, f"{n_files}개 파일" if n_files else "—",
+                         f"{size/1e6:.0f}MB" if size else "—", _trunc(why, 44)])
+        else:
+            fp = os.path.join(base, f"{name}.parquet")
+            ok = os.path.exists(fp)
+            n = ""
+            if ok:
+                try:
+                    d = VAULT.get_table(name, scope=scope)
+                    n = f"{len(d):,}행" if d is not None else "—"
+                except Exception:
+                    n = "읽기실패"
+            rows.append([name, scope, n or "—",
+                         f"{_safe_size(fp)/1e6:.1f}MB" if ok else "—", _trunc(why, 44)])
+    LOG.table(rows, ["데이터셋", "인덱스", "저장량", "용량", "무엇인가"],
+              ["l", "c", "r", "r", "l"],
+              title="★ 캐시 원장 — 신규 수집된 모든 데이터는 여기에 저장되고 다음 실행에서 "
+                    "네트워크 없이 재호출됩니다 (공용=다른 전략도 재사용 · 전용=이 전략 산출물)")
+    miss = [r[0] for r in rows if r[2] in ("—", "")]
+    if miss:
+        LOG.info(f"아직 비어 있는 항목: {', '.join(miss[:8])}"
+                 f"{' 외' if len(miss) > 8 else ''} — 해당 소스를 수집하지 않았거나 "
+                 f"키가 없어 건너뛴 것입니다. 다음 실행에서 채워집니다.")
+
+
+def scg_research_windows(cached: Optional[pd.DataFrame], start: str, end: str,
+                         edge_days: int = 45) -> List[Tuple[str, str]]:
+    """리포트 원장이 아직 덮지 못한 기간만 돌려준다 (증분 크롤).
+
+    ★ 매 실행 15년치를 재크롤하지 않기 위한 것이다. 캐시가 [c0, c1] 을 덮고 있으면
+      요청구간에서 그 앞뒤만 새로 긁는다. 최근 edge_days 는 항상 다시 긁는다 —
+      뒤늦게 등록되는 리포트가 있기 때문이다(그래야 최신 구간이 비지 않는다).
+    """
+    lo, hi = as_ts(start), as_ts(end)
+    if cached is None or not len(cached) or "pub_date" not in cached.columns:
+        return [(lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"))]
+    d = as_ts_series(cached["pub_date"]).dropna()
+    if d.empty:
+        return [(lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"))]
+    c0, c1 = d.min(), d.max()
+    out: List[Tuple[str, str]] = []
+    if lo < c0:
+        out.append((lo.strftime("%Y-%m-%d"),
+                    min(c0 - pd.Timedelta(days=1), hi).strftime("%Y-%m-%d")))
+    tail = max(c1 - pd.Timedelta(days=edge_days), lo)
+    if tail <= hi:
+        out.append((tail.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")))
+    n_cached = len(cached)
+    LOG.info(f"리포트 원장 캐시 {n_cached:,}건이 {c0.date()}~{c1.date()} 를 덮고 있습니다 → "
+             f"신규 크롤 구간 {len(out)}개 {out}")
+    return out
