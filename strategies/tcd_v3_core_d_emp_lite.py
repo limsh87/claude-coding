@@ -108,6 +108,11 @@ CUSTOMS_API_KEY = ""          # 이 전략은 쓰지 않습니다 (코어 호환
 #    GDRIVE_ROOT      : 캐시 최상위 루트
 #    GDRIVE_SHARED_NS : 공용 인덱스 — 다른 전략도 그대로 재사용 (가격·재무·직원·보고서 원장)
 #    GDRIVE_PRIVATE_NS: 전용 인덱스 — 이 전략 고유 (피처패널·스코어·백테스트·판정문)
+#    ▸ 기본값은 Colab 기준입니다. JupyterLab(로컬)에서는 구글드라이브 '데스크톱' 동기화
+#      폴더를 자동으로 찾습니다 — Windows 의 드라이브 문자(G:/내 드라이브 …), macOS 의
+#      ~/Library/CloudStorage/GoogleDrive-<계정>/My Drive 를 모두 훑습니다.
+#      자동탐지가 실패하면 홈 폴더로 폴백하며 그 사실을 경고로 남깁니다. 그때는 아래 한 줄을
+#      실제 경로로 바꾸세요.  예)  GDRIVE_ROOT = r"G:/내 드라이브/tcd_cache"
 GDRIVE_ROOT       = "/content/drive/MyDrive/tcd_cache"
 GDRIVE_SHARED_NS  = "_shared"
 GDRIVE_PRIVATE_NS = "tcd_v3_core_d_emp"
@@ -144,6 +149,26 @@ RATE_LIMIT_QPS = {       # 소스별 초당 요청 상한 — 차단 방지. 낮
     "generic":   3.0,
 }
 MEM_BUDGET_GB  = 6.0     # 초과가 예상되면 청크 처리로 자동 전환
+
+# ── ⑥-b DART 호출 예산  ★ 4시간 계약(§12-6)을 지키는 유일한 장치입니다 ─────────────────────
+#
+#    DART 재무는 2층 구조입니다.
+#      Tier-1  fnlttMultiAcnt     : 1회 호출로 100사 — 매출·영업이익·순이익·자산·부채·자본
+#                                   전 종목 10년치가 2,000여 회(≈5분)로 끝납니다. 항상 받습니다.
+#      Tier-2  fnlttSinglAcntAll  : 1회 호출로 1사×1기간 — 재고·매출채권·영업CF·CAPEX 까지
+#                                   전 계정. **호출 수가 기업×연도×분기로 곱해집니다.**
+#                                   3,981사 × 13년 × 4분기 = 207,012회 = DART 일일한도 기준 11일.
+#
+#    그래서 Tier-2 는 반드시 상한을 겁니다. 상한 안에서 '투자 가능한 종목의 최근 연도'부터
+#    채우므로, 첫 실행에서도 백테스트는 끝까지 돌아가고 재실행할 때마다 커버리지가 올라갑니다.
+DART_FS_MAX_CALLS   = 12_000   # 이번 실행의 Tier-2 호출 상한. 0 = Tier-2 생략(Tier-1만).
+                               # 실측 5건/초 → 12,000건 ≈ 40분. 일일한도(19,000)보다 낮게 두세요.
+                               # None 으로 두면 상한 없음 = 며칠짜리 콜드빌드(4시간 계약 밖).
+DART_FS_FREQ        = "annual"  # "annual" = 사업보고서(FY)만 → 호출 1/4. 첫 실행 권장.
+                                # "quarterly" = 분기까지. TTM 정밀도는 오르지만 4배 비쌉니다.
+DART_FS_UNIVERSE_ONLY = True   # True = U-MID 투자가능 대역에 한 번이라도 든 종목만 Tier-2 수집.
+                               # 애초에 담을 수 없는 종목의 전체 재무제표는 백테스트에 안 쓰입니다.
+DART_FS_WARMUP_Y      = 3      # 백테스트 시작연도보다 몇 년 더 과거까지 받을지(TTM·전년대비용)
 
 # ── ⑦ 애널리스트 리포트 (한경컨센서스 · 네이버 리서치) ──────────────────────────────────────
 #    이 전략에서의 용도: U(반영도)축의 컨센서스 보강 + 다중소스 원장연결 감사.
@@ -215,6 +240,12 @@ V8_TAX_DROP    = -0.03           # ★ Δ실효세율 < -3%p
 # ── §5 empSttus 수집 범위 ───────────────────────────────────────────────────────────────────
 EMP_YEARS_BACK = 2               # 백테스트 시작연도보다 몇 년 더 과거까지 받을지(차분에 필요)
 EMP_MAX_CORPS  = 0               # 0 = 제한 없음. 테스트 시 300 등으로 줄이면 빨라집니다.
+#   ▸ empSttus 도 |기업| × |연도| 로 곱해집니다(3,981사 × 13년 = 51,753 > 일일한도 19,000).
+#     한계임금은 이 전략의 알파 원천이라 DART 일일예산을 **Tier-2 재무보다 먼저** 여기에 씁니다.
+#     상한에 걸리면 '담길 확률이 높은 종목 × 최근 연도'부터 채우고 재실행 시 이어받습니다.
+EMP_MAX_CALLS  = 14_000          # 실측 8건/초 → ≈30분. None = 상한 없음(4시간 계약 밖).
+EMP_UNIVERSE_ONLY = True         # True = U-MID 대역을 한 번이라도 경험한 종목만 수집.
+                                 # 셀 정규화도 U-MID 패널 안에서만 하므로 제외분은 안 쓰입니다.
 
 # ── §2 CANARY 임계값 ────────────────────────────────────────────────────────────────────────
 CANARY_SAMPLE_N     = 200        # 표본 종목수 (K3·K4·K7·K8·K9)
@@ -234,7 +265,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260807.2232"
+BUILD_VERSION  = "v3.20260808.0007"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -453,6 +484,16 @@ if OPT.get("pykrx"):
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
+        # ★ yfinance 는 실패 종목마다 ERROR 한 줄을 직접 찍는다. 한국 폐지종목은 .KS/.KQ 양쪽이
+        #   모두 없으므로 종목당 2줄 — 1,800종목이면 3,600줄이 진단 로그를 덮어버린다.
+        #   실패 사실은 fetch_prices 의 시도 원장(price_fetch_attempts)에 이미 남으므로
+        #   여기서는 라이브러리 자체 출력만 CRITICAL 로 올려 침묵시킨다(예외는 그대로 전파).
+        for _n in ("yfinance", "yfinance.data", "yfinance.utils", "peewee", "urllib3"):
+            logging.getLogger(_n).setLevel(logging.CRITICAL)
+        try:
+            yf.set_tz_cache_location(os.path.join(tempfile.gettempdir(), "py-yfinance"))
+        except Exception:
+            pass
     except Exception:
         yf = None
 if OPT.get("fitz"):
@@ -2317,15 +2358,72 @@ def mount_cache_v3() -> Tuple[str, str]:
             return local, "COLAB_MOUNT_ERROR→LOCAL"
 
     # JupyterLab / CLI — 드라이브 데스크톱이 동기화해 둔 경로가 있으면 그것을 우선한다.
-    cands = [GDRIVE_ROOT,
-             os.path.expanduser("~/Google Drive/MyDrive/tcd_cache"),
-             os.path.expanduser("~/GoogleDrive/MyDrive/tcd_cache"),
-             os.path.expanduser("~/내 드라이브/tcd_cache")]
-    for c in cands:
+    for c in _gdrive_desktop_candidates():
         if c and os.path.isdir(c):
+            os.makedirs(c, exist_ok=True)
             return c, "LOCAL_SYNCED_DRIVE"
+    # 캐시 폴더는 없지만 드라이브 자체는 붙어 있는 경우 → 거기에 만들어 준다.
+    #   ★ 이것이 없으면 첫 실행에서 조용히 홈 폴더로 폴백해, 수집물이 드라이브에
+    #     한 줄도 남지 않는다(사용자 절대1원칙 위반). 부모가 실재할 때만 만든다.
+    for c in _gdrive_desktop_candidates():
+        par = os.path.dirname(c.rstrip("/\\"))
+        if par and os.path.isdir(par):
+            try:
+                os.makedirs(c, exist_ok=True)
+                LOG.ok(f"구글드라이브(데스크톱 동기화) 안에 캐시 폴더를 새로 만들었습니다: {c}")
+                return c, "LOCAL_SYNCED_DRIVE"
+            except Exception:
+                continue
     os.makedirs(local, exist_ok=True)
+    LOG.warn(f"구글드라이브 경로를 찾지 못해 로컬({local})에 저장합니다. "
+             f"드라이브에 남기려면 상단 GDRIVE_ROOT 를 실제 드라이브 경로로 바꾸세요 "
+             f"(예: Windows 'G:/내 드라이브/tcd_cache', macOS "
+             f"'~/Library/CloudStorage/GoogleDrive-<계정>/My Drive/tcd_cache').")
     return local, "LOCAL"
+
+
+def _gdrive_desktop_candidates() -> List[str]:
+    """구글드라이브 '데스크톱' 동기화 폴더 후보. 환경마다 이름이 다르다.
+
+    Windows 는 드라이브 문자(G:, H: …)로 붙고 한국어 계정은 '내 드라이브'다.
+    macOS 는 최신 버전이 ~/Library/CloudStorage/GoogleDrive-<메일>/My Drive 로 바뀌었다.
+    이 목록을 갖고 있지 않으면 JupyterLab 사용자는 매번 홈 폴더로 폴백한다.
+    """
+    out: List[str] = [GDRIVE_ROOT] if GDRIVE_ROOT else []
+    leaf = os.path.basename(str(GDRIVE_ROOT).rstrip("/\\")) or "tcd_cache"
+    home = os.path.expanduser("~")
+    roots: List[str] = []
+    if platform.system() == "Windows":
+        # ★ 존재하지 않거나 '연결 끊긴 네트워크 드라이브'에 os.path.isdir 를 던지면 letter 당
+        #   수 초씩 블로킹된다. 비트마스크로 **실재하는 드라이브만** 먼저 걸러낸다.
+        letters = "GHIJKLMNOPQRSTUVWXYZ"
+        try:
+            import ctypes
+            mask = ctypes.windll.kernel32.GetLogicalDrives()      # type: ignore[attr-defined]
+            letters = "".join(L for L in letters
+                              if mask >> (ord(L) - ord("A")) & 1)
+        except Exception:
+            pass
+        for L in letters:
+            roots += [f"{L}:/내 드라이브", f"{L}:/My Drive", f"{L}:/공유 드라이브"]
+    roots += [os.path.join(home, "Google Drive", "My Drive"),
+              os.path.join(home, "Google Drive", "MyDrive"),
+              os.path.join(home, "GoogleDrive", "MyDrive"),
+              os.path.join(home, "내 드라이브")]
+    cs = os.path.join(home, "Library", "CloudStorage")
+    try:
+        for d in sorted(os.listdir(cs)):
+            if d.startswith("GoogleDrive"):
+                roots += [os.path.join(cs, d, "My Drive"), os.path.join(cs, d, "내 드라이브")]
+    except Exception:
+        pass
+    out += [os.path.join(r, leaf) for r in roots]
+    seen, uniq = set(), []
+    for p in out:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
 
 
 # ── 런타임 예산 추적 (§10) ──────────────────────────────────────────────────────────────────
@@ -3192,10 +3290,17 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+# 코드 → 야후 접미사 힌트. fetch_prices 가 상장정보(sec)로 채워 넣는다.
+# 비어 있으면 종전대로 .KS → .KQ 양쪽을 시도한다(동작은 같고, 채워지면 호출이 절반이 된다).
+YF_SUFFIX_HINT: Dict[str, str] = {}
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if yf is None:
         return None
-    for suf in (".KS", ".KQ"):
+    hint = YF_SUFFIX_HINT.get(code)
+    sufs = ((hint, ".KQ" if hint == ".KS" else ".KS") if hint else (".KS", ".KQ"))
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
@@ -3732,11 +3837,24 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
 
 def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
-                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                          priority: Optional[Sequence[str]] = None,
+                          max_calls: Optional[int] = None,
+                          freq: Optional[str] = None) -> pd.DataFrame:
     """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
 
     priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
-    일일 한도로 중간에 끊겨도 '투자 가능한 종목의 최근 데이터'가 먼저 확보되도록 하기 위함이다."""
+    일일 한도로 중간에 끊겨도 '투자 가능한 종목의 최근 데이터'가 먼저 확보되도록 하기 위함이다.
+
+    ★ max_calls (2026-08 추가 — 이번 실행에서 던질 호출 수의 하드 상한)
+      이 함수의 잡 수는 |기업| × |연도| × |보고서| 로 **곱셈으로 폭발**한다.
+      3,981사 × 13년 × 4분기 = 207,012건 = 11일치. 호출자가 상한을 주지 않으면
+      tqdm 이 11시간짜리 ETA 를 띄운 채 그대로 돌아간다 — 4시간 예산 계약이 있는
+      호출자에게 이것은 계약 위반이다. 상한을 받으면 **우선순위 순으로 잘라서** 그만큼만
+      던지고, 무엇을 남겼는지 로그로 밝힌다. None 이면 종전과 동일(무제한 콜드빌드).
+
+    ★ freq  ("annual" | "quarterly") — 전역 DART_STATEMENT_FREQ 를 호출자가 덮어쓴다.
+      연간만 받으면 잡 수가 정확히 1/4 이 된다.
+    """
     if not DART_API_KEY:
         LOG.warn("DART_API_KEY 미입력 — B축(회계품질)·C축(자원투입)·PACK-C 가 전부 비활성화됩니다. "
                  "이 전략의 핵심 입력이므로 키 입력을 강력히 권합니다.")
@@ -3749,7 +3867,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
-    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
+    reprts = ([REPRT_CODES["FY"]] if (freq or DART_STATEMENT_FREQ) == "annual"
               else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
     # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
@@ -3757,15 +3875,32 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
     order = {str(c): i for i, c in enumerate(priority or [])}
     corp_sorted = sorted((str(c) for c in corp_codes),
                          key=lambda c: (order.get(c, 10 ** 9), c))
+    # 연도 내림차순 → 기업 우선순위 → 사업보고서(FY) 우선. FY 를 먼저 받아야 연간 축(직원현황·
+    # 한계임금)과 짝이 맞는 회계 데이터가 먼저 완성된다.
+    _rorder = {REPRT_CODES["FY"]: 0, REPRT_CODES["Q3"]: 1,
+               REPRT_CODES["H1"]: 2, REPRT_CODES["Q1"]: 3}
+    reprts = sorted(reprts, key=lambda r: _rorder.get(r, 9))
     jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
             if (c, int(y), str(r)) not in done]
     if RUN_MODE == "CACHED":
         jobs = []
+
+    total_needed = len(jobs)
+    left_today = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+    cap = total_needed
+    if max_calls is not None:
+        cap = max(0, min(cap, int(max_calls), left_today))
     if jobs:
-        total_needed = len(jobs)
-        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
-                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
-        if total_needed > DART_DAILY_LIMIT:
+        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 (오늘 가용 호출 {left_today:,}건)")
+        if cap < total_needed:
+            jobs = jobs[:cap]
+            LOG.warn(
+                f"이번 실행에서는 상한 {cap:,}건만 받습니다 "
+                f"(전체 {total_needed:,}건 = 약 {math.ceil(total_needed / max(DART_DAILY_LIMIT,1))}일치). "
+                f"미수집분은 Tier-1 주요계정(fnlttMultiAcnt)으로 대체되며, "
+                f"재실행하면 정확히 이 지점부터 이어받습니다. "
+                f"상한은 DART_FS_MAX_CALLS 로 조절합니다.")
+        elif total_needed > DART_DAILY_LIMIT:
             LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
                      f"오늘 받을 수 있는 만큼 받고 저장합니다. "
                      f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
@@ -5602,12 +5737,39 @@ def _canary_accounts(corps: Sequence[str], year: int) -> Optional[bool]:
     _k("K3", "필수계정 커버리지", ok,
        " · ".join(f"{a}={cov[a]:.0%}" for a in CANARY_REQUIRED_ACCOUNTS),
        f"전 계정 ≥{CANARY_K3_MIN_COV:.0%}",
-       "" if ok else f"미달 계정 {weak} 을 쓰는 센서는 결측으로 두고 진행합니다(0 채움 금지)")
+       "" if ok else (f"미달 계정 {weak} 을 쓰는 센서는 결측으로 두고 진행합니다(0 채움 금지). "
+                      f"※ 재고·매출채권은 금융·지주·순수서비스 기업에 **원래 없는** 계정이라 "
+                      f"표본에 그런 업종이 섞이면 80% 안팎이 정상입니다 — 수집 실패와 구분하려면 "
+                      f"§6 커버리지표의 업종별 분포를 함께 보세요."))
     return ok
 
 
 # ── K4 : 가격 10년 ──────────────────────────────────────────────────────────────────────────
-def _canary_price(codes: Sequence[str]) -> bool:
+def _canary_price(codes: Sequence[str], sec: Optional[pd.DataFrame] = None) -> bool:
+    """탐침 구간(2016 상반기) 가격 확보율.
+
+    ★ 분모를 반드시 '그 구간에 실제로 상장돼 있던 종목'으로 좁힌다.
+      이 전략의 CANARY 표본은 생존자편향을 없애려고 폐지종목을 대역 비중대로 섞어 뽑는다.
+      2016 이후 상장했거나 2016 이전에 이미 폐지된 종목은 2016 상반기 시세가 **없는 게 정상**이다.
+      그것을 실패로 세면, 편향을 제대로 제거할수록 K4 가 FAIL 로 기울어 임계값을 낮추라는
+      압력이 생긴다 — 정확히 스펙이 금지하는 방향이다(§2 "임계값을 낮춰 통과시키지 말 것").
+    """
+    P0, P1 = as_ts("2016-01-01"), as_ts("2016-06-30")
+    codes = [str(c) for c in codes]
+    elig, n_off = codes, 0
+    if sec is not None and len(sec):
+        s = sec.drop_duplicates("code").copy()
+        s.index = pd.Index(s["code"].astype(str))
+        nat = pd.Series(pd.NaT, index=s.index)
+        ld = as_ts_series(s["listing_date"]) if "listing_date" in s.columns else nat
+        dd = as_ts_series(s["delisting_date"]) if "delisting_date" in s.columns else nat
+        live = ((ld.isna() | (ld <= P1)) & (dd.isna() | (dd >= P0)))
+        live = pd.Series(np.asarray(live), index=s.index)  # as_ts_series 가 인덱스를 갈아끼워도 안전
+        elig = [c for c in codes if bool(live.get(c, True))]
+        n_off = len(codes) - len(elig)
+    if not elig:
+        elig, n_off = codes, 0
+
     got, chain_used = 0, Counter()
     def _one(c):
         for nm, fn in PRICE_CHAIN:
@@ -5618,16 +5780,18 @@ def _canary_price(codes: Sequence[str]) -> bool:
             if d is not None and len(d):
                 return nm
         return None
-    res = pmap_io(_one, list(codes), workers=min(N_WORKERS_IO, 8), desc="CANARY K4 가격")
+    res = pmap_io(_one, elig, workers=min(N_WORKERS_IO, 8), desc="CANARY K4 가격")
     for r in res:
         if r:
             got += 1
             chain_used[r] += 1
-    rate = got / max(len(codes), 1)
+    rate = got / max(len(elig), 1)
     ok = rate >= 0.90
-    _k("K4", "10년 가격 확보", ok, f"{got}/{len(codes)} ({rate:.0%}) · 경로 " +
+    _k("K4", "10년 가격 확보", ok,
+       f"{got}/{len(elig)} ({rate:.0%})" +
+       (f" · 구간 미상장/기폐지 {n_off}종목 분모 제외" if n_off else "") + " · 경로 " +
        (", ".join(f"{k}×{v}" for k, v in chain_used.most_common()) or "없음"),
-       "표본 대부분 성공",
+       "상장중 표본 ≥90%",
        "" if ok else "체인(pykrx→FDR→네이버→yfinance)이 전부 실패 — 네트워크/차단을 확인하세요")
     return ok
 
@@ -5752,7 +5916,7 @@ def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
 
     k1, k2 = _canary_bulk(corps, n_uni)
     k3 = _canary_accounts(corps, probe_year)
-    k4 = _canary_price(codes)
+    k4 = _canary_price(codes, sec)
     k5 = _canary_delisting(sec)
     k7, k8, k9 = _canary_emp(corps, probe_year)
 
@@ -5964,8 +6128,15 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
             "unit_fix": int(unit_fix), "pay_fix": float(pay_fix), "src_flag": flag}
 
 
-def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    """empSttus 증분 수집. 공용 캐시(dart_employees_ext)를 먼저 소진하고 부족분만 호출한다."""
+def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
+                     priority: Optional[Sequence[str]] = None,
+                     max_calls: Optional[int] = None) -> pd.DataFrame:
+    """empSttus 증분 수집. 공용 캐시(dart_employees_ext)를 먼저 소진하고 부족분만 호출한다.
+
+    ★ 잡 수는 |기업| × |연도| 로 곱해진다(3,981사 × 13년 = 51,753 > 일일한도 19,000).
+      max_calls 로 이번 실행분을 잘라내고, priority 순서로 '담길 확률이 높은 종목'부터 채운다.
+      한계임금은 이 전략의 알파 원천이므로 Tier-2 재무보다 **먼저** 예산을 배정한다.
+    """
     cached = VAULT.get_table("dart_employees_ext", scope="shared")
     done = set()
     if cached is not None and len(cached):
@@ -5983,7 +6154,11 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Data
     corps = [str(c) for c in dict.fromkeys(corp_codes) if str(c) and str(c) != "nan"]
     if EMP_MAX_CORPS and EMP_MAX_CORPS > 0:
         corps = corps[:EMP_MAX_CORPS]
-    jobs = [(c, y) for c in corps for y in years if (c, int(y)) not in done]
+    # 담길 확률이 높은 종목 먼저 — 예산에 걸려 잘려도 '쓸 수 있는' 한계임금이 먼저 완성된다.
+    _ord = {str(c): i for i, c in enumerate(priority or [])}
+    corps = sorted(corps, key=lambda c: (_ord.get(c, 10 ** 9), c))
+    # 최근 연도 우선. 차분에 t-1 이 필요하므로 연도는 내림차순으로 촘촘히 채운다.
+    jobs = [(c, y) for y in sorted(years, reverse=True) for c in corps if (c, int(y)) not in done]
     if RUN_MODE == "CACHED":
         if jobs:
             LOG.info(f"RUN_MODE='CACHED' — 신규 수집 대상 {len(jobs):,}건을 건너뜁니다.")
@@ -5991,6 +6166,15 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Data
 
     got: List[dict] = []
     if jobs:
+        total_needed = len(jobs)
+        if max_calls is not None:
+            left = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+            cap = max(0, min(total_needed, int(max_calls), left))
+            if cap < total_needed:
+                jobs = jobs[:cap]
+                LOG.warn(f"직원현황 {total_needed:,}건 중 이번 실행은 {cap:,}건만 받습니다 "
+                         f"(오늘 남은 DART 호출 {left:,}건 · 상한 EMP_MAX_CALLS={max_calls:,}). "
+                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다.")
         LOG.info(f"직원현황 신규 수집 {len(jobs):,}건 "
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
                  f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상")
@@ -8469,6 +8653,37 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     _cc("절대1원칙", "구글드라이브 캐시 훼손 불가능성", vault_safe)
 
+    # ── §12-6 : 수집 호출량 상한 (4시간 계약) ─────────────────────────────────────────────
+    def budget_bounded():
+        """★ 실제로 터졌던 사고를 고정하는 회귀 테스트.
+
+        Tier-2 재무(fnlttSinglAcntAll)와 직원현황(empSttus)은 잡 수가 |기업|×|연도|(×|분기|)
+        로 **곱해진다**. 상한이 없으면 3,981사 × 13년 × 4분기 = 207,012 호출 = 11일치가
+        조용히 큐에 올라간다 — tqdm ETA 로 드러났을 때는 이미 돌고 있다.
+        이 계약은 (a) 두 단계 모두 상한을 갖고 (b) 그 상한이 DART 일일한도 안에 들고
+        (c) 수집 함수가 상한 인자를 실제로 받는지를 강제한다.
+        """
+        caps = {"EMP_MAX_CALLS": EMP_MAX_CALLS, "DART_FS_MAX_CALLS": DART_FS_MAX_CALLS}
+        missing = [k for k, v in caps.items() if v is None]
+        if missing:
+            return False, f"{missing} 에 상한이 없습니다 — 콜드빌드가 4시간 계약을 벗어납니다"
+        import inspect as _ins
+        for fn, arg in ((fetch_dart_financials, "max_calls"), (fetch_emp_status, "max_calls")):
+            if arg not in _ins.signature(fn).parameters:
+                return False, f"{fn.__name__} 이 {arg} 인자를 받지 않습니다"
+        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS)
+        if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT:
+            return False, f"단일 단계 상한이 일일한도({DART_DAILY_LIMIT:,})를 넘습니다"
+        # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
+        worst_h = (int(EMP_MAX_CALLS) / 8.0 + int(DART_FS_MAX_CALLS) / 5.0) / 3600.0
+        if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
+            return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
+                           f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")
+        return True, (f"EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,} = {plan:,}건 "
+                      f"(≈{worst_h*60:.0f}분) · 일일한도 {DART_DAILY_LIMIT:,} 안")
+
+    _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
+
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 34), "PASS" if r["pass"] else "FAIL",
              _trunc(r["msg"], 60)] for r in CONTRACT_V3]
@@ -9248,6 +9463,64 @@ def _rehearsal_hook_v3(G: dict, sec: pd.DataFrame, corps: Sequence[str],
 REHEARSAL_HOOKS.append(_rehearsal_hook_v3)
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  Tier-2 전체재무제표 수집 범위 — 4시간 계약(§12-6)을 지키는 지점
+#
+#  이 함수가 없으면 잡 수는 |상장·폐지 전 종목| × |연도| × |보고서| 로 곱해진다.
+#  3,981사 × 13년 × 4분기 = 207,012회. DART 일일한도 19,000 기준 11일이다.
+#  좁히는 근거는 두 가지뿐이고, 둘 다 결과를 바꾸지 않는다:
+#    ① 한 번도 U-MID 대역(투자가능)에 들지 못한 종목의 전체재무제표는 어떤 달에도
+#       포트폴리오에 들어갈 수 없다 → 스코어에 쓰이지 않는다.
+#    ② 백테스트 시작연도 −DART_FS_WARMUP_Y 이전 회계연도는 TTM·전년대비에도 안 쓰인다.
+#  ①의 U-MID 판정은 **가격패널만으로** 내려진다(20일 평균거래대금 랭크) — 재무를 보지
+#  않으므로 순환참조가 없고, 미래 재무를 미리 들여다보는 일도 없다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+def dart_fs_scope_v3(ctx: dict, all_corps: Sequence[str], quiet: bool = False
+                     ) -> Tuple[List[str], List[int], List[str]]:
+    """(수집대상 corp_code, 연도, 우선순위 corp_code) 를 돌려준다.
+
+    quiet=True 면 로그를 찍지 않는다 — 직원현황 단계가 우선순위만 빌려 쓸 때 쓴다."""
+    y0 = as_ts(BACKTEST_START).year - int(DART_FS_WARMUP_Y)
+    years = list(range(y0, as_ts(BACKTEST_END).year + 1))
+    corps = [str(c) for c in all_corps]
+    prio: List[str] = []
+    try:
+        pm = ctx["panel"]["monthly"]
+        adv = col(pm, "adv20")
+        rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
+        in_band = rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)
+        # 우선순위: 'U-MID 대역에 머문 달 수'가 많은 종목부터. 유동성 1등이 아니라
+        # **실제로 담길 확률이 높은 종목**부터 채우는 것이 백테스트 커버리지에 직결된다.
+        months_in = (pm.loc[in_band.fillna(False), "code"].value_counts())
+        c2c = (ctx["sec"].dropna(subset=["corp_code"]).drop_duplicates("code")
+               .set_index("code")["corp_code"].astype(str).to_dict())
+        prio = [c2c[c] for c in months_in.index if c in c2c]
+        if DART_FS_UNIVERSE_ONLY and prio:
+            keep = set(prio)
+            dropped = len(corps) - len([c for c in corps if c in keep])
+            corps = [c for c in corps if c in keep]
+            if not quiet:
+                LOG.info(f"Tier-2 수집대상을 U-MID 대역 경험 종목 {len(corps):,}사로 좁힙니다 "
+                         f"(제외 {dropped:,}사 — 전 기간 한 번도 투자가능 대역에 들지 못해 "
+                         f"어떤 달에도 편입될 수 없는 종목입니다).")
+    except Exception as e:                                          # noqa
+        if not quiet:
+            LOG.warn(f"U-MID 기반 Tier-2 범위 축소 실패({type(e).__name__}) — 전 종목으로 진행합니다.")
+    n_reprt = 1 if DART_FS_FREQ == "annual" else 4
+    est = len(corps) * len(years) * n_reprt
+    cap = est if DART_FS_MAX_CALLS is None else min(est, int(DART_FS_MAX_CALLS))
+    if not quiet:
+        LOG.info(f"Tier-2 전체재무제표 계획: {len(corps):,}사 × {len(years)}년 × "
+                 f"{n_reprt}보고서 = 최대 {est:,}건 → 이번 실행 상한 {cap:,}건 "
+                 f"(≈{cap/5/60:.0f}분). 나머지는 Tier-1 주요계정으로 대체하고 재실행 시 이어받습니다.")
+    if DART_FS_MAX_CALLS == 0:
+        if not quiet:
+            LOG.warn("DART_FS_MAX_CALLS=0 — Tier-2 를 건너뜁니다. 재고·매출채권·영업CF 가 결측이므로 "
+                 "TP_I1/TP_I2(회계품질) 가 비활성화됩니다.")
+        return [], years, prio
+    return corps, years, prio
+
+
 def offer_download_v3(paths: Sequence[str]):
     """미리보기 없이 '클릭하면 바로 저장' 되는 링크만 띄운다."""
     paths = [p for p in paths if p and os.path.exists(p)]
@@ -9299,10 +9572,47 @@ def downcast_floats(P: pd.DataFrame) -> pd.DataFrame:
     return P
 
 
+def announce_budget_v3():
+    """수집을 시작하기 전에 '이번 실행이 몇 분짜리인지'를 먼저 못박아 보여준다.
+
+    ★ 이 표가 없으면 곱셈으로 폭발한 잡 수가 tqdm ETA 로만 드러난다 — 이미 돌기 시작한
+      뒤다. 4시간 계약(§12-6)은 사후 판정이 아니라 **사전 상한**이어야 한다.
+    """
+    fs_cap, emp_cap = DART_FS_MAX_CALLS, EMP_MAX_CALLS
+    used = DBUDGET.n if DBUDGET else 0
+    left = max(0, DART_DAILY_LIMIT - used)
+    _n = lambda v: "무제한" if v is None else f"{int(v):,}"
+    _m = lambda v, qps: "며칠" if v is None else f"{int(v)/qps/60:.0f}"
+    rows = [
+        ["L1.UNI  종목마스터·스냅샷", "-", "10", "pykrx/FDR/KIND"],
+        ["L1.PX   일봉·거래대금", "-", "40", "실패종목 30일 음성캐시 → 재실행은 대폭 단축"],
+        ["L1.EMP  직원현황(empSttus)", _n(emp_cap), _m(emp_cap, 8.0),
+         "① 알파 원천 — 예산을 먼저 배정 · EMP_MAX_CALLS"],
+        ["L1.DART Tier-1 주요계정(배치)", "≈2,100", "5", "100사/호출 — 전 종목 전 연도"],
+        ["L1.DART Tier-2 전체재무제표", _n(fs_cap), _m(fs_cap, 5.0),
+         f"② 남는 예산으로 · {DART_FS_FREQ} · DART_FS_MAX_CALLS"],
+        ["L2~R    피처·백테스트·강건성", "-", "35", "네트워크 없음"],
+    ]
+    LOG.table(rows, ["단계", "DART 호출 상한", "예상(분)", "비고"], ["l", "r", "r", "l"],
+              title="이번 실행의 수집 예산 (§10 · 총 예산 153분 / 킬 기준 4시간)")
+    plan = sum(int(v) for v in (emp_cap, fs_cap) if v is not None) + 2100
+    LOG.info(f"DART 일일 한도 {DART_DAILY_LIMIT:,} · 오늘 사용 {used:,} · 잔여 {left:,} → "
+             f"이번 실행 계획 {plan:,}건. 한도에 닿으면 그 지점에서 깨끗이 멈추고 "
+             f"수집분을 드라이브에 저장합니다. 재실행하면 이어받습니다.")
+    if fs_cap is None or emp_cap is None:
+        LOG.warn("호출 상한이 None 인 단계가 있습니다 — 콜드빌드는 며칠이 걸리며 §12-6 의 "
+                 "4시간 계약 밖입니다. 4시간 안에 끝내려면 숫자를 넣으세요 "
+                 "(권장: EMP_MAX_CALLS=14000, DART_FS_MAX_CALLS=12000).")
+    if plan > left:
+        LOG.warn(f"계획 호출({plan:,})이 오늘 잔여 한도({left:,})를 넘습니다 — 우선순위 상위부터 "
+                 f"채우고 한도에서 멈춥니다. 커버리지는 재실행할 때마다 올라갑니다.")
+
+
 # ── L1 수집 ─────────────────────────────────────────────────────────────────────────────────
 def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     ctx: Dict[str, Any] = {}
     t_ing = time.time()
+    announce_budget_v3()
 
     with PIPE.stage("L1.UNI", "종목 마스터 · PIT 유니버스", "L1", budget_s=900):
         snaps = fetch_pykrx_snapshots(months)
@@ -9312,6 +9622,15 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.PX", "가격 · 거래대금 (다중소스 폴백 체인)", "L1", budget_s=2400):
         KRX.login()
         LOG.info(f"KRX 마켓플레이스 세션: {getattr(KRX, 'status', '미시도')}")
+        # 야후 접미사를 미리 알려준다 — 모르면 종목당 .KS/.KQ 를 둘 다 때려 호출이 2배가 된다.
+        try:
+            _mk = ctx["sec"].dropna(subset=["code"]).drop_duplicates("code")
+            _s = _mk["market"].astype(str).str.upper()
+            YF_SUFFIX_HINT.update(dict(zip(
+                _mk["code"].astype(str),
+                np.where(_s.str.contains("KOSDAQ|KSQ|코스닥"), ".KQ", ".KS"))))
+        except Exception:
+            pass
         px = fetch_prices(ctx["sec"]["code"].tolist(),
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
                           BACKTEST_END)
@@ -9325,36 +9644,21 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.FLOW", "기관·외국인 수급 (U축 d3)", "L1", budget_s=1200, critical=False):
         ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START, BACKTEST_END)
 
-    with PIPE.stage("L1.DART", "DART 재무 · 공시목록", "L1", budget_s=3600, critical=False):
-        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-        years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
-        prio: List[str] = []
-        try:
-            pm = ctx["panel"]["monthly"]
-            adv = pm.groupby("code", observed=True)["adv20"].median().sort_values(ascending=False)
-            c2c = (ctx["sec"].dropna(subset=["corp_code"]).drop_duplicates("code")
-                   .set_index("code")["corp_code"].astype(str).to_dict())
-            prio = [c2c[c] for c in adv.index if c in c2c]
-        except Exception:
-            prio = []
-        multi = fetch_dart_multi_accounts(corps, years)
-        fs = fetch_dart_financials(corps, years, priority=prio)
-        fin = tidy_financials(merge_financial_tiers(fs, multi))
-        dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
-        ctx["fin"], ctx["disclosures"] = fin, dis
-        # ★ 빈 경로의 tidy_financials 는 PIT 컬럼조차 없는 3열짜리 프레임을 돌려준다.
-        #   그대로 register 하면 KeyError 로 죽으므로 컬럼 존재를 먼저 확인한다.
-        if len(fin) and all(c in fin.columns for c in PIT_COLS):
-            PIT.register("dart_financials", fin, key_cols=["corp_code"])
-        else:
-            LOG.warn("DART 재무가 비어 PIT 등록을 건너뜁니다 — CORE-D TP 는 전부 결측이 됩니다.")
-
     with PIPE.stage("L1.EMP", "DART 직원현황(확장) · C15 한계임금", "L1",
                     budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         eyears = list(range(as_ts(BACKTEST_START).year - EMP_YEARS_BACK,
                             as_ts(BACKTEST_END).year + 1))
-        E = fetch_emp_status(corps, eyears)
+        # ★ 한계임금이 이 전략의 알파 원천이므로 DART 일일예산을 **여기에 먼저** 배정한다.
+        #   (Tier-2 전체재무제표는 남는 예산으로 채우고, 부족분은 Tier-1 주요계정이 받친다)
+        emp_corps, _, emp_prio = dart_fs_scope_v3(ctx, corps, quiet=True)
+        if not (EMP_UNIVERSE_ONLY and emp_corps):
+            emp_corps = corps          # 축소 실패 또는 사용자가 끈 경우 → 전 종목
+        else:
+            LOG.info(f"직원현황 수집대상 {len(emp_corps):,}사 "
+                     f"(전체 {len(corps):,}사 중 U-MID 대역을 한 번이라도 경험한 종목). "
+                     f"셀 정규화도 U-MID 패널 안에서만 이뤄지므로 제외분은 스코어에 쓰이지 않습니다.")
+        E = fetch_emp_status(emp_corps, eyears, priority=emp_prio, max_calls=EMP_MAX_CALLS)
         ctx["emp_raw"] = E
         S = build_emp_sensors(E)
         ctx["emp_sensors"] = S
@@ -9368,6 +9672,25 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                          key_cols=["corp_code"])
             VAULT.put_table("emp_sensors_annual", S, scope="shared", domain="dart",
                             source="v3 EMP-LITE 연도 센서 (C15 적용) — 타 전략 재사용 가능")
+
+    with PIPE.stage("L1.DART", "DART 재무 · 공시목록", "L1", budget_s=3600, critical=False):
+        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+        years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
+        # ── Tier-1(배치): 전 종목 · 전 연도. 100사/호출이므로 싸다. 항상 전부 받는다.
+        multi = fetch_dart_multi_accounts(corps, years)
+        # ── Tier-2(단건): 기업×연도×보고서로 곱해진다 → 반드시 범위를 좁히고 상한을 건다.
+        fs_corps, fs_years, prio = dart_fs_scope_v3(ctx, corps)
+        fs = fetch_dart_financials(fs_corps, fs_years, priority=prio,
+                                   max_calls=DART_FS_MAX_CALLS, freq=DART_FS_FREQ)
+        fin = tidy_financials(merge_financial_tiers(fs, multi))
+        dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
+        ctx["fin"], ctx["disclosures"] = fin, dis
+        # ★ 빈 경로의 tidy_financials 는 PIT 컬럼조차 없는 3열짜리 프레임을 돌려준다.
+        #   그대로 register 하면 KeyError 로 죽으므로 컬럼 존재를 먼저 확인한다.
+        if len(fin) and all(c in fin.columns for c in PIT_COLS):
+            PIT.register("dart_financials", fin, key_cols=["corp_code"])
+        else:
+            LOG.warn("DART 재무가 비어 PIT 등록을 건너뜁니다 — CORE-D TP 는 전부 결측이 됩니다.")
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장 구축", "L1",
                     budget_s=3600, critical=False):
@@ -9565,6 +9888,13 @@ def main() -> dict:
                 else "없음 (가격은 pykrx→FDR→네이버→yfinance 체인으로 대체)"],
                ["선택 패키지", ", ".join(k for k, v in OPT.items() if v) or "없음"]],
               ["항목", "값"], ["l", "l"], title="실행 환경")
+    if pykrx_stock is None:
+        LOG.warn(
+            "pykrx 를 쓸 수 없습니다 — 결과에 실제로 영향이 갑니다. 두 가지가 죽습니다:\n"
+            "     ① 기관·외국인 수급 → U축 d3 가 전 기간 결측 (U 는 d1 하나로만 구성됩니다)\n"
+            "     ② 특정일 상장목록 스냅샷 → PIT 유니버스가 KIND·FDR 경로에만 의존합니다\n"
+            "   가격 자체는 FDR→네이버→yfinance 로 대체되지만 3~4배 느립니다. "
+            f"현재 파이썬 {ENV['python']} 에 설치 가능한 휠이 없으면 3.11~3.12 환경을 권합니다.")
 
     t_l0 = time.time()
     with PIPE.stage("L0.VAULT", "구글드라이브 캐시 연결 (공용/전용 인덱스)", "L0", budget_s=600):
@@ -9581,8 +9911,15 @@ def main() -> dict:
                 LOG.warn("여유 공간이 2GB 미만입니다. RESEARCH_DOWNLOAD_PDF=False 를 권합니다.")
         VAULT.load_index("shared"); VAULT.load_index("private")
         # 중복 경로를 미리 제거한다(ADOPT_DIRS[0] 이 ROOT 와 같으면 같은 트리를 두 번 훑는다)
-        adopt = list(dict.fromkeys(os.path.abspath(os.path.expanduser(d))
-                                   for d in GDRIVE_ADOPT_DIRS if d))
+        # ★ 헤더의 ADOPT 경로는 Colab 기준(/content/...)이라 JupyterLab 에서는 하나도 안 맞는다.
+        #   실제로 붙어 있는 캐시 루트의 형제 폴더(research/reports/consensus)도 함께 훑어
+        #   '드라이브에 이미 모아둔 리포트'를 어느 환경에서든 등록만 하고 재사용한다.
+        _sib = os.path.dirname(VAULT.root)
+        adopt = list(dict.fromkeys(os.path.abspath(os.path.expanduser(d)) for d in (
+            list(GDRIVE_ADOPT_DIRS) + [VAULT.root] +
+            [os.path.join(_sib, n) for n in ("research", "reports", "consensus", "tcd_cache")]
+        ) if d))
+        adopt = [d for d in adopt if os.path.isdir(d)]
         VAULT.adopt_scan(adopt)
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET

@@ -105,12 +105,39 @@ def _canary_accounts(corps: Sequence[str], year: int) -> Optional[bool]:
     _k("K3", "필수계정 커버리지", ok,
        " · ".join(f"{a}={cov[a]:.0%}" for a in CANARY_REQUIRED_ACCOUNTS),
        f"전 계정 ≥{CANARY_K3_MIN_COV:.0%}",
-       "" if ok else f"미달 계정 {weak} 을 쓰는 센서는 결측으로 두고 진행합니다(0 채움 금지)")
+       "" if ok else (f"미달 계정 {weak} 을 쓰는 센서는 결측으로 두고 진행합니다(0 채움 금지). "
+                      f"※ 재고·매출채권은 금융·지주·순수서비스 기업에 **원래 없는** 계정이라 "
+                      f"표본에 그런 업종이 섞이면 80% 안팎이 정상입니다 — 수집 실패와 구분하려면 "
+                      f"§6 커버리지표의 업종별 분포를 함께 보세요."))
     return ok
 
 
 # ── K4 : 가격 10년 ──────────────────────────────────────────────────────────────────────────
-def _canary_price(codes: Sequence[str]) -> bool:
+def _canary_price(codes: Sequence[str], sec: Optional[pd.DataFrame] = None) -> bool:
+    """탐침 구간(2016 상반기) 가격 확보율.
+
+    ★ 분모를 반드시 '그 구간에 실제로 상장돼 있던 종목'으로 좁힌다.
+      이 전략의 CANARY 표본은 생존자편향을 없애려고 폐지종목을 대역 비중대로 섞어 뽑는다.
+      2016 이후 상장했거나 2016 이전에 이미 폐지된 종목은 2016 상반기 시세가 **없는 게 정상**이다.
+      그것을 실패로 세면, 편향을 제대로 제거할수록 K4 가 FAIL 로 기울어 임계값을 낮추라는
+      압력이 생긴다 — 정확히 스펙이 금지하는 방향이다(§2 "임계값을 낮춰 통과시키지 말 것").
+    """
+    P0, P1 = as_ts("2016-01-01"), as_ts("2016-06-30")
+    codes = [str(c) for c in codes]
+    elig, n_off = codes, 0
+    if sec is not None and len(sec):
+        s = sec.drop_duplicates("code").copy()
+        s.index = pd.Index(s["code"].astype(str))
+        nat = pd.Series(pd.NaT, index=s.index)
+        ld = as_ts_series(s["listing_date"]) if "listing_date" in s.columns else nat
+        dd = as_ts_series(s["delisting_date"]) if "delisting_date" in s.columns else nat
+        live = ((ld.isna() | (ld <= P1)) & (dd.isna() | (dd >= P0)))
+        live = pd.Series(np.asarray(live), index=s.index)  # as_ts_series 가 인덱스를 갈아끼워도 안전
+        elig = [c for c in codes if bool(live.get(c, True))]
+        n_off = len(codes) - len(elig)
+    if not elig:
+        elig, n_off = codes, 0
+
     got, chain_used = 0, Counter()
     def _one(c):
         for nm, fn in PRICE_CHAIN:
@@ -121,16 +148,18 @@ def _canary_price(codes: Sequence[str]) -> bool:
             if d is not None and len(d):
                 return nm
         return None
-    res = pmap_io(_one, list(codes), workers=min(N_WORKERS_IO, 8), desc="CANARY K4 가격")
+    res = pmap_io(_one, elig, workers=min(N_WORKERS_IO, 8), desc="CANARY K4 가격")
     for r in res:
         if r:
             got += 1
             chain_used[r] += 1
-    rate = got / max(len(codes), 1)
+    rate = got / max(len(elig), 1)
     ok = rate >= 0.90
-    _k("K4", "10년 가격 확보", ok, f"{got}/{len(codes)} ({rate:.0%}) · 경로 " +
+    _k("K4", "10년 가격 확보", ok,
+       f"{got}/{len(elig)} ({rate:.0%})" +
+       (f" · 구간 미상장/기폐지 {n_off}종목 분모 제외" if n_off else "") + " · 경로 " +
        (", ".join(f"{k}×{v}" for k, v in chain_used.most_common()) or "없음"),
-       "표본 대부분 성공",
+       "상장중 표본 ≥90%",
        "" if ok else "체인(pykrx→FDR→네이버→yfinance)이 전부 실패 — 네트워크/차단을 확인하세요")
     return ok
 
@@ -255,7 +284,7 @@ def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
 
     k1, k2 = _canary_bulk(corps, n_uni)
     k3 = _canary_accounts(corps, probe_year)
-    k4 = _canary_price(codes)
+    k4 = _canary_price(codes, sec)
     k5 = _canary_delisting(sec)
     k7, k8, k9 = _canary_emp(corps, probe_year)
 

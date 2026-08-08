@@ -303,6 +303,37 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     _cc("절대1원칙", "구글드라이브 캐시 훼손 불가능성", vault_safe)
 
+    # ── §12-6 : 수집 호출량 상한 (4시간 계약) ─────────────────────────────────────────────
+    def budget_bounded():
+        """★ 실제로 터졌던 사고를 고정하는 회귀 테스트.
+
+        Tier-2 재무(fnlttSinglAcntAll)와 직원현황(empSttus)은 잡 수가 |기업|×|연도|(×|분기|)
+        로 **곱해진다**. 상한이 없으면 3,981사 × 13년 × 4분기 = 207,012 호출 = 11일치가
+        조용히 큐에 올라간다 — tqdm ETA 로 드러났을 때는 이미 돌고 있다.
+        이 계약은 (a) 두 단계 모두 상한을 갖고 (b) 그 상한이 DART 일일한도 안에 들고
+        (c) 수집 함수가 상한 인자를 실제로 받는지를 강제한다.
+        """
+        caps = {"EMP_MAX_CALLS": EMP_MAX_CALLS, "DART_FS_MAX_CALLS": DART_FS_MAX_CALLS}
+        missing = [k for k, v in caps.items() if v is None]
+        if missing:
+            return False, f"{missing} 에 상한이 없습니다 — 콜드빌드가 4시간 계약을 벗어납니다"
+        import inspect as _ins
+        for fn, arg in ((fetch_dart_financials, "max_calls"), (fetch_emp_status, "max_calls")):
+            if arg not in _ins.signature(fn).parameters:
+                return False, f"{fn.__name__} 이 {arg} 인자를 받지 않습니다"
+        plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS)
+        if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT:
+            return False, f"단일 단계 상한이 일일한도({DART_DAILY_LIMIT:,})를 넘습니다"
+        # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
+        worst_h = (int(EMP_MAX_CALLS) / 8.0 + int(DART_FS_MAX_CALLS) / 5.0) / 3600.0
+        if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
+            return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
+                           f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")
+        return True, (f"EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,} = {plan:,}건 "
+                      f"(≈{worst_h*60:.0f}분) · 일일한도 {DART_DAILY_LIMIT:,} 안")
+
+    _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
+
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 34), "PASS" if r["pass"] else "FAIL",
              _trunc(r["msg"], 60)] for r in CONTRACT_V3]

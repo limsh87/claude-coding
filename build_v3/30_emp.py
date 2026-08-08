@@ -172,8 +172,15 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
             "unit_fix": int(unit_fix), "pay_fix": float(pay_fix), "src_flag": flag}
 
 
-def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    """empSttus 증분 수집. 공용 캐시(dart_employees_ext)를 먼저 소진하고 부족분만 호출한다."""
+def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
+                     priority: Optional[Sequence[str]] = None,
+                     max_calls: Optional[int] = None) -> pd.DataFrame:
+    """empSttus 증분 수집. 공용 캐시(dart_employees_ext)를 먼저 소진하고 부족분만 호출한다.
+
+    ★ 잡 수는 |기업| × |연도| 로 곱해진다(3,981사 × 13년 = 51,753 > 일일한도 19,000).
+      max_calls 로 이번 실행분을 잘라내고, priority 순서로 '담길 확률이 높은 종목'부터 채운다.
+      한계임금은 이 전략의 알파 원천이므로 Tier-2 재무보다 **먼저** 예산을 배정한다.
+    """
     cached = VAULT.get_table("dart_employees_ext", scope="shared")
     done = set()
     if cached is not None and len(cached):
@@ -191,7 +198,11 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Data
     corps = [str(c) for c in dict.fromkeys(corp_codes) if str(c) and str(c) != "nan"]
     if EMP_MAX_CORPS and EMP_MAX_CORPS > 0:
         corps = corps[:EMP_MAX_CORPS]
-    jobs = [(c, y) for c in corps for y in years if (c, int(y)) not in done]
+    # 담길 확률이 높은 종목 먼저 — 예산에 걸려 잘려도 '쓸 수 있는' 한계임금이 먼저 완성된다.
+    _ord = {str(c): i for i, c in enumerate(priority or [])}
+    corps = sorted(corps, key=lambda c: (_ord.get(c, 10 ** 9), c))
+    # 최근 연도 우선. 차분에 t-1 이 필요하므로 연도는 내림차순으로 촘촘히 채운다.
+    jobs = [(c, y) for y in sorted(years, reverse=True) for c in corps if (c, int(y)) not in done]
     if RUN_MODE == "CACHED":
         if jobs:
             LOG.info(f"RUN_MODE='CACHED' — 신규 수집 대상 {len(jobs):,}건을 건너뜁니다.")
@@ -199,6 +210,15 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Data
 
     got: List[dict] = []
     if jobs:
+        total_needed = len(jobs)
+        if max_calls is not None:
+            left = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+            cap = max(0, min(total_needed, int(max_calls), left))
+            if cap < total_needed:
+                jobs = jobs[:cap]
+                LOG.warn(f"직원현황 {total_needed:,}건 중 이번 실행은 {cap:,}건만 받습니다 "
+                         f"(오늘 남은 DART 호출 {left:,}건 · 상한 EMP_MAX_CALLS={max_calls:,}). "
+                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다.")
         LOG.info(f"직원현황 신규 수집 {len(jobs):,}건 "
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
                  f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상")
