@@ -54,13 +54,30 @@ def _drive_mount_points() -> List[str]:
     #     문자 후보를 GHIJK 로만 잡으면 다른 문자에 마운트된 경우를 통째로 놓친다.
     #     A~Z 전부 훑어도 os.path.isdir 은 존재하지 않는 문자에서 즉시 False 다(비용 무시 가능).
     if platform.system() == "Windows":
+        # ★ isdir 이 항상 즉시 반환한다는 가정은 틀렸다. 끊긴 네트워크 매핑 드라이브에서는
+        #   SMB 재접속을 시도하며 수십 초씩 멈춘다. 문자 하나당이 아니라 전체에 예산을 건다.
+        _t_letters = time.monotonic()
         for letter in "GHIJKLMNOPQRSTUVWXYZDEF":
+            if time.monotonic() - _t_letters > 8.0:
+                _safe_print("[루트] 드라이브 문자 탐색이 8초를 넘겨 중단합니다 "
+                            "(끊긴 네트워크 드라이브일 수 있습니다). "
+                            "코드 상단 GDRIVE_ROOT 에 경로를 직접 넣으면 탐색을 건너뜁니다.")
+                break
             root = f"{letter}:\\"
             if not os.path.isdir(root):
                 continue
-            cands.append(root)          # 드라이브 루트 자체가 'My Drive' 인 구성도 있다
-            for leaf in ("My Drive", "내 드라이브", "Mi unidad", "Mon Drive"):
-                cands.append(os.path.join(root, leaf))
+            leaves = ("My Drive", "내 드라이브", "Mi unidad", "Mon Drive")
+            hit = False
+            for leaf in leaves:
+                if os.path.isdir(os.path.join(root, leaf)):
+                    cands.append(os.path.join(root, leaf))
+                    hit = True
+            # 드라이브 루트 자체가 'My Drive' 인 구성도 있다. 다만 매핑된 네트워크 드라이브
+            # (Z: 등)를 통째로 후보로 넣으면 뒤의 구조 탐색이 사내 파일서버를 훑게 된다.
+            # → 우리 캐시 표식이 실제로 보일 때만 루트를 후보에 넣는다.
+            if not hit and (os.path.isdir(os.path.join(root, GDRIVE_SHARED_NS))
+                            or os.path.isdir(os.path.join(root, GDRIVE_PRIVATE_NS))):
+                cands.append(root)
     # WSL 에서 윈도우 드라이브가 /mnt/g 등으로 보이는 경우
     for letter in "gdefhijk":
         p = f"/mnt/{letter}"
@@ -81,7 +98,15 @@ def _vault_marker(p: str) -> bool:
     """
     try:
         for ns in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS):
-            if os.path.isdir(os.path.join(p, ns, "index")):
+            idx = os.path.join(p, ns, "index")
+            if not os.path.isdir(idx):
+                continue
+            # ★ '_shared/index' 라는 이름만으로 남의 폴더를 우리 캐시로 오인하면 안 된다.
+            #   Vault 는 생성 즉시 blob/table 디렉터리와 저널을 만들고 compact() 는
+            #   index.parquet 을 통째로 재작성하므로, 잘못 고르면 무관한 프로젝트의
+            #   인덱스를 덮어쓴다 — 절대 1원칙 위반이다. 우리 저널/파케이가 있어야 인정한다.
+            if (os.path.exists(os.path.join(idx, "index.jsonl"))
+                    or os.path.exists(os.path.join(idx, "index.parquet"))):
                 return True
     except Exception:
         pass
@@ -98,9 +123,12 @@ def _discover_vaults(drives: Sequence[str], max_depth: int = 3) -> List[str]:
     """
     found: List[str] = []
     budget = 4000
+    # 벽시계 예산도 함께 둔다. 느린 네트워크 드라이브에서는 디렉터리 수가 적어도
+    # scandir 한 번에 수백 ms 가 걸려, 개수 예산만으로는 몇 분씩 멈출 수 있다.
+    deadline = time.monotonic() + 20.0
     for d in drives:
         stack = [(d, 0)]
-        while stack and budget > 0:
+        while stack and budget > 0 and time.monotonic() < deadline:
             cur, depth = stack.pop()
             budget -= 1
             try:
@@ -108,8 +136,11 @@ def _discover_vaults(drives: Sequence[str], max_depth: int = 3) -> List[str]:
             except Exception:
                 continue
             for e in entries:
+                if budget <= 0 or time.monotonic() >= deadline:
+                    break            # scandir 한 번에 수천 개가 나올 수 있다 — 안쪽에서도 본다
                 if e.name.startswith((".", "$")) or e.name in ("__pycache__", "node_modules"):
                     continue
+                budget -= 1          # _vault_marker 의 isdir 비용도 예산에 포함한다
                 if _vault_marker(e.path):
                     if e.path not in found:
                         found.append(e.path)
@@ -158,6 +189,10 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
             LOG_FN(f"[루트] GDRIVE_ROOT='{p}' 를 만들 수 없습니다({type(e).__name__}). "
                    f"경로를 다시 확인하세요 — 자동 탐색으로 넘어갑니다.")
         if os.path.isdir(p):
+            if not exists:
+                _safe_print(f"[루트] ⚠ GDRIVE_ROOT 경로가 없어 새로 만들었습니다: {p}\n"
+                            f"        오타라면 기존 캐시를 한 건도 못 쓰고 전부 재수집합니다. "
+                            f"탐색기 주소창의 경로와 글자 하나까지 같은지 확인하세요.")
             return p, ("USER_SET_EXISTING" if exists else "USER_SET_CREATED"), \
                 _resolve_adopt_dirs(drives, extra=[p])
 
@@ -172,7 +207,11 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
     for tpl in GDRIVE_ROOT_CANDIDATES:
         expanded.extend(_expand_candidate(tpl, drives or [""]))
     # {DRIVE} 를 못 채운 후보(드라이브 없음)는 빈 접두사가 되어 무의미하므로 걸러낸다
-    expanded = [p for p in expanded if p and not p.startswith(("/MyDrive", "MyDrive"))]
+    # {DRIVE} 를 못 채운 후보는 '/MyDrive/...' 같은 접두사만 남는다. 윈도우에서는
+    # normpath 가 '\\MyDrive\\...' 로 바꿔 이 검사를 빠져나가고, abspath 가
+    # 'C:\\MyDrive\\...' 로 만들어 엉뚱한 곳에 캐시를 만든다 → 드라이브 문자를 떼고 본다.
+    expanded = [p for p in expanded
+                if p and not os.path.splitdrive(p)[1].lstrip("\\/").startswith("MyDrive")]
 
     # ③ 이름이 아니라 '구조'로 기존 캐시를 찾는다 — 이게 최우선이다.
     #    후보 이름이 사용자의 실제 폴더명과 달라 캐시를 통째로 놓치던 실패를 여기서 막는다.
@@ -183,10 +222,13 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
     if vaults:
         # 가장 알맹이가 많은 것을 고른다 (여러 개면 사용자가 실제로 쓰던 것일 확률이 높다)
         def _weight(p: str) -> int:
+            # ★ 디렉터리명이 틀려 있었다. Vault 가 만드는 것은 index/blob/table 이고
+            #   여기서는 tables/blobs 를 세고 있었다 — 결국 index 파일 수(1~3)만 세어
+            #   모든 후보의 점수가 같아졌고, '가장 알맹이 많은 것' 선택이 무의미했다.
             n = 0
             for ns in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS):
                 d = os.path.join(p, ns)
-                for sub in ("index", "tables", "blobs"):
+                for sub in ("table", "blob", "index"):
                     try:
                         n += len(os.listdir(os.path.join(d, sub)))
                     except Exception:

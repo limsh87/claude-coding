@@ -310,24 +310,36 @@ def hankyung_probe(end: str) -> Optional[int]:
                     return i
         except Exception:
             pass
-    ed = as_ts(end)
-    sd = (ed - pd.Timedelta(days=21)).strftime("%Y-%m-%d")
+    # ★ 프로브 창을 end 에서 그대로 잘라내면 안 된다. BACKTEST_END 를 여유 있게 미래로
+    #   잡아둔 사용자는 '미래 21일'을 조회하게 되고, 모든 후보가 200 + 빈 표를 돌려준다.
+    #   그러면 멀쩡히 살아 있는 소스를 "사이트 레이아웃이 바뀌었다"고 오진하고 버린다 —
+    #   이 재작성이 없애려던 바로 그 '한경 0건'을 프로브가 스스로 재현하는 셈이다.
+    #   → 오늘 이전으로 자르고, 그래도 비면 더 과거 창으로 한 번 더 본다.
+    ed0 = min(as_ts(end), as_ts(_dt.date.today()))
+    windows = [(ed0 - pd.Timedelta(days=45), ed0),
+               (ed0 - pd.Timedelta(days=400), ed0 - pd.Timedelta(days=340))]
     rows_out, best = [], None
-    for i, (desc, url, _mk) in enumerate(HK_ENDPOINTS):
-        html = _hk_request(i, sd, ed.strftime("%Y-%m-%d"), 1, 20)
-        if html is None:
-            rows_out.append([desc, "도달실패", "-", "-", "네트워크/차단/404"])
-            continue
-        n_bytes = len(html)
-        has_idx = "report_idx" in html
-        parsed = _hk_parse(html, "probe")
-        rows_out.append([desc, "200", f"{n_bytes:,}B",
-                         f"{len(parsed)}건", "OK" if parsed else
-                         ("표는 있으나 파싱 0" if has_idx else "리포트 링크 없음")])
-        if parsed and best is None:
-            best = i
+    for wi, (ws, we) in enumerate(windows):
+        sd, edd = ws.strftime("%Y-%m-%d"), we.strftime("%Y-%m-%d")
+        tag = "" if wi == 0 else " (과거창 재시도)"
+        for i, (desc, url, _mk) in enumerate(HK_ENDPOINTS):
+            html = _hk_request(i, sd, edd, 1, 20)
+            if html is None:
+                rows_out.append([desc + tag, "도달실패", "-", "-", "네트워크/차단/404"])
+                continue
+            n_bytes = len(html)
+            has_idx = "report_idx" in html
+            parsed = _hk_parse(html, "probe")
+            rows_out.append([desc + tag, "200", f"{n_bytes:,}B",
+                             f"{len(parsed)}건", "OK" if parsed else
+                             ("표는 있으나 파싱 0" if has_idx else "리포트 링크 없음")])
+            if parsed and best is None:
+                best = i
+        if best is not None:
+            break
     LOG.table(rows_out, ["엔드포인트 후보", "응답", "크기", "파싱", "판정"],
-              ["l", "l", "r", "r", "l"], title="한경컨센서스 엔드포인트 탐색")
+              ["l", "l", "r", "r", "l"],
+              title=f"한경컨센서스 엔드포인트 탐색 (프로브 창 {windows[0][0]:%Y-%m-%d}~{ed0:%Y-%m-%d})")
     if best is None:
         LOG.error(
             "한경컨센서스에서 리포트를 한 건도 파싱하지 못했습니다. 위 표가 원인을 가립니다:\n"
@@ -344,7 +356,7 @@ def hankyung_probe(end: str) -> Optional[int]:
     return best
 
 
-def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
+def hankyung_collect(start: str, end: str,
                      page_size: int = 80, max_pages: int = 400) -> pd.DataFrame:
     """연도 단위로 쪼개서 수집. 한 번에 10년을 요청하면 서버 페이지 상한에 걸린다.
 
@@ -358,9 +370,16 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
         # 한 달치만 있는 해를 '완료'로 보면 나머지 11개월을 영원히 못 받는다.
         cov = pdt.dt.to_period("M").astype(str).groupby(pdt.dt.year).nunique() \
             if len(pdt.dropna()) else pd.Series(dtype=int)
-        this_y = as_ts(end).year
         for y, n_m in cov.items():
-            need = 12 if int(y) < this_y else max(1, as_ts(end).month)
+            # ★ '그 해 12개월'이 아니라 '요청 구간과 겹치는 개월수'가 만점이다.
+            #   BACKTEST_START=2016-08 이면 2016년은 최대 5개월인데 12를 요구하면
+            #   영원히 미완결로 남아 매 실행마다 400페이지 스윕을 반복한다(2 QPS).
+            #   반대로 진짜로 잘린 해는 그대로 봉인된다 — 양쪽으로 틀린 규칙이었다.
+            lo = max(as_ts(start), as_ts(f"{int(y)}-01-01"))
+            hi = min(as_ts(end), as_ts(f"{int(y)}-12-31"))
+            if hi < lo:
+                continue
+            need = len(pd.period_range(lo, hi, freq="M"))
             if int(n_m) >= need:
                 have_years.add(int(y))
         LOG.info(f"공용 캐시에서 한경 {len(prev):,}건 재사용 — "
@@ -608,7 +627,26 @@ def _nv_missing_ranges(prev: Optional[pd.DataFrame], cat: str,
             if "category" in prev.columns else prev
         if len(sub):
             have = set(as_ts_series(sub["pub_date"]).dt.to_period("M").astype(str).dropna())
-    miss = [m for m in months if m not in have]
+    # ★ '한 행이라도 있으면 그 달은 보유'는 위험하다. 페이지 상한에 걸려 잘린 달이나
+    #   실행일 기준으로 아직 안 끝난 달이 그대로 봉인되어 영원히 채워지지 않는다.
+    #   → ⓐ 이웃 달 대비 행수가 현저히 적은 달과 ⓑ 마지막 2개월은 항상 다시 본다.
+    cnt = pd.Series(dtype=float)
+    if prev is not None and len(prev):
+        sub2 = prev[prev.get("category", pd.Series("", index=prev.index)).astype(str) == cat] \
+            if "category" in prev.columns else prev
+        if len(sub2):
+            cnt = (as_ts_series(sub2["pub_date"]).dt.to_period("M").astype(str)
+                   .value_counts().astype(float))
+    thin: set = set()
+    if len(cnt) >= 6:
+        med = float(cnt.median())
+        if med > 0:
+            thin = set(cnt[cnt < 0.30 * med].index)
+    tail = set(months[-2:])
+    miss = [m for m in months if (m not in have) or (m in thin) or (m in tail)]
+    if thin:
+        LOG.info(f"네이버 '{cat}' — 이웃 달 대비 수집량이 30% 미만인 {len(thin)}개월을 "
+                 f"보강 대상으로 되돌립니다(페이지 상한으로 잘렸을 가능성).")
     if not miss:
         return []
     out, run_lo, prev_m = [], miss[0], miss[0]
@@ -654,7 +692,13 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
             if not probe:
                 LOG.warn(f"네이버 '{cat}' {gs}~{ge} 리스트 접근 실패 — 이 구간을 건너뜁니다.")
                 continue
-            last = min(_nv_last_page(probe), max_pages)
+            n_pages = _nv_last_page(probe)
+            last = min(n_pages, max_pages)
+            LOG.info(f"네이버 '{cat}' {gs[:7]}~{ge[:7]} — {last:,}페이지")
+            if n_pages > max_pages:
+                LOG.warn(f"네이버 '{cat}' {gs[:7]}~{ge[:7]} 가 페이지 상한 {max_pages:,}에 "
+                         f"걸렸습니다(전체 {n_pages:,}페이지). 이 구간은 잘린 채로 저장되며, "
+                         f"다음 실행에서 '수집량 빈약'으로 자동 재시도됩니다.")
 
             def _pg(p: int, _b=base, _gs=gs, _ge=ge, _c=cat, _first=probe):
                 # ★ 파라미터 dict 를 기본인자로 공유하면 안 된다. 기본인자는 함수당 한 번만
@@ -718,6 +762,25 @@ def _nv_stratified(need: pd.DataFrame, limit: int) -> pd.DataFrame:
     return n
 
 
+def nv_load_detail_cache(cache: pd.DataFrame) -> Dict[str, dict]:
+    """저장된 상세 캐시를 {nid: {...}} 로 되돌린다.
+
+    ★ 여기서 itertuples 를 쓰면 안 된다. namedtuple 은 '_' 로 시작하는 필드명을 못 쓰므로
+      pandas 가 rename=True 로 '_detail_src' 를 위치 이름('_4')으로 바꿔 버리고,
+      r._detail_src 는 AttributeError 를 낸다. 1회차(캐시 없음)에는 이 경로를 안 타서
+      통과하고, 2회차부터 100% 죽는다 — "두 번째 실행부터 0초"가 "두 번째 실행부터 실패"가
+      되는, 가장 늦게 발견되는 종류의 고장이다. 계약 K20 이 이 왕복을 직접 검사한다.
+    """
+    if cache is None or not len(cache):
+        return {}
+    c = cache.drop_duplicates("src_report_id", keep="last")
+    cols = {k: (c[k] if k in c.columns else pd.Series([None] * len(c), index=c.index))
+            for k in ("src_report_id", "target_price", "opinion", "_detail_src")}
+    return {str(sid): {"target_price": tp, "opinion": op, "_detail_src": ds}
+            for sid, tp, op, ds in zip(cols["src_report_id"], cols["target_price"],
+                                       cols["opinion"], cols["_detail_src"])}
+
+
 def naver_enrich_detail(df: pd.DataFrame, limit: int = 0) -> pd.DataFrame:
     """네이버 상세 보강 — 애널리스트 바이라인(1순위)과 목표주가(부수)를 회수한다.
 
@@ -740,14 +803,28 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 0) -> pd.DataFrame:
     known: Dict[str, dict] = {}
     if cache is not None and len(cache):
         cache = cache.drop_duplicates("src_report_id", keep="last")
-        known = {str(r.src_report_id): {"target_price": r.target_price, "opinion": r.opinion,
-                                        "_detail_src": r._detail_src}
-                 for r in cache.itertuples(index=False)}
+        # ★ itertuples 를 쓰면 안 된다. namedtuple 은 '_' 로 시작하는 필드명을 허용하지 않아
+        #   rename=True 로 '_detail_src' → '_4' 가 되고, r._detail_src 는 AttributeError 다.
+        #   1회차(캐시 없음)에는 이 분기를 안 타므로 통과하고, 2회차부터 100% 죽는다.
+        #   즉 "두 번째 실행부터 0초"라는 약속이 "두 번째 실행부터 실패"가 된다.
+        #   컬럼으로 직접 zip 하면 이름 제약이 없다.
+        known = nv_load_detail_cache(cache)
         LOG.info(f"공용 캐시에서 네이버 상세 {len(known):,}건 재사용 — 다시 받지 않습니다.")
 
     is_nv = df["source"].astype(str).eq("naver") if "source" in df.columns else pd.Series(True, index=df.index)
     cat_ok = df["category"].astype(str).eq("company") if "category" in df.columns else pd.Series(True, index=df.index)
-    has_url = df["detail_url"].notna() if "detail_url" in df.columns else pd.Series(False, index=df.index)
+    # ★ 캐시에서 올라온 행은 detail_url 이 비어 있을 수 있다(구버전 JSON 경로 등).
+    #   그걸 그대로 두면 nid 만으로 만들 수 있는데도 영원히 바이라인 보강 대상에서 빠진다.
+    df = df.copy()
+    if "detail_url" not in df.columns:
+        df["detail_url"] = None
+    _need_url = df["detail_url"].isna()
+    if _need_url.any() and "src_report_id" in df.columns:
+        _cats = df.get("category", pd.Series("company", index=df.index)).astype(str)
+        df.loc[_need_url, "detail_url"] = [
+            _nv_detail_url(c, n) for c, n in
+            zip(_cats[_need_url], df.loc[_need_url, "src_report_id"])]
+    has_url = df["detail_url"].notna()
     # ★ 결측 id 를 astype(str) 하면 전부 "nan" 이 되어 서로 같은 키가 된다.
     #   그 상태로 merge 하면 서로 다른 리포트에 같은 애널리스트·목표주가가 붙는다
     #   (원장 오염 → 링크 행렬 오염 → 신호 오염). 아예 대상에서 빼는 것이 유일한 안전책이다.
@@ -796,21 +873,27 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 0) -> pd.DataFrame:
             part = jobs[k0:k0 + CH]
             res = pmap_io(_one, part, workers=w,
                           desc=f"네이버 상세 {k0 // CH + 1}/{(len(jobs) - 1) // CH + 1}")
-            acc.extend([r for r in res if r])
             # ★ 청크마다 즉시 영속화 — 여기서 끊겨도 다음 실행이 이어받는다
+            got_now = [r for r in res if r]
+            # ★ 누계(len(acc))가 아니라 이번 청크분(len(got_now))을 등록한다.
+            #   누계를 매 청크 더하면 45,000건이 원장에 427,500건으로 찍힌다.
+            note_new_data("naver_research_detail", len(got_now), "shared", "research", "naver")
+            acc.extend(got_now)
             if acc:
                 snap = pd.DataFrame(acc)
                 full = pd.concat([x for x in (cache, snap) if x is not None and len(x)],
                                  ignore_index=True).drop_duplicates("src_report_id", keep="last")
-                note_new_data("naver_research_detail", len(snap), "shared", "research", "naver")
                 persist("naver_research_detail", full.reindex(columns=NV_DETAIL_COLS),
                         scope="shared", domain="research", source="naver detail")
             del res
         for r in acc:
             known[str(r["src_report_id"])] = r
         LOG.ok(f"네이버 상세 신규 {len(acc):,}건 — "
-               f"바이라인 {sum(1 for r in acc if r.get('_detail_src')):,}건 / "
+               f"바이라인 문자열 {sum(1 for r in acc if r.get('_detail_src')):,}건 / "
                f"목표주가 {sum(1 for r in acc if r.get('target_price') is not None):,}건")
+        LOG.info("※ '바이라인 문자열'은 상세페이지 출처란의 원문이며, 증권사명만 있고 사람 "
+                 "이름이 없는 경우도 포함됩니다. 실제 애널리스트 식별 성공률은 parse_byline "
+                 "이후의 Phase 0 게이트 수치로 판단하세요(이 숫자는 상한입니다).")
 
     if not known:
         return df
@@ -935,12 +1018,20 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
         return df
 
     idx = VAULT.load_index("shared")
-    known = {}
+    known: Dict[str, str] = {}
+    known_path: Dict[str, str] = {}
     if len(idx) and "domain" in idx.columns:
         sub = idx[(idx["domain"].astype(str) == "research") &
                   (idx["subtype"].astype(str) == "report_pdf")]
         # iterrows 는 30만 행에서 13초를 쓴다. zip 은 같은 결과를 0.2초에 만든다.
         known = dict(zip(sub["key"].astype(str), sub["uid"].astype(str)))
+        # ★ 경로도 함께 미리 뽑아 둔다. 안 그러면 캐시 적중마다 VAULT.get_blob 이
+        #   전체 인덱스에 astype(str) 비교를 돌린다(30만행 × 6만건 = 180억 회 문자열 비교,
+        #   GIL 아래 10 스레드). 진행률도 안 보이는 구간이라 '멈춤'과 구분되지 않는다.
+        if "abs_path" in sub.columns:
+            known_path = {str(k): str(pth) for k, pth in
+                          zip(sub["key"].astype(str), sub["abs_path"].astype(str))
+                          if pth and str(pth) != "nan"}
     n_cached = sum(1 for k in work["report_uid"] if k in known)
 
     # 디스크 방어 — 실측에서 free_gb 가 nan 이라 이 점검이 무력했다(윈도우 statvfs 부재)
@@ -949,16 +1040,32 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     est_gb = n_new * 0.3 / 1024.0
     if math.isfinite(free) and est_gb > free * 0.5 and n_new:
         allow = max(0, int((free * 0.5) / (0.3 / 1024.0)))
+        # ★ head(n_cached + allow) 는 상한이 아니다. 캐시 보유분은 work 전체에 흩어져
+        #   있으므로 앞에서 잘라도 그 안에 신규가 얼마나 섞였는지 알 수 없다.
+        #   실제로 allow=1,024 를 광고하면서 5,684건을 받는 일이 벌어진다.
+        #   → 위치가 아니라 '캐시 보유 여부'로 갈라서 신규분만 정확히 자른다.
+        is_cached = work["report_uid"].astype(str).isin(known)
+        work = pd.concat([work[is_cached], work[~is_cached].head(allow)], ignore_index=True)
         LOG.warn(f"PDF 예상 용량 {est_gb:.1f}GB > 여유 {free:.1f}GB 의 절반 — "
-                 f"{allow:,}건으로 제한합니다. 나머지는 다음 실행에서 이어받습니다.")
-        work = work.head(n_cached + allow)
+                 f"신규 다운로드를 {min(allow, n_new):,}건으로 제한합니다"
+                 f"(캐시 보유 {int(is_cached.sum()):,}건은 그대로 사용). "
+                 f"나머지는 다음 실행에서 이어받습니다.")
     LOG.info(f"PDF 대상 {len(work):,}건 (드라이브 캐시 보유 {n_cached:,}건 / "
              f"신규 {max(0, len(work) - n_cached):,}건, 여유 {free:.1f}GB)")
 
     def _one(rec):
         uid, url = rec
         if uid in known:
-            data = VAULT.get_blob(known[uid], "shared")
+            data = None
+            pth = known_path.get(uid)
+            if pth and os.path.exists(pth):          # 인덱스 스캔 없이 바로 읽는다
+                try:
+                    with open(pth, "rb") as fh:
+                        data = fh.read()
+                except Exception:
+                    data = None
+            if not data:
+                data = VAULT.get_blob(known[uid], "shared")
             if data:
                 return (uid, known[uid], data)
             # 인덱스에는 있는데 실제 파일이 없으면(드라이브 동기화 누락 등) 재수집으로 폴백한다.
@@ -971,42 +1078,69 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
 
     jobs = list(zip(work["report_uid"].astype(str), work["pdf_url"].astype(str)))
     PDF_CHUNK = 2000
-    rows, ok = [], 0
+    rows, ok, n_savefail = [], 0, 0
     # pymupdf 는 페이지마다 'Could not get FontBBox' 를 C 레벨에서 stderr 로 뱉는다.
     # 6만 건이면 수십만 줄이고, 주피터 IOPub 한도를 터뜨려 출력이 정지한다 → 통째로 봉인.
     n_chunk = (len(jobs) - 1) // PDF_CHUNK + 1
     for k0 in range(0, len(jobs), PDF_CHUNK):
         chunk = jobs[k0:k0 + PDF_CHUNK]
-        # ★ 봉인 범위를 '수다를 떠는 구간'으로만 좁힌다. VAULT.flush 까지 감싸면 저장 실패
-        #   경고가 화면에서 사라진다 — 캐시가 안 남는 사고를 눈으로 못 보게 되는 셈이다.
-        with quiet_fds():
-            res = pmap_io(_one, chunk, workers=min(N_WORKERS_IO, 10), desc="", quiet=True)
-            for r in res:
-                if not r:
-                    continue
-                uid, existing_blob_uid, data = r
-                if not data:
-                    continue
+        # ★ 봉인 범위를 'PDF 파싱' 한 줄로 좁힌다.
+        #   다운로드 루프까지 감싸고 desc="" · quiet=True 로 두면, 가장 오래 걸리는 작업이
+        #   몇 시간 동안 화면에 아무것도 안 찍는다. 사용자는 그걸 '멈춤'으로 읽고 커널을
+        #   죽인다 — 출력 폭주를 막으려다 정확히 같은 피해를 만드는 셈이다.
+        #   폰트 경고는 silence_thirdparty() 의 mupdf_display_errors(False) 로 이미 대부분
+        #   차단되며, 남는 C 레벨 출력만 파싱 순간에 봉인하면 충분하다.
+        res = pmap_io(_one, chunk, workers=min(N_WORKERS_IO, 10),
+                      desc=f"리포트 PDF {k0 // PDF_CHUNK + 1}/{n_chunk}")
+        for r in res:
+            if not r:
+                continue
+            uid, existing_blob_uid, data = r
+            if not data:
+                continue
+            blob_uid = existing_blob_uid
+            if not blob_uid:
+                bp = VAULT.put_blob("research", "report_pdf", uid, data, "pdf",
+                                    source="report_pdf", scope="shared")
+                if bp:
+                    blob_uid = sha1_str("research", "report_pdf", uid, sha1_bytes(data))
+                    ok += 1
+                else:
+                    n_savefail += 1     # 받았지만 드라이브에 못 남긴 것 — 구분해서 센다
+            else:
                 ok += 1
-                blob_uid = existing_blob_uid
-                if not blob_uid:
-                    p = VAULT.put_blob("research", "report_pdf", uid, data, "pdf",
-                                       source="report_pdf", scope="shared")
-                    blob_uid = sha1_str("research", "report_pdf", uid, sha1_bytes(data)) if p else ""
+            with quiet_fds():
                 f = pdf_extract_fields(pdf_text(data))
-                rows.append({"report_uid": uid, "pdf_uid": blob_uid, **f})
-            del res
+            rows.append({"report_uid": uid, "pdf_uid": blob_uid, **f})
+        del res
         VAULT.flush("shared")
         LOG.info(f"PDF {k0 // PDF_CHUNK + 1}/{n_chunk} 청크 완료 — 누적 확보 {ok:,}건")
     VAULT.flush("shared")
-    LOG.ok(f"PDF 확보 {ok:,}/{len(jobs):,}건 — 공용 인덱스에 저장(내용해시 중복제거 적용)")
+    LOG.ok(f"PDF 저장 {ok:,}/{len(jobs):,}건 — 공용 인덱스(내용해시 중복제거 적용)")
+    if n_savefail:
+        LOG.error(f"PDF {n_savefail:,}건은 내려받았지만 드라이브에 저장하지 못했습니다 — "
+                  f"다음 세션에서 재호출할 수 없습니다(디스크 여유·동기화 확인).")
     if not rows:
         return df
-    ext = pd.DataFrame(rows)
+    ext = pd.DataFrame(rows).drop_duplicates("report_uid", keep="last")   # 증식 방지
     note_new_data("research_pdf_fields", len(ext), "shared", "research", "pdf")
     persist("research_pdf_fields", ext, scope="shared", domain="research", source="pdf extract")
     for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target"):
         if c in df.columns:
             df = df.drop(columns=[c])
+    n_before = len(df)
     df = df.merge(ext, on="report_uid", how="left")
+    if len(df) != n_before:
+        LOG.warn(f"PDF 병합에서 행수가 {n_before:,}→{len(df):,} 로 변했습니다 — "
+                 f"중복 report_uid 입니다. 원장 기준으로 접습니다.")
+        df = df.drop_duplicates("report_uid", keep="first")
+    # ★ 좌측조인에서 안 붙은 행은 NaN(float)이 된다. np.nan 은 참이라
+    #   build_analyst_ledger 의 `praw = getattr(r,"pdf_analysts","") or ""` 를 통과하고,
+    #   str(nan)="nan" 이 애널리스트 이름이 되어 브로커마다 유령 애널리스트가 하나씩 생긴다.
+    #   그 유령은 해당 브로커의 미식별 리포트 전부를 '공동 커버'하므로 링크 행렬에
+    #   거대한 완전그래프 블록을 만든다 — 신호가 브로커 평균으로 붕괴한다.
+    for c in ("pdf_analysts", "pdf_emails"):
+        if c in df.columns:
+            df[c] = df[c].where(df[c].notna(), "").astype(str).replace(
+                {"nan": "", "None": "", "<NA>": ""})
     return df

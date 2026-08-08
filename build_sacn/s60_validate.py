@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-V  계약 자동검정 K1~K19  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
+# ║  L0-V  계약 자동검정 K1~K21  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
 # ║                                                                                          ║
 # ║  세 검증은 서로 다른 것을 본다. 하나로 합칠 수 없다:                                       ║
 # ║   · 계약검정 : 협상 불가 규칙(PIT·생존편향·사전등록)이 코드에 실제로 박혀 있는가            ║
@@ -25,15 +25,29 @@ def _src(*objs) -> str:
             out.append(inspect.getsource(o))
         except Exception:
             pass
+    if not out:
+        # ★ 빈 문자열을 돌려주면 모든 `'x' in src` 검사가 False 가 되어, 소스검사 계약
+        #   6개가 한꺼번에 '위반'으로 뒤집히고 strict 모드가 실행을 죽인다.
+        #   exec(open(...).read()) 나 일부 %paste 경로가 정확히 이 상태다 —
+        #   진짜 위반이 하나도 없는데 6건 위반으로 멈춘다. 검사 불가는 SKIP 이어야 한다.
+        raise _SrcUnavailable("inspect.getsource 로 소스를 얻을 수 없는 실행 방식입니다"
+                              " (예: exec(open(...).read())). 소스검사 계약만 건너뜁니다.")
     return "\n".join(out)
 
 
+class _SrcUnavailable(Exception):
+    """소스 텍스트를 얻을 수 없는 환경 — 계약 위반이 아니라 '검사 불가'다."""
+
+
 def _k(cid: str, name: str, fn: Callable[[], Tuple[bool, str]]):
+    skip = False
     try:
         ok, msg = fn()
+    except _SrcUnavailable as e:
+        ok, msg, skip = True, f"검사 불가 — {e}", True
     except Exception as e:                                    # noqa
         ok, msg = False, f"{type(e).__name__}: {str(e)[:180]}"
-    CONTRACTS.append({"id": cid, "name": name, "pass": bool(ok), "msg": msg})
+    CONTRACTS.append({"id": cid, "name": name, "pass": bool(ok), "msg": msg, "skip": skip})
 
 
 def _synth(n_codes: int = 140, n_months: int = 54, n_analysts: int = 90,
@@ -239,7 +253,7 @@ def run_selftest(full: bool = True) -> bool:
 
 # ── 계약 검정 ───────────────────────────────────────────────────────────────────────────────
 def run_contract_tests(strict: bool = True) -> bool:
-    LOG.banner("계약 자동검정 K1~K19", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
+    LOG.banner("계약 자동검정 K1~K21", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
     CONTRACTS.clear()
 
     def k1():
@@ -343,8 +357,20 @@ def run_contract_tests(strict: bool = True) -> bool:
             "src_report_id": [f"{i}" for i in range(len(months) * 50)]})
         picked = _nv_stratified(need, 200)
         cov = as_ts_series(picked["pub_date"]).dt.to_period("M").nunique()
-        return (cov >= min(len(months), 200)), \
-            f"상한 200건이 {cov}/{len(months)}개월에 고루 배분됨 (최신순 편식 아님)"
+        why = []
+        if len(picked) != 200:
+            # 상한을 무시하고 need 를 그대로 돌려줘도 커버리지 검사만으로는 통과한다.
+            # 그 실패 모드가 곧 '45,000건 무제한 요청'이므로 반드시 함께 본다.
+            why.append(f"상한 미적용: {len(picked)}건 반환(기대 200)")
+        if cov < min(len(months), 200):
+            why.append(f"시간축 편식: {cov}/{len(months)}개월")
+        # 상한 < 개월수 구간(실제로 문제가 되는 영역)도 확인한다
+        few = _nv_stratified(need, 30)
+        cov2 = as_ts_series(few["pub_date"]).dt.to_period("M").nunique()
+        if len(few) != 30 or cov2 != 30:
+            why.append(f"상한 30 에서 {len(few)}건/{cov2}개월 (기대 30/30)")
+        return (not why), ("상한이 지켜지고 월별로 고루 배분됨 (최신순 편식 아님)"
+                           if not why else " · ".join(why))
 
     def k16():
         """가격 수집 대상 축소가 상장폐지 보통주를 절대 버리지 않는가 (생존자편향)."""
@@ -355,7 +381,19 @@ def run_contract_tests(strict: bool = True) -> bool:
             "listing_date": [as_ts("2000-01-01")] * 5,
             "delisting_date": [pd.NaT, pd.NaT, pd.NaT, as_ts("2019-05-01"), pd.NaT]})
         keep, _aud = price_target_codes(sec)
+        # ★ 실제 환경에서 name 은 자주 비어 있고(pykrx 부재 시 특히), 그러면 이름 패턴
+        #   판정이 통째로 무력해진다. 이름 없는 보통주가 살아남는지도 함께 본다.
+        sec2 = sec.copy()
+        sec2.loc[sec2["code"] == "037350", "name"] = ""
+        keep2, _a2 = price_target_codes(sec2)
         missing = [c for c in ("037350", "005930") if c not in keep]
+        if "037350" not in keep2:
+            missing.append("037350(이름없음)")
+        # 이름 패턴이 보통주를 삼키지 않는지 (구버전의 '파워' 부분일치 사고)
+        sec3 = pd.DataFrame({"code": ["047310"], "name": ["파워로직스"], "market": ["KOSDAQ"],
+                             "listing_date": [as_ts("2000-01-01")], "delisting_date": [pd.NaT]})
+        if "047310" not in price_target_codes(sec3)[0]:
+            missing.append("047310 파워로직스(보통주인데 ETF 로 오분류)")
         leaked = [c for c in ("005935", "069500", "323230") if c in keep]
         ok = (not missing) and (not leaked)
         if not ok:
@@ -363,18 +401,53 @@ def run_contract_tests(strict: bool = True) -> bool:
         return ok, f"폐지 보통주 유지 · 우선주/ETF/스팩 제외 → 대상 {len(keep)}종목"
 
     def k17():
-        """리허설 중에는 어떤 것도 드라이브에 쓰이지 않는가 (절대 1원칙)."""
+        """리허설 중에는 '어떤 경로로도' 드라이브에 쓰이지 않는가 (절대 1원칙).
+
+        ★ persist() 하나만 검사하면 안 된다. 그 주장은 "어떤 것도 쓰이지 않는다" 인데,
+          put_table / put_blob / _save_links 는 별도의 경로다. 그래서 Vault 수준에서
+          쓰기 횟수를 세고, 리허설이 실제로 도는 동안 0 인지 확인한다.
+        """
         g = globals()
-        before = len(CACHE_LEDGER)
+        V = g.get("VAULT")
+        if V is None:
+            raise _SrcUnavailable("VAULT 미초기화 — 이 계약은 런타임에서만 검사 가능합니다")
+        n_led = len(CACHE_LEDGER)
+        calls: List[str] = []
+        orig_t, orig_b = V.__class__.put_table, V.__class__.put_blob
+        orig_save = g.get("_save_links")
+
+        def _spy_t(self, name, df, *a, **kw):
+            calls.append(f"put_table:{name}")
+            return None
+
+        def _spy_b(self, *a, **kw):
+            calls.append("put_blob")
+            return None
+
+        def _spy_s(*a, **kw):
+            calls.append("_save_links")
+            return None
+
+        V.__class__.put_table, V.__class__.put_blob = _spy_t, _spy_b
+        if orig_save is not None:
+            g["_save_links"] = _spy_s
         g["_REHEARSAL"] = True
         try:
             wrote = persist("__contract_probe__", pd.DataFrame({"a": [1]}),
                             scope="shared", domain="test", source="k17")
+            S = _synth(n_codes=20, n_months=14, n_analysts=12)
+            build_link_matrices(S["ledger"], pd.DatetimeIndex(S["months"]), S["codes"],
+                                "unweighted", use_cache=False)
         finally:
             g["_REHEARSAL"] = False
-        last = CACHE_LEDGER[-1] if len(CACHE_LEDGER) > before else {}
-        return (wrote is False and last.get("action") == "리허설-저장금지"), \
-            "리허설 플래그가 켜지면 persist() 가 쓰기를 거부한다"
+            V.__class__.put_table, V.__class__.put_blob = orig_t, orig_b
+            if orig_save is not None:
+                g["_save_links"] = orig_save
+            del CACHE_LEDGER[n_led:]          # 프로브 흔적을 원장에 남기지 않는다
+        bad = [c for c in calls]
+        return (wrote is False and not bad), \
+            ("리허설 중 Vault 쓰기 0건 (persist·put_table·put_blob·_save_links 전부)"
+             if not bad else f"리허설 중 쓰기 발생: {sorted(set(bad))}")
 
     def k18():
         """레이트 버킷이 실제 호스트와 일치하는가 (구버전 병목의 재발 방지).
@@ -382,30 +455,134 @@ def run_contract_tests(strict: bool = True) -> bool:
         FDR 호출이 krx 버킷(2 QPS)을 쓰면 종목 수 ÷ 2초가 그대로 벽시계가 된다.
         실측 2,875초의 정체가 이것이었으므로, 소스코드 수준에서 못 돌아가게 못 박는다.
         """
-        src = _src(_px_fdr)
         why = []
-        if 'limiter("fdr")' not in src or 'limiter("krx")' in src:
-            why.append("_px_fdr 이 fdr 버킷을 쓰지 않음")
-        if 'source="naver_chart"' not in _src(_px_naver):
-            why.append("_px_naver 가 naver_chart 버킷을 쓰지 않음")
-        if float(RATE_LIMIT_QPS.get("fdr", 0)) <= float(RATE_LIMIT_QPS.get("krx", 99)):
-            why.append("fdr QPS 가 krx QPS 이하")
-        for b in ("fdr", "naver_chart", "naver_detail"):
+        # ① 병목의 원인이었던 오배정: 네이버 차트를 부르는 경로가 KRX 버킷(2 QPS)에 묶임
+        if 'limiter("krx")' in _src(_px_fdr):
+            why.append("_px_fdr 이 KRX 버킷을 쓴다(구버전 병목 재발)")
+        if 'source="krx' in _src(_px_naver):
+            why.append("_px_naver 가 KRX 버킷을 쓴다")
+        # ② 같은 호스트는 같은 버킷을 공유해야 한다.
+        #    FinanceDataReader 의 한국주식 리더는 내부적으로 fchart.stock.naver.com 을
+        #    부른다 — _px_naver 와 같은 서버다. 버킷을 나누면 한 서버에 두 배가 나간다.
+        if PRICE_BUCKET.get("fdr") != PRICE_BUCKET.get("naver"):
+            why.append(f"같은 호스트인데 버킷이 다름: fdr={PRICE_BUCKET.get('fdr')} "
+                       f"naver={PRICE_BUCKET.get('naver')}")
+        # ③ 실제 요청 경로가 그 버킷을 쓰는지 (런타임 관측)
+        seen = []
+        _orig = globals()["limiter"]
+
+        def _spy(name, _o=_orig, _s=seen):
+            _s.append(name)
+            return _o(name)
+        globals()["limiter"] = _spy
+        try:
+            _px_fdr("000000", "2020-01-01", "2020-01-05")     # fdr 미설치면 즉시 None
+        except Exception:
+            pass
+        finally:
+            globals()["limiter"] = _orig
+        if fdr is not None and seen and seen[0] != PRICE_BUCKET["fdr"]:
+            why.append(f"_px_fdr 실측 버킷={seen[0]} (선언={PRICE_BUCKET['fdr']})")
+        # ④ 병목 재발 방지: 가격 경로 버킷이 KRX 보다 빨라야 한다
+        if float(RATE_LIMIT_QPS.get(PRICE_BUCKET["fdr"], 0)) <= float(RATE_LIMIT_QPS.get("krx", 99)):
+            why.append("가격 버킷 QPS 가 krx 이하 — 구버전과 같은 병목")
+        for b in ("naver_chart", "naver_detail"):
             if b not in RATE_LIMIT_QPS:
                 why.append(f"버킷 '{b}' 미정의")
-        return (not why), ("FDR/네이버차트가 KRX 버킷을 쓰지 않고 각자 버킷을 쓴다"
+        return (not why), ("가격 경로가 호스트 기준 버킷을 쓰고 KRX 예산에 묶이지 않는다"
                            if not why else " · ".join(why))
 
     def k19():
-        """신규 수집물은 예외 없이 persist() 를 거치는가 (세션 무관 재호출 보장)."""
-        bad = []
-        for fn in (fetch_prices, fetch_mktcap_monthly, fetch_fundamental_monthly,
-                   hankyung_collect, naver_collect, naver_enrich_detail):
-            s = _src(fn)
-            if ("persist(" not in s) and ("put_table" not in s):
-                bad.append(fn.__name__)
-        return (not bad), ("모든 수집 함수가 드라이브 저장 경로를 갖는다"
-                           if not bad else f"저장 경로 없는 수집 함수: {bad}")
+        """드라이브 쓰기에 '영수증'이 빠진 경로가 없는가 (세션 무관 재호출 보장).
+
+        ★ 구버전은 소스에 'persist(' 나 'put_table' 문자열이 있는지만 봤다. 그건
+          ⓐ 주석에도 걸리고 ⓑ note_new_data 유무를 전혀 못 보며 ⓒ 목록에 없는 함수는
+          아예 검사하지 않는다. 실제로 가장 큰 데이터셋(krx_ohlcv_daily)이 영수증 없이
+          put_table 만 부르고 있었는데도 이 계약은 초록불이었다.
+          → 런타임에 Vault 쓰기를 가로채, 그 이름이 _NEW_DATA 에 등록돼 있는지 본다.
+        """
+        V = globals().get("VAULT")
+        if V is None:
+            raise _SrcUnavailable("VAULT 미초기화 — 이 계약은 런타임에서만 검사 가능합니다")
+        n_led = len(CACHE_LEDGER)
+        seen: List[str] = []
+        orig = V.__class__.put_table
+
+        def _spy(self, name, df, *a, **kw):
+            seen.append(str(name))
+            return orig(self, name, df, *a, **kw)
+        V.__class__.put_table = _spy
+        try:
+            note_new_data("__k19_probe__", 3, "shared", "test", "k19")
+            ok_flag = persist("__k19_probe__", pd.DataFrame({"a": [1, 2, 3]}),
+                              scope="private", domain="test", source="k19")
+            _led, viol = cache_audit()
+        finally:
+            V.__class__.put_table = orig
+            del CACHE_LEDGER[n_led:]
+            _NEW_DATA.pop("__k19_probe__", None)
+        why = []
+        if "__k19_probe__" not in seen:
+            why.append("persist() 가 Vault 쓰기를 수행하지 않음")
+        if not ok_flag:
+            why.append("persist() 가 성공을 보고하지 않음")
+        if any("__k19_probe__" in v for v in viol):
+            why.append("영수증이 있는데도 위반으로 집계됨")
+        # 영수증이 없는 상태에서 감사가 실제로 잡아내는지(역방향)
+        note_new_data("__k19_orphan__", 5, "shared", "test", "k19")
+        try:
+            _led2, viol2 = cache_audit()
+            if not any("__k19_orphan__" in v for v in viol2):
+                why.append("저장되지 않은 신규 수집물을 감사가 잡아내지 못함")
+        finally:
+            _NEW_DATA.pop("__k19_orphan__", None)
+            del CACHE_LEDGER[n_led:]
+        return (not why), ("persist 경로가 실제로 쓰고, 영수증 없는 수집물을 감사가 잡아낸다"
+                           if not why else " · ".join(why))
+
+    def k20():
+        """상세 캐시 왕복 — 저장했다 되읽었을 때 바이라인이 살아 있는가.
+
+        ★ 이 계약이 없어서 '2회차 실행이 반드시 죽는' 결함을 1회차 테스트가 전부 통과시켰다.
+          캐시가 비어 있으면 적재 경로를 아예 안 타기 때문이다. 그래서 여기서는 일부러
+          캐시가 '있는' 상태를 만들어 되읽힌다.
+        """
+        c = pd.DataFrame([{"src_report_id": "12345", "detail_url": "u",
+                           "target_price": 70000.0, "opinion": "BUY",
+                           "_detail_src": "미래에셋증권 홍길동",
+                           "fetched_at": as_ts("2026-01-02")}])
+        k = nv_load_detail_cache(c)
+        ok = (k.get("12345", {}).get("_detail_src") == "미래에셋증권 홍길동")
+        return ok, ("상세 캐시 왕복에서 _detail_src 보존" if ok
+                    else f"바이라인 유실 — 되읽은 값: {k}")
+
+    def k21():
+        """결측 PDF 필드가 'nan' 이라는 유령 애널리스트를 만들지 않는가.
+
+        np.nan 은 참이라 `praw or ""` 를 통과하고 str(nan)='nan' 이 이름이 된다.
+        그 유령은 같은 브로커의 미식별 리포트 전부를 공동커버하는 완전그래프를 만들어
+        링크 행렬을 브로커 평균으로 붕괴시킨다 — 신호 자체가 다른 것이 되어 버린다.
+        """
+        rep = pd.DataFrame([{
+            "report_uid": f"u{i}", "source": "naver", "pub_date": as_ts("2020-05-11"),
+            "stock_code": f"00593{i}", "stock_name": "합성", "broker_id": "B1",
+            "broker_name": "합성증권", "analyst_raw": "", "target_price": np.nan,
+            "opinion": "BUY", "broker_raw": "합성증권", "category": "company",
+            "src_report_id": f"{i}", "title": "합성", "detail_url": None, "pdf_url": None,
+            "knowledge_date": as_ts("2020-05-12"), "event_date": as_ts("2020-05-11"),
+            "pdf_analysts": np.nan, "pdf_emails": np.nan, "pdf_target": np.nan,
+        } for i in range(3)])
+        try:
+            A, L = build_analyst_ledger(rep)
+        except Exception as e:                                # noqa
+            return False, f"{type(e).__name__}: {str(e)[:80]}"
+        names = set()
+        for c in ("analyst_name", "name", "analyst_raw"):
+            if L is not None and len(L) and c in L.columns:
+                names |= set(L[c].astype(str).str.strip().str.lower())
+        bad = names & {"nan", "none", "<na>"}
+        return (not bad), ("결측 PDF 필드가 애널리스트로 승격되지 않음"
+                           if not bad else f"유령 애널리스트 생성됨: {bad}")
 
     for cid, name, fn in [
         ("K1", "미래누수 차단 (PIT 게이트)", k1),
@@ -427,12 +604,21 @@ def run_contract_tests(strict: bool = True) -> bool:
         ("K17", "리허설 중 캐시 쓰기 차단", k17),
         ("K18", "레이트 버킷 ↔ 실제 호스트 일치", k18),
         ("K19", "신규 수집물 전량 드라이브 저장", k19),
+        ("K20", "상세 캐시 왕복 — 바이라인 보존", k20),
+        ("K21", "결측 PDF 필드가 유령 애널리스트를 안 만듦", k21),
     ]:
         _k(cid, name, fn)
 
-    LOG.table([[c["id"], c["name"], "✔" if c["pass"] else "✘", _trunc(c["msg"], 54)]
+    LOG.table([[c["id"], c["name"],
+                ("—" if c.get("skip") else ("✔" if c["pass"] else "✘")),
+                _trunc(c["msg"], 54)]
                for c in CONTRACTS], ["ID", "계약", "판정", "근거/사유"],
               ["c", "l", "c", "l"], maxw=56)
+    n_skip = sum(1 for c in CONTRACTS if c.get("skip"))
+    if n_skip:
+        LOG.warn(f"소스검사 계약 {n_skip}건을 '검사 불가'로 건너뛰었습니다 — "
+                 f"위반이 없다는 뜻이 아니라 확인하지 못했다는 뜻입니다. "
+                 f"파일로 실행하면(python <파일>) 전부 검사됩니다.")
     fails = [c for c in CONTRACTS if not c["pass"]]
     if fails:
         LOG.error(f"계약 위반 {len(fails)}건: {[c['id'] for c in fails]}")
@@ -440,7 +626,8 @@ def run_contract_tests(strict: bool = True) -> bool:
             raise RuntimeError(f"계약 검정 실패 {[c['id'] for c in fails]} — "
                                f"실데이터 수집을 시작하지 않습니다.")
         return False
-    LOG.ok(f"계약 {len(CONTRACTS)}건 전부 통과")
+    LOG.ok(f"계약 {len(CONTRACTS) - n_skip}건 전부 통과"
+           + (f" (검사 불가 {n_skip}건)" if n_skip else ""))
     return True
 
 

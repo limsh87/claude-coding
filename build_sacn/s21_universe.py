@@ -20,7 +20,7 @@ UNI_GATES = ["① 상장중(PIT)", "② 시장/증권 종류", "③ 가격 보�
 #   유니버스 패널에서 쓰이지도 않으면서 universe_YYYYMM.parquet 안에 들어가면,
 #   PIT 스냅샷이라는 이름의 파일에 미래 정보가 담긴 채로 남는다 — 장전된 총이다. 아예 빼둔다.
 UNIVERSE_COLS = ["code", "month", "market", "close_m", "adv20", "mktcap", "shares",
-                 "sector", "bm", "in_universe"]
+                 "mcap_approx", "sector", "bm", "in_universe"]
 
 
 class SACNUniverse:
@@ -30,6 +30,8 @@ class SACNUniverse:
         self.attrition: List[dict] = []
         self.panel: Optional[pd.DataFrame] = None
         self.saved_months: List[str] = []
+        self.mcap_partial_months: List[tuple] = []   # 커버리지 부족으로 결측을 통과시킨 달
+        self.mcap_skipped_months: List[Any] = []     # 시총이 통째로 없어 하한을 못 건 달
 
     def _mark(self, month, gate: str, n: int):
         self.attrition.append({"month": as_ts(month), "gate": gate, "n": int(n)})
@@ -44,10 +46,12 @@ class SACNUniverse:
         pm = pm.set_index(["code", "month"])
 
         mc = mcap.copy() if mcap is not None and len(mcap) else pd.DataFrame(
-            columns=["code", "month", "mktcap", "shares"])
+            columns=["code", "month", "mktcap", "shares", "mktcap_is_approx"])
         if len(mc):
             mc["code"] = mc["code"].astype(str)
             mc["month"] = as_ts_series(mc["month"])
+            if "mktcap_is_approx" not in mc.columns:
+                mc["mktcap_is_approx"] = False
             mc = mc.drop_duplicates(["code", "month"]).set_index(["code", "month"])
 
         fd = fund.copy() if fund is not None and len(fund) else pd.DataFrame(
@@ -79,6 +83,9 @@ class SACNUniverse:
             for c in ("close", "adv20"):
                 g[c] = pm[c].reindex(idx) if c in pm.columns else np.nan
             g["mktcap"] = mc["mktcap"].reindex(idx) if "mktcap" in getattr(mc, "columns", []) else np.nan
+            g["mcap_approx"] = (mc["mktcap_is_approx"].reindex(idx).fillna(False).astype(bool)
+                                if "mktcap_is_approx" in getattr(mc, "columns", [])
+                                else pd.Series(False, index=idx))
             g["shares"] = mc["shares"].reindex(idx) if "shares" in getattr(mc, "columns", []) else np.nan
             g["bm"] = fd["bm"].reindex(idx) if "bm" in getattr(fd, "columns", []) else np.nan
             g = g.reset_index()
@@ -89,11 +96,31 @@ class SACNUniverse:
             g = g[g["close"] >= UNI_MIN_PRICE_KRW]
             self._mark(m, UNI_GATES[3], len(g))                      # ④ 주가 하한
 
-            # 시총 스냅샷이 통째로 없는 달에는 이 게이트를 적용하지 않는다.
-            # (데이터 부재를 '탈락'으로 처리하면 그 달 유니버스가 0이 되고, 그건 필터가 아니라 버그다)
-            if g["mktcap"].notna().any():
+            # ⑤ 시총 하한 — 커버리지에 따라 두 갈래로 간다.
+            #   · 커버리지가 충분하면 '값이 있고 하한 이상'만 통과시킨다. 결측을 통과시키면
+            #     시총 미상 소형주가 그대로 들어와, 하한을 둔 의미가 사라진다(성과 과대 방향).
+            #   · 커버리지가 부족하면 하한을 적용하지 않는다. 데이터 부재를 '탈락'으로 처리하면
+            #     그 달 유니버스가 0이 되고, 그건 필터가 아니라 버그다.
+            #   ★ 근사 시총(mktcap_is_approx)도 하한 판정에 쓴다. 근사라고 통과시키면
+            #     소형주가 무조건 들어오고, 근사라고 전부 빼면 실측 소스가 전멸한 실행에서
+            #     유니버스가 통째로 비어 버린다 — 둘 다 하한을 둔 목적에 반한다.
+            #     근사 오차는 대칭 잡음이고, 하한을 '적용하는' 쪽이 보수적이다.
+            #     근사 비중은 시총 출처 감사표와 OPEN_QUESTIONS 에 그대로 남는다.
+            cov = float(g["mktcap"].notna().mean()) if len(g) else 0.0
+            ap = float(g["mcap_approx"].mean()) if len(g) and "mcap_approx" in g.columns else 0.0
+            # ★ 근사 시총이 지배적인 달에는 '값 없으면 탈락' 규칙을 쓰면 안 된다.
+            #   근사는 현재 상장주식수를 과거에 곱한 값이라 ⓐ 미래참조이고
+            #   ⓑ 상장폐지 종목은 현재 상장목록에 없어 값 자체가 생기지 않는다.
+            #   그 상태로 엄격 규칙을 걸면 폐지종목이 전부 탈락해 생존자편향이 되살아난다.
+            #   → 근사 지배 구간에서는 하한을 느슨하게(결측 통과) 두고 그 사실을 기록한다.
+            if cov >= MCAP_GATE_MIN_COVERAGE and ap < 0.5:
+                g = g[g["mktcap"].notna() & (g["mktcap"] >= UNI_MIN_MKTCAP_KRW)]
+            elif g["mktcap"].notna().any():
                 g = g[g["mktcap"].isna() | (g["mktcap"] >= UNI_MIN_MKTCAP_KRW)]
-            self._mark(m, UNI_GATES[4], len(g))                      # ⑤ 시총 하한
+                self.mcap_partial_months.append((m, cov, ap))
+            else:
+                self.mcap_skipped_months.append(m)
+            self._mark(m, UNI_GATES[4], len(g))
 
             g = g[g["adv20"].isna() | (g["adv20"] >= UNI_MIN_ADV_KRW)]
             self._mark(m, UNI_GATES[5], len(g))                      # ⑥ 유동성 하한
@@ -114,6 +141,29 @@ class SACNUniverse:
                                ("code", "month")] + [c for c in P.columns if c not in UNIVERSE_COLS])
         P["code"] = P["code"].astype(str)
         P["month"] = as_ts_series(P["month"])
+        # ★ 시총 하한이 실제로 몇 달에 걸렸는지 밝힌다. "하한 500억을 적용했다"는 말이
+        #   절반의 달에만 참이면, 그건 적용한 게 아니라 적용했다고 믿는 것이다.
+        n_ok = len(months) - len(self.mcap_partial_months) - len(self.mcap_skipped_months)
+        if self.mcap_partial_months or self.mcap_skipped_months:
+            LOG.warn(
+                f"§5 시총 하한 적용 실태 — 정상 적용 {n_ok}개월 / "
+                f"커버리지 부족(결측 통과) {len(self.mcap_partial_months)}개월 / "
+                f"시총 전무(하한 미적용) {len(self.mcap_skipped_months)}개월. "
+                f"미적용 구간에는 시총 미상 소형주가 포함되어 있으며, 이는 성과를 "
+                f"과대평가하는 방향입니다. 결과 해석에 반드시 반영하세요. "
+                f"(근사 시총이 지배적인 달은 폐지종목이 통째로 탈락하는 생존자편향을 피하려고 "
+                f"일부러 하한을 느슨하게 둡니다 — 둘 중 생존자편향이 더 큰 왜곡입니다)")
+            open_question(
+                "MCAP_GATE_PARTIAL", "§5 시총 하한이 전 구간에 걸리지 않음",
+                f"시총 데이터 커버리지가 {MCAP_GATE_MIN_COVERAGE:.0%} 미만인 달이 "
+                f"{len(self.mcap_partial_months) + len(self.mcap_skipped_months)}개월 있어 "
+                f"해당 월에는 500억 하한을 온전히 적용하지 못했습니다.",
+                "데이터 부재를 '탈락'으로 처리하면 그 달 유니버스가 0이 되어 백테스트가 "
+                "끊기므로, 하한 미적용 + 명시 보고를 택했습니다(가장 보수적인 '전부 제외'는 "
+                "표본을 없애 검정 자체를 불가능하게 만듭니다).",
+                "해당 월 성과는 상향 편의를 가질 수 있습니다.")
+        else:
+            LOG.ok(f"§5 시총 하한을 전 {len(months)}개월에 온전히 적용했습니다.")
         dup = int(P.duplicated(["code", "month"]).sum()) if len(P) else 0
         if dup:
             raise RuntimeError(f"유니버스 패널에 (code, month) 중복 {dup:,}행이 있습니다. "

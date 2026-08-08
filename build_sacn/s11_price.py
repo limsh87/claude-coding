@@ -5,9 +5,10 @@
 # ║      L1.PX  2,875초 / 예산 2,400초 초과 · 5,398종목 · 실패 1,901종목 · pykrx 0건           ║
 # ║                                                                                          ║
 # ║  ■ 원인 3개 — 전부 '느린 네트워크'가 아니었다                                              ║
-# ║   ① 레이트 버킷 오배정.  _px_fdr 이 limiter("krx") 를 썼다. FDR 은 KRX 서버를 부르지도     ║
-# ║      않는데 KRX 용 2 QPS 버킷에 묶였다. 워커 12개를 줘도 전역 토큰버킷이 초당 2건으로      ║
-# ║      제한한다.  5,398 ÷ 2.0 = 2,699초 ≈ 실측 2,875초. 숫자가 정확히 들어맞는다.            ║
+# ║   ① 레이트 버킷 오배정.  _px_fdr 이 limiter("krx") 를 썼다. FinanceDataReader 의 한국주식  ║
+# ║      리더는 fchart.stock.naver.com 을 부르는데 KRX 용 2 QPS 예산에 묶여 있었다. 워커를     ║
+# ║      12개로 늘려도 전역 토큰버킷이 초당 2건으로 제한한다.                                  ║
+# ║      5,398 ÷ 2.0 = 2,699초 ≈ 실측 2,875초. 숫자가 정확히 들어맞는다.                       ║
 # ║   ② 죽은 소스 헛돌리기.  실패 종목마다 pykrx→fdr→naver→yfinance 를 전부 시도했다.          ║
 # ║      pykrx 는 설치조차 안 됐고 yfinance 는 0건이었다. 1,901 × 4 = 7,604번의 헛수고.        ║
 # ║      yfinance 는 .KS/.KQ 두 번씩 두드리므로 실제로는 그 이상이고, 실패마다 stderr 로       ║
@@ -18,10 +19,12 @@
 # ║  ■ 재작성 원칙                                                                            ║
 # ║   · 요청 수를 줄인다  : §5 에서 죽을 종목은 애초에 요청하지 않는다 (price_target_codes)    ║
 # ║   · 요청당 수확을 늘린다: 한 종목 = 한 요청 = 10년치. 월별·연도별 쪼개기 금지.             ║
-# ║   · 버킷을 실제 호스트에 맞춘다: fdr/naver_chart/krx 를 분리                               ║
+# ║   · 버킷을 '라이브러리'가 아니라 '실제 호스트'에 맞춘다.                                   ║
+# ║     fdr 과 naver 는 같은 서버(fchart.stock.naver.com)이므로 한 버킷을 공유한다 —           ║
+# ║     따로 주면 한 서버에 두 배가 나가 차단을 자초한다. krx 만 분리한다.                     ║
 # ║   · 죽은 소스는 끊는다  : 사전 프로브로 순서를 정하고, 실행 중 연속실패는 회로차단          ║
 # ║   · 실패를 기억한다    : 지수 백오프 음성캐시 (30·60·120·240·365일)                        ║
-# ║   · 중간에 끊겨도 잃지 않는다: 청크 단위 영속화                                            ║
+# ║   · 중간에 끊겨도 잃지 않는다: 청크마다 실제로 공용 캐시에 반영한다                        ║
 # ║   · 서드파티 수다는 봉인한다: yfinance 는 별도 패스로 분리해 통째로 fd 봉인               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
@@ -68,7 +71,7 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if fdr is None:
         return None
     try:
-        limiter("fdr").wait()
+        limiter("naver_chart").wait()      # FDR 의 KR 리더도 네이버 차트를 부른다
         d = fdr.DataReader(code, start, end)
     except Exception:
         return None
@@ -169,7 +172,12 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 
 PRICE_FN = {"pykrx": _px_pykrx, "fdr": _px_fdr, "naver": _px_naver, "yfinance": _px_yf}
-PRICE_BUCKET = {"pykrx": "krx", "fdr": "fdr", "naver": "naver_chart", "yfinance": "generic"}
+# ★ 버킷은 '라이브러리'가 아니라 '호스트' 기준이다.
+#   FinanceDataReader 의 한국주식 리더는 내부적으로 fchart.stock.naver.com 을 부른다 —
+#   _px_naver 와 같은 서버다. 둘에 각각 8 QPS 버킷을 주면 한 서버에 16 rps 가 나가
+#   차단을 자초한다. 같은 호스트는 같은 버킷을 공유해야 한다.
+PRICE_BUCKET = {"pykrx": "krx", "fdr": "naver_chart", "naver": "naver_chart",
+                "yfinance": "generic"}
 
 
 def _px_available(src: str) -> bool:
@@ -261,15 +269,100 @@ def _price_windows(codes: Sequence[str], start: str, end: str,
     s = s.dropna(subset=["code"]).drop_duplicates("code", keep="first")
     li = as_ts_series(s["listing_date"]) if "listing_date" in s.columns else pd.Series(pd.NaT, index=s.index)
     dl = as_ts_series(s["delisting_date"]) if "delisting_date" in s.columns else pd.Series(pd.NaT, index=s.index)
+    n_hi = 0
     for c, l, d in zip(s["code"], li, dl):
         if c not in win:
             continue
-        lo = lo_all if pd.isna(l) else max(lo_all, as_ts(l) - pd.Timedelta(days=10))
+        # ★ 하한(lo)은 좁히지 않는다.
+        #   build_security_master 는 listing_date 가 없으면 '첫 스냅샷 날짜'로 채우는데,
+        #   폐지종목은 KIND 목록에 없어 거의 항상 그 대체값을 받는다. 그 값으로 창을 좁히면
+        #   생존 종목만 15개월 사전구간을 온전히 받고 폐지종목은 못 받는다 — 생존자편향을
+        #   없애려는 코드가 정확히 그 편향을 만든다. 요청 하한은 전부 동일하게 둔다.
+        lo = lo_all
         hi = hi_all if pd.isna(d) else min(hi_all, as_ts(d) + pd.Timedelta(days=10))
+        if pd.notna(d):
+            n_hi += 1
         if hi <= lo:
             hi = lo + pd.Timedelta(days=30)
         win[c] = (lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"))
+    if n_hi:
+        LOG.info(f"폐지일 기준으로 요청 상한을 좁힌 종목 {n_hi:,}개 "
+                 f"(하한은 좁히지 않습니다 — 상장일 대체값이 폐지종목에 불리하게 작용합니다).")
     return win
+
+
+PRICE_COVERAGE_COLS = ["code", "requested_from", "got_min", "got_max", "checked_at"]
+
+
+def _load_price_coverage() -> Dict[str, dict]:
+    """'어디서부터 요청해서 무엇을 받았는가'의 기록.
+
+    ★ 이게 없으면 '2021년 상장 종목'을 영원히 다시 받는다. 캐시 최소일이 2021년인 것을
+      '앞 구간 결손'으로 오해해 매 실행마다 전체 재수집을 걸기 때문이다. 실패가 아니라
+      성공이므로 음성 캐시도 잡아주지 못한다 — 조용히 매번 몇 분씩 태우는 경로다.
+    """
+    d = VAULT.get_table("price_coverage", scope="shared") if globals().get("VAULT") else None
+    if d is None or not len(d):
+        return {}
+    d = d.copy()
+    for c in ("requested_from", "got_min", "got_max", "checked_at"):
+        d[c] = as_ts_series(d[c]) if c in d.columns else pd.NaT
+    d["code"] = d["code"].astype(str)
+    d = d.sort_values("checked_at").drop_duplicates("code", keep="last")
+    return {r.code: {"frm": r.requested_from, "lo": r.got_min, "hi": r.got_max}
+            for r in d.itertuples(index=False)}
+
+
+def _save_price_chunk(cached, new_frames, src_used) -> None:
+    """청크마다 공용 캐시를 갱신한다(중간에 끊겨도 그때까지 받은 것은 남는다)."""
+    if not new_frames:
+        return
+    try:
+        parts = ([cached] if cached is not None and len(cached) else []) + new_frames
+        u = pd.concat(parts, ignore_index=True)
+        u["date"] = as_ts_series(u["date"])
+        u["code"] = u["code"].astype(str)
+        u = _fold_by_source(u)
+        persist("krx_ohlcv_daily", downcast(u), scope="shared", domain="price",
+                source="chain:" + ",".join(f"{k}x{v}" for k, v in src_used.most_common()),
+                note="chunk flush")
+    except Exception as e:                                   # noqa
+        LOG.warn(f"청크 저장 실패({type(e).__name__}) — 계속 진행하고 마지막에 다시 시도합니다.")
+
+
+def _fold_by_source(px: pd.DataFrame) -> pd.DataFrame:
+    """(code,date) 중복을 '더 정확한 소스' 우선으로 접는다.
+
+    캐시에 KRX 실측 거래대금이 있는데 네이버 근사(종가×거래량)로 덮어쓰면
+    유동성 필터의 품질이 되레 나빠진다 — keep="last" 로는 그걸 막지 못한다.
+    """
+    prio = {"pykrx": 0, "krx_bulk": 0, "fdr": 1, "naver": 2, "yfinance": 3}
+    p = px.assign(_p=px["src"].astype(str).map(prio).fillna(9))
+    return (p.sort_values(["code", "date", "_p"])
+             .drop_duplicates(["code", "date"], keep="first")
+             .drop(columns=["_p"]).reset_index(drop=True))
+
+
+_COVERAGE_ACC: List[dict] = []
+
+
+def _mark_coverage(part, got) -> None:
+    """'어디서부터 요청해서 무엇을 받았는가'를 남긴다 (무한 백필 방지)."""
+    if not part:
+        return
+    by_code = {}
+    for d in (got or []):
+        if d is not None and len(d):
+            c = str(d["code"].iloc[0])
+            dd = as_ts_series(d["date"])
+            by_code[c] = (dd.min(), dd.max())
+    now = as_ts(_dt.date.today())
+    for (c, st, _en) in part:
+        lo, hi = by_code.get(c, (pd.NaT, pd.NaT))
+        if pd.isna(lo):
+            continue
+        _COVERAGE_ACC.append({"code": c, "requested_from": as_ts(st),
+                              "got_min": lo, "got_max": hi, "checked_at": now})
 
 
 def fetch_prices(codes: Sequence[str], start: str, end: str,
@@ -286,7 +379,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
     if cached is not None and len(cached):
         cached = cached.copy()
         cached["date"] = as_ts_series(cached["date"])
-        cached["code"] = cached["code"].map(to_code6)
+        # ★ downcast 가 code 를 category 로 바꾸고 parquet 이 그대로 보존한다.
+        #   그러면 groupby 가 '행이 하나도 없는 카테고리'에 NaT 를 돌려주고,
+        #   아래 `mx is None` 은 NaT 를 못 걸러 그 종목을 '캐시 충족'으로 판정한다.
+        cached["code"] = cached["code"].astype(str).map(to_code6)
         cached = cached.dropna(subset=["date", "code"])
         g = cached.groupby("code")["date"]
         have_max, have_min = g.max().to_dict(), g.min().to_dict()
@@ -294,8 +390,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                  f"이 종목들은 다시 조회하지 않습니다.")
 
     attempts, att_prev = _load_price_attempts()
+    covered = _load_price_coverage()
     windows = _price_windows(codes, start, end, sec)
-    today = as_ts(end)
+    # ★ '지금'은 벽시계 오늘이다. as_ts(end)(=BACKTEST_END)를 쓰면 attempted_at 과 now 가
+    #   같은 값이라 경과일수가 항상 0 이 되고, 백오프가 영원히 만료되지 않는다.
+    #   "최대 1년 안에 반드시 다시 본다"는 주석이 실제로는 '영구 포기'였다.
+    today = as_ts(_dt.date.today())
 
     def _recently_failed(c: str, want_from: pd.Timestamp) -> bool:
         p = attempts.get(c)
@@ -312,6 +412,8 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         w_lo, w_hi = windows.get(c, (start, end))
         w_lo_ts, w_hi_ts = as_ts(w_lo), as_ts(w_hi)
         mx, mn = have_max.get(c), have_min.get(c)
+        if mx is not None and pd.isna(mx):
+            mx = mn = None                 # NaT = 사실상 캐시 없음
         if mx is None:
             if _recently_failed(c, w_lo_ts):
                 n_skip += 1
@@ -321,14 +423,26 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         # ★ 과거 방향 백필을 반드시 함께 본다. max 만 보면 앞 7년이 조용히 빈다.
         #   단, 비교 기준은 '요청 구간'이 아니라 '그 종목이 존재할 수 있었던 구간'이다.
         #   2021년 상장 종목의 캐시 최소일이 2021년인 것은 결손이 아니라 정상이다.
-        if mn is not None and mn > w_lo_ts + pd.Timedelta(days=10):
+        cov = covered.get(c)
+        asked_from = cov.get("frm") if cov else None
+        # 이미 이 시작일(또는 더 이른 날)부터 통째로 요청해 봤다면, 캐시 최소일이 늦은 것은
+        # 결손이 아니라 '그 종목의 상장이 늦었다'는 사실이다 — 다시 요청할 이유가 없다.
+        already_scanned = (asked_from is not None and pd.notna(asked_from)
+                           and asked_from <= w_lo_ts + pd.Timedelta(days=10))
+        if mn is not None and mn > w_lo_ts + pd.Timedelta(days=10) and not already_scanned:
             if _recently_failed(c, w_lo_ts):
                 n_skip += 1
                 continue
             todo.append((c, w_lo, w_hi))
             n_back += 1
         elif mx < w_hi_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), w_hi))
+            nxt_from = (mx + pd.Timedelta(days=1))
+            # ★ 전방 증분에도 백오프를 적용한다. 거래정지·폐지로 더 이상 새 봉이 없는
+            #   종목은 이 분기에 영원히 걸려 매 실행마다 헛되이 재요청된다.
+            if _recently_failed(c, nxt_from):
+                n_skip += 1
+                continue
+            todo.append((c, nxt_from.strftime("%Y-%m-%d"), w_hi))
             n_fwd += 1
         else:
             n_hit += 1
@@ -347,16 +461,23 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
     src_used: Counter = Counter()
     new_frames: List[pd.DataFrame] = []
     failed: List[dict] = []
+    n_new_rows = 0
 
     if todo:
         # ── ③ 프로브 → 체인 확정 ────────────────────────────────────────────────────────
-        chain, ptab = price_probe([c for c, _, _ in todo], start, end)
+        # ★ 표본은 'todo' 가 아니라 '전체 대상'에서 뽑는다. 2회차 실행의 todo 는
+        #   어려운/죽은 종목만 남아 있어, 프로브가 소스가 아니라 표본을 측정하게 된다
+        #   (멀쩡한 소스를 '0건'으로 제외해 버린다).
+        chain, ptab = price_probe(codes, start, end)
         LOG.table(ptab.values.tolist(), list(ptab.columns), ["l", "r", "r", "r", "l"],
                   title="가격 소스 사전 프로브 (실측 성공률 순으로 체인 구성)")
         chain = [s for s in chain if s != "yfinance"]        # yfinance 는 별도 패스
         if not chain and "yfinance" not in PRICE_SOURCES:
             LOG.error("살아 있는 가격 소스가 없습니다 — 캐시만으로 진행합니다.")
 
+        # ★ 회로차단 임계에 '성공 이력'을 함께 본다. 빈 응답(=그 종목이 원래 없음)이
+        #   연속 10번 나오는 건 흔한 일이고(폐지종목이 몰려 있으면 바로 발생),
+        #   그걸로 살아 있는 소스를 은퇴시키면 남은 수천 종목이 통째로 실패 처리된다.
         health = SourceHealth()
         n_workers = max(_resolve_workers(PRICE_BUCKET.get(s, "generic")) for s in chain) if chain else 4
 
@@ -394,7 +515,13 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 else:
                     pending.append((c, st, en))
             if got:
-                new_frames.append(downcast(pd.concat(got, ignore_index=True)))
+                _c = downcast(pd.concat(got, ignore_index=True))
+                n_new_rows += len(_c)
+                new_frames.append(_c)
+                # ★ 진짜로 청크마다 저장한다. 예전엔 헤더만 그렇게 주장하고 실제로는
+                #   전 청크가 끝난 뒤 한 번만 썼다 — 3/4 지점에서 끊기면 전량 손실이다.
+                _save_price_chunk(cached, new_frames, src_used)
+            _mark_coverage(part, got)
             del res, got
             if health.tripped:
                 LOG.warn("회로차단 발동 — " + ", ".join(
@@ -419,7 +546,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 else:
                     still.append(job)
             if got:
-                new_frames.append(downcast(pd.concat(got, ignore_index=True)))
+                _c = downcast(pd.concat(got, ignore_index=True))
+                n_new_rows += len(_c)
+                new_frames.append(_c)
             LOG.ok(f"yfinance 마무리 — {len(got):,}/{len(pending):,}종목 확보 "
                    f"({time.time() - t0:.0f}초)")
             pending = still
@@ -455,12 +584,31 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
             _all = (_all.reindex(columns=PRICE_ATTEMPT_COLS)
                         .sort_values("attempted_at")
                         .drop_duplicates("code", keep="last").reset_index(drop=True))
-            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
-                            source="fetch_prices:negative_cache")
+            # ★ 이번에 성공한 종목은 원장에서 지운다. 안 지우면 예전 실패기록이 남아
+            #   나중에 정당한 백필까지 '최근 실패'로 건너뛰게 만든다.
+            _ok_now = {r["code"] for r in _COVERAGE_ACC}
+            if _ok_now:
+                _all = _all[~_all["code"].astype(str).isin(_ok_now)].reset_index(drop=True)
+            note_new_data("price_fetch_attempts", len(_new), "shared", "price",
+                          "negative cache")
+            persist("price_fetch_attempts", _all, scope="shared", domain="price",
+                    source="fetch_prices:negative_cache")
         hrows = health.rows()
         if hrows:
             LOG.table(hrows, ["소스", "성공", "실패", "성공률", "상태"],
                       ["l", "r", "r", "r", "l"], title="가격 소스 실행중 건강도")
+
+    if _COVERAGE_ACC:
+        _cv = pd.DataFrame(_COVERAGE_ACC).drop_duplicates("code", keep="last")
+        _prev_cv = VAULT.get_table("price_coverage", scope="shared")
+        if _prev_cv is not None and len(_prev_cv):
+            _cv = (pd.concat([_prev_cv.reindex(columns=PRICE_COVERAGE_COLS), _cv],
+                             ignore_index=True)
+                     .drop_duplicates("code", keep="last"))
+        note_new_data("price_coverage", len(_COVERAGE_ACC), "shared", "price", "coverage")
+        persist("price_coverage", _cv.reindex(columns=PRICE_COVERAGE_COLS), scope="shared",
+                domain="price", source="fetch_prices:coverage")
+        _COVERAGE_ACC.clear()
 
     # ── ⑦ 병합 ─────────────────────────────────────────────────────────────────────────
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
@@ -479,16 +627,35 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
     px["date"] = as_ts_series(px["date"])
     px["code"] = px["code"].map(to_code6)
     px = px.dropna(subset=["code", "date", "close"])
+    n_bad = int((pd.to_numeric(px["close"], errors="coerce") <= 0).sum())
+    if n_bad:
+        LOG.warn(f"종가가 0 이하인 {n_bad:,}행을 제거했습니다 — 그대로 두면 exec_px=0 이 되어 "
+                 f"fwd_ret 이 inf 가 되고, 그 달 수익률 평균 전체가 inf 로 오염됩니다.")
+    px = px[pd.to_numeric(px["close"], errors="coerce") > 0]
     for c in ("open", "high", "low", "close", "volume", "amount"):
         px[c] = pd.to_numeric(px[c], errors="coerce")
-    px = (px.sort_values(["code", "date"])
-            .drop_duplicates(["code", "date"], keep="last")
-            .reset_index(drop=True))
-    px = px[(px["date"] >= start_ts - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
-
+    px = px.sort_values(["code", "date"]).reset_index(drop=True)   # 접기는 소스 우선순위로 뒤에서
+    # ★ 공용 캐시에 '쓰는 것'과 '이번 실행이 쓰는 것'을 분리한다.
+    #   구버전은 (캐시 ⊕ 신규)를 이번 실행 창으로 자른 뒤 그대로 공용 테이블에 덮어썼다.
+    #   같은 테이블을 쓰는 다른 전략(TCD v2)의 백테스트 창이 조금만 달라도, 한쪽이
+    #   돌 때마다 다른 쪽의 이력이 삭제된다 — 삭제 API 가 없는데 삭제가 일어나는 경로다.
+    #   → 저장본은 창을 자르지 않은 전체 합집합, 반환본만 이번 창으로 자른다.
+    if n_new_rows:
+        note_new_data("krx_ohlcv_daily", n_new_rows, "shared", "price", "price chain")
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
-                        source="chain:" + ",".join(f"{k}x{v}" for k, v in src_used.most_common()))
+        _store = px
+        # 같은 (code,date) 가 겹치면 '더 정확한 소스'를 남긴다. 캐시에 이미 KRX 실측
+        #   거래대금이 있는데 네이버 근사(종가×거래량)로 덮어쓰면 품질이 되레 나빠진다.
+        _prio = {"pykrx": 0, "krx_bulk": 0, "fdr": 1, "naver": 2, "yfinance": 3}
+        _store = _store.assign(_p=_store["src"].astype(str).map(_prio).fillna(9))
+        _store = (_store.sort_values(["code", "date", "_p"])
+                        .drop_duplicates(["code", "date"], keep="first")
+                        .drop(columns=["_p"]).reset_index(drop=True))
+        persist("krx_ohlcv_daily", downcast(_store), scope="shared", domain="price",
+                source="chain:" + ",".join(f"{k}x{v}" for k, v in src_used.most_common()),
+                note=f"union {len(_store):,}행 (창 자르지 않음)")
+        del _store
+    px = px[(px["date"] >= start_ts - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
@@ -496,7 +663,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
             LOG.warn("FDR/네이버/yfinance 경로로 받은 종목은 거래대금이 종가×거래량 근사입니다. "
                      "유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향). "
                      "KRX 벌크가 살아 있으면 월말 거래대금은 실측치로 덮어씁니다.")
-    PIPE.io("OUT", "DRIVE", "krx_ohlcv_daily", px, source="price chain")
+    _prio2 = {"pykrx": 0, "krx_bulk": 0, "fdr": 1, "naver": 2, "yfinance": 3}
+    px = px.assign(_p=px["src"].astype(str).map(_prio2).fillna(9))
+    px = (px.sort_values(["code", "date", "_p"])
+            .drop_duplicates(["code", "date"], keep="first")
+            .drop(columns=["_p"]).reset_index(drop=True))
+    PIPE.io("OUT", "MEM", "price_daily_returned", px, source="price chain")
     return downcast(px)
 
 
@@ -508,7 +680,9 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     px = px.sort_values(["code", "date"])
     px["adv20"] = (px.groupby("code", observed=True)["amount"]
                      .transform(lambda s: s.rolling(20, min_periods=10).mean()))
-    px["ret1d"] = px.groupby("code", observed=True)["close"].pct_change()
+    # fill_method 를 명시한다. pandas 2.x 는 기본 pad 로 FutureWarning 을 내고
+    # 3.x 는 기본이 None 이라 같은 코드가 버전에 따라 다른 값을 만든다.
+    px["ret1d"] = px.groupby("code", observed=True)["close"].pct_change(fill_method=None)
 
     # 월말 스냅샷
     px["ym"] = px["date"].values.astype("datetime64[M]")
@@ -531,7 +705,16 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     # 그 가격으로 체결했다고 가정할 수 없으므로 종가로 폴백한다.
     gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
     monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
-    monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
+    # ★ 종가 폴백을 없앤다. 이 함수의 docstring 이 스스로 '당일 종가 체결은 미래누수'라고
+    #   쓰고 있으면서, 다음 거래일이 없거나 멀면 바로 그 종가로 체결하고 있었다.
+    #   (거래정지 종목과 백테스트 마지막 달이 전부 이 경로를 탄다)
+    #   체결가를 만들 수 없으면 결측으로 두고, 상장폐지 처리는 백테스트 엔진이 맡는다.
+    n_nofill = int(monthly["exec_px"].isna().sum())
+    monthly["exec_px"] = monthly["exec_px"].where(monthly["exec_px"] > 0)
+    if n_nofill:
+        LOG.info(f"체결가를 만들 수 없는 {n_nofill:,}건(다음 거래일 없음/10일 초과)을 "
+                 f"결측으로 둡니다. 종가로 채우면 그건 당일 종가 체결 = 미래누수입니다. "
+                 f"상장폐지 구간은 백테스트 엔진이 §0.3 규칙으로 별도 처리합니다.")
 
     # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
     #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
@@ -592,6 +775,6 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
         LOG.warn("수급 데이터를 받지 못했습니다 — 해석표의 수급 항목만 비웁니다.")
         return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
     fl = pd.concat(got, ignore_index=True)
-    VAULT.put_table("krx_investor_flows", fl, scope="shared", domain="flow", source="pykrx")
-    PIPE.io("OUT", "DRIVE", "krx_investor_flows", fl, source="pykrx")
+    note_new_data("krx_investor_flows", len(fl), "shared", "flow", "pykrx")
+    persist("krx_investor_flows", fl, scope="shared", domain="flow", source="pykrx")
     return downcast(fl)

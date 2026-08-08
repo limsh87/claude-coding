@@ -5,6 +5,7 @@
 # ║  실패 시: 무엇이 없어서 실패했는지 + 정확한 설치 명령을 한글로 출력하고 즉시 중단          ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 import os, sys, re, io, gc, json, time, math, zipfile, hashlib, logging, textwrap, traceback
+import glob
 import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, threading, unicodedata
 import datetime as _dt
 from collections import defaultdict, Counter, OrderedDict

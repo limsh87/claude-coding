@@ -78,30 +78,42 @@ class _Log:
             _safe_print(ch * width, flush=True)
 
     def banner(self, title: str, sub: str = "", width: int = 104):
-        _safe_print("", flush=True)
-        _safe_print("╔" + "═" * (width - 2) + "╗", flush=True)
-        _safe_print("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║", flush=True)
+        self._tee("")
+        self._tee("╔" + "═" * (width - 2) + "╗")
+        self._tee("║ " + _pad(_trunc(title, width - 4), width - 4) + " ║")
         if sub:
-            _safe_print("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║", flush=True)
-        _safe_print("╚" + "═" * (width - 2) + "╝", flush=True)
+            self._tee("║ " + _pad(_trunc(sub, width - 4), width - 4) + " ║")
+        self._tee("╚" + "═" * (width - 2) + "╝")
+
+    def _tee(self, line: str):
+        """화면에 찍고 버퍼에도 남긴다.
+
+        ★ 표·배너가 버퍼에 안 들어가면 run_log_*.txt 에 감사표가 통째로 빠진다.
+          정작 나중에 다시 봐야 하는 것이 바로 그 표들이다(캐시 원장·성과·강건성).
+        """
+        _safe_print(line, flush=True)
+        try:
+            self.buffer.append(line)
+        except Exception:
+            pass
 
     def table(self, rows: List[Sequence[Any]], headers: Sequence[str],
               aligns: Optional[Sequence[str]] = None, maxw: int = 46, title: str = ""):
         """한글 폭 보정 표. 강건성/성과/감사 출력 전부 이걸 쓴다."""
         if title:
-            _safe_print(f"\n▶ {title}", flush=True)
+            self._tee(f"\n▶ {title}")
         if not rows:
-            _safe_print("   (행 없음)", flush=True)
+            self._tee("   (행 없음)")
             return
         ncol = len(headers)
         aligns = list(aligns or ["l"] * ncol)
         cells = [[_trunc("" if c is None else c, maxw) for c in r] + [""] * (ncol - len(r)) for r in rows]
         widths = [max(_dw(headers[i]), *(_dw(r[i]) for r in cells)) for i in range(ncol)]
         head = "  " + " │ ".join(_pad(headers[i], widths[i], "c") for i in range(ncol))
-        _safe_print(head, flush=True)
-        _safe_print("  " + "─┼─".join("─" * widths[i] for i in range(ncol)), flush=True)
+        self._tee(head)
+        self._tee("  " + "─┼─".join("─" * widths[i] for i in range(ncol)))
         for r in cells:
-            _safe_print("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)), flush=True)
+            self._tee("  " + " │ ".join(_pad(r[i], widths[i], aligns[i]) for i in range(ncol)))
 
 
 LOG = _Log("DEBUG" if VERBOSE else "INFO")
@@ -310,6 +322,16 @@ class Pipeline:
             rec.hint = "§15 킬 기준입니다. 파라미터를 조정해 통과시키지 마세요. 결과를 그대로 보고합니다."
             self.failed.append(sid)
             LOG.error(f"킬 기준 발동 — {e}")
+            raise
+        except (KeyboardInterrupt, SystemExit) as e:
+            # ★ critical=False 스테이지가 Ctrl-C 를 삼키면 안 된다. 사용자가 2시간짜리
+            #   수집을 멈추려고 눌렀는데 "비필수 스테이지 실패"로 넘어가 계속 돌아간다.
+            #   중단은 사용자의 의사표시이므로 항상 위로 올린다.
+            rec.t_end = time.time(); rec.status = "FAIL"
+            rec.err_type = type(e).__name__
+            rec.err_msg = "사용자 중단"
+            self.failed.append(sid)
+            LOG.warn(f"[{sid}] 사용자 중단 — 여기까지 받은 데이터는 캐시에 남습니다.")
             raise
         except BaseException as e:                                   # noqa
             rec.t_end = time.time(); rec.status = "FAIL"

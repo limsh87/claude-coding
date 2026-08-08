@@ -15,8 +15,11 @@
 # ║    각 행에 출처(src)를 남겨, 근사분이 얼마나 섞였는지 감사표에서 보이게 한다.               ║
 # ║    ★ 근사는 '조용히' 쓰지 않는다. 비중을 표로 찍고 OPEN_QUESTIONS 에 기록한다.             ║
 # ║                                                                                          ║
-# ║  ★ 호출량: 전부 '날짜 1개 = 전종목 1호출' 이다. 시총 120 + 펀더멘털 120 ≈ 240호출로        ║
-# ║    10년이 끝난다. 종목축 루프(2,500회)로 짜면 같은 데이터에 20배를 쓴다.                   ║
+# ║  ★ 호출량: 신호에 쓰이는 것은 전부 '날짜 1개 = 전종목 1호출' 이다.                         ║
+# ║    시총 120 + 펀더멘털 120 ≈ 240호출로 10년이 끝난다(종목축 루프면 20배).                  ║
+# ║    예외 둘은 기본 비활성이며 신호에 쓰이지 않는다:                                         ║
+# ║      · fetch_retail_share  — 종목축(H3 보조축).  COLLECT_RETAIL_SHARE=False 가 기본        ║
+# ║      · attach_bm_fallback  — DART 배치(100사/호출). PBR 스냅샷이 빈 곳만 보강              ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 MKTCAP_COLS = ["code", "month", "mktcap", "shares", "close_m", "amount_m", "src"]
@@ -179,9 +182,10 @@ def fetch_mktcap_monthly(months: pd.DatetimeIndex,
         LOG.warn(f"부분 응답으로 버린 달 {partial}개 — 다음 실행에서 자동 재시도합니다 "
                  f"(캐시에 저장되지 않았으므로 '미보유'로 남습니다).")
 
-    frames = [f for f in rows if len(f)]
-    if cached is not None and len(cached):
-        frames.append(cached.reindex(columns=MKTCAP_COLS))
+    # ★ 캐시를 '앞'에 둔다. keep="last" 와 함께 쓰면 신규 수집분이 캐시를 이긴다.
+    #   반대로 두면 재수집해도 낡은 값이 살아남아, 정정이 영원히 반영되지 않는다.
+    frames = ([cached.reindex(columns=MKTCAP_COLS)] if cached is not None and len(cached) else []) \
+        + [f for f in rows if len(f)]
     if not frames:
         return _finalize_mcap(cached, months, panel, wrote=False)
     out = pd.concat(frames, ignore_index=True)
@@ -239,18 +243,23 @@ def _finalize_mcap(mc: Optional[pd.DataFrame], months: pd.DatetimeIndex,
     n_ap = int(base["mktcap_is_approx"].sum())
     if n_ap:
         LOG.warn(f"시총 {n_ap:,}행({100*n_ap/n:.1f}%)이 근사치입니다(현재 상장주식수 × 과거 종가). "
-                 f"§5 의 500억 하한은 실측분에만 적용하고, 근사분은 하한 통과로 간주하지 "
-                 f"않습니다. 시총하위1000 순위 산정에는 사용합니다(순위는 대체로 보존됨).")
+                 f"근사분도 §5 하한 판정과 시총하위1000 순위에 그대로 씁니다 — 근사라고 "
+                 f"통과시키면 소형주가 무조건 들어오고, 근사라고 전부 빼면 실측 소스가 "
+                 f"전멸한 실행에서 유니버스가 통째로 비기 때문입니다. 두 선택 모두 하한을 "
+                 f"둔 목적에 반합니다. 대신 이 비중을 표와 OPEN_QUESTIONS 에 남깁니다.")
         open_question(
             "MCAP_APPROX", "시가총액 근사 사용",
             f"실측 시총 소스(pykrx / KRX MDC 벌크)를 확보하지 못해 {n_ap:,}행"
             f"({100*n_ap/n:.1f}%)을 '현재 상장주식수 × 과거 종가'로 근사했습니다. "
             f"액면분할·유상증자·자사주소각을 반영하지 못하므로 절대수준이 왜곡될 수 있고, "
             f"상장폐지 종목은 현재 상장목록에 없어 근사조차 불가합니다.",
-            "가장 보수적인 선택을 적용: 근사분에 대해서는 §5 시총하한(500억)을 '통과'로 "
-            "간주하지 않고 유니버스에서 제외합니다(포함하면 표본이 늘어 성과가 좋아지는 "
-            "방향이므로 제외가 보수적). 순위만 쓰는 시총하위1000 아암에는 사용합니다.",
-            "전체 유니버스 아암의 표본이 줄어듭니다. 실측 시총 소스가 살아나면 자동 해소됩니다.")
+            "근사값도 §5 하한 판정에 사용합니다. 대안 두 가지가 모두 더 나쁩니다: "
+            "근사분을 무조건 통과시키면 하한을 둔 의미가 사라지고(소형주 전량 유입, 성과 "
+            "과대), 근사분을 전부 제외하면 실측 소스가 전멸한 실행에서 유니버스가 0이 되어 "
+            "검정 자체가 불가능해집니다. 근사 오차는 대칭 잡음이므로 하한을 '적용하는' 쪽이 "
+            "체계적 편의가 가장 작습니다.",
+            "절대수준 오차만큼 경계 근처 종목의 편입·제외가 뒤바뀔 수 있습니다. "
+            "실측 시총 소스(pykrx 또는 KRX 벌크)가 살아나면 자동 해소됩니다.")
     LOG.ok(f"시가총액 {base['month'].nunique()}개월 × {base['code'].nunique():,}종목 = {len(base):,}행"
            + ("" if wrote else " (신규 저장 없음)"))
     return base
@@ -311,9 +320,8 @@ def fetch_fundamental_monthly(months: pd.DatetimeIndex) -> pd.DataFrame:
         fails = 0
         rows.append(g)
 
-    frames = [f for f in rows if len(f)]
-    if cached is not None and len(cached):
-        frames.append(cached.reindex(columns=FUND_COLS))
+    frames = ([cached.reindex(columns=FUND_COLS)] if cached is not None and len(cached) else []) \
+        + [f for f in rows if len(f)]
     if not frames:
         return _finalize_fund(cached, wrote=False)
     out = pd.concat(frames, ignore_index=True)
@@ -537,17 +545,33 @@ def attach_bm_fallback(fund: pd.DataFrame, mcap: pd.DataFrame,
                        sec: pd.DataFrame, months: pd.DatetimeIndex) -> pd.DataFrame:
     """KRX PBR 이 비어 있는 (code, month) 만 DART 자본총계로 보강한다.
 
-    보강 대상 수를 먼저 세고, 그게 DART 잔여 호출량 대비 얼마인지 표로 보여준 뒤 실행한다.
+    보강 대상 수와 DART 잔여 호출량을 표로 보여준 뒤 실행한다.
+    ★ 격자는 base(PBR 표)가 아니라 시총 패널이다 — PBR 수집이 통째로 실패한 경우에도
+      BM 을 복구할 수 있어야 하고, base 기준이면 그 순간 폴백이 꺼져 버린다.
     """
     base = fund.copy() if fund is not None and len(fund) else pd.DataFrame(columns=FUND_COLS)
     if not len(base):
         base = pd.DataFrame(columns=FUND_COLS)
-    miss = int(base["bm"].isna().sum()) if "bm" in base.columns else 0
-    total = max(len(base), 1)
-    LOG.table([["KRX PBR 로 BM 확보", f"{total - miss:,}", f"{100*(total-miss)/total:.1f}%"],
-               ["결측 (DART 보강 대상)", f"{miss:,}", f"{100*miss/total:.1f}%"]],
+    # ★ 보강이 필요한 격자는 base 가 아니라 '시총 패널'이다.
+    #   base 를 기준으로 삼으면, PBR 수집이 통째로 실패해 base 가 0행일 때
+    #   miss = 0 이 되어 "결측 없음"으로 판정하고 DART 를 부르지도 않는다.
+    #   BM 이 가장 필요한 순간에 폴백이 정확히 꺼지는 구조였다.
+    grid_src = (mcap[["code", "month"]].drop_duplicates()
+                if mcap is not None and len(mcap) else
+                (base[["code", "month"]].drop_duplicates() if len(base) else
+                 pd.DataFrame(columns=["code", "month"])))
+    have_bm = 0
+    if len(base) and "bm" in base.columns:
+        have_bm = int(base["bm"].notna().sum())
+    total = max(len(grid_src), 1)
+    miss = max(0, len(grid_src) - have_bm)
+    LOG.table([["KRX PBR 로 BM 확보", f"{have_bm:,}", f"{100*have_bm/total:.1f}%"],
+               ["결측 (DART 보강 대상)", f"{miss:,}", f"{100*miss/total:.1f}%"],
+               ["DART 잔여 호출량", f"{DQ.remaining():,}" if DQ else "키 없음", ""]],
               ["BM 출처", "행수", "비중"], ["l", "r", "r"], title="§6.3 BM 확보 현황")
-    if miss == 0 or not DART_API_KEY or DQ is None or DQ.exhausted:
+    if not len(base):
+        LOG.warn("KRX PBR 스냅샷이 0행입니다 — BM 전량을 DART 자본총계로 시도합니다.")
+    if miss == 0 or not len(grid_src) or not DART_API_KEY or DQ is None or DQ.exhausted:
         if miss and not DART_API_KEY:
             LOG.info("DART 키가 없어 BM 결측은 그대로 둡니다. 직교화 회귀는 해당 항을 "
                      "결측 제외로 처리하며, 그 사실이 산출물에 남습니다.")
@@ -567,7 +591,7 @@ def attach_bm_fallback(fund: pd.DataFrame, mcap: pd.DataFrame,
     if not len(eq):
         return base
     PIT.register("dart_equity", eq, key_cols=["code"])
-    grid = base[["code", "month"]].copy() if len(base) else pd.DataFrame(columns=["code", "month"])
+    grid = grid_src.copy()
     if not len(grid):
         return base
     j = PIT.asof_join(grid.assign(code=grid["code"].astype(str)), "dart_equity",
@@ -581,7 +605,12 @@ def attach_bm_fallback(fund: pd.DataFrame, mcap: pd.DataFrame,
     j = j.merge(mm, on=["code", "month"], how="left")
     j["bm_dart"] = np.where((j.get("equity", pd.Series(np.nan, index=j.index)) > 0) & (j["mktcap"] > 0),
                             safe_div(j.get("equity"), j["mktcap"]), np.nan)
-    base = base.merge(j[["code", "month", "bm_dart"]], on=["code", "month"], how="left")
+    # base 가 비었거나 격자보다 좁을 수 있으므로 외부조인으로 넓힌다 —
+    # 좌측조인이면 DART 가 새로 채울 수 있는 (code, month) 가 통째로 사라진다.
+    base = base.merge(j[["code", "month", "bm_dart"]], on=["code", "month"], how="outer")
+    for _c in FUND_COLS:
+        if _c not in base.columns:
+            base[_c] = np.nan
     base["bm"] = pd.to_numeric(base["bm"], errors="coerce").astype("float64")
     fill = base["bm"].isna() & base["bm_dart"].notna()
     base.loc[fill, "bm"] = pd.to_numeric(base.loc[fill, "bm_dart"], errors="coerce").astype("float64")

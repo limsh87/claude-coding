@@ -227,18 +227,41 @@ def build_analyst_ledger(rep: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     if rep.empty:
         return (pd.DataFrame(columns=["analyst_id", "name", "broker_id", "broker_name"]),
                 pd.DataFrame(columns=["report_uid", "analyst_id", "link_method", "link_conf"]))
+    def _txt(v) -> str:
+        """결측을 확실히 빈 문자열로 만든다.
+
+        ★ `getattr(r, "x", "") or ""` 는 np.nan 을 못 거른다 — nan 은 참이다.
+          그대로 통과하면 str(nan)="nan" 이 애널리스트 이름이 되고,
+          analyst_id = sha1(broker, "nan") 인 유령이 브로커마다 하나씩 생긴다.
+          그 유령은 해당 브로커의 미식별 리포트 전부를 '공동 커버'하므로 SACN 링크
+          행렬에 완전그래프 블록을 만들고, 신호가 브로커 평균으로 붕괴한다.
+          좌측조인이 있는 어떤 경로에서도 이 값은 nan 이 될 수 있다.
+        """
+        if v is None:
+            return ""
+        try:
+            if isinstance(v, float) and not np.isfinite(v):
+                return ""
+        except Exception:
+            pass
+        s = str(v).strip()
+        return "" if s.lower() in ("nan", "none", "<na>", "nat") else s
+
     links = []
     for r in rep.itertuples(index=False):
         names, method, conf = [], "unresolved", 0.0
-        raw = getattr(r, "analyst_raw", "") or ""
+        raw = _txt(getattr(r, "analyst_raw", ""))
         if str(raw).strip():
             names = split_analysts(raw)
             method, conf = "list_field", 0.98        # 한경 '작성자' 컬럼 — 가장 신뢰도 높음
         if not names:
-            praw = getattr(r, "pdf_analysts", "") or ""
+            praw = _txt(getattr(r, "pdf_analysts", ""))
             if str(praw).strip():
                 names = [n for n in str(praw).split(",") if n.strip()]
                 method, conf = "pdf_header", 0.80
+        if not names:
+            continue
+        names = [n for n in names if _txt(n)]
         if not names:
             continue
         for i, nm in enumerate(names):

@@ -159,6 +159,10 @@ def main() -> dict:
                     (f"  ({adopts[0]})" if adopts else "")],
                    ["여유 공간", f"{free_gb_safe(VAULT.root):.1f} GB"]],
                   ["항목", "값"], ["l", "l"], title="구글드라이브 캐시")
+        if mode.endswith("_CREATED") and not mode.startswith(("LOCAL", "FALLBACK")):
+            LOG.warn(f"캐시 루트를 새로 만들었습니다({mode}) — 기존 캐시를 물려받지 "
+                     f"못했다는 뜻입니다. 경로 오타이거나 드라이브가 아직 동기화되지 "
+                     f"않았을 수 있습니다. 이대로 진행하면 전부 재수집합니다.")
         if mode.startswith(("LOCAL", "FALLBACK")):
             LOG.warn(
                 "구글드라이브를 찾지 못해 로컬 경로를 씁니다. 기존 드라이브 캐시를 한 건도 "
@@ -175,7 +179,7 @@ def main() -> dict:
         globals()["DQ"] = DQ
         DQ.report()
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K19", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K21", "L0", budget_s=300):
         run_contract_tests(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0", budget_s=900):
@@ -359,9 +363,17 @@ def main() -> dict:
         else:
             sp_x = pd.Series(dtype=float)
         test_H2(sp_full, sp_x, ppy)
-        ctx["retail"] = fetch_retail_share(
-            sorted(U["code"].astype(str).unique()), BACKTEST_START, BACKTEST_END) \
-            if RUN_MODE == "FULL" else pd.DataFrame()
+        # ★ 수집은 L1 에서 끝났어야 한다. 여기(critical=False 스테이지) 에서 네트워크를
+        #   때리면, 그 한 번의 실패로 이미 계산된 H1·H2 결과와 ctx["hyp_table"] 까지
+        #   통째로 버려진다. 예외가 나도 가설검정은 계속되도록 감싼다.
+        try:
+            ctx["retail"] = fetch_retail_share(
+                sorted(U["code"].astype(str).unique()), BACKTEST_START, BACKTEST_END) \
+                if RUN_MODE == "FULL" else pd.DataFrame()
+        except Exception as e:                                    # noqa
+            LOG.warn(f"개인 거래비중 수집 실패({type(e).__name__}) — H3 는 소형주·저커버리지 "
+                     f"축으로만 판정합니다. 나머지 가설검정은 그대로 진행합니다.")
+            ctx["retail"] = pd.DataFrame()
         T3 = test_H3(P0, PRIMARY_SIGNAL, ppy, ctx.get("retail"))
         cid_f = _cfg_id(PRIMARY_CONFIG["window"], PRIMARY_CONFIG["rebal"], "freq")
         cid_s = _cfg_id(PRIMARY_CONFIG["window"], PRIMARY_CONFIG["rebal"], "highskill")
@@ -433,8 +445,45 @@ def main() -> dict:
     return {"ctx": ctx, "verdict": ctx.get("verdict"), "outputs": OUTPUTS}
 
 
+def _write_cache_evidence() -> None:
+    """절대원칙 증빙 — 매니페스트와 원장. 다른 산출물과 독립적으로, 먼저 쓴다."""
+    try:
+        man = cache_manifest()
+        write_text("cache_manifest.json",
+                   json.dumps(man, ensure_ascii=False, indent=2, default=str))
+        led, _viol = cache_audit()
+        write_df("cache_ledger.csv", led)
+        if man.get("datasets"):
+            LOG.table([[d["scope"], d["name"], f"{d['rows']:,}"]
+                       for d in sorted(man["datasets"], key=lambda x: -x["rows"])[:20]],
+                      ["인덱스", "데이터셋", "행수"], ["l", "l", "r"],
+                      title="드라이브 캐시 매니페스트 (cache_manifest.json — 다음 세션 재호출용)")
+    except Exception as e:                                        # noqa
+        LOG.error(f"캐시 증빙 산출 실패({type(e).__name__}: {e}) — "
+                  f"드라이브에 무엇이 남았는지 파일로 증명할 수 없습니다.")
+
+
+def _emergency_flush() -> None:
+    """중단·예외 시에도 인덱스를 반드시 커밋한다. 안 하면 이번 실행의 저장분을 잃는다."""
+    V = globals().get("VAULT")
+    if V is None:
+        return
+    try:
+        V.flush()
+        LOG.ok(f"인덱스 커밋 완료 — 여기까지 받은 데이터는 {V.root} 에서 재호출 가능합니다.")
+    except Exception as e:                                        # noqa
+        _safe_print(f"[경고] 인덱스 커밋 실패({type(e).__name__}) — 다음 실행에서 "
+                    f"일부 데이터를 다시 받게 됩니다.")
+
+
 def write_outputs(ctx: dict, ppy: float, t_all: float):
-    """SPEC §10 산출물 일체."""
+    """SPEC §10 산출물 일체.
+
+    ★ 캐시 증빙(cache_manifest.json / cache_ledger.csv)을 '맨 먼저' 쓴다.
+      맨 뒤에 두면, 그 앞 어딘가의 KeyError 하나로 절대원칙 증빙이 통째로 사라지면서
+      report_cache_ledger() 는 여전히 '통과'를 출력한다 — 증빙 없는 초록불이 된다.
+    """
+    _write_cache_evidence()
     rows = []
     for cid, bt in ctx["allbt"].items():
         R = bt.get("returns", pd.DataFrame())
@@ -519,17 +568,7 @@ def write_outputs(ctx: dict, ppy: float, t_all: float):
         if len(bt.get("returns", [])):
             persist(f"backtest_returns_{STRATEGY_ID}_{cid.replace('|', '_')}", bt["returns"],
                     scope="private", domain="backtest", source=cid)
-    # ★ 절대원칙: 세션이 바뀌어도 '이름을 몰라도' 다시 꺼낼 수 있어야 한다.
-    #   매니페스트에 공용/전용 인덱스의 모든 데이터셋과 그 재호출 코드를 박아 둔다.
-    man = cache_manifest()
-    write_text("cache_manifest.json", json.dumps(man, ensure_ascii=False, indent=2, default=str))
-    led, _viol = cache_audit()
-    write_df("cache_ledger.csv", led)
-    if man.get("datasets"):
-        LOG.table([[d["scope"], d["name"], f"{d['rows']:,}"]
-                   for d in sorted(man["datasets"], key=lambda x: -x["rows"])[:20]],
-                  ["인덱스", "데이터셋", "행수"], ["l", "l", "r"],
-                  title="드라이브 캐시 매니페스트 (cache_manifest.json — 다음 세션 재호출용)")
+    _write_cache_evidence()          # 백테스트 저장분까지 반영해 한 번 더 갱신
     LOG.table([[os.path.basename(p), f"{os.path.getsize(p)/1024:.1f}KB"] for p in OUTPUTS
                if os.path.exists(p)], ["산출물", "크기"], ["l", "r"],
               title=f"산출물 (§10) → {os.path.join(GDRIVE_PRIVATE_NS, 'outputs')}")
@@ -547,6 +586,18 @@ if __name__ == "__main__" or ENV["ipython"]:
     except KeyboardInterrupt:
         LOG.warn("사용자 중단. 여기까지 수집된 데이터는 캐시에 저장되어 있으며 "
                  "재실행 시 이어받습니다.")
+        _emergency_flush()
+    except Exception as e:                                        # noqa
+        # ★ StageFailure/KeyboardInterrupt 외의 예외(스테이지 밖에서 난 RuntimeError 등)가
+        #   여기까지 오면, 예전엔 맨 트레이스백만 남기고 죽어 이번 실행이 디스크에 쓴
+        #   parquet 이 저널에 등록되지 않은 채 남았다 — 다음 세션이 못 찾는다.
+        LOG.banner("실행 중단", f"{type(e).__name__}: {str(e)[:200]}")
+        _safe_print(traceback.format_exc()[-3000:])
+        try:
+            PIPE.report_stages()
+        except Exception:
+            pass
+        _emergency_flush()
         try:
             if VAULT:
                 VAULT.flush()

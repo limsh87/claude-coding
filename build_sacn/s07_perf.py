@@ -17,7 +17,7 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 TQDM_MININTERVAL = 1.0          # 진행률 갱신 최소 간격(초). 주피터 IOPub 보호.
-_QUIET_LOCK = threading.Lock()
+_QUIET_LOCK = threading.Lock()   # 봉인 구간 중첩 방지 (fd 교체는 프로세스 전역이다)
 
 # ★ 리허설(가짜 네트워크) 중에는 캐시에 절대 쓰지 않는다.
 #   이 플래그가 없으면 리허설이 만들어낸 합성 데이터가 공용 인덱스에 저장되고,
@@ -67,6 +67,15 @@ def silence_thirdparty() -> None:
             _fz.TOOLS.mupdf_display_warnings(False)
     except Exception:
         pass
+    # ★ 전역 소켓 타임아웃. FinanceDataReader 의 한국주식 리더는 requests.get 을
+    #   timeout 없이 부른다 — TCP 가 한 번 멈추면 pmap_io 의 스레드풀이 join 에서
+    #   영원히 대기하고, 스테이지 예산으로도 끊을 수 없다(몇 시간짜리 정지).
+    try:
+        import socket as _sock
+        if _sock.getdefaulttimeout() is None:
+            _sock.setdefaulttimeout(40)
+    except Exception:
+        pass
     os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
 
@@ -88,22 +97,44 @@ class quiet_fds:
         self.enabled = bool(enabled) and not os.environ.get("SACN_NO_QUIET")
         self._saved: List[Tuple[int, int]] = []
         self._null = -1
+        self._pyout = None
+        self._pyerr = None
+        self._held = False
 
     def __enter__(self):
         if not self.enabled:
             return self
+        # ★ 재진입/동시진입 금지. fd 를 바꿔치는 작업은 프로세스 전역이라,
+        #   두 구간이 겹치면 복원 순서가 엇갈려 양쪽 fd 가 /dev/null 에 남는다.
+        if not _QUIET_LOCK.acquire(blocking=False):
+            self.enabled = False             # 이미 누군가 봉인 중 — 중첩하지 않는다
+            return self
+        self._held = True
         try:
             sys.stdout.flush(); sys.stderr.flush()
         except Exception:
             pass
+        # ★ 주피터에서는 sys.stdout/stderr 가 fd 1/2 가 아니라 ipykernel 의 ZMQ 스트림이다.
+        #   IOPub 폭주의 실제 원인은 라이브러리의 print()/logging 이고, 그건 ZMQ 스트림으로
+        #   간다 — fd 만 바꾸면 정작 막아야 할 것을 못 막는다. 둘 다 갈아끼운다.
+        try:
+            self._pyout, self._pyerr = sys.stdout, sys.stderr
+            sys.stdout = open(os.devnull, "w")
+            sys.stderr = sys.stdout
+        except Exception:
+            self._pyout = self._pyerr = None
         try:
             self._null = os.open(os.devnull, os.O_WRONLY)
             for fd in (1, 2):
                 self._saved.append((fd, os.dup(fd)))
                 os.dup2(self._null, fd)
-        except Exception:
-            self._restore()                  # 반쯤 성공한 상태를 남기지 않는다
+        except BaseException:
+            # ★ except Exception 이면 KeyboardInterrupt 가 여기를 통과한다.
+            #   fd 1 만 바뀐 채 __enter__ 를 빠져나가면 with 본문도 __exit__ 도 실행되지
+            #   않아, 남은 몇 시간 동안 모든 출력이 /dev/null 로 사라진다.
+            self._restore()
             self.enabled = False
+            raise
         return self
 
     def _restore(self):
@@ -120,6 +151,20 @@ class quiet_fds:
             except Exception:
                 pass
             self._null = -1
+        if self._pyout is not None:
+            try:
+                if sys.stdout is not self._pyout:
+                    sys.stdout.close()
+            except Exception:
+                pass
+            sys.stdout, sys.stderr = self._pyout, self._pyerr
+            self._pyout = self._pyerr = None
+        if self._held:
+            self._held = False
+            try:
+                _QUIET_LOCK.release()
+            except Exception:
+                pass
 
     def __exit__(self, *exc):
         self._restore()
@@ -169,7 +214,12 @@ class SourceHealth:
             else:
                 self.bad[src] += 1
                 self.streak[src] += 1
-                if self.streak[src] >= self.threshold and src not in self.tripped:
+                # ★ 한 번이라도 정상 응답을 준 소스는 은퇴시키지 않는다.
+                #   '빈 응답'은 대개 그 종목이 원래 없다는 뜻이지 소스 고장이 아니다.
+                #   폐지종목이 몰린 구간에서 연속 10건은 아주 흔하고, 그걸로 살아 있는
+                #   소스를 끊으면 남은 수천 종목이 통째로 실패 처리된다.
+                if (self.streak[src] >= self.threshold and self.ok[src] == 0
+                        and src not in self.tripped):
                     self.tripped[src] = self.bad[src]
 
     def live_sources(self, order: Sequence[str]) -> List[str]:
@@ -243,13 +293,24 @@ def persist(name: str, df: Any, *, scope: str = "shared", domain: str = "",
         return False
     ok = True
     try:
-        V.put_table(name, df, scope=scope, domain=domain or "misc", source=source or name)
+        # ★ put_table 은 쓰기 실패를 '예외'가 아니라 'None 반환'으로 알린다
+        #   (04_vault.py 에서 스스로 except 하고 LOG.warn 후 return None).
+        #   반환값을 안 보면 디스크가 꽉 찼거나 드라이브가 파일을 잡고 있어도
+        #   원장에는 '저장'으로 찍히고 감사는 '절대원칙 점검 통과'를 출력한다 —
+        #   보증이 깨진 순간에 초록불이 켜지는, 가능한 최악의 결과다.
+        ok = V.put_table(name, df, scope=scope, domain=domain or "misc",
+                         source=source or name) is not None
     except Exception as e:                                   # noqa
         ok = False
         LOG.error(f"캐시 저장 실패 [{scope}/{name}] {type(e).__name__}: {e} — "
                   f"이번 실행에서 받은 데이터가 드라이브에 남지 않습니다. "
                   f"디스크 여유({free_gb_safe(getattr(V, 'root', '.')):.1f}GB)와 "
                   f"드라이브 동기화 상태를 확인하세요.")
+    if not ok:
+        LOG.error(f"캐시 저장 실패 [{scope}/{name}] {rows:,}행 — 드라이브에 남지 않았습니다. "
+                  f"여유 {free_gb_safe(getattr(V, 'root', '.')):.1f}GB · "
+                  f"드라이브 동기화가 파일을 잡고 있는지 확인하세요. "
+                  f"이 데이터는 다음 세션에서 재호출할 수 없습니다.")
     with _CACHE_LK:
         CACHE_LEDGER.append({"dataset": name, "scope": scope, "rows": rows,
                              "action": "저장" if ok else "저장실패", "note": note or source})

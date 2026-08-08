@@ -68,8 +68,12 @@ class KRXAuth:
                      "대부분의 통계 화면(전종목시세·PER/PBR)은 비로그인으로도 응답합니다.")
             return self.openapi_ok
         with self._lk:
-            if self._logged_in_once and self.session_ok:
-                return True
+            # ★ 실패도 기억한다. 예전엔 성공만 memoize 해서, 비밀번호가 틀리면
+            #   bld 호출마다 워밍업 2 + 로그인 POST 2(각 내부 3회 재시도)를 2 QPS 로
+            #   다시 돌았다. 120개월 × 8일 walk-back 이면 몇 시간이 순수 재로그인이고,
+            #   KRX 쪽에는 실패 로그인 수천 건이 쌓인다.
+            if self._logged_in_once:
+                return self.session_ok or self.openapi_ok
             self._logged_in_once = True
             # 워밍업 없이 바로 POST 하면 세션 쿠키가 없어 항상 실패한다
             http_get(self.LOGIN_WARM1, source="krx", tries=1)
@@ -211,7 +215,11 @@ def _krx_map_frame(rows: List[dict], want: Sequence[str]) -> pd.DataFrame:
     """응답 dict 리스트를 우리 스키마로 접는다. 없는 필드는 NaN 으로 남긴다."""
     if not rows:
         return pd.DataFrame(columns=list(want))
-    keys = set(rows[0].keys())
+    # ★ 첫 행 하나로 키 집합을 정하면 요약행·부분행 하나에 매핑 전체가 무너진다.
+    #   앞쪽 여러 행의 합집합을 쓴다.
+    keys: set = set()
+    for r in rows[:50]:
+        keys |= set(r.keys())
     pick: Dict[str, str] = {}
     for tgt in want:
         for cand in _KRX_FIELD.get(tgt, ()):
@@ -247,7 +255,11 @@ def _krx_bld_call(kind: str, **params) -> List[dict]:
 
 
 def _prev_bizday(ts: Any, back: int = 0) -> _dt.date:
-    d = as_ts(ts).date() - _dt.timedelta(days=int(back))
+    try:
+        base = as_ts(ts).date()
+    except Exception:
+        base = _dt.date.today()          # 파싱 불가한 값 하나로 스테이지를 죽이지 않는다
+    d = base - _dt.timedelta(days=int(back))
     while d.weekday() >= 5:
         d -= _dt.timedelta(days=1)
     return d
@@ -261,13 +273,31 @@ def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional
     """
     want = ["code", "name", "market", "close", "open", "high", "low",
             "volume", "amount", "mktcap", "shares"]
+    seen_days: set = set()
     for back in range(walk_back + 1):
         d = _prev_bizday(day, back)
+        if d in seen_days:          # 주말이면 back=0,1,2 가 같은 금요일을 가리킨다
+            continue
+        seen_days.add(d)
         rows = _krx_bld_call("allprice", mktId=market, trdDd=d.strftime("%Y%m%d"))
         if not rows:
             continue
         f = _krx_map_frame(rows, want)
         if len(f):
+            # ★ 단위 검증. KRX 가 시총 단위를 원→백만원으로 바꾸면 값이 1e-6 이 되고,
+            #   §5 하한(500억)이 매달 유니버스를 통째로 비운다. 값이 '있으므로'
+            #   결측 가드도 안 걸린다. 같은 응답 안의 상장주식수×종가로 교차검증한다.
+            try:
+                chk = (pd.to_numeric(f["mktcap"], errors="coerce") /
+                       (pd.to_numeric(f["shares"], errors="coerce") *
+                        pd.to_numeric(f["close"], errors="coerce")))
+                med = float(np.nanmedian(chk.replace([np.inf, -np.inf], np.nan)))
+                if np.isfinite(med) and not (0.5 <= med <= 2.0):
+                    LOG.error(f"KRX 시총 단위 이상 — 시총/(주식수×종가) 중앙값 {med:.3g} "
+                              f"(정상 1.0). 단위가 바뀐 것으로 보고 이 스냅샷을 버립니다.")
+                    return None
+            except Exception:
+                pass
             f["date"] = pd.Timestamp(d)
             return f
     return None
@@ -276,8 +306,12 @@ def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional
 def krx_all_perpbr(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional[pd.DataFrame]:
     """전종목 PER/PBR/BPS/배당 스냅샷 — 날짜 1개 = 1호출. §6.3 직교화의 BM 원천."""
     want = ["code", "name", "close", "eps", "per", "bps", "pbr", "dps", "div_yield"]
+    seen_days: set = set()
     for back in range(walk_back + 1):
         d = _prev_bizday(day, back)
+        if d in seen_days:
+            continue
+        seen_days.add(d)
         rows = _krx_bld_call("perpbr", mktId=market, trdDd=d.strftime("%Y%m%d"), searchType="1")
         if not rows:
             continue
@@ -377,15 +411,22 @@ def krx_listing_snapshots(months: pd.DatetimeIndex, freq_q: bool = True) -> pd.D
 _PREF_TAIL = set("579KLMklm")
 _SPAC_PAT = re.compile(r"스팩|기업인수목적")
 _REIT_PAT = re.compile(r"리츠|위탁관리부동산|기업구조조정부동산")
-_ETF_PAT = re.compile(r"KODEX|TIGER|KBSTAR|ARIRANG|HANARO|SOL |ACE |PLUS |RISE |KOSEF|"
-                      r"TIMEFOLIO|파워|마이티|네비게이터|ETN|레버리지|인버스", re.I)
+# ★ ETP 판정은 '앞머리 브랜드'로만 한다. 부분일치로 두면 보통주를 삼킨다:
+#   구버전의 '파워' 는 파워로직스(047310)·파워넷·한국파워트레인 같은 멀쩡한 코스닥
+#   보통주를 ETF 로 분류해 가격 수집에서 빼고 §5 로 제외했다. 시가총액 수천억 종목이
+#   10년 내내 유니버스에서 사라지는데, 감사표에는 'ETF/ETN 제외' 한 줄로만 남는다.
+#   '레버리지·인버스'도 상품명 어디에나 붙을 수 있어 앞머리에서만 인정한다.
+_ETF_BRANDS = (r"KODEX|TIGER|KBSTAR|ARIRANG|HANARO|KOSEF|TIMEFOLIO|SOL|ACE|PLUS|RISE|"
+               r"KINDEX|KTOP|FOCUS|마이다스|네비게이터")
+_ETF_PAT = re.compile(rf"^\s*(?:{_ETF_BRANDS})\b|(?:^|\s)(?:ETN|ETF)(?:\s|$)|"
+                      rf"^\s*(?:레버리지|인버스)\b", re.I)
 _ELW_PAT = re.compile(r"콜\d|풋\d|ELW|워런트|신주인수권", re.I)
 
 
 def is_preferred(code: str, name: str = "") -> bool:
     """우선주 판정. 코드 말자리(구형 5/7/9, 신형 K/L/M)와 종목명 '우/우B/2우B' 를 함께 본다."""
     c = str(code or "")
-    if len(c) == 6 and c[-1] in _PREF_TAIL and c[-1] != "0":
+    if len(c) == 6 and c[-1] in _PREF_TAIL:      # '0' 은 _PREF_TAIL 에 없다 (가드 불필요)
         return True
     n = str(name or "").strip()
     return bool(re.search(r"(\d?우[BC]?)$|우선주$", n))
@@ -395,8 +436,10 @@ def classify_security(code: str, name: str = "", market: str = "") -> str:
     """'common' | 'preferred' | 'etp' | 'spac' | 'reit' | 'elw' | 'konex'.
 
     보통주(common)만 백테스트 유니버스의 후보다. 나머지는 가격조차 받지 않는다.
-    ★ 리츠는 §5 가 명시적으로 배제하지 않으므로 common 으로 남기되 라벨은 붙여 둔다
-      (해석표에서 비중을 볼 수 있어야 하고, 나중에 배제하려면 근거가 있어야 한다).
+    ★ 리츠는 여기서 'reit' 로 라벨만 붙이고 가격은 받는다. 실제 제외는 §5 의
+      build_exclusion_flags 가 담당한다(is_reit → excluded). 즉 리츠는 가격을 받고
+      유니버스에서 빠진다 — 소량이라 그대로 두지만, 두 곳의 정책이 다르다는 사실을
+      여기 적어 둔다(주석과 코드가 어긋나 있던 부분).
     """
     c, n = str(code or ""), str(name or "")
     mk = str(market or "").upper()

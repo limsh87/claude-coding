@@ -348,19 +348,47 @@ def equal_weight_universe(grid: "PriceGrid", uni_panel: pd.DataFrame,
 
 
 def index_benchmarks(dates: Sequence[pd.Timestamp]) -> Dict[str, pd.Series]:
-    """KOSPI / KOSDAQ — 리밸런싱 시점 격자에 맞춰 수익률화."""
+    """KOSPI / KOSDAQ — 리밸런싱 시점 격자에 맞춰 수익률화.
+
+    ★ 절대원칙: 여기도 네트워크 수집이다. 예전엔 매 실행마다 새로 받고 캐시에 한 줄도
+      남기지 않았다 — 세션이 바뀌면 다시 받아야 하고, 네트워크가 없으면 §8 의 '진짜
+      비교 기준'이 통째로 사라진다. 일별 종가를 공용 인덱스에 남긴다.
+    """
     out: Dict[str, pd.Series] = {}
-    if fdr is None or not len(dates):
+    if not len(dates):
         return out
     idx = pd.DatetimeIndex(sorted(as_ts(d) for d in dates))
+    cached = cache_recall("krx_index_daily", scope="shared")
+    have: Dict[str, pd.DataFrame] = {}
+    if cached is not None and len(cached):
+        cached = cached.copy()
+        cached["date"] = as_ts_series(cached["date"])
+        for nm, g in cached.groupby("index_name"):
+            have[str(nm)] = g
+    fresh: List[pd.DataFrame] = []
     for name, sym in (("KOSPI", "KS11"), ("KOSDAQ", "KQ11")):
         try:
-            df = fdr.DataReader(sym, (idx[0] - pd.DateOffset(months=2)).strftime("%Y-%m-%d"),
-                                idx[-1].strftime("%Y-%m-%d"))
-            if df is None or df.empty:
+            g = have.get(name)
+            need = (g is None or not len(g)
+                    or as_ts_series(g["date"]).max() < idx[-1] - pd.Timedelta(days=7)
+                    or as_ts_series(g["date"]).min() > idx[0] - pd.Timedelta(days=20))
+            if need and fdr is not None and RUN_MODE != "CACHED":
+                limiter("naver_chart").wait()
+                df = fdr.DataReader(sym, (idx[0] - pd.DateOffset(months=2)).strftime("%Y-%m-%d"),
+                                    idx[-1].strftime("%Y-%m-%d"))
+                if df is not None and len(df):
+                    nd = pd.DataFrame({"index_name": name,
+                                       "date": as_ts_series(pd.Series(df.index)).to_numpy(),
+                                       "close": pd.to_numeric(df["Close"], errors="coerce")})
+                    fresh.append(nd.dropna())
+                    g = pd.concat([x for x in (g, nd) if x is not None and len(x)],
+                                  ignore_index=True)
+            if g is None or not len(g):
+                LOG.warn(f"벤치마크 {name} 을(를) 캐시에서도 네트워크에서도 얻지 못했습니다 — "
+                         f"이 벤치마크는 표에서 빠집니다.")
                 continue
-            c = df["Close"].copy()
-            c.index = as_ts_series(pd.Series(df.index)).to_numpy()
+            c = pd.Series(pd.to_numeric(g["close"], errors="coerce").to_numpy(),
+                          index=as_ts_series(g["date"]).to_numpy()).dropna()
             # FDR 이 같은 날짜를 두 번 돌려주는 경우가 있다. 중복 인덱스에 reindex 하면
             # ValueError 로 죽고, 위 except 가 삼켜 벤치마크가 조용히 사라진다.
             c = c[~pd.Index(c.index).duplicated(keep="last")].sort_index()
@@ -368,6 +396,14 @@ def index_benchmarks(dates: Sequence[pd.Timestamp]) -> Dict[str, pd.Series]:
             out[name] = v.pct_change()
         except Exception as e:                                   # noqa
             LOG.warn(f"벤치마크 {name} 수집 실패({type(e).__name__}) — 이 벤치마크는 표에서 빠집니다.")
+    if fresh:
+        allb = pd.concat(([cached] if cached is not None and len(cached) else []) + fresh,
+                         ignore_index=True)
+        allb["date"] = as_ts_series(allb["date"])
+        allb = allb.drop_duplicates(["index_name", "date"], keep="last").reset_index(drop=True)
+        note_new_data("krx_index_daily", sum(len(f) for f in fresh), "shared", "price", "fdr")
+        persist("krx_index_daily", allb, scope="shared", domain="price",
+                source="fdr KS11/KQ11")
     return out
 
 

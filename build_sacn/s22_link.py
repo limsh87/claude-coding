@@ -235,7 +235,11 @@ def build_link_matrices(ledger: pd.DataFrame, months: pd.DatetimeIndex,
                   ["월", "활동 애널", "연결보유 종목", "링크쌍", "종목당 연결(중위)"],
                   ["l", "r", "r", "r", "r"],
                   title=f"링크 행렬 요약 [{weight_mode}] — 표본 8개월")
-    _save_links(LM, ck)
+    # ★ use_cache=False 는 '읽지 않는다'였을 뿐 쓰기를 막지 않았다. 그래서 계약검정(K4)과
+    #   합성 스모크가 매 실행마다 합성 링크행렬 .npz 를 사용자 드라이브에 남겼다.
+    #   Vault 에는 삭제 API 가 없으므로 영원히 쌓인다 — 절대 1원칙 위반 경로다.
+    if use_cache and not globals().get("_REHEARSAL"):
+        _save_links(LM, ck)
     return LM
 
 

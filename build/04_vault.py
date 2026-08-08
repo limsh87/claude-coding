@@ -109,9 +109,14 @@ class Vault:
                         pass
                 time.sleep(0.4)
         if not acquired:
-            LOG.warn(f"잠금 획득 실패({name}) — 저널 append 는 원자적이므로 그대로 진행합니다.")
+            # ★ "저널 append 는 원자적"이라는 주장은 POSIX 로컬 파일시스템에서 한 번의
+            #   write(≤PIPE_BUF)일 때만 참이다. 드라이브 FUSE/드라이브 데스크톱 마운트에는
+            #   그런 보장이 없고, 우리는 행마다 f.write 를 한다. 두 세션이 겹치면 줄이
+            #   섞이고, 깨진 줄은 read_jsonl 이 조용히 버린다(인덱스 행 유실).
+            LOG.warn(f"잠금 획득 실패({name}) — 다른 세션이 같은 캐시를 쓰고 있는 것 같습니다. "
+                     f"저널이 섞이지 않도록 이번 flush 는 건너뛰고 종료 시 다시 시도합니다.")
         try:
-            yield
+            yield acquired
         finally:
             if acquired:
                 try:
@@ -309,16 +314,31 @@ class Vault:
         })
         return path
 
+    def _table_path(self, scope: str, name: str) -> Optional[str]:
+        """정규 경로 → 없으면 가장 최근 .rev 파일.
+
+        ★ put_table 은 백업(shutil.copy2)이 실패하면 덮어쓰지 않고 '{name}.rev<ts>.parquet'
+          로 피신시킨다. 그런데 get_table 은 '{name}.parquet' 만 열었다. 즉 드라이브가
+          _backup 폴더를 잡고 있던 실행의 결과물은 디스크에 멀쩡히 있는데도 영원히
+          안 읽히고, 다음 세션은 갱신 전의 낡은 표를 받는다 — 저장은 성공, 재호출은 실패.
+        """
+        base = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        if os.path.exists(base):
+            revs = sorted(glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
+            if revs and os.path.getmtime(revs[-1]) > os.path.getmtime(base):
+                return revs[-1]
+            return base
+        revs = sorted(glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
+        return revs[-1] if revs else None
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
-        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if not os.path.exists(path):
+        path = self._table_path(scope, name)
+        if path is None:
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
-            path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
-            if os.path.exists(path2):
-                path = path2
-            else:
+            path = self._table_path(alt, name)
+            if path is None:
                 return None
         if max_age_days is not None:
             age = (time.time() - os.path.getmtime(path)) / 86400.0
@@ -359,7 +379,12 @@ class Vault:
                 rows, self._pending[sc] = self._pending[sc], []
             if not rows:
                 continue
-            with self.lock(f"journal_{sc}"):
+            with self.lock(f"journal_{sc}") as got_lock:
+                if not got_lock:
+                    # 잠금을 못 얻었으면 쓰지 않고 되돌려 놓는다. 다음 flush 에서 다시 시도한다.
+                    with self._lk:
+                        self._pending[sc] = rows + self._pending[sc]
+                    continue
                 append_jsonl(self.journal(sc), rows)
             self.stats[f"journal_append:{sc}"] += len(rows)
             LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")
@@ -401,7 +426,15 @@ class Vault:
             seen.add(rd)
             LOG.info(f"기존 캐시 스캔: {d}")
             n = 0
+            # ★ 안쪽 break 는 os.walk 를 멈추지 못한다 — 파일 상한에 걸려도 남은 디렉터리를
+            #   끝까지 순회한다. 드라이브 데스크톱 스트리밍 모드에서는 그것만으로 드라이브
+            #   전체의 메타데이터를 끌어오게 되어 L0 에서 수 분이 사라진다. 벽시계도 함께 건다.
+            _t0 = time.time()
             for dirpath, dirnames, filenames in os.walk(d):
+                if n >= max_files or (time.time() - _t0) > ADOPT_SCAN_MAX_SEC:
+                    LOG.info(f"  스캔 중단(상한 도달): 파일 {n:,}건 / "
+                             f"{time.time()-_t0:.0f}초 — 나머지는 다음 실행에서 이어서 봅니다.")
+                    break
                 dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
                 for fn in filenames:
                     if n >= max_files:
