@@ -643,6 +643,54 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     _cc("C-TP0", "증거층 전멸을 백테스트 전에 판정 (원인 지목 포함)", c_tp0)
 
+    # ── C-PERSIST : 신규 수집물은 무조건 인덱스에 남는다 (세션 무관 절대원칙) ──────────────
+    def c_persist():
+        """★ 사용자 절대원칙: "어떤 신규수집데이터든 무조건 캐시저장-재호출 가능하게."
+
+        수집 함수가 네트워크로 나가 놓고 결과를 인덱스에 남기지 않으면, 다음 세션은
+        같은 것을 다시 받는다. 그것이 반복수집의 정의다. 주석으로는 못 막으므로
+        **소스에 put_table 이 실제로 있는지**를 검정한다.
+        """
+        collectors = [
+            ("fetch_prices", fetch_prices), ("fetch_investor_flows", fetch_investor_flows),
+            ("fetch_dart_multi_accounts", fetch_dart_multi_accounts),
+            ("fetch_dart_financials", fetch_dart_financials),
+            ("fetch_dart_disclosures", fetch_dart_disclosures),
+            # ★ 저장이 헬퍼로 분리된 수집기는 헬퍼까지 함께 본다. 함수 하나만 보면
+            #   '저장 안 함'으로 오판한다(실제로 이 계약이 첫 실행에서 그렇게 걸렸다).
+            ("fetch_emp_status(+체크포인트·마감)",
+             (fetch_emp_status, _emp_checkpoint, _emp_finalize)),
+            ("fetch_dart_employees", fetch_dart_employees),
+            ("fetch_dart_corpcode", fetch_dart_corpcode),
+            ("fetch_pykrx_snapshots", fetch_pykrx_snapshots),
+            ("build_security_master", build_security_master),
+        ]
+        missing = []
+        for nm, fn in collectors:
+            src = _src_of(*fn) if isinstance(fn, tuple) else _src_of(fn)
+            if not src:
+                return None, "소스 조회 불가 — 검사하지 못했습니다(통과 아님)"
+            if "put_table" not in src:
+                missing.append(nm)
+        if missing:
+            return False, (f"★ 네트워크로 나가면서 인덱스에 남기지 않는 수집기: {missing}. "
+                           f"다음 세션이 같은 것을 다시 받습니다 — 이것이 반복수집의 정의입니다.")
+        # 유니버스 3종은 헬퍼 경유로 저장된다 — 그 헬퍼가 실제로 배선돼 있는지 본다.
+        usrc = _src_of(build_security_master) or ""
+        wired = [t for t in ("src_fdr_listing", "src_kind_listing", "src_fdr_delisting")
+                 if t in usrc]
+        if len(wired) < 3:
+            return False, (f"유니버스 원천이 캐시 경유로 배선되지 않았습니다(배선 {len(wired)}/3) "
+                           f"— 매 실행 네트워크로 나갑니다.")
+        # 빈 결과로 멀쩡한 캐시를 덮지 않는가 (소스 장애 하루가 다음 실행까지 무너뜨린다)
+        hsrc = _src_of(_cached_or_fetch) or ""
+        if hsrc and "len(got)" not in hsrc:
+            return False, "빈 수집 결과로 캐시를 덮어쓰지 않는다는 가드가 보이지 않습니다"
+        return True, (f"수집기 {len(collectors)}종 전부 put_table 보유 · "
+                      f"유니버스 원천 3종 캐시 경유 · 빈 결과 덮어쓰기 차단")
+
+    _cc("C-PERSIST", "신규 수집물은 무조건 인덱스에 남는다 (세션 무관)", c_persist)
+
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     _verdict = lambda p: "SKIP" if p is None else ("PASS" if p else "FAIL")
     rows = [[r["id"], _trunc(r["name"], 34), _verdict(r["pass"]),

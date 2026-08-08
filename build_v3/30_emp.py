@@ -17,6 +17,80 @@ EMP_EXT_COLS = ["corp_code", "bsns_year", "rcept_no", "rcept_dt", "employees",
                 "regular", "payroll_total", "avg_salary", "n_rows", "unit_fix",
                 "pay_fix", "src_flag"]
 
+def adopt_legacy_emp_cache(ext: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """★★ 구버전(v2 코어)이 같은 empSttus 로 채워 둔 공용 캐시를 흡수한다 ★★
+
+    v2 코어의 fetch_dart_employees 는 **같은 API**(empSttus)를 받아 공용 테이블
+    `dart_employees` 에 (corp_code, bsns_year, employees, payroll, knowledge_date) 로 쌓는다.
+    v3 는 확장 파서를 쓰느라 `dart_employees_ext` **하나만** 읽었고, 그래서 v2 를 여러 번
+    돌려 이미 받아 둔 직원현황이 눈앞에 있는데도 "직원현황 데이터가 전혀 없습니다" 로
+    끝났다. 호출권을 다 쓴 날에는 이것이 알파의 유일한 원천이다.
+
+    한계임금은 **연간급여총액과 직원수 두 개면 계산된다**:
+        한계임금    = Δpayroll / Δemployees
+        임금프리미엄 = 한계임금 / (payroll_prev / employees_prev)
+    즉 v2 스키마만으로 TP_N1(핵심 알파)·TP_N2 가 살아난다.
+    정규직 수(rgllbr_co)는 v2 가 받지 않으므로 nl_regular(TP_N3)만 결측으로 남는다 —
+    없는 것을 0 으로 채우지 않는다(원칙 6).
+
+    ★ 우선순위: 같은 (회사, 연도)가 양쪽에 있으면 **ext 를 이긴다**(부문×성별 분해행을
+      쓰고 단위 역추정까지 거친 값이라 더 정확하다). 레거시는 빈 자리만 메운다.
+    """
+    try:
+        leg = VAULT.get_table("dart_employees", scope="shared")
+    except Exception:                                               # noqa
+        leg = None
+    if leg is None or not len(leg):
+        return ext
+    need = {"corp_code", "bsns_year", "employees", "payroll"}
+    if not need.issubset(set(leg.columns)):
+        LOG.warn(f"구버전 직원현황 캐시에 필요한 컬럼이 없습니다({sorted(need - set(leg.columns))}) "
+                 f"— 흡수를 건너뜁니다.")
+        return ext
+    L = leg.copy()
+    L["corp_code"] = L["corp_code"].astype(str)
+    L["bsns_year"] = pd.to_numeric(L["bsns_year"], errors="coerce")
+    L = L.dropna(subset=["corp_code", "bsns_year"])
+    L["bsns_year"] = L["bsns_year"].astype(int)
+    L["employees"] = pd.to_numeric(L["employees"], errors="coerce")
+    L["payroll_total"] = pd.to_numeric(L["payroll"], errors="coerce")
+    # 1인평균급여는 v2 가 저장하지 않는다 → 총액/인원으로 역산한다(0 나눗셈은 결측).
+    L["avg_salary"] = safe_div(L["payroll_total"], L["employees"])
+    L["regular"] = np.nan          # v2 는 rgllbr_co 를 받지 않는다 — 모르는 것은 결측
+    L["n_rows"] = np.nan
+    L["unit_fix"] = L["pay_fix"] = 1.0
+    L["src_flag"] = "legacy_v2"
+    if "rcept_no" not in L.columns:
+        L["rcept_no"] = ""
+    L["rcept_dt"] = (as_ts_series(L["knowledge_date"]) if "knowledge_date" in L.columns
+                     else pd.NaT)
+    L = L.reindex(columns=EMP_EXT_COLS)
+    L = L[L["employees"].notna() & (L["employees"] > 0)]
+    if not len(L):
+        return ext
+    have = set()
+    if ext is not None and len(ext):
+        try:
+            have = set(zip(ext["corp_code"].astype(str), ext["bsns_year"].astype(int)))
+        except Exception:                                           # noqa
+            have = set()
+    add = L[[(c, y) not in have
+             for c, y in zip(L["corp_code"], L["bsns_year"])]]
+    if not len(add):
+        return ext
+    _pay = int(add["payroll_total"].notna().sum())
+    LOG.ok(f"★ 구버전 공용 캐시(dart_employees)에서 직원현황 {len(add):,}행을 흡수했습니다 "
+           f"— {add['corp_code'].nunique():,}사 · {int(add['bsns_year'].min())}~"
+           f"{int(add['bsns_year'].max())}년 · 급여총액 기재 {_pay:,}행 "
+           f"({100*_pay/max(len(add),1):.0f}%).\n"
+           f"     같은 empSttus API 를 v2 전략이 이미 받아 둔 것입니다. 한계임금은 "
+           f"연간급여총액과 직원수만 있으면 계산되므로 TP_N1·TP_N2 가 이 데이터로 살아납니다.\n"
+           f"     ※ 정규직 수(rgllbr_co)는 v2 가 받지 않으므로 TP_N3(nl_regular)만 결측으로 "
+           f"남습니다 — 0 으로 채우지 않습니다.")
+    out = (pd.concat([ext, add], ignore_index=True) if ext is not None and len(ext) else add)
+    return out.drop_duplicates(["corp_code", "bsns_year"], keep="first").reset_index(drop=True)
+
+
 _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 계", "합계(계)", "-"}
 
 # 서킷브레이커 — 연속 실패가 이 수를 넘으면 남은 호출을 즉시 포기한다(§3).
@@ -212,7 +286,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
       max_calls 로 이번 실행분을 잘라내고, priority 순서로 '담길 확률이 높은 종목'부터 채운다.
       한계임금은 이 전략의 알파 원천이므로 Tier-2 재무보다 **먼저** 예산을 배정한다.
     """
-    cached = VAULT.get_table("dart_employees_ext", scope="shared")
+    cached = adopt_legacy_emp_cache(VAULT.get_table("dart_employees_ext", scope="shared"))
     done = set()
     if cached is not None and len(cached):
         try:

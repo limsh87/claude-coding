@@ -704,7 +704,9 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         if cap < total_needed:
             # ★ 회사 경계로 내림한다. 반쪽짜리 회사는 12개월 차분에 한 건도 기여하지 못하므로
             #   그 회사에 쓴 호출은 전액 손실이다. '완전하거나 없거나' 둘 중 하나여야 한다.
-            cap = max(_per_corp, (cap // _per_corp) * _per_corp)
+            #   ★ 단 cap==0(CACHE_ONLY 등)이면 **0사**여야 한다 — max(_per_corp, …) 로
+            #     최소 1사를 강제하면 "받지 않기로 한 실행"이 1사를 받으러 나간다.
+            cap = 0 if cap <= 0 else max(_per_corp, (cap // _per_corp) * _per_corp)
             jobs = jobs[:cap]
             LOG.warn(
                 f"이번 실행에서는 상한 {cap:,}건만 받습니다 — **회사 {cap // _per_corp:,}사의 "

@@ -177,6 +177,48 @@ def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
     return {str(c).strip().lower(): c for c in d.columns}
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★★ 절대원칙 — 신규 수집물은 **무조건** 인덱스에 남는다 ★★★
+#    루트가 구글드라이브든 로컬이든, 한 번 받은 것은 다음 세션이 그대로 재호출한다.
+#    유니버스 3종(FDR 상장·FDR 폐지·KIND 상장법인)은 매 실행 네트워크로 나가고 있었다.
+#    작아 보여도 (a) 네트워크가 죽으면 그날 실행이 통째로 무의미해지고
+#    (b) 소스가 스키마를 바꾸면 어제까지 되던 실행이 오늘 실패한다.
+#    캐시가 있으면 신선도만 확인하고, 신규 수집이 성공했을 때만 갱신한다(좁혀 덮어쓰기 금지).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+UNIVERSE_CACHE_MAX_DAYS = 1.0        # 이보다 낡으면 새로 받아 본다(실패하면 낡은 것을 쓴다)
+
+
+def _cached_or_fetch(name: str, fetch_fn: Callable[[], pd.DataFrame],
+                     max_age_days: float = UNIVERSE_CACHE_MAX_DAYS) -> pd.DataFrame:
+    """캐시 우선 → 신선하지 않으면 수집 → 성공하면 저장, 실패하면 낡은 캐시로 폴백.
+
+    ★ 신규 수집이 **0행이면 저장하지 않는다.** 소스 장애로 빈 응답이 온 날
+      멀쩡한 캐시를 빈 프레임으로 덮으면 그 다음 실행부터 전부 무너진다.
+    """
+    fresh = VAULT.get_table(name, scope="shared", max_age_days=max_age_days)
+    if fresh is not None and len(fresh):
+        LOG.info(f"공용 캐시에서 {name} {len(fresh):,}행 재사용 "
+                 f"({max_age_days:g}일 이내) — 네트워크로 나가지 않습니다.")
+        return fresh
+    try:
+        got = fetch_fn()
+    except Exception as e:                                          # noqa
+        got = None
+        LOG.warn(f"{name} 수집 실패({type(e).__name__}).")
+    if got is not None and len(got):
+        if VAULT.put_table(name, got, scope="shared", domain="universe",
+                           source="자동 캐시 — 신규 수집물은 무조건 인덱스에 남긴다") is None:
+            LOG.error(f"{name} 저장 실패 — 다음 실행이 같은 것을 다시 받습니다.")
+        return got
+    stale = VAULT.get_table(name, scope="shared")          # 신선도 무시
+    if stale is not None and len(stale):
+        LOG.warn(f"{name} 신규 수집이 비었습니다 — 낡은 공용 캐시 {len(stale):,}행을 씁니다. "
+                 f"빈 결과로 캐시를 덮지 않습니다(그러면 다음 실행까지 무너집니다).")
+        return stale
+    return got if got is not None else pd.DataFrame()
+
+
 def fetch_fdr_listing() -> pd.DataFrame:
     d = _fdr_cache_csv("listing/krx")
     if d is not None and len(d):
@@ -558,19 +600,19 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     parts: List[pd.DataFrame] = []
     src_stats: List[Tuple[str, int]] = []
 
-    lst = fetch_fdr_listing()
+    lst = _cached_or_fetch("src_fdr_listing", fetch_fdr_listing)
     if len(lst):
         parts.append(lst)
         src_stats.append(("FDR 상장목록", len(lst)))
         PIPE.io("IN", "HTTP", "fdr:StockListing", lst, source="FinanceDataReader")
 
-    kind = fetch_kind_listing()
+    kind = _cached_or_fetch("src_kind_listing", fetch_kind_listing)
     if len(kind):
         parts.append(kind)
         src_stats.append(("KIND 상장법인", len(kind)))
         PIPE.io("IN", "HTTP", "kind:corpList", kind, source="KIND")
 
-    dead = fetch_fdr_delisting()
+    dead = _cached_or_fetch("src_fdr_delisting", fetch_fdr_delisting)
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):

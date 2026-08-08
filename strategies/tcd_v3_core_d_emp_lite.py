@@ -352,7 +352,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.1058"
+BUILD_VERSION  = "v3.20260808.1119"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -2930,6 +2930,48 @@ def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
     return {str(c).strip().lower(): c for c in d.columns}
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★★★ 절대원칙 — 신규 수집물은 **무조건** 인덱스에 남는다 ★★★
+#    루트가 구글드라이브든 로컬이든, 한 번 받은 것은 다음 세션이 그대로 재호출한다.
+#    유니버스 3종(FDR 상장·FDR 폐지·KIND 상장법인)은 매 실행 네트워크로 나가고 있었다.
+#    작아 보여도 (a) 네트워크가 죽으면 그날 실행이 통째로 무의미해지고
+#    (b) 소스가 스키마를 바꾸면 어제까지 되던 실행이 오늘 실패한다.
+#    캐시가 있으면 신선도만 확인하고, 신규 수집이 성공했을 때만 갱신한다(좁혀 덮어쓰기 금지).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+UNIVERSE_CACHE_MAX_DAYS = 1.0        # 이보다 낡으면 새로 받아 본다(실패하면 낡은 것을 쓴다)
+
+
+def _cached_or_fetch(name: str, fetch_fn: Callable[[], pd.DataFrame],
+                     max_age_days: float = UNIVERSE_CACHE_MAX_DAYS) -> pd.DataFrame:
+    """캐시 우선 → 신선하지 않으면 수집 → 성공하면 저장, 실패하면 낡은 캐시로 폴백.
+
+    ★ 신규 수집이 **0행이면 저장하지 않는다.** 소스 장애로 빈 응답이 온 날
+      멀쩡한 캐시를 빈 프레임으로 덮으면 그 다음 실행부터 전부 무너진다.
+    """
+    fresh = VAULT.get_table(name, scope="shared", max_age_days=max_age_days)
+    if fresh is not None and len(fresh):
+        LOG.info(f"공용 캐시에서 {name} {len(fresh):,}행 재사용 "
+                 f"({max_age_days:g}일 이내) — 네트워크로 나가지 않습니다.")
+        return fresh
+    try:
+        got = fetch_fn()
+    except Exception as e:                                          # noqa
+        got = None
+        LOG.warn(f"{name} 수집 실패({type(e).__name__}).")
+    if got is not None and len(got):
+        if VAULT.put_table(name, got, scope="shared", domain="universe",
+                           source="자동 캐시 — 신규 수집물은 무조건 인덱스에 남긴다") is None:
+            LOG.error(f"{name} 저장 실패 — 다음 실행이 같은 것을 다시 받습니다.")
+        return got
+    stale = VAULT.get_table(name, scope="shared")          # 신선도 무시
+    if stale is not None and len(stale):
+        LOG.warn(f"{name} 신규 수집이 비었습니다 — 낡은 공용 캐시 {len(stale):,}행을 씁니다. "
+                 f"빈 결과로 캐시를 덮지 않습니다(그러면 다음 실행까지 무너집니다).")
+        return stale
+    return got if got is not None else pd.DataFrame()
+
+
 def fetch_fdr_listing() -> pd.DataFrame:
     d = _fdr_cache_csv("listing/krx")
     if d is not None and len(d):
@@ -3311,19 +3353,19 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     parts: List[pd.DataFrame] = []
     src_stats: List[Tuple[str, int]] = []
 
-    lst = fetch_fdr_listing()
+    lst = _cached_or_fetch("src_fdr_listing", fetch_fdr_listing)
     if len(lst):
         parts.append(lst)
         src_stats.append(("FDR 상장목록", len(lst)))
         PIPE.io("IN", "HTTP", "fdr:StockListing", lst, source="FinanceDataReader")
 
-    kind = fetch_kind_listing()
+    kind = _cached_or_fetch("src_kind_listing", fetch_kind_listing)
     if len(kind):
         parts.append(kind)
         src_stats.append(("KIND 상장법인", len(kind)))
         PIPE.io("IN", "HTTP", "kind:corpList", kind, source="KIND")
 
-    dead = fetch_fdr_delisting()
+    dead = _cached_or_fetch("src_fdr_delisting", fetch_fdr_delisting)
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
@@ -4988,7 +5030,9 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         if cap < total_needed:
             # ★ 회사 경계로 내림한다. 반쪽짜리 회사는 12개월 차분에 한 건도 기여하지 못하므로
             #   그 회사에 쓴 호출은 전액 손실이다. '완전하거나 없거나' 둘 중 하나여야 한다.
-            cap = max(_per_corp, (cap // _per_corp) * _per_corp)
+            #   ★ 단 cap==0(CACHE_ONLY 등)이면 **0사**여야 한다 — max(_per_corp, …) 로
+            #     최소 1사를 강제하면 "받지 않기로 한 실행"이 1사를 받으러 나간다.
+            cap = 0 if cap <= 0 else max(_per_corp, (cap // _per_corp) * _per_corp)
             jobs = jobs[:cap]
             LOG.warn(
                 f"이번 실행에서는 상한 {cap:,}건만 받습니다 — **회사 {cap // _per_corp:,}사의 "
@@ -7479,6 +7523,80 @@ EMP_EXT_COLS = ["corp_code", "bsns_year", "rcept_no", "rcept_dt", "employees",
                 "regular", "payroll_total", "avg_salary", "n_rows", "unit_fix",
                 "pay_fix", "src_flag"]
 
+def adopt_legacy_emp_cache(ext: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """★★ 구버전(v2 코어)이 같은 empSttus 로 채워 둔 공용 캐시를 흡수한다 ★★
+
+    v2 코어의 fetch_dart_employees 는 **같은 API**(empSttus)를 받아 공용 테이블
+    `dart_employees` 에 (corp_code, bsns_year, employees, payroll, knowledge_date) 로 쌓는다.
+    v3 는 확장 파서를 쓰느라 `dart_employees_ext` **하나만** 읽었고, 그래서 v2 를 여러 번
+    돌려 이미 받아 둔 직원현황이 눈앞에 있는데도 "직원현황 데이터가 전혀 없습니다" 로
+    끝났다. 호출권을 다 쓴 날에는 이것이 알파의 유일한 원천이다.
+
+    한계임금은 **연간급여총액과 직원수 두 개면 계산된다**:
+        한계임금    = Δpayroll / Δemployees
+        임금프리미엄 = 한계임금 / (payroll_prev / employees_prev)
+    즉 v2 스키마만으로 TP_N1(핵심 알파)·TP_N2 가 살아난다.
+    정규직 수(rgllbr_co)는 v2 가 받지 않으므로 nl_regular(TP_N3)만 결측으로 남는다 —
+    없는 것을 0 으로 채우지 않는다(원칙 6).
+
+    ★ 우선순위: 같은 (회사, 연도)가 양쪽에 있으면 **ext 를 이긴다**(부문×성별 분해행을
+      쓰고 단위 역추정까지 거친 값이라 더 정확하다). 레거시는 빈 자리만 메운다.
+    """
+    try:
+        leg = VAULT.get_table("dart_employees", scope="shared")
+    except Exception:                                               # noqa
+        leg = None
+    if leg is None or not len(leg):
+        return ext
+    need = {"corp_code", "bsns_year", "employees", "payroll"}
+    if not need.issubset(set(leg.columns)):
+        LOG.warn(f"구버전 직원현황 캐시에 필요한 컬럼이 없습니다({sorted(need - set(leg.columns))}) "
+                 f"— 흡수를 건너뜁니다.")
+        return ext
+    L = leg.copy()
+    L["corp_code"] = L["corp_code"].astype(str)
+    L["bsns_year"] = pd.to_numeric(L["bsns_year"], errors="coerce")
+    L = L.dropna(subset=["corp_code", "bsns_year"])
+    L["bsns_year"] = L["bsns_year"].astype(int)
+    L["employees"] = pd.to_numeric(L["employees"], errors="coerce")
+    L["payroll_total"] = pd.to_numeric(L["payroll"], errors="coerce")
+    # 1인평균급여는 v2 가 저장하지 않는다 → 총액/인원으로 역산한다(0 나눗셈은 결측).
+    L["avg_salary"] = safe_div(L["payroll_total"], L["employees"])
+    L["regular"] = np.nan          # v2 는 rgllbr_co 를 받지 않는다 — 모르는 것은 결측
+    L["n_rows"] = np.nan
+    L["unit_fix"] = L["pay_fix"] = 1.0
+    L["src_flag"] = "legacy_v2"
+    if "rcept_no" not in L.columns:
+        L["rcept_no"] = ""
+    L["rcept_dt"] = (as_ts_series(L["knowledge_date"]) if "knowledge_date" in L.columns
+                     else pd.NaT)
+    L = L.reindex(columns=EMP_EXT_COLS)
+    L = L[L["employees"].notna() & (L["employees"] > 0)]
+    if not len(L):
+        return ext
+    have = set()
+    if ext is not None and len(ext):
+        try:
+            have = set(zip(ext["corp_code"].astype(str), ext["bsns_year"].astype(int)))
+        except Exception:                                           # noqa
+            have = set()
+    add = L[[(c, y) not in have
+             for c, y in zip(L["corp_code"], L["bsns_year"])]]
+    if not len(add):
+        return ext
+    _pay = int(add["payroll_total"].notna().sum())
+    LOG.ok(f"★ 구버전 공용 캐시(dart_employees)에서 직원현황 {len(add):,}행을 흡수했습니다 "
+           f"— {add['corp_code'].nunique():,}사 · {int(add['bsns_year'].min())}~"
+           f"{int(add['bsns_year'].max())}년 · 급여총액 기재 {_pay:,}행 "
+           f"({100*_pay/max(len(add),1):.0f}%).\n"
+           f"     같은 empSttus API 를 v2 전략이 이미 받아 둔 것입니다. 한계임금은 "
+           f"연간급여총액과 직원수만 있으면 계산되므로 TP_N1·TP_N2 가 이 데이터로 살아납니다.\n"
+           f"     ※ 정규직 수(rgllbr_co)는 v2 가 받지 않으므로 TP_N3(nl_regular)만 결측으로 "
+           f"남습니다 — 0 으로 채우지 않습니다.")
+    out = (pd.concat([ext, add], ignore_index=True) if ext is not None and len(ext) else add)
+    return out.drop_duplicates(["corp_code", "bsns_year"], keep="first").reset_index(drop=True)
+
+
 _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 계", "합계(계)", "-"}
 
 # 서킷브레이커 — 연속 실패가 이 수를 넘으면 남은 호출을 즉시 포기한다(§3).
@@ -7674,7 +7792,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
       max_calls 로 이번 실행분을 잘라내고, priority 순서로 '담길 확률이 높은 종목'부터 채운다.
       한계임금은 이 전략의 알파 원천이므로 Tier-2 재무보다 **먼저** 예산을 배정한다.
     """
-    cached = VAULT.get_table("dart_employees_ext", scope="shared")
+    cached = adopt_legacy_emp_cache(VAULT.get_table("dart_employees_ext", scope="shared"))
     done = set()
     if cached is not None and len(cached):
         try:
@@ -10887,6 +11005,54 @@ def run_contracts_v3(strict: bool = True) -> bool:
                       f"TP<{MIN_TP_ARMS}개면 단일팩터 실행 차단")
 
     _cc("C-TP0", "증거층 전멸을 백테스트 전에 판정 (원인 지목 포함)", c_tp0)
+
+    # ── C-PERSIST : 신규 수집물은 무조건 인덱스에 남는다 (세션 무관 절대원칙) ──────────────
+    def c_persist():
+        """★ 사용자 절대원칙: "어떤 신규수집데이터든 무조건 캐시저장-재호출 가능하게."
+
+        수집 함수가 네트워크로 나가 놓고 결과를 인덱스에 남기지 않으면, 다음 세션은
+        같은 것을 다시 받는다. 그것이 반복수집의 정의다. 주석으로는 못 막으므로
+        **소스에 put_table 이 실제로 있는지**를 검정한다.
+        """
+        collectors = [
+            ("fetch_prices", fetch_prices), ("fetch_investor_flows", fetch_investor_flows),
+            ("fetch_dart_multi_accounts", fetch_dart_multi_accounts),
+            ("fetch_dart_financials", fetch_dart_financials),
+            ("fetch_dart_disclosures", fetch_dart_disclosures),
+            # ★ 저장이 헬퍼로 분리된 수집기는 헬퍼까지 함께 본다. 함수 하나만 보면
+            #   '저장 안 함'으로 오판한다(실제로 이 계약이 첫 실행에서 그렇게 걸렸다).
+            ("fetch_emp_status(+체크포인트·마감)",
+             (fetch_emp_status, _emp_checkpoint, _emp_finalize)),
+            ("fetch_dart_employees", fetch_dart_employees),
+            ("fetch_dart_corpcode", fetch_dart_corpcode),
+            ("fetch_pykrx_snapshots", fetch_pykrx_snapshots),
+            ("build_security_master", build_security_master),
+        ]
+        missing = []
+        for nm, fn in collectors:
+            src = _src_of(*fn) if isinstance(fn, tuple) else _src_of(fn)
+            if not src:
+                return None, "소스 조회 불가 — 검사하지 못했습니다(통과 아님)"
+            if "put_table" not in src:
+                missing.append(nm)
+        if missing:
+            return False, (f"★ 네트워크로 나가면서 인덱스에 남기지 않는 수집기: {missing}. "
+                           f"다음 세션이 같은 것을 다시 받습니다 — 이것이 반복수집의 정의입니다.")
+        # 유니버스 3종은 헬퍼 경유로 저장된다 — 그 헬퍼가 실제로 배선돼 있는지 본다.
+        usrc = _src_of(build_security_master) or ""
+        wired = [t for t in ("src_fdr_listing", "src_kind_listing", "src_fdr_delisting")
+                 if t in usrc]
+        if len(wired) < 3:
+            return False, (f"유니버스 원천이 캐시 경유로 배선되지 않았습니다(배선 {len(wired)}/3) "
+                           f"— 매 실행 네트워크로 나갑니다.")
+        # 빈 결과로 멀쩡한 캐시를 덮지 않는가 (소스 장애 하루가 다음 실행까지 무너뜨린다)
+        hsrc = _src_of(_cached_or_fetch) or ""
+        if hsrc and "len(got)" not in hsrc:
+            return False, "빈 수집 결과로 캐시를 덮어쓰지 않는다는 가드가 보이지 않습니다"
+        return True, (f"수집기 {len(collectors)}종 전부 put_table 보유 · "
+                      f"유니버스 원천 3종 캐시 경유 · 빈 결과 덮어쓰기 차단")
+
+    _cc("C-PERSIST", "신규 수집물은 무조건 인덱스에 남는다 (세션 무관)", c_persist)
 
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     _verdict = lambda p: "SKIP" if p is None else ("PASS" if p else "FAIL")
