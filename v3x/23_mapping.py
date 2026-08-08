@@ -522,15 +522,38 @@ def apply_mapping_gates(mapping: pd.DataFrame, cx: pd.DataFrame, fin: pd.DataFra
             "g1_total": int(len(g1)),
             "g2_pass": int(g2["gate2"].sum()) if len(g2) else 0,
             "g2_total": int(len(g2))}
-    LOG.banner("매핑 게이트 결과", f"종목 {n0:,} → {n1:,}")
+    # ★ '판정 유보'를 '통과'처럼 보이게 하면 안 된다.
+    #   입력이 없어 검정을 못 한 게이트는 coverage/selfdisc_corr 가 전부 NaN 인 채로
+    #   gate=1(통과 처리)이 된다. 그걸 "58/58 HS 통과"로 찍으면 **검증된 적 없는 매핑이
+    #   3중 게이트를 통과한 것처럼** 읽힌다 — 이 전략에서 가장 위험한 오해다.
+    g1_held = bool(len(g1)) and not g1["coverage"].notna().any()
+    g2_held = bool(len(g2)) and not g2["selfdisc_corr"].notna().any()
+    g3_held = "유보" in str(g3.get("detail", ""))
+    n_held = sum([g1_held, g2_held, g3_held])
+    LOG.banner("매핑 게이트 결과",
+               f"종목 {n0:,} → {n1:,}" + (f" · ⚠ {n_held}개 게이트가 판정 유보" if n_held else ""))
     LOG.table([
-        ["게이트1 합계정합성", f"{info['g1_pass']}/{info['g1_total']} HS",
+        ["게이트1 합계정합성",
+         "판정 유보" if g1_held else f"{info['g1_pass']}/{info['g1_total']} HS",
+         "별도 수출매출 부재 — 검정 못 함" if g1_held else
          f"허용 {COVERAGE_BAND[0]:.2f}~{COVERAGE_BAND[1]:.2f} · 변동계수<{COVERAGE_CV_MAX}"],
-        ["게이트2 자기공시상관", f"{info['g2_pass']}/{info['g2_total']} 종목",
-         f"상관 하한 {SELFDISC_CORR_MIN}"],
-        ["게이트3 플라시보", "통과" if g3.get("pass") else "탈락", g3.get("detail", "")[:60]],
+        ["게이트2 자기공시상관",
+         "판정 유보" if g2_held else f"{info['g2_pass']}/{info['g2_total']} 종목",
+         "품목별 매출 부재 — 검정 못 함" if g2_held else f"상관 하한 {SELFDISC_CORR_MIN}"],
+        ["게이트3 플라시보",
+         "판정 유보" if g3_held else ("통과" if g3.get("pass") else "탈락"),
+         g3.get("detail", "")[:60]],
         ["게이트4 PIT 라벨(C3)", "구조 보장", "valid_from = 사업보고서 접수일"],
     ], ["게이트", "결과", "기준"])
+    info["n_held"] = n_held
+    if n_held >= 2:
+        LOG.error(
+            f"매핑 4중 게이트 중 {n_held}개가 **판정 유보**입니다 — 통과가 아니라 "
+            f"'검증하지 못했다'는 뜻입니다.\n"
+            f"    HS↔상장사 매핑이 실질적으로 검증되지 않은 상태이며, A축(통관) 신호의 "
+            f"기업 귀속을 신뢰할 근거가 없습니다.\n"
+            f"    → 이 상태의 백테스트 결과는 '매핑이 맞다면'이라는 큰 가정 위에 있습니다. "
+            f"R4(플라시보)와 R5(A축 절제) 결과를 반드시 함께 보세요.")
 
     if n1 < MAPPING_MIN_NAMES:
         LOG.warn(f"[킬 기준 4] 매핑 게이트 통과 종목 {n1} < {MAPPING_MIN_NAMES} — "

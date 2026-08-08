@@ -480,7 +480,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         def _one(job):
             code, st = job
             chain = _chain_order()
-            if code in dead_set:
+            # ★ 폐지 종목의 실패는 '소스 고장'이 아니라 **정상**이다. 이걸 사망 카운터에
+            #   넣으면, 폐지분이 앞쪽에 몰린 큐에서 40건만에 모든 소스가 내려가고
+            #   뒤에 오는 **생존 종목이 통째로 수집 실패**한다(실측: 614건 전부 폐지분인데
+            #   pykrx·fdr·naver 가 전부 내려갔다). 기대된 실패는 세지 않는다.
+            expected_fail = code in dead_set
+            if expected_fail:
                 chain = [(nm, fn) for nm, fn in chain if nm != "yfinance"]
             for nm, fn in chain:
                 try:
@@ -494,8 +499,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                             _ok[nm] += 1
                             _fail[nm] = 0
                         return d
-                with _lk:
-                    _fail[nm] += 1
+                if not expected_fail:
+                    with _lk:
+                        _fail[nm] += 1
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")

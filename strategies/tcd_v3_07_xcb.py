@@ -3878,7 +3878,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         def _one(job):
             code, st = job
             chain = _chain_order()
-            if code in dead_set:
+            # ★ 폐지 종목의 실패는 '소스 고장'이 아니라 **정상**이다. 이걸 사망 카운터에
+            #   넣으면, 폐지분이 앞쪽에 몰린 큐에서 40건만에 모든 소스가 내려가고
+            #   뒤에 오는 **생존 종목이 통째로 수집 실패**한다(실측: 614건 전부 폐지분인데
+            #   pykrx·fdr·naver 가 전부 내려갔다). 기대된 실패는 세지 않는다.
+            expected_fail = code in dead_set
+            if expected_fail:
                 chain = [(nm, fn) for nm, fn in chain if nm != "yfinance"]
             for nm, fn in chain:
                 try:
@@ -3892,8 +3897,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                             _ok[nm] += 1
                             _fail[nm] = 0
                         return d
-                with _lk:
-                    _fail[nm] += 1
+                if not expected_fail:
+                    with _lk:
+                        _fail[nm] += 1
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
@@ -4387,11 +4393,29 @@ def fetch_dart_bulk(years: Sequence[int], reprts: Sequence[str]) -> pd.DataFrame
     ok_q, fail_q = [], []
     if jobs:
         LOG.info(f"DART 재무정보 일괄다운로드 {len(jobs)} 분기 (분기당 파일 여러 개)")
+        # ★ 벌크 페이지가 로그인벽으로 막히면 48분기가 **전부** 같은 이유로 실패한다.
+        #   실측에서 26,035자짜리 동일 진단이 48줄 쏟아져 콘솔이 묻혔다. 원인은 하나인데
+        #   증상을 48번 출력하는 건 정보가 아니라 소음이다.
+        #   → 같은 진단이 연속 3회면 나머지는 시도하지 않고 한 줄로 요약한다.
+        _first_diag, _streak, _bailed = "", 0, False
         for y, r in tqdm(jobs, desc="DART 벌크", ncols=88, leave=False):
+            if _bailed:
+                fail_q.append((y, r))
+                continue
             names, diag = _bulk_discover(y, r)
             if not names:
                 # 추측 후보를 만들지 않는다(성공확률 0 · 원인만 가림). 즉시 폴백으로 내려간다.
-                LOG.debug(f"벌크 {y}/{REPRT_NAME.get(r, r)} 목록 발견 실패 → 건너뜀 · {diag}")
+                if not _first_diag:
+                    _first_diag = diag
+                    LOG.debug(f"벌크 {y}/{REPRT_NAME.get(r, r)} 목록 발견 실패 → 건너뜀 · {diag}")
+                _streak = _streak + 1 if diag == _first_diag else 0
+                if _streak >= 3 and not ok_q:
+                    _bailed = True
+                    LOG.warn(
+                        f"벌크 목록 발견이 동일한 이유로 연속 실패해 나머지 "
+                        f"{len(jobs) - len(fail_q) - 1}분기는 시도하지 않습니다 "
+                        f"(같은 진단 반복 = 사이트 구조/로그인벽 문제이지 분기별 문제가 아님). "
+                        f"진단: {_first_diag[:120]}")
                 fail_q.append((y, r))
                 continue
             frames = []
@@ -8394,15 +8418,38 @@ def apply_mapping_gates(mapping: pd.DataFrame, cx: pd.DataFrame, fin: pd.DataFra
             "g1_total": int(len(g1)),
             "g2_pass": int(g2["gate2"].sum()) if len(g2) else 0,
             "g2_total": int(len(g2))}
-    LOG.banner("매핑 게이트 결과", f"종목 {n0:,} → {n1:,}")
+    # ★ '판정 유보'를 '통과'처럼 보이게 하면 안 된다.
+    #   입력이 없어 검정을 못 한 게이트는 coverage/selfdisc_corr 가 전부 NaN 인 채로
+    #   gate=1(통과 처리)이 된다. 그걸 "58/58 HS 통과"로 찍으면 **검증된 적 없는 매핑이
+    #   3중 게이트를 통과한 것처럼** 읽힌다 — 이 전략에서 가장 위험한 오해다.
+    g1_held = bool(len(g1)) and not g1["coverage"].notna().any()
+    g2_held = bool(len(g2)) and not g2["selfdisc_corr"].notna().any()
+    g3_held = "유보" in str(g3.get("detail", ""))
+    n_held = sum([g1_held, g2_held, g3_held])
+    LOG.banner("매핑 게이트 결과",
+               f"종목 {n0:,} → {n1:,}" + (f" · ⚠ {n_held}개 게이트가 판정 유보" if n_held else ""))
     LOG.table([
-        ["게이트1 합계정합성", f"{info['g1_pass']}/{info['g1_total']} HS",
+        ["게이트1 합계정합성",
+         "판정 유보" if g1_held else f"{info['g1_pass']}/{info['g1_total']} HS",
+         "별도 수출매출 부재 — 검정 못 함" if g1_held else
          f"허용 {COVERAGE_BAND[0]:.2f}~{COVERAGE_BAND[1]:.2f} · 변동계수<{COVERAGE_CV_MAX}"],
-        ["게이트2 자기공시상관", f"{info['g2_pass']}/{info['g2_total']} 종목",
-         f"상관 하한 {SELFDISC_CORR_MIN}"],
-        ["게이트3 플라시보", "통과" if g3.get("pass") else "탈락", g3.get("detail", "")[:60]],
+        ["게이트2 자기공시상관",
+         "판정 유보" if g2_held else f"{info['g2_pass']}/{info['g2_total']} 종목",
+         "품목별 매출 부재 — 검정 못 함" if g2_held else f"상관 하한 {SELFDISC_CORR_MIN}"],
+        ["게이트3 플라시보",
+         "판정 유보" if g3_held else ("통과" if g3.get("pass") else "탈락"),
+         g3.get("detail", "")[:60]],
         ["게이트4 PIT 라벨(C3)", "구조 보장", "valid_from = 사업보고서 접수일"],
     ], ["게이트", "결과", "기준"])
+    info["n_held"] = n_held
+    if n_held >= 2:
+        LOG.error(
+            f"매핑 4중 게이트 중 {n_held}개가 **판정 유보**입니다 — 통과가 아니라 "
+            f"'검증하지 못했다'는 뜻입니다.\n"
+            f"    HS↔상장사 매핑이 실질적으로 검증되지 않은 상태이며, A축(통관) 신호의 "
+            f"기업 귀속을 신뢰할 근거가 없습니다.\n"
+            f"    → 이 상태의 백테스트 결과는 '매핑이 맞다면'이라는 큰 가정 위에 있습니다. "
+            f"R4(플라시보)와 R5(A축 절제) 결과를 반드시 함께 보세요.")
 
     if n1 < MAPPING_MIN_NAMES:
         LOG.warn(f"[킬 기준 4] 매핑 게이트 통과 종목 {n1} < {MAPPING_MIN_NAMES} — "
@@ -8975,12 +9022,26 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
     out["delisted_in_window"] = int(((dd >= lo) & (dd <= hi)).sum())
     out["listing_known"] = float(ld.notna().mean())
 
-    # ★ 타당성: 폐지일이 상장일로 오염되면 아주 오래된 '폐지'가 대량으로 생긴다.
-    #   개수만 세면 이 오염을 통과시켜 버리므로 분포까지 본다.
-    n_ancient = int((dd < pd.Timestamp("1995-01-01")).sum())
+    # ★ 타당성 — '오래된 폐지가 많다'는 오염의 증거가 아니다.
+    #   거래소는 1956년에 열렸고 폐지목록은 70년치다. 실측 159/2,526(6.3%)이 1995년 이전인데
+    #   이건 정상이다. 예전 판정식은 이걸 FAIL 로 외쳐 **정상 데이터에 늑대야를 불렀다**.
+    #   오염은 논리적 모순으로만 판정한다(fetch_fdr_delisting 과 동일한 기준).
+    both = dd.notna() & ld.notna()
+    n_before = int((both & (dd < ld)).sum())          # 상장 전 폐지 — 불가능
+    n_equal = int((both & (dd == ld)).sum())          # 같은 컬럼을 두 번 읽음
+    n_impossible = int((dd < pd.Timestamp("1956-03-03")).sum())   # 거래소 개장 전
+    n_ancient = int((dd < pd.Timestamp("1995-01-01")).sum())      # 참고 지표(판정 아님)
     out["ancient"] = n_ancient
-    ok = (out["delisted_in_window"] >= 50) and (n_ancient <= max(20, 0.05 * max(out["delisted"], 1)))
+    out["contradiction"] = n_before + n_equal
+    contaminated = ((n_before + n_equal) > 0.5 * max(int(both.sum()), 1)
+                    or n_impossible > max(5, 0.02 * max(out["delisted"], 1)))
+    enough = out["delisted_in_window"] >= 50
+    ok = enough and not contaminated
     out["verdict"] = "PASS" if ok else "FAIL"
+    # ★ 실패 사유를 실제 조건과 일치시킨다. 예전엔 오염으로 FAIL 인데
+    #   "구간 내 폐지 50개 미만"이라고 찍어 625건을 보면서 50 미만이라 우겼다.
+    out["why"] = ("구간 내 폐지 부족" if not enough else
+                  "폐지일 오염(상장일 오적재)" if contaminated else "")
     out["detail"] = (
         f"마스터 {out['total']:,}종목 중 폐지일 보유 {out['delisted']:,}종목 · "
         f"백테스트 구간 내 폐지 {out['delisted_in_window']:,}종목 · "
@@ -8997,12 +9058,14 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
                ["폐지일 보유 종목", f"{out['delisted']:,}"],
                ["백테스트 구간 내 폐지", f"{out['delisted_in_window']:,}"],
                ["상장일 확보율", f"{out['listing_known']*100:.1f}%"],
-               ["1995년 이전 '폐지'(오염 지표)", f"{out.get('ancient', 0):,}"],
-               ["판정", out["verdict"]]], ["항목", "값"])
-    if out.get("ancient", 0) > max(20, 0.05 * max(out["delisted"], 1)):
+               ["폐지일 모순(폐지<상장 · 폐지==상장)", f"{out.get('contradiction', 0):,}"],
+               ["1995년 이전 폐지(참고 — 판정 아님)", f"{out.get('ancient', 0):,}"],
+               ["판정", out["verdict"] + (f" · {out['why']}" if out.get("why") else "")]],
+              ["항목", "값"])
+    if out.get("contradiction", 0):
         LOG.error(
-            f"1995년 이전 '폐지'가 {out['ancient']:,}건입니다 — 폐지일 자리에 **상장일**이 "
-            f"들어왔을 때 나타나는 전형적 증상입니다.\n"
+            f"폐지일 모순이 {out['contradiction']:,}건입니다 (폐지일<상장일 또는 폐지일==상장일) — "
+            f"폐지일 자리에 **상장일**이 들어왔을 때 나타나는 전형적 증상입니다.\n"
             f"    이 상태로 두면 '오래전 상장 → 최근 폐지' 종목이 백테스트 전 구간에서 빠져\n"
             f"    실패 사례가 사라집니다(생존자편향 재유입). 폐지일 소스를 먼저 고치세요.")
     if out["listing_known"] < 0.10:
@@ -9014,13 +9077,17 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
             f"**느슨해질 뿐**이며, 반대로 '모르면 신규상장'으로 처리했다면 패널 앞 구간의 "
             f"유니버스가 통째로 비었을 것입니다. 생존자편향은 폐지일로 제거되므로 영향 없습니다.")
     if pre and not ok:
-        LOG.info("폐지일이 아직 비어 있습니다 — 가격 수집 후 '마지막 거래일'로 복원한 뒤 "
-                 "최종 판정합니다(여기서는 중단하지 않습니다).")
+        LOG.info(f"중간 점검 미충족({out['why']}) — 폐지일은 가격 수집 후 '마지막 거래일'로 "
+                 f"복원한 뒤 최종 판정합니다(여기서는 중단하지 않습니다).")
         out["verdict"] = "PENDING"
-    elif not ok:
-        LOG.error("[C2] 구간 내 폐지 종목이 50개 미만입니다. 10년이면 통상 수백 종목이 폐지됩니다. "
-                  "상장폐지 목록을 못 받은 상태이며, 이대로 나온 성과는 생존자편향으로 "
-                  "부풀려진 값입니다. raw.githubusercontent.com(FDR 캐시) 접근을 확인하세요.")
+    elif not enough:
+        LOG.error(f"[C2] 구간 내 폐지 종목이 {out['delisted_in_window']:,}개로 50개 미만입니다. "
+                  f"10년이면 통상 수백 종목이 폐지됩니다. 상장폐지 목록을 못 받은 상태이며, "
+                  f"이대로 나온 성과는 생존자편향으로 부풀려진 값입니다. "
+                  f"raw.githubusercontent.com(FDR 캐시) 접근을 확인하세요.")
+    elif contaminated:
+        LOG.error(f"[C2] 구간 내 폐지는 {out['delisted_in_window']:,}종목으로 충분하지만 "
+                  f"폐지일이 오염됐습니다 — 위 모순 건수를 확인하세요.")
     else:
         LOG.ok(f"생존자편향 제거 정상 — 구간 내 폐지 {out['delisted_in_window']:,}종목이 "
                f"유니버스에 포함되었다가 폐지일에 빠집니다(정리매매 없으면 -100%).")
@@ -9147,6 +9214,70 @@ def flows_naver(codes: "Sequence[str]", months: "pd.DatetimeIndex",
     LOG.ok(f"네이버 수급 확보: {g['code'].nunique():,}종목 × {g['month'].nunique()}개월 "
            f"(실패 {fails}종목)")
     return g.rename(columns={"month": "ym"})[["code", "ym", "net_buy_120d"]]
+
+
+FLOW_COLS = ["code", "ym", "net_buy_120d"]
+
+
+def normalize_flows_monthly(fl: "Optional[pd.DataFrame]") -> "Optional[pd.DataFrame]":
+    """수급 데이터를 **패널 계약** [code, ym, net_buy_120d] 로 통일한다.
+
+    ★ 왜 필요한가 — 실측 크래시의 정체.
+      수급 소스가 둘인데 모양이 완전히 다르다:
+        · fetch_investor_flows(pykrx/캐시) → [code, **date**, inst_net, foreign_net]  (일별)
+        · flows_naver                      → [code, **ym**,  net_buy_120d]            (월별)
+      호출부는 {"month": "ym"} 리네임 하나로 때웠는데, pykrx 판에는 month 가 아예 없어
+      date 인 채로 통과했고 d_sensors 의 merge(on=["code","ym"]) 가
+      `KeyError: 'ym'` 로 죽었다 — pandas 내부 8프레임 아래에서.
+      그리고 설령 키를 맞췄어도 값 컬럼이 net_buy_120d 가 아니라 d3 는 전부 결측이었다.
+      → 모양 변환을 **한 곳**에 모으고, 계약을 못 맞추면 조용히 죽지 말고 말한다.
+    """
+    if fl is None or not len(fl):
+        return None
+    d = fl.copy()
+    d.columns = [str(c) for c in d.columns]
+    if "code" not in d.columns:
+        LOG.warn("수급 데이터에 code 컬럼이 없습니다 — d3 를 비활성화합니다(0 채움 금지).")
+        return None
+    d["code"] = d["code"].astype(str).map(to_code6)
+
+    # 이미 계약을 만족하면 그대로 쓴다(네이버 폴백 경로).
+    if "ym" in d.columns and "net_buy_120d" in d.columns:
+        d["ym"] = as_ts_series(d["ym"]) + pd.offsets.MonthEnd(0)
+        return d.dropna(subset=["code", "ym"]).reindex(columns=FLOW_COLS)
+
+    # 월 축 확정 — ym / month / date 어느 것이 와도 월말로 맞춘다.
+    tcol = next((c for c in ("ym", "month", "date") if c in d.columns), None)
+    if tcol is None:
+        LOG.warn(f"수급 데이터에 시간축(ym/month/date)이 없습니다 — 컬럼 {list(d.columns)[:8]}. "
+                 f"d3 를 비활성화합니다(0 채움 금지).")
+        return None
+    d["ym"] = as_ts_series(d[tcol]) + pd.offsets.MonthEnd(0)
+
+    # 값 축 확정 — 순매수 합계를 만든다.
+    if "net" in d.columns:
+        d["_net"] = pd.to_numeric(d["net"], errors="coerce")
+    elif {"inst_net", "foreign_net"} & set(d.columns):
+        # ★ 기관·외국인 중 한쪽만 있는 판이 있다. 둘 다 NaN 인 행만 결측으로 남긴다.
+        _i = pd.to_numeric(d.get("inst_net"), errors="coerce")
+        _f = pd.to_numeric(d.get("foreign_net"), errors="coerce")
+        d["_net"] = _i.fillna(0) + _f.fillna(0)
+        d.loc[_i.isna() & _f.isna(), "_net"] = np.nan
+    else:
+        LOG.warn(f"수급 데이터에 순매수 컬럼(net/inst_net/foreign_net)이 없습니다 — "
+                 f"컬럼 {list(d.columns)[:8]}. d3 를 비활성화합니다(0 채움 금지).")
+        return None
+
+    d = d.dropna(subset=["code", "ym"])
+    g = (d.groupby(["code", "ym"], observed=True)["_net"].sum(min_count=1)
+           .reset_index().sort_values(["code", "ym"]))
+    # 120영업일 ≈ 6개월 누적. flows_naver 와 동일한 정의를 쓴다(소스 간 비교가능성 유지).
+    g["net_buy_120d"] = g.groupby("code", observed=True)["_net"].transform(
+        lambda s: s.rolling(6, min_periods=3).sum())
+    out = g.reindex(columns=FLOW_COLS).dropna(subset=["net_buy_120d"])
+    LOG.ok(f"수급 정규화: {len(fl):,}행({tcol} 축) → {len(out):,}행 "
+           f"[code, ym, net_buy_120d] · {out['code'].nunique():,}종목")
+    return out if len(out) else None
 
 
 def universe_sources_audit(sec: "pd.DataFrame", px_m: "pd.DataFrame",
@@ -9795,6 +9926,24 @@ def c6_contract_ratio(contracts: pd.DataFrame, months: pd.DatetimeIndex) -> pd.D
 #  D축 — 미반영도 (할인율 U)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
+def _merge_ready(df: "Optional[pd.DataFrame]", keys: Sequence[str], what: str) -> bool:
+    """병합 직전에 키 존재를 확인한다. 없으면 **어느 프레임의 무엇이 없는지** 말하고 False.
+
+    ★ 실측: 수급 프레임이 [code, date, ...] 인데 on=["code","ym"] 로 merge 해
+      pandas 내부에서 `KeyError: 'ym'` 만 떨어졌다. 어느 데이터가 문제인지 알 수 없어
+      6분짜리 수집을 다시 돌려가며 찾아야 했다. 계약 위반은 위반 지점에서 말한다.
+    """
+    if df is None or not len(df):
+        return False
+    miss = [k for k in keys if k not in df.columns]
+    if miss:
+        LOG.warn(f"[병합 계약] {what}: 키 {miss} 가 없습니다 "
+                 f"(보유 컬럼 {list(df.columns)[:8]}). 이 소스를 건너뜁니다 — "
+                 f"결측으로 두며 0 으로 채우지 않습니다.")
+        return False
+    return True
+
+
 def d_sensors(px_m: pd.DataFrame, fin_m: pd.DataFrame,
               flows: Optional[pd.DataFrame] = None,
               coverage: Optional[pd.DataFrame] = None,
@@ -9837,10 +9986,17 @@ def d_sensors(px_m: pd.DataFrame, fin_m: pd.DataFrame,
         d["d2"] = np.nan
         d["d4"] = np.nan
 
-    if flows is not None and len(flows):
+    # ★ 패널 병합은 계약을 먼저 확인한다. 없는 키로 merge 하면 pandas 내부에서
+    #   KeyError 만 튀어나와 '어느 프레임의 어느 컬럼이 없는지'를 알 수 없다(실측 사고).
+    if flows is not None and len(flows) and _merge_ready(flows, ["code", "ym"], "flows(d3)"):
         d = d.merge(flows, on=["code", "ym"], how="left")
-        d["d3"] = -safe_div(pd.to_numeric(d.get("net_buy_120d"), errors="coerce"),
-                            pd.to_numeric(d.get("mcap"), errors="coerce"))
+        if "net_buy_120d" not in d.columns:
+            LOG.warn("수급에 net_buy_120d 가 없어 d3 를 비활성화합니다 "
+                     "(0 으로 채우면 '수급이 없었다'는 거짓 주장이 됩니다).")
+            d["d3"] = np.nan
+        else:
+            d["d3"] = -safe_div(pd.to_numeric(d["net_buy_120d"], errors="coerce"),
+                                pd.to_numeric(d.get("mcap"), errors="coerce"))
     else:
         d["d3"] = np.nan
     return d.reindex(columns=cols)
@@ -11581,14 +11737,15 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
         if "xcb_uni" in P.columns else sorted(P["code"].astype(str).unique())
     if krx_mode() != "off":
         try:
-            fl = fetch_investor_flows(_codes, BACKTEST_START, BACKTEST_END)
-            if fl is not None and len(fl):
-                flows = fl.rename(columns={"month": "ym"}) if "month" in fl.columns else fl
+            # ★ 모양 변환은 normalize_flows_monthly 한 곳에서만 한다.
+            #   여기서 리네임으로 때우면 소스마다 다른 스키마가 그대로 패널까지 흘러간다.
+            flows = normalize_flows_monthly(
+                fetch_investor_flows(_codes, BACKTEST_START, BACKTEST_END))
         except Exception as e:                                          # noqa
             LOG.warn(f"KRX 수급 수집 실패({type(e).__name__}) — 네이버 폴백을 시도합니다.")
     if flows is None or not len(flows):
         try:
-            flows = flows_naver(_codes, months)
+            flows = normalize_flows_monthly(flows_naver(_codes, months))
         except Exception as e:                                          # noqa
             LOG.warn(f"네이버 수급 폴백 실패({type(e).__name__}) — d3 비활성화(0 채움 금지).")
             flows = None

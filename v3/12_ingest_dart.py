@@ -314,11 +314,29 @@ def fetch_dart_bulk(years: Sequence[int], reprts: Sequence[str]) -> pd.DataFrame
     ok_q, fail_q = [], []
     if jobs:
         LOG.info(f"DART 재무정보 일괄다운로드 {len(jobs)} 분기 (분기당 파일 여러 개)")
+        # ★ 벌크 페이지가 로그인벽으로 막히면 48분기가 **전부** 같은 이유로 실패한다.
+        #   실측에서 26,035자짜리 동일 진단이 48줄 쏟아져 콘솔이 묻혔다. 원인은 하나인데
+        #   증상을 48번 출력하는 건 정보가 아니라 소음이다.
+        #   → 같은 진단이 연속 3회면 나머지는 시도하지 않고 한 줄로 요약한다.
+        _first_diag, _streak, _bailed = "", 0, False
         for y, r in tqdm(jobs, desc="DART 벌크", ncols=88, leave=False):
+            if _bailed:
+                fail_q.append((y, r))
+                continue
             names, diag = _bulk_discover(y, r)
             if not names:
                 # 추측 후보를 만들지 않는다(성공확률 0 · 원인만 가림). 즉시 폴백으로 내려간다.
-                LOG.debug(f"벌크 {y}/{REPRT_NAME.get(r, r)} 목록 발견 실패 → 건너뜀 · {diag}")
+                if not _first_diag:
+                    _first_diag = diag
+                    LOG.debug(f"벌크 {y}/{REPRT_NAME.get(r, r)} 목록 발견 실패 → 건너뜀 · {diag}")
+                _streak = _streak + 1 if diag == _first_diag else 0
+                if _streak >= 3 and not ok_q:
+                    _bailed = True
+                    LOG.warn(
+                        f"벌크 목록 발견이 동일한 이유로 연속 실패해 나머지 "
+                        f"{len(jobs) - len(fail_q) - 1}분기는 시도하지 않습니다 "
+                        f"(같은 진단 반복 = 사이트 구조/로그인벽 문제이지 분기별 문제가 아님). "
+                        f"진단: {_first_diag[:120]}")
                 fail_q.append((y, r))
                 continue
             frames = []

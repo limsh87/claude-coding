@@ -187,12 +187,26 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
     out["delisted_in_window"] = int(((dd >= lo) & (dd <= hi)).sum())
     out["listing_known"] = float(ld.notna().mean())
 
-    # ★ 타당성: 폐지일이 상장일로 오염되면 아주 오래된 '폐지'가 대량으로 생긴다.
-    #   개수만 세면 이 오염을 통과시켜 버리므로 분포까지 본다.
-    n_ancient = int((dd < pd.Timestamp("1995-01-01")).sum())
+    # ★ 타당성 — '오래된 폐지가 많다'는 오염의 증거가 아니다.
+    #   거래소는 1956년에 열렸고 폐지목록은 70년치다. 실측 159/2,526(6.3%)이 1995년 이전인데
+    #   이건 정상이다. 예전 판정식은 이걸 FAIL 로 외쳐 **정상 데이터에 늑대야를 불렀다**.
+    #   오염은 논리적 모순으로만 판정한다(fetch_fdr_delisting 과 동일한 기준).
+    both = dd.notna() & ld.notna()
+    n_before = int((both & (dd < ld)).sum())          # 상장 전 폐지 — 불가능
+    n_equal = int((both & (dd == ld)).sum())          # 같은 컬럼을 두 번 읽음
+    n_impossible = int((dd < pd.Timestamp("1956-03-03")).sum())   # 거래소 개장 전
+    n_ancient = int((dd < pd.Timestamp("1995-01-01")).sum())      # 참고 지표(판정 아님)
     out["ancient"] = n_ancient
-    ok = (out["delisted_in_window"] >= 50) and (n_ancient <= max(20, 0.05 * max(out["delisted"], 1)))
+    out["contradiction"] = n_before + n_equal
+    contaminated = ((n_before + n_equal) > 0.5 * max(int(both.sum()), 1)
+                    or n_impossible > max(5, 0.02 * max(out["delisted"], 1)))
+    enough = out["delisted_in_window"] >= 50
+    ok = enough and not contaminated
     out["verdict"] = "PASS" if ok else "FAIL"
+    # ★ 실패 사유를 실제 조건과 일치시킨다. 예전엔 오염으로 FAIL 인데
+    #   "구간 내 폐지 50개 미만"이라고 찍어 625건을 보면서 50 미만이라 우겼다.
+    out["why"] = ("구간 내 폐지 부족" if not enough else
+                  "폐지일 오염(상장일 오적재)" if contaminated else "")
     out["detail"] = (
         f"마스터 {out['total']:,}종목 중 폐지일 보유 {out['delisted']:,}종목 · "
         f"백테스트 구간 내 폐지 {out['delisted_in_window']:,}종목 · "
@@ -209,12 +223,14 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
                ["폐지일 보유 종목", f"{out['delisted']:,}"],
                ["백테스트 구간 내 폐지", f"{out['delisted_in_window']:,}"],
                ["상장일 확보율", f"{out['listing_known']*100:.1f}%"],
-               ["1995년 이전 '폐지'(오염 지표)", f"{out.get('ancient', 0):,}"],
-               ["판정", out["verdict"]]], ["항목", "값"])
-    if out.get("ancient", 0) > max(20, 0.05 * max(out["delisted"], 1)):
+               ["폐지일 모순(폐지<상장 · 폐지==상장)", f"{out.get('contradiction', 0):,}"],
+               ["1995년 이전 폐지(참고 — 판정 아님)", f"{out.get('ancient', 0):,}"],
+               ["판정", out["verdict"] + (f" · {out['why']}" if out.get("why") else "")]],
+              ["항목", "값"])
+    if out.get("contradiction", 0):
         LOG.error(
-            f"1995년 이전 '폐지'가 {out['ancient']:,}건입니다 — 폐지일 자리에 **상장일**이 "
-            f"들어왔을 때 나타나는 전형적 증상입니다.\n"
+            f"폐지일 모순이 {out['contradiction']:,}건입니다 (폐지일<상장일 또는 폐지일==상장일) — "
+            f"폐지일 자리에 **상장일**이 들어왔을 때 나타나는 전형적 증상입니다.\n"
             f"    이 상태로 두면 '오래전 상장 → 최근 폐지' 종목이 백테스트 전 구간에서 빠져\n"
             f"    실패 사례가 사라집니다(생존자편향 재유입). 폐지일 소스를 먼저 고치세요.")
     if out["listing_known"] < 0.10:
@@ -226,13 +242,17 @@ def audit_survivorship(sec: "pd.DataFrame", months: "pd.DatetimeIndex",
             f"**느슨해질 뿐**이며, 반대로 '모르면 신규상장'으로 처리했다면 패널 앞 구간의 "
             f"유니버스가 통째로 비었을 것입니다. 생존자편향은 폐지일로 제거되므로 영향 없습니다.")
     if pre and not ok:
-        LOG.info("폐지일이 아직 비어 있습니다 — 가격 수집 후 '마지막 거래일'로 복원한 뒤 "
-                 "최종 판정합니다(여기서는 중단하지 않습니다).")
+        LOG.info(f"중간 점검 미충족({out['why']}) — 폐지일은 가격 수집 후 '마지막 거래일'로 "
+                 f"복원한 뒤 최종 판정합니다(여기서는 중단하지 않습니다).")
         out["verdict"] = "PENDING"
-    elif not ok:
-        LOG.error("[C2] 구간 내 폐지 종목이 50개 미만입니다. 10년이면 통상 수백 종목이 폐지됩니다. "
-                  "상장폐지 목록을 못 받은 상태이며, 이대로 나온 성과는 생존자편향으로 "
-                  "부풀려진 값입니다. raw.githubusercontent.com(FDR 캐시) 접근을 확인하세요.")
+    elif not enough:
+        LOG.error(f"[C2] 구간 내 폐지 종목이 {out['delisted_in_window']:,}개로 50개 미만입니다. "
+                  f"10년이면 통상 수백 종목이 폐지됩니다. 상장폐지 목록을 못 받은 상태이며, "
+                  f"이대로 나온 성과는 생존자편향으로 부풀려진 값입니다. "
+                  f"raw.githubusercontent.com(FDR 캐시) 접근을 확인하세요.")
+    elif contaminated:
+        LOG.error(f"[C2] 구간 내 폐지는 {out['delisted_in_window']:,}종목으로 충분하지만 "
+                  f"폐지일이 오염됐습니다 — 위 모순 건수를 확인하세요.")
     else:
         LOG.ok(f"생존자편향 제거 정상 — 구간 내 폐지 {out['delisted_in_window']:,}종목이 "
                f"유니버스에 포함되었다가 폐지일에 빠집니다(정리매매 없으면 -100%).")
@@ -359,6 +379,70 @@ def flows_naver(codes: "Sequence[str]", months: "pd.DatetimeIndex",
     LOG.ok(f"네이버 수급 확보: {g['code'].nunique():,}종목 × {g['month'].nunique()}개월 "
            f"(실패 {fails}종목)")
     return g.rename(columns={"month": "ym"})[["code", "ym", "net_buy_120d"]]
+
+
+FLOW_COLS = ["code", "ym", "net_buy_120d"]
+
+
+def normalize_flows_monthly(fl: "Optional[pd.DataFrame]") -> "Optional[pd.DataFrame]":
+    """수급 데이터를 **패널 계약** [code, ym, net_buy_120d] 로 통일한다.
+
+    ★ 왜 필요한가 — 실측 크래시의 정체.
+      수급 소스가 둘인데 모양이 완전히 다르다:
+        · fetch_investor_flows(pykrx/캐시) → [code, **date**, inst_net, foreign_net]  (일별)
+        · flows_naver                      → [code, **ym**,  net_buy_120d]            (월별)
+      호출부는 {"month": "ym"} 리네임 하나로 때웠는데, pykrx 판에는 month 가 아예 없어
+      date 인 채로 통과했고 d_sensors 의 merge(on=["code","ym"]) 가
+      `KeyError: 'ym'` 로 죽었다 — pandas 내부 8프레임 아래에서.
+      그리고 설령 키를 맞췄어도 값 컬럼이 net_buy_120d 가 아니라 d3 는 전부 결측이었다.
+      → 모양 변환을 **한 곳**에 모으고, 계약을 못 맞추면 조용히 죽지 말고 말한다.
+    """
+    if fl is None or not len(fl):
+        return None
+    d = fl.copy()
+    d.columns = [str(c) for c in d.columns]
+    if "code" not in d.columns:
+        LOG.warn("수급 데이터에 code 컬럼이 없습니다 — d3 를 비활성화합니다(0 채움 금지).")
+        return None
+    d["code"] = d["code"].astype(str).map(to_code6)
+
+    # 이미 계약을 만족하면 그대로 쓴다(네이버 폴백 경로).
+    if "ym" in d.columns and "net_buy_120d" in d.columns:
+        d["ym"] = as_ts_series(d["ym"]) + pd.offsets.MonthEnd(0)
+        return d.dropna(subset=["code", "ym"]).reindex(columns=FLOW_COLS)
+
+    # 월 축 확정 — ym / month / date 어느 것이 와도 월말로 맞춘다.
+    tcol = next((c for c in ("ym", "month", "date") if c in d.columns), None)
+    if tcol is None:
+        LOG.warn(f"수급 데이터에 시간축(ym/month/date)이 없습니다 — 컬럼 {list(d.columns)[:8]}. "
+                 f"d3 를 비활성화합니다(0 채움 금지).")
+        return None
+    d["ym"] = as_ts_series(d[tcol]) + pd.offsets.MonthEnd(0)
+
+    # 값 축 확정 — 순매수 합계를 만든다.
+    if "net" in d.columns:
+        d["_net"] = pd.to_numeric(d["net"], errors="coerce")
+    elif {"inst_net", "foreign_net"} & set(d.columns):
+        # ★ 기관·외국인 중 한쪽만 있는 판이 있다. 둘 다 NaN 인 행만 결측으로 남긴다.
+        _i = pd.to_numeric(d.get("inst_net"), errors="coerce")
+        _f = pd.to_numeric(d.get("foreign_net"), errors="coerce")
+        d["_net"] = _i.fillna(0) + _f.fillna(0)
+        d.loc[_i.isna() & _f.isna(), "_net"] = np.nan
+    else:
+        LOG.warn(f"수급 데이터에 순매수 컬럼(net/inst_net/foreign_net)이 없습니다 — "
+                 f"컬럼 {list(d.columns)[:8]}. d3 를 비활성화합니다(0 채움 금지).")
+        return None
+
+    d = d.dropna(subset=["code", "ym"])
+    g = (d.groupby(["code", "ym"], observed=True)["_net"].sum(min_count=1)
+           .reset_index().sort_values(["code", "ym"]))
+    # 120영업일 ≈ 6개월 누적. flows_naver 와 동일한 정의를 쓴다(소스 간 비교가능성 유지).
+    g["net_buy_120d"] = g.groupby("code", observed=True)["_net"].transform(
+        lambda s: s.rolling(6, min_periods=3).sum())
+    out = g.reindex(columns=FLOW_COLS).dropna(subset=["net_buy_120d"])
+    LOG.ok(f"수급 정규화: {len(fl):,}행({tcol} 축) → {len(out):,}행 "
+           f"[code, ym, net_buy_120d] · {out['code'].nunique():,}종목")
+    return out if len(out) else None
 
 
 def universe_sources_audit(sec: "pd.DataFrame", px_m: "pd.DataFrame",

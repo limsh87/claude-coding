@@ -121,14 +121,15 @@ def build_panel_xcb(months, sec, px_m, px_d, mcap, cx, mapping,
         if "xcb_uni" in P.columns else sorted(P["code"].astype(str).unique())
     if krx_mode() != "off":
         try:
-            fl = fetch_investor_flows(_codes, BACKTEST_START, BACKTEST_END)
-            if fl is not None and len(fl):
-                flows = fl.rename(columns={"month": "ym"}) if "month" in fl.columns else fl
+            # ★ 모양 변환은 normalize_flows_monthly 한 곳에서만 한다.
+            #   여기서 리네임으로 때우면 소스마다 다른 스키마가 그대로 패널까지 흘러간다.
+            flows = normalize_flows_monthly(
+                fetch_investor_flows(_codes, BACKTEST_START, BACKTEST_END))
         except Exception as e:                                          # noqa
             LOG.warn(f"KRX 수급 수집 실패({type(e).__name__}) — 네이버 폴백을 시도합니다.")
     if flows is None or not len(flows):
         try:
-            flows = flows_naver(_codes, months)
+            flows = normalize_flows_monthly(flows_naver(_codes, months))
         except Exception as e:                                          # noqa
             LOG.warn(f"네이버 수급 폴백 실패({type(e).__name__}) — d3 비활성화(0 채움 금지).")
             flows = None

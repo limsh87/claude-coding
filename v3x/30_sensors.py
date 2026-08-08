@@ -588,6 +588,24 @@ def c6_contract_ratio(contracts: pd.DataFrame, months: pd.DatetimeIndex) -> pd.D
 #  D축 — 미반영도 (할인율 U)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
+def _merge_ready(df: "Optional[pd.DataFrame]", keys: Sequence[str], what: str) -> bool:
+    """병합 직전에 키 존재를 확인한다. 없으면 **어느 프레임의 무엇이 없는지** 말하고 False.
+
+    ★ 실측: 수급 프레임이 [code, date, ...] 인데 on=["code","ym"] 로 merge 해
+      pandas 내부에서 `KeyError: 'ym'` 만 떨어졌다. 어느 데이터가 문제인지 알 수 없어
+      6분짜리 수집을 다시 돌려가며 찾아야 했다. 계약 위반은 위반 지점에서 말한다.
+    """
+    if df is None or not len(df):
+        return False
+    miss = [k for k in keys if k not in df.columns]
+    if miss:
+        LOG.warn(f"[병합 계약] {what}: 키 {miss} 가 없습니다 "
+                 f"(보유 컬럼 {list(df.columns)[:8]}). 이 소스를 건너뜁니다 — "
+                 f"결측으로 두며 0 으로 채우지 않습니다.")
+        return False
+    return True
+
+
 def d_sensors(px_m: pd.DataFrame, fin_m: pd.DataFrame,
               flows: Optional[pd.DataFrame] = None,
               coverage: Optional[pd.DataFrame] = None,
@@ -630,10 +648,17 @@ def d_sensors(px_m: pd.DataFrame, fin_m: pd.DataFrame,
         d["d2"] = np.nan
         d["d4"] = np.nan
 
-    if flows is not None and len(flows):
+    # ★ 패널 병합은 계약을 먼저 확인한다. 없는 키로 merge 하면 pandas 내부에서
+    #   KeyError 만 튀어나와 '어느 프레임의 어느 컬럼이 없는지'를 알 수 없다(실측 사고).
+    if flows is not None and len(flows) and _merge_ready(flows, ["code", "ym"], "flows(d3)"):
         d = d.merge(flows, on=["code", "ym"], how="left")
-        d["d3"] = -safe_div(pd.to_numeric(d.get("net_buy_120d"), errors="coerce"),
-                            pd.to_numeric(d.get("mcap"), errors="coerce"))
+        if "net_buy_120d" not in d.columns:
+            LOG.warn("수급에 net_buy_120d 가 없어 d3 를 비활성화합니다 "
+                     "(0 으로 채우면 '수급이 없었다'는 거짓 주장이 됩니다).")
+            d["d3"] = np.nan
+        else:
+            d["d3"] = -safe_div(pd.to_numeric(d["net_buy_120d"], errors="coerce"),
+                                pd.to_numeric(d.get("mcap"), errors="coerce"))
     else:
         d["d3"] = np.nan
     return d.reindex(columns=cols)
