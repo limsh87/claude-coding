@@ -406,7 +406,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.1313"
+BUILD_VERSION  = "v3.20260808.1318"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -8027,6 +8027,36 @@ def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
         k1, k2 = _canary_bulk(corps, n_uni)
         k3 = _canary_accounts(corps, probe_year)
         k7, k8, k9 = _canary_emp(corps, probe_year)
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★ 최근 1개 연도만 재고 PASS 를 주면 앞 구간 공백을 구조적으로 못 본다 ★
+        #    7회차가 정확히 그랬다 — K7/K8 이 최근 연도에서 PASS 인데 실제 EMP 커버리지는
+        #    2022~2025 네 해뿐이었고, 백테스트 120개월 중 앞 80개월이 무증거였다.
+        #    CANARY 의 목적은 '몇 시간 쓰기 전에 막는 것'이므로 **앞 구간을 같이 재야** 한다.
+        #    표본을 줄여(1/4) 호출을 늘리지 않으면서 시작연도를 한 번 더 찔러 본다.
+        #    받은 것은 캐시에 남으므로 이 호출도 버려지지 않는다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        _y0 = as_ts(BACKTEST_START).year - 1
+        if _y0 < probe_year and not dart_halt_reason():
+            _small = corps[:max(20, CANARY_SAMPLE_N // 4)]
+            try:
+                _rows = [r for r in pmap_io(lambda c: _emp_one_raw(c, _y0), _small,
+                                            workers=min(N_WORKERS_IO, 12),
+                                            desc=f"CANARY 시작연도 탐침({_y0})")
+                         if r is not None]
+                if _rows:
+                    _emp_checkpoint(VAULT.get_table("dart_employees_ext", scope="shared"), _rows)
+                _r0 = len(_rows) / max(len(_small), 1)
+                _p0 = (int(pd.DataFrame(_rows)["payroll_total"].notna().sum()) / max(len(_rows), 1)
+                       if _rows else 0.0)
+                _ok0 = (_r0 >= CANARY_K7_MIN_RATE) and (_p0 >= CANARY_K8_MIN_RATE)
+                _k("K7b", f"시작연도({_y0}) 직원현황 가용성", _ok0,
+                   f"응답 {len(_rows)}/{len(_small)} ({_r0:.0%}) · 급여총액 {_p0:.0%}",
+                   f"응답≥{CANARY_K7_MIN_RATE:.0%} · 급여≥{CANARY_K8_MIN_RATE:.0%}",
+                   "" if _ok0 else
+                   f"백테스트 앞 구간에 EMP 신호가 얇습니다. 최근 연도만 PASS 인 것을 "
+                   f"'10년 커버리지 확보'로 읽지 마세요 — 결과는 EMP 레짐 분할표에서 읽으세요.")
+            except Exception as e:                                   # noqa
+                LOG.debug(f"시작연도 탐침 실패({type(e).__name__}) — 판정을 생략합니다.")
     k4 = _canary_price(codes, sec)
     k5 = _canary_delisting(sec)
 
@@ -9784,13 +9814,31 @@ TP_DEFS = [
 ]
 
 
-def build_tps(P: pd.DataFrame) -> pd.DataFrame:
+def build_tps(P: pd.DataFrame, disabled: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """TP 조립. disabled 에 든 TP 는 만들되 **전량 결측으로 비활성화**한다.
+
+    ★★ 왜 '만들되 비활성화' 인가 — CANARY 판정이 소비되지 않던 문제 ★★
+      CANARY 는 K8(연간급여총액 기재율)이 기준 미달이면 "임금프리미엄 계산 불가"
+      라고 판정하고, K3 은 커버리지 미달 계정 목록(weak_accounts)을 남긴다.
+      그런데 그 verdict 는 ctx["canary"] 에 저장만 되고 **읽는 코드가 한 줄도 없었다.**
+      즉 "FAIL 시 조치" 열에 적힌 처방이 실행되지 않는 약속이었고, 미달인 원천으로
+      만든 TP 가 정상 TP 와 나란히 증거층 평균에 들어갔다.
+      → 비활성 TP 는 컬럼을 남기되 값을 비운다. 그래야 하류의 '살아 있는 TP' 판정이
+        자동으로 제외하고, 진단표에는 '왜 죽었는지'가 그대로 남는다.
+    """
     # ★ 이 단계의 진단만 표에 나오게 한다. 전역 리스트라 계약검정·스모크 값이 누적된다.
     CELL_RANK_DIAG.clear()
     P = P.copy()
+    disabled = set(disabled or [])
+    if disabled:
+        LOG.warn(f"CANARY 판정에 따라 TP {sorted(disabled)} 를 비활성화합니다 — "
+                 f"원천 기재율이 기준에 미달해 그 TP 의 값을 신뢰할 수 없습니다. "
+                 f"컬럼은 남기되 값을 비워 증거층에서 자동 제외되게 합니다"
+                 f"(0 으로 채우면 '대가를 치르지 않았다'는 거짓 주장이 됩니다).")
     rows = []
     for name, a, b, desc in TP_DEFS:
-        P[name] = tp(P, a, b)
+        P[name] = (pd.Series(np.nan, index=P.index, dtype="float32") if name in disabled
+                   else tp(P, a, b))
         cov = float(P[name].notna().mean()) if len(P) else 0.0
         pos = float((P[name] > 0).mean()) if len(P) else 0.0
         rows.append([name, f"{a} × {b}", _trunc(desc, 30), f"{cov*100:.1f}%", f"{pos*100:.1f}%"])
@@ -10713,6 +10761,40 @@ def _budget_ok(rid: str, t0: float) -> bool:
     return not (lim and (time.time() - t0) > lim)
 
 
+# ── 스위트 전체의 절대 데드라인 ─────────────────────────────────────────────────────────────
+#   ★ 예전엔 시간 집행이 R5 안에만 있었다. 그런데 이 스위트는 백테스트를 26회 재실행하고
+#     (R1 3 · R2-N 5 · R3 2 · R5 최대 13 · R10 1 · 본선 2), 그중 어느 하나가 길어지면
+#     4시간 계약이 통째로 무너진다. L5 스테이지의 budget_s=3시간 은 후속 몫(60분)과도
+#     모순이었다 — 둘 다 지켜질 수 없는 숫자였다.
+#   → 스위트 진입 시각을 기준으로 절대 데드라인을 세우고, 각 검사 **진입부**에서 확인한다.
+#     넘겼으면 그 검사는 실행하지 않고 '미판정(N/A)'으로 기록한다. 조용히 건너뛰지 않는다.
+ROBUST_DEADLINE: Dict[str, float] = {"at": 0.0}
+
+
+def robust_arm_deadline() -> None:
+    total = sum(ROBUST_BUDGET_S.values())
+    try:
+        left = max(0.0, (_T0_PROCESS + WALL_CLOCK_LIMIT_H * 3600.0) - time.time())
+        budget = max(120.0, min(float(total), left * 0.80))   # 리포트 몫 20% 를 남긴다
+    except Exception:                                          # noqa
+        budget = float(total)
+    ROBUST_DEADLINE["at"] = time.time() + budget
+    LOG.info(f"강건성 스위트 시간 예산 {budget/60:.0f}분 — 각 검사는 시작 전에 잔여를 확인하고, "
+             f"넘겼으면 실행하지 않고 **미판정(N/A)** 으로 기록합니다. "
+             f"통과로 집계하지 않습니다.")
+
+
+def _suite_ok(rid: str, name: str) -> bool:
+    at = ROBUST_DEADLINE.get("at") or 0.0
+    if at and time.time() >= at:
+        _rec(rid, name, None,
+             "강건성 스위트의 시간 예산을 다 써서 이 검사를 실행하지 못했습니다 — "
+             "'통과'가 아니라 '미판정'입니다. 4시간 계약을 넘기는 대신 여기서 멈춥니다.",
+             f"경과 {(time.time()-_T0_PROCESS)/60:.0f}분")
+        return False
+    return True
+
+
 ALPHA_FLOOR = 0.20      # 이 아래의 Sharpe 는 '알파가 있다'고 말하지 않는다
 
 
@@ -10895,6 +10977,8 @@ def R1_leakage(P: pd.DataFrame, months: pd.DatetimeIndex, run_fn: Callable) -> N
       '신호에 지속성이 없다'는 별개의 사실이다. 둘을 한 판정에 묶으면 서로 다른 두
       사건을 구별할 수 없게 된다 — 그래서 ②는 참고 지표로 따로 보고한다.
     """
+    if not _suite_ok("R1", "누수 자가검정"):
+        return
     t0 = time.time()
     base = _stat(run_fn(P, label="R1_base"), "Sharpe")
 
@@ -10940,6 +11024,8 @@ def R2N_kill_gate(P: pd.DataFrame, run_fn: Callable) -> None:
       A 에만 허용하면 A 의 유니버스가 넓어져 비교가 성립하지 않는다.
       (실제로 이 통제를 빠뜨리면 나이브 팔이 표본 수 덕분에 이기는 일이 생긴다)
     """
+    if not _suite_ok("R2-N", "한계임금 킬게이트 ⭐⭐"):
+        return
     t0 = time.time()
     have_emp = ("nl_emp" in P.columns and "nl_premium" in P.columns
                 and P["nl_emp"].notna().any() and P["nl_premium"].notna().any())
@@ -11140,6 +11226,8 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
 
     '트레이드오프'라는 게 사실 그냥 퀄리티 팩터의 다른 이름이라면, 직교화 후 알파가 사라진다.
     """
+    if not _suite_ok("R3", "퀄리티 직교화"):
+        return
     t0 = time.time()
     Q = P.sort_values(["code", "month"]).copy()
     Q["f_size"] = np.log(col(Q, "assets").where(col(Q, "assets") > 0))
@@ -11220,6 +11308,8 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
 
 # ── R5 : 절제 (TP별 · 경계 · 분모임계) ─────────────────────────────────────────────────────
 def R5_ablation(P: pd.DataFrame, run_fn: Callable) -> None:
+    if not _suite_ok("R5", "절제 안정성"):
+        return
     t0 = time.time()
     live = [c for c in TP_ALL if c in P.columns and P[c].notna().any()]
     base_bt = run_fn(P, label="R5_base")
@@ -11388,6 +11478,8 @@ def R8_subperiod(bt: dict) -> None:
 # ── R10 : 정책반증 (고용장려금 캘린더 ±6M 제외) ─────────────────────────────────────────────
 def R10_policy_falsify(P: pd.DataFrame, cal: pd.DataFrame, months: pd.DatetimeIndex,
                        run_fn: Callable) -> None:
+    if not _suite_ok("R10", "정책반증 (고용정책 ±6M 제외)"):
+        return
     t0 = time.time()
     m = policy_mask(cal, months)
     clean = pd.DatetimeIndex(months[~m.to_numpy()])
@@ -13953,6 +14045,28 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                 VAULT.put_table("emp_sensors_annual", S, scope="shared", domain="dart",
                                 source="v3 EMP-LITE 연도 센서 (C15 적용) — 타 전략 재사용 가능")
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 알파 원천이 비었으면 여기서 멈춘다 ★★
+    #    L1.EMP 는 critical=False 다(수집 실패로 전체가 죽는 것을 막으려는 의도).
+    #    그런데 그러면 예외가 WARN 로 넘어가고 실행은 끝까지 진행돼, **CORE-D 축소판**이
+    #    '전략 3 · CORE-D + EMP-LITE' 라는 이름으로 보고된다. 사용자는 한계임금 전략의
+    #    결과를 받았다고 믿게 되는데 TP_N1·N2·N3 는 전량 결측이다.
+    #    critical=False 는 '조용히 다른 전략이 되어도 좋다'는 뜻이 아니다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _emp_n = len(ctx.get("emp_sensors", []) or [])
+    if _emp_n == 0:
+        _msg = ("직원현황(알파 원천) 수집·적재가 0행입니다 — TP_N1·N2·N3 가 전부 결측이라 "
+                "이 실행은 'CORE-D 단독' 축소판이 됩니다. 그것을 '전략 3'의 결과로 "
+                "보고하지 않습니다.")
+        if REQUIRE_EMP_ALPHA:
+            raise KillCriteria(
+                _msg + " 위 L1.EMP 로그에서 원인(호출 한도·네트워크·캐시 부재)을 확인하고 "
+                       "재실행하세요. CORE-D 축소판으로라도 돌려 보려면 "
+                       "REQUIRE_EMP_ALPHA=False 로 두십시오 — 그때는 모든 산출물에 "
+                       "축소판임이 명시됩니다.")
+        LOG.warn(_msg + " REQUIRE_EMP_ALPHA=False 이므로 축소판으로 계속합니다.")
+        ctx["emp_reduced"] = True
+
     with PIPE.stage("L1.DART", "DART 재무 · 공시목록", "L1", budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
@@ -14125,7 +14239,17 @@ def score_and_backtest_v3(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
                           uni: "Universe") -> Tuple[pd.DataFrame, dict, Callable]:
     t_l2 = time.time()
     with PIPE.stage("L2.SCORE", "TP 조립 · 거부권 · Signal", "L2", budget_s=300):
-        P = build_tps(P)
+        # ★ CANARY 판정을 실제 게이트로 쓴다. 예전엔 ctx["canary"] 를 저장만 하고 아무도
+        #   읽지 않아, "FAIL 시 조치" 열의 처방이 실행되지 않는 약속이었다.
+        _cv = ctx.get("canary") or {}
+        _disabled: List[str] = []
+        if _cv.get("wage_premium_ok") is False:
+            # K8: 연간급여총액 기재율 미달 → 임금프리미엄(한계임금 나눗셈)을 신뢰할 수 없다.
+            _disabled.append("TP_N1")
+            LOG.warn("CANARY K8(연간급여총액 기재율) 미달 판정에 따라 TP_N1(임금프리미엄)을 "
+                     "비활성화합니다. 이 전략의 핵심 신호이므로, 이 실행의 결론은 "
+                     "'한계임금 트레이드오프를 검정하지 못했다'로 읽어야 합니다.")
+        P = build_tps(P, disabled=_disabled)
         P = apply_vetoes_v3(P, ctx)
         P = assemble_score_v3(P)
         VAULT.put_table(f"l2_scores_{STRATEGY_ID}",
@@ -14441,6 +14565,7 @@ def main() -> dict:
         #   종합표까지 통째로 사라지고** 실행은 아무 일 없던 듯 다음 단계로 넘어갔다.
         #   강건성 검사는 서로 독립이므로 하나가 죽어도 나머지는 돌아야 한다.
         #   KillCriteria 만 스위트를 멈춘다 — 그건 '더 볼 필요가 없다'는 판정이기 때문이다.
+        robust_arm_deadline()
         _checks = [
             ("R1", lambda: R1_leakage(P, months, _run)),
             ("R2-N", lambda: R2N_kill_gate(P, _run)),

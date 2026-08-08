@@ -204,13 +204,31 @@ TP_DEFS = [
 ]
 
 
-def build_tps(P: pd.DataFrame) -> pd.DataFrame:
+def build_tps(P: pd.DataFrame, disabled: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """TP 조립. disabled 에 든 TP 는 만들되 **전량 결측으로 비활성화**한다.
+
+    ★★ 왜 '만들되 비활성화' 인가 — CANARY 판정이 소비되지 않던 문제 ★★
+      CANARY 는 K8(연간급여총액 기재율)이 기준 미달이면 "임금프리미엄 계산 불가"
+      라고 판정하고, K3 은 커버리지 미달 계정 목록(weak_accounts)을 남긴다.
+      그런데 그 verdict 는 ctx["canary"] 에 저장만 되고 **읽는 코드가 한 줄도 없었다.**
+      즉 "FAIL 시 조치" 열에 적힌 처방이 실행되지 않는 약속이었고, 미달인 원천으로
+      만든 TP 가 정상 TP 와 나란히 증거층 평균에 들어갔다.
+      → 비활성 TP 는 컬럼을 남기되 값을 비운다. 그래야 하류의 '살아 있는 TP' 판정이
+        자동으로 제외하고, 진단표에는 '왜 죽었는지'가 그대로 남는다.
+    """
     # ★ 이 단계의 진단만 표에 나오게 한다. 전역 리스트라 계약검정·스모크 값이 누적된다.
     CELL_RANK_DIAG.clear()
     P = P.copy()
+    disabled = set(disabled or [])
+    if disabled:
+        LOG.warn(f"CANARY 판정에 따라 TP {sorted(disabled)} 를 비활성화합니다 — "
+                 f"원천 기재율이 기준에 미달해 그 TP 의 값을 신뢰할 수 없습니다. "
+                 f"컬럼은 남기되 값을 비워 증거층에서 자동 제외되게 합니다"
+                 f"(0 으로 채우면 '대가를 치르지 않았다'는 거짓 주장이 됩니다).")
     rows = []
     for name, a, b, desc in TP_DEFS:
-        P[name] = tp(P, a, b)
+        P[name] = (pd.Series(np.nan, index=P.index, dtype="float32") if name in disabled
+                   else tp(P, a, b))
         cov = float(P[name].notna().mean()) if len(P) else 0.0
         pos = float((P[name] > 0).mean()) if len(P) else 0.0
         rows.append([name, f"{a} × {b}", _trunc(desc, 30), f"{cov*100:.1f}%", f"{pos*100:.1f}%"])

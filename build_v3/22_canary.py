@@ -391,6 +391,36 @@ def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
         k1, k2 = _canary_bulk(corps, n_uni)
         k3 = _canary_accounts(corps, probe_year)
         k7, k8, k9 = _canary_emp(corps, probe_year)
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★ 최근 1개 연도만 재고 PASS 를 주면 앞 구간 공백을 구조적으로 못 본다 ★
+        #    7회차가 정확히 그랬다 — K7/K8 이 최근 연도에서 PASS 인데 실제 EMP 커버리지는
+        #    2022~2025 네 해뿐이었고, 백테스트 120개월 중 앞 80개월이 무증거였다.
+        #    CANARY 의 목적은 '몇 시간 쓰기 전에 막는 것'이므로 **앞 구간을 같이 재야** 한다.
+        #    표본을 줄여(1/4) 호출을 늘리지 않으면서 시작연도를 한 번 더 찔러 본다.
+        #    받은 것은 캐시에 남으므로 이 호출도 버려지지 않는다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        _y0 = as_ts(BACKTEST_START).year - 1
+        if _y0 < probe_year and not dart_halt_reason():
+            _small = corps[:max(20, CANARY_SAMPLE_N // 4)]
+            try:
+                _rows = [r for r in pmap_io(lambda c: _emp_one_raw(c, _y0), _small,
+                                            workers=min(N_WORKERS_IO, 12),
+                                            desc=f"CANARY 시작연도 탐침({_y0})")
+                         if r is not None]
+                if _rows:
+                    _emp_checkpoint(VAULT.get_table("dart_employees_ext", scope="shared"), _rows)
+                _r0 = len(_rows) / max(len(_small), 1)
+                _p0 = (int(pd.DataFrame(_rows)["payroll_total"].notna().sum()) / max(len(_rows), 1)
+                       if _rows else 0.0)
+                _ok0 = (_r0 >= CANARY_K7_MIN_RATE) and (_p0 >= CANARY_K8_MIN_RATE)
+                _k("K7b", f"시작연도({_y0}) 직원현황 가용성", _ok0,
+                   f"응답 {len(_rows)}/{len(_small)} ({_r0:.0%}) · 급여총액 {_p0:.0%}",
+                   f"응답≥{CANARY_K7_MIN_RATE:.0%} · 급여≥{CANARY_K8_MIN_RATE:.0%}",
+                   "" if _ok0 else
+                   f"백테스트 앞 구간에 EMP 신호가 얇습니다. 최근 연도만 PASS 인 것을 "
+                   f"'10년 커버리지 확보'로 읽지 마세요 — 결과는 EMP 레짐 분할표에서 읽으세요.")
+            except Exception as e:                                   # noqa
+                LOG.debug(f"시작연도 탐침 실패({type(e).__name__}) — 판정을 생략합니다.")
     k4 = _canary_price(codes, sec)
     k5 = _canary_delisting(sec)
 

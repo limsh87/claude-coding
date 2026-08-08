@@ -41,6 +41,40 @@ def _budget_ok(rid: str, t0: float) -> bool:
     return not (lim and (time.time() - t0) > lim)
 
 
+# ── 스위트 전체의 절대 데드라인 ─────────────────────────────────────────────────────────────
+#   ★ 예전엔 시간 집행이 R5 안에만 있었다. 그런데 이 스위트는 백테스트를 26회 재실행하고
+#     (R1 3 · R2-N 5 · R3 2 · R5 최대 13 · R10 1 · 본선 2), 그중 어느 하나가 길어지면
+#     4시간 계약이 통째로 무너진다. L5 스테이지의 budget_s=3시간 은 후속 몫(60분)과도
+#     모순이었다 — 둘 다 지켜질 수 없는 숫자였다.
+#   → 스위트 진입 시각을 기준으로 절대 데드라인을 세우고, 각 검사 **진입부**에서 확인한다.
+#     넘겼으면 그 검사는 실행하지 않고 '미판정(N/A)'으로 기록한다. 조용히 건너뛰지 않는다.
+ROBUST_DEADLINE: Dict[str, float] = {"at": 0.0}
+
+
+def robust_arm_deadline() -> None:
+    total = sum(ROBUST_BUDGET_S.values())
+    try:
+        left = max(0.0, (_T0_PROCESS + WALL_CLOCK_LIMIT_H * 3600.0) - time.time())
+        budget = max(120.0, min(float(total), left * 0.80))   # 리포트 몫 20% 를 남긴다
+    except Exception:                                          # noqa
+        budget = float(total)
+    ROBUST_DEADLINE["at"] = time.time() + budget
+    LOG.info(f"강건성 스위트 시간 예산 {budget/60:.0f}분 — 각 검사는 시작 전에 잔여를 확인하고, "
+             f"넘겼으면 실행하지 않고 **미판정(N/A)** 으로 기록합니다. "
+             f"통과로 집계하지 않습니다.")
+
+
+def _suite_ok(rid: str, name: str) -> bool:
+    at = ROBUST_DEADLINE.get("at") or 0.0
+    if at and time.time() >= at:
+        _rec(rid, name, None,
+             "강건성 스위트의 시간 예산을 다 써서 이 검사를 실행하지 못했습니다 — "
+             "'통과'가 아니라 '미판정'입니다. 4시간 계약을 넘기는 대신 여기서 멈춥니다.",
+             f"경과 {(time.time()-_T0_PROCESS)/60:.0f}분")
+        return False
+    return True
+
+
 ALPHA_FLOOR = 0.20      # 이 아래의 Sharpe 는 '알파가 있다'고 말하지 않는다
 
 
@@ -223,6 +257,8 @@ def R1_leakage(P: pd.DataFrame, months: pd.DatetimeIndex, run_fn: Callable) -> N
       '신호에 지속성이 없다'는 별개의 사실이다. 둘을 한 판정에 묶으면 서로 다른 두
       사건을 구별할 수 없게 된다 — 그래서 ②는 참고 지표로 따로 보고한다.
     """
+    if not _suite_ok("R1", "누수 자가검정"):
+        return
     t0 = time.time()
     base = _stat(run_fn(P, label="R1_base"), "Sharpe")
 
@@ -268,6 +304,8 @@ def R2N_kill_gate(P: pd.DataFrame, run_fn: Callable) -> None:
       A 에만 허용하면 A 의 유니버스가 넓어져 비교가 성립하지 않는다.
       (실제로 이 통제를 빠뜨리면 나이브 팔이 표본 수 덕분에 이기는 일이 생긴다)
     """
+    if not _suite_ok("R2-N", "한계임금 킬게이트 ⭐⭐"):
+        return
     t0 = time.time()
     have_emp = ("nl_emp" in P.columns and "nl_premium" in P.columns
                 and P["nl_emp"].notna().any() and P["nl_premium"].notna().any())
@@ -468,6 +506,8 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
 
     '트레이드오프'라는 게 사실 그냥 퀄리티 팩터의 다른 이름이라면, 직교화 후 알파가 사라진다.
     """
+    if not _suite_ok("R3", "퀄리티 직교화"):
+        return
     t0 = time.time()
     Q = P.sort_values(["code", "month"]).copy()
     Q["f_size"] = np.log(col(Q, "assets").where(col(Q, "assets") > 0))
@@ -548,6 +588,8 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
 
 # ── R5 : 절제 (TP별 · 경계 · 분모임계) ─────────────────────────────────────────────────────
 def R5_ablation(P: pd.DataFrame, run_fn: Callable) -> None:
+    if not _suite_ok("R5", "절제 안정성"):
+        return
     t0 = time.time()
     live = [c for c in TP_ALL if c in P.columns and P[c].notna().any()]
     base_bt = run_fn(P, label="R5_base")
@@ -716,6 +758,8 @@ def R8_subperiod(bt: dict) -> None:
 # ── R10 : 정책반증 (고용장려금 캘린더 ±6M 제외) ─────────────────────────────────────────────
 def R10_policy_falsify(P: pd.DataFrame, cal: pd.DataFrame, months: pd.DatetimeIndex,
                        run_fn: Callable) -> None:
+    if not _suite_ok("R10", "정책반증 (고용정책 ±6M 제외)"):
+        return
     t0 = time.time()
     m = policy_mask(cal, months)
     clean = pd.DatetimeIndex(months[~m.to_numpy()])

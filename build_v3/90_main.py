@@ -654,6 +654,28 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                 VAULT.put_table("emp_sensors_annual", S, scope="shared", domain="dart",
                                 source="v3 EMP-LITE 연도 센서 (C15 적용) — 타 전략 재사용 가능")
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 알파 원천이 비었으면 여기서 멈춘다 ★★
+    #    L1.EMP 는 critical=False 다(수집 실패로 전체가 죽는 것을 막으려는 의도).
+    #    그런데 그러면 예외가 WARN 로 넘어가고 실행은 끝까지 진행돼, **CORE-D 축소판**이
+    #    '전략 3 · CORE-D + EMP-LITE' 라는 이름으로 보고된다. 사용자는 한계임금 전략의
+    #    결과를 받았다고 믿게 되는데 TP_N1·N2·N3 는 전량 결측이다.
+    #    critical=False 는 '조용히 다른 전략이 되어도 좋다'는 뜻이 아니다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _emp_n = len(ctx.get("emp_sensors", []) or [])
+    if _emp_n == 0:
+        _msg = ("직원현황(알파 원천) 수집·적재가 0행입니다 — TP_N1·N2·N3 가 전부 결측이라 "
+                "이 실행은 'CORE-D 단독' 축소판이 됩니다. 그것을 '전략 3'의 결과로 "
+                "보고하지 않습니다.")
+        if REQUIRE_EMP_ALPHA:
+            raise KillCriteria(
+                _msg + " 위 L1.EMP 로그에서 원인(호출 한도·네트워크·캐시 부재)을 확인하고 "
+                       "재실행하세요. CORE-D 축소판으로라도 돌려 보려면 "
+                       "REQUIRE_EMP_ALPHA=False 로 두십시오 — 그때는 모든 산출물에 "
+                       "축소판임이 명시됩니다.")
+        LOG.warn(_msg + " REQUIRE_EMP_ALPHA=False 이므로 축소판으로 계속합니다.")
+        ctx["emp_reduced"] = True
+
     with PIPE.stage("L1.DART", "DART 재무 · 공시목록", "L1", budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         years = list(range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1))
@@ -826,7 +848,17 @@ def score_and_backtest_v3(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
                           uni: "Universe") -> Tuple[pd.DataFrame, dict, Callable]:
     t_l2 = time.time()
     with PIPE.stage("L2.SCORE", "TP 조립 · 거부권 · Signal", "L2", budget_s=300):
-        P = build_tps(P)
+        # ★ CANARY 판정을 실제 게이트로 쓴다. 예전엔 ctx["canary"] 를 저장만 하고 아무도
+        #   읽지 않아, "FAIL 시 조치" 열의 처방이 실행되지 않는 약속이었다.
+        _cv = ctx.get("canary") or {}
+        _disabled: List[str] = []
+        if _cv.get("wage_premium_ok") is False:
+            # K8: 연간급여총액 기재율 미달 → 임금프리미엄(한계임금 나눗셈)을 신뢰할 수 없다.
+            _disabled.append("TP_N1")
+            LOG.warn("CANARY K8(연간급여총액 기재율) 미달 판정에 따라 TP_N1(임금프리미엄)을 "
+                     "비활성화합니다. 이 전략의 핵심 신호이므로, 이 실행의 결론은 "
+                     "'한계임금 트레이드오프를 검정하지 못했다'로 읽어야 합니다.")
+        P = build_tps(P, disabled=_disabled)
         P = apply_vetoes_v3(P, ctx)
         P = assemble_score_v3(P)
         VAULT.put_table(f"l2_scores_{STRATEGY_ID}",
@@ -1142,6 +1174,7 @@ def main() -> dict:
         #   종합표까지 통째로 사라지고** 실행은 아무 일 없던 듯 다음 단계로 넘어갔다.
         #   강건성 검사는 서로 독립이므로 하나가 죽어도 나머지는 돌아야 한다.
         #   KillCriteria 만 스위트를 멈춘다 — 그건 '더 볼 필요가 없다'는 판정이기 때문이다.
+        robust_arm_deadline()
         _checks = [
             ("R1", lambda: R1_leakage(P, months, _run)),
             ("R2-N", lambda: R2N_kill_gate(P, _run)),
