@@ -143,6 +143,15 @@ def main() -> dict:
                            f"{PRIMARY_CONFIG['rebal']} 리밸 · {PRIMARY_CONFIG['weight']} 링크"],
                ["선택 패키지", ", ".join(k for k, v in OPT.items() if v) or "없음"]],
               ["항목", "값"], ["l", "l"], title="실행 환경")
+    _ierr = globals().get("OPT_IMPORT_ERR") or {}
+    if _ierr:
+        # ★ '설치는 됐는데 import 실패'는 "없음"과 다르다. 원인을 보여줘야 고칠 수 있다.
+        LOG.table([[k, v] for k, v in _ierr.items()], ["패키지", "import 실패 사유"],
+                  ["l", "l"], title="선택 패키지 import 실패 (설치는 되어 있으나 못 씀)")
+        if "pykrx" in _ierr:
+            LOG.warn("pykrx 가 설치돼 있는데 import 에 실패했습니다. 시총·PBR 1순위 경로가 "
+                     "막히므로 KRX MDC 벌크 → 근사 폴백으로 내려갑니다. "
+                     "위 사유가 의존성 문제면 `pip install -U pykrx` 로 해결될 수 있습니다.")
 
     with PIPE.stage("L0.ROOT", "프로젝트 루트 결정 · 캐시 연결", "L0", budget_s=300):
         root, mode, adopts = resolve_project_root()
@@ -150,11 +159,15 @@ def main() -> dict:
         globals()["GDRIVE_ROOT"] = root
         ADOPT_DIRS_RESOLVED = adopts
         globals()["ADOPT_DIRS_RESOLVED"] = adopts
-        VAULT = Vault(root, mode)
+        alts = list(globals().get("ALT_READ_ROOTS") or [])
+        VAULT = Vault(root, mode, extra_roots=alts)
         globals()["VAULT"] = VAULT
         LOG.table([["캐시 루트", VAULT.root], ["결정 방식", mode],
                    ["공용 인덱스", f"{GDRIVE_SHARED_NS}  (다른 전략과 공유·재사용)"],
                    ["전용 인덱스", f"{GDRIVE_PRIVATE_NS}  (이 전략 고유)"],
+                   ["보조 읽기 루트", (f"{len(alts)}곳 — " + " | ".join(alts[:2])
+                                          + (" …" if len(alts) > 2 else "")) if alts
+                    else "없음 (이 루트 하나만 사용)"],
                    ["기존 캐시 스캔 대상", f"{len(adopts)}개 경로" +
                     (f"  ({adopts[0]})" if adopts else "")],
                    ["여유 공간", f"{free_gb_safe(VAULT.root):.1f} GB"]],
@@ -179,7 +192,7 @@ def main() -> dict:
         globals()["DQ"] = DQ
         DQ.report()
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K21", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K23", "L0", budget_s=300):
         run_contract_tests(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0", budget_s=900):

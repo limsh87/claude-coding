@@ -207,11 +207,16 @@ if OPT.get("FinanceDataReader"):
         import FinanceDataReader as fdr           # type: ignore
     except Exception:
         fdr = None
+OPT_IMPORT_ERR: Dict[str, str] = {}
 if OPT.get("pykrx"):
     try:
         from pykrx import stock as pykrx_stock    # type: ignore
-    except Exception:
+    except Exception as _e:                       # noqa
+        # ★ '설치는 됐는데 import 가 실패'하는 상태를 조용히 넘기면, 나중에
+        #   "pykrx 없음"이라는 메시지만 남고 사용자는 설치가 안 된 줄 안다.
+        #   실제로는 파이썬 3.14 + 의존성 문제 같은 고칠 수 있는 원인일 때가 많다.
         pykrx_stock = None
+        OPT_IMPORT_ERR["pykrx"] = f"{type(_e).__name__}: {str(_e)[:200]}"
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore

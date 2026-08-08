@@ -20,7 +20,7 @@
 #   `python arc_sacn_shared_coverage_network.py` 로 그냥 실행해도 동일하게 동작합니다.
 #
 #   실행하면 순서대로 로그에 출력됩니다:
-#     [0] 환경·의존성 → 캐시 연결 → 계약 자동검정 K1~K21
+#     [0] 환경·의존성 → 캐시 연결 → 계약 자동검정 K1~K23
 #     [1] 합성데이터 엔드투엔드 스모크  (실데이터 전에 계산경로를 먼저 증명)
 #     [2] 실경로 리허설  (네트워크만 가짜로 두고 수집·정제 함수를 실물 실행)
 #     [3] ★ PHASE 0 데이터 실현가능성 게이트 — 애널리스트 식별자 확보율 판정
@@ -249,7 +249,7 @@ VERBOSE = True
 
 STRATEGY_ID   = "ARC_SACN"
 STRATEGY_NAME = "공동커버리지 네트워크 모멘텀 (Shared Analyst Coverage Network Momentum)"
-BUILD_VERSION = "sacn.20260808.1211"
+BUILD_VERSION = "sacn.20260808.1231"
 
 # 사전등록 하이퍼파라미터 격자 (SPEC §6.4 — 총 12개, 확장 금지) ------------------------------
 #   링크 룩백 12M 고정 × 신호수익률윈도우 2 × 리밸런싱 2 × 링크가중 3 = 12
@@ -486,11 +486,16 @@ if OPT.get("FinanceDataReader"):
         import FinanceDataReader as fdr           # type: ignore
     except Exception:
         fdr = None
+OPT_IMPORT_ERR: Dict[str, str] = {}
 if OPT.get("pykrx"):
     try:
         from pykrx import stock as pykrx_stock    # type: ignore
-    except Exception:
+    except Exception as _e:                       # noqa
+        # ★ '설치는 됐는데 import 가 실패'하는 상태를 조용히 넘기면, 나중에
+        #   "pykrx 없음"이라는 메시지만 남고 사용자는 설치가 안 된 줄 안다.
+        #   실제로는 파이썬 3.14 + 의존성 문제 같은 고칠 수 있는 원인일 때가 많다.
         pykrx_stock = None
+        OPT_IMPORT_ERR["pykrx"] = f"{type(_e).__name__}: {str(_e)[:200]}"
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
@@ -612,6 +617,40 @@ def _drive_mount_points() -> List[str]:
             if not hit and (os.path.isdir(os.path.join(root, GDRIVE_SHARED_NS))
                             or os.path.isdir(os.path.join(root, GDRIVE_PRIVATE_NS))):
                 cands.append(root)
+    # 윈도우: 구글드라이브 데스크톱이 남기는 설정에서 마운트 문자를 직접 읽는다.
+    #   ★ 문자 순회만으로는 못 찾는 구성이 있다(레이블만 다르거나, 스트리밍 모드에서
+    #     루트에 'My Drive' 가 아닌 계정 폴더가 오는 경우). 설정 파일이 가장 확실하다.
+    if platform.system() == "Windows":
+        try:
+            base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "DriveFS")
+            if os.path.isdir(base):
+                for acct in os.listdir(base):
+                    for leaf in ("My Drive", "내 드라이브"):
+                        for letter in "GHIJKLMNOPQRSTUVWXYZ":
+                            cands.append(os.path.join(f"{letter}:\\", leaf))
+                    break
+        except Exception:
+            pass
+        # 볼륨 레이블에 'Google Drive' 가 들어간 드라이브를 찾는다
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(261)
+            for letter in "GHIJKLMNOPQRSTUVWXYZDEF":
+                root = f"{letter}:\\"
+                if not os.path.isdir(root):
+                    continue
+                try:
+                    ok = ctypes.windll.kernel32.GetVolumeInformationW(
+                        ctypes.c_wchar_p(root), buf, 260, None, None, None, None, 0)
+                    if ok and ("google" in buf.value.lower() or "드라이브" in buf.value):
+                        cands.append(root)
+                        for leaf in ("My Drive", "내 드라이브"):
+                            cands.append(os.path.join(root, leaf))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     # WSL 에서 윈도우 드라이브가 /mnt/g 등으로 보이는 경우
     for letter in "gdefhijk":
         p = f"/mnt/{letter}"
@@ -723,6 +762,16 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
             LOG_FN(f"[루트] GDRIVE_ROOT='{p}' 를 만들 수 없습니다({type(e).__name__}). "
                    f"경로를 다시 확인하세요 — 자동 탐색으로 넘어갑니다.")
         if os.path.isdir(p):
+            try:
+                found = [v for v in _discover_vaults(drives)
+                         if os.path.abspath(v) != os.path.abspath(p)]
+                for extra in (LOCAL_CACHE_ROOT, os.path.expanduser("~/.kr_data_work/ARC_SACN")):
+                    ep = os.path.abspath(os.path.expanduser(extra))
+                    if os.path.isdir(ep) and _vault_marker(ep) and ep != os.path.abspath(p):
+                        found.append(ep)
+                globals()["ALT_READ_ROOTS"] = list(dict.fromkeys(found))
+            except Exception:
+                pass
             if not exists:
                 _safe_print(f"[루트] ⚠ GDRIVE_ROOT 경로가 없어 새로 만들었습니다: {p}\n"
                             f"        오타라면 기존 캐시를 한 건도 못 쓰고 전부 재수집합니다. "
@@ -754,7 +803,9 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
     vaults = list(dict.fromkeys(named_hit + scanned))
     trace.append(["기존 캐시(_shared/index) 발견", f"{len(vaults)}개"])
     if vaults:
-        # 가장 알맹이가 많은 것을 고른다 (여러 개면 사용자가 실제로 쓰던 것일 확률이 높다)
+        # ★ 하나만 고르고 나머지를 버리면, 로컬과 드라이브에 흩어진 캐시의 절반을
+        #   매번 다시 받게 된다. 쓰기 루트는 하나(드라이브 우선)로 정하되,
+        #   읽기는 발견된 전부에서 한다(ALT_READ_ROOTS). 시간을 가장 크게 아끼는 지점이다.
         def _weight(p: str) -> int:
             # ★ 디렉터리명이 틀려 있었다. Vault 가 만드는 것은 index/blob/table 이고
             #   여기서는 tables/blobs 를 세고 있었다 — 결국 index 파일 수(1~3)만 세어
@@ -768,8 +819,22 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
                     except Exception:
                         pass
             return n
-        best = max(vaults, key=_weight)
+        on_drv = [v for v in vaults if _under_any(v, drives)]
+        # 쓰기 루트: 드라이브 위의 것을 우선하고, 그중 알맹이가 많은 것을 고른다.
+        best = max(on_drv or vaults, key=_weight)
+        alts = [v for v in vaults if os.path.abspath(v) != os.path.abspath(best)]
+        # 로컬 폴백 루트에 캐시가 있으면 그것도 읽기 대상에 넣는다(드라이브를 쓰더라도)
+        for extra in (LOCAL_CACHE_ROOT, os.path.expanduser("~/.kr_data_work/ARC_SACN")):
+            ep = os.path.abspath(os.path.expanduser(extra))
+            if (os.path.isdir(ep) and _vault_marker(ep)
+                    and ep != os.path.abspath(best) and ep not in map(os.path.abspath, alts)):
+                alts.append(ep)
+        globals()["ALT_READ_ROOTS"] = alts
         mode = "DRIVE_EXISTING" if _under_any(best, drives) else "LOCAL_EXISTING"
+        if alts:
+            _safe_print(f"[루트] 캐시 루트 {len(alts) + 1}곳을 함께 읽습니다 "
+                        f"(쓰기는 {os.path.basename(best)}). 추가 읽기: "
+                        + ", ".join(alts[:3]) + (" …" if len(alts) > 3 else ""))
         return os.path.abspath(best), mode, _resolve_adopt_dirs(drives, extra=vaults)
 
     # ④ 캐시는 없지만 존재하는 후보 경로
@@ -835,6 +900,9 @@ def _resolve_adopt_dirs(drives: Sequence[str], extra: Optional[Sequence[str]] = 
 # 재사용 코어(04_vault.py 의 _mount_drive)가 이 이름을 참조한다. 런타임에 확정된다.
 GDRIVE_ROOT: str = ""
 ADOPT_DIRS_RESOLVED: List[str] = []
+# ★ 읽기 전용 보조 캐시 루트. 로컬과 드라이브에 캐시가 흩어져 있을 때 양쪽을 모두 읽어
+#   재수집을 없앤다. 쓰기는 언제나 주 루트 한 곳에만 한다(분산 저장은 관리 불가능해진다).
+ALT_READ_ROOTS: List[str] = []
 
 # ── 판단 보류 항목 (SPEC §0 / §10 OPEN_QUESTIONS.md) ────────────────────────────────────────
 #   "애매한 지점이 있으면 임의 판단하지 말고 여기 기록한 뒤 가장 보수적인 선택을 하라."
@@ -1845,10 +1913,34 @@ def gby(df: pd.DataFrame, name: str, key: str = "code"):
 
 
 def safe_div(a, b, eps: float = 1e-12):
+    """0 나눗셈 안전 나눗셈. Series·배열·스칼라 전부 받는다.
+
+    ★ 예전에는 b 가 Series 라고 가정하고 b.where(...) 를 불렀다. 스칼라를 넘기면
+      AttributeError: 'int' object has no attribute 'where' 로 죽는다.
+      실제로 그 한 줄이 4분짜리 가격수집을 끝낸 직후 전부 날려버렸다(집계 표를 찍다가).
+      범용 유틸이 입력 형태를 가리면 호출부마다 지뢰가 된다 — 여기서 흡수한다.
+    """
     a = pd.to_numeric(a, errors="coerce")
     b = pd.to_numeric(b, errors="coerce")
-    out = a / b.where(b.abs() > eps)
-    return out.replace([np.inf, -np.inf], np.nan)
+    if hasattr(b, "where") and hasattr(b, "abs"):          # Series / DataFrame
+        out = a / b.where(b.abs() > eps)
+        return out.replace([np.inf, -np.inf], np.nan)
+    if isinstance(b, np.ndarray):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = np.asarray(a, dtype="float64") / np.where(np.abs(b) > eps, b, np.nan)
+        return np.where(np.isfinite(out), out, np.nan)
+    try:
+        bv = float(b)
+    except Exception:
+        return float("nan")
+    if not np.isfinite(bv) or abs(bv) <= eps:
+        return float("nan")
+    try:
+        av = float(a)
+    except Exception:
+        return float("nan")
+    out = av / bv
+    return out if np.isfinite(out) else float("nan")
 
 
 def dlog(s: pd.Series, periods: int = 12) -> pd.Series:
@@ -2031,9 +2123,21 @@ def _mount_drive() -> Tuple[str, str]:
 
 
 class Vault:
-    def __init__(self, root: str, mode: str):
+    """캐시 저장소.
+
+    ★ 읽기는 여러 루트에서, 쓰기는 한 루트에만.
+      로컬과 구글드라이브에 캐시가 흩어져 있으면(자주 그렇다) 하나만 골라 읽는 순간
+      나머지 절반을 매번 다시 수집하게 된다. extra_roots 는 '읽기 전용' 보조 루트로,
+      테이블·blob·인덱스를 모두 함께 본다. 쓰기는 절대 주 루트 한 곳에만 한다 —
+      분산 저장은 어느 쪽이 최신인지 알 수 없게 만들고, 그게 훼손의 시작이다.
+    """
+
+    def __init__(self, root: str, mode: str, extra_roots: Optional[Sequence[str]] = None):
         self.root = os.path.abspath(root)
         self.mode = mode
+        self.extra_roots = [os.path.abspath(r) for r in (extra_roots or [])
+                            if r and os.path.abspath(r) != os.path.abspath(root)
+                            and os.path.isdir(r)]
         self.ns = {"shared": os.path.join(self.root, GDRIVE_SHARED_NS),
                    "private": os.path.join(self.root, GDRIVE_PRIVATE_NS)}
         for p in self.ns.values():
@@ -2121,6 +2225,25 @@ class Vault:
         jr = read_jsonl(self.journal(scope))
         if jr:
             frames.append(pd.DataFrame(jr))
+
+        # (b2) 보조 루트(로컬/드라이브 반대편)의 인덱스도 읽는다 — 쓰지는 않는다.
+        #   양쪽에 흩어진 캐시를 한 번에 보게 해 재수집을 없앤다.
+        for r in self.extra_roots:
+            ns = os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS)
+            try:
+                dj = read_jsonl(os.path.join(ns, "index", "index.jsonl"))
+                if dj:
+                    df_alt = pd.DataFrame(dj)
+                    df_alt["_alt_root"] = r
+                    frames.append(df_alt)
+                dp = read_parquet_safe(os.path.join(ns, "index", "index.parquet"))
+                if dp is not None and len(dp):
+                    dp = dp.copy()
+                    dp["_alt_root"] = r
+                    frames.append(dp)
+                self.stats[f"alt_index_read:{scope}"] += 1
+            except Exception:
+                continue
 
         # (c) 과거 버전/다른 전략이 남긴 인덱스 파일도 흡수 (읽기 전용, 훼손 없음)
         legacy_glob = []
@@ -2255,7 +2378,11 @@ class Vault:
         if rows.empty:
             return None
         for _, r in rows.iterrows():
-            for cand in (r.get("abs_path"), os.path.join(self.root, str(r.get("path") or ""))):
+            rel = str(r.get("path") or "")
+            # 보조 루트에도 같은 상대경로로 존재할 수 있다(로컬↔드라이브 어느 쪽이든)
+            cands = [r.get("abs_path"), os.path.join(self.root, rel)]
+            cands += [os.path.join(alt, rel) for alt in self.extra_roots if rel]
+            for cand in cands:
                 try:
                     if cand and isinstance(cand, str) and os.path.exists(cand):
                         return open(cand, "rb").read()
@@ -2302,14 +2429,26 @@ class Vault:
           _backup 폴더를 잡고 있던 실행의 결과물은 디스크에 멀쩡히 있는데도 영원히
           안 읽히고, 다음 세션은 갱신 전의 낡은 표를 받는다 — 저장은 성공, 재호출은 실패.
         """
-        base = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if os.path.exists(base):
-            revs = sorted(glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
-            if revs and os.path.getmtime(revs[-1]) > os.path.getmtime(base):
-                return revs[-1]
-            return base
-        revs = sorted(glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
-        return revs[-1] if revs else None
+        cands: List[str] = []
+        dirs = [self.table_dir(scope)] + [
+            os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                         "table") for r in self.extra_roots]
+        for d in dirs:
+            base = os.path.join(d, f"{name}.parquet")
+            if os.path.exists(base):
+                cands.append(base)
+            cands.extend(glob.glob(os.path.join(d, f"{name}.rev*.parquet")))
+        if not cands:
+            return None
+        # 여러 루트에 같은 이름이 있으면 가장 최근 것을 쓴다
+        try:
+            return max(cands, key=os.path.getmtime)
+        except Exception:
+            return cands[0]
+
+    def alt_blob_dirs(self, scope: str) -> List[str]:
+        return [os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                             "blob") for r in self.extra_roots]
 
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
@@ -2985,7 +3124,8 @@ class SourceHealth:
         out = []
         for s in sorted(set(list(self.ok) + list(self.bad))):
             n_ok, n_bad = self.ok[s], self.bad[s]
-            rate = safe_div(n_ok, n_ok + n_bad, 0.0)
+            tot = n_ok + n_bad
+            rate = (n_ok / tot) if tot else 0.0
             out.append([s, f"{n_ok:,}", f"{n_bad:,}", f"{rate:.0%}",
                         "차단됨" if s in self.tripped else "정상"])
         return out
@@ -3195,6 +3335,24 @@ def report_cache_ledger() -> pd.DataFrame:
                                      .head(25).itertuples(index=False)],
                       ["저장된 데이터셋", "인덱스", "행수"], ["l", "l", "r"],
                       title="이번 실행에서 드라이브에 새로 저장된 것")
+    # ★ '저장됐다'와 '구글드라이브에 저장됐다'는 다른 말이다. 로컬에만 남았으면
+    #   다른 기기·다른 세션에서 재호출할 수 없다 — 절대원칙의 절반만 충족한 상태다.
+    V = globals().get("VAULT")
+    if V is not None:
+        on_drive = bool(re.search(r"(drive|내 드라이브|My Drive|CloudStorage)",
+                                  str(getattr(V, "root", "")), re.I)) or \
+            str(getattr(V, "mode", "")).startswith(("DRIVE", "COLAB"))
+        rows_loc = [["쓰기 루트", getattr(V, "root", "?")],
+                    ["구글드라이브 여부", "예" if on_drive else "아니오 (로컬 디스크)"],
+                    ["보조 읽기 루트", f"{len(getattr(V, 'extra_roots', []))}곳"]]
+        LOG.table(rows_loc, ["캐시 위치", "값"], ["l", "l"], title="캐시 저장 위치 확인")
+        if not on_drive:
+            LOG.warn(
+                "이번 실행의 수집물은 이 PC 에만 저장됐습니다. 저장·재호출은 되지만 "
+                "구글드라이브가 아니므로 다른 기기·다른 세션에서는 못 씁니다.\n"
+                f"  → 드라이브 폴더를 만든 뒤 코드 상단 GDRIVE_ROOT 에 그 경로를 넣고 다시 "
+                f"실행하세요. 지금 로컬 캐시({getattr(V, 'root', '')})는 자동으로 "
+                f"'보조 읽기 루트'로 잡히므로 재수집 없이 그대로 이어집니다.")
     if viol:
         LOG.error("절대원칙 위반 — 새로 수집했는데 드라이브에 저장되지 않은 데이터가 있습니다:\n  · "
                   + "\n  · ".join(viol) +
@@ -3835,26 +3993,49 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         good6 = set(codes.dropna().astype(str))
         covered = int(base6.isin(good6).sum())          # 본주가 이미 목록에 있는 파생증권
         shapes = Counter()
-        for s in bad_raw:
-            if len(s) > 6 and re.fullmatch(r"\d{4,6}[0-9A-Z]{1,4}", s):
-                shapes["6자리 초과(파생·신주인수권류)"] += 1
-            elif not s or s.lower() in ("nan", "none"):
-                shapes["빈 값"] += 1
-            else:
-                shapes["기타 형식"] += 1
+        # ★ 추측하지 말고 데이터를 본다. FDR 폐지목록에는 SecuGroup/Kind 컬럼이 있고,
+        #   거기에 '주권/신주인수권증권/수익증권' 같은 증권 종류가 그대로 적혀 있다.
+        #   이 한 컬럼이 "보통주를 잃은 것인가, 파생증권이 걸러진 것인가"를 확정해 준다.
+        sg_col = col.get("secugroup") or col.get("kind")
+        if sg_col is not None:
+            sg = d.loc[codes.isna(), sg_col].astype(str).str.strip().replace(
+                {"": "(미표기)", "nan": "(미표기)"})
+            for k, v in sg.value_counts().items():
+                shapes[f"증권종류: {k}"] += int(v)
+        else:
+            for s in bad_raw:
+                if len(s) > 6 and re.fullmatch(r"\d{4,6}[0-9A-Z]{1,4}", s):
+                    shapes["6자리 초과(파생·신주인수권류)"] += 1
+                elif not s or s.lower() in ("nan", "none"):
+                    shapes["빈 값"] += 1
+                else:
+                    shapes["기타 형식"] += 1
         LOG.table([[k, f"{v:,}"] for k, v in shapes.most_common()] +
                   [["└ 그중 본주가 폐지목록에 이미 있음", f"{covered:,}"]],
                   ["정규화 탈락 유형", "건수"], ["l", "r"],
                   title=f"상장폐지 목록 정규화 탈락 {n_badcode:,}건의 정체")
-        residual = n_badcode - covered
+        # 보통주(주권)로 표기된 탈락분만이 진짜 생존자편향 위험이다
+        n_common_lost = 0
+        if sg_col is not None:
+            sgv = d.loc[codes.isna(), sg_col].astype(str)
+            n_common_lost = int(sgv.str.contains("주권|보통주|Common", case=False,
+                                                 na=False).sum())
+            LOG.info(f"  그중 '주권(보통주)'로 표기된 것은 {n_common_lost:,}건입니다 — "
+                     f"나머지 {n_badcode - n_common_lost:,}건은 신주인수권·수익증권 등 "
+                     f"애초에 유니버스 대상이 아닌 증권입니다.")
+        residual = (n_common_lost if sg_col is not None else n_badcode - covered)
         LOG.info(
             f"탈락분 {n_badcode:,}건 중 {covered:,}건은 본주가 이미 폐지목록에 있는 "
             f"파생증권(신주인수권증서·ELW 등)이라 보통주 유니버스에 영향이 없습니다. "
             f"나머지 {residual:,}건은 6자리 코드로 환원할 근거가 없어 그대로 둡니다 — "
             f"임의로 앞 6자리를 잘라 붙이면 살아 있는 회사에 폐지일을 심게 됩니다.")
         if residual > max(50, int(0.05 * n_raw)):
-            LOG.warn(f"근거 없이 남은 탈락분이 {residual:,}건({100*residual/max(n_raw,1):.1f}%)으로 "
-                     f"적지 않습니다. 잔여 생존자편향이 이 크기만큼 남아 있을 수 있습니다.")
+            LOG.warn(f"보통주로 보이는 탈락분이 {residual:,}건"
+                     f"({100*residual/max(n_raw,1):.1f}%)으로 적지 않습니다. "
+                     f"잔여 생존자편향이 이 크기만큼 남아 있을 수 있습니다.")
+        elif sg_col is not None:
+            LOG.ok(f"탈락분 중 보통주는 {residual:,}건뿐입니다 — 생존자편향에 실질적 영향이 "
+                   f"없습니다(나머지는 유니버스 대상이 아닌 증권종류).")
     t = pd.DataFrame({
         "code": codes,
         "name": d[name_c].astype(str),
@@ -4000,8 +4181,10 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
     new_rows: List[dict] = []
     if todo:
         if not KRXG.warmup():
-            LOG.info(f"KRX 세션이 없어 스냅샷 {len(todo)}개 시점을 건너뜁니다. "
-                     f"유니버스는 상장일·폐지일로 구성되며 이는 정상 경로입니다.")
+            why = ("pykrx 를 쓸 수 없어" if pykrx_stock is None else "KRX 세션이 없어")
+            LOG.info(f"{why} pykrx 상장 스냅샷 {len(todo)}개 시점을 건너뜁니다. "
+                     f"유니버스는 상장일·폐지일로 구성되며 이는 정상 경로입니다. "
+                     f"(KRX MDC 벌크가 살아 있으면 그쪽으로 스냅샷을 복원합니다)")
             todo = []
     if todo:
         LOG.info(f"KRX 상장 스냅샷 {len(todo)}개 시점 수집 (주기={UNIVERSE_SNAPSHOT_FREQ}, 직렬)")
@@ -4277,6 +4460,7 @@ class KRXAuth:
         self.session_ok = False
         self.openapi_ok = False
         self.anon_ok: Optional[bool] = None      # None=미확인
+        self.last_status = ""                    # 마지막 bld 응답 앞부분 (진단용)
         self._openapi_mode = "query"
         self._lk = threading.RLock()
         self._logged_in_once = False
@@ -4355,10 +4539,15 @@ class KRXAuth:
           (예전 구현은 session_ok 가 아니면 시도조차 안 했다 — ID/PW 를 안 넣은 사용자에게
            KRX 경로가 통째로 없는 것과 같았다)
         """
-        body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
+        # ★ locale 을 빼면 MDC 가 빈 응답을 준다(가장 흔한 실패 원인). pykrx 도 항상 넣는다.
+        body = {"bld": bld, "locale": "ko_KR", "share": "1", "money": "1",
+                "csvxls_isNo": "false", **params}
+        self.last_status = ""
         for attempt in (0, 1):
             txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
                             headers={"X-Requested-With": "XMLHttpRequest"})
+            if txt is not None:
+                self.last_status = str(txt)[:180].replace("\n", " ")
             if txt and str(txt).lstrip()[:1] in ("{", "["):
                 try:
                     js = json.loads(txt)
@@ -4388,11 +4577,14 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 #   성공한 후보를 _KRX_BLD_OK 에 기억해 두 번째 호출부터는 곧장 그걸 쓴다.
 KRX_BLD = {
     "allprice": ["dbms/MDC/STAT/standard/MDCSTAT01501",
-                 "dbms/MDC/STAT/standard/MDCSTAT01502"],
+                 "dbms/MDC/STAT/standard/MDCSTAT01502",
+                 "dbms/MDC/STAT/standard/MDCSTAT00301"],
     "perpbr":   ["dbms/MDC/STAT/standard/MDCSTAT03501",
                  "dbms/MDC/STAT/standard/MDCSTAT03502"],
     "listed":   ["dbms/MDC/STAT/standard/MDCSTAT01901"],
 }
+# mktId 후보. 화면에 따라 ALL 을 안 받고 시장별만 받는 bld 가 있다.
+KRX_MKT_CANDS = ["ALL", "STK", "KSQ"]
 _KRX_BLD_OK: Dict[str, str] = {}
 _KRX_BLD_DEAD: set = set()
 
@@ -4494,7 +4686,7 @@ def _prev_bizday(ts: Any, back: int = 0) -> _dt.date:
     return d
 
 
-def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional[pd.DataFrame]:
+def krx_all_price(day: Any, market: str = "", walk_back: int = 7) -> Optional[pd.DataFrame]:
     """전종목 시세 스냅샷 — 날짜 1개 = 1호출. 종가·시가·고저·거래량·거래대금·시총·상장주식수.
 
     휴장일이면 빈 응답이 오므로 직전 영업일로 최대 walk_back 일 당겨본다.
@@ -4502,6 +4694,7 @@ def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional
     """
     want = ["code", "name", "market", "close", "open", "high", "low",
             "volume", "amount", "mktcap", "shares"]
+    market = market or globals().get("_KRX_MKT_OK") or "ALL"
     seen_days: set = set()
     for back in range(walk_back + 1):
         d = _prev_bizday(day, back)
@@ -4532,9 +4725,10 @@ def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional
     return None
 
 
-def krx_all_perpbr(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional[pd.DataFrame]:
+def krx_all_perpbr(day: Any, market: str = "", walk_back: int = 7) -> Optional[pd.DataFrame]:
     """전종목 PER/PBR/BPS/배당 스냅샷 — 날짜 1개 = 1호출. §6.3 직교화의 BM 원천."""
     want = ["code", "name", "close", "eps", "per", "bps", "pbr", "dps", "div_yield"]
+    market = market or globals().get("_KRX_MKT_OK") or "ALL"
     seen_days: set = set()
     for back in range(walk_back + 1):
         d = _prev_bizday(day, back)
@@ -4561,16 +4755,35 @@ def krx_bulk_available() -> bool:
     cur = globals().get("_KRX_BULK_OK")
     if cur is not None:
         return bool(cur)
-    probe = krx_all_price(_dt.date.today() - _dt.timedelta(days=3), walk_back=9)
-    ok = probe is not None and len(probe) > 100
+    probe = None
+    for mkt in KRX_MKT_CANDS:
+        probe = krx_all_price(_dt.date.today() - _dt.timedelta(days=3), market=mkt, walk_back=9)
+        if probe is not None and len(probe) > 100:
+            globals()["_KRX_MKT_OK"] = mkt
+            break
+        probe = None
+    ok = probe is not None
     globals()["_KRX_BULK_OK"] = ok
     if ok:
         LOG.ok(f"KRX MDC 벌크 스냅샷 사용 가능 — 전종목 {len(probe):,}건/1호출 "
-               f"(bld={_KRX_BLD_OK.get('allprice', '?')}). pykrx 없이도 시총·PBR 을 받습니다.")
+               f"(bld={_KRX_BLD_OK.get('allprice', '?')}, mktId={globals().get('_KRX_MKT_OK')}). "
+               f"pykrx 없이도 시총·PBR 을 받습니다.")
     else:
         _KRX_BLD_DEAD.add("allprice")
-        LOG.warn("KRX MDC 벌크 스냅샷 응답 없음 — 시총/BM 은 파생계산(상장주식수×종가) 및 "
-                 "DART 폴백으로 대체합니다. 유니버스 시총하한은 그만큼 근사가 됩니다.")
+        # ★ '응답 없음' 한 줄로 끝내면 아무도 고칠 수 없다. 무엇을 보냈고 무엇이 왔는지 남긴다.
+        LOG.table([["시도한 bld", " / ".join(KRX_BLD["allprice"])],
+                   ["시도한 mktId", " / ".join(KRX_MKT_CANDS)],
+                   ["로그인 상태", KRX.status],
+                   ["세션 확보", "예" if KRX.session_ok else "아니오"],
+                   ["익명 조회 가능", {True: "예", False: "아니오"}.get(KRX.anon_ok, "미확인")],
+                   ["마지막 응답 앞부분", (KRX.last_status or "(응답 없음/네트워크 실패)")[:110]]],
+                  ["KRX 벌크 진단", "값"], ["l", "l"],
+                  title="KRX MDC 벌크 실패 진단 (시총·PBR 의 1순위 경로)")
+        LOG.warn("KRX MDC 벌크 스냅샷을 쓸 수 없습니다 — 시총/BM 은 파생계산(상장주식수×종가)과 "
+                 "DART 폴백으로 대체합니다. 유니버스 시총하한이 그만큼 근사가 되고, "
+                 "시총하위1000 아암은 '근사 순위' 기준이 됩니다. "
+                 "위 표의 '마지막 응답 앞부분'이 로그인 HTML 이면 ID/PW 를, "
+                 "빈 JSON 이면 bld/mktId 가 개편된 것입니다.")
     return ok
 
 
@@ -5086,6 +5299,25 @@ def _fold_by_source(px: pd.DataFrame) -> pd.DataFrame:
 _COVERAGE_ACC: List[dict] = []
 
 
+def _flush_coverage() -> None:
+    """커버리지 원장을 즉시 영속화한다(누적 후 한 번이 아니라 청크마다)."""
+    if not _COVERAGE_ACC:
+        return
+    try:
+        cv = pd.DataFrame(_COVERAGE_ACC).drop_duplicates("code", keep="last")
+        prev = VAULT.get_table("price_coverage", scope="shared")
+        if prev is not None and len(prev):
+            cv = (pd.concat([prev.reindex(columns=PRICE_COVERAGE_COLS), cv], ignore_index=True)
+                    .drop_duplicates("code", keep="last"))
+        note_new_data("price_coverage", len(_COVERAGE_ACC), "shared", "price", "coverage")
+        persist("price_coverage", cv.reindex(columns=PRICE_COVERAGE_COLS), scope="shared",
+                domain="price", source="fetch_prices:coverage")
+        _COVERAGE_ACC.clear()
+    except Exception as e:                                       # noqa
+        LOG.warn(f"커버리지 원장 저장 실패({type(e).__name__}) — 다음 실행이 일부 종목을 "
+                 f"다시 받을 수 있습니다(데이터 손실은 아닙니다).")
+
+
 def _mark_coverage(part, got) -> None:
     """'어디서부터 요청해서 무엇을 받았는가'를 남긴다 (무한 백필 방지)."""
     if not part:
@@ -5223,6 +5455,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
 
         def _one(job):
             code, st, en = job
+            tried: List[str] = []
             for nm in chain:
                 if not health.alive(nm):
                     continue
@@ -5231,11 +5464,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 except Exception:
                     d = None
                 good = d is not None and len(d) > 0
-                health.mark(nm, good)
                 if good:
+                    # 이 소스는 성공 — 그 앞에서 빈손이던 소스들은 '이 종목에 대해서만'
+                    # 못 준 것이므로 소스 고장으로 센다(회로차단의 정당한 근거).
+                    for prev_nm in tried:
+                        health.mark(prev_nm, False)
+                    health.mark(nm, True)
                     d = d.dropna(subset=["date"])
                     if len(d):
                         return d
+                tried.append(nm)
+            # ★ 전 소스가 빈손이면 그건 '종목이 원래 없다'는 뜻이지 소스 고장이 아니다.
+            #   여기서 실패를 세면, 폐지종목이 몰린 구간에서 멀쩡한 소스가 회로차단된다.
+            #   (실측에서 fdr 이 그렇게 끊겼다 — 앞선 naver 가 다 처리해 성공 기회조차
+            #    없는 상태로 죽은 종목만 넘겨받았기 때문이다)
             return None
 
         # ── ④ 청크 실행 ──────────────────────────────────────────────────────────────────
@@ -5262,6 +5504,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 #   전 청크가 끝난 뒤 한 번만 썼다 — 3/4 지점에서 끊기면 전량 손실이다.
                 _save_price_chunk(cached, new_frames, src_used)
             _mark_coverage(part, got)
+            # ★ 커버리지도 청크마다 남긴다. 이번 실행에서 마지막에 한 번만 쓰다가
+            #   그 앞에서 죽는 바람에 1,036종목의 '이미 전 구간 조회함' 기록이 통째로
+            #   사라졌다 — 다음 실행이 같은 1,036종목을 또 받게 된다.
+            _flush_coverage()
             del res, got
             if health.tripped:
                 LOG.warn("회로차단 발동 — " + ", ".join(
@@ -5333,22 +5579,18 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                           "negative cache")
             persist("price_fetch_attempts", _all, scope="shared", domain="price",
                     source="fetch_prices:negative_cache")
-        hrows = health.rows()
-        if hrows:
-            LOG.table(hrows, ["소스", "성공", "실패", "성공률", "상태"],
-                      ["l", "r", "r", "r", "l"], title="가격 소스 실행중 건강도")
+        # ★ 표 하나 그리다가 4분짜리 수집을 날리지 않는다.
+        #   실제로 safe_div(int,int) 하나가 여기서 터져 스테이지 전체가 FAIL 했다.
+        #   보고는 어떤 경우에도 데이터 경로를 죽여서는 안 된다.
+        try:
+            hrows = health.rows()
+            if hrows:
+                LOG.table(hrows, ["소스", "성공", "실패", "성공률", "상태"],
+                          ["l", "r", "r", "r", "l"], title="가격 소스 실행중 건강도")
+        except Exception as e:                                   # noqa
+            LOG.warn(f"소스 건강도 표 생성 실패({type(e).__name__}) — 수집 결과에는 영향 없습니다.")
 
-    if _COVERAGE_ACC:
-        _cv = pd.DataFrame(_COVERAGE_ACC).drop_duplicates("code", keep="last")
-        _prev_cv = VAULT.get_table("price_coverage", scope="shared")
-        if _prev_cv is not None and len(_prev_cv):
-            _cv = (pd.concat([_prev_cv.reindex(columns=PRICE_COVERAGE_COLS), _cv],
-                             ignore_index=True)
-                     .drop_duplicates("code", keep="last"))
-        note_new_data("price_coverage", len(_COVERAGE_ACC), "shared", "price", "coverage")
-        persist("price_coverage", _cv.reindex(columns=PRICE_COVERAGE_COLS), scope="shared",
-                domain="price", source="fetch_prices:coverage")
-        _COVERAGE_ACC.clear()
+    _flush_coverage()
 
     # ── ⑦ 병합 ─────────────────────────────────────────────────────────────────────────
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
@@ -10892,7 +11134,7 @@ def write_verdict_md(v: dict, arms: Dict[str, dict], ppy: float) -> str:
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-V  계약 자동검정 K1~K21  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
+# ║  L0-V  계약 자동검정 K1~K23  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
 # ║                                                                                          ║
 # ║  세 검증은 서로 다른 것을 본다. 하나로 합칠 수 없다:                                       ║
 # ║   · 계약검정 : 협상 불가 규칙(PIT·생존편향·사전등록)이 코드에 실제로 박혀 있는가            ║
@@ -11144,7 +11386,7 @@ def run_selftest(full: bool = True) -> bool:
 
 # ── 계약 검정 ───────────────────────────────────────────────────────────────────────────────
 def run_contract_tests(strict: bool = True) -> bool:
-    LOG.banner("계약 자동검정 K1~K21", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
+    LOG.banner("계약 자동검정 K1~K23", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
     CONTRACTS.clear()
 
     def k1():
@@ -11367,7 +11609,10 @@ def run_contract_tests(strict: bool = True) -> bool:
             return _o(name)
         globals()["limiter"] = _spy
         try:
-            _px_fdr("000000", "2020-01-01", "2020-01-05")     # fdr 미설치면 즉시 None
+            # ★ FDR 은 실패 시 bare print 를 흘린다("<sym>" invalid symbol or has no data).
+            #   계약검정 로그에 그게 섞이면 사용자가 진짜 오류로 오인한다 → 봉인하고 부른다.
+            with quiet_fds():
+                _px_fdr("000000", "2020-01-01", "2020-01-05")   # fdr 미설치면 즉시 None
         except Exception:
             pass
         finally:
@@ -11400,8 +11645,11 @@ def run_contract_tests(strict: bool = True) -> bool:
         orig = V.__class__.put_table
 
         def _spy(self, name, df, *a, **kw):
+            # ★ 실제로 쓰지 않는다. 예전 구현은 orig 를 그대로 불러 사용자 드라이브에
+            #   '__k19_probe__' 테이블을 남겼다 — 삭제 API 가 없으니 영원히 남는다.
+            #   계약검정이 캐시를 오염시키면 그 자체가 절대 1원칙 위반이다.
             seen.append(str(name))
-            return orig(self, name, df, *a, **kw)
+            return f"probe:{name}"
         V.__class__.put_table = _spy
         try:
             note_new_data("__k19_probe__", 3, "shared", "test", "k19")
@@ -11475,6 +11723,68 @@ def run_contract_tests(strict: bool = True) -> bool:
         return (not bad), ("결측 PDF 필드가 애널리스트로 승격되지 않음"
                            if not bad else f"유령 애널리스트 생성됨: {bad}")
 
+    def k22():
+        """공용 유틸이 입력 형태를 가리지 않는가 (실측 크래시 재발 방지).
+
+        safe_div 가 Series 전용이던 탓에 스칼라를 넘긴 한 줄이
+        AttributeError 로 4분짜리 가격수집을 끝낸 직후 통째로 날려버렸다.
+        범용 유틸이 형태를 가리면 호출부 수십 곳이 전부 지뢰가 된다.
+        """
+        checks = [
+            ("스칼라/스칼라", lambda: safe_div(3, 4), 0.75),
+            ("0 나눗셈", lambda: safe_div(3, 0), None),
+            ("넘파이 스칼라", lambda: safe_div(np.int64(6), np.int64(3)), 2.0),
+            ("파이썬 float", lambda: safe_div(1.0, 8.0), 0.125),
+        ]
+        why = []
+        for nm, fn_, exp in checks:
+            try:
+                v = fn_()
+            except Exception as e:                             # noqa
+                why.append(f"{nm}: {type(e).__name__}")
+                continue
+            vv = float(v) if v is not None and np.isscalar(v) else float("nan")
+            if exp is None:
+                if np.isfinite(vv):
+                    why.append(f"{nm}: 0 나눗셈이 {vv} 를 돌려줌(NaN 이어야 함)")
+            elif not (np.isfinite(vv) and abs(vv - exp) < 1e-9):
+                why.append(f"{nm}: {vv} (기대 {exp})")
+        try:                                    # Series 경로도 그대로 살아 있어야 한다
+            sv = safe_div(pd.Series([1.0, 2.0]), pd.Series([2.0, 0.0]))
+            if not (abs(float(sv.iloc[0]) - 0.5) < 1e-9 and pd.isna(sv.iloc[1])):
+                why.append(f"Series 경로 회귀: {list(sv)}")
+        except Exception as e:                                 # noqa
+            why.append(f"Series 경로: {type(e).__name__}")
+        return (not why), ("safe_div 이 스칼라·배열·Series 를 모두 안전하게 처리한다"
+                           if not why else " · ".join(why))
+
+    def k23():
+        """보조 캐시 루트(로컬↔드라이브)를 실제로 함께 읽는가.
+
+        읽기 루트를 하나만 쓰면 양쪽에 흩어진 캐시의 절반을 매번 다시 수집하게 된다.
+        '읽는다고 주장'만 하지 않도록, 임시 보조 루트에 테이블을 심고 되읽는다.
+        """
+        V = globals().get("VAULT")
+        if V is None:
+            raise _SrcUnavailable("VAULT 미초기화 — 런타임에서만 검사 가능합니다")
+        alt = tempfile.mkdtemp(prefix="sacn_altroot_")
+        try:
+            tdir = os.path.join(alt, GDRIVE_SHARED_NS, "table")
+            os.makedirs(tdir, exist_ok=True)
+            probe = pd.DataFrame({"code": ["005930"], "v": [42]})
+            atomic_write_parquet(probe, os.path.join(tdir, "__k23_alt__.parquet"))
+            saved = list(V.extra_roots)
+            V.extra_roots = saved + [alt]
+            try:
+                got = V.get_table("__k23_alt__", scope="shared")
+            finally:
+                V.extra_roots = saved
+            ok = got is not None and len(got) == 1 and int(got["v"].iloc[0]) == 42
+            return ok, ("보조 루트의 테이블을 그대로 읽어온다 (로컬·드라이브 동시 활용)"
+                        if ok else "보조 루트를 읽지 못함 — 반대편 캐시를 매번 재수집하게 된다")
+        finally:
+            shutil.rmtree(alt, ignore_errors=True)
+
     for cid, name, fn in [
         ("K1", "미래누수 차단 (PIT 게이트)", k1),
         ("K2", "생존편향 — 폐지 수익률 처리", k2),
@@ -11497,6 +11807,8 @@ def run_contract_tests(strict: bool = True) -> bool:
         ("K19", "신규 수집물 전량 드라이브 저장", k19),
         ("K20", "상세 캐시 왕복 — 바이라인 보존", k20),
         ("K21", "결측 PDF 필드가 유령 애널리스트를 안 만듦", k21),
+        ("K22", "공용 유틸의 스칼라 안전성 (safe_div)", k22),
+        ("K23", "보조 캐시 루트 동시 읽기 (로컬↔드라이브)", k23),
     ]:
         _k(cid, name, fn)
 
@@ -11814,6 +12126,15 @@ def main() -> dict:
                            f"{PRIMARY_CONFIG['rebal']} 리밸 · {PRIMARY_CONFIG['weight']} 링크"],
                ["선택 패키지", ", ".join(k for k, v in OPT.items() if v) or "없음"]],
               ["항목", "값"], ["l", "l"], title="실행 환경")
+    _ierr = globals().get("OPT_IMPORT_ERR") or {}
+    if _ierr:
+        # ★ '설치는 됐는데 import 실패'는 "없음"과 다르다. 원인을 보여줘야 고칠 수 있다.
+        LOG.table([[k, v] for k, v in _ierr.items()], ["패키지", "import 실패 사유"],
+                  ["l", "l"], title="선택 패키지 import 실패 (설치는 되어 있으나 못 씀)")
+        if "pykrx" in _ierr:
+            LOG.warn("pykrx 가 설치돼 있는데 import 에 실패했습니다. 시총·PBR 1순위 경로가 "
+                     "막히므로 KRX MDC 벌크 → 근사 폴백으로 내려갑니다. "
+                     "위 사유가 의존성 문제면 `pip install -U pykrx` 로 해결될 수 있습니다.")
 
     with PIPE.stage("L0.ROOT", "프로젝트 루트 결정 · 캐시 연결", "L0", budget_s=300):
         root, mode, adopts = resolve_project_root()
@@ -11821,11 +12142,15 @@ def main() -> dict:
         globals()["GDRIVE_ROOT"] = root
         ADOPT_DIRS_RESOLVED = adopts
         globals()["ADOPT_DIRS_RESOLVED"] = adopts
-        VAULT = Vault(root, mode)
+        alts = list(globals().get("ALT_READ_ROOTS") or [])
+        VAULT = Vault(root, mode, extra_roots=alts)
         globals()["VAULT"] = VAULT
         LOG.table([["캐시 루트", VAULT.root], ["결정 방식", mode],
                    ["공용 인덱스", f"{GDRIVE_SHARED_NS}  (다른 전략과 공유·재사용)"],
                    ["전용 인덱스", f"{GDRIVE_PRIVATE_NS}  (이 전략 고유)"],
+                   ["보조 읽기 루트", (f"{len(alts)}곳 — " + " | ".join(alts[:2])
+                                          + (" …" if len(alts) > 2 else "")) if alts
+                    else "없음 (이 루트 하나만 사용)"],
                    ["기존 캐시 스캔 대상", f"{len(adopts)}개 경로" +
                     (f"  ({adopts[0]})" if adopts else "")],
                    ["여유 공간", f"{free_gb_safe(VAULT.root):.1f} GB"]],
@@ -11850,7 +12175,7 @@ def main() -> dict:
         globals()["DQ"] = DQ
         DQ.report()
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K21", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 K1~K23", "L0", budget_s=300):
         run_contract_tests(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0", budget_s=900):

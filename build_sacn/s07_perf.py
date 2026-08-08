@@ -229,7 +229,8 @@ class SourceHealth:
         out = []
         for s in sorted(set(list(self.ok) + list(self.bad))):
             n_ok, n_bad = self.ok[s], self.bad[s]
-            rate = safe_div(n_ok, n_ok + n_bad, 0.0)
+            tot = n_ok + n_bad
+            rate = (n_ok / tot) if tot else 0.0
             out.append([s, f"{n_ok:,}", f"{n_bad:,}", f"{rate:.0%}",
                         "차단됨" if s in self.tripped else "정상"])
         return out
@@ -439,6 +440,24 @@ def report_cache_ledger() -> pd.DataFrame:
                                      .head(25).itertuples(index=False)],
                       ["저장된 데이터셋", "인덱스", "행수"], ["l", "l", "r"],
                       title="이번 실행에서 드라이브에 새로 저장된 것")
+    # ★ '저장됐다'와 '구글드라이브에 저장됐다'는 다른 말이다. 로컬에만 남았으면
+    #   다른 기기·다른 세션에서 재호출할 수 없다 — 절대원칙의 절반만 충족한 상태다.
+    V = globals().get("VAULT")
+    if V is not None:
+        on_drive = bool(re.search(r"(drive|내 드라이브|My Drive|CloudStorage)",
+                                  str(getattr(V, "root", "")), re.I)) or \
+            str(getattr(V, "mode", "")).startswith(("DRIVE", "COLAB"))
+        rows_loc = [["쓰기 루트", getattr(V, "root", "?")],
+                    ["구글드라이브 여부", "예" if on_drive else "아니오 (로컬 디스크)"],
+                    ["보조 읽기 루트", f"{len(getattr(V, 'extra_roots', []))}곳"]]
+        LOG.table(rows_loc, ["캐시 위치", "값"], ["l", "l"], title="캐시 저장 위치 확인")
+        if not on_drive:
+            LOG.warn(
+                "이번 실행의 수집물은 이 PC 에만 저장됐습니다. 저장·재호출은 되지만 "
+                "구글드라이브가 아니므로 다른 기기·다른 세션에서는 못 씁니다.\n"
+                f"  → 드라이브 폴더를 만든 뒤 코드 상단 GDRIVE_ROOT 에 그 경로를 넣고 다시 "
+                f"실행하세요. 지금 로컬 캐시({getattr(V, 'root', '')})는 자동으로 "
+                f"'보조 읽기 루트'로 잡히므로 재수집 없이 그대로 이어집니다.")
     if viol:
         LOG.error("절대원칙 위반 — 새로 수집했는데 드라이브에 저장되지 않은 데이터가 있습니다:\n  · "
                   + "\n  · ".join(viol) +

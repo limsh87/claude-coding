@@ -48,6 +48,7 @@ class KRXAuth:
         self.session_ok = False
         self.openapi_ok = False
         self.anon_ok: Optional[bool] = None      # None=미확인
+        self.last_status = ""                    # 마지막 bld 응답 앞부분 (진단용)
         self._openapi_mode = "query"
         self._lk = threading.RLock()
         self._logged_in_once = False
@@ -126,10 +127,15 @@ class KRXAuth:
           (예전 구현은 session_ok 가 아니면 시도조차 안 했다 — ID/PW 를 안 넣은 사용자에게
            KRX 경로가 통째로 없는 것과 같았다)
         """
-        body = {"bld": bld, "share": "1", "money": "1", "csvxls_isNo": "false", **params}
+        # ★ locale 을 빼면 MDC 가 빈 응답을 준다(가장 흔한 실패 원인). pykrx 도 항상 넣는다.
+        body = {"bld": bld, "locale": "ko_KR", "share": "1", "money": "1",
+                "csvxls_isNo": "false", **params}
+        self.last_status = ""
         for attempt in (0, 1):
             txt = http_post(self.JSONDATA, source="krx", data=body, referer=self.JSON_REF,
                             headers={"X-Requested-With": "XMLHttpRequest"})
+            if txt is not None:
+                self.last_status = str(txt)[:180].replace("\n", " ")
             if txt and str(txt).lstrip()[:1] in ("{", "["):
                 try:
                     js = json.loads(txt)
@@ -159,11 +165,14 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 #   성공한 후보를 _KRX_BLD_OK 에 기억해 두 번째 호출부터는 곧장 그걸 쓴다.
 KRX_BLD = {
     "allprice": ["dbms/MDC/STAT/standard/MDCSTAT01501",
-                 "dbms/MDC/STAT/standard/MDCSTAT01502"],
+                 "dbms/MDC/STAT/standard/MDCSTAT01502",
+                 "dbms/MDC/STAT/standard/MDCSTAT00301"],
     "perpbr":   ["dbms/MDC/STAT/standard/MDCSTAT03501",
                  "dbms/MDC/STAT/standard/MDCSTAT03502"],
     "listed":   ["dbms/MDC/STAT/standard/MDCSTAT01901"],
 }
+# mktId 후보. 화면에 따라 ALL 을 안 받고 시장별만 받는 bld 가 있다.
+KRX_MKT_CANDS = ["ALL", "STK", "KSQ"]
 _KRX_BLD_OK: Dict[str, str] = {}
 _KRX_BLD_DEAD: set = set()
 
@@ -265,7 +274,7 @@ def _prev_bizday(ts: Any, back: int = 0) -> _dt.date:
     return d
 
 
-def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional[pd.DataFrame]:
+def krx_all_price(day: Any, market: str = "", walk_back: int = 7) -> Optional[pd.DataFrame]:
     """전종목 시세 스냅샷 — 날짜 1개 = 1호출. 종가·시가·고저·거래량·거래대금·시총·상장주식수.
 
     휴장일이면 빈 응답이 오므로 직전 영업일로 최대 walk_back 일 당겨본다.
@@ -273,6 +282,7 @@ def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional
     """
     want = ["code", "name", "market", "close", "open", "high", "low",
             "volume", "amount", "mktcap", "shares"]
+    market = market or globals().get("_KRX_MKT_OK") or "ALL"
     seen_days: set = set()
     for back in range(walk_back + 1):
         d = _prev_bizday(day, back)
@@ -303,9 +313,10 @@ def krx_all_price(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional
     return None
 
 
-def krx_all_perpbr(day: Any, market: str = "ALL", walk_back: int = 7) -> Optional[pd.DataFrame]:
+def krx_all_perpbr(day: Any, market: str = "", walk_back: int = 7) -> Optional[pd.DataFrame]:
     """전종목 PER/PBR/BPS/배당 스냅샷 — 날짜 1개 = 1호출. §6.3 직교화의 BM 원천."""
     want = ["code", "name", "close", "eps", "per", "bps", "pbr", "dps", "div_yield"]
+    market = market or globals().get("_KRX_MKT_OK") or "ALL"
     seen_days: set = set()
     for back in range(walk_back + 1):
         d = _prev_bizday(day, back)
@@ -332,16 +343,35 @@ def krx_bulk_available() -> bool:
     cur = globals().get("_KRX_BULK_OK")
     if cur is not None:
         return bool(cur)
-    probe = krx_all_price(_dt.date.today() - _dt.timedelta(days=3), walk_back=9)
-    ok = probe is not None and len(probe) > 100
+    probe = None
+    for mkt in KRX_MKT_CANDS:
+        probe = krx_all_price(_dt.date.today() - _dt.timedelta(days=3), market=mkt, walk_back=9)
+        if probe is not None and len(probe) > 100:
+            globals()["_KRX_MKT_OK"] = mkt
+            break
+        probe = None
+    ok = probe is not None
     globals()["_KRX_BULK_OK"] = ok
     if ok:
         LOG.ok(f"KRX MDC 벌크 스냅샷 사용 가능 — 전종목 {len(probe):,}건/1호출 "
-               f"(bld={_KRX_BLD_OK.get('allprice', '?')}). pykrx 없이도 시총·PBR 을 받습니다.")
+               f"(bld={_KRX_BLD_OK.get('allprice', '?')}, mktId={globals().get('_KRX_MKT_OK')}). "
+               f"pykrx 없이도 시총·PBR 을 받습니다.")
     else:
         _KRX_BLD_DEAD.add("allprice")
-        LOG.warn("KRX MDC 벌크 스냅샷 응답 없음 — 시총/BM 은 파생계산(상장주식수×종가) 및 "
-                 "DART 폴백으로 대체합니다. 유니버스 시총하한은 그만큼 근사가 됩니다.")
+        # ★ '응답 없음' 한 줄로 끝내면 아무도 고칠 수 없다. 무엇을 보냈고 무엇이 왔는지 남긴다.
+        LOG.table([["시도한 bld", " / ".join(KRX_BLD["allprice"])],
+                   ["시도한 mktId", " / ".join(KRX_MKT_CANDS)],
+                   ["로그인 상태", KRX.status],
+                   ["세션 확보", "예" if KRX.session_ok else "아니오"],
+                   ["익명 조회 가능", {True: "예", False: "아니오"}.get(KRX.anon_ok, "미확인")],
+                   ["마지막 응답 앞부분", (KRX.last_status or "(응답 없음/네트워크 실패)")[:110]]],
+                  ["KRX 벌크 진단", "값"], ["l", "l"],
+                  title="KRX MDC 벌크 실패 진단 (시총·PBR 의 1순위 경로)")
+        LOG.warn("KRX MDC 벌크 스냅샷을 쓸 수 없습니다 — 시총/BM 은 파생계산(상장주식수×종가)과 "
+                 "DART 폴백으로 대체합니다. 유니버스 시총하한이 그만큼 근사가 되고, "
+                 "시총하위1000 아암은 '근사 순위' 기준이 됩니다. "
+                 "위 표의 '마지막 응답 앞부분'이 로그인 HTML 이면 ID/PW 를, "
+                 "빈 JSON 이면 bld/mktId 가 개편된 것입니다.")
     return ok
 
 

@@ -51,9 +51,21 @@ def _mount_drive() -> Tuple[str, str]:
 
 
 class Vault:
-    def __init__(self, root: str, mode: str):
+    """캐시 저장소.
+
+    ★ 읽기는 여러 루트에서, 쓰기는 한 루트에만.
+      로컬과 구글드라이브에 캐시가 흩어져 있으면(자주 그렇다) 하나만 골라 읽는 순간
+      나머지 절반을 매번 다시 수집하게 된다. extra_roots 는 '읽기 전용' 보조 루트로,
+      테이블·blob·인덱스를 모두 함께 본다. 쓰기는 절대 주 루트 한 곳에만 한다 —
+      분산 저장은 어느 쪽이 최신인지 알 수 없게 만들고, 그게 훼손의 시작이다.
+    """
+
+    def __init__(self, root: str, mode: str, extra_roots: Optional[Sequence[str]] = None):
         self.root = os.path.abspath(root)
         self.mode = mode
+        self.extra_roots = [os.path.abspath(r) for r in (extra_roots or [])
+                            if r and os.path.abspath(r) != os.path.abspath(root)
+                            and os.path.isdir(r)]
         self.ns = {"shared": os.path.join(self.root, GDRIVE_SHARED_NS),
                    "private": os.path.join(self.root, GDRIVE_PRIVATE_NS)}
         for p in self.ns.values():
@@ -141,6 +153,25 @@ class Vault:
         jr = read_jsonl(self.journal(scope))
         if jr:
             frames.append(pd.DataFrame(jr))
+
+        # (b2) 보조 루트(로컬/드라이브 반대편)의 인덱스도 읽는다 — 쓰지는 않는다.
+        #   양쪽에 흩어진 캐시를 한 번에 보게 해 재수집을 없앤다.
+        for r in self.extra_roots:
+            ns = os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS)
+            try:
+                dj = read_jsonl(os.path.join(ns, "index", "index.jsonl"))
+                if dj:
+                    df_alt = pd.DataFrame(dj)
+                    df_alt["_alt_root"] = r
+                    frames.append(df_alt)
+                dp = read_parquet_safe(os.path.join(ns, "index", "index.parquet"))
+                if dp is not None and len(dp):
+                    dp = dp.copy()
+                    dp["_alt_root"] = r
+                    frames.append(dp)
+                self.stats[f"alt_index_read:{scope}"] += 1
+            except Exception:
+                continue
 
         # (c) 과거 버전/다른 전략이 남긴 인덱스 파일도 흡수 (읽기 전용, 훼손 없음)
         legacy_glob = []
@@ -275,7 +306,11 @@ class Vault:
         if rows.empty:
             return None
         for _, r in rows.iterrows():
-            for cand in (r.get("abs_path"), os.path.join(self.root, str(r.get("path") or ""))):
+            rel = str(r.get("path") or "")
+            # 보조 루트에도 같은 상대경로로 존재할 수 있다(로컬↔드라이브 어느 쪽이든)
+            cands = [r.get("abs_path"), os.path.join(self.root, rel)]
+            cands += [os.path.join(alt, rel) for alt in self.extra_roots if rel]
+            for cand in cands:
                 try:
                     if cand and isinstance(cand, str) and os.path.exists(cand):
                         return open(cand, "rb").read()
@@ -322,14 +357,26 @@ class Vault:
           _backup 폴더를 잡고 있던 실행의 결과물은 디스크에 멀쩡히 있는데도 영원히
           안 읽히고, 다음 세션은 갱신 전의 낡은 표를 받는다 — 저장은 성공, 재호출은 실패.
         """
-        base = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if os.path.exists(base):
-            revs = sorted(glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
-            if revs and os.path.getmtime(revs[-1]) > os.path.getmtime(base):
-                return revs[-1]
-            return base
-        revs = sorted(glob.glob(os.path.join(self.table_dir(scope), f"{name}.rev*.parquet")))
-        return revs[-1] if revs else None
+        cands: List[str] = []
+        dirs = [self.table_dir(scope)] + [
+            os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                         "table") for r in self.extra_roots]
+        for d in dirs:
+            base = os.path.join(d, f"{name}.parquet")
+            if os.path.exists(base):
+                cands.append(base)
+            cands.extend(glob.glob(os.path.join(d, f"{name}.rev*.parquet")))
+        if not cands:
+            return None
+        # 여러 루트에 같은 이름이 있으면 가장 최근 것을 쓴다
+        try:
+            return max(cands, key=os.path.getmtime)
+        except Exception:
+            return cands[0]
+
+    def alt_blob_dirs(self, scope: str) -> List[str]:
+        return [os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                             "blob") for r in self.extra_roots]
 
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:

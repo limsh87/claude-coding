@@ -78,6 +78,40 @@ def _drive_mount_points() -> List[str]:
             if not hit and (os.path.isdir(os.path.join(root, GDRIVE_SHARED_NS))
                             or os.path.isdir(os.path.join(root, GDRIVE_PRIVATE_NS))):
                 cands.append(root)
+    # 윈도우: 구글드라이브 데스크톱이 남기는 설정에서 마운트 문자를 직접 읽는다.
+    #   ★ 문자 순회만으로는 못 찾는 구성이 있다(레이블만 다르거나, 스트리밍 모드에서
+    #     루트에 'My Drive' 가 아닌 계정 폴더가 오는 경우). 설정 파일이 가장 확실하다.
+    if platform.system() == "Windows":
+        try:
+            base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "DriveFS")
+            if os.path.isdir(base):
+                for acct in os.listdir(base):
+                    for leaf in ("My Drive", "내 드라이브"):
+                        for letter in "GHIJKLMNOPQRSTUVWXYZ":
+                            cands.append(os.path.join(f"{letter}:\\", leaf))
+                    break
+        except Exception:
+            pass
+        # 볼륨 레이블에 'Google Drive' 가 들어간 드라이브를 찾는다
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(261)
+            for letter in "GHIJKLMNOPQRSTUVWXYZDEF":
+                root = f"{letter}:\\"
+                if not os.path.isdir(root):
+                    continue
+                try:
+                    ok = ctypes.windll.kernel32.GetVolumeInformationW(
+                        ctypes.c_wchar_p(root), buf, 260, None, None, None, None, 0)
+                    if ok and ("google" in buf.value.lower() or "드라이브" in buf.value):
+                        cands.append(root)
+                        for leaf in ("My Drive", "내 드라이브"):
+                            cands.append(os.path.join(root, leaf))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     # WSL 에서 윈도우 드라이브가 /mnt/g 등으로 보이는 경우
     for letter in "gdefhijk":
         p = f"/mnt/{letter}"
@@ -189,6 +223,16 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
             LOG_FN(f"[루트] GDRIVE_ROOT='{p}' 를 만들 수 없습니다({type(e).__name__}). "
                    f"경로를 다시 확인하세요 — 자동 탐색으로 넘어갑니다.")
         if os.path.isdir(p):
+            try:
+                found = [v for v in _discover_vaults(drives)
+                         if os.path.abspath(v) != os.path.abspath(p)]
+                for extra in (LOCAL_CACHE_ROOT, os.path.expanduser("~/.kr_data_work/ARC_SACN")):
+                    ep = os.path.abspath(os.path.expanduser(extra))
+                    if os.path.isdir(ep) and _vault_marker(ep) and ep != os.path.abspath(p):
+                        found.append(ep)
+                globals()["ALT_READ_ROOTS"] = list(dict.fromkeys(found))
+            except Exception:
+                pass
             if not exists:
                 _safe_print(f"[루트] ⚠ GDRIVE_ROOT 경로가 없어 새로 만들었습니다: {p}\n"
                             f"        오타라면 기존 캐시를 한 건도 못 쓰고 전부 재수집합니다. "
@@ -220,7 +264,9 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
     vaults = list(dict.fromkeys(named_hit + scanned))
     trace.append(["기존 캐시(_shared/index) 발견", f"{len(vaults)}개"])
     if vaults:
-        # 가장 알맹이가 많은 것을 고른다 (여러 개면 사용자가 실제로 쓰던 것일 확률이 높다)
+        # ★ 하나만 고르고 나머지를 버리면, 로컬과 드라이브에 흩어진 캐시의 절반을
+        #   매번 다시 받게 된다. 쓰기 루트는 하나(드라이브 우선)로 정하되,
+        #   읽기는 발견된 전부에서 한다(ALT_READ_ROOTS). 시간을 가장 크게 아끼는 지점이다.
         def _weight(p: str) -> int:
             # ★ 디렉터리명이 틀려 있었다. Vault 가 만드는 것은 index/blob/table 이고
             #   여기서는 tables/blobs 를 세고 있었다 — 결국 index 파일 수(1~3)만 세어
@@ -234,8 +280,22 @@ def resolve_project_root() -> Tuple[str, str, List[str]]:
                     except Exception:
                         pass
             return n
-        best = max(vaults, key=_weight)
+        on_drv = [v for v in vaults if _under_any(v, drives)]
+        # 쓰기 루트: 드라이브 위의 것을 우선하고, 그중 알맹이가 많은 것을 고른다.
+        best = max(on_drv or vaults, key=_weight)
+        alts = [v for v in vaults if os.path.abspath(v) != os.path.abspath(best)]
+        # 로컬 폴백 루트에 캐시가 있으면 그것도 읽기 대상에 넣는다(드라이브를 쓰더라도)
+        for extra in (LOCAL_CACHE_ROOT, os.path.expanduser("~/.kr_data_work/ARC_SACN")):
+            ep = os.path.abspath(os.path.expanduser(extra))
+            if (os.path.isdir(ep) and _vault_marker(ep)
+                    and ep != os.path.abspath(best) and ep not in map(os.path.abspath, alts)):
+                alts.append(ep)
+        globals()["ALT_READ_ROOTS"] = alts
         mode = "DRIVE_EXISTING" if _under_any(best, drives) else "LOCAL_EXISTING"
+        if alts:
+            _safe_print(f"[루트] 캐시 루트 {len(alts) + 1}곳을 함께 읽습니다 "
+                        f"(쓰기는 {os.path.basename(best)}). 추가 읽기: "
+                        + ", ".join(alts[:3]) + (" …" if len(alts) > 3 else ""))
         return os.path.abspath(best), mode, _resolve_adopt_dirs(drives, extra=vaults)
 
     # ④ 캐시는 없지만 존재하는 후보 경로
@@ -301,6 +361,9 @@ def _resolve_adopt_dirs(drives: Sequence[str], extra: Optional[Sequence[str]] = 
 # 재사용 코어(04_vault.py 의 _mount_drive)가 이 이름을 참조한다. 런타임에 확정된다.
 GDRIVE_ROOT: str = ""
 ADOPT_DIRS_RESOLVED: List[str] = []
+# ★ 읽기 전용 보조 캐시 루트. 로컬과 드라이브에 캐시가 흩어져 있을 때 양쪽을 모두 읽어
+#   재수집을 없앤다. 쓰기는 언제나 주 루트 한 곳에만 한다(분산 저장은 관리 불가능해진다).
+ALT_READ_ROOTS: List[str] = []
 
 # ── 판단 보류 항목 (SPEC §0 / §10 OPEN_QUESTIONS.md) ────────────────────────────────────────
 #   "애매한 지점이 있으면 임의 판단하지 말고 여기 기록한 뒤 가장 보수적인 선택을 하라."

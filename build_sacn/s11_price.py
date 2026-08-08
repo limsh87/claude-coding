@@ -346,6 +346,25 @@ def _fold_by_source(px: pd.DataFrame) -> pd.DataFrame:
 _COVERAGE_ACC: List[dict] = []
 
 
+def _flush_coverage() -> None:
+    """커버리지 원장을 즉시 영속화한다(누적 후 한 번이 아니라 청크마다)."""
+    if not _COVERAGE_ACC:
+        return
+    try:
+        cv = pd.DataFrame(_COVERAGE_ACC).drop_duplicates("code", keep="last")
+        prev = VAULT.get_table("price_coverage", scope="shared")
+        if prev is not None and len(prev):
+            cv = (pd.concat([prev.reindex(columns=PRICE_COVERAGE_COLS), cv], ignore_index=True)
+                    .drop_duplicates("code", keep="last"))
+        note_new_data("price_coverage", len(_COVERAGE_ACC), "shared", "price", "coverage")
+        persist("price_coverage", cv.reindex(columns=PRICE_COVERAGE_COLS), scope="shared",
+                domain="price", source="fetch_prices:coverage")
+        _COVERAGE_ACC.clear()
+    except Exception as e:                                       # noqa
+        LOG.warn(f"커버리지 원장 저장 실패({type(e).__name__}) — 다음 실행이 일부 종목을 "
+                 f"다시 받을 수 있습니다(데이터 손실은 아닙니다).")
+
+
 def _mark_coverage(part, got) -> None:
     """'어디서부터 요청해서 무엇을 받았는가'를 남긴다 (무한 백필 방지)."""
     if not part:
@@ -483,6 +502,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
 
         def _one(job):
             code, st, en = job
+            tried: List[str] = []
             for nm in chain:
                 if not health.alive(nm):
                     continue
@@ -491,11 +511,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 except Exception:
                     d = None
                 good = d is not None and len(d) > 0
-                health.mark(nm, good)
                 if good:
+                    # 이 소스는 성공 — 그 앞에서 빈손이던 소스들은 '이 종목에 대해서만'
+                    # 못 준 것이므로 소스 고장으로 센다(회로차단의 정당한 근거).
+                    for prev_nm in tried:
+                        health.mark(prev_nm, False)
+                    health.mark(nm, True)
                     d = d.dropna(subset=["date"])
                     if len(d):
                         return d
+                tried.append(nm)
+            # ★ 전 소스가 빈손이면 그건 '종목이 원래 없다'는 뜻이지 소스 고장이 아니다.
+            #   여기서 실패를 세면, 폐지종목이 몰린 구간에서 멀쩡한 소스가 회로차단된다.
+            #   (실측에서 fdr 이 그렇게 끊겼다 — 앞선 naver 가 다 처리해 성공 기회조차
+            #    없는 상태로 죽은 종목만 넘겨받았기 때문이다)
             return None
 
         # ── ④ 청크 실행 ──────────────────────────────────────────────────────────────────
@@ -522,6 +551,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 #   전 청크가 끝난 뒤 한 번만 썼다 — 3/4 지점에서 끊기면 전량 손실이다.
                 _save_price_chunk(cached, new_frames, src_used)
             _mark_coverage(part, got)
+            # ★ 커버리지도 청크마다 남긴다. 이번 실행에서 마지막에 한 번만 쓰다가
+            #   그 앞에서 죽는 바람에 1,036종목의 '이미 전 구간 조회함' 기록이 통째로
+            #   사라졌다 — 다음 실행이 같은 1,036종목을 또 받게 된다.
+            _flush_coverage()
             del res, got
             if health.tripped:
                 LOG.warn("회로차단 발동 — " + ", ".join(
@@ -593,22 +626,18 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                           "negative cache")
             persist("price_fetch_attempts", _all, scope="shared", domain="price",
                     source="fetch_prices:negative_cache")
-        hrows = health.rows()
-        if hrows:
-            LOG.table(hrows, ["소스", "성공", "실패", "성공률", "상태"],
-                      ["l", "r", "r", "r", "l"], title="가격 소스 실행중 건강도")
+        # ★ 표 하나 그리다가 4분짜리 수집을 날리지 않는다.
+        #   실제로 safe_div(int,int) 하나가 여기서 터져 스테이지 전체가 FAIL 했다.
+        #   보고는 어떤 경우에도 데이터 경로를 죽여서는 안 된다.
+        try:
+            hrows = health.rows()
+            if hrows:
+                LOG.table(hrows, ["소스", "성공", "실패", "성공률", "상태"],
+                          ["l", "r", "r", "r", "l"], title="가격 소스 실행중 건강도")
+        except Exception as e:                                   # noqa
+            LOG.warn(f"소스 건강도 표 생성 실패({type(e).__name__}) — 수집 결과에는 영향 없습니다.")
 
-    if _COVERAGE_ACC:
-        _cv = pd.DataFrame(_COVERAGE_ACC).drop_duplicates("code", keep="last")
-        _prev_cv = VAULT.get_table("price_coverage", scope="shared")
-        if _prev_cv is not None and len(_prev_cv):
-            _cv = (pd.concat([_prev_cv.reindex(columns=PRICE_COVERAGE_COLS), _cv],
-                             ignore_index=True)
-                     .drop_duplicates("code", keep="last"))
-        note_new_data("price_coverage", len(_COVERAGE_ACC), "shared", "price", "coverage")
-        persist("price_coverage", _cv.reindex(columns=PRICE_COVERAGE_COLS), scope="shared",
-                domain="price", source="fetch_prices:coverage")
-        _COVERAGE_ACC.clear()
+    _flush_coverage()
 
     # ── ⑦ 병합 ─────────────────────────────────────────────────────────────────────────
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames

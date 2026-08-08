@@ -545,10 +545,34 @@ def gby(df: pd.DataFrame, name: str, key: str = "code"):
 
 
 def safe_div(a, b, eps: float = 1e-12):
+    """0 나눗셈 안전 나눗셈. Series·배열·스칼라 전부 받는다.
+
+    ★ 예전에는 b 가 Series 라고 가정하고 b.where(...) 를 불렀다. 스칼라를 넘기면
+      AttributeError: 'int' object has no attribute 'where' 로 죽는다.
+      실제로 그 한 줄이 4분짜리 가격수집을 끝낸 직후 전부 날려버렸다(집계 표를 찍다가).
+      범용 유틸이 입력 형태를 가리면 호출부마다 지뢰가 된다 — 여기서 흡수한다.
+    """
     a = pd.to_numeric(a, errors="coerce")
     b = pd.to_numeric(b, errors="coerce")
-    out = a / b.where(b.abs() > eps)
-    return out.replace([np.inf, -np.inf], np.nan)
+    if hasattr(b, "where") and hasattr(b, "abs"):          # Series / DataFrame
+        out = a / b.where(b.abs() > eps)
+        return out.replace([np.inf, -np.inf], np.nan)
+    if isinstance(b, np.ndarray):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = np.asarray(a, dtype="float64") / np.where(np.abs(b) > eps, b, np.nan)
+        return np.where(np.isfinite(out), out, np.nan)
+    try:
+        bv = float(b)
+    except Exception:
+        return float("nan")
+    if not np.isfinite(bv) or abs(bv) <= eps:
+        return float("nan")
+    try:
+        av = float(a)
+    except Exception:
+        return float("nan")
+    out = av / bv
+    return out if np.isfinite(out) else float("nan")
 
 
 def dlog(s: pd.Series, periods: int = 12) -> pd.Series:

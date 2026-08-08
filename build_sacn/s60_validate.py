@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-V  계약 자동검정 K1~K21  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
+# ║  L0-V  계약 자동검정 K1~K23  +  합성데이터 엔드투엔드 스모크  +  실경로 리허설             ║
 # ║                                                                                          ║
 # ║  세 검증은 서로 다른 것을 본다. 하나로 합칠 수 없다:                                       ║
 # ║   · 계약검정 : 협상 불가 규칙(PIT·생존편향·사전등록)이 코드에 실제로 박혀 있는가            ║
@@ -253,7 +253,7 @@ def run_selftest(full: bool = True) -> bool:
 
 # ── 계약 검정 ───────────────────────────────────────────────────────────────────────────────
 def run_contract_tests(strict: bool = True) -> bool:
-    LOG.banner("계약 자동검정 K1~K21", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
+    LOG.banner("계약 자동검정 K1~K23", "협상 불가 규칙이 코드에 실제로 박혀 있는지 검사한다")
     CONTRACTS.clear()
 
     def k1():
@@ -476,7 +476,10 @@ def run_contract_tests(strict: bool = True) -> bool:
             return _o(name)
         globals()["limiter"] = _spy
         try:
-            _px_fdr("000000", "2020-01-01", "2020-01-05")     # fdr 미설치면 즉시 None
+            # ★ FDR 은 실패 시 bare print 를 흘린다("<sym>" invalid symbol or has no data).
+            #   계약검정 로그에 그게 섞이면 사용자가 진짜 오류로 오인한다 → 봉인하고 부른다.
+            with quiet_fds():
+                _px_fdr("000000", "2020-01-01", "2020-01-05")   # fdr 미설치면 즉시 None
         except Exception:
             pass
         finally:
@@ -509,8 +512,11 @@ def run_contract_tests(strict: bool = True) -> bool:
         orig = V.__class__.put_table
 
         def _spy(self, name, df, *a, **kw):
+            # ★ 실제로 쓰지 않는다. 예전 구현은 orig 를 그대로 불러 사용자 드라이브에
+            #   '__k19_probe__' 테이블을 남겼다 — 삭제 API 가 없으니 영원히 남는다.
+            #   계약검정이 캐시를 오염시키면 그 자체가 절대 1원칙 위반이다.
             seen.append(str(name))
-            return orig(self, name, df, *a, **kw)
+            return f"probe:{name}"
         V.__class__.put_table = _spy
         try:
             note_new_data("__k19_probe__", 3, "shared", "test", "k19")
@@ -584,6 +590,68 @@ def run_contract_tests(strict: bool = True) -> bool:
         return (not bad), ("결측 PDF 필드가 애널리스트로 승격되지 않음"
                            if not bad else f"유령 애널리스트 생성됨: {bad}")
 
+    def k22():
+        """공용 유틸이 입력 형태를 가리지 않는가 (실측 크래시 재발 방지).
+
+        safe_div 가 Series 전용이던 탓에 스칼라를 넘긴 한 줄이
+        AttributeError 로 4분짜리 가격수집을 끝낸 직후 통째로 날려버렸다.
+        범용 유틸이 형태를 가리면 호출부 수십 곳이 전부 지뢰가 된다.
+        """
+        checks = [
+            ("스칼라/스칼라", lambda: safe_div(3, 4), 0.75),
+            ("0 나눗셈", lambda: safe_div(3, 0), None),
+            ("넘파이 스칼라", lambda: safe_div(np.int64(6), np.int64(3)), 2.0),
+            ("파이썬 float", lambda: safe_div(1.0, 8.0), 0.125),
+        ]
+        why = []
+        for nm, fn_, exp in checks:
+            try:
+                v = fn_()
+            except Exception as e:                             # noqa
+                why.append(f"{nm}: {type(e).__name__}")
+                continue
+            vv = float(v) if v is not None and np.isscalar(v) else float("nan")
+            if exp is None:
+                if np.isfinite(vv):
+                    why.append(f"{nm}: 0 나눗셈이 {vv} 를 돌려줌(NaN 이어야 함)")
+            elif not (np.isfinite(vv) and abs(vv - exp) < 1e-9):
+                why.append(f"{nm}: {vv} (기대 {exp})")
+        try:                                    # Series 경로도 그대로 살아 있어야 한다
+            sv = safe_div(pd.Series([1.0, 2.0]), pd.Series([2.0, 0.0]))
+            if not (abs(float(sv.iloc[0]) - 0.5) < 1e-9 and pd.isna(sv.iloc[1])):
+                why.append(f"Series 경로 회귀: {list(sv)}")
+        except Exception as e:                                 # noqa
+            why.append(f"Series 경로: {type(e).__name__}")
+        return (not why), ("safe_div 이 스칼라·배열·Series 를 모두 안전하게 처리한다"
+                           if not why else " · ".join(why))
+
+    def k23():
+        """보조 캐시 루트(로컬↔드라이브)를 실제로 함께 읽는가.
+
+        읽기 루트를 하나만 쓰면 양쪽에 흩어진 캐시의 절반을 매번 다시 수집하게 된다.
+        '읽는다고 주장'만 하지 않도록, 임시 보조 루트에 테이블을 심고 되읽는다.
+        """
+        V = globals().get("VAULT")
+        if V is None:
+            raise _SrcUnavailable("VAULT 미초기화 — 런타임에서만 검사 가능합니다")
+        alt = tempfile.mkdtemp(prefix="sacn_altroot_")
+        try:
+            tdir = os.path.join(alt, GDRIVE_SHARED_NS, "table")
+            os.makedirs(tdir, exist_ok=True)
+            probe = pd.DataFrame({"code": ["005930"], "v": [42]})
+            atomic_write_parquet(probe, os.path.join(tdir, "__k23_alt__.parquet"))
+            saved = list(V.extra_roots)
+            V.extra_roots = saved + [alt]
+            try:
+                got = V.get_table("__k23_alt__", scope="shared")
+            finally:
+                V.extra_roots = saved
+            ok = got is not None and len(got) == 1 and int(got["v"].iloc[0]) == 42
+            return ok, ("보조 루트의 테이블을 그대로 읽어온다 (로컬·드라이브 동시 활용)"
+                        if ok else "보조 루트를 읽지 못함 — 반대편 캐시를 매번 재수집하게 된다")
+        finally:
+            shutil.rmtree(alt, ignore_errors=True)
+
     for cid, name, fn in [
         ("K1", "미래누수 차단 (PIT 게이트)", k1),
         ("K2", "생존편향 — 폐지 수익률 처리", k2),
@@ -606,6 +674,8 @@ def run_contract_tests(strict: bool = True) -> bool:
         ("K19", "신규 수집물 전량 드라이브 저장", k19),
         ("K20", "상세 캐시 왕복 — 바이라인 보존", k20),
         ("K21", "결측 PDF 필드가 유령 애널리스트를 안 만듦", k21),
+        ("K22", "공용 유틸의 스칼라 안전성 (safe_div)", k22),
+        ("K23", "보조 캐시 루트 동시 읽기 (로컬↔드라이브)", k23),
     ]:
         _k(cid, name, fn)
 
