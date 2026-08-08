@@ -51,9 +51,21 @@ def _mount_drive() -> Tuple[str, str]:
 
 
 class Vault:
-    def __init__(self, root: str, mode: str):
+    """캐시 저장소.
+
+    ★ 읽기는 여러 루트에서, 쓰기는 한 루트에만.
+      로컬과 구글드라이브에 캐시가 흩어져 있으면(자주 그렇다) 하나만 골라 읽는 순간
+      나머지 절반을 매번 다시 수집하게 된다. extra_roots 는 '읽기 전용' 보조 루트로,
+      테이블·blob·인덱스를 모두 함께 본다. 쓰기는 절대 주 루트 한 곳에만 한다 —
+      분산 저장은 어느 쪽이 최신인지 알 수 없게 만들고, 그게 훼손의 시작이다.
+    """
+
+    def __init__(self, root: str, mode: str, extra_roots: Optional[Sequence[str]] = None):
         self.root = os.path.abspath(root)
         self.mode = mode
+        self.extra_roots = [os.path.abspath(r) for r in (extra_roots or [])
+                            if r and os.path.abspath(r) != os.path.abspath(root)
+                            and os.path.isdir(r)]
         self.ns = {"shared": os.path.join(self.root, GDRIVE_SHARED_NS),
                    "private": os.path.join(self.root, GDRIVE_PRIVATE_NS)}
         for p in self.ns.values():
@@ -109,9 +121,14 @@ class Vault:
                         pass
                 time.sleep(0.4)
         if not acquired:
-            LOG.warn(f"잠금 획득 실패({name}) — 저널 append 는 원자적이므로 그대로 진행합니다.")
+            # ★ "저널 append 는 원자적"이라는 주장은 POSIX 로컬 파일시스템에서 한 번의
+            #   write(≤PIPE_BUF)일 때만 참이다. 드라이브 FUSE/드라이브 데스크톱 마운트에는
+            #   그런 보장이 없고, 우리는 행마다 f.write 를 한다. 두 세션이 겹치면 줄이
+            #   섞이고, 깨진 줄은 read_jsonl 이 조용히 버린다(인덱스 행 유실).
+            LOG.warn(f"잠금 획득 실패({name}) — 다른 세션이 같은 캐시를 쓰고 있는 것 같습니다. "
+                     f"저널이 섞이지 않도록 이번 flush 는 건너뛰고 종료 시 다시 시도합니다.")
         try:
-            yield
+            yield acquired
         finally:
             if acquired:
                 try:
@@ -136,6 +153,25 @@ class Vault:
         jr = read_jsonl(self.journal(scope))
         if jr:
             frames.append(pd.DataFrame(jr))
+
+        # (b2) 보조 루트(로컬/드라이브 반대편)의 인덱스도 읽는다 — 쓰지는 않는다.
+        #   양쪽에 흩어진 캐시를 한 번에 보게 해 재수집을 없앤다.
+        for r in self.extra_roots:
+            ns = os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS)
+            try:
+                dj = read_jsonl(os.path.join(ns, "index", "index.jsonl"))
+                if dj:
+                    df_alt = pd.DataFrame(dj)
+                    df_alt["_alt_root"] = r
+                    frames.append(df_alt)
+                dp = read_parquet_safe(os.path.join(ns, "index", "index.parquet"))
+                if dp is not None and len(dp):
+                    dp = dp.copy()
+                    dp["_alt_root"] = r
+                    frames.append(dp)
+                self.stats[f"alt_index_read:{scope}"] += 1
+            except Exception:
+                continue
 
         # (c) 과거 버전/다른 전략이 남긴 인덱스 파일도 흡수 (읽기 전용, 훼손 없음)
         legacy_glob = []
@@ -270,7 +306,11 @@ class Vault:
         if rows.empty:
             return None
         for _, r in rows.iterrows():
-            for cand in (r.get("abs_path"), os.path.join(self.root, str(r.get("path") or ""))):
+            rel = str(r.get("path") or "")
+            # 보조 루트에도 같은 상대경로로 존재할 수 있다(로컬↔드라이브 어느 쪽이든)
+            cands = [r.get("abs_path"), os.path.join(self.root, rel)]
+            cands += [os.path.join(alt, rel) for alt in self.extra_roots if rel]
+            for cand in cands:
                 try:
                     if cand and isinstance(cand, str) and os.path.exists(cand):
                         return open(cand, "rb").read()
@@ -309,16 +349,43 @@ class Vault:
         })
         return path
 
+    def _table_path(self, scope: str, name: str) -> Optional[str]:
+        """정규 경로 → 없으면 가장 최근 .rev 파일.
+
+        ★ put_table 은 백업(shutil.copy2)이 실패하면 덮어쓰지 않고 '{name}.rev<ts>.parquet'
+          로 피신시킨다. 그런데 get_table 은 '{name}.parquet' 만 열었다. 즉 드라이브가
+          _backup 폴더를 잡고 있던 실행의 결과물은 디스크에 멀쩡히 있는데도 영원히
+          안 읽히고, 다음 세션은 갱신 전의 낡은 표를 받는다 — 저장은 성공, 재호출은 실패.
+        """
+        cands: List[str] = []
+        dirs = [self.table_dir(scope)] + [
+            os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                         "table") for r in self.extra_roots]
+        for d in dirs:
+            base = os.path.join(d, f"{name}.parquet")
+            if os.path.exists(base):
+                cands.append(base)
+            cands.extend(glob.glob(os.path.join(d, f"{name}.rev*.parquet")))
+        if not cands:
+            return None
+        # 여러 루트에 같은 이름이 있으면 가장 최근 것을 쓴다
+        try:
+            return max(cands, key=os.path.getmtime)
+        except Exception:
+            return cands[0]
+
+    def alt_blob_dirs(self, scope: str) -> List[str]:
+        return [os.path.join(r, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS,
+                             "blob") for r in self.extra_roots]
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
-        path = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if not os.path.exists(path):
+        path = self._table_path(scope, name)
+        if path is None:
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
-            path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
-            if os.path.exists(path2):
-                path = path2
-            else:
+            path = self._table_path(alt, name)
+            if path is None:
                 return None
         if max_age_days is not None:
             age = (time.time() - os.path.getmtime(path)) / 86400.0
@@ -359,7 +426,12 @@ class Vault:
                 rows, self._pending[sc] = self._pending[sc], []
             if not rows:
                 continue
-            with self.lock(f"journal_{sc}"):
+            with self.lock(f"journal_{sc}") as got_lock:
+                if not got_lock:
+                    # 잠금을 못 얻었으면 쓰지 않고 되돌려 놓는다. 다음 flush 에서 다시 시도한다.
+                    with self._lk:
+                        self._pending[sc] = rows + self._pending[sc]
+                    continue
                 append_jsonl(self.journal(sc), rows)
             self.stats[f"journal_append:{sc}"] += len(rows)
             LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")
@@ -401,7 +473,15 @@ class Vault:
             seen.add(rd)
             LOG.info(f"기존 캐시 스캔: {d}")
             n = 0
+            # ★ 안쪽 break 는 os.walk 를 멈추지 못한다 — 파일 상한에 걸려도 남은 디렉터리를
+            #   끝까지 순회한다. 드라이브 데스크톱 스트리밍 모드에서는 그것만으로 드라이브
+            #   전체의 메타데이터를 끌어오게 되어 L0 에서 수 분이 사라진다. 벽시계도 함께 건다.
+            _t0 = time.time()
             for dirpath, dirnames, filenames in os.walk(d):
+                if n >= max_files or (time.time() - _t0) > ADOPT_SCAN_MAX_SEC:
+                    LOG.info(f"  스캔 중단(상한 도달): 파일 {n:,}건 / "
+                             f"{time.time()-_t0:.0f}초 — 나머지는 다음 실행에서 이어서 봅니다.")
+                    break
                 dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
                 for fn in filenames:
                     if n >= max_files:
@@ -479,6 +559,14 @@ def _safe_size(p: str) -> int:
 
 
 def free_gb(path: str) -> float:
+    """여유 디스크(GB). ★ os.statvfs 는 윈도우에 없다 — 그러면 nan 이 되어 용량 점검이
+    통째로 무력해진다(실측 로그의 '여유 공간 nan GB'). shutil.disk_usage 는 3개 OS 전부에서
+    동작하므로 그것을 1순위로 쓴다."""
+    for p in (path, os.path.dirname(os.path.abspath(path or ".")) or "."):
+        try:
+            return shutil.disk_usage(p).free / 1e9
+        except Exception:
+            continue
     try:
         st = os.statvfs(path)
         return st.f_bavail * st.f_frsize / 1e9

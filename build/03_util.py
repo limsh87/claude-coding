@@ -151,7 +151,7 @@ def atomic_write_text(path: str, text: str) -> str:
 
 def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd") -> str:
     _ensure_dir(path)
-    tmp = f"{path}.tmp.{os.getpid()}"
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"   # 스레드 id 없으면 동명 tmp 경합
     out = df.copy()
     for c in out.columns:                       # object 컬럼은 arrow 가 종종 거부한다 → 문자열화
         if out[c].dtype == object:
@@ -198,15 +198,38 @@ def read_jsonl(path: str) -> List[dict]:
 
 
 def append_jsonl(path: str, rows: Iterable[dict]):
+    """append-only 저널에 행을 덧붙인다.
+
+    ★ 행마다 버퍼드 write 를 하면, 8KB 경계에서 잘린 조각이 다른 프로세스의 조각과
+      섞일 수 있다(구글드라이브 FUSE/드라이브 데스크톱은 O_APPEND 원자성을 보장하지 않는다).
+      깨진 줄은 read_jsonl 이 조용히 버리므로 인덱스 행이 소리 없이 사라진다.
+      → 전체를 한 덩어리로 만들어 O_APPEND fd 에 단 한 번 os.write 한다.
+    """
     _ensure_dir(path)
-    with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
-        f.flush()
+    blob = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows)
+    if not blob:
+        return
+    data = blob.encode("utf-8")
+    fd = None
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        n = 0
+        while n < len(data):
+            n += os.write(fd, data[n:])
         try:
-            os.fsync(f.fileno())
+            os.fsync(fd)
         except Exception:
             pass
+    except Exception:
+        with open(path, "a", encoding="utf-8") as f:      # 최후 폴백
+            f.write(blob)
+            f.flush()
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
 
 
 # ── 레이트리미터 / 재시도 ───────────────────────────────────────────────────────────────────
@@ -522,10 +545,34 @@ def gby(df: pd.DataFrame, name: str, key: str = "code"):
 
 
 def safe_div(a, b, eps: float = 1e-12):
+    """0 나눗셈 안전 나눗셈. Series·배열·스칼라 전부 받는다.
+
+    ★ 예전에는 b 가 Series 라고 가정하고 b.where(...) 를 불렀다. 스칼라를 넘기면
+      AttributeError: 'int' object has no attribute 'where' 로 죽는다.
+      실제로 그 한 줄이 4분짜리 가격수집을 끝낸 직후 전부 날려버렸다(집계 표를 찍다가).
+      범용 유틸이 입력 형태를 가리면 호출부마다 지뢰가 된다 — 여기서 흡수한다.
+    """
     a = pd.to_numeric(a, errors="coerce")
     b = pd.to_numeric(b, errors="coerce")
-    out = a / b.where(b.abs() > eps)
-    return out.replace([np.inf, -np.inf], np.nan)
+    if hasattr(b, "where") and hasattr(b, "abs"):          # Series / DataFrame
+        out = a / b.where(b.abs() > eps)
+        return out.replace([np.inf, -np.inf], np.nan)
+    if isinstance(b, np.ndarray):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = np.asarray(a, dtype="float64") / np.where(np.abs(b) > eps, b, np.nan)
+        return np.where(np.isfinite(out), out, np.nan)
+    try:
+        bv = float(b)
+    except Exception:
+        return float("nan")
+    if not np.isfinite(bv) or abs(bv) <= eps:
+        return float("nan")
+    try:
+        av = float(a)
+    except Exception:
+        return float("nan")
+    out = av / bv
+    return out if np.isfinite(out) else float("nan")
 
 
 def dlog(s: pd.Series, periods: int = 12) -> pd.Series:

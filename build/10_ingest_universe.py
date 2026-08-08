@@ -258,6 +258,62 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     raw_codes = d[code_c].astype(str)
     codes = raw_codes.map(to_code6)
     n_badcode = int(codes.isna().sum())
+
+    # ── 탈락분의 정체를 밝힌다 (실측에서 4,172 → 2,636 으로 37% 가 여기서 사라졌다) ──────────
+    #   '코드 형식 불일치'라는 한 줄로는 ⓐ 파서 버그로 진짜 종목을 잃은 것과
+    #   ⓑ 애초에 보통주가 아닌 파생증권(신주인수권증서·ELW 등)이 걸러진 것을 구분할 수 없다.
+    #   생존자편향의 크기가 달라지므로 반드시 갈라 봐야 한다.
+    #   ★ 임의 복원은 하지 않는다. '722011J7' → '722011' 로 잘라 붙이면 멀쩡히 상장돼 있는
+    #     회사에 폐지일을 심어 -70% 수익을 주입하는 사고가 난다. 근거 없는 매핑은 금지다.
+    if n_badcode:
+        bad_raw = raw_codes[codes.isna()].astype(str).str.strip()
+        base6 = bad_raw.str[:6]
+        good6 = set(codes.dropna().astype(str))
+        covered = int(base6.isin(good6).sum())          # 본주가 이미 목록에 있는 파생증권
+        shapes = Counter()
+        # ★ 추측하지 말고 데이터를 본다. FDR 폐지목록에는 SecuGroup/Kind 컬럼이 있고,
+        #   거기에 '주권/신주인수권증권/수익증권' 같은 증권 종류가 그대로 적혀 있다.
+        #   이 한 컬럼이 "보통주를 잃은 것인가, 파생증권이 걸러진 것인가"를 확정해 준다.
+        sg_col = col.get("secugroup") or col.get("kind")
+        if sg_col is not None:
+            sg = d.loc[codes.isna(), sg_col].astype(str).str.strip().replace(
+                {"": "(미표기)", "nan": "(미표기)"})
+            for k, v in sg.value_counts().items():
+                shapes[f"증권종류: {k}"] += int(v)
+        else:
+            for s in bad_raw:
+                if len(s) > 6 and re.fullmatch(r"\d{4,6}[0-9A-Z]{1,4}", s):
+                    shapes["6자리 초과(파생·신주인수권류)"] += 1
+                elif not s or s.lower() in ("nan", "none"):
+                    shapes["빈 값"] += 1
+                else:
+                    shapes["기타 형식"] += 1
+        LOG.table([[k, f"{v:,}"] for k, v in shapes.most_common()] +
+                  [["└ 그중 본주가 폐지목록에 이미 있음", f"{covered:,}"]],
+                  ["정규화 탈락 유형", "건수"], ["l", "r"],
+                  title=f"상장폐지 목록 정규화 탈락 {n_badcode:,}건의 정체")
+        # 보통주(주권)로 표기된 탈락분만이 진짜 생존자편향 위험이다
+        n_common_lost = 0
+        if sg_col is not None:
+            sgv = d.loc[codes.isna(), sg_col].astype(str)
+            n_common_lost = int(sgv.str.contains("주권|보통주|Common", case=False,
+                                                 na=False).sum())
+            LOG.info(f"  그중 '주권(보통주)'로 표기된 것은 {n_common_lost:,}건입니다 — "
+                     f"나머지 {n_badcode - n_common_lost:,}건은 신주인수권·수익증권 등 "
+                     f"애초에 유니버스 대상이 아닌 증권입니다.")
+        residual = (n_common_lost if sg_col is not None else n_badcode - covered)
+        LOG.info(
+            f"탈락분 {n_badcode:,}건 중 {covered:,}건은 본주가 이미 폐지목록에 있는 "
+            f"파생증권(신주인수권증서·ELW 등)이라 보통주 유니버스에 영향이 없습니다. "
+            f"나머지 {residual:,}건은 6자리 코드로 환원할 근거가 없어 그대로 둡니다 — "
+            f"임의로 앞 6자리를 잘라 붙이면 살아 있는 회사에 폐지일을 심게 됩니다.")
+        if residual > max(50, int(0.05 * n_raw)):
+            LOG.warn(f"보통주로 보이는 탈락분이 {residual:,}건"
+                     f"({100*residual/max(n_raw,1):.1f}%)으로 적지 않습니다. "
+                     f"잔여 생존자편향이 이 크기만큼 남아 있을 수 있습니다.")
+        elif sg_col is not None:
+            LOG.ok(f"탈락분 중 보통주는 {residual:,}건뿐입니다 — 생존자편향에 실질적 영향이 "
+                   f"없습니다(나머지는 유니버스 대상이 아닌 증권종류).")
     t = pd.DataFrame({
         "code": codes,
         "name": d[name_c].astype(str),
@@ -403,8 +459,10 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
     new_rows: List[dict] = []
     if todo:
         if not KRXG.warmup():
-            LOG.info(f"KRX 세션이 없어 스냅샷 {len(todo)}개 시점을 건너뜁니다. "
-                     f"유니버스는 상장일·폐지일로 구성되며 이는 정상 경로입니다.")
+            why = ("pykrx 를 쓸 수 없어" if pykrx_stock is None else "KRX 세션이 없어")
+            LOG.info(f"{why} pykrx 상장 스냅샷 {len(todo)}개 시점을 건너뜁니다. "
+                     f"유니버스는 상장일·폐지일로 구성되며 이는 정상 경로입니다. "
+                     f"(KRX MDC 벌크가 살아 있으면 그쪽으로 스냅샷을 복원합니다)")
             todo = []
     if todo:
         LOG.info(f"KRX 상장 스냅샷 {len(todo)}개 시점 수집 (주기={UNIVERSE_SNAPSHOT_FREQ}, 직렬)")
