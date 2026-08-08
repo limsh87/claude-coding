@@ -48,7 +48,10 @@ def _canary_bulk(corps: Sequence[str], n_universe: int) -> Tuple[Optional[bool],
         _k("K2", "배치 최초 제공 사업연도", None, "키 없음", "≤2016", "")
         return None, None
 
-    batch = [str(c) for c in corps[:DART_MULTI_BATCH]]
+    # ★ 배치 상한을 정확히 채우면 서버가 021(조회 가능한 회사 개수 초과)로 거부할 수 있다.
+    #   5차 실행에서 죽은 DART 호출이 정확히 이 한 건이었다. CANARY 는 '수집을 시작해도
+    #   되는지' 판정하는 단계인데, 그 판정 자체가 키를 죽이면 본말전도다. 여유를 둔다.
+    batch = [str(c) for c in corps[:max(1, DART_MULTI_BATCH // 2)]]
     rows_per_corp, ok_batch = 0.0, False
     js = dart_api("fnlttMultiAcnt.json", {"corp_code": ",".join(batch), "bsns_year": "2016",
                                           "reprt_code": REPRT_CODES["Q1"]})

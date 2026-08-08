@@ -24,6 +24,10 @@ FS_CARRY_MAX_DAYS = 550
 # 이게 없으면 상장 전·폐지 후·비제출 조합(격자의 대부분)을 매 실행 영원히 다시 묻는다.
 MULTI_NODATA_TABLE = "dart_multi_nodata"
 FS_NODATA_TABLE = "dart_fnltt_nodata"      # 전체재무제표(단건) 쪽 같은 원장
+# ★ Tier-2 는 호출 수가 아니라 **시간**으로 자른다. 4시간 계약을 지키는 것은 개수가 아니라
+#   벽시계다 — 개수 상한은 서버가 먼저 막으면 아무것도 보호하지 못한다(5차 실행에서 실증).
+FS_TIME_BUDGET_S = 20 * 60                 # 0 이면 시간 제한 없음
+FS_CHECKPOINT_CORPS = 40                   # 이만큼 회사를 완성할 때마다 드라이브에 저장
 MULTI_NODATA_RECENT_DAYS = 30     # 최근 2개 회계연도 — 나중에 제출될 수 있으므로 짧게
 MULTI_NODATA_OLD_DAYS = 365       # 그 이전 — 이제 와서 새로 제출될 일은 사실상 없다
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
@@ -104,6 +108,15 @@ class DartBudget:
         """긴 실행이 자정을 넘으면 한도도 리셋된다. take() 안에서 값싸게 확인한다."""
         d = self._kst_day()
         if d != self.today:
+            # ★ 계약 검정의 합성 객체(_ephemeral)는 사용자 로그를 더럽히지 않는다.
+            #   §12-A 가 만드는 b2 는 n = DART_DAILY_LIMIT*99 = 1,881,000 이라
+            #   "직전 사용 1,881,000건" 이 프로덕션 로그에 그대로 샜다.
+            #   게다가 아래에서 전역 DART_HALT 를 지우므로 실제 상태까지 오염시킨다.
+            if getattr(self, "_ephemeral", False):
+                self.today, self.n, self.exhausted = d, 0, False
+                self.per_key = {kid: 0 for kid in self._kid_of.values()}
+                self.blocked.clear()
+                return
             LOG.info(f"KST 자정 경과 — DART 일일 한도가 초기화됐습니다 "
                      f"({self.today} → {d}, 직전 사용 {self.n:,}건). 차단 표시도 해제합니다.")
             self._save()
@@ -113,7 +126,14 @@ class DartBudget:
             DART_HALT["reason"] = DART_HALT["detail"] = None
 
     def _path(self) -> str:
-        return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
+        # ★★ 공용 네임스페이스에 둔다 ★★
+        #   예전엔 전략 **전용** 인덱스에 있었다. 그래서 같은 DART 키로 전략 5개를 돌리면
+        #   각 전략이 자기 파일만 보고 "오늘 0건 썼다"고 믿었다. 실제로는 서버 기준으로
+        #   이미 소진돼 있었고, 5차 실행은 첫 호출에서 020 을 맞았다.
+        #   한도는 **키 단위**지 전략 단위가 아니다. 그러니 원장도 키 단위여야 한다.
+        #   ※ 이 값은 여전히 추정치이고 차단 기준이 아니다 — 계획·ETA 표시에만 쓴다.
+        #     (전략끼리 알려주면 최소한 '왜 갑자기 020 이 났는지'는 설명할 수 있다)
+        return os.path.join(VAULT.ns["shared"], "index", "dart_budget.json")
 
     def _load(self):
         """어제·오늘 사용량을 읽되 **차단 상태는 복원하지 않는다.**
@@ -316,18 +336,29 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
             dart_note_halt(f"DART 키 {len(DBUDGET.keys)}개 전부 한도초과(서버 응답 020/021)",
                            "KST 자정 이후 재실행하면 이어받습니다.")
             return None
-        js, over = _dart_call_once(endpoint, params, key, source, tries, no_data_ok,
-                                   purpose=purpose)
-        if not over:
+        js, why = _dart_call_once(endpoint, params, key, source, tries, no_data_ok,
+                                  purpose=purpose)
+        if why != "quota":
+            # ★★ 021 은 '이 요청 하나가 잘못됐다'이지 '키가 소진됐다'가 아니다 ★★
+            #   예전엔 020 과 021 을 같은 bool 로 뭉개서, 회사 개수를 초과한 요청 한 건이
+            #   **모든 키를 차례로 접었다.** 5차 실행에서 CANARY 의 첫 호출이 그렇게
+            #   19,000건 호출권을 통째로 날렸다. 021 은 호출자가 배치를 줄여 재시도할
+            #   문제이므로 키를 건드리지 않고 그대로 올려 보낸다.
+            if why == "oversize":
+                LOG.warn(f"DART status=021(조회 가능한 회사 개수 초과) — {endpoint}. "
+                         f"이 요청 하나가 큰 것이지 키가 소진된 것이 아닙니다. "
+                         f"키를 접지 않고 호출자가 배치를 줄여 재시도합니다.")
             return js
-        DBUDGET.mark_blocked(key, f"ep={endpoint}")     # 다음 키로 자동 재시도
+        DBUDGET.mark_blocked(key, f"status=020 ep={endpoint}")   # 다음 키로 자동 재시도
     return None
 
 
 def _dart_call_once(endpoint: str, params: dict, key: str, source: str,
                     tries: int, no_data_ok: bool,
-                    purpose: Optional[str] = None) -> Tuple[Optional[dict], bool]:
-    """(응답, 이_키가_한도초과인가). 예산 계측은 여기서만 한다.
+                    purpose: Optional[str] = None) -> Tuple[Optional[dict], str]:
+    """(응답, 사유). 사유는 "" | "quota"(020, 이 키 소진) | "oversize"(021, 요청이 큼).
+
+    예산 계측은 여기서만 한다.
 
     ★ http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다. 호출당 1건으로 세면
       실사용량을 tries 배 과소집계하므로, 최악을 먼저 계상하고 실제 시도 수를 알면 환급한다.
@@ -347,11 +378,14 @@ def _dart_call_once(endpoint: str, params: dict, key: str, source: str,
         if DBUDGET is not None:
             DBUDGET.refund(max(0, tries - max(1, attempts["n"])), purpose=purpose, key=key)
     if not isinstance(js, dict):
-        return None, False
+        return None, ""
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
-            return None, True                  # ← 이 키만 소진. 호출자가 다음 키로 넘긴다
+        if st == "020":
+            return None, "quota"               # ← 이 키가 오늘 소진. 호출자가 다음 키로 넘긴다
+        if st == "021":
+            # 조회 가능한 회사 개수 초과 — 요청이 큰 것이지 키 소진이 아니다.
+            return None, "oversize"
         if st in ("010", "011", "012", "901"):
             dart_note_halt(f"DART 인증 오류(status={st} · {DART_STATUS_MSG.get(st, '?')})",
                            "DART_API_KEY / DART_API_KEYS 를 확인하세요. 데이터 부재가 아닙니다.")
@@ -365,7 +399,7 @@ def _dart_call_once(endpoint: str, params: dict, key: str, source: str,
         #   뭉개면 호출자가 '실패'와 구별할 수 없어 서킷브레이커가 정상 데이터로 터진다.
         if st == "013" and no_data_ok:
             return {"status": "013", "list": []}, False
-        return None, False
+        return None, ""
     return js, False
 
 
@@ -626,7 +660,27 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
     _rorder = {REPRT_CODES["FY"]: 0, REPRT_CODES["Q3"]: 1,
                REPRT_CODES["H1"]: 2, REPRT_CODES["Q1"]: 3}
     reprts = sorted(reprts, key=lambda r: _rorder.get(r, 9))
-    jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 회사 우선 루프 — 이 순서가 CORE-D 의 생사를 가른다 ★★
+    #
+    #  예전엔 `for y in years for c in corps` 였다(연도 바깥 루프). 상한에서 끊기면
+    #  **모든 회사가 최근 1년씩** 남는다. 그런데 CORE-D 의 Tier-2 센서는 전부 12개월
+    #  차분을 요구한다 — i_turn/p_payout/p_invest/i_ic 는 연속 2개 회계연도,
+    #  i_capex(shift(12).rolling(36))·i_accr·i_roic 는 3개가 필요하다.
+    #  즉 연도 우선 격자는 **연속 FY 2개를 가진 회사를 구조적으로 0사** 로 만든다.
+    #  5차 실행에서 캐시에 Tier-2 가 2,210조합이나 있는데도 i_capex=0 · i_turn=0 ·
+    #  i_accr=0 · p_payout=0 · p_invest=0 이었던 이유가 이것이다. 키가 멀쩡했어도
+    #  같은 자리에서 죽었다 — 키 소진은 사망 시각을 앞당겼을 뿐이다.
+    #
+    #  회사 우선으로 뒤집으면 같은 호출 수로 (상한 ÷ 연수) 개의 회사가 **완전한 전 기간**을
+    #  갖는다. 3,667 호출 · 13년이면 282사다. 적어 보이지만, 부분 연도만 가진 3,667사는
+    #  12개월 차분에 **한 건도** 기여하지 못하므로 그쪽이 전액 손실이다.
+    #
+    #  ★ 절단도 회사 경계에서 한다. 회사는 '완전하거나 없거나' 둘 중 하나여야 한다.
+    #    반쪽짜리 회사에 쓴 호출은 회수되지 않는다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _per_corp = max(1, len(years) * len(reprts))
+    jobs = [(c, y, r) for c in corp_sorted for y in sorted(years, reverse=True) for r in reprts
             if (c, int(y), str(r)) not in done]
     if RUN_MODE == "CACHED":
         jobs = []
@@ -648,21 +702,52 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                  f"(계획 기준선 {dart_budget_left():,}건 — 추정치이며 차단 기준이 아닙니다. "
                  f"실제 중단은 서버가 한도초과를 응답할 때만 일어납니다)")
         if cap < total_needed:
+            # ★ 회사 경계로 내림한다. 반쪽짜리 회사는 12개월 차분에 한 건도 기여하지 못하므로
+            #   그 회사에 쓴 호출은 전액 손실이다. '완전하거나 없거나' 둘 중 하나여야 한다.
+            cap = max(_per_corp, (cap // _per_corp) * _per_corp)
             jobs = jobs[:cap]
             LOG.warn(
-                f"이번 실행에서는 상한 {cap:,}건만 받습니다 "
-                f"(전체 {total_needed:,}건 = 약 {math.ceil(total_needed / max(DART_DAILY_LIMIT,1))}일치). "
-                f"미수집분은 Tier-1 주요계정(fnlttMultiAcnt)으로 대체되며, "
-                f"재실행하면 정확히 이 지점부터 이어받습니다. "
-                f"상한은 DART_FS_MAX_CALLS 로 조절합니다.")
+                f"이번 실행에서는 상한 {cap:,}건만 받습니다 — **회사 {cap // _per_corp:,}사의 "
+                f"전 기간({len(years)}년)** 을 완성합니다(반쪽짜리 회사를 만들지 않습니다). "
+                f"전체 {total_needed:,}건 = 약 {math.ceil(total_needed / max(cap, 1))}회 실행분. "
+                f"미수집 회사는 Tier-1 주요계정으로 대체되며, 재실행하면 다음 회사부터 이어받습니다.")
         elif total_needed > DART_DAILY_LIMIT:
             LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
                      f"오늘 받을 수 있는 만큼 받고 저장합니다. "
                      f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
                      f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
         _FS_EMPTY.clear()
-        res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
-        got = [d for d in res if d is not None and len(d)]
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★★ 청크 체크포인트 ★★ 예전엔 잡 전체를 pmap_io 한 방에 던지고 맨 끝에 한 번만
+        #    저장했다. 중간에 서버가 막거나 세션이 끊기면 **받은 것이 전부 증발**한다.
+        #    회사 경계로 자른 청크마다 저장하므로, 어디서 끊겨도 '완성된 회사'는 남는다.
+        #    EMP 는 이미 이 구조였는데 Tier-2 에만 없었다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        got, _deadline = [], (time.time() + FS_TIME_BUDGET_S if FS_TIME_BUDGET_S else None)
+        _chunk = max(_per_corp, (FS_CHECKPOINT_CORPS * _per_corp))
+        for _i in range(0, len(jobs), _chunk):
+            if dart_halt_reason():
+                LOG.warn(f"DART 가 중단되어 {_i:,}/{len(jobs):,}건에서 멈춥니다 — "
+                         f"여기까지는 드라이브에 저장됐습니다.")
+                break
+            if _deadline and time.time() > _deadline:
+                LOG.warn(f"Tier-2 시간 예산 {FS_TIME_BUDGET_S/60:.0f}분을 다 썼습니다 — "
+                         f"{_i:,}/{len(jobs):,}건에서 멈춥니다. 받은 만큼은 저장됐고, "
+                         f"재실행하면 다음 회사부터 이어받습니다. "
+                         f"(호출 수가 아니라 **시간**으로 4시간 계약을 지킵니다)")
+                break
+            _res = pmap_io(_fs_one, jobs[_i:_i + _chunk], workers=min(N_WORKERS_IO, 12),
+                           desc=f"DART 재무제표({_i//_chunk + 1}/{math.ceil(len(jobs)/_chunk)})")
+            _new = [d for d in _res if d is not None and len(d)]
+            got.extend(_new)
+            if _new:
+                _acc = pd.concat(([cached] if cached is not None and len(cached) else []) + got,
+                                 ignore_index=True)
+                _acc = _acc.drop_duplicates(
+                    ["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id", "account_nm"],
+                    keep="last")
+                VAULT.put_table("dart_fnltt_raw", _acc, scope="shared", domain="dart",
+                                source="opendart (청크 체크포인트)")
         if _FS_EMPTY:
             try:
                 _pv = VAULT.get_table(FS_NODATA_TABLE, scope="shared")

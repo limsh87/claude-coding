@@ -42,7 +42,14 @@ def dart_fs_scope_v3(ctx: dict, all_corps: Sequence[str], quiet: bool = False
 
     quiet=True 면 로그를 찍지 않는다."""
     y0 = as_ts(BACKTEST_START).year - int(DART_FS_WARMUP_Y)
-    years = list(range(y0, as_ts(BACKTEST_END).year + 1))
+    # ★ 아직 제출되지 않은 회계연도를 큐 맨 앞에 놓지 않는다.
+    #   사업보고서는 다음 해 3~4월에 나오므로 FY(올해)는 존재할 수 없고, 3월 이전이면
+    #   FY(작년)조차 아직 없다. 예전엔 BACKTEST_END.year(2026)까지 넣었고, 연도 내림차순
+    #   루프가 그 유령연도를 맨 앞에 놓아 2,931잡 × 2호출 = 5,862건을 확정 빈 응답에 태웠다
+    #   (Tier-2 호출예산의 80%). EMP 쪽은 이미 고쳐져 있었는데 여기만 남아 있었다.
+    _tod = _dt.date.today()
+    _ymax = min(as_ts(BACKTEST_END).year, _tod.year - (1 if _tod.month >= 4 else 2))
+    years = list(range(y0, _ymax + 1))
     corps = [str(c) for c in all_corps]
     keep, prio = umid_experienced_corps(ctx, quiet=quiet)
     if DART_FS_UNIVERSE_ONLY and keep:
@@ -206,6 +213,37 @@ def _flush_on_abort_v3():
         LOG.warn(f"중단 경로 산출물 저장 실패({type(e).__name__}) — 로그는 위에 남아 있습니다.")
 
 
+def report_cache_only_outlook_v3(ctx: dict) -> None:
+    """DART 를 더 받을 수 없다고 판정된 순간, **캐시만으로 갈 수 있는 최선**을 알린다.
+
+    ★ 왜 필요한가. 5차 실행에서 캐시는 결코 비어 있지 않았다 — Tier-2 214,625행(2,210조합),
+      Tier-1 1,249,787행, 공시 204,508행이 있었고 i_sales 는 109,032건이나 관측됐다.
+      죽은 이유는 '데이터가 없어서'가 아니라 **짝을 이룰 두 번째 다리가 없어서**다.
+      그런데 그 사실은 5분 뒤 RuntimeError 로만 드러났고, 처방문은 엉뚱하게
+      'DART_FS_MAX_CALLS 가 0 이 아닌지 확인하세요' 라고 안내했다(그 값은 3,667이었다).
+      지금 아는 것을 지금 말한다.
+    """
+    rows = []
+    for t, need in (("dart_fnltt_raw", "Tier-2 전체재무제표 — CORE-D 5개 TP 의 필수 원천"),
+                    ("dart_multi_raw", "Tier-1 주요계정 — 매출/영업이익/순이익/자산·부채·자본"),
+                    ("dart_employees_ext", "직원현황 — EMP-LITE 3개 TP 의 유일한 원천"),
+                    ("dart_disclosures", "공시목록 — 거부권 V3·자사주 소각")):
+        try:
+            d = VAULT.get_table(t, scope="shared")
+            n = 0 if d is None else len(d)
+        except Exception:                                           # noqa
+            n = 0
+        rows.append([t, f"{n:,}행", "있음" if n else "**비어 있음**", need])
+    LOG.table(rows, ["공용 캐시 테이블", "보유", "상태", "이것이 없으면 죽는 것"],
+              ["l", "r", "c", "l"],
+              title="캐시만으로 갈 수 있는 최선 — 오늘 DART 를 못 받는 상태에서의 실제 자산")
+    LOG.warn("이 상태로 끝까지 돌려도 증거층이 구성되지 않으면 L2 에서 멈춥니다. "
+             "그때의 원인은 '수집 설정'이 아니라 **오늘 호출권이 없었다**는 것입니다. "
+             "KST 자정 이후 재실행하면 캐시는 append-only 라 정확히 이어받습니다. "
+             "같은 DART 키로 다른 전략을 함께 돌리셨다면 한도를 나눠 쓴 것입니다 — "
+             "한도는 키 단위지 전략 단위가 아닙니다(키를 더 발급하면 그만큼 곱해집니다).")
+
+
 def persist_diagnostics_v3() -> List[str]:
     """실행이 어디서 죽었든 남길 수 있는 것만 모아 파일로 쓴다(패널·백테스트 없이도 동작)."""
     out: List[str] = []
@@ -213,8 +251,17 @@ def persist_diagnostics_v3() -> List[str]:
         "strategy": STRATEGY_ID,
         "build": BUILD_VERSION,
         "aborted": True,
-        "stages": [{"id": k, **{a: getattr(v, a, None) for a in
-                                ("name", "layer", "ok", "sec", "err")}}
+        # ★ StageRecord 의 실제 필드명은 status/err_type/err_msg 다. 예전엔 ok/sec/err 을
+        #   getattr 폴백으로 읽어 **모든 스테이지를 null 로** 기록했다 — 죽었을 때 가장
+        #   필요한 파일이 통째로 비어 있었다.
+        "stages": [{"id": k, "name": getattr(v, "name", ""), "layer": getattr(v, "layer", ""),
+                    "status": getattr(v, "status", ""),
+                    "sec": round(float(getattr(v, "dur", 0.0) or 0.0), 2),
+                    "rows_in": int(getattr(v, "rows_in", 0) or 0),
+                    "rows_out": int(getattr(v, "rows_out", 0) or 0),
+                    "err": (getattr(v, "err_type", "") + (": " + getattr(v, "err_msg", "")
+                                                          if getattr(v, "err_msg", "") else "")),
+                    "notes": list(getattr(v, "notes", []) or [])}
                    for k, v in getattr(PIPE, "stages", {}).items()],
         "contracts": CONTRACT_V3,
         "canary": CANARY_RESULTS,
@@ -482,6 +529,23 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L0.CANARY", "CANARY K1~K9", "L0", budget_s=2100):
         ctx["canary"] = run_canary(ctx["sec"],
                                    canary_sample(ctx["sec"], ctx["panel"]["monthly"]))
+        # ══════════════════════════════════════════════════════════════════════════════════
+        #  ★★ 여기서 다시 판정한다 ★★
+        #  preflight 는 announce_budget_v3 안에서 **DART 호출 0건 시점**에 딱 한 번 불린다.
+        #  그때는 dart_halt_reason() 이 구조적으로 항상 None 이라 언제나 'LIVE' 를 돌려줬고,
+        #  그 반환값(ctx['dart_mode'])은 저장소 어디에서도 읽히지 않았다.
+        #  5차 실행이 정확히 그 대가를 치렀다 — 00:46 에 'DART 전부 한도초과'를 알았는데
+        #  L1.DART 85초 + L1.RESEARCH 84초 + L1.PANEL 38초를 더 돌고 L2 에서 죽었다.
+        #  '알 수 있었던 사실로 나중에 죽지 않는다'가 정확히 반대로 일어났다.
+        #  CANARY 는 실제로 DART 를 때려 보는 첫 단계다. 사실이 확정된 지금 다시 판정한다.
+        # ══════════════════════════════════════════════════════════════════════════════════
+        _why = dart_halt_reason()
+        if _why and ctx.get("dart_mode") != "CACHE_ONLY":
+            ctx["dart_mode"] = "CACHE_ONLY"
+            LOG.error(f"이번 실행에서는 DART 를 더 받을 수 없습니다 — {_why}. "
+                      f"지금부터는 **공용 캐시에 이미 있는 것만** 씁니다. "
+                      f"신규 수집 단계는 요청을 보내지 않고 즉시 넘어갑니다.")
+            report_cache_only_outlook_v3(ctx)
 
     with PIPE.stage("L1.FLOW", "기관·외국인 수급 (U축 d3)", "L1", budget_s=1200, critical=False):
         ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START,
@@ -512,8 +576,12 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
         if not emp_corps:
             emp_corps = corps      # 축소가 전멸시키면 축소하지 않는다(덜 받는 쪽이 아니라 못 받는 쪽)
         pairs = emp_pairs_needed_v3(ctx, eyears)
+        # ★ CACHE_ONLY 면 신규 요청을 아예 만들지 않는다(요청해도 서버가 거부한다).
+        #   예전엔 이 판정이 배선돼 있지 않아 8,965건을 큐에 올린 뒤 첫 청크에서 멈췄다.
         E = fetch_emp_status(emp_corps, eyears, priority=emp_prio,
-                             max_calls=EMP_MAX_CALLS, pairs=pairs)
+                             max_calls=(0 if ctx.get("dart_mode") == "CACHE_ONLY"
+                                        else EMP_MAX_CALLS),
+                             pairs=pairs)
         ctx["emp_raw"] = E
         S = build_emp_sensors(E)
         ctx["emp_sensors"] = S
@@ -536,7 +604,9 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
         # ── Tier-2(단건): 기업×연도×보고서로 곱해진다 → 반드시 범위를 좁히고 상한을 건다.
         fs_corps, fs_years, prio = dart_fs_scope_v3(ctx, corps)
         fs = fetch_dart_financials(fs_corps, fs_years, priority=prio,
-                                   max_calls=DART_FS_MAX_CALLS, freq=DART_FS_FREQ)
+                                   max_calls=(0 if ctx.get("dart_mode") == "CACHE_ONLY"
+                                              else DART_FS_MAX_CALLS),
+                                   freq=DART_FS_FREQ)
         fin = tidy_financials(merge_financial_tiers(fs, multi))
         dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         ctx["fin"], ctx["disclosures"] = fin, dis
@@ -649,7 +719,7 @@ def build_features_v3(ctx: dict, months: pd.DatetimeIndex) -> Tuple[pd.DataFrame
                        ctx["panel"]["daily"])
         P = build_base_panel_v3(uni, months, ctx["panel"]["monthly"])
         P = attach_pit_sources(P, ctx["sec"])
-        P = apply_umid(P, uni)
+        P = apply_umid(P, uni, band=ARM_MAIN)
         # 전 종목 기준 셀 — U(반영도) 축이 컷 이전 패널 위에서 계산되므로 여기서도 필요하다.
         P = build_cells_v3(P, ctx["sec"], tag="(전 종목) ")
         P = core_d_sensors(P, ctx)
@@ -727,7 +797,7 @@ def run_smallcap_arm_v3(ctx: dict, months: pd.DatetimeIndex, uni: "Universe",
         return None
     with PIPE.stage("L3.SMALL", f"스몰캡 비교 팔 (랭크 [{SMALL_RANK_LO},{SMALL_RANK_HI}])",
                     "L3", budget_s=600, critical=False):
-        S = apply_umid(PF.copy(), uni, band="SMALL")
+        S = apply_umid(PF.copy(), uni, band=ARM_COMPARE)
         S = S[S["u_mid"]].reset_index(drop=True)
         if S.empty or S["month"].nunique() < 24:
             LOG.warn(f"스몰캡 대역에 남는 행이 부족합니다({len(S):,}행 · "

@@ -9,6 +9,13 @@
 # ║  C11: 셀 = (date, industry, size_bucket). 다른 그룹키 금지.                                ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+# ★ as-of 결합에서 '마지막으로 알려진 값'을 며칠까지 실어 나를 것인가.
+#   연간 공시 주기(365일) + 제출 지연 여유. 이보다 오래된 것은 결측으로 둔다 —
+#   무한 이월은 결측을 가짜 0.0 차분으로 둔갑시켜 증거층 게이트를 속인다.
+#   0 이면 제한 없음(예전 동작). 바꾸지 마십시오.
+PIT_ASOF_MAX_DAYS = 550
+
+
 class PITStore:
     """유일한 데이터 게이트웨이. 등록된 테이블은 knowledge_date 로 정렬되어 보관되고,
     as_of 조회는 항상 knowledge_date <= as_of 를 강제한다. 예외 경로는 존재하지 않는다."""
@@ -105,9 +112,16 @@ class PITStore:
         R[by] = R[by].astype(str)
         L[by] = L[by].astype(str)
         L = L.sort_values(left_time, kind="stable")
+        # ★★ tolerance ★★ 이게 없으면 '마지막으로 알려진 행'이 **무한히 미래로 이월**된다.
+        #   격자가 불완전해 중간 연도가 빈 회사에서, 2019년 재무가 2024년 달에 그대로 붙고
+        #   diff(12) 가 결측이 아니라 **정확히 0.0** 이 된다. 그 가짜 관측이 FLOOR
+        #   (MIN_TP_OBSERVED)를 통과해 '커버리지가 있는 것처럼' 보인다 — 조용히 틀리는
+        #   방향이라 크래시보다 나쁘다. 알 수 없는 것은 끝까지 결측으로 둔다.
+        _tol = pd.Timedelta(days=int(PIT_ASOF_MAX_DAYS)) if PIT_ASOF_MAX_DAYS else None
         try:
             M = pd.merge_asof(L, R, left_on=left_time, right_on="knowledge_date",
-                              by=by, direction="backward", suffixes=("", suffix or "_r"))
+                              by=by, direction="backward", tolerance=_tol,
+                              suffixes=("", suffix or "_r"))
         except Exception as e:                                     # noqa
             LOG.warn(f"asof_join 실패({type(e).__name__}) — '{name}' 결합을 건너뜁니다. "
                      f"대개 정렬/타입 문제입니다.")

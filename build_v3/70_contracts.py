@@ -326,8 +326,13 @@ def run_contracts_v3(strict: bool = True) -> bool:
                 return False, f"{fn.__name__} 이 {arg} 인자를 받지 않습니다"
         # ★ Tier-2 는 잡당 OFS→CFS 로 최대 2회를 던진다. '잡 수'가 아니라 '호출 수'로 센다.
         plan = int(EMP_MAX_CALLS) + int(DART_FS_MAX_CALLS) * 2 + 2100 + 600
-        if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT:
-            return False, f"단일 단계 상한이 일일한도({DART_DAILY_LIMIT:,})를 넘습니다"
+        _nk = max(1, len([k for k in ([DART_API_KEY] + list(DART_API_KEYS)) if str(k).strip()]))
+        # ★ 한도는 **키 하나당**이다. 예전엔 단일 단계 상한을 키 1개분과 비교해서,
+        #   키를 3개 넣으면(헤더와 이 계약의 오류 메시지가 둘 다 권하는 처방이다)
+        #   유도된 EMP_MAX_CALLS 가 19,000 을 넘어 **실행 자체를 거부**했다 — 자살 스위치다.
+        if max(int(EMP_MAX_CALLS), int(DART_FS_MAX_CALLS)) > DART_DAILY_LIMIT * _nk:
+            return False, (f"단일 단계 상한이 전체 한도({DART_DAILY_LIMIT * _nk:,} "
+                           f"= 키 {_nk}개 × {DART_DAILY_LIMIT:,})를 넘습니다")
         # 예전엔 plan 을 계산해 성공 메시지에 찍기만 하고 **한도와 비교하지 않았다.**
         # 그래서 26,000건 계획이 "일일한도 19,000 안" 이라는 문구와 함께 PASS 했다.
         # ★ 한도는 **키 하나당**이다. 키를 여러 개 넣으면 그만큼 곱해진다.
@@ -339,8 +344,19 @@ def run_contracts_v3(strict: bool = True) -> bool:
                            f"(키 {n_keys}개 × {DART_DAILY_LIMIT:,})을 넘습니다. "
                            f"상한을 낮추거나 DART_API_KEYS 에 키를 추가하세요 — "
                            f"키는 opendart.fss.or.kr 에서 무료·즉시 발급됩니다")
+        # ★★ 개수 비교는 **항등식**이라 절대 발동하지 않는다 ★★
+        #   EMP=ROOM×0.55, FS×2=ROOM×0.45, ROOM=19,000n−2,700 이므로
+        #   plan = ROOM + 2,700 = 19,000n = room. 즉 위 `plan > room` 은 언제나 거짓이다.
+        #   26,000건 사고를 고정한다던 회귀 테스트가 상수를 유도식으로 바꾼 순간 무력화됐다.
+        #   → 4시간 계약을 실제로 지키는 것은 개수가 아니라 **시간**이다. 시간으로 검정한다.
+        if not FS_TIME_BUDGET_S:
+            return False, ("Tier-2 에 시간 예산(FS_TIME_BUDGET_S)이 없습니다 — "
+                           "개수 상한만으로는 4시간 계약을 지킬 수 없습니다. "
+                           "서버가 먼저 막으면 개수 상한은 아무것도 보호하지 못합니다.")
         # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
-        worst_h = (int(EMP_MAX_CALLS) / 8.0 + int(DART_FS_MAX_CALLS) / 5.0) / 3600.0
+        #   Tier-2 는 시간 데드라인이 있으므로 그 값으로 계상한다(개수는 상한일 뿐이다).
+        worst_h = (int(EMP_MAX_CALLS) / 8.0 + min(int(DART_FS_MAX_CALLS) / 5.0,
+                                                  float(FS_TIME_BUDGET_S))) / 3600.0
         if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
             return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
                            f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")

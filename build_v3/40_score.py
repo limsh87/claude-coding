@@ -28,8 +28,13 @@ def report_cell_rank_diag(top: int = 24):
     """센서별 '관측 → 랭크 해결' 표. 어느 계단에서 해결됐는지까지 보여준다."""
     if not CELL_RANK_DIAG:
         return
+    # ★ 예전엔 `if name in seen: continue` 로 **가장 먼저** append 된 것만 남겼다.
+    #   CELL_RANK_DIAG 는 L0.CONTRACT → L0.SMOKE → L1 → L2 내내 비워지지 않으므로,
+    #   L2.SCORE 표에 계약검정(a=400)·스모크(i_capex=2,245) 값이 그대로 찍히고 실제 FULL
+    #   값은 한 줄도 안 나왔다. 사용자가 "2,245건 있는데 왜 TP 가 0이지" 로 오판한다.
+    #   → 같은 이름은 **마지막 것**(=이번 단계의 것)을 남긴다. clear 는 호출부가 한다.
     seen, rows = set(), []
-    for d in CELL_RANK_DIAG:
+    for d in reversed(CELL_RANK_DIAG):
         if d["name"] in seen:
             continue
         seen.add(d["name"])
@@ -39,7 +44,7 @@ def report_cell_rank_diag(top: int = 24):
                                 for k, v in lv.items() if v) or "—",
                      "입력 없음" if d["obs"] == 0 else
                      ("표본 미달" if d["resolved"] == 0 else "")])
-    rows = rows[:top]
+    rows = list(reversed(rows))[:top]
     LOG.table(rows, ["센서", "유효관측", "랭크산출", "해결 단계", "비고"],
               ["l", "r", "r", "l", "l"],
               title="셀 랭크 진단 — '입력이 없어서'와 '표본이 모자라서'를 구별합니다")
@@ -166,6 +171,8 @@ TP_DEFS = [
 
 
 def build_tps(P: pd.DataFrame) -> pd.DataFrame:
+    # ★ 이 단계의 진단만 표에 나오게 한다. 전역 리스트라 계약검정·스모크 값이 누적된다.
+    CELL_RANK_DIAG.clear()
     P = P.copy()
     rows = []
     for name, a, b, desc in TP_DEFS:
@@ -311,6 +318,29 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
         need = sorted({SENSOR_SOURCE_HINT.get(leg, leg)
                        for n, a, b, _ in TP_DEFS if n not in tp_cols for leg in (a, b)
                        if leg not in P.columns or col(P, leg).notna().sum() == 0})
+        # ★ 처방은 **이번 실행에서 실제로 일어난 일**을 근거로 말해야 한다.
+        #   예전 메시지는 무조건 'DART_FS_MAX_CALLS 가 0 이 아닌지 확인하세요' 라고 했는데,
+        #   5차 실행에서 그 값은 3,667 이었고 진짜 원인은 서버가 첫 호출에서 거부한 것이었다.
+        #   원인과 어긋난 처방은 사용자를 엉뚱한 곳으로 보낸다.
+        _halt = None
+        try:
+            _halt = dart_halt_reason()
+        except Exception:                                           # noqa
+            _halt = None
+        if _halt:
+            raise RuntimeError(
+                f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {MIN_TP_ARMS}개 필요).\n"
+                f"  원인은 **수집 설정이 아니라 자원**입니다 — {_halt}\n"
+                f"  · 살아 있는 TP : {tp_cols or '없음'}\n"
+                f"  · 이번 실행에서 채우지 못한 원천 :"
+                f"{chr(10) + '      - ' + (chr(10) + '      - ').join(need) if need else ' 판별 불가'}\n"
+                f"  처방:\n"
+                f"    ① KST 자정 이후 재실행하세요. 캐시는 append-only 라 정확히 이어받습니다.\n"
+                f"    ② 같은 DART 키로 다른 전략을 함께 돌리셨다면 한도를 나눠 쓴 것입니다.\n"
+                f"       한도는 **키 단위**지 전략 단위가 아닙니다.\n"
+                f"    ③ DART_API_KEYS 에 키를 추가하면 하루 한도가 키 개수만큼 곱해집니다\n"
+                f"       (opendart.fss.or.kr 에서 무료·즉시 발급).\n"
+                f"    설정을 바꾸지 마세요 — 이번 실행의 설정에는 문제가 없었습니다.")
         raise RuntimeError(
             f"증거층으로 쓸 수 있는 TP 가 {len(tp_cols)}개뿐입니다(최소 {MIN_TP_ARMS}개 필요). "
             f"컬럼은 만들어졌지만 관측이 0이라 제외됐습니다 — 계산 버그가 아니라 원천 결손입니다.\n"
@@ -321,7 +351,8 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
             f"       Tier-1(주요계정)에는 현금흐름표가 통째로 없어 CORE-D 5개 TP 가 전부 죽습니다.\n"
             f"    ② 'empSttus' 가 목록에 있으면 직원현황 수집이 0건이었다는 뜻입니다.\n"
             f"       위 L1.EMP 로그에서 '신규 확보 N/M건' 을 확인하세요.\n"
-            f"    ③ DART_API_KEYS 에 키를 추가하면 하루 한도가 키 개수만큼 곱해집니다.\n"
+            f"    ③ 연속된 회계연도가 모자라면 12개월 차분 센서가 전부 죽습니다 —\n"
+            f"       Tier-2 는 **회사 우선**으로 받으므로 재실행할수록 완성된 회사가 늘어납니다.\n"
             f"    캐시는 append-only 라 재실행하면 정확히 이어받습니다 — 처음부터 다시 받지 않습니다.")
     if len(tp_cols) < min_tp:
         # ★ FLOOR = n_obs >= min(min_tp, len(tp_cols)) 이므로, 살아 있는 TP 가 min_tp 보다
@@ -332,6 +363,8 @@ def score_arm(P: pd.DataFrame, tp_cols: Sequence[str], min_tp: int = None,
     T = P[tp_cols].astype("float64")
     n_obs = T.notna().sum(axis=1)
     E_raw = T.mean(axis=1, skipna=True)                       # 결측 제외 동일가중 (C7)
+    # ★ 이름 없는 Series 를 cell_rank 에 넘기면 진단표에 '<식>' 으로 찍혀 정체를 알 수 없다.
+    E_raw.name = "E_raw(증거층 평균)"
     E = cell_rank(P, E_raw)
     FLOOR = (n_obs >= min(min_tp, len(tp_cols))).astype(float)
     U = (P["U"].fillna(0.0) if use_u and "U" in P.columns else pd.Series(1.0, index=P.index))
