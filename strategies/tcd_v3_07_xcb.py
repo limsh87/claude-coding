@@ -6600,6 +6600,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
     prev_w: Dict[str, float] = {}
     charged: set = set()          # 폐지 -100% 를 이미 계상한 종목 (이중 계상 방지)
     n_unresolved, w_unresolved = 0, 0.0   # 결과 미관측 보유 — 0% 로 계상한 건수·가중치
+    n_noselect = 0                # 후보 ≤ k 라 '상위 N%'가 '전부'가 된 달
 
     for m in months:
         sub = Pm.get(m)
@@ -6627,6 +6628,11 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
                       "체결가보유": len(elig)})
 
         k = int(max(min_names, min(max_names, round(len(elig) * top_pct))))
+        # ★ 후보가 k 이하면 '상위 top_pct%' 선택이 곧 '전부 선택'이 된다 — 신호가
+        #   포트폴리오에 아무 영향을 주지 못하는 상태다(R1a 가 Δ0.000 으로 잡아낸 것).
+        #   조용히 지나가면 '신호로 고른 결과'로 오독되므로 달 수를 센다.
+        if len(elig) and len(elig) <= k:
+            n_noselect += 1
         pick = _top_n(elig, k, signal_col) if len(elig) else elig
 
         # ── 청산 게이트 ───────────────────────────────────────────────────────────────
@@ -6737,7 +6743,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
             "mean_invested": float(inv.mean()),
             "mean_invested_active": float(inv[inv > 0].mean()) if (inv > 0).any() else 0.0,
             "n_unresolved": int(n_unresolved), "w_unresolved": float(w_unresolved),
-            "n_delist_charged": int(len(charged))}
+            "n_delist_charged": int(len(charged)), "n_noselect": int(n_noselect)}
     # 투자자본 기준 수익률 — 현금 희석을 걷어낸 계열. 해석용이며 실제 성과가 아니다.
     R["ret_invested"] = np.where(inv > 1e-9, R["ret"] / inv.where(inv > 1e-9), np.nan)
     if not quiet:
@@ -6749,7 +6755,15 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
             ["폐지 -100% 계상", f"{diag['n_delist_charged']}종목 (중복 계상 없음)"],
             ["결과 미관측 보유", f"{n_unresolved}건 · 누적가중 {w_unresolved:.2f} "
                                  f"(0% 로 계상 — 성과를 부풀리는 방향)"],
+            ["신호가 선택을 못 한 달", f"{n_noselect}/{len(R)} "
+                                       f"(후보 ≤ 최소보유수 → '상위 N%'가 곧 '전부')"],
         ], ["노출·계상 진단", "실측"], title=f"백테스트 노출 진단 · {label}")
+        if n_noselect > 0.5 * max(len(R), 1):
+            LOG.error(
+                f"{n_noselect}/{len(R)}개월에서 후보가 최소보유수 이하라 **신호가 종목 선택에 "
+                f"관여하지 못했습니다.**\n"
+                f"    이 성과는 '신호로 고른 결과'가 아니라 '거부권·하한선을 통과한 잔여물'입니다.\n"
+                f"    R1a(미래주입)가 Δ0 으로 나오는 것도 같은 이유입니다 — 엔진 고장이 아닙니다.")
         if diag["mean_invested_active"] < 0.5 and (inv > 0).any():
             LOG.warn(
                 f"보유월 평균 투자비중이 {diag['mean_invested_active']*100:.0f}% 입니다 — "
@@ -8601,6 +8615,12 @@ def gate3_placebo(mapping: pd.DataFrame, a_hs: pd.DataFrame, fin: pd.DataFrame,
         return out
 
     n_f, n_h = len(cd_idx), len(hs_idx)
+    # ★ 검정력 판단에는 **행렬 크기가 아니라 실제 매핑된 종목/HS 수**를 써야 한다.
+    #   cd_idx 는 재무행렬의 전 종목(실측 2,543)이고 그중 매핑된 건 22개뿐이었다.
+    #   그걸 '종목 2543'으로 보고해 저검정력 경고가 발동하지 않았다 — 22종목짜리 검정이
+    #   잘 설계된 검정처럼 보였다.
+    n_f_eff = int(mp["code"].astype(str).nunique())
+    n_h_eff = int(mp["hs"].astype(str).nunique())
     rows = mp["code"].astype(str).map(cd_idx).to_numpy()
     cols_ = mp["hs"].astype(str).map(hs_idx).to_numpy()
     w = pd.to_numeric(mp["weight"], errors="coerce").fillna(1.0).to_numpy()
@@ -8644,18 +8664,19 @@ def gate3_placebo(mapping: pd.DataFrame, a_hs: pd.DataFrame, fin: pd.DataFrame,
     #   상관 추정 자체가 잡음이라 PASS 든 FAIL 이든 신뢰할 수 없다.
     #   그래도 FAIL 을 통과로 바꾸지는 않는다(fail-open 이 더 나쁘다). 대신 그 판정이
     #   무엇에 근거했는지를 숫자로 남겨 사람이 판단할 수 있게 한다.
-    low_power = (n_f < 30) or (n_h < 10) or (len(years) < 6)
-    out.update(stat=real, p=p, n=int(len(null)), n_firms=int(n_f), n_hs=int(n_h),
+    low_power = (n_f_eff < 30) or (n_h_eff < 10) or (len(years) < 6)
+    out.update(stat=real, p=p, n=int(len(null)), n_firms=int(n_f_eff), n_hs=int(n_h_eff),
                n_years=int(len(years)), low_power=bool(low_power),
                **{"pass": int(p < alpha)},
                detail=f"실제 {real:+.4f} vs 귀무 평균 {np.mean(null):+.4f} "
-                      f"(셔플 {len(null)}회, p={p:.4f} · 종목 {n_f} × HS {n_h} × "
-                      f"연도 {len(years)})")
+                      f"(셔플 {len(null)}회, p={p:.4f} · **매핑된** 종목 {n_f_eff} × "
+                      f"HS {n_h_eff} × 연도 {len(years)})")
     LOG.info(f"게이트3 플라시보: {out['detail']} → "
              f"{'통과' if out['pass'] else '탈락(매핑이 무작위와 구분 안 됨)'}")
     if low_power:
         LOG.warn(
-            f"게이트3 검정력 부족: 종목 {n_f}개 × HS {n_h}개 × 연도 {len(years)}개.\n"
+            f"게이트3 검정력 부족: **매핑된** 종목 {n_f_eff}개 × HS {n_h_eff}개 × "
+            f"연도 {len(years)}개 (재무행렬 전체는 {n_f}종목이지만 매핑된 것만이 검정에 기여).\n"
             f"    이 규모에서는 상관 추정이 잡음이라 통과든 탈락이든 신뢰 구간이 매우 넓습니다.\n"
             f"    그런데 이 게이트의 탈락은 V12 를 통해 **A축(통관) 전체를 끕니다** — "
             f"전략의 존재 이유가 사라집니다.\n"
@@ -10869,11 +10890,35 @@ def RX1_leakage(P, months, sec, runner, base_bt: dict) -> None:
     bt_leak = runner(Q, label="R1a-미래주입")
     s_leak = _stat(bt_leak, "sharpe")
     ok_a = np.isfinite(s_leak) and np.isfinite(base) and (s_leak > base + 0.5)
+    # ★★ FAIL 의 원인을 구분한다 ★★
+    #   '엔진 고장'과 '고를 것이 없어 랭킹이 무의미'는 전혀 다른 사건인데 예전엔 둘 다
+    #   "엔진이 고장났고 모든 결과가 무효"로 찍혔다. 실측에서 Δ가 정확히 -0.000 이었는데,
+    #   이는 주입 전후 **보유 종목이 완전히 동일**했다는 뜻이다 —
+    #   후보가 최소보유수(PORTFOLIO_MIN_NAMES) 이하라 '상위 N%'가 곧 '전부'가 된 것이다.
+    #   엔진은 멀쩡하고, 선택이 작동할 표본이 없는 것이다.
+    cause = ""
+    if not ok_a:
+        try:
+            _h0 = bt_leak.get("holdings")
+            _h1 = base_bt.get("holdings")
+            def _key(h):
+                return set() if h is None or not len(h) else set(
+                    zip(h["month"].astype(str), h["code"].astype(str)))
+            same = _key(_h0) == _key(_h1)
+            _n = _f(_stat(base_bt, "평균보유종목수"))
+        except Exception:                                               # noqa
+            same, _n = False, float("nan")
+        if same:
+            cause = (f"미래를 주입해도 **보유 종목이 한 건도 바뀌지 않았습니다** "
+                     f"(평균 보유 {_n:.2f}종목). 엔진 고장이 아니라 **고를 것이 없어 "
+                     f"랭킹이 작동하지 않는 상태**입니다 — 후보가 최소보유수 이하라 "
+                     f"'상위 N%'가 곧 '전부'가 됩니다. 유니버스를 먼저 키우세요.")
+        else:
+            cause = ("미래를 알려줘도 성과가 오르지 않습니다. 백테스트 엔진이 고장났고 "
+                     "이 실행의 **모든 결과가 무효**입니다.")
     _rx("R1a", "미래수익률 주입(하네스 검정)", "PASS" if ok_a else "FAIL",
         f"주입 Sharpe {s_leak:.3f} vs 기준 {base:.3f} — "
-        + ("하네스가 미래정보에 반응합니다(정상)." if ok_a else
-           "미래를 알려줘도 성과가 오르지 않습니다. 백테스트 엔진이 고장났고 "
-           "이 실행의 **모든 결과가 무효**입니다."),
+        + ("하네스가 미래정보에 반응합니다(정상)." if ok_a else cause),
         metric=f"Δ{s_leak-base:+.3f}", kill=True)
 
     # (b) 참고: 신호를 120일 앞당김

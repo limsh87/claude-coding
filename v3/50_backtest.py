@@ -128,6 +128,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
     prev_w: Dict[str, float] = {}
     charged: set = set()          # 폐지 -100% 를 이미 계상한 종목 (이중 계상 방지)
     n_unresolved, w_unresolved = 0, 0.0   # 결과 미관측 보유 — 0% 로 계상한 건수·가중치
+    n_noselect = 0                # 후보 ≤ k 라 '상위 N%'가 '전부'가 된 달
 
     for m in months:
         sub = Pm.get(m)
@@ -155,6 +156,11 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
                       "체결가보유": len(elig)})
 
         k = int(max(min_names, min(max_names, round(len(elig) * top_pct))))
+        # ★ 후보가 k 이하면 '상위 top_pct%' 선택이 곧 '전부 선택'이 된다 — 신호가
+        #   포트폴리오에 아무 영향을 주지 못하는 상태다(R1a 가 Δ0.000 으로 잡아낸 것).
+        #   조용히 지나가면 '신호로 고른 결과'로 오독되므로 달 수를 센다.
+        if len(elig) and len(elig) <= k:
+            n_noselect += 1
         pick = _top_n(elig, k, signal_col) if len(elig) else elig
 
         # ── 청산 게이트 ───────────────────────────────────────────────────────────────
@@ -265,7 +271,7 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
             "mean_invested": float(inv.mean()),
             "mean_invested_active": float(inv[inv > 0].mean()) if (inv > 0).any() else 0.0,
             "n_unresolved": int(n_unresolved), "w_unresolved": float(w_unresolved),
-            "n_delist_charged": int(len(charged))}
+            "n_delist_charged": int(len(charged)), "n_noselect": int(n_noselect)}
     # 투자자본 기준 수익률 — 현금 희석을 걷어낸 계열. 해석용이며 실제 성과가 아니다.
     R["ret_invested"] = np.where(inv > 1e-9, R["ret"] / inv.where(inv > 1e-9), np.nan)
     if not quiet:
@@ -277,7 +283,15 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, sec: pd.DataFrame,
             ["폐지 -100% 계상", f"{diag['n_delist_charged']}종목 (중복 계상 없음)"],
             ["결과 미관측 보유", f"{n_unresolved}건 · 누적가중 {w_unresolved:.2f} "
                                  f"(0% 로 계상 — 성과를 부풀리는 방향)"],
+            ["신호가 선택을 못 한 달", f"{n_noselect}/{len(R)} "
+                                       f"(후보 ≤ 최소보유수 → '상위 N%'가 곧 '전부')"],
         ], ["노출·계상 진단", "실측"], title=f"백테스트 노출 진단 · {label}")
+        if n_noselect > 0.5 * max(len(R), 1):
+            LOG.error(
+                f"{n_noselect}/{len(R)}개월에서 후보가 최소보유수 이하라 **신호가 종목 선택에 "
+                f"관여하지 못했습니다.**\n"
+                f"    이 성과는 '신호로 고른 결과'가 아니라 '거부권·하한선을 통과한 잔여물'입니다.\n"
+                f"    R1a(미래주입)가 Δ0 으로 나오는 것도 같은 이유입니다 — 엔진 고장이 아닙니다.")
         if diag["mean_invested_active"] < 0.5 and (inv > 0).any():
             LOG.warn(
                 f"보유월 평균 투자비중이 {diag['mean_invested_active']*100:.0f}% 입니다 — "

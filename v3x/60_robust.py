@@ -118,11 +118,35 @@ def RX1_leakage(P, months, sec, runner, base_bt: dict) -> None:
     bt_leak = runner(Q, label="R1a-미래주입")
     s_leak = _stat(bt_leak, "sharpe")
     ok_a = np.isfinite(s_leak) and np.isfinite(base) and (s_leak > base + 0.5)
+    # ★★ FAIL 의 원인을 구분한다 ★★
+    #   '엔진 고장'과 '고를 것이 없어 랭킹이 무의미'는 전혀 다른 사건인데 예전엔 둘 다
+    #   "엔진이 고장났고 모든 결과가 무효"로 찍혔다. 실측에서 Δ가 정확히 -0.000 이었는데,
+    #   이는 주입 전후 **보유 종목이 완전히 동일**했다는 뜻이다 —
+    #   후보가 최소보유수(PORTFOLIO_MIN_NAMES) 이하라 '상위 N%'가 곧 '전부'가 된 것이다.
+    #   엔진은 멀쩡하고, 선택이 작동할 표본이 없는 것이다.
+    cause = ""
+    if not ok_a:
+        try:
+            _h0 = bt_leak.get("holdings")
+            _h1 = base_bt.get("holdings")
+            def _key(h):
+                return set() if h is None or not len(h) else set(
+                    zip(h["month"].astype(str), h["code"].astype(str)))
+            same = _key(_h0) == _key(_h1)
+            _n = _f(_stat(base_bt, "평균보유종목수"))
+        except Exception:                                               # noqa
+            same, _n = False, float("nan")
+        if same:
+            cause = (f"미래를 주입해도 **보유 종목이 한 건도 바뀌지 않았습니다** "
+                     f"(평균 보유 {_n:.2f}종목). 엔진 고장이 아니라 **고를 것이 없어 "
+                     f"랭킹이 작동하지 않는 상태**입니다 — 후보가 최소보유수 이하라 "
+                     f"'상위 N%'가 곧 '전부'가 됩니다. 유니버스를 먼저 키우세요.")
+        else:
+            cause = ("미래를 알려줘도 성과가 오르지 않습니다. 백테스트 엔진이 고장났고 "
+                     "이 실행의 **모든 결과가 무효**입니다.")
     _rx("R1a", "미래수익률 주입(하네스 검정)", "PASS" if ok_a else "FAIL",
         f"주입 Sharpe {s_leak:.3f} vs 기준 {base:.3f} — "
-        + ("하네스가 미래정보에 반응합니다(정상)." if ok_a else
-           "미래를 알려줘도 성과가 오르지 않습니다. 백테스트 엔진이 고장났고 "
-           "이 실행의 **모든 결과가 무효**입니다."),
+        + ("하네스가 미래정보에 반응합니다(정상)." if ok_a else cause),
         metric=f"Δ{s_leak-base:+.3f}", kill=True)
 
     # (b) 참고: 신호를 120일 앞당김
