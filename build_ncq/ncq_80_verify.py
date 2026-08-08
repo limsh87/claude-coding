@@ -1560,9 +1560,12 @@ def run_rehearsal(strict: bool = True) -> bool:
 
         # ── ② 가격 · 시가총액 · 유니버스 ──────────────────────────────────────────────────
         codes = sec["code"].dropna().astype(str).tolist()[:10]
-        px = ncq_rh("fetch_prices (네이버 차트 폴백)",
-                    lambda: fetch_prices(codes, BACKTEST_START, BACKTEST_END),
-                    note="pykrx/FDR/yfinance 없이 네이버 경로만으로 동작해야 한다")
+        px = ncq_rh("fetch_prices (네이버 우선 + 대상축소 + 서킷브레이커)",
+                    lambda: fetch_prices(codes, BACKTEST_START, BACKTEST_END, sec=sec),
+                    note="sec 를 넘겨 대상축소·종목별 구간·시장별 접미사 경로까지 실제로 태운다")
+        ncq_rh("price_targets (상장구간 교차 필터)",
+               lambda: price_targets(sec["code"].tolist(), sec, BACKTEST_START, BACKTEST_END)[0],
+               note="구간 밖 폐지/상장 종목을 걸러도 '근거 없는 종목'은 남겨야 한다")
         panel = None
         if px is not None and len(px):
             panel = ncq_rh("build_price_panel", lambda: build_price_panel(px, months))

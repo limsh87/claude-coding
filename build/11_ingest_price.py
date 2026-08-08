@@ -114,15 +114,18 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 
 # ── 개별 소스 ───────────────────────────────────────────────────────────────────────────────
 def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if pykrx_stock is None:
+    if pykrx_stock is None or not px_gate_open("pykrx"):
         return None
     try:
         limiter("krx").wait()
         d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
+        px_gate_mark("pykrx", False)
         return None
     if d is None or len(d) == 0:
+        px_gate_mark("pykrx", False)
         return None
+    px_gate_mark("pykrx", True)
     d = d.reset_index()
     ren = {"날짜": "date", "시가": "open", "고가": "high", "저가": "low",
            "종가": "close", "거래량": "volume", "거래대금": "amount"}
@@ -134,15 +137,18 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 
 def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if fdr is None:
+    if fdr is None or not px_gate_open("fdr"):
         return None
     try:
         limiter("krx").wait()
         d = fdr.DataReader(code, start, end)
     except Exception:
+        px_gate_mark("fdr", False)
         return None
     if d is None or len(d) == 0:
+        px_gate_mark("fdr", False)
         return None
+    px_gate_mark("fdr", True)
     d = d.reset_index()
     d.columns = [str(c).lower() for c in d.columns]
     if "date" not in d.columns:
@@ -156,12 +162,15 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """네이버 차트 API. 폴백 중에서는 가장 안정적이지만 거래대금이 없다."""
+    if not px_gate_open("naver"):
+        return None
     qs = (f"?symbol={code}&requestType=1&startTime={as_ts(start):%Y%m%d}"
           f"&endTime={as_ts(end):%Y%m%d}&timeframe=day")
     arr = None
     for host in ("https://fchart.stock.naver.com/siseJson.naver",
                  "https://api.finance.naver.com/siseJson.naver"):
-        t = http_get(host + qs, source="naver", tries=2, referer="https://finance.naver.com/")
+        t = http_get(host + qs, source="naver_chart", tries=2,
+                     referer="https://finance.naver.com/")
         if not t:
             continue
         # 응답이 파이썬 리터럴에 가까운 준-JSON 이다: 홑따옴표 + 따옴표 없는 키워드
@@ -177,7 +186,9 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
             break
         arr = None
     if not isinstance(arr, list) or len(arr) < 2:
+        px_gate_mark("naver", False)
         return None
+    px_gate_mark("naver", True)
     hdr = [str(x).strip().lower() for x in arr[0]]
     rows = [r for r in arr[1:] if isinstance(r, (list, tuple)) and len(r) == len(hdr)]
     if not rows:
@@ -203,17 +214,71 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+# ── 소스 서킷브레이커 ───────────────────────────────────────────────────────────────────────
+#   ★ 실측 사고: 5,398종목 × 폴백 4단 × yfinance 접미사 2종 = 최대 1만회 이상의 야후 요청이
+#     발생해 YFRateLimitError → DNS 해석 실패(query2.finance.yahoo.com)까지 번졌고,
+#     P0.PX 한 단계에서만 60분을 태웠다. 실패가 누적되는데도 계속 두드린 것이 원인이다.
+#   → 소스별로 '연속 실패'를 세고 임계치를 넘으면 **이번 실행 동안 그 소스를 끈다.**
+#     성공하면 카운터는 0으로 돌아가므로 일시적 흔들림으로는 꺼지지 않는다.
+PRICE_SRC_TRIP = {"yfinance": 30, "fdr": 60, "pykrx": 40, "naver": 80}
+_PX_GATE: Dict[str, dict] = {}
+_PX_GATE_LK = threading.Lock()
+
+
+def px_gate_reset():
+    with _PX_GATE_LK:
+        _PX_GATE.clear()
+
+
+def px_gate_open(src: str) -> bool:
+    """이 소스를 지금 써도 되는가."""
+    with _PX_GATE_LK:
+        return not _PX_GATE.get(src, {}).get("off", False)
+
+
+def px_gate_mark(src: str, ok: bool, reason: str = ""):
+    trip = PRICE_SRC_TRIP.get(src, 50)
+    fire = False
+    with _PX_GATE_LK:
+        st = _PX_GATE.setdefault(src, {"miss": 0, "off": False, "why": ""})
+        if ok:
+            st["miss"] = 0
+            return
+        st["miss"] += 1
+        if not st["off"] and st["miss"] >= trip:
+            st["off"], st["why"] = True, (reason or f"연속 실패 {st['miss']}회")
+            fire = True
+    if fire:
+        LOG.warn(f"가격소스 '{src}' 를 이번 실행에서 차단합니다 — {reason or f'연속 실패 {trip}회'}. "
+                 f"남은 소스로 계속 진행하며, 어떤 소스가 몇 종목을 채웠는지는 감사표에 나옵니다. "
+                 f"(계속 두드리면 IP 차단·속도저하만 커집니다)")
+
+
+_YF_SUFFIX = {"KOSPI": ".KS", "KOSDAQ": ".KQ", "KONEX": ".KQ"}
+_PX_MARKET_HINT: Dict[str, str] = {}       # code -> 'KOSPI'|'KOSDAQ' (fetch_prices 가 채운다)
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if yf is None:
+    """★ 접미사를 '두 개 다' 시도하던 것을 종목 마스터의 시장으로 1회만 시도하도록 바꿨다.
+    한국 폐지주는 야후에 사실상 없으므로, 2배 요청은 순수 낭비이자 레이트리밋의 직접 원인이었다."""
+    if yf is None or not px_gate_open("yfinance"):
         return None
-    for suf in (".KS", ".KQ"):
+    mkt = _PX_MARKET_HINT.get(code, "")
+    sufs = [_YF_SUFFIX[mkt]] if mkt in _YF_SUFFIX else [".KS"]
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
                             auto_adjust=False, threads=False)
-        except Exception:
+        except Exception as e:
+            msg = str(e)
+            if re.search(r"RateLimit|Too Many Requests|Could not resolve host|429", msg, re.I):
+                px_gate_mark("yfinance", False, "레이트리밋/DNS 실패")
+            else:
+                px_gate_mark("yfinance", False)
             continue
         if d is None or len(d) == 0:
+            px_gate_mark("yfinance", False)
             continue
         if isinstance(d.columns, pd.MultiIndex):
             d.columns = [str(c[0]).lower() for c in d.columns]
@@ -226,15 +291,114 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         d["amount"] = pd.to_numeric(d.get("close"), errors="coerce") * \
             pd.to_numeric(d.get("volume"), errors="coerce")
         d["code"], d["src"] = code, "yfinance"
+        px_gate_mark("yfinance", True)
         return d.reindex(columns=PRICE_COLS)
     return None
 
 
-PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
+# ★ 체인 순서가 곧 실행시간이다.
+#   (구) pykrx → fdr → naver → yfinance : pykrx 는 종목당 KRX 호출 1건이고 QPS 상한 2.0 이라
+#        5,398종목이면 그것만으로 45분이 확정된다. 게다가 실패하면 fdr·naver·yfinance 를 또 탄다.
+#   (신) naver → fdr → pykrx → yfinance : 네이버 차트는 10년치를 **한 번의 요청**으로 주고
+#        QPS 1.5 에 워커 8이라 대부분 종목이 1회 호출로 끝난다. KRX 는 검증·보강용으로 뒤로 뺀다.
+PRICE_CHAIN = [("naver", _px_naver), ("fdr", _px_fdr), ("pykrx", _px_pykrx), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+def price_targets(codes: Sequence[str], sec: Optional[pd.DataFrame],
+                  start: str, end: str) -> Tuple[List[str], Dict[str, Tuple[str, str]]]:
+    """'가격을 받을 가치가 있는 종목'만 남기고, 종목별 요청 구간까지 좁힌다.
+
+    ★ 실측 사고의 두 번째 원인. 종목마스터 5,398개를 그대로 넘기면 그 안에는
+        · 1956~2015 사이에 이미 폐지되어 백테스트 구간에 존재조차 않는 종목
+        · 우선주(보통주와 같은 기업, 유니버스에서 정적 배제됨)
+        · 외국주·리츠·선박투자회사·스팩(9xxxxx / 8자리 코드 등)
+      이 대량으로 섞여 있다. 이들은 **어느 소스에도 데이터가 없거나, 있어도 안 쓴다.**
+      전 소스 폴백을 헛돌리는 비용만 남는다.
+
+    ★ 생존자편향 주의: 여기서 거르는 기준은 '수익률에 유리한가'가 아니라
+      **'백테스트 구간과 상장구간이 겹치는가'** 뿐이다. 구간이 겹치면 폐지 종목도
+      전부 남긴다(오히려 그게 생존자편향 방어의 핵심이다). 상장일·폐지일을 모르면
+      근거가 없으므로 **버리지 않고 남긴다.**
+    """
+    s_ts, e_ts = as_ts(start), as_ts(end)
+    codes = sorted({c for c in map(to_code6, codes) if c})
+    win: Dict[str, Tuple[str, str]] = {}
+    if sec is None or not len(sec) or "code" not in sec.columns:
+        return codes, {c: (start, end) for c in codes}
+
+    m = sec.dropna(subset=["code"]).copy()
+    m["code"] = m["code"].astype(str).map(to_code6)
+    m = m.dropna(subset=["code"]).drop_duplicates("code").set_index("code")
+    ld = as_ts_series(m["listing_date"]) if "listing_date" in m.columns else None
+    dd = as_ts_series(m["delisting_date"]) if "delisting_date" in m.columns else None
+    mk = m["market"].astype(str) if "market" in m.columns else None
+    nm = m["name"].astype(str) if "name" in m.columns else None
+
+    keep: List[str] = []
+    n_dead, n_future, n_pref, n_nonstd = 0, 0, 0, 0
+    for c in codes:
+        if not re.fullmatch(r"\d{6}", c):
+            n_nonstd += 1
+            continue
+        nmv = str(nm.get(c, "")) if nm is not None else ""
+        # ★ 우선주 판정은 직접 정규식을 새로 쓰지 않는다. '이름이 우로 끝나면 우선주'는
+        #   '미래에셋대우' 같은 보통주를 통째로 날려 버리는 오탐을 낳는다(실제로 걸렸다).
+        #   유니버스에서 이미 쓰고 있는 검증된 판정기를 그대로 재사용하고, 그 함수가 없는
+        #   조립본(TCD v2)에서는 **코드 끝자리 규칙만** 보수적으로 적용한다.
+        _isp = globals().get("ncq_is_preferred")
+        if callable(_isp):
+            pref = bool(_isp(c, nmv))
+        else:
+            pref = (c[:5].isdigit() and c[5] in ("5", "7", "9"))
+        if pref:
+            n_pref += 1
+            continue
+        d = dd.get(c) if dd is not None else None
+        if d is not None and pd.notna(d) and d < s_ts:
+            n_dead += 1                       # 백테스트 시작 전에 이미 폐지 → 등장 불가
+            continue
+        l = ld.get(c) if ld is not None else None
+        if l is not None and pd.notna(l) and l > e_ts:
+            n_future += 1                     # 백테스트 종료 후 상장 → 등장 불가
+            continue
+        st = start
+        if l is not None and pd.notna(l) and l > s_ts:
+            st = (l - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+        en = end
+        if d is not None and pd.notna(d) and d < e_ts:
+            en = (d + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        win[c] = (st, en)
+        keep.append(c)
+        if mk is not None:
+            v = str(mk.get(c, "")).upper()
+            if "KOSPI" in v or v == "STK":
+                _PX_MARKET_HINT[c] = "KOSPI"
+            elif "KOSDAQ" in v or v == "KSQ":
+                _PX_MARKET_HINT[c] = "KOSDAQ"
+
+    LOG.table([["종목 마스터 전체", f"{len(codes):,}", "-"],
+               ["비표준 코드 제외", f"-{n_nonstd:,}", "6자리 숫자가 아님(외국주·ETN 등)"],
+               ["우선주·스팩 제외", f"-{n_pref:,}", "유니버스에서 어차피 정적 배제"],
+               ["구간 전 폐지 제외", f"-{n_dead:,}", f"{start} 이전 폐지 → 백테스트에 등장 불가"],
+               ["구간 후 상장 제외", f"-{n_future:,}", f"{end} 이후 상장 → 백테스트에 등장 불가"],
+               ["실제 가격수집 대상", f"{len(keep):,}",
+                f"절감 {100*(1-len(keep)/max(len(codes),1)):.0f}%"]],
+              ["가격수집 대상 축소", "종목수", "근거"], ["l", "r", "l"],
+              title="가격 수집 대상 축소 (헛수고를 먼저 걷어낸다)")
+    return keep, win
+
+
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장.
+
+    sec 를 주면 ① 수집 대상을 상장구간이 겹치는 종목으로 좁히고 ② 종목별 요청 구간을
+    상장~폐지로 잘라내며 ③ yfinance 접미사를 시장으로 1회만 고른다.
+    """
+    px_gate_reset()
+    _win: Dict[str, Tuple[str, str]] = {}
+    if sec is not None:
+        codes, _win = price_targets(codes, sec, start, end)
     codes = sorted({c for c in map(to_code6, codes) if c})
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
@@ -246,7 +410,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         have_max, have_min = g.max().to_dict(), g.min().to_dict()
         LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
-    start_ts, end_ts = as_ts(start), as_ts(end)
+    end_ts = as_ts(end)
 
     # ── 시도 원장 (음성 캐시) ─────────────────────────────────────────────────────────────
     #  ★ 폐지 종목과 '어느 소스에도 없는 종목'은 매 실행마다 전 소스 체인을 헛돌게 만든다.
@@ -276,22 +440,24 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     todo, n_back, n_fwd, n_skip = [], 0, 0, 0
     for c in codes:
+        c_st, c_en = _win.get(c, (start, end))       # 종목별 상장~폐지로 좁혀진 구간
         mx, mn = have_max.get(c), have_min.get(c)
+        c_st_ts, c_en_ts = as_ts(c_st), as_ts(c_en)
         if mx is None:
-            if _recently_failed(c, start_ts):
+            if _recently_failed(c, c_st_ts):
                 n_skip += 1
                 continue
-            todo.append((c, start))
+            todo.append((c, c_st, c_en))
             continue
         # ★ 과거 방향 백필을 반드시 함께 본다.
         #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
         #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
         #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
-            todo.append((c, start))
+        if mn is not None and mn > c_st_ts + pd.Timedelta(days=10):
+            todo.append((c, c_st, c_en))
             n_back += 1
-        elif mx < end_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+        elif mx < c_en_ts - pd.Timedelta(days=5):
+            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), c_en))
             n_fwd += 1
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
@@ -310,10 +476,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
         def _one(job):
-            code, st = job
+            code, st, en = job
             for nm, fn in PRICE_CHAIN:
+                if not px_gate_open(nm):
+                    continue           # 차단된 소스는 아예 두드리지 않는다(레이트리밋 확산 차단)
                 try:
-                    d = fn(code, st, end)
+                    d = fn(code, st, en)
                 except Exception:
                     d = None
                 if d is not None and len(d):
@@ -322,9 +490,23 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                         return d
             return None
 
-        res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        # ★ 청크 단위로 돌리고 중간 결과를 그때그때 원장에 남긴다.
+        #   30분짜리 단계가 통째로 날아가서 다음 실행이 처음부터 다시 하는 일을 막는다.
+        #   (사용자가 가장 싫어하는 '쓸데없는 가격조회 반복'의 마지막 원인)
+        CH_PX = 1000
+        res: List[Optional[pd.DataFrame]] = []
+        for k0 in range(0, len(todo), CH_PX):
+            chunk = todo[k0:k0 + CH_PX]
+            res.extend(pmap_io(_one, chunk, workers=min(N_WORKERS_IO, 12),
+                               desc=f"일봉 수집 {k0 // CH_PX + 1}/{(len(todo) - 1) // CH_PX + 1}"))
+            alive = [nm for nm, _ in PRICE_CHAIN if px_gate_open(nm)]
+            if not alive:
+                LOG.warn(f"살아 있는 가격소스가 하나도 없습니다 — 남은 {len(todo)-len(res):,}종목 수집을 "
+                         f"중단하고 지금까지 받은 것만 저장합니다. 잠시 후 재실행하면 이어받습니다.")
+                res.extend([None] * (len(todo) - len(res)))
+                break
         failed = []
-        for (c, st), d in zip(todo, res):
+        for (c, st, _en), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
@@ -343,6 +525,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                         .drop_duplicates("code", keep="last").reset_index(drop=True))
             VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
                             source="fetch_prices:negative_cache")
+        _off = [k for k, v in _PX_GATE.items() if v.get("off")]
+        if _off:
+            LOG.warn(f"이번 실행에서 차단된 가격소스: {', '.join(_off)}. "
+                     f"차단 이후의 실패는 '그 종목에 데이터가 없다'는 근거가 되지 못하므로 "
+                     f"음성 캐시가 다음 실행을 영구히 막지 않도록 30일 후 재시도됩니다.")
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:

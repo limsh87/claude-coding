@@ -26,19 +26,27 @@ def ncq_phase0(months: pd.DatetimeIndex) -> dict:
     with PhaseBudget("P0", NCQ_PHASE_BUDGET_S["P0"]) as B:
 
         with PIPE.stage("P0.SEC", "종목 마스터 (다중소스 · 생존자편향 제거)", "L1", budget_s=900):
-            snaps = fetch_pykrx_snapshots(months) if ncq_krx_enabled() else \
+            # ★ KRX 로그인은 반드시 스냅샷 수집 **이전**에 끝나야 한다. 예전엔 P0.PX 안에서
+            #   로그인해서, 정작 스냅샷을 쓰는 P0.SEC 은 "세션이 없어 건너뜁니다"를 찍고
+            #   지나간 뒤였다(로그로 확인된 순서 버그). 로그인 성공 로그가 스킵 로그보다
+            #   뒤에 찍히는 게 그 증거다.
+            if ncq_krx_enabled():
+                KRX.login()
+            snaps = fetch_pykrx_snapshots(months) if (ncq_krx_enabled() and KRX.session_ok) else \
                 pd.DataFrame(columns=["snap_date", "code", "market"])
             sec = build_security_master(snaps)
             dead = ncq_fdr_delisting_full()
             listing_now = ncq_fdr_listing_full()
             ctx.update(sec=sec, snapshots=snaps, dead=dead, listing_now=listing_now)
 
-        with PIPE.stage("P0.PX", "가격 · 거래대금 (KRX-free 폴백 체인)", "L1", budget_s=1500):
-            if ncq_krx_enabled():
-                KRX.login()
+        with PIPE.stage("P0.PX", "가격 · 거래대금 (대상 축소 + 소스 서킷브레이커)", "L1",
+                        budget_s=2400):
+            # ★ sec 를 넘겨야 ① 백테스트 구간과 상장구간이 겹치는 종목만 받고
+            #   ② 종목별 요청구간을 상장~폐지로 자르고 ③ yfinance 접미사를 1회로 확정한다.
+            #   이 인자 하나가 실측 60분짜리 단계를 만든 헛수고의 대부분을 제거한다.
             px = fetch_prices(ctx["sec"]["code"].tolist(),
                               (as_ts(BACKTEST_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d"),
-                              BACKTEST_END)
+                              BACKTEST_END, sec=ctx["sec"])
             ctx["px"] = px
             ctx["panel"] = build_price_panel(px, months)
             ctx["pxm"] = ctx["panel"]["monthly"]
@@ -49,12 +57,24 @@ def ncq_phase0(months: pd.DatetimeIndex) -> dict:
                             source="fdr+dart+price_intervals")
             ctx["uni_obj"] = Universe(ctx["sec"], ctx["snapshots"], ctx["panel"]["daily"])
 
-        with PIPE.stage("P0.SHARES", "PIT 상장주식수 (DART 접수일자 기준)", "L1",
-                        budget_s=1200, critical=False):
+        with PIPE.stage("P0.SHARES", "PIT 상장주식수 (DART 접수일자 기준 · 격자 축소 + 실시간 잔량)",
+                        "L1", budget_s=1800, critical=False):
             corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist() \
                 if "corp_code" in ctx["sec"].columns else []
             years = list(range(as_ts(BACKTEST_START).year - 1, as_ts(BACKTEST_END).year + 1))
-            ds = fetch_dart_shares(corps, years) if corps else pd.DataFrame()
+            jobs: List[Tuple[str, int, str]] = []
+            if corps:
+                # 이미 받아 둔 조합은 계획 단계에서 미리 빼야 깔때기표의 숫자가 진실이 된다.
+                _cache = VAULT.get_table("dart_shares_history", scope="shared")
+                _have = set()
+                if _cache is not None and len(_cache):
+                    _have = set(zip(_cache["corp_code"].astype(str),
+                                    _cache["bsns_year"].astype(int),
+                                    _cache["reprt_code"].astype(str)))
+                jobs, _ = ncq_plan_dart_share_jobs(ctx["sec"], ctx["panel"]["daily"],
+                                                   ctx["listing_now"], months,
+                                                   cached_keys=_have)
+            ds = fetch_dart_shares(corps, years, jobs=jobs) if corps else pd.DataFrame()
             ctx["shares_hist"] = ncq_build_shares_history(ctx["sec"], ds, ctx["listing_now"])
 
         with PIPE.stage("P0.MCAP", "PIT 시가총액", "L1", budget_s=900):
@@ -313,8 +333,16 @@ def main() -> dict:
             ctx["BT_nocap"] = run_fn(ctx["SIG"], adv_cap=False, label="ADV 제약 미적용")
 
         with PIPE.stage("P6.BENCH", "벤치마크 구성", "L3", budget_s=300, critical=False):
-            bench_ew = bench_universe_ew(ctx["UNI"], ctx["pxm"], months_eff, ctx["uni_obj"])
+            bench_ew = bench_universe_ew(ctx["UNI"], ctx["pxm"], months_eff, ctx["uni_obj"],
+                                         gate="liq_pass", name="Bottom-N EW")
             benches: Dict[str, pd.Series] = {"Bottom-N EW(주)": bench_ew}
+            # ★ 스몰캡 비교 팔 — 유동성 필터 **이전**의 '시총 하위 N 전체 동일가중'.
+            #   주 벤치마크(liq_pass)와 나란히 놓으면 (a) 유동성 필터가 성과에 얼마를
+            #   기여했는지, (b) 전략의 초과수익이 단순 소형주 프리미엄인지가 분리된다.
+            #   전략과 동일한 실효 수익률 행렬(폐지 -50%·정지 0%)을 쓰므로 비대칭이 없다.
+            benches[f"스몰캡 {NCQ_UNIVERSE_BOTTOM_N} EW(유동성 미적용)"] = bench_universe_ew(
+                ctx["UNI"], ctx["pxm"], months_eff, ctx["uni_obj"],
+                gate="in_uni", name=f"Smallcap-{NCQ_UNIVERSE_BOTTOM_N} EW")
             benches.update(bench_index(months_eff))
             benches["Placebo(z 하위)"] = ctx["BT_placebo"]["returns"].set_index("month")["ret"]
             benches["이벤트 EW"] = ctx["BT_eventew"]["returns"].set_index("month")["ret"]

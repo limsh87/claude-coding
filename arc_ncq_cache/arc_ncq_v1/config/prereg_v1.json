@@ -1,0 +1,58 @@
+{
+  "adoption_criteria": [
+    "P1 과 P3 가 BH-FDR 통과",
+    "왕복 거래비용 3.0% 시나리오에서도 초과수익 > 0",
+    "Placebo(z 하위 tercile) 대비 스프레드 > 0"
+  ],
+  "frozen_at": "2026-08-08",
+  "hypotheses": [
+    {
+      "direction": ">0",
+      "id": "P1",
+      "stat": "월별 초과수익 평균, Newey-West t (lag=12)",
+      "text": "De novo 신규커버리지 × z상위tercile 포트폴리오가 Bottom-N EW 대비 초과수익"
+    },
+    {
+      "direction": ">0",
+      "id": "P2",
+      "stat": "롱숏 스프레드 HAC t",
+      "text": "텍스트 z점수의 단조성: 상위 tercile − 하위 tercile 스프레드"
+    },
+    {
+      "direction": ">0",
+      "id": "P3",
+      "stat": "서브그룹 초과수익 HAC t",
+      "text": "ORGANIC_ONLY 서브그룹에서도 P1 유지"
+    },
+    {
+      "direction": ">0",
+      "id": "P4",
+      "stat": "전체 이벤트 EW 대비 z상위 tercile 스프레드 HAC t",
+      "text": "텍스트 점수가 신규커버리지 이벤트 단독 대비 증분 정보 제공"
+    }
+  ],
+  "kill_criteria": [
+    "커버리지 완결성 진단에서 유효 윈도우 < 5년이면 백테스트 중단",
+    "하네스 누수 민감도(N11) 실패 시 전 결과 무효"
+  ],
+  "multiple_testing": "BH-FDR (alpha=0.10) applied to P1~P4",
+  "parameters": {
+    "universe_bottom_n": 1000,
+    "min_adv_krw": 100000000,
+    "lookback_months": 24,
+    "burnin_months": 24,
+    "hold_months": 12,
+    "tercile": 0.333333,
+    "cost_roundtrip": 0.018,
+    "max_new_per_month": 20,
+    "backtest_window": [
+      "2016-08-01",
+      "2026-07-31"
+    ],
+    "seed": 20260808
+  },
+  "primary_hypothesis": "시총 하위 N 소형주에서 발생한 신규 애널리스트 커버리지 이벤트 중, 동월 이벤트 풀 내 텍스트 z-score 상위 tercile 종목군이 동일 유니버스 동일가중(Bottom-N EW) 대비 12개월 초과수익을 낸다.",
+  "sensitivity_plan": "기본 1조합 + 각 축 단독 변동 8조합 = 9조합만 실행. DSR 시행횟수에 9 반영.",
+  "strategy": "ARC-NCQ v1.0 — New Coverage × Qualitative Shift",
+  "version": "v1.0"
+}

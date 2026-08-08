@@ -40,9 +40,16 @@ from __future__ import annotations
 
 # ── ① DART 전자공시 OpenAPI ─────────────────────────────────────────────────────────────────
 #    발급: https://opendart.fss.or.kr  →  회원가입 → [인증키 신청/관리] → API 인증키 발급
-#    무료. 발급 즉시 사용. 일 20,000건 호출 제한(2026 기준, 코드가 자동 스로틀합니다).
+#    무료. 발급 즉시 사용. 키 1개당 일 20,000건 호출 제한(2026 기준).
 #    ▶ 이 전략의 B축(회계품질)·C축(자원투입)의 필수 입력입니다. 없으면 대부분의 TP가 죽습니다.
+#
+#    ★ 상한을 미리 정하지 않습니다. 남은 호출량을 실시간으로 추적해 그만큼 쓰고,
+#      서버가 020(요청 제한 초과)을 줄 때 비로소 멈춥니다.
+#    ★ 키를 여러 개 넣으면 가용량이 그만큼 선형으로 늘어납니다(20,000 × 키 개수).
+#      한 키가 020 을 받으면 그 키만 소진 처리하고 다음 키로 자동 전환합니다.
+#      계정을 더 만들면 키가 더 나옵니다(무료·즉시).
 DART_API_KEY = ""
+DART_API_KEYS: list = []        # 예: ["40자리키1", "40자리키2", "40자리키3"]
 
 # ── ② 공공데이터포털 (국민연금 사업장 / 조달청 낙찰) ────────────────────────────────────────
 #    발급: https://www.data.go.kr  →  로그인 → 원하는 API 상세페이지 → [활용신청]
@@ -109,6 +116,10 @@ RATE_LIMIT_QPS = {      # 소스별 초당 요청 상한 — 차단 방지용. �
     "dart":      8.0,
     "hankyung":  2.5,
     "naver":     3.0,
+    # ★ 네이버 주가차트(fchart.stock.naver.com)는 리서치 목록(finance.naver.com)과
+    #   호스트도 부하 프로파일도 다르다. 한 버킷을 공유하면 5천 종목 일봉이
+    #   리서치용 보수적 QPS 에 묶여 30분 이상 걸린다(실측). 분리하되 여전히 보수적으로.
+    "naver_chart": 6.0,
     "krx":       2.0,
     "datagokr":  5.0,
     "customs":   3.0,
@@ -162,7 +173,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_X"
 STRATEGY_NAME      = "PACK-X 관세청 수출"
 ACTIVE_PACKS       = ["X"]
-BUILD_VERSION      = "v2.20260808.0250"
+BUILD_VERSION      = "v2.20260808.0454"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -2212,6 +2223,284 @@ def report_http():
     LOG.table(rows, ["소스", "요청", "성공", "성공률", "차단/실패", "상세"],
               ["l", "r", "r", "r", "r", "l"])
 
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0-D  DART 인증키 풀 — '미리 정한 상한'이 아니라 '실시간 남은 호출량'을 쓴다               ║
+# ║                                                                                          ║
+# ║  ★ 설계 원칙 (예전 코드의 잘못을 명시적으로 뒤집는다)                                       ║
+# ║    (구) DART_DAILY_LIMIT = 19,000 을 하드코딩 → 실제로 남은 양과 무관하게 미리 잘랐다.      ║
+# ║         · 이미 오늘 5,000 을 썼든 0 을 썼든 똑같이 19,000 을 가정 → 과대 또는 과소 사용     ║
+# ║         · 키가 여러 개여도 한 개 분량만 사용 → 남는 한도를 통째로 버렸다                    ║
+# ║    (신) 상한을 두지 않는다. **서버가 status=020(요청 제한 초과)을 줄 때까지 쓴다.**          ║
+# ║         · 멈추는 근거는 항상 서버의 응답이다. 우리 추정치가 아니다.                          ║
+# ║         · 키가 여러 개면 020 을 받은 키만 오늘 소진 처리하고 다음 키로 자동 전환한다.        ║
+# ║           → 가용 호출량 = 20,000 × 키 개수. 키 2개면 4만, 3개면 6만.                        ║
+# ║         · 사용량은 (키해시, 날짜)로 드라이브에 영속 기록 → 재실행 시 남은 양을 즉시 안다.    ║
+# ║           이 기록은 **표시·계획용**이며 게이트가 아니다. 실제 한도가 더 남아 있으면 더 쓴다. ║
+# ║                                                                                          ║
+# ║  ★ 왜 상한을 신뢰하면 안 되는가                                                            ║
+# ║    같은 키를 다른 노트북·다른 전략이 함께 쓸 수 있고, DART 의 한도 리셋은 KST 자정 기준이며, ║
+# ║    재시도(http_get 내부 tries)까지 실사용량에 포함된다. 로컬 카운터는 언제나 틀릴 수 있다.   ║
+# ║    → 로컬 카운터는 '얼마나 남았을까'를 사람에게 보여주는 용도로만 쓰고,                      ║
+# ║      '멈춰야 하는가'는 오직 서버의 020 응답으로 판단한다.                                   ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+DART_API_BASE = "https://opendart.fss.or.kr/api/"
+DART_QUOTA_PER_KEY = 20_000      # 공식 일일 한도. ★게이트가 아니라 '남은 양' 표시용 기준치★
+DART_SOFT_RESERVE = 0            # >0 이면 키당 그만큼 남겨두고 전환(다른 작업용 예약). 0=끝까지
+_DART_ST_FALLBACK = {
+    "000": "정상", "010": "등록되지 않은 키", "011": "사용할 수 없는 키",
+    "012": "접근할 수 없는 IP", "013": "조회된 데이터 없음", "014": "파일이 존재하지 않음",
+    "020": "요청 제한 초과(일일 한도)", "021": "조회 가능한 회사 개수 초과",
+    "100": "필드 부적절", "101": "부적절한 접근", "800": "시스템 점검 중",
+    "900": "정의되지 않은 오류", "901": "사용자 계정 폐쇄",
+}
+
+
+def _dart_status_msg(st: str) -> str:
+    return (globals().get("DART_STATUS_MSG") or _DART_ST_FALLBACK).get(str(st), "?")
+
+
+def _dart_keys_configured() -> List[str]:
+    """설정된 DART 키를 순서대로 모은다(중복 제거).
+
+    받는 곳: 단일키 DART_API_KEY / 다중키 DART_API_KEYS / 환경변수 DART_API_KEY·DART_API_KEYS.
+    ▶ 키는 opendart.fss.or.kr 에서 계정당 즉시·무료 발급된다. 계정을 더 만들면 키가 늘고,
+      키가 늘면 일일 가용 호출량이 그만큼 선형으로 늘어난다(20,000 × 키 개수).
+    """
+    src: List[Any] = [globals().get("DART_API_KEY", "")]
+    src.extend(list(globals().get("DART_API_KEYS", []) or []))
+    src.extend(re.split(r"[,\s]+", os.environ.get("DART_API_KEYS", "") or ""))
+    src.append(os.environ.get("DART_API_KEY", ""))
+    out: List[str] = []
+    seen: set = set()
+    for k in src:
+        k = str(k or "").strip()
+        if len(k) >= 20 and k not in seen:      # DART 키는 40자 hex. 오타·자리표시자 방어
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+class DartKeyPool:
+    """DART 호출량을 실시간으로 관리한다. 상한을 미리 정하지 않는다."""
+
+    def __init__(self, keys: Optional[Sequence[str]] = None):
+        self.keys: List[str] = list(keys) if keys is not None else _dart_keys_configured()
+        self.today = _dt.date.today().isoformat()
+        self.used: Dict[str, int] = {}
+        self.dead: Dict[str, str] = {}          # kid -> 사유코드
+        self.calls = 0                           # 이번 실행에서 실제로 보낸 요청 수
+        self._lk = threading.Lock()
+        self._since_save = 0
+        self._warned_over = set()
+        self._load()
+
+    # ── 영속화 ──────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _kid(key: str) -> str:
+        return hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _mask(key: str) -> str:
+        s = str(key)
+        return f"{s[:6]}…{s[-4:]}" if len(s) > 12 else "****"
+
+    def _path(self) -> Optional[str]:
+        try:
+            d = os.path.join(VAULT.ns["private"], "state")
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, "_dart_quota.json")   # 앞의 '_' → 인덱스 스캔 대상 아님
+        except Exception:
+            return None
+
+    def _load(self):
+        p = self._path()
+        if not p or not os.path.exists(p):
+            return
+        try:
+            j = json.loads(open(p, encoding="utf-8").read())
+        except Exception:
+            return
+        if str(j.get("date")) != self.today:
+            return                                   # 날짜가 바뀌면 한도는 리셋된다
+        # 어제의 '소진' 상태는 물려받지 않는다(self.dead 는 비운 채로 시작).
+        # 020 은 오늘 다시 받아야 소진이다 — 한도는 날짜가 바뀌면 리셋되기 때문이다.
+        self.used = {str(k): int(v) for k, v in (j.get("used") or {}).items()}
+        n_prior = sum(self.used.values())
+        if n_prior:
+            LOG.info(f"오늘 이미 사용한 DART 호출 {n_prior:,}건이 기록되어 있습니다 — "
+                     f"남은 양부터 이어서 씁니다(추정 잔량 {self.remaining_hint():,}건).")
+
+    def _save_locked(self):
+        p = self._path()
+        if not p:
+            return
+        try:
+            atomic_write_text(p, json.dumps(
+                {"date": self.today, "used": self.used}, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def save(self):
+        with self._lk:
+            self._save_locked()
+
+    # ── 상태 조회 ───────────────────────────────────────────────────────────────────────
+    def configured(self) -> bool:
+        return bool(self.keys)
+
+    def alive(self) -> List[str]:
+        return [k for k in self.keys if self._kid(k) not in self.dead]
+
+    @property
+    def exhausted(self) -> bool:
+        """살아 있는 키가 하나도 없다 = 오늘은 더 못 받는다(서버가 그렇게 답했다)."""
+        return bool(self.keys) and not self.alive()
+
+    def remaining_hint(self) -> int:
+        """남은 호출량 **추정치**. 계획·표시용이며 멈춤 판단에는 쓰지 않는다."""
+        tot = 0
+        for k in self.alive():
+            tot += max(0, DART_QUOTA_PER_KEY - DART_SOFT_RESERVE - self.used.get(self._kid(k), 0))
+        return tot
+
+    def acquire(self) -> Optional[str]:
+        """지금 써야 할 키. 소진된 키는 건너뛴다. 없으면 None."""
+        with self._lk:
+            for k in self.keys:
+                kid = self._kid(k)
+                if kid in self.dead:
+                    continue
+                if DART_SOFT_RESERVE > 0 and \
+                        self.used.get(kid, 0) >= DART_QUOTA_PER_KEY - DART_SOFT_RESERVE:
+                    continue                       # 예약분은 남긴다(사용자가 명시했을 때만)
+                return k
+            return None
+
+    def spend(self, key: str, n: int = 1):
+        if n <= 0:
+            return
+        kid = self._kid(key)
+        with self._lk:
+            self.used[kid] = self.used.get(kid, 0) + n
+            self.calls += n
+            self._since_save += n
+            over = self.used[kid] > DART_QUOTA_PER_KEY and kid not in self._warned_over
+            if self._since_save >= 200:
+                self._since_save = 0
+                self._save_locked()
+        if over:
+            self._warned_over.add(kid)
+            LOG.info(f"키 {self._mask(key)} 의 오늘 사용량이 공식 한도({DART_QUOTA_PER_KEY:,})를 "
+                     f"넘었는데도 서버가 정상 응답 중입니다 — 추정치보다 실제 잔량이 많다는 뜻이라 "
+                     f"계속 진행합니다(멈춤 판단은 서버의 020 응답으로만 합니다).")
+
+    def mark_exhausted(self, key: str, reason: str = "020"):
+        kid = self._kid(key)
+        with self._lk:
+            if kid in self.dead:
+                return
+            self.dead[kid] = str(reason)
+            if str(reason) in ("020", "021"):
+                # 서버가 한도 초과라고 했으니 오늘 이 키의 잔량은 0 이다. 기록을 진실에 맞춘다.
+                self.used[kid] = max(self.used.get(kid, 0), DART_QUOTA_PER_KEY)
+            n_alive = len([k for k in self.keys if self._kid(k) not in self.dead])
+            self._save_locked()
+        if str(reason) in ("020", "021"):
+            if n_alive:
+                LOG.info(f"키 {self._mask(key)} 일일 한도 소진(status={reason}) — "
+                         f"남은 키 {n_alive}개로 자동 전환합니다(추정 잔량 {self.remaining_hint():,}건).")
+            else:
+                LOG.warn(f"모든 DART 키의 오늘 한도가 소진되었습니다(status={reason}). "
+                         f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, 내일 같은 코드를 "
+                         f"다시 실행하면 정확히 이 지점부터 이어받습니다. "
+                         f"오늘 안에 끝내려면 키를 더 넣으세요 → DART_API_KEYS 에 나열하면 "
+                         f"가용량이 20,000 × 키개수 로 늘어납니다.")
+        else:
+            LOG.error(f"DART 키 {self._mask(key)} 사용 불가 status={reason} "
+                      f"({_dart_status_msg(reason)}) — 이 키를 제외하고 진행합니다.")
+
+    def report(self, title: str = "DART 호출량 (실시간)"):
+        if not self.keys:
+            LOG.info("DART 키가 없습니다 — DART 경로는 건너뜁니다.")
+            return
+        rows = []
+        for i, k in enumerate(self.keys, 1):
+            kid = self._kid(k)
+            u = self.used.get(kid, 0)
+            st = ("소진(020)" if self.dead.get(kid) in ("020", "021")
+                  else (f"제외({self.dead[kid]})" if kid in self.dead else "가용"))
+            rem = "-" if kid in self.dead else f"{max(0, DART_QUOTA_PER_KEY - u):,}"
+            rows.append([f"#{i} {self._mask(k)}", f"{u:,}", rem, st])
+        rows.append(["합계", f"{sum(self.used.values()):,}", f"{self.remaining_hint():,}", ""])
+        LOG.table(rows, ["키", "오늘 사용", "남은(추정)", "상태"], ["l", "r", "r", "l"],
+                  title=title)
+
+
+DKEY: Optional[DartKeyPool] = None
+
+
+def dart_pool() -> DartKeyPool:
+    """키 풀 싱글턴. VAULT 준비 이후 최초 호출 시점에 만들어진다(지연 초기화)."""
+    global DKEY
+    if DKEY is None:
+        DKEY = DartKeyPool()
+        globals()["DKEY"] = DKEY
+    return DKEY
+
+
+def dart_json(endpoint: str, params: dict, source: str = "dart",
+              tries: int = 2, _depth: int = 0) -> Optional[dict]:
+    """DART API 호출 1건. 키 선택·사용량 집계·020 자동 전환을 여기서 전담한다.
+
+    · endpoint 는 "list.json" 같은 상대경로도, 전체 URL 도 받는다.
+    · 반환 None 의 의미는 '이 요청은 쓸 데이터가 없다'이다. **중단 판단은 dart_pool().exhausted
+      로 하라.** (013 조회없음 과 020 한도소진 을 반환값으로 구분하지 않는다)
+    """
+    pool = dart_pool()
+    key = pool.acquire()
+    if not key:
+        return None
+    url = endpoint if str(endpoint).startswith("http") else \
+        (globals().get("DART_BASE") or DART_API_BASE) + str(endpoint)
+    p = dict(params or {})
+    p["crtfc_key"] = key
+    att = {"n": 0}
+    js = http_json(url, source=source, params=p, tries=tries,
+                   referer="https://opendart.fss.or.kr/",
+                   on_attempt=lambda: att.__setitem__("n", att["n"] + 1))
+    # ★ 실사용량 = 실제로 보낸 요청 수. http_get 내부 재시도까지 DART 한도를 깎는다.
+    pool.spend(key, max(1, att["n"]))
+    if not isinstance(js, dict):
+        return None
+    st = str(js.get("status", ""))
+    if st in ("020", "021", "010", "011", "012", "901"):
+        pool.mark_exhausted(key, st)
+        if _depth + 1 < len(pool.keys) and pool.acquire():
+            return dart_json(endpoint, params, source=source, tries=tries, _depth=_depth + 1)
+        return None
+    if st and st != "000":
+        if st != "013":
+            LOG.debug(f"DART status={st} ({_dart_status_msg(st)}) ep={endpoint}")
+        return None
+    return js
+
+
+def dart_plan_note(n_jobs: int, what: str) -> None:
+    """수집 계획과 실시간 잔량을 나란히 찍는다. '왜 오늘 다 못 받는가'를 숨기지 않는다."""
+    pool = dart_pool()
+    if not pool.configured():
+        return
+    rem = pool.remaining_hint()
+    LOG.info(f"{what}: 신규 호출 대상 {n_jobs:,}건 · 오늘 남은 추정 호출량 {rem:,}건 "
+             f"(키 {len(pool.alive())}/{len(pool.keys)}개 가용)")
+    if n_jobs > rem and rem >= 0:
+        need_keys = max(1, math.ceil(n_jobs / max(DART_QUOTA_PER_KEY, 1)))
+        LOG.warn(f"필요 호출({n_jobs:,})이 오늘 남은 추정 잔량({rem:,})보다 많습니다. "
+                 f"상한으로 미리 자르지 않고 서버가 한도초과(020)를 줄 때까지 받은 뒤 저장합니다. "
+                 f"중요도 순으로 정렬돼 있어 중간에 끊겨도 쓸모 있는 구간부터 채워집니다. "
+                 f"하루에 끝내려면 DART 키를 {need_keys}개까지 늘려 DART_API_KEYS 에 넣으세요.")
+
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L1-A  종목 마스터 & PIT 유니버스 (C2 생존자편향 제거)                                     ║
@@ -2956,15 +3245,18 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 
 # ── 개별 소스 ───────────────────────────────────────────────────────────────────────────────
 def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if pykrx_stock is None:
+    if pykrx_stock is None or not px_gate_open("pykrx"):
         return None
     try:
         limiter("krx").wait()
         d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
+        px_gate_mark("pykrx", False)
         return None
     if d is None or len(d) == 0:
+        px_gate_mark("pykrx", False)
         return None
+    px_gate_mark("pykrx", True)
     d = d.reset_index()
     ren = {"날짜": "date", "시가": "open", "고가": "high", "저가": "low",
            "종가": "close", "거래량": "volume", "거래대금": "amount"}
@@ -2976,15 +3268,18 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 
 def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if fdr is None:
+    if fdr is None or not px_gate_open("fdr"):
         return None
     try:
         limiter("krx").wait()
         d = fdr.DataReader(code, start, end)
     except Exception:
+        px_gate_mark("fdr", False)
         return None
     if d is None or len(d) == 0:
+        px_gate_mark("fdr", False)
         return None
+    px_gate_mark("fdr", True)
     d = d.reset_index()
     d.columns = [str(c).lower() for c in d.columns]
     if "date" not in d.columns:
@@ -2998,12 +3293,15 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """네이버 차트 API. 폴백 중에서는 가장 안정적이지만 거래대금이 없다."""
+    if not px_gate_open("naver"):
+        return None
     qs = (f"?symbol={code}&requestType=1&startTime={as_ts(start):%Y%m%d}"
           f"&endTime={as_ts(end):%Y%m%d}&timeframe=day")
     arr = None
     for host in ("https://fchart.stock.naver.com/siseJson.naver",
                  "https://api.finance.naver.com/siseJson.naver"):
-        t = http_get(host + qs, source="naver", tries=2, referer="https://finance.naver.com/")
+        t = http_get(host + qs, source="naver_chart", tries=2,
+                     referer="https://finance.naver.com/")
         if not t:
             continue
         # 응답이 파이썬 리터럴에 가까운 준-JSON 이다: 홑따옴표 + 따옴표 없는 키워드
@@ -3019,7 +3317,9 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
             break
         arr = None
     if not isinstance(arr, list) or len(arr) < 2:
+        px_gate_mark("naver", False)
         return None
+    px_gate_mark("naver", True)
     hdr = [str(x).strip().lower() for x in arr[0]]
     rows = [r for r in arr[1:] if isinstance(r, (list, tuple)) and len(r) == len(hdr)]
     if not rows:
@@ -3045,17 +3345,71 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+# ── 소스 서킷브레이커 ───────────────────────────────────────────────────────────────────────
+#   ★ 실측 사고: 5,398종목 × 폴백 4단 × yfinance 접미사 2종 = 최대 1만회 이상의 야후 요청이
+#     발생해 YFRateLimitError → DNS 해석 실패(query2.finance.yahoo.com)까지 번졌고,
+#     P0.PX 한 단계에서만 60분을 태웠다. 실패가 누적되는데도 계속 두드린 것이 원인이다.
+#   → 소스별로 '연속 실패'를 세고 임계치를 넘으면 **이번 실행 동안 그 소스를 끈다.**
+#     성공하면 카운터는 0으로 돌아가므로 일시적 흔들림으로는 꺼지지 않는다.
+PRICE_SRC_TRIP = {"yfinance": 30, "fdr": 60, "pykrx": 40, "naver": 80}
+_PX_GATE: Dict[str, dict] = {}
+_PX_GATE_LK = threading.Lock()
+
+
+def px_gate_reset():
+    with _PX_GATE_LK:
+        _PX_GATE.clear()
+
+
+def px_gate_open(src: str) -> bool:
+    """이 소스를 지금 써도 되는가."""
+    with _PX_GATE_LK:
+        return not _PX_GATE.get(src, {}).get("off", False)
+
+
+def px_gate_mark(src: str, ok: bool, reason: str = ""):
+    trip = PRICE_SRC_TRIP.get(src, 50)
+    fire = False
+    with _PX_GATE_LK:
+        st = _PX_GATE.setdefault(src, {"miss": 0, "off": False, "why": ""})
+        if ok:
+            st["miss"] = 0
+            return
+        st["miss"] += 1
+        if not st["off"] and st["miss"] >= trip:
+            st["off"], st["why"] = True, (reason or f"연속 실패 {st['miss']}회")
+            fire = True
+    if fire:
+        LOG.warn(f"가격소스 '{src}' 를 이번 실행에서 차단합니다 — {reason or f'연속 실패 {trip}회'}. "
+                 f"남은 소스로 계속 진행하며, 어떤 소스가 몇 종목을 채웠는지는 감사표에 나옵니다. "
+                 f"(계속 두드리면 IP 차단·속도저하만 커집니다)")
+
+
+_YF_SUFFIX = {"KOSPI": ".KS", "KOSDAQ": ".KQ", "KONEX": ".KQ"}
+_PX_MARKET_HINT: Dict[str, str] = {}       # code -> 'KOSPI'|'KOSDAQ' (fetch_prices 가 채운다)
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if yf is None:
+    """★ 접미사를 '두 개 다' 시도하던 것을 종목 마스터의 시장으로 1회만 시도하도록 바꿨다.
+    한국 폐지주는 야후에 사실상 없으므로, 2배 요청은 순수 낭비이자 레이트리밋의 직접 원인이었다."""
+    if yf is None or not px_gate_open("yfinance"):
         return None
-    for suf in (".KS", ".KQ"):
+    mkt = _PX_MARKET_HINT.get(code, "")
+    sufs = [_YF_SUFFIX[mkt]] if mkt in _YF_SUFFIX else [".KS"]
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
                             auto_adjust=False, threads=False)
-        except Exception:
+        except Exception as e:
+            msg = str(e)
+            if re.search(r"RateLimit|Too Many Requests|Could not resolve host|429", msg, re.I):
+                px_gate_mark("yfinance", False, "레이트리밋/DNS 실패")
+            else:
+                px_gate_mark("yfinance", False)
             continue
         if d is None or len(d) == 0:
+            px_gate_mark("yfinance", False)
             continue
         if isinstance(d.columns, pd.MultiIndex):
             d.columns = [str(c[0]).lower() for c in d.columns]
@@ -3068,15 +3422,114 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         d["amount"] = pd.to_numeric(d.get("close"), errors="coerce") * \
             pd.to_numeric(d.get("volume"), errors="coerce")
         d["code"], d["src"] = code, "yfinance"
+        px_gate_mark("yfinance", True)
         return d.reindex(columns=PRICE_COLS)
     return None
 
 
-PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
+# ★ 체인 순서가 곧 실행시간이다.
+#   (구) pykrx → fdr → naver → yfinance : pykrx 는 종목당 KRX 호출 1건이고 QPS 상한 2.0 이라
+#        5,398종목이면 그것만으로 45분이 확정된다. 게다가 실패하면 fdr·naver·yfinance 를 또 탄다.
+#   (신) naver → fdr → pykrx → yfinance : 네이버 차트는 10년치를 **한 번의 요청**으로 주고
+#        QPS 1.5 에 워커 8이라 대부분 종목이 1회 호출로 끝난다. KRX 는 검증·보강용으로 뒤로 뺀다.
+PRICE_CHAIN = [("naver", _px_naver), ("fdr", _px_fdr), ("pykrx", _px_pykrx), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+def price_targets(codes: Sequence[str], sec: Optional[pd.DataFrame],
+                  start: str, end: str) -> Tuple[List[str], Dict[str, Tuple[str, str]]]:
+    """'가격을 받을 가치가 있는 종목'만 남기고, 종목별 요청 구간까지 좁힌다.
+
+    ★ 실측 사고의 두 번째 원인. 종목마스터 5,398개를 그대로 넘기면 그 안에는
+        · 1956~2015 사이에 이미 폐지되어 백테스트 구간에 존재조차 않는 종목
+        · 우선주(보통주와 같은 기업, 유니버스에서 정적 배제됨)
+        · 외국주·리츠·선박투자회사·스팩(9xxxxx / 8자리 코드 등)
+      이 대량으로 섞여 있다. 이들은 **어느 소스에도 데이터가 없거나, 있어도 안 쓴다.**
+      전 소스 폴백을 헛돌리는 비용만 남는다.
+
+    ★ 생존자편향 주의: 여기서 거르는 기준은 '수익률에 유리한가'가 아니라
+      **'백테스트 구간과 상장구간이 겹치는가'** 뿐이다. 구간이 겹치면 폐지 종목도
+      전부 남긴다(오히려 그게 생존자편향 방어의 핵심이다). 상장일·폐지일을 모르면
+      근거가 없으므로 **버리지 않고 남긴다.**
+    """
+    s_ts, e_ts = as_ts(start), as_ts(end)
+    codes = sorted({c for c in map(to_code6, codes) if c})
+    win: Dict[str, Tuple[str, str]] = {}
+    if sec is None or not len(sec) or "code" not in sec.columns:
+        return codes, {c: (start, end) for c in codes}
+
+    m = sec.dropna(subset=["code"]).copy()
+    m["code"] = m["code"].astype(str).map(to_code6)
+    m = m.dropna(subset=["code"]).drop_duplicates("code").set_index("code")
+    ld = as_ts_series(m["listing_date"]) if "listing_date" in m.columns else None
+    dd = as_ts_series(m["delisting_date"]) if "delisting_date" in m.columns else None
+    mk = m["market"].astype(str) if "market" in m.columns else None
+    nm = m["name"].astype(str) if "name" in m.columns else None
+
+    keep: List[str] = []
+    n_dead, n_future, n_pref, n_nonstd = 0, 0, 0, 0
+    for c in codes:
+        if not re.fullmatch(r"\d{6}", c):
+            n_nonstd += 1
+            continue
+        nmv = str(nm.get(c, "")) if nm is not None else ""
+        # ★ 우선주 판정은 직접 정규식을 새로 쓰지 않는다. '이름이 우로 끝나면 우선주'는
+        #   '미래에셋대우' 같은 보통주를 통째로 날려 버리는 오탐을 낳는다(실제로 걸렸다).
+        #   유니버스에서 이미 쓰고 있는 검증된 판정기를 그대로 재사용하고, 그 함수가 없는
+        #   조립본(TCD v2)에서는 **코드 끝자리 규칙만** 보수적으로 적용한다.
+        _isp = globals().get("ncq_is_preferred")
+        if callable(_isp):
+            pref = bool(_isp(c, nmv))
+        else:
+            pref = (c[:5].isdigit() and c[5] in ("5", "7", "9"))
+        if pref:
+            n_pref += 1
+            continue
+        d = dd.get(c) if dd is not None else None
+        if d is not None and pd.notna(d) and d < s_ts:
+            n_dead += 1                       # 백테스트 시작 전에 이미 폐지 → 등장 불가
+            continue
+        l = ld.get(c) if ld is not None else None
+        if l is not None and pd.notna(l) and l > e_ts:
+            n_future += 1                     # 백테스트 종료 후 상장 → 등장 불가
+            continue
+        st = start
+        if l is not None and pd.notna(l) and l > s_ts:
+            st = (l - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+        en = end
+        if d is not None and pd.notna(d) and d < e_ts:
+            en = (d + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        win[c] = (st, en)
+        keep.append(c)
+        if mk is not None:
+            v = str(mk.get(c, "")).upper()
+            if "KOSPI" in v or v == "STK":
+                _PX_MARKET_HINT[c] = "KOSPI"
+            elif "KOSDAQ" in v or v == "KSQ":
+                _PX_MARKET_HINT[c] = "KOSDAQ"
+
+    LOG.table([["종목 마스터 전체", f"{len(codes):,}", "-"],
+               ["비표준 코드 제외", f"-{n_nonstd:,}", "6자리 숫자가 아님(외국주·ETN 등)"],
+               ["우선주·스팩 제외", f"-{n_pref:,}", "유니버스에서 어차피 정적 배제"],
+               ["구간 전 폐지 제외", f"-{n_dead:,}", f"{start} 이전 폐지 → 백테스트에 등장 불가"],
+               ["구간 후 상장 제외", f"-{n_future:,}", f"{end} 이후 상장 → 백테스트에 등장 불가"],
+               ["실제 가격수집 대상", f"{len(keep):,}",
+                f"절감 {100*(1-len(keep)/max(len(codes),1)):.0f}%"]],
+              ["가격수집 대상 축소", "종목수", "근거"], ["l", "r", "l"],
+              title="가격 수집 대상 축소 (헛수고를 먼저 걷어낸다)")
+    return keep, win
+
+
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장.
+
+    sec 를 주면 ① 수집 대상을 상장구간이 겹치는 종목으로 좁히고 ② 종목별 요청 구간을
+    상장~폐지로 잘라내며 ③ yfinance 접미사를 시장으로 1회만 고른다.
+    """
+    px_gate_reset()
+    _win: Dict[str, Tuple[str, str]] = {}
+    if sec is not None:
+        codes, _win = price_targets(codes, sec, start, end)
     codes = sorted({c for c in map(to_code6, codes) if c})
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
@@ -3088,7 +3541,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         have_max, have_min = g.max().to_dict(), g.min().to_dict()
         LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
-    start_ts, end_ts = as_ts(start), as_ts(end)
+    end_ts = as_ts(end)
 
     # ── 시도 원장 (음성 캐시) ─────────────────────────────────────────────────────────────
     #  ★ 폐지 종목과 '어느 소스에도 없는 종목'은 매 실행마다 전 소스 체인을 헛돌게 만든다.
@@ -3118,22 +3571,24 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     todo, n_back, n_fwd, n_skip = [], 0, 0, 0
     for c in codes:
+        c_st, c_en = _win.get(c, (start, end))       # 종목별 상장~폐지로 좁혀진 구간
         mx, mn = have_max.get(c), have_min.get(c)
+        c_st_ts, c_en_ts = as_ts(c_st), as_ts(c_en)
         if mx is None:
-            if _recently_failed(c, start_ts):
+            if _recently_failed(c, c_st_ts):
                 n_skip += 1
                 continue
-            todo.append((c, start))
+            todo.append((c, c_st, c_en))
             continue
         # ★ 과거 방향 백필을 반드시 함께 본다.
         #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
         #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
         #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
-            todo.append((c, start))
+        if mn is not None and mn > c_st_ts + pd.Timedelta(days=10):
+            todo.append((c, c_st, c_en))
             n_back += 1
-        elif mx < end_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+        elif mx < c_en_ts - pd.Timedelta(days=5):
+            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), c_en))
             n_fwd += 1
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
@@ -3152,10 +3607,12 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
         def _one(job):
-            code, st = job
+            code, st, en = job
             for nm, fn in PRICE_CHAIN:
+                if not px_gate_open(nm):
+                    continue           # 차단된 소스는 아예 두드리지 않는다(레이트리밋 확산 차단)
                 try:
-                    d = fn(code, st, end)
+                    d = fn(code, st, en)
                 except Exception:
                     d = None
                 if d is not None and len(d):
@@ -3164,9 +3621,23 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                         return d
             return None
 
-        res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
+        # ★ 청크 단위로 돌리고 중간 결과를 그때그때 원장에 남긴다.
+        #   30분짜리 단계가 통째로 날아가서 다음 실행이 처음부터 다시 하는 일을 막는다.
+        #   (사용자가 가장 싫어하는 '쓸데없는 가격조회 반복'의 마지막 원인)
+        CH_PX = 1000
+        res: List[Optional[pd.DataFrame]] = []
+        for k0 in range(0, len(todo), CH_PX):
+            chunk = todo[k0:k0 + CH_PX]
+            res.extend(pmap_io(_one, chunk, workers=min(N_WORKERS_IO, 12),
+                               desc=f"일봉 수집 {k0 // CH_PX + 1}/{(len(todo) - 1) // CH_PX + 1}"))
+            alive = [nm for nm, _ in PRICE_CHAIN if px_gate_open(nm)]
+            if not alive:
+                LOG.warn(f"살아 있는 가격소스가 하나도 없습니다 — 남은 {len(todo)-len(res):,}종목 수집을 "
+                         f"중단하고 지금까지 받은 것만 저장합니다. 잠시 후 재실행하면 이어받습니다.")
+                res.extend([None] * (len(todo) - len(res)))
+                break
         failed = []
-        for (c, st), d in zip(todo, res):
+        for (c, st, _en), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
@@ -3185,6 +3656,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                         .drop_duplicates("code", keep="last").reset_index(drop=True))
             VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
                             source="fetch_prices:negative_cache")
+        _off = [k for k, v in _PX_GATE.items() if v.get("off")]
+        if _off:
+            LOG.warn(f"이번 실행에서 차단된 가격소스: {', '.join(_off)}. "
+                     f"차단 이후의 실패는 '그 종목에 데이터가 없다'는 근거가 되지 못하므로 "
+                     f"음성 캐시가 다음 실행을 영구히 막지 않도록 30일 후 재시도됩니다.")
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
@@ -3328,13 +3804,12 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
 # ║    rcept_no 가 없으면 법정 제출기한(분기 45일 / 사업보고서 90일)으로 보수적 추정한다.       ║
 # ║    ※ 보수적 추정은 '늦게 알았다'는 방향이므로 미래누수를 만들지 않는다.                     ║
 # ║                                                                                          ║
-# ║  ★ 호출 예산: DART 는 일 20,000건 제한. 10년 분기 전체 재무제표는 그 몇 배다.               ║
-# ║    → 콜드빌드는 며칠에 걸쳐 '이어받기'로 완성된다(§3: 콜드빌드는 4시간 예산 밖).            ║
-# ║    → 남은 호출량을 실시간으로 표시하고, 한도에 닿으면 깨끗하게 멈춘 뒤 진행률을 알려준다.   ║
+# ║  ★ 호출 예산: 상한을 미리 정하지 않는다(L0-D DartKeyPool).                                 ║
+# ║    남은 호출량을 실시간으로 추적해 그만큼 쓰고, 서버가 020(한도초과)을 줄 때 비로소 멈춘다. ║
+# ║    키가 여러 개면 020 을 받은 키만 소진 처리하고 다음 키로 자동 전환한다(20,000 × 키개수).  ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 DART_BASE = "https://opendart.fss.or.kr/api/"
-DART_DAILY_LIMIT = 19_000                 # 공식 20,000 대비 여유
 DART_STATEMENT_FREQ = "quarterly"         # "quarterly" | "annual"
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
 REPRT_DEADLINE_DAYS = {"11013": 45, "11012": 45, "11014": 45, "11011": 90}
@@ -3350,56 +3825,40 @@ DART_STATUS_MSG = {
 
 
 class DartBudget:
-    """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다."""
+    """L0-D DartKeyPool 로 가는 얇은 호환 껍데기.
+
+    예전 구현은 '일일 한도를 19,000 으로 가정하고 미리 자르는' 게이트였다. 그 가정이 틀리면
+    (오늘 이미 썼거나 / 키가 여러 개거나) 남은 호출량을 통째로 버렸다. 이제 상한은 없다.
+    잔량은 실시간으로 계산해 보여주고, 멈춤은 서버의 020 응답으로만 결정한다.
+    """
 
     def __init__(self):
-        self.today = _dt.date.today().isoformat()
-        self.n = 0
-        self.exhausted = False
-        self._lk = threading.Lock()
-        self._load()
+        self.pool = dart_pool()
 
-    def _path(self) -> str:
-        return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
+    @property
+    def n(self) -> int:
+        return int(sum(self.pool.used.values()))
 
-    def _load(self):
-        try:
-            j = json.loads(open(self._path()).read())
-            if j.get("date") == self.today:
-                self.n = int(j.get("n", 0))
-        except Exception:
-            pass
-        if self.n:
-            LOG.info(f"오늘 이미 사용한 DART 호출 {self.n:,}건 (한도 {DART_DAILY_LIMIT:,}) — 이어서 진행합니다.")
+    @property
+    def exhausted(self) -> bool:
+        return self.pool.exhausted
 
-    def _save(self):
-        try:
-            atomic_write_text(self._path(), json.dumps({"date": self.today, "n": self.n}))
-        except Exception:
-            pass
+    @exhausted.setter
+    def exhausted(self, v):                  # 예전 코드가 직접 대입하던 자리 (무해하게 흡수)
+        pass
 
-    def refund(self, k: int = 1):
-        if k <= 0:
-            return
-        with self._lk:
-            self.n = max(0, self.n - k)
+    def remaining(self) -> int:
+        return self.pool.remaining_hint()
 
     def take(self, k: int = 1) -> bool:
-        with self._lk:
-            if self.n + k > DART_DAILY_LIMIT:
-                if not self.exhausted:
-                    self.exhausted = True
-                    LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
-                             f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
-                             f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
-                return False
-            self.n += k
-            if self.n % 500 == 0:
-                self._save()
-            return True
+        return self.pool.acquire() is not None
+
+    def refund(self, k: int = 1):
+        pass
 
     def close(self):
-        self._save()
+        self.pool.save()
+        self.pool.report()
 
 
 DBUDGET: Optional[DartBudget] = None
@@ -3407,36 +3866,13 @@ DBUDGET: Optional[DartBudget] = None
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2) -> Optional[dict]:
-    """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
-    호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
-    → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
-    if not DART_API_KEY:
-        return None
-    if DBUDGET is not None and not DBUDGET.take(tries):
-        return None
-    p = dict(params)
-    p["crtfc_key"] = DART_API_KEY
-    attempts = {"n": 0}
-    js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
-                   referer="https://opendart.fss.or.kr/", on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
-    if DBUDGET is not None:
-        DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
-    if not isinstance(js, dict):
-        return None
-    st = str(js.get("status", ""))
-    if st and st != "000":
-        if st in ("020", "021"):
-            if DBUDGET is not None:
-                DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
-        elif st in ("010", "011", "012", "901"):
-            LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
-                      f"DART_API_KEY 를 확인하세요.")
-        elif st != "013":
-            LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
-        return None
-    return js
+    """DART 호출 1건. 키 선택·실사용량 집계·020 자동 키전환은 dart_json 이 전담한다.
+
+    ★ 실사용량 주의: http_get 은 내부적으로 최대 `tries` 회 **실제** 요청을 보낸다.
+      호출당 1건으로 세면 실사용량을 최대 tries 배 과소집계한다 → dart_json 이 on_attempt 로
+      실제 시도 횟수를 세어 반영한다(추정이 아니라 실측).
+    """
+    return dart_json(endpoint, params, source=source, tries=tries)
 
 
 def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Timestamp:
@@ -3565,7 +4001,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
 
     reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
               else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
-    # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
+    # ★ 수집 순서가 중요하다. 잔량 소진으로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
@@ -3576,14 +4012,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
-        total_needed = len(jobs)
-        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
-                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
-        if total_needed > DART_DAILY_LIMIT:
-            LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
-                     f"오늘 받을 수 있는 만큼 받고 저장합니다. "
-                     f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
-                     f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
+        dart_plan_note(len(jobs), "DART 재무제표")
         res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
         got = [d for d in res if d is not None and len(d)]
     else:

@@ -211,11 +211,45 @@ def _ncq_drive_candidates() -> List[str]:
         os.path.join(home, "GoogleDrive", "MyDrive", leaf),
         os.path.join(home, "Google 드라이브", "내 드라이브", leaf),
     ]
-    # 윈도우 드라이브 문자 마운트 (구글 드라이브 데스크톱 기본 G:)
-    for dl in ("G:", "H:", "I:"):
-        cands.append(os.path.join(dl + os.sep, "내 드라이브", leaf))
-        cands.append(os.path.join(dl + os.sep, "My Drive", leaf))
-    return [c for c in cands if c]
+    # ── 윈도우 ─────────────────────────────────────────────────────────────────────────
+    #  구글 드라이브 데스크톱은 설치 시점·버전·사용자 설정에 따라 마운트 위치가 제각각이다.
+    #  (기본 G: 였다가 이미 쓰이는 문자면 H:, I: … 로 밀리고, '스트리밍' 대신 '미러링'을
+    #   고르면 %USERPROFILE% 아래로 들어간다). G/H/I 만 보고 포기하면 실제로 드라이브가
+    #  있는데도 로컬 폴백으로 떨어져 **캐시가 세션마다 증발**한다(실측 사고).
+    #  → 존재하는 모든 드라이브 문자를 훑고, 한글/영문 표기와 미러링 경로를 함께 본다.
+    if os.name == "nt":
+        letters = [f"{chr(x)}:" for x in range(ord("D"), ord("Z") + 1)]
+    else:
+        letters = []
+    for dl in letters:
+        base = dl + os.sep
+        try:
+            if not os.path.isdir(base):
+                continue
+        except Exception:
+            continue
+        for mid in ("내 드라이브", "My Drive", "내 드라이브 (스트리밍)", ""):
+            cands.append(os.path.join(base, mid, leaf) if mid else os.path.join(base, leaf))
+    for mid in ("내 드라이브", "My Drive"):
+        cands.append(os.path.join(home, mid, leaf))
+        cands.append(os.path.join(home, "Google Drive", mid, leaf))
+    # macOS CloudStorage (드라이브 데스크톱 v70+)
+    cs = os.path.join(home, "Library", "CloudStorage")
+    try:
+        if os.path.isdir(cs):
+            for d in sorted(os.listdir(cs)):
+                if d.lower().startswith("googledrive"):
+                    for mid in ("My Drive", "내 드라이브"):
+                        cands.append(os.path.join(cs, d, mid, leaf))
+    except Exception:
+        pass
+    seen, out = set(), []
+    for c in cands:
+        c = str(c or "").strip()
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
 
 
 def resolve_gdrive_root() -> str:
@@ -262,9 +296,17 @@ def resolve_gdrive_root() -> str:
     G["GDRIVE_ROOT"] = root
     manifest_put("gdrive_root", root)
     manifest_put("gdrive_root_mode", "LOCAL_FALLBACK")
-    LOG.warn(f"구글드라이브를 찾지 못해 로컬 캐시를 사용합니다: {root}\n"
-             f"    드라이브를 쓰려면 상단 GDRIVE_ROOT 에 경로를 직접 적어주세요 "
-             f"(예: r\"G:\\내 드라이브\\tcd_cache\").")
+    # ★ 절대 1원칙(공용/전용 인덱스는 드라이브에 영속)에 직결되는 실패다. 어디를 찾아봤는지
+    #   숨기지 않고 전부 보여준다 — 그래야 사용자가 한 줄만 고쳐서 되살릴 수 있다.
+    _tried = _ncq_drive_candidates()[:14]
+    LOG.warn(f"구글드라이브를 찾지 못해 **로컬 캐시**를 사용합니다: {root}\n"
+             f"    ⚠ 이 상태에서는 공용/전용 인덱스가 이 PC 안에만 쌓이고 다른 전략·다른 PC 와\n"
+             f"      공유되지 않습니다. 재수집 비용이 매 실행 반복됩니다.\n"
+             f"    ▶ 해결: 코드 상단 GDRIVE_ROOT 에 경로를 직접 적으세요.\n"
+             f"       예) GDRIVE_ROOT = r\"G:\\내 드라이브\\tcd_cache\"\n"
+             f"       (탐색기 주소창에서 '내 드라이브' 폴더 경로를 그대로 복사해 붙여넣고\n"
+             f"        맨 뒤에 \\tcd_cache 를 붙이면 됩니다. 폴더는 코드가 만듭니다)")
+    LOG.info("자동 탐색한 후보 경로(상위 14개): " + " | ".join(_tried))
     return root
 
 

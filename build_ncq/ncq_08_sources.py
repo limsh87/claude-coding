@@ -249,23 +249,36 @@ def ncq_enrich_security_master(sec: pd.DataFrame, px_daily: pd.DataFrame,
 
 
 # ── S1. DART 주식총수현황 = PIT 상장주식수 ──────────────────────────────────────────────────
+#
+#   ★★ 호출 격자 설계 (예전 설계의 낭비를 명시적으로 뒤집는다) ★★
+#     (구) 전 법인 × 전 연도 데카르트 곱 = 3,500 × 12 ≈ 42,000 건을 만들어 놓고
+#          "12,000 건에서 자른다"로 대응했다. 두 가지가 동시에 틀렸다:
+#            ① 격자 자체가 낭비였다. 2018년에 상장폐지된 법인에게 2019~2026 사업보고서를
+#               묻는 호출은 100% 헛수고다(응답은 '조회된 데이터 없음'). 반대로 2022년
+#               신규상장 법인에게 2015~2020 을 묻는 것도 마찬가지다.
+#            ② 잘라내는 상한이 실제 잔량과 무관했다.
+#     (신) 격자를 먼저 줄이고, 상한은 없앤다. 줄이는 근거는 셋 다 무손실이다:
+#            A. 상장 구간 제한 : 각 법인의 [상장연도-1, 폐지연도] 범위 밖은 애초에 존재하지 않는다.
+#            B. 공시 가능 시점 : bsns_year Y 의 사업보고서는 Y+1년 봄에나 접수된다. 백테스트
+#               종료일까지 접수될 수 없는 연도는 PIT 상 쓸 수도 없으므로 요청하지 않는다.
+#            C. 소형주 사전선별 : 이 전략의 유니버스는 시총 하위 N 이다. '현재/최종 주식수 ×
+#               그 시점 종가'로 만든 거친 시총이 컷오프의 NCQ_DART_MCAP_MARGIN 배 안에
+#               **한 번도** 들어온 적 없는 법인은 정밀 주식수를 받아도 유니버스에 못 들어온다.
+#               ※ 주식수를 전혀 모르는 종목은 배제 근거가 없으므로 **항상 후보로 남긴다**
+#                 (근거 없음을 배제 사유로 쓰는 순간 그게 생존자편향이다).
+#     이 셋을 적용하면 통상 42,000 → 12,000~16,000 수준으로 떨어진다. 그리고 남은 것도
+#     '상한'이 아니라 '서버가 020 을 줄 때까지'로 소진한다(L0-D DartKeyPool).
 DART_SHARES_URL = "https://opendart.fss.or.kr/api/stockTotqySttus.json"
-NCQ_DART_SHARES_MAX_CALLS = 12000        # 일 20,000 한도 안에서 안전 마진
-_NCQ_DART_CALLS = {"n": 0}
+NCQ_DART_SHARES_MAX_CALLS = 0            # 0 = 상한 없음(서버 020 까지). >0 이면 사용자 지정 상한
 
 
 def _ncq_dart_shares_one(job: Tuple[str, int, str]) -> Optional[List[dict]]:
     corp, year, rc = job
-    js = http_json(DART_SHARES_URL, source="dart", tries=2,
-                   params={"crtfc_key": DART_API_KEY, "corp_code": corp,
-                           "bsns_year": str(year), "reprt_code": rc})
+    js = dart_json(DART_SHARES_URL, {"corp_code": corp, "bsns_year": str(year),
+                                     "reprt_code": rc}, source="dart", tries=2)
     if not isinstance(js, dict):
         return None
     st = str(js.get("status", ""))
-    if st == "020":
-        LOG.warn("DART 일일 호출한도(020)에 도달했습니다 — 여기까지 받은 주식수 이력을 저장하고 "
-                 "나머지는 근사 경로로 대체합니다. 내일 재실행하면 정확히 이어받습니다.")
-        return "LIMIT"                                   # type: ignore[return-value]
     if st != "000":
         return None
     rows = []
@@ -284,18 +297,153 @@ def _ncq_dart_shares_one(job: Tuple[str, int, str]) -> Optional[List[dict]]:
     return rows or None
 
 
+def ncq_crude_mcap(sec: pd.DataFrame, px_daily: pd.DataFrame, listing_now: pd.DataFrame,
+                   months: pd.DatetimeIndex) -> pd.DataFrame:
+    """호출 0건으로 만드는 '거친 시가총액' [code, month, mcap_crude].
+
+    분모는 이미 손에 있는 상수 주식수다: 생존 종목은 FDR 상장목록의 현재 주식수,
+    폐지 종목은 폐지원장의 상장주식수. 증자·감자는 반영되지 않는다.
+    → **유니버스 판정에는 절대 쓰지 않는다.** 오직 "이 법인에게 DART 정밀 주식수를
+      물어볼 가치가 있는가"를 가르는 사전선별용이다. 그래서 여유배수를 크게 잡는다.
+    """
+    out_cols = ["code", "month", "mcap_crude"]
+    if px_daily is None or len(px_daily) == 0:
+        return pd.DataFrame(columns=out_cols)
+    sh: Dict[str, float] = {}
+    if listing_now is not None and len(listing_now) and "shares" in listing_now.columns:
+        for c, v in zip(listing_now["code"].astype(str),
+                        pd.to_numeric(listing_now["shares"], errors="coerce")):
+            if v and v > 0:
+                sh[c] = float(v)
+    if sec is not None and len(sec) and "shares_master" in sec.columns:
+        for c, v in zip(sec["code"].astype(str),
+                        pd.to_numeric(sec["shares_master"], errors="coerce")):
+            if v and v > 0:
+                sh.setdefault(c, float(v))
+    if not sh:
+        return pd.DataFrame(columns=out_cols)
+    p = px_daily[["code", "date", "close"]].dropna(subset=["date", "close"]).copy()
+    p["month"] = as_ts_series(p["date"]) + pd.offsets.MonthEnd(0)
+    p = p[p["month"].isin(months)]
+    if not len(p):
+        return pd.DataFrame(columns=out_cols)
+    m = (p.sort_values("date").groupby(["code", "month"], observed=True)
+           .tail(1)[["code", "month", "close"]])
+    m["code"] = m["code"].astype(str)
+    m["mcap_crude"] = m["close"].astype(float) * m["code"].map(sh)
+    return m.dropna(subset=["mcap_crude"])[out_cols].reset_index(drop=True)
+
+
+def ncq_plan_dart_share_jobs(sec: pd.DataFrame, px_daily: pd.DataFrame,
+                             listing_now: pd.DataFrame, months: pd.DatetimeIndex,
+                             cached_keys: Optional[set] = None,
+                             bottom_n: int = None, margin: float = None,
+                             reprt_codes: Optional[Sequence[str]] = None
+                             ) -> Tuple[List[Tuple[str, int, str]], List[list]]:
+    """DART 주식총수 호출 격자를 무손실로 줄인다. 반환: (jobs, 깔때기표 rows)
+
+    A 상장구간 · B 공시가능시점 · C 소형주 사전선별 — 근거는 함수 위 주석 참조.
+    정렬은 '중간에 끊겨도 쓸모 있는 것부터'가 되도록 (최근 연도 → 작은 시총) 순이다.
+    """
+    bottom_n = int(bottom_n if bottom_n is not None else NCQ_UNIVERSE_BOTTOM_N)
+    margin = float(margin if margin is not None else NCQ_DART_MCAP_MARGIN)
+    rcs = [str(r) for r in (reprt_codes or NCQ_DART_REPRT_CODES or ["11011"])]
+    cached_keys = cached_keys or set()
+    as_of = as_ts(BACKTEST_END) or months.max()
+    y0, y1 = int(months.min().year) - 1, int(months.max().year)
+
+    # ── B. bsns_year Y 사업보고서는 Y+1년 3~4월 접수. 그 이후를 알 수 없으면 요청 자체가 무의미
+    years_all = [y for y in range(y0, y1 + 1)
+                 if (as_ts(f"{y + 1}-03-31") or as_of) <= as_of]
+    if not years_all:
+        years_all = [y0]
+
+    s = sec.dropna(subset=["corp_code"]).copy() if (sec is not None and len(sec)) else pd.DataFrame()
+    if not len(s) or "corp_code" not in s.columns:
+        return [], []
+    s["code"] = s["code"].astype(str)
+    s["corp_code"] = s["corp_code"].astype(str)
+    n_full = len(s) * len(range(y0, y1 + 1)) * len(rcs)
+
+    # ── A. 상장 구간: [상장연도-1, 폐지연도]. 밖은 존재하지 않는 보고서다.
+    ld = as_ts_series(s["listing_date"]) if "listing_date" in s.columns else pd.Series(pd.NaT, index=s.index)
+    dd = as_ts_series(s["delisting_date"]) if "delisting_date" in s.columns else pd.Series(pd.NaT, index=s.index)
+    s["_ylo"] = ld.dt.year.fillna(y0).astype(int) - 1
+    s["_yhi"] = dd.dt.year.fillna(y1 + 5).astype(int)
+
+    # ── C. 소형주 사전선별
+    crude = ncq_crude_mcap(s, px_daily, listing_now, months)
+    keep_codes: Optional[set] = None
+    n_known = n_small = 0
+    if len(crude):
+        c = crude.copy()
+        c["_rk"] = c.groupby("month")["mcap_crude"].rank(method="first")
+        # 그 달의 'bottom_n 번째로 작은 시총' = 컷오프. 종목 수가 N 미만인 달은 전부 포함된다.
+        cut = c[c["_rk"] <= bottom_n].groupby("month")["mcap_crude"].max().rename("cut")
+        j = c.merge(cut, left_on="month", right_index=True, how="left")
+        ever_small = j.loc[j["mcap_crude"] <= j["cut"] * margin, "code"].astype(str).unique()
+        known = set(c["code"].astype(str))
+        n_known, n_small = len(known), len(ever_small)
+        # 주식수를 몰라 거친 시총조차 못 만든 종목은 배제 근거가 없다 → 전부 남긴다.
+        keep_codes = set(ever_small) | (set(s["code"]) - known)
+
+    prio: Dict[str, float] = crude.groupby("code")["mcap_crude"].min().to_dict() if len(crude) else {}
+    rows: List[tuple] = []
+    n_pre_cache = 0
+    n_keep_corp = 0
+    for code, corp, ylo, yhi in zip(s["code"], s["corp_code"], s["_ylo"], s["_yhi"]):
+        if keep_codes is not None and code not in keep_codes:
+            continue
+        n_keep_corp += 1
+        pk = float(prio.get(code, 0.0))
+        for y in years_all:
+            if y < ylo or y > yhi:
+                continue
+            for rc in rcs:
+                n_pre_cache += 1
+                if (corp, int(y), str(rc)) in cached_keys:
+                    continue
+                rows.append((-y, pk, corp, int(y), str(rc)))
+    rows.sort(key=lambda t: (t[0], t[1]))                        # 최근 연도 → 작은 시총 순
+    jobs = [(c, y, r) for (_a, _b, c, y, r) in rows]
+
+    n_B = len(s) * len(years_all) * len(rcs)
+    n_C = n_keep_corp * len(years_all) * len(rcs)
+    funnel = [
+        ["① 전 법인 × 전 연도 (예전 격자)", f"{n_full:,}", "이 방식이 4만 건을 만들었다"],
+        ["② 공시 가능 연도만 (B)", f"{n_B:,}", f"-{max(0, n_full - n_B):,}"],
+        ["③ 소형주 후보만 (C)", f"{n_C:,}", f"-{max(0, n_B - n_C):,}"],
+        ["④ 상장·폐지 구간 안만 (A)", f"{n_pre_cache:,}", f"-{max(0, n_C - n_pre_cache):,}"],
+        ["⑤ 캐시 차감 후 실제 호출", f"{len(jobs):,}",
+         f"전체 대비 {100 * (1 - len(jobs) / max(n_full, 1)):.0f}% 절감"],
+    ]
+    LOG.table(funnel, ["DART 주식총수 호출 격자", "건수", "비고"], ["l", "r", "l"],
+              title="호출량 절감 깔때기 (상한으로 자르는 대신 격자를 줄인다)")
+    if len(crude):
+        LOG.info(f"소형주 사전선별: 거친시총 산출 {n_known:,}종목 중 컷오프×{margin:g} 안에 "
+                 f"한 번이라도 들어온 {n_small:,}종목 + 주식수 미상 "
+                 f"{len(s) - n_known:,}종목(배제 근거 없음 → 전부 유지)")
+    manifest_put("dart_share_plan", {"grid_full": int(n_full), "grid_planned": int(len(jobs)),
+                                     "reprt_codes": rcs, "margin": margin})
+    return jobs, funnel
+
+
 def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int],
-                      max_calls: int = NCQ_DART_SHARES_MAX_CALLS) -> pd.DataFrame:
+                      max_calls: int = NCQ_DART_SHARES_MAX_CALLS,
+                      jobs: Optional[List[Tuple[str, int, str]]] = None) -> pd.DataFrame:
     """DART 주식총수현황으로 PIT 상장주식수 이력을 만든다(KRX 무관).
 
     ★ knowledge_date = 접수일자(rcept_no 앞 8자리). 결산일이 아니다. 결산일을 쓰면
       아직 공시되지 않은 주식수를 그 시점에 알았다고 주장하는 것이라 명백한 미래누수다.
-    ★ 호출량이 크므로 ① 공용 캐시 재활용 ② 우선순위 순서 ③ 상한 을 모두 적용한다.
+    ★ 호출량: ① 공용 캐시 재활용 ② 격자 축소(ncq_plan_dart_share_jobs) ③ 중요도 정렬
+      ④ **실시간 잔량 소진**(상한 없음 — 서버가 020 을 줄 때까지). max_calls>0 을 명시한
+      경우에만 사용자 지정 상한으로 자른다.
     """
     cols = ["corp_code", "shares", "knowledge_date", "bsns_year", "reprt_code"]
-    if not DART_API_KEY:
-        ncq_src("DART주식총수", False, 0, "DART_API_KEY 미입력 — 시가총액이 근사 경로로 낮아집니다")
-        LOG.warn("DART_API_KEY 가 없어 PIT 상장주식수를 만들 수 없습니다. 시가총액은 "
+    pool = dart_pool()
+    if not pool.configured():
+        ncq_src("DART주식총수", False, 0, "DART 키 미입력 — 시가총액이 근사 경로로 낮아집니다")
+        LOG.warn("DART 인증키가 없어 PIT 상장주식수를 만들 수 없습니다. 시가총액은 "
                  "'현재 주식수 × 과거 종가' 근사가 되며, 증자가 잦은 소형주에서 오차가 큽니다. "
                  "무료·즉시 발급이므로 넣어 두시길 권합니다: https://opendart.fss.or.kr")
         return pd.DataFrame(columns=cols)
@@ -310,33 +458,38 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int],
         frames.append(c)
         LOG.info(f"공용 캐시에서 DART 주식총수 {len(c):,}행 재사용 ({len(have):,} 조합)")
 
-    jobs = [(str(c), int(y), "11011") for y in sorted(years, reverse=True)
-            for c in corp_codes if (str(c), int(y), "11011") not in have]
+    if jobs is None:      # 계획이 없으면(구 호출부·테스트) 최소한의 격자만 만든다
+        rcs = [str(r) for r in (NCQ_DART_REPRT_CODES or ["11011"])]
+        jobs = [(str(c), int(y), rc) for y in sorted(years, reverse=True)
+                for c in corp_codes for rc in rcs if (str(c), int(y), rc) not in have]
+    else:
+        jobs = [j for j in jobs if (str(j[0]), int(j[1]), str(j[2])) not in have]
     if RUN_MODE == "CACHED":
         jobs = []
-    if len(jobs) > max_calls:
-        LOG.warn(f"DART 주식총수 요청 대상이 {len(jobs):,}건이라 상한 {max_calls:,}건으로 자릅니다. "
-                 f"최근 연도·우선순위 종목부터 받았으므로, 재실행하면 나머지를 이어받습니다. "
-                 f"이번 실행에서 못 받은 구간은 근사 경로로 대체되고 감사표에 표시됩니다.")
+    if max_calls and len(jobs) > max_calls:
+        LOG.warn(f"사용자 지정 상한 NCQ_DART_SHARES_MAX_CALLS={max_calls:,} 로 자릅니다 "
+                 f"(대상 {len(jobs):,}건). 0 으로 두면 실시간 잔량만큼 끝까지 씁니다.")
         jobs = jobs[:max_calls]
 
     new_rows: List[dict] = []
     if jobs:
-        LOG.info(f"DART 주식총수현황 {len(jobs):,}건 수집 (PIT 상장주식수 — 시가총액의 분모)")
-        stop = False
+        dart_plan_note(len(jobs), "DART 주식총수현황 (PIT 상장주식수 — 시가총액의 분모)")
         CH = 500
+        n_ch = (len(jobs) - 1) // CH + 1
         for k0 in range(0, len(jobs), CH):
-            if stop:
+            # ★ 멈춤 판단은 오직 서버의 020(→ 모든 키 소진). 우리 추정 잔량으로 멈추지 않는다.
+            if pool.exhausted:
+                LOG.warn(f"잔여 {len(jobs) - k0:,}건은 오늘 받지 못했습니다 — 받은 만큼 저장합니다. "
+                         f"재실행하면 정확히 이 지점부터 이어받습니다.")
                 break
             chunk = jobs[k0:k0 + CH]
             res = pmap_io(_ncq_dart_shares_one, chunk, workers=min(N_WORKERS_IO, 8),
-                          desc=f"DART 주식수 {k0//CH+1}/{(len(jobs)-1)//CH+1}")
+                          desc=f"DART 주식수 {k0 // CH + 1}/{n_ch}")
             for r in res:
-                if r == "LIMIT":
-                    stop = True
-                    continue
                 if r:
                     new_rows.extend(r)
+        pool.save()
+        pool.report("DART 호출량 — 주식총수 수집 후")
     if new_rows:
         frames.append(pd.DataFrame(new_rows))
     if not frames:

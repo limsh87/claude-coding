@@ -434,7 +434,8 @@ def run_overlap_backtest(SIG: pd.DataFrame, pxm: pd.DataFrame, sec: pd.DataFrame
 
 # ── 벤치마크 ────────────────────────────────────────────────────────────────────────────────
 def bench_universe_ew(UNI: pd.DataFrame, pxm: pd.DataFrame, months: pd.DatetimeIndex,
-                      uni_obj: Optional["Universe"] = None) -> pd.Series:
+                      uni_obj: Optional["Universe"] = None,
+                      gate: str = "liq_pass", name: str = "Bottom-N EW") -> pd.Series:
     """주 벤치마크 — 동일 유니버스 동일가중(Bottom-N EW).
 
     ★ 이것이 진짜 비교 대상이다. KOSDAQ 지수와 비교하면 '소형주 프리미엄'을 알파로 착각한다.
@@ -447,7 +448,8 @@ def bench_universe_ew(UNI: pd.DataFrame, pxm: pd.DataFrame, months: pd.DatetimeI
        결측은 양쪽 모두 0(정지 마킹)으로 채운다.
     """
     if UNI is None or UNI.empty or pxm is None or pxm.empty:
-        return pd.Series(np.nan, index=months, name="Bottom-N EW")
+        return pd.Series(np.nan, index=months, name=name)
+    gate = gate if gate in UNI.columns else "liq_pass"
     delist = {}
     if uni_obj is not None:
         try:
@@ -456,8 +458,8 @@ def bench_universe_ew(UNI: pd.DataFrame, pxm: pd.DataFrame, months: pd.DatetimeI
             delist = {}
     E, _ = ncq_effective_return_matrix(pxm, months, delist)
     if E.empty:
-        return pd.Series(np.nan, index=months, name="Bottom-N EW")
-    u = UNI[UNI["liq_pass"].fillna(False).astype(bool)][["month", "code"]].copy()
+        return pd.Series(np.nan, index=months, name=name)
+    u = UNI[UNI[gate].fillna(False).astype(bool)][["month", "code"]].copy()
     u["code"] = u["code"].astype(str)
     vals, cnts = [], []
     cols = set(map(str, E.columns))
@@ -468,8 +470,8 @@ def bench_universe_ew(UNI: pd.DataFrame, pxm: pd.DataFrame, months: pd.DatetimeI
         r = pd.to_numeric(E.loc[m].reindex(names), errors="coerce").to_numpy(dtype=float)
         r = np.where(np.isfinite(r), r, 0.0)      # 전략과 동일한 '정지 마킹' 규약
         vals.append(float(r.mean())); cnts.append(len(names))
-    s = pd.Series(vals, index=months, name="Bottom-N EW")
-    LOG.info(f"주 벤치마크(Bottom-N EW) 구성 — 월평균 {np.mean(cnts):,.0f}종목 동일가중 · "
+    s = pd.Series(vals, index=months, name=name)
+    LOG.info(f"벤치마크({name}) 구성 — 월평균 {np.mean(cnts):,.0f}종목 동일가중 · "
              f"전략과 동일한 실효 수익률 행렬 사용(폐지 -50%·정지 0% 동일 적용)")
     return s
 

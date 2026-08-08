@@ -24,6 +24,7 @@ PARTS = [
     (CORE, "03_util.py"),                # 날짜·해시·원자적IO·병렬·횡단면 통계
     (CORE, "04_vault.py"),               # 구글드라이브 공용/전용 인덱스 (절대 1원칙)
     (CORE, "05_http.py"),                # 세션·스로틀·인코딩 자동판별
+    (CORE, "06_dartkey.py"),             # DART 키 풀 — 실시간 잔량·다중키 자동전환
     (CORE, "10_ingest_universe.py"),     # 종목 마스터 (FDR/KIND/DART/스냅샷)
     (CORE, "11_ingest_price.py"),        # 가격 폴백 체인
     (CORE, "13_ingest_research.py"),     # 한경컨센서스 / 네이버 리서치
