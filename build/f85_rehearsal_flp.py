@@ -158,6 +158,42 @@ def run_rehearsal(strict: bool = False) -> bool:
                                            str(px["date"].max().date()))
     _rh("생존자편향 잔존 감사", _surv)
 
+    # ⑧-b ★ 가격 재수집 판정 — "완전한 캐시인데 또 받는" 낭비의 회귀 방지
+    def _plan():
+        """실제로 있었던 낭비: IPO 종목은 캐시 최소일이 곧 상장일이라 매 실행 '앞구간 결손'
+        으로 오판되어 전량 재수집됐고, 폐지 종목은 마지막 거래일이 영원히 종료일보다 일러
+        매 실행 '뒤구간 증분'으로 재수집됐다. 다시 받아도 늘지 않으니 영구 반복이다."""
+        today = pd.Timestamp("2026-08-08")
+        ws, we = pd.Timestamp("2016-08-01"), pd.Timestamp("2026-07-31")
+        codes = ["AAA", "IPO", "DEAD", "GONE", "NEW"]
+        listing = {"AAA": pd.Timestamp("2010-01-04"), "IPO": pd.Timestamp("2021-05-03"),
+                   "DEAD": pd.Timestamp("2010-01-04"), "GONE": pd.Timestamp("2010-01-04"),
+                   "NEW": pd.Timestamp("2015-01-02")}
+        delist = {"DEAD": pd.Timestamp("2019-03-15"), "GONE": pd.Timestamp("2016-01-10")}
+        have_min = {"AAA": ws, "IPO": pd.Timestamp("2021-05-03"),
+                    "DEAD": pd.Timestamp("2010-01-04")}
+        have_max = {"AAA": pd.Timestamp("2026-07-30"), "IPO": pd.Timestamp("2026-07-30"),
+                    "DEAD": pd.Timestamp("2019-03-14")}
+        todo, reasons = plan_price_fetch(codes, ws, we, have_min, have_max, listing, delist,
+                                         {}, today)
+        got = {c for c, _ in todo}
+        # AAA(완전) · IPO(상장일부터 완전) · DEAD(폐지일까지 완전) 는 받지 않아야 한다.
+        # GONE 은 구간 자체가 없고(폐지가 시작 전), NEW 만 신규 수집 대상이다.
+        if got != {"NEW"}:
+            raise RuntimeError(f"재수집 판정 오류 — 받아야 할 것은 NEW 뿐인데 {sorted(got)} "
+                               f"(사유: {dict(reasons)})")
+        # 미증가 유예: 한 번 시도했는데 커버리지가 그대로면 다음 실행에서 건너뛴다
+        att = {"NEW": {"at": today - pd.Timedelta(days=3), "frm": ws,
+                       "gmin": pd.Timestamp("2018-01-02"), "gmax": pd.Timestamp("2026-07-30")}}
+        have_min2 = dict(have_min, NEW=pd.Timestamp("2018-01-02"))
+        have_max2 = dict(have_max, NEW=pd.Timestamp("2026-07-30"))
+        todo2, r2 = plan_price_fetch(codes, ws, we, have_min2, have_max2, listing, delist,
+                                     att, today)
+        if todo2:
+            raise RuntimeError(f"미증가 유예가 동작하지 않음 — {todo2} (사유: {dict(r2)})")
+        return [("1차", len(todo)), ("2차", len(todo2))]
+    _rh("가격 재수집 판정(IPO·폐지·미증가 유예)", _plan)
+
     # ⑨ 드라이브 인덱스 왕복 + adopt (원본을 옮기지 않고 등록만)
     def _vault():
         tmp = os.path.join(VAULT.root, "_rehearsal_adopt")

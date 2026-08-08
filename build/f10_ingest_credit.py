@@ -170,7 +170,8 @@ def _flow_one(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return None
 
 
-def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str,
+                               sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """종목별 일별 투자자유형 순매수(금액). 이 전략의 '소유권 이전' 관측치.
 
     F2 카나리가 여기서 판정된다. 실패하면 §11-2 킬 기준(소유권 이전 관측 불가)이다.
@@ -192,15 +193,46 @@ def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str) -> pd
         frames.append(cached[FLOW_TABLE_COLS])
         LOG.info(f"공용 캐시에서 일별 수급 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
-    end_ts = as_ts(end)
-    todo = []
+    # ★ 가격과 똑같은 낭비가 여기서 훨씬 비싸게 일어난다(종목당 최대 9페이지).
+    #   폐지·거래정지 종목은 마지막 관측일이 영원히 종료일보다 이르므로, 커버리지 판정 없이
+    #   '최대일 < 종료일-7일' 만 보면 매 실행 전량 재수집된다. 가격과 같은 판정기를 쓴다.
+    have_min: Dict[str, pd.Timestamp] = {}
+    if cached is not None and len(cached):
+        have_min = cached.groupby("code")["date"].min().to_dict()
+    listing, delist = {}, {}
+    if sec is not None and len(sec) and "code" in sec.columns:
+        _s = sec.dropna(subset=["code"]).drop_duplicates("code")
+        if "listing_date" in _s.columns:
+            listing = {str(c): d for c, d in zip(_s["code"], as_ts_series(_s["listing_date"]))
+                       if pd.notna(d)}
+        if "delisting_date" in _s.columns:
+            delist = {str(c): d for c, d in zip(_s["code"], as_ts_series(_s["delisting_date"]))
+                      if pd.notna(d)}
+    _today = as_ts(_dt.date.today())
+    eff_end = min(as_ts(end), _today)
+    attempts: Dict[str, dict] = {}
+    _fa = VAULT.get_table("flow_fetch_attempts", scope="shared")
+    if _fa is not None and len(_fa):
+        _fa = _fa.copy()
+        for _c in ("attempted_at", "requested_from", "got_min", "got_max"):
+            if _c not in _fa.columns:
+                _fa[_c] = pd.NaT
+            _fa[_c] = as_ts_series(_fa[_c])
+        _fa = _fa.sort_values("attempted_at").drop_duplicates("code", keep="last")
+        attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from,
+                                  "gmin": r.got_min, "gmax": r.got_max}
+                    for r in _fa.itertuples(index=False)}
+    todo, reasons = ([], Counter())
     if RUN_MODE != "CACHED":
-        for c in codes:
-            mx = have_max.get(c)
-            if mx is None:
-                todo.append((c, start))
-            elif mx < end_ts - pd.Timedelta(days=7):
-                todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+        todo, reasons = plan_price_fetch(codes, as_ts(start), eff_end, have_min, have_max,
+                                         listing, delist, attempts, _today,
+                                         retry_fail_days=30, retry_stale_days=21,
+                                         tol_back=14, tol_fwd=7)
+    if reasons:
+        LOG.table([[k, f"{v:,}"] for k, v in reasons.most_common()] +
+                  [["── 실제 수집 대상", f"{len(todo):,}"]],
+                  ["판정 사유", "종목수"], ["l", "r"],
+                  title=f"수급 수집 판정 — 대상 {len(codes):,}종목 중 {len(todo):,}종목만 받습니다")
     if todo:
         LOG.info(f"일별 수급 {len(todo):,}종목 수집 (캐시 미보유/증분분만)")
         fails = {"n": 0}
@@ -216,6 +248,24 @@ def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str) -> pd
         got = [d for d in res if d is not None and len(d)]
         if got:
             frames.append(pd.concat(got, ignore_index=True).reindex(columns=FLOW_TABLE_COLS))
+        # ★ 시도 원장: 받아도 커버리지가 안 늘면 다음 실행이 같은 요청을 반복하지 않는다
+        _att_rows = []
+        for (c, st), d in zip(todo, res):
+            _dd = as_ts_series(d["date"]) if (d is not None and len(d)) else pd.Series(dtype="datetime64[ns]")
+            _gmin = min([x for x in (have_min.get(c), (_dd.min() if len(_dd) else pd.NaT))
+                         if pd.notna(x)] or [pd.NaT])
+            _gmax = max([x for x in (have_max.get(c), (_dd.max() if len(_dd) else pd.NaT))
+                         if pd.notna(x)] or [pd.NaT])
+            _att_rows.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today,
+                              "got_min": _gmin, "got_max": _gmax})
+        if _att_rows:
+            _prev = _fa if (_fa is not None and len(_fa)) else None
+            _all = pd.concat([_prev, pd.DataFrame(_att_rows)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(_att_rows)
+            _all = (_all.sort_values("attempted_at").drop_duplicates("code", keep="last")
+                        .reset_index(drop=True))
+            VAULT.put_table("flow_fetch_attempts", _all, scope="shared", domain="flow",
+                            source="fetch_investor_flows_daily:coverage_ledger")
         if fails["n"] > len(todo) * 0.7:
             LOG.warn(f"수급 수집 실패율 {100*fails['n']/max(len(todo),1):.0f}% — KRX 세션/차단을 의심하세요.")
 

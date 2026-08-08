@@ -182,7 +182,7 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.PX", "가격 · 거래대금 (M0)", "L1", budget_s=2700):
         px = fetch_prices(ctx["sec"]["code"].tolist(),
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+                          BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
 
     with PIPE.stage("L1.UNIFIX", "상장/폐지 창 재구성 (KRX 없이 C2 성립)", "L1", budget_s=300):
@@ -208,7 +208,7 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         preflight_estimate(len(ctx["sec"]), len(targets),
                            int(ctx["sec"]["corp_code"].notna().sum()), _yrs)
         ctx["flows"] = fetch_investor_flows_daily(targets or ctx["sec"]["code"].tolist(),
-                                                  BACKTEST_START, BACKTEST_END)
+                                                  BACKTEST_START, BACKTEST_END, sec=ctx["sec"])
 
     with PIPE.stage("L1.SHARES", "상장주식수 (DART 주식총수 우선 · PIT)", "L1", budget_s=1200,
                     critical=False):

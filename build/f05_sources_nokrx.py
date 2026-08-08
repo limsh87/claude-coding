@@ -100,8 +100,23 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Dat
         frames.append(cached.reindex(columns=cols))
         LOG.info(f"공용 캐시에서 DART 주식총수 {len(cached):,}행 재사용")
 
+    # ★ '조회했는데 자료가 없는' (회사, 연도) 는 캐시에 남지 않으므로 매 실행 다시 호출된다.
+    #   최악의 경우 8,000콜 × 매 실행 = 매번 17분을 같은 빈 응답에 쓴다. 별도 원장에 남겨
+    #   60일간 재시도하지 않는다(영구 포기가 아니라 유예).
+    MISS_RETRY_DAYS = 60
+    _today = as_ts(_dt.date.today())
+    miss = set()
+    _mt = VAULT.get_table("dart_shares_missing", scope="shared")
+    if _mt is not None and len(_mt):
+        _mt = _mt.copy()
+        _mt["attempted_at"] = as_ts_series(_mt["attempted_at"])
+        fresh = _mt[(_today - _mt["attempted_at"]).dt.days < MISS_RETRY_DAYS]
+        miss = set(zip(fresh["corp_code"].astype(str), fresh["year"].astype(str)))
+        if len(miss):
+            LOG.info(f"DART 주식총수 '자료없음' 원장 {len(miss):,}건은 {MISS_RETRY_DAYS}일간 "
+                     f"재조회하지 않습니다(빈 응답 반복 방지).")
     jobs = [(c, y) for c in corp_codes for y in years
-            if (str(c), str(y)) not in have]
+            if (str(c), str(y)) not in have and (str(c), str(y)) not in miss]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
@@ -130,6 +145,18 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Dat
 
         res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="DART 주식총수")
         got = [d for d in res if d is not None and len(d)]
+        _miss_rows = [{"corp_code": str(c), "year": str(y), "attempted_at": _today}
+                      for (c, y), d in zip(jobs, res) if d is None or not len(d)]
+        if _miss_rows:
+            _prev = _mt if (_mt is not None and len(_mt)) else None
+            _all = pd.concat([_prev, pd.DataFrame(_miss_rows)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(_miss_rows)
+            _all = (_all.sort_values("attempted_at")
+                        .drop_duplicates(["corp_code", "year"], keep="last")
+                        .reset_index(drop=True))
+            VAULT.put_table("dart_shares_missing", _all, scope="shared", domain="dart",
+                            source="fetch_dart_shares:miss_ledger")
+            LOG.info(f"DART 주식총수 자료없음 {len(_miss_rows):,}건을 원장에 기록했습니다.")
         if got:
             n = pd.concat(got, ignore_index=True)
             n["knowledge_date"] = [_knowledge_from_rcept(rn, "11011", int(str(pe)[:4]))

@@ -208,7 +208,7 @@ ACTIVE_PACKS    = ["F"]
 
 STRATEGY_ID   = "TCD_V3_FLP"
 STRATEGY_NAME = "FLP 강제매도 소진 (Forced Liquidation Exhaustion)"
-BUILD_VERSION = "v2.20260808.0415"
+BUILD_VERSION = "v2.20260808.0422"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -3143,8 +3143,99 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+
+def plan_price_fetch(codes: Sequence[str], want_start: pd.Timestamp, want_end: pd.Timestamp,
+                     have_min: Dict[str, pd.Timestamp], have_max: Dict[str, pd.Timestamp],
+                     listing: Dict[str, pd.Timestamp], delist: Dict[str, pd.Timestamp],
+                     attempts: Dict[str, dict], today: pd.Timestamp,
+                     retry_fail_days: int = 30, retry_stale_days: int = 21,
+                     tol_back: int = 14, tol_fwd: int = 7
+                     ) -> Tuple[List[Tuple[str, str]], "Counter"]:
+    """'무엇을 받을지'만 결정하는 순수 함수 — 네트워크도 캐시도 건드리지 않는다.
+
+    분리한 이유: 이 판정이 틀리면 완전한 캐시를 갖고도 매 실행 수십 분을 같은 요청에
+    쓴다. 그런데 예전 구조에서는 이 로직을 실제 수집을 돌리지 않고는 검증할 수 없었다.
+    이제 리허설이 IPO·폐지·완전커버 세 경우를 직접 넣어 '두 번째 실행은 0건'을 확인한다.
+    """
+    todo: List[Tuple[str, str]] = []
+    reasons: Counter = Counter()
+
+    def _recently_failed(c, want_from):
+        p = attempts.get(c)
+        if p is None or pd.isna(p.get("at")):
+            return False
+        if pd.notna(p.get("frm")) and p["frm"] > want_from:
+            return False
+        return (today - p["at"]).days < retry_fail_days
+
+    def _stale_no_growth(c, want_from):
+        p = attempts.get(c)
+        if p is None or pd.isna(p.get("at")):
+            return False
+        if (today - p["at"]).days >= retry_stale_days:
+            return False
+        if pd.notna(p.get("frm")) and p["frm"] > want_from:
+            return False
+        gmin, gmax = p.get("gmin"), p.get("gmax")
+        cur_min, cur_max = have_min.get(c), have_max.get(c)
+        if pd.isna(gmin) or pd.isna(gmax) or cur_min is None or cur_max is None:
+            return False
+        return (gmin <= cur_min) and (gmax >= cur_max)
+
+    for c in codes:
+        ld, dd = listing.get(c), delist.get(c)
+        want_from = max(want_start, ld) if ld is not None and pd.notna(ld) else want_start
+        want_to = min(want_end, dd) if dd is not None and pd.notna(dd) else want_end
+        if want_to <= want_from:
+            reasons["구간없음(상장 전/폐지 후)"] += 1
+            continue
+        mx, mn = have_max.get(c), have_min.get(c)
+        if mx is None:
+            if _recently_failed(c, want_from):
+                reasons[f"최근 {retry_fail_days}일 내 전 소스 실패"] += 1
+                continue
+            todo.append((c, want_from.strftime("%Y-%m-%d")))
+            reasons["신규(캐시 없음)"] += 1
+            continue
+        need_back = mn is not None and mn > want_from + pd.Timedelta(days=tol_back)
+        need_fwd = mx < want_to - pd.Timedelta(days=tol_fwd)
+        if not (need_back or need_fwd):
+            reasons["캐시가 구간을 덮음"] += 1
+            continue
+        if _stale_no_growth(c, want_from):
+            reasons[f"직전 시도에서 미증가({retry_stale_days}일 유예)"] += 1
+            continue
+        if need_back:
+            todo.append((c, want_from.strftime("%Y-%m-%d")))
+            reasons["앞구간 결손"] += 1
+        else:
+            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+            reasons["뒤구간 증분"] += 1
+    return todo, reasons
+
+
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 전 종목 일봉 수집. ★'받을 게 남았을 때만' 받는다.
+
+    ── 왜 이 함수가 다시 쓰였는가 (실측된 낭비) ────────────────────────────────────────
+    예전 판정은 캐시의 (최소일, 최대일)만 보고 이렇게 결정했다:
+      · 최소일 > 시작일+10일  → "앞 구간 결손" 으로 보고 처음부터 다시 받는다
+      · 최대일 < 종료일-5일   → "뒤 구간 결손" 으로 보고 이어서 받는다
+    그런데
+      · 백테스트 시작일 이후에 '상장'한 종목은 최소일이 곧 상장일이다. 영원히 첫 조건에
+        걸려 매 실행 전량 재수집된다. 10년 구간이면 유니버스의 30~40%가 여기 해당한다.
+      · '상장폐지·거래정지' 종목은 마지막 거래일이 영원히 종료일보다 이르다. 매 실행
+        두 번째 조건에 걸린다.
+    게다가 다시 받아도 데이터가 늘지 않으므로 다음 실행에서 똑같은 판정을 다시 받는다.
+    즉 완전한 캐시를 갖고도 매번 수십 분을 같은 요청에 쓴다.
+
+    ── 지금 판정 ───────────────────────────────────────────────────────────────────────
+    '있어야 할 구간'을 상장일·폐지일로 먼저 확정하고(want_from ~ want_to),
+    캐시가 그 구간을 덮고 있으면 받지 않는다. 덮지 못했더라도 '지난번에 같은 구간을
+    요청했는데 더 안 늘어났다면' 일정 기간 재시도하지 않는다(소스에 그 데이터가 없는 것).
+    모든 판정은 사유별 집계로 출력한다 — 조용히 건너뛰지 않는다.
+    """
     codes = sorted({c for c in map(to_code6, codes) if c})
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
@@ -3157,61 +3248,51 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         LOG.info(f"공용 캐시에서 일봉 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
     start_ts, end_ts = as_ts(start), as_ts(end)
-
-    # ── 시도 원장 (음성 캐시) ─────────────────────────────────────────────────────────────
-    #  ★ 폐지 종목과 '어느 소스에도 없는 종목'은 매 실행마다 전 소스 체인을 헛돌게 만든다.
-    #    성공한 종목만 캐시에 남으므로 실패는 영원히 기억되지 않고, 그 수는 백테스트 기간이
-    #    길어질수록 단조 증가한다. 실측상 완전 캐시 상태의 실행에서도 13~15분을 여기서 쓴다.
-    #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
-    #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
-    RETRY_AFTER_DAYS = 30
-    # ★ '오늘'은 벽시계 시각이어야 한다. BACKTEST_END 를 쓰면 실패 기록의 나이가 항상 0일이라
-    #   한 번 실패한 종목을 영원히 재시도하지 않는다(= 그 종목이 유니버스에서 영구 탈락).
-    #   폐지 예정 종목이 여기 걸리면 그대로 생존자편향이 된다.
     _today = as_ts(_dt.date.today())
+    eff_end = min(end_ts, _today)          # 미래 구간은 애초에 존재하지 않는다
+
+    # 상장일·폐지일 — '있어야 할 구간'의 근거. 없으면 보수적으로 전 구간을 원한다.
+    listing: Dict[str, pd.Timestamp] = {}
+    delist: Dict[str, pd.Timestamp] = {}
+    if sec is not None and len(sec) and "code" in sec.columns:
+        _s = sec.dropna(subset=["code"]).drop_duplicates("code")
+        if "listing_date" in _s.columns:
+            listing = {str(c): d for c, d in zip(_s["code"], as_ts_series(_s["listing_date"]))
+                       if pd.notna(d)}
+        if "delisting_date" in _s.columns:
+            delist = {str(c): d for c, d in zip(_s["code"], as_ts_series(_s["delisting_date"]))
+                      if pd.notna(d)}
+
+    # ── 시도 원장 ────────────────────────────────────────────────────────────────────────
+    #   실패뿐 아니라 '시도했는데 더 안 늘어난' 경우도 기억한다. 그래야 반복이 멈춘다.
+    RETRY_AFTER_DAYS = 30        # 전 소스 실패
+    RETRY_STALE_DAYS = 21        # 시도했으나 커버리지가 늘지 않음(소스에 없는 구간)
+    TOL_BACK, TOL_FWD = 14, 7    # 달력일 여유 (휴장·데이터 지연 흡수)
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):
-        _att["attempted_at"] = as_ts_series(_att["attempted_at"])
-        _att["requested_from"] = as_ts_series(_att["requested_from"])
+        _att = _att.copy()
+        for _c in ("attempted_at", "requested_from", "got_min", "got_max"):
+            if _c not in _att.columns:
+                _att[_c] = pd.NaT
+            _att[_c] = as_ts_series(_att[_c])
         _att = _att.sort_values("attempted_at").drop_duplicates("code", keep="last")
-        attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from}
+        attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from,
+                                  "gmin": r.got_min, "gmax": r.got_max}
                     for r in _att.itertuples(index=False)}
 
-    def _recently_failed(c: str, want_from: pd.Timestamp) -> bool:
-        p = attempts.get(c)
-        if p is None or pd.isna(p["at"]):
-            return False
-        # 이번에 더 이른 구간을 원한다면 이전 실패는 근거가 되지 않는다.
-        if pd.notna(p["frm"]) and p["frm"] > want_from:
-            return False
-        return (_today - p["at"]).days < RETRY_AFTER_DAYS
+    todo, reasons = plan_price_fetch(
+        codes, start_ts, eff_end, have_min, have_max, listing, delist, attempts, _today,
+        retry_fail_days=RETRY_AFTER_DAYS, retry_stale_days=RETRY_STALE_DAYS,
+        tol_back=TOL_BACK, tol_fwd=TOL_FWD)
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
-    for c in codes:
-        mx, mn = have_max.get(c), have_min.get(c)
-        if mx is None:
-            if _recently_failed(c, start_ts):
-                n_skip += 1
-                continue
-            todo.append((c, start))
-            continue
-        # ★ 과거 방향 백필을 반드시 함께 본다.
-        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
-        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
-        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
-            todo.append((c, start))
-            n_back += 1
-        elif mx < end_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
-            n_fwd += 1
-    if n_back:
-        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
-    if n_skip:
-        LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
-                 f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
+    LOG.table([[k, f"{v:,}"] for k, v in reasons.most_common()] +
+              [["── 실제 수집 대상", f"{len(todo):,}"]],
+              ["판정 사유", "종목수"], ["l", "r"],
+              title=f"가격 수집 판정 — 전체 {len(codes):,}종목 중 {len(todo):,}종목만 받습니다 "
+                    f"(상장일·폐지일로 '있어야 할 구간'을 먼저 확정)")
+    if not todo and cached is not None and len(cached):
+        LOG.ok("받을 것이 없습니다 — 캐시가 요청 구간을 전부 덮고 있습니다.")
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 미수집 {len(todo):,}종목을 건너뜁니다.")
@@ -3241,10 +3322,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
+                # ★ 성공도 기록한다. '받았는데 커버리지가 안 늘었다'를 다음 실행이 알아야
+                #   같은 요청을 영원히 반복하지 않는다(폐지·거래정지 종목의 주된 낭비원).
+                _dd = as_ts_series(d["date"])
+                _gmin = min([x for x in (have_min.get(c), _dd.min()) if pd.notna(x)] or [pd.NaT])
+                _gmax = max([x for x in (have_max.get(c), _dd.max()) if pd.notna(x)] or [pd.NaT])
+                failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today,
+                               "got_min": _gmin, "got_max": _gmax})
             else:
-                failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+                failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today,
+                               "got_min": have_min.get(c, pd.NaT),
+                               "got_max": have_max.get(c, pd.NaT)})
         if failed:
-            LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
+            _nf = sum(1 for f in failed if pd.isna(f.get("got_max")))
+            LOG.warn(f"일봉 시도 원장 {len(failed):,}건 기록 (전 소스 실패 {_nf:,}종목) — "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
             # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
@@ -5164,8 +5255,23 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Dat
         frames.append(cached.reindex(columns=cols))
         LOG.info(f"공용 캐시에서 DART 주식총수 {len(cached):,}행 재사용")
 
+    # ★ '조회했는데 자료가 없는' (회사, 연도) 는 캐시에 남지 않으므로 매 실행 다시 호출된다.
+    #   최악의 경우 8,000콜 × 매 실행 = 매번 17분을 같은 빈 응답에 쓴다. 별도 원장에 남겨
+    #   60일간 재시도하지 않는다(영구 포기가 아니라 유예).
+    MISS_RETRY_DAYS = 60
+    _today = as_ts(_dt.date.today())
+    miss = set()
+    _mt = VAULT.get_table("dart_shares_missing", scope="shared")
+    if _mt is not None and len(_mt):
+        _mt = _mt.copy()
+        _mt["attempted_at"] = as_ts_series(_mt["attempted_at"])
+        fresh = _mt[(_today - _mt["attempted_at"]).dt.days < MISS_RETRY_DAYS]
+        miss = set(zip(fresh["corp_code"].astype(str), fresh["year"].astype(str)))
+        if len(miss):
+            LOG.info(f"DART 주식총수 '자료없음' 원장 {len(miss):,}건은 {MISS_RETRY_DAYS}일간 "
+                     f"재조회하지 않습니다(빈 응답 반복 방지).")
     jobs = [(c, y) for c in corp_codes for y in years
-            if (str(c), str(y)) not in have]
+            if (str(c), str(y)) not in have and (str(c), str(y)) not in miss]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
@@ -5194,6 +5300,18 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Dat
 
         res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="DART 주식총수")
         got = [d for d in res if d is not None and len(d)]
+        _miss_rows = [{"corp_code": str(c), "year": str(y), "attempted_at": _today}
+                      for (c, y), d in zip(jobs, res) if d is None or not len(d)]
+        if _miss_rows:
+            _prev = _mt if (_mt is not None and len(_mt)) else None
+            _all = pd.concat([_prev, pd.DataFrame(_miss_rows)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(_miss_rows)
+            _all = (_all.sort_values("attempted_at")
+                        .drop_duplicates(["corp_code", "year"], keep="last")
+                        .reset_index(drop=True))
+            VAULT.put_table("dart_shares_missing", _all, scope="shared", domain="dart",
+                            source="fetch_dart_shares:miss_ledger")
+            LOG.info(f"DART 주식총수 자료없음 {len(_miss_rows):,}건을 원장에 기록했습니다.")
         if got:
             n = pd.concat(got, ignore_index=True)
             n["knowledge_date"] = [_knowledge_from_rcept(rn, "11011", int(str(pe)[:4]))
@@ -6125,7 +6243,8 @@ def _flow_one(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return None
 
 
-def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str,
+                               sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """종목별 일별 투자자유형 순매수(금액). 이 전략의 '소유권 이전' 관측치.
 
     F2 카나리가 여기서 판정된다. 실패하면 §11-2 킬 기준(소유권 이전 관측 불가)이다.
@@ -6147,15 +6266,46 @@ def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str) -> pd
         frames.append(cached[FLOW_TABLE_COLS])
         LOG.info(f"공용 캐시에서 일별 수급 {len(cached):,}행 재사용 ({len(have_max):,}종목)")
 
-    end_ts = as_ts(end)
-    todo = []
+    # ★ 가격과 똑같은 낭비가 여기서 훨씬 비싸게 일어난다(종목당 최대 9페이지).
+    #   폐지·거래정지 종목은 마지막 관측일이 영원히 종료일보다 이르므로, 커버리지 판정 없이
+    #   '최대일 < 종료일-7일' 만 보면 매 실행 전량 재수집된다. 가격과 같은 판정기를 쓴다.
+    have_min: Dict[str, pd.Timestamp] = {}
+    if cached is not None and len(cached):
+        have_min = cached.groupby("code")["date"].min().to_dict()
+    listing, delist = {}, {}
+    if sec is not None and len(sec) and "code" in sec.columns:
+        _s = sec.dropna(subset=["code"]).drop_duplicates("code")
+        if "listing_date" in _s.columns:
+            listing = {str(c): d for c, d in zip(_s["code"], as_ts_series(_s["listing_date"]))
+                       if pd.notna(d)}
+        if "delisting_date" in _s.columns:
+            delist = {str(c): d for c, d in zip(_s["code"], as_ts_series(_s["delisting_date"]))
+                      if pd.notna(d)}
+    _today = as_ts(_dt.date.today())
+    eff_end = min(as_ts(end), _today)
+    attempts: Dict[str, dict] = {}
+    _fa = VAULT.get_table("flow_fetch_attempts", scope="shared")
+    if _fa is not None and len(_fa):
+        _fa = _fa.copy()
+        for _c in ("attempted_at", "requested_from", "got_min", "got_max"):
+            if _c not in _fa.columns:
+                _fa[_c] = pd.NaT
+            _fa[_c] = as_ts_series(_fa[_c])
+        _fa = _fa.sort_values("attempted_at").drop_duplicates("code", keep="last")
+        attempts = {str(r.code): {"at": r.attempted_at, "frm": r.requested_from,
+                                  "gmin": r.got_min, "gmax": r.got_max}
+                    for r in _fa.itertuples(index=False)}
+    todo, reasons = ([], Counter())
     if RUN_MODE != "CACHED":
-        for c in codes:
-            mx = have_max.get(c)
-            if mx is None:
-                todo.append((c, start))
-            elif mx < end_ts - pd.Timedelta(days=7):
-                todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+        todo, reasons = plan_price_fetch(codes, as_ts(start), eff_end, have_min, have_max,
+                                         listing, delist, attempts, _today,
+                                         retry_fail_days=30, retry_stale_days=21,
+                                         tol_back=14, tol_fwd=7)
+    if reasons:
+        LOG.table([[k, f"{v:,}"] for k, v in reasons.most_common()] +
+                  [["── 실제 수집 대상", f"{len(todo):,}"]],
+                  ["판정 사유", "종목수"], ["l", "r"],
+                  title=f"수급 수집 판정 — 대상 {len(codes):,}종목 중 {len(todo):,}종목만 받습니다")
     if todo:
         LOG.info(f"일별 수급 {len(todo):,}종목 수집 (캐시 미보유/증분분만)")
         fails = {"n": 0}
@@ -6171,6 +6321,24 @@ def fetch_investor_flows_daily(codes: Sequence[str], start: str, end: str) -> pd
         got = [d for d in res if d is not None and len(d)]
         if got:
             frames.append(pd.concat(got, ignore_index=True).reindex(columns=FLOW_TABLE_COLS))
+        # ★ 시도 원장: 받아도 커버리지가 안 늘면 다음 실행이 같은 요청을 반복하지 않는다
+        _att_rows = []
+        for (c, st), d in zip(todo, res):
+            _dd = as_ts_series(d["date"]) if (d is not None and len(d)) else pd.Series(dtype="datetime64[ns]")
+            _gmin = min([x for x in (have_min.get(c), (_dd.min() if len(_dd) else pd.NaT))
+                         if pd.notna(x)] or [pd.NaT])
+            _gmax = max([x for x in (have_max.get(c), (_dd.max() if len(_dd) else pd.NaT))
+                         if pd.notna(x)] or [pd.NaT])
+            _att_rows.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today,
+                              "got_min": _gmin, "got_max": _gmax})
+        if _att_rows:
+            _prev = _fa if (_fa is not None and len(_fa)) else None
+            _all = pd.concat([_prev, pd.DataFrame(_att_rows)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(_att_rows)
+            _all = (_all.sort_values("attempted_at").drop_duplicates("code", keep="last")
+                        .reset_index(drop=True))
+            VAULT.put_table("flow_fetch_attempts", _all, scope="shared", domain="flow",
+                            source="fetch_investor_flows_daily:coverage_ledger")
         if fails["n"] > len(todo) * 0.7:
             LOG.warn(f"수급 수집 실패율 {100*fails['n']/max(len(todo),1):.0f}% — KRX 세션/차단을 의심하세요.")
 
@@ -9334,6 +9502,42 @@ def run_rehearsal(strict: bool = False) -> bool:
                                            str(px["date"].max().date()))
     _rh("생존자편향 잔존 감사", _surv)
 
+    # ⑧-b ★ 가격 재수집 판정 — "완전한 캐시인데 또 받는" 낭비의 회귀 방지
+    def _plan():
+        """실제로 있었던 낭비: IPO 종목은 캐시 최소일이 곧 상장일이라 매 실행 '앞구간 결손'
+        으로 오판되어 전량 재수집됐고, 폐지 종목은 마지막 거래일이 영원히 종료일보다 일러
+        매 실행 '뒤구간 증분'으로 재수집됐다. 다시 받아도 늘지 않으니 영구 반복이다."""
+        today = pd.Timestamp("2026-08-08")
+        ws, we = pd.Timestamp("2016-08-01"), pd.Timestamp("2026-07-31")
+        codes = ["AAA", "IPO", "DEAD", "GONE", "NEW"]
+        listing = {"AAA": pd.Timestamp("2010-01-04"), "IPO": pd.Timestamp("2021-05-03"),
+                   "DEAD": pd.Timestamp("2010-01-04"), "GONE": pd.Timestamp("2010-01-04"),
+                   "NEW": pd.Timestamp("2015-01-02")}
+        delist = {"DEAD": pd.Timestamp("2019-03-15"), "GONE": pd.Timestamp("2016-01-10")}
+        have_min = {"AAA": ws, "IPO": pd.Timestamp("2021-05-03"),
+                    "DEAD": pd.Timestamp("2010-01-04")}
+        have_max = {"AAA": pd.Timestamp("2026-07-30"), "IPO": pd.Timestamp("2026-07-30"),
+                    "DEAD": pd.Timestamp("2019-03-14")}
+        todo, reasons = plan_price_fetch(codes, ws, we, have_min, have_max, listing, delist,
+                                         {}, today)
+        got = {c for c, _ in todo}
+        # AAA(완전) · IPO(상장일부터 완전) · DEAD(폐지일까지 완전) 는 받지 않아야 한다.
+        # GONE 은 구간 자체가 없고(폐지가 시작 전), NEW 만 신규 수집 대상이다.
+        if got != {"NEW"}:
+            raise RuntimeError(f"재수집 판정 오류 — 받아야 할 것은 NEW 뿐인데 {sorted(got)} "
+                               f"(사유: {dict(reasons)})")
+        # 미증가 유예: 한 번 시도했는데 커버리지가 그대로면 다음 실행에서 건너뛴다
+        att = {"NEW": {"at": today - pd.Timedelta(days=3), "frm": ws,
+                       "gmin": pd.Timestamp("2018-01-02"), "gmax": pd.Timestamp("2026-07-30")}}
+        have_min2 = dict(have_min, NEW=pd.Timestamp("2018-01-02"))
+        have_max2 = dict(have_max, NEW=pd.Timestamp("2026-07-30"))
+        todo2, r2 = plan_price_fetch(codes, ws, we, have_min2, have_max2, listing, delist,
+                                     att, today)
+        if todo2:
+            raise RuntimeError(f"미증가 유예가 동작하지 않음 — {todo2} (사유: {dict(r2)})")
+        return [("1차", len(todo)), ("2차", len(todo2))]
+    _rh("가격 재수집 판정(IPO·폐지·미증가 유예)", _plan)
+
     # ⑨ 드라이브 인덱스 왕복 + adopt (원본을 옮기지 않고 등록만)
     def _vault():
         tmp = os.path.join(VAULT.root, "_rehearsal_adopt")
@@ -9543,7 +9747,7 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
     with PIPE.stage("L1.PX", "가격 · 거래대금 (M0)", "L1", budget_s=2700):
         px = fetch_prices(ctx["sec"]["code"].tolist(),
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+                          BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
 
     with PIPE.stage("L1.UNIFIX", "상장/폐지 창 재구성 (KRX 없이 C2 성립)", "L1", budget_s=300):
@@ -9569,7 +9773,7 @@ def collect_all(weeks: pd.DatetimeIndex) -> dict:
         preflight_estimate(len(ctx["sec"]), len(targets),
                            int(ctx["sec"]["corp_code"].notna().sum()), _yrs)
         ctx["flows"] = fetch_investor_flows_daily(targets or ctx["sec"]["code"].tolist(),
-                                                  BACKTEST_START, BACKTEST_END)
+                                                  BACKTEST_START, BACKTEST_END, sec=ctx["sec"])
 
     with PIPE.stage("L1.SHARES", "상장주식수 (DART 주식총수 우선 · PIT)", "L1", budget_s=1200,
                     critical=False):
