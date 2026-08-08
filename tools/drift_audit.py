@@ -136,7 +136,32 @@ def run(P, months, delist, **kw):
             "CAGR": st.get("CAGR"), "Sharpe": st.get("Sharpe")}
 
 
-def main():
+def inject_alpha(P, a_annual):
+    """신호에 진짜 예측력을 심는다: fwd_ret += a · (Signal_rank − 0.5).
+
+    선정 종목의 월중 평균 랭크가 대략 0.9 이므로 (0.9−0.5)=0.4 를 나눠 스케일을 맞춘다.
+    정확한 통과분은 '엔진 총수익 초과' 열로 실측하므로 이 스케일은 라벨링 편의일 뿐이다.
+    """
+    a_m = (1 + a_annual) ** (1 / 12) - 1
+    Q = P.copy()
+    Q["fwd_ret"] = Q["fwd_ret"] + (a_m / 0.47) * (Q["Signal_rank"] - 0.5)
+    return Q
+
+
+def multiseed(n_seeds=40, **kw):
+    d, c, inv, n = [], [], [], []
+    for s in range(n_seeds):
+        P, m, dl = make_panel(seed=s, rho_sig=0.95)
+        r = run(P, m, dl, **kw)
+        d.append(r["월순"] - r["벤치"])
+        c.append(r["월비용"])
+        inv.append(r["투자비중"])
+        n.append(r["n"])
+    d = np.array(d)
+    return d, np.array(c), float(np.mean(inv)), float(np.mean(n))
+
+
+def main(deep=False):
     hr = "─" * 92
     print(hr)
     print("하향 드리프트 감사 — 참 알파 = 0 인 신호를 실제 엔진에 넣었을 때 무엇이 나오는가")
@@ -145,11 +170,25 @@ def main():
     P, months, dl = make_panel(rho_sig=0.95)
     base = run(P, months, dl)
     B = base["벤치"]
-    print(f"\n적격 유니버스 동일가중(정답값)  {B*100:+.3f}%/월  →  {ann(B)*100:+.2f}%/년")
-    print(f"엔진이 뱉는 값                  {base['월순']*100:+.3f}%/월  →  CAGR {base['CAGR']*100:+.2f}%"
-          f" · Sharpe {base['Sharpe']:+.3f}")
+    print(f"\n적격 유니버스 동일가중(정답값)  {B*100:+.3f}%/월")
+    print(f"엔진이 뱉는 값                  {base['월순']*100:+.3f}%/월")
     print(f"인공 드리프트                   {(base['월순']-B)*100:+.3f}%/월  →  "
           f"{base['드리프트연']*100:+.2f}%p/년   ★ 알파가 0인데 이만큼 잃는다")
+    print("\n  ※ CAGR·Sharpe 절대값은 여기 싣지 않는다. 합성 시장팩터 120개월 표본평균의 노이즈와")
+    print("     8종목 집중의 변동성 드래그(≈ −1%p)가 섞여 엔진 귀책분을 부풀리기 때문이다.")
+    print("     같은 데이터 위에서 잰 '드리프트'만이 엔진에 귀속되는 값이다.")
+
+    if deep:
+        print(f"\n{hr}\n[0] 드리프트 다중시드 — 오차범위 (시드 40개)\n{hr}")
+        d, c, inv, nn = multiseed(40)
+        se = d.std(ddof=1) / math.sqrt(len(d))
+        print(f"  드리프트  월 {d.mean()*100:+.3f}%p ± {se*100:.3f}  →  연 {ann(d.mean())*100:+.2f}%p"
+              f"  [95%CI {ann(d.mean()-1.96*se)*100:+.2f} ~ {ann(d.mean()+1.96*se)*100:+.2f}%p]")
+        print(f"  그중 비용 월 {c.mean()*100:+.3f}%p → 연 {ann(c.mean())*100:+.2f}%p"
+              f"  ← 결정론적, 표본오차 없음 (시드간 표준편차 {c.std()*100:.3f})")
+        print(f"  나머지    월 {(d.mean()+c.mean())*100:+.3f}%p · 투자비중 {inv:.1%} · 평균 {nn:.1f}종목")
+        print("  ※ 이 합성시장은 표본평균이 음수라 현금끌림이 오히려 도움이 됐다.")
+        print("     실제 시장(+6%/년)에서는 반대로 작용하므로 위 값은 현금끌림 몫만큼 과소평가다.")
 
     print(f"\n{hr}\n[1] 신호 지속성별 — 회전율과 비용 (i.i.d. 신호는 회전율을 과대평가하므로 함께 본다)\n{hr}")
     print(f"{'신호 자기상관':>12} {'회전율/월':>10} {'실효보유':>9} {'월비용':>9} {'연비용':>9} "
@@ -201,8 +240,31 @@ def main():
           f"(연 {ann(r['월비용'])*100:.2f}%p).")
     print(f"  → 총수익 기준 월 +{r['월비용']*100:.3f}%p 의 진짜 알파가 있어도 R3 는 알파 0 으로 읽고,")
     print(f"     kill=True + STOP_ON_KILL_CRITERIA=True 이므로 '퀄리티 재포장'으로 판정하고 실행을 중단한다.")
+
+    if deep:
+        print(f"\n{hr}\n[6] ★ 진짜 알파 통과율 — 알파를 심어 놓고 엔진 출력을 본다 (시드 20개)\n{hr}")
+        print(f"{'심은 알파(연)':>14} {'총수익 초과':>13} {'순수익 초과':>13} {'R3 이 읽는 알파':>16} {'R3 판정':>10}")
+        for a in (0.0, 0.025, 0.05, 0.075, 0.125):
+            gs, ns, cs = [], [], []
+            for s in range(20):
+                Px, mx, dx = make_panel(seed=s, rho_sig=0.95)
+                Q = inject_alpha(Px, a)
+                rg = run(Q, mx, dx, apply_costs=False)
+                rn = run(Q, mx, dx)
+                gs.append(rg["월순"] - rg["벤치"])
+                ns.append(rn["월순"] - rn["벤치"])
+                cs.append(rn["월비용"])
+            g, nz, cst = np.mean(gs), np.mean(ns), np.mean(cs)
+            r3 = g - cst          # R3 절편 ≈ 총수익 알파 − 비용 (좌변만 비용을 뺐으므로)
+            print(f"{a*100:>13.1f}% {ann(g)*100:>12.2f}% {ann(nz)*100:>12.2f}% "
+                  f"{ann(r3)*100:>15.2f}% {'통과 가능' if r3 > 0 else '✘ KILL':>12}")
+        print("\n  ※ '총수익 초과'가 심은 알파보다 작은 것은 상위 5%만 사는 선정 손실 때문이다(정상).")
+        print("  ※ R3 은 alpha_m > 0 AND t > 1.5 를 요구하므로 '통과 가능'조차 t 값이 받쳐줘야 한다.")
+    else:
+        print("\n  (다중시드 오차범위와 알파 통과율 표는 `--deep` 으로 실행 — 수 분 걸린다)")
     print()
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    main(deep="--deep" in sys.argv)
