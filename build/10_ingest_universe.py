@@ -238,16 +238,22 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     그대로 생존자편향이 되기 때문이다(운영에서 4,172행 → 2,526행으로 줄었던 구간)."""
     d = _fdr_cache_csv("listing/delisting")
     if d is None or len(d) == 0:
-        if fdr is None:
-            LOG.warn("상장폐지 목록을 확보하지 못했습니다 — C2(생존자편향 제거) 미충족 상태입니다. "
-                     "결과 해석 시 반드시 감안하세요.")
-            return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-        try:
-            limiter("krx").wait()
-            d = fdr.StockListing("KRX-DELISTING")
-        except Exception:
-            d = None
+        # ★ fdr.StockListing 은 내부적으로 data.krx.co.kr 에 '최신 영업일'을 먼저 물어보고
+        #   그 답으로 GitHub 캐시 CSV 를 읽는다. KRX 가 차단·점검이면 json.loads 가 깨지고
+        #   bare except 가 삼켜 ValueError("Failed to load data from ...") 로 둔갑한다.
+        #   날짜 문자열 하나 때문에 폐지목록 전체를 못 얻고, 그게 곧 생존자편향이다.
+        #   → KRX 를 거치지 않는 정적 캐시를 먼저 시도한다.
+        d = fdr_cache_csv("delisting")
+        if (d is None or len(d) == 0) and fdr is not None and not krx_blocked():
+            try:
+                limiter("krx").wait()
+                d = fdr.StockListing("KRX-DELISTING")
+            except Exception:
+                d = None
         if d is None or len(d) == 0:
+            LOG.warn("상장폐지 목록을 확보하지 못했습니다 — C2(생존자편향 제거) 미충족 "
+                     "상태입니다. 결과 해석 시 반드시 감안하세요. "
+                     "(정적 캐시·FDR 두 경로 모두 실패)")
             return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
 
     col = _lower_map(d)
@@ -305,9 +311,16 @@ def fetch_fdr_delisting() -> pd.DataFrame:
                  f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
                  f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
         if n_badcode > n_raw * 0.25:
-            LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
-                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
-                     f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+            # ★ 이 탈락은 대개 '사고'가 아니라 '정상'이다. KRX 폐지목록에는 보통주(주권)뿐
+            #   아니라 신주인수권증서·신주인수권증권·수익증권이 함께 들어 있고, 그것들은
+            #   722011J7 같은 8자리 코드를 쓴다. 6자리 종목코드로 정규화되지 않는 게 맞다.
+            #   (실측: 1,428건 중 보통주는 543건뿐) 그래서 경고 문구를 사실에 맞게 쓴다 —
+            #   여기서 "생존자편향이 남는다"고만 적으면 멀쩡한 동작을 버그로 오인해
+            #   엉뚱한 곳을 고치게 된다.
+            LOG.info(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 6자리 종목코드로 "
+                     f"정규화되지 않아 제외됐습니다. 대부분 신주인수권증서·수익증권 등 "
+                     f"주권이 아닌 증권이며, 제외가 정상입니다(보통주만 유니버스 대상). "
+                     f"예시: {raw_codes[codes.isna()].head(5).tolist()}")
     return t
 
 
