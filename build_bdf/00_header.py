@@ -133,6 +133,13 @@ BACKTEST_END   = "2026-07-31"
 #    "CACHED" : 스모크 → 리허설 → 드라이브 캐시만 사용(신규 수집 안 함) → 전체
 #    "PHASE0" : Phase 0 데이터 실현가능성 게이트만 돌리고 보고 후 종료 (SPEC §12-1)
 RUN_MODE = "FULL"
+#    ▸ 코드를 고치지 않고 모드만 바꿔 돌리고 싶으면 환경변수를 쓰세요:
+#         Colab/Jupyter :  import os; os.environ["ARC_BDF_RUN_MODE"] = "SMOKE"   (셀 실행 전에)
+#         터미널        :  ARC_BDF_RUN_MODE=SMOKE python arc_bdf_report_broker_flow.py
+import os as _os_early
+RUN_MODE = (_os_early.environ.get("ARC_BDF_RUN_MODE") or RUN_MODE).strip().upper()
+if RUN_MODE not in ("SMOKE", "FULL", "CACHED", "PHASE0"):
+    RUN_MODE = "FULL"
 
 # ── ⑥ Phase 0 게이트 (SPEC §4) ──────────────────────────────────────────────────────────────
 #    거래원(회원사)별 일별 매매동향의 '과거 이력' 확보 가능성을 실제로 찔러보고 판정합니다.
@@ -175,6 +182,20 @@ FLOW_INSTITUTION_ENABLE = True   # 기관 순매수(네이버 frgn 페이지네�
                                  #     플로우(소진율 차분·종목당 1요청)만으로 즉시 전 구간이 완성된다.
 FLOW_MEMBER_FORWARD     = True   # B-1 전진수집: 오늘자 거래원 상위5창구 스냅샷을 매 실행마다 적재
                                  #   (과거 이력은 어떤 무료 소스에도 없다 — Phase 0 참조)
+
+# ── ⑧-b 가격/시세 수집 예산 (★ "쓸데없이 반복 수집 금지" 를 강제하는 손잡이) ────────────────
+#    이전 판은 5,398종목을 4개 소스 × 2개 접미사로 매 실행마다 다시 긁었습니다. 그중 대부분은
+#    어떤 소스에도 존재하지 않는 코드라 다음 실행에서도 똑같이 실패합니다 — 확정적 시간 낭비입니다.
+#    아래 세 값이 그 낭비를 원천 차단합니다. 값을 키우면 커버리지가 늘고 실행이 길어집니다.
+PRICE_BUDGET_MIN         = 25    # 종목별 가격 수집에 쓸 최대 시간(분). 초과하면 '여기까지 저장하고
+                                 # 정상 진행'. 다음 실행이 남은 종목을 이어받습니다(중단 아님).
+PRICE_MAX_NEW_CODES      = 1200  # 한 실행에서 새로 시도할 최대 종목 수. 이벤트 보유 종목이 앞에
+                                 # 배치되므로, 잘려도 백테스트에 실제로 쓰이는 종목은 확보됩니다.
+PRICE_DEAD_COOLDOWN_DAYS = 30    # 전 소스가 실패한 종목의 재시도 금지 기간(일). 재실패할수록
+                                 # 자동으로 늘어납니다(30일 → 120일 → 1년). 0 으로 두면 매번 재시도.
+PRICE_FLUSH_EVERY        = 200   # N종목마다 로컬 스테이징 저장. 중간에 끊겨도 다음 실행이 이어받습니다.
+DGK_BUDGET_MIN           = 40    # 공공데이터 일별 전종목 수집 예산(분).
+DGK_FLUSH_EVERY          = 120   # N일마다 스테이징 저장.
 
 # ── ⑨ 포트폴리오 (SPEC §7 — 사전 확정, 실행 중 변경 금지) ───────────────────────────────────
 PORT_LONG_PCT          = 0.30    # BDF 잔차 상위 30% 이벤트 롱

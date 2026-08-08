@@ -34,9 +34,9 @@ def run_phase0_gate(probe_codes: Optional[Sequence[str]] = None) -> dict:
     LOG.banner("Phase 0 — 데이터 실현가능성 게이트",
                "거래원 과거 이력을 정말 못 구하는지 코드가 직접 확인합니다 (SPEC §4)")
 
-    offline = (RUN_MODE in ("SMOKE",))
+    offline = (RUN_MODE in ("SMOKE",)) or (not net_online())
     if offline:
-        LOG.info("SMOKE 모드 — 네트워크 프로브를 건너뛰고 PROXY 분기를 가정합니다.")
+        LOG.info("SMOKE 모드 또는 네트워크 미도달 — 프로브를 건너뛰고 PROXY 분기를 가정합니다.")
 
     # ── ① KRX 정보데이터시스템 ────────────────────────────────────────────────────────────
     krx_note = ("KRX 로그인 차단 상태로 사용하지 않음(KRX_ENABLE=False). "
@@ -297,8 +297,8 @@ _FORWARD_TEMPLATE = '''#!/usr/bin/env python3
 거래원 과거 이력은 어떤 무료 소스에도 없다. 그래서 오늘부터 쌓는다.
 매 영업일 장마감 후 1회 실행하도록 스케줄러에 등록하라.
 
-  · Linux/Mac cron :   30 16 * * 1-5  /usr/bin/python3 {path}
-  · Windows        :   작업 스케줄러 → 매일 16:30 → python {path}
+  · Linux/Mac cron :   30 16 * * 1-5  /usr/bin/python3 %%FORWARD_PATH%%
+  · Windows        :   작업 스케줄러 → 매일 16:30 → python %%FORWARD_PATH%%
   · GitHub Actions :   schedule: - cron: "30 7 * * 1-5"   (UTC 기준)
 
 하루라도 빠지면 그날은 영구 결손이다. Colab 세션에 의존하지 말고 상시 실행 환경에 올릴 것.
@@ -328,9 +328,9 @@ def codes_today():
 
 
 def fetch_one(code):
-    url = f"https://finance.naver.com/item/frame_trade.naver?code={{code}}"
+    url = f"https://finance.naver.com/item/frame_trade.naver?code={code}"
     try:
-        r = requests.get(url, headers={{"User-Agent": UA, "Referer": "https://finance.naver.com/"}},
+        r = requests.get(url, headers={"User-Agent": UA, "Referer": "https://finance.naver.com/"},
                          timeout=20)
         if r.status_code != 200:
             return None
@@ -368,16 +368,16 @@ def main():
         fail = 0
         out.extend(r)
         if i % 200 == 0:
-            print(f"  {{i}}/{{len(codes)}} ...")
+            print(f"  {i}/{len(codes)} ...")
     if not out:
         print("수집 0건 — 휴장이거나 차단입니다."); return
     df = pd.DataFrame(out)
     df["trade_date"] = pd.Timestamp(td)
     df["captured_at"] = pd.Timestamp(now)
     df["parser_ver"] = 1
-    p = os.path.join(OUT, f"snapshot_{{td:%Y%m%d}}.parquet")
+    p = os.path.join(OUT, f"snapshot_{td:%Y%m%d}.parquet")
     df.to_parquet(p, index=False)                     # 기존 파일을 덮지 않는 날짜별 파일
-    print(f"저장 {{len(df):,}}행 → {{p}}")
+    print(f"저장 {len(df):,}행 → {p}")
 
 
 if __name__ == "__main__":
@@ -391,10 +391,10 @@ def _emit_forward_collector(branch: str) -> Optional[str]:
         return None
     p = out_path("forward_collect_member_flow.py")
     try:
-        atomic_write_text(p, _FORWARD_TEMPLATE.format(path=p))
+        atomic_write_text(p, _FORWARD_TEMPLATE.replace("%%FORWARD_PATH%%", str(p)))
         LOG.ok(f"B-1 전진수집 스크립트 생성 → {p}  "
                f"(매 영업일 장마감 후 1회 실행하도록 스케줄러에 등록하세요)")
         return p
     except Exception as e:                                            # noqa
-        LOG.warn(f"전진수집 스크립트 생성 실패: {type(e).__name__}")
+        LOG.warn(f"전진수집 스크립트 생성 실패: {type(e).__name__}: {e}")
         return None

@@ -133,6 +133,13 @@ BACKTEST_END   = "2026-07-31"
 #    "CACHED" : 스모크 → 리허설 → 드라이브 캐시만 사용(신규 수집 안 함) → 전체
 #    "PHASE0" : Phase 0 데이터 실현가능성 게이트만 돌리고 보고 후 종료 (SPEC §12-1)
 RUN_MODE = "FULL"
+#    ▸ 코드를 고치지 않고 모드만 바꿔 돌리고 싶으면 환경변수를 쓰세요:
+#         Colab/Jupyter :  import os; os.environ["ARC_BDF_RUN_MODE"] = "SMOKE"   (셀 실행 전에)
+#         터미널        :  ARC_BDF_RUN_MODE=SMOKE python arc_bdf_report_broker_flow.py
+import os as _os_early
+RUN_MODE = (_os_early.environ.get("ARC_BDF_RUN_MODE") or RUN_MODE).strip().upper()
+if RUN_MODE not in ("SMOKE", "FULL", "CACHED", "PHASE0"):
+    RUN_MODE = "FULL"
 
 # ── ⑥ Phase 0 게이트 (SPEC §4) ──────────────────────────────────────────────────────────────
 #    거래원(회원사)별 일별 매매동향의 '과거 이력' 확보 가능성을 실제로 찔러보고 판정합니다.
@@ -175,6 +182,20 @@ FLOW_INSTITUTION_ENABLE = True   # 기관 순매수(네이버 frgn 페이지네�
                                  #     플로우(소진율 차분·종목당 1요청)만으로 즉시 전 구간이 완성된다.
 FLOW_MEMBER_FORWARD     = True   # B-1 전진수집: 오늘자 거래원 상위5창구 스냅샷을 매 실행마다 적재
                                  #   (과거 이력은 어떤 무료 소스에도 없다 — Phase 0 참조)
+
+# ── ⑧-b 가격/시세 수집 예산 (★ "쓸데없이 반복 수집 금지" 를 강제하는 손잡이) ────────────────
+#    이전 판은 5,398종목을 4개 소스 × 2개 접미사로 매 실행마다 다시 긁었습니다. 그중 대부분은
+#    어떤 소스에도 존재하지 않는 코드라 다음 실행에서도 똑같이 실패합니다 — 확정적 시간 낭비입니다.
+#    아래 세 값이 그 낭비를 원천 차단합니다. 값을 키우면 커버리지가 늘고 실행이 길어집니다.
+PRICE_BUDGET_MIN         = 25    # 종목별 가격 수집에 쓸 최대 시간(분). 초과하면 '여기까지 저장하고
+                                 # 정상 진행'. 다음 실행이 남은 종목을 이어받습니다(중단 아님).
+PRICE_MAX_NEW_CODES      = 1200  # 한 실행에서 새로 시도할 최대 종목 수. 이벤트 보유 종목이 앞에
+                                 # 배치되므로, 잘려도 백테스트에 실제로 쓰이는 종목은 확보됩니다.
+PRICE_DEAD_COOLDOWN_DAYS = 30    # 전 소스가 실패한 종목의 재시도 금지 기간(일). 재실패할수록
+                                 # 자동으로 늘어납니다(30일 → 120일 → 1년). 0 으로 두면 매번 재시도.
+PRICE_FLUSH_EVERY        = 200   # N종목마다 로컬 스테이징 저장. 중간에 끊겨도 다음 실행이 이어받습니다.
+DGK_BUDGET_MIN           = 40    # 공공데이터 일별 전종목 수집 예산(분).
+DGK_FLUSH_EVERY          = 120   # N일마다 스테이징 저장.
 
 # ── ⑨ 포트폴리오 (SPEC §7 — 사전 확정, 실행 중 변경 금지) ───────────────────────────────────
 PORT_LONG_PCT          = 0.30    # BDF 잔차 상위 30% 이벤트 롱
@@ -231,7 +252,7 @@ STOP_ON_KILL_CRITERIA = False   # SPEC §11 KILL 판정 시에도 산출물은 �
 STRATEGY_ID        = "ARC_BDF"
 STRATEGY_NAME      = "리포트 × 자사 거래원 플로우"
 STRATEGY_DESC      = "리서치의 가치는 발간 자체가 아니라 세일즈 채널을 통한 배포 강도에 있다. 한국은 종목별 거래원(회원사) 매매동향이 상위 5개 창구 기준으로 일별 공개되는 드문 시장이고, 이 데이터는 배포 강도의 관측 가능한 그림자다. 매수성 리포트를 낸 증권사의 창구에서 순매수가 동반되면 확증(롱), 순매도가 나오면 물량 분배(배제)로 읽는다. 거래원 과거 이력이 확보되지 않으면 Phase 0 게이트가 자동으로 ARC-BDF-PROXY(투자 주체 기반)로 전환하고, 그 사실을 모든 산출물에 명시한다."
-BUILD_VERSION      = "bdf.20260808.0313"
+BUILD_VERSION      = "bdf.20260808.0429"
 SPEC_ID            = "SPEC-B / ARC-BDF"
 
 # KRX 를 끈 상태에서는 자격증명을 환경변수에 주입조차 하지 않는다.
@@ -1306,26 +1327,69 @@ def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, qui
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
 def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
-            desc: str = "", quiet: bool = False) -> List[Any]:
-    """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다."""
+            desc: str = "", quiet: bool = False,
+            budget_s: Optional[float] = None,
+            should_stop: Optional[Callable[[], bool]] = None,
+            on_result: Optional[Callable[[int, Any, Any], None]] = None,
+            chunk: int = 0) -> List[Any]:
+    """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다.
+
+    ★ 이 함수가 '무한 대기' 를 만들지 않도록 세 개의 탈출구를 갖는다 —
+      셋 중 하나라도 없으면 소스 한 곳이 느려질 때 전체 실행이 멈춘다:
+        budget_s     벽시계 예산. 넘으면 '아직 시작하지 않은' 작업을 취소하고 받은 것만 돌려준다.
+        should_stop  외부 서킷브레이커. True 가 되면 즉시 남은 작업을 취소한다.
+        chunk        한 번에 제출할 작업 수. 전부 미리 제출하면 취소가 불가능해진다.
+      on_result(i, item, result) 는 완료될 때마다 불린다 → 증분 저장(중단 내성)에 쓴다.
+    """
     items = list(items)
     if not items:
         return []
     w = max(1, min(workers or N_WORKERS_IO, len(items)))
     out: List[Any] = [None] * len(items)
     errs: Counter = Counter()
-    with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
-        futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
-        it_ = as_completed(futs)
-        if not quiet:
-            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
-        for fu in it_:
-            i = futs[fu]
-            try:
-                out[i] = fu.result()
-            except Exception as e:                       # noqa
-                errs[type(e).__name__] += 1
-                out[i] = None
+    t0 = time.time()
+    # 청크 크기: 취소 반응성과 스케줄링 효율의 절충. 기본은 워커의 40배.
+    cz = int(chunk) if chunk and chunk > 0 else max(w * 40, 200)
+    stopped = ""
+    n_done = 0
+    bar = None if quiet else tqdm(total=len(items), desc=desc or "수집", leave=False, ncols=88)
+    try:
+        with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
+            pos = 0
+            while pos < len(items) and not stopped:
+                sl = list(range(pos, min(pos + cz, len(items))))
+                pos = sl[-1] + 1
+                futs = {ex.submit(fn, items[i]): i for i in sl}
+                for fu in as_completed(futs):
+                    i = futs[fu]
+                    try:
+                        r = fu.result()
+                    except Exception as e:                   # noqa
+                        errs[type(e).__name__] += 1
+                        r = None
+                    out[i] = r
+                    n_done += 1
+                    if bar is not None:
+                        bar.update(1)
+                    if on_result is not None:
+                        try:
+                            on_result(i, items[i], r)
+                        except Exception:
+                            pass
+                    if not stopped:
+                        if should_stop is not None and should_stop():
+                            stopped = "외부 중단 신호(서킷 브레이커)"
+                        elif budget_s and (time.time() - t0) > budget_s:
+                            stopped = f"시간 예산 {budget_s:.0f}s 초과"
+                    if stopped:
+                        for f2 in futs:
+                            f2.cancel()
+    finally:
+        if bar is not None:
+            bar.close()
+    if stopped:
+        LOG.warn(f"{desc or '병렬작업'} 조기 종료 — {stopped}. "
+                 f"{n_done:,}/{len(items):,}건까지 확보분은 그대로 사용합니다(0으로 채우지 않음).")
     if errs:
         LOG.warn(f"{desc or '병렬작업'} 중 실패 {sum(errs.values())}/{len(items)}건 — " +
                  ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))
@@ -2182,6 +2246,22 @@ def free_gb(path: str) -> float:
 VAULT: Optional[Vault] = None
 
 
+def state_path(name: str) -> str:
+    """중단·재개 상태 파일의 위치.
+
+    ★ outputs/ 는 Colab 세션이 끝나면 사라진다. 상태 파일이 거기 있으면 '이미 실패한 종목을
+      다시 긁지 않는다' 는 약속이 세션마다 깨진다 — 사용자가 겪은 반복 수집의 근본 원인이다.
+      그래서 드라이브 전용 인덱스 아래 state/ 에 둔다. 기존 인덱스는 건드리지 않는다(신규 폴더)."""
+    try:
+        if VAULT is not None:
+            d = os.path.join(VAULT.ns["private"], "state")
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, name)
+    except Exception:
+        pass
+    return out_path(name)
+
+
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L0-E  HTTP 계층 — 스레드로컬 세션 / 소스별 스로틀 / 인코딩 자동판별 / 차단 회피          ║
@@ -2456,6 +2536,42 @@ def report_http():
                      _trunc(", ".join(f"{k}×{v}" for k, v in c.most_common(5)), 44)])
     LOG.table(rows, ["소스", "요청", "성공", "성공률", "차단/실패", "상세"],
               ["l", "r", "r", "r", "r", "l"])
+
+
+# ── 네트워크 사전 점검 ──────────────────────────────────────────────────────────────────────
+#  ★ 막힌 네트워크(사내 프록시, 오프라인 노트북, 방화벽)에서 이 코드는 '멈춘 것처럼' 보인다.
+#    실제로는 수천 건의 요청이 각각 4회 재시도 × 지수 백오프를 도는 중이다. 눈에 보이는 것은
+#    진행 없는 프로그레스바뿐이라 원인을 알 수 없다 — 사용자가 겪은 '장시간 무반응' 의 한 축이다.
+#    그래서 짧은 타임아웃으로 딱 한 번 도달성을 확인하고, 막혔으면 즉시 캐시 전용으로 강등한다.
+_NET_STATE: Dict[str, Any] = {"checked": False, "online": True, "why": ""}
+_NET_LK = threading.Lock()
+NET_PROBES = ["https://finance.naver.com/", "https://apis.data.go.kr/", "https://www.google.com/"]
+
+
+def net_online(force: bool = False) -> bool:
+    with _NET_LK:
+        if _NET_STATE["checked"] and not force:
+            return bool(_NET_STATE["online"])
+    ok, why = False, ""
+    for u in NET_PROBES:
+        try:
+            r = requests.get(u, timeout=6, headers={"User-Agent": UA_POOL[0]})
+            if r.status_code < 500:
+                ok, why = True, f"{u} → {r.status_code}"
+                break
+            why = f"{u} → {r.status_code}"
+        except Exception as e:                                    # noqa
+            why = f"{u} → {type(e).__name__}"
+    with _NET_LK:
+        _NET_STATE.update({"checked": True, "online": ok, "why": why})
+    if ok:
+        LOG.ok(f"네트워크 도달 확인 — {why}")
+    else:
+        LOG.error(f"네트워크에 도달할 수 없습니다 ({why}). 신규 수집을 전부 건너뛰고 "
+                  f"드라이브 캐시만으로 진행합니다 — 막힌 네트워크에서 수천 건을 재시도하며 "
+                  f"몇 시간을 태우는 것을 막기 위한 조치입니다. "
+                  f"프록시 환경이라면 HTTPS_PROXY 환경변수를 설정한 뒤 다시 실행하세요.")
+    return ok
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -3693,25 +3809,107 @@ def _px_naver_html(code: str, start: str, end: str, max_pages: int = 700) -> Opt
 
 
 # ── ④ yfinance 최후 폴백 ────────────────────────────────────────────────────────────────────
+#  ★ 이전 판의 치명적 병목이 여기 있었다. 코드 하나당 .KS 와 .KQ 를 둘 다 때렸고,
+#    상장폐지·비보통주 코드까지 전부 통과시켰다. 5,398종목 × 2 = 10,796 요청이
+#    'possibly delisted / YFRateLimitError / DNS 실패 / 10초 타임아웃' 으로 돌아오며
+#    30분을 태우고 결국 멈췄다. 해결은 세 가지다:
+#      ⓐ 시장(KOSPI/KOSDAQ)으로 접미사를 하나만 고른다 — 요청 절반.
+#      ⓑ 소스 단위 서킷 브레이커 — 연속 실패가 쌓이면 그 소스를 이번 실행 내내 끈다.
+#      ⓒ yfinance 자체 로거를 잠재운다 — 수만 줄 로그가 노트북 커널을 마비시킨다.
+_YF_SUFFIX_HINT: Dict[str, str] = {}          # code → ".KS"/".KQ"  (시장 마스터에서 주입)
+
+
+class SourceBreaker:
+    """소스 단위 서킷 브레이커.
+
+    ★ 날짜/종목 단위 브레이커와 목적이 다르다. 이건 '이 소스가 지금 살아있는가' 만 본다.
+      연속 실패가 한계를 넘으면 그 소스를 이번 실행 동안 꺼서, 죽은 소스를 수천 번
+      다시 때리는 낭비를 원천 차단한다(사용자 요구: 쓸데없는 반복 수집 금지).
+      성공이 한 번이라도 나오면 연속 카운터는 0 으로 돌아간다."""
+
+    def __init__(self, limit: int = 40):
+        self.limit = int(limit)
+        self._lk = threading.Lock()
+        self.streak: Counter = Counter()
+        self.dead: Dict[str, str] = {}
+        self.ok: Counter = Counter()
+        self.bad: Counter = Counter()
+
+    def alive(self, name: str) -> bool:
+        return name not in self.dead
+
+    def hit(self, name: str, good: bool, why: str = "") -> None:
+        """★ '빈 응답' 과 '예외' 를 같은 무게로 세면 안 된다.
+          폐지종목 40개가 연달아 빈 응답을 준 것뿐인데 멀쩡한 소스를 통째로 꺼버리게 된다.
+          예외(레이트리밋·DNS·타임아웃)는 소스 건강의 신호이므로 1.0,
+          빈 응답은 종목의 속성이므로 0.2 로 센다 → 연속 200건이면 그때 끈다."""
+        w = 0.2 if why in ("empty", "no-close") else 1.0
+        with self._lk:
+            if good:
+                self.streak[name] = 0
+                self.ok[name] += 1
+                return
+            self.bad[name] += 1
+            self.streak[name] += w
+            if self.streak[name] >= self.limit and name not in self.dead:
+                self.dead[name] = why or "연속 실패"
+                LOG.warn(f"[소스 차단] {name} — 연속 실패 누적 {self.streak[name]:.0f}점({why or '사유 미상'}). "
+                         f"이번 실행에서는 더 호출하지 않습니다. 남은 소스로 계속합니다.")
+
+    def table(self) -> List[List[str]]:
+        rows = []
+        for n in sorted(set(list(self.ok) + list(self.bad))):
+            o, b = self.ok[n], self.bad[n]
+            rows.append([n, f"{o:,}", f"{b:,}", f"{100 * o / max(o + b, 1):.1f}%",
+                         "차단됨" if n in self.dead else "정상"])
+        return rows
+
+
+PX_BREAKER = SourceBreaker(limit=40)
+
+
+def _hush_yfinance() -> None:
+    """yfinance 는 종목마다 stderr 로 경고를 쏟는다. 폐지종목 수천 건이면 로그가 수만 줄이 되고,
+    주피터 커널은 출력 버퍼 때문에 눈에 띄게 느려진다. 진단 정보는 우리가 따로 집계하므로 끈다."""
+    try:
+        for nm in ("yfinance", "peewee", "urllib3.connectionpool"):
+            lg = logging.getLogger(nm)
+            lg.setLevel(logging.CRITICAL)
+            lg.propagate = False
+    except Exception:
+        pass
+    try:
+        import yfinance.utils as _yu
+        _yu.get_yf_logger().setLevel(logging.CRITICAL)
+    except Exception:
+        pass
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if yf is None:
+    if yf is None or not PX_BREAKER.alive("yfinance"):
         return None
-    for suf in (".KS", ".KQ"):
+    hint = _YF_SUFFIX_HINT.get(code)
+    sufs = (hint,) if hint else (".KS", ".KQ")      # 시장을 알면 요청이 절반이 된다
+    for suf in sufs:
         try:
             d = yf.download(code + suf, start=start, end=end, progress=False,
-                            auto_adjust=False, threads=False)
-        except Exception:
+                            auto_adjust=False, threads=False, timeout=12)
+        except Exception as ex:                                       # noqa
+            PX_BREAKER.hit("yfinance", False, type(ex).__name__)
             continue
         if d is None or len(d) == 0:
+            PX_BREAKER.hit("yfinance", False, "empty")
             continue
         if isinstance(d.columns, pd.MultiIndex):     # yfinance 0.2.5x 는 항상 MultiIndex 를 준다
             d.columns = [c[0] for c in d.columns]
         d = d.reset_index()
         lc = {str(c).strip().lower(): c for c in d.columns}
         if "close" not in lc:
+            PX_BREAKER.hit("yfinance", False, "no-close")
             continue
         close = pd.to_numeric(d[lc["close"]], errors="coerce")
         vol = pd.to_numeric(d[lc["volume"]], errors="coerce") if "volume" in lc else np.nan
+        PX_BREAKER.hit("yfinance", True)
         return pd.DataFrame({
             "code": code, "date": as_ts_series(d[lc.get("date", d.columns[0])]),
             "open": pd.to_numeric(d[lc["open"]], errors="coerce") if "open" in lc else close,
@@ -3725,68 +3923,257 @@ PRICE_CHAIN = [("fdr", _px_fdr), ("naver_json", _px_naver_json),
                ("naver_html", _px_naver_html), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """가격 수집. 캐시 우선 → 부족분만 신규 → 드라이브 재적재(공용 인덱스).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  가격 수집 상태 원장 — "쓸데없이 다시 긁지 않는다" 를 파일로 보증한다
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  이전 판은 매 실행마다 커버리지가 부족한 종목 전부를 다시 시도했다. 그런데 그중 대부분은
+#  '어떤 소스에도 존재하지 않는 코드'(뮤추얼펀드 7xxxxx/9xxxxx, 오래된 폐지종목)여서
+#  다음 실행에서도 똑같이 실패한다. 즉 매 실행 30분이 확정적으로 버려진다.
+#  → 실패 이력을 원장에 남기고, 쿨다운 안에는 절대 재시도하지 않는다.
+_PX_STATE_V = 2
 
-    ★ 캐시 병합 규칙: 종목별로 '캐시가 요구 구간을 덮는가'를 판정한다.
-      전체를 한 덩어리로 보고 '있다/없다'를 정하면, 캐시가 2020년까지만 있는 상태에서
-      2016년 백테스트가 조용히 4년치 결측으로 돌아간다."""
+
+def _px_state_path() -> str:
+    return state_path("_price_state.json")
+
+
+def _px_stage_path() -> str:
+    return state_path("_price_stage.parquet")
+
+
+def _px_load_state() -> dict:
+    st = read_json(_px_state_path(), default=None)
+    if not isinstance(st, dict) or int(st.get("_v", 0)) != _PX_STATE_V:
+        return {"_v": _PX_STATE_V, "dead": {}, "done": {}}
+    st.setdefault("dead", {})
+    st.setdefault("done", {})
+    return st
+
+
+def _px_save_state(st: dict) -> None:
+    try:
+        st["dead"] = dict(sorted(st.get("dead", {}).items())[-40000:])
+        st["done"] = dict(sorted(st.get("done", {}).items())[-40000:])
+        write_json(_px_state_path(), st)
+    except Exception:
+        pass
+
+
+def _px_is_dead(st: dict, code: str, today: pd.Timestamp) -> bool:
+    rec = st.get("dead", {}).get(code)
+    if not isinstance(rec, dict):
+        return False
+    last = as_ts(rec.get("last"))
+    if last is None:
+        return False
+    # 실패가 반복될수록 쿨다운을 늘린다(1회 7일 → 2회 30일 → 3회 이상 영구에 가깝게 365일)
+    n = int(rec.get("n", 1))
+    cd = PRICE_DEAD_COOLDOWN_DAYS * (1 if n <= 1 else (4 if n == 2 else 52))
+    return (today - last).days < cd
+
+
+def _valid_equity_code(c: str) -> bool:
+    """가격을 긁을 가치가 있는 코드인가.
+
+    ★ 7xxxxx / 9xxxxx 는 뮤추얼펀드·수익증권으로 FDR/네이버/yfinance 어디에도 일별 시세가 없다.
+      이전 판은 이것들까지 4개 소스 전부를 태워서 시간을 버렸다."""
+    c = to_code6(c) or ""
+    if not re.fullmatch(r"\d{6}", c):
+        return False
+    if c[0] in ("7", "9"):
+        return False
+    return True
+
+
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None,
+                 dgk: Optional[pd.DataFrame] = None,
+                 priority: Optional[Sequence[str]] = None,
+                 budget_s: Optional[float] = None) -> pd.DataFrame:
+    """가격 수집. 캐시 → 공공데이터 벌크 → (부족분만) 종목별 폴백 사슬.
+
+    설계 원칙 4가지 — 어느 하나가 빠지면 실행이 몇 시간짜리로 부풀거나 그냥 멈춘다:
+      ① 벌크 우선.  공공데이터 일별 전종목 패널이 있으면 그게 곧 OHLCV 다.
+                    종목별 요청은 '패널이 못 덮은 종목' 에만 쓴다(수천 → 수백).
+      ② 재시도 금지. 지난 실행에서 전 소스가 실패한 코드는 상태 원장의 쿨다운이 끝날 때까지
+                    건드리지 않는다. 존재하지 않는 코드를 매번 30분씩 다시 긁지 않는다.
+      ③ 우선순위.   이벤트(리포트)가 실제로 걸린 종목을 먼저 처리한다. 예산이 끊겨도
+                    백테스트에 쓰이는 종목은 확보된 상태가 된다.
+      ④ 증분 저장.  N종목마다 로컬 스테이징 parquet 에 떨군다. 중간에 끊겨도 다음 실행이 이어받는다.
+
+    캐시 병합 규칙: 종목별로 '캐시가 요구 구간을 덮는가'를 판정한다. 전체를 한 덩어리로 보고
+    '있다/없다'를 정하면, 캐시가 2020년까지만 있는 상태에서 2016년 백테스트가 조용히
+    4년치 결측으로 돌아간다."""
+    _hush_yfinance()
     codes = sorted({c for c in map(to_code6, codes) if c})
     s, e = as_ts(start), as_ts(end)
     if not codes or s is None or e is None:
         return pd.DataFrame(columns=PRICE_COLS)
-
-    cached = VAULT.get_table("price_daily", scope="shared")
-    have: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+    t0 = time.time()
+    budget_s = float(budget_s if budget_s is not None else PRICE_BUDGET_MIN * 60.0)
+    today = as_ts(now_kst()).normalize()
+    pad = pd.Timedelta(days=16)
     frames: List[pd.DataFrame] = []
+
+    # ── 시장 힌트(yfinance 접미사) ──────────────────────────────────────────────────────────
+    if sec is not None and len(sec) and "market" in sec.columns:
+        for c, m in zip(sec["code"].map(to_code6), sec["market"].astype(str)):
+            if not c:
+                continue
+            mu = m.upper()
+            _YF_SUFFIX_HINT[c] = ".KQ" if ("KOSDAQ" in mu or "코스닥" in m) else ".KS"
+
+    # ── 0) 공용 캐시 ────────────────────────────────────────────────────────────────────────
+    cached = VAULT.get_table("price_daily", scope="shared")
     if cached is not None and len(cached):
         cached = cached.copy()
         cached["date"] = as_ts_series(cached["date"])
         cached["code"] = cached["code"].map(to_code6)
         cached = cached.dropna(subset=["code", "date", "close"])
         if len(cached):
-            frames.append(cached)
-            g = cached.groupby("code", observed=True)["date"]
-            have = {c: (lo, hi) for c, lo, hi in zip(g.min().index, g.min().values, g.max().values)}
-            have = {c: (as_ts(lo), as_ts(hi)) for c, (lo, hi) in have.items()}
+            frames.append(cached.reindex(columns=PRICE_COLS))
             LOG.info(f"공용 캐시에서 가격 {len(cached):,}행 / {cached['code'].nunique():,}종목 재사용")
 
-    # 캐시가 요구 구간을 '충분히' 덮으면 재수집하지 않는다(양끝 10영업일 여유 허용)
-    pad = pd.Timedelta(days=16)
-    todo = [c for c in codes
-            if c not in have or have[c][0] > s + pad or have[c][1] < e - pad]
+    # ── 0-b) 직전 실행이 중단되며 남긴 스테이징 ────────────────────────────────────────────
+    stg = read_parquet_safe(_px_stage_path()) if os.path.exists(_px_stage_path()) else None
+    if stg is not None and len(stg):
+        stg = stg.copy()
+        stg["date"] = as_ts_series(stg["date"])
+        stg["code"] = stg["code"].map(to_code6)
+        stg = stg.dropna(subset=["code", "date", "close"])
+        if len(stg):
+            frames.append(stg.reindex(columns=PRICE_COLS))
+            LOG.ok(f"직전 중단 지점의 스테이징 {len(stg):,}행 / {stg['code'].nunique():,}종목을 "
+                   f"이어받았습니다 — 같은 종목을 다시 수집하지 않습니다.")
+
+    # ── 1) 공공데이터 벌크 패널을 가격으로 승격 ─────────────────────────────────────────────
+    #    ★ 이게 핵심 최적화다. 하루 1~3요청으로 전 종목이 오므로, 여기서 덮인 종목은
+    #      종목별 요청이 아예 필요 없다.
+    if dgk is not None and len(dgk):
+        g = dgk.reindex(columns=["code", "date", "open", "high", "low", "close",
+                                 "volume", "amount"]).copy()
+        g["src"] = "datagokr"
+        g["date"] = as_ts_series(g["date"])
+        g["code"] = g["code"].map(to_code6)
+        g = g.dropna(subset=["code", "date", "close"])
+        if len(g):
+            frames.append(g.reindex(columns=PRICE_COLS))
+            LOG.ok(f"공공데이터 벌크 패널을 가격으로 승격 — {len(g):,}행 / "
+                   f"{g['code'].nunique():,}종목 (이 종목들은 개별 요청 대상에서 제외됩니다)")
+
+    have = _coverage_map(frames)
+
+    # ── 2) 수집 대상 선정 ───────────────────────────────────────────────────────────────────
+    st = _px_load_state()
+    n_bad_code = n_dead = 0
+    todo: List[str] = []
+    for c in codes:
+        if not _valid_equity_code(c):
+            n_bad_code += 1
+            continue
+        cov = have.get(c)
+        if cov is not None and cov[0] <= s + pad and cov[1] >= e - pad:
+            continue
+        if cov is None and _px_is_dead(st, c, today):
+            n_dead += 1
+            continue
+        todo.append(c)
+
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 가격 부족 종목 {len(todo):,}건을 수집하지 않습니다. "
                      f"해당 종목의 이벤트는 수익률 결측으로 자동 제외됩니다(0으로 채우지 않음).")
         todo = []
 
-    fail_reasons: Counter = Counter()
+    if n_bad_code or n_dead:
+        LOG.info(f"수집 대상에서 제외 — 비주식 코드(7/9 시작 등) {n_bad_code:,}건 · "
+                 f"과거 전 소스 실패로 쿨다운 중 {n_dead:,}건. "
+                 f"(쿨다운은 {PRICE_DEAD_COOLDOWN_DAYS}일부터 시작해 재실패마다 늘어납니다)")
+
+    # ── 3) 우선순위 정렬 — 이벤트가 걸린 종목 먼저 ─────────────────────────────────────────
+    if todo and priority:
+        pri = {c for c in map(to_code6, priority) if c}
+        todo.sort(key=lambda c: (0 if c in pri else 1, c))
+        n_pri = sum(1 for c in todo if c in pri)
+        LOG.info(f"우선 수집 대상(리포트 이벤트 보유) {n_pri:,}종목을 앞에 배치했습니다 — "
+                 f"시간 예산이 끊겨도 백테스트에 실제로 쓰이는 종목이 먼저 확보됩니다.")
+
+    if todo and PRICE_MAX_NEW_CODES and len(todo) > PRICE_MAX_NEW_CODES:
+        LOG.warn(f"신규 수집 대상 {len(todo):,}종목 중 상위 {PRICE_MAX_NEW_CODES:,}종목만 "
+                 f"이번 실행에서 처리합니다(PRICE_MAX_NEW_CODES). 나머지는 다음 실행이 이어받습니다 "
+                 f"— 조용히 버리는 것이 아니라 명시적으로 유예하는 것입니다.")
+        todo = todo[:PRICE_MAX_NEW_CODES]
+
+    # ── 4) 종목별 폴백 사슬 ─────────────────────────────────────────────────────────────────
     src_hit: Counter = Counter()
+    fail_reasons: Counter = Counter()
+    new_frames: List[pd.DataFrame] = []
+    lk = threading.Lock()
 
     def _one(code: str) -> Optional[pd.DataFrame]:
         lo = s
-        if code in have and have[code][0] <= s + pad:
-            lo = max(s, have[code][1] - pd.Timedelta(days=7))   # 뒷부분만 증분 수집
+        cov = have.get(code)
+        if cov is not None and cov[0] <= s + pad:
+            lo = max(s, cov[1] - pd.Timedelta(days=7))      # 뒷부분만 증분 수집
         for name, fn in PRICE_CHAIN:
+            if not PX_BREAKER.alive(name):
+                continue
             try:
                 d = fn(code, lo.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"))
             except Exception as ex:                                       # noqa
-                fail_reasons[f"{name}:{type(ex).__name__}"] += 1
-                d = None
+                with lk:
+                    fail_reasons[f"{name}:{type(ex).__name__}"] += 1
+                PX_BREAKER.hit(name, False, type(ex).__name__)
+                continue
             if d is not None and len(d) >= 5:
-                src_hit[name] += 1
+                with lk:
+                    src_hit[name] += 1
+                PX_BREAKER.hit(name, True)
                 d = d.reindex(columns=PRICE_COLS)
                 d["code"] = code
                 return d
-            fail_reasons[f"{name}:empty"] += 1
+            with lk:
+                fail_reasons[f"{name}:empty"] += 1
+            if name != "yfinance":
+                PX_BREAKER.hit(name, False, "empty")
         return None
+
+    def _flush() -> None:
+        if not new_frames:
+            return
+        try:
+            atomic_write_parquet(pd.concat(new_frames, ignore_index=True), _px_stage_path())
+        except Exception as ex:                                           # noqa
+            LOG.debug(f"스테이징 저장 실패({type(ex).__name__}) — 계속 진행합니다.")
+
+    def _on_result(i: int, code: str, d: Optional[pd.DataFrame]) -> None:
+        with lk:
+            if d is not None and len(d):
+                new_frames.append(d)
+                st["dead"].pop(code, None)
+                st["done"][code] = today.strftime("%Y-%m-%d")
+            else:
+                rec = st["dead"].get(code) or {}
+                st["dead"][code] = {"n": int(rec.get("n", 0)) + 1,
+                                    "last": today.strftime("%Y-%m-%d")}
+            n = len(new_frames)
+        if n and n % PRICE_FLUSH_EVERY == 0:
+            with lk:
+                _flush()
+                _px_save_state(st)
 
     if todo:
         LOG.info(f"가격 신규 수집 {len(todo):,}종목 (폴백 사슬: "
-                 f"{' → '.join(n for n, _ in PRICE_CHAIN)})")
-        res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 10), desc="가격 수집")
-        frames += [d for d in res if d is not None and len(d)]
+                 f"{' → '.join(n for n, _ in PRICE_CHAIN)} · "
+                 f"예산 {budget_s / 60:.0f}분 · {PRICE_FLUSH_EVERY}종목마다 중간 저장)")
+        left = max(30.0, budget_s - (time.time() - t0))
+        pmap_io(_one, todo, workers=min(N_WORKERS_IO, 10), desc="가격 수집",
+                budget_s=left, on_result=_on_result,
+                should_stop=lambda: not any(PX_BREAKER.alive(n) for n, _ in PRICE_CHAIN))
+        with lk:
+            _flush()
+            _px_save_state(st)
+        frames += new_frames
 
     if not frames:
         LOG.warn("가격 데이터를 하나도 확보하지 못했습니다. 네트워크 또는 소스 접근을 확인하세요.")
@@ -3798,7 +4185,8 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = px.dropna(subset=["code", "date", "close"])
     px = px[(px["close"] > 0)]
     # 같은 (code,date) 가 여러 소스에서 오면 우선순위가 높은 소스를 남긴다
-    prio = {n: i for i, (n, _) in enumerate(PRICE_CHAIN)}
+    prio = {"datagokr": -1}
+    prio.update({n: i for i, (n, _) in enumerate(PRICE_CHAIN)})
     px["_p"] = px["src"].map(lambda x: prio.get(str(x), 99)).fillna(99)
     px = (px.sort_values(["code", "date", "_p"], kind="stable")
             .drop_duplicates(["code", "date"], keep="first")
@@ -3807,16 +4195,44 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     if src_hit:
         LOG.table([[k, f"{v:,}"] for k, v in src_hit.most_common()],
-                  ["소스", "성공 종목수"], ["l", "r"], title="가격 소스별 기여")
+                  ["소스", "성공 종목수"], ["l", "r"], title="가격 소스별 기여(신규분)")
+    rows = PX_BREAKER.table()
+    if rows:
+        LOG.table(rows, ["소스", "성공", "실패", "성공률", "상태"],
+                  ["l", "r", "r", "r", "l"], title="가격 소스 상태(서킷 브레이커)")
     if fail_reasons:
         LOG.debug(f"가격 수집 실패 사유 상위: {fail_reasons.most_common(8)}")
 
-    if todo:
+    if new_frames:
         VAULT.put_table("price_daily", px, scope="shared", domain="price",
-                        source="fdr+naver+yfinance",
+                        source="datagokr+fdr+naver+yfinance",
                         extra={"note": "일별 수정주가 OHLCV — 전 전략 공용"})
-    PIPE.io("OUT", "DRIVE", "price_daily", px, source="fdr+naver+yfinance")
+        try:                       # 공용 캐시에 안전하게 올라갔으면 스테이징은 회수한다
+            if os.path.exists(_px_stage_path()):
+                os.remove(_px_stage_path())
+        except Exception:
+            pass
+    PIPE.io("OUT", "DRIVE", "price_daily", px, source="datagokr+fdr+naver+yfinance")
+    LOG.ok(f"가격 패널 확정 — {len(px):,}행 · {px['code'].nunique():,}종목 · "
+           f"소요 {time.time() - t0:.0f}s")
     return downcast(px)
+
+
+def _coverage_map(frames: Sequence[pd.DataFrame]) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
+    """종목별 (최초일, 최종일). 여러 조각을 합쳐서 한 번에 본다 —
+    조각별로 따로 보면 '캐시엔 앞부분, 공공데이터엔 뒷부분' 인 종목을 불필요하게 재수집한다."""
+    have: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for f in frames:
+        if f is None or not len(f):
+            continue
+        g = f.groupby("code", observed=True)["date"].agg(["min", "max"])
+        for c, lo, hi in zip(g.index, g["min"], g["max"]):
+            lo, hi = as_ts(lo), as_ts(hi)
+            if lo is None or hi is None:
+                continue
+            prev = have.get(c)
+            have[c] = (lo, hi) if prev is None else (min(prev[0], lo), max(prev[1], hi))
+    return have
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -4073,25 +4489,106 @@ def _dgk_key() -> str:
     return k
 
 
-def _dgk_day(day: pd.Timestamp) -> Optional[pd.DataFrame]:
-    """하루치 전 종목. 실패는 None, 휴장(정상 0건)은 빈 DataFrame 으로 구분해서 돌려준다."""
+DGK_STATE_V = 3
+_DGK_RC: Counter = Counter()          # resultCode 분포 — 실패 원인을 '추측' 하지 않기 위해 집계한다
+_DGK_RC_LK = threading.Lock()
+
+# ── 하루당 요청 수 — 여기가 전체 호출량을 결정한다 ────────────────────────────────────────────
+#  ★ 2,700종목/일 을 numOfRows=1000 으로 받으면 하루 3요청 → 10년이면 약 7,400요청이다.
+#    한 번에 다 받으면 하루 1요청 → 약 2,450요청. 같은 데이터를 3분의 1로 받는다.
+#    이 API 는 numOfRows 상한이 넉넉하므로 굳이 쪼갤 이유가 없다.
+DGK_ROWS_PER_REQ = 6000
+DGK_MAX_PAGES = 3                     # 상한 초과 시의 안전장치일 뿐, 평시엔 1페이지로 끝난다
+
+
+class DgkQuota:
+    """일일 호출 한도를 '미리 정해두지 않고' 실시간으로 관측한다.
+
+    ★ 상한값을 코드에 박아 넣는 것은 두 방향 모두로 틀린다 —
+      낮게 잡으면 남은 할당량을 놔두고 멈추고, 높게 잡으면 한도 초과 응답을 수백 번 받는다.
+      포털은 잔여량을 응답 헤더로 주지 않으므로, 유일하게 정확한 신호는
+      'LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_ERROR(22)' 응답 그 자체다.
+      그래서 ① 오늘 몇 번 썼는지 세고 ② 한도 응답이 오는 순간의 카운트를 '관측된 실제 한도'로
+      기록해 상태 파일에 남긴다. 다음 실행은 그 관측값을 알고 시작한다(추측이 아니라 실측)."""
+
+    def __init__(self, state: dict):
+        self._lk = threading.Lock()
+        self.day = as_ts(now_kst()).normalize().strftime("%Y%m%d")
+        q = state.get("quota") or {}
+        self.used = int(q.get("used", 0)) if q.get("day") == self.day else 0
+        self.observed = int(q.get("observed_limit", 0) or 0)   # 0 = 아직 한도를 본 적 없음
+        self.exhausted = bool(q.get("day") == self.day and q.get("exhausted"))
+
+    def note(self, n: int = 1) -> None:
+        with self._lk:
+            self.used += int(n)
+
+    def hit_limit(self) -> None:
+        with self._lk:
+            self.exhausted = True
+            self.observed = max(self.observed, self.used)
+
+    def dump(self) -> dict:
+        return {"day": self.day, "used": int(self.used),
+                "observed_limit": int(self.observed), "exhausted": bool(self.exhausted)}
+
+    def remaining_hint(self) -> str:
+        if self.exhausted:
+            return f"오늘 한도 소진(관측된 실제 한도 {self.observed:,}회)"
+        if self.observed:
+            return f"오늘 {self.used:,}회 사용 · 관측된 한도 {self.observed:,}회 → 잔여 약 {max(0, self.observed - self.used):,}회"
+        return f"오늘 {self.used:,}회 사용 · 한도는 아직 관측되지 않음(한도 응답이 올 때까지 계속 씁니다)"
+
+
+DGK_QUOTA: Optional["DgkQuota"] = None
+
+
+def _dgk_day(day: pd.Timestamp, tries: int = 3) -> Tuple[Optional[pd.DataFrame], str]:
+    """하루치 전 종목.
+
+    반환은 (데이터, 사유) 다. 사유를 같이 돌려주는 것이 이 함수의 요점이다 —
+    이전 판은 실패를 전부 None 으로 뭉개서, 2,895일 중 15일이 실패했을 때 그것이
+    '인증키 오류' 인지 '일시적 네트워크' 인지 알 수 없었고, 결국 서킷 브레이커가
+    잘못 발동해 수집량이 0 이 되었다.
+      · (DataFrame, "ok")       정상
+      · (빈 DataFrame, "holiday") 휴장 — 정상적인 0건
+      · (None, "key:...")       인증키 문제 → 즉시 전체 중단이 옳다
+      · (None, "quota")         일일 트래픽 초과 → 즉시 전체 중단이 옳다
+      · (None, "net")           일시적 실패 → 재시도 큐로. 절대 전체를 멈추지 않는다
+    """
     key = _dgk_key()
     if not key:
-        return None
+        return None, "nokey"
     bas = day.strftime("%Y%m%d")
     rows: List[dict] = []
-    for page in range(1, 6):                     # 안전 상한 (하루 5,000행이면 충분)
+    for page in range(1, DGK_MAX_PAGES + 1):
+        if DGK_QUOTA is not None:
+            if DGK_QUOTA.exhausted:
+                return None, "quota"
+            DGK_QUOTA.note(1)
         js = http_json(DGK_BASE, source="datagokr",
-                       params={"serviceKey": key, "numOfRows": 1000, "pageNo": page,
-                               "resultType": "json", "basDt": bas}, tries=3, timeout=30)
+                       params={"serviceKey": key, "numOfRows": DGK_ROWS_PER_REQ, "pageNo": page,
+                               "resultType": "json", "basDt": bas}, tries=tries, timeout=45)
         if not isinstance(js, dict):
-            return None                          # XML 오류응답 / 파싱 실패 → '수집 실패'
-        body = (js.get("response") or {}).get("body") or {}
+            with _DGK_RC_LK:
+                _DGK_RC["응답없음/XML오류"] += 1
+            return None, "net"
         hdr = (js.get("response") or {}).get("header") or {}
+        body = (js.get("response") or {}).get("body") or {}
         rc = str(hdr.get("resultCode", "")).strip()
+        msg = str(hdr.get("resultMsg", "")).strip()
         if rc and rc not in ("00", "0", ""):
-            LOG.debug(f"data.go.kr resultCode={rc} msg={hdr.get('resultMsg')} @{bas}")
-            return None
+            with _DGK_RC_LK:
+                _DGK_RC[f"{rc} {msg}"[:60]] += 1
+            up = (rc + " " + msg).upper()
+            if any(t in up for t in ("SERVICE_KEY", "SERVICEKEY", "NOT_REGISTERED",
+                                     "UNREGISTERED", "APPLICATION_ERROR", "30", "31")):
+                return None, f"key:{rc} {msg}"[:80]
+            if "LIMITED_NUMBER" in up or "TRAFFIC" in up or rc == "22":
+                if DGK_QUOTA is not None:
+                    DGK_QUOTA.hit_limit()
+                return None, "quota"
+            return None, "net"
         items = (body.get("items") or {})
         it = items.get("item") if isinstance(items, dict) else items
         if it is None:
@@ -4102,8 +4599,10 @@ def _dgk_day(day: pd.Timestamp) -> Optional[pd.DataFrame]:
         tot = int(body.get("totalCount") or 0)
         if len(rows) >= tot or len(it) == 0:
             break
+    with _DGK_RC_LK:
+        _DGK_RC["00 정상"] += 1
     if not rows:
-        return pd.DataFrame(columns=DGK_COLS)    # 휴장(정상 0건)
+        return pd.DataFrame(columns=DGK_COLS), "holiday"    # 휴장(정상 0건)
 
     d = pd.DataFrame(rows)
     g = lambda c: pd.to_numeric(d[c], errors="coerce") if c in d.columns else np.nan
@@ -4116,7 +4615,29 @@ def _dgk_day(day: pd.Timestamp) -> Optional[pd.DataFrame]:
         "volume": g("trqu"), "amount": g("trPrc"),
         "shares": g("lstgStCnt"), "marcap": g("mrktTotAmt"),
     })
-    return out.dropna(subset=["code", "date", "close"])
+    return out.dropna(subset=["code", "date", "close"]), "ok"
+
+
+def dgk_preflight() -> Tuple[bool, str]:
+    """수집을 시작하기 전에 최근 영업일 한 건으로 키를 검증한다.
+
+    ★ 이것이 없어서 이전 판은 잘못된 키로 2,895일을 요청했다. 한 번의 요청으로 알 수 있는 것을
+      2,895번 확인하지 않는다(사용자 요구: 쓸데없는 반복 수집 금지)."""
+    if not _dgk_key():
+        return False, "nokey"
+    probe = as_ts(now_kst()).normalize() - pd.Timedelta(days=1)
+    for _ in range(8):                       # 최근 영업일을 찾을 때까지 최대 8일 거슬러 올라감
+        while probe.weekday() >= 5:
+            probe -= pd.Timedelta(days=1)
+        d, why = _dgk_day(probe, tries=2)
+        if why == "ok":
+            return True, f"정상 — {probe:%Y-%m-%d} {len(d):,}종목 응답"
+        if why.startswith("key:"):
+            return False, why
+        if why == "quota":
+            return False, "일일 트래픽 한도 초과"
+        probe -= pd.Timedelta(days=1)
+    return False, "net"
 
 
 def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
@@ -4125,7 +4646,9 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
     ★ 수집 순서는 최근 → 과거 다. 차단당하거나 중단되어도 '최신 구간' 이 먼저 확보되어
       부분 결과로도 최근 몇 년 백테스트가 가능하다 (SPEC §2.3).
     ★ 휴장일은 'holiday' 로, 실패일은 'fail' 로 각각 기록한다. 이 둘을 섞으면 몇 달 뒤에
-      패널의 구멍이 무엇이었는지 영영 알 수 없게 된다."""
+      패널의 구멍이 무엇이었는지 영영 알 수 없게 된다.
+    ★ 서킷 브레이커는 '치명적 사유'(키·한도) 에만 즉시 반응한다. 일시적 네트워크 실패는
+      재시도 큐로 보내고 계속 간다 — 2,895일 중 15일 실패로 전체를 죽이지 않는다."""
     key = _dgk_key()
     s, e = as_ts(cal_start), as_ts(cal_end)
     if s is None or e is None:
@@ -4144,13 +4667,33 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
             have_days = set(c["date"].dt.strftime("%Y%m%d"))
             LOG.info(f"공용 캐시에서 공공데이터 시세 {len(c):,}행 / {len(have_days):,}일 재사용")
 
+    # 중단·재개 스테이징: 이번 실행에서 받은 날들을 즉시 로컬에 떨궈 둔다
+    stage_p = state_path("_dgk_stage.parquet")
+    stg = read_parquet_safe(stage_p) if os.path.exists(stage_p) else None
+    if stg is not None and len(stg):
+        stg = stg.copy()
+        stg["date"] = as_ts_series(stg["date"])
+        stg["code"] = stg["code"].map(to_code6)
+        stg = stg.dropna(subset=["date", "code"])
+        if len(stg):
+            frames.append(stg.reindex(columns=DGK_COLS))
+            have_days |= set(stg["date"].dt.strftime("%Y%m%d"))
+            LOG.ok(f"직전 중단 지점의 공공데이터 스테이징 {stg['date'].nunique():,}일을 이어받았습니다.")
+
     # 상태 저장(중단·재개): 이미 '휴장 확인' 된 날은 다시 때리지 않는다
-    state_p = out_path("_dgk_state.json")
-    state = {"holiday": [], "fail": []}
+    state_p = state_path("_dgk_state.json")
+    state = {"_v": DGK_STATE_V, "holiday": [], "fail": {}}
     _prev = read_json(state_p, default=None)
-    if isinstance(_prev, dict):
+    if isinstance(_prev, dict) and int(_prev.get("_v", 0)) == DGK_STATE_V:
         state.update(_prev)
+        if not isinstance(state.get("fail"), dict):
+            state["fail"] = {}
     known_holiday = set(state.get("holiday", []))
+    global DGK_QUOTA
+    DGK_QUOTA = DgkQuota(state)
+    # 3회 이상 실패한 날은 '그 날짜에 데이터가 없는 것' 으로 보고 더 시도하지 않는다.
+    # (공공데이터는 아주 오래된 구간에서 간헐적으로 비어 있다 — 매 실행 재시도는 낭비다)
+    give_up = {k for k, v in state.get("fail", {}).items() if int(v or 0) >= 3}
 
     if not key:
         if frames:
@@ -4160,13 +4703,13 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
                      "정품 경로로 만들 수 없습니다. 시총은 근사(T2~T4)로 강등되고, "
                      "유니버스는 상장일·폐지일 기반으로만 구성됩니다(그래도 동작합니다). "
                      "정확도를 크게 올리려면 상단 ②-b 안내대로 키를 발급받아 넣으세요.")
-        return (pd.concat(frames, ignore_index=True) if frames
-                else pd.DataFrame(columns=DGK_COLS))
+        return _dgk_finalize(frames, wrote=False)
 
     days = pd.bdate_range(s, e)                       # 주말 제외 (공휴일은 응답 0건으로 판별)
     todo = [d for d in days
             if d.strftime("%Y%m%d") not in have_days
-            and d.strftime("%Y%m%d") not in known_holiday]
+            and d.strftime("%Y%m%d") not in known_holiday
+            and d.strftime("%Y%m%d") not in give_up]
     todo = sorted(todo, reverse=True)                 # ★ 최근 → 과거 (SPEC §2.3)
 
     if RUN_MODE == "CACHED":
@@ -4175,70 +4718,146 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
         todo = []
 
     if todo:
-        LOG.info(f"공공데이터 일별 전종목 수집 {len(todo):,}일 (최근→과거 · 하루 1~3요청)")
+        ok, why = dgk_preflight()
+        if not ok:
+            _dgk_key_help(why)
+            return _dgk_finalize(frames, wrote=False)
+        LOG.ok(f"공공데이터 인증키 사전점검 통과 — {why}")
+
+    if todo:
+        LOG.info(f"공공데이터 일별 전종목 수집 {len(todo):,}일 — "
+                 f"하루 1요청(numOfRows={DGK_ROWS_PER_REQ:,}) 설계이므로 예상 호출량은 "
+                 f"약 {len(todo):,}회입니다. {DGK_QUOTA.remaining_hint()}. "
+                 f"호출 한도는 미리 정하지 않고, 포털이 한도 초과를 응답하는 순간에만 멈춥니다.")
+        if DGK_QUOTA.exhausted:
+            LOG.warn("오늘 이미 한도를 소진한 기록이 있습니다 — 신규 수집을 건너뛰고 캐시만 씁니다. "
+                     "내일 다시 실행하면 남은 구간을 이어받습니다(최근→과거라 최신 구간부터 완성).")
+            todo = []
         got: List[pd.DataFrame] = []
-        n_holiday = n_fail = 0
-        streak = 0
-        stop = False
-        # 스레드 수를 낮게 유지한다 — 공공데이터포털은 순간 폭주에 민감하다.
+        n_holiday = 0
+        fatal = {"why": ""}
         lk = threading.Lock()
 
         def _one(day: pd.Timestamp):
-            nonlocal n_holiday, n_fail, streak, stop
-            if stop:
+            if fatal["why"]:
                 return None
             polite_sleep(0.05, 0.25)
-            d = _dgk_day(day)
+            d, why = _dgk_day(day)
+            ds = day.strftime("%Y%m%d")
             with lk:
-                if d is None:
-                    n_fail += 1
-                    streak += 1
-                    state["fail"].append(day.strftime("%Y%m%d"))
-                    if streak >= FLOW_CIRCUIT_BREAK_N:
-                        stop = True
-                        LOG.error(f"공공데이터 연속 실패 {streak}회 → 서킷 브레이커 작동. "
-                                  f"여기까지 받은 분량은 캐시에 저장하고 중단합니다. "
-                                  f"(키 오류이거나 일일 트래픽 한도 초과일 수 있습니다)")
-                    return None
-                streak = 0
-                if len(d) == 0:
-                    n_holiday += 1
-                    state["holiday"].append(day.strftime("%Y%m%d"))
-                    return None
-            return d
+                if why in ("holiday",):
+                    state["holiday"].append(ds)
+                    return "holiday"
+                if why == "ok":
+                    state["fail"].pop(ds, None)
+                    return d
+                # 실패 — 치명적 사유만 전체를 멈춘다
+                state["fail"][ds] = int(state["fail"].get(ds, 0)) + 1
+                if (why.startswith("key:") or why == "quota") and not fatal["why"]:
+                    fatal["why"] = why
+                return None
 
-        res = pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="공공데이터 시세")
-        got = [d for d in res if d is not None and len(d)]
+        def _on_result(i, day, r):
+            nonlocal n_holiday
+            with lk:
+                if r is None or isinstance(r, str):
+                    if r == "holiday":
+                        n_holiday += 1
+                    return
+                got.append(r)
+                n = len(got)
+            if n and n % DGK_FLUSH_EVERY == 0:
+                _dgk_flush(frames, got, stage_p, state, state_p)
+
+        pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="공공데이터 시세",
+                budget_s=DGK_BUDGET_MIN * 60.0, on_result=_on_result,
+                should_stop=lambda: bool(fatal["why"]))
+        _dgk_flush(frames, got, stage_p, state, state_p)
         frames += got
-        try:
-            state["holiday"] = sorted(set(state["holiday"]))
-            state["fail"] = sorted(set(state["fail"]))[-4000:]
-            write_json(state_p, state)
-        except Exception:
-            pass
-        LOG.ok(f"공공데이터 수집 완료 — 신규 {len(got):,}일 · 휴장 {n_holiday:,}일 · 실패 {n_fail:,}일")
-        if n_fail > len(todo) * 0.3:
-            LOG.warn(f"실패율이 {100*n_fail/max(len(todo),1):.0f}% 로 높습니다. "
-                     f"인증키(Decoding) 와 일일 트래픽 한도를 확인하세요. "
-                     f"실패한 날짜는 결측으로 남고 0으로 채우지 않습니다.")
 
+        n_fail = sum(1 for d in todo
+                     if d.strftime("%Y%m%d") in state["fail"]
+                     and d.strftime("%Y%m%d") not in {x for x in state["holiday"]})
+        LOG.ok(f"공공데이터 수집 완료 — 신규 {len(got):,}일 · 휴장 {n_holiday:,}일 · 실패 {n_fail:,}일")
+        LOG.info(f"공공데이터 호출량 — {DGK_QUOTA.remaining_hint()} "
+                 f"(수집일수 {len(got)+n_holiday:,}일당 요청 "
+                 f"{DGK_QUOTA.used / max(len(got)+n_holiday+n_fail, 1):.2f}회)")
+        if _DGK_RC:
+            LOG.table([[k, f"{v:,}"] for k, v in _DGK_RC.most_common(8)],
+                      ["resultCode / 사유", "건수"], ["l", "r"],
+                      title="공공데이터 응답 코드 분포")
+        if fatal["why"]:
+            _dgk_key_help(fatal["why"])
+        elif n_fail > max(20, len(todo) * 0.3):
+            LOG.warn(f"실패율이 {100 * n_fail / max(len(todo), 1):.0f}% 로 높습니다. "
+                     f"실패한 날짜는 결측으로 남기고 0으로 채우지 않습니다. "
+                     f"다음 실행에서 자동으로 재시도합니다(3회 실패 시 영구 제외).")
+
+    return _dgk_finalize(frames, wrote=True)
+
+
+def _dgk_key_help(why: str) -> None:
+    """키 문제는 조용히 넘기면 안 된다 — 사용자가 5초 만에 고칠 수 있는 문제이기 때문이다."""
+    if why == "quota":
+        obs = DGK_QUOTA.observed if DGK_QUOTA is not None else 0
+        LOG.error(f"공공데이터포털 일일 호출 한도에 도달했습니다"
+                  f"{f' — 관측된 실제 한도 {obs:,}회' if obs else ''}. "
+                  f"미리 정한 상한이 아니라 포털이 직접 알려준 시점에 멈춘 것입니다. "
+                  f"여기까지 받은 분량은 캐시에 저장되어 다음 실행이 이어받습니다"
+                  f"(최근→과거 순이므로 최신 구간부터 완성됩니다). "
+                  f"더 필요하면 포털 마이페이지 → 활용신청 상세 → '트래픽 증가 신청' 을 하세요.")
+        return
+    if why == "nokey":
+        return
+    LOG.error(f"공공데이터포털 인증키가 거부되었습니다 ({why}). 수집을 시작하지 않고 중단합니다 "
+              f"— 잘못된 키로 수천 건을 요청하는 낭비를 막기 위함입니다.\n"
+              f"   확인 순서: ① data.go.kr → 마이페이지 → 활용신청 현황에서 "
+              f"'금융위원회_주식시세정보' 가 '승인' 인지\n"
+              f"             ② 승인 직후라면 반영에 최대 1시간이 걸립니다\n"
+              f"             ③ 상단 DATA_GO_KR_KEY 에 'Encoding' 이 아니라 "
+              f"'Decoding' 일반 인증키를 넣었는지")
+
+
+def _dgk_flush(frames, got, stage_p, state, state_p) -> None:
+    """증분 저장. 중간에 끊겨도 여기까지는 다음 실행이 이어받는다."""
+    try:
+        if got:
+            atomic_write_parquet(pd.concat(got, ignore_index=True), stage_p)
+    except Exception as ex:                                     # noqa
+        LOG.debug(f"공공데이터 스테이징 저장 실패({type(ex).__name__})")
+    try:
+        state["holiday"] = sorted(set(state.get("holiday", [])))
+        if DGK_QUOTA is not None:
+            state["quota"] = DGK_QUOTA.dump()
+        write_json(state_p, state)
+    except Exception:
+        pass
+
+
+def _dgk_finalize(frames: List[pd.DataFrame], wrote: bool) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame(columns=DGK_COLS)
-
     P = pd.concat(frames, ignore_index=True)
     P["date"] = as_ts_series(P["date"])
     P["code"] = P["code"].map(to_code6)
     P = (P.dropna(subset=["date", "code", "close"])
            .drop_duplicates(["code", "date"], keep="last")
            .sort_values(["code", "date"], kind="stable").reset_index(drop=True))
-
-    VAULT.put_table("dgk_stock_price_daily", P, scope="shared", domain="price",
-                    source="data.go.kr:getStockPriceInfo",
-                    extra={"note": "일별 전종목 시세+시총+상장주식수 — 전 전략 공용"})
+    if wrote and len(P):
+        VAULT.put_table("dgk_stock_price_daily", P, scope="shared", domain="price",
+                        source="data.go.kr:getStockPriceInfo",
+                        extra={"note": "일별 전종목 시세+시총+상장주식수 — 전 전략 공용"})
+        try:
+            sp = state_path("_dgk_stage.parquet")
+            if os.path.exists(sp):
+                os.remove(sp)
+        except Exception:
+            pass
     PIPE.io("OUT", "DRIVE", "dgk_stock_price_daily", P, source="data.go.kr")
-    LOG.ok(f"공공데이터 패널 확정 — {len(P):,}행 · {P['code'].nunique():,}종목 · "
-           f"{P['date'].nunique():,}거래일 "
-           f"({P['date'].min():%Y-%m-%d} ~ {P['date'].max():%Y-%m-%d})")
+    if len(P):
+        LOG.ok(f"공공데이터 패널 확정 — {len(P):,}행 · {P['code'].nunique():,}종목 · "
+               f"{P['date'].nunique():,}거래일 "
+               f"({P['date'].min():%Y-%m-%d} ~ {P['date'].max():%Y-%m-%d})")
     return downcast(P)
 
 
@@ -6614,9 +7233,9 @@ def run_phase0_gate(probe_codes: Optional[Sequence[str]] = None) -> dict:
     LOG.banner("Phase 0 — 데이터 실현가능성 게이트",
                "거래원 과거 이력을 정말 못 구하는지 코드가 직접 확인합니다 (SPEC §4)")
 
-    offline = (RUN_MODE in ("SMOKE",))
+    offline = (RUN_MODE in ("SMOKE",)) or (not net_online())
     if offline:
-        LOG.info("SMOKE 모드 — 네트워크 프로브를 건너뛰고 PROXY 분기를 가정합니다.")
+        LOG.info("SMOKE 모드 또는 네트워크 미도달 — 프로브를 건너뛰고 PROXY 분기를 가정합니다.")
 
     # ── ① KRX 정보데이터시스템 ────────────────────────────────────────────────────────────
     krx_note = ("KRX 로그인 차단 상태로 사용하지 않음(KRX_ENABLE=False). "
@@ -6876,8 +7495,8 @@ _FORWARD_TEMPLATE = '''#!/usr/bin/env python3
 거래원 과거 이력은 어떤 무료 소스에도 없다. 그래서 오늘부터 쌓는다.
 매 영업일 장마감 후 1회 실행하도록 스케줄러에 등록하라.
 
-  · Linux/Mac cron :   30 16 * * 1-5  /usr/bin/python3 {path}
-  · Windows        :   작업 스케줄러 → 매일 16:30 → python {path}
+  · Linux/Mac cron :   30 16 * * 1-5  /usr/bin/python3 %%FORWARD_PATH%%
+  · Windows        :   작업 스케줄러 → 매일 16:30 → python %%FORWARD_PATH%%
   · GitHub Actions :   schedule: - cron: "30 7 * * 1-5"   (UTC 기준)
 
 하루라도 빠지면 그날은 영구 결손이다. Colab 세션에 의존하지 말고 상시 실행 환경에 올릴 것.
@@ -6907,9 +7526,9 @@ def codes_today():
 
 
 def fetch_one(code):
-    url = f"https://finance.naver.com/item/frame_trade.naver?code={{code}}"
+    url = f"https://finance.naver.com/item/frame_trade.naver?code={code}"
     try:
-        r = requests.get(url, headers={{"User-Agent": UA, "Referer": "https://finance.naver.com/"}},
+        r = requests.get(url, headers={"User-Agent": UA, "Referer": "https://finance.naver.com/"},
                          timeout=20)
         if r.status_code != 200:
             return None
@@ -6947,16 +7566,16 @@ def main():
         fail = 0
         out.extend(r)
         if i % 200 == 0:
-            print(f"  {{i}}/{{len(codes)}} ...")
+            print(f"  {i}/{len(codes)} ...")
     if not out:
         print("수집 0건 — 휴장이거나 차단입니다."); return
     df = pd.DataFrame(out)
     df["trade_date"] = pd.Timestamp(td)
     df["captured_at"] = pd.Timestamp(now)
     df["parser_ver"] = 1
-    p = os.path.join(OUT, f"snapshot_{{td:%Y%m%d}}.parquet")
+    p = os.path.join(OUT, f"snapshot_{td:%Y%m%d}.parquet")
     df.to_parquet(p, index=False)                     # 기존 파일을 덮지 않는 날짜별 파일
-    print(f"저장 {{len(df):,}}행 → {{p}}")
+    print(f"저장 {len(df):,}행 → {p}")
 
 
 if __name__ == "__main__":
@@ -6970,12 +7589,12 @@ def _emit_forward_collector(branch: str) -> Optional[str]:
         return None
     p = out_path("forward_collect_member_flow.py")
     try:
-        atomic_write_text(p, _FORWARD_TEMPLATE.format(path=p))
+        atomic_write_text(p, _FORWARD_TEMPLATE.replace("%%FORWARD_PATH%%", str(p)))
         LOG.ok(f"B-1 전진수집 스크립트 생성 → {p}  "
                f"(매 영업일 장마감 후 1회 실행하도록 스케줄러에 등록하세요)")
         return p
     except Exception as e:                                            # noqa
-        LOG.warn(f"전진수집 스크립트 생성 실패: {type(e).__name__}")
+        LOG.warn(f"전진수집 스크립트 생성 실패: {type(e).__name__}: {e}")
         return None
 
 
@@ -9410,8 +10029,15 @@ def collect_all() -> dict:
     ctx: Dict[str, Any] = {}
     warm = (as_ts(BACKTEST_START) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
 
+    # ★ 수집을 시작하기 전에 네트워크 도달성을 딱 한 번 확인한다. 막혀 있으면 캐시 전용으로
+    #   강등한다 — 막힌 네트워크에서 수천 건을 재시도하며 몇 시간을 태우는 것이 이전 판의
+    #   '장시간 무반응' 의 정체였다.
+    global RUN_MODE
+    if RUN_MODE != "SMOKE" and not net_online():
+        RUN_MODE = "CACHED"
+
     with PIPE.stage("L1.DGK", "공공데이터 일별 전종목 (시총·상장주식수)", "L1",
-                    budget_s=5400, critical=False):
+                    budget_s=int(DGK_BUDGET_MIN * 60 * 1.5), critical=False):
         ctx["dgk"] = fetch_datagokr_panel(warm, BACKTEST_END)
 
     with PIPE.stage("L1.UNI", "종목 마스터 · 상장/폐지 이력", "L1", budget_s=900):
@@ -9419,39 +10045,6 @@ def collect_all() -> dict:
                  else fetch_listing_snapshots(date_range_me(BACKTEST_START, BACKTEST_END)))
         ctx["snapshots"] = snaps
         ctx["sec"] = build_security_master(snaps)
-
-    with PIPE.stage("L1.PX", "가격 · 거래대금", "L1", budget_s=5400):
-        codes = ctx["sec"]["code"].tolist()
-        px = fetch_prices(codes, warm, BACKTEST_END)
-        if len(ctx.get("dgk", [])):
-            # 공공데이터 시세를 가격 패널에 합류시킨다(가장 신뢰도 높은 소스)
-            g = ctx["dgk"].reindex(columns=PRICE_COLS + ["shares", "marcap"]).copy()
-            g["src"] = "datagokr"
-            px = concat_nonempty([g.reindex(columns=PRICE_COLS), px], cols=PRICE_COLS)
-            px = (px.sort_values(["code", "date"], kind="stable")
-                    .drop_duplicates(["code", "date"], keep="first").reset_index(drop=True))
-        ctx["px"] = px
-        ctx["cal"] = build_trading_calendar(px)
-
-    with PIPE.stage("L1.MCAP", "PIT 시가총액 사다리", "L1", budget_s=1800, critical=False):
-        corps = (ctx["sec"]["corp_code"].dropna().astype(str).tolist()
-                 if "corp_code" in ctx["sec"].columns else [])
-        years = list(range(as_ts(BACKTEST_START).year - 1, as_ts(BACKTEST_END).year + 1))
-        shares_pit = fetch_dart_shares(corps, years)
-        cur = fetch_current_shares(ctx["sec"])
-        mc = build_marketcap_panel(ctx["px"], ctx["sec"], shares_pit, cur)
-        if len(ctx.get("dgk", [])):
-            # ★ 공공데이터의 시총/주식수는 '그 시점 값' 이므로 T1 보다도 우선한다
-            g = ctx["dgk"][["code", "date", "marcap", "shares"]].dropna(subset=["marcap"])
-            mc = mc.merge(g.rename(columns={"marcap": "mc_dgk"}), on=["code", "date"],
-                          how="left")
-            hit = mc["mc_dgk"].notna()
-            set_where(mc, hit, "marcap", mc.loc[hit, "mc_dgk"])
-            set_where(mc, hit, "mc_tier", "T0")
-            mc = mc.drop(columns=[c for c in ("mc_dgk", "shares") if c in mc.columns])
-            LOG.ok(f"공공데이터 시총으로 {int(hit.sum()):,}행을 T0(정품 관측)으로 승격 — "
-                   f"{100*hit.mean():.1f}%. 이 비율이 높을수록 H4/비교전략이 정확합니다.")
-        ctx["mc"] = assign_size_bucket(mc)
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 구축", "L1",
                     budget_s=7200, critical=False,
@@ -9496,13 +10089,51 @@ def collect_all() -> dict:
                 VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
                                 source=STRATEGY_ID)
 
+    with PIPE.stage("L1.PX", "가격 · 거래대금", "L1",
+                    budget_s=int(PRICE_BUDGET_MIN * 60 * 1.6)):
+        # ★ 수집 대상은 '보통주' 로 좁힌다. 우선주·ETF·스팩·리츠는 이벤트 매칭을 오염시키고,
+        #   어차피 리포트가 붙지 않으므로 긁을 이유가 없다(요청수 수천 건 절감).
+        sec = ctx["sec"]
+        keep = [is_common_stock(c, n, m) for c, n, m in
+                zip(sec["code"], sec.get("name", ""), sec.get("market", ""))]
+        codes = sec.loc[pd.Series(keep, index=sec.index), "code"].tolist()
+        LOG.info(f"가격 수집 대상 {len(codes):,}종목 "
+                 f"(전체 {len(sec):,} 중 보통주만 — 우선주/ETF/스팩/리츠 {len(sec)-len(codes):,}종목 제외)")
+        # 리포트 이벤트가 실제로 걸린 종목을 앞에 세운다 → 예산이 끊겨도 백테스트는 성립한다
+        pri = (sorted(set(ctx["rep"]["stock_code"].dropna().map(to_code6).dropna()))
+               if len(ctx.get("rep", [])) else [])
+        px = fetch_prices(codes, warm, BACKTEST_END, sec=sec,
+                          dgk=ctx.get("dgk"), priority=pri)
+        ctx["px"] = px
+        ctx["cal"] = build_trading_calendar(px)
+
+    with PIPE.stage("L1.MCAP", "PIT 시가총액 사다리", "L1", budget_s=1800, critical=False):
+        corps = (ctx["sec"]["corp_code"].dropna().astype(str).tolist()
+                 if "corp_code" in ctx["sec"].columns else [])
+        years = list(range(as_ts(BACKTEST_START).year - 1, as_ts(BACKTEST_END).year + 1))
+        shares_pit = fetch_dart_shares(corps, years)
+        cur = fetch_current_shares(ctx["sec"])
+        mc = build_marketcap_panel(ctx["px"], ctx["sec"], shares_pit, cur)
+        if len(ctx.get("dgk", [])):
+            # ★ 공공데이터의 시총/주식수는 '그 시점 값' 이므로 T1 보다도 우선한다
+            g = ctx["dgk"][["code", "date", "marcap", "shares"]].dropna(subset=["marcap"])
+            mc = mc.merge(g.rename(columns={"marcap": "mc_dgk"}), on=["code", "date"],
+                          how="left")
+            hit = mc["mc_dgk"].notna()
+            set_where(mc, hit, "marcap", mc.loc[hit, "mc_dgk"])
+            set_where(mc, hit, "mc_tier", "T0")
+            mc = mc.drop(columns=[c for c in ("mc_dgk", "shares") if c in mc.columns])
+            LOG.ok(f"공공데이터 시총으로 {int(hit.sum()):,}행을 T0(정품 관측)으로 승격 — "
+                   f"{100*hit.mean():.1f}%. 이 비율이 높을수록 H4/비교전략이 정확합니다.")
+        ctx["mc"] = assign_size_bucket(mc)
+
     with PIPE.stage("L1.FLOW", "플로우 수집 (거래원 / 투자자별)", "L1",
                     budget_s=int(FLOW_TIME_BUDGET_MIN * 60 * 1.3), critical=False):
         ev_codes = (sorted(set(ctx["rep"]["stock_code"].dropna().map(to_code6).dropna()))
                     if len(ctx.get("rep", [])) else ctx["sec"]["code"].tolist())
         LOG.info(f"플로우 수집 대상 {len(ev_codes):,}종목 (리포트가 존재하는 종목만 — "
                  f"전 종목을 긁으면 요청수가 10배가 되고 차단 위험이 그만큼 커집니다)")
-        if RUN_MODE != "SMOKE":
+        if RUN_MODE not in ("SMOKE", "CACHED"):
             canary = collect_member_snapshot(ev_codes[:FLOW_CANARY_TICKERS], limit=FLOW_CANARY_TICKERS)
             LOG.info(f"카나리(거래원 {FLOW_CANARY_TICKERS}종목): "
                      f"{'도달 성공' if len(canary) else '도달 실패(전진수집만 영향)'}")

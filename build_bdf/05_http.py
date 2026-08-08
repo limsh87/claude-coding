@@ -273,3 +273,39 @@ def report_http():
                      _trunc(", ".join(f"{k}×{v}" for k, v in c.most_common(5)), 44)])
     LOG.table(rows, ["소스", "요청", "성공", "성공률", "차단/실패", "상세"],
               ["l", "r", "r", "r", "r", "l"])
+
+
+# ── 네트워크 사전 점검 ──────────────────────────────────────────────────────────────────────
+#  ★ 막힌 네트워크(사내 프록시, 오프라인 노트북, 방화벽)에서 이 코드는 '멈춘 것처럼' 보인다.
+#    실제로는 수천 건의 요청이 각각 4회 재시도 × 지수 백오프를 도는 중이다. 눈에 보이는 것은
+#    진행 없는 프로그레스바뿐이라 원인을 알 수 없다 — 사용자가 겪은 '장시간 무반응' 의 한 축이다.
+#    그래서 짧은 타임아웃으로 딱 한 번 도달성을 확인하고, 막혔으면 즉시 캐시 전용으로 강등한다.
+_NET_STATE: Dict[str, Any] = {"checked": False, "online": True, "why": ""}
+_NET_LK = threading.Lock()
+NET_PROBES = ["https://finance.naver.com/", "https://apis.data.go.kr/", "https://www.google.com/"]
+
+
+def net_online(force: bool = False) -> bool:
+    with _NET_LK:
+        if _NET_STATE["checked"] and not force:
+            return bool(_NET_STATE["online"])
+    ok, why = False, ""
+    for u in NET_PROBES:
+        try:
+            r = requests.get(u, timeout=6, headers={"User-Agent": UA_POOL[0]})
+            if r.status_code < 500:
+                ok, why = True, f"{u} → {r.status_code}"
+                break
+            why = f"{u} → {r.status_code}"
+        except Exception as e:                                    # noqa
+            why = f"{u} → {type(e).__name__}"
+    with _NET_LK:
+        _NET_STATE.update({"checked": True, "online": ok, "why": why})
+    if ok:
+        LOG.ok(f"네트워크 도달 확인 — {why}")
+    else:
+        LOG.error(f"네트워크에 도달할 수 없습니다 ({why}). 신규 수집을 전부 건너뛰고 "
+                  f"드라이브 캐시만으로 진행합니다 — 막힌 네트워크에서 수천 건을 재시도하며 "
+                  f"몇 시간을 태우는 것을 막기 위한 조치입니다. "
+                  f"프록시 환경이라면 HTTPS_PROXY 환경변수를 설정한 뒤 다시 실행하세요.")
+    return ok

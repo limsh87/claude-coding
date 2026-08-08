@@ -487,3 +487,19 @@ def free_gb(path: str) -> float:
 
 
 VAULT: Optional[Vault] = None
+
+
+def state_path(name: str) -> str:
+    """중단·재개 상태 파일의 위치.
+
+    ★ outputs/ 는 Colab 세션이 끝나면 사라진다. 상태 파일이 거기 있으면 '이미 실패한 종목을
+      다시 긁지 않는다' 는 약속이 세션마다 깨진다 — 사용자가 겪은 반복 수집의 근본 원인이다.
+      그래서 드라이브 전용 인덱스 아래 state/ 에 둔다. 기존 인덱스는 건드리지 않는다(신규 폴더)."""
+    try:
+        if VAULT is not None:
+            d = os.path.join(VAULT.ns["private"], "state")
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, name)
+    except Exception:
+        pass
+    return out_path(name)

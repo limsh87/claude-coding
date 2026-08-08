@@ -60,8 +60,15 @@ def collect_all() -> dict:
     ctx: Dict[str, Any] = {}
     warm = (as_ts(BACKTEST_START) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
 
+    # ★ 수집을 시작하기 전에 네트워크 도달성을 딱 한 번 확인한다. 막혀 있으면 캐시 전용으로
+    #   강등한다 — 막힌 네트워크에서 수천 건을 재시도하며 몇 시간을 태우는 것이 이전 판의
+    #   '장시간 무반응' 의 정체였다.
+    global RUN_MODE
+    if RUN_MODE != "SMOKE" and not net_online():
+        RUN_MODE = "CACHED"
+
     with PIPE.stage("L1.DGK", "공공데이터 일별 전종목 (시총·상장주식수)", "L1",
-                    budget_s=5400, critical=False):
+                    budget_s=int(DGK_BUDGET_MIN * 60 * 1.5), critical=False):
         ctx["dgk"] = fetch_datagokr_panel(warm, BACKTEST_END)
 
     with PIPE.stage("L1.UNI", "종목 마스터 · 상장/폐지 이력", "L1", budget_s=900):
@@ -69,39 +76,6 @@ def collect_all() -> dict:
                  else fetch_listing_snapshots(date_range_me(BACKTEST_START, BACKTEST_END)))
         ctx["snapshots"] = snaps
         ctx["sec"] = build_security_master(snaps)
-
-    with PIPE.stage("L1.PX", "가격 · 거래대금", "L1", budget_s=5400):
-        codes = ctx["sec"]["code"].tolist()
-        px = fetch_prices(codes, warm, BACKTEST_END)
-        if len(ctx.get("dgk", [])):
-            # 공공데이터 시세를 가격 패널에 합류시킨다(가장 신뢰도 높은 소스)
-            g = ctx["dgk"].reindex(columns=PRICE_COLS + ["shares", "marcap"]).copy()
-            g["src"] = "datagokr"
-            px = concat_nonempty([g.reindex(columns=PRICE_COLS), px], cols=PRICE_COLS)
-            px = (px.sort_values(["code", "date"], kind="stable")
-                    .drop_duplicates(["code", "date"], keep="first").reset_index(drop=True))
-        ctx["px"] = px
-        ctx["cal"] = build_trading_calendar(px)
-
-    with PIPE.stage("L1.MCAP", "PIT 시가총액 사다리", "L1", budget_s=1800, critical=False):
-        corps = (ctx["sec"]["corp_code"].dropna().astype(str).tolist()
-                 if "corp_code" in ctx["sec"].columns else [])
-        years = list(range(as_ts(BACKTEST_START).year - 1, as_ts(BACKTEST_END).year + 1))
-        shares_pit = fetch_dart_shares(corps, years)
-        cur = fetch_current_shares(ctx["sec"])
-        mc = build_marketcap_panel(ctx["px"], ctx["sec"], shares_pit, cur)
-        if len(ctx.get("dgk", [])):
-            # ★ 공공데이터의 시총/주식수는 '그 시점 값' 이므로 T1 보다도 우선한다
-            g = ctx["dgk"][["code", "date", "marcap", "shares"]].dropna(subset=["marcap"])
-            mc = mc.merge(g.rename(columns={"marcap": "mc_dgk"}), on=["code", "date"],
-                          how="left")
-            hit = mc["mc_dgk"].notna()
-            set_where(mc, hit, "marcap", mc.loc[hit, "mc_dgk"])
-            set_where(mc, hit, "mc_tier", "T0")
-            mc = mc.drop(columns=[c for c in ("mc_dgk", "shares") if c in mc.columns])
-            LOG.ok(f"공공데이터 시총으로 {int(hit.sum()):,}행을 T0(정품 관측)으로 승격 — "
-                   f"{100*hit.mean():.1f}%. 이 비율이 높을수록 H4/비교전략이 정확합니다.")
-        ctx["mc"] = assign_size_bucket(mc)
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 구축", "L1",
                     budget_s=7200, critical=False,
@@ -146,13 +120,51 @@ def collect_all() -> dict:
                 VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
                                 source=STRATEGY_ID)
 
+    with PIPE.stage("L1.PX", "가격 · 거래대금", "L1",
+                    budget_s=int(PRICE_BUDGET_MIN * 60 * 1.6)):
+        # ★ 수집 대상은 '보통주' 로 좁힌다. 우선주·ETF·스팩·리츠는 이벤트 매칭을 오염시키고,
+        #   어차피 리포트가 붙지 않으므로 긁을 이유가 없다(요청수 수천 건 절감).
+        sec = ctx["sec"]
+        keep = [is_common_stock(c, n, m) for c, n, m in
+                zip(sec["code"], sec.get("name", ""), sec.get("market", ""))]
+        codes = sec.loc[pd.Series(keep, index=sec.index), "code"].tolist()
+        LOG.info(f"가격 수집 대상 {len(codes):,}종목 "
+                 f"(전체 {len(sec):,} 중 보통주만 — 우선주/ETF/스팩/리츠 {len(sec)-len(codes):,}종목 제외)")
+        # 리포트 이벤트가 실제로 걸린 종목을 앞에 세운다 → 예산이 끊겨도 백테스트는 성립한다
+        pri = (sorted(set(ctx["rep"]["stock_code"].dropna().map(to_code6).dropna()))
+               if len(ctx.get("rep", [])) else [])
+        px = fetch_prices(codes, warm, BACKTEST_END, sec=sec,
+                          dgk=ctx.get("dgk"), priority=pri)
+        ctx["px"] = px
+        ctx["cal"] = build_trading_calendar(px)
+
+    with PIPE.stage("L1.MCAP", "PIT 시가총액 사다리", "L1", budget_s=1800, critical=False):
+        corps = (ctx["sec"]["corp_code"].dropna().astype(str).tolist()
+                 if "corp_code" in ctx["sec"].columns else [])
+        years = list(range(as_ts(BACKTEST_START).year - 1, as_ts(BACKTEST_END).year + 1))
+        shares_pit = fetch_dart_shares(corps, years)
+        cur = fetch_current_shares(ctx["sec"])
+        mc = build_marketcap_panel(ctx["px"], ctx["sec"], shares_pit, cur)
+        if len(ctx.get("dgk", [])):
+            # ★ 공공데이터의 시총/주식수는 '그 시점 값' 이므로 T1 보다도 우선한다
+            g = ctx["dgk"][["code", "date", "marcap", "shares"]].dropna(subset=["marcap"])
+            mc = mc.merge(g.rename(columns={"marcap": "mc_dgk"}), on=["code", "date"],
+                          how="left")
+            hit = mc["mc_dgk"].notna()
+            set_where(mc, hit, "marcap", mc.loc[hit, "mc_dgk"])
+            set_where(mc, hit, "mc_tier", "T0")
+            mc = mc.drop(columns=[c for c in ("mc_dgk", "shares") if c in mc.columns])
+            LOG.ok(f"공공데이터 시총으로 {int(hit.sum()):,}행을 T0(정품 관측)으로 승격 — "
+                   f"{100*hit.mean():.1f}%. 이 비율이 높을수록 H4/비교전략이 정확합니다.")
+        ctx["mc"] = assign_size_bucket(mc)
+
     with PIPE.stage("L1.FLOW", "플로우 수집 (거래원 / 투자자별)", "L1",
                     budget_s=int(FLOW_TIME_BUDGET_MIN * 60 * 1.3), critical=False):
         ev_codes = (sorted(set(ctx["rep"]["stock_code"].dropna().map(to_code6).dropna()))
                     if len(ctx.get("rep", [])) else ctx["sec"]["code"].tolist())
         LOG.info(f"플로우 수집 대상 {len(ev_codes):,}종목 (리포트가 존재하는 종목만 — "
                  f"전 종목을 긁으면 요청수가 10배가 되고 차단 위험이 그만큼 커집니다)")
-        if RUN_MODE != "SMOKE":
+        if RUN_MODE not in ("SMOKE", "CACHED"):
             canary = collect_member_snapshot(ev_codes[:FLOW_CANARY_TICKERS], limit=FLOW_CANARY_TICKERS)
             LOG.info(f"카나리(거래원 {FLOW_CANARY_TICKERS}종목): "
                      f"{'도달 성공' if len(canary) else '도달 실패(전진수집만 영향)'}")

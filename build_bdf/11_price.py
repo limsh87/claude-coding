@@ -138,25 +138,107 @@ def _px_naver_html(code: str, start: str, end: str, max_pages: int = 700) -> Opt
 
 
 # ── ④ yfinance 최후 폴백 ────────────────────────────────────────────────────────────────────
+#  ★ 이전 판의 치명적 병목이 여기 있었다. 코드 하나당 .KS 와 .KQ 를 둘 다 때렸고,
+#    상장폐지·비보통주 코드까지 전부 통과시켰다. 5,398종목 × 2 = 10,796 요청이
+#    'possibly delisted / YFRateLimitError / DNS 실패 / 10초 타임아웃' 으로 돌아오며
+#    30분을 태우고 결국 멈췄다. 해결은 세 가지다:
+#      ⓐ 시장(KOSPI/KOSDAQ)으로 접미사를 하나만 고른다 — 요청 절반.
+#      ⓑ 소스 단위 서킷 브레이커 — 연속 실패가 쌓이면 그 소스를 이번 실행 내내 끈다.
+#      ⓒ yfinance 자체 로거를 잠재운다 — 수만 줄 로그가 노트북 커널을 마비시킨다.
+_YF_SUFFIX_HINT: Dict[str, str] = {}          # code → ".KS"/".KQ"  (시장 마스터에서 주입)
+
+
+class SourceBreaker:
+    """소스 단위 서킷 브레이커.
+
+    ★ 날짜/종목 단위 브레이커와 목적이 다르다. 이건 '이 소스가 지금 살아있는가' 만 본다.
+      연속 실패가 한계를 넘으면 그 소스를 이번 실행 동안 꺼서, 죽은 소스를 수천 번
+      다시 때리는 낭비를 원천 차단한다(사용자 요구: 쓸데없는 반복 수집 금지).
+      성공이 한 번이라도 나오면 연속 카운터는 0 으로 돌아간다."""
+
+    def __init__(self, limit: int = 40):
+        self.limit = int(limit)
+        self._lk = threading.Lock()
+        self.streak: Counter = Counter()
+        self.dead: Dict[str, str] = {}
+        self.ok: Counter = Counter()
+        self.bad: Counter = Counter()
+
+    def alive(self, name: str) -> bool:
+        return name not in self.dead
+
+    def hit(self, name: str, good: bool, why: str = "") -> None:
+        """★ '빈 응답' 과 '예외' 를 같은 무게로 세면 안 된다.
+          폐지종목 40개가 연달아 빈 응답을 준 것뿐인데 멀쩡한 소스를 통째로 꺼버리게 된다.
+          예외(레이트리밋·DNS·타임아웃)는 소스 건강의 신호이므로 1.0,
+          빈 응답은 종목의 속성이므로 0.2 로 센다 → 연속 200건이면 그때 끈다."""
+        w = 0.2 if why in ("empty", "no-close") else 1.0
+        with self._lk:
+            if good:
+                self.streak[name] = 0
+                self.ok[name] += 1
+                return
+            self.bad[name] += 1
+            self.streak[name] += w
+            if self.streak[name] >= self.limit and name not in self.dead:
+                self.dead[name] = why or "연속 실패"
+                LOG.warn(f"[소스 차단] {name} — 연속 실패 누적 {self.streak[name]:.0f}점({why or '사유 미상'}). "
+                         f"이번 실행에서는 더 호출하지 않습니다. 남은 소스로 계속합니다.")
+
+    def table(self) -> List[List[str]]:
+        rows = []
+        for n in sorted(set(list(self.ok) + list(self.bad))):
+            o, b = self.ok[n], self.bad[n]
+            rows.append([n, f"{o:,}", f"{b:,}", f"{100 * o / max(o + b, 1):.1f}%",
+                         "차단됨" if n in self.dead else "정상"])
+        return rows
+
+
+PX_BREAKER = SourceBreaker(limit=40)
+
+
+def _hush_yfinance() -> None:
+    """yfinance 는 종목마다 stderr 로 경고를 쏟는다. 폐지종목 수천 건이면 로그가 수만 줄이 되고,
+    주피터 커널은 출력 버퍼 때문에 눈에 띄게 느려진다. 진단 정보는 우리가 따로 집계하므로 끈다."""
+    try:
+        for nm in ("yfinance", "peewee", "urllib3.connectionpool"):
+            lg = logging.getLogger(nm)
+            lg.setLevel(logging.CRITICAL)
+            lg.propagate = False
+    except Exception:
+        pass
+    try:
+        import yfinance.utils as _yu
+        _yu.get_yf_logger().setLevel(logging.CRITICAL)
+    except Exception:
+        pass
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if yf is None:
+    if yf is None or not PX_BREAKER.alive("yfinance"):
         return None
-    for suf in (".KS", ".KQ"):
+    hint = _YF_SUFFIX_HINT.get(code)
+    sufs = (hint,) if hint else (".KS", ".KQ")      # 시장을 알면 요청이 절반이 된다
+    for suf in sufs:
         try:
             d = yf.download(code + suf, start=start, end=end, progress=False,
-                            auto_adjust=False, threads=False)
-        except Exception:
+                            auto_adjust=False, threads=False, timeout=12)
+        except Exception as ex:                                       # noqa
+            PX_BREAKER.hit("yfinance", False, type(ex).__name__)
             continue
         if d is None or len(d) == 0:
+            PX_BREAKER.hit("yfinance", False, "empty")
             continue
         if isinstance(d.columns, pd.MultiIndex):     # yfinance 0.2.5x 는 항상 MultiIndex 를 준다
             d.columns = [c[0] for c in d.columns]
         d = d.reset_index()
         lc = {str(c).strip().lower(): c for c in d.columns}
         if "close" not in lc:
+            PX_BREAKER.hit("yfinance", False, "no-close")
             continue
         close = pd.to_numeric(d[lc["close"]], errors="coerce")
         vol = pd.to_numeric(d[lc["volume"]], errors="coerce") if "volume" in lc else np.nan
+        PX_BREAKER.hit("yfinance", True)
         return pd.DataFrame({
             "code": code, "date": as_ts_series(d[lc.get("date", d.columns[0])]),
             "open": pd.to_numeric(d[lc["open"]], errors="coerce") if "open" in lc else close,
@@ -170,68 +252,257 @@ PRICE_CHAIN = [("fdr", _px_fdr), ("naver_json", _px_naver_json),
                ("naver_html", _px_naver_html), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """가격 수집. 캐시 우선 → 부족분만 신규 → 드라이브 재적재(공용 인덱스).
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  가격 수집 상태 원장 — "쓸데없이 다시 긁지 않는다" 를 파일로 보증한다
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  이전 판은 매 실행마다 커버리지가 부족한 종목 전부를 다시 시도했다. 그런데 그중 대부분은
+#  '어떤 소스에도 존재하지 않는 코드'(뮤추얼펀드 7xxxxx/9xxxxx, 오래된 폐지종목)여서
+#  다음 실행에서도 똑같이 실패한다. 즉 매 실행 30분이 확정적으로 버려진다.
+#  → 실패 이력을 원장에 남기고, 쿨다운 안에는 절대 재시도하지 않는다.
+_PX_STATE_V = 2
 
-    ★ 캐시 병합 규칙: 종목별로 '캐시가 요구 구간을 덮는가'를 판정한다.
-      전체를 한 덩어리로 보고 '있다/없다'를 정하면, 캐시가 2020년까지만 있는 상태에서
-      2016년 백테스트가 조용히 4년치 결측으로 돌아간다."""
+
+def _px_state_path() -> str:
+    return state_path("_price_state.json")
+
+
+def _px_stage_path() -> str:
+    return state_path("_price_stage.parquet")
+
+
+def _px_load_state() -> dict:
+    st = read_json(_px_state_path(), default=None)
+    if not isinstance(st, dict) or int(st.get("_v", 0)) != _PX_STATE_V:
+        return {"_v": _PX_STATE_V, "dead": {}, "done": {}}
+    st.setdefault("dead", {})
+    st.setdefault("done", {})
+    return st
+
+
+def _px_save_state(st: dict) -> None:
+    try:
+        st["dead"] = dict(sorted(st.get("dead", {}).items())[-40000:])
+        st["done"] = dict(sorted(st.get("done", {}).items())[-40000:])
+        write_json(_px_state_path(), st)
+    except Exception:
+        pass
+
+
+def _px_is_dead(st: dict, code: str, today: pd.Timestamp) -> bool:
+    rec = st.get("dead", {}).get(code)
+    if not isinstance(rec, dict):
+        return False
+    last = as_ts(rec.get("last"))
+    if last is None:
+        return False
+    # 실패가 반복될수록 쿨다운을 늘린다(1회 7일 → 2회 30일 → 3회 이상 영구에 가깝게 365일)
+    n = int(rec.get("n", 1))
+    cd = PRICE_DEAD_COOLDOWN_DAYS * (1 if n <= 1 else (4 if n == 2 else 52))
+    return (today - last).days < cd
+
+
+def _valid_equity_code(c: str) -> bool:
+    """가격을 긁을 가치가 있는 코드인가.
+
+    ★ 7xxxxx / 9xxxxx 는 뮤추얼펀드·수익증권으로 FDR/네이버/yfinance 어디에도 일별 시세가 없다.
+      이전 판은 이것들까지 4개 소스 전부를 태워서 시간을 버렸다."""
+    c = to_code6(c) or ""
+    if not re.fullmatch(r"\d{6}", c):
+        return False
+    if c[0] in ("7", "9"):
+        return False
+    return True
+
+
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None,
+                 dgk: Optional[pd.DataFrame] = None,
+                 priority: Optional[Sequence[str]] = None,
+                 budget_s: Optional[float] = None) -> pd.DataFrame:
+    """가격 수집. 캐시 → 공공데이터 벌크 → (부족분만) 종목별 폴백 사슬.
+
+    설계 원칙 4가지 — 어느 하나가 빠지면 실행이 몇 시간짜리로 부풀거나 그냥 멈춘다:
+      ① 벌크 우선.  공공데이터 일별 전종목 패널이 있으면 그게 곧 OHLCV 다.
+                    종목별 요청은 '패널이 못 덮은 종목' 에만 쓴다(수천 → 수백).
+      ② 재시도 금지. 지난 실행에서 전 소스가 실패한 코드는 상태 원장의 쿨다운이 끝날 때까지
+                    건드리지 않는다. 존재하지 않는 코드를 매번 30분씩 다시 긁지 않는다.
+      ③ 우선순위.   이벤트(리포트)가 실제로 걸린 종목을 먼저 처리한다. 예산이 끊겨도
+                    백테스트에 쓰이는 종목은 확보된 상태가 된다.
+      ④ 증분 저장.  N종목마다 로컬 스테이징 parquet 에 떨군다. 중간에 끊겨도 다음 실행이 이어받는다.
+
+    캐시 병합 규칙: 종목별로 '캐시가 요구 구간을 덮는가'를 판정한다. 전체를 한 덩어리로 보고
+    '있다/없다'를 정하면, 캐시가 2020년까지만 있는 상태에서 2016년 백테스트가 조용히
+    4년치 결측으로 돌아간다."""
+    _hush_yfinance()
     codes = sorted({c for c in map(to_code6, codes) if c})
     s, e = as_ts(start), as_ts(end)
     if not codes or s is None or e is None:
         return pd.DataFrame(columns=PRICE_COLS)
-
-    cached = VAULT.get_table("price_daily", scope="shared")
-    have: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+    t0 = time.time()
+    budget_s = float(budget_s if budget_s is not None else PRICE_BUDGET_MIN * 60.0)
+    today = as_ts(now_kst()).normalize()
+    pad = pd.Timedelta(days=16)
     frames: List[pd.DataFrame] = []
+
+    # ── 시장 힌트(yfinance 접미사) ──────────────────────────────────────────────────────────
+    if sec is not None and len(sec) and "market" in sec.columns:
+        for c, m in zip(sec["code"].map(to_code6), sec["market"].astype(str)):
+            if not c:
+                continue
+            mu = m.upper()
+            _YF_SUFFIX_HINT[c] = ".KQ" if ("KOSDAQ" in mu or "코스닥" in m) else ".KS"
+
+    # ── 0) 공용 캐시 ────────────────────────────────────────────────────────────────────────
+    cached = VAULT.get_table("price_daily", scope="shared")
     if cached is not None and len(cached):
         cached = cached.copy()
         cached["date"] = as_ts_series(cached["date"])
         cached["code"] = cached["code"].map(to_code6)
         cached = cached.dropna(subset=["code", "date", "close"])
         if len(cached):
-            frames.append(cached)
-            g = cached.groupby("code", observed=True)["date"]
-            have = {c: (lo, hi) for c, lo, hi in zip(g.min().index, g.min().values, g.max().values)}
-            have = {c: (as_ts(lo), as_ts(hi)) for c, (lo, hi) in have.items()}
+            frames.append(cached.reindex(columns=PRICE_COLS))
             LOG.info(f"공용 캐시에서 가격 {len(cached):,}행 / {cached['code'].nunique():,}종목 재사용")
 
-    # 캐시가 요구 구간을 '충분히' 덮으면 재수집하지 않는다(양끝 10영업일 여유 허용)
-    pad = pd.Timedelta(days=16)
-    todo = [c for c in codes
-            if c not in have or have[c][0] > s + pad or have[c][1] < e - pad]
+    # ── 0-b) 직전 실행이 중단되며 남긴 스테이징 ────────────────────────────────────────────
+    stg = read_parquet_safe(_px_stage_path()) if os.path.exists(_px_stage_path()) else None
+    if stg is not None and len(stg):
+        stg = stg.copy()
+        stg["date"] = as_ts_series(stg["date"])
+        stg["code"] = stg["code"].map(to_code6)
+        stg = stg.dropna(subset=["code", "date", "close"])
+        if len(stg):
+            frames.append(stg.reindex(columns=PRICE_COLS))
+            LOG.ok(f"직전 중단 지점의 스테이징 {len(stg):,}행 / {stg['code'].nunique():,}종목을 "
+                   f"이어받았습니다 — 같은 종목을 다시 수집하지 않습니다.")
+
+    # ── 1) 공공데이터 벌크 패널을 가격으로 승격 ─────────────────────────────────────────────
+    #    ★ 이게 핵심 최적화다. 하루 1~3요청으로 전 종목이 오므로, 여기서 덮인 종목은
+    #      종목별 요청이 아예 필요 없다.
+    if dgk is not None and len(dgk):
+        g = dgk.reindex(columns=["code", "date", "open", "high", "low", "close",
+                                 "volume", "amount"]).copy()
+        g["src"] = "datagokr"
+        g["date"] = as_ts_series(g["date"])
+        g["code"] = g["code"].map(to_code6)
+        g = g.dropna(subset=["code", "date", "close"])
+        if len(g):
+            frames.append(g.reindex(columns=PRICE_COLS))
+            LOG.ok(f"공공데이터 벌크 패널을 가격으로 승격 — {len(g):,}행 / "
+                   f"{g['code'].nunique():,}종목 (이 종목들은 개별 요청 대상에서 제외됩니다)")
+
+    have = _coverage_map(frames)
+
+    # ── 2) 수집 대상 선정 ───────────────────────────────────────────────────────────────────
+    st = _px_load_state()
+    n_bad_code = n_dead = 0
+    todo: List[str] = []
+    for c in codes:
+        if not _valid_equity_code(c):
+            n_bad_code += 1
+            continue
+        cov = have.get(c)
+        if cov is not None and cov[0] <= s + pad and cov[1] >= e - pad:
+            continue
+        if cov is None and _px_is_dead(st, c, today):
+            n_dead += 1
+            continue
+        todo.append(c)
+
     if RUN_MODE == "CACHED":
         if todo:
             LOG.warn(f"CACHED 모드 — 가격 부족 종목 {len(todo):,}건을 수집하지 않습니다. "
                      f"해당 종목의 이벤트는 수익률 결측으로 자동 제외됩니다(0으로 채우지 않음).")
         todo = []
 
-    fail_reasons: Counter = Counter()
+    if n_bad_code or n_dead:
+        LOG.info(f"수집 대상에서 제외 — 비주식 코드(7/9 시작 등) {n_bad_code:,}건 · "
+                 f"과거 전 소스 실패로 쿨다운 중 {n_dead:,}건. "
+                 f"(쿨다운은 {PRICE_DEAD_COOLDOWN_DAYS}일부터 시작해 재실패마다 늘어납니다)")
+
+    # ── 3) 우선순위 정렬 — 이벤트가 걸린 종목 먼저 ─────────────────────────────────────────
+    if todo and priority:
+        pri = {c for c in map(to_code6, priority) if c}
+        todo.sort(key=lambda c: (0 if c in pri else 1, c))
+        n_pri = sum(1 for c in todo if c in pri)
+        LOG.info(f"우선 수집 대상(리포트 이벤트 보유) {n_pri:,}종목을 앞에 배치했습니다 — "
+                 f"시간 예산이 끊겨도 백테스트에 실제로 쓰이는 종목이 먼저 확보됩니다.")
+
+    if todo and PRICE_MAX_NEW_CODES and len(todo) > PRICE_MAX_NEW_CODES:
+        LOG.warn(f"신규 수집 대상 {len(todo):,}종목 중 상위 {PRICE_MAX_NEW_CODES:,}종목만 "
+                 f"이번 실행에서 처리합니다(PRICE_MAX_NEW_CODES). 나머지는 다음 실행이 이어받습니다 "
+                 f"— 조용히 버리는 것이 아니라 명시적으로 유예하는 것입니다.")
+        todo = todo[:PRICE_MAX_NEW_CODES]
+
+    # ── 4) 종목별 폴백 사슬 ─────────────────────────────────────────────────────────────────
     src_hit: Counter = Counter()
+    fail_reasons: Counter = Counter()
+    new_frames: List[pd.DataFrame] = []
+    lk = threading.Lock()
 
     def _one(code: str) -> Optional[pd.DataFrame]:
         lo = s
-        if code in have and have[code][0] <= s + pad:
-            lo = max(s, have[code][1] - pd.Timedelta(days=7))   # 뒷부분만 증분 수집
+        cov = have.get(code)
+        if cov is not None and cov[0] <= s + pad:
+            lo = max(s, cov[1] - pd.Timedelta(days=7))      # 뒷부분만 증분 수집
         for name, fn in PRICE_CHAIN:
+            if not PX_BREAKER.alive(name):
+                continue
             try:
                 d = fn(code, lo.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"))
             except Exception as ex:                                       # noqa
-                fail_reasons[f"{name}:{type(ex).__name__}"] += 1
-                d = None
+                with lk:
+                    fail_reasons[f"{name}:{type(ex).__name__}"] += 1
+                PX_BREAKER.hit(name, False, type(ex).__name__)
+                continue
             if d is not None and len(d) >= 5:
-                src_hit[name] += 1
+                with lk:
+                    src_hit[name] += 1
+                PX_BREAKER.hit(name, True)
                 d = d.reindex(columns=PRICE_COLS)
                 d["code"] = code
                 return d
-            fail_reasons[f"{name}:empty"] += 1
+            with lk:
+                fail_reasons[f"{name}:empty"] += 1
+            if name != "yfinance":
+                PX_BREAKER.hit(name, False, "empty")
         return None
+
+    def _flush() -> None:
+        if not new_frames:
+            return
+        try:
+            atomic_write_parquet(pd.concat(new_frames, ignore_index=True), _px_stage_path())
+        except Exception as ex:                                           # noqa
+            LOG.debug(f"스테이징 저장 실패({type(ex).__name__}) — 계속 진행합니다.")
+
+    def _on_result(i: int, code: str, d: Optional[pd.DataFrame]) -> None:
+        with lk:
+            if d is not None and len(d):
+                new_frames.append(d)
+                st["dead"].pop(code, None)
+                st["done"][code] = today.strftime("%Y-%m-%d")
+            else:
+                rec = st["dead"].get(code) or {}
+                st["dead"][code] = {"n": int(rec.get("n", 0)) + 1,
+                                    "last": today.strftime("%Y-%m-%d")}
+            n = len(new_frames)
+        if n and n % PRICE_FLUSH_EVERY == 0:
+            with lk:
+                _flush()
+                _px_save_state(st)
 
     if todo:
         LOG.info(f"가격 신규 수집 {len(todo):,}종목 (폴백 사슬: "
-                 f"{' → '.join(n for n, _ in PRICE_CHAIN)})")
-        res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 10), desc="가격 수집")
-        frames += [d for d in res if d is not None and len(d)]
+                 f"{' → '.join(n for n, _ in PRICE_CHAIN)} · "
+                 f"예산 {budget_s / 60:.0f}분 · {PRICE_FLUSH_EVERY}종목마다 중간 저장)")
+        left = max(30.0, budget_s - (time.time() - t0))
+        pmap_io(_one, todo, workers=min(N_WORKERS_IO, 10), desc="가격 수집",
+                budget_s=left, on_result=_on_result,
+                should_stop=lambda: not any(PX_BREAKER.alive(n) for n, _ in PRICE_CHAIN))
+        with lk:
+            _flush()
+            _px_save_state(st)
+        frames += new_frames
 
     if not frames:
         LOG.warn("가격 데이터를 하나도 확보하지 못했습니다. 네트워크 또는 소스 접근을 확인하세요.")
@@ -243,7 +514,8 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = px.dropna(subset=["code", "date", "close"])
     px = px[(px["close"] > 0)]
     # 같은 (code,date) 가 여러 소스에서 오면 우선순위가 높은 소스를 남긴다
-    prio = {n: i for i, (n, _) in enumerate(PRICE_CHAIN)}
+    prio = {"datagokr": -1}
+    prio.update({n: i for i, (n, _) in enumerate(PRICE_CHAIN)})
     px["_p"] = px["src"].map(lambda x: prio.get(str(x), 99)).fillna(99)
     px = (px.sort_values(["code", "date", "_p"], kind="stable")
             .drop_duplicates(["code", "date"], keep="first")
@@ -252,16 +524,44 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     if src_hit:
         LOG.table([[k, f"{v:,}"] for k, v in src_hit.most_common()],
-                  ["소스", "성공 종목수"], ["l", "r"], title="가격 소스별 기여")
+                  ["소스", "성공 종목수"], ["l", "r"], title="가격 소스별 기여(신규분)")
+    rows = PX_BREAKER.table()
+    if rows:
+        LOG.table(rows, ["소스", "성공", "실패", "성공률", "상태"],
+                  ["l", "r", "r", "r", "l"], title="가격 소스 상태(서킷 브레이커)")
     if fail_reasons:
         LOG.debug(f"가격 수집 실패 사유 상위: {fail_reasons.most_common(8)}")
 
-    if todo:
+    if new_frames:
         VAULT.put_table("price_daily", px, scope="shared", domain="price",
-                        source="fdr+naver+yfinance",
+                        source="datagokr+fdr+naver+yfinance",
                         extra={"note": "일별 수정주가 OHLCV — 전 전략 공용"})
-    PIPE.io("OUT", "DRIVE", "price_daily", px, source="fdr+naver+yfinance")
+        try:                       # 공용 캐시에 안전하게 올라갔으면 스테이징은 회수한다
+            if os.path.exists(_px_stage_path()):
+                os.remove(_px_stage_path())
+        except Exception:
+            pass
+    PIPE.io("OUT", "DRIVE", "price_daily", px, source="datagokr+fdr+naver+yfinance")
+    LOG.ok(f"가격 패널 확정 — {len(px):,}행 · {px['code'].nunique():,}종목 · "
+           f"소요 {time.time() - t0:.0f}s")
     return downcast(px)
+
+
+def _coverage_map(frames: Sequence[pd.DataFrame]) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
+    """종목별 (최초일, 최종일). 여러 조각을 합쳐서 한 번에 본다 —
+    조각별로 따로 보면 '캐시엔 앞부분, 공공데이터엔 뒷부분' 인 종목을 불필요하게 재수집한다."""
+    have: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for f in frames:
+        if f is None or not len(f):
+            continue
+        g = f.groupby("code", observed=True)["date"].agg(["min", "max"])
+        for c, lo, hi in zip(g.index, g["min"], g["max"]):
+            lo, hi = as_ts(lo), as_ts(hi)
+            if lo is None or hi is None:
+                continue
+            prev = have.get(c)
+            have[c] = (lo, hi) if prev is None else (min(prev[0], lo), max(prev[1], hi))
+    return have
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════

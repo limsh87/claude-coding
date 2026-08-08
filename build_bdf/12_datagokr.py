@@ -40,25 +40,106 @@ def _dgk_key() -> str:
     return k
 
 
-def _dgk_day(day: pd.Timestamp) -> Optional[pd.DataFrame]:
-    """하루치 전 종목. 실패는 None, 휴장(정상 0건)은 빈 DataFrame 으로 구분해서 돌려준다."""
+DGK_STATE_V = 3
+_DGK_RC: Counter = Counter()          # resultCode 분포 — 실패 원인을 '추측' 하지 않기 위해 집계한다
+_DGK_RC_LK = threading.Lock()
+
+# ── 하루당 요청 수 — 여기가 전체 호출량을 결정한다 ────────────────────────────────────────────
+#  ★ 2,700종목/일 을 numOfRows=1000 으로 받으면 하루 3요청 → 10년이면 약 7,400요청이다.
+#    한 번에 다 받으면 하루 1요청 → 약 2,450요청. 같은 데이터를 3분의 1로 받는다.
+#    이 API 는 numOfRows 상한이 넉넉하므로 굳이 쪼갤 이유가 없다.
+DGK_ROWS_PER_REQ = 6000
+DGK_MAX_PAGES = 3                     # 상한 초과 시의 안전장치일 뿐, 평시엔 1페이지로 끝난다
+
+
+class DgkQuota:
+    """일일 호출 한도를 '미리 정해두지 않고' 실시간으로 관측한다.
+
+    ★ 상한값을 코드에 박아 넣는 것은 두 방향 모두로 틀린다 —
+      낮게 잡으면 남은 할당량을 놔두고 멈추고, 높게 잡으면 한도 초과 응답을 수백 번 받는다.
+      포털은 잔여량을 응답 헤더로 주지 않으므로, 유일하게 정확한 신호는
+      'LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_ERROR(22)' 응답 그 자체다.
+      그래서 ① 오늘 몇 번 썼는지 세고 ② 한도 응답이 오는 순간의 카운트를 '관측된 실제 한도'로
+      기록해 상태 파일에 남긴다. 다음 실행은 그 관측값을 알고 시작한다(추측이 아니라 실측)."""
+
+    def __init__(self, state: dict):
+        self._lk = threading.Lock()
+        self.day = as_ts(now_kst()).normalize().strftime("%Y%m%d")
+        q = state.get("quota") or {}
+        self.used = int(q.get("used", 0)) if q.get("day") == self.day else 0
+        self.observed = int(q.get("observed_limit", 0) or 0)   # 0 = 아직 한도를 본 적 없음
+        self.exhausted = bool(q.get("day") == self.day and q.get("exhausted"))
+
+    def note(self, n: int = 1) -> None:
+        with self._lk:
+            self.used += int(n)
+
+    def hit_limit(self) -> None:
+        with self._lk:
+            self.exhausted = True
+            self.observed = max(self.observed, self.used)
+
+    def dump(self) -> dict:
+        return {"day": self.day, "used": int(self.used),
+                "observed_limit": int(self.observed), "exhausted": bool(self.exhausted)}
+
+    def remaining_hint(self) -> str:
+        if self.exhausted:
+            return f"오늘 한도 소진(관측된 실제 한도 {self.observed:,}회)"
+        if self.observed:
+            return f"오늘 {self.used:,}회 사용 · 관측된 한도 {self.observed:,}회 → 잔여 약 {max(0, self.observed - self.used):,}회"
+        return f"오늘 {self.used:,}회 사용 · 한도는 아직 관측되지 않음(한도 응답이 올 때까지 계속 씁니다)"
+
+
+DGK_QUOTA: Optional["DgkQuota"] = None
+
+
+def _dgk_day(day: pd.Timestamp, tries: int = 3) -> Tuple[Optional[pd.DataFrame], str]:
+    """하루치 전 종목.
+
+    반환은 (데이터, 사유) 다. 사유를 같이 돌려주는 것이 이 함수의 요점이다 —
+    이전 판은 실패를 전부 None 으로 뭉개서, 2,895일 중 15일이 실패했을 때 그것이
+    '인증키 오류' 인지 '일시적 네트워크' 인지 알 수 없었고, 결국 서킷 브레이커가
+    잘못 발동해 수집량이 0 이 되었다.
+      · (DataFrame, "ok")       정상
+      · (빈 DataFrame, "holiday") 휴장 — 정상적인 0건
+      · (None, "key:...")       인증키 문제 → 즉시 전체 중단이 옳다
+      · (None, "quota")         일일 트래픽 초과 → 즉시 전체 중단이 옳다
+      · (None, "net")           일시적 실패 → 재시도 큐로. 절대 전체를 멈추지 않는다
+    """
     key = _dgk_key()
     if not key:
-        return None
+        return None, "nokey"
     bas = day.strftime("%Y%m%d")
     rows: List[dict] = []
-    for page in range(1, 6):                     # 안전 상한 (하루 5,000행이면 충분)
+    for page in range(1, DGK_MAX_PAGES + 1):
+        if DGK_QUOTA is not None:
+            if DGK_QUOTA.exhausted:
+                return None, "quota"
+            DGK_QUOTA.note(1)
         js = http_json(DGK_BASE, source="datagokr",
-                       params={"serviceKey": key, "numOfRows": 1000, "pageNo": page,
-                               "resultType": "json", "basDt": bas}, tries=3, timeout=30)
+                       params={"serviceKey": key, "numOfRows": DGK_ROWS_PER_REQ, "pageNo": page,
+                               "resultType": "json", "basDt": bas}, tries=tries, timeout=45)
         if not isinstance(js, dict):
-            return None                          # XML 오류응답 / 파싱 실패 → '수집 실패'
-        body = (js.get("response") or {}).get("body") or {}
+            with _DGK_RC_LK:
+                _DGK_RC["응답없음/XML오류"] += 1
+            return None, "net"
         hdr = (js.get("response") or {}).get("header") or {}
+        body = (js.get("response") or {}).get("body") or {}
         rc = str(hdr.get("resultCode", "")).strip()
+        msg = str(hdr.get("resultMsg", "")).strip()
         if rc and rc not in ("00", "0", ""):
-            LOG.debug(f"data.go.kr resultCode={rc} msg={hdr.get('resultMsg')} @{bas}")
-            return None
+            with _DGK_RC_LK:
+                _DGK_RC[f"{rc} {msg}"[:60]] += 1
+            up = (rc + " " + msg).upper()
+            if any(t in up for t in ("SERVICE_KEY", "SERVICEKEY", "NOT_REGISTERED",
+                                     "UNREGISTERED", "APPLICATION_ERROR", "30", "31")):
+                return None, f"key:{rc} {msg}"[:80]
+            if "LIMITED_NUMBER" in up or "TRAFFIC" in up or rc == "22":
+                if DGK_QUOTA is not None:
+                    DGK_QUOTA.hit_limit()
+                return None, "quota"
+            return None, "net"
         items = (body.get("items") or {})
         it = items.get("item") if isinstance(items, dict) else items
         if it is None:
@@ -69,8 +150,10 @@ def _dgk_day(day: pd.Timestamp) -> Optional[pd.DataFrame]:
         tot = int(body.get("totalCount") or 0)
         if len(rows) >= tot or len(it) == 0:
             break
+    with _DGK_RC_LK:
+        _DGK_RC["00 정상"] += 1
     if not rows:
-        return pd.DataFrame(columns=DGK_COLS)    # 휴장(정상 0건)
+        return pd.DataFrame(columns=DGK_COLS), "holiday"    # 휴장(정상 0건)
 
     d = pd.DataFrame(rows)
     g = lambda c: pd.to_numeric(d[c], errors="coerce") if c in d.columns else np.nan
@@ -83,7 +166,29 @@ def _dgk_day(day: pd.Timestamp) -> Optional[pd.DataFrame]:
         "volume": g("trqu"), "amount": g("trPrc"),
         "shares": g("lstgStCnt"), "marcap": g("mrktTotAmt"),
     })
-    return out.dropna(subset=["code", "date", "close"])
+    return out.dropna(subset=["code", "date", "close"]), "ok"
+
+
+def dgk_preflight() -> Tuple[bool, str]:
+    """수집을 시작하기 전에 최근 영업일 한 건으로 키를 검증한다.
+
+    ★ 이것이 없어서 이전 판은 잘못된 키로 2,895일을 요청했다. 한 번의 요청으로 알 수 있는 것을
+      2,895번 확인하지 않는다(사용자 요구: 쓸데없는 반복 수집 금지)."""
+    if not _dgk_key():
+        return False, "nokey"
+    probe = as_ts(now_kst()).normalize() - pd.Timedelta(days=1)
+    for _ in range(8):                       # 최근 영업일을 찾을 때까지 최대 8일 거슬러 올라감
+        while probe.weekday() >= 5:
+            probe -= pd.Timedelta(days=1)
+        d, why = _dgk_day(probe, tries=2)
+        if why == "ok":
+            return True, f"정상 — {probe:%Y-%m-%d} {len(d):,}종목 응답"
+        if why.startswith("key:"):
+            return False, why
+        if why == "quota":
+            return False, "일일 트래픽 한도 초과"
+        probe -= pd.Timedelta(days=1)
+    return False, "net"
 
 
 def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
@@ -92,7 +197,9 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
     ★ 수집 순서는 최근 → 과거 다. 차단당하거나 중단되어도 '최신 구간' 이 먼저 확보되어
       부분 결과로도 최근 몇 년 백테스트가 가능하다 (SPEC §2.3).
     ★ 휴장일은 'holiday' 로, 실패일은 'fail' 로 각각 기록한다. 이 둘을 섞으면 몇 달 뒤에
-      패널의 구멍이 무엇이었는지 영영 알 수 없게 된다."""
+      패널의 구멍이 무엇이었는지 영영 알 수 없게 된다.
+    ★ 서킷 브레이커는 '치명적 사유'(키·한도) 에만 즉시 반응한다. 일시적 네트워크 실패는
+      재시도 큐로 보내고 계속 간다 — 2,895일 중 15일 실패로 전체를 죽이지 않는다."""
     key = _dgk_key()
     s, e = as_ts(cal_start), as_ts(cal_end)
     if s is None or e is None:
@@ -111,13 +218,33 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
             have_days = set(c["date"].dt.strftime("%Y%m%d"))
             LOG.info(f"공용 캐시에서 공공데이터 시세 {len(c):,}행 / {len(have_days):,}일 재사용")
 
+    # 중단·재개 스테이징: 이번 실행에서 받은 날들을 즉시 로컬에 떨궈 둔다
+    stage_p = state_path("_dgk_stage.parquet")
+    stg = read_parquet_safe(stage_p) if os.path.exists(stage_p) else None
+    if stg is not None and len(stg):
+        stg = stg.copy()
+        stg["date"] = as_ts_series(stg["date"])
+        stg["code"] = stg["code"].map(to_code6)
+        stg = stg.dropna(subset=["date", "code"])
+        if len(stg):
+            frames.append(stg.reindex(columns=DGK_COLS))
+            have_days |= set(stg["date"].dt.strftime("%Y%m%d"))
+            LOG.ok(f"직전 중단 지점의 공공데이터 스테이징 {stg['date'].nunique():,}일을 이어받았습니다.")
+
     # 상태 저장(중단·재개): 이미 '휴장 확인' 된 날은 다시 때리지 않는다
-    state_p = out_path("_dgk_state.json")
-    state = {"holiday": [], "fail": []}
+    state_p = state_path("_dgk_state.json")
+    state = {"_v": DGK_STATE_V, "holiday": [], "fail": {}}
     _prev = read_json(state_p, default=None)
-    if isinstance(_prev, dict):
+    if isinstance(_prev, dict) and int(_prev.get("_v", 0)) == DGK_STATE_V:
         state.update(_prev)
+        if not isinstance(state.get("fail"), dict):
+            state["fail"] = {}
     known_holiday = set(state.get("holiday", []))
+    global DGK_QUOTA
+    DGK_QUOTA = DgkQuota(state)
+    # 3회 이상 실패한 날은 '그 날짜에 데이터가 없는 것' 으로 보고 더 시도하지 않는다.
+    # (공공데이터는 아주 오래된 구간에서 간헐적으로 비어 있다 — 매 실행 재시도는 낭비다)
+    give_up = {k for k, v in state.get("fail", {}).items() if int(v or 0) >= 3}
 
     if not key:
         if frames:
@@ -127,13 +254,13 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
                      "정품 경로로 만들 수 없습니다. 시총은 근사(T2~T4)로 강등되고, "
                      "유니버스는 상장일·폐지일 기반으로만 구성됩니다(그래도 동작합니다). "
                      "정확도를 크게 올리려면 상단 ②-b 안내대로 키를 발급받아 넣으세요.")
-        return (pd.concat(frames, ignore_index=True) if frames
-                else pd.DataFrame(columns=DGK_COLS))
+        return _dgk_finalize(frames, wrote=False)
 
     days = pd.bdate_range(s, e)                       # 주말 제외 (공휴일은 응답 0건으로 판별)
     todo = [d for d in days
             if d.strftime("%Y%m%d") not in have_days
-            and d.strftime("%Y%m%d") not in known_holiday]
+            and d.strftime("%Y%m%d") not in known_holiday
+            and d.strftime("%Y%m%d") not in give_up]
     todo = sorted(todo, reverse=True)                 # ★ 최근 → 과거 (SPEC §2.3)
 
     if RUN_MODE == "CACHED":
@@ -142,70 +269,146 @@ def fetch_datagokr_panel(cal_start: str, cal_end: str) -> pd.DataFrame:
         todo = []
 
     if todo:
-        LOG.info(f"공공데이터 일별 전종목 수집 {len(todo):,}일 (최근→과거 · 하루 1~3요청)")
+        ok, why = dgk_preflight()
+        if not ok:
+            _dgk_key_help(why)
+            return _dgk_finalize(frames, wrote=False)
+        LOG.ok(f"공공데이터 인증키 사전점검 통과 — {why}")
+
+    if todo:
+        LOG.info(f"공공데이터 일별 전종목 수집 {len(todo):,}일 — "
+                 f"하루 1요청(numOfRows={DGK_ROWS_PER_REQ:,}) 설계이므로 예상 호출량은 "
+                 f"약 {len(todo):,}회입니다. {DGK_QUOTA.remaining_hint()}. "
+                 f"호출 한도는 미리 정하지 않고, 포털이 한도 초과를 응답하는 순간에만 멈춥니다.")
+        if DGK_QUOTA.exhausted:
+            LOG.warn("오늘 이미 한도를 소진한 기록이 있습니다 — 신규 수집을 건너뛰고 캐시만 씁니다. "
+                     "내일 다시 실행하면 남은 구간을 이어받습니다(최근→과거라 최신 구간부터 완성).")
+            todo = []
         got: List[pd.DataFrame] = []
-        n_holiday = n_fail = 0
-        streak = 0
-        stop = False
-        # 스레드 수를 낮게 유지한다 — 공공데이터포털은 순간 폭주에 민감하다.
+        n_holiday = 0
+        fatal = {"why": ""}
         lk = threading.Lock()
 
         def _one(day: pd.Timestamp):
-            nonlocal n_holiday, n_fail, streak, stop
-            if stop:
+            if fatal["why"]:
                 return None
             polite_sleep(0.05, 0.25)
-            d = _dgk_day(day)
+            d, why = _dgk_day(day)
+            ds = day.strftime("%Y%m%d")
             with lk:
-                if d is None:
-                    n_fail += 1
-                    streak += 1
-                    state["fail"].append(day.strftime("%Y%m%d"))
-                    if streak >= FLOW_CIRCUIT_BREAK_N:
-                        stop = True
-                        LOG.error(f"공공데이터 연속 실패 {streak}회 → 서킷 브레이커 작동. "
-                                  f"여기까지 받은 분량은 캐시에 저장하고 중단합니다. "
-                                  f"(키 오류이거나 일일 트래픽 한도 초과일 수 있습니다)")
-                    return None
-                streak = 0
-                if len(d) == 0:
-                    n_holiday += 1
-                    state["holiday"].append(day.strftime("%Y%m%d"))
-                    return None
-            return d
+                if why in ("holiday",):
+                    state["holiday"].append(ds)
+                    return "holiday"
+                if why == "ok":
+                    state["fail"].pop(ds, None)
+                    return d
+                # 실패 — 치명적 사유만 전체를 멈춘다
+                state["fail"][ds] = int(state["fail"].get(ds, 0)) + 1
+                if (why.startswith("key:") or why == "quota") and not fatal["why"]:
+                    fatal["why"] = why
+                return None
 
-        res = pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="공공데이터 시세")
-        got = [d for d in res if d is not None and len(d)]
+        def _on_result(i, day, r):
+            nonlocal n_holiday
+            with lk:
+                if r is None or isinstance(r, str):
+                    if r == "holiday":
+                        n_holiday += 1
+                    return
+                got.append(r)
+                n = len(got)
+            if n and n % DGK_FLUSH_EVERY == 0:
+                _dgk_flush(frames, got, stage_p, state, state_p)
+
+        pmap_io(_one, todo, workers=min(6, N_WORKERS_IO), desc="공공데이터 시세",
+                budget_s=DGK_BUDGET_MIN * 60.0, on_result=_on_result,
+                should_stop=lambda: bool(fatal["why"]))
+        _dgk_flush(frames, got, stage_p, state, state_p)
         frames += got
-        try:
-            state["holiday"] = sorted(set(state["holiday"]))
-            state["fail"] = sorted(set(state["fail"]))[-4000:]
-            write_json(state_p, state)
-        except Exception:
-            pass
-        LOG.ok(f"공공데이터 수집 완료 — 신규 {len(got):,}일 · 휴장 {n_holiday:,}일 · 실패 {n_fail:,}일")
-        if n_fail > len(todo) * 0.3:
-            LOG.warn(f"실패율이 {100*n_fail/max(len(todo),1):.0f}% 로 높습니다. "
-                     f"인증키(Decoding) 와 일일 트래픽 한도를 확인하세요. "
-                     f"실패한 날짜는 결측으로 남고 0으로 채우지 않습니다.")
 
+        n_fail = sum(1 for d in todo
+                     if d.strftime("%Y%m%d") in state["fail"]
+                     and d.strftime("%Y%m%d") not in {x for x in state["holiday"]})
+        LOG.ok(f"공공데이터 수집 완료 — 신규 {len(got):,}일 · 휴장 {n_holiday:,}일 · 실패 {n_fail:,}일")
+        LOG.info(f"공공데이터 호출량 — {DGK_QUOTA.remaining_hint()} "
+                 f"(수집일수 {len(got)+n_holiday:,}일당 요청 "
+                 f"{DGK_QUOTA.used / max(len(got)+n_holiday+n_fail, 1):.2f}회)")
+        if _DGK_RC:
+            LOG.table([[k, f"{v:,}"] for k, v in _DGK_RC.most_common(8)],
+                      ["resultCode / 사유", "건수"], ["l", "r"],
+                      title="공공데이터 응답 코드 분포")
+        if fatal["why"]:
+            _dgk_key_help(fatal["why"])
+        elif n_fail > max(20, len(todo) * 0.3):
+            LOG.warn(f"실패율이 {100 * n_fail / max(len(todo), 1):.0f}% 로 높습니다. "
+                     f"실패한 날짜는 결측으로 남기고 0으로 채우지 않습니다. "
+                     f"다음 실행에서 자동으로 재시도합니다(3회 실패 시 영구 제외).")
+
+    return _dgk_finalize(frames, wrote=True)
+
+
+def _dgk_key_help(why: str) -> None:
+    """키 문제는 조용히 넘기면 안 된다 — 사용자가 5초 만에 고칠 수 있는 문제이기 때문이다."""
+    if why == "quota":
+        obs = DGK_QUOTA.observed if DGK_QUOTA is not None else 0
+        LOG.error(f"공공데이터포털 일일 호출 한도에 도달했습니다"
+                  f"{f' — 관측된 실제 한도 {obs:,}회' if obs else ''}. "
+                  f"미리 정한 상한이 아니라 포털이 직접 알려준 시점에 멈춘 것입니다. "
+                  f"여기까지 받은 분량은 캐시에 저장되어 다음 실행이 이어받습니다"
+                  f"(최근→과거 순이므로 최신 구간부터 완성됩니다). "
+                  f"더 필요하면 포털 마이페이지 → 활용신청 상세 → '트래픽 증가 신청' 을 하세요.")
+        return
+    if why == "nokey":
+        return
+    LOG.error(f"공공데이터포털 인증키가 거부되었습니다 ({why}). 수집을 시작하지 않고 중단합니다 "
+              f"— 잘못된 키로 수천 건을 요청하는 낭비를 막기 위함입니다.\n"
+              f"   확인 순서: ① data.go.kr → 마이페이지 → 활용신청 현황에서 "
+              f"'금융위원회_주식시세정보' 가 '승인' 인지\n"
+              f"             ② 승인 직후라면 반영에 최대 1시간이 걸립니다\n"
+              f"             ③ 상단 DATA_GO_KR_KEY 에 'Encoding' 이 아니라 "
+              f"'Decoding' 일반 인증키를 넣었는지")
+
+
+def _dgk_flush(frames, got, stage_p, state, state_p) -> None:
+    """증분 저장. 중간에 끊겨도 여기까지는 다음 실행이 이어받는다."""
+    try:
+        if got:
+            atomic_write_parquet(pd.concat(got, ignore_index=True), stage_p)
+    except Exception as ex:                                     # noqa
+        LOG.debug(f"공공데이터 스테이징 저장 실패({type(ex).__name__})")
+    try:
+        state["holiday"] = sorted(set(state.get("holiday", [])))
+        if DGK_QUOTA is not None:
+            state["quota"] = DGK_QUOTA.dump()
+        write_json(state_p, state)
+    except Exception:
+        pass
+
+
+def _dgk_finalize(frames: List[pd.DataFrame], wrote: bool) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame(columns=DGK_COLS)
-
     P = pd.concat(frames, ignore_index=True)
     P["date"] = as_ts_series(P["date"])
     P["code"] = P["code"].map(to_code6)
     P = (P.dropna(subset=["date", "code", "close"])
            .drop_duplicates(["code", "date"], keep="last")
            .sort_values(["code", "date"], kind="stable").reset_index(drop=True))
-
-    VAULT.put_table("dgk_stock_price_daily", P, scope="shared", domain="price",
-                    source="data.go.kr:getStockPriceInfo",
-                    extra={"note": "일별 전종목 시세+시총+상장주식수 — 전 전략 공용"})
+    if wrote and len(P):
+        VAULT.put_table("dgk_stock_price_daily", P, scope="shared", domain="price",
+                        source="data.go.kr:getStockPriceInfo",
+                        extra={"note": "일별 전종목 시세+시총+상장주식수 — 전 전략 공용"})
+        try:
+            sp = state_path("_dgk_stage.parquet")
+            if os.path.exists(sp):
+                os.remove(sp)
+        except Exception:
+            pass
     PIPE.io("OUT", "DRIVE", "dgk_stock_price_daily", P, source="data.go.kr")
-    LOG.ok(f"공공데이터 패널 확정 — {len(P):,}행 · {P['code'].nunique():,}종목 · "
-           f"{P['date'].nunique():,}거래일 "
-           f"({P['date'].min():%Y-%m-%d} ~ {P['date'].max():%Y-%m-%d})")
+    if len(P):
+        LOG.ok(f"공공데이터 패널 확정 — {len(P):,}행 · {P['code'].nunique():,}종목 · "
+               f"{P['date'].nunique():,}거래일 "
+               f"({P['date'].min():%Y-%m-%d} ~ {P['date'].max():%Y-%m-%d})")
     return downcast(P)
 
 

@@ -348,26 +348,69 @@ def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, qui
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
 def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
-            desc: str = "", quiet: bool = False) -> List[Any]:
-    """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다."""
+            desc: str = "", quiet: bool = False,
+            budget_s: Optional[float] = None,
+            should_stop: Optional[Callable[[], bool]] = None,
+            on_result: Optional[Callable[[int, Any, Any], None]] = None,
+            chunk: int = 0) -> List[Any]:
+    """네트워크 병렬(스레드). 예외는 삼키지 않고 None 으로 표시하되 개수를 로그에 남긴다.
+
+    ★ 이 함수가 '무한 대기' 를 만들지 않도록 세 개의 탈출구를 갖는다 —
+      셋 중 하나라도 없으면 소스 한 곳이 느려질 때 전체 실행이 멈춘다:
+        budget_s     벽시계 예산. 넘으면 '아직 시작하지 않은' 작업을 취소하고 받은 것만 돌려준다.
+        should_stop  외부 서킷브레이커. True 가 되면 즉시 남은 작업을 취소한다.
+        chunk        한 번에 제출할 작업 수. 전부 미리 제출하면 취소가 불가능해진다.
+      on_result(i, item, result) 는 완료될 때마다 불린다 → 증분 저장(중단 내성)에 쓴다.
+    """
     items = list(items)
     if not items:
         return []
     w = max(1, min(workers or N_WORKERS_IO, len(items)))
     out: List[Any] = [None] * len(items)
     errs: Counter = Counter()
-    with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
-        futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
-        it_ = as_completed(futs)
-        if not quiet:
-            it_ = tqdm(it_, total=len(futs), desc=desc or "수집", leave=False, ncols=88)
-        for fu in it_:
-            i = futs[fu]
-            try:
-                out[i] = fu.result()
-            except Exception as e:                       # noqa
-                errs[type(e).__name__] += 1
-                out[i] = None
+    t0 = time.time()
+    # 청크 크기: 취소 반응성과 스케줄링 효율의 절충. 기본은 워커의 40배.
+    cz = int(chunk) if chunk and chunk > 0 else max(w * 40, 200)
+    stopped = ""
+    n_done = 0
+    bar = None if quiet else tqdm(total=len(items), desc=desc or "수집", leave=False, ncols=88)
+    try:
+        with ThreadPoolExecutor(max_workers=w, thread_name_prefix="io") as ex:
+            pos = 0
+            while pos < len(items) and not stopped:
+                sl = list(range(pos, min(pos + cz, len(items))))
+                pos = sl[-1] + 1
+                futs = {ex.submit(fn, items[i]): i for i in sl}
+                for fu in as_completed(futs):
+                    i = futs[fu]
+                    try:
+                        r = fu.result()
+                    except Exception as e:                   # noqa
+                        errs[type(e).__name__] += 1
+                        r = None
+                    out[i] = r
+                    n_done += 1
+                    if bar is not None:
+                        bar.update(1)
+                    if on_result is not None:
+                        try:
+                            on_result(i, items[i], r)
+                        except Exception:
+                            pass
+                    if not stopped:
+                        if should_stop is not None and should_stop():
+                            stopped = "외부 중단 신호(서킷 브레이커)"
+                        elif budget_s and (time.time() - t0) > budget_s:
+                            stopped = f"시간 예산 {budget_s:.0f}s 초과"
+                    if stopped:
+                        for f2 in futs:
+                            f2.cancel()
+    finally:
+        if bar is not None:
+            bar.close()
+    if stopped:
+        LOG.warn(f"{desc or '병렬작업'} 조기 종료 — {stopped}. "
+                 f"{n_done:,}/{len(items):,}건까지 확보분은 그대로 사용합니다(0으로 채우지 않음).")
     if errs:
         LOG.warn(f"{desc or '병렬작업'} 중 실패 {sum(errs.values())}/{len(items)}건 — " +
                  ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))

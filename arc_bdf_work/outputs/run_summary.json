@@ -1,0 +1,16 @@
+{
+ "strategy": "ARC-BDF",
+ "build": "bdf.20260808.0429",
+ "run_mode": "SMOKE",
+ "signal_mode": "MEMBER",
+ "phase0_branch": "SMOKE",
+ "period": [
+  "2016-08-01",
+  "2026-07-31"
+ ],
+ "best_config": "k=0·hold=20d·raw",
+ "n_events": 2500,
+ "n_configs": 12,
+ "verdict": "본문 참조",
+ "elapsed_min": 1.42
+}
