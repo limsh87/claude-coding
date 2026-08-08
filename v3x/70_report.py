@@ -97,8 +97,83 @@ def report_interpretation_xcb(P: pd.DataFrame, bt: dict) -> None:
     LOG.table(vrows, ["거부권", "종류", "발동 종목월", "발동률"])
 
     if "axis_flag" in P.columns:
+        # ★ 전 패널이 아니라 **실제 유니버스** 기준으로 본다. 매핑 안 된 3,400종목까지
+        #   세면 'FULL 308,059'처럼 찍혀 A축이 멀쩡한 것처럼 읽힌다(실측 오독).
+        _u = P[P["xcb_uni"]] if "xcb_uni" in P.columns else P
         LOG.table([[k, f"{v:,}"] for k, v in
-                   P["axis_flag"].value_counts().items()], ["활성 축 조합", "종목월"])
+                   _u["axis_flag"].value_counts().items()],
+                  ["활성 축 조합 (유니버스 기준)", "종목월"])
+        # ★★ A축이 전멸했으면 그건 더 이상 XCB 가 아니다 ★★
+        #   V9/V12 로 A축이 꺼진 채 나온 성과를 'XCB 의 성과'로 보고하면
+        #   전략을 검증한 게 아니라 **다른 전략(B·C축 잔여물)을 측정한 것**이다.
+        if len(_u):
+            _live = float((_u["axis_flag"] == "FULL").mean())
+            if _live < 0.10:
+                LOG.error(
+                    f"유니버스의 A축(통관) 활성 비중이 {_live*100:.1f}% 입니다 — 사실상 전멸입니다.\n"
+                    f"    ★ 이 실행의 성과는 **XCB 의 성과가 아닙니다.** 통관 4센서가 꺼진 채\n"
+                    f"      B·C축 잔여물로 낸 숫자이며, 전략을 검증한 것이 아닙니다.\n"
+                    f"      원인은 대개 매핑 게이트3(플라시보) 탈락 → V12 전면 발동입니다.\n"
+                    f"      HS↔상장사 연계표(CANARY X6)를 먼저 개선해야 합니다.")
+
+
+def audit_signal_integrity(P: pd.DataFrame, bt: dict) -> None:
+    """★ 성과 숫자를 믿어도 되는지 **먼저** 판정한다.
+
+    성과가 나쁠 때 '전략이 나쁘다'와 '측정이 깨졌다'를 구분하지 못하면
+    멀쩡한 가설을 버리거나 깨진 코드를 신뢰하게 된다. 둘을 수치로 가른다.
+    """
+    LOG.banner("측정 신뢰도 감사", "이 성과표를 믿어도 되는가 — 전략 판정 이전의 질문")
+    rows, fatal = [], []
+    n_uni = int(P["xcb_uni"].sum()) if "xcb_uni" in P.columns else len(P)
+    n_sig = int(P["Signal"].notna().sum()) if "Signal" in P.columns else 0
+    # ★ bt 에 stats 가 실려 오지 않는 경로가 있다 — 없으면 여기서 직접 낸다.
+    _st = bt.get("stats") or {}
+    R = bt.get("returns")
+    if not _st and R is not None and len(R):
+        try:
+            _st = perf_stats(R)
+        except Exception:                                               # noqa
+            _st = {}
+    hold = _f(_st.get("평균보유종목수"))
+    if not np.isfinite(hold) and R is not None and "n" in getattr(R, "columns", []):
+        hold = float(pd.to_numeric(R["n"], errors="coerce").fillna(0).mean())
+    # 포지션이 아예 없던 달 — 이게 많으면 수익률 시계열이 대부분 0 이고 통계가 왜곡된다.
+    n_empty = int((pd.to_numeric(R["n"], errors="coerce").fillna(0) <= 0).sum()) \
+        if (R is not None and "n" in getattr(R, "columns", [])) else 0
+    n_mon = int(len(R)) if R is not None else 0
+
+    def _row(name, val, ok, note):
+        rows.append([name, val, "✔" if ok else "✘", note])
+        if not ok:
+            fatal.append(name)
+
+    _row("유니버스 종목월", f"{n_uni:,}", n_uni >= 3000,
+         "10년×월 이면 최소 수천이어야 통계가 성립")
+    _row("유효 Signal", f"{n_sig:,}", n_sig >= 1000, "신호가 없으면 성과는 잡음")
+    _row("평균 보유종목수", f"{hold:.2f}", np.isfinite(hold) and hold >= 3.0,
+         "1 미만이면 포트폴리오가 아니라 단일종목 베팅")
+    if n_mon:
+        _row("포지션 없던 달", f"{n_empty}/{n_mon}", n_empty <= 0.2 * n_mon,
+             "빈 달의 0% 가 시계열을 채우면 변동성↓·Sharpe·승률이 통째로 왜곡")
+    if "axis_flag" in P.columns and "xcb_uni" in P.columns:
+        _u = P[P["xcb_uni"]]
+        live = float((_u["axis_flag"] == "FULL").mean()) if len(_u) else 0.0
+        _row("A축(통관) 활성 비중", f"{live*100:.1f}%", live >= 0.10,
+             "이게 0 이면 XCB 를 측정한 것이 아님")
+    tp_alive = sum(1 for c in XCB_TP_COLS
+                   if c in P.columns and int(P[c].notna().sum()) > 0)
+    _row("살아있는 TP 쌍", f"{tp_alive}/{len(XCB_TP_COLS)}", tp_alive >= 5,
+         "쌍이 죽으면 E 가 남은 몇 개의 평균으로 퇴화")
+    LOG.table(rows, ["점검", "실측", "판정", "기준"])
+    if fatal:
+        LOG.error(
+            f"측정 신뢰도 {len(fatal)}건 미달: {', '.join(fatal)}\n"
+            f"    → 위 성과표는 **전략의 성과가 아니라 데이터 결손의 결과**입니다.\n"
+            f"      이 상태의 CAGR·Sharpe 로 전략을 채택/폐기 판단하지 마세요.\n"
+            f"      먼저 결손을 메우고, 그 다음에 성과를 읽어야 합니다.")
+    else:
+        LOG.ok("측정 신뢰도 점검 통과 — 성과표를 전략 판정에 쓸 수 있습니다.")
 
 
 def diagnostic_cards_xcb(P: pd.DataFrame, bt: dict, sec: pd.DataFrame,

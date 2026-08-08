@@ -42,12 +42,26 @@ def guard_dart_jobs(n_jobs: int, what: str, universe_hint: str = "") -> None:
 
 
 # 코어 DISCLOSURE_PATTERNS 에 없는, XCB 가 추가로 필요로 하는 공시 유형.
+# ★ 순서가 의미를 바꾼다. 태깅은 '먼저 맞는 것이 이긴다'인데
+#   `관리종목\s*지정` 은 "관리종목 지정 **해제**" 의 부분문자열이다.
+#   해제를 먼저 두지 않으면 모든 해제가 '지정'으로 기록되고 계단함수가 영원히 안 꺼진다.
 XCB_DISCLOSURE_PATTERNS = {
     "supply_contract": r"단일판매[·・]?\s*공급계약|공급계약\s*체결",
-    "watch_designate": r"관리종목\s*지정|투자주의\s*환기종목\s*지정|상장적격성\s*실질심사",
-    "watch_release":   r"관리종목\s*지정\s*해제|투자주의\s*환기종목\s*해제",
-    "trading_halt":    r"매매거래\s*정지",
+    # ── 해제 계열을 반드시 먼저 ──
+    "watch_release":   (r"(관리종목|투자주의\s*환기종목)\s*지정?\s*해제"
+                        r"|상장적격성\s*실질심사.*?(해제|종료|미해당|대상\s*아)"
+                        r"|상장유지\s*결정"),
+    "halt_release":    r"매매거래\s*정지\s*해제|매매거래\s*재개",
+    "watch_designate": r"(관리종목|투자주의\s*환기종목)\s*지정(?!\s*해제)|상장적격성\s*실질심사",
+    "trading_halt":    r"매매거래\s*정지(?!\s*해제)",
 }
+# 매매거래정지 중 '부실 신호'로 볼 것과 절차성(며칠짜리)을 구분한다.
+#   액면분할·주식병합·권리락 같은 절차성 정지까지 계단함수로 걸면, 며칠짜리 사건이
+#   남은 기간 전체를 거부하게 된다(실측 V5 발동률 32% — 실제 관리종목 비중은 2~5%다).
+HALT_PROCEDURAL = r"액면|병합|분할|권리락|배당|주권\s*교체|기준가|변경상장|재상장|합병|분할상장"
+# 관리종목 지정 상태의 상한(개월). 사유 미해소 시 상장폐지로 이어져 폐지일이 처리하므로
+# 무기한 지속은 현실에 없다. 해제 공시를 놓쳤을 때의 안전장치다.
+WATCH_MAX_MONTHS = 30
 
 # 공시 제목에서 계약금액을 뽑는 패턴. 제목에 금액이 없으면 본문 조회로 내려간다.
 _AMT_RX = re.compile(r"([0-9][0-9,\.]*)\s*(억|백만|천만|만|원)")
@@ -144,24 +158,75 @@ def build_watch_flags(dis: pd.DataFrame, months: pd.DatetimeIndex,
     nm = d.get("report_nm", pd.Series("", index=d.index)).astype(str)
     d["code"] = d.get("stock_code", pd.Series(pd.NA, index=d.index)).map(to_code6)
     d["rcept_dt"] = as_ts_series(d.get("rcept_dt"))
-    on = nm.str.contains(XCB_DISCLOSURE_PATTERNS["watch_designate"], regex=True, na=False) | \
-        nm.str.contains(XCB_DISCLOSURE_PATTERNS["trading_halt"], regex=True, na=False)
-    off = nm.str.contains(XCB_DISCLOSURE_PATTERNS["watch_release"], regex=True, na=False)
-    ev = d[(on | off) & d["code"].notna() & d["rcept_dt"].notna()].copy()
-    if not len(ev):
+    _has = lambda k: nm.str.contains(XCB_DISCLOSURE_PATTERNS[k], regex=True, na=False)  # noqa
+    rel_w, rel_h = _has("watch_release"), _has("halt_release")
+    des = _has("watch_designate") & ~rel_w
+    halt = _has("trading_halt") & ~rel_h
+    # ★ 절차성 정지(액면분할·병합·권리락 등)는 며칠짜리 사건이다. 계단함수로 걸면
+    #   그 한 번이 남은 기간 전체를 거부한다. 지속 상태로 보지 않는다.
+    proc = halt & nm.str.contains(HALT_PROCEDURAL, regex=True, na=False)
+    halt_distress = halt & ~proc
+
+    d["_ym"] = as_ts_series(d["rcept_dt"]) + pd.offsets.MonthEnd(0)
+    keep = d["code"].notna() & d["rcept_dt"].notna()
+    # ① 지속 상태(관리종목·실질심사) — 지정 +1 / 해제 −1 의 계단함수
+    st = d[keep & (des | rel_w)].copy()
+    st["delta"] = np.where(rel_w.reindex(st.index).fillna(False).to_numpy(), -1.0, 1.0)
+    # ② 일시 사건(부실성 거래정지) — 발생한 달만 발동. 계단으로 누적하지 않는다.
+    ev1 = d[keep & halt_distress][["code", "_ym"]].copy()
+
+    if not len(st) and not len(ev1):
         LOG.warn("관리종목/거래정지 공시를 찾지 못했습니다 — V5 는 자본잠식 조항만으로 축소됩니다. "
                  "없는 것을 있는 척하지 않고 감사표에 그대로 표기합니다.")
         return pd.DataFrame(columns=cols)
-    ev["delta"] = np.where(off.reindex(ev.index).fillna(False).to_numpy(), -1.0, 1.0)
-    ev["ym"] = as_ts_series(ev["rcept_dt"]) + pd.offsets.MonthEnd(0)
-    step = ev.groupby(["code", "ym"], observed=True)["delta"].sum().reset_index()
 
-    codes = step["code"].unique()
+    codes = sorted(set(st["code"]).union(ev1["code"]))
     grid = pd.MultiIndex.from_product([codes, months], names=["code", "ym"]).to_frame(index=False)
-    g = grid.merge(step, on=["code", "ym"], how="left").sort_values(["code", "ym"])
-    g["delta"] = g["delta"].fillna(0.0)
-    g["watch_flag"] = (g.groupby("code", observed=True)["delta"].cumsum() > 0).astype(float)
-    LOG.ok(f"V5 관리/정지 계단함수 복원: {int(g['watch_flag'].sum()):,} 종목월 발동")
+    if len(st):
+        step = st.groupby(["code", "_ym"], observed=True)["delta"].sum().reset_index()
+        step = step.rename(columns={"_ym": "ym"})
+        g = grid.merge(step, on=["code", "ym"], how="left").sort_values(["code", "ym"])
+        g["delta"] = g["delta"].fillna(0.0)
+        # 음수로 내려가지 않게 클립 — 해제가 지정보다 많이 잡히면 이후 지정이 무시된다.
+        g["_cum"] = g.groupby("code", observed=True)["delta"].cumsum().clip(lower=0)
+        g["watch_flag"] = (g["_cum"] > 0).astype(float)
+        # ★★ 상한 없는 계단은 위험하다 ★★
+        #   해제 공시 제목이 우리 패턴과 조금만 달라도 계단이 **영원히** 켜진 채 남는다.
+        #   실측에서 그 결과가 V5 발동률 32%(실제 관리종목 비중의 6배 이상)였고,
+        #   멀쩡한 종목이 대량 거부되어 성과가 인위적으로 나빠졌다.
+        #   관리종목은 사유해소 기간이 유한하고(보통 1~2년), 해소 못 하면 상장폐지되어
+        #   폐지일로 유니버스에서 빠진다. 즉 '무기한 관리종목'은 현실에 없다.
+        #   → 마지막 지정 이후 WATCH_MAX_MONTHS 를 넘으면 자동 만료시키고, 만료를 표에 남긴다.
+        _on = g["watch_flag"] > 0
+        _blk = (_on != _on.groupby(g["code"], observed=True).shift()).cumsum()
+        _age = g.groupby([g["code"], _blk], observed=True).cumcount() + 1
+        _expired = _on & (_age > WATCH_MAX_MONTHS)
+        n_exp = int(_expired.sum())
+        g.loc[_expired, "watch_flag"] = 0.0
+        if n_exp:
+            LOG.warn(f"지정 후 {WATCH_MAX_MONTHS}개월이 지나도 해제 공시를 못 찾은 "
+                     f"{n_exp:,} 종목월을 자동 만료 처리했습니다 — 해제 제목이 패턴과 다를 수 "
+                     f"있습니다. 만료하지 않으면 계단이 영원히 켜진 채 정상 종목을 거부합니다.")
+    else:
+        g = grid.assign(watch_flag=0.0)
+    if len(ev1):
+        ev1 = ev1.rename(columns={"_ym": "ym"}).drop_duplicates()
+        ev1["_halt"] = 1.0
+        g = g.merge(ev1, on=["code", "ym"], how="left")
+        g["watch_flag"] = g[["watch_flag", "_halt"]].max(axis=1).fillna(0.0)
+
+    n_on = int(g["watch_flag"].sum())
+    share = n_on / max(len(months) * max(len(codes), 1), 1)
+    LOG.ok(f"V5 관리/정지 복원: {n_on:,} 종목월 발동 "
+           f"(지정/해제 계단 {len(st):,}건 · 부실성 거래정지 {len(ev1):,}건 · "
+           f"절차성 정지 {int(proc.sum()):,}건 제외)")
+    # ★ 현실 점검 — 실제 관리종목 비중은 상시 2~5% 다. 그보다 훨씬 높으면
+    #   해제 공시를 못 잡아 계단이 안 꺼지고 있다는 뜻이다(실측 32% 사고).
+    if share > 0.12:
+        LOG.error(f"V5 발동률이 대상 종목월의 {share*100:.0f}% 입니다 — 실제 관리종목 비중"
+                  f"(상시 2~5%)의 몇 배입니다. 해제 공시를 못 잡아 계단이 꺼지지 않는 상태를 "
+                  f"의심하세요. 이 상태로는 정상 종목이 대량으로 거부되어 성과가 "
+                  f"인위적으로 나빠집니다.")
     return g[cols]
 
 

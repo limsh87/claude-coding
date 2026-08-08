@@ -70,9 +70,27 @@ def fetch_pit_marketcap(months: pd.DatetimeIndex, px_monthly: pd.DataFrame,
         cached["month"] = as_ts_series(cached["month"])
         cached["code"] = cached["code"].map(to_code6)
         cached = cached.dropna(subset=["month", "code"])
-        have = set(cached["month"].dt.strftime("%Y-%m-%d"))
+        # ★★ '그 달에 행이 하나라도 있으면 완료'로 보면 안 된다 ★★
+        #   실측: 480행 / 120개월 = **월 4종목**짜리 캐시가 전 월을 '완료'로 표시했고,
+        #   그래서 영원히 다시 받지 않았다. 결과적으로 시총이 100% 최후수단(거래대금 대리)로
+        #   떨어졌는데 — 그건 규모가 아니라 유동성이라 규모 밴드의 의미가 통째로 달라진다.
+        #   월별 종목수가 그 달 가격 관측 종목수에 비해 터무니없이 적으면 미완으로 본다.
+        _per_m = cached.groupby(cached["month"].dt.strftime("%Y-%m-%d"))["code"].nunique()
+        _ref = 0
+        if px_monthly is not None and len(px_monthly) and "code" in px_monthly.columns:
+            _mcol = "month" if "month" in px_monthly.columns else "ym"
+            if _mcol in px_monthly.columns:
+                _ref = int(px_monthly.groupby(_mcol)["code"].nunique().median())
+        _min_ok = max(50, int(0.30 * _ref))     # 가격 관측 종목의 30% 미만이면 미완으로 간주
+        have = set(_per_m[_per_m >= _min_ok].index)
+        _thin = _per_m[_per_m < _min_ok]
         frames.append(cached)
-        LOG.info(f"공용 캐시에서 PIT 시가총액 {len(cached):,}행 재사용 ({len(have)}개 월)")
+        LOG.info(f"공용 캐시에서 PIT 시가총액 {len(cached):,}행 재사용 "
+                 f"(완결 {len(have)}개월 · 월평균 {_per_m.mean():.0f}종목)")
+        if len(_thin):
+            LOG.warn(f"커버리지가 얇은 {len(_thin)}개월(월 {int(_thin.median())}종목 "
+                     f"< 기준 {_min_ok}종목)은 **미완으로 보고 다시 채웁니다** — "
+                     f"예전엔 '행이 있으면 완료'라 월 4종목짜리 캐시가 영구 고정됐습니다.")
 
     todo = [m for m in months if m.strftime("%Y-%m-%d") not in have]
     if RUN_MODE == "CACHED":

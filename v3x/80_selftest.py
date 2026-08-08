@@ -301,6 +301,7 @@ def smoke_xcb() -> bool:
     if int(st.get("월수", 0)) < 12:
         LOG.error("스모크: 백테스트 월수가 12 미만입니다.")
         return False
+    audit_signal_integrity(P, bt)
     report_performance_xcb(bt, {}, title="스모크 성과(합성)")
     report_interpretation_xcb(P, bt)
 

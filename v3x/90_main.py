@@ -477,6 +477,8 @@ def main_xcb() -> int:
 
     # ── [6] 성과 · 원장 · 해석 ───────────────────────────────────────────────────────────
     with PIPE.stage("L4.PERF", "성과 검증", "L4", budget_s=300), Stage("REPORT.perf", 3.0):
+        # ★ 성과표를 읽기 **전에** 그 표를 믿어도 되는지 먼저 판정한다.
+        audit_signal_integrity(P, bt)
         report_performance_xcb(bt, bench)
         report_ledger_integrity(reports, analysts, build_coverage_panel(reports, months))
         report_interpretation_xcb(P, bt)
