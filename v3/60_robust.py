@@ -276,13 +276,25 @@ def R3_orthogonal(P: pd.DataFrame, bt: dict, months) -> None:
     #   → 퇴화 입력을 먼저 판정하고, 숫자를 지어내지 말고 SKIP 사유를 남긴다(C10).
     Xc = [D[c].to_numpy(dtype="float64") for c in F.columns]
     yv = D["y"].to_numpy(dtype="float64")
-    bad = [c for c, v in zip(F.columns, Xc)
-           if not np.all(np.isfinite(v)) or float(np.nanstd(v)) < 1e-12]
+    # ★ '상수'와 '비유한'은 원인이 전혀 다르다. 뭉뚱그리면 진단이 불가능하다.
+    #   비유한 = fwd_ret 에 ±inf 가 섞였다는 뜻이고(체결가 0), 그건 가격 파이프라인 결함이다.
+    #   상수   = 팩터 스프레드가 실제로 0 이라는 뜻이고, 그건 유니버스/커버리지 문제다.
+    why = {}
+    for c, v in zip(F.columns, Xc):
+        n_inf = int(np.isinf(v).sum())
+        n_nan = int(np.isnan(v).sum())
+        sd = float(np.nanstd(v)) if np.isfinite(v).any() else float("nan")
+        if n_inf or n_nan:
+            why[c] = f"비유한(inf {n_inf} · NaN {n_nan}) — 상류 fwd_ret 오염 의심"
+        elif not np.isfinite(sd) or sd < 1e-12:
+            why[c] = f"상수(표준편차 {sd:.2e}) — 팩터 스프레드가 실제로 0"
+    bad = list(why)
     if bad:
         Xc = [v for c, v in zip(F.columns, Xc) if c not in bad]
         F = F.drop(columns=list(bad))
-        LOG.warn(f"직교화에서 제외한 상수/비유한 팩터: {list(bad)} "
-                 f"(분산이 0이면 회귀행렬이 특이해져 SVD 가 수렴하지 않습니다)")
+        LOG.table([[c, why[c]] for c in bad], ["제외된 팩터", "기각 사유(실측)"], ["l", "l"],
+                  title="직교화에서 제외한 팩터 — 사유를 구분해 남깁니다 "
+                        "(비유한이면 가격 파이프라인, 상수면 유니버스 문제입니다)")
     if not Xc:
         _rec("R3", "퀄리티 직교화", "SKIP",
              "설명변수가 전부 상수이거나 비유한이라 회귀를 세울 수 없습니다.", "")

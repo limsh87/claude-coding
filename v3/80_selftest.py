@@ -488,6 +488,30 @@ def run_contract_tests(strict: bool = True) -> bool:
     # ── 벽시계 게이트: 선택 수집만 끊고, 끊었다는 사실을 반드시 남긴다 ──────────────
     #   실측 실패: 수집이 3시간을 먹고도 파이프라인은 계속 진행 → 사용자는 백테스트 결과를
     #   한 번도 못 봤다. 연구 도구로서 '완벽한 무결과'는 부분 결과보다 나쁘다.
+    # ── 체결가 0 이 무한대 수익률로 둔갑하지 않는다 ─────────────────────────────────
+    #   실측 재현: 한 달 종가가 0(데이터 오류·정리매매)인 종목이 다음 달 정상가로 돌아오면
+    #   fwd_ret = +inf 다. 가드가 코드 어디에도 없었다. 그 값이 포트폴리오에 들어가면
+    #   CAGR·Sharpe 가 통째로 무의미해지고, 실제로 R3 직교화가 이 inf 로 죽었다.
+    try:
+        _d = pd.bdate_range("2018-01-02", periods=300)
+        _cl = np.full(len(_d), 1000.0)
+        _cl[40:65] = 0.0
+        _px = pd.DataFrame({"code": "000001", "date": _d, "open": _cl, "high": _cl,
+                            "low": _cl, "close": _cl, "volume": 1e4, "amount": _cl * 1e4})
+        _mm = pd.date_range("2018-01-31", "2019-02-28", freq="ME")
+        _o = build_price_panel(_px, _mm)["monthly"]
+        _fr = pd.to_numeric(_o["fwd_ret"], errors="coerce")
+        _ep = pd.to_numeric(_o["exec_px"], errors="coerce")
+        _t("RET-INF", "체결가 0 이 ±무한대 수익률로 둔갑하지 않는다",
+           int(np.isinf(_fr).sum()) == 0 and int((_ep <= 0).sum()) == 0
+           and bool(_fr.notna().any()),
+           f"±inf {int(np.isinf(_fr).sum())}행 (0이어야) · 체결가≤0 "
+           f"{int((_ep <= 0).sum())}행 (0이어야) · 유효 fwd_ret "
+           f"{int(_fr.notna().sum())}행 (전부 결측이 되면 과잉 방어입니다)")
+    except Exception as e:                                       # noqa
+        _t("RET-INF", "체결가 0 이 무한대 수익률로 둔갑하지 않는다", False,
+           f"{type(e).__name__}: {e}")
+
     # ── 캐시 재사용이 결과를 바꾸지 않는다 (dtype 포함) ─────────────────────────────
     #   실측 위험: parquet 왕복이 datetime64[ns] 를 [ms] 로 바꾼다. 값은 같지만 dtype 이
     #   다르면 하류 merge 가 **예외 없이 0행 매칭**을 낸다 — PIT 시총이 정확히 그렇게

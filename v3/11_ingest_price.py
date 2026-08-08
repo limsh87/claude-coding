@@ -339,6 +339,8 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
     todo, n_back, n_fwd, n_skip, n_neg, n_life = [], 0, 0, 0, 0, 0
+    n_new, n_gap = 0, 0            # 신규(캐시 없음) vs 갭백필(캐시가 늦게 시작)
+    gap_sample: List[str] = []
     GRACE = pd.Timedelta(days=10)
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
@@ -356,6 +358,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 continue
             todo.append((c, want_from.strftime("%Y-%m-%d")))
             n_back += 1
+            n_new += 1
             continue
         # 과거 방향 백필. 단 **상장일 이전은 애초에 존재하지 않으므로 요청하지 않는다**.
         # 그리고 이미 그 구간을 요청해 본 적이 있으면 다시 묻지 않는다 — 그때 못 받은 건
@@ -363,6 +366,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         if mn is not None and mn > want_from + GRACE and not asked:
             todo.append((c, want_from.strftime("%Y-%m-%d")))
             n_back += 1
+            n_gap += 1
+            if len(gap_sample) < 5:
+                gap_sample.append(f"{c}(캐시시작 {mn:%Y-%m} · 요청 {want_from:%Y-%m}"
+                                  f"{' · 상장일없음' if pd.isna(ld) else f' · 상장 {ld:%Y-%m}'})")
         elif mx < want_to - pd.Timedelta(days=5):
             # 폐지 종목은 폐지일까지만 있으면 완결이다. 그 뒤를 매달 다시 묻지 않는다.
             frm = mx + pd.Timedelta(days=1)
@@ -373,7 +380,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
                 n_fwd += 1
         else:
             n_skip += 1
-    LOG.table([["신규/백필", f"{n_back:,}", "캐시에 없거나 상장일까지 비어 있음 → 받는다"],
+    LOG.table([["신규(캐시 없음)", f"{n_new:,}", "이 종목의 일봉이 캐시에 아예 없다"],
+               ["갭 백필", f"{n_gap:,}",
+                "캐시가 요청 시작일보다 늦게 시작 → 앞 구간을 한 번 더 물어본다"],
                ["증분", f"{n_fwd:,}", "마지막 캐시일 다음날부터만 받는다"],
                ["캐시 충분", f"{n_skip:,}", "상장~폐지 구간이 이미 다 차 있음 → 요청 안 함"],
                ["음성 캐시", f"{n_neg:,}", f"최근 {RETRY_AFTER_DAYS}일 내 전 소스 실패 → 재시도 안 함"],
@@ -382,6 +391,13 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
               ["일봉 수집 계획", "종목수", "근거"], ["l", "r", "l"],
               title="가격 수집 계획 — 없는 데이터를 찾아 헤매지 않는다 "
                     "(상장일·폐지일로 존재 가능 구간을 먼저 자릅니다)")
+    if n_gap:
+        LOG.warn(f"갭 백필 {n_gap:,}종목 — 캐시가 요청 시작일보다 늦게 시작합니다. "
+                 f"소스가 그 이전을 못 주는 것이면 이번 한 번만 묻고 시도원장에 기록되어 "
+                 f"{RETRY_AFTER_DAYS}일간 다시 묻지 않습니다. 예: {gap_sample}. "
+                 f"이 숫자가 매 실행 크게 남으면 상장일 결측(현재 "
+                 f"{100*(1-len(listing)/max(len(codes),1)):.0f}%)이 원인입니다 — "
+                 f"상장일을 모르면 '2015년부터 있어야 한다'고 가정할 수밖에 없습니다.")
     if not todo:
         LOG.ok("새로 받을 일봉이 없습니다 — 캐시만으로 충분합니다.")
     if n_neg:
@@ -599,7 +615,28 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
     nxt_m = monthly.groupby("code", observed=True)["month"].shift(-1)
     adjacent = (((nxt_m.dt.year - monthly["month"].dt.year) * 12 +
                  (nxt_m.dt.month - monthly["month"].dt.month)) == 1)
+    # ★ 체결가가 0 이면 나눗셈이 ±inf 를 낸다. 실측 재현: 한 달 종가가 0(데이터 오류·정리매매)
+    #   인 종목이 다음 달 정상가로 돌아오면 fwd_ret = +inf 다. 가드가 코드 어디에도 없었고,
+    #   그 값이 그대로 포트폴리오 수익률로 들어가면 CAGR·Sharpe 가 통째로 무의미해진다.
+    #   실제로 R3 직교화가 이 inf 때문에 LinAlgError 로 죽었다(회귀행렬에 inf).
+    #   → 0/음수 체결가는 '가격을 모른다'로 처리한다. 0으로 채우지 않는다(그건 -100% 라는
+    #     주장이고, 상장폐지 처리는 백테스트 엔진이 따로 -100% 로 강제한다).
+    _px_ok = pd.to_numeric(monthly["exec_px"], errors="coerce") > 0
+    monthly["exec_px"] = monthly["exec_px"].where(_px_ok)
+    _n_bad_px = int((~_px_ok).sum())
     monthly["fwd_ret"] = (nxt_px / monthly["exec_px"] - 1.0).where(adjacent)
+    _fr = pd.to_numeric(monthly["fwd_ret"], errors="coerce")
+    _n_inf = int(np.isinf(_fr).sum())
+    monthly["fwd_ret"] = _fr.replace([np.inf, -np.inf], np.nan)
+    # 극단값도 보고한다. 월 +2000% 는 대개 액면분할·병합 미조정이지 실수익이 아니다.
+    _n_wild = int((monthly["fwd_ret"].abs() > 20.0).sum())
+    if _n_bad_px or _n_inf or _n_wild:
+        LOG.warn(f"체결가 이상 {_n_bad_px:,}행(0 또는 음수) · fwd_ret ±inf {_n_inf:,}행 · "
+                 f"|월수익| > 2000% {_n_wild:,}행 을 결측 처리했습니다. 0 으로 채우지 "
+                 f"않습니다 — 그건 '-100% 였다'는 주장이고, 상장폐지는 백테스트 엔진이 "
+                 f"따로 -100% 로 강제합니다. (inf 가 남으면 성과지표와 회귀가 통째로 "
+                 f"무의미해집니다)")
+        monthly.loc[monthly["fwd_ret"].abs() > 20.0, "fwd_ret"] = np.nan
     n_gap = int((nxt_m.notna() & ~adjacent).sum())
     if n_gap:
         LOG.info(f"월 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
