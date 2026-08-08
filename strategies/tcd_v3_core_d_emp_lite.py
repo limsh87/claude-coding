@@ -406,7 +406,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.1303"
+BUILD_VERSION  = "v3.20260808.1313"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -815,6 +815,22 @@ class StageRecord:
     def dur(self) -> float:
         return (self.t_end or time.time()) - self.t_start
 
+    @property
+    def active(self) -> bool:
+        """이 스테이지의 본문을 실제로 수행해야 하는가.
+
+        ★★ 왜 이 속성이 필요한가 — skip_if 의 함정 ★★
+          `PIPE.stage(..., skip_if=True)` 는 **본문을 건너뛰지 못한다.**
+          @contextmanager 로 만든 컨텍스트 매니저는 yield 하는 순간 with 블록의 본문이
+          반드시 실행된다 — 파이썬에 '본문을 안 돌리는 with' 는 없다.
+          그래서 skip_if 는 지금까지 상태 표시(SKIP)와 경고 한 줄만 남기고,
+          정작 건너뛰려던 수집은 그대로 수행돼 왔다. 로그에는 '건너뜀' 이라고 찍히고
+          네트워크로는 나가는, 가장 헷갈리는 형태의 조용한 실패다.
+        → 호출부가 `with PIPE.stage(...) as st: if st.active:` 로 명시적으로 가른다.
+          컨텍스트 매니저가 못 하는 일을 하는 척하지 않는다.
+        """
+        return self.status != "SKIP"
+
 
 class KillCriteria(Exception):
     """§15 킬 기준 위반. 우회하지 말고 사용자에게 보고하고 멈춘다."""
@@ -954,6 +970,8 @@ class Pipeline:
         prev, self.current = self.current, rec
         LOG.ctx.append(sid)
         if skip_if:
+            # ★ 여기서 yield 하면 with 본문은 **그대로 실행된다**(위 StageRecord.active 참조).
+            #   호출부가 `if st.active:` 로 가르지 않으면 '건너뜀' 이라고 찍고도 수집이 돈다.
             rec.status, rec.t_start, rec.t_end = "SKIP", time.time(), time.time()
             rec.notes.append(skip_reason or "조건 미충족")
             LOG.warn(f"건너뜀 — {skip_reason}")
@@ -7718,7 +7736,25 @@ def _canary_accounts(corps: Sequence[str], year: int) -> Optional[bool]:
         _k("K3", "필수계정 커버리지", False, "응답 0건", f"≥{CANARY_K3_MIN_COV:.0%}",
            "재무 기반 TP 전부 비활성 위험 — 키·한도를 확인하세요")
         return False
-    W = tidy_financials(pd.concat(res, ignore_index=True))
+    _raw = pd.concat(res, ignore_index=True)
+    # ★ 탐침으로 받은 전체재무제표도 공용 인덱스에 남긴다(절대1원칙). 200사 × FY 1년치는
+    #   Tier-2 본수집이 곧바로 다시 요청할 조합이고, 그 호출은 하루 예산에서 빠진다.
+    try:
+        _prev = VAULT.get_table("dart_fnltt_raw", scope="shared")
+        _acc = pd.concat([f for f in (_prev, _raw) if f is not None and len(f)],
+                         ignore_index=True)
+        _keys = [c for c in ("corp_code", "bsns_year", "reprt_code", "sj_div",
+                             "account_id", "account_nm") if c in _acc.columns]
+        if _keys:
+            _acc = _acc.drop_duplicates(_keys, keep="last")
+        VAULT.put_table("dart_fnltt_raw", _acc, scope="shared", domain="dart",
+                        source="CANARY K3 탐침분 (본수집이 재요청하지 않도록 영속)",
+                        backup=False)
+        LOG.ok(f"CANARY 탐침 재무 {len(_raw):,}행을 공용 인덱스에 저장했습니다 — "
+               f"Tier-2 본수집이 같은 조합을 다시 묻지 않습니다.")
+    except Exception as e:                                           # noqa
+        LOG.debug(f"CANARY 재무 저장 실패({type(e).__name__}) — 판정에는 영향 없음")
+    W = tidy_financials(_raw)
     n = W["corp_code"].nunique() if len(W) else 0
     cov, weak = {}, []
     for a in CANARY_REQUIRED_ACCOUNTS:
@@ -7830,6 +7866,21 @@ def _canary_emp(corps: Sequence[str], year: int) -> Tuple[Optional[bool], Option
     rows = [r for r in pmap_io(lambda c: _emp_one_raw(c, year), list(corps),
                                workers=min(N_WORKERS_IO, 12), desc="CANARY K7~K9 직원현황")
             if r is not None]
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 탐침으로 받은 것도 **반드시 캐시에 남긴다** (절대1원칙) ★★
+    #    예전엔 200사 × empSttus 를 실제로 받아 비율만 계산하고 프레임을 통째로 버렸다.
+    #    같은 실행의 본수집(L1.EMP)이 조금 뒤에 그 200사를 **다시** 요청했고,
+    #    그 호출들은 알파(직원현황)의 하루 예산에서 그대로 빠져나갔다.
+    #    사용자 원칙은 '어떤 신규수집데이터든 무조건 캐시저장-재호출 가능하게' 다 —
+    #    탐침이라고 예외가 아니다. 저장해 두면 본수집의 done 집합이 자동으로 흡수한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    if rows:
+        try:
+            _emp_checkpoint(VAULT.get_table("dart_employees_ext", scope="shared"), rows)
+            LOG.ok(f"CANARY 탐침으로 받은 직원현황 {len(rows):,}행을 공용 인덱스에 저장했습니다 "
+                   f"— 본수집(L1.EMP)이 같은 조합을 다시 묻지 않습니다(호출 예산 절약).")
+        except Exception as e:                                       # noqa
+            LOG.debug(f"CANARY 직원현황 저장 실패({type(e).__name__}) — 판정에는 영향 없음")
     n_try = len(corps)
     n_ok = len(rows)
     rate7 = n_ok / max(n_try, 1)
@@ -9259,7 +9310,7 @@ def _attach_treasury(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
 # ★ EMP 신호가 실제로 존재한 달의 범위. 리포트가 '두 전략의 이어붙임'을 가르는 근거다.
 #   여기서 채워 두지 않으면 L6 이 120개월을 하나의 전략처럼 합산해 보고한다.
-EMP_SIGNAL_SPAN: Dict[str, Any] = {"lo": None, "hi": None, "n_rows": 0}
+EMP_SIGNAL_SPAN: Dict[str, Any] = {"lo": None, "hi": None, "n_rows": 0, "months": set()}
 
 
 # ── EMP-LITE 파생 (연도 프레임 센서는 이미 붙어 있고, 여기선 패널 결합이 필요한 것만) ───────
@@ -9317,15 +9368,18 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
             _obs |= col(P, c).notna()
     if bool(_obs.any()):
         _mm = P.loc[_obs, "month"]
+        # ★ 봉투(min~max)가 아니라 **실제 관측이 있는 달의 집합**을 남긴다. 중간이 뚫린
+        #   구간까지 'EMP 있음'으로 세면 레짐 분할이 다시 두 전략을 뭉갠다.
         EMP_SIGNAL_SPAN.update({"lo": _mm.min(), "hi": _mm.max(),
-                                "n_rows": int(_obs.sum())})
+                                "n_rows": int(_obs.sum()),
+                                "months": set(pd.unique(_mm))})
         _tot = int(P["month"].nunique())
         _cov = int(P.loc[_obs, "month"].nunique())
         LOG.info(f"EMP 신호 존재 구간 {_mm.min():%Y-%m}~{_mm.max():%Y-%m} — "
                  f"{_cov}/{_tot}개월({_cov/max(_tot,1):.0%})에 관측이 있습니다. "
                  f"나머지 달은 CORE-D 단독으로 돕니다(성과 보고 시 분리 표기).")
     else:
-        EMP_SIGNAL_SPAN.update({"lo": None, "hi": None, "n_rows": 0})
+        EMP_SIGNAL_SPAN.update({"lo": None, "hi": None, "n_rows": 0, "months": set()})
         LOG.warn("EMP 신호가 어느 달에도 존재하지 않습니다 — 이 실행은 사실상 "
                  "'CORE-D 단독' 전략입니다. 결론에 그대로 명시하세요.")
     return P
@@ -10175,8 +10229,18 @@ def _run_backtest_inner(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Univers
     last_seen = (_pm.groupby("code", observed=True)["month"].max().to_dict()
                  if len(_pm) else {})
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 월별 인덱스를 **한 번만** 만든다. 예전엔 매달 `P[P["month"] == m].copy()` 로
+    #    전체 패널에 불리언 마스크를 걸고 복사했다 — 120개월이면 패널을 120번 완주하고
+    #    120번 복사한다. 그리고 이 함수는 강건성 스위트에서 26번 재실행되므로
+    #    그 비용이 그대로 26배가 된다. 실측상 L5 의 지배적 병목이었다.
+    #    groupby(...).indices 는 한 번의 패스로 월→행위치 배열을 만들어 준다(원칙 3).
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _midx = P.groupby("month", observed=True).indices if len(P) else {}
     for i, m in enumerate(months):
-        sub = P[(P["month"] == m)].copy()
+        _rows_i = _midx.get(m)
+        sub = (P.take(np.asarray(_rows_i)) if _rows_i is not None and len(_rows_i)
+               else P.iloc[0:0])
         if sub.empty:
             rows.append({"month": m, "ret": 0.0, "n": 0, "turnover": 0.0, "cost": 0.0})
             continue
@@ -10722,15 +10786,36 @@ def R0_benchmark(P: pd.DataFrame, bt: dict, months: pd.DatetimeIndex) -> Dict[st
     n_by_m = _g.size().reindex(months)
 
     def _fin(s: pd.Series) -> pd.Series:
-        v = pd.to_numeric(s, errors="coerce")
-        return v.where(np.isfinite(v.to_numpy(dtype="float64"))).fillna(0.0)
+        """비유한값만 결측으로 되돌린다. **0 으로 채우지 않는다.**
 
-    ew, ew_raw, ew_med = _fin(ew), _fin(ew_raw), _fin(ew_med)
+        ★ 결측월을 0% 수익으로 채우면 '그 달 시장이 보합이었다'는 없는 사실이 생긴다.
+          지수 시계열은 수집 실패·구간 부족으로 앞뒤가 비는 일이 흔한데, 0 으로 채운 채
+          복리를 돌리면 벤치마크 CAGR 이 실제보다 0 쪽으로 끌려가고 —
+          하락장 구간이 비면 벤치마크가 **부당하게 좋아 보이고**, 상승장 구간이 비면
+          반대가 된다. 그리고 표에는 '이 실행에서 직접 재측정'이라고 적힌다.
+        """
+        v = pd.to_numeric(s, errors="coerce")
+        return v.where(np.isfinite(v.to_numpy(dtype="float64")))
+
+    # 유니버스 동일가중은 '그 달 고를 수 있었던 종목이 없었다'는 뜻이므로 0 이 맞다
+    # (포지션을 못 잡으면 수익도 없다). 지수와는 성격이 다르다.
+    ew = _fin(ew).fillna(0.0)
+    ew_raw, ew_med = _fin(ew_raw).fillna(0.0), _fin(ew_med).fillna(0.0)
     bench = {"유니버스 동일가중": ew}
     try:
         for k, v in benchmark_returns(months).items():
-            if v is not None and v.notna().any():
-                bench[k] = _fin(v.reindex(months))
+            if v is None:
+                continue
+            vv = _fin(v.reindex(months))
+            cov = float(vv.notna().mean())
+            if cov < 0.98:
+                # ★ 구멍 난 지수를 0 으로 메워 비교표에 올리지 않는다. 빠진 사실을 말한다.
+                LOG.warn(f"지수 벤치마크 '{k}' 의 구간 커버리지가 {cov:.0%} 라 비교에서 "
+                         f"제외합니다({int(vv.isna().sum())}개월 결측). 결측월을 0% 로 채우면 "
+                         f"'그 달 시장이 보합이었다'는 없는 사실이 생기고, 그 위에서 계산한 "
+                         f"초과수익은 신호가 아니라 결측의 함수가 됩니다.")
+                continue
+            bench[k] = vv
     except Exception as e:                                       # noqa
         LOG.debug(f"지수 벤치마크 수집 실패({type(e).__name__}) — 자체측정만 사용합니다.")
 
@@ -11454,16 +11539,40 @@ def report_emp_regime_v3(bt: dict) -> None:
     → 신호가 실제로 존재한 구간과 아닌 구간을 갈라서 나란히 낸다. 합산값도 함께 두되,
       그것이 두 전략의 이어붙임이라는 사실을 표 제목에 적는다. 숨기고 합치지 않는다.
     """
-    lo, hi = EMP_SIGNAL_SPAN.get("lo"), EMP_SIGNAL_SPAN.get("hi")
     R = bt.get("returns")
-    if R is None or R.empty or lo is None or hi is None:
+    if R is None or R.empty:
         return
     R = R.copy()
     R["month"] = as_ts_series(R["month"])
-    on = (R["month"] >= as_ts(lo)) & (R["month"] <= as_ts(hi))
+    # ★ '최소~최대 봉투'가 아니라 **실제 관측이 있는 달의 집합**으로 가른다.
+    #   봉투를 쓰면 중간에 뚫린 달(수집이 안 된 해)까지 'EMP 있음'으로 계산된다.
+    _mset = EMP_SIGNAL_SPAN.get("months") or set()
+    if _mset:
+        on = R["month"].isin({as_ts(m) for m in _mset})
+    else:
+        lo, hi = EMP_SIGNAL_SPAN.get("lo"), EMP_SIGNAL_SPAN.get("hi")
+        on = (pd.Series(False, index=R.index) if lo is None or hi is None
+              else (R["month"] >= as_ts(lo)) & (R["month"] <= as_ts(hi)))
     pre = R[~on]
-    if len(pre) < 6 or int(on.sum()) < 6:
-        return                       # 한쪽이 없으면 가를 것이 없다(전 구간이 같은 레짐)
+    n_on = int(on.sum())
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 표를 못 그리는 경우일수록 **더 크게** 말해야 한다 ★★
+    #    예전 판은 `if len(pre) < 6 or n_on < 6: return` 으로 조용히 빠져나갔다.
+    #    그런데 이 함수의 존재 이유는 'EMP 구간이 짧으니 합산 CAGR 을 인용하지 말라'는
+    #    경고다. EMP 커버리지가 최악일 때(=경고가 가장 필요할 때) 정확히 침묵하는 셈이었다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    if n_on < 6:
+        LOG.warn(f"★ 이 실행에는 직원현황(알파) 관측이 {n_on}개월뿐입니다 — 사실상 "
+                 f"**CORE-D 단독 전략**의 백테스트입니다. 위/아래의 CAGR·Sharpe 를 "
+                 f"'CORE-D + EMP-LITE' 의 성과로 인용하면 안 됩니다. TP_N1·N2·N3 가 "
+                 f"거의 전 구간 결측이므로 이 문서의 존재 이유인 R2-N 도 검정불가입니다. "
+                 f"직원현황을 더 채운 뒤 재실행하세요(격자가 회사 우선이라 재실행할수록 "
+                 f"과거 구간이 함께 채워집니다).")
+        return
+    if len(pre) < 6:
+        LOG.info(f"전 구간({len(R)}개월) 중 {n_on}개월에 EMP 관측이 있어 레짐이 사실상 "
+                 f"하나입니다 — 분할표를 생략합니다(가를 것이 없습니다).")
+        return
     rows = []
     for lab, sub, note in (
             ("EMP 신호 없음 (CORE-D 단독)", pre, "직원현황 미수집 구간"),
@@ -11590,9 +11699,28 @@ def report_ledger_v3(ctx: dict):
     fin = ctx.get("fin", pd.DataFrame())
 
     def _n(df, c=None):
+        """행수(c=None) 또는 컬럼 c 의 유효값 수.
+
+        ★★ 예전엔 컬럼이 없으면 **전체 행수**를 돌려줬다 ★★
+          그래서 리포트 원장의 종목코드 연결률이 항상 100% 로 찍혔다 — 실제 컬럼명은
+          'stock_code' 인데 표는 'code' 를 물었고, 없으니 len(df) 가 반환돼
+          '연결 N건 (100%)' 이 되는 구조였다. 연결이 하나도 안 됐을 때 가장 크게
+          100% 라고 말하는 셈이다. 컬럼 부재는 '전부 연결됨'이 아니라 '잴 수 없음'이다.
+        """
         if df is None or len(df) == 0:
             return 0
-        return int(df[c].notna().sum()) if c and c in df.columns else int(len(df))
+        if not c:
+            return int(len(df))
+        return int(df[c].notna().sum()) if c in df.columns else 0
+
+    def _link(df, cands: Sequence[str]) -> Tuple[int, str]:
+        """후보 컬럼명 중 실제로 존재하는 것으로 연결 수를 센다(이름 불일치로 0 이 되지 않게)."""
+        if df is None or len(df) == 0:
+            return 0, "-"
+        for c in cands:
+            if c in df.columns:
+                return int(df[c].notna().sum()), c
+        return 0, "컬럼없음"
 
     def _nuniq(df, c):
         """컬럼이 없거나 비어도 감사표가 죽지 않게 한다 — 감사표는 실패했을 때 가장 필요하다."""
@@ -11611,7 +11739,9 @@ def report_ledger_v3(ctx: dict):
          f"{_n(emp):,}", _nuniq(emp, "corp_code"),
          "knowledge_date = 사업보고서 접수일"],
         ["리포트 원장 ← 한경컨센서스·네이버", "report_id", f"{_n(rep):,}",
-         f"종목코드 연결 {_n(rep,'code'):,} ({100*_n(rep,'code')/max(_n(rep),1):.0f}%)",
+         (lambda nc: f"종목코드 연결 {nc[0]:,} "
+                     f"({100*nc[0]/max(_n(rep),1):.0f}% · 키={nc[1]})")(
+             _link(rep, ["stock_code", "code", "ticker"])),
          "제목 정규식 + 네이버 stock_item href"],
         ["애널리스트 원장 ← 리포트", "analyst_id", f"{_n(A):,}",
          f"보고서-애널 링크 {_n(L):,}건", "증권사 사명 정규화 후 (이름,증권사) 동일성"],
@@ -13690,10 +13820,37 @@ def preflight_dart_v3() -> str:
 
 
 # ── L1 수집 ─────────────────────────────────────────────────────────────────────────────────
+def deadline_guard_v3(stage: str, ctx: dict) -> bool:
+    """수집 단계 **진입 전** 데드라인 확인. 넘겼으면 그 단계를 건너뛴다.
+
+    ══════════════════════════════════════════════════════════════════════════════════════
+     ★★ PIPE.stage 의 budget_s 는 4시간 계약을 집행하지 못한다 ★★
+       그 값은 컨텍스트가 **닫힐 때** 경과시간과 비교돼 경고 한 줄을 남길 뿐이다
+       (build/02_kernel.py). 즉 L1.PX 가 2,400초 예산을 40분 넘겨도 아무 일도 일어나지
+       않고, 그 40분은 뒤 단계(직원현황·Tier-2)의 몫에서 그대로 빠진다.
+       수집 루프 안쪽에는 데드라인을 심어 두었지만(EMP·Tier-2·수급), 단계 자체를
+       건너뛸 판단은 루프 밖에서 해야 한다 — 앞 단계가 예산을 다 먹었으면 뒤 단계는
+       시작조차 하지 않는 것이 맞다. 캐시는 append-only 라 다음 실행이 이어받는다.
+    ══════════════════════════════════════════════════════════════════════════════════════
+    """
+    if not deadline_hit():
+        return True
+    ctx.setdefault("skipped_by_deadline", []).append(stage)
+    LOG.warn(f"[{stage}] 수집을 시작하지 않고 건너뜁니다 — {deadline_note()} "
+             f"이미 받은 것은 드라이브 공용 인덱스에 있으므로 재실행하면 정확히 이 지점부터 "
+             f"이어받습니다. 4시간 계약을 넘겨서 더 받는 것보다, 끝까지 돌려 결과를 "
+             f"보여드리는 쪽이 낫습니다.")
+    return False
+
+
 def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     ctx: Dict[str, Any] = {}
     t_ing = time.time()
     ctx["dart_mode"] = announce_budget_v3()
+    LOG.info(f"수집 예산 — 전체 {WALL_CLOCK_LIMIT_H:.0f}시간 중 "
+             f"{(WALL_CLOCK_LIMIT_H*60 - POST_COLLECT_RESERVE_MIN):.0f}분을 수집에 쓰고 "
+             f"{POST_COLLECT_RESERVE_MIN:.0f}분을 피처·백테스트·강건성·리포트로 남깁니다. "
+             f"각 수집 단계는 시작 전에 잔여시간을 확인하고, 넘겼으면 시작하지 않습니다.")
 
     with PIPE.stage("L1.UNI", "종목 마스터 · PIT 유니버스", "L1", budget_s=900):
         snaps = fetch_pykrx_snapshots(months)
@@ -13741,54 +13898,60 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
                       f"신규 수집 단계는 요청을 보내지 않고 즉시 넘어갑니다.")
             report_cache_only_outlook_v3(ctx)
 
-    with PIPE.stage("L1.FLOW", "기관·외국인 수급 (U축 d3)", "L1", budget_s=1200, critical=False):
-        ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START,
-                                            BACKTEST_END, sec=ctx["sec"])
+    with PIPE.stage("L1.FLOW", "기관·외국인 수급 (U축 d3)", "L1", budget_s=1200, critical=False,
+                    skip_if=not deadline_guard_v3("L1.FLOW", ctx),
+                    skip_reason="4시간 계약의 수집 몫 소진 — U 는 d1 단독으로 계산됩니다") as _st:
+        if _st.active:   # ★ skip_if 는 본문을 못 건너뛴다 — 여기서 명시적으로 가른다
+            ctx["flows"] = fetch_investor_flows(ctx["sec"]["code"].tolist(), BACKTEST_START,
+                                                BACKTEST_END, sec=ctx["sec"])
 
     with PIPE.stage("L1.EMP", "DART 직원현황(확장) · C15 한계임금", "L1",
-                    budget_s=3600, critical=False):
-        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
-        # ★ 상한을 '아직 제출되지 않은 회계연도' 앞에서 끊는다.
-        #   사업보고서는 다음 해 3~4월에 나오므로 FY(올해)는 존재할 수 없다. 그런데 잡은
-        #   연도 내림차순이라 그 없는 연도가 **큐 맨 앞**에 온다 — 3,366건(상한의 24%)을
-        #   확실히 빈 응답에 먼저 태우고 나서야 쓸 수 있는 연도에 도달했다.
-        _y_max = min(as_ts(BACKTEST_END).year, _dt.date.today().year) - 1
-        eyears = list(range(as_ts(BACKTEST_START).year - EMP_YEARS_BACK, _y_max + 1))
-        LOG.info(f"직원현황 대상 회계연도 {eyears[0]}~{eyears[-1]} "
-                 f"(FY{_y_max + 1} 이후는 아직 제출 전이라 제외 — 없는 연도를 먼저 묻지 않습니다)")
-        # ★ 한계임금이 이 전략의 알파 원천이므로 DART 일일예산을 **여기에 먼저** 배정한다.
-        # ★ 직원현황의 모집단은 Tier-2 예산과 무관하다. 예전엔 dart_fs_scope_v3 를
-        #   빌려 써서, Tier-2 를 끄면(DART_FS_MAX_CALLS=0) 여기가 빈 리스트를 받고
-        #   falsy 판정에 걸려 전 종목(3,981사)으로 되돌아갔다 — 축소가 명목상만 켜져 있었다.
-        _umid_keep, emp_prio = umid_experienced_corps(ctx, quiet=True)
-        emp_corps = corps
-        if EMP_UNIVERSE_ONLY and _umid_keep:
-            emp_corps = [c for c in corps if c in _umid_keep]
-            LOG.info(f"직원현황 대상을 U-MID 대역 경험 종목 {len(emp_corps):,}사로 좁힙니다 "
-                     f"(전체 {len(corps):,}사). 한 번도 투자가능 대역에 들지 못한 회사의 "
-                     f"직원현황은 어떤 달의 스코어에도 들어가지 않습니다.")
-        if not emp_corps:
-            emp_corps = corps      # 축소가 전멸시키면 축소하지 않는다(덜 받는 쪽이 아니라 못 받는 쪽)
-        pairs = emp_pairs_needed_v3(ctx, eyears)
-        # ★ CACHE_ONLY 면 신규 요청을 아예 만들지 않는다(요청해도 서버가 거부한다).
-        #   예전엔 이 판정이 배선돼 있지 않아 8,965건을 큐에 올린 뒤 첫 청크에서 멈췄다.
-        E = fetch_emp_status(emp_corps, eyears, priority=emp_prio,
-                             max_calls=(0 if ctx.get("dart_mode") == "CACHE_ONLY"
-                                        else EMP_MAX_CALLS),
-                             pairs=pairs)
-        ctx["emp_raw"] = E
-        S = build_emp_sensors(E)
-        ctx["emp_sensors"] = S
-        ok, msg = test_c15(S)
-        (LOG.ok if ok else LOG.error)(f"C15 자가검정 — {msg}")
-        if not ok and STOP_ON_KILL_CRITERIA:
-            raise KillCriteria(f"C15 계약 위반: {msg}")
-        if len(S):
-            PIT.register("emp_sensors",
-                         pit_frame(S, "period_end", "knowledge_date", source="dart"),
-                         key_cols=["corp_code"])
-            VAULT.put_table("emp_sensors_annual", S, scope="shared", domain="dart",
-                            source="v3 EMP-LITE 연도 센서 (C15 적용) — 타 전략 재사용 가능")
+                    budget_s=3600, critical=False,
+                    skip_if=not deadline_guard_v3("L1.EMP", ctx),
+                    skip_reason="4시간 계약의 수집 몫 소진 — 캐시분만 사용합니다") as _st:
+        if _st.active:   # ★ skip_if 는 본문을 못 건너뛴다 — 여기서 명시적으로 가른다
+            corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+            # ★ 상한을 '아직 제출되지 않은 회계연도' 앞에서 끊는다.
+            #   사업보고서는 다음 해 3~4월에 나오므로 FY(올해)는 존재할 수 없다. 그런데 잡은
+            #   연도 내림차순이라 그 없는 연도가 **큐 맨 앞**에 온다 — 3,366건(상한의 24%)을
+            #   확실히 빈 응답에 먼저 태우고 나서야 쓸 수 있는 연도에 도달했다.
+            _y_max = min(as_ts(BACKTEST_END).year, _dt.date.today().year) - 1
+            eyears = list(range(as_ts(BACKTEST_START).year - EMP_YEARS_BACK, _y_max + 1))
+            LOG.info(f"직원현황 대상 회계연도 {eyears[0]}~{eyears[-1]} "
+                     f"(FY{_y_max + 1} 이후는 아직 제출 전이라 제외 — 없는 연도를 먼저 묻지 않습니다)")
+            # ★ 한계임금이 이 전략의 알파 원천이므로 DART 일일예산을 **여기에 먼저** 배정한다.
+            # ★ 직원현황의 모집단은 Tier-2 예산과 무관하다. 예전엔 dart_fs_scope_v3 를
+            #   빌려 써서, Tier-2 를 끄면(DART_FS_MAX_CALLS=0) 여기가 빈 리스트를 받고
+            #   falsy 판정에 걸려 전 종목(3,981사)으로 되돌아갔다 — 축소가 명목상만 켜져 있었다.
+            _umid_keep, emp_prio = umid_experienced_corps(ctx, quiet=True)
+            emp_corps = corps
+            if EMP_UNIVERSE_ONLY and _umid_keep:
+                emp_corps = [c for c in corps if c in _umid_keep]
+                LOG.info(f"직원현황 대상을 U-MID 대역 경험 종목 {len(emp_corps):,}사로 좁힙니다 "
+                         f"(전체 {len(corps):,}사). 한 번도 투자가능 대역에 들지 못한 회사의 "
+                         f"직원현황은 어떤 달의 스코어에도 들어가지 않습니다.")
+            if not emp_corps:
+                emp_corps = corps      # 축소가 전멸시키면 축소하지 않는다(덜 받는 쪽이 아니라 못 받는 쪽)
+            pairs = emp_pairs_needed_v3(ctx, eyears)
+            # ★ CACHE_ONLY 면 신규 요청을 아예 만들지 않는다(요청해도 서버가 거부한다).
+            #   예전엔 이 판정이 배선돼 있지 않아 8,965건을 큐에 올린 뒤 첫 청크에서 멈췄다.
+            E = fetch_emp_status(emp_corps, eyears, priority=emp_prio,
+                                 max_calls=(0 if ctx.get("dart_mode") == "CACHE_ONLY"
+                                            else EMP_MAX_CALLS),
+                                 pairs=pairs)
+            ctx["emp_raw"] = E
+            S = build_emp_sensors(E)
+            ctx["emp_sensors"] = S
+            ok, msg = test_c15(S)
+            (LOG.ok if ok else LOG.error)(f"C15 자가검정 — {msg}")
+            if not ok and STOP_ON_KILL_CRITERIA:
+                raise KillCriteria(f"C15 계약 위반: {msg}")
+            if len(S):
+                PIT.register("emp_sensors",
+                             pit_frame(S, "period_end", "knowledge_date", source="dart"),
+                             key_cols=["corp_code"])
+                VAULT.put_table("emp_sensors_annual", S, scope="shared", domain="dart",
+                                source="v3 EMP-LITE 연도 센서 (C15 적용) — 타 전략 재사용 가능")
 
     with PIPE.stage("L1.DART", "DART 재무 · 공시목록", "L1", budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
@@ -13812,93 +13975,96 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
             LOG.warn("DART 재무가 비어 PIT 등록을 건너뜁니다 — CORE-D TP 는 전부 결측이 됩니다.")
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 · 원장 구축", "L1",
-                    budget_s=3600, critical=False):
-        cached = VAULT.get_table("research_report_master", scope="shared")
-        frames = []
-        # ★ 캐시를 읽어 놓고도 전 구간을 다시 긁고 있었다. "재수집하지 않습니다" 로그는
-        #   재수집이 **끝난 뒤에** 찍혔다(13분 낭비 × 매 실행). 가격·공시는 이미 증분인데
-        #   리포트만 전량 재수집이었다 → 캐시 최신일 이후만 받는다.
-        # ★★ 증분 게이트가 **존재하지 않는 컬럼**을 보고 있었다 ★★
-        #   원장의 발간일 컬럼명은 build_report_master 가 만드는 `pub_date` 다("date" 가 아니다).
-        #   그래서 `if "date" in cached.columns` 가 영구히 False 였고, r_start 는 언제나
-        #   BACKTEST_START 로 남아 **매 실행 11년 전 구간을 네이버에서 다시 긁었다.**
-        #   실측 869초(전체 런의 55%) — 2,350페이지 ÷ 3.0qps = 783초가 정확히 이 대기였다.
-        #   바로 위 주석이 "→ 캐시 최신일 이후만 받는다" 라고 선언하고 있었는데
-        #   그 선언을 실행하는 줄이 오타 하나로 죽어 있었다.
-        r_start = BACKTEST_START
-        _dcol = next((c for c in ("pub_date", "date", "report_date") if
-                      cached is not None and len(cached) and c in cached.columns), None)
-        if _dcol:
-            try:
-                _mx = as_ts_series(cached[_dcol]).max()
-                if pd.notna(_mx):
-                    # 7일 겹쳐 받는다 — 경계일에 늦게 올라온 리포트를 놓치지 않기 위함.
-                    r_start = max(as_ts(BACKTEST_START),
-                                  _mx - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
-                    if r_start != BACKTEST_START:
-                        LOG.ok(f"보고서 증분 수집 — 캐시 최신 {_mx:%Y-%m-%d}({_dcol}) 이후만 받습니다 "
-                               f"({r_start} ~ {BACKTEST_END}). "
-                               f"전 구간 재수집이면 실측 869초가 **매 실행** 듭니다.")
-            except Exception as e:                                  # noqa
-                LOG.warn(f"보고서 캐시의 발간일 파싱 실패({type(e).__name__}) — "
-                         f"안전하게 전 구간을 다시 받습니다(느립니다).")
-        elif cached is not None and len(cached):
-            LOG.warn(f"보고서 캐시에 발간일 컬럼이 없습니다(보유 컬럼: "
-                     f"{list(cached.columns)[:8]}) — 증분 수집이 불가능해 전 구간을 다시 받습니다.")
-        if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
-            LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
-                     "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
-                     "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
-            if "hankyung" in RESEARCH_SOURCES:
-                _hk = hankyung_collect(r_start, BACKTEST_END)
-                if not len(_hk) and r_start == BACKTEST_START:
-                    # ★ 전 구간을 요청했는데 0건이면 소스 장애다. 예전엔 LOG.ok 로 찍혀
-                    #   초록 체크마크 뒤에 숨었다. 한경은 analyst_raw 의 **유일한** 원천이라
-                    #   0건이면 애널리스트 원장 전체가 빈다.
-                    LOG.error("한경컨센서스 0건 — 전 구간을 요청했는데 한 건도 받지 못했습니다. "
-                              "위 'HTTP 수집 감사' 표에서 hankyung 의 403/404 건수를 확인하세요. "
-                              "403 이면 차단(잠시 뒤 재시도), 404 면 엔드포인트 변경입니다. "
-                              "이 소스가 비면 애널리스트 원장·목표주가가 통째로 비어 "
-                              "다중소스 원장연결 감사가 무의미해집니다.")
-                frames.append(_hk)
-            if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(r_start, BACKTEST_END)
-                # ★ 상세 보강은 리포트 1건당 1회 요청이라 **이 전략에서 가장 비싼 단계**다.
-                #   실측: 45,000건 대상 → 20,000건만 해도 ETA 1시간 44분(2.99 it/s).
-                #   §10 의 수집 총예산이 95분인데 한 보조축 보강이 그 배를 먹는다.
-                #   게다가 리허설·실행 모두 '목표주가 0건 추가 확보' 였다 — 수율이 0 이다.
-                #   → 시간 상한을 걸고, 그 안에서 **U-MID 대역 종목부터** 보강한다.
-                #     (담을 수 없는 종목의 목표주가는 스코어에 쓰이지 않는다)
-                nv = _enrich_research_bounded(nv, ctx.get("sec"))
-                frames.append(nv)
-        if cached is not None and len(cached):
-            LOG.ok(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 "
-                   f"(신규는 {r_start} 이후만 받았습니다)")
-            frames.append(cached)
-        rep = build_report_master(frames, ctx["sec"]) if frames else pd.DataFrame()
-        if len(rep):
-            if RESEARCH_DOWNLOAD_PDF:
-                rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
-                if "pdf_target" in rep.columns:
-                    fill = rep["target_price"].isna() & rep["pdf_target"].notna()
-                    if fill.any():
-                        rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
-                        LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건 추가 확보")
-            VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
-                            source="hankyung+naver")
-            VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",
-                            domain="research", source="strategy view")
-            A, L = build_analyst_ledger(rep)
-            if len(A):
-                VAULT.put_table("analyst_master", A, scope="shared", domain="research",
-                                source="entity_resolution")
-                VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
-                                source="entity_resolution")
-            ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
-        else:
-            ctx["reports"] = ctx["analysts"] = ctx["links"] = pd.DataFrame()
-            LOG.info("리포트 원장이 비었습니다 — U 는 스펙 §8 대로 d1·d3 로만 구성되므로 "
-                     "전략 자체는 온전합니다(원장은 감사·공용재활용 목적).")
+                    budget_s=3600, critical=False,
+                    skip_if=not deadline_guard_v3("L1.RESEARCH", ctx),
+                    skip_reason="4시간 계약의 수집 몫 소진 — 드라이브 캐시분만 사용합니다") as _st:
+        if _st.active:   # ★ skip_if 는 본문을 못 건너뛴다 — 여기서 명시적으로 가른다
+            cached = VAULT.get_table("research_report_master", scope="shared")
+            frames = []
+            # ★ 캐시를 읽어 놓고도 전 구간을 다시 긁고 있었다. "재수집하지 않습니다" 로그는
+            #   재수집이 **끝난 뒤에** 찍혔다(13분 낭비 × 매 실행). 가격·공시는 이미 증분인데
+            #   리포트만 전량 재수집이었다 → 캐시 최신일 이후만 받는다.
+            # ★★ 증분 게이트가 **존재하지 않는 컬럼**을 보고 있었다 ★★
+            #   원장의 발간일 컬럼명은 build_report_master 가 만드는 `pub_date` 다("date" 가 아니다).
+            #   그래서 `if "date" in cached.columns` 가 영구히 False 였고, r_start 는 언제나
+            #   BACKTEST_START 로 남아 **매 실행 11년 전 구간을 네이버에서 다시 긁었다.**
+            #   실측 869초(전체 런의 55%) — 2,350페이지 ÷ 3.0qps = 783초가 정확히 이 대기였다.
+            #   바로 위 주석이 "→ 캐시 최신일 이후만 받는다" 라고 선언하고 있었는데
+            #   그 선언을 실행하는 줄이 오타 하나로 죽어 있었다.
+            r_start = BACKTEST_START
+            _dcol = next((c for c in ("pub_date", "date", "report_date") if
+                          cached is not None and len(cached) and c in cached.columns), None)
+            if _dcol:
+                try:
+                    _mx = as_ts_series(cached[_dcol]).max()
+                    if pd.notna(_mx):
+                        # 7일 겹쳐 받는다 — 경계일에 늦게 올라온 리포트를 놓치지 않기 위함.
+                        r_start = max(as_ts(BACKTEST_START),
+                                      _mx - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+                        if r_start != BACKTEST_START:
+                            LOG.ok(f"보고서 증분 수집 — 캐시 최신 {_mx:%Y-%m-%d}({_dcol}) 이후만 받습니다 "
+                                   f"({r_start} ~ {BACKTEST_END}). "
+                                   f"전 구간 재수집이면 실측 869초가 **매 실행** 듭니다.")
+                except Exception as e:                                  # noqa
+                    LOG.warn(f"보고서 캐시의 발간일 파싱 실패({type(e).__name__}) — "
+                             f"안전하게 전 구간을 다시 받습니다(느립니다).")
+            elif cached is not None and len(cached):
+                LOG.warn(f"보고서 캐시에 발간일 컬럼이 없습니다(보유 컬럼: "
+                         f"{list(cached.columns)[:8]}) — 증분 수집이 불가능해 전 구간을 다시 받습니다.")
+            if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+                LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
+                         "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
+                         "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
+                if "hankyung" in RESEARCH_SOURCES:
+                    _hk = hankyung_collect(r_start, BACKTEST_END)
+                    if not len(_hk) and r_start == BACKTEST_START:
+                        # ★ 전 구간을 요청했는데 0건이면 소스 장애다. 예전엔 LOG.ok 로 찍혀
+                        #   초록 체크마크 뒤에 숨었다. 한경은 analyst_raw 의 **유일한** 원천이라
+                        #   0건이면 애널리스트 원장 전체가 빈다.
+                        LOG.error("한경컨센서스 0건 — 전 구간을 요청했는데 한 건도 받지 못했습니다. "
+                                  "위 'HTTP 수집 감사' 표에서 hankyung 의 403/404 건수를 확인하세요. "
+                                  "403 이면 차단(잠시 뒤 재시도), 404 면 엔드포인트 변경입니다. "
+                                  "이 소스가 비면 애널리스트 원장·목표주가가 통째로 비어 "
+                                  "다중소스 원장연결 감사가 무의미해집니다.")
+                    frames.append(_hk)
+                if "naver" in RESEARCH_SOURCES:
+                    nv = naver_collect(r_start, BACKTEST_END)
+                    # ★ 상세 보강은 리포트 1건당 1회 요청이라 **이 전략에서 가장 비싼 단계**다.
+                    #   실측: 45,000건 대상 → 20,000건만 해도 ETA 1시간 44분(2.99 it/s).
+                    #   §10 의 수집 총예산이 95분인데 한 보조축 보강이 그 배를 먹는다.
+                    #   게다가 리허설·실행 모두 '목표주가 0건 추가 확보' 였다 — 수율이 0 이다.
+                    #   → 시간 상한을 걸고, 그 안에서 **U-MID 대역 종목부터** 보강한다.
+                    #     (담을 수 없는 종목의 목표주가는 스코어에 쓰이지 않는다)
+                    nv = _enrich_research_bounded(nv, ctx.get("sec"))
+                    frames.append(nv)
+            if cached is not None and len(cached):
+                LOG.ok(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용 "
+                       f"(신규는 {r_start} 이후만 받았습니다)")
+                frames.append(cached)
+            rep = build_report_master(frames, ctx["sec"]) if frames else pd.DataFrame()
+            if len(rep):
+                if RESEARCH_DOWNLOAD_PDF:
+                    rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+                    if "pdf_target" in rep.columns:
+                        fill = rep["target_price"].isna() & rep["pdf_target"].notna()
+                        if fill.any():
+                            rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
+                            LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건 추가 확보")
+                VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
+                                source="hankyung+naver")
+                VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",
+                                domain="research", source="strategy view")
+                A, L = build_analyst_ledger(rep)
+                if len(A):
+                    VAULT.put_table("analyst_master", A, scope="shared", domain="research",
+                                    source="entity_resolution")
+                    VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
+                                    source="entity_resolution")
+                ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
+            else:
+                ctx["reports"] = ctx["analysts"] = ctx["links"] = pd.DataFrame()
+                LOG.info("리포트 원장이 비었습니다 — U 는 스펙 §8 대로 d1·d3 로만 구성되므로 "
+                         "전략 자체는 온전합니다(원장은 감사·공용재활용 목적).")
 
     runtime_mark("수집", time.time() - t_ing)
     return ctx
@@ -13967,17 +14133,36 @@ def score_and_backtest_v3(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex,
                                        "VETO", "FLOOR", "n_tp") if c in P.columns]],
                         scope="private", domain="scores", source="L2")
 
-    def _run(pp, label="run", apply_costs=True, months_override=None):
-        # ★ 강건성 스위트가 부르는 경로다. 감쇠 원장에는 기록하지 않는다 —
-        #   R1·R3·R5·R10 이 백테스트를 10여 회 재실행하므로 같은 달이 10번 세어진다.
-        return run_backtest(pp, months_override if months_override is not None else months,
-                            uni, ctx["sec"], apply_costs=apply_costs, label=label,
-                            audit=False)
-
     with PIPE.stage("L3.BT", "백테스트", "L3", budget_s=300):
         uni.set_audit_arm(ARM_MAIN, on=True)
         bt = run_backtest(P, months, uni, ctx["sec"], apply_costs=True,
                           label=STRATEGY_ID, audit=True)
+
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 기준팔 메모 — R1·R3·R5·R10 이 **인자까지 동일한** 기준 백테스트를 각자 다시 돌린다
+    #    (R1_base · R3_base · R5_base · R10_base). 본선 bt 까지 세면 같은 계산을 5번 한다.
+    #    강건성 스위트 전체가 26회 재실행인데 그중 4회가 순수 중복이다 — 15%를 그냥 태운다.
+    #    입력 프레임이 본선 패널 그대로이고 months·비용 가정이 같으면 결과는 정의상 같다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _base_cache: Dict[tuple, dict] = {}
+
+    def _run(pp, label="run", apply_costs=True, months_override=None):
+        # ★ 강건성 스위트가 부르는 경로다. 감쇠 원장에는 기록하지 않는다 —
+        #   R1·R3·R5·R10 이 백테스트를 10여 회 재실행하므로 같은 달이 10번 세어진다.
+        mm = months_override if months_override is not None else months
+        _same = (pp is P) and apply_costs and (mm is months)
+        if _same:
+            hit = _base_cache.get(("base",))
+            if hit is not None:
+                LOG.debug(f"[{label}] 기준팔은 이미 계산된 결과를 재사용합니다(동일 입력).")
+                return hit
+        out = run_backtest(pp, mm, uni, ctx["sec"], apply_costs=apply_costs, label=label,
+                           audit=False)
+        if _same:
+            _base_cache[("base",)] = out
+        return out
+
+    _base_cache[("base",)] = bt          # 본선 결과를 그대로 기준팔로 물려준다
     runtime_mark("L2+L3.백테스트", time.time() - t_l2)
     return P, bt, _run
 

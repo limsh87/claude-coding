@@ -100,7 +100,25 @@ def _canary_accounts(corps: Sequence[str], year: int) -> Optional[bool]:
         _k("K3", "필수계정 커버리지", False, "응답 0건", f"≥{CANARY_K3_MIN_COV:.0%}",
            "재무 기반 TP 전부 비활성 위험 — 키·한도를 확인하세요")
         return False
-    W = tidy_financials(pd.concat(res, ignore_index=True))
+    _raw = pd.concat(res, ignore_index=True)
+    # ★ 탐침으로 받은 전체재무제표도 공용 인덱스에 남긴다(절대1원칙). 200사 × FY 1년치는
+    #   Tier-2 본수집이 곧바로 다시 요청할 조합이고, 그 호출은 하루 예산에서 빠진다.
+    try:
+        _prev = VAULT.get_table("dart_fnltt_raw", scope="shared")
+        _acc = pd.concat([f for f in (_prev, _raw) if f is not None and len(f)],
+                         ignore_index=True)
+        _keys = [c for c in ("corp_code", "bsns_year", "reprt_code", "sj_div",
+                             "account_id", "account_nm") if c in _acc.columns]
+        if _keys:
+            _acc = _acc.drop_duplicates(_keys, keep="last")
+        VAULT.put_table("dart_fnltt_raw", _acc, scope="shared", domain="dart",
+                        source="CANARY K3 탐침분 (본수집이 재요청하지 않도록 영속)",
+                        backup=False)
+        LOG.ok(f"CANARY 탐침 재무 {len(_raw):,}행을 공용 인덱스에 저장했습니다 — "
+               f"Tier-2 본수집이 같은 조합을 다시 묻지 않습니다.")
+    except Exception as e:                                           # noqa
+        LOG.debug(f"CANARY 재무 저장 실패({type(e).__name__}) — 판정에는 영향 없음")
+    W = tidy_financials(_raw)
     n = W["corp_code"].nunique() if len(W) else 0
     cov, weak = {}, []
     for a in CANARY_REQUIRED_ACCOUNTS:
@@ -212,6 +230,21 @@ def _canary_emp(corps: Sequence[str], year: int) -> Tuple[Optional[bool], Option
     rows = [r for r in pmap_io(lambda c: _emp_one_raw(c, year), list(corps),
                                workers=min(N_WORKERS_IO, 12), desc="CANARY K7~K9 직원현황")
             if r is not None]
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 탐침으로 받은 것도 **반드시 캐시에 남긴다** (절대1원칙) ★★
+    #    예전엔 200사 × empSttus 를 실제로 받아 비율만 계산하고 프레임을 통째로 버렸다.
+    #    같은 실행의 본수집(L1.EMP)이 조금 뒤에 그 200사를 **다시** 요청했고,
+    #    그 호출들은 알파(직원현황)의 하루 예산에서 그대로 빠져나갔다.
+    #    사용자 원칙은 '어떤 신규수집데이터든 무조건 캐시저장-재호출 가능하게' 다 —
+    #    탐침이라고 예외가 아니다. 저장해 두면 본수집의 done 집합이 자동으로 흡수한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    if rows:
+        try:
+            _emp_checkpoint(VAULT.get_table("dart_employees_ext", scope="shared"), rows)
+            LOG.ok(f"CANARY 탐침으로 받은 직원현황 {len(rows):,}행을 공용 인덱스에 저장했습니다 "
+                   f"— 본수집(L1.EMP)이 같은 조합을 다시 묻지 않습니다(호출 예산 절약).")
+        except Exception as e:                                       # noqa
+            LOG.debug(f"CANARY 직원현황 저장 실패({type(e).__name__}) — 판정에는 영향 없음")
     n_try = len(corps)
     n_ok = len(rows)
     rate7 = n_ok / max(n_try, 1)

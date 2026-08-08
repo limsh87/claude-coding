@@ -186,8 +186,18 @@ def _run_backtest_inner(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Univers
     last_seen = (_pm.groupby("code", observed=True)["month"].max().to_dict()
                  if len(_pm) else {})
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 월별 인덱스를 **한 번만** 만든다. 예전엔 매달 `P[P["month"] == m].copy()` 로
+    #    전체 패널에 불리언 마스크를 걸고 복사했다 — 120개월이면 패널을 120번 완주하고
+    #    120번 복사한다. 그리고 이 함수는 강건성 스위트에서 26번 재실행되므로
+    #    그 비용이 그대로 26배가 된다. 실측상 L5 의 지배적 병목이었다.
+    #    groupby(...).indices 는 한 번의 패스로 월→행위치 배열을 만들어 준다(원칙 3).
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _midx = P.groupby("month", observed=True).indices if len(P) else {}
     for i, m in enumerate(months):
-        sub = P[(P["month"] == m)].copy()
+        _rows_i = _midx.get(m)
+        sub = (P.take(np.asarray(_rows_i)) if _rows_i is not None and len(_rows_i)
+               else P.iloc[0:0])
         if sub.empty:
             rows.append({"month": m, "ret": 0.0, "n": 0, "turnover": 0.0, "cost": 0.0})
             continue

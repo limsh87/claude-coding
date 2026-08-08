@@ -337,7 +337,7 @@ def _attach_treasury(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
 
 # ★ EMP 신호가 실제로 존재한 달의 범위. 리포트가 '두 전략의 이어붙임'을 가르는 근거다.
 #   여기서 채워 두지 않으면 L6 이 120개월을 하나의 전략처럼 합산해 보고한다.
-EMP_SIGNAL_SPAN: Dict[str, Any] = {"lo": None, "hi": None, "n_rows": 0}
+EMP_SIGNAL_SPAN: Dict[str, Any] = {"lo": None, "hi": None, "n_rows": 0, "months": set()}
 
 
 # ── EMP-LITE 파생 (연도 프레임 센서는 이미 붙어 있고, 여기선 패널 결합이 필요한 것만) ───────
@@ -395,15 +395,18 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
             _obs |= col(P, c).notna()
     if bool(_obs.any()):
         _mm = P.loc[_obs, "month"]
+        # ★ 봉투(min~max)가 아니라 **실제 관측이 있는 달의 집합**을 남긴다. 중간이 뚫린
+        #   구간까지 'EMP 있음'으로 세면 레짐 분할이 다시 두 전략을 뭉갠다.
         EMP_SIGNAL_SPAN.update({"lo": _mm.min(), "hi": _mm.max(),
-                                "n_rows": int(_obs.sum())})
+                                "n_rows": int(_obs.sum()),
+                                "months": set(pd.unique(_mm))})
         _tot = int(P["month"].nunique())
         _cov = int(P.loc[_obs, "month"].nunique())
         LOG.info(f"EMP 신호 존재 구간 {_mm.min():%Y-%m}~{_mm.max():%Y-%m} — "
                  f"{_cov}/{_tot}개월({_cov/max(_tot,1):.0%})에 관측이 있습니다. "
                  f"나머지 달은 CORE-D 단독으로 돕니다(성과 보고 시 분리 표기).")
     else:
-        EMP_SIGNAL_SPAN.update({"lo": None, "hi": None, "n_rows": 0})
+        EMP_SIGNAL_SPAN.update({"lo": None, "hi": None, "n_rows": 0, "months": set()})
         LOG.warn("EMP 신호가 어느 달에도 존재하지 않습니다 — 이 실행은 사실상 "
                  "'CORE-D 단독' 전략입니다. 결론에 그대로 명시하세요.")
     return P

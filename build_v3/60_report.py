@@ -76,16 +76,40 @@ def report_emp_regime_v3(bt: dict) -> None:
     → 신호가 실제로 존재한 구간과 아닌 구간을 갈라서 나란히 낸다. 합산값도 함께 두되,
       그것이 두 전략의 이어붙임이라는 사실을 표 제목에 적는다. 숨기고 합치지 않는다.
     """
-    lo, hi = EMP_SIGNAL_SPAN.get("lo"), EMP_SIGNAL_SPAN.get("hi")
     R = bt.get("returns")
-    if R is None or R.empty or lo is None or hi is None:
+    if R is None or R.empty:
         return
     R = R.copy()
     R["month"] = as_ts_series(R["month"])
-    on = (R["month"] >= as_ts(lo)) & (R["month"] <= as_ts(hi))
+    # ★ '최소~최대 봉투'가 아니라 **실제 관측이 있는 달의 집합**으로 가른다.
+    #   봉투를 쓰면 중간에 뚫린 달(수집이 안 된 해)까지 'EMP 있음'으로 계산된다.
+    _mset = EMP_SIGNAL_SPAN.get("months") or set()
+    if _mset:
+        on = R["month"].isin({as_ts(m) for m in _mset})
+    else:
+        lo, hi = EMP_SIGNAL_SPAN.get("lo"), EMP_SIGNAL_SPAN.get("hi")
+        on = (pd.Series(False, index=R.index) if lo is None or hi is None
+              else (R["month"] >= as_ts(lo)) & (R["month"] <= as_ts(hi)))
     pre = R[~on]
-    if len(pre) < 6 or int(on.sum()) < 6:
-        return                       # 한쪽이 없으면 가를 것이 없다(전 구간이 같은 레짐)
+    n_on = int(on.sum())
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 표를 못 그리는 경우일수록 **더 크게** 말해야 한다 ★★
+    #    예전 판은 `if len(pre) < 6 or n_on < 6: return` 으로 조용히 빠져나갔다.
+    #    그런데 이 함수의 존재 이유는 'EMP 구간이 짧으니 합산 CAGR 을 인용하지 말라'는
+    #    경고다. EMP 커버리지가 최악일 때(=경고가 가장 필요할 때) 정확히 침묵하는 셈이었다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    if n_on < 6:
+        LOG.warn(f"★ 이 실행에는 직원현황(알파) 관측이 {n_on}개월뿐입니다 — 사실상 "
+                 f"**CORE-D 단독 전략**의 백테스트입니다. 위/아래의 CAGR·Sharpe 를 "
+                 f"'CORE-D + EMP-LITE' 의 성과로 인용하면 안 됩니다. TP_N1·N2·N3 가 "
+                 f"거의 전 구간 결측이므로 이 문서의 존재 이유인 R2-N 도 검정불가입니다. "
+                 f"직원현황을 더 채운 뒤 재실행하세요(격자가 회사 우선이라 재실행할수록 "
+                 f"과거 구간이 함께 채워집니다).")
+        return
+    if len(pre) < 6:
+        LOG.info(f"전 구간({len(R)}개월) 중 {n_on}개월에 EMP 관측이 있어 레짐이 사실상 "
+                 f"하나입니다 — 분할표를 생략합니다(가를 것이 없습니다).")
+        return
     rows = []
     for lab, sub, note in (
             ("EMP 신호 없음 (CORE-D 단독)", pre, "직원현황 미수집 구간"),
@@ -212,9 +236,28 @@ def report_ledger_v3(ctx: dict):
     fin = ctx.get("fin", pd.DataFrame())
 
     def _n(df, c=None):
+        """행수(c=None) 또는 컬럼 c 의 유효값 수.
+
+        ★★ 예전엔 컬럼이 없으면 **전체 행수**를 돌려줬다 ★★
+          그래서 리포트 원장의 종목코드 연결률이 항상 100% 로 찍혔다 — 실제 컬럼명은
+          'stock_code' 인데 표는 'code' 를 물었고, 없으니 len(df) 가 반환돼
+          '연결 N건 (100%)' 이 되는 구조였다. 연결이 하나도 안 됐을 때 가장 크게
+          100% 라고 말하는 셈이다. 컬럼 부재는 '전부 연결됨'이 아니라 '잴 수 없음'이다.
+        """
         if df is None or len(df) == 0:
             return 0
-        return int(df[c].notna().sum()) if c and c in df.columns else int(len(df))
+        if not c:
+            return int(len(df))
+        return int(df[c].notna().sum()) if c in df.columns else 0
+
+    def _link(df, cands: Sequence[str]) -> Tuple[int, str]:
+        """후보 컬럼명 중 실제로 존재하는 것으로 연결 수를 센다(이름 불일치로 0 이 되지 않게)."""
+        if df is None or len(df) == 0:
+            return 0, "-"
+        for c in cands:
+            if c in df.columns:
+                return int(df[c].notna().sum()), c
+        return 0, "컬럼없음"
 
     def _nuniq(df, c):
         """컬럼이 없거나 비어도 감사표가 죽지 않게 한다 — 감사표는 실패했을 때 가장 필요하다."""
@@ -233,7 +276,9 @@ def report_ledger_v3(ctx: dict):
          f"{_n(emp):,}", _nuniq(emp, "corp_code"),
          "knowledge_date = 사업보고서 접수일"],
         ["리포트 원장 ← 한경컨센서스·네이버", "report_id", f"{_n(rep):,}",
-         f"종목코드 연결 {_n(rep,'code'):,} ({100*_n(rep,'code')/max(_n(rep),1):.0f}%)",
+         (lambda nc: f"종목코드 연결 {nc[0]:,} "
+                     f"({100*nc[0]/max(_n(rep),1):.0f}% · 키={nc[1]})")(
+             _link(rep, ["stock_code", "code", "ticker"])),
          "제목 정규식 + 네이버 stock_item href"],
         ["애널리스트 원장 ← 리포트", "analyst_id", f"{_n(A):,}",
          f"보고서-애널 링크 {_n(L):,}건", "증권사 사명 정규화 후 (이름,증권사) 동일성"],

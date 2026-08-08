@@ -114,15 +114,36 @@ def R0_benchmark(P: pd.DataFrame, bt: dict, months: pd.DatetimeIndex) -> Dict[st
     n_by_m = _g.size().reindex(months)
 
     def _fin(s: pd.Series) -> pd.Series:
-        v = pd.to_numeric(s, errors="coerce")
-        return v.where(np.isfinite(v.to_numpy(dtype="float64"))).fillna(0.0)
+        """비유한값만 결측으로 되돌린다. **0 으로 채우지 않는다.**
 
-    ew, ew_raw, ew_med = _fin(ew), _fin(ew_raw), _fin(ew_med)
+        ★ 결측월을 0% 수익으로 채우면 '그 달 시장이 보합이었다'는 없는 사실이 생긴다.
+          지수 시계열은 수집 실패·구간 부족으로 앞뒤가 비는 일이 흔한데, 0 으로 채운 채
+          복리를 돌리면 벤치마크 CAGR 이 실제보다 0 쪽으로 끌려가고 —
+          하락장 구간이 비면 벤치마크가 **부당하게 좋아 보이고**, 상승장 구간이 비면
+          반대가 된다. 그리고 표에는 '이 실행에서 직접 재측정'이라고 적힌다.
+        """
+        v = pd.to_numeric(s, errors="coerce")
+        return v.where(np.isfinite(v.to_numpy(dtype="float64")))
+
+    # 유니버스 동일가중은 '그 달 고를 수 있었던 종목이 없었다'는 뜻이므로 0 이 맞다
+    # (포지션을 못 잡으면 수익도 없다). 지수와는 성격이 다르다.
+    ew = _fin(ew).fillna(0.0)
+    ew_raw, ew_med = _fin(ew_raw).fillna(0.0), _fin(ew_med).fillna(0.0)
     bench = {"유니버스 동일가중": ew}
     try:
         for k, v in benchmark_returns(months).items():
-            if v is not None and v.notna().any():
-                bench[k] = _fin(v.reindex(months))
+            if v is None:
+                continue
+            vv = _fin(v.reindex(months))
+            cov = float(vv.notna().mean())
+            if cov < 0.98:
+                # ★ 구멍 난 지수를 0 으로 메워 비교표에 올리지 않는다. 빠진 사실을 말한다.
+                LOG.warn(f"지수 벤치마크 '{k}' 의 구간 커버리지가 {cov:.0%} 라 비교에서 "
+                         f"제외합니다({int(vv.isna().sum())}개월 결측). 결측월을 0% 로 채우면 "
+                         f"'그 달 시장이 보합이었다'는 없는 사실이 생기고, 그 위에서 계산한 "
+                         f"초과수익은 신호가 아니라 결측의 함수가 됩니다.")
+                continue
+            bench[k] = vv
     except Exception as e:                                       # noqa
         LOG.debug(f"지수 벤치마크 수집 실패({type(e).__name__}) — 자체측정만 사용합니다.")
 
