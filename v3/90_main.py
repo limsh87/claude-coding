@@ -124,7 +124,12 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
 
     with PIPE.stage("M0.UNI", "종목 마스터 (다중소스)", "M0", budget_s=600), Stage("M0.universe", 8):
         snaps = fetch_pykrx_snapshots(months)
-        sec = build_security_master(snaps)
+        sec = cached_table(
+            "security_master", [len(snaps), months.min(), months.max(), len(months)],
+            lambda: build_security_master(snaps), scope="shared", domain="universe",
+            source="fdr+kind+delisting+corpcode",
+            note="종목 마스터(상장일·폐지일·corp_code) — 전 전략 공용",
+            date_cols=("listing_date", "delisting_date"))
         ctx["sec"], ctx["snapshots"] = sec, snaps
         ctx["code_of_corp"] = (sec.dropna(subset=["corp_code"])
                                   .assign(corp_code=lambda d: d["corp_code"].astype(str))
@@ -145,7 +150,11 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         dis = fetch_dart_disclosures(
             (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"), BACKTEST_END)
         ctx["disclosures"] = dis
-        kmap = build_knowledge_map(dis)
+        kmap = cached_table("dart_knowledge_map", [dis],
+                            lambda: build_knowledge_map(dis), scope="shared", domain="dart",
+                            source="build_knowledge_map",
+                            note="rcept_no → 접수일자 원장 — 전 전략 공용",
+                            date_cols=("knowledge_date",))
         reprts = [REPRT_CODES[k] for k in ("Q1", "H1", "Q3", "FY")]
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         # 유동성 상위 종목의 corp_code 를 우선순위로 넘긴다 — 일일 한도로 끊겨도
@@ -204,7 +213,15 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
                 t_full = fetch_dart_full(corps, years, priority=prio,
                                          scope=inv_scope or None)
         raw = merge_financial_tiers(t_bulk, t_full, t_multi)
-        ctx["fin"] = tidy_financials(raw, kmap, ctx.get("code_of_corp"))
+        # ★ 실측 2.5분. 입력(원시 재무 + 접수일자 원장)이 그대로면 결과도 그대로다.
+        #   전략과 무관한 중간 결과이므로 공용 인덱스에 둔다 — 다른 전략이 그대로 쓴다.
+        ctx["fin"] = cached_table(
+            "financials_tidy", [raw, kmap, DART_FS_FREQ, DART_MIN_YEAR,
+                                sorted(ACCOUNT_MAP.keys())],
+            lambda: tidy_financials(raw, kmap, ctx.get("code_of_corp")),
+            scope="shared", domain="dart", source="tidy_financials",
+            note="정제 재무(누적→분기·TTM 복원 완료) — 전 전략 공용",
+            date_cols=("period_end", "knowledge_date"))
         ctx["weak_tp"] = report_account_coverage()
 
     if _stage_ok("M2", stage):
@@ -320,15 +337,26 @@ def collect_research(months: pd.DatetimeIndex, sec: pd.DataFrame) -> dict:
         VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
                         source="entity_resolution")
     audit_linkage(rep, A, L)
-    cons = build_consensus_panel(L, months)
+    cons = cached_table("consensus_panel", [L, months.min(), months.max(), len(months)],
+                        lambda: build_consensus_panel(L, months), scope="shared",
+                        domain="research", source="build_consensus_panel",
+                        note="애널리스트 컨센서스 월 패널 — 전 전략 공용",
+                        date_cols=("month",))
     return {"reports": rep, "analysts": A, "links": L, "consensus": cons}
 
 
 def build_L1(ctx: dict, months: pd.DatetimeIndex, stage: str) -> Tuple[pd.DataFrame, "UniverseV3"]:
     with PIPE.stage("L1.PANEL", "L1 피처 패널 (정규화 없음)", "L1", budget_s=900), \
             Stage("L1.panel", 12):
-        P = build_base_panel(months, ctx["pp"]["monthly"], ctx["pp"]["daily"],
-                             ctx["sec"], ctx.get("mcap"))
+        P = cached_table(
+            "base_panel", [ctx["pp"]["monthly"], ctx["sec"], ctx.get("mcap"),
+                           months.min(), months.max(), len(months),
+                           UNIVERSE_SEASON_DAYS],
+            lambda: build_base_panel(months, ctx["pp"]["monthly"], ctx["pp"]["daily"],
+                                     ctx["sec"], ctx.get("mcap")),
+            scope="shared", domain="universe", source="build_base_panel",
+            note="PIT 기본 패널(시총랭크·상장경과·유동성) — 전 전략 공용",
+            date_cols=("month", "signal_date", "next_date"))
         sources = {}
         if len(ctx.get("fin", [])):
             sources["fin"] = ctx["fin"]
@@ -465,7 +493,7 @@ def main() -> dict:
 
     # ── §2 단계별 백테스트 — M0 에서 이미 결과가 나온다 ──────────────────────────────
     results = {}
-    bench = benchmark_returns(months)
+    bench = benchmark_returns(months)   # (내부에서 소스별 캐시를 씁니다)
     for st in STAGE_ORDER:
         if not _stage_ok(st, stage):
             break

@@ -500,8 +500,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
     px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
-                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+        # ★ 전체 재기록 금지. 실측: 697만 행 캐시에 58종목을 더하려고 350MB 를 통째로
+        #   다시 쓰고(2.7초) 백업까지 복사했다(2.9초). 매 실행 반복되는 순수 낭비다.
+        #   새로 받은 것만 조각으로 덧붙이면 0.04초다. 본체는 손대지 않는다.
+        _new = pd.concat(new_frames, ignore_index=True)
+        _new["date"] = as_ts_series(_new["date"])
+        _new["code"] = _new["code"].map(to_code6)
+        _new = _new.dropna(subset=["code", "date", "close"])
+        for _c in ("open", "high", "low", "close", "volume", "amount"):
+            if _c in _new.columns:
+                _new[_c] = pd.to_numeric(_new[_c], errors="coerce")
+        _new = (_new.sort_values(["code", "date"])
+                    .drop_duplicates(["code", "date"], keep="last").reset_index(drop=True))
+        VAULT.append_table("krx_ohlcv_daily", downcast(_new), scope="shared", domain="price",
+                           source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
@@ -517,6 +529,37 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
 
     체결은 '신호 산출일 다음 거래일 시가'(§10.1). 당일 종가 체결은 미래누수다.
     """
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  월 패널 캐시 — 일봉이 안 바뀌었으면 다시 계산하지 않는다
+    #
+    #  ★ 실측: 700만 행에서 이 함수가 36.4초를 쓴다(rolling(20) + groupby tail + shift).
+    #    일봉 캐시가 그대로인 재실행에서도 매번 전액을 다시 낸다. 지문이 같으면 건너뛴다.
+    #    지문 = (행수, 종목수, 최종일, 최초일, 월격자 범위). 일봉이 한 행이라도 늘면
+    #    행수가 달라지므로 지문이 깨지고 자동으로 재계산된다 — 낡은 값이 남을 수 없다.
+    # ══════════════════════════════════════════════════════════════════════════════
+    _fp = ""
+    try:
+        _d = as_ts_series(px["date"])
+        _fp = sha1_str("pxpanel_v2", str(len(px)), str(px["code"].nunique()),
+                       str(_d.min()), str(_d.max()),
+                       str(months.min()), str(months.max()), str(len(months)))
+        _cm = VAULT.get_table(f"price_panel_monthly_{_fp[:12]}", scope="shared")
+        if nonempty(_cm):
+            for _c in ("month", "signal_date", "next_date"):
+                if _c in _cm.columns:
+                    _cm[_c] = as_ts_series(_cm[_c])
+            # ★ parquet 왕복은 datetime64[ns] 를 [ms] 로 바꿔 놓는다. 값은 같지만 dtype 이
+            #   다르면 하류 merge 가 **예외 없이 0행 매칭**을 낼 수 있다 — PIT 시총이
+            #   정확히 그렇게 죽었다. 계산 경로와 똑같이 downcast 를 태워 dtype 을 못박는다.
+            _cm = downcast(_cm)
+            LOG.ok(f"월 패널 캐시 적중 — 일봉이 그대로라 재계산을 건너뜁니다 "
+                   f"({len(_cm):,}행 · 실측 36초 절약). 일봉이 한 행이라도 늘면 "
+                   f"지문이 달라져 자동으로 다시 계산합니다.")
+            PIPE.io("OUT", "MEM", "price_panel_monthly", _cm, source="cache")
+            return {"daily": px, "monthly": _cm}
+    except Exception as e:                                       # noqa
+        LOG.debug(f"월 패널 캐시 조회 건너뜀({type(e).__name__})")
+
     px = px.sort_values(["code", "date"])
     px["adv20"] = (px.groupby("code", observed=True)["amount"]
                      .transform(lambda s: s.rolling(20, min_periods=10).mean()))
@@ -563,7 +606,15 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
                  f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
                  f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
     PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
-    return {"daily": px, "monthly": downcast(monthly)}
+    monthly = downcast(monthly)
+    if _fp:
+        try:
+            VAULT.put_table(f"price_panel_monthly_{_fp[:12]}", monthly, scope="shared",
+                            domain="price", source="build_price_panel",
+                            extra={"note": "일봉 지문별 월패널 캐시 — 일봉이 바뀌면 자동 무효화"})
+        except Exception as e:                                   # noqa
+            LOG.debug(f"월 패널 캐시 저장 건너뜀({type(e).__name__})")
+    return {"daily": px, "monthly": monthly}
 
 
 def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:

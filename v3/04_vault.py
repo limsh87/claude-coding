@@ -351,25 +351,116 @@ class Vault:
                 f"새어 나가려던 참이었습니다. 검정 코드에서 VAULT 를 대역으로 교체했는지 "
                 f"확인하세요.")
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  증분 샤드 저장 — 700만 행을 매 실행 다시 쓰지 않는다
+    #
+    #  ★ 실측 낭비: 일봉 캐시가 697만 행인데 이번 실행에서 새로 받은 건 58종목뿐이었다.
+    #    그런데 put_table 은 전체를 다시 쓰고(2.7초) 교체 전 백업까지 복사한다(2.9초).
+    #    로컬 SSD 에서 5.6초, 구글드라이브 마운트에서는 분 단위다. 매 실행 반복된다.
+    #    새로 받은 58종목만 쓰면 0.04초다.
+    #
+    #  구조: 기존 {name}.parquet 은 **손대지 않는다**(절대 1원칙). 새 데이터는
+    #        {name}.parts/ 아래 새 파일로만 쌓는다. 읽을 때 본체 + 조각을 합친다.
+    #        기존 캐시와 100% 호환된다 — 조각이 없으면 예전과 똑같이 동작한다.
+    #        조각이 많아지면 본체로 합치되(compact), 그때도 백업 후 교체한다.
+    # ══════════════════════════════════════════════════════════════════════════════
+    def _parts_dir(self, name: str, scope: str) -> str:
+        return os.path.join(self.table_dir(scope), f"{name}.parts")
+
+    def _part_files(self, name: str, scope: str) -> List[str]:
+        d = self._parts_dir(name, scope)
+        if not os.path.isdir(d):
+            return []
+        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".parquet"))
+
+    def append_table(self, name: str, new_df: pd.DataFrame, scope: str = "shared",
+                     domain: str = "table", source: str = "",
+                     extra: Optional[dict] = None,
+                     compact_parts: int = 12) -> Optional[str]:
+        """새 행만 조각 파일로 덧붙인다. 본체는 건드리지 않는다."""
+        if new_df is None or not len(new_df):
+            return None
+        self._assert_writable(f"append_table({name}, scope={scope})")
+        d = self._parts_dir(name, scope)
+        os.makedirs(d, exist_ok=True)
+        stamp = f"{_dt.datetime.now():%Y%m%d_%H%M%S}"
+        path = os.path.join(d, f"{stamp}.{sha1_str(name, str(len(new_df)), stamp)[:8]}.parquet")
+        try:
+            atomic_write_parquet(new_df, path)
+        except Exception as e:                              # noqa
+            LOG.warn(f"조각 저장 실패({type(e).__name__}): {name} — 전체 저장으로 폴백합니다.")
+            return self.put_table(name, new_df, scope, domain, source, extra)
+        self._register(scope, {
+            "uid": sha1_str("table_part", scope, name, stamp), "domain": domain,
+            "subtype": "table_part", "key": name,
+            "path": os.path.relpath(path, self.root), "abs_path": path, "fmt": "parquet",
+            "bytes": os.path.getsize(path), "sha1": "", "source": source, "adopted": False,
+            "extra": json.dumps({**(extra or {}), "rows": int(len(new_df))}, ensure_ascii=False),
+        })
+        parts = self._part_files(name, scope)
+        LOG.info(f"'{name}' 증분 {len(new_df):,}행을 조각으로 저장했습니다 "
+                 f"(본체는 그대로 · 조각 {len(parts)}개). 전체 재기록을 하지 않습니다.")
+        if len(parts) >= compact_parts:
+            self.compact_table(name, scope)
+        return path
+
+    def compact_table(self, name: str, scope: str = "shared") -> bool:
+        """조각들을 본체로 합친다. 본체는 백업 후에만 교체하고, 조각은 지우지 않고 보관한다."""
+        parts = self._part_files(name, scope)
+        if not parts:
+            return False
+        base = self.get_table(name, scope=scope)
+        if base is None or not len(base):
+            return False
+        if self.put_table(name, base, scope=scope, source=f"compact:{len(parts)}parts") is None:
+            return False
+        keep = os.path.join(self._parts_dir(name, scope), "_merged")
+        os.makedirs(keep, exist_ok=True)
+        moved = 0
+        for f in parts:
+            try:                       # ★ 삭제가 아니라 이동이다. 삭제 API 는 존재하지 않는다.
+                os.replace(f, os.path.join(keep, os.path.basename(f)))
+                moved += 1
+            except Exception:                                # noqa
+                pass
+        LOG.ok(f"'{name}' 조각 {moved}개를 본체({len(base):,}행)로 합쳤습니다 "
+               f"(조각 원본은 {os.path.relpath(keep, self.root)} 에 그대로 보관).")
+        return True
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        use_scope = scope
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
             path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
             if os.path.exists(path2):
-                path = path2
-            else:
+                path, use_scope = path2, alt
+            elif not self._part_files(name, scope):
                 return None
-        if max_age_days is not None:
+            else:
+                path = ""
+        if path and max_age_days is not None:
             age = (time.time() - os.path.getmtime(path)) / 86400.0
             if age > max_age_days:
                 return None
-        d = read_parquet_safe(path)
-        if d is not None:
-            PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
-        return d
+        frames = []
+        d = read_parquet_safe(path) if path else None
+        if d is not None and len(d):
+            frames.append(d)
+        for f in self._part_files(name, use_scope) + (
+                self._part_files(name, scope) if use_scope != scope else []):
+            pf = read_parquet_safe(f)
+            if pf is not None and len(pf):
+                frames.append(pf)
+        if not frames:
+            return d
+        out = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+        PIPE.io("IN", "DRIVE", f"table:{name}", out,
+                source=(os.path.relpath(path, self.root) if path else f"{name}.parts")
+                       + (f" +조각{len(frames)-1}" if len(frames) > 1 else ""))
+        return out
 
     def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
               source: str = "", event_date=None, knowledge_date=None,

@@ -621,6 +621,92 @@ def first_nonempty(*sources, min_len: int = 1):
     return None
 
 
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  범용 금고 캐시 — "한 번 만든 것은 두 번 만들지 않는다"                                    ║
+# ║                                                                                          ║
+# ║  ★ 왜 이게 필요한가 (실측):                                                               ║
+# ║    · 재무 정제(tidy_financials)   : 매 실행 2.5분. 입력이 그대로여도 매번 다시 한다.       ║
+# ║    · 월 가격패널(build_price_panel): 700만 행에서 36초. 마찬가지.                          ║
+# ║    · L1 센서 패널                  : 37초.                                                ║
+# ║    비슷한 전략을 여러 개 돌리면 이 시간이 전략 수만큼 곱해진다. 그런데 이 산출물들은        ║
+# ║    대부분 **전략과 무관한 중간 결과**다 — 공용 인덱스에 두면 다른 전략이 그대로 쓴다.      ║
+# ║                                                                                          ║
+# ║  안전 규칙:                                                                               ║
+# ║    · 키는 '입력의 지문'이다. 입력이 한 글자라도 바뀌면 지문이 깨져 자동으로 다시 만든다.    ║
+# ║      낡은 값이 살아남을 수 없다 — 이게 시간 기반 만료(max_age)보다 훨씬 안전하다.          ║
+# ║    · dtype 까지 계산 경로와 일치시킨다. parquet 왕복은 datetime64[ns]→[ms] 로 바꾸는데,    ║
+# ║      그 차이 하나로 하류 merge 가 예외 없이 0행 매칭을 낸 전례가 있다(PIT 시총).           ║
+# ║    · 실패해도 절대 죽지 않는다. 캐시는 최적화지 정답이 아니다.                              ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+def fingerprint(*parts) -> str:
+    """입력의 지문. DataFrame 은 (행수·열이름·시작/끝 값)으로 싸게 요약한다."""
+    bits: List[str] = []
+    for x in parts:
+        if isinstance(x, pd.DataFrame):
+            bits.append(f"df:{len(x)}:{','.join(map(str, x.columns))[:400]}")
+            if len(x):
+                for c in list(x.columns)[:6]:
+                    try:
+                        bits.append(f"{c}={x[c].iloc[0]}|{x[c].iloc[-1]}")
+                    except Exception:                             # noqa
+                        pass
+        elif isinstance(x, (pd.Series, pd.Index)):
+            bits.append(f"s:{len(x)}:{x[0] if len(x) else ''}|{x[-1] if len(x) else ''}")
+        elif isinstance(x, (list, tuple, set)):
+            bits.append(f"seq:{len(x)}:{str(sorted(map(str, x))[:50])[:400]}")
+        elif isinstance(x, dict):
+            bits.append(f"map:{str(sorted((str(k), str(v)) for k, v in x.items()))[:400]}")
+        else:
+            bits.append(str(x))
+    return sha1_str(*bits)
+
+
+def cached_table(name: str, fp_parts: Sequence[Any], build: Callable[[], pd.DataFrame],
+                 scope: str = "shared", domain: str = "table", source: str = "",
+                 note: str = "", date_cols: Sequence[str] = ()) -> pd.DataFrame:
+    """지문이 같으면 금고에서 꺼내고, 다르면 만들어서 넣는다.
+
+    scope="shared"  → 다른 전략도 그대로 재사용한다 (전략과 무관한 중간 결과)
+    scope="private" → 이 전략 고유 산출물
+    """
+    def _norm(df: pd.DataFrame) -> pd.DataFrame:
+        """캐시 경로와 계산 경로에 **똑같이** 적용되는 정규화. 두 경로가 같아야만 캐시다.
+
+        ★ downcast 를 여기서 쓰면 안 된다. float64→float32 는 유효숫자 7자리라
+          원화 금액(수백조 = 3e14)에서 정밀도를 잃는다. 캐시를 켰다고 재무 숫자가
+          달라지면 그건 최적화가 아니라 데이터 손상이다.
+        ★ 실제로 손볼 것은 datetime 해상도뿐이다. parquet 왕복은 [ns]→[ms] 로 바꾸고,
+          그 차이 하나로 하류 merge 가 예외 없이 0행 매칭을 낸 전례가 있다(PIT 시총).
+        """
+        if df is None or not len(df):
+            return df
+        for c in list(date_cols) or []:
+            if c in df.columns:
+                df[c] = as_ts_series(df[c])
+        return df
+
+    key = ""
+    try:
+        key = f"{name}__{fingerprint(*fp_parts)[:14]}"
+        got = VAULT.get_table(key, scope=scope)
+        if nonempty(got):
+            LOG.ok(f"캐시 적중 — '{name}' {len(got):,}행을 다시 만들지 않고 재사용합니다 "
+                   f"({'공용' if scope == 'shared' else '전용'} 인덱스). "
+                   f"입력이 바뀌면 지문이 달라져 자동으로 다시 만듭니다.")
+            return _norm(got)
+    except Exception as e:                                        # noqa
+        LOG.debug(f"캐시 조회 실패({type(e).__name__}) — 새로 만듭니다: {name}")
+
+    out = _norm(build())
+    try:
+        if key and nonempty(out):
+            VAULT.put_table(key, out, scope=scope, domain=domain, source=source or name,
+                            extra={"note": note or f"{name} 지문 캐시 — 입력이 바뀌면 무효화"})
+    except Exception as e:                                        # noqa
+        LOG.debug(f"캐시 저장 실패({type(e).__name__}): {name}")
+    return out
+
+
 def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
 

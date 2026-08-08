@@ -1603,6 +1603,92 @@ def first_nonempty(*sources, min_len: int = 1):
     return None
 
 
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  범용 금고 캐시 — "한 번 만든 것은 두 번 만들지 않는다"                                    ║
+# ║                                                                                          ║
+# ║  ★ 왜 이게 필요한가 (실측):                                                               ║
+# ║    · 재무 정제(tidy_financials)   : 매 실행 2.5분. 입력이 그대로여도 매번 다시 한다.       ║
+# ║    · 월 가격패널(build_price_panel): 700만 행에서 36초. 마찬가지.                          ║
+# ║    · L1 센서 패널                  : 37초.                                                ║
+# ║    비슷한 전략을 여러 개 돌리면 이 시간이 전략 수만큼 곱해진다. 그런데 이 산출물들은        ║
+# ║    대부분 **전략과 무관한 중간 결과**다 — 공용 인덱스에 두면 다른 전략이 그대로 쓴다.      ║
+# ║                                                                                          ║
+# ║  안전 규칙:                                                                               ║
+# ║    · 키는 '입력의 지문'이다. 입력이 한 글자라도 바뀌면 지문이 깨져 자동으로 다시 만든다.    ║
+# ║      낡은 값이 살아남을 수 없다 — 이게 시간 기반 만료(max_age)보다 훨씬 안전하다.          ║
+# ║    · dtype 까지 계산 경로와 일치시킨다. parquet 왕복은 datetime64[ns]→[ms] 로 바꾸는데,    ║
+# ║      그 차이 하나로 하류 merge 가 예외 없이 0행 매칭을 낸 전례가 있다(PIT 시총).           ║
+# ║    · 실패해도 절대 죽지 않는다. 캐시는 최적화지 정답이 아니다.                              ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+def fingerprint(*parts) -> str:
+    """입력의 지문. DataFrame 은 (행수·열이름·시작/끝 값)으로 싸게 요약한다."""
+    bits: List[str] = []
+    for x in parts:
+        if isinstance(x, pd.DataFrame):
+            bits.append(f"df:{len(x)}:{','.join(map(str, x.columns))[:400]}")
+            if len(x):
+                for c in list(x.columns)[:6]:
+                    try:
+                        bits.append(f"{c}={x[c].iloc[0]}|{x[c].iloc[-1]}")
+                    except Exception:                             # noqa
+                        pass
+        elif isinstance(x, (pd.Series, pd.Index)):
+            bits.append(f"s:{len(x)}:{x[0] if len(x) else ''}|{x[-1] if len(x) else ''}")
+        elif isinstance(x, (list, tuple, set)):
+            bits.append(f"seq:{len(x)}:{str(sorted(map(str, x))[:50])[:400]}")
+        elif isinstance(x, dict):
+            bits.append(f"map:{str(sorted((str(k), str(v)) for k, v in x.items()))[:400]}")
+        else:
+            bits.append(str(x))
+    return sha1_str(*bits)
+
+
+def cached_table(name: str, fp_parts: Sequence[Any], build: Callable[[], pd.DataFrame],
+                 scope: str = "shared", domain: str = "table", source: str = "",
+                 note: str = "", date_cols: Sequence[str] = ()) -> pd.DataFrame:
+    """지문이 같으면 금고에서 꺼내고, 다르면 만들어서 넣는다.
+
+    scope="shared"  → 다른 전략도 그대로 재사용한다 (전략과 무관한 중간 결과)
+    scope="private" → 이 전략 고유 산출물
+    """
+    def _norm(df: pd.DataFrame) -> pd.DataFrame:
+        """캐시 경로와 계산 경로에 **똑같이** 적용되는 정규화. 두 경로가 같아야만 캐시다.
+
+        ★ downcast 를 여기서 쓰면 안 된다. float64→float32 는 유효숫자 7자리라
+          원화 금액(수백조 = 3e14)에서 정밀도를 잃는다. 캐시를 켰다고 재무 숫자가
+          달라지면 그건 최적화가 아니라 데이터 손상이다.
+        ★ 실제로 손볼 것은 datetime 해상도뿐이다. parquet 왕복은 [ns]→[ms] 로 바꾸고,
+          그 차이 하나로 하류 merge 가 예외 없이 0행 매칭을 낸 전례가 있다(PIT 시총).
+        """
+        if df is None or not len(df):
+            return df
+        for c in list(date_cols) or []:
+            if c in df.columns:
+                df[c] = as_ts_series(df[c])
+        return df
+
+    key = ""
+    try:
+        key = f"{name}__{fingerprint(*fp_parts)[:14]}"
+        got = VAULT.get_table(key, scope=scope)
+        if nonempty(got):
+            LOG.ok(f"캐시 적중 — '{name}' {len(got):,}행을 다시 만들지 않고 재사용합니다 "
+                   f"({'공용' if scope == 'shared' else '전용'} 인덱스). "
+                   f"입력이 바뀌면 지문이 달라져 자동으로 다시 만듭니다.")
+            return _norm(got)
+    except Exception as e:                                        # noqa
+        LOG.debug(f"캐시 조회 실패({type(e).__name__}) — 새로 만듭니다: {name}")
+
+    out = _norm(build())
+    try:
+        if key and nonempty(out):
+            VAULT.put_table(key, out, scope=scope, domain=domain, source=source or name,
+                            extra={"note": note or f"{name} 지문 캐시 — 입력이 바뀌면 무효화"})
+    except Exception as e:                                        # noqa
+        LOG.debug(f"캐시 저장 실패({type(e).__name__}): {name}")
+    return out
+
+
 def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
 
@@ -2119,25 +2205,116 @@ class Vault:
                 f"새어 나가려던 참이었습니다. 검정 코드에서 VAULT 를 대역으로 교체했는지 "
                 f"확인하세요.")
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  증분 샤드 저장 — 700만 행을 매 실행 다시 쓰지 않는다
+    #
+    #  ★ 실측 낭비: 일봉 캐시가 697만 행인데 이번 실행에서 새로 받은 건 58종목뿐이었다.
+    #    그런데 put_table 은 전체를 다시 쓰고(2.7초) 교체 전 백업까지 복사한다(2.9초).
+    #    로컬 SSD 에서 5.6초, 구글드라이브 마운트에서는 분 단위다. 매 실행 반복된다.
+    #    새로 받은 58종목만 쓰면 0.04초다.
+    #
+    #  구조: 기존 {name}.parquet 은 **손대지 않는다**(절대 1원칙). 새 데이터는
+    #        {name}.parts/ 아래 새 파일로만 쌓는다. 읽을 때 본체 + 조각을 합친다.
+    #        기존 캐시와 100% 호환된다 — 조각이 없으면 예전과 똑같이 동작한다.
+    #        조각이 많아지면 본체로 합치되(compact), 그때도 백업 후 교체한다.
+    # ══════════════════════════════════════════════════════════════════════════════
+    def _parts_dir(self, name: str, scope: str) -> str:
+        return os.path.join(self.table_dir(scope), f"{name}.parts")
+
+    def _part_files(self, name: str, scope: str) -> List[str]:
+        d = self._parts_dir(name, scope)
+        if not os.path.isdir(d):
+            return []
+        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".parquet"))
+
+    def append_table(self, name: str, new_df: pd.DataFrame, scope: str = "shared",
+                     domain: str = "table", source: str = "",
+                     extra: Optional[dict] = None,
+                     compact_parts: int = 12) -> Optional[str]:
+        """새 행만 조각 파일로 덧붙인다. 본체는 건드리지 않는다."""
+        if new_df is None or not len(new_df):
+            return None
+        self._assert_writable(f"append_table({name}, scope={scope})")
+        d = self._parts_dir(name, scope)
+        os.makedirs(d, exist_ok=True)
+        stamp = f"{_dt.datetime.now():%Y%m%d_%H%M%S}"
+        path = os.path.join(d, f"{stamp}.{sha1_str(name, str(len(new_df)), stamp)[:8]}.parquet")
+        try:
+            atomic_write_parquet(new_df, path)
+        except Exception as e:                              # noqa
+            LOG.warn(f"조각 저장 실패({type(e).__name__}): {name} — 전체 저장으로 폴백합니다.")
+            return self.put_table(name, new_df, scope, domain, source, extra)
+        self._register(scope, {
+            "uid": sha1_str("table_part", scope, name, stamp), "domain": domain,
+            "subtype": "table_part", "key": name,
+            "path": os.path.relpath(path, self.root), "abs_path": path, "fmt": "parquet",
+            "bytes": os.path.getsize(path), "sha1": "", "source": source, "adopted": False,
+            "extra": json.dumps({**(extra or {}), "rows": int(len(new_df))}, ensure_ascii=False),
+        })
+        parts = self._part_files(name, scope)
+        LOG.info(f"'{name}' 증분 {len(new_df):,}행을 조각으로 저장했습니다 "
+                 f"(본체는 그대로 · 조각 {len(parts)}개). 전체 재기록을 하지 않습니다.")
+        if len(parts) >= compact_parts:
+            self.compact_table(name, scope)
+        return path
+
+    def compact_table(self, name: str, scope: str = "shared") -> bool:
+        """조각들을 본체로 합친다. 본체는 백업 후에만 교체하고, 조각은 지우지 않고 보관한다."""
+        parts = self._part_files(name, scope)
+        if not parts:
+            return False
+        base = self.get_table(name, scope=scope)
+        if base is None or not len(base):
+            return False
+        if self.put_table(name, base, scope=scope, source=f"compact:{len(parts)}parts") is None:
+            return False
+        keep = os.path.join(self._parts_dir(name, scope), "_merged")
+        os.makedirs(keep, exist_ok=True)
+        moved = 0
+        for f in parts:
+            try:                       # ★ 삭제가 아니라 이동이다. 삭제 API 는 존재하지 않는다.
+                os.replace(f, os.path.join(keep, os.path.basename(f)))
+                moved += 1
+            except Exception:                                # noqa
+                pass
+        LOG.ok(f"'{name}' 조각 {moved}개를 본체({len(base):,}행)로 합쳤습니다 "
+               f"(조각 원본은 {os.path.relpath(keep, self.root)} 에 그대로 보관).")
+        return True
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        use_scope = scope
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
             path2 = os.path.join(self.table_dir(alt), f"{name}.parquet")
             if os.path.exists(path2):
-                path = path2
-            else:
+                path, use_scope = path2, alt
+            elif not self._part_files(name, scope):
                 return None
-        if max_age_days is not None:
+            else:
+                path = ""
+        if path and max_age_days is not None:
             age = (time.time() - os.path.getmtime(path)) / 86400.0
             if age > max_age_days:
                 return None
-        d = read_parquet_safe(path)
-        if d is not None:
-            PIPE.io("IN", "DRIVE", f"table:{name}", d, source=os.path.relpath(path, self.root))
-        return d
+        frames = []
+        d = read_parquet_safe(path) if path else None
+        if d is not None and len(d):
+            frames.append(d)
+        for f in self._part_files(name, use_scope) + (
+                self._part_files(name, scope) if use_scope != scope else []):
+            pf = read_parquet_safe(f)
+            if pf is not None and len(pf):
+                frames.append(pf)
+        if not frames:
+            return d
+        out = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+        PIPE.io("IN", "DRIVE", f"table:{name}", out,
+                source=(os.path.relpath(path, self.root) if path else f"{name}.parts")
+                       + (f" +조각{len(frames)-1}" if len(frames) > 1 else ""))
+        return out
 
     def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
               source: str = "", event_date=None, knowledge_date=None,
@@ -4199,8 +4376,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
     px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
 
     if new_frames:
-        VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
-                        source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+        # ★ 전체 재기록 금지. 실측: 697만 행 캐시에 58종목을 더하려고 350MB 를 통째로
+        #   다시 쓰고(2.7초) 백업까지 복사했다(2.9초). 매 실행 반복되는 순수 낭비다.
+        #   새로 받은 것만 조각으로 덧붙이면 0.04초다. 본체는 손대지 않는다.
+        _new = pd.concat(new_frames, ignore_index=True)
+        _new["date"] = as_ts_series(_new["date"])
+        _new["code"] = _new["code"].map(to_code6)
+        _new = _new.dropna(subset=["code", "date", "close"])
+        for _c in ("open", "high", "low", "close", "volume", "amount"):
+            if _c in _new.columns:
+                _new[_c] = pd.to_numeric(_new[_c], errors="coerce")
+        _new = (_new.sort_values(["code", "date"])
+                    .drop_duplicates(["code", "date"], keep="last").reset_index(drop=True))
+        VAULT.append_table("krx_ohlcv_daily", downcast(_new), scope="shared", domain="price",
+                           source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
@@ -4216,6 +4405,37 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
 
     체결은 '신호 산출일 다음 거래일 시가'(§10.1). 당일 종가 체결은 미래누수다.
     """
+    # ══════════════════════════════════════════════════════════════════════════════
+    #  월 패널 캐시 — 일봉이 안 바뀌었으면 다시 계산하지 않는다
+    #
+    #  ★ 실측: 700만 행에서 이 함수가 36.4초를 쓴다(rolling(20) + groupby tail + shift).
+    #    일봉 캐시가 그대로인 재실행에서도 매번 전액을 다시 낸다. 지문이 같으면 건너뛴다.
+    #    지문 = (행수, 종목수, 최종일, 최초일, 월격자 범위). 일봉이 한 행이라도 늘면
+    #    행수가 달라지므로 지문이 깨지고 자동으로 재계산된다 — 낡은 값이 남을 수 없다.
+    # ══════════════════════════════════════════════════════════════════════════════
+    _fp = ""
+    try:
+        _d = as_ts_series(px["date"])
+        _fp = sha1_str("pxpanel_v2", str(len(px)), str(px["code"].nunique()),
+                       str(_d.min()), str(_d.max()),
+                       str(months.min()), str(months.max()), str(len(months)))
+        _cm = VAULT.get_table(f"price_panel_monthly_{_fp[:12]}", scope="shared")
+        if nonempty(_cm):
+            for _c in ("month", "signal_date", "next_date"):
+                if _c in _cm.columns:
+                    _cm[_c] = as_ts_series(_cm[_c])
+            # ★ parquet 왕복은 datetime64[ns] 를 [ms] 로 바꿔 놓는다. 값은 같지만 dtype 이
+            #   다르면 하류 merge 가 **예외 없이 0행 매칭**을 낼 수 있다 — PIT 시총이
+            #   정확히 그렇게 죽었다. 계산 경로와 똑같이 downcast 를 태워 dtype 을 못박는다.
+            _cm = downcast(_cm)
+            LOG.ok(f"월 패널 캐시 적중 — 일봉이 그대로라 재계산을 건너뜁니다 "
+                   f"({len(_cm):,}행 · 실측 36초 절약). 일봉이 한 행이라도 늘면 "
+                   f"지문이 달라져 자동으로 다시 계산합니다.")
+            PIPE.io("OUT", "MEM", "price_panel_monthly", _cm, source="cache")
+            return {"daily": px, "monthly": _cm}
+    except Exception as e:                                       # noqa
+        LOG.debug(f"월 패널 캐시 조회 건너뜀({type(e).__name__})")
+
     px = px.sort_values(["code", "date"])
     px["adv20"] = (px.groupby("code", observed=True)["amount"]
                      .transform(lambda s: s.rolling(20, min_periods=10).mean()))
@@ -4262,7 +4482,15 @@ def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, p
                  f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
                  f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
     PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
-    return {"daily": px, "monthly": downcast(monthly)}
+    monthly = downcast(monthly)
+    if _fp:
+        try:
+            VAULT.put_table(f"price_panel_monthly_{_fp[:12]}", monthly, scope="shared",
+                            domain="price", source="build_price_panel",
+                            extra={"note": "일봉 지문별 월패널 캐시 — 일봉이 바뀌면 자동 무효화"})
+        except Exception as e:                                   # noqa
+            LOG.debug(f"월 패널 캐시 저장 건너뜀({type(e).__name__})")
+    return {"daily": px, "monthly": monthly}
 
 
 def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
@@ -9705,6 +9933,10 @@ class _MemVault:
     def put_table(self, name, df, *a, **k):
         self.t[name] = df.copy()
 
+    def append_table(self, name, df, *a, **k):
+        prev = self.t.get(name)
+        self.t[name] = df.copy() if prev is None else pd.concat([prev, df], ignore_index=True)
+
 
 class _NullVault:
     """계약검정 전용 무해 금고. 절대 1원칙 — 검정이 실제 드라이브 인덱스를 건드리면 안 된다.
@@ -9714,6 +9946,9 @@ class _NullVault:
         return None
 
     def put_table(self, *a, **k):
+        return None
+
+    def append_table(self, *a, **k):
         return None
 
 
@@ -10026,6 +10261,67 @@ def run_contract_tests(strict: bool = True) -> bool:
     # ── 벽시계 게이트: 선택 수집만 끊고, 끊었다는 사실을 반드시 남긴다 ──────────────
     #   실측 실패: 수집이 3시간을 먹고도 파이프라인은 계속 진행 → 사용자는 백테스트 결과를
     #   한 번도 못 봤다. 연구 도구로서 '완벽한 무결과'는 부분 결과보다 나쁘다.
+    # ── 캐시 재사용이 결과를 바꾸지 않는다 (dtype 포함) ─────────────────────────────
+    #   실측 위험: parquet 왕복이 datetime64[ns] 를 [ms] 로 바꾼다. 값은 같지만 dtype 이
+    #   다르면 하류 merge 가 **예외 없이 0행 매칭**을 낸다 — PIT 시총이 정확히 그렇게
+    #   죽었다(정확도 0.0%). 캐시가 '조금 다른' 것을 돌려주면 캐시가 없는 것만 못하다.
+    _sv = {k: globals().get(k, _MISSING) for k in ("VAULT",)}
+    try:
+        globals()["VAULT"] = _MemVault()
+        _rg = np.random.default_rng(3)
+        _src = pd.DataFrame({"code": [f"{i:06d}" for i in range(40)],
+                             "month": pd.Timestamp("2020-01-31"),
+                             "x": _rg.normal(size=40)})
+        _calls = {"n": 0}
+
+        def _build():
+            _calls["n"] += 1
+            return _src.copy()
+
+        _a = cached_table("t_cache_probe", [_src], _build, scope="shared",
+                          date_cols=("month",))
+        _b = cached_table("t_cache_probe", [_src], _build, scope="shared",
+                          date_cols=("month",))
+        _same = (list(_a.columns) == list(_b.columns) and len(_a) == len(_b)
+                 and all(str(_a[c].dtype) == str(_b[c].dtype) for c in _a.columns)
+                 and bool(np.allclose(_a["x"].astype(float), _b["x"].astype(float)))
+                 and bool((_a["month"].values == _b["month"].values).all()))
+        # 입력이 바뀌면 지문이 깨져 반드시 다시 만든다 (낡은 값이 살아남을 수 없다)
+        _src2 = pd.concat([_src, _src.tail(1)], ignore_index=True)
+        cached_table("t_cache_probe", [_src2], lambda: _src2.copy(), scope="shared",
+                     date_cols=("month",))
+        _t("CACHE-EQ", "캐시가 돌려준 값이 계산한 값과 dtype 까지 같다",
+           _calls["n"] == 1 and _same,
+           f"build 호출 {_calls['n']}회 (1이어야 = 2회차는 캐시) · 값·dtype 동일 {_same} "
+           f"(parquet 왕복은 datetime64[ns]→[ms] 로 바꿉니다 — 그 차이 하나로 merge 가 "
+           f"조용히 0행이 됩니다)")
+    except Exception as e:                                       # noqa
+        _t("CACHE-EQ", "캐시 값이 계산 값과 같다", False, f"{type(e).__name__}: {e}")
+    finally:
+        _restore(_sv)
+
+    # ── 금고 증분 조각: 본체를 다시 쓰지 않고 덧붙인다 ──────────────────────────────
+    try:
+        import tempfile as _tf
+        _td = _tf.mkdtemp()
+        _v = Vault(_td, "LOCAL")
+        _base = pd.DataFrame({"code": [f"{i:06d}" for i in range(100)], "v": range(100)})
+        _v.put_table("t_shard", _base, scope="shared")
+        _p0 = os.path.join(_v.table_dir("shared"), "t_shard.parquet")
+        _mt0 = os.path.getmtime(_p0)
+        _add = pd.DataFrame({"code": [f"{i:06d}" for i in range(100, 105)], "v": range(100, 105)})
+        _v.append_table("t_shard", _add, scope="shared")
+        _got = _v.get_table("t_shard", scope="shared")
+        _untouched = os.path.getmtime(_p0) == _mt0
+        _t("SHARD", "증분은 조각으로 덧붙이고 본체는 건드리지 않는다",
+           _got is not None and len(_got) == 105 and _untouched,
+           f"읽기 {0 if _got is None else len(_got)}행 (105여야) · 본체 미변경 {_untouched} "
+           f"(697만 행을 매 실행 다시 쓰면 로컬 SSD 로도 5.6초, 드라이브면 분 단위입니다)")
+        import shutil as _sh
+        _sh.rmtree(_td, ignore_errors=True)
+    except Exception as e:                                       # noqa
+        _t("SHARD", "증분은 조각으로 덧붙인다", False, f"{type(e).__name__}: {e}")
+
     # ── TTM: 사업보고서 단독(연간 모드)에서도 유량계정이 살아남는다 ─────────────────
     #   실측 사고: DART_FS_FREQ="annual" 이면 (code, year) 그룹에 행이 하나뿐이라
     #   누적→분기 차분이 전부 NaN 이 되고, rolling(4, min_periods=4) 도 전부 NaN 이 됐다.
@@ -10493,7 +10789,12 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
 
     with PIPE.stage("M0.UNI", "종목 마스터 (다중소스)", "M0", budget_s=600), Stage("M0.universe", 8):
         snaps = fetch_pykrx_snapshots(months)
-        sec = build_security_master(snaps)
+        sec = cached_table(
+            "security_master", [len(snaps), months.min(), months.max(), len(months)],
+            lambda: build_security_master(snaps), scope="shared", domain="universe",
+            source="fdr+kind+delisting+corpcode",
+            note="종목 마스터(상장일·폐지일·corp_code) — 전 전략 공용",
+            date_cols=("listing_date", "delisting_date"))
         ctx["sec"], ctx["snapshots"] = sec, snaps
         ctx["code_of_corp"] = (sec.dropna(subset=["corp_code"])
                                   .assign(corp_code=lambda d: d["corp_code"].astype(str))
@@ -10514,7 +10815,11 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
         dis = fetch_dart_disclosures(
             (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"), BACKTEST_END)
         ctx["disclosures"] = dis
-        kmap = build_knowledge_map(dis)
+        kmap = cached_table("dart_knowledge_map", [dis],
+                            lambda: build_knowledge_map(dis), scope="shared", domain="dart",
+                            source="build_knowledge_map",
+                            note="rcept_no → 접수일자 원장 — 전 전략 공용",
+                            date_cols=("knowledge_date",))
         reprts = [REPRT_CODES[k] for k in ("Q1", "H1", "Q3", "FY")]
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
         # 유동성 상위 종목의 corp_code 를 우선순위로 넘긴다 — 일일 한도로 끊겨도
@@ -10573,7 +10878,15 @@ def collect_all(months: pd.DatetimeIndex, stage: str) -> dict:
                 t_full = fetch_dart_full(corps, years, priority=prio,
                                          scope=inv_scope or None)
         raw = merge_financial_tiers(t_bulk, t_full, t_multi)
-        ctx["fin"] = tidy_financials(raw, kmap, ctx.get("code_of_corp"))
+        # ★ 실측 2.5분. 입력(원시 재무 + 접수일자 원장)이 그대로면 결과도 그대로다.
+        #   전략과 무관한 중간 결과이므로 공용 인덱스에 둔다 — 다른 전략이 그대로 쓴다.
+        ctx["fin"] = cached_table(
+            "financials_tidy", [raw, kmap, DART_FS_FREQ, DART_MIN_YEAR,
+                                sorted(ACCOUNT_MAP.keys())],
+            lambda: tidy_financials(raw, kmap, ctx.get("code_of_corp")),
+            scope="shared", domain="dart", source="tidy_financials",
+            note="정제 재무(누적→분기·TTM 복원 완료) — 전 전략 공용",
+            date_cols=("period_end", "knowledge_date"))
         ctx["weak_tp"] = report_account_coverage()
 
     if _stage_ok("M2", stage):
@@ -10689,15 +11002,26 @@ def collect_research(months: pd.DatetimeIndex, sec: pd.DataFrame) -> dict:
         VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
                         source="entity_resolution")
     audit_linkage(rep, A, L)
-    cons = build_consensus_panel(L, months)
+    cons = cached_table("consensus_panel", [L, months.min(), months.max(), len(months)],
+                        lambda: build_consensus_panel(L, months), scope="shared",
+                        domain="research", source="build_consensus_panel",
+                        note="애널리스트 컨센서스 월 패널 — 전 전략 공용",
+                        date_cols=("month",))
     return {"reports": rep, "analysts": A, "links": L, "consensus": cons}
 
 
 def build_L1(ctx: dict, months: pd.DatetimeIndex, stage: str) -> Tuple[pd.DataFrame, "UniverseV3"]:
     with PIPE.stage("L1.PANEL", "L1 피처 패널 (정규화 없음)", "L1", budget_s=900), \
             Stage("L1.panel", 12):
-        P = build_base_panel(months, ctx["pp"]["monthly"], ctx["pp"]["daily"],
-                             ctx["sec"], ctx.get("mcap"))
+        P = cached_table(
+            "base_panel", [ctx["pp"]["monthly"], ctx["sec"], ctx.get("mcap"),
+                           months.min(), months.max(), len(months),
+                           UNIVERSE_SEASON_DAYS],
+            lambda: build_base_panel(months, ctx["pp"]["monthly"], ctx["pp"]["daily"],
+                                     ctx["sec"], ctx.get("mcap")),
+            scope="shared", domain="universe", source="build_base_panel",
+            note="PIT 기본 패널(시총랭크·상장경과·유동성) — 전 전략 공용",
+            date_cols=("month", "signal_date", "next_date"))
         sources = {}
         if len(ctx.get("fin", [])):
             sources["fin"] = ctx["fin"]
@@ -10834,7 +11158,7 @@ def main() -> dict:
 
     # ── §2 단계별 백테스트 — M0 에서 이미 결과가 나온다 ──────────────────────────────
     results = {}
-    bench = benchmark_returns(months)
+    bench = benchmark_returns(months)   # (내부에서 소스별 캐시를 씁니다)
     for st in STAGE_ORDER:
         if not _stage_ok(st, stage):
             break

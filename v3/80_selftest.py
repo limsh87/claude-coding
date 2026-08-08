@@ -160,6 +160,10 @@ class _MemVault:
     def put_table(self, name, df, *a, **k):
         self.t[name] = df.copy()
 
+    def append_table(self, name, df, *a, **k):
+        prev = self.t.get(name)
+        self.t[name] = df.copy() if prev is None else pd.concat([prev, df], ignore_index=True)
+
 
 class _NullVault:
     """계약검정 전용 무해 금고. 절대 1원칙 — 검정이 실제 드라이브 인덱스를 건드리면 안 된다.
@@ -169,6 +173,9 @@ class _NullVault:
         return None
 
     def put_table(self, *a, **k):
+        return None
+
+    def append_table(self, *a, **k):
         return None
 
 
@@ -481,6 +488,67 @@ def run_contract_tests(strict: bool = True) -> bool:
     # ── 벽시계 게이트: 선택 수집만 끊고, 끊었다는 사실을 반드시 남긴다 ──────────────
     #   실측 실패: 수집이 3시간을 먹고도 파이프라인은 계속 진행 → 사용자는 백테스트 결과를
     #   한 번도 못 봤다. 연구 도구로서 '완벽한 무결과'는 부분 결과보다 나쁘다.
+    # ── 캐시 재사용이 결과를 바꾸지 않는다 (dtype 포함) ─────────────────────────────
+    #   실측 위험: parquet 왕복이 datetime64[ns] 를 [ms] 로 바꾼다. 값은 같지만 dtype 이
+    #   다르면 하류 merge 가 **예외 없이 0행 매칭**을 낸다 — PIT 시총이 정확히 그렇게
+    #   죽었다(정확도 0.0%). 캐시가 '조금 다른' 것을 돌려주면 캐시가 없는 것만 못하다.
+    _sv = {k: globals().get(k, _MISSING) for k in ("VAULT",)}
+    try:
+        globals()["VAULT"] = _MemVault()
+        _rg = np.random.default_rng(3)
+        _src = pd.DataFrame({"code": [f"{i:06d}" for i in range(40)],
+                             "month": pd.Timestamp("2020-01-31"),
+                             "x": _rg.normal(size=40)})
+        _calls = {"n": 0}
+
+        def _build():
+            _calls["n"] += 1
+            return _src.copy()
+
+        _a = cached_table("t_cache_probe", [_src], _build, scope="shared",
+                          date_cols=("month",))
+        _b = cached_table("t_cache_probe", [_src], _build, scope="shared",
+                          date_cols=("month",))
+        _same = (list(_a.columns) == list(_b.columns) and len(_a) == len(_b)
+                 and all(str(_a[c].dtype) == str(_b[c].dtype) for c in _a.columns)
+                 and bool(np.allclose(_a["x"].astype(float), _b["x"].astype(float)))
+                 and bool((_a["month"].values == _b["month"].values).all()))
+        # 입력이 바뀌면 지문이 깨져 반드시 다시 만든다 (낡은 값이 살아남을 수 없다)
+        _src2 = pd.concat([_src, _src.tail(1)], ignore_index=True)
+        cached_table("t_cache_probe", [_src2], lambda: _src2.copy(), scope="shared",
+                     date_cols=("month",))
+        _t("CACHE-EQ", "캐시가 돌려준 값이 계산한 값과 dtype 까지 같다",
+           _calls["n"] == 1 and _same,
+           f"build 호출 {_calls['n']}회 (1이어야 = 2회차는 캐시) · 값·dtype 동일 {_same} "
+           f"(parquet 왕복은 datetime64[ns]→[ms] 로 바꿉니다 — 그 차이 하나로 merge 가 "
+           f"조용히 0행이 됩니다)")
+    except Exception as e:                                       # noqa
+        _t("CACHE-EQ", "캐시 값이 계산 값과 같다", False, f"{type(e).__name__}: {e}")
+    finally:
+        _restore(_sv)
+
+    # ── 금고 증분 조각: 본체를 다시 쓰지 않고 덧붙인다 ──────────────────────────────
+    try:
+        import tempfile as _tf
+        _td = _tf.mkdtemp()
+        _v = Vault(_td, "LOCAL")
+        _base = pd.DataFrame({"code": [f"{i:06d}" for i in range(100)], "v": range(100)})
+        _v.put_table("t_shard", _base, scope="shared")
+        _p0 = os.path.join(_v.table_dir("shared"), "t_shard.parquet")
+        _mt0 = os.path.getmtime(_p0)
+        _add = pd.DataFrame({"code": [f"{i:06d}" for i in range(100, 105)], "v": range(100, 105)})
+        _v.append_table("t_shard", _add, scope="shared")
+        _got = _v.get_table("t_shard", scope="shared")
+        _untouched = os.path.getmtime(_p0) == _mt0
+        _t("SHARD", "증분은 조각으로 덧붙이고 본체는 건드리지 않는다",
+           _got is not None and len(_got) == 105 and _untouched,
+           f"읽기 {0 if _got is None else len(_got)}행 (105여야) · 본체 미변경 {_untouched} "
+           f"(697만 행을 매 실행 다시 쓰면 로컬 SSD 로도 5.6초, 드라이브면 분 단위입니다)")
+        import shutil as _sh
+        _sh.rmtree(_td, ignore_errors=True)
+    except Exception as e:                                       # noqa
+        _t("SHARD", "증분은 조각으로 덧붙인다", False, f"{type(e).__name__}: {e}")
+
     # ── TTM: 사업보고서 단독(연간 모드)에서도 유량계정이 살아남는다 ─────────────────
     #   실측 사고: DART_FS_FREQ="annual" 이면 (code, year) 그룹에 행이 하나뿐이라
     #   누적→분기 차분이 전부 NaN 이 되고, rolling(4, min_periods=4) 도 전부 NaN 이 됐다.
