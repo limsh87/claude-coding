@@ -29,7 +29,26 @@ CORE_POST = ["30_policy.py", "40_score.py", "41_backtest.py", "50_robust.py",
              "60_report.py", "70_contracts.py", "75_rehearsal.py", "80_selftest.py",
              "90_main.py"]
 
+# ── TCD v3 (전략 8 · FLP) — 공용 코어를 재사용하고 FLP 전용 계층만 새로 얹는다 ───────────────
+V3_FLP_FILES = [
+    "f00_header_flp.py", "01_bootstrap.py", "02_kernel.py", "03_util.py", "04_vault.py",
+    "05_http.py", "10_ingest_universe.py", "11_ingest_price.py", "12_ingest_dart_fin.py",
+    "13_ingest_research.py", "14_entity_research.py", "f05_sources_nokrx.py",
+    "20_pit.py",
+    "f10_ingest_credit.py", "f20_features_flp.py", "f30_research_flp.py",
+    "f40_backtest_flp.py", "f50_robust_flp.py", "f60_report_flp.py",
+    "f70_contracts_flp.py", "f80_selftest_flp.py", "f85_rehearsal_flp.py", "f90_main_flp.py",
+]
+
 STRATEGIES = [
+    dict(sid="TCD_V3_FLP", fname="tcd_v3_08_flp_liquidation.py", packs=[],
+         files=V3_FLP_FILES,
+         name="FLP 강제매도 소진 (Forced Liquidation Exhaustion)",
+         desc="남이 팔아야만 해서 팔 때 내가 사준다 — 즉시성(immediacy) 공급의 대가를 수확한다. "
+              "핵심은 '얼마나 빠졌는가'가 아니라 '강제 재고(신용융자잔고)가 소진되었는가'다. "
+              "국면 A(물타기)·B(반대매매 진행)에서는 진입하지 않고, 재고 소진 + 소유권 이전이 "
+              "완료된 국면 C 에서만 유동성을 공급한다. 알파가 아니라 위험 프리미엄이므로 "
+              "R2-F(소진조건 vs 단순 낙폭과대)와 R12(꼬리 동시손실)가 존재 이유를 검정한다."),
     dict(sid="PACK_C", fname="tcd_v2_01_pack_c_capital.py", packs=["C"],
          name="PACK-C 자본배분 체제 전환",
          desc="제국 건설을 멈추고 자본을 돌려주기 시작하는 전환을 탐지한다. "
@@ -86,8 +105,8 @@ def strip_shebang_and_future(src: str, keep_header: bool) -> str:
 
 def build_one(spec: dict, version: str) -> str:
     parts = []
-    order = (CORE_PRE + list(CORE_INGEST.values()) + CORE_MID +
-             [PACK_FILES[p] for p in spec["packs"]] + CORE_POST)
+    order = spec.get("files") or (CORE_PRE + list(CORE_INGEST.values()) + CORE_MID +
+                                  [PACK_FILES[p] for p in spec["packs"]] + CORE_POST)
     for i, fn in enumerate(order):
         src = read(fn)
         src = strip_shebang_and_future(src, keep_header=(i == 0))

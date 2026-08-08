@@ -39,6 +39,12 @@ class PITStore:
                             "kd_min": d["knowledge_date"].min(), "kd_max": d["knowledge_date"].max()}
         PIPE.io("OUT", "MEM", f"PIT:{name}", d)
 
+    def drop(self, name: str) -> None:
+        """등록을 되돌린다. 합성 스모크가 남긴 테이블이 실데이터 실행에 섞이면
+        '재무 없음' 경고가 사라진 채 전 종목 결측으로 조용히 진행된다."""
+        self._t.pop(name, None)
+        self._meta.pop(name, None)
+
     def has(self, name: str) -> bool:
         return name in self._t and not self._meta.get(name, {}).get("empty", True)
 

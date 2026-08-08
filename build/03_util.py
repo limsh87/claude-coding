@@ -168,17 +168,31 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
 
 
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """★ 읽기 실패 시에도 원본을 '원래 자리에' 남긴다.
+
+    예전 구현은 어떤 예외든 즉시 os.replace 로 파일을 .corrupt 로 옮겼다. 그런데 드라이브
+    FUSE 는 일시적 I/O 오류를 흔히 낸다. 원본이 자리에서 사라지면 put_table 이 백업할 대상을
+    찾지 못해 '백업 없이' 새 파일을 쓰게 되고, 그건 "백업 없이는 절대 교체하지 않는다"는
+    절대 1원칙을 정확히 뒤집는다. → 1회 재시도 후에도 실패하면 '복사본'만 격리하고
+    원본은 그대로 둔다(다음 put_table 이 그 원본을 백업할 수 있도록)."""
     if not os.path.exists(path):
         return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
-        return None
+    for attempt in range(2):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                                          # noqa
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            LOG.warn(f"parquet 읽기 실패 — 원본은 자리에 두고 사본만 격리합니다: "
+                     f"{os.path.basename(path)} ({type(e).__name__}). "
+                     f"다음 쓰기 때 이 원본이 백업된 뒤 교체됩니다(무백업 교체 방지).")
+            try:
+                shutil.copy2(path, path + f".corrupt.{int(time.time())}")
+            except Exception:
+                pass
+            return None
+    return None
 
 
 def read_jsonl(path: str) -> List[dict]:
