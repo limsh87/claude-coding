@@ -8,13 +8,12 @@
 # ║    rcept_no 가 없으면 법정 제출기한(분기 45일 / 사업보고서 90일)으로 보수적 추정한다.       ║
 # ║    ※ 보수적 추정은 '늦게 알았다'는 방향이므로 미래누수를 만들지 않는다.                     ║
 # ║                                                                                          ║
-# ║  ★ 호출 예산: DART 는 일 20,000건 제한. 10년 분기 전체 재무제표는 그 몇 배다.               ║
-# ║    → 콜드빌드는 며칠에 걸쳐 '이어받기'로 완성된다(§3: 콜드빌드는 4시간 예산 밖).            ║
-# ║    → 남은 호출량을 실시간으로 표시하고, 한도에 닿으면 깨끗하게 멈춘 뒤 진행률을 알려준다.   ║
+# ║  ★ 호출 예산: 상한을 미리 정하지 않는다(L0-D DartKeyPool).                                 ║
+# ║    남은 호출량을 실시간으로 추적해 그만큼 쓰고, 서버가 020(한도초과)을 줄 때 비로소 멈춘다. ║
+# ║    키가 여러 개면 020 을 받은 키만 소진 처리하고 다음 키로 자동 전환한다(20,000 × 키개수).  ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 DART_BASE = "https://opendart.fss.or.kr/api/"
-DART_DAILY_LIMIT = 19_000                 # 공식 20,000 대비 여유
 DART_STATEMENT_FREQ = "quarterly"         # "quarterly" | "annual"
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
 REPRT_DEADLINE_DAYS = {"11013": 45, "11012": 45, "11014": 45, "11011": 90}
@@ -30,56 +29,40 @@ DART_STATUS_MSG = {
 
 
 class DartBudget:
-    """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다."""
+    """L0-D DartKeyPool 로 가는 얇은 호환 껍데기.
+
+    예전 구현은 '일일 한도를 19,000 으로 가정하고 미리 자르는' 게이트였다. 그 가정이 틀리면
+    (오늘 이미 썼거나 / 키가 여러 개거나) 남은 호출량을 통째로 버렸다. 이제 상한은 없다.
+    잔량은 실시간으로 계산해 보여주고, 멈춤은 서버의 020 응답으로만 결정한다.
+    """
 
     def __init__(self):
-        self.today = _dt.date.today().isoformat()
-        self.n = 0
-        self.exhausted = False
-        self._lk = threading.Lock()
-        self._load()
+        self.pool = dart_pool()
 
-    def _path(self) -> str:
-        return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
+    @property
+    def n(self) -> int:
+        return int(sum(self.pool.used.values()))
 
-    def _load(self):
-        try:
-            j = json.loads(open(self._path()).read())
-            if j.get("date") == self.today:
-                self.n = int(j.get("n", 0))
-        except Exception:
-            pass
-        if self.n:
-            LOG.info(f"오늘 이미 사용한 DART 호출 {self.n:,}건 (한도 {DART_DAILY_LIMIT:,}) — 이어서 진행합니다.")
+    @property
+    def exhausted(self) -> bool:
+        return self.pool.exhausted
 
-    def _save(self):
-        try:
-            atomic_write_text(self._path(), json.dumps({"date": self.today, "n": self.n}))
-        except Exception:
-            pass
+    @exhausted.setter
+    def exhausted(self, v):                  # 예전 코드가 직접 대입하던 자리 (무해하게 흡수)
+        pass
 
-    def refund(self, k: int = 1):
-        if k <= 0:
-            return
-        with self._lk:
-            self.n = max(0, self.n - k)
+    def remaining(self) -> int:
+        return self.pool.remaining_hint()
 
     def take(self, k: int = 1) -> bool:
-        with self._lk:
-            if self.n + k > DART_DAILY_LIMIT:
-                if not self.exhausted:
-                    self.exhausted = True
-                    LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
-                             f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
-                             f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
-                return False
-            self.n += k
-            if self.n % 500 == 0:
-                self._save()
-            return True
+        return self.pool.acquire() is not None
+
+    def refund(self, k: int = 1):
+        pass
 
     def close(self):
-        self._save()
+        self.pool.save()
+        self.pool.report()
 
 
 DBUDGET: Optional[DartBudget] = None
@@ -87,36 +70,13 @@ DBUDGET: Optional[DartBudget] = None
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2) -> Optional[dict]:
-    """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
-    호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
-    → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
-    if not DART_API_KEY:
-        return None
-    if DBUDGET is not None and not DBUDGET.take(tries):
-        return None
-    p = dict(params)
-    p["crtfc_key"] = DART_API_KEY
-    attempts = {"n": 0}
-    js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
-                   referer="https://opendart.fss.or.kr/", on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
-    if DBUDGET is not None:
-        DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
-    if not isinstance(js, dict):
-        return None
-    st = str(js.get("status", ""))
-    if st and st != "000":
-        if st in ("020", "021"):
-            if DBUDGET is not None:
-                DBUDGET.exhausted = True
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
-        elif st in ("010", "011", "012", "901"):
-            LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
-                      f"DART_API_KEY 를 확인하세요.")
-        elif st != "013":
-            LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
-        return None
-    return js
+    """DART 호출 1건. 키 선택·실사용량 집계·020 자동 키전환은 dart_json 이 전담한다.
+
+    ★ 실사용량 주의: http_get 은 내부적으로 최대 `tries` 회 **실제** 요청을 보낸다.
+      호출당 1건으로 세면 실사용량을 최대 tries 배 과소집계한다 → dart_json 이 on_attempt 로
+      실제 시도 횟수를 세어 반영한다(추정이 아니라 실측).
+    """
+    return dart_json(endpoint, params, source=source, tries=tries)
 
 
 def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Timestamp:
@@ -245,7 +205,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
 
     reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
               else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
-    # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
+    # ★ 수집 순서가 중요하다. 잔량 소진으로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
@@ -256,14 +216,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
-        total_needed = len(jobs)
-        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
-                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
-        if total_needed > DART_DAILY_LIMIT:
-            LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
-                     f"오늘 받을 수 있는 만큼 받고 저장합니다. "
-                     f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
-                     f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
+        dart_plan_note(len(jobs), "DART 재무제표")
         res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
         got = [d for d in res if d is not None and len(d)]
     else:

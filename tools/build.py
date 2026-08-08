@@ -14,7 +14,7 @@ BUILD = os.path.join(ROOT, "build")
 OUT = os.path.join(ROOT, "strategies")
 
 CORE_PRE = ["00_header.py", "01_bootstrap.py", "02_kernel.py", "03_util.py",
-            "04_vault.py", "05_http.py"]
+            "04_vault.py", "05_http.py", "06_dartkey.py"]
 CORE_INGEST = {
     "universe": "10_ingest_universe.py",
     "price": "11_ingest_price.py",
