@@ -327,18 +327,22 @@ def run_contracts_v3(strict: bool = True) -> bool:
             return False, f"단일 단계 상한이 일일한도({DART_DAILY_LIMIT:,})를 넘습니다"
         # 예전엔 plan 을 계산해 성공 메시지에 찍기만 하고 **한도와 비교하지 않았다.**
         # 그래서 26,000건 계획이 "일일한도 19,000 안" 이라는 문구와 함께 PASS 했다.
-        if plan > DART_DAILY_LIMIT:
-            return False, (f"계획 호출 {plan:,}건이 일일한도 {DART_DAILY_LIMIT:,}건을 넘습니다 "
-                           f"(EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,}×2 + "
-                           f"배치·캐너리 ≈2,700). 한 실행이 한도를 넘게 계획하면 "
-                           f"뒤쪽 단계는 반드시 굶습니다 — 상한을 낮추세요")
+        # ★ 한도는 **키 하나당**이다. 키를 여러 개 넣으면 그만큼 곱해진다.
+        n_keys = max(1, len([k for k in ([DART_API_KEY] + list(DART_API_KEYS))
+                             if str(k).strip()]))
+        room = DART_DAILY_LIMIT * n_keys
+        if plan > room:
+            return False, (f"계획 호출 {plan:,}건이 하루 한도 {room:,}건"
+                           f"(키 {n_keys}개 × {DART_DAILY_LIMIT:,})을 넘습니다. "
+                           f"상한을 낮추거나 DART_API_KEYS 에 키를 추가하세요 — "
+                           f"키는 opendart.fss.or.kr 에서 무료·즉시 발급됩니다")
         # 5~8건/초 실측 기준 상한 소진에 걸리는 최악 시간이 4시간 안이어야 한다.
         worst_h = (int(EMP_MAX_CALLS) / 8.0 + int(DART_FS_MAX_CALLS) / 5.0) / 3600.0
         if worst_h > WALL_CLOCK_LIMIT_H * 0.6:
             return False, (f"상한 소진 예상 {worst_h:.1f}h 가 수집 몫(4h×0.6)을 넘습니다 — "
                            f"EMP_MAX_CALLS/DART_FS_MAX_CALLS 를 낮추세요")
-        return True, (f"계획 {plan:,}건 (EMP {EMP_MAX_CALLS:,} + Tier-2 {DART_FS_MAX_CALLS:,}×2 "
-                      f"+ 배치·캐너리) ≈{worst_h*60:.0f}분 · 일일한도 {DART_DAILY_LIMIT:,} 안")
+        return True, (f"계획 {plan:,}건 ≈{worst_h*60:.0f}분 · "
+                      f"하루 한도 {room:,}(키 {n_keys}개) 안")
 
     _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
 
@@ -444,26 +448,44 @@ def run_contracts_v3(strict: bool = True) -> bool:
         이 계약은 (a) 예약 API 가 존재하고 실제로 남의 인출을 막으며 (b) 예약분은 해당
         용도가 인출할 수 있고 (c) 사전점검이 알파 테이블을 개별로 본다는 것을 강제한다.
         """
-        for fn in ("reserve", "left", "take"):
+        for fn in ("reserve", "left", "pick_key", "mark_blocked", "all_blocked", "charge"):
             if not callable(getattr(DartBudget, fn, None)):
                 return False, f"DartBudget.{fn}() 이 없습니다 — 알파 예산을 지킬 수단이 없습니다"
         b = DartBudget.__new__(DartBudget)          # _load(파일 I/O) 를 타지 않게 직접 구성
         b.today, b.n, b.exhausted = "T", 0, False
         b._lk = threading.RLock()
-        b._reserved, b._dirty, b._warned_reserve = {}, 0, False
+        b.keys = ["k1", "k2"]
+        b._kid_of = {k: DartBudget._make_kid(k) for k in b.keys}
+        b.per_key = {kid: 0 for kid in b._kid_of.values()}
+        b.blocked = set()
+        b._reserved, b._dirty, b._rr = {}, 0, 0
+        # ① 예약은 '계획 기준선'에 반영되어야 한다 (호출 거부가 아니라 잡 수 산정용)
         b.reserve("emp", 100)
-        room = DART_DAILY_LIMIT - 100
-        if b.left(None) != room:
-            return False, f"예약 후 일반 잔량이 {b.left(None):,} (기대 {room:,})"
-        if b.left("emp") != DART_DAILY_LIMIT:
-            return False, "예약 당사자가 자기 예약분을 못 봅니다"
-        # 일반 소비자가 예약분까지 먹어치우지 못해야 한다.
-        if b.take(room, purpose=None) is not True:
-            return False, "일반 소비자가 정당한 잔량조차 인출하지 못합니다"
-        if b.take(1, purpose=None) is not False:
-            return False, "★ 일반 소비자가 예약분을 인출했습니다 — 알파가 또 굶습니다"
-        if b.take(1, purpose="emp") is not True:
-            return False, "★ 예약 당사자가 자기 예약분을 인출하지 못합니다"
+        if b.left(None) != b.left("emp") - 100:
+            return False, "예약이 계획 기준선(left)에 반영되지 않습니다"
+        # ② 키 로테이션 — 소진되지 않은 키를 고르고, 서버가 거부한 키는 건너뛴다
+        if b.pick_key() is None:
+            return False, "쓸 수 있는 키가 있는데 pick_key() 가 None 을 돌려줍니다"
+        b.mark_blocked("k1")
+        if b.pick_key() != "k2":
+            return False, "★ 서버가 거부한 키를 계속 고릅니다 — 로테이션이 동작하지 않습니다"
+        if b.all_blocked():
+            return False, "키가 하나 남았는데 전부 차단으로 판정합니다"
+        b.mark_blocked("k2")
+        if not b.all_blocked() or b.pick_key() is not None:
+            return False, "모든 키가 거부됐는데 계속 진행하려 합니다"
+        # ③ ★ 로컬 카운터로는 절대 차단하지 않는다 (이 계약의 핵심)
+        b2 = DartBudget.__new__(DartBudget)
+        b2.today, b2.n, b2.exhausted = "T", DART_DAILY_LIMIT * 99, False
+        b2._lk = threading.RLock()
+        b2.keys = ["k1"]
+        b2._kid_of = {"k1": DartBudget._make_kid("k1")}
+        b2.per_key = {b2._kid_of["k1"]: DART_DAILY_LIMIT * 99}
+        b2.blocked, b2._reserved, b2._dirty, b2._rr = set(), {}, 0, 0
+        if b2.pick_key() is None:
+            return False, ("★ 로컬 카운터가 한도를 넘었다는 이유로 호출을 막습니다 — "
+                           "진짜 잔여량은 서버만 압니다. 추정으로 우리를 막으면 "
+                           "서버가 답해 줄 수 있는 상태에서 한 건도 안 쏘게 됩니다")
         # 사전점검이 알파 테이블을 개별 판정하는가 (합산 판정이면 사고가 재현된다)
         src = _src_of(preflight_dart_v3) or ""
         if src:
@@ -473,8 +495,8 @@ def run_contracts_v3(strict: bool = True) -> bool:
                 return False, "사전점검이 여전히 합산으로만 판정합니다"
         if not REQUIRE_EMP_ALPHA:
             return True, "예약 동작 확인 · REQUIRE_EMP_ALPHA=False (알파 없이도 진행하도록 설정됨)"
-        return True, (f"예약 {EMP_RESERVED_CALLS:,}건은 EMP 만 인출 가능 · "
-                      f"알파 부재 시 수집 전 중단")
+        return True, (f"키 로테이션 · 서버 거부만 하드 차단 · 로컬 카운터는 계획용 · "
+                      f"예약 {EMP_RESERVED_CALLS:,}건 · 알파 부재 시 수집 전 중단")
 
     _cc("§12-A", "알파 원천(직원현황) 예산 보호 · 부재 시 사전 중단", alpha_guard)
 

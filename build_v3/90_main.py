@@ -195,6 +195,56 @@ def _enrich_research_bounded(nv: pd.DataFrame, sec: Optional[pd.DataFrame]) -> p
     return naver_enrich_detail(nv, limit=cap)
 
 
+def emp_pairs_needed_v3(ctx: dict, years: Sequence[int]) -> Optional[set]:
+    """실제로 스코어에 쓰이는 **(회사, 사업연도) 조합만** 골라낸다.
+
+    ★ 왜 이게 핵심인가. 예전 격자는 데카르트 곱이었다 — 3,366사 × 12년 = 40,392건.
+      그런데 2020~2022년에만 U-MID 대역에 있었던 회사의 FY2014 직원현황은 **어떤 달의
+      스코어에도 들어가지 않는다.** 담을 수 없는 시점의 데이터이기 때문이다.
+      실제로 필요한 건 '그 회사가 담길 수 있었던 해' + 차분용 직전 1년뿐이다.
+      이렇게 뽑으면 보통 1/3 이하로 줄어 **키 하나로 하루에 끝난다.**
+
+    ★ PIT 안전성: 대역 판정은 가격패널(20일 평균거래대금 랭크)만 쓴다. 재무·직원현황을
+      보지 않으므로 순환참조가 없고, '나중에 좋아진 회사'를 미리 고르는 일도 없다.
+      또 여기서 고르는 것은 **수집 대상**이지 스코어 입력이 아니다 — 덜 받으면 결측이
+      될 뿐 신호가 유리하게 바뀌지 않는다.
+    """
+    try:
+        pm = ctx["panel"]["monthly"]
+        adv = col(pm, "adv20")
+        rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
+        in_band = (rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)).fillna(False)
+        B = pm.loc[in_band, ["code", "month"]].copy()
+        if B.empty:
+            return None
+        c2c = (ctx["sec"].dropna(subset=["corp_code"]).drop_duplicates("code")
+               .set_index("code")["corp_code"].astype(str).to_dict())
+        B["corp_code"] = B["code"].astype(str).map(c2c)
+        B = B.dropna(subset=["corp_code"])
+        if B.empty:
+            return None
+        # 월 m 에 쓰이는 신호는 그 시점에 **알 수 있었던** 사업보고서다. 3~4월 접수를
+        # 감안해 보수적으로 m 의 2년 전까지 열어 둔다(덜 받아 결측이 되는 쪽이 안전하다).
+        ymin, ymax = min(years), max(years)
+        need: set = set()
+        yy = B["month"].dt.year.to_numpy()
+        cc = B["corp_code"].to_numpy()
+        for back in (1, 2, 3):        # 신호연도 후보 + C15 차분용 직전연도
+            for c, y in zip(cc, yy - back):
+                if ymin <= y <= ymax:
+                    need.add((str(c), int(y)))
+        if not need:
+            return None
+        full = len(set(cc)) * len(years)
+        LOG.ok(f"직원현황 수집 격자를 **필요한 조합만**으로 좁혔습니다 — "
+               f"{len(need):,}건 (데카르트 곱이면 {full:,}건, {100*len(need)/max(full,1):.0f}%). "
+               f"담길 수 없었던 해의 직원현황은 어떤 달의 스코어에도 쓰이지 않습니다.")
+        return need
+    except Exception as e:                                          # noqa
+        LOG.warn(f"직원현황 조합 축소 실패({type(e).__name__}) — 전체 격자로 진행합니다.")
+        return None
+
+
 def announce_budget_v3():
     """수집을 시작하기 전에 '이번 실행이 몇 분짜리인지'를 먼저 못박아 보여준다.
 
@@ -203,7 +253,9 @@ def announce_budget_v3():
     """
     fs_cap, emp_cap = DART_FS_MAX_CALLS, EMP_MAX_CALLS
     used = DBUDGET.n if DBUDGET else 0
-    left = max(0, DART_DAILY_LIMIT - used)
+    n_keys = len(DBUDGET.keys) if DBUDGET and DBUDGET.keys else 1
+    room = DART_DAILY_LIMIT * n_keys
+    left = max(0, room - used)
     _n = lambda v: "무제한" if v is None else f"{int(v):,}"
     _m = lambda v, qps: "며칠" if v is None else f"{int(v)/qps/60:.0f}"
     rows = [
@@ -219,14 +271,17 @@ def announce_budget_v3():
     LOG.table(rows, ["단계", "DART 호출 상한", "예상(분)", "비고"], ["l", "r", "r", "l"],
               title="이번 실행의 수집 예산 (§10 · 총 예산 153분 / 킬 기준 4시간)")
     plan = sum(int(v) for v in (emp_cap, fs_cap) if v is not None) + 2100
-    LOG.info(f"DART 일일 한도 {DART_DAILY_LIMIT:,} · 오늘 사용 {used:,} · 잔여 {left:,} → "
-             f"이번 실행 계획 {plan:,}건. 한도에 닿으면 그 지점에서 깨끗이 멈추고 "
-             f"수집분을 드라이브에 저장합니다. 재실행하면 이어받습니다.")
+    LOG.info(f"DART 키 {n_keys}개 · 하루 한도 {room:,}(키당 {DART_DAILY_LIMIT:,}) · "
+             f"오늘 사용 추정 {used:,} · 잔여 추정 {left:,} → 이번 실행 계획 {plan:,}건.\n"
+             f"     ※ 이 잔여값은 **추정치입니다.** 실제 잔여는 서버만 알기에, 추정이 0 이어도 "
+             f"호출을 막지 않습니다 — 서버가 020(한도초과)으로 거부한 키만 오늘 접습니다.\n"
+             f"     ※ 부족하면 opendart.fss.or.kr 에서 키를 더 발급(무료·즉시)해 "
+             f"DART_API_KEYS 에 추가하세요. 한도가 키 개수만큼 곱해집니다.")
     if fs_cap is None or emp_cap is None:
         LOG.warn("호출 상한이 None 인 단계가 있습니다 — 콜드빌드는 며칠이 걸리며 §12-6 의 "
                  "4시간 계약 밖입니다. 4시간 안에 끝내려면 숫자를 넣으세요 "
                  "(권장: EMP_MAX_CALLS=14000, DART_FS_MAX_CALLS=12000).")
-    if plan > left and left > 0:
+    if plan > left > 0:
         LOG.warn(f"계획 호출({plan:,})이 오늘 잔여 한도({left:,})를 넘습니다 — 우선순위 상위부터 "
                  f"채우고 한도에서 멈춥니다. 커버리지는 재실행할 때마다 올라갑니다.")
     return preflight_dart_v3()
@@ -373,15 +428,12 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
         LOG.info(f"직원현황 대상 회계연도 {eyears[0]}~{eyears[-1]} "
                  f"(FY{_y_max + 1} 이후는 아직 제출 전이라 제외 — 없는 연도를 먼저 묻지 않습니다)")
         # ★ 한계임금이 이 전략의 알파 원천이므로 DART 일일예산을 **여기에 먼저** 배정한다.
-        #   (Tier-2 전체재무제표는 남는 예산으로 채우고, 부족분은 Tier-1 주요계정이 받친다)
         emp_corps, _, emp_prio = dart_fs_scope_v3(ctx, corps, quiet=True)
         if not (EMP_UNIVERSE_ONLY and emp_corps):
-            emp_corps = corps          # 축소 실패 또는 사용자가 끈 경우 → 전 종목
-        else:
-            LOG.info(f"직원현황 수집대상 {len(emp_corps):,}사 "
-                     f"(전체 {len(corps):,}사 중 U-MID 대역을 한 번이라도 경험한 종목). "
-                     f"셀 정규화도 U-MID 패널 안에서만 이뤄지므로 제외분은 스코어에 쓰이지 않습니다.")
-        E = fetch_emp_status(emp_corps, eyears, priority=emp_prio, max_calls=EMP_MAX_CALLS)
+            emp_corps = corps
+        pairs = emp_pairs_needed_v3(ctx, eyears)
+        E = fetch_emp_status(emp_corps, eyears, priority=emp_prio,
+                             max_calls=EMP_MAX_CALLS, pairs=pairs)
         ctx["emp_raw"] = E
         S = build_emp_sensors(E)
         ctx["emp_sensors"] = S

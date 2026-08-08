@@ -42,7 +42,7 @@ def _canary_bulk(corps: Sequence[str], n_universe: int) -> Tuple[Optional[bool],
       fnlttMultiAcnt(100사/호출)이므로, 그 경로의 실측 처리량으로 판정한다.
       외삽값임을 표에 명시한다 — 실측처럼 위장하지 않는다.
     """
-    if not DART_API_KEY:
+    if not dart_has_key():
         _k("K1", "DART 재무 배치(2016Q1)", None, "키 없음", f">{CANARY_K1_MIN_ROWS:,}행",
            "DART_API_KEY 미입력 — 재무 기반 TP 전부 비활성")
         _k("K2", "배치 최초 제공 사업연도", None, "키 없음", "≤2016", "")
@@ -87,7 +87,7 @@ CANARY_REQUIRED_ACCOUNTS = ["revenue", "inventory", "receivable", "cfo", "capex"
 
 
 def _canary_accounts(corps: Sequence[str], year: int) -> Optional[bool]:
-    if not DART_API_KEY:
+    if not dart_has_key():
         _k("K3", "필수계정 커버리지", None, "키 없음", f"≥{CANARY_K3_MIN_COV:.0%}", "")
         return None
     jobs = [(c, year, REPRT_CODES["FY"]) for c in corps]
@@ -199,7 +199,7 @@ def _canary_delisting(sec: pd.DataFrame) -> bool:
 
 # ── K7 / K8 / K9 : empSttus ─────────────────────────────────────────────────────────────────
 def _canary_emp(corps: Sequence[str], year: int) -> Tuple[Optional[bool], Optional[bool], Optional[bool]]:
-    if not DART_API_KEY:
+    if not dart_has_key():
         for kid, nm, crit in (("K7", "empSttus 응답", f"≥{CANARY_K7_MIN_RATE:.0%}"),
                               ("K8", "연간급여총액 기재율", f"≥{CANARY_K8_MIN_RATE:.0%}"),
                               ("K9", "단위 정합성", f"불일치<{CANARY_K9_MAX_BAD:.0%}")):

@@ -368,7 +368,7 @@ def fetch_kind_listing() -> pd.DataFrame:
 
 def fetch_dart_corpcode() -> pd.DataFrame:
     """corp_code ↔ 종목코드. DART 의 모든 재무·공시 조회는 corp_code 로만 된다."""
-    if not DART_API_KEY:
+    if not dart_has_key():
         return pd.DataFrame(columns=["corp_code", "corp_name", "code", "modify_date"])
     cached = VAULT.get_table("dart_corpcode", scope="shared", max_age_days=30)
     if cached is not None and len(cached):

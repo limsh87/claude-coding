@@ -30,17 +30,53 @@ DART_STATUS_MSG = {
 
 
 class DartBudget:
-    """일일 호출 한도를 드라이브에 영속 기록. 재실행 시 이어받기의 근거가 된다."""
+    """DART 호출 사용량 추적 + 다중 키 로테이션.
+
+    ★★ 설계 원칙 (한 번 크게 틀렸던 부분) ★★
+      이 카운터는 **계획용 추정치이지 허가권이 아니다.**
+      예전 판은 로컬 카운터가 19,000 에 닿으면 호출 자체를 거부했다. 그런데 그 카운터는
+      틀릴 수밖에 없다 — 이전 세션의 잔여, 동시 실행, 환불 누락, 강제 종료로 저장 못 한
+      구간, KST 경계 오차가 전부 여기에 쌓인다. 실제로 사용자 실행이 그렇게 죽었다:
+      파일엔 19,000/19,000 인데 서버는 답해 줄 수 있는 상태에서 **한 건도 시도하지 않고**
+      "한도 소진" 을 선언했다. 우리 추정으로 우리를 막은 것이다.
+
+      → 진짜 잔여량은 **서버만 안다.** DART 는 한도를 넘기면 status 020/021 로 명시적으로
+        알려 준다. 그러니 그 응답이 오기 전까지는 계속 쏜다. 카운터는 ETA·예산표·우선순위
+        정렬에만 쓰고, 차단은 **서버가 거부한 키**로만 판정한다.
+        (초과 요청은 020 응답 하나로 끝나며 별도 불이익이 없다 — 헛차단이 훨씬 비싸다)
+
+    ★ 다중 키 — 한도는 키 하나당이다. DART 는 계정당 여러 키를 무료·즉시 발급한다.
+      키가 여러 개면 하루 총량이 그만큼 곱해지고, 소진된 키는 건너뛰고 다음 키로 넘어간다.
+      드라이브에는 키 원문이 아니라 해시(kid)만 남긴다.
+    """
 
     def __init__(self):
         self.today = self._kst_day()
+        raw = [str(k).strip() for k in ([DART_API_KEY] + list(DART_API_KEYS))]
+        self.keys = list(dict.fromkeys(k for k in raw if k))
+        self._kid_of = {k: self._make_kid(k) for k in self.keys}
+        self.per_key: Dict[str, int] = {kid: 0 for kid in self._kid_of.values()}
+        self.blocked: set = set()          # ★ 서버가 020/021 로 거부한 kid — 유일한 하드 차단
         self.n = 0
         self.exhausted = False
         self._lk = threading.RLock()
         self._reserved: Dict[str, int] = {}
         self._dirty = 0
-        self._warned_reserve = False
+        self._rr = 0
         self._load()
+        if len(self.keys) > 1:
+            LOG.ok(f"DART 키 {len(self.keys)}개 로테이션 — 소진된 키는 자동으로 건너뜁니다. "
+                   f"참고 한도 {self.soft_cap:,}건(키당 {DART_DAILY_LIMIT:,}), "
+                   f"오늘 사용 추정 {self.n:,}건. 실제 잔여는 서버 응답으로 판정합니다.")
+
+    # ── 참고용 상한 (계획·ETA 전용, 차단에는 쓰지 않는다) ───────────────────────────────
+    @property
+    def soft_cap(self) -> int:
+        return DART_DAILY_LIMIT * max(1, len(self.keys))
+
+    @staticmethod
+    def _make_kid(key: str) -> str:
+        return hashlib.sha1(key.encode()).hexdigest()[:10] if key else "none"
 
     @staticmethod
     def _kst_day() -> str:
@@ -58,47 +94,105 @@ class DartBudget:
         d = self._kst_day()
         if d != self.today:
             LOG.info(f"KST 자정 경과 — DART 일일 한도가 초기화됐습니다 "
-                     f"({self.today} → {d}, 직전 사용 {self.n:,}건).")
+                     f"({self.today} → {d}, 직전 사용 {self.n:,}건). 차단 표시도 해제합니다.")
             self._save()
             self.today, self.n, self.exhausted = d, 0, False
+            self.per_key = {kid: 0 for kid in self._kid_of.values()}
+            self.blocked.clear()
             DART_HALT["reason"] = DART_HALT["detail"] = None
 
     def _path(self) -> str:
         return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
 
     def _load(self):
+        """어제·오늘 사용량을 읽되 **차단 상태는 복원하지 않는다.**
+
+        ★ blocked 를 파일에서 되살리면 그 순간 다시 '우리 추정으로 우리를 막는' 옛 버그가
+          된다. 서버가 오늘 실제로 거부해야만 차단이다. 사용량은 ETA 표시에만 쓴다.
+        """
         try:
             j = json.loads(open(self._path()).read())
             if j.get("date") == self.today:
-                self.n = int(j.get("n", 0))
+                pk = j.get("per_key", {})
+                for kid in self.per_key:
+                    self.per_key[kid] = int(pk.get(kid, 0))
+                if not pk and "n" in j:           # 단일 키 시절 파일 하위호환
+                    only = next(iter(self.per_key), None)
+                    if only is not None:
+                        self.per_key[only] = int(j.get("n", 0))
+                self.n = sum(self.per_key.values())
         except Exception:
             pass
         if self.n:
-            LOG.info(f"오늘 이미 사용한 DART 호출 {self.n:,}건 (한도 {DART_DAILY_LIMIT:,}) — 이어서 진행합니다.")
+            LOG.info(f"오늘 사용한 것으로 기록된 DART 호출 {self.n:,}건 "
+                     f"(참고 한도 {self.soft_cap:,}). 이 값이 한도에 닿아 있어도 "
+                     f"**시도는 계속합니다** — 실제 잔여는 서버만 알기 때문입니다.")
 
     def _save(self):
         try:
-            atomic_write_text(self._path(), json.dumps({"date": self.today, "n": self.n}))
+            atomic_write_text(self._path(), json.dumps(
+                {"date": self.today, "n": self.n, "per_key": self.per_key}))
         except Exception:
             pass
 
-    def refund(self, k: int = 1, purpose: Optional[str] = None):
+    # ── 키 선택 ────────────────────────────────────────────────────────────────────────
+    def pick_key(self) -> Optional[str]:
+        """차단되지 않은 키 중 **가장 적게 쓴** 키. 전부 차단이면 None."""
+        with self._lk:
+            self._roll_if_new_day()
+            live = [k for k in self.keys if self._kid_of[k] not in self.blocked]
+            if not live:
+                return None
+            return min(live, key=lambda k: self.per_key.get(self._kid_of[k], 0))
+
+    def mark_blocked(self, key: Optional[str], why: str = ""):
+        """서버가 한도초과(020/021)를 알려온 키를 오늘 더 쓰지 않는다. 유일한 하드 차단."""
+        with self._lk:
+            kid = self._kid_of.get(key or "")
+            if not kid or kid in self.blocked:
+                return
+            self.blocked.add(kid)
+            left_keys = len(self.keys) - len(self.blocked)
+            if left_keys > 0:
+                LOG.info(f"DART 키 하나가 서버에서 한도초과로 거부됐습니다{(' — ' + why) if why else ''}. "
+                         f"남은 키 {left_keys}개로 계속합니다.")
+            elif not self.exhausted:
+                self.exhausted = True
+                LOG.warn(f"DART 키 {len(self.keys)}개가 전부 한도초과입니다 "
+                         f"(사용 추정 {self.n:,}건). 여기까지 받은 데이터는 드라이브에 "
+                         f"저장되어 있으니, KST 자정 이후 재실행하면 이어받습니다. "
+                         f"키를 더 발급해 DART_API_KEYS 에 추가하면 하루에 더 받을 수 있습니다.")
+            self._save()
+
+    # ── 사용량 기록 (허가가 아니라 계측이다) ──────────────────────────────────────────
+    def charge(self, k: int, key: Optional[str], purpose: Optional[str] = None):
+        with self._lk:
+            kid = self._kid_of.get(key or "")
+            if kid:
+                self.per_key[kid] = self.per_key.get(kid, 0) + k
+            self.n += k
+            if purpose in self._reserved:
+                self._reserved[purpose] = max(0, self._reserved[purpose] - k)
+            self._dirty += k
+            if self._dirty >= 200:
+                self._dirty = 0
+                self._save()
+
+    def refund(self, k: int = 1, purpose: Optional[str] = None, key: Optional[str] = None):
         if k <= 0:
             return
         with self._lk:
+            kid = self._kid_of.get(key or "")
+            if kid and kid in self.per_key:
+                self.per_key[kid] = max(0, self.per_key[kid] - k)
             self.n = max(0, self.n - k)
-            # ★ 예약분도 함께 되돌린다. take(2) 후 refund(1) 이 정상 경로이므로,
-            #   되돌리지 않으면 예약이 잡당 2 씩 깎여 14,000 예약이 7,000건만 보호한다.
             if purpose in self._reserved:
                 self._reserved[purpose] += k
             self._dirty += k
 
-    # ── 예약(reservation) ─────────────────────────────────────────────────────────────
-    #  ★ 이 전략의 알파는 직원현황 하나뿐인데, 실행 3회 내내 dart_employees_ext 가 0행이었다.
-    #    원인은 단순하다 — Tier-2 전체재무제표가 일일 한도를 먼저 다 써버렸다. 단계 순서를
-    #    바꿔도 예산은 '날짜별 누적 카운터'라 어제 태운 것이 오늘까지 따라온다.
-    #    → 특정 용도(purpose)에 호출 수를 **예약**해 두고, 예약분은 그 용도만 인출한다.
-    #      일반 소비자는 (한도 − 예약잔량) 까지만 쓸 수 있다.
+    # ── 예약 — 알파(직원현황) 몫을 다른 단계가 먼저 못 쓰게 한다 ────────────────────────
+    #  ★ 예약은 '계획'에만 작용한다. 각 수집 함수가 자기 상한을 정할 때 left(purpose) 를
+    #    보고 잡 수를 자르는 용도다. 호출 자체를 거부하지는 않는다(그건 서버 몫).
     def reserve(self, purpose: str, k: int):
         with self._lk:
             self._reserved[purpose] = max(0, int(k))
@@ -107,43 +201,33 @@ class DartBudget:
         return sum(v for p, v in self._reserved.items() if p != purpose)
 
     def left(self, purpose: Optional[str] = None) -> int:
-        """purpose 가 지금 쓸 수 있는 호출 수. 남의 예약분은 빼고 센다."""
-        with self._lk:
-            return max(0, DART_DAILY_LIMIT - self.n - self._reserved_for_others(purpose))
+        """purpose 가 이번 실행에서 계획해도 되는 호출 수(추정). 남의 예약분은 뺀다.
 
-    def take(self, k: int = 1, purpose: Optional[str] = None) -> bool:
+        ★ 이것은 '허가된 잔량'이 아니라 '계획 기준선'이다. 0 이어도 시도는 막지 않는다.
+        """
         with self._lk:
-            self._roll_if_new_day()
-            room = DART_DAILY_LIMIT - self._reserved_for_others(purpose)
-            if self.n + k > room:
-                # 예약 때문에 막힌 것인지, 한도 자체가 끝난 것인지 구별해서 알린다.
-                if self.n + k > DART_DAILY_LIMIT:
-                    if not self.exhausted:
-                        self.exhausted = True
-                        LOG.warn(f"DART 일일 호출 한도({DART_DAILY_LIMIT:,})에 도달했습니다. "
-                                 f"여기까지 받은 데이터는 드라이브에 저장되어 있으니, "
-                                 f"내일 같은 코드를 다시 실행하면 정확히 이 지점부터 이어받습니다.")
-                elif not self._warned_reserve:
-                    self._warned_reserve = True
-                    LOG.info(f"남은 호출은 다른 용도로 예약되어 있습니다 "
-                             f"(예약 {self._reserved}). 이 단계는 여기서 멈춥니다 — "
-                             f"예약분은 알파 원천(직원현황) 몫입니다.")
-                if purpose in self._reserved:
-                    self._reserved[purpose] = max(0, self._reserved[purpose] - k)
-                return False
-            self.n += k
-            if purpose in self._reserved:
-                self._reserved[purpose] = max(0, self._reserved[purpose] - k)
-            self._dirty += k
-            # ★ n % 500 은 refund 가 임의 값으로 감산하는 순간 영원히 안 맞을 수 있다.
-            #   '마지막 저장 이후 변동량'으로 세면 어떤 감산 패턴에서도 반드시 저장된다.
-            if self._dirty >= 200:
-                self._dirty = 0
-                self._save()
-            return True
+            live = max(1, len(self.keys) - len(self.blocked))
+            cap = DART_DAILY_LIMIT * live
+            used = sum(v for k, v in self.per_key.items() if k not in self.blocked)
+            return max(0, cap - used - self._reserved_for_others(purpose))
+
+    def all_blocked(self) -> bool:
+        with self._lk:
+            return bool(self.keys) and len(self.blocked) >= len(self.keys)
 
     def close(self):
         self._save()
+
+    def report(self):
+        if not self.keys:
+            return
+        rows = [[f"키 #{i+1} ({self._kid_of[k]})",
+                 f"{self.per_key.get(self._kid_of[k], 0):,}",
+                 "서버 거부" if self._kid_of[k] in self.blocked else "사용 가능"]
+                for i, k in enumerate(self.keys)]
+        rows.append(["── 합계", f"{self.n:,}", f"차단 {len(self.blocked)}/{len(self.keys)}"])
+        LOG.table(rows, ["DART 키", "이번 실행까지 사용(추정)", "상태"], ["l", "r", "c"],
+                  title="DART 키별 사용량 — 차단은 서버 응답(020/021)으로만 판정합니다")
 
 
 DBUDGET: Optional[DartBudget] = None
@@ -163,6 +247,11 @@ DBUDGET: Optional[DartBudget] = None
 DART_HALT: Dict[str, Optional[str]] = {"reason": None, "detail": None}
 
 
+def dart_has_key() -> bool:
+    """키가 하나라도 있는가. DART_API_KEY(단일) 와 DART_API_KEYS(복수) 를 함께 본다."""
+    return bool(str(DART_API_KEY).strip() or [k for k in DART_API_KEYS if str(k).strip()])
+
+
 def dart_note_halt(reason: str, detail: str = ""):
     if DART_HALT["reason"] is None:
         DART_HALT["reason"], DART_HALT["detail"] = reason, detail
@@ -173,13 +262,13 @@ def dart_halt_reason(purpose: Optional[str] = None) -> Optional[str]:
 
     purpose 를 주면 그 용도의 **예약분까지 고려**해서 판정한다. 예약이 남아 있으면
     전체 잔량이 0 이어도 그 용도는 계속 진행할 수 있다."""
-    if not DART_API_KEY:
-        return "DART_API_KEY 미입력"
-    if DBUDGET is not None:
-        if DBUDGET.left(purpose) <= 0 or DBUDGET.n >= DART_DAILY_LIMIT:
-            return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
-        if purpose is None and DBUDGET.exhausted:
-            return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
+    if not dart_has_key():
+        return "DART API 키 미입력 (DART_API_KEY / DART_API_KEYS)"
+    # ★ 로컬 카운터로는 절대 차단하지 않는다. 그 카운터는 추정치이고, 추정으로 우리를 막는
+    #   순간 '서버는 답해 줄 수 있는데 한 건도 안 쏘는' 상태가 된다(실제로 그렇게 죽었다).
+    #   하드 차단은 서버가 020/021 로 거부해 모든 키가 막혔을 때뿐이다.
+    if DBUDGET is not None and DBUDGET.all_blocked():
+        return f"DART 키 전부 한도초과 — 서버 거부 (사용 추정 {DBUDGET.n:,}건)"
     return DART_HALT["reason"]
 
 
@@ -190,55 +279,75 @@ def dart_budget_left(purpose: Optional[str] = None) -> int:
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2, no_data_ok: bool = False,
              purpose: Optional[str] = None) -> Optional[dict]:
-    """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
-    호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
-    → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
-    if not DART_API_KEY:
+    """DART 단건 호출. 키 로테이션 + 사용량 계측.
+
+    ★ 로컬 카운터로 호출을 **거부하지 않는다.** 진짜 잔여량은 서버만 알고, 서버는 넘치면
+      status 020/021 로 알려 준다. 그 응답이 오면 그 키만 오늘 접고 다음 키로 재시도한다.
+      (예전 판은 우리 추정으로 우리를 막아, 서버가 답해 줄 수 있는 상태에서 한 건도
+       시도하지 않고 '한도 소진'을 선언했다)
+    """
+    if not (DART_API_KEY or DART_API_KEYS):
         return None
-    if DBUDGET is not None and not DBUDGET.take(tries, purpose=purpose):
-        dart_note_halt(f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})",
-                       "내일 재실행하면 정확히 이 지점부터 이어받습니다.")
-        return None
+    if DBUDGET is None:
+        return _dart_call_once(endpoint, params, DART_API_KEY, source, tries, no_data_ok)[0]
+
+    for _ in range(max(1, len(DBUDGET.keys))):
+        key = DBUDGET.pick_key()
+        if key is None:                       # 모든 키가 서버에서 거부됨 = 진짜 소진
+            dart_note_halt(f"DART 키 {len(DBUDGET.keys)}개 전부 한도초과(서버 응답 020/021)",
+                           "KST 자정 이후 재실행하면 이어받습니다.")
+            return None
+        js, over = _dart_call_once(endpoint, params, key, source, tries, no_data_ok,
+                                   purpose=purpose)
+        if not over:
+            return js
+        DBUDGET.mark_blocked(key, f"ep={endpoint}")     # 다음 키로 자동 재시도
+    return None
+
+
+def _dart_call_once(endpoint: str, params: dict, key: str, source: str,
+                    tries: int, no_data_ok: bool,
+                    purpose: Optional[str] = None) -> Tuple[Optional[dict], bool]:
+    """(응답, 이_키가_한도초과인가). 예산 계측은 여기서만 한다.
+
+    ★ http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다. 호출당 1건으로 세면
+      실사용량을 tries 배 과소집계하므로, 최악을 먼저 계상하고 실제 시도 수를 알면 환급한다.
+      try/finally 가 없으면 예외가 새는 순간 그만큼이 영구 소실된다(EMP 경로는 상위에서
+      예외를 삼키므로 그 누수가 완전히 조용하다).
+    """
     p = dict(params)
-    p["crtfc_key"] = DART_API_KEY
+    p["crtfc_key"] = key
     attempts = {"n": 0}
-    # ★ try/finally 가 없으면 http_json 에서 예외가 새는 순간 tries 만큼이 영구 소실된다.
-    #   EMP 경로는 상위에서 예외를 삼키므로 이 누수가 **완전히 조용하다**.
+    if DBUDGET is not None:
+        DBUDGET.charge(tries, key, purpose=purpose)
     try:
         js = http_json(DART_BASE + endpoint, source=source, params=p, tries=tries,
                        referer="https://opendart.fss.or.kr/",
                        on_attempt=lambda: attempts.__setitem__("n", attempts["n"] + 1))
     finally:
         if DBUDGET is not None:
-            DBUDGET.refund(max(0, tries - max(1, attempts["n"])), purpose=purpose)
+            DBUDGET.refund(max(0, tries - max(1, attempts["n"])), purpose=purpose, key=key)
     if not isinstance(js, dict):
-        return None
+        return None, False
     st = str(js.get("status", ""))
     if st and st != "000":
         if st in ("020", "021"):
-            if DBUDGET is not None:
-                DBUDGET.exhausted = True
-            dart_note_halt(f"DART 서버가 한도 초과 응답(status={st})",
-                           "내일 재실행하면 이어받습니다.")
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
-        elif st in ("010", "011", "012", "901"):
+            return None, True                  # ← 이 키만 소진. 호출자가 다음 키로 넘긴다
+        if st in ("010", "011", "012", "901"):
             dart_note_halt(f"DART 인증 오류(status={st} · {DART_STATUS_MSG.get(st, '?')})",
-                           "DART_API_KEY 를 확인하세요. 데이터 부재가 아닙니다.")
+                           "DART_API_KEY / DART_API_KEYS 를 확인하세요. 데이터 부재가 아닙니다.")
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
-                      f"DART_API_KEY 를 확인하세요.")
+                      f"키를 확인하세요.")
         elif st == "800":
             dart_note_halt("DART 시스템 점검 중(status=800)", "점검 종료 후 재실행하세요.")
         elif st != "013":
             LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
-        # ★ 013("조회된 데이터 없음")은 통신 실패가 아니라 **정상 응답**이다. 그런데 None 으로
-        #   뭉개면 호출자가 '실패'와 구별할 수 없다. 서킷브레이커를 둔 호출자에게 이건 치명적이다
-        #   — 그 해에 사업보고서를 안 낸 회사가 몇 곳만 연속돼도 브레이커가 터져 남은 수집을
-        #   통째로 포기한다. 원하는 호출자만 opt-in 으로 빈 응답을 받아 구별할 수 있게 한다.
+        # ★ 013("조회된 데이터 없음")은 통신 실패가 아니라 **정상 응답**이다. None 으로
+        #   뭉개면 호출자가 '실패'와 구별할 수 없어 서킷브레이커가 정상 데이터로 터진다.
         if st == "013" and no_data_ok:
-            return {"status": "013", "list": []}
-        return None
-    return js
+            return {"status": "013", "list": []}, False
+        return None, False
+    return js, False
 
 
 def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Timestamp:
@@ -297,7 +406,7 @@ _MULTI_ACCOUNT_MAP = {
 
 def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
     """주요계정 배치 수집. 전체 재무제표의 '바닥'을 싸게 깔아둔다."""
-    if not DART_API_KEY:
+    if not dart_has_key():
         return pd.DataFrame(columns=_FS_KEEP)
     cached = VAULT.get_table("dart_multi_raw", scope="shared")
     done = set()
@@ -374,7 +483,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
     ★ freq  ("annual" | "quarterly") — 전역 DART_STATEMENT_FREQ 를 호출자가 덮어쓴다.
       연간만 받으면 잡 수가 정확히 1/4 이 된다.
     """
-    if not DART_API_KEY:
+    if not dart_has_key():
         LOG.warn("DART_API_KEY 미입력 — B축(회계품질)·C축(자원투입)·PACK-C 가 전부 비활성화됩니다. "
                  "이 전략의 핵심 입력이므로 키 입력을 강력히 권합니다.")
         return pd.DataFrame(columns=_FS_KEEP)
@@ -617,7 +726,7 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
 
 # ── 직원현황 (θ_N, TP_C2) ───────────────────────────────────────────────────────────────────
 def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    if not DART_API_KEY:
+    if not dart_has_key():
         return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
     cached = VAULT.get_table("dart_employees", scope="shared")
     done = set()
@@ -712,7 +821,7 @@ def _disclosure_done_months(cached: Optional[pd.DataFrame]) -> set:
         return set()
 
     have = cached["rcept_dt"].dt.to_period("M").astype(str).value_counts().to_dict()
-    if not have or not DART_API_KEY or RUN_MODE == "CACHED" or dart_halt_reason():
+    if not have or not dart_has_key() or RUN_MODE == "CACHED" or dart_halt_reason():
         # 검증할 수 없으면 재수집 대상으로 둔다 — 조용히 '완결'로 승격시키지 않는다.
         return set()
 
@@ -773,7 +882,7 @@ def _save_disclosure_ledger(complete_months) -> None:
 
 def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     """월 단위로 시장 전체 공시목록을 훑는다. PACK-C(자사주/배당)와 V3(희석성 조달)의 입력."""
-    if not DART_API_KEY:
+    if not dart_has_key():
         return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
     cached = VAULT.get_table("dart_disclosures", scope="shared")
     if cached is not None and len(cached):

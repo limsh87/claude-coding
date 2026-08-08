@@ -204,7 +204,8 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
 
 def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                      priority: Optional[Sequence[str]] = None,
-                     max_calls: Optional[int] = None) -> pd.DataFrame:
+                     max_calls: Optional[int] = None,
+                     pairs: Optional[set] = None) -> pd.DataFrame:
     """empSttus 증분 수집. 공용 캐시(dart_employees_ext)를 먼저 소진하고 부족분만 호출한다.
 
     ★ 잡 수는 |기업| × |연도| 로 곱해진다(3,981사 × 13년 = 51,753 > 일일한도 19,000).
@@ -229,7 +230,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                      f"그 해 사업보고서를 내지 않은 조합이라 다시 물어도 답이 없습니다.")
         except Exception:
             pass
-    if not DART_API_KEY:
+    if not dart_has_key():
         LOG.warn("DART_API_KEY 미입력 — 직원현황 신규 수집을 건너뜁니다. "
                  "캐시에 있는 것만으로 진행하며, 없으면 EMP-LITE 전 센서가 결측입니다.")
         return _emp_finalize(cached, [])
@@ -242,6 +243,14 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
     corps = sorted(corps, key=lambda c: (_ord.get(c, 10 ** 9), c))
     # 최근 연도 우선. 차분에 t-1 이 필요하므로 연도는 내림차순으로 촘촘히 채운다.
     jobs = [(c, y) for y in sorted(years, reverse=True) for c in corps if (c, int(y)) not in done]
+    # ★ 호출자가 '실제로 쓰이는 조합'을 주면 그것만 남긴다. 데카르트 곱은 담길 수 없었던
+    #   해까지 묻느라 한도의 대부분을 태운다 — 부족한 건 한도가 아니라 격자 설계였다.
+    if pairs:
+        before = len(jobs)
+        jobs = [j for j in jobs if (str(j[0]), int(j[1])) in pairs]
+        if before != len(jobs):
+            LOG.info(f"  필요 조합 필터로 {before:,} → {len(jobs):,}건 "
+                     f"({100*len(jobs)/max(before,1):.0f}%)")
     if RUN_MODE == "CACHED":
         if jobs:
             LOG.info(f"RUN_MODE='CACHED' — 신규 수집 대상 {len(jobs):,}건을 건너뜁니다.")
