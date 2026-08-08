@@ -506,6 +506,8 @@ def resolve_report_codes(reports: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFra
         return reports
     n2c = _name_to_code_map(sec)
     if not n2c:
+        LOG.warn("종목 마스터에서 이름→코드 표를 만들지 못했습니다(name/code 컬럼 확인) — "
+                 "리포트 종목 매칭을 건너뜁니다. d2/d4 커버리지가 그만큼 낮아집니다.")
         return reports
     # 종목명 후보를 길이순으로 훑어 가장 긴 일치를 택한다(‘한화’ 가 ‘한화솔루션’을 먹지 않게).
     names = sorted(n2c, key=len, reverse=True)
@@ -527,11 +529,25 @@ def resolve_report_codes(reports: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFra
         return hit
 
     out = reports.copy()
-    filled = [_match(x) for x in out.loc[need, "stock_name"].astype(str)]
+    # ★★ stock_name 만 보면 **구조적으로 0건** 이다 ★★
+    #   수집기에서 stock_code 와 stock_name 은 제목의 **같은 정규식 매치 하나**로 만들어진다
+    #   (code_from_title / name_from_title). 즉 코드가 없으면 이름도 반드시 빈 문자열이다.
+    #   따라서 '코드가 없는 행'의 이름은 항상 "" 이고, 이름으로 매칭하면 0건이 나온다 —
+    #   운이 나쁜 게 아니라 산수다(실측: 25,473건 중 0건).
+    #   회사명은 사라진 게 아니라 **제목에 그대로 남아 있다.** 제목으로 폴백한다.
+    _stem = out.loc[need, "stock_name"].astype(str)
+    if "title" in out.columns:
+        _blank = _stem.str.strip().str.lower().isin(("", "nan", "none", "<na>"))
+        _stem = _stem.where(~_blank, out.loc[need, "title"].astype(str))
+        n_from_title = int(_blank.sum())
+    else:
+        n_from_title = 0
+    filled = [_match(x) for x in _stem]
     out.loc[need, "stock_code"] = filled
     n_ok = int(out["stock_code"].notna().sum()) - (len(out) - n_need)
     LOG.ok(f"리포트 종목명 매칭: {n_need:,}건 중 {n_ok:,}건에 종목코드를 붙였습니다 "
-           f"(최종 코드 보유 {int(out['stock_code'].notna().sum()):,}/{len(out):,}). "
+           f"(종목명 비어 제목에서 찾은 건 {n_from_title:,}건 · "
+           f"최종 코드 보유 {int(out['stock_code'].notna().sum()):,}/{len(out):,}). "
            f"미매칭분은 코드 없이 남기며 d2/d4 에서 제외됩니다(0 채움 아님).")
     return out
 
@@ -597,10 +613,18 @@ def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
     out["event_date"] = out["pub_date"]
     out["knowledge_date"] = out["pub_date"]
     out = out.reindex(columns=REPORT_COLS)
+    # ★ 종목명 커버리지를 반드시 함께 찍는다. 이게 빠져 있어서 '종목명이 통째로 비어
+    #   매칭이 구조적으로 0건'인 상태를 아무도 못 봤다. 안 보이는 숫자가 사고를 만든다.
+    _nm_cov = float((out["stock_name"].astype(str).str.strip()
+                     .str.lower().isin(("", "nan", "none", "<na>")) == False).mean())  # noqa: E712
     LOG.ok(f"외부 리포트 원장 흡수: {len(out):,}건 "
            f"(종목코드 {out['stock_code'].notna().mean() * 100:.0f}% · "
+           f"종목명 {_nm_cov * 100:.0f}% · "
            f"애널리스트 {(out['analyst_raw'].astype(str).str.len() > 0).mean() * 100:.0f}% · "
            f"목표주가 {out['target_price'].notna().mean() * 100:.0f}%)")
+    if _nm_cov < 0.5:
+        LOG.info("종목명 커버리지가 낮습니다 — 종목 매칭은 **제목**에서 회사명을 찾아 "
+                 "보완합니다(수집기가 코드와 종목명을 같은 정규식으로 만들기 때문입니다).")
     return out
 
 

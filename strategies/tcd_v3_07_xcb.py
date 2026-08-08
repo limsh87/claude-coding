@@ -2693,7 +2693,10 @@ def expand_events_to_months(ev: pd.DataFrame, date_col: str, months: pd.Datetime
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
-                   "corp_code", "industry", "sector_src", "src"]
+                   "corp_code", "industry", "sector_src", "src",
+                   # ★ shares 가 여기 없으면 reindex 단계에서 잘려나가고,
+                   #   15_mcap 의 sec["shares"] 분기가 **도달 불가능한 죽은 코드**가 된다.
+                   "shares", "mcap_snap"]
 
 # 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
 #   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
@@ -2835,8 +2838,11 @@ def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
                     "", "unnamed: 0", "unnamed:0", "index"):
                 df = df.drop(columns=[df.columns[0]])
             if len(df):
+                # ★ [:6] 로 자르지 않는다. 실측에서 이 절단 때문에 Marcap·Stocks 가 있는
+                #   스냅샷을 '시총 컬럼이 없다'고 오판했고, 시총 근사 경로를 통째로
+                #   포기할 뻔했다. 진단 로그가 데이터를 숨기면 진단이 아니라 오도다.
                 LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} "
-                          f"({len(df):,}행 · 컬럼 {list(df.columns)[:6]})")
+                          f"({len(df):,}행 · 컬럼 {list(df.columns)})")
                 return df
         except Exception:
             continue
@@ -2863,6 +2869,18 @@ def fetch_fdr_listing() -> pd.DataFrame:
                 "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
                 "industry": (d[col["sector"]].astype(str) if "sector" in col
                              else d[col["industry"]].astype(str) if "industry" in col else ""),
+                # ★★ 상장주식수·시가총액을 버리지 않는다 ★★
+                #   이 CSV 는 Marcap 과 Stocks 를 이미 담고 있는데(17개 컬럼) 여기서
+                #   9개 컬럼짜리 프레임으로 새로 만들며 통째로 버려 왔다. 그 결과
+                #   PIT 시총 근사(③ 상장주식수 역투영)가 **구조적으로 항상 0행**이었고,
+                #   시총이 100% '거래대금 대리(④)'로 떨어졌다 — 규모가 아니라 유동성이라
+                #   규모 밴드(U-MID)의 의미가 통째로 달라진다.
+                "shares": (pd.to_numeric(d[col["stocks"]], errors="coerce")
+                           if "stocks" in col else
+                           pd.to_numeric(d[col["shares"]], errors="coerce")
+                           if "shares" in col else np.nan),
+                "mcap_snap": (pd.to_numeric(d[col["marcap"]], errors="coerce")
+                              if "marcap" in col else np.nan),
             })
             t["sector_src"], t["src"] = "fdr_cache", "fdr_github_cache"
             t["delisting_date"] = pd.NaT
@@ -3322,6 +3340,9 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         delisting_date=("delisting_date", "max"),
         industry=("industry", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
+        # 상장주식수·시총 스냅샷은 소스마다 결측이 많으므로 최댓값(=확보된 값)을 남긴다.
+        shares=("shares", "max"),
+        mcap_snap=("mcap_snap", "max"),
     )
     assert_no_dup_cols(agg, "security_master:agg")
 
@@ -4480,18 +4501,54 @@ def fetch_dart_multi(corp_codes: Sequence[str], years: Sequence[int],
     cached = VAULT.get_table("dart_multi_raw", scope="shared")
     done = set()
     if cached is not None and len(cached):
+        # ★★ 스키마 충돌 감지 ★★ 같은 테이블명을 구 버전(v2/build 계열)도 쓰는데
+        #   그쪽 _FS_KEEP 에는 stock_code 가 없다. 그 캐시가 섞여 들어오면
+        #   corp_code 는 멀쩡한데 stock_code 만 통째로 비어, 하류에서 종목코드 해석이
+        #   실패하고 전 행이 사라진다(실측 1,249,787 → 6). 게다가 done 이 그 조합을
+        #   '완료'로 표시해 **재수집으로 스스로 치유되지도 않는다.**
+        #   지우지 않는다(절대1원칙) — 사실만 알리고 하류가 corp_code 로 복원하게 한다.
+        if "stock_code" not in cached.columns:
+            LOG.warn("공용 캐시 dart_multi_raw 에 stock_code 컬럼이 없습니다 "
+                     "(구 버전 스키마로 기록된 캐시). corp_code→종목코드 매핑으로 "
+                     "복원하므로 문제 없습니다 — 캐시는 그대로 보존합니다.")
+        else:
+            _sc_cov = float(cached["stock_code"].notna().mean())
+            if _sc_cov < 0.5:
+                LOG.warn(f"공용 캐시의 stock_code 채움률이 {_sc_cov*100:.0f}% 입니다 — "
+                         f"구·신 스키마가 섞인 캐시입니다. corp_code 로 복원합니다.")
         done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 주요계정 {len(cached):,}행 재사용")
+    # ★★ '결과가 없다'와 '물어본 적 없다'를 구분한다 ★★
+    #   done 은 캐시에 **행이 있는** 조합만 담는다. 그런데 상장 전 연도나 미제출 분기는
+    #   아무리 물어도 영원히 빈다. 그 조합이 매 실행 다시 대상이 되어,
+    #   실측에서 994배치(≈99,400조합)를 2분간 돌리고 **행수가 1도 안 늘었다**.
+    #   그리고 그건 다음 실행에도, 그 다음에도 똑같이 반복된다.
+    #   → 물어본 조합을 원장에 남긴다. 소스가 늦게 채워질 수 있으므로 영구가 아니라 20일.
+    ASK_FRESH_DAYS = 20
+    asked: set = set()
+    _ask = VAULT.get_table("dart_multi_asked", scope="shared")
+    if _ask is not None and len(_ask):
+        _age = (pd.Timestamp.now() - as_ts_series(_ask["asked_at"])).dt.total_seconds() / 86400.0
+        _fresh = _ask[_age <= ASK_FRESH_DAYS]
+        asked = set(zip(_fresh["corp_code"].astype(str),
+                        _fresh["bsns_year"].astype(int),
+                        _fresh["reprt_code"].astype(str)))
+        if len(asked):
+            LOG.info(f"최근 {ASK_FRESH_DAYS}일 내 조회한 {len(asked):,}조합은 건너뜁니다 "
+                     f"(제출이 없어 빈 응답이었던 조합 — 매 실행 다시 묻지 않습니다).")
     corps = [str(c) for c in corp_codes]
-    jobs = []
+    jobs, ask_rows = [], []
     for y in sorted(years, reverse=True):          # 최근 연도 우선 (중단돼도 최신이 남게)
         for r in reprts:
-            todo = [c for c in corps if (c, int(y), str(r)) not in done]
+            todo = [c for c in corps
+                    if (c, int(y), str(r)) not in done and (c, int(y), str(r)) not in asked]
             for i in range(0, len(todo), DART_MULTI_BATCH):
                 jobs.append((todo[i:i + DART_MULTI_BATCH], int(y), str(r)))
+            ask_rows.extend({"corp_code": c, "bsns_year": int(y), "reprt_code": str(r)}
+                            for c in todo)
     if RUN_MODE == "CACHED":
-        jobs = []
+        jobs, ask_rows = [], []
 
     def _one(job):
         batch, y, r = job
@@ -4513,12 +4570,29 @@ def fetch_dart_multi(corp_codes: Sequence[str], years: Sequence[int],
                  f"단건이면 {len(jobs)*DART_MULTI_BATCH:,}회였을 분량")
         res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="DART 주요계정(배치)")
         got = [d for d in res if d is not None and len(d)]
+        # 물어본 사실을 남긴다 — 성공이든 빈 응답이든. 이게 없으면 위 폭주가 재발한다.
+        if ask_rows:
+            _new = pd.DataFrame(ask_rows).assign(
+                asked_at=pd.Timestamp.now().isoformat(timespec="seconds"))
+            _all = (pd.concat([_ask, _new], ignore_index=True)
+                    if _ask is not None and len(_ask) else _new)
+            _all = (_all.sort_values("asked_at")
+                        .drop_duplicates(["corp_code", "bsns_year", "reprt_code"], keep="last")
+                        .reset_index(drop=True))
+            VAULT.put_table("dart_multi_asked", _all, scope="shared", domain="dart",
+                            source="fnlttMultiAcnt:asked_ledger")
+            LOG.info(f"조회 원장 {len(ask_rows):,}조합 기록 — 다음 실행은 이 지점부터 "
+                     f"이어받습니다(빈 응답 반복 차단).")
     frames = ([cached] if cached is not None and len(cached) else []) + got
     if not frames:
         return pd.DataFrame(columns=_FS_KEEP)
     M = pd.concat(frames, ignore_index=True)
-    M = M.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div", "account_nm"],
-                          keep="last")
+    # ★ fs_div 를 키에 넣는다. fnlttMultiAcnt 는 한 응답에 CFS(연결)와 OFS(별도)를 함께
+    #   주는데, 키에서 빼면 둘이 한 행으로 뭉개지고 keep="last" 가 임의로 하나를 고른다.
+    #   지주회사는 연결/별도 매출이 자릿수로 다르다 — 기업마다 무작위로 섞인 값이 된다.
+    #   (뒤에서 _fs_pri 로 CFS 를 우선하는 로직이 있는데, 여기서 이미 지워지면 무의미하다)
+    M = M.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
+                           "account_nm"], keep="last")
     if got:
         VAULT.put_table("dart_multi_raw", M, scope="shared", domain="dart",
                         source="opendart fnlttMultiAcnt")
@@ -4559,6 +4633,10 @@ _PRIOR_COLS = (("frmtrm_amount", 1), ("bfefrmtrm_amount", 2))
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 #  공시목록 — 값이 아니라 '시점'과 '이벤트'를 준다
 # ═══════════════════════════════════════════════════════════════════════════════════════════
+# 수집할 공시 유형. A·B 만으로는 XCB 의 c6·V2·V3 이 구조적으로 0건이 된다(위 주석 참조).
+DISCLOSURE_TYPES = ("A", "B", "I")
+DISCLOSURE_TYPE_NAME = {"A": "정기공시", "B": "주요사항보고", "I": "거래소공시"}
+
 DISCLOSURE_PATTERNS = {
     "treasury_acq":   r"자기주식\s*취득(?!.*신탁\s*해지)",
     "treasury_trust": r"자기주식\s*취득\s*신탁",
@@ -4585,35 +4663,54 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     if not DART_API_KEY:
         return empty
     cached = VAULT.get_table("dart_disclosures", scope="shared")
-    have_months = set()
+    have: set = set()
     if cached is not None and len(cached):
         cached = cached.copy()
         cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
         cached = cached.dropna(subset=["rcept_dt"])
-        have_months = set(cached["rcept_dt"].dt.to_period("M").astype(str))
+        _pm = cached["rcept_dt"].dt.to_period("M").astype(str)
+        if "pblntf_ty" in cached.columns:
+            have = set(zip(_pm, cached["pblntf_ty"].astype(str)))
+        else:
+            # 구 캐시에는 유형 표시가 없다. 예전 코드가 A·B 만 받았으므로 그렇게 간주하고,
+            # I(거래소공시)는 '아직 없음'으로 둬서 자동 백필되게 한다.
+            have = {(m, t) for m in set(_pm) for t in ("A", "B")}
+            LOG.info("구 버전 공시 캐시(유형 미표기)를 A·B 로 간주하고 I(거래소공시)만 "
+                     "보충합니다 — 기존 캐시는 그대로 재사용됩니다.")
         LOG.info(f"공용 캐시에서 공시목록 {len(cached):,}행 재사용")
 
     months = pd.period_range(as_ts(start), as_ts(end), freq="M")
-    todo = [m for m in months if str(m) not in have_months]
+    # ★★ I(거래소공시)를 반드시 받아야 한다 ★★
+    #   XCB 가 쓰는 네 가지 — 단일판매·공급계약(c6/TP_XC), 관리종목 지정/해제(V2),
+    #   매매거래정지(V3) — 는 전부 **거래소 수시공시**다. 예전엔 A·B 만 받아서
+    #   이 네 개가 구조적으로 0건이었다(실측: "단일판매·공급계약 공시를 찾지 못했습니다",
+    #   공시 유형별 집계에 supply_contract 가 아예 없음). 거부권 V2·V3 도 발동 불가였다.
+    todo = [(m, t) for m in months for t in DISCLOSURE_TYPES if (str(m), t) not in have]
     if RUN_MODE == "CACHED":
         todo = []
+    if todo:
+        _by_ty = Counter(t for _, t in todo)
+        LOG.info(f"공시목록 수집 대상 {len(todo):,}건 "
+                 f"({' · '.join(f'{DISCLOSURE_TYPE_NAME.get(t, t)}={n:,}개월' for t, n in sorted(_by_ty.items()))})")
 
-    def _one(m):
+    def _one(job):
+        m, ty = job
         rows = []
-        for ty in ("A", "B"):                     # A=정기공시, B=주요사항보고
-            page = 1
-            while page <= 100:
-                js = dart_api("list.json", {
-                    "bgn_de": m.start_time.strftime("%Y%m%d"),
-                    "end_de": m.end_time.strftime("%Y%m%d"),
-                    "pblntf_ty": ty, "page_no": page, "page_count": 100,
-                    "last_reprt_at": "N"})       # ★ 'N' — 정정 전 원본까지 전부 받는다
-                if not js or not isinstance(js.get("list"), list) or not js["list"]:
-                    break
-                rows.extend(js["list"])
-                if page >= int(js.get("total_page", 1) or 1):
-                    break
-                page += 1
+        page = 1
+        while page <= 100:
+            js = dart_api("list.json", {
+                "bgn_de": m.start_time.strftime("%Y%m%d"),
+                "end_de": m.end_time.strftime("%Y%m%d"),
+                "pblntf_ty": ty, "page_no": page, "page_count": 100,
+                "last_reprt_at": "N"})           # ★ 'N' — 정정 전 원본까지 전부 받는다
+            if not js or not isinstance(js.get("list"), list) or not js["list"]:
+                break
+            for r in js["list"]:
+                r["pblntf_ty"] = ty
+            rows.extend(js["list"])
+            if page >= int(js.get("total_page", 1) or 1):
+                break
+            page += 1
         return rows
 
     new = []
@@ -4627,7 +4724,7 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     if new:
         d = pd.DataFrame(new)
         keep = [c for c in ("corp_code", "corp_name", "stock_code", "rcept_no", "rcept_dt",
-                            "report_nm", "flr_nm", "corp_cls") if c in d.columns]
+                            "report_nm", "flr_nm", "corp_cls", "pblntf_ty") if c in d.columns]
         frames.append(d[keep])
     if not frames:
         return empty
@@ -4638,7 +4735,11 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     if "stock_code" in D.columns:
         D["stock_code"] = D["stock_code"].map(to_code6)
     D["event"] = ""
-    for ev, pat in DISCLOSURE_PATTERNS.items():
+    # 전략층이 추가 유형을 정의했으면 함께 태깅한다(없으면 그대로). 이렇게 해야
+    # 아래 집계 로그에 supply_contract 같은 XCB 전용 유형이 실제로 드러난다.
+    _pats = dict(DISCLOSURE_PATTERNS)
+    _pats.update(globals().get("XCB_DISCLOSURE_PATTERNS", {}) or {})
+    for ev, pat in _pats.items():
         hit = D["report_nm"].str.contains(pat, regex=True, na=False) & (D["event"] == "")
         D.loc[hit, "event"] = ev
     if new:
@@ -4649,7 +4750,15 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     D = pit_frame(D, "rcept_dt", "rcept_dt", source="dart")       # 접수일 = 공개일
     LOG.ok(f"공시목록 {len(D):,}건 — " +
            ", ".join(f"{k}={int((D['event'] == k).sum()):,}"
-                     for k in DISCLOSURE_PATTERNS if (D["event"] == k).any()))
+                     for k in _pats if (D["event"] == k).any()))
+    # ★ 거래소공시(I)를 받았는지 눈으로 확인 가능하게 남긴다 — c6·V2·V3 의 생사가 여기 달렸다.
+    if "pblntf_ty" in D.columns:
+        _tyc = D["pblntf_ty"].astype(str).value_counts().to_dict()
+        LOG.info("  공시 유형별: " + " · ".join(
+            f"{DISCLOSURE_TYPE_NAME.get(k, k)} {v:,}건" for k, v in sorted(_tyc.items())))
+        if not _tyc.get("I"):
+            LOG.warn("거래소공시(I)가 0건입니다 — 단일판매·공급계약(c6/TP_XC)과 "
+                     "관리종목·매매거래정지 거부권(V2·V3)이 전부 비활성화됩니다.")
     PIPE.io("IN", "HTTP", "dart:list", D, source="opendart list.json")
     return D
 
@@ -4753,7 +4862,9 @@ ACCOUNT_MAP: Dict[str, Tuple[str, List[str], List[str]]] = {
     "dividend_paid": ("CF", [r"DividendsPaid"], [r"배당금\s*지급"]),
     "treasury_buy":  ("CF", [r"PaymentsToAcquireOrRedeemEntitysShares"], [r"자기주식의?\s*취득"]),
     "tax_expense":   ("IS", [r"IncomeTaxExpense"], [r"법인세비용"]),
-    "pretax_income": ("IS", [r"ProfitLossBeforeTax"], [r"법인세비용차감전"]),
+    # 주요계정 명칭은 '법인세차감전 순이익', 전체재무제표는 '법인세비용차감전순이익' —
+    # '비용'을 필수로 두면 주요계정 경로에서 구조적으로 매칭이 0건이 된다.
+    "pretax_income": ("IS", [r"ProfitLossBeforeTax"], [r"법인세(비용)?차감전"]),
 }
 _SJ_ACCEPT = {"BS": ("BS",), "IS": ("IS", "CIS"), "CF": ("CF",)}
 
@@ -4797,13 +4908,30 @@ def tidy_financials(raw: pd.DataFrame, kmap: pd.DataFrame,
     if d["code"].isna().any() and code_of_corp and "corp_code" in d.columns:
         need = d["code"].isna()
         d.loc[need, "code"] = d.loc[need, "corp_code"].astype(str).map(code_of_corp)
+    # ★ 조용한 전멸을 막는다. 여기서 행이 사라지면 B·C축이 통째로 죽는데,
+    #   예전엔 아무 말 없이 dropna 만 하고 지나가 '재무 정제 6행'이 정상처럼 보였다.
+    _n0 = len(d)
     d = d.dropna(subset=["code"])
+    if _n0 and len(d) < 0.5 * _n0:
+        _has_sc = "stock_code" in d.columns or "stock_code" in base_cols
+        LOG.error(
+            f"종목코드 해석 실패로 {_n0 - len(d):,}/{_n0:,}행이 사라졌습니다 "
+            f"({len(d)/max(_n0,1)*100:.1f}%만 생존).\n"
+            f"    원인 1: 캐시가 stock_code 없이 저장된 판(구 버전 스키마) — "
+            f"{'컬럼 있음' if _has_sc else '**컬럼 자체가 없음**'}\n"
+            f"    원인 2: tidy_financials(raw, kmap, **code_of_corp**) 세 번째 인자 미전달 — "
+            f"{'전달됨' if code_of_corp else '**미전달**'}\n"
+            f"    둘 중 하나면 corp_code→종목코드 복원이 불가능해 전 행이 버려집니다.")
     if d.empty:
+        LOG.error("재무 원본에서 종목코드를 하나도 해석하지 못했습니다 — B·C축 전멸입니다.")
         return pd.DataFrame(columns=base_cols + FUNDAMENTAL_COLS)
 
     d["amount"] = _num(d["thstrm_amount"])
     d = d.dropna(subset=["amount"])
-    d["account_id"] = d["account_id"].astype(str).fillna("")
+    # ★ astype(str) 이 먼저면 None/NaN 이 "None"/"nan" 문자열이 되어 fillna 가 무의미하다.
+    #   그러면 '표준코드 없음'과 '진짜 코드'를 구분할 수 없다. 결측을 먼저 지운다.
+    d["account_id"] = d["account_id"].fillna("").astype(str).replace(
+        {"None": "", "nan": "", "<NA>": ""})
     d["account_nm"] = d["account_nm"].astype(str).str.replace(r"\s+", "", regex=True)
     d["sj_div"] = d["sj_div"].astype(str)
     # 연결(CFS) 우선. 개별만 있는 회사는 개별을 쓴다.
@@ -4846,9 +4974,17 @@ def tidy_financials(raw: pd.DataFrame, kmap: pd.DataFrame,
         return pd.DataFrame(columns=base_cols + FUNDAMENTAL_COLS)
 
     L = pd.concat(out_rows, ignore_index=True)
-    n_codes = max(L["code"].nunique(), 1)
+    # ★★ 커버리지 분모를 '살아남은 종목'으로 잡으면 안 된다 ★★
+    #   3,107사 중 5사만 남았을 때 5/5 = 100% 가 되어, 재무 전멸을 감시하라고 만든
+    #   경보가 오히려 '완전 정상'을 보고했다. 분모는 **요청한 유니버스**여야 한다.
+    n_survived = max(L["code"].nunique(), 1)
+    n_universe = max(len(code_of_corp) if code_of_corp else 0, n_survived)
     ACCOUNT_COVERAGE.clear()
-    ACCOUNT_COVERAGE.update({k: v / n_codes for k, v in cov.items()})
+    ACCOUNT_COVERAGE.update({k: v / n_universe for k, v in cov.items()})
+    if n_survived < 0.5 * n_universe:
+        LOG.error(f"재무를 확보한 종목이 {n_survived:,}개로 요청 유니버스 {n_universe:,}개의 "
+                  f"{n_survived/n_universe*100:.1f}% 에 불과합니다 — 계정 커버리지 표는 "
+                  f"**유니버스 기준**으로 계산했으니 그 낮은 값을 그대로 보세요.")
 
     W = L.pivot_table(index=["code", "bsns_year", "reprt_code"], columns="item",
                       values="amount", aggfunc="first").reset_index()
@@ -4926,10 +5062,19 @@ def tidy_financials(raw: pd.DataFrame, kmap: pd.DataFrame,
     #   ★ 월 패널에서 rolling(9) 로 세면 같은 분기값이 1~4개월 반복되므로 어떤 고정 개월수도
     #     정답이 아니다. 발동이 1~2개월 늦고 결산→1Q→반기 창은 아예 놓친다.
     #     분기 프레임은 관측당 정확히 한 행이고 이미 (code, year, q) 로 정렬돼 있다.
-    _bad = ((col(W, "net_income_ttm") > 0) &
-            (col(W, "cfo_ttm") < 0.5 * col(W, "net_income_ttm"))).astype(float)
+    #   ★★ fail-open 금지 ★★ cfo 는 fnlttMultiAcnt(주요계정)에 **없다**. 그러면
+    #     NaN 비교가 전부 False → astype(float) → 0.0 → rolling.min()=0.0 이 되어
+    #     "이익-현금 괴리 없음(깨끗함)"으로 읽힌다. 데이터가 없어서 깨끗한 것을
+    #     깨끗하다고 판정하면 그게 곧 거부권 무력화다. 없으면 결측으로 둔다.
+    _ni, _cfo = col(W, "net_income_ttm"), col(W, "cfo_ttm")
+    _bad = ((_ni > 0) & (_cfo < 0.5 * _ni)).astype(float)
+    _bad = _bad.where(_ni.notna() & _cfo.notna())        # 둘 중 하나라도 없으면 판정 불가
     W["v2_bad_3q"] = (_bad.groupby(W["code"], observed=True)
                           .transform(lambda s: s.rolling(3, min_periods=3).min()))
+    if _cfo.notna().sum() == 0:
+        LOG.warn("영업현금흐름(cfo)이 전무해 V2(이익-현금 괴리) 거부권을 **판정 불가**로 "
+                 "둡니다 — 0(깨끗함)으로 채우지 않습니다. 이 계정은 주요계정 API 에 없으며 "
+                 "fnlttSinglAcntAll(Fallback B)가 있어야 살아납니다.")
 
     miss = [k for k in ACCOUNT_MAP if W[k].notna().sum() == 0]
     if miss:
@@ -5897,11 +6042,31 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     need = d["stock_code"].isna()
     if need.any():
         d.loc[need, "stock_code"] = d.loc[need, "title"].map(code_from_title)
-    need = d["stock_code"].isna() & d["stock_name"].astype(str).str.len().gt(0)
+    # ★ 예전 조건은 `코드 없음 AND 종목명 있음` 이었는데, 수집기에서 코드와 종목명은
+    #   제목의 **같은 정규식 매치 하나**로 만들어진다(code_from_title/name_from_title).
+    #   코드가 없으면 종목명도 반드시 "" 이므로 이 조건은 **영원히 거짓**이었다 —
+    #   즉 이 보정은 처음부터 아무 일도 하지 않는 죽은 코드였다.
+    #   회사명은 제목에 남아 있으므로 종목명이 비면 제목으로 찾는다.
+    need = d["stock_code"].isna()
     if need.any() and len(sec):
         n2c = _name_to_code_map(sec)
-        d.loc[need, "stock_code"] = d.loc[need, "stock_name"].map(
-            lambda s: n2c.get(norm_corp_name(s)))
+        names = sorted(n2c, key=len, reverse=True)
+
+        def _find(stem: str) -> Optional[str]:
+            s = norm_corp_name(stem)
+            if not s:
+                return None
+            hit = n2c.get(s)
+            if hit is None:
+                for nm in names:                     # 긴 이름 우선(한화 < 한화솔루션)
+                    if len(nm) >= 2 and nm in s:
+                        return n2c[nm]
+            return hit
+
+        _stem = d.loc[need, "stock_name"].astype(str)
+        _blank = _stem.str.strip().str.lower().isin(("", "nan", "none", "<na>"))
+        _stem = _stem.where(~_blank, d.loc[need, "title"].astype(str))
+        d.loc[need, "stock_code"] = [_find(x) for x in _stem]
 
     d["title"] = d["title"].map(_dedup_repeat)
     # report_uid 는 '한 번 붙으면 안 바뀌는' 식별자여야 한다. 이미 붙어 있으면 보존한다.
@@ -7119,6 +7284,8 @@ def resolve_report_codes(reports: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFra
         return reports
     n2c = _name_to_code_map(sec)
     if not n2c:
+        LOG.warn("종목 마스터에서 이름→코드 표를 만들지 못했습니다(name/code 컬럼 확인) — "
+                 "리포트 종목 매칭을 건너뜁니다. d2/d4 커버리지가 그만큼 낮아집니다.")
         return reports
     # 종목명 후보를 길이순으로 훑어 가장 긴 일치를 택한다(‘한화’ 가 ‘한화솔루션’을 먹지 않게).
     names = sorted(n2c, key=len, reverse=True)
@@ -7140,11 +7307,25 @@ def resolve_report_codes(reports: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFra
         return hit
 
     out = reports.copy()
-    filled = [_match(x) for x in out.loc[need, "stock_name"].astype(str)]
+    # ★★ stock_name 만 보면 **구조적으로 0건** 이다 ★★
+    #   수집기에서 stock_code 와 stock_name 은 제목의 **같은 정규식 매치 하나**로 만들어진다
+    #   (code_from_title / name_from_title). 즉 코드가 없으면 이름도 반드시 빈 문자열이다.
+    #   따라서 '코드가 없는 행'의 이름은 항상 "" 이고, 이름으로 매칭하면 0건이 나온다 —
+    #   운이 나쁜 게 아니라 산수다(실측: 25,473건 중 0건).
+    #   회사명은 사라진 게 아니라 **제목에 그대로 남아 있다.** 제목으로 폴백한다.
+    _stem = out.loc[need, "stock_name"].astype(str)
+    if "title" in out.columns:
+        _blank = _stem.str.strip().str.lower().isin(("", "nan", "none", "<na>"))
+        _stem = _stem.where(~_blank, out.loc[need, "title"].astype(str))
+        n_from_title = int(_blank.sum())
+    else:
+        n_from_title = 0
+    filled = [_match(x) for x in _stem]
     out.loc[need, "stock_code"] = filled
     n_ok = int(out["stock_code"].notna().sum()) - (len(out) - n_need)
     LOG.ok(f"리포트 종목명 매칭: {n_need:,}건 중 {n_ok:,}건에 종목코드를 붙였습니다 "
-           f"(최종 코드 보유 {int(out['stock_code'].notna().sum()):,}/{len(out):,}). "
+           f"(종목명 비어 제목에서 찾은 건 {n_from_title:,}건 · "
+           f"최종 코드 보유 {int(out['stock_code'].notna().sum()):,}/{len(out):,}). "
            f"미매칭분은 코드 없이 남기며 d2/d4 에서 제외됩니다(0 채움 아님).")
     return out
 
@@ -7210,10 +7391,18 @@ def foreign_reports(cat: "Optional[ForeignCatalog]") -> pd.DataFrame:
     out["event_date"] = out["pub_date"]
     out["knowledge_date"] = out["pub_date"]
     out = out.reindex(columns=REPORT_COLS)
+    # ★ 종목명 커버리지를 반드시 함께 찍는다. 이게 빠져 있어서 '종목명이 통째로 비어
+    #   매칭이 구조적으로 0건'인 상태를 아무도 못 봤다. 안 보이는 숫자가 사고를 만든다.
+    _nm_cov = float((out["stock_name"].astype(str).str.strip()
+                     .str.lower().isin(("", "nan", "none", "<na>")) == False).mean())  # noqa: E712
     LOG.ok(f"외부 리포트 원장 흡수: {len(out):,}건 "
            f"(종목코드 {out['stock_code'].notna().mean() * 100:.0f}% · "
+           f"종목명 {_nm_cov * 100:.0f}% · "
            f"애널리스트 {(out['analyst_raw'].astype(str).str.len() > 0).mean() * 100:.0f}% · "
            f"목표주가 {out['target_price'].notna().mean() * 100:.0f}%)")
+    if _nm_cov < 0.5:
+        LOG.info("종목명 커버리지가 낮습니다 — 종목 매칭은 **제목**에서 회사명을 찾아 "
+                 "보완합니다(수집기가 코드와 종목명을 같은 정규식으로 만들기 때문입니다).")
     return out
 
 
@@ -12002,7 +12191,11 @@ def main_xcb() -> int:
         dis = fetch_dart_disclosures(BACKTEST_START.replace("-", ""),
                                      BACKTEST_END.replace("-", ""))
         kmap = build_knowledge_map(dis)
-        fin = tidy_financials(raw, kmap)
+        # ★★ code_of 를 반드시 넘긴다 ★★
+        #   벌크는 stock_code 로, API(fnlttMultiAcnt)는 corp_code 로 온다.
+        #   이 인자를 빠뜨리면 corp_code→종목코드 복원 분기가 죽고 dropna(subset=["code"])가
+        #   전 행을 지운다. 실측: 1,249,787행 → **6행**. B·C축·θ_X·d1 이 통째로 사망했다.
+        fin = tidy_financials(raw, kmap, code_of)
         # ★ 직원현황(c3·c4)은 **매핑이 끝난 뒤** 그 종목들만 받는다.
         #   여기서 받으면 대상이 확정되지 않아 전 상장사 × 12년이 되고, 그중 대부분은
         #   유니버스에 들어오지도 못해 통째로 버려진다. L2.PANEL 직전으로 옮겼다.

@@ -17,7 +17,10 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
-                   "corp_code", "industry", "sector_src", "src"]
+                   "corp_code", "industry", "sector_src", "src",
+                   # ★ shares 가 여기 없으면 reindex 단계에서 잘려나가고,
+                   #   15_mcap 의 sec["shares"] 분기가 **도달 불가능한 죽은 코드**가 된다.
+                   "shares", "mcap_snap"]
 
 # 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
 #   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
@@ -159,8 +162,11 @@ def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
                     "", "unnamed: 0", "unnamed:0", "index"):
                 df = df.drop(columns=[df.columns[0]])
             if len(df):
+                # ★ [:6] 로 자르지 않는다. 실측에서 이 절단 때문에 Marcap·Stocks 가 있는
+                #   스냅샷을 '시총 컬럼이 없다'고 오판했고, 시총 근사 경로를 통째로
+                #   포기할 뻔했다. 진단 로그가 데이터를 숨기면 진단이 아니라 오도다.
                 LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} "
-                          f"({len(df):,}행 · 컬럼 {list(df.columns)[:6]})")
+                          f"({len(df):,}행 · 컬럼 {list(df.columns)})")
                 return df
         except Exception:
             continue
@@ -187,6 +193,18 @@ def fetch_fdr_listing() -> pd.DataFrame:
                 "listing_date": as_ts_series(d[col["listingdate"]]) if "listingdate" in col else pd.NaT,
                 "industry": (d[col["sector"]].astype(str) if "sector" in col
                              else d[col["industry"]].astype(str) if "industry" in col else ""),
+                # ★★ 상장주식수·시가총액을 버리지 않는다 ★★
+                #   이 CSV 는 Marcap 과 Stocks 를 이미 담고 있는데(17개 컬럼) 여기서
+                #   9개 컬럼짜리 프레임으로 새로 만들며 통째로 버려 왔다. 그 결과
+                #   PIT 시총 근사(③ 상장주식수 역투영)가 **구조적으로 항상 0행**이었고,
+                #   시총이 100% '거래대금 대리(④)'로 떨어졌다 — 규모가 아니라 유동성이라
+                #   규모 밴드(U-MID)의 의미가 통째로 달라진다.
+                "shares": (pd.to_numeric(d[col["stocks"]], errors="coerce")
+                           if "stocks" in col else
+                           pd.to_numeric(d[col["shares"]], errors="coerce")
+                           if "shares" in col else np.nan),
+                "mcap_snap": (pd.to_numeric(d[col["marcap"]], errors="coerce")
+                              if "marcap" in col else np.nan),
             })
             t["sector_src"], t["src"] = "fdr_cache", "fdr_github_cache"
             t["delisting_date"] = pd.NaT
@@ -646,6 +664,9 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         delisting_date=("delisting_date", "max"),
         industry=("industry", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
+        # 상장주식수·시총 스냅샷은 소스마다 결측이 많으므로 최댓값(=확보된 값)을 남긴다.
+        shares=("shares", "max"),
+        mcap_snap=("mcap_snap", "max"),
     )
     assert_no_dup_cols(agg, "security_master:agg")
 

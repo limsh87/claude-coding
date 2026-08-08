@@ -386,7 +386,11 @@ def main_xcb() -> int:
         dis = fetch_dart_disclosures(BACKTEST_START.replace("-", ""),
                                      BACKTEST_END.replace("-", ""))
         kmap = build_knowledge_map(dis)
-        fin = tidy_financials(raw, kmap)
+        # ★★ code_of 를 반드시 넘긴다 ★★
+        #   벌크는 stock_code 로, API(fnlttMultiAcnt)는 corp_code 로 온다.
+        #   이 인자를 빠뜨리면 corp_code→종목코드 복원 분기가 죽고 dropna(subset=["code"])가
+        #   전 행을 지운다. 실측: 1,249,787행 → **6행**. B·C축·θ_X·d1 이 통째로 사망했다.
+        fin = tidy_financials(raw, kmap, code_of)
         # ★ 직원현황(c3·c4)은 **매핑이 끝난 뒤** 그 종목들만 받는다.
         #   여기서 받으면 대상이 확정되지 않아 전 상장사 × 12년이 되고, 그중 대부분은
         #   유니버스에 들어오지도 못해 통째로 버려진다. L2.PANEL 직전으로 옮겼다.

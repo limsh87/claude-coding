@@ -169,11 +169,31 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     need = d["stock_code"].isna()
     if need.any():
         d.loc[need, "stock_code"] = d.loc[need, "title"].map(code_from_title)
-    need = d["stock_code"].isna() & d["stock_name"].astype(str).str.len().gt(0)
+    # ★ 예전 조건은 `코드 없음 AND 종목명 있음` 이었는데, 수집기에서 코드와 종목명은
+    #   제목의 **같은 정규식 매치 하나**로 만들어진다(code_from_title/name_from_title).
+    #   코드가 없으면 종목명도 반드시 "" 이므로 이 조건은 **영원히 거짓**이었다 —
+    #   즉 이 보정은 처음부터 아무 일도 하지 않는 죽은 코드였다.
+    #   회사명은 제목에 남아 있으므로 종목명이 비면 제목으로 찾는다.
+    need = d["stock_code"].isna()
     if need.any() and len(sec):
         n2c = _name_to_code_map(sec)
-        d.loc[need, "stock_code"] = d.loc[need, "stock_name"].map(
-            lambda s: n2c.get(norm_corp_name(s)))
+        names = sorted(n2c, key=len, reverse=True)
+
+        def _find(stem: str) -> Optional[str]:
+            s = norm_corp_name(stem)
+            if not s:
+                return None
+            hit = n2c.get(s)
+            if hit is None:
+                for nm in names:                     # 긴 이름 우선(한화 < 한화솔루션)
+                    if len(nm) >= 2 and nm in s:
+                        return n2c[nm]
+            return hit
+
+        _stem = d.loc[need, "stock_name"].astype(str)
+        _blank = _stem.str.strip().str.lower().isin(("", "nan", "none", "<na>"))
+        _stem = _stem.where(~_blank, d.loc[need, "title"].astype(str))
+        d.loc[need, "stock_code"] = [_find(x) for x in _stem]
 
     d["title"] = d["title"].map(_dedup_repeat)
     # report_uid 는 '한 번 붙으면 안 바뀌는' 식별자여야 한다. 이미 붙어 있으면 보존한다.
