@@ -49,6 +49,10 @@ def report_performance_v3(bt: dict, bench: Dict[str, pd.Series], label: str = ""
                       ["l", "r", "r", "r", "r", "r", "r"],
                       title="벤치마크 대비 (이 실행에서 직접 재측정 — 인용 없음)")
 
+    if "월평균현금비중" in s and np.isfinite(s.get("월평균현금비중", np.nan)):
+        LOG.info(f"월평균 현금 비중 {s['월평균현금비중']:.1%} — 이 비중만큼은 시장에 노출되지 "
+                 f"않았습니다. 다른 팔과 CAGR 을 비교하기 전에 이 값부터 맞춰 보세요.")
+    report_emp_regime_v3(bt)
     rt = right_tail_contribution(bt)
     if rt:
         LOG.table([[k, f"{v:.4f}" if isinstance(v, float) else str(v)] for k, v in rt.items()],
@@ -59,6 +63,50 @@ def report_performance_v3(bt: dict, bench: Dict[str, pd.Series], label: str = ""
             LOG.warn(f"총기여의 {100*top5/base:.0f}%가 상위 5% 종목에서 나옵니다. "
                      f"이 전략은 우측 꼬리 의존적입니다 — 표본 밖에서 재현되지 않을 위험이 "
                      f"IR 이 시사하는 것보다 훨씬 큽니다. 숨기지 않고 명시합니다.")
+
+
+def report_emp_regime_v3(bt: dict) -> None:
+    """★★ 이 전략의 결과를 CAGR 한 줄로 말하면 안 되는 이유를 표로 보여준다 ★★
+
+    7회차 실행의 직원현황 커버리지는 2022~2025 네 해뿐이었다. 백테스트는 120개월인데
+    앞 80개월에는 EMP 센서가 한 건도 없다. 그 구간의 성과는 **CORE-D 단독 전략**의
+    성과이고, 뒤 40개월만이 'CORE-D + EMP-LITE' 다. 두 구간을 복리로 이어 붙여
+    "이 전략의 10년 CAGR" 이라고 부르면, 존재한 적 없는 하나의 전략을 보고하는 셈이다.
+
+    → 신호가 실제로 존재한 구간과 아닌 구간을 갈라서 나란히 낸다. 합산값도 함께 두되,
+      그것이 두 전략의 이어붙임이라는 사실을 표 제목에 적는다. 숨기고 합치지 않는다.
+    """
+    lo, hi = EMP_SIGNAL_SPAN.get("lo"), EMP_SIGNAL_SPAN.get("hi")
+    R = bt.get("returns")
+    if R is None or R.empty or lo is None or hi is None:
+        return
+    R = R.copy()
+    R["month"] = as_ts_series(R["month"])
+    on = (R["month"] >= as_ts(lo)) & (R["month"] <= as_ts(hi))
+    pre = R[~on]
+    if len(pre) < 6 or int(on.sum()) < 6:
+        return                       # 한쪽이 없으면 가를 것이 없다(전 구간이 같은 레짐)
+    rows = []
+    for lab, sub, note in (
+            ("EMP 신호 없음 (CORE-D 단독)", pre, "직원현황 미수집 구간"),
+            (f"EMP 신호 있음 ({as_ts(lo):%Y-%m}~{as_ts(hi):%Y-%m})", R[on],
+             "CORE-D + EMP-LITE"),
+            ("합산 (두 전략의 이어붙임)", R, "★ 하나의 전략이 아님")):
+        st = perf_stats(sub.reset_index(drop=True))
+        _f = lambda k, fmt: (format(st[k], fmt)
+                             if k in st and np.isfinite(st.get(k, np.nan)) else "-")
+        rows.append([lab, f"{len(sub)}", _f("CAGR", ".2%"), _f("Sharpe", ".2f"),
+                     _f("MDD", ".1%"), _f("t통계량(HAC)", ".2f"), note])
+    LOG.table(rows, ["구간", "월수", "CAGR", "Sharpe", "MDD", "t(HAC)", "비고"],
+              ["l", "r", "r", "r", "r", "r", "l"],
+              title="★ EMP 레짐 분할 — 이 표를 보기 전에 위의 합산 CAGR 을 인용하지 마십시오")
+    LOG.warn(f"직원현황(알파 원천)이 존재한 구간은 {int(on.sum())}/{len(R)}개월"
+             f"({on.mean():.0%})뿐입니다. 나머지 {len(pre)}개월은 CORE-D 5개 TP 만으로 돈 "
+             f"**다른 전략**입니다. 두 구간을 복리로 이어 붙인 값을 '이 전략의 10년 성과'로 "
+             f"쓰면 존재한 적 없는 전략을 보고하는 것이 됩니다. "
+             f"결론은 위 표의 'EMP 신호 있음' 행에서 읽으시고, 그 구간이 짧다면 "
+             f"직원현황을 더 채운 뒤 재판정하세요 — 격자가 회사 우선이라 재실행할수록 "
+             f"과거 구간이 함께 채워집니다.")
 
 
 INTERP_D_STATE_V3 = [

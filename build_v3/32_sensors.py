@@ -198,19 +198,41 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     g = lambda c: gby(P, c)
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ '같은 공시를 두 번 보고 차분한 것'을 관측으로 세지 않는다 ★★
+    #    as-of 결합은 마지막으로 알려진 재무를 최대 550일까지 실어 나른다(PIT_ASOF_MAX_DAYS).
+    #    550일 ≈ 18개월이므로, 격자가 비어 다음 사업보고서를 못 받은 회사에서는
+    #    **t 와 t-12 가 같은 공시**를 가리키는 구간이 생긴다. 그 상태로 diff(12) 를 하면
+    #    결측이 아니라 **정확히 0.0** 이 나온다. 0.0 은 '변화 없음' 이라는 관측처럼 보여서
+    #      · MIN_TP_OBSERVED(FLOOR) 게이트를 통과하고
+    #      · 셀 랭크에서 중간 순위를 차지하고
+    #      · 커버리지 표에는 '관측 있음'으로 집계된다.
+    #    즉 데이터가 없다는 사실이 '변화가 없었다'는 사실로 둔갑한다 — 조용히 틀리는 쪽이다.
+    #    다행히 패널에는 이미 kd_fin(재무 지식일)이 붙어 있으므로 한 줄로 판별된다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    if "kd_fin" in P.columns:
+        _kd = as_ts_series(P["kd_fin"])
+        P["_kd_fin_ts"] = _kd
+        _stale = (_kd.notna() & g("_kd_fin_ts").shift(12).eq(_kd)).fillna(False)
+        P = P.drop(columns=["_kd_fin_ts"], errors="ignore")
+    else:
+        _stale = pd.Series(False, index=P.index)
+    _n_stale = int(_stale.sum())
+    _fresh = lambda s: s.where(~_stale)      # 같은 공시 재사용 구간은 결측으로 되돌린다
+
     # i_sales — 매출 TTM 의 전년동월 대비 로그변화
-    P["i_sales"] = g("revenue_ttm").transform(lambda s: dlog(s, 12))
+    P["i_sales"] = _fresh(g("revenue_ttm").transform(lambda s: dlog(s, 12)))
 
     # i_dio / i_dso / i_turn — 회전일수는 '줄어드는 것'이 좋으므로 부호를 뒤집는다
     P["i_dio"] = safe_div(col(P, "inventory"), col(P, "cogs_ttm")) * 365.0
     P["i_dso"] = safe_div(col(P, "receivable"), col(P, "revenue_ttm")) * 365.0
     P["turn_days"] = P["i_dio"] + P["i_dso"]
-    P["i_turn"] = -g("turn_days").diff(12)
+    P["i_turn"] = _fresh(-g("turn_days").diff(12))
 
     # i_accr — Sloan 발생액. 순이익이 음수인 구간에서도 안전(분모가 평균총자산이므로)
     avg_assets = (col(P, "assets") + g("assets").shift(12)) / 2.0
     P["accruals"] = safe_div(col(P, "net_income_ttm") - col(P, "cfo_ttm"), avg_assets)
-    P["i_accr"] = -g("accruals").diff(12)
+    P["i_accr"] = _fresh(-g("accruals").diff(12))
 
     # i_capex — 유형자산취득 / 직전 3년 평균.  1.0 이면 평년 수준, 2.0 이면 두 배 투자.
     #   ★ 분모는 '직전' 3년이어야 한다. 현재를 포함하면 자기 자신으로 나누는 꼴이 되어
@@ -222,7 +244,7 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["_capex_abs"] = capex_abs
     base3 = (g("_capex_abs")
              .transform(lambda s: s.shift(12).rolling(36, min_periods=12).mean()))
-    P["i_capex"] = safe_div(capex_abs, base3)
+    P["i_capex"] = _fresh(safe_div(capex_abs, base3))
 
     # i_ic / i_roic — 투하자본과 그 수익률
     # ★ 구성항목을 각각 fillna(0) 한 뒤 더하면, 계정이 **하나도 없는** 회사의 IC 가
@@ -236,14 +258,14 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     nwc = (col(P, "receivable").fillna(0) + col(P, "inventory").fillna(0)
            - col(P, "payable").fillna(0))
     P["IC"] = (nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)).where(_ic_obs)
-    P["i_ic"] = g("IC").transform(lambda s: dlog(s, 12))
+    P["i_ic"] = _fresh(g("IC").transform(lambda s: dlog(s, 12)))
     #   NOPAT: 실효세율이 관측되면 그걸 쓰고, 아니면 22% 가정. 셀 내 상대값이라 수준은 무해.
     eff = safe_div(col(P, "tax_expense_ttm"), col(P, "pretax_income_ttm"))
     eff = eff.where((eff >= 0) & (eff <= 0.6))
     P["nopat"] = col(P, "op_income_ttm") * (1.0 - eff.fillna(0.22))
     avg_ic = (P["IC"] + g("IC").shift(12)) / 2.0
     P["ROIC"] = safe_div(P["nopat"], avg_ic)
-    P["i_roic"] = g("ROIC").diff(12)
+    P["i_roic"] = _fresh(g("ROIC").diff(12))
 
     # p_payout / p_invest — 자본배분
     # ★ 같은 함정이 여기 두 번 더 있었다. capex_ttm·rnd_ttm 이 **통째로 없는** 실행에서
@@ -254,12 +276,12 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     payout = (col(P, "dividend_paid_ttm").abs().fillna(0)
               + col(P, "treasury_buy_ttm").abs().fillna(0)).where(_payout_obs)
     P["payout_ratio"] = safe_div(payout, col(P, "cfo_ttm"))
-    P["p_payout"] = g("payout_ratio").diff(12)
+    P["p_payout"] = _fresh(g("payout_ratio").diff(12))
     _invest_obs = col(P, "capex_ttm").notna() | col(P, "rnd_ttm").notna()
     invest = (col(P, "capex_ttm").abs().fillna(0)
               + col(P, "rnd_ttm").abs().fillna(0)).where(_invest_obs)
     P["invest_ratio"] = safe_div(invest, col(P, "revenue_ttm"))
-    P["p_invest"] = g("invest_ratio").diff(12)
+    P["p_invest"] = _fresh(g("invest_ratio").diff(12))
 
     # p_cancel — 자사주 취득공시 대비 12M 내 실제 소각 실행률 (한국 특수성: 취득≠소각)
     P = _attach_treasury(P, ctx)
@@ -268,10 +290,16 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["eff_tax"] = safe_div(col(P, "tax_expense_ttm"),
                             col(P, "pretax_income_ttm").where(col(P, "pretax_income_ttm") > 0))
     P["eff_tax"] = P["eff_tax"].where((P["eff_tax"] >= -0.5) & (P["eff_tax"] <= 1.0))
-    P["d_eff_tax"] = g("eff_tax").diff(12)
+    P["d_eff_tax"] = _fresh(g("eff_tax").diff(12))
 
     P["equity_impaired"] = (col(P, "equity") <= 0)
     P = P.drop(columns=["_capex_abs"], errors="ignore")
+    if _n_stale:
+        LOG.warn(f"★ 12개월 전과 **같은 재무공시**를 보고 있는 {_n_stale:,}행"
+                 f"({100*_n_stale/max(len(P),1):.1f}%)의 CORE-D 차분 센서를 결측 처리했습니다. "
+                 f"그대로 두면 diff(12) 가 결측이 아니라 정확히 0.0 이 되어 '변화 없음'이라는 "
+                 f"관측으로 둔갑하고, 최소 TP 관측수 게이트와 커버리지 표를 동시에 속입니다. "
+                 f"원인은 격자 결손(Tier-2 미수집)이며, 재실행으로 채우면 이 수가 줄어듭니다.")
     return P
 
 
@@ -305,6 +333,11 @@ def _attach_treasury(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                              P["treasury_acq_n"].where(P["treasury_acq_n"] > 0)).clip(0, 2)
     P["acq_size"] = safe_div(col(P, "treasury_buy_ttm").abs(), col(P, "assets"))
     return P
+
+
+# ★ EMP 신호가 실제로 존재한 달의 범위. 리포트가 '두 전략의 이어붙임'을 가르는 근거다.
+#   여기서 채워 두지 않으면 L6 이 120개월을 하나의 전략처럼 합산해 보고한다.
+EMP_SIGNAL_SPAN: Dict[str, Any] = {"lo": None, "hi": None, "n_rows": 0}
 
 
 # ── EMP-LITE 파생 (연도 프레임 센서는 이미 붙어 있고, 여기선 패널 결합이 필요한 것만) ───────
@@ -353,6 +386,26 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
                 P.loc[pre, c] = np.nan
         LOG.warn(f"§6 커버리지 판정에 따라 {as_ts(emp_start):%Y-%m} 이전 {n:,}행의 EMP 센서를 "
                  f"결측 처리했습니다. 이 구간은 CORE-D 5개 TP 만으로 평가됩니다.")
+
+    # ★ 알파(직원현황)가 실제로 관측된 달의 범위를 기록한다. 이것이 없으면 L6 이
+    #   'EMP 없는 80개월 + EMP 있는 40개월' 을 하나의 10년 전략으로 합산해 보고한다.
+    _obs = pd.Series(False, index=P.index)
+    for c in ("nl_emp", "nl_premium"):
+        if c in P.columns:
+            _obs |= col(P, c).notna()
+    if bool(_obs.any()):
+        _mm = P.loc[_obs, "month"]
+        EMP_SIGNAL_SPAN.update({"lo": _mm.min(), "hi": _mm.max(),
+                                "n_rows": int(_obs.sum())})
+        _tot = int(P["month"].nunique())
+        _cov = int(P.loc[_obs, "month"].nunique())
+        LOG.info(f"EMP 신호 존재 구간 {_mm.min():%Y-%m}~{_mm.max():%Y-%m} — "
+                 f"{_cov}/{_tot}개월({_cov/max(_tot,1):.0%})에 관측이 있습니다. "
+                 f"나머지 달은 CORE-D 단독으로 돕니다(성과 보고 시 분리 표기).")
+    else:
+        EMP_SIGNAL_SPAN.update({"lo": None, "hi": None, "n_rows": 0})
+        LOG.warn("EMP 신호가 어느 달에도 존재하지 않습니다 — 이 실행은 사실상 "
+                 "'CORE-D 단독' 전략입니다. 결론에 그대로 명시하세요.")
     return P
 
 
@@ -361,12 +414,21 @@ UMID_RANK_LO, UMID_RANK_HI = 251, 1400
 
 
 def universe_band(name: str) -> Tuple[int, int, float]:
-    """(랭크 하한, 랭크 상한, 거래대금 하한). 비교용 대역을 한 곳에서 정의한다."""
+    """(랭크 하한, 랭크 상한, 거래대금 하한). 비교용 대역을 한 곳에서 정의한다.
+
+    ★ 랭크는 **유동성 하한을 통과한 집합 안에서** 매긴 순위다(apply_umid 참조).
+      전 종목 기준 순위가 아니다 — 그렇게 하면 랭크 변수와 하한 변수가 같은 adv20 이라
+      하위 대역이 정의상 공집합이 된다.
+    """
     if name == "SMALL":
-        # 시총(대리: 거래대금) 하위 1,000. 유동성 하한은 그대로 두어야 '못 담는 종목으로
-        # 만든 성과'가 되지 않는다. 하한을 낮추면 체결 불가능한 종목이 섞여 성과가
-        # 부풀려진다 — 비교의 의미가 사라진다.
-        return SMALL_RANK_LO, SMALL_RANK_HI, MIN_ADV_KRW
+        # 시총(대리: 거래대금) 하위 SMALL_BAND_N 개. 유동성 하한은 그대로 두어야
+        # '못 담는 종목으로 만든 성과'가 되지 않는다.
+        # ★ 하한이 절대 랭크(1401~2400)로 박혀 있으면, 담을 수 있는 종목이 월 1,400개인
+        #   시장에서 이 대역은 **영구히 비어 있다**(7회차 월 2.5종목). 그러면 비교팔이
+        #   '소형주는 성과가 나쁘다'가 아니라 '대역을 잘못 정의했다'를 재게 된다.
+        #   → 아래에서 -1 은 '매월 담을 수 있는 종목의 **끝에서부터**' 를 뜻하는 표식이고,
+        #     실제 경계는 apply_umid 가 그 달의 가용 종목수에서 계산한다.
+        return -SMALL_BAND_N, -1, MIN_ADV_KRW
     if name == "ALL":
         # ★ 전체 종목. 규모 랭크 제한 없음 — 대형주부터 소형주까지 전부.
         #   유동성 하한만 남긴다(체결 불가 종목을 넣으면 비교 자체가 성립하지 않는다).
@@ -388,9 +450,41 @@ def apply_umid(P: pd.DataFrame, uni: "Universe", band: str = "UMID") -> pd.DataF
     lo, hi, adv_min = universe_band(band)
     P = P.copy()
     adv = col(P, "adv20")
-    rank = adv.groupby(P["month"], observed=True).rank(ascending=False, method="first")
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 랭크는 '유동성 하한을 통과한 집합 안에서' 매긴다 ★★
+    #    예전엔 전 종목에서 랭크를 매긴 뒤 `rank.between(lo,hi) & (adv >= adv_min)` 로
+    #    둘을 AND 했다. 그런데 **랭크 변수와 하한 변수가 똑같이 adv20** 이다.
+    #    하한(3억)을 넘는 종목이 월 1,400개 안팎이면, 랭크 1401~2400 구간은 정의상
+    #    전부 하한 미달이라 교집합이 **거의 공집합**이 된다.
+    #    7회차 스몰캡 팔이 월평균 2.5종목이었던 이유가 이것이다 — 신호가 나빠서가 아니라
+    #    대역 정의가 스스로를 배제하고 있었다. 그 위에서 '규모 대역의 효과'를 논했다.
+    #  → 하한을 먼저 적용해 '실제로 담을 수 있는 종목'을 확정하고, 그 안에서 랭크를 매긴다.
+    #    이러면 SMALL 은 '담을 수 있는 종목 중 규모 하위 N' 이라는 원래 의도가 되고,
+    #    사용자 요구('시총하위 1000개 종목 한정')와도 정확히 맞는다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    tradable = (adv >= adv_min).fillna(False)
+    rank = adv.where(tradable).groupby(P["month"], observed=True).rank(
+        ascending=False, method="first")
     P["size_rank"] = rank
-    P["u_mid"] = (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
+    n_tr = tradable.groupby(P["month"], observed=True).transform("sum")
+    if lo < 0:
+        # '끝에서부터' 대역 — 그 달 담을 수 있는 종목수에서 역산한다. 시장 규모가 해마다
+        # 달라지므로 절대 랭크로 박으면 어떤 해에는 비고 어떤 해에는 넘친다.
+        _lo_m = (n_tr + lo + 1).clip(lower=1)      # lo = -1000 → 끝에서 1000번째
+        _hi_m = n_tr
+        P["u_mid"] = (tradable & (rank >= _lo_m) & (rank <= _hi_m)).fillna(False)
+        _width = float((_hi_m - _lo_m + 1).mean()) if len(P) else 0.0
+        LOG.info(f"{band} 대역 = 매월 '담을 수 있는 종목'의 하위 {abs(lo):,}개 — "
+                 f"월평균 가용 {float(n_tr.mean()):,.0f}종목 중 실제 폭 {_width:,.0f}종목. "
+                 f"절대 랭크로 박지 않는 이유: 시장 규모가 해마다 달라 어떤 해에는 대역이 "
+                 f"통째로 비어 버립니다(7회차 스몰캡 팔 월 2.5종목의 원인).")
+    else:
+        P["u_mid"] = (tradable & rank.between(lo, hi)).fillna(False)
+        _n_tr = float(n_tr.mean()) if len(P) else 0.0
+        if band != "ALL" and _n_tr and hi > _n_tr:
+            LOG.warn(f"{band} 대역의 랭크 상한({hi:,})이 유동성 하한을 통과하는 월평균 종목수"
+                     f"({_n_tr:,.0f})를 넘습니다 — 대역 뒷부분이 비어 실제 폭이 "
+                     f"{max(0.0, _n_tr - lo + 1):,.0f}종목으로 줄어듭니다.")
     # ★ 감쇠 원장에 **어느 팔인지** 를 함께 남긴다. 전체(ALL)와 하위1000(SMALL)이
     #   같은 태그로 섞이면 뒤 단계가 앞 단계보다 커져 잔존율이 100%를 넘는다(7회차 113.7%).
     for m, g in P.groupby("month", observed=True):

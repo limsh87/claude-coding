@@ -49,6 +49,40 @@ def report_cell_rank_diag(top: int = 24):
               ["l", "r", "r", "l", "l"],
               title="셀 랭크 진단 — '입력이 없어서'와 '표본이 모자라서'를 구별합니다")
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 사다리가 실제로 밟혔는가 — **행 수가 아니라 랭크 해결 건수**로 판정한다 ★★
+    #    build_cells_v3 의 사다리 표는 '셀당 행 수'를 센다. 그런데 cell_rank 의 게이트는
+    #    **센서별 유효관측수**(transform("count"))다. 30행짜리 셀이라도 그 센서를 관측한
+    #    종목이 3개면 1단은 못 밟고 아래로 내려간다.
+    #    그래서 행 기준 표에는 '표본≥8 비율 88%' 처럼 건강하게 찍히는데, 실제로는
+    #    랭크의 대부분이 4단(month|ALL|ALL = 전체시장)에서 해결되고 있을 수 있다.
+    #    그 상태면 산업·규모 중립화는 **한 번도 일어나지 않은 것**이고, 정책효과가
+    #    셀 내 공통충격으로 흡수된다는 이 전략의 전제(§8)가 통째로 깨진다.
+    #    감지 장치가 셋인데 셋 다 행을 세고 있었으므로 절대 걸리지 않았다 — 그래서 여기서 센다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    agg: Dict[str, int] = {}
+    for d in CELL_RANK_DIAG:
+        for k, v in (d.get("by_level") or {}).items():
+            agg[k] = agg.get(k, 0) + int(v)
+    tot = sum(agg.values())
+    if not tot:
+        return
+    _nm = {"cell": "1단 month|업종|규모", "cell_l2": "2단 month|업종|ALL",
+           "cell_l3": "3단 month|업종군|ALL", "cell_l4": "4단 month|ALL|ALL(전체시장)"}
+    LOG.table([[_nm.get(k, k), f"{agg.get(k, 0):,}", f"{100*agg.get(k, 0)/tot:.1f}%"]
+               for k in CELL_LADDER_V3 if k in agg],
+              ["실제 해결 단계", "랭크 산출 건수", "비중"], ["l", "r", "r"],
+              title="셀 사다리 실효 사용률 — 행 수가 아니라 '센서별 유효관측' 기준")
+    _flat = agg.get("cell_l4", 0) / tot
+    if _flat > 0.5:
+        LOG.warn(f"★ 셀 랭크의 {_flat:.0%}가 **전체시장(4단)** 에서 해결됐습니다 — 산업·규모 "
+                 f"중립화가 사실상 일어나지 않았습니다. 스펙 §8 이 셀에 규모를 넣은 이유는 "
+                 f"정부 지원제도가 기업 규모에 연동되므로 정책효과를 셀 내 공통충격으로 "
+                 f"흡수시키기 위함인데, 전체시장 랭크로 떨어지면 그 흡수가 사라지고 "
+                 f"규모효과·산업효과가 신호로 둔갑합니다. "
+                 f"원인은 센서 커버리지 부족(Tier-2·직원현황 미수집)이지 셀 정의가 아닙니다 — "
+                 f"CELL_MIN_N_V3 를 낮추지 마시고 수집을 채우세요.")
+
 
 def _clean_num(P: pd.DataFrame, name_or_series) -> pd.Series:
     v = col(P, name_or_series) if isinstance(name_or_series, str) else \
@@ -266,6 +300,18 @@ def apply_vetoes_v3(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     adm = ctx.get("administrative")
     if adm is not None and len(adm) and "code" in adm.columns:
         P["V5"] = np.where(P["code"].isin(set(adm["code"].dropna())), 0.0, P["V5"])
+    else:
+        # ★★ 선언한 거부권이 배선되지 않은 채 조용히 통과하고 있었다 ★★
+        #   VETO_DEFS_V3 는 V5 를 '자본잠식 · 관리종목 · 감사의견 비적정' 이라고 선언하는데,
+        #   ctx["administrative"] 를 채우는 코드가 저장소 어디에도 없다. 즉 실제로 걸리는
+        #   것은 자본잠식(equity<=0) 하나뿐이고, **관리종목·감사의견 비적정은 한 번도
+        #   거부되지 않았다.** 그런데 거부권 발동표에는 V5 가 정상 항목으로 찍히므로
+        #   읽는 사람은 세 다리가 모두 작동한다고 믿는다 — 조용히 성과를 부풀리는 쪽이다.
+        #   (관리종목은 폭락 직전 구간이 많아, 빠지지 않으면 손실이 그대로 들어온다)
+        LOG.warn("V5 거부권의 '관리종목·감사의견 비적정' 다리가 배선되지 않았습니다 "
+                 "— 실제로 걸리는 것은 자본잠식(자본총계≤0) 하나뿐입니다. "
+                 "관리종목 목록이 없으면 그 종목들이 유니버스에 그대로 남아 성과가 "
+                 "**과대평가**될 수 있습니다. 아래 거부권 표의 V5 수치를 그렇게 읽으세요.")
 
     # V6 — 유동성
     P["V6"] = np.where((col(P, "adv20").fillna(0) >= MIN_ADV_KRW) &

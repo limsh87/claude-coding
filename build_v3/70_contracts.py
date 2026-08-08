@@ -680,6 +680,13 @@ def run_contracts_v3(strict: bool = True) -> bool:
             ("fetch_dart_corpcode", fetch_dart_corpcode),
             ("fetch_pykrx_snapshots", fetch_pykrx_snapshots),
             ("build_security_master", build_security_master),
+            # ★ 이번에 새로 만든 수집물도 예외가 아니다. 사용자 절대원칙은 '어떤 신규
+            #   수집데이터든' 이므로, 새 경로를 추가할 때마다 이 목록에도 넣어야 한다.
+            #   지수 일봉은 매 실행 FDR 에서 새로 받으면서 **어디에도 저장하지 않았다** —
+            #   강건성 스위트가 R0 을 부를 때마다 같은 네트워크 왕복을 반복했다.
+            ("_index_daily(지수 벤치마크)", _index_daily),
+            # 가격 무결성 원장(버린 관측의 근거)도 재호출 가능해야 한다.
+            ("build_price_panel(무결성 원장)", build_price_panel),
         ]
         missing = []
         for nm, fn in collectors:
@@ -702,8 +709,20 @@ def run_contracts_v3(strict: bool = True) -> bool:
         hsrc = _src_of(_cached_or_fetch) or ""
         if hsrc and "len(got)" not in hsrc:
             return False, "빈 수집 결과로 캐시를 덮어쓰지 않는다는 가드가 보이지 않습니다"
+        # ★ 2단 캐시(로컬 미러)는 **읽기 가속**이어야 한다. 미러가 드라이브를 덮는 경로가
+        #   생기면 그 순간 절대1원칙이 깨진다(로컬의 좁은 스냅샷이 공용 원본을 덮는다).
+        #   방향이 한쪽인지 소스로 확인한다: 미러 기록은 put_table 이후에만 일어나야 한다.
+        vsrc = _src_of(Vault.put_table, Vault.get_table, Vault._mirror_write) or ""
+        if vsrc:
+            if "_mirror_write" not in vsrc:
+                return False, "2단 캐시 미러 배선이 보이지 않습니다 — 드라이브 재읽기가 반복됩니다"
+            if re.search(r"shutil\.copy2\(\s*mp\s*,", vsrc) or \
+               re.search(r"os\.replace\([^)]*,\s*src\s*\)", vsrc):
+                return False, ("★ 로컬 미러가 드라이브 원본을 덮는 경로가 있습니다 — "
+                               "절대1원칙 위반입니다. 방향은 드라이브 → 로컬 한쪽뿐이어야 합니다")
         return True, (f"수집기 {len(collectors)}종 전부 put_table 보유 · "
-                      f"유니버스 원천 3종 캐시 경유 · 빈 결과 덮어쓰기 차단")
+                      f"유니버스 원천 3종 캐시 경유 · 빈 결과 덮어쓰기 차단 · "
+                      f"2단 캐시는 드라이브→로컬 단방향")
 
     _cc("C-PERSIST", "신규 수집물은 무조건 인덱스에 남는다 (세션 무관)", c_persist)
 

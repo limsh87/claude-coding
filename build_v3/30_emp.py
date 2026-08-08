@@ -205,7 +205,11 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
         #   연도가 격자의 40% 가까이 되고, 그게 연도 내림차순 큐의 앞쪽에 몰린다.
         #   → 답이 있을 수 없는 질문에 매일 한도의 대부분을 쓰고 있었다. 기록해 둔다.
         with _EMP_CB["lock"]:
-            _EMP_NODATA.append({"corp_code": str(corp), "bsns_year": int(year)})
+            # ★ asked_at 이 없으면 이 원장은 **영구**가 된다. 사업보고서 제출 전에 한 번
+            #   물어본 (회사,연도)가 영영 결측으로 굳는다 — 다른 음성캐시는 전부 만료를
+            #   갖는데 여기만 없었다. 최근 회계연도일수록 짧게 만료시킨다.
+            _EMP_NODATA.append({"corp_code": str(corp), "bsns_year": int(year),
+                                "asked_at": _dt.date.today().isoformat()})
         return None
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
         _emp_cb_mark(False)
@@ -286,28 +290,45 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
       max_calls 로 이번 실행분을 잘라내고, priority 순서로 '담길 확률이 높은 종목'부터 채운다.
       한계임금은 이 전략의 알파 원천이므로 Tier-2 재무보다 **먼저** 예산을 배정한다.
     """
-    cached = adopt_legacy_emp_cache(VAULT.get_table("dart_employees_ext", scope="shared"))
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ v2 레거시 흡수분을 dart_employees_ext 로 되쓰지 않는다 ★★
+    #    v2 코어의 dart_employees 에는 **정규직 수(rgllbr_co)가 없다.** 흡수하면서
+    #    regular=NaN 으로 채우는데, 그 행을 그대로 ext 에 저장해 버리면 다음 실행의
+    #    `done` 집합에 (회사,연도)가 들어가 **영영 다시 묻지 않는다.**
+    #    그러면 nl_regular 가 영구 결측이 되고 TP_N3(정규직 확충 = 확신의 증거)는
+    #    이 캐시가 존재하는 한 절대 살아나지 못한다. 흡수가 알파를 살린 자리에서
+    #    다른 알파를 죽이는 셈이다.
+    #  → 저장용(ext_only)과 계산용(cached)을 분리한다. 흡수분은 계산·반환에만 쓴다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    ext_only = VAULT.get_table("dart_employees_ext", scope="shared")
+    cached = adopt_legacy_emp_cache(ext_only)
     done = set()
     if cached is not None and len(cached):
         try:
-            done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
+            _full = cached
+            if "src_flag" in cached.columns:
+                # 레거시 흡수분은 '값은 쓰되 완성으로 치지 않는다'. 정규직 수가 없으므로
+                # 예산이 남으면 원본(empSttus)으로 다시 받아 TP_N3 를 살릴 여지를 남긴다.
+                _full = cached[cached["src_flag"].astype(str) != "legacy_v2"]
+            done = set(zip(_full["corp_code"].astype(str), _full["bsns_year"].astype(int)))
+            _leg = len(cached) - len(_full)
             LOG.ok(f"공용 캐시에서 직원현황 {len(cached):,}행 재사용 ({len(done):,} 조합) — "
-                   f"이만큼은 API 를 다시 부르지 않습니다")
+                   f"이만큼은 API 를 다시 부르지 않습니다" +
+                   (f" · 그중 v2 레거시 {_leg:,}행은 정규직 수가 없어 **재수집 대상으로 남깁니다**"
+                    f"(TP_N3 를 영구 결측으로 굳히지 않기 위함 — 값 자체는 지금도 씁니다)"
+                    if _leg else ""))
         except Exception:
             done = set()
-    nod = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
-    if nod is not None and len(nod):
-        try:
-            skip = set(zip(nod["corp_code"].astype(str), nod["bsns_year"].astype(int)))
-            done |= skip
-            LOG.info(f"미제출 원장에서 {len(skip):,} (사×연) 을 제외합니다 — "
-                     f"그 해 사업보고서를 내지 않은 조합이라 다시 물어도 답이 없습니다.")
-        except Exception:
-            pass
+    skip = emp_nodata_skip_set()          # ★ 만료된 기록은 제외 대상에서 빠진다
+    if skip:
+        done |= skip
+        LOG.info(f"미제출 원장에서 {len(skip):,} (사×연) 을 제외합니다 — "
+                 f"그 해 사업보고서를 내지 않은 조합이라 다시 물어도 답이 없습니다. "
+                 f"(만료된 기록은 이 집합에 들어가지 않아 다시 시도합니다)")
     if not dart_has_key():
         LOG.warn("DART_API_KEY 미입력 — 직원현황 신규 수집을 건너뜁니다. "
                  "캐시에 있는 것만으로 진행하며, 없으면 EMP-LITE 전 센서가 결측입니다.")
-        return _emp_finalize(cached, [])
+        return _emp_finalize(cached, [], store=ext_only)
 
     corps = [str(c) for c in dict.fromkeys(corp_codes) if str(c) and str(c) != "nan"]
     if EMP_MAX_CORPS and EMP_MAX_CORPS > 0:
@@ -407,7 +428,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                                f"{math.ceil(len(jobs)/_chunk_n)})")
             got.extend(r for r in res if r)
             done_n += len(chunk)
-            _emp_checkpoint(cached, got)
+            _emp_checkpoint(ext_only, got)
             _halt = (None if _emp_cb_ok() else
                      (dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"))
             if _halt is None and time.time() >= _deadline:
@@ -423,7 +444,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                              f"※ 미수집분이 있으므로 §6 자동 창 단축은 비활성화됩니다.")
                 break
         LOG.info(f"직원현황 신규 확보 {len(got):,}/{len(jobs):,}건")
-    return _emp_finalize(cached, got)
+    return _emp_finalize(cached, got, store=ext_only)
 
 
 EMP_CHECKPOINT_EVERY = 1_000
@@ -438,20 +459,65 @@ def _emp_checkpoint(cached: Optional[pd.DataFrame], got: List[dict]) -> None:
             E["corp_code"] = E["corp_code"].astype(str)
             E = E.drop_duplicates(["corp_code", "bsns_year"], keep="last")
             VAULT.put_table("dart_employees_ext", E, scope="shared", domain="dart",
-                            source="opendart empSttus 확장 (증분 체크포인트)")
+                            source="opendart empSttus 확장 (증분 체크포인트)",
+                            backup=False)   # 청크마다 전량 복사하지 않는다(수집 시간·용량)
         if _EMP_NODATA:
             prev = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
             N = pd.concat([f for f in (prev, pd.DataFrame(_EMP_NODATA))
                            if f is not None and len(f)], ignore_index=True)
             N["corp_code"] = N["corp_code"].astype(str)
-            VAULT.put_table(EMP_NODATA_TABLE, N.drop_duplicates(["corp_code", "bsns_year"]),
-                            scope="shared", domain="dart",
-                            source="empSttus 미제출(013) 원장 — 재요청 방지")
+            if "asked_at" not in N.columns:
+                N["asked_at"] = pd.NaT
+            N = (N.sort_values("asked_at", na_position="first")
+                  .drop_duplicates(["corp_code", "bsns_year"], keep="last"))
+            VAULT.put_table(EMP_NODATA_TABLE, N, scope="shared", domain="dart",
+                            source="empSttus 미제출(013) 원장 — 재요청 방지(만료 있음)")
     except Exception as e:                                          # noqa
         LOG.debug(f"직원현황 체크포인트 실패({type(e).__name__}) — 수집은 계속합니다.")
 
 
-def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict]) -> pd.DataFrame:
+def emp_nodata_skip_set() -> set:
+    """'물어봤는데 자료가 없더라' 원장에서 **아직 유효한** 조합만 돌려준다.
+
+    ★ 만료가 없으면 이 원장은 영구 배제 목록이 된다. 사업보고서는 다음 해 3~4월에
+      제출되므로, 제출 전에 한 번 물어본 (회사, 최근연도) 조합이 영영 결측으로 굳는다.
+      실제로 이 파일의 다른 음성캐시(dart_multi_nodata·dart_fnltt_nodata)는 전부
+      만료를 갖고 있는데 여기만 없었다.
+      → 오래된 회계연도는 1년, 최근 2개 회계연도는 30일 뒤 다시 묻는다.
+        asked_at 이 없는 기존 기록은 '최근 연도만' 만료로 보수적으로 처리한다.
+    """
+    nod = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
+    if nod is None or not len(nod):
+        return set()
+    try:
+        d = nod.copy()
+        d["bsns_year"] = pd.to_numeric(d["bsns_year"], errors="coerce")
+        d = d.dropna(subset=["corp_code", "bsns_year"])
+        _y_now = _dt.date.today().year
+        recent = d["bsns_year"] >= (_y_now - 2)
+        age = ((pd.Timestamp(_dt.date.today()) - as_ts_series(d.get("asked_at", pd.NaT)))
+               .dt.days if "asked_at" in d.columns else pd.Series(np.nan, index=d.index))
+        ttl = np.where(recent, MULTI_NODATA_RECENT_DAYS, MULTI_NODATA_OLD_DAYS)
+        # asked_at 결측(구 원장) → 최근 연도는 만료시키고 과거 연도는 유지한다.
+        alive = np.where(age.isna().to_numpy(), ~recent.to_numpy(),
+                         age.fillna(0).to_numpy() <= ttl)
+        keep = d[alive]
+        n_exp = len(d) - len(keep)
+        if n_exp:
+            LOG.info(f"직원현황 미제출 원장에서 {n_exp:,}건이 만료돼 다시 묻습니다 "
+                     f"(최근 회계연도 {MULTI_NODATA_RECENT_DAYS}일 · 과거 "
+                     f"{MULTI_NODATA_OLD_DAYS}일). 제출 전에 물어본 조합이 영구 결측으로 "
+                     f"굳는 것을 막습니다.")
+        return set(zip(keep["corp_code"].astype(str), keep["bsns_year"].astype(int)))
+    except Exception:                                                # noqa
+        return set()
+
+
+def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict],
+                  store: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    # store 가 주어지면 **저장은 그것에만** 한다(v2 레거시 흡수분을 ext 로 되쓰지 않기 위함).
+    if store is not None and got:
+        _emp_checkpoint(store, got)
     frames = []
     if cached is not None and len(cached):
         frames.append(cached)
@@ -539,11 +605,6 @@ def build_emp_sensors(E: pd.DataFrame) -> pd.DataFrame:
     D["emp_prev"] = emp_prev.where(contiguous)
     D["dn"] = (D["employees"] - emp_prev).where(contiguous)
     D["d_pay"] = (D["payroll_total"] - pay_prev).where(contiguous)
-    D["nl_emp"] = np.log(D["employees"].where(D["employees"] > 0)) - \
-                  np.log(D["emp_prev"].where(D["emp_prev"] > 0))
-    D["nl_dn"] = D["dn"]
-    D["nl_regular"] = (D["regular_ratio"] - g["regular_ratio"].shift(1)).where(contiguous) \
-        if "regular_ratio" in D.columns else np.nan
 
     # (a) |Δ직원수| >= max(5, 직원수_{t-1} × 3%) 일 때만 계산
     thresh = np.maximum(C15_MIN_ABS_DN, D["emp_prev"].fillna(0) * C15_MIN_REL_DN)
@@ -553,7 +614,26 @@ def build_emp_sensors(E: pd.DataFrame) -> pd.DataFrame:
     rel = safe_div(D["dn"], D["emp_prev"])
     gate_d = (rel <= C15_MNA_UP) & (rel >= C15_MNA_DN)
 
-    ok = gate_a.fillna(False) & gate_d.fillna(False) & contiguous.fillna(False)
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ (d) M&A·분할 게이트는 nl_marginal 뿐 아니라 **nl_emp 계열 전부**에 걸어야 한다 ★★
+    #    예전엔 gate_d 가 nl_marginal(=한계임금)에만 걸려 있었다. 그런데 nl_emp 는
+    #    TP_N1·TP_N2·TP_N3 **세 개 모두의 a-다리**다. 인수합병으로 인원이 2배가 된 회사는
+    #    nl_emp 가 크게 양(+)이 되어 셀 상위 랭크를 받고, TP_N2(희석 없는 확장)·
+    #    TP_N3(정규직 확충)에서 '인력을 크게 늘렸다'는 증거로 계산된다.
+    #    그건 채용이 아니라 회계적 편입이다 — 스펙 §4 C15(d) 가 정확히 배제하려던 것이고,
+    #    한 다리에만 걸어 두면 산식 정의가 절반만 지켜진다.
+    #  ★ 반대로 (a) 분모 안정성 게이트는 nl_emp 에 걸지 않는다. 그건 'Δn 으로 나눌 때'의
+    #    조건이지 '인원이 얼마나 변했는가' 자체의 조건이 아니다. 걸면 정상적인 소폭 증감이
+    #    통째로 사라져 표본이 근거 없이 줄어든다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _organic = gate_d.fillna(False) & contiguous.fillna(False)
+    D["nl_emp"] = (np.log(D["employees"].where(D["employees"] > 0)) -
+                   np.log(D["emp_prev"].where(D["emp_prev"] > 0))).where(_organic)
+    D["nl_dn"] = D["dn"].where(_organic)
+    D["nl_regular"] = ((D["regular_ratio"] - g["regular_ratio"].shift(1)).where(_organic)
+                       if "regular_ratio" in D.columns else np.nan)
+
+    ok = gate_a.fillna(False) & _organic
     D["nl_marginal"] = safe_div(D["d_pay"], D["dn"]).where(ok)
 
     # (b) 임금프리미엄 [0, 5] 클리핑. 초과는 '오류'로 보고 NaN — 절대 clip 으로 뭉개지 않는다.

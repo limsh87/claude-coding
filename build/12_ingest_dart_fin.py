@@ -769,7 +769,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                     ["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id", "account_nm"],
                     keep="last")
                 VAULT.put_table("dart_fnltt_raw", _acc, scope="shared", domain="dart",
-                                source="opendart (청크 체크포인트)")
+                                source="opendart (청크 체크포인트)", backup=False)
         if _FS_EMPTY:
             try:
                 _pv = VAULT.get_table(FS_NODATA_TABLE, scope="shared")

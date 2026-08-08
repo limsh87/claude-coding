@@ -460,7 +460,10 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
         return
 
     resid = pd.Series(np.nan, index=Q.index, dtype="float64")
+    _n_months = 0
+    _n_fit = 0
     for m, idx in Q.groupby("month", observed=True).indices.items():
+        _n_months += 1
         idx = np.asarray(idx)
         yy = y.to_numpy()[idx]
         XX = np.column_stack([np.ones(len(idx))] + [Q[f].to_numpy()[idx] for f in facs])
@@ -474,6 +477,30 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
         r = np.full(len(idx), np.nan)
         r[ok] = yy[ok] - XX[ok] @ beta
         resid[idx] = r
+        _n_fit += 1
+
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 회귀가 돌지 못한 달을 '직교화했다'고 말하지 않는다 ★★
+    #    통제변수 4개 중 f_prof·f_accr·f_size 는 Tier-2 재무(현금흐름표·자산)에 의존한다.
+    #    Tier-2 커버리지가 13.5% 이던 실행에서는 완전관측(complete-case) 행이 20개를 못 넘겨
+    #    대부분의 달에서 `continue` 로 건너뛰었다. 그 달의 잔차는 전부 NaN 이고,
+    #    아래에서 Signal = E.fillna(0) × … 를 타면 **전 종목이 동점 0** 이 된다.
+    #    동점은 _top_n 의 2·3차 키(Signal, code)로 깨지므로, 그 달의 포트폴리오는
+    #    사실상 '종목코드 오름차순 바스켓'이다. 그걸로 얻은 Sharpe 를 '직교화 후 알파'라고
+    #    보고하면 팩터 이야기가 아니라 정렬 이야기를 하는 것이다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _cov_m = _n_fit / max(_n_months, 1)
+    _cov_r = float(resid.notna().mean()) if len(resid) else 0.0
+    if _cov_m < 0.60 or _n_fit < 24:
+        _rec("R3", "퀄리티 직교화", None,
+             f"통제변수(규모·수익성·모멘텀·발생액)가 완전관측되는 달이 "
+             f"{_n_fit}/{_n_months}({_cov_m:.0%})뿐이라 직교화가 성립하지 않습니다. "
+             f"건너뛴 달은 잔차가 전부 결측이라 신호가 동점이 되고, 그 달의 포트폴리오는 "
+             f"사실상 종목코드 순 바스켓이 됩니다 — 그 위에서 '알파 잔존/소멸'을 판정하지 "
+             f"않습니다. Tier-2 재무 커버리지를 먼저 올리세요.",
+             f"회귀 성공 {_n_fit}/{_n_months}개월 · 잔차 산출 {_cov_r:.1%}행")
+        runtime_mark("R3", time.time() - t0)
+        return
 
     Z = Q.copy()
     Z["E"] = cell_rank(Z, resid)

@@ -185,7 +185,13 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if pykrx_stock is None:
         return None
     try:
-        limiter("krx").wait()
+        # ★★ 병목: 예전엔 limiter("krx") 를 썼다 ★★
+        #   'krx' 버킷은 KRX 마켓플레이스 세션(중복 로그인에 민감)을 보호하려고 2.0 qps 로
+        #   묶여 있다. 그런데 pykrx 의 일봉 조회는 그 세션이 아니라 별도 공개 엔드포인트다.
+        #   같은 버킷에 넣으면 **체인의 첫 링크가 초당 2건으로 직렬화**되어 N_WORKERS_IO=12
+        #   가 무의미해진다(실효 동시성 1). 3,000종목이면 그것만으로 25분이다.
+        #   → 전용 버킷으로 분리한다. 마켓플레이스 세션은 여전히 'krx' 로 보호된다.
+        limiter("pykrx").wait()
         d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
         return None
@@ -912,6 +918,7 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str,
         code, st, en, _kind = job
         try:
             limiter("krx").wait()
+            limiter("pykrx").wait()
             d = pykrx_stock.get_market_trading_value_by_date(
                 as_ts(st).strftime("%Y%m%d"), as_ts(en).strftime("%Y%m%d"), code)
         except Exception:
@@ -928,7 +935,40 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str,
                              "inst_net": pd.to_numeric(d[inst], errors="coerce") if inst else np.nan,
                              "foreign_net": pd.to_numeric(d[forg], errors="coerce") if forg else np.nan})
 
-    res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="수급 증분 수집")
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 청크 + 데드라인 + 체크포인트 — 가격·직원현황·Tier-2 가 다 갖고 있는데 여기만 없었다.
+    #    전량을 pmap_io 한 방에 던지면 (a) 4시간 계약에 걸려도 멈출 방법이 없고
+    #    (b) 중간에 끊기면 **받은 것이 전량 소실**된다(저장이 맨 끝에 한 번뿐이므로).
+    #    d3(수급)는 U축의 절반이라 조용히 사라지면 U 가 d1 단독으로 퇴화한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    try:
+        _dl = time.time() + stage_time_budget(FLOW_TIME_SHARE, floor_s=60.0)
+    except Exception:                                               # noqa
+        _dl = None
+    res: List[Optional[pd.DataFrame]] = []
+    _CH = 400
+    for _i in range(0, len(jobs), _CH):
+        _chunk = jobs[_i:_i + _CH]
+        res.extend(pmap_io(_one, _chunk, workers=min(N_WORKERS_IO, 8),
+                           desc=f"수급 증분 수집({_i//_CH + 1}/{math.ceil(len(jobs)/_CH)})"))
+        _new = [d for d in res if d is not None and len(d)]
+        if _new:
+            try:
+                _acc = pd.concat(([cached] if cached is not None and len(cached) else []) + _new,
+                                 ignore_index=True)
+                _acc["date"] = as_ts_series(_acc["date"])
+                _acc = (_acc.dropna(subset=["code", "date"])
+                            .drop_duplicates(["code", "date"], keep="last"))
+                VAULT.put_table("krx_investor_flows", _acc, scope="shared", domain="flow",
+                                source="pykrx (청크 체크포인트)", backup=False)
+            except Exception as e:                                  # noqa
+                LOG.debug(f"수급 체크포인트 실패({type(e).__name__}) — 수집은 계속합니다.")
+        if _dl and time.time() > _dl and (_i + _CH) < len(jobs):
+            LOG.warn(f"수급 수집 시간 몫을 다 썼습니다 — {_i+len(_chunk):,}/{len(jobs):,}건에서 "
+                     f"멈춥니다. 받은 만큼은 공용 인덱스에 저장됐고 재실행 시 이어받습니다. "
+                     f"덮이지 않는 달의 d3 는 결측이 되고 U 는 d1 단독으로 계산됩니다.")
+            jobs = jobs[:_i + len(_chunk)]
+            break
     got = [d for d in res if d is not None and len(d)]
     # ★ 빈 응답을 기억한다. 예전엔 got 필터에서 조용히 사라져 다음 실행이 같은 구간을
     #   그대로 다시 요청했다 — '수집 실패'와 '원래 자료가 없음'을 구별하지 못했다.

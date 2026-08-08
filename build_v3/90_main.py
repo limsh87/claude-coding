@@ -81,6 +81,31 @@ def dart_fs_scope_v3(ctx: dict, all_corps: Sequence[str], quiet: bool = False
     return corps, years, prio
 
 
+def collect_band_mask(pm: pd.DataFrame) -> pd.Series:
+    """수집 대상 대역 마스크 — **실제로 평가할 팔들의 합집합**에서 유도한다.
+
+    ══════════════════════════════════════════════════════════════════════════════════════
+     ★★ 여기가 하드코딩돼 있어서 비교팔이 통째로 무의미해지고 있었다 ★★
+       수집 대상 판정(umid_experienced_corps · emp_pairs_needed_v3)이 둘 다
+       `rank.between(UMID_RANK_LO, UMID_RANK_HI)` = [251,1400] 으로 못박혀 있었다.
+       그런데 평가 팔은 ARM_MAIN="ALL"(제한 없음) 과 ARM_COMPARE="SMALL"(1401~2400) 이다.
+       SMALL 은 U-MID 와 **교집합이 없다** — 즉 스몰캡 비교팔이 쓸 직원현황·Tier-2 재무를
+       설계상 단 한 건도 수집하지 않으면서, 그 팔의 성과를 '규모 대역의 효과'로 보고했다.
+       ALL 팔도 랭크 1~250(대형주)과 1401 이하(소형주) 구간이 통째로 무증거였다.
+     → 대역 상수를 직접 참조하지 않고 universe_band() 로 유도한다. 팔을 바꾸면
+       수집 대상이 따라 바뀐다. 두 곳이 같은 함수를 쓰므로 다시 어긋날 수 없다.
+    ══════════════════════════════════════════════════════════════════════════════════════
+    """
+    adv = col(pm, "adv20")
+    rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
+    m = pd.Series(False, index=pm.index)
+    bands = [ARM_MAIN] + ([ARM_COMPARE] if RUN_SMALLCAP_ARM else [])
+    for b in dict.fromkeys(bands):
+        lo, hi, adv_min = universe_band(b)
+        m |= (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
+    return m.fillna(False)
+
+
 def umid_experienced_corps(ctx: dict, quiet: bool = False) -> Tuple[set, List[str]]:
     """전 기간 중 한 번이라도 U-MID 대역에 든 종목의 corp_code 집합과 우선순위 목록.
 
@@ -94,9 +119,7 @@ def umid_experienced_corps(ctx: dict, quiet: bool = False) -> Tuple[set, List[st
     """
     try:
         pm = ctx["panel"]["monthly"]
-        adv = col(pm, "adv20")
-        rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
-        in_band = rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)
+        in_band = collect_band_mask(pm)      # ★ 평가 팔(ALL ∪ SMALL)에서 유도 — 상수 금지
         # ★ code 는 downcast 를 거쳐 category dtype 이다. category 에 대한 value_counts() 는
         #   **관측이 0인 카테고리까지 전부** 인덱스에 싣는다. 그래서 예전 코드는
         #   '대역에 한 번도 못 든 종목'까지 keep 에 담아 축소가 실효 0 이었다
@@ -326,9 +349,7 @@ def emp_pairs_needed_v3(ctx: dict, years: Sequence[int]) -> Optional[set]:
     """
     try:
         pm = ctx["panel"]["monthly"]
-        adv = col(pm, "adv20")
-        rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
-        in_band = (rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)).fillna(False)
+        in_band = collect_band_mask(pm)      # ★ 평가 팔(ALL ∪ SMALL)에서 유도 — 상수 금지
         B = pm.loc[in_band, ["code", "month"]].copy()
         if B.empty:
             return None
@@ -393,9 +414,13 @@ def announce_budget_v3():
              f"     ※ 부족하면 opendart.fss.or.kr 에서 키를 더 발급(무료·즉시)해 "
              f"DART_API_KEYS 에 추가하세요. 한도가 키 개수만큼 곱해집니다.")
     if fs_cap is None or emp_cap is None:
-        LOG.warn("호출 상한이 None 인 단계가 있습니다 — 콜드빌드는 며칠이 걸리며 §12-6 의 "
-                 "4시간 계약 밖입니다. 4시간 안에 끝내려면 숫자를 넣으세요 "
-                 "(권장: EMP_MAX_CALLS=14000, DART_FS_MAX_CALLS=12000).")
+        # ★ 예전엔 여기서 "숫자를 넣으세요" 라고 경고했다. 그런데 사용자 요구는 정반대다 —
+        #   "호출량을 처음부터 19,000/20,000 으로 정하지 말고 남은 만큼 쓰게 하라."
+        #   무제한이 위험한 것은 **개수**가 아니라 **시간**이었고, 그건 이제 데드라인이 막는다.
+        LOG.info(f"호출 상한을 걸지 않았습니다(무제한). 멈추는 조건은 둘뿐입니다 — "
+                 f"① 서버가 020/021 로 거부한 키 ② 4시간 계약의 시간 몫"
+                 f"(EMP {EMP_TIME_SHARE:.0%} → Tier-2 {FS_TIME_SHARE:.0%} · {deadline_note()}). "
+                 f"로컬 추정 잔량으로는 자르지 않습니다 — 잔여량은 서버만 압니다.")
     if plan > left > 0:
         LOG.warn(f"계획 호출({plan:,})이 오늘 잔여 한도({left:,})를 넘습니다 — 우선순위 상위부터 "
                  f"채우고 한도에서 멈춥니다. 커버리지는 재실행할 때마다 올라갑니다.")
@@ -452,7 +477,7 @@ def preflight_dart_v3() -> str:
             f"\n"
             f"  선택지\n"
             f"    ① 한도 회복 후 재실행 — DART 한도는 매일 자정(KST)에 초기화됩니다.\n"
-            f"       다음 실행은 EMP 에 예산을 **먼저** 배정하므로 한 번에 {EMP_MAX_CALLS:,}건까지 채웁니다.\n"
+            f"       다음 실행은 EMP 에 예산을 **먼저** 배정하며, 서버가 거부할 때까지 받습니다.\n"
             f"    ② EMP 만 먼저 채우기 — DART_FS_MAX_CALLS=0 으로 두면 Tier-2 가 예산을 쓰지 않아\n"
             f"       직원현황이 최대 속도로 완성됩니다(권장).\n"
             f"    ③ CORE-D 단독으로 돌려보려면 REQUIRE_EMP_ALPHA=False 로 두세요.\n"

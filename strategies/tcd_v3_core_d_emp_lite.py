@@ -110,6 +110,7 @@ _DART_ROOM     = max(2_000, 19_000 * _DART_N_KEYS - _DART_FIXED)
 # ══════════════════════════════════════════════════════════════════════════════════════════
 EMP_TIME_SHARE = 0.50    # 수집 잔여시간 중 직원현황(알파) 몫
 FS_TIME_SHARE  = 0.75    # 그 다음, 남은 잔여시간 중 Tier-2 재무 몫
+FLOW_TIME_SHARE = 0.25   # 기관·외국인 수급(U축 d3) 몫 — 보조축이므로 작게
 
 # ── ② KRX 데이터 마켓플레이스  (2025-12 인증방식 변경 대응) ─────────────────────────────────
 #
@@ -201,7 +202,8 @@ RATE_LIMIT_QPS = {       # 소스별 초당 요청 상한 — 차단 방지. 낮
     "dart":      8.0,    # OpenDART 공식 권고 상한 근방
     "hankyung":  2.5,
     "naver":     3.0,
-    "krx":       2.0,
+    "krx":       2.0,    # KRX 마켓플레이스 **세션** — 중복 로그인에 민감하므로 낮게 유지
+    "pykrx":     6.0,    # pykrx 공개 엔드포인트 — 세션과 무관하므로 따로 둔다(체인 첫 링크)
     "datagokr":  5.0,
     "customs":   3.0,
     "kind":      2.0,
@@ -241,7 +243,9 @@ MEM_BUDGET_GB  = 6.0     # 초과가 예상되면 청크 처리로 자동 전환
 #           축소가 실효 0 이었습니다 — 로그엔 '제외 0사'가 찍히고 있었습니다).
 #      → 연간(annual) × 좁혀진 모집단이면 키 하나로도 몇 번의 실행에 걸쳐 채워집니다.
 #        캐시는 append-only 라 재실행할 때마다 정확히 이어받습니다.
-DART_FS_MAX_CALLS   = int(_DART_ROOM * 0.40 / 2)   # 키 1개면 ≈3,260 · 2개면 ≈7,060 잡.
+DART_FS_MAX_CALLS   = None    # ★ 기본 무제한 — 멈추는 것은 서버(020/021)와 시계입니다.
+                              #   숫자를 넣으면 "이번 실행은 여기까지" 라는 계획 상한이 됩니다.
+                              #   참고값: int(_DART_ROOM*0.40/2) = 키 1개 ≈3,260 잡.
                                # 잡당 OFS→CFS 최대 2회이므로 2로 나눕니다.
                                # 0 = Tier-2 생략 → CORE-D 전멸. 특별한 이유 없으면 쓰지 마세요.
                                # None = 상한 없음 = 며칠짜리 콜드빌드(4시간 계약 밖).
@@ -320,7 +324,13 @@ SIZE_BUCKET_N  = 3               # ★ 규모버킷 3단계
 #    ▸ 유동성 하한(MIN_ADV_KRW)은 **낮추지 않습니다.** 낮추면 실제로 체결할 수 없는 종목이
 #      섞여 성과가 부풀려지고, 그 순간 비교의 의미가 사라집니다.
 RUN_SMALLCAP_ARM = True          # False = 메인 팔만 실행
-SMALL_RANK_LO, SMALL_RANK_HI = 1401, 2400   # 거래대금 랭크 하위 1,000 구간
+#   ▸ ★ '하위 1,000개'는 **절대 랭크가 아니라 그 달 담을 수 있는 종목의 끝에서부터** 셉니다.
+#     예전엔 1401~2400 으로 못박혀 있었는데, 규모 랭크와 유동성 하한이 똑같이 20일
+#     평균거래대금이라 하한(3억)을 넘는 종목이 월 1,400개 안팎이면 그 구간은
+#     **정의상 공집합**이 됩니다. 7회차 스몰캡 팔이 월 2.5종목이었던 이유가 이것입니다 —
+#     신호가 나빠서가 아니라 대역이 스스로를 배제하고 있었습니다.
+SMALL_BAND_N = 1000              # 담을 수 있는 종목 중 규모 하위 N 개
+SMALL_RANK_LO, SMALL_RANK_HI = 1401, 2400   # (하위호환 표시용 — 판정에는 쓰지 않습니다)
 #   ▸ 비교 대상 대역. 사용자 요구: "시총하위 1000개 종목 한정 vs 전체종목" 을 나란히 본다.
 #     "ALL"  = 규모 랭크 제한 없음(유동성 하한만) — 대형주부터 소형주까지 전부
 #     "SMALL"= 거래대금 랭크 하위 1,000 구간
@@ -353,8 +363,10 @@ EMP_MAX_CORPS  = 0               # 0 = 제한 없음. 테스트 시 300 등으�
 #   ▸ empSttus 도 |기업| × |연도| 로 곱해집니다(3,981사 × 13년 = 51,753 > 일일한도 19,000).
 #     한계임금은 이 전략의 알파 원천이라 DART 일일예산을 **Tier-2 재무보다 먼저** 여기에 씁니다.
 #     상한에 걸리면 '담길 확률이 높은 종목 × 최근 연도'부터 채우고 재실행 시 이어받습니다.
-EMP_MAX_CALLS  = int(_DART_ROOM * 0.60)   # 키 1개면 ≈9,780 · 2개면 ≈21,180. 실측 8건/초.
-                                 # None = 계획 상한 없음(그래도 시간·서버가 멈춥니다).
+EMP_MAX_CALLS  = None            # ★ 기본 무제한 — 멈추는 것은 서버(020/021)와 시계입니다.
+                                 #   사용자 요구 그대로: 호출량을 19,000/20,000 으로 처음부터
+                                 #   못박지 않고, 서버가 거부할 때까지 남은 만큼 씁니다.
+                                 #   참고값: int(_DART_ROOM*0.60) = 키 1개 ≈9,780. 실측 8건/초.
 #   ▸ ★★ 격자는 **회사 우선**입니다 (7회차 사고를 고정한 설계 결정) ★★
 #     예전엔 연도 우선이라, 상한에 걸리면 항상 '오래된 연도'가 통째로 잘렸습니다.
 #     실측 결과가 2,536사 × 3.4년이었고 — 백테스트 120개월 중 **앞 80개월에 EMP 신호가
@@ -374,7 +386,7 @@ REQUIRE_EMP_ALPHA = True
 #   ▸ 직원현황 전용 예산 하한. 다른 단계가 아무리 많이 써도 이만큼은 EMP 몫으로 남깁니다.
 #     이것이 없으면 Tier-2 재무가 일일 한도를 먼저 다 써버려 알파가 영원히 안 모입니다
 #     (실제로 3회 실행 내내 dart_employees_ext 가 0행이었던 이유입니다).
-EMP_RESERVED_CALLS = EMP_MAX_CALLS
+EMP_RESERVED_CALLS = EMP_MAX_CALLS if EMP_MAX_CALLS is not None else int(_DART_ROOM * 0.60)
 
 # ── §2 CANARY 임계값 ────────────────────────────────────────────────────────────────────────
 CANARY_SAMPLE_N     = 200        # 표본 종목수 (K3·K4·K7·K8·K9)
@@ -394,7 +406,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.1246"
+BUILD_VERSION  = "v3.20260808.1303"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -2082,12 +2094,24 @@ class Vault:
         return None
 
     def put_table(self, name: str, df: pd.DataFrame, scope: str = "shared",
-                  domain: str = "table", source: str = "", extra: Optional[dict] = None) -> Optional[str]:
-        """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다."""
+                  domain: str = "table", source: str = "", extra: Optional[dict] = None,
+                  backup: bool = True) -> Optional[str]:
+        """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다.
+
+        backup=False 는 **증분 체크포인트 전용**이다. 왜 필요한가:
+          이 함수는 한 번 불릴 때마다 전체 파일 작업을 네 번 한다 —
+          sha1_file(파일 전체 읽기) → copy2(전량 복사) → parquet 쓰기 → 미러 복사.
+          대상이 구글드라이브 FUSE 이고 대상 테이블이 수백 MB 이면 한 번이 수십 초다.
+          수집 루프는 청크마다 이 함수를 부르므로(EMP 1,000건·Tier-2 40사) 그 비용이
+          수집 시간 자체를 압도하고, _backup 폴더도 청크 수만큼 불어난다.
+        ★ 세대 보존 원칙은 깨지지 않는다: 진실의 원천은 append-only 저널이고,
+          중간 체크포인트는 같은 실행 안에서 **단조 증가**하는 스냅샷이라
+          마지막 저장 한 번만 백업하면 잃을 세대가 없다.
+        """
         if df is None:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if os.path.exists(path):
+        if os.path.exists(path) and backup:
             # ★★ 백업 이름을 타임스탬프에서 **내용해시**로 바꿨다 ★★
             #   실측: 340MB 짜리 가격 테이블이 신규 1종목만 있어도 매 실행 통째로 복사됐고,
             #   _backup 에는 개수·용량 상한이 없으며 삭제 API 도 없다(원칙상 있어서도 안 된다).
@@ -3931,7 +3955,13 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if pykrx_stock is None:
         return None
     try:
-        limiter("krx").wait()
+        # ★★ 병목: 예전엔 limiter("krx") 를 썼다 ★★
+        #   'krx' 버킷은 KRX 마켓플레이스 세션(중복 로그인에 민감)을 보호하려고 2.0 qps 로
+        #   묶여 있다. 그런데 pykrx 의 일봉 조회는 그 세션이 아니라 별도 공개 엔드포인트다.
+        #   같은 버킷에 넣으면 **체인의 첫 링크가 초당 2건으로 직렬화**되어 N_WORKERS_IO=12
+        #   가 무의미해진다(실효 동시성 1). 3,000종목이면 그것만으로 25분이다.
+        #   → 전용 버킷으로 분리한다. 마켓플레이스 세션은 여전히 'krx' 로 보호된다.
+        limiter("pykrx").wait()
         d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
         return None
@@ -4658,6 +4688,7 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str,
         code, st, en, _kind = job
         try:
             limiter("krx").wait()
+            limiter("pykrx").wait()
             d = pykrx_stock.get_market_trading_value_by_date(
                 as_ts(st).strftime("%Y%m%d"), as_ts(en).strftime("%Y%m%d"), code)
         except Exception:
@@ -4674,7 +4705,40 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str,
                              "inst_net": pd.to_numeric(d[inst], errors="coerce") if inst else np.nan,
                              "foreign_net": pd.to_numeric(d[forg], errors="coerce") if forg else np.nan})
 
-    res = pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8), desc="수급 증분 수집")
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 청크 + 데드라인 + 체크포인트 — 가격·직원현황·Tier-2 가 다 갖고 있는데 여기만 없었다.
+    #    전량을 pmap_io 한 방에 던지면 (a) 4시간 계약에 걸려도 멈출 방법이 없고
+    #    (b) 중간에 끊기면 **받은 것이 전량 소실**된다(저장이 맨 끝에 한 번뿐이므로).
+    #    d3(수급)는 U축의 절반이라 조용히 사라지면 U 가 d1 단독으로 퇴화한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    try:
+        _dl = time.time() + stage_time_budget(FLOW_TIME_SHARE, floor_s=60.0)
+    except Exception:                                               # noqa
+        _dl = None
+    res: List[Optional[pd.DataFrame]] = []
+    _CH = 400
+    for _i in range(0, len(jobs), _CH):
+        _chunk = jobs[_i:_i + _CH]
+        res.extend(pmap_io(_one, _chunk, workers=min(N_WORKERS_IO, 8),
+                           desc=f"수급 증분 수집({_i//_CH + 1}/{math.ceil(len(jobs)/_CH)})"))
+        _new = [d for d in res if d is not None and len(d)]
+        if _new:
+            try:
+                _acc = pd.concat(([cached] if cached is not None and len(cached) else []) + _new,
+                                 ignore_index=True)
+                _acc["date"] = as_ts_series(_acc["date"])
+                _acc = (_acc.dropna(subset=["code", "date"])
+                            .drop_duplicates(["code", "date"], keep="last"))
+                VAULT.put_table("krx_investor_flows", _acc, scope="shared", domain="flow",
+                                source="pykrx (청크 체크포인트)", backup=False)
+            except Exception as e:                                  # noqa
+                LOG.debug(f"수급 체크포인트 실패({type(e).__name__}) — 수집은 계속합니다.")
+        if _dl and time.time() > _dl and (_i + _CH) < len(jobs):
+            LOG.warn(f"수급 수집 시간 몫을 다 썼습니다 — {_i+len(_chunk):,}/{len(jobs):,}건에서 "
+                     f"멈춥니다. 받은 만큼은 공용 인덱스에 저장됐고 재실행 시 이어받습니다. "
+                     f"덮이지 않는 달의 d3 는 결측이 되고 U 는 d1 단독으로 계산됩니다.")
+            jobs = jobs[:_i + len(_chunk)]
+            break
     got = [d for d in res if d is not None and len(d)]
     # ★ 빈 응답을 기억한다. 예전엔 got 필터에서 조용히 사라져 다음 실행이 같은 구간을
     #   그대로 다시 요청했다 — '수집 실패'와 '원래 자료가 없음'을 구별하지 못했다.
@@ -5482,7 +5546,7 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                     ["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id", "account_nm"],
                     keep="last")
                 VAULT.put_table("dart_fnltt_raw", _acc, scope="shared", domain="dart",
-                                source="opendart (청크 체크포인트)")
+                                source="opendart (청크 체크포인트)", backup=False)
         if _FS_EMPTY:
             try:
                 _pv = VAULT.get_table(FS_NODATA_TABLE, scope="shared")
@@ -8159,7 +8223,11 @@ def _emp_one_raw(corp: str, year: int) -> Optional[dict]:
         #   연도가 격자의 40% 가까이 되고, 그게 연도 내림차순 큐의 앞쪽에 몰린다.
         #   → 답이 있을 수 없는 질문에 매일 한도의 대부분을 쓰고 있었다. 기록해 둔다.
         with _EMP_CB["lock"]:
-            _EMP_NODATA.append({"corp_code": str(corp), "bsns_year": int(year)})
+            # ★ asked_at 이 없으면 이 원장은 **영구**가 된다. 사업보고서 제출 전에 한 번
+            #   물어본 (회사,연도)가 영영 결측으로 굳는다 — 다른 음성캐시는 전부 만료를
+            #   갖는데 여기만 없었다. 최근 회계연도일수록 짧게 만료시킨다.
+            _EMP_NODATA.append({"corp_code": str(corp), "bsns_year": int(year),
+                                "asked_at": _dt.date.today().isoformat()})
         return None
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
         _emp_cb_mark(False)
@@ -8240,28 +8308,45 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
       max_calls 로 이번 실행분을 잘라내고, priority 순서로 '담길 확률이 높은 종목'부터 채운다.
       한계임금은 이 전략의 알파 원천이므로 Tier-2 재무보다 **먼저** 예산을 배정한다.
     """
-    cached = adopt_legacy_emp_cache(VAULT.get_table("dart_employees_ext", scope="shared"))
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ v2 레거시 흡수분을 dart_employees_ext 로 되쓰지 않는다 ★★
+    #    v2 코어의 dart_employees 에는 **정규직 수(rgllbr_co)가 없다.** 흡수하면서
+    #    regular=NaN 으로 채우는데, 그 행을 그대로 ext 에 저장해 버리면 다음 실행의
+    #    `done` 집합에 (회사,연도)가 들어가 **영영 다시 묻지 않는다.**
+    #    그러면 nl_regular 가 영구 결측이 되고 TP_N3(정규직 확충 = 확신의 증거)는
+    #    이 캐시가 존재하는 한 절대 살아나지 못한다. 흡수가 알파를 살린 자리에서
+    #    다른 알파를 죽이는 셈이다.
+    #  → 저장용(ext_only)과 계산용(cached)을 분리한다. 흡수분은 계산·반환에만 쓴다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    ext_only = VAULT.get_table("dart_employees_ext", scope="shared")
+    cached = adopt_legacy_emp_cache(ext_only)
     done = set()
     if cached is not None and len(cached):
         try:
-            done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
+            _full = cached
+            if "src_flag" in cached.columns:
+                # 레거시 흡수분은 '값은 쓰되 완성으로 치지 않는다'. 정규직 수가 없으므로
+                # 예산이 남으면 원본(empSttus)으로 다시 받아 TP_N3 를 살릴 여지를 남긴다.
+                _full = cached[cached["src_flag"].astype(str) != "legacy_v2"]
+            done = set(zip(_full["corp_code"].astype(str), _full["bsns_year"].astype(int)))
+            _leg = len(cached) - len(_full)
             LOG.ok(f"공용 캐시에서 직원현황 {len(cached):,}행 재사용 ({len(done):,} 조합) — "
-                   f"이만큼은 API 를 다시 부르지 않습니다")
+                   f"이만큼은 API 를 다시 부르지 않습니다" +
+                   (f" · 그중 v2 레거시 {_leg:,}행은 정규직 수가 없어 **재수집 대상으로 남깁니다**"
+                    f"(TP_N3 를 영구 결측으로 굳히지 않기 위함 — 값 자체는 지금도 씁니다)"
+                    if _leg else ""))
         except Exception:
             done = set()
-    nod = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
-    if nod is not None and len(nod):
-        try:
-            skip = set(zip(nod["corp_code"].astype(str), nod["bsns_year"].astype(int)))
-            done |= skip
-            LOG.info(f"미제출 원장에서 {len(skip):,} (사×연) 을 제외합니다 — "
-                     f"그 해 사업보고서를 내지 않은 조합이라 다시 물어도 답이 없습니다.")
-        except Exception:
-            pass
+    skip = emp_nodata_skip_set()          # ★ 만료된 기록은 제외 대상에서 빠진다
+    if skip:
+        done |= skip
+        LOG.info(f"미제출 원장에서 {len(skip):,} (사×연) 을 제외합니다 — "
+                 f"그 해 사업보고서를 내지 않은 조합이라 다시 물어도 답이 없습니다. "
+                 f"(만료된 기록은 이 집합에 들어가지 않아 다시 시도합니다)")
     if not dart_has_key():
         LOG.warn("DART_API_KEY 미입력 — 직원현황 신규 수집을 건너뜁니다. "
                  "캐시에 있는 것만으로 진행하며, 없으면 EMP-LITE 전 센서가 결측입니다.")
-        return _emp_finalize(cached, [])
+        return _emp_finalize(cached, [], store=ext_only)
 
     corps = [str(c) for c in dict.fromkeys(corp_codes) if str(c) and str(c) != "nan"]
     if EMP_MAX_CORPS and EMP_MAX_CORPS > 0:
@@ -8361,7 +8446,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                                f"{math.ceil(len(jobs)/_chunk_n)})")
             got.extend(r for r in res if r)
             done_n += len(chunk)
-            _emp_checkpoint(cached, got)
+            _emp_checkpoint(ext_only, got)
             _halt = (None if _emp_cb_ok() else
                      (dart_halt_reason(EMP_PURPOSE) or "수집 중단(서킷브레이커)"))
             if _halt is None and time.time() >= _deadline:
@@ -8377,7 +8462,7 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
                              f"※ 미수집분이 있으므로 §6 자동 창 단축은 비활성화됩니다.")
                 break
         LOG.info(f"직원현황 신규 확보 {len(got):,}/{len(jobs):,}건")
-    return _emp_finalize(cached, got)
+    return _emp_finalize(cached, got, store=ext_only)
 
 
 EMP_CHECKPOINT_EVERY = 1_000
@@ -8392,20 +8477,65 @@ def _emp_checkpoint(cached: Optional[pd.DataFrame], got: List[dict]) -> None:
             E["corp_code"] = E["corp_code"].astype(str)
             E = E.drop_duplicates(["corp_code", "bsns_year"], keep="last")
             VAULT.put_table("dart_employees_ext", E, scope="shared", domain="dart",
-                            source="opendart empSttus 확장 (증분 체크포인트)")
+                            source="opendart empSttus 확장 (증분 체크포인트)",
+                            backup=False)   # 청크마다 전량 복사하지 않는다(수집 시간·용량)
         if _EMP_NODATA:
             prev = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
             N = pd.concat([f for f in (prev, pd.DataFrame(_EMP_NODATA))
                            if f is not None and len(f)], ignore_index=True)
             N["corp_code"] = N["corp_code"].astype(str)
-            VAULT.put_table(EMP_NODATA_TABLE, N.drop_duplicates(["corp_code", "bsns_year"]),
-                            scope="shared", domain="dart",
-                            source="empSttus 미제출(013) 원장 — 재요청 방지")
+            if "asked_at" not in N.columns:
+                N["asked_at"] = pd.NaT
+            N = (N.sort_values("asked_at", na_position="first")
+                  .drop_duplicates(["corp_code", "bsns_year"], keep="last"))
+            VAULT.put_table(EMP_NODATA_TABLE, N, scope="shared", domain="dart",
+                            source="empSttus 미제출(013) 원장 — 재요청 방지(만료 있음)")
     except Exception as e:                                          # noqa
         LOG.debug(f"직원현황 체크포인트 실패({type(e).__name__}) — 수집은 계속합니다.")
 
 
-def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict]) -> pd.DataFrame:
+def emp_nodata_skip_set() -> set:
+    """'물어봤는데 자료가 없더라' 원장에서 **아직 유효한** 조합만 돌려준다.
+
+    ★ 만료가 없으면 이 원장은 영구 배제 목록이 된다. 사업보고서는 다음 해 3~4월에
+      제출되므로, 제출 전에 한 번 물어본 (회사, 최근연도) 조합이 영영 결측으로 굳는다.
+      실제로 이 파일의 다른 음성캐시(dart_multi_nodata·dart_fnltt_nodata)는 전부
+      만료를 갖고 있는데 여기만 없었다.
+      → 오래된 회계연도는 1년, 최근 2개 회계연도는 30일 뒤 다시 묻는다.
+        asked_at 이 없는 기존 기록은 '최근 연도만' 만료로 보수적으로 처리한다.
+    """
+    nod = VAULT.get_table(EMP_NODATA_TABLE, scope="shared")
+    if nod is None or not len(nod):
+        return set()
+    try:
+        d = nod.copy()
+        d["bsns_year"] = pd.to_numeric(d["bsns_year"], errors="coerce")
+        d = d.dropna(subset=["corp_code", "bsns_year"])
+        _y_now = _dt.date.today().year
+        recent = d["bsns_year"] >= (_y_now - 2)
+        age = ((pd.Timestamp(_dt.date.today()) - as_ts_series(d.get("asked_at", pd.NaT)))
+               .dt.days if "asked_at" in d.columns else pd.Series(np.nan, index=d.index))
+        ttl = np.where(recent, MULTI_NODATA_RECENT_DAYS, MULTI_NODATA_OLD_DAYS)
+        # asked_at 결측(구 원장) → 최근 연도는 만료시키고 과거 연도는 유지한다.
+        alive = np.where(age.isna().to_numpy(), ~recent.to_numpy(),
+                         age.fillna(0).to_numpy() <= ttl)
+        keep = d[alive]
+        n_exp = len(d) - len(keep)
+        if n_exp:
+            LOG.info(f"직원현황 미제출 원장에서 {n_exp:,}건이 만료돼 다시 묻습니다 "
+                     f"(최근 회계연도 {MULTI_NODATA_RECENT_DAYS}일 · 과거 "
+                     f"{MULTI_NODATA_OLD_DAYS}일). 제출 전에 물어본 조합이 영구 결측으로 "
+                     f"굳는 것을 막습니다.")
+        return set(zip(keep["corp_code"].astype(str), keep["bsns_year"].astype(int)))
+    except Exception:                                                # noqa
+        return set()
+
+
+def _emp_finalize(cached: Optional[pd.DataFrame], got: List[dict],
+                  store: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    # store 가 주어지면 **저장은 그것에만** 한다(v2 레거시 흡수분을 ext 로 되쓰지 않기 위함).
+    if store is not None and got:
+        _emp_checkpoint(store, got)
     frames = []
     if cached is not None and len(cached):
         frames.append(cached)
@@ -8493,11 +8623,6 @@ def build_emp_sensors(E: pd.DataFrame) -> pd.DataFrame:
     D["emp_prev"] = emp_prev.where(contiguous)
     D["dn"] = (D["employees"] - emp_prev).where(contiguous)
     D["d_pay"] = (D["payroll_total"] - pay_prev).where(contiguous)
-    D["nl_emp"] = np.log(D["employees"].where(D["employees"] > 0)) - \
-                  np.log(D["emp_prev"].where(D["emp_prev"] > 0))
-    D["nl_dn"] = D["dn"]
-    D["nl_regular"] = (D["regular_ratio"] - g["regular_ratio"].shift(1)).where(contiguous) \
-        if "regular_ratio" in D.columns else np.nan
 
     # (a) |Δ직원수| >= max(5, 직원수_{t-1} × 3%) 일 때만 계산
     thresh = np.maximum(C15_MIN_ABS_DN, D["emp_prev"].fillna(0) * C15_MIN_REL_DN)
@@ -8507,7 +8632,26 @@ def build_emp_sensors(E: pd.DataFrame) -> pd.DataFrame:
     rel = safe_div(D["dn"], D["emp_prev"])
     gate_d = (rel <= C15_MNA_UP) & (rel >= C15_MNA_DN)
 
-    ok = gate_a.fillna(False) & gate_d.fillna(False) & contiguous.fillna(False)
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ (d) M&A·분할 게이트는 nl_marginal 뿐 아니라 **nl_emp 계열 전부**에 걸어야 한다 ★★
+    #    예전엔 gate_d 가 nl_marginal(=한계임금)에만 걸려 있었다. 그런데 nl_emp 는
+    #    TP_N1·TP_N2·TP_N3 **세 개 모두의 a-다리**다. 인수합병으로 인원이 2배가 된 회사는
+    #    nl_emp 가 크게 양(+)이 되어 셀 상위 랭크를 받고, TP_N2(희석 없는 확장)·
+    #    TP_N3(정규직 확충)에서 '인력을 크게 늘렸다'는 증거로 계산된다.
+    #    그건 채용이 아니라 회계적 편입이다 — 스펙 §4 C15(d) 가 정확히 배제하려던 것이고,
+    #    한 다리에만 걸어 두면 산식 정의가 절반만 지켜진다.
+    #  ★ 반대로 (a) 분모 안정성 게이트는 nl_emp 에 걸지 않는다. 그건 'Δn 으로 나눌 때'의
+    #    조건이지 '인원이 얼마나 변했는가' 자체의 조건이 아니다. 걸면 정상적인 소폭 증감이
+    #    통째로 사라져 표본이 근거 없이 줄어든다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _organic = gate_d.fillna(False) & contiguous.fillna(False)
+    D["nl_emp"] = (np.log(D["employees"].where(D["employees"] > 0)) -
+                   np.log(D["emp_prev"].where(D["emp_prev"] > 0))).where(_organic)
+    D["nl_dn"] = D["dn"].where(_organic)
+    D["nl_regular"] = ((D["regular_ratio"] - g["regular_ratio"].shift(1)).where(_organic)
+                       if "regular_ratio" in D.columns else np.nan)
+
+    ok = gate_a.fillna(False) & _organic
     D["nl_marginal"] = safe_div(D["d_pay"], D["dn"]).where(ok)
 
     # (b) 임금프리미엄 [0, 5] 클리핑. 초과는 '오류'로 보고 NaN — 절대 clip 으로 뭉개지 않는다.
@@ -8976,19 +9120,41 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P = P.sort_values(["code", "month"]).copy()
     g = lambda c: gby(P, c)
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ '같은 공시를 두 번 보고 차분한 것'을 관측으로 세지 않는다 ★★
+    #    as-of 결합은 마지막으로 알려진 재무를 최대 550일까지 실어 나른다(PIT_ASOF_MAX_DAYS).
+    #    550일 ≈ 18개월이므로, 격자가 비어 다음 사업보고서를 못 받은 회사에서는
+    #    **t 와 t-12 가 같은 공시**를 가리키는 구간이 생긴다. 그 상태로 diff(12) 를 하면
+    #    결측이 아니라 **정확히 0.0** 이 나온다. 0.0 은 '변화 없음' 이라는 관측처럼 보여서
+    #      · MIN_TP_OBSERVED(FLOOR) 게이트를 통과하고
+    #      · 셀 랭크에서 중간 순위를 차지하고
+    #      · 커버리지 표에는 '관측 있음'으로 집계된다.
+    #    즉 데이터가 없다는 사실이 '변화가 없었다'는 사실로 둔갑한다 — 조용히 틀리는 쪽이다.
+    #    다행히 패널에는 이미 kd_fin(재무 지식일)이 붙어 있으므로 한 줄로 판별된다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    if "kd_fin" in P.columns:
+        _kd = as_ts_series(P["kd_fin"])
+        P["_kd_fin_ts"] = _kd
+        _stale = (_kd.notna() & g("_kd_fin_ts").shift(12).eq(_kd)).fillna(False)
+        P = P.drop(columns=["_kd_fin_ts"], errors="ignore")
+    else:
+        _stale = pd.Series(False, index=P.index)
+    _n_stale = int(_stale.sum())
+    _fresh = lambda s: s.where(~_stale)      # 같은 공시 재사용 구간은 결측으로 되돌린다
+
     # i_sales — 매출 TTM 의 전년동월 대비 로그변화
-    P["i_sales"] = g("revenue_ttm").transform(lambda s: dlog(s, 12))
+    P["i_sales"] = _fresh(g("revenue_ttm").transform(lambda s: dlog(s, 12)))
 
     # i_dio / i_dso / i_turn — 회전일수는 '줄어드는 것'이 좋으므로 부호를 뒤집는다
     P["i_dio"] = safe_div(col(P, "inventory"), col(P, "cogs_ttm")) * 365.0
     P["i_dso"] = safe_div(col(P, "receivable"), col(P, "revenue_ttm")) * 365.0
     P["turn_days"] = P["i_dio"] + P["i_dso"]
-    P["i_turn"] = -g("turn_days").diff(12)
+    P["i_turn"] = _fresh(-g("turn_days").diff(12))
 
     # i_accr — Sloan 발생액. 순이익이 음수인 구간에서도 안전(분모가 평균총자산이므로)
     avg_assets = (col(P, "assets") + g("assets").shift(12)) / 2.0
     P["accruals"] = safe_div(col(P, "net_income_ttm") - col(P, "cfo_ttm"), avg_assets)
-    P["i_accr"] = -g("accruals").diff(12)
+    P["i_accr"] = _fresh(-g("accruals").diff(12))
 
     # i_capex — 유형자산취득 / 직전 3년 평균.  1.0 이면 평년 수준, 2.0 이면 두 배 투자.
     #   ★ 분모는 '직전' 3년이어야 한다. 현재를 포함하면 자기 자신으로 나누는 꼴이 되어
@@ -9000,7 +9166,7 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["_capex_abs"] = capex_abs
     base3 = (g("_capex_abs")
              .transform(lambda s: s.shift(12).rolling(36, min_periods=12).mean()))
-    P["i_capex"] = safe_div(capex_abs, base3)
+    P["i_capex"] = _fresh(safe_div(capex_abs, base3))
 
     # i_ic / i_roic — 투하자본과 그 수익률
     # ★ 구성항목을 각각 fillna(0) 한 뒤 더하면, 계정이 **하나도 없는** 회사의 IC 가
@@ -9014,14 +9180,14 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     nwc = (col(P, "receivable").fillna(0) + col(P, "inventory").fillna(0)
            - col(P, "payable").fillna(0))
     P["IC"] = (nwc + col(P, "ppe").fillna(0) + col(P, "intangible").fillna(0)).where(_ic_obs)
-    P["i_ic"] = g("IC").transform(lambda s: dlog(s, 12))
+    P["i_ic"] = _fresh(g("IC").transform(lambda s: dlog(s, 12)))
     #   NOPAT: 실효세율이 관측되면 그걸 쓰고, 아니면 22% 가정. 셀 내 상대값이라 수준은 무해.
     eff = safe_div(col(P, "tax_expense_ttm"), col(P, "pretax_income_ttm"))
     eff = eff.where((eff >= 0) & (eff <= 0.6))
     P["nopat"] = col(P, "op_income_ttm") * (1.0 - eff.fillna(0.22))
     avg_ic = (P["IC"] + g("IC").shift(12)) / 2.0
     P["ROIC"] = safe_div(P["nopat"], avg_ic)
-    P["i_roic"] = g("ROIC").diff(12)
+    P["i_roic"] = _fresh(g("ROIC").diff(12))
 
     # p_payout / p_invest — 자본배분
     # ★ 같은 함정이 여기 두 번 더 있었다. capex_ttm·rnd_ttm 이 **통째로 없는** 실행에서
@@ -9032,12 +9198,12 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     payout = (col(P, "dividend_paid_ttm").abs().fillna(0)
               + col(P, "treasury_buy_ttm").abs().fillna(0)).where(_payout_obs)
     P["payout_ratio"] = safe_div(payout, col(P, "cfo_ttm"))
-    P["p_payout"] = g("payout_ratio").diff(12)
+    P["p_payout"] = _fresh(g("payout_ratio").diff(12))
     _invest_obs = col(P, "capex_ttm").notna() | col(P, "rnd_ttm").notna()
     invest = (col(P, "capex_ttm").abs().fillna(0)
               + col(P, "rnd_ttm").abs().fillna(0)).where(_invest_obs)
     P["invest_ratio"] = safe_div(invest, col(P, "revenue_ttm"))
-    P["p_invest"] = g("invest_ratio").diff(12)
+    P["p_invest"] = _fresh(g("invest_ratio").diff(12))
 
     # p_cancel — 자사주 취득공시 대비 12M 내 실제 소각 실행률 (한국 특수성: 취득≠소각)
     P = _attach_treasury(P, ctx)
@@ -9046,10 +9212,16 @@ def core_d_sensors(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     P["eff_tax"] = safe_div(col(P, "tax_expense_ttm"),
                             col(P, "pretax_income_ttm").where(col(P, "pretax_income_ttm") > 0))
     P["eff_tax"] = P["eff_tax"].where((P["eff_tax"] >= -0.5) & (P["eff_tax"] <= 1.0))
-    P["d_eff_tax"] = g("eff_tax").diff(12)
+    P["d_eff_tax"] = _fresh(g("eff_tax").diff(12))
 
     P["equity_impaired"] = (col(P, "equity") <= 0)
     P = P.drop(columns=["_capex_abs"], errors="ignore")
+    if _n_stale:
+        LOG.warn(f"★ 12개월 전과 **같은 재무공시**를 보고 있는 {_n_stale:,}행"
+                 f"({100*_n_stale/max(len(P),1):.1f}%)의 CORE-D 차분 센서를 결측 처리했습니다. "
+                 f"그대로 두면 diff(12) 가 결측이 아니라 정확히 0.0 이 되어 '변화 없음'이라는 "
+                 f"관측으로 둔갑하고, 최소 TP 관측수 게이트와 커버리지 표를 동시에 속입니다. "
+                 f"원인은 격자 결손(Tier-2 미수집)이며, 재실행으로 채우면 이 수가 줄어듭니다.")
     return P
 
 
@@ -9083,6 +9255,11 @@ def _attach_treasury(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                              P["treasury_acq_n"].where(P["treasury_acq_n"] > 0)).clip(0, 2)
     P["acq_size"] = safe_div(col(P, "treasury_buy_ttm").abs(), col(P, "assets"))
     return P
+
+
+# ★ EMP 신호가 실제로 존재한 달의 범위. 리포트가 '두 전략의 이어붙임'을 가르는 근거다.
+#   여기서 채워 두지 않으면 L6 이 120개월을 하나의 전략처럼 합산해 보고한다.
+EMP_SIGNAL_SPAN: Dict[str, Any] = {"lo": None, "hi": None, "n_rows": 0}
 
 
 # ── EMP-LITE 파생 (연도 프레임 센서는 이미 붙어 있고, 여기선 패널 결합이 필요한 것만) ───────
@@ -9131,6 +9308,26 @@ def emp_lite_sensors(P: pd.DataFrame, emp_start: Optional[pd.Timestamp]) -> pd.D
                 P.loc[pre, c] = np.nan
         LOG.warn(f"§6 커버리지 판정에 따라 {as_ts(emp_start):%Y-%m} 이전 {n:,}행의 EMP 센서를 "
                  f"결측 처리했습니다. 이 구간은 CORE-D 5개 TP 만으로 평가됩니다.")
+
+    # ★ 알파(직원현황)가 실제로 관측된 달의 범위를 기록한다. 이것이 없으면 L6 이
+    #   'EMP 없는 80개월 + EMP 있는 40개월' 을 하나의 10년 전략으로 합산해 보고한다.
+    _obs = pd.Series(False, index=P.index)
+    for c in ("nl_emp", "nl_premium"):
+        if c in P.columns:
+            _obs |= col(P, c).notna()
+    if bool(_obs.any()):
+        _mm = P.loc[_obs, "month"]
+        EMP_SIGNAL_SPAN.update({"lo": _mm.min(), "hi": _mm.max(),
+                                "n_rows": int(_obs.sum())})
+        _tot = int(P["month"].nunique())
+        _cov = int(P.loc[_obs, "month"].nunique())
+        LOG.info(f"EMP 신호 존재 구간 {_mm.min():%Y-%m}~{_mm.max():%Y-%m} — "
+                 f"{_cov}/{_tot}개월({_cov/max(_tot,1):.0%})에 관측이 있습니다. "
+                 f"나머지 달은 CORE-D 단독으로 돕니다(성과 보고 시 분리 표기).")
+    else:
+        EMP_SIGNAL_SPAN.update({"lo": None, "hi": None, "n_rows": 0})
+        LOG.warn("EMP 신호가 어느 달에도 존재하지 않습니다 — 이 실행은 사실상 "
+                 "'CORE-D 단독' 전략입니다. 결론에 그대로 명시하세요.")
     return P
 
 
@@ -9139,12 +9336,21 @@ UMID_RANK_LO, UMID_RANK_HI = 251, 1400
 
 
 def universe_band(name: str) -> Tuple[int, int, float]:
-    """(랭크 하한, 랭크 상한, 거래대금 하한). 비교용 대역을 한 곳에서 정의한다."""
+    """(랭크 하한, 랭크 상한, 거래대금 하한). 비교용 대역을 한 곳에서 정의한다.
+
+    ★ 랭크는 **유동성 하한을 통과한 집합 안에서** 매긴 순위다(apply_umid 참조).
+      전 종목 기준 순위가 아니다 — 그렇게 하면 랭크 변수와 하한 변수가 같은 adv20 이라
+      하위 대역이 정의상 공집합이 된다.
+    """
     if name == "SMALL":
-        # 시총(대리: 거래대금) 하위 1,000. 유동성 하한은 그대로 두어야 '못 담는 종목으로
-        # 만든 성과'가 되지 않는다. 하한을 낮추면 체결 불가능한 종목이 섞여 성과가
-        # 부풀려진다 — 비교의 의미가 사라진다.
-        return SMALL_RANK_LO, SMALL_RANK_HI, MIN_ADV_KRW
+        # 시총(대리: 거래대금) 하위 SMALL_BAND_N 개. 유동성 하한은 그대로 두어야
+        # '못 담는 종목으로 만든 성과'가 되지 않는다.
+        # ★ 하한이 절대 랭크(1401~2400)로 박혀 있으면, 담을 수 있는 종목이 월 1,400개인
+        #   시장에서 이 대역은 **영구히 비어 있다**(7회차 월 2.5종목). 그러면 비교팔이
+        #   '소형주는 성과가 나쁘다'가 아니라 '대역을 잘못 정의했다'를 재게 된다.
+        #   → 아래에서 -1 은 '매월 담을 수 있는 종목의 **끝에서부터**' 를 뜻하는 표식이고,
+        #     실제 경계는 apply_umid 가 그 달의 가용 종목수에서 계산한다.
+        return -SMALL_BAND_N, -1, MIN_ADV_KRW
     if name == "ALL":
         # ★ 전체 종목. 규모 랭크 제한 없음 — 대형주부터 소형주까지 전부.
         #   유동성 하한만 남긴다(체결 불가 종목을 넣으면 비교 자체가 성립하지 않는다).
@@ -9166,9 +9372,41 @@ def apply_umid(P: pd.DataFrame, uni: "Universe", band: str = "UMID") -> pd.DataF
     lo, hi, adv_min = universe_band(band)
     P = P.copy()
     adv = col(P, "adv20")
-    rank = adv.groupby(P["month"], observed=True).rank(ascending=False, method="first")
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 랭크는 '유동성 하한을 통과한 집합 안에서' 매긴다 ★★
+    #    예전엔 전 종목에서 랭크를 매긴 뒤 `rank.between(lo,hi) & (adv >= adv_min)` 로
+    #    둘을 AND 했다. 그런데 **랭크 변수와 하한 변수가 똑같이 adv20** 이다.
+    #    하한(3억)을 넘는 종목이 월 1,400개 안팎이면, 랭크 1401~2400 구간은 정의상
+    #    전부 하한 미달이라 교집합이 **거의 공집합**이 된다.
+    #    7회차 스몰캡 팔이 월평균 2.5종목이었던 이유가 이것이다 — 신호가 나빠서가 아니라
+    #    대역 정의가 스스로를 배제하고 있었다. 그 위에서 '규모 대역의 효과'를 논했다.
+    #  → 하한을 먼저 적용해 '실제로 담을 수 있는 종목'을 확정하고, 그 안에서 랭크를 매긴다.
+    #    이러면 SMALL 은 '담을 수 있는 종목 중 규모 하위 N' 이라는 원래 의도가 되고,
+    #    사용자 요구('시총하위 1000개 종목 한정')와도 정확히 맞는다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    tradable = (adv >= adv_min).fillna(False)
+    rank = adv.where(tradable).groupby(P["month"], observed=True).rank(
+        ascending=False, method="first")
     P["size_rank"] = rank
-    P["u_mid"] = (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
+    n_tr = tradable.groupby(P["month"], observed=True).transform("sum")
+    if lo < 0:
+        # '끝에서부터' 대역 — 그 달 담을 수 있는 종목수에서 역산한다. 시장 규모가 해마다
+        # 달라지므로 절대 랭크로 박으면 어떤 해에는 비고 어떤 해에는 넘친다.
+        _lo_m = (n_tr + lo + 1).clip(lower=1)      # lo = -1000 → 끝에서 1000번째
+        _hi_m = n_tr
+        P["u_mid"] = (tradable & (rank >= _lo_m) & (rank <= _hi_m)).fillna(False)
+        _width = float((_hi_m - _lo_m + 1).mean()) if len(P) else 0.0
+        LOG.info(f"{band} 대역 = 매월 '담을 수 있는 종목'의 하위 {abs(lo):,}개 — "
+                 f"월평균 가용 {float(n_tr.mean()):,.0f}종목 중 실제 폭 {_width:,.0f}종목. "
+                 f"절대 랭크로 박지 않는 이유: 시장 규모가 해마다 달라 어떤 해에는 대역이 "
+                 f"통째로 비어 버립니다(7회차 스몰캡 팔 월 2.5종목의 원인).")
+    else:
+        P["u_mid"] = (tradable & rank.between(lo, hi)).fillna(False)
+        _n_tr = float(n_tr.mean()) if len(P) else 0.0
+        if band != "ALL" and _n_tr and hi > _n_tr:
+            LOG.warn(f"{band} 대역의 랭크 상한({hi:,})이 유동성 하한을 통과하는 월평균 종목수"
+                     f"({_n_tr:,.0f})를 넘습니다 — 대역 뒷부분이 비어 실제 폭이 "
+                     f"{max(0.0, _n_tr - lo + 1):,.0f}종목으로 줄어듭니다.")
     # ★ 감쇠 원장에 **어느 팔인지** 를 함께 남긴다. 전체(ALL)와 하위1000(SMALL)이
     #   같은 태그로 섞이면 뒤 단계가 앞 단계보다 커져 잔존율이 100%를 넘는다(7회차 113.7%).
     for m, g in P.groupby("month", observed=True):
@@ -9336,6 +9574,40 @@ def report_cell_rank_diag(top: int = 24):
     LOG.table(rows, ["센서", "유효관측", "랭크산출", "해결 단계", "비고"],
               ["l", "r", "r", "l", "l"],
               title="셀 랭크 진단 — '입력이 없어서'와 '표본이 모자라서'를 구별합니다")
+
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 사다리가 실제로 밟혔는가 — **행 수가 아니라 랭크 해결 건수**로 판정한다 ★★
+    #    build_cells_v3 의 사다리 표는 '셀당 행 수'를 센다. 그런데 cell_rank 의 게이트는
+    #    **센서별 유효관측수**(transform("count"))다. 30행짜리 셀이라도 그 센서를 관측한
+    #    종목이 3개면 1단은 못 밟고 아래로 내려간다.
+    #    그래서 행 기준 표에는 '표본≥8 비율 88%' 처럼 건강하게 찍히는데, 실제로는
+    #    랭크의 대부분이 4단(month|ALL|ALL = 전체시장)에서 해결되고 있을 수 있다.
+    #    그 상태면 산업·규모 중립화는 **한 번도 일어나지 않은 것**이고, 정책효과가
+    #    셀 내 공통충격으로 흡수된다는 이 전략의 전제(§8)가 통째로 깨진다.
+    #    감지 장치가 셋인데 셋 다 행을 세고 있었으므로 절대 걸리지 않았다 — 그래서 여기서 센다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    agg: Dict[str, int] = {}
+    for d in CELL_RANK_DIAG:
+        for k, v in (d.get("by_level") or {}).items():
+            agg[k] = agg.get(k, 0) + int(v)
+    tot = sum(agg.values())
+    if not tot:
+        return
+    _nm = {"cell": "1단 month|업종|규모", "cell_l2": "2단 month|업종|ALL",
+           "cell_l3": "3단 month|업종군|ALL", "cell_l4": "4단 month|ALL|ALL(전체시장)"}
+    LOG.table([[_nm.get(k, k), f"{agg.get(k, 0):,}", f"{100*agg.get(k, 0)/tot:.1f}%"]
+               for k in CELL_LADDER_V3 if k in agg],
+              ["실제 해결 단계", "랭크 산출 건수", "비중"], ["l", "r", "r"],
+              title="셀 사다리 실효 사용률 — 행 수가 아니라 '센서별 유효관측' 기준")
+    _flat = agg.get("cell_l4", 0) / tot
+    if _flat > 0.5:
+        LOG.warn(f"★ 셀 랭크의 {_flat:.0%}가 **전체시장(4단)** 에서 해결됐습니다 — 산업·규모 "
+                 f"중립화가 사실상 일어나지 않았습니다. 스펙 §8 이 셀에 규모를 넣은 이유는 "
+                 f"정부 지원제도가 기업 규모에 연동되므로 정책효과를 셀 내 공통충격으로 "
+                 f"흡수시키기 위함인데, 전체시장 랭크로 떨어지면 그 흡수가 사라지고 "
+                 f"규모효과·산업효과가 신호로 둔갑합니다. "
+                 f"원인은 센서 커버리지 부족(Tier-2·직원현황 미수집)이지 셀 정의가 아닙니다 — "
+                 f"CELL_MIN_N_V3 를 낮추지 마시고 수집을 채우세요.")
 
 
 def _clean_num(P: pd.DataFrame, name_or_series) -> pd.Series:
@@ -9554,6 +9826,18 @@ def apply_vetoes_v3(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     adm = ctx.get("administrative")
     if adm is not None and len(adm) and "code" in adm.columns:
         P["V5"] = np.where(P["code"].isin(set(adm["code"].dropna())), 0.0, P["V5"])
+    else:
+        # ★★ 선언한 거부권이 배선되지 않은 채 조용히 통과하고 있었다 ★★
+        #   VETO_DEFS_V3 는 V5 를 '자본잠식 · 관리종목 · 감사의견 비적정' 이라고 선언하는데,
+        #   ctx["administrative"] 를 채우는 코드가 저장소 어디에도 없다. 즉 실제로 걸리는
+        #   것은 자본잠식(equity<=0) 하나뿐이고, **관리종목·감사의견 비적정은 한 번도
+        #   거부되지 않았다.** 그런데 거부권 발동표에는 V5 가 정상 항목으로 찍히므로
+        #   읽는 사람은 세 다리가 모두 작동한다고 믿는다 — 조용히 성과를 부풀리는 쪽이다.
+        #   (관리종목은 폭락 직전 구간이 많아, 빠지지 않으면 손실이 그대로 들어온다)
+        LOG.warn("V5 거부권의 '관리종목·감사의견 비적정' 다리가 배선되지 않았습니다 "
+                 "— 실제로 걸리는 것은 자본잠식(자본총계≤0) 하나뿐입니다. "
+                 "관리종목 목록이 없으면 그 종목들이 유니버스에 그대로 남아 성과가 "
+                 "**과대평가**될 수 있습니다. 아래 거부권 표의 V5 수치를 그렇게 읽으세요.")
 
     # V6 — 유동성
     P["V6"] = np.where((col(P, "adv20").fillna(0) >= MIN_ADV_KRW) &
@@ -10784,7 +11068,10 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
         return
 
     resid = pd.Series(np.nan, index=Q.index, dtype="float64")
+    _n_months = 0
+    _n_fit = 0
     for m, idx in Q.groupby("month", observed=True).indices.items():
+        _n_months += 1
         idx = np.asarray(idx)
         yy = y.to_numpy()[idx]
         XX = np.column_stack([np.ones(len(idx))] + [Q[f].to_numpy()[idx] for f in facs])
@@ -10798,6 +11085,30 @@ def R3_orthogonal(P: pd.DataFrame, run_fn: Callable) -> None:
         r = np.full(len(idx), np.nan)
         r[ok] = yy[ok] - XX[ok] @ beta
         resid[idx] = r
+        _n_fit += 1
+
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★★ 회귀가 돌지 못한 달을 '직교화했다'고 말하지 않는다 ★★
+    #    통제변수 4개 중 f_prof·f_accr·f_size 는 Tier-2 재무(현금흐름표·자산)에 의존한다.
+    #    Tier-2 커버리지가 13.5% 이던 실행에서는 완전관측(complete-case) 행이 20개를 못 넘겨
+    #    대부분의 달에서 `continue` 로 건너뛰었다. 그 달의 잔차는 전부 NaN 이고,
+    #    아래에서 Signal = E.fillna(0) × … 를 타면 **전 종목이 동점 0** 이 된다.
+    #    동점은 _top_n 의 2·3차 키(Signal, code)로 깨지므로, 그 달의 포트폴리오는
+    #    사실상 '종목코드 오름차순 바스켓'이다. 그걸로 얻은 Sharpe 를 '직교화 후 알파'라고
+    #    보고하면 팩터 이야기가 아니라 정렬 이야기를 하는 것이다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    _cov_m = _n_fit / max(_n_months, 1)
+    _cov_r = float(resid.notna().mean()) if len(resid) else 0.0
+    if _cov_m < 0.60 or _n_fit < 24:
+        _rec("R3", "퀄리티 직교화", None,
+             f"통제변수(규모·수익성·모멘텀·발생액)가 완전관측되는 달이 "
+             f"{_n_fit}/{_n_months}({_cov_m:.0%})뿐이라 직교화가 성립하지 않습니다. "
+             f"건너뛴 달은 잔차가 전부 결측이라 신호가 동점이 되고, 그 달의 포트폴리오는 "
+             f"사실상 종목코드 순 바스켓이 됩니다 — 그 위에서 '알파 잔존/소멸'을 판정하지 "
+             f"않습니다. Tier-2 재무 커버리지를 먼저 올리세요.",
+             f"회귀 성공 {_n_fit}/{_n_months}개월 · 잔차 산출 {_cov_r:.1%}행")
+        runtime_mark("R3", time.time() - t0)
+        return
 
     Z = Q.copy()
     Z["E"] = cell_rank(Z, resid)
@@ -11116,6 +11427,10 @@ def report_performance_v3(bt: dict, bench: Dict[str, pd.Series], label: str = ""
                       ["l", "r", "r", "r", "r", "r", "r"],
                       title="벤치마크 대비 (이 실행에서 직접 재측정 — 인용 없음)")
 
+    if "월평균현금비중" in s and np.isfinite(s.get("월평균현금비중", np.nan)):
+        LOG.info(f"월평균 현금 비중 {s['월평균현금비중']:.1%} — 이 비중만큼은 시장에 노출되지 "
+                 f"않았습니다. 다른 팔과 CAGR 을 비교하기 전에 이 값부터 맞춰 보세요.")
+    report_emp_regime_v3(bt)
     rt = right_tail_contribution(bt)
     if rt:
         LOG.table([[k, f"{v:.4f}" if isinstance(v, float) else str(v)] for k, v in rt.items()],
@@ -11126,6 +11441,50 @@ def report_performance_v3(bt: dict, bench: Dict[str, pd.Series], label: str = ""
             LOG.warn(f"총기여의 {100*top5/base:.0f}%가 상위 5% 종목에서 나옵니다. "
                      f"이 전략은 우측 꼬리 의존적입니다 — 표본 밖에서 재현되지 않을 위험이 "
                      f"IR 이 시사하는 것보다 훨씬 큽니다. 숨기지 않고 명시합니다.")
+
+
+def report_emp_regime_v3(bt: dict) -> None:
+    """★★ 이 전략의 결과를 CAGR 한 줄로 말하면 안 되는 이유를 표로 보여준다 ★★
+
+    7회차 실행의 직원현황 커버리지는 2022~2025 네 해뿐이었다. 백테스트는 120개월인데
+    앞 80개월에는 EMP 센서가 한 건도 없다. 그 구간의 성과는 **CORE-D 단독 전략**의
+    성과이고, 뒤 40개월만이 'CORE-D + EMP-LITE' 다. 두 구간을 복리로 이어 붙여
+    "이 전략의 10년 CAGR" 이라고 부르면, 존재한 적 없는 하나의 전략을 보고하는 셈이다.
+
+    → 신호가 실제로 존재한 구간과 아닌 구간을 갈라서 나란히 낸다. 합산값도 함께 두되,
+      그것이 두 전략의 이어붙임이라는 사실을 표 제목에 적는다. 숨기고 합치지 않는다.
+    """
+    lo, hi = EMP_SIGNAL_SPAN.get("lo"), EMP_SIGNAL_SPAN.get("hi")
+    R = bt.get("returns")
+    if R is None or R.empty or lo is None or hi is None:
+        return
+    R = R.copy()
+    R["month"] = as_ts_series(R["month"])
+    on = (R["month"] >= as_ts(lo)) & (R["month"] <= as_ts(hi))
+    pre = R[~on]
+    if len(pre) < 6 or int(on.sum()) < 6:
+        return                       # 한쪽이 없으면 가를 것이 없다(전 구간이 같은 레짐)
+    rows = []
+    for lab, sub, note in (
+            ("EMP 신호 없음 (CORE-D 단독)", pre, "직원현황 미수집 구간"),
+            (f"EMP 신호 있음 ({as_ts(lo):%Y-%m}~{as_ts(hi):%Y-%m})", R[on],
+             "CORE-D + EMP-LITE"),
+            ("합산 (두 전략의 이어붙임)", R, "★ 하나의 전략이 아님")):
+        st = perf_stats(sub.reset_index(drop=True))
+        _f = lambda k, fmt: (format(st[k], fmt)
+                             if k in st and np.isfinite(st.get(k, np.nan)) else "-")
+        rows.append([lab, f"{len(sub)}", _f("CAGR", ".2%"), _f("Sharpe", ".2f"),
+                     _f("MDD", ".1%"), _f("t통계량(HAC)", ".2f"), note])
+    LOG.table(rows, ["구간", "월수", "CAGR", "Sharpe", "MDD", "t(HAC)", "비고"],
+              ["l", "r", "r", "r", "r", "r", "l"],
+              title="★ EMP 레짐 분할 — 이 표를 보기 전에 위의 합산 CAGR 을 인용하지 마십시오")
+    LOG.warn(f"직원현황(알파 원천)이 존재한 구간은 {int(on.sum())}/{len(R)}개월"
+             f"({on.mean():.0%})뿐입니다. 나머지 {len(pre)}개월은 CORE-D 5개 TP 만으로 돈 "
+             f"**다른 전략**입니다. 두 구간을 복리로 이어 붙인 값을 '이 전략의 10년 성과'로 "
+             f"쓰면 존재한 적 없는 전략을 보고하는 것이 됩니다. "
+             f"결론은 위 표의 'EMP 신호 있음' 행에서 읽으시고, 그 구간이 짧다면 "
+             f"직원현황을 더 채운 뒤 재판정하세요 — 격자가 회사 우선이라 재실행할수록 "
+             f"과거 구간이 함께 채워집니다.")
 
 
 INTERP_D_STATE_V3 = [
@@ -11989,6 +12348,13 @@ def run_contracts_v3(strict: bool = True) -> bool:
             ("fetch_dart_corpcode", fetch_dart_corpcode),
             ("fetch_pykrx_snapshots", fetch_pykrx_snapshots),
             ("build_security_master", build_security_master),
+            # ★ 이번에 새로 만든 수집물도 예외가 아니다. 사용자 절대원칙은 '어떤 신규
+            #   수집데이터든' 이므로, 새 경로를 추가할 때마다 이 목록에도 넣어야 한다.
+            #   지수 일봉은 매 실행 FDR 에서 새로 받으면서 **어디에도 저장하지 않았다** —
+            #   강건성 스위트가 R0 을 부를 때마다 같은 네트워크 왕복을 반복했다.
+            ("_index_daily(지수 벤치마크)", _index_daily),
+            # 가격 무결성 원장(버린 관측의 근거)도 재호출 가능해야 한다.
+            ("build_price_panel(무결성 원장)", build_price_panel),
         ]
         missing = []
         for nm, fn in collectors:
@@ -12011,8 +12377,20 @@ def run_contracts_v3(strict: bool = True) -> bool:
         hsrc = _src_of(_cached_or_fetch) or ""
         if hsrc and "len(got)" not in hsrc:
             return False, "빈 수집 결과로 캐시를 덮어쓰지 않는다는 가드가 보이지 않습니다"
+        # ★ 2단 캐시(로컬 미러)는 **읽기 가속**이어야 한다. 미러가 드라이브를 덮는 경로가
+        #   생기면 그 순간 절대1원칙이 깨진다(로컬의 좁은 스냅샷이 공용 원본을 덮는다).
+        #   방향이 한쪽인지 소스로 확인한다: 미러 기록은 put_table 이후에만 일어나야 한다.
+        vsrc = _src_of(Vault.put_table, Vault.get_table, Vault._mirror_write) or ""
+        if vsrc:
+            if "_mirror_write" not in vsrc:
+                return False, "2단 캐시 미러 배선이 보이지 않습니다 — 드라이브 재읽기가 반복됩니다"
+            if re.search(r"shutil\.copy2\(\s*mp\s*,", vsrc) or \
+               re.search(r"os\.replace\([^)]*,\s*src\s*\)", vsrc):
+                return False, ("★ 로컬 미러가 드라이브 원본을 덮는 경로가 있습니다 — "
+                               "절대1원칙 위반입니다. 방향은 드라이브 → 로컬 한쪽뿐이어야 합니다")
         return True, (f"수집기 {len(collectors)}종 전부 put_table 보유 · "
-                      f"유니버스 원천 3종 캐시 경유 · 빈 결과 덮어쓰기 차단")
+                      f"유니버스 원천 3종 캐시 경유 · 빈 결과 덮어쓰기 차단 · "
+                      f"2단 캐시는 드라이브→로컬 단방향")
 
     _cc("C-PERSIST", "신규 수집물은 무조건 인덱스에 남는다 (세션 무관)", c_persist)
 
@@ -12872,6 +13250,31 @@ def dart_fs_scope_v3(ctx: dict, all_corps: Sequence[str], quiet: bool = False
     return corps, years, prio
 
 
+def collect_band_mask(pm: pd.DataFrame) -> pd.Series:
+    """수집 대상 대역 마스크 — **실제로 평가할 팔들의 합집합**에서 유도한다.
+
+    ══════════════════════════════════════════════════════════════════════════════════════
+     ★★ 여기가 하드코딩돼 있어서 비교팔이 통째로 무의미해지고 있었다 ★★
+       수집 대상 판정(umid_experienced_corps · emp_pairs_needed_v3)이 둘 다
+       `rank.between(UMID_RANK_LO, UMID_RANK_HI)` = [251,1400] 으로 못박혀 있었다.
+       그런데 평가 팔은 ARM_MAIN="ALL"(제한 없음) 과 ARM_COMPARE="SMALL"(1401~2400) 이다.
+       SMALL 은 U-MID 와 **교집합이 없다** — 즉 스몰캡 비교팔이 쓸 직원현황·Tier-2 재무를
+       설계상 단 한 건도 수집하지 않으면서, 그 팔의 성과를 '규모 대역의 효과'로 보고했다.
+       ALL 팔도 랭크 1~250(대형주)과 1401 이하(소형주) 구간이 통째로 무증거였다.
+     → 대역 상수를 직접 참조하지 않고 universe_band() 로 유도한다. 팔을 바꾸면
+       수집 대상이 따라 바뀐다. 두 곳이 같은 함수를 쓰므로 다시 어긋날 수 없다.
+    ══════════════════════════════════════════════════════════════════════════════════════
+    """
+    adv = col(pm, "adv20")
+    rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
+    m = pd.Series(False, index=pm.index)
+    bands = [ARM_MAIN] + ([ARM_COMPARE] if RUN_SMALLCAP_ARM else [])
+    for b in dict.fromkeys(bands):
+        lo, hi, adv_min = universe_band(b)
+        m |= (rank.between(lo, hi) & (adv >= adv_min)).fillna(False)
+    return m.fillna(False)
+
+
 def umid_experienced_corps(ctx: dict, quiet: bool = False) -> Tuple[set, List[str]]:
     """전 기간 중 한 번이라도 U-MID 대역에 든 종목의 corp_code 집합과 우선순위 목록.
 
@@ -12885,9 +13288,7 @@ def umid_experienced_corps(ctx: dict, quiet: bool = False) -> Tuple[set, List[st
     """
     try:
         pm = ctx["panel"]["monthly"]
-        adv = col(pm, "adv20")
-        rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
-        in_band = rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)
+        in_band = collect_band_mask(pm)      # ★ 평가 팔(ALL ∪ SMALL)에서 유도 — 상수 금지
         # ★ code 는 downcast 를 거쳐 category dtype 이다. category 에 대한 value_counts() 는
         #   **관측이 0인 카테고리까지 전부** 인덱스에 싣는다. 그래서 예전 코드는
         #   '대역에 한 번도 못 든 종목'까지 keep 에 담아 축소가 실효 0 이었다
@@ -13117,9 +13518,7 @@ def emp_pairs_needed_v3(ctx: dict, years: Sequence[int]) -> Optional[set]:
     """
     try:
         pm = ctx["panel"]["monthly"]
-        adv = col(pm, "adv20")
-        rank = adv.groupby(pm["month"], observed=True).rank(ascending=False, method="first")
-        in_band = (rank.between(UMID_RANK_LO, UMID_RANK_HI) & (adv >= MIN_ADV_KRW)).fillna(False)
+        in_band = collect_band_mask(pm)      # ★ 평가 팔(ALL ∪ SMALL)에서 유도 — 상수 금지
         B = pm.loc[in_band, ["code", "month"]].copy()
         if B.empty:
             return None
@@ -13184,9 +13583,13 @@ def announce_budget_v3():
              f"     ※ 부족하면 opendart.fss.or.kr 에서 키를 더 발급(무료·즉시)해 "
              f"DART_API_KEYS 에 추가하세요. 한도가 키 개수만큼 곱해집니다.")
     if fs_cap is None or emp_cap is None:
-        LOG.warn("호출 상한이 None 인 단계가 있습니다 — 콜드빌드는 며칠이 걸리며 §12-6 의 "
-                 "4시간 계약 밖입니다. 4시간 안에 끝내려면 숫자를 넣으세요 "
-                 "(권장: EMP_MAX_CALLS=14000, DART_FS_MAX_CALLS=12000).")
+        # ★ 예전엔 여기서 "숫자를 넣으세요" 라고 경고했다. 그런데 사용자 요구는 정반대다 —
+        #   "호출량을 처음부터 19,000/20,000 으로 정하지 말고 남은 만큼 쓰게 하라."
+        #   무제한이 위험한 것은 **개수**가 아니라 **시간**이었고, 그건 이제 데드라인이 막는다.
+        LOG.info(f"호출 상한을 걸지 않았습니다(무제한). 멈추는 조건은 둘뿐입니다 — "
+                 f"① 서버가 020/021 로 거부한 키 ② 4시간 계약의 시간 몫"
+                 f"(EMP {EMP_TIME_SHARE:.0%} → Tier-2 {FS_TIME_SHARE:.0%} · {deadline_note()}). "
+                 f"로컬 추정 잔량으로는 자르지 않습니다 — 잔여량은 서버만 압니다.")
     if plan > left > 0:
         LOG.warn(f"계획 호출({plan:,})이 오늘 잔여 한도({left:,})를 넘습니다 — 우선순위 상위부터 "
                  f"채우고 한도에서 멈춥니다. 커버리지는 재실행할 때마다 올라갑니다.")
@@ -13243,7 +13646,7 @@ def preflight_dart_v3() -> str:
             f"\n"
             f"  선택지\n"
             f"    ① 한도 회복 후 재실행 — DART 한도는 매일 자정(KST)에 초기화됩니다.\n"
-            f"       다음 실행은 EMP 에 예산을 **먼저** 배정하므로 한 번에 {EMP_MAX_CALLS:,}건까지 채웁니다.\n"
+            f"       다음 실행은 EMP 에 예산을 **먼저** 배정하며, 서버가 거부할 때까지 받습니다.\n"
             f"    ② EMP 만 먼저 채우기 — DART_FS_MAX_CALLS=0 으로 두면 Tier-2 가 예산을 쓰지 않아\n"
             f"       직원현황이 최대 속도로 완성됩니다(권장).\n"
             f"    ③ CORE-D 단독으로 돌려보려면 REQUIRE_EMP_ALPHA=False 로 두세요.\n"

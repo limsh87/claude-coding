@@ -365,12 +365,24 @@ class Vault:
         return None
 
     def put_table(self, name: str, df: pd.DataFrame, scope: str = "shared",
-                  domain: str = "table", source: str = "", extra: Optional[dict] = None) -> Optional[str]:
-        """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다."""
+                  domain: str = "table", source: str = "", extra: Optional[dict] = None,
+                  backup: bool = True) -> Optional[str]:
+        """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다.
+
+        backup=False 는 **증분 체크포인트 전용**이다. 왜 필요한가:
+          이 함수는 한 번 불릴 때마다 전체 파일 작업을 네 번 한다 —
+          sha1_file(파일 전체 읽기) → copy2(전량 복사) → parquet 쓰기 → 미러 복사.
+          대상이 구글드라이브 FUSE 이고 대상 테이블이 수백 MB 이면 한 번이 수십 초다.
+          수집 루프는 청크마다 이 함수를 부르므로(EMP 1,000건·Tier-2 40사) 그 비용이
+          수집 시간 자체를 압도하고, _backup 폴더도 청크 수만큼 불어난다.
+        ★ 세대 보존 원칙은 깨지지 않는다: 진실의 원천은 append-only 저널이고,
+          중간 체크포인트는 같은 실행 안에서 **단조 증가**하는 스냅샷이라
+          마지막 저장 한 번만 백업하면 잃을 세대가 없다.
+        """
         if df is None:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
-        if os.path.exists(path):
+        if os.path.exists(path) and backup:
             # ★★ 백업 이름을 타임스탬프에서 **내용해시**로 바꿨다 ★★
             #   실측: 340MB 짜리 가격 테이블이 신규 1종목만 있어도 매 실행 통째로 복사됐고,
             #   _backup 에는 개수·용량 상한이 없으며 삭제 API 도 없다(원칙상 있어서도 안 된다).
