@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_N"
 STRATEGY_NAME      = "PACK-N 국민연금 고용"
 ACTIVE_PACKS       = ["N"]
-BUILD_VERSION      = "v2.20260807.1316"
+BUILD_VERSION      = "v2.20260808.0912"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -174,7 +174,7 @@ import os, sys, re, io, gc, json, time, math, zipfile, hashlib, logging, textwra
 import sqlite3, random, shutil, tempfile, platform, subprocess, warnings, threading, unicodedata
 import datetime as _dt
 from collections import defaultdict, Counter, OrderedDict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -366,42 +366,41 @@ np.random.seed(SEED % (2 ** 32 - 1))
 RNG = np.random.default_rng(SEED)
 
 # 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
+#
+# ★ except 절이 Exception 이 아니라 BaseException 인 이유 — 실제로 겪은 사고다.
+#   pdfplumber → pdfminer.six → cryptography 는 Rust 확장(pyo3)을 쓰는데, 그 바이너리가
+#   런타임의 libffi/_cffi_backend 와 어긋나면 ImportError 가 아니라
+#   `pyo3_runtime.PanicException` 을 던진다. 이건 BaseException 의 직계라
+#   `except Exception` 을 그대로 통과해 실행 전체를 죽인다.
+#   "선택 패키지" 하나가 파이프라인을 죽이는 것은 어떤 경우에도 옳지 않으므로
+#   여기서는 BaseException 을 잡는다. (KeyboardInterrupt/SystemExit 은 아래에서 재전파)
+def _opt_import(name: str, attr: str = ""):
+    try:
+        mod = __import__(name, fromlist=[attr] if attr else [])
+        return getattr(mod, attr) if attr else mod
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:                     # noqa: BLE001 — 위 주석 참조
+        _safe_print(f"  · 선택 패키지 '{name}' 로드 실패({type(e).__name__}) — "
+                    f"해당 기능만 비활성화하고 계속합니다.")
+        return None
+
+
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
 if OPT.get("FinanceDataReader"):
-    try:
-        import FinanceDataReader as fdr           # type: ignore
-    except Exception:
-        fdr = None
+    fdr = _opt_import("FinanceDataReader")
 if OPT.get("pykrx"):
-    try:
-        from pykrx import stock as pykrx_stock    # type: ignore
-    except Exception:
-        pykrx_stock = None
+    pykrx_stock = _opt_import("pykrx", "stock")
 if OPT.get("yfinance"):
-    try:
-        import yfinance as yf                     # type: ignore
-    except Exception:
-        yf = None
+    yf = _opt_import("yfinance")
 if OPT.get("fitz"):
-    try:
-        import fitz                               # type: ignore  (pymupdf)
-    except Exception:
-        fitz = None
+    fitz = _opt_import("fitz")
 if OPT.get("pdfplumber"):
-    try:
-        import pdfplumber                         # type: ignore
-    except Exception:
-        pdfplumber = None
+    pdfplumber = _opt_import("pdfplumber")
 if OPT.get("rapidfuzz"):
-    try:
-        from rapidfuzz import fuzz as rapidfuzz_fuzz   # type: ignore
-    except Exception:
-        rapidfuzz_fuzz = None
+    rapidfuzz_fuzz = _opt_import("rapidfuzz", "fuzz")
 if OPT.get("statsmodels"):
-    try:
-        import statsmodels.api as smapi           # type: ignore
-    except Exception:
-        smapi = None
+    smapi = _opt_import("statsmodels.api")
 
 # ── 병렬 전략 결정 ──────────────────────────────────────────────────────────────────────────
 #   노트북에서 ProcessPoolExecutor 는 "__main__ 에 정의된 함수를 피클할 수 없음" 으로 자주 죽는다.
