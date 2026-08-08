@@ -353,7 +353,15 @@ def collect_event_texts(EV: pd.DataFrame, REP: pd.DataFrame,
     T_cached = pd.concat(cached_txt, ignore_index=True) if cached_txt else pd.DataFrame(columns=TXT_COLS)
     if len(T_cached):
         T_cached = T_cached.drop_duplicates("report_uid", keep="first")
-    have = set(T_cached["report_uid"].astype(str)) if len(T_cached) else set()
+    # ★ 캐시에 있어도 '본문 확보에 실패한' 건은 재시도 대상으로 남긴다.
+    if len(T_cached):
+        _bad = T_cached["extract_method"].astype(str).isin(("download_failed", "no_engine")) \
+            if "extract_method" in T_cached.columns else pd.Series(False, index=T_cached.index)
+        have = set(T_cached.loc[~_bad, "report_uid"].astype(str))
+        if int(_bad.sum()):
+            LOG.info(f"본문 확보에 실패했던 {int(_bad.sum()):,}건을 재시도 대상으로 되돌립니다.")
+    else:
+        have = set()
     todo = R[~R["report_uid"].astype(str).isin(have)]
     LOG.info(f"Phase 3 대상 리포트 {len(R):,}건 — 본문 캐시 보유 {len(R)-len(todo):,}건 / "
              f"신규 추출 {len(todo):,}건")
@@ -464,7 +472,16 @@ def _ncq_download_and_extract(todo: pd.DataFrame) -> pd.DataFrame:
                           desc=f"리포트 PDF {k0//CH+1}/{(len(jobs)-1)//CH+1}")
             got = [r for r in res if r]
             rows.extend(got)
-            _ncq_flush_text_shards(pd.DataFrame(got))
+            # ★★ 다운로드 실패 행을 공용 캐시에 남기면 '음성 캐싱'이 된다. 다음 실행의
+            #   have 집합에 들어가 재시도 대상에서 영구히 빠지고, 그 보고서는 영원히
+            #   제목만으로 채점되어 z 하위로 계통적으로 몰린다(조용한 선택 편향).
+            #   게다가 scope="shared" 라 다른 전략의 캐시까지 오염시킨다. 저장하지 않는다.
+            _keep = [r for r in got if str(r.get("extract_method")) != "download_failed"]
+            if _keep:
+                _ncq_flush_text_shards(pd.DataFrame(_keep))
+            if len(_keep) < len(got):
+                LOG.debug(f"다운로드 실패 {len(got)-len(_keep)}건은 캐시에 저장하지 않습니다"
+                          f"(다음 실행에서 재시도).")
             VAULT.flush("shared")
             del res, got
     if not rows:

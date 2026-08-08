@@ -160,8 +160,19 @@ def ncq_irs_collect(start: str, end: str, max_pages: int = 40) -> pd.DataFrame:
 
 # ── 세션 지속성 (_done.jsonl) ───────────────────────────────────────────────────────────────
 def ncq_done_path(phase: str) -> str:
-    p = os.path.join(VAULT.ns["private"], "index", f"ncq_{phase}_done.jsonl")
+    """★ 파일명을 '_' 로 시작시킨다. Vault.load_index 는 index/ 안의 .jsonl 을 '레거시 인덱스'로
+    간주해 흡수하는데, 그러면 진행상황 기록이 인덱스 행으로 둔갑해 매 실행 누적된다.
+    '_' 로 시작하는 파일은 흡수 대상에서 제외되므로 이름 규칙만으로 원천 차단한다."""
+    p = os.path.join(VAULT.ns["private"], "index", f"_ncq_{phase}_done.jsonl")
     os.makedirs(os.path.dirname(p), exist_ok=True)
+    # 과거 버전이 만든 밑줄 없는 파일이 있으면 그 진행상황도 이어받는다(버리지 않는다).
+    legacy = os.path.join(VAULT.ns["private"], "index", f"ncq_{phase}_done.jsonl")
+    if os.path.exists(legacy) and not os.path.exists(p):
+        try:
+            shutil.copy2(legacy, p)
+            LOG.info(f"이전 형식의 진행기록을 이어받았습니다: {os.path.basename(legacy)}")
+        except Exception:
+            pass
     return p
 
 
@@ -198,11 +209,19 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
     fn = _SOURCE_FN.get(source)
     if fn is None:
         return pd.DataFrame(columns=REPORT_COLS)
-    done = ncq_done_load(f"p1_{source}")
+    done_all = ncq_done_load(f"p1_{source}")
+    # ★ 실패로 기록된 달은 '완료'가 아니다. 일시적 503 하나로 그 달이 영구히 빈 달로 굳으면,
+    #   커버리지 이력에 구멍이 뚫려 **존재하지 않는 신규 커버리지(H1)** 가 만들어진다.
+    #   완결성 진단의 월별 건수도 같이 낮아져 valid_start 까지 틀어진다.
+    done = {k: v for k, v in done_all.items() if str(v.get("status", "ok")) == "ok"}
+    n_retry = len(done_all) - len(done)
+    if n_retry:
+        LOG.info(f"[{source}] 지난 실행에서 실패로 기록된 {n_retry}개월을 이번에 재시도합니다.")
     cb = NcqCircuit(source)
     frames: List[pd.DataFrame] = []
     n_skip = n_new = 0
     flushed = 0                     # frames 중 이미 샤드로 저장한 개수
+    pending_ym: List[Optional[str]] = []   # 저장 확정 전까지 done 표시를 보류하는 달
 
     todo = [m for m in reversed(list(months))]
     bar = tqdm(todo, desc=f"P1 {source}", ncols=88, leave=False)
@@ -224,29 +243,44 @@ def ncq_collect_source_by_month(source: str, months: pd.DatetimeIndex,
         except Exception as ex:                                  # noqa
             LOG.debug(f"[{source}] {ym} 수집 예외 {type(ex).__name__}: {ex}")
             d = None
-        if d is None or len(d) == 0:
+        if d is None:
+            # 예외/HTTP 실패 — '데이터가 없는 달'과 구분해서 기록하고 다음 실행에 재시도한다
             if cb.fail():
                 break
-            ncq_done_mark(f"p1_{source}", ym, n=0, note="empty")
+            ncq_done_mark(f"p1_{source}", ym, n=0, note="fetch_failed", status="failed")
+            pending_ym.append(None)
+            continue
+        if len(d) == 0:
+            cb.ok()
+            ncq_done_mark(f"p1_{source}", ym, n=0, note="empty", status="ok")
             continue
         cb.ok()
         d = d.copy()
         d["_ym"] = ym
         frames.append(d)
         n_new += len(d)
-        ncq_done_mark(f"p1_{source}", ym, n=int(len(d)))
+        pending_ym.append(ym)
         # 연 단위 샤딩 저장 (공용 — 다른 전략도 그대로 재사용)
         # ★ '아직 저장하지 않은 프레임만' 넘긴다. 누적 리스트를 매번 통째로 넘기면
         #   ① concat 이 O(n²) 이 되고 ② put_table 이 같은 연도 샤드를 반복 교체하면서
         #   교체할 때마다 백업 파일을 만들어 드라이브에 백업이 수십 개씩 쌓인다.
+        # ★★ done 표시는 **디스크에 저장된 뒤에만** 한다. 먼저 표시하면 Colab 세션이
+        #   SIGKILL 로 죽었을 때(파이썬 예외가 아니라 finally 도 안 돈다) 최대 12개월치가
+        #   메모리와 함께 증발하는데 _done.jsonl 에는 완료로 남아 영구 결손이 된다.
         if m.month == 1 or m == todo[-1] or (len(frames) - flushed) >= 12:
             _ncq_flush_index_shard(source, frames[flushed:])
             flushed = len(frames)
+            for _y in [x for x in pending_ym if x]:
+                ncq_done_mark(f"p1_{source}", _y, n=-1, status="ok")
+            pending_ym.clear()
     try:
         bar.close()
     except Exception:
         pass
     _ncq_flush_index_shard(source, frames[flushed:], final=True)
+    for _y in [x for x in pending_ym if x]:
+        ncq_done_mark(f"p1_{source}", _y, n=-1, status="ok")
+    pending_ym.clear()
     LOG.ok(f"[P1/{source}] 신규 {n_new:,}건 · 캐시 스킵 {n_skip}개월 · "
            f"소요 {budget.elapsed()/60:.1f}분")
     if not frames:
@@ -277,8 +311,9 @@ def _ncq_flush_index_shard(source: str, frames: List[pd.DataFrame], final: bool 
         VAULT.put_table(name, merged, scope="shared", domain="research",
                         source=f"{source} index shard",
                         extra={"note": "리포트 인덱스 연도 샤드 — 전 전략 공용"})
-    if final:
-        VAULT.flush("shared")
+    # ★ 샤드를 쓸 때마다 저널을 확정한다. parquet 은 디스크에 있는데 인덱스 등록만 메모리에
+    #   남아 있는 상태에서 프로세스가 죽으면, 다음 실행이 그 샤드를 '없는 것'으로 취급한다.
+    VAULT.flush("shared")
 
 
 def ncq_load_cached_index() -> List[pd.DataFrame]:
@@ -293,16 +328,27 @@ def ncq_load_cached_index() -> List[pd.DataFrame]:
         LOG.ok(f"공용 캐시 재활용 — 보고서 원장 {len(master):,}건 "
                f"(다른 전략이 수집한 것도 그대로 씁니다)")
         out.append(master)
+    # ★ 인덱스 key 만 보지 않고 **파일시스템도 직접 훑는다.** 저널 등록 전에 프로세스가
+    #   죽으면 parquet 은 멀쩡히 있는데 key 가 없어 수 시간의 수확을 통째로 못 읽는다.
+    shard_keys: set = set()
     idx = VAULT.load_index("shared")
     if idx is not None and len(idx) and "key" in idx.columns:
-        shard_keys = sorted({str(k) for k in idx["key"].astype(str)
-                             if k.startswith("report_index_")})
-        for k in shard_keys:
-            d = VAULT.get_table(k, scope="shared")
-            if d is not None and len(d):
-                out.append(d)
-        if shard_keys:
-            LOG.info(f"공용 캐시 연도 샤드 {len(shard_keys)}개 재활용")
+        shard_keys |= {str(k) for k in idx["key"].astype(str) if k.startswith("report_index_")}
+    try:
+        for fn in os.listdir(VAULT.table_dir("shared")):
+            if fn.startswith("report_index_") and fn.endswith(".parquet"):
+                shard_keys.add(fn[:-len(".parquet")])
+    except Exception:
+        pass
+    n_ok = 0
+    for k in sorted(shard_keys):
+        d = VAULT.get_table(k, scope="shared")
+        if d is not None and len(d):
+            out.append(d)
+            n_ok += 1
+    if shard_keys:
+        LOG.info(f"공용 캐시 연도 샤드 {n_ok}/{len(shard_keys)}개 재활용 "
+                 f"(인덱스 + 파일시스템 양쪽 스캔)")
     return out
 
 
@@ -355,8 +401,37 @@ def collect_report_index(months: pd.DatetimeIndex, sec: pd.DataFrame) -> pd.Data
     else:
         LOG.ok(f"종목명→티커 매핑 실패율 {100*fail_rate:.2f}% ({n_nocode:,}/{n_all:,}건)")
 
-    VAULT.put_table("research_report_master", REP, scope="shared", domain="research",
-                    source="+".join(RESEARCH_SOURCES))
+    # ★★ 절대 1원칙: 공용 원장을 '컬럼이 깎인 재조립본'으로 덮어쓰지 않는다.
+    #   build_report_master 의 groupby agg 는 16개 컬럼만 만든다. 다른 전략(TCD v2)이 채워둔
+    #   pdf_uid / pdf_analysts / pdf_emails / pdf_target / views 는 그 결과에 없으므로,
+    #   그대로 저장하면 남의 수확을 통째로 지우는 셈이다. 게다가 CACHED 모드(읽기 전용이어야
+    #   하는 실행)에서도 이 저장이 무조건 돌았다.
+    #   → ① 신규 수집이 0건이면 아예 쓰지 않는다  ② 쓸 때는 기존 테이블과 컬럼 합집합으로
+    #     병합해 기존 컬럼을 보존한다.
+    _n_new_collected = int(n_all - n_cached) if n_all > n_cached else 0
+    if RUN_MODE == "CACHED" or _n_new_collected <= 0:
+        LOG.info(f"공용 보고서 원장을 다시 쓰지 않습니다 (신규 수집 {_n_new_collected:,}건, "
+                 f"RUN_MODE={RUN_MODE}) — 기존 캐시를 그대로 보존합니다.")
+    else:
+        _to_save = REP
+        _old = VAULT.get_table("research_report_master", scope="shared")
+        if _old is not None and len(_old) and "report_uid" in _old.columns:
+            _extra = [c for c in _old.columns if c not in REP.columns]
+            if _extra:
+                _side = _old.drop_duplicates("report_uid", keep="last")[["report_uid"] + _extra]
+                _to_save = REP.merge(_side, on="report_uid", how="left")
+                LOG.info(f"기존 공용 원장의 컬럼 {len(_extra)}개를 보존해 병합했습니다: "
+                         f"{_extra[:8]} — 다른 전략이 채운 값이 지워지지 않습니다.")
+            # 이번 원장에 없는 과거 보고서 행도 버리지 않는다(원장은 누적이다)
+            _missing = _old[~_old["report_uid"].astype(str).isin(
+                set(_to_save["report_uid"].astype(str)))]
+            if len(_missing):
+                _cols = list(dict.fromkeys(list(_to_save.columns) + list(_missing.columns)))
+                _to_save = pd.concat([_to_save.reindex(columns=_cols),
+                                      _missing.reindex(columns=_cols)], ignore_index=True)
+                LOG.info(f"기존 원장에만 있던 보고서 {len(_missing):,}건을 함께 보존했습니다.")
+        VAULT.put_table("research_report_master", _to_save, scope="shared", domain="research",
+                        source="+".join(RESEARCH_SOURCES))
     VAULT.put_table(f"report_index_{STRATEGY_ID}", REP, scope="private", domain="research",
                     source="strategy view")
     VAULT.flush()
