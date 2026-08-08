@@ -151,6 +151,7 @@ RUN_MODE = "FULL"
 #    ③이 없던 빌드가 ①②를 다 통과하고도 실행 2분 만에 수집부 한 줄 때문에 죽은 적이 있어
 #    추가되었습니다. 세 검증은 서로 다른 것을 봅니다.
 
+BANNED_PACKAGES: "list[str]" = []   # TCD 는 pykrx 를 씁니다
 SEED = 20260807          # C8 결정성: 모든 난수는 이 시드에서 파생
 VERBOSE = True
 STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 보고 (False로 끄지 마세요)

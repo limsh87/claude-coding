@@ -153,9 +153,14 @@ def scg_dart_api(endpoint: str, params: dict, tries: int = 2) -> Optional[dict]:
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             if q is not None:
                 q.hit_limit()
+        elif st == "021":
+            #  021 = '조회 가능한 회사 개수 초과' — 배치 크기 문제이지 일일 한도가 아니다.
+            #  이걸 소진으로 처리하면 그 순간부터 모든 DART 수집이 조용히 꺼진다.
+            LOG.warn(f"DART status=021 (조회 가능한 회사 개수 초과) — 배치 크기를 줄이세요 "
+                     f"(SCG_DART_MULTI_BATCH={SCG_DART_MULTI_BATCH}). 일일 한도와 무관합니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({SCG_DART_STATUS.get(st,'?')}). "
                       f"DART_API_KEY 를 확인하세요 — https://opendart.fss.or.kr 에서 재발급 가능합니다.")
@@ -204,7 +209,12 @@ def scg_fetch_periodic_disclosures(start: str, end: str) -> pd.DataFrame:
     fin = as_ts(end)
     rows: List[dict] = []
     #  분기별로 끊어 요청한다 (한 구간의 total_page 가 너무 커지지 않도록)
-    periods = pd.date_range(bgn, fin, freq="QS").tolist() or [bgn]
+    #  ★ date_range(freq="QS") 는 bgn 이 분기 중간이면 '다음 분기 시작'부터 시작한다.
+    #    그러면 이어받기 지점과 그 분기 시작 사이의 공시가 영구히 누락된다
+    #    (다음 실행은 더 늦은 지점부터 시작하므로 영영 메워지지 않는다). bgn 을 앞에 붙인다.
+    periods = pd.date_range(bgn, fin, freq="QS").tolist()
+    if not periods or periods[0] > bgn:
+        periods.insert(0, bgn)
     if periods[-1] < fin:
         periods.append(fin)
     for i in range(len(periods) - 1 if len(periods) > 1 else 1):
@@ -271,7 +281,7 @@ def scg_annual_report_dates(dis: pd.DataFrame) -> Dict[Tuple[str, int], pd.Times
 # ── ② 다중회사 주요계정 — 순이익·자본금을 100사/호출로 ────────────────────────────────────
 def scg_fetch_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
     """fnlttMultiAcnt — 100사를 한 번에. 순진한 단건 호출 대비 100배 싸다."""
-    cols = ["corp_code", "bsns_year", "account_nm", "thstrm_amount", "rcept_no"]
+    cols = ["corp_code", "bsns_year", "fs_div", "account_nm", "thstrm_amount", "rcept_no"]
     cached = VAULT.get_table("dart_multi_annual", scope="shared")
     done = set()
     if cached is not None and len(cached):
@@ -288,7 +298,7 @@ def scg_fetch_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) ->
         for k in range(0, len(todo), SCG_DART_MULTI_BATCH):
             jobs.append((todo[k:k + SCG_DART_MULTI_BATCH], int(y)))
     if not jobs:
-        return cached.reindex(columns=cols)
+        return cached.reindex(columns=cols) if cached is not None else pd.DataFrame(columns=cols)
     LOG.info(f"다중회사 주요계정: {len(jobs):,} 호출 예정 "
              f"(오늘 남은 호출 추정 {SCG_QUOTA.est_remaining():,}건)" if SCG_QUOTA else "")
 
@@ -312,7 +322,7 @@ def scg_fetch_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) ->
         return cached.reindex(columns=cols) if cached is not None else pd.DataFrame(columns=cols)
     new = pd.concat(frames, ignore_index=True)
     allr = pd.concat([cached, new], ignore_index=True) if cached is not None and len(cached) else new
-    allr = allr.drop_duplicates(["corp_code", "bsns_year", "account_nm"], keep="last")
+    allr = allr.drop_duplicates(["corp_code", "bsns_year", "fs_div", "account_nm"], keep="last")
     VAULT.put_table("dart_multi_annual", allr, scope="shared", domain="dart",
                     source="opendart fnlttMultiAcnt")
     VAULT.flush("shared")
@@ -330,6 +340,15 @@ def scg_tidy_multi(multi: pd.DataFrame) -> pd.DataFrame:
     if multi is None or multi.empty:
         return pd.DataFrame(columns=cols)
     d = multi.copy()
+    #  ★ 연결(CFS)과 별도(OFS)를 한 회사·한 해에 섞으면 순이익이 두 기준으로 뒤섞여
+    #    EPS 실측치가 조용히 틀어진다. 연결이 있으면 연결만, 없으면 별도만 쓴다.
+    if "fs_div" in d.columns and d["fs_div"].notna().any():
+        pref = d.assign(_p=np.where(d["fs_div"].astype(str).str.upper().eq("CFS"), 0, 1))
+        best = pref.groupby(["corp_code", "bsns_year"], observed=True)["_p"].transform("min")
+        n0 = len(d)
+        d = pref[pref["_p"] == best].drop(columns=["_p"])
+        if len(d) < n0:
+            LOG.debug(f"연결/별도 혼합 제거: {n0:,} → {len(d):,}행 (회사·연도별 연결 우선)")
     d["amt"] = pd.to_numeric(d["thstrm_amount"].astype(str).str.replace(",", "", regex=False),
                              errors="coerce")
     nm = d["account_nm"].astype(str)
@@ -376,7 +395,7 @@ def scg_fetch_shares(corp_map: pd.DataFrame, years: Sequence[int],
             for r in cm.itertuples(index=False)
             if (str(r.corp_code), int(y)) not in done]
     if not jobs:
-        return cached.reindex(columns=cols)
+        return cached.reindex(columns=cols) if cached is not None else pd.DataFrame(columns=cols)
     est = SCG_QUOTA.est_remaining() if SCG_QUOTA else 0
     LOG.info(f"주식총수: 미확보 {len(jobs):,}건 · 오늘 남은 호출 추정 {est:,}건. "
              f"{'오늘 안에 끝납니다.' if len(jobs) <= est else '오늘 다 못 받으면 내일 이어받습니다(캐시 보존).'}")

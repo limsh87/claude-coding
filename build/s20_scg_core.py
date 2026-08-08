@@ -838,9 +838,17 @@ def build_scg_signals(smart_consensus: pd.DataFrame, calendar, cfg: SCGConfig = 
     sd = pd.DatetimeIndex(sorted(D["signal_date"].dropna().unique()))
     back = _scg_shift_td(sd, -int(cfg.ACCEL_LOOKBACK_TRADING_DAYS), cal)
     sdv = sd.values.astype("datetime64[ns]")
-    pos = np.searchsorted(sdv, back, side="right") - 1
+    #  ★ '가장 가까운' signal date 를 쓴다. '이하 중 최대' 로 하면 거래일이 21일 미만인
+    #    달에서 t-20 이 직전 시점보다 살짝 앞서 두 칸 전으로 미끄러지고, 그 달의
+    #    accel 과 BASE_REV 가 조용히 40거래일 변화가 된다(값은 나오는데 정의가 다르다).
+    lo = np.searchsorted(sdv, back, side="right") - 1
+    hi = np.minimum(lo + 1, len(sdv) - 1)
+    lo_c = np.clip(lo, 0, len(sdv) - 1)
+    d_lo = np.abs(sdv[lo_c].astype("int64") - back.astype("datetime64[ns]").astype("int64"))
+    d_hi = np.abs(sdv[hi].astype("int64") - back.astype("datetime64[ns]").astype("int64"))
+    pick = np.where((lo >= 0) & (d_lo <= d_hi), lo_c, hi)
     prev_map = pd.Series(
-        [sd[p] if (p >= 0 and not pd.isna(b)) else pd.NaT for p, b in zip(pos, back)],
+        [sd[p] if (not pd.isna(b)) else pd.NaT for p, b in zip(pick, back)],
         index=sd, name="_prev_sd")
     #  자기 자신을 가리키면(캘린더가 짧아 t-20 이 t 이후로 계산되는 경우) 무효 처리
     prev_map = prev_map.where(prev_map < pd.Series(sd, index=sd))

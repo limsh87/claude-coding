@@ -46,25 +46,28 @@ def scg_forward_returns(signals: pd.DataFrame, px: pd.DataFrame, cal,
     lastpos = np.where(has.any(axis=0), has.shape[0] - 1 - has[::-1].argmax(axis=0), -1)
     last_px = np.where(lastpos >= 0, M[np.clip(lastpos, 0, len(didx) - 1),
                                        np.arange(M.shape[1])], np.nan)
+    #  패널 전체의 마지막 관측 위치. 이 뒤는 '폐지'가 아니라 '아직 오지 않은 미래' 다.
+    data_end = int(lastpos.max()) if lastpos.size else -1
 
     n_delist = np.zeros(len(out), dtype="int32")
 
-    def _ret_at(pos: np.ndarray) -> np.ndarray:
+    def _ret_at(pos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        #  ★ '폐지' 와 '데이터 끝' 을 반드시 분리한다. 한 플래그로 묶으면 표본 마지막
+        #    h 거래일에서 폐지 종목만 결측이 되고 생존자만 값을 갖는다 — 생존자편향의
+        #    정확한 재현이다. 그리고 살아있는 종목의 지평이 패널 끝을 넘었을 때
+        #    마지막 행으로 clip 하면 9일 수익률을 20일 수익률인 척 내보내게 된다.
         pos_c = np.clip(pos, 0, len(didx) - 1)
         inrange = valid0 & (pos >= 0)
-        px_h = np.where(inrange, M[pos_c, ci_v], np.nan)
-        #  지평 시점에 가격이 없다 = 그 사이에 폐지되었거나 캘린더를 넘어섰다.
-        gone = inrange & np.isnan(px_h) & (lastpos[ci_v] >= 0) & (lastpos[ci_v] >= p0i)
-        beyond = pos >= len(didx)          # 데이터 끝을 넘어선 것은 '폐지'가 아니다
-        if delist_mode == "minus100":
-            px_g = np.zeros_like(px_h)
-        else:
-            px_g = last_px[ci_v]
-        px_h = np.where(gone & ~beyond, px_g, px_h)
+        lp = lastpos[ci_v]
+        gone = inrange & (lp >= 0) & (lp >= p0i) & (pos > lp) & (lp < data_end)
+        unobs = inrange & ~gone & (pos > data_end)      # 관측 불가 → 결측 (fabrication 금지)
+        px_h = np.where(inrange & ~unobs, M[pos_c, ci_v], np.nan)
+        px_g = np.zeros_like(px_h) if delist_mode == "minus100" else last_px[ci_v]
+        px_h = np.where(gone, px_g, px_h)
         r = np.where(np.isfinite(base) & (base > 0), px_h / base - 1.0, np.nan)
         #  진입 후 한 번도 체결이 없었으면 팔 기회 자체가 없었다 → -100%
-        r = np.where(gone & ~beyond & ~np.isfinite(r), -1.0, r)
-        return np.clip(r, -1.0, None), (gone & ~beyond)
+        r = np.where(gone & ~np.isfinite(r), -1.0, r)
+        return np.clip(r, -1.0, None), gone
 
     for h in hs:
         r, g = _ret_at(p0i + h)
@@ -149,7 +152,8 @@ def scg_bucket_backtest(sig: pd.DataFrame, alpha_col: str, n_buckets: int,
         g = g.assign(_b=b, _nb=nb)
         for bi, gg in g.groupby("_b", observed=True):
             rows.append({"signal_date": T, "bucket": int(bi), "n_buckets": nb,
-                         "ret": float(gg[ret_col].mean()), "n": int(len(gg))})
+                         "ret": float(gg[ret_col].mean()), "n": int(len(gg)),
+                         "is_top": int(bi) == nb - 1, "is_bottom": int(bi) == 0})
         top = g.loc[g["_b"] == nb - 1, "stock_id"]
         holds[T] = set(top.astype(str))
 
@@ -159,9 +163,13 @@ def scg_bucket_backtest(sig: pd.DataFrame, alpha_col: str, n_buckets: int,
     nb_mode = int(pd.Series(used_nb).mode().iloc[0])
     res["n_buckets_used"] = nb_mode
 
-    #  버킷 번호를 항상 1..nb 로 통일해 5분위/10분위가 섞여도 최상/최하가 어긋나지 않게 한다
-    B["bucket_label"] = np.where(B["n_buckets"] == nb_mode, B["bucket"] + 1,
-                                 np.ceil((B["bucket"] + 1) * nb_mode / B["n_buckets"]).astype(int))
+    #  ★ 5분위 fallback 이 섞인 날의 라벨 매핑 — 양 끝이 반드시 1 과 nb_mode 가 되어야 한다.
+    #    ceil((i+1)*nb_mode/nb) 는 5분위를 2,4,6,8,10 으로 보내 라벨 1 을 영영 만들지 않는다.
+    #    그러면 최하위 버킷이 D2 행에 섞이고 롱숏은 5분위 날짜를 통째로 버린다.
+    B["bucket_label"] = np.where(
+        B["n_buckets"] == nb_mode, B["bucket"] + 1,
+        np.rint(1 + B["bucket"] * (nb_mode - 1)
+                / np.maximum(B["n_buckets"] - 1, 1)).astype(int))
     piv = B.pivot_table(index="signal_date", columns="bucket_label", values="ret", aggfunc="mean")
     res["buckets"] = piv
 
@@ -174,8 +182,12 @@ def scg_bucket_backtest(sig: pd.DataFrame, alpha_col: str, n_buckets: int,
     res["avg_holdings"] = float(np.mean([len(v) for v in holds.values()])) if holds else np.nan
 
     cost = (cost_bps / 1e4) * (res["turnover"] if np.isfinite(res["turnover"]) else 0.0) * 2.0
-    res["long"] = (piv[hi_b] - cost).dropna()
-    res["ls"] = (piv[hi_b] - piv[lo_b] - cost).dropna()
+    #  ★ 레그는 라벨이 아니라 '그 날의 실제 최상/최하 버킷' 에서 뽑는다. 라벨로 뽑으면
+    #    5분위 날짜가 롱에는 남고 롱숏에서는 빠져 두 계열의 표본이 달라진다.
+    top_s = B.loc[B["is_top"]].set_index("signal_date")["ret"].sort_index()
+    bot_s = B.loc[B["is_bottom"]].set_index("signal_date")["ret"].sort_index()
+    res["long"] = (top_s - cost).dropna()
+    res["ls"] = (top_s - bot_s - 2.0 * cost).dropna()
 
     smry = piv.mean().rename("mean_ret").to_frame()
     smry["std"] = piv.std()

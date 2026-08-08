@@ -68,9 +68,16 @@ def _eps_num(tok: str) -> Tuple[Optional[float], str]:
 
 
 # ── 연도 헤더 ───────────────────────────────────────────────────────────────────────────────
+#  ★ 2자리 연도는 반드시 표식(', FY, 년, 또는 E/F/P/A 접미사)이 있어야 인정한다.
+#    맨 두 자리 숫자까지 연도로 받으면 '12 15 18' 같은 평범한 숫자 행이 헤더로 오인되고,
+#    그 아래 EPS 행이 엉뚱한 연도에 붙는다 — 예외 없이 조용히 틀린다.
+#  ★ 2024.12 / 24/12 같은 결산월 포함 표기도 받는다(한국 리포트에서 흔하다).
 _YEAR_RE = re.compile(
-    r"^\(?(?:FY|fy)?((?:19|20)\d{2}|\d{2})\)?(?:년|년도|년말)?"
-    r"(?:\(([AEFPaefp])\)|([AEFPaefp])|(예상|추정|실적|확정|E|F|P))?$")
+    r"^\(?(?:FY|fy)?"
+    r"(?:(?P<y4>(?:19|20)\d{2})|(?:'|FY|fy)(?P<y2q>\d{2})|(?P<y2>\d{2})(?=[A-Za-z년]))"
+    r"(?:[./-](?P<m>0?[1-9]|1[0-2]))?"
+    r"\)?(?:년|년도|년말|월)?"
+    r"(?:\((?P<s1>[AEFPaefp])\)|(?P<s2>[AEFPaefp])|(?P<s3>예상|추정|실적|확정))?$")
 _SUFFIX_ROW_OK = {"e", "f", "p", "a", "(e)", "(f)", "(p)", "(a)",
                   "십억원", "억원", "백만원", "원", "%", "배", "천원"}
 _FYEAR_MONTH_RE = re.compile(r"(\d{1,2})\s*월")
@@ -122,12 +129,16 @@ def _eps_cells(row: Sequence[Tuple], gap: float = 3.0) -> List[Tuple[float, floa
         x0, x1, t = float(w[0]), float(w[2]), str(w[4])
         if out:
             p = out[-1]
-            both_num = _eps_num(p[2])[1] == "NUM" and _eps_num(t)[1] == "NUM"
+            #  ★ 셀 전체가 아니라 '마지막에 붙은 토큰' 으로 판정해야 한다. 셀이
+            #    '(원)' 처럼 비숫자로 시작하면 셀 전체는 영영 NUM 이 아니게 되어
+            #    가드가 죽고, 그 뒤 숫자들이 전부 한 셀로 뭉쳐 '1,2345,678' 이 된다.
+            both_num = _eps_num(p[3])[1] == "NUM" and _eps_num(t)[1] == "NUM"
             if (x0 - p[1]) < gap and not both_num:
                 p[1] = max(p[1], x1)
                 p[2] = p[2] + t
+                p[3] = t                      # 마지막 토큰 기억
                 continue
-        out.append([x0, x1, t])
+        out.append([x0, x1, t, t])
     return [(c[0], c[1], c[2].strip()) for c in out]
 
 
@@ -143,13 +154,18 @@ def _eps_parse_header(cells: List[Tuple[float, float, str]]
         m = _YEAR_RE.match(t.replace(" ", ""))
         if not m:
             continue
-        y = int(m.group(1))
+        g = m.groupdict()
+        raw = g.get("y4") or g.get("y2q") or g.get("y2")
+        if not raw:
+            continue
+        y = int(raw)
         if y < 100:
             y += 2000
         if not (1990 <= y <= 2100):
             continue
-        suf = (m.group(2) or m.group(3) or m.group(4) or "").upper()
-        ys.append({"year": y, "suffix": suf, "xc": (x0 + x1) / 2.0})
+        suf = (g.get("s1") or g.get("s2") or g.get("s3") or "").upper()
+        ys.append({"year": y, "suffix": suf, "xc": (x0 + x1) / 2.0,
+                   "fmonth": int(g["m"]) if g.get("m") else None})
     if len(ys) < 3:
         return None
     yrs = [d["year"] for d in ys]
@@ -219,12 +235,15 @@ def _eps_scan_page(words: Sequence[Sequence]) -> Tuple[List[Dict[str, Any]], int
         if not hdr:
             continue
         n_hdr += 1
-        fmonth = 12
-        for _, _, t in cr:
-            m = _FYEAR_MONTH_RE.search(t)
-            if m and 1 <= int(m.group(1)) <= 12:
-                fmonth = int(m.group(1))
-                break
+        #  결산월: ① 헤더 토큰 자체(2024.03) ② 라벨의 '(12월 결산)' ③ 기본 12
+        fmonth = next((d["fmonth"] for d in hdr if d.get("fmonth")), None)
+        if not fmonth:
+            fmonth = 12
+            for _, _, t in cr:
+                m = _FYEAR_MONTH_RE.search(t)
+                if m and 1 <= int(m.group(1)) <= 12:
+                    fmonth = int(m.group(1))
+                    break
         j = i + 1
         if j < len(cellrows) and _eps_merge_suffix_row(hdr, cellrows[j]):
             j += 1
@@ -236,7 +255,16 @@ def _eps_scan_page(words: Sequence[Sequence]) -> Tuple[List[Dict[str, Any]], int
             cr2 = cellrows[j]
             if cr2:
                 label = cr2[0][2].strip()
-                if _EPS_OK_RE.match(label.replace(" ", "")) and not _EPS_BAD_RE.search(label):
+                #  ★ 금지어 검사는 첫 셀이 아니라 '숫자가 시작되기 전까지의 라벨 전체'에
+                #    적용한다. 'EPS' 와 '증가율' 이 다른 셀로 쪼개지면 첫 셀만 보는 검사는
+                #    'EPS 증가율(%)' 행을 EPS 로 받아들인다(값은 %라서 완전히 다른 척도다).
+                head = []
+                for _c in cr2:
+                    if _eps_num(_c[2])[1] == "NUM":
+                        break
+                    head.append(_c[2])
+                label_full = " ".join(head).strip()
+                if _EPS_OK_RE.match(label.replace(" ", "")) and not _EPS_BAD_RE.search(label_full):
                     n_eps += 1
                     mapped = _eps_map_to_years(hdr, cr2[1:])
                     if len(mapped) >= 2:
@@ -352,26 +380,41 @@ def build_eps_forecasts(reports: pd.DataFrame, links: pd.DataFrame,
             del out
             #  청크마다 저장 — 중간에 끊겨도 다음 실행이 정확히 이어받는다
             if new_rows or new_status:
-                _eps_persist(cached, new_rows, new_status)
-                cached = VAULT.get_table(EPS_TABLE, scope="shared")
+                _eps_persist(new_rows, new_status)
                 new_rows, new_status = [], []
     if new_rows or new_status:
-        _eps_persist(cached, new_rows, new_status)
-        cached = VAULT.get_table(EPS_TABLE, scope="shared")
+        _eps_persist(new_rows, new_status)
+    #  최종 조립 직전에 전체 원장을 다시 읽고 **여기서** 파서버전으로 거른다
+    cached = VAULT.get_table(EPS_TABLE, scope="shared")
+    if cached is not None and len(cached) and "parser_version" in cached.columns:
+        cached = cached[cached["parser_version"].astype(str) == EPS_PARSER_VERSION]
 
     _eps_report_extraction(reports, links)
     return cached_to_forecasts(cached, links, annual_rcept)
 
 
-def _eps_persist(cached: Optional[pd.DataFrame], rows: List[dict], status: List[dict]):
-    """추출 결과를 공용 인덱스에 누적 저장 (기존 행을 지우지 않고 합집합)."""
+def _eps_persist(rows: List[dict], status: List[dict]) -> bool:
+    """추출 결과를 공용 인덱스에 누적 저장 (기존 행을 지우지 않고 합집합).
+
+    ★★ put_table 은 파일을 **통째로 교체**한다. 그래서 여기서 합칠 원본은 반드시
+       '필터되지 않은 전체 원장' 이어야 한다. 호출부의 cached 는 parser_version 으로
+       걸러진 부분집합이므로, 그걸 넘겨 받아 합치면 파서 버전을 올리는 순간
+       이전 버전 행 전체(그리고 다른 전략이 쌓은 행까지)가 삭제된다.
+       — 절대 1원칙(기존 캐시 훼손 금지) 위반이라 파라미터 자체를 없앴다.
+    """
+    ok = True
     if rows:
         new = pd.DataFrame(rows)
-        allr = pd.concat([cached, new], ignore_index=True) if cached is not None and len(cached) else new
+        prev = VAULT.get_table(EPS_TABLE, scope="shared")        # 항상 '전체' 원장
+        allr = pd.concat([prev, new], ignore_index=True) if prev is not None and len(prev) else new
         allr = allr.drop_duplicates(subset=["report_uid", "fiscal_year", "parser_version"],
                                     keep="last")
-        VAULT.put_table(EPS_TABLE, allr, scope="shared", domain="research",
-                        source=f"pdf_eps_parser v{EPS_PARSER_VERSION}")
+        if VAULT.put_table(EPS_TABLE, allr, scope="shared", domain="research",
+                           source=f"pdf_eps_parser v{EPS_PARSER_VERSION}") is None:
+            #  저장에 실패했는데 상태표만 쓰면 그 리포트는 영원히 '처리됨'으로 남아
+            #  다음 실행에서 재파싱되지 않는다 → 조용한 데이터 유실
+            LOG.warn("EPS 원장 저장 실패 — 상태표를 기록하지 않고 다음 실행에서 재파싱합니다.")
+            return False
         PIPE.io("OUT", "DRIVE", EPS_TABLE, allr, source="pdf eps extraction")
     if status:
         prev = VAULT.get_table(EPS_STATUS_TABLE, scope="shared")
@@ -381,6 +424,7 @@ def _eps_persist(cached: Optional[pd.DataFrame], rows: List[dict], status: List[
         VAULT.put_table(EPS_STATUS_TABLE, alls, scope="shared", domain="research",
                         source=f"pdf_eps_parser v{EPS_PARSER_VERSION}")
     VAULT.flush("shared")
+    return ok
 
 
 def cached_to_forecasts(eps: Optional[pd.DataFrame], links: pd.DataFrame,

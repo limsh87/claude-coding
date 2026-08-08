@@ -151,6 +151,7 @@ RUN_MODE = "FULL"
 #    ③이 없던 빌드가 ①②를 다 통과하고도 실행 2분 만에 수집부 한 줄 때문에 죽은 적이 있어
 #    추가되었습니다. 세 검증은 서로 다른 것을 봅니다.
 
+BANNED_PACKAGES: "list[str]" = []   # TCD 는 pykrx 를 씁니다
 SEED = 20260807          # C8 결정성: 모든 난수는 이 시드에서 파생
 VERBOSE = True
 STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 보고 (False로 끄지 마세요)
@@ -162,7 +163,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_D"
 STRATEGY_NAME      = "PACK-D 공시텍스트 경직성"
 ACTIVE_PACKS       = ["D"]
-BUILD_VERSION      = "v2.20260808.0912"
+BUILD_VERSION      = "v2.20260808.1002"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -331,15 +332,52 @@ def _ensure_deps() -> Dict[str, bool]:
     return {mod: (importlib.util.find_spec(mod) is not None) for mod, _pkg, _why in _OPTIONAL}
 
 
+# ═══ 금지 패키지 차단 — '안 부른다'가 아니라 'import 자체가 불가능하다' ══════════════════════
+#   ★ pykrx 는 **import 하는 것만으로** data.krx.co.kr 에 접속한다:
+#     pykrx/website/comm/webio.py 는 모듈 본문에서 build_krx_session() 을 실행하고,
+#     auth.py 는 os.getenv("KRX_ID")/("KRX_PW") 가 있으면 실제 로그인 POST 까지 보낸다.
+#     즉 KRX 를 쓰지 않는 전략이라도 이 import 한 줄이 남아 있으면 금지가 깨진다.
+#     (같은 커널에서 다른 전략을 먼저 돌렸다면 KRX_ID/PW 가 os.environ 에 남아 있다)
+#   → BANNED_PACKAGES 에 올라온 패키지는 설치도, import 도, 자격증명 주입도 하지 않는다.
+#     meta_path 훅으로 제3의 코드가 몰래 import 하는 것까지 막는다.
+BANNED_PACKAGES = [str(x).strip() for x in globals().get("BANNED_PACKAGES", []) if str(x).strip()]
+if BANNED_PACKAGES:
+    _REQUIRED = [t for t in _REQUIRED if t[0] not in BANNED_PACKAGES]
+    _OPTIONAL = [t for t in _OPTIONAL if t[0] not in BANNED_PACKAGES]
+
+    class _BannedImportBlocker:
+        """금지 패키지의 import 를 예외로 막는다 (sys.meta_path 최우선)."""
+
+        def find_module(self, name, path=None):
+            self.find_spec(name, path)
+            return None
+
+        def find_spec(self, name, path=None, target=None):
+            root = str(name).split(".")[0]
+            if root in BANNED_PACKAGES:
+                raise ImportError(
+                    f"'{root}' 는 이 전략에서 금지된 패키지입니다. "
+                    f"(import 만으로 외부 사이트에 접속하기 때문입니다) "
+                    f"BANNED_PACKAGES 를 확인하세요.")
+            return None
+
+    if not any(isinstance(h, _BannedImportBlocker) for h in sys.meta_path):
+        sys.meta_path.insert(0, _BannedImportBlocker())
+    if "pykrx" in BANNED_PACKAGES:
+        #   이미 남아 있는 자격증명도 지운다 — 있으면 로그인 시도가 일어난다
+        for _k in ("KRX_ID", "KRX_PW", "KRX_OPENAPI_KEY", "KRX_API_KEY"):
+            os.environ.pop(_k, None)
+
 # ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
 #   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
 #   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
-    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
-    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
-if KRX_OPENAPI_KEY:
-    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
-    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
+if "pykrx" not in BANNED_PACKAGES:
+    if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+        os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
+        os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
+    if KRX_OPENAPI_KEY:
+        os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
+        os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
 
 OPT = _ensure_deps()
 

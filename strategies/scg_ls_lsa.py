@@ -76,6 +76,11 @@ DART_RESERVE_CALLS = 0
 #        거래일 캘린더도 KRX 없이 '실제 거래가 관측된 날'의 합집합으로 만듭니다.
 KRX_ENABLED = False
 
+#    ★ 구조적 차단: pykrx 는 **import 하는 것만으로** data.krx.co.kr 에 로그인한다
+#      (webio.py 가 모듈 본문에서 세션을 만들고, KRX_ID/KRX_PW 가 있으면 로그인까지 한다).
+#      그래서 '부르지 않는다'로는 부족하고, 설치·import 자체를 막는다.
+BANNED_PACKAGES = ["pykrx"]
+
 # ── ③ 구글드라이브 캐시 ─────────────────────────────────────────────────────────────────────
 #    ★★★ 절대 1원칙: 기존 캐시를 절대 삭제·훼손하지 않습니다. ★★★
 #      · 인덱스의 원천은 append-only JSONL 저널입니다. 기존 줄을 다시 쓰지 않습니다.
@@ -209,7 +214,7 @@ STOP_ON_KILL_CRITERIA = False   # SCG 는 '킬'이 아니라 '증분 기여 판�
 STRATEGY_ID        = "SCG_LS_LSA"
 STRATEGY_NAME      = "SCG-LS / SCG-LSA — Smart Consensus Gap + Analyst Leadership"
 ACTIVE_PACKS       = []
-BUILD_VERSION      = "v2.20260808.0912"
+BUILD_VERSION      = "v2.20260808.1002"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -378,15 +383,52 @@ def _ensure_deps() -> Dict[str, bool]:
     return {mod: (importlib.util.find_spec(mod) is not None) for mod, _pkg, _why in _OPTIONAL}
 
 
+# ═══ 금지 패키지 차단 — '안 부른다'가 아니라 'import 자체가 불가능하다' ══════════════════════
+#   ★ pykrx 는 **import 하는 것만으로** data.krx.co.kr 에 접속한다:
+#     pykrx/website/comm/webio.py 는 모듈 본문에서 build_krx_session() 을 실행하고,
+#     auth.py 는 os.getenv("KRX_ID")/("KRX_PW") 가 있으면 실제 로그인 POST 까지 보낸다.
+#     즉 KRX 를 쓰지 않는 전략이라도 이 import 한 줄이 남아 있으면 금지가 깨진다.
+#     (같은 커널에서 다른 전략을 먼저 돌렸다면 KRX_ID/PW 가 os.environ 에 남아 있다)
+#   → BANNED_PACKAGES 에 올라온 패키지는 설치도, import 도, 자격증명 주입도 하지 않는다.
+#     meta_path 훅으로 제3의 코드가 몰래 import 하는 것까지 막는다.
+BANNED_PACKAGES = [str(x).strip() for x in globals().get("BANNED_PACKAGES", []) if str(x).strip()]
+if BANNED_PACKAGES:
+    _REQUIRED = [t for t in _REQUIRED if t[0] not in BANNED_PACKAGES]
+    _OPTIONAL = [t for t in _OPTIONAL if t[0] not in BANNED_PACKAGES]
+
+    class _BannedImportBlocker:
+        """금지 패키지의 import 를 예외로 막는다 (sys.meta_path 최우선)."""
+
+        def find_module(self, name, path=None):
+            self.find_spec(name, path)
+            return None
+
+        def find_spec(self, name, path=None, target=None):
+            root = str(name).split(".")[0]
+            if root in BANNED_PACKAGES:
+                raise ImportError(
+                    f"'{root}' 는 이 전략에서 금지된 패키지입니다. "
+                    f"(import 만으로 외부 사이트에 접속하기 때문입니다) "
+                    f"BANNED_PACKAGES 를 확인하세요.")
+            return None
+
+    if not any(isinstance(h, _BannedImportBlocker) for h in sys.meta_path):
+        sys.meta_path.insert(0, _BannedImportBlocker())
+    if "pykrx" in BANNED_PACKAGES:
+        #   이미 남아 있는 자격증명도 지운다 — 있으면 로그인 시도가 일어난다
+        for _k in ("KRX_ID", "KRX_PW", "KRX_OPENAPI_KEY", "KRX_API_KEY"):
+            os.environ.pop(_k, None)
+
 # ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
 #   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
 #   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
-if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
-    os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
-    os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
-if KRX_OPENAPI_KEY:
-    os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
-    os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
+if "pykrx" not in BANNED_PACKAGES:
+    if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
+        os.environ["KRX_ID"] = KRX_MARKETPLACE_ID
+        os.environ["KRX_PW"] = KRX_MARKETPLACE_PW
+    if KRX_OPENAPI_KEY:
+        os.environ["KRX_OPENAPI_KEY"] = KRX_OPENAPI_KEY
+        os.environ["KRX_API_KEY"] = KRX_OPENAPI_KEY
 
 OPT = _ensure_deps()
 
@@ -3346,9 +3388,14 @@ def scg_dart_api(endpoint: str, params: dict, tries: int = 2) -> Optional[dict]:
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             if q is not None:
                 q.hit_limit()
+        elif st == "021":
+            #  021 = '조회 가능한 회사 개수 초과' — 배치 크기 문제이지 일일 한도가 아니다.
+            #  이걸 소진으로 처리하면 그 순간부터 모든 DART 수집이 조용히 꺼진다.
+            LOG.warn(f"DART status=021 (조회 가능한 회사 개수 초과) — 배치 크기를 줄이세요 "
+                     f"(SCG_DART_MULTI_BATCH={SCG_DART_MULTI_BATCH}). 일일 한도와 무관합니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({SCG_DART_STATUS.get(st,'?')}). "
                       f"DART_API_KEY 를 확인하세요 — https://opendart.fss.or.kr 에서 재발급 가능합니다.")
@@ -3397,7 +3444,12 @@ def scg_fetch_periodic_disclosures(start: str, end: str) -> pd.DataFrame:
     fin = as_ts(end)
     rows: List[dict] = []
     #  분기별로 끊어 요청한다 (한 구간의 total_page 가 너무 커지지 않도록)
-    periods = pd.date_range(bgn, fin, freq="QS").tolist() or [bgn]
+    #  ★ date_range(freq="QS") 는 bgn 이 분기 중간이면 '다음 분기 시작'부터 시작한다.
+    #    그러면 이어받기 지점과 그 분기 시작 사이의 공시가 영구히 누락된다
+    #    (다음 실행은 더 늦은 지점부터 시작하므로 영영 메워지지 않는다). bgn 을 앞에 붙인다.
+    periods = pd.date_range(bgn, fin, freq="QS").tolist()
+    if not periods or periods[0] > bgn:
+        periods.insert(0, bgn)
     if periods[-1] < fin:
         periods.append(fin)
     for i in range(len(periods) - 1 if len(periods) > 1 else 1):
@@ -3464,7 +3516,7 @@ def scg_annual_report_dates(dis: pd.DataFrame) -> Dict[Tuple[str, int], pd.Times
 # ── ② 다중회사 주요계정 — 순이익·자본금을 100사/호출로 ────────────────────────────────────
 def scg_fetch_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
     """fnlttMultiAcnt — 100사를 한 번에. 순진한 단건 호출 대비 100배 싸다."""
-    cols = ["corp_code", "bsns_year", "account_nm", "thstrm_amount", "rcept_no"]
+    cols = ["corp_code", "bsns_year", "fs_div", "account_nm", "thstrm_amount", "rcept_no"]
     cached = VAULT.get_table("dart_multi_annual", scope="shared")
     done = set()
     if cached is not None and len(cached):
@@ -3481,7 +3533,7 @@ def scg_fetch_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) ->
         for k in range(0, len(todo), SCG_DART_MULTI_BATCH):
             jobs.append((todo[k:k + SCG_DART_MULTI_BATCH], int(y)))
     if not jobs:
-        return cached.reindex(columns=cols)
+        return cached.reindex(columns=cols) if cached is not None else pd.DataFrame(columns=cols)
     LOG.info(f"다중회사 주요계정: {len(jobs):,} 호출 예정 "
              f"(오늘 남은 호출 추정 {SCG_QUOTA.est_remaining():,}건)" if SCG_QUOTA else "")
 
@@ -3505,7 +3557,7 @@ def scg_fetch_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) ->
         return cached.reindex(columns=cols) if cached is not None else pd.DataFrame(columns=cols)
     new = pd.concat(frames, ignore_index=True)
     allr = pd.concat([cached, new], ignore_index=True) if cached is not None and len(cached) else new
-    allr = allr.drop_duplicates(["corp_code", "bsns_year", "account_nm"], keep="last")
+    allr = allr.drop_duplicates(["corp_code", "bsns_year", "fs_div", "account_nm"], keep="last")
     VAULT.put_table("dart_multi_annual", allr, scope="shared", domain="dart",
                     source="opendart fnlttMultiAcnt")
     VAULT.flush("shared")
@@ -3523,6 +3575,15 @@ def scg_tidy_multi(multi: pd.DataFrame) -> pd.DataFrame:
     if multi is None or multi.empty:
         return pd.DataFrame(columns=cols)
     d = multi.copy()
+    #  ★ 연결(CFS)과 별도(OFS)를 한 회사·한 해에 섞으면 순이익이 두 기준으로 뒤섞여
+    #    EPS 실측치가 조용히 틀어진다. 연결이 있으면 연결만, 없으면 별도만 쓴다.
+    if "fs_div" in d.columns and d["fs_div"].notna().any():
+        pref = d.assign(_p=np.where(d["fs_div"].astype(str).str.upper().eq("CFS"), 0, 1))
+        best = pref.groupby(["corp_code", "bsns_year"], observed=True)["_p"].transform("min")
+        n0 = len(d)
+        d = pref[pref["_p"] == best].drop(columns=["_p"])
+        if len(d) < n0:
+            LOG.debug(f"연결/별도 혼합 제거: {n0:,} → {len(d):,}행 (회사·연도별 연결 우선)")
     d["amt"] = pd.to_numeric(d["thstrm_amount"].astype(str).str.replace(",", "", regex=False),
                              errors="coerce")
     nm = d["account_nm"].astype(str)
@@ -3569,7 +3630,7 @@ def scg_fetch_shares(corp_map: pd.DataFrame, years: Sequence[int],
             for r in cm.itertuples(index=False)
             if (str(r.corp_code), int(y)) not in done]
     if not jobs:
-        return cached.reindex(columns=cols)
+        return cached.reindex(columns=cols) if cached is not None else pd.DataFrame(columns=cols)
     est = SCG_QUOTA.est_remaining() if SCG_QUOTA else 0
     LOG.info(f"주식총수: 미확보 {len(jobs):,}건 · 오늘 남은 호출 추정 {est:,}건. "
              f"{'오늘 안에 끝납니다.' if len(jobs) <= est else '오늘 다 못 받으면 내일 이어받습니다(캐시 보존).'}")
@@ -5955,9 +6016,17 @@ def build_scg_signals(smart_consensus: pd.DataFrame, calendar, cfg: SCGConfig = 
     sd = pd.DatetimeIndex(sorted(D["signal_date"].dropna().unique()))
     back = _scg_shift_td(sd, -int(cfg.ACCEL_LOOKBACK_TRADING_DAYS), cal)
     sdv = sd.values.astype("datetime64[ns]")
-    pos = np.searchsorted(sdv, back, side="right") - 1
+    #  ★ '가장 가까운' signal date 를 쓴다. '이하 중 최대' 로 하면 거래일이 21일 미만인
+    #    달에서 t-20 이 직전 시점보다 살짝 앞서 두 칸 전으로 미끄러지고, 그 달의
+    #    accel 과 BASE_REV 가 조용히 40거래일 변화가 된다(값은 나오는데 정의가 다르다).
+    lo = np.searchsorted(sdv, back, side="right") - 1
+    hi = np.minimum(lo + 1, len(sdv) - 1)
+    lo_c = np.clip(lo, 0, len(sdv) - 1)
+    d_lo = np.abs(sdv[lo_c].astype("int64") - back.astype("datetime64[ns]").astype("int64"))
+    d_hi = np.abs(sdv[hi].astype("int64") - back.astype("datetime64[ns]").astype("int64"))
+    pick = np.where((lo >= 0) & (d_lo <= d_hi), lo_c, hi)
     prev_map = pd.Series(
-        [sd[p] if (p >= 0 and not pd.isna(b)) else pd.NaT for p, b in zip(pos, back)],
+        [sd[p] if (not pd.isna(b)) else pd.NaT for p, b in zip(pick, back)],
         index=sd, name="_prev_sd")
     #  자기 자신을 가리키면(캘린더가 짧아 t-20 이 t 이후로 계산되는 경우) 무효 처리
     prev_map = prev_map.where(prev_map < pd.Series(sd, index=sd))
@@ -6076,9 +6145,16 @@ def _eps_num(tok: str) -> Tuple[Optional[float], str]:
 
 
 # ── 연도 헤더 ───────────────────────────────────────────────────────────────────────────────
+#  ★ 2자리 연도는 반드시 표식(', FY, 년, 또는 E/F/P/A 접미사)이 있어야 인정한다.
+#    맨 두 자리 숫자까지 연도로 받으면 '12 15 18' 같은 평범한 숫자 행이 헤더로 오인되고,
+#    그 아래 EPS 행이 엉뚱한 연도에 붙는다 — 예외 없이 조용히 틀린다.
+#  ★ 2024.12 / 24/12 같은 결산월 포함 표기도 받는다(한국 리포트에서 흔하다).
 _YEAR_RE = re.compile(
-    r"^\(?(?:FY|fy)?((?:19|20)\d{2}|\d{2})\)?(?:년|년도|년말)?"
-    r"(?:\(([AEFPaefp])\)|([AEFPaefp])|(예상|추정|실적|확정|E|F|P))?$")
+    r"^\(?(?:FY|fy)?"
+    r"(?:(?P<y4>(?:19|20)\d{2})|(?:'|FY|fy)(?P<y2q>\d{2})|(?P<y2>\d{2})(?=[A-Za-z년]))"
+    r"(?:[./-](?P<m>0?[1-9]|1[0-2]))?"
+    r"\)?(?:년|년도|년말|월)?"
+    r"(?:\((?P<s1>[AEFPaefp])\)|(?P<s2>[AEFPaefp])|(?P<s3>예상|추정|실적|확정))?$")
 _SUFFIX_ROW_OK = {"e", "f", "p", "a", "(e)", "(f)", "(p)", "(a)",
                   "십억원", "억원", "백만원", "원", "%", "배", "천원"}
 _FYEAR_MONTH_RE = re.compile(r"(\d{1,2})\s*월")
@@ -6130,12 +6206,16 @@ def _eps_cells(row: Sequence[Tuple], gap: float = 3.0) -> List[Tuple[float, floa
         x0, x1, t = float(w[0]), float(w[2]), str(w[4])
         if out:
             p = out[-1]
-            both_num = _eps_num(p[2])[1] == "NUM" and _eps_num(t)[1] == "NUM"
+            #  ★ 셀 전체가 아니라 '마지막에 붙은 토큰' 으로 판정해야 한다. 셀이
+            #    '(원)' 처럼 비숫자로 시작하면 셀 전체는 영영 NUM 이 아니게 되어
+            #    가드가 죽고, 그 뒤 숫자들이 전부 한 셀로 뭉쳐 '1,2345,678' 이 된다.
+            both_num = _eps_num(p[3])[1] == "NUM" and _eps_num(t)[1] == "NUM"
             if (x0 - p[1]) < gap and not both_num:
                 p[1] = max(p[1], x1)
                 p[2] = p[2] + t
+                p[3] = t                      # 마지막 토큰 기억
                 continue
-        out.append([x0, x1, t])
+        out.append([x0, x1, t, t])
     return [(c[0], c[1], c[2].strip()) for c in out]
 
 
@@ -6151,13 +6231,18 @@ def _eps_parse_header(cells: List[Tuple[float, float, str]]
         m = _YEAR_RE.match(t.replace(" ", ""))
         if not m:
             continue
-        y = int(m.group(1))
+        g = m.groupdict()
+        raw = g.get("y4") or g.get("y2q") or g.get("y2")
+        if not raw:
+            continue
+        y = int(raw)
         if y < 100:
             y += 2000
         if not (1990 <= y <= 2100):
             continue
-        suf = (m.group(2) or m.group(3) or m.group(4) or "").upper()
-        ys.append({"year": y, "suffix": suf, "xc": (x0 + x1) / 2.0})
+        suf = (g.get("s1") or g.get("s2") or g.get("s3") or "").upper()
+        ys.append({"year": y, "suffix": suf, "xc": (x0 + x1) / 2.0,
+                   "fmonth": int(g["m"]) if g.get("m") else None})
     if len(ys) < 3:
         return None
     yrs = [d["year"] for d in ys]
@@ -6227,12 +6312,15 @@ def _eps_scan_page(words: Sequence[Sequence]) -> Tuple[List[Dict[str, Any]], int
         if not hdr:
             continue
         n_hdr += 1
-        fmonth = 12
-        for _, _, t in cr:
-            m = _FYEAR_MONTH_RE.search(t)
-            if m and 1 <= int(m.group(1)) <= 12:
-                fmonth = int(m.group(1))
-                break
+        #  결산월: ① 헤더 토큰 자체(2024.03) ② 라벨의 '(12월 결산)' ③ 기본 12
+        fmonth = next((d["fmonth"] for d in hdr if d.get("fmonth")), None)
+        if not fmonth:
+            fmonth = 12
+            for _, _, t in cr:
+                m = _FYEAR_MONTH_RE.search(t)
+                if m and 1 <= int(m.group(1)) <= 12:
+                    fmonth = int(m.group(1))
+                    break
         j = i + 1
         if j < len(cellrows) and _eps_merge_suffix_row(hdr, cellrows[j]):
             j += 1
@@ -6244,7 +6332,16 @@ def _eps_scan_page(words: Sequence[Sequence]) -> Tuple[List[Dict[str, Any]], int
             cr2 = cellrows[j]
             if cr2:
                 label = cr2[0][2].strip()
-                if _EPS_OK_RE.match(label.replace(" ", "")) and not _EPS_BAD_RE.search(label):
+                #  ★ 금지어 검사는 첫 셀이 아니라 '숫자가 시작되기 전까지의 라벨 전체'에
+                #    적용한다. 'EPS' 와 '증가율' 이 다른 셀로 쪼개지면 첫 셀만 보는 검사는
+                #    'EPS 증가율(%)' 행을 EPS 로 받아들인다(값은 %라서 완전히 다른 척도다).
+                head = []
+                for _c in cr2:
+                    if _eps_num(_c[2])[1] == "NUM":
+                        break
+                    head.append(_c[2])
+                label_full = " ".join(head).strip()
+                if _EPS_OK_RE.match(label.replace(" ", "")) and not _EPS_BAD_RE.search(label_full):
                     n_eps += 1
                     mapped = _eps_map_to_years(hdr, cr2[1:])
                     if len(mapped) >= 2:
@@ -6360,26 +6457,41 @@ def build_eps_forecasts(reports: pd.DataFrame, links: pd.DataFrame,
             del out
             #  청크마다 저장 — 중간에 끊겨도 다음 실행이 정확히 이어받는다
             if new_rows or new_status:
-                _eps_persist(cached, new_rows, new_status)
-                cached = VAULT.get_table(EPS_TABLE, scope="shared")
+                _eps_persist(new_rows, new_status)
                 new_rows, new_status = [], []
     if new_rows or new_status:
-        _eps_persist(cached, new_rows, new_status)
-        cached = VAULT.get_table(EPS_TABLE, scope="shared")
+        _eps_persist(new_rows, new_status)
+    #  최종 조립 직전에 전체 원장을 다시 읽고 **여기서** 파서버전으로 거른다
+    cached = VAULT.get_table(EPS_TABLE, scope="shared")
+    if cached is not None and len(cached) and "parser_version" in cached.columns:
+        cached = cached[cached["parser_version"].astype(str) == EPS_PARSER_VERSION]
 
     _eps_report_extraction(reports, links)
     return cached_to_forecasts(cached, links, annual_rcept)
 
 
-def _eps_persist(cached: Optional[pd.DataFrame], rows: List[dict], status: List[dict]):
-    """추출 결과를 공용 인덱스에 누적 저장 (기존 행을 지우지 않고 합집합)."""
+def _eps_persist(rows: List[dict], status: List[dict]) -> bool:
+    """추출 결과를 공용 인덱스에 누적 저장 (기존 행을 지우지 않고 합집합).
+
+    ★★ put_table 은 파일을 **통째로 교체**한다. 그래서 여기서 합칠 원본은 반드시
+       '필터되지 않은 전체 원장' 이어야 한다. 호출부의 cached 는 parser_version 으로
+       걸러진 부분집합이므로, 그걸 넘겨 받아 합치면 파서 버전을 올리는 순간
+       이전 버전 행 전체(그리고 다른 전략이 쌓은 행까지)가 삭제된다.
+       — 절대 1원칙(기존 캐시 훼손 금지) 위반이라 파라미터 자체를 없앴다.
+    """
+    ok = True
     if rows:
         new = pd.DataFrame(rows)
-        allr = pd.concat([cached, new], ignore_index=True) if cached is not None and len(cached) else new
+        prev = VAULT.get_table(EPS_TABLE, scope="shared")        # 항상 '전체' 원장
+        allr = pd.concat([prev, new], ignore_index=True) if prev is not None and len(prev) else new
         allr = allr.drop_duplicates(subset=["report_uid", "fiscal_year", "parser_version"],
                                     keep="last")
-        VAULT.put_table(EPS_TABLE, allr, scope="shared", domain="research",
-                        source=f"pdf_eps_parser v{EPS_PARSER_VERSION}")
+        if VAULT.put_table(EPS_TABLE, allr, scope="shared", domain="research",
+                           source=f"pdf_eps_parser v{EPS_PARSER_VERSION}") is None:
+            #  저장에 실패했는데 상태표만 쓰면 그 리포트는 영원히 '처리됨'으로 남아
+            #  다음 실행에서 재파싱되지 않는다 → 조용한 데이터 유실
+            LOG.warn("EPS 원장 저장 실패 — 상태표를 기록하지 않고 다음 실행에서 재파싱합니다.")
+            return False
         PIPE.io("OUT", "DRIVE", EPS_TABLE, allr, source="pdf eps extraction")
     if status:
         prev = VAULT.get_table(EPS_STATUS_TABLE, scope="shared")
@@ -6389,6 +6501,7 @@ def _eps_persist(cached: Optional[pd.DataFrame], rows: List[dict], status: List[
         VAULT.put_table(EPS_STATUS_TABLE, alls, scope="shared", domain="research",
                         source=f"pdf_eps_parser v{EPS_PARSER_VERSION}")
     VAULT.flush("shared")
+    return ok
 
 
 def cached_to_forecasts(eps: Optional[pd.DataFrame], links: pd.DataFrame,
@@ -6932,25 +7045,28 @@ def scg_forward_returns(signals: pd.DataFrame, px: pd.DataFrame, cal,
     lastpos = np.where(has.any(axis=0), has.shape[0] - 1 - has[::-1].argmax(axis=0), -1)
     last_px = np.where(lastpos >= 0, M[np.clip(lastpos, 0, len(didx) - 1),
                                        np.arange(M.shape[1])], np.nan)
+    #  패널 전체의 마지막 관측 위치. 이 뒤는 '폐지'가 아니라 '아직 오지 않은 미래' 다.
+    data_end = int(lastpos.max()) if lastpos.size else -1
 
     n_delist = np.zeros(len(out), dtype="int32")
 
-    def _ret_at(pos: np.ndarray) -> np.ndarray:
+    def _ret_at(pos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        #  ★ '폐지' 와 '데이터 끝' 을 반드시 분리한다. 한 플래그로 묶으면 표본 마지막
+        #    h 거래일에서 폐지 종목만 결측이 되고 생존자만 값을 갖는다 — 생존자편향의
+        #    정확한 재현이다. 그리고 살아있는 종목의 지평이 패널 끝을 넘었을 때
+        #    마지막 행으로 clip 하면 9일 수익률을 20일 수익률인 척 내보내게 된다.
         pos_c = np.clip(pos, 0, len(didx) - 1)
         inrange = valid0 & (pos >= 0)
-        px_h = np.where(inrange, M[pos_c, ci_v], np.nan)
-        #  지평 시점에 가격이 없다 = 그 사이에 폐지되었거나 캘린더를 넘어섰다.
-        gone = inrange & np.isnan(px_h) & (lastpos[ci_v] >= 0) & (lastpos[ci_v] >= p0i)
-        beyond = pos >= len(didx)          # 데이터 끝을 넘어선 것은 '폐지'가 아니다
-        if delist_mode == "minus100":
-            px_g = np.zeros_like(px_h)
-        else:
-            px_g = last_px[ci_v]
-        px_h = np.where(gone & ~beyond, px_g, px_h)
+        lp = lastpos[ci_v]
+        gone = inrange & (lp >= 0) & (lp >= p0i) & (pos > lp) & (lp < data_end)
+        unobs = inrange & ~gone & (pos > data_end)      # 관측 불가 → 결측 (fabrication 금지)
+        px_h = np.where(inrange & ~unobs, M[pos_c, ci_v], np.nan)
+        px_g = np.zeros_like(px_h) if delist_mode == "minus100" else last_px[ci_v]
+        px_h = np.where(gone, px_g, px_h)
         r = np.where(np.isfinite(base) & (base > 0), px_h / base - 1.0, np.nan)
         #  진입 후 한 번도 체결이 없었으면 팔 기회 자체가 없었다 → -100%
-        r = np.where(gone & ~beyond & ~np.isfinite(r), -1.0, r)
-        return np.clip(r, -1.0, None), (gone & ~beyond)
+        r = np.where(gone & ~np.isfinite(r), -1.0, r)
+        return np.clip(r, -1.0, None), gone
 
     for h in hs:
         r, g = _ret_at(p0i + h)
@@ -7035,7 +7151,8 @@ def scg_bucket_backtest(sig: pd.DataFrame, alpha_col: str, n_buckets: int,
         g = g.assign(_b=b, _nb=nb)
         for bi, gg in g.groupby("_b", observed=True):
             rows.append({"signal_date": T, "bucket": int(bi), "n_buckets": nb,
-                         "ret": float(gg[ret_col].mean()), "n": int(len(gg))})
+                         "ret": float(gg[ret_col].mean()), "n": int(len(gg)),
+                         "is_top": int(bi) == nb - 1, "is_bottom": int(bi) == 0})
         top = g.loc[g["_b"] == nb - 1, "stock_id"]
         holds[T] = set(top.astype(str))
 
@@ -7045,9 +7162,13 @@ def scg_bucket_backtest(sig: pd.DataFrame, alpha_col: str, n_buckets: int,
     nb_mode = int(pd.Series(used_nb).mode().iloc[0])
     res["n_buckets_used"] = nb_mode
 
-    #  버킷 번호를 항상 1..nb 로 통일해 5분위/10분위가 섞여도 최상/최하가 어긋나지 않게 한다
-    B["bucket_label"] = np.where(B["n_buckets"] == nb_mode, B["bucket"] + 1,
-                                 np.ceil((B["bucket"] + 1) * nb_mode / B["n_buckets"]).astype(int))
+    #  ★ 5분위 fallback 이 섞인 날의 라벨 매핑 — 양 끝이 반드시 1 과 nb_mode 가 되어야 한다.
+    #    ceil((i+1)*nb_mode/nb) 는 5분위를 2,4,6,8,10 으로 보내 라벨 1 을 영영 만들지 않는다.
+    #    그러면 최하위 버킷이 D2 행에 섞이고 롱숏은 5분위 날짜를 통째로 버린다.
+    B["bucket_label"] = np.where(
+        B["n_buckets"] == nb_mode, B["bucket"] + 1,
+        np.rint(1 + B["bucket"] * (nb_mode - 1)
+                / np.maximum(B["n_buckets"] - 1, 1)).astype(int))
     piv = B.pivot_table(index="signal_date", columns="bucket_label", values="ret", aggfunc="mean")
     res["buckets"] = piv
 
@@ -7060,8 +7181,12 @@ def scg_bucket_backtest(sig: pd.DataFrame, alpha_col: str, n_buckets: int,
     res["avg_holdings"] = float(np.mean([len(v) for v in holds.values()])) if holds else np.nan
 
     cost = (cost_bps / 1e4) * (res["turnover"] if np.isfinite(res["turnover"]) else 0.0) * 2.0
-    res["long"] = (piv[hi_b] - cost).dropna()
-    res["ls"] = (piv[hi_b] - piv[lo_b] - cost).dropna()
+    #  ★ 레그는 라벨이 아니라 '그 날의 실제 최상/최하 버킷' 에서 뽑는다. 라벨로 뽑으면
+    #    5분위 날짜가 롱에는 남고 롱숏에서는 빠져 두 계열의 표본이 달라진다.
+    top_s = B.loc[B["is_top"]].set_index("signal_date")["ret"].sort_index()
+    bot_s = B.loc[B["is_bottom"]].set_index("signal_date")["ret"].sort_index()
+    res["long"] = (top_s - cost).dropna()
+    res["ls"] = (top_s - bot_s - 2.0 * cost).dropna()
 
     smry = piv.mean().rename("mean_ret").to_frame()
     smry["std"] = piv.std()
@@ -8226,12 +8351,19 @@ def scg_pick_primary_period(sig: pd.DataFrame, metric: str) -> pd.DataFrame:
     fpe = pd.to_datetime(d["fiscal_period"].astype(str) + "-01", errors="coerce") \
         + pd.offsets.MonthEnd(0)
     d["_fpe"] = fpe
+    #  ★ 아직 도래하지 않은 회계기간이 하나도 없으면 primary 를 두지 않는다.
+    #    센티넬(10**9)로 채워두고 idxmin 을 돌리면 '이미 끝난 회계기간'이 뽑히는데,
+    #    그 실적은 이미 공표된 뒤라 '전망' 이 아니다 — 신호가 아니라 뒷북이 된다.
     fut = d["_fpe"] >= d["signal_date"]
-    d["_rank"] = np.where(fut, (d["_fpe"] - d["signal_date"]).dt.days, 10 ** 9)
-    idx = d[d["status"].eq(STATUS_OK)].groupby(["signal_date", "stock_id"],
-                                               observed=True)["_rank"].idxmin()
+    d["_rank"] = np.where(fut, (d["_fpe"] - d["signal_date"]).dt.days, np.nan)
+    cand = d[d["status"].eq(STATUS_OK) & d["_rank"].notna()]
     d["is_primary"] = False
-    d.loc[idx.dropna().astype(int), "is_primary"] = True
+    if len(cand):
+        idx = cand.groupby(["signal_date", "stock_id"], observed=True)["_rank"].idxmin()
+        d.loc[idx.dropna().to_numpy(), "is_primary"] = True
+    n_drop = int((d["status"].eq(STATUS_OK)).sum() - len(cand))
+    if n_drop > 0:
+        LOG.debug(f"FY1 후보 없음(이미 종료된 회계기간뿐)으로 {n_drop:,}행을 신호에서 제외")
     n = int(d["is_primary"].sum())
     LOG.debug(f"FY1 선택: {len(d):,}행 중 {n:,}행을 신호로 사용 (나머지는 FY2+ 로 진단에만 사용)")
     return d.drop(columns=["_fpe", "_rank"])
@@ -8335,12 +8467,15 @@ def main() -> dict:
 
     with PIPE.stage("L1.LEDGER", "원장 4단 사슬 감사 (리포트→애널→종목→추정치)", "L1",
                     budget_s=300, critical=False):
-        allf = pd.concat([t["forecasts"] for t in tracks.values()
-                          if t.get("forecasts") is not None and len(t["forecasts"])],
-                         ignore_index=True) if tracks else pd.DataFrame()
-        alla = pd.concat([t["actuals"] for t in tracks.values()
-                          if t.get("actuals") is not None and len(t["actuals"])],
-                         ignore_index=True) if tracks else pd.DataFrame()
+        #  ★ `if tracks` 는 dict 가 비었는지만 본다. TP 트랙은 actuals=None 이고
+        #    EPS 실측치는 DART 키가 없으면 빈 프레임이라, 기본 설정에서 리스트가 비고
+        #    pd.concat([]) 가 ValueError 로 터진다 — 그러면 이 감사표 자체가 안 나온다.
+        _ff = [t["forecasts"] for t in tracks.values()
+               if t.get("forecasts") is not None and len(t["forecasts"])]
+        _aa = [t["actuals"] for t in tracks.values()
+               if t.get("actuals") is not None and len(t["actuals"])]
+        allf = pd.concat(_ff, ignore_index=True) if _ff else pd.DataFrame()
+        alla = pd.concat(_aa, ignore_index=True) if _aa else pd.DataFrame()
         scg_audit_forecast_ledger(ctx.get("reports", pd.DataFrame()),
                                   ctx.get("links", pd.DataFrame()), allf, alla)
 
@@ -8399,8 +8534,7 @@ def main() -> dict:
             key = f"{metric}/{uname}"
             with PIPE.stage(f"L2.{metric}.{uname}", f"SCG 산출 {key}", "L2", budget_s=3600,
                             critical=False):
-                tr = scg_run_track(ctx, metric, fc, t.get("actuals"),
-                                   uni if uname != "ALL" else uni, uname)
+                tr = scg_run_track(ctx, metric, fc, t.get("actuals"), uni, uname)
                 sig = tr.get("signals")
                 if sig is None or sig.empty:
                     LOG.warn(f"[{key}] 신호가 비었습니다.")
@@ -8417,12 +8551,15 @@ def main() -> dict:
             "어느 고리가 끊겼는지 확인하세요 (리포트 → 애널리스트 → 종목코드 → 추정치).")
 
     #  ★ EPS 커버리지가 무너졌으면 공식 트랙을 TP 로 승격한다 — 단, 조용히 하지 않는다.
-    tot = max(1, sum(cov.values()))
-    eps_share = cov.get(f"EPS/ALL", 0) / tot
-    if primary == "EPS" and f"EPS/ALL" in results and eps_share < PRIMARY_METRIC_MIN_COVERAGE:
-        LOG.warn(f"EPS 트랙의 유효 신호가 전체의 {100*eps_share:.1f}% 에 불과합니다 "
-                 f"(임계 {100*PRIMARY_METRIC_MIN_COVERAGE:.0f}%). 공식 트랙을 TP 로 승격합니다. "
-                 f"EPS 결과도 아래에 그대로 출력하니 반드시 함께 읽으세요.")
+    #  ★ 두 트랙의 '같은 유니버스에서의' 신호 수를 직접 비교한다. 전체 합계로 나누면
+    #    SMALL1000 행까지 분모에 들어가 비율이 흐려진다.
+    n_eps, n_tp = cov.get("EPS/ALL", 0), cov.get("TP/ALL", 0)
+    eps_share = n_eps / max(n_tp, 1) if n_tp else (1.0 if n_eps else 0.0)
+    if primary == "EPS" and "TP/ALL" in results and eps_share < PRIMARY_METRIC_MIN_COVERAGE:
+        LOG.warn(f"EPS 트랙의 유효 신호가 {n_eps:,}건으로 TP 트랙({n_tp:,}건) 대비 "
+                 f"{100*eps_share:.1f}% 에 불과합니다 (임계 {100*PRIMARY_METRIC_MIN_COVERAGE:.0f}%). "
+                 f"공식 트랙을 TP 로 승격합니다. EPS 결과도 아래에 그대로 출력하니 "
+                 f"반드시 함께 읽으세요 — 조용히 바꾸지 않습니다.")
         primary = "TP"
     if f"{primary}/ALL" not in results:
         primary = list(results)[0].split("/")[0]

@@ -272,12 +272,19 @@ def scg_pick_primary_period(sig: pd.DataFrame, metric: str) -> pd.DataFrame:
     fpe = pd.to_datetime(d["fiscal_period"].astype(str) + "-01", errors="coerce") \
         + pd.offsets.MonthEnd(0)
     d["_fpe"] = fpe
+    #  ★ 아직 도래하지 않은 회계기간이 하나도 없으면 primary 를 두지 않는다.
+    #    센티넬(10**9)로 채워두고 idxmin 을 돌리면 '이미 끝난 회계기간'이 뽑히는데,
+    #    그 실적은 이미 공표된 뒤라 '전망' 이 아니다 — 신호가 아니라 뒷북이 된다.
     fut = d["_fpe"] >= d["signal_date"]
-    d["_rank"] = np.where(fut, (d["_fpe"] - d["signal_date"]).dt.days, 10 ** 9)
-    idx = d[d["status"].eq(STATUS_OK)].groupby(["signal_date", "stock_id"],
-                                               observed=True)["_rank"].idxmin()
+    d["_rank"] = np.where(fut, (d["_fpe"] - d["signal_date"]).dt.days, np.nan)
+    cand = d[d["status"].eq(STATUS_OK) & d["_rank"].notna()]
     d["is_primary"] = False
-    d.loc[idx.dropna().astype(int), "is_primary"] = True
+    if len(cand):
+        idx = cand.groupby(["signal_date", "stock_id"], observed=True)["_rank"].idxmin()
+        d.loc[idx.dropna().to_numpy(), "is_primary"] = True
+    n_drop = int((d["status"].eq(STATUS_OK)).sum() - len(cand))
+    if n_drop > 0:
+        LOG.debug(f"FY1 후보 없음(이미 종료된 회계기간뿐)으로 {n_drop:,}행을 신호에서 제외")
     n = int(d["is_primary"].sum())
     LOG.debug(f"FY1 선택: {len(d):,}행 중 {n:,}행을 신호로 사용 (나머지는 FY2+ 로 진단에만 사용)")
     return d.drop(columns=["_fpe", "_rank"])
@@ -381,12 +388,15 @@ def main() -> dict:
 
     with PIPE.stage("L1.LEDGER", "원장 4단 사슬 감사 (리포트→애널→종목→추정치)", "L1",
                     budget_s=300, critical=False):
-        allf = pd.concat([t["forecasts"] for t in tracks.values()
-                          if t.get("forecasts") is not None and len(t["forecasts"])],
-                         ignore_index=True) if tracks else pd.DataFrame()
-        alla = pd.concat([t["actuals"] for t in tracks.values()
-                          if t.get("actuals") is not None and len(t["actuals"])],
-                         ignore_index=True) if tracks else pd.DataFrame()
+        #  ★ `if tracks` 는 dict 가 비었는지만 본다. TP 트랙은 actuals=None 이고
+        #    EPS 실측치는 DART 키가 없으면 빈 프레임이라, 기본 설정에서 리스트가 비고
+        #    pd.concat([]) 가 ValueError 로 터진다 — 그러면 이 감사표 자체가 안 나온다.
+        _ff = [t["forecasts"] for t in tracks.values()
+               if t.get("forecasts") is not None and len(t["forecasts"])]
+        _aa = [t["actuals"] for t in tracks.values()
+               if t.get("actuals") is not None and len(t["actuals"])]
+        allf = pd.concat(_ff, ignore_index=True) if _ff else pd.DataFrame()
+        alla = pd.concat(_aa, ignore_index=True) if _aa else pd.DataFrame()
         scg_audit_forecast_ledger(ctx.get("reports", pd.DataFrame()),
                                   ctx.get("links", pd.DataFrame()), allf, alla)
 
