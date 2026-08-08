@@ -72,8 +72,13 @@ def _canary_bulk(corps: Sequence[str], n_universe: int) -> Tuple[Optional[bool],
             first_year = y
             break
     k2 = first_year is not None and first_year <= 2016
+    # ★ first_year 가 None 이면 '탐침이 아무것도 못 받았다'는 뜻이지 '2016년 데이터가 없다'가
+    #   아니다. 예전엔 그대로 문자열에 끼워 "시작일을 None년 이후로 상향" 이라는 실행 불가능한
+    #   지시가 찍혔다 — 처방이 원인 진단과 어긋나면 사용자는 엉뚱한 곳을 고친다.
     _k("K2", "배치 최초 제공 사업연도", k2, str(first_year or "미확인"), "≤2016",
-       "" if k2 else f"백테스트 시작일을 {first_year}년 이후로 상향해야 합니다")
+       "" if k2 else (f"백테스트 시작일을 {first_year}년 이후로 상향해야 합니다" if first_year
+                      else "2015~2018 탐침이 모두 빈 응답 — 키·한도·네트워크를 먼저 확인하세요. "
+                           "이 결과만으로 시작연도를 바꾸지 마세요."))
     return k1, k2
 
 
@@ -138,7 +143,17 @@ def _canary_price(codes: Sequence[str], sec: Optional[pd.DataFrame] = None) -> b
     if not elig:
         elig, n_off = codes, 0
 
-    got, chain_used = 0, Counter()
+    # ★ 판정 기준을 '폐지 예정 여부'로 쪼갠다.
+    #   존속 종목의 시세 결손은 진짜 결손이다 — 그 종목은 실제로 담겨서 수익률을 만든다.
+    #   반면 이미 폐지된 종목의 시세 결손은 백테스트 엔진이 -100%(정리매매가 없으면)로
+    #   처리하므로 **보수적 방향**이며, 이를 실패로 세면 편향을 제대로 제거할수록
+    #   K4 가 FAIL 로 기울어 임계값을 낮추라는 압력이 생긴다(§2 가 금지하는 방향).
+    #   → 존속에 엄격한 기준(≥95%)을 걸고, 폐지분은 정보성으로 따로 보고한다.
+    dead: set = set()
+    if sec is not None and len(sec) and "delisting_date" in sec.columns:
+        dead = set(sec.loc[sec["delisting_date"].notna(), "code"].astype(str))
+
+    chain_used = Counter()
     def _one(c):
         for nm, fn in PRICE_CHAIN:
             try:
@@ -149,18 +164,27 @@ def _canary_price(codes: Sequence[str], sec: Optional[pd.DataFrame] = None) -> b
                 return nm
         return None
     res = pmap_io(_one, elig, workers=min(N_WORKERS_IO, 8), desc="CANARY K4 가격")
-    for r in res:
+    live_n = live_ok = dead_n = dead_ok = 0
+    for c, r in zip(elig, res):
         if r:
-            got += 1
             chain_used[r] += 1
-    rate = got / max(len(elig), 1)
-    ok = rate >= 0.90
+        if c in dead:
+            dead_n += 1
+            dead_ok += 1 if r else 0
+        else:
+            live_n += 1
+            live_ok += 1 if r else 0
+    rate_live = live_ok / max(live_n, 1)
+    rate_dead = dead_ok / max(dead_n, 1)
+    ok = (live_n == 0) or (rate_live >= 0.95)
     _k("K4", "10년 가격 확보", ok,
-       f"{got}/{len(elig)} ({rate:.0%})" +
-       (f" · 구간 미상장/기폐지 {n_off}종목 분모 제외" if n_off else "") + " · 경로 " +
-       (", ".join(f"{k}×{v}" for k, v in chain_used.most_common()) or "없음"),
-       "상장중 표본 ≥90%",
-       "" if ok else "체인(pykrx→FDR→네이버→yfinance)이 전부 실패 — 네트워크/차단을 확인하세요")
+       f"존속 {live_ok}/{live_n} ({rate_live:.0%})" +
+       (f" · 폐지 {dead_ok}/{dead_n} ({rate_dead:.0%}, 미확보분은 -100% 처리)" if dead_n else "") +
+       (f" · 구간 미상장 {n_off}종목 분모 제외" if n_off else "") + " · " +
+       (", ".join(f"{k}×{v}" for k, v in chain_used.most_common()) or "경로 없음"),
+       "존속 종목 ≥95%",
+       "" if ok else "존속 종목의 시세가 비어 있습니다 — 체인(pykrx→FDR→네이버→yfinance)과 "
+                     "네트워크·차단을 확인하세요. 폐지 종목 결손은 여기 포함되지 않습니다.")
     return ok
 
 
@@ -266,6 +290,33 @@ def canary_sample(sec: pd.DataFrame, monthly: pd.DataFrame, n: int = None) -> Li
     return pick
 
 
+DART_DEPENDENT_KS = ("K1", "K2", "K3", "K7", "K8", "K9")
+
+
+def canary_resource_flip() -> bool:
+    """DART 가 자원 조건으로 멈춘 상태라면, 이미 기록된 DART 검사 FAIL 을 SKIP 으로 되돌린다.
+
+    ★ 예산은 CANARY 도중에도 바닥난다(시작 시점엔 남아 있었던 경우). 그때 기록된 FAIL 은
+      '자원 없음'을 '데이터 없음'으로 오판한 결과다. 되돌린 사실 자체를 로그로 남겨
+      은폐가 아니라 정정임을 밝힌다. 되돌렸으면 True.
+    """
+    why = dart_halt_reason()
+    if not why:
+        return False
+    flipped = [r["id"] for r in CANARY_RESULTS
+               if r["id"] in DART_DEPENDENT_KS and r["passed"] is False]
+    for r in CANARY_RESULTS:
+        if r["id"] in DART_DEPENDENT_KS and r["passed"] is False:
+            r["passed"], r["fatal"] = None, False
+            r["measured"] = f"{r['measured']}  ← 측정 중 {why}"
+            r["action"] = "자원 조건으로 판정 보류. 데이터 부재가 아닙니다."
+    if flipped:
+        LOG.warn(f"수집 도중 DART 가 중단됐습니다 — {why}. "
+                 f"{flipped} 의 FAIL 을 **판정 보류(SKIP)** 로 되돌립니다. "
+                 f"호출권이 없어 못 받은 것을 '데이터가 없다'로 판정하면 안 됩니다.")
+    return True
+
+
 def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
     """CANARY 전체 실행. 반환 dict 는 하류가 '무엇을 끄고 갈지' 정하는 데 쓴다."""
     LOG.banner("③ CANARY K1~K9", "수집을 시작해도 되는지 25분 안에 판정합니다 (스펙 §2)")
@@ -282,11 +333,33 @@ def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
 
     LOG.info(f"표본 {len(codes)}종목 / corp_code {len(corps)}개 · 직원현황 탐침연도 {probe_year}")
 
-    k1, k2 = _canary_bulk(corps, n_uni)
-    k3 = _canary_accounts(corps, probe_year)
+    # ★ DART 를 지금 쓸 수 없는 상태라면, DART 의존 검사는 FAIL 이 아니라 SKIP 이다.
+    #   '오늘 호출권이 없다'는 것과 '그 데이터가 세상에 없다'는 것은 전혀 다른 사건이고,
+    #   후자의 처방(백테스트 시작연도 상향·전략 축소)을 전자에 적용하면 일시적 조건 때문에
+    #   전략이 영구히 훼손된다. 실제로 이것 때문에 실행이 §12-2 킬 기준으로 죽었다.
+    halt = dart_halt_reason()
+    if halt:
+        LOG.warn(f"DART 를 지금 쓸 수 없습니다 — {halt}. "
+                 f"K1·K2·K3·K7·K8·K9 는 **판정 보류(SKIP)** 로 두고 진행합니다. "
+                 f"이 상태에서의 '응답 0건'은 데이터 부재의 증거가 아니므로 킬 기준을 걸지 않습니다.")
+        for kid, nm, crit in (("K1", "DART 재무 배치(2016Q1)", f">{CANARY_K1_MIN_ROWS:,}행"),
+                              ("K2", "배치 최초 제공 사업연도", "≤2016"),
+                              ("K3", "필수계정 커버리지", f"≥{CANARY_K3_MIN_COV:.0%}"),
+                              ("K7", "empSttus 응답", f"≥{CANARY_K7_MIN_RATE:.0%}"),
+                              ("K8", "연간급여총액 기재율", f"≥{CANARY_K8_MIN_RATE:.0%}"),
+                              ("K9", "단위 정합성", f"불일치<{CANARY_K9_MAX_BAD:.0%}")):
+            _k(kid, nm, None, f"측정 불가 — {halt}", crit,
+               "자원 조건입니다. 데이터 부재가 아니므로 시작연도·전략을 바꾸지 마세요.")
+        k1 = k2 = k3 = k7 = k8 = k9 = None
+    else:
+        k1, k2 = _canary_bulk(corps, n_uni)
+        k3 = _canary_accounts(corps, probe_year)
+        k7, k8, k9 = _canary_emp(corps, probe_year)
     k4 = _canary_price(codes, sec)
     k5 = _canary_delisting(sec)
-    k7, k8, k9 = _canary_emp(corps, probe_year)
+
+    if canary_resource_flip():
+        k1 = k2 = k3 = k7 = k8 = k9 = None
 
     LOG.table([[r["id"], _trunc(r["name"], 26),
                 "PASS" if r["passed"] else ("SKIP" if r["passed"] is None else "FAIL"),

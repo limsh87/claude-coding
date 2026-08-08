@@ -265,7 +265,7 @@ ROBUST_BUDGET_S = {"R0": 240, "R1": 360, "R2N": 300, "R3": 120,
 
 STRATEGY_ID    = "TCD_V3_CORE_D_EMP_LITE"
 STRATEGY_NAME  = "CORE-D + EMP-LITE (DART 직원현황 기반 한계임금 전환 코어)"
-BUILD_VERSION  = "v3.20260808.0007"
+BUILD_VERSION  = "v3.20260808.0151"
 ACTIVE_PACKS   = ["CORE_D", "EMP_LITE"]        # 진단 출력용 라벨 (레지스트리 없음 — 경량화)
 
 
@@ -2375,11 +2375,73 @@ def mount_cache_v3() -> Tuple[str, str]:
             except Exception:
                 continue
     os.makedirs(local, exist_ok=True)
-    LOG.warn(f"구글드라이브 경로를 찾지 못해 로컬({local})에 저장합니다. "
-             f"드라이브에 남기려면 상단 GDRIVE_ROOT 를 실제 드라이브 경로로 바꾸세요 "
-             f"(예: Windows 'G:/내 드라이브/tcd_cache', macOS "
-             f"'~/Library/CloudStorage/GoogleDrive-<계정>/My Drive/tcd_cache').")
+    # ★ '못 찾았다'만 말하면 사용자는 무엇을 고쳐야 할지 모른다. 실제로 뒤진 경로를 보여준다.
+    tried = _gdrive_desktop_candidates()
+    LOG.warn(f"구글드라이브 경로를 찾지 못해 로컬({local})에 저장합니다.\n"
+             f"     뒤져본 경로 {len(tried)}개 중 앞부분: {tried[:6]}\n"
+             f"     드라이브에 남기려면 상단 GDRIVE_ROOT 를 실제 경로로 바꾸세요. 확인 방법:\n"
+             f"       · Windows 탐색기에서 구글 드라이브를 열고 주소창 경로를 복사\n"
+             f"         예)  GDRIVE_ROOT = r\"G:/내 드라이브/tcd_cache\"\n"
+             f"       · macOS  ~/Library/CloudStorage/GoogleDrive-<계정>/My Drive/tcd_cache\n"
+             f"     ※ 로컬에 저장해도 백테스트는 정상 동작합니다. 다음 실행에서 드라이브 경로를 "
+             f"지정하면 이 폴더를 GDRIVE_ADOPT_DIRS 에 넣어 그대로 흡수할 수 있습니다 "
+             f"(파일 이동·삭제 없음).")
     return local, "LOCAL"
+
+
+def _win_drivefs_roots() -> List[str]:
+    """구글드라이브(데스크톱)가 **스스로 기록해 둔** 마운트 지점을 읽는다.
+
+    ① 레지스트리 DefaultMountPoint — 정책(HKLM\\Policies) > 시스템 > 사용자 순.
+       드라이브 문자일 수도, '%USERPROFILE%\\GFS' 같은 확장 경로일 수도 있다.
+    ② %LOCALAPPDATA%\\Google\\DriveFS\\root_preference_sqlite.db
+       media.last_mount_point = 실제로 마운트했던 지점,
+       roots.last_seen_absolute_path = 미러링 폴더(문자 스캔으로는 절대 못 찾는 경로).
+    부팅 경로에서 도는 함수이므로 어떤 예외도 밖으로 내보내지 않는다.
+    """
+    out: List[str] = []
+    if platform.system() != "Windows":
+        return out
+    try:
+        import winreg                                            # type: ignore
+        for hive, sub in ((winreg.HKEY_LOCAL_MACHINE, r"Software\Policies\Google\DriveFS"),
+                          (winreg.HKEY_LOCAL_MACHINE, r"Software\Google\DriveFS"),
+                          (winreg.HKEY_CURRENT_USER, r"Software\Google\DriveFS")):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | view) as k:
+                        v, _ = winreg.QueryValueEx(k, "DefaultMountPoint")
+                        p = os.path.expandvars(str(v)).strip()
+                        if p:
+                            out.append(p + ":\\" if len(p.rstrip(":")) == 1 else p)
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    try:
+        import sqlite3
+        db = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "DriveFS",
+                          "root_preference_sqlite.db")
+        if os.path.isfile(db):
+            # 드라이브가 파일을 열어 두고 있으므로 반드시 읽기 전용·불변으로 연다.
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True, timeout=2)
+            try:
+                for q, colname in (("SELECT last_mount_point FROM media", 0),
+                                   ("SELECT last_seen_absolute_path FROM roots", 0)):
+                    try:
+                        for row in con.execute(q):
+                            p = str(row[colname] or "").strip()
+                            if p:
+                                out.append(p + ":\\" if len(p.rstrip(":")) == 1 else p)
+                    except Exception:
+                        continue
+            finally:
+                con.close()
+    except Exception:
+        pass
+    # 루트 아래의 '내 드라이브' 계열 하위폴더도 후보에 넣는다(폴더 마운트 대응).
+    kids = ("My Drive", "내 드라이브", "Shared drives", "공유 드라이브")
+    return out + [os.path.join(r, k) for r in list(out) for k in kids]
 
 
 def _gdrive_desktop_candidates() -> List[str]:
@@ -2394,18 +2456,23 @@ def _gdrive_desktop_candidates() -> List[str]:
     home = os.path.expanduser("~")
     roots: List[str] = []
     if platform.system() == "Windows":
-        # ★ 존재하지 않거나 '연결 끊긴 네트워크 드라이브'에 os.path.isdir 를 던지면 letter 당
-        #   수 초씩 블로킹된다. 비트마스크로 **실재하는 드라이브만** 먼저 걸러낸다.
-        letters = "GHIJKLMNOPQRSTUVWXYZ"
+        # ★ 드라이브 문자를 훑는 것만으로는 못 찾는다. 구글 드라이브는 (a) 드라이브 문자
+        #   (b) **임의의 빈 폴더** (c) 미러링 모드의 로컬 폴더 중 하나로 붙을 수 있고,
+        #   (b)(c)는 어떤 문자 스캔으로도 발견되지 않는다. 실제로 사용자 환경에서 못 찾았다.
+        #   → 드라이브 자신이 기록해 둔 설정을 먼저 읽는다. 추측보다 조회가 정확하다.
+        roots += _win_drivefs_roots()
+        letters = "DEFGHIJKLMNOPQRSTUVWXYZ"     # 기본은 G: 지만 사용자가 바꿀 수 있다
         try:
             import ctypes
             mask = ctypes.windll.kernel32.GetLogicalDrives()      # type: ignore[attr-defined]
-            letters = "".join(L for L in letters
-                              if mask >> (ord(L) - ord("A")) & 1)
+            live = "".join(L for L in letters if mask >> (ord(L) - ord("A")) & 1)
+            letters = live or letters          # 비트마스크는 '힌트'다. 실패해도 스캔은 한다.
         except Exception:
             pass
         for L in letters:
             roots += [f"{L}:/내 드라이브", f"{L}:/My Drive", f"{L}:/공유 드라이브"]
+        roots += [os.path.join(home, n) for n in
+                  ("My Drive", "내 드라이브", "Google Drive", "GoogleDrive")]
     roots += [os.path.join(home, "Google Drive", "My Drive"),
               os.path.join(home, "Google Drive", "MyDrive"),
               os.path.join(home, "GoogleDrive", "MyDrive"),
@@ -2476,7 +2543,10 @@ def report_runtime_v3(t0: float) -> pd.DataFrame:
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
-                   "corp_code", "industry", "sector_src", "src"]
+                   "corp_code", "industry", "sector_src", "src",
+                   # 폐지 사유 — 백테스트가 청산가를 정할 때 쓴다. 흡수합병·완전자회사화·
+                   # 스팩해산을 -100% 로 처리하면 없는 손실을 매년 지어낸다(41_backtest).
+                   "delist_reason", "to_code"]
 
 # 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
 #   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
@@ -2618,8 +2688,11 @@ def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
                     "", "unnamed: 0", "unnamed:0", "index"):
                 df = df.drop(columns=[df.columns[0]])
             if len(df):
+                # ★ 컬럼 목록을 자르지 않는다. [:6] 으로 자른 로그가 delisting CSV 의
+                #   DelistingDate(7번째)를 가려, '상장일을 폐지일로 읽고 있다'는 오진을
+                #   유발했다. 진단 출력이 진단을 방해하면 없느니만 못하다.
                 LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} "
-                          f"({len(df):,}행 · 컬럼 {list(df.columns)[:6]})")
+                          f"({len(df):,}행 · 컬럼 {list(df.columns)})")
                 return df
         except Exception:
             continue
@@ -2716,15 +2789,49 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_raw = len(d)
     raw_codes = d[code_c].astype(str)
     codes = raw_codes.map(to_code6)
-    n_badcode = int(codes.isna().sum())
+    # ★ dl_c 폴백 목록에 "listingdate" 가 들어 있다. 업스트림이 DelistingDate 컬럼명을
+    #   바꾸는 순간 상장일이 폐지일로 읽히고, 모든 종목이 상장 첫날 폐지된 것으로 처리되어
+    #   유니버스가 통째로 비워진다 — 예외가 아니라 '그럴듯한 숫자'로 실패한다. 방어한다.
+    if dl_c and str(dl_c).strip().lower().replace("_", "") == "listingdate":
+        LOG.error("폐지목록에 폐지일 컬럼이 없어 상장일 컬럼을 쓸 뻔했습니다 — "
+                  f"상장일을 폐지일로 읽으면 전 종목이 즉시 폐지 처리됩니다. "
+                  f"폐지일 없이 진행합니다. 원본 컬럼: {list(d.columns)}")
+        dl_c = None
+    lst_c = next((col[k] for k in ("listingdate", "listing_date", "listdate") if k in col), None)
     t = pd.DataFrame({
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        # 폐지 종목의 상장일 — 상장 전 달에 유니버스로 새는 것(C13)과 시즈닝 면제를 막는다.
+        "listing_date": as_ts_series(d[lst_c]) if lst_c else pd.NaT,
+        # 폐지 '사유'. 흡수합병·완전자회사화·스팩해산은 -100% 가 아니다(41_backtest 가 소비).
+        "delist_reason": (d[col["reason"]].astype(str).str.strip() if "reason" in col else ""),
+        "to_code": (d[col["tosymbol"]].map(to_code6) if "tosymbol" in col else None),
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
-        "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
-                      else d[col["kind"]].astype(str) if "kind" in col else ""),
+        "secugroup": (d[col["secugroup"]].astype(str).str.strip() if "secugroup" in col
+                      else d[col["kind"]].astype(str).str.strip() if "kind" in col else ""),
     })
+    # ★ 탈락분의 정체를 반드시 증권종류로 분류한다.
+    #   업스트림 원본(4,172행)을 직접 확인한 결과, to_code6 이 떨어뜨리는 1,536행은
+    #   전부 신주인수권증서(857)·수익증권(521)·신주인수권증권(158)이고 **주권은 0건**이다.
+    #   그런데 예전 코드는 이를 "코드형식 불일치 → 생존자편향이 그만큼 남습니다"로 경고했다.
+    #   주식 전략의 유니버스가 아닌 파생·펀드 상품이 빠진 것을 편향으로 보고하면,
+    #   ① 멀쩡한 결과를 의심하게 만들고 ② 진짜 편향 경고까지 같이 무시하게 만든다.
+    #   → '정책적 제외'와 '진짜 유실'을 분리해서 세고, 주권이 유실될 때만 경고한다.
+    _EQUITY_SG = ("주권", "외국주권", "주식예탁증권")
+    sg = t["secugroup"].fillna("")
+    is_equity = sg.isin(_EQUITY_SG) if sg.str.len().gt(0).any() else pd.Series(True, index=t.index)
+    bad = t["code"].isna()
+    n_badcode = int(bad.sum())
+    n_lost_equity = int((bad & is_equity).sum())
+    n_nonequity = int((~bad & ~is_equity).sum())
+    if sg.str.len().gt(0).any() and n_badcode:
+        LOG.info(f"  코드 정규화 탈락 {n_badcode:,}건의 증권종류: "
+                 f"{dict(sg[bad].value_counts().head(5))} → 이 중 주권계열 {n_lost_equity:,}건")
+    # ★ 비주권(수익증권·리츠·투자회사 등)은 여기서 **버리지 않는다.**
+    #   폐지 기록을 지우면 그 종목이 유니버스에서 영원히 살아있는 것으로 보인다 — 제거하려던
+    #   생존자편향을 오히려 만드는 방향이다. 담을 수 없는 종목은 U-MID 의 유동성·규모 조건이
+    #   이미 걸러내므로, 여기서는 '분류해서 보고'만 하고 기록은 보존한다.
     t = t.dropna(subset=["code"])
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
@@ -2732,15 +2839,17 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
     n_nodate = int(t["delisting_date"].isna().sum())
 
-    LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
+    LOG.ok(f"상장폐지 목록 {len(t):,}건 (주권계열 {int(t['secugroup'].isin(_EQUITY_SG).sum()):,} · "
+           f"비주권 {n_nonequity:,}) — 생존자편향 제거 입력 확보")
     if n_raw - len(t):
         LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
-                 f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
+                 f"(증권종류상 코드체계가 다른 {n_badcode:,}건 제외 · 동일코드 중복 {n_dupe:,} 병합) · "
                  f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
-        if n_badcode > n_raw * 0.25:
-            LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
-                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
-                     f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+    # ★ 경고는 '주권이 유실됐을 때'만 띄운다. 비주권 제외는 편향이 아니라 유니버스 정의다.
+    if n_lost_equity:
+        LOG.warn(f"폐지목록에서 **주권** {n_lost_equity:,}건이 코드 정규화에 실패했습니다 — "
+                 f"이만큼은 실제로 생존자편향으로 남습니다. "
+                 f"원본 코드 예시: {raw_codes[codes.isna() & is_equity].head(5).tolist()}")
     return t
 
 
@@ -2965,8 +3074,15 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market",
+                                   "listing_date", "delist_reason", "to_code"]).copy()
+        # ★ 예전엔 여기서 listing_date 를 pd.NaT 로 못박았다. 그런데 폐지목록 원본에는
+        #   ListingDate 가 4,172건 **전부** 들어 있다. 버리면 두 가지가 동시에 깨진다:
+        #     ① Universe.at 는 listing_date 결측을 '태초부터 상장'으로 읽는다 →
+        #        2016년 이후 상장했다가 폐지된 292종목이 상장 전 달의 유니버스에 낀다(C13 위반).
+        #     ② 250일 시즈닝 게이트는 listing_date 가 있을 때만 걸린다 → 결측인 종목만
+        #        면제된다. 그 면제 대상이 하필 '나중에 폐지된 종목'이라, 어느 종목이 게이트를
+        #        건너뛰는지가 **그 종목의 미래로 결정**된다. 실거래로는 재현 불가능한 유니버스다.
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
@@ -3015,6 +3131,8 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         listing_date=("listing_date", "min"),
         delisting_date=("delisting_date", "max"),
         industry=("industry", _first_str),
+        delist_reason=("delist_reason", _first_str),
+        to_code=("to_code", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
     )
     assert_no_dup_cols(agg, "security_master:agg")
@@ -3221,10 +3339,15 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 
 def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    # ★ 이름은 FDR 이지만 6자리 KRX 코드는 FinanceDataReader 내부에서 NaverDailyReader 로
+    #   라우팅된다(fchart.stock.naver.com). 즉 KRX 가 아니라 네이버다. 그런데 예전엔
+    #   krx 버킷(2.0 qps)의 토큰을 먹었다. RateLimiter 는 소스당 전역 단일 간격이라
+    #   12스레드가 0.5초 슬롯 하나를 나눠 쓰게 되고, 실효 동시성이 1로 떨어진다.
+    #   실측: 1,833건 × 0.5초 = 916.5초 ≈ 관측 916.7초 — 수집 시간의 100%가 이 대기였다.
     if fdr is None:
         return None
     try:
-        limiter("krx").wait()
+        limiter("naver").wait()
         d = fdr.DataReader(code, start, end)
     except Exception:
         return None
@@ -3327,7 +3450,8 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
     codes = sorted({c for c in map(to_code6, codes) if c})
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
@@ -3368,6 +3492,24 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
+    # ── 전 구간 재수집을 막는 두 가지 하한 ──────────────────────────────────────────────
+    #   ① 상장일 — 그 이전 봉은 존재하지 않는다.
+    #   ② 워터마크 — 전 구간을 요청했는데도 더 이전이 안 온 지점. 소스에 없다는 뜻이다.
+    listing_of: Dict[str, pd.Timestamp] = {}
+    if sec is not None and len(sec) and "listing_date" in getattr(sec, "columns", []):
+        try:
+            _s = sec.dropna(subset=["code"]).drop_duplicates("code")
+            listing_of = dict(zip(_s["code"].astype(str), as_ts_series(_s["listing_date"])))
+        except Exception:
+            listing_of = {}
+    watermark: Dict[str, pd.Timestamp] = {}
+    _wm = VAULT.get_table("price_earliest_available", scope="shared")
+    if _wm is not None and len(_wm):
+        try:
+            watermark = dict(zip(_wm["code"].astype(str), as_ts_series(_wm["earliest"])))
+        except Exception:
+            watermark = {}
+
     todo, n_back, n_fwd, n_skip = [], 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
@@ -3381,7 +3523,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
         #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
         #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+        #
+        #   ★★ 다만 '요청 시작일'을 그대로 기준으로 삼으면 안 된다. 2021년에 상장한 종목은
+        #   2015년 봉이 **존재할 수 없으므로** 조건이 영원히 참이고, 매 실행 전 구간을 다시
+        #   받는다. 실측: 캐시 3,517종목 중 1,487종목(42%)이 매번 재수집 대상이 되어
+        #   가격 단계 992초 중 916초를 이미 갖고 있는 데이터를 다시 받는 데 썼다.
+        #   → 상장일과 '이 종목에서 실제로 받아진 최소일' 워터마크로 하한을 올린다.
+        want = start_ts
+        _ld = listing_of.get(c)
+        if _ld is not None and pd.notna(_ld):
+            want = max(want, as_ts(_ld))
+        _wm = watermark.get(c)
+        if _wm is not None and pd.notna(_wm):
+            want = max(want, _wm)          # 이미 '더 이전은 없다'가 확인된 지점
+        if mn is not None and mn > want + pd.Timedelta(days=10):
             todo.append((c, start))
             n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
@@ -3417,13 +3572,30 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
-        failed = []
+        failed, wm_rows = [], []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
+                # ★ 전 구간(start)을 요청했는데 이만큼만 왔다면 그 이전은 소스에 없다.
+                #   이 워터마크가 없으면 2021년 상장 종목은 2015년 봉이 영영 안 오므로
+                #   '앞 구간 결손'으로 판정되어 **매 실행 전 구간을 다시 받는다.**
+                if as_ts(st) <= start_ts + pd.Timedelta(days=1):
+                    _mn = as_ts_series(d["date"]).min()
+                    if pd.notna(_mn):
+                        wm_rows.append({"code": c, "earliest": _mn, "checked_at": _today})
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if wm_rows:
+            _wprev = VAULT.get_table("price_earliest_available", scope="shared")
+            _wall = pd.concat([_wprev, pd.DataFrame(wm_rows)], ignore_index=True) \
+                if _wprev is not None and len(_wprev) else pd.DataFrame(wm_rows)
+            _wall = (_wall.sort_values("checked_at")
+                          .drop_duplicates("code", keep="last").reset_index(drop=True))
+            VAULT.put_table("price_earliest_available", _wall, scope="shared", domain="price",
+                            source="fetch_prices: 소스가 보유한 최초 관측일 워터마크")
+            LOG.info(f"최초 관측일 워터마크 {len(wm_rows):,}종목 기록 — 다음 실행부터 이 종목들의 "
+                     f"전 구간 재수집을 건너뜁니다(상장 이전 구간은 존재하지 않습니다).")
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
@@ -3490,7 +3662,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
-        if src_used.get("naver", 0) or src_used.get("yfinance", 0):
+        if any(src_used.get(k, 0) for k in ("naver", "yfinance", "fdr")):
             LOG.warn("네이버/yfinance 경로로 받은 종목은 거래대금이 종가×거래량 근사입니다. "
                      "V6 유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향).")
     PIPE.io("OUT", "DRIVE", "krx_ohlcv_daily", px, source="price chain")
@@ -3689,6 +3861,38 @@ class DartBudget:
 
 DBUDGET: Optional[DartBudget] = None
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★ '지금 못 받는다' 와 '원래 없다' 를 구별하는 단일 진실
+#
+#  dart_api() 는 세 가지 전혀 다른 사건을 모두 None 으로 뭉갠다:
+#    ① 예산 게이트가 호출을 거부   ② 네트워크 실패   ③ API 가 '데이터 없음'(013) 응답
+#  호출자는 ①②를 ③으로 읽는다. 실제로 이것 때문에 실행이 죽었다 —
+#  일일 한도가 소진된 상태로 시작한 실행에서 CANARY 가 K8 을 '급여총액 미기재'로 판정하고
+#  §12-2 킬 기준을 발동시켰다. 데이터는 멀쩡히 있었고 오늘 호출권이 없었을 뿐이다.
+#  게다가 그 판정의 처방은 '백테스트 시작일 상향' — 일시적 조건으로 전략을 영구 훼손한다.
+#
+#  → 사유를 여기에 기록하고, 자원 조건으로 실패한 검사는 FAIL 이 아니라 SKIP 이어야 한다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+DART_HALT: Dict[str, Optional[str]] = {"reason": None, "detail": None}
+
+
+def dart_note_halt(reason: str, detail: str = ""):
+    if DART_HALT["reason"] is None:
+        DART_HALT["reason"], DART_HALT["detail"] = reason, detail
+
+
+def dart_halt_reason() -> Optional[str]:
+    """지금 DART 를 쓸 수 없는 이유. None 이면 정상 — 즉 '응답 0건'은 진짜 데이터 부재다."""
+    if not DART_API_KEY:
+        return "DART_API_KEY 미입력"
+    if DBUDGET is not None and (DBUDGET.exhausted or DBUDGET.n >= DART_DAILY_LIMIT):
+        return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
+    return DART_HALT["reason"]
+
+
+def dart_budget_left() -> int:
+    return max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2, no_data_ok: bool = False) -> Optional[dict]:
@@ -3698,6 +3902,8 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
     if not DART_API_KEY:
         return None
     if DBUDGET is not None and not DBUDGET.take(tries):
+        dart_note_halt(f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})",
+                       "내일 재실행하면 정확히 이 지점부터 이어받습니다.")
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
@@ -3713,11 +3919,17 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         if st in ("020", "021"):
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
+            dart_note_halt(f"DART 서버가 한도 초과 응답(status={st})",
+                           "내일 재실행하면 이어받습니다.")
             LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
                      f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
         elif st in ("010", "011", "012", "901"):
+            dart_note_halt(f"DART 인증 오류(status={st} · {DART_STATUS_MSG.get(st, '?')})",
+                           "DART_API_KEY 를 확인하세요. 데이터 부재가 아닙니다.")
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
+        elif st == "800":
+            dart_note_halt("DART 시스템 점검 중(status=800)", "점검 종료 후 재실행하세요.")
         elif st != "013":
             LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
         # ★ 013("조회된 데이터 없음")은 통신 실패가 아니라 **정상 응답**이다. 그런데 None 으로
@@ -3748,9 +3960,15 @@ _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
 
 def _fs_one(job) -> Optional[pd.DataFrame]:
     corp, year, reprt = job
+    # ★ 예산·인증이 이미 막혔으면 남은 잡을 즉시 포기한다. 계속 돌면 OFS/CFS 두 번씩
+    #   헛호출하며 큐 전체(최대 12,000건)를 소진하고, 로그만 실패로 채운다.
+    if dart_halt_reason():
+        return None
     js = dart_api("fnlttSinglAcntAll.json",
                   {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
     if not js or "list" not in js:
+        if dart_halt_reason():
+            return None
         js = dart_api("fnlttSinglAcntAll.json",
                       {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
@@ -3802,6 +4020,8 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
     def _one(job):
         batch, y, r = job
+        if dart_halt_reason():          # 예산·인증이 막히면 남은 배치를 즉시 포기
+            return None
         js = dart_api("fnlttMultiAcnt.json",
                       {"corp_code": ",".join(batch), "bsns_year": str(y), "reprt_code": r})
         if not js or not isinstance(js.get("list"), list) or not js["list"]:
@@ -4169,21 +4389,114 @@ DISCLOSURE_PATTERNS = {
 }
 
 
+DISCLOSURE_LEDGER = "dart_disclosure_months"
+
+
+def _disclosure_done_months(cached: Optional[pd.DataFrame]) -> set:
+    """완결이 **증명된** 달만 돌려준다.
+
+    기존 캐시에는 이 원장이 없다. 그렇다고 '캐시에 행이 있으니 완결'로 간주하면
+    이미 뚫려 있는 구멍을 그대로 물려받는다. 그래서 레거시 캐시는 (달 × 유형)당
+    1회짜리 값싼 탐침으로 total_count 를 받아 실제 보유 행수와 대조해 검증한다.
+    120개월이면 240회 — 전체 재수집(수천 회)에 비하면 무시할 수 있는 비용이고,
+    이 한 번으로 과거 실행이 남긴 조용한 결손이 드러난다.
+    """
+    led = VAULT.get_table(DISCLOSURE_LEDGER, scope="shared")
+    if led is not None and len(led) and "month" in led.columns:
+        d = led[led.get("complete", False).astype(bool)] if "complete" in led.columns else led
+        return set(d["month"].astype(str))
+    if cached is None or not len(cached):
+        return set()
+
+    have = cached["rcept_dt"].dt.to_period("M").astype(str).value_counts().to_dict()
+    if not have or not DART_API_KEY or RUN_MODE == "CACHED" or dart_halt_reason():
+        # 검증할 수 없으면 재수집 대상으로 둔다 — 조용히 '완결'로 승격시키지 않는다.
+        return set()
+
+    LOG.info(f"공시목록 캐시 {len(have)}개월의 완결성을 검증합니다 "
+             f"(달당 {len(DISCLOSURE_TYPES)}회 탐침 — 과거 실행이 페이지 중간에 끊겼는지 확인).")
+
+    def _probe(mk):
+        p = pd.Period(mk, freq="M")
+        total = 0
+        for ty in DISCLOSURE_TYPES:
+            js = dart_api("list.json", {
+                "bgn_de": p.start_time.strftime("%Y%m%d"), "end_de": p.end_time.strftime("%Y%m%d"),
+                "pblntf_ty": ty, "page_no": 1, "page_count": 1, "last_reprt_at": "N"},
+                no_data_ok=True)
+            if js is None:
+                return mk, None                       # 검증 실패 → 완결로 승격하지 않는다
+            total += int(js.get("total_count", 0) or 0)
+        return mk, total
+
+    res = pmap_io(_probe, sorted(have), workers=min(N_WORKERS_IO, 8), desc="공시 캐시 완결성 검증")
+    ok, holed, unknown = set(), [], 0
+    for r in res:
+        if not r:
+            unknown += 1
+            continue
+        mk, total = r
+        if total is None:
+            unknown += 1
+        elif have.get(mk, 0) >= total:
+            ok.add(mk)
+        else:
+            holed.append((mk, have.get(mk, 0), total))
+    if holed:
+        LOG.warn(f"과거 실행이 남긴 공시목록 결손 {len(holed)}개월을 찾았습니다 — "
+                 f"예: {[f'{m}: {h}/{t}행' for m, h, t in holed[:3]]}. "
+                 f"이 달들을 다시 받습니다. (그대로 뒀다면 유상증자·전환사채·자기주식 공시가 "
+                 f"'애초에 없었던 것'으로 백테스트에 들어갔습니다)")
+    if unknown:
+        LOG.info(f"  {unknown}개월은 검증하지 못해 재수집 대상으로 둡니다(안전한 방향).")
+    _save_disclosure_ledger(ok)
+    return ok
+
+
+def _save_disclosure_ledger(complete_months) -> None:
+    prev = VAULT.get_table(DISCLOSURE_LEDGER, scope="shared")
+    rows = set()
+    if prev is not None and len(prev) and "month" in prev.columns:
+        keep = prev[prev["complete"].astype(bool)] if "complete" in prev.columns else prev
+        rows |= set(keep["month"].astype(str))
+    rows |= {str(m) for m in complete_months}
+    if not rows:
+        return
+    VAULT.put_table(DISCLOSURE_LEDGER,
+                    pd.DataFrame({"month": sorted(rows), "complete": True}),
+                    scope="shared", domain="dart",
+                    source="공시목록 완결성 원장 — 페이지를 끝까지 훑은 달만 기록")
+
+
 def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     """월 단위로 시장 전체 공시목록을 훑는다. PACK-C(자사주/배당)와 V3(희석성 조달)의 입력."""
     if not DART_API_KEY:
         return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
     cached = VAULT.get_table("dart_disclosures", scope="shared")
-    have_months = set()
     if cached is not None and len(cached):
         cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
-        have_months = set(cached["rcept_dt"].dt.to_period("M").astype(str))
         LOG.info(f"공용 캐시에서 공시목록 {len(cached):,}행 재사용")
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ '그 달에 행이 하나라도 있다' ≠ '그 달을 다 받았다'
+    #
+    #  예전에는 have_months 를 캐시 행의 rcept_dt 에서 유도했다. 그래서 12페이지짜리 달을
+    #  3페이지에서 예산·네트워크로 놓쳐도, 1~2페이지가 저장되는 순간 그 달은 영원히
+    #  '보유'로 표시되고 나머지 페이지는 **두 번 다시 시도되지 않았다.**
+    #  잃어버리는 것이 유상증자·전환사채·자기주식 공시라서, 하류(V3 희석 거부권·PACK-C)는
+    #  '이벤트 없음'이라는 **정상적인 값**을 읽는다 — 경고도 FAIL 도 뜨지 않고, 재실행할수록
+    #  그 거짓이 굳는다. 일시적 장애를 영구적 음성 관측으로 세탁하는 최악의 형태다.
+    #  → 완결 여부를 별도 원장에 명시적으로 기록하고, 그 원장만 신뢰한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    done_months = _disclosure_done_months(cached)
     months = pd.period_range(as_ts(start), as_ts(end), freq="M")
-    todo = [m for m in months if str(m) not in have_months]
+    todo = [m for m in months if str(m) not in done_months]
     if RUN_MODE == "CACHED":
         todo = []
+    elif todo and cached is not None and len(cached):
+        LOG.info(f"공시목록 미완결 {len(todo)}개월을 다시 받습니다 "
+                 f"(완결 확인 {len(done_months)}개월). 페이지 중간에 끊긴 달은 "
+                 f"'보유'로 세지 않습니다 — 그렇게 세면 빠진 공시가 영구히 없는 것이 됩니다.")
 
     # ★ 파이프라인이 실제로 소비하는 공시 유형을 전부 훑어야 한다.
     #   B(주요사항보고)만 훑으면 PACK-C 의 자사주·증자는 잡히지만
@@ -4193,29 +4506,48 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
 
     def _one(m):
-        rows = []
+        """(월, 행들, 완결여부). 한 페이지라도 못 받으면 그 달은 미완결이다."""
+        rows, complete = [], True
         for ty in DISCLOSURE_TYPES:
-            page = 1
+            page, walked = 1, False
             while page <= 100:
                 js = dart_api("list.json", {
                     "bgn_de": m.start_time.strftime("%Y%m%d"),
                     "end_de": m.end_time.strftime("%Y%m%d"),
                     "pblntf_ty": ty, "page_no": page, "page_count": 100,
-                    "last_reprt_at": "N"})
-                if not js or not isinstance(js.get("list"), list) or not js["list"]:
+                    "last_reprt_at": "N"}, no_data_ok=True)
+                if js is None:                       # 예산·네트워크·인증 → 이 달은 미완결
+                    complete = False
                     break
-                rows.extend(js["list"])
+                lst = js.get("list")
+                if not isinstance(lst, list) or not lst:
+                    walked = True                    # 정상 빈 응답 = 이 유형은 여기서 끝
+                    break
+                rows.extend(lst)
                 if page >= int(js.get("total_page", 1) or 1):
+                    walked = True
                     break
                 page += 1
-        return rows
+            else:
+                complete = False                     # 100페이지 상한 = 다 못 훑었다
+            if not walked and complete is not False:
+                complete = False
+        return str(m), rows, complete
 
-    new = []
+    new, ok_months, bad_months = [], [], []
     if todo:
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8), desc="DART 공시목록")
         for r in res:
-            if r:
-                new.extend(r)
+            if not r:
+                continue
+            mkey, rows, complete = r
+            new.extend(rows)
+            (ok_months if complete else bad_months).append(mkey)
+        if bad_months:
+            LOG.warn(f"공시목록 {len(bad_months)}개월이 미완결로 남았습니다 "
+                     f"(예: {bad_months[:3]}). 받은 부분은 저장하되 **완결로 표시하지 않으므로** "
+                     f"다음 실행에서 그 달부터 다시 받습니다. "
+                     + (f"사유: {dart_halt_reason()}" if dart_halt_reason() else ""))
 
     frames = ([cached] if cached is not None and len(cached) else [])
     if new:
@@ -4234,6 +4566,9 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
         D.loc[hit, "event"] = ev
     if new:
         VAULT.put_table("dart_disclosures", D, scope="shared", domain="dart", source="opendart list.json")
+    # 원장 갱신은 저장 뒤에. 완결로 표시한 달은 실제로 저장된 달이어야 한다.
+    if ok_months:
+        _save_disclosure_ledger(ok_months)
     D = pit_frame(D, "rcept_dt", "rcept_dt", source="dart")     # 접수일 = 공개일
     LOG.ok(f"공시목록 {len(D):,}건 — 이벤트 분류: " +
            ", ".join(f"{k}={int((D['event']==k).sum()):,}" for k in DISCLOSURE_PATTERNS if (D['event']==k).any()))
@@ -5448,6 +5783,59 @@ PIT = PITStore()
 LISTING_SEASONING_DAYS = 250          # 상장일 + 250거래일 ≈ 1년
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  상장폐지 '유형' 분류 — 청산가를 -100% 로 둘지 직전가로 둘지 가른다
+#
+#  ★ 왜 필요한가. 예전엔 모든 폐지를 -100% 로 처리했다. 그런데 폐지목록 원본의 Reason 을
+#    실측해 보면 2016년 이후 폐지된 주권 561건 중
+#      · 피흡수합병 60 · 스팩소멸합병 53 · 지주회사 완전자회사화 29 · 타법인 완전자회사 편입 14
+#        → 합병 대가로 인수기업 주식을 받는다. 0% 도 아니고 보통 프리미엄이 붙는다.
+#      · 스팩 예심청구서 미제출·해산 ~110  → 예치금이 공모가 + 이자로 반환된다(사실상 원금).
+#    즉 **절반 이상이 전액손실이 아닌데 전액손실로 계상**되고 있었다.
+#    U-MID 대역의 연 폐지율(~4.9%)과 25종목 포트폴리오로 환산하면 연 -2%p 안팎의
+#    '있지도 않은 손실'이다. 게다가 이것은 보수적인 방향이 아니라 **틀린** 방향이다.
+#
+#  ★ 그렇다고 프리미엄을 지어내지 않는다. 합병·해산 건은 **직전 관측가로 청산**한다.
+#    한국 시장의 합병 스프레드는 좁아 직전가가 편향 없는 추정치이고, 실제 프리미엄보다
+#    낮으므로 여전히 보수적이다. 부실 폐지(감사의견 거절·자본잠식·부도)는 종전대로
+#    정리매매가가 없으면 -100% 다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+DELIST_TRANSFER_PAT = (
+    r"흡수합병|피흡수|합병으로|완전자회사|지주회사|주식교환|주식의\s*포괄적|"
+    r"신청에\s*의한\s*상장폐지|상장폐지\s*신청|자진|공개매수|이전상장|재상장|시장이전")
+DELIST_SPAC_PAT = (
+    # 스팩 특유의 사유들. '청구서'와 '신청서'가 혼용되고, '존속기간 만료'는 스팩의
+    # 3년 존속기간이 끝나 예치금을 반환하고 해산하는 경우다(부실이 아니다).
+    r"스팩|기업인수목적|예비심사\s*(청구서|신청서)\s*미제출|합병상장예비심사신청서\s*미제출|"
+    r"해산\s*사유|존속기간\s*만료")
+DELIST_DISTRESS_PAT = (
+    # ★ '자본잠식' 을 그대로 쓰면 실제 표기인 '자본전액잠식'(전액이 사이에 낀다)을 놓친다.
+    #   계약 C2c 가 이 누락을 잡아냈다 — 사유 문자열은 KRX 표기 그대로 검증해야 한다.
+    r"감사의견|의견거절|부적정|자본\S*잠식|부도|파산|회생|영업정지|계속기업|"
+    r"상장폐지\s*기준에\s*해당|횡령|배임|사업보고서\s*미제출|주식\S*분산\s*미달|"
+    r"매출액\s*미달|시가총액\s*미달|거래량\s*미달")
+
+
+def classify_delisting(reason: Any) -> str:
+    """'transfer'(합병·자진) | 'spac'(스팩 해산) | 'distress'(부실) | 'unknown'"""
+    s = str(reason or "").strip()
+    if not s:
+        return "unknown"
+    # 부실을 먼저 본다. '스팩소멸합병'처럼 두 패턴이 겹칠 때 관대한 쪽으로 새지 않게
+    # 하려는 것이 아니라, 반대로 부실 신호가 있으면 무조건 부실로 보내기 위함이다.
+    if re.search(DELIST_DISTRESS_PAT, s):
+        return "distress"
+    if re.search(DELIST_TRANSFER_PAT, s):
+        return "transfer"
+    if re.search(DELIST_SPAC_PAT, s):
+        return "spac"
+    return "unknown"
+
+
+# 직전가 청산으로 볼 유형. 'unknown' 은 포함하지 않는다 — 모르면 보수적으로 -100%.
+DELIST_NOT_WIPEOUT = ("transfer", "spac")
+
+
 class Universe:
     def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame,
                  snap_window_days: int = 100):
@@ -5549,6 +5937,14 @@ class Universe:
 
     def delisting_map(self) -> Dict[str, pd.Timestamp]:
         return {r.code: r.delisting_date for r in self.sec.itertuples(index=False)
+                if pd.notna(r.delisting_date)}
+
+    def delist_kind_map(self) -> Dict[str, str]:
+        """종목 → 폐지 유형. 청산가를 -100% 로 둘지 직전가로 둘지 가른다."""
+        if "delist_reason" not in self.sec.columns:
+            return {}
+        return {r.code: classify_delisting(getattr(r, "delist_reason", ""))
+                for r in self.sec.itertuples(index=False)
                 if pd.notna(r.delisting_date)}
 
     def audit_row(self, stage: str, t, codes: Sequence[str]):
@@ -5704,8 +6100,13 @@ def _canary_bulk(corps: Sequence[str], n_universe: int) -> Tuple[Optional[bool],
             first_year = y
             break
     k2 = first_year is not None and first_year <= 2016
+    # ★ first_year 가 None 이면 '탐침이 아무것도 못 받았다'는 뜻이지 '2016년 데이터가 없다'가
+    #   아니다. 예전엔 그대로 문자열에 끼워 "시작일을 None년 이후로 상향" 이라는 실행 불가능한
+    #   지시가 찍혔다 — 처방이 원인 진단과 어긋나면 사용자는 엉뚱한 곳을 고친다.
     _k("K2", "배치 최초 제공 사업연도", k2, str(first_year or "미확인"), "≤2016",
-       "" if k2 else f"백테스트 시작일을 {first_year}년 이후로 상향해야 합니다")
+       "" if k2 else (f"백테스트 시작일을 {first_year}년 이후로 상향해야 합니다" if first_year
+                      else "2015~2018 탐침이 모두 빈 응답 — 키·한도·네트워크를 먼저 확인하세요. "
+                           "이 결과만으로 시작연도를 바꾸지 마세요."))
     return k1, k2
 
 
@@ -5770,7 +6171,17 @@ def _canary_price(codes: Sequence[str], sec: Optional[pd.DataFrame] = None) -> b
     if not elig:
         elig, n_off = codes, 0
 
-    got, chain_used = 0, Counter()
+    # ★ 판정 기준을 '폐지 예정 여부'로 쪼갠다.
+    #   존속 종목의 시세 결손은 진짜 결손이다 — 그 종목은 실제로 담겨서 수익률을 만든다.
+    #   반면 이미 폐지된 종목의 시세 결손은 백테스트 엔진이 -100%(정리매매가 없으면)로
+    #   처리하므로 **보수적 방향**이며, 이를 실패로 세면 편향을 제대로 제거할수록
+    #   K4 가 FAIL 로 기울어 임계값을 낮추라는 압력이 생긴다(§2 가 금지하는 방향).
+    #   → 존속에 엄격한 기준(≥95%)을 걸고, 폐지분은 정보성으로 따로 보고한다.
+    dead: set = set()
+    if sec is not None and len(sec) and "delisting_date" in sec.columns:
+        dead = set(sec.loc[sec["delisting_date"].notna(), "code"].astype(str))
+
+    chain_used = Counter()
     def _one(c):
         for nm, fn in PRICE_CHAIN:
             try:
@@ -5781,18 +6192,27 @@ def _canary_price(codes: Sequence[str], sec: Optional[pd.DataFrame] = None) -> b
                 return nm
         return None
     res = pmap_io(_one, elig, workers=min(N_WORKERS_IO, 8), desc="CANARY K4 가격")
-    for r in res:
+    live_n = live_ok = dead_n = dead_ok = 0
+    for c, r in zip(elig, res):
         if r:
-            got += 1
             chain_used[r] += 1
-    rate = got / max(len(elig), 1)
-    ok = rate >= 0.90
+        if c in dead:
+            dead_n += 1
+            dead_ok += 1 if r else 0
+        else:
+            live_n += 1
+            live_ok += 1 if r else 0
+    rate_live = live_ok / max(live_n, 1)
+    rate_dead = dead_ok / max(dead_n, 1)
+    ok = (live_n == 0) or (rate_live >= 0.95)
     _k("K4", "10년 가격 확보", ok,
-       f"{got}/{len(elig)} ({rate:.0%})" +
-       (f" · 구간 미상장/기폐지 {n_off}종목 분모 제외" if n_off else "") + " · 경로 " +
-       (", ".join(f"{k}×{v}" for k, v in chain_used.most_common()) or "없음"),
-       "상장중 표본 ≥90%",
-       "" if ok else "체인(pykrx→FDR→네이버→yfinance)이 전부 실패 — 네트워크/차단을 확인하세요")
+       f"존속 {live_ok}/{live_n} ({rate_live:.0%})" +
+       (f" · 폐지 {dead_ok}/{dead_n} ({rate_dead:.0%}, 미확보분은 -100% 처리)" if dead_n else "") +
+       (f" · 구간 미상장 {n_off}종목 분모 제외" if n_off else "") + " · " +
+       (", ".join(f"{k}×{v}" for k, v in chain_used.most_common()) or "경로 없음"),
+       "존속 종목 ≥95%",
+       "" if ok else "존속 종목의 시세가 비어 있습니다 — 체인(pykrx→FDR→네이버→yfinance)과 "
+                     "네트워크·차단을 확인하세요. 폐지 종목 결손은 여기 포함되지 않습니다.")
     return ok
 
 
@@ -5898,6 +6318,33 @@ def canary_sample(sec: pd.DataFrame, monthly: pd.DataFrame, n: int = None) -> Li
     return pick
 
 
+DART_DEPENDENT_KS = ("K1", "K2", "K3", "K7", "K8", "K9")
+
+
+def canary_resource_flip() -> bool:
+    """DART 가 자원 조건으로 멈춘 상태라면, 이미 기록된 DART 검사 FAIL 을 SKIP 으로 되돌린다.
+
+    ★ 예산은 CANARY 도중에도 바닥난다(시작 시점엔 남아 있었던 경우). 그때 기록된 FAIL 은
+      '자원 없음'을 '데이터 없음'으로 오판한 결과다. 되돌린 사실 자체를 로그로 남겨
+      은폐가 아니라 정정임을 밝힌다. 되돌렸으면 True.
+    """
+    why = dart_halt_reason()
+    if not why:
+        return False
+    flipped = [r["id"] for r in CANARY_RESULTS
+               if r["id"] in DART_DEPENDENT_KS and r["passed"] is False]
+    for r in CANARY_RESULTS:
+        if r["id"] in DART_DEPENDENT_KS and r["passed"] is False:
+            r["passed"], r["fatal"] = None, False
+            r["measured"] = f"{r['measured']}  ← 측정 중 {why}"
+            r["action"] = "자원 조건으로 판정 보류. 데이터 부재가 아닙니다."
+    if flipped:
+        LOG.warn(f"수집 도중 DART 가 중단됐습니다 — {why}. "
+                 f"{flipped} 의 FAIL 을 **판정 보류(SKIP)** 로 되돌립니다. "
+                 f"호출권이 없어 못 받은 것을 '데이터가 없다'로 판정하면 안 됩니다.")
+    return True
+
+
 def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
     """CANARY 전체 실행. 반환 dict 는 하류가 '무엇을 끄고 갈지' 정하는 데 쓴다."""
     LOG.banner("③ CANARY K1~K9", "수집을 시작해도 되는지 25분 안에 판정합니다 (스펙 §2)")
@@ -5914,11 +6361,33 @@ def run_canary(sec: pd.DataFrame, sample_codes: Sequence[str]) -> dict:
 
     LOG.info(f"표본 {len(codes)}종목 / corp_code {len(corps)}개 · 직원현황 탐침연도 {probe_year}")
 
-    k1, k2 = _canary_bulk(corps, n_uni)
-    k3 = _canary_accounts(corps, probe_year)
+    # ★ DART 를 지금 쓸 수 없는 상태라면, DART 의존 검사는 FAIL 이 아니라 SKIP 이다.
+    #   '오늘 호출권이 없다'는 것과 '그 데이터가 세상에 없다'는 것은 전혀 다른 사건이고,
+    #   후자의 처방(백테스트 시작연도 상향·전략 축소)을 전자에 적용하면 일시적 조건 때문에
+    #   전략이 영구히 훼손된다. 실제로 이것 때문에 실행이 §12-2 킬 기준으로 죽었다.
+    halt = dart_halt_reason()
+    if halt:
+        LOG.warn(f"DART 를 지금 쓸 수 없습니다 — {halt}. "
+                 f"K1·K2·K3·K7·K8·K9 는 **판정 보류(SKIP)** 로 두고 진행합니다. "
+                 f"이 상태에서의 '응답 0건'은 데이터 부재의 증거가 아니므로 킬 기준을 걸지 않습니다.")
+        for kid, nm, crit in (("K1", "DART 재무 배치(2016Q1)", f">{CANARY_K1_MIN_ROWS:,}행"),
+                              ("K2", "배치 최초 제공 사업연도", "≤2016"),
+                              ("K3", "필수계정 커버리지", f"≥{CANARY_K3_MIN_COV:.0%}"),
+                              ("K7", "empSttus 응답", f"≥{CANARY_K7_MIN_RATE:.0%}"),
+                              ("K8", "연간급여총액 기재율", f"≥{CANARY_K8_MIN_RATE:.0%}"),
+                              ("K9", "단위 정합성", f"불일치<{CANARY_K9_MAX_BAD:.0%}")):
+            _k(kid, nm, None, f"측정 불가 — {halt}", crit,
+               "자원 조건입니다. 데이터 부재가 아니므로 시작연도·전략을 바꾸지 마세요.")
+        k1 = k2 = k3 = k7 = k8 = k9 = None
+    else:
+        k1, k2 = _canary_bulk(corps, n_uni)
+        k3 = _canary_accounts(corps, probe_year)
+        k7, k8, k9 = _canary_emp(corps, probe_year)
     k4 = _canary_price(codes, sec)
     k5 = _canary_delisting(sec)
-    k7, k8, k9 = _canary_emp(corps, probe_year)
+
+    if canary_resource_flip():
+        k1 = k2 = k3 = k7 = k8 = k9 = None
 
     LOG.table([[r["id"], _trunc(r["name"], 26),
                 "PASS" if r["passed"] else ("SKIP" if r["passed"] is None else "FAIL"),
@@ -5977,10 +6446,19 @@ _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 
 
 # 서킷브레이커 — 연속 실패가 이 수를 넘으면 남은 호출을 즉시 포기한다(§3).
 EMP_CIRCUIT_MAX = 15
+
+# 이번 실행에서 직원현황 수집이 잘렸는가. §6 커버리지 판정이 '미수집'을 'DART 결측'으로
+# 오독하지 않게 하는 근거. dropped>0 이면 자동 창 단축(COVERAGE_AUTO_TRIM)을 걸지 않는다.
+EMP_TRUNCATED: Dict[str, Any] = {"dropped": 0, "why": ""}
 _EMP_CB = {"consec": 0, "tripped": False, "lock": threading.Lock()}
 
 
 def _emp_cb_ok() -> bool:
+    # ★ 예산이 이미 바닥났으면 한 건도 시도하지 않는다. 예전엔 예산 거부(None)를 '실패'로
+    #   세어 서킷브레이커가 15건 만에 터질 때까지 헛돌았고, 각 호출마다 0.05~0.15초를
+    #   자고 있었다 — 14,000건이면 12스레드로도 2분을 아무 일 없이 태운다.
+    if dart_halt_reason():
+        return False
     with _EMP_CB["lock"]:
         return not _EMP_CB["tripped"]
 
@@ -5993,9 +6471,16 @@ def _emp_cb_mark(success: bool):
             _EMP_CB["consec"] += 1
             if _EMP_CB["consec"] >= EMP_CIRCUIT_MAX and not _EMP_CB["tripped"]:
                 _EMP_CB["tripped"] = True
-                LOG.warn(f"직원현황 수집 서킷브레이커 작동 — 연속 {EMP_CIRCUIT_MAX}건 실패. "
+                # ★ 사유를 추측하지 않는다. 예산 소진·인증 오류는 이미 기록돼 있으므로
+                #   "대개 …입니다" 같은 짐작 대신 실제 사유를 그대로 말한다. 짐작이 틀리면
+                #   사용자는 멀쩡한 키를 의심하거나 IP 차단을 걱정하며 시간을 버린다.
+                why = dart_halt_reason()
+                LOG.warn(f"직원현황 수집 중단 — 연속 {EMP_CIRCUIT_MAX}건 실패. "
                          f"남은 호출을 포기하고 여기까지 받은 것을 저장합니다. "
-                         f"(대개 일일 한도 소진 또는 IP 차단입니다. 내일 재실행하면 이어받습니다)")
+                         + (f"사유: {why}. 내일 재실행하면 이어받습니다."
+                            if why else
+                            "예산·인증에는 이상이 없습니다 — 네트워크 또는 DART 서버 상태를 "
+                            "확인하세요(이 경우는 데이터 부재가 아닙니다)."))
 
 
 def _emp_pick_rows(d: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
@@ -6171,10 +6656,17 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
             left = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
             cap = max(0, min(total_needed, int(max_calls), left))
             if cap < total_needed:
+                # ★ 절단 사실을 기록해 둔다. §6 커버리지 판정이 이 표를 'DART 의 보유량'으로
+                #   오독해 백테스트 창을 영구히 잘라내는 것을 막기 위한 유일한 근거다.
+                EMP_TRUNCATED.update({
+                    "dropped": total_needed - cap,
+                    "why": (f"오늘 남은 DART 호출 {left:,}건" if left < int(max_calls)
+                            else f"상한 EMP_MAX_CALLS={int(max_calls):,}")})
                 jobs = jobs[:cap]
                 LOG.warn(f"직원현황 {total_needed:,}건 중 이번 실행은 {cap:,}건만 받습니다 "
                          f"(오늘 남은 DART 호출 {left:,}건 · 상한 EMP_MAX_CALLS={max_calls:,}). "
-                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다.")
+                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다. "
+                         f"※ 미수집분이 있으므로 §6 커버리지 기반 자동 창 단축은 비활성화됩니다.")
         LOG.info(f"직원현황 신규 수집 {len(jobs):,}건 "
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
                  f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상")
@@ -6406,6 +6898,25 @@ def coverage_verdict(C: pd.DataFrame) -> Tuple[Optional[pd.Timestamp], str]:
     """
     if C is None or C.empty:
         return None, "커버리지 표가 비어 판정을 유보합니다."
+
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 이 판정의 전제: 커버리지 표가 'DART 가 실제로 보유한 양'을 잰다는 것.
+    #    예산에 걸려 잘린 실행에서는 그 전제가 깨진다. 수집 잡은 연도 내림차순이라
+    #    jobs[:cap] 은 **항상 오래된 연도부터** 버린다 → 커버리지는 최근이 두껍고 과거가
+    #    얇은 모양이 되고, 그건 DART 의 사실이 아니라 우리 지갑의 사실이다.
+    #    그 모양을 그대로 읽어 COVERAGE_AUTO_TRIM 이 창을 자르면, **일시적 예산 부족이
+    #    10년 백테스트를 영구히 단축**시키고 그 단축이 §6 데이터 근거로 리포트에 박힌다.
+    #  → 절단이 있었으면 자동 트림을 걸지 않는다. 자를지 말지는 완전 수집 후에 판단한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    trunc = EMP_TRUNCATED.get("dropped", 0)
+    if trunc:
+        return None, (
+            f"이번 실행에서 직원현황 수집이 {trunc:,}건 잘렸습니다"
+            f"({EMP_TRUNCATED.get('why', '호출 상한')}). 수집은 최근 연도부터 채우므로 "
+            f"아래 표의 과거 연도 부족분은 **DART 의 결측이 아니라 이번 실행의 미수집**입니다. "
+            f"이 표를 근거로 백테스트 창을 자르면 일시적 예산 부족이 10년 구간을 영구히 "
+            f"단축시킵니다 — 자동 트림을 걸지 않습니다. 재실행으로 수집을 완성한 뒤 재판정하세요.")
+
     good = C[C["valid"] >= COVERAGE_MIN_OBS_START]
     if good.empty:
         worst = int(C["valid"].max()) if len(C) else 0
@@ -7365,12 +7876,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                  label: str = "TCD") -> dict:
     mkt = sec.set_index("code")["market"].astype(str).to_dict()
     delist = uni.delisting_map()
+    # 폐지 '유형' — 흡수합병·스팩해산은 -100% 가 아니다. 없으면 전부 -100%(종전 동작).
+    dkind = uni.delist_kind_map() if hasattr(uni, "delist_kind_map") else {}
     hold: Dict[str, dict] = {}
     rows, trades, holdings_log = [], [], []
     prev_w: Dict[str, float] = {}
     # 폐지 손실을 이미 반영한 종목 — 같은 종목에 -100% 를 두 번 물리지 않기 위한 장부
     delist_realized: set = set()
-    vanished_delisted = vanished_other = 0
+    vanished_delisted = vanished_other = vanished_transfer = 0
     # 종목별 '패널에 마지막으로 등장한 달'. 사라진 종목이 나중에 돌아오는지(유동성 회복 등)를
     # 판별해야 '거래정지→폐지'와 '일시적 유니버스 이탈'을 가를 수 있다.
     _pm = P[P["month"].isin(months)] if len(P) else P
@@ -7428,9 +7941,17 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 terminal = (dl is not None and pd.notna(dl) and never_back
                             and dl <= m + pd.DateOffset(months=DELIST_VANISH_HORIZON_M))
                 if w_prev > 0 and terminal and c not in delist_realized:
-                    vanished_loss += w_prev * -1.0
+                    # ★ 폐지 유형에 따라 청산가가 다르다. 흡수합병·완전자회사화·스팩해산은
+                    #   전액손실이 아니다(대가로 인수기업 주식 또는 예치금을 받는다).
+                    #   그런 건을 -100% 로 계상하면 없는 손실을 매년 지어낸다.
+                    #   모르는 사유('unknown')는 보수적으로 -100% 를 유지한다.
+                    kind = dkind.get(c, "unknown")
+                    if kind in DELIST_NOT_WIPEOUT:
+                        vanished_transfer += 1      # 직전가 청산 = 그 달 수익 0%
+                    else:
+                        vanished_loss += w_prev * -1.0
+                        vanished_delisted += 1
                     delist_realized.add(c)
-                    vanished_delisted += 1
                 elif w_prev > 0:
                     vanished_other += 1
                 continue
@@ -7476,8 +7997,15 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
             fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
             dl = delist.get(c)
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
-                # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
-                fr = -1.0 if not np.isfinite(fr) else fr
+                # ★ 상장폐지: 정리매매 최종가가 있으면 그것을 쓴다. 없을 때만 유형을 본다.
+                #   부실·사유불명 → -100%(C2 원칙7). 합병·스팩해산 → 직전가 청산(0%).
+                if not np.isfinite(fr):
+                    kind = dkind.get(c, "unknown")
+                    if kind in DELIST_NOT_WIPEOUT:
+                        fr = 0.0
+                        vanished_transfer += 1
+                    else:
+                        fr = -1.0
                 delist_realized.add(c)      # 이 종목의 폐지 손익은 여기서 확정 — 재차감 금지
             if not np.isfinite(fr):
                 fr = 0.0
@@ -7501,10 +8029,15 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     R = pd.DataFrame(rows)
     R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
     H = pd.DataFrame(holdings_log)
-    if vanished_delisted or vanished_other:
-        LOG.info(f"[{label}] 보유 중 패널에서 사라진 종목 — 폐지 진행 {vanished_delisted}건은 "
-                 f"-100% 로 반영, 그 외 {vanished_other}건은 직전가 청산(그 달 수익 0%). "
+    if vanished_delisted or vanished_other or vanished_transfer:
+        LOG.info(f"[{label}] 보유 중 청산된 종목 — 부실·사유불명 폐지 {vanished_delisted}건은 "
+                 f"-100%, 합병·완전자회사화·스팩해산 {vanished_transfer}건은 직전가 청산(0%), "
+                 f"그 외 유니버스 이탈 {vanished_other}건도 직전가 청산. "
                  f"조용히 사라지게 두지 않습니다(C2).")
+        if not dkind:
+            LOG.warn(f"[{label}] 폐지 사유 정보가 없어 **모든** 폐지를 -100% 로 계상했습니다. "
+                     f"실측상 폐지의 절반가량(흡수합병·스팩해산)은 전액손실이 아니므로 "
+                     f"성과가 과소평가됩니다 — 종목마스터에 delist_reason 이 실렸는지 확인하세요.")
     return {"returns": R, "holdings": H, "label": label,
             "vanished_delisted": vanished_delisted, "vanished_other": vanished_other}
 
@@ -8684,6 +9217,95 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
 
+    # ── §12-R : 자원 부족을 데이터 부재로 판정 금지 ───────────────────────────────────────
+    def resource_vs_data():
+        """★ 실제로 실행을 죽인 사고를 고정하는 회귀 테스트.
+
+        DART 일일 한도가 이미 소진된 상태로 시작한 실행에서, 모든 호출이 예산 게이트에
+        막혀 None 을 돌려줬다. CANARY 는 그것을 '데이터 없음'으로 읽어 K8 을 FAIL 시키고
+        §12-2 킬 기준을 발동해 실행을 중단했다 — 데이터는 멀쩡히 있었다.
+        더 나쁜 건 처방이었다: '백테스트 시작연도를 상향하라'. 오늘 호출권이 없다는
+        일시적 사실로 10년 백테스트 구간을 영구히 잘라낼 뻔했다.
+
+        이 계약은 (a) 자원 사유가 조회 가능하고 (b) 그 상태에서 CANARY 의 DART 검사가
+        FAIL 이 아니라 SKIP 이 되며 (c) 킬 기준이 발동하지 않음을 강제한다.
+        """
+        for fn in ("dart_halt_reason", "dart_note_halt", "dart_budget_left"):
+            if not callable(globals().get(fn)):
+                return False, f"{fn}() 이 없습니다 — 자원 사유를 구별할 방법이 없습니다"
+        saved = dict(DART_HALT)
+        saved_results = list(CANARY_RESULTS)
+        try:
+            # 사고 당시와 똑같은 상태를 만든다: K8 이 치명 FAIL 로 기록된 채 예산이 소진됨.
+            CANARY_RESULTS.clear()
+            _k("K8", "연간급여총액 기재율", False, "표본 0건", "≥70%",
+               "★ 임금프리미엄 계산 불가 — 중단(§12-2)", fatal=True)
+            _k("K7", "empSttus 응답", False, "0/191 (0%)", "≥80%", "")
+            _k("K5", "상장폐지 목록 확보", False, "폐지일 보유 0종목", "≥50종목", "", fatal=True)
+            dart_note_halt("테스트: 일일 한도 소진", "회귀 검정")
+            if not dart_halt_reason():
+                return False, "halt 를 기록했는데 dart_halt_reason() 이 None 입니다"
+            if not canary_resource_flip():
+                return False, "자원 사유가 있는데 canary_resource_flip() 이 되돌리지 않았습니다"
+            k8 = next(r for r in CANARY_RESULTS if r["id"] == "K8")
+            k7 = next(r for r in CANARY_RESULTS if r["id"] == "K7")
+            k5 = next(r for r in CANARY_RESULTS if r["id"] == "K5")
+            if k8["passed"] is not None or k8["fatal"]:
+                return False, "K8 이 여전히 치명 FAIL 입니다 — 실행이 또 킬 기준으로 죽습니다"
+            if k7["passed"] is not None:
+                return False, "K7 이 여전히 FAIL 입니다 (SKIP 이어야 함)"
+            # K5(상장폐지 목록)는 DART 와 무관하므로 절대 완화되면 안 된다.
+            if k5["passed"] is not False or not k5["fatal"]:
+                return False, "K5(생존자편향)까지 완화됐습니다 — DART 무관 검사는 건드리면 안 됩니다"
+            fatal_left = [r["id"] for r in CANARY_RESULTS if r["fatal"] and r["passed"] is False]
+            return True, (f"K7·K8 → SKIP 전환 · K5 는 치명 FAIL 유지 "
+                          f"(잔여 치명 {fatal_left}) · 킬 기준 오발동 차단")
+        finally:
+            DART_HALT.update(saved)
+            CANARY_RESULTS.clear()
+            CANARY_RESULTS.extend(saved_results)
+
+    _cc("§12-R", "자원 부족 ≠ 데이터 부재 (킬 기준 오발동 방지)", resource_vs_data)
+
+    # ── C2c : 폐지 유형별 청산가 ──────────────────────────────────────────────────────────
+    def delist_kinds():
+        """흡수합병·스팩해산을 -100% 로 계상하지 않는다. 단, 모르면 -100% 를 유지한다.
+
+        ★ 실측 근거(폐지목록 원본 Reason, 2016년 이후 폐지 주권 561건):
+          피흡수합병 60 · 스팩소멸합병 53 · 완전자회사화 43 → 인수기업 주식을 받는다.
+          스팩 예심 미제출·해산·존속기간만료 ~130 → 예치금이 공모가+이자로 반환된다.
+          이 308건(55%)을 전액손실로 계상하면 매년 -2%p 안팎의 없는 손실을 지어낸다.
+          이것은 '보수적'이 아니라 그냥 틀린 것이다. 반대로 사유를 모르면(unknown)
+          반드시 -100% 를 유지해야 한다 — 그쪽이 진짜 보수다(원칙7).
+        """
+        cases = {
+            "피흡수합병": "transfer", "피흡수합병(스팩소멸합병)": "transfer",
+            "지주회사(최대주주등)의 완전자회사화 등": "transfer", "타법인의 완전자회사로 편입": "transfer",
+            "신청에 의한 상장폐지": "transfer",
+            "상장예비심사 청구서 미제출로 관리종목 지정 후 1개월 이내 동 사유 미해소": "spac",
+            "해산 사유 발생": "spac", "존속기간 만료": "spac",
+            "감사의견 거절(감사범위 제한)": "distress",
+            "기업의 계속성 및 경영의 투명성 등을 종합적으로 고려하여 상장폐지기준에 해당한다고 결정": "distress",
+            "자본전액잠식": "distress", "최종부도": "distress",
+            "": "unknown", "사유 미상": "unknown",
+        }
+        wrong = [(k, classify_delisting(k), v) for k, v in cases.items()
+                 if classify_delisting(k) != v]
+        if wrong:
+            return False, f"폐지 사유 분류 오류: {wrong[:3]}"
+        # 모르면 전액손실이어야 한다 — 관대한 쪽으로 새면 성과가 부풀려진다.
+        if "unknown" in DELIST_NOT_WIPEOUT:
+            return False, "'unknown' 이 직전가 청산으로 분류돼 있습니다 — 모르면 -100% 여야 합니다"
+        src = _src_of(run_backtest) or ""
+        if src and "DELIST_NOT_WIPEOUT" not in src:
+            return False, "백테스트 엔진이 폐지 유형을 쓰지 않습니다 — 전부 -100% 로 계상됩니다"
+        if src and "-1.0" not in src:
+            return False, "백테스트 엔진에서 -100% 경로가 사라졌습니다(원칙7 위반)"
+        return True, (f"합병·완전자회사화·스팩해산 → 직전가 청산 · "
+                      f"부실·사유불명 → -100% 유지 (표본 {len(cases)}건 전부 일치)")
+
+    _cc("C2c", "폐지 유형별 청산가 (합병을 전액손실로 계상 금지)", delist_kinds)
+
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 34), "PASS" if r["pass"] else "FAIL",
              _trunc(r["msg"], 60)] for r in CONTRACT_V3]
@@ -9572,6 +10194,40 @@ def downcast_floats(P: pd.DataFrame) -> pd.DataFrame:
     return P
 
 
+def _flush_on_abort_v3():
+    """중단 경로에서도 원장과 진단표를 반드시 남긴다.
+
+    ★ 예전엔 DBUDGET.close() 와 report_http() 가 정상 종료 경로에만 있었다. 그래서
+      ① 중단된 실행이 오늘 쓴 DART 호출이 파일에 기록되지 않아 다음 실행이 없는 예산을
+         있다고 믿고 또 실패하고,
+      ② '이번 실행에서 DART 요청을 한 건도 못 보냈다'를 보여줄 유일한 표(HTTP 감사)가
+         하필 그게 가장 필요한 순간에 출력되지 않았다.
+      중단은 진단 정보가 가장 필요한 순간이다. 그때 정보를 끊으면 안 된다.
+    """
+    try:
+        if DBUDGET:
+            DBUDGET.close()
+    except Exception:
+        pass
+    try:
+        report_http()
+    except Exception:
+        pass
+    why = None
+    try:
+        why = dart_halt_reason()
+    except Exception:
+        pass
+    if why:
+        LOG.warn(f"참고 — 이번 실행의 DART 상태: {why}. "
+                 f"위 표에서 dart 요청 수가 0 이면 '데이터가 없어서'가 아니라 "
+                 f"'요청을 못 보내서'입니다. 한도는 매일 자정(KST)에 초기화됩니다.")
+    try:
+        VAULT.flush()
+    except Exception:
+        pass
+
+
 def announce_budget_v3():
     """수집을 시작하기 전에 '이번 실행이 몇 분짜리인지'를 먼저 못박아 보여준다.
 
@@ -9603,16 +10259,73 @@ def announce_budget_v3():
         LOG.warn("호출 상한이 None 인 단계가 있습니다 — 콜드빌드는 며칠이 걸리며 §12-6 의 "
                  "4시간 계약 밖입니다. 4시간 안에 끝내려면 숫자를 넣으세요 "
                  "(권장: EMP_MAX_CALLS=14000, DART_FS_MAX_CALLS=12000).")
-    if plan > left:
+    if plan > left and left > 0:
         LOG.warn(f"계획 호출({plan:,})이 오늘 잔여 한도({left:,})를 넘습니다 — 우선순위 상위부터 "
                  f"채우고 한도에서 멈춥니다. 커버리지는 재실행할 때마다 올라갑니다.")
+    return preflight_dart_v3()
+
+
+def preflight_dart_v3() -> str:
+    """이번 실행에서 DART 로 무엇을 할 수 있는지 **수집 시작 전에** 확정한다.
+
+    ★ 왜 필요한가. 직전 실행은 0.35초 시점에 이미 '잔여 0'을 알고 있었는데도 그대로
+      진행해, 16분 30초짜리 가격 수집을 끝낸 뒤 CANARY 에서 죽었다. 사용자는 17분을
+      쓰고 아무 산출물도 받지 못했다. 알 수 있었던 사실로 나중에 죽는 것은 설계 결함이다.
+
+    반환 "LIVE"(정상 수집) / "CACHE_ONLY"(캐시로 진행) / "BLOCKED"(진행 불가)
+    """
+    halt = dart_halt_reason()
+    if not halt:
+        return "LIVE"
+
+    have = {}
+    for t in ("dart_employees_ext", "dart_fnltt_raw", "dart_multi_raw"):
+        try:
+            d = VAULT.get_table(t, scope="shared")
+            have[t] = 0 if d is None else len(d)
+        except Exception:
+            have[t] = 0
+    total = sum(have.values())
+
+    LOG.table([[k, f"{v:,}행", "사용 가능" if v else "비어 있음"] for k, v in have.items()],
+              ["공용 캐시 테이블", "보유", "이번 실행"], ["l", "r", "c"],
+              title=f"DART 사전점검 — 지금 신규 수집 불가: {halt}")
+
+    if total > 0:
+        LOG.warn(
+            f"DART 신규 수집은 못 하지만 공용 캐시에 {total:,}행이 있어 **그것만으로 진행**합니다.\n"
+            f"     · 캐시에 없는 (회사×연도)는 결측으로 남습니다 — 0 으로 채우지 않습니다.\n"
+            f"     · CANARY 의 DART 항목은 판정 보류(SKIP)로 처리되며 킬 기준을 걸지 않습니다.\n"
+            f"     · 내일(또는 한도 회복 후) 재실행하면 정확히 이 지점부터 이어받습니다.")
+        return "CACHE_ONLY"
+
+    LOG.error(
+        f"DART 를 쓸 수 없고 공용 캐시도 비어 있습니다 — {halt}\n"
+        f"  이 상태로 계속하면 가격 수집에만 15~40분을 쓰고 결국 재무·직원현황이 전부 비어\n"
+        f"  백테스트가 성립하지 않습니다. 그래서 **지금** 멈춥니다.\n"
+        f"\n"
+        f"  선택지\n"
+        f"    ① 한도 회복 후 재실행 — DART 한도는 매일 자정(KST)에 초기화됩니다.\n"
+        f"       지금까지 받은 것은 전부 캐시에 있으므로 이어받습니다.\n"
+        f"    ② 가격·유니버스만 먼저 채우기 — DART_FS_MAX_CALLS=0, EMP_MAX_CALLS=0 으로 두고\n"
+        f"       실행하면 이 점검을 통과하고 가격 캐시를 미리 완성해 둘 수 있습니다.\n"
+        f"    ③ RUN_MODE='CACHED' — 신규 수집 없이 캐시만으로 재현합니다.\n"
+        f"    ④ 키가 문제라면 상단 DART_API_KEY 를 확인하세요 "
+        f"(https://opendart.fss.or.kr → 인증키 신청/관리).")
+    if (DART_FS_MAX_CALLS or 0) == 0 and (EMP_MAX_CALLS or 0) == 0:
+        LOG.warn("DART 상한이 둘 다 0 이므로 애초에 DART 를 쓰지 않는 실행입니다 — 계속합니다.")
+        return "CACHE_ONLY"
+    raise KillCriteria(
+        f"DART 사전점검 실패 — {halt} · 공용 캐시도 비어 있습니다. "
+        f"위 선택지 중 하나를 고른 뒤 재실행하세요. "
+        f"(17분을 쓰고 죽는 대신 지금 멈춥니다)")
 
 
 # ── L1 수집 ─────────────────────────────────────────────────────────────────────────────────
 def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     ctx: Dict[str, Any] = {}
     t_ing = time.time()
-    announce_budget_v3()
+    ctx["dart_mode"] = announce_budget_v3()
 
     with PIPE.stage("L1.UNI", "종목 마스터 · PIT 유니버스", "L1", budget_s=900):
         snaps = fetch_pykrx_snapshots(months)
@@ -9633,7 +10346,7 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
             pass
         px = fetch_prices(ctx["sec"]["code"].tolist(),
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+                          BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
         ctx["panel"] = build_price_panel(px, months)
 
@@ -10014,6 +10727,7 @@ if __name__ == "__main__" or ENV["ipython"]:
         LOG.banner("⛔ 킬 기준으로 중단", "§12 — 파라미터를 조정해 통과시키지 마십시오")
         _safe_print(f"  {e}")
         PIPE.report_stages()
+        _flush_on_abort_v3()
         try:
             report_robustness_v3()
         except Exception:
@@ -10021,6 +10735,7 @@ if __name__ == "__main__" or ENV["ipython"]:
     except StageFailure as e:
         LOG.banner("실행 중단", "위의 '실패 지점' 상세와 아래 표에서 원인을 확인하세요")
         _safe_print(f"  {e}")
+        _flush_on_abort_v3()
         PIPE.report_stages(); PIPE.report_flow()
     except KeyboardInterrupt:
         LOG.warn("사용자 중단. 여기까지 수집된 데이터는 드라이브에 저장되어 있으며 "

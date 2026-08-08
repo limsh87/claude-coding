@@ -135,12 +135,14 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                  label: str = "TCD") -> dict:
     mkt = sec.set_index("code")["market"].astype(str).to_dict()
     delist = uni.delisting_map()
+    # 폐지 '유형' — 흡수합병·스팩해산은 -100% 가 아니다. 없으면 전부 -100%(종전 동작).
+    dkind = uni.delist_kind_map() if hasattr(uni, "delist_kind_map") else {}
     hold: Dict[str, dict] = {}
     rows, trades, holdings_log = [], [], []
     prev_w: Dict[str, float] = {}
     # 폐지 손실을 이미 반영한 종목 — 같은 종목에 -100% 를 두 번 물리지 않기 위한 장부
     delist_realized: set = set()
-    vanished_delisted = vanished_other = 0
+    vanished_delisted = vanished_other = vanished_transfer = 0
     # 종목별 '패널에 마지막으로 등장한 달'. 사라진 종목이 나중에 돌아오는지(유동성 회복 등)를
     # 판별해야 '거래정지→폐지'와 '일시적 유니버스 이탈'을 가를 수 있다.
     _pm = P[P["month"].isin(months)] if len(P) else P
@@ -198,9 +200,17 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
                 terminal = (dl is not None and pd.notna(dl) and never_back
                             and dl <= m + pd.DateOffset(months=DELIST_VANISH_HORIZON_M))
                 if w_prev > 0 and terminal and c not in delist_realized:
-                    vanished_loss += w_prev * -1.0
+                    # ★ 폐지 유형에 따라 청산가가 다르다. 흡수합병·완전자회사화·스팩해산은
+                    #   전액손실이 아니다(대가로 인수기업 주식 또는 예치금을 받는다).
+                    #   그런 건을 -100% 로 계상하면 없는 손실을 매년 지어낸다.
+                    #   모르는 사유('unknown')는 보수적으로 -100% 를 유지한다.
+                    kind = dkind.get(c, "unknown")
+                    if kind in DELIST_NOT_WIPEOUT:
+                        vanished_transfer += 1      # 직전가 청산 = 그 달 수익 0%
+                    else:
+                        vanished_loss += w_prev * -1.0
+                        vanished_delisted += 1
                     delist_realized.add(c)
-                    vanished_delisted += 1
                 elif w_prev > 0:
                     vanished_other += 1
                 continue
@@ -246,8 +256,15 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
             fr = float(_f) if _f is not None and pd.notna(_f) else np.nan
             dl = delist.get(c)
             if dl is not None and pd.notna(dl) and m < dl <= m + pd.offsets.MonthEnd(1):
-                # ★ 상장폐지: 정리매매 최종가가 없으면 -100%. 누락 처리 금지(C2).
-                fr = -1.0 if not np.isfinite(fr) else fr
+                # ★ 상장폐지: 정리매매 최종가가 있으면 그것을 쓴다. 없을 때만 유형을 본다.
+                #   부실·사유불명 → -100%(C2 원칙7). 합병·스팩해산 → 직전가 청산(0%).
+                if not np.isfinite(fr):
+                    kind = dkind.get(c, "unknown")
+                    if kind in DELIST_NOT_WIPEOUT:
+                        fr = 0.0
+                        vanished_transfer += 1
+                    else:
+                        fr = -1.0
                 delist_realized.add(c)      # 이 종목의 폐지 손익은 여기서 확정 — 재차감 금지
             if not np.isfinite(fr):
                 fr = 0.0
@@ -271,10 +288,15 @@ def run_backtest(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "Universe",
     R = pd.DataFrame(rows)
     R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
     H = pd.DataFrame(holdings_log)
-    if vanished_delisted or vanished_other:
-        LOG.info(f"[{label}] 보유 중 패널에서 사라진 종목 — 폐지 진행 {vanished_delisted}건은 "
-                 f"-100% 로 반영, 그 외 {vanished_other}건은 직전가 청산(그 달 수익 0%). "
+    if vanished_delisted or vanished_other or vanished_transfer:
+        LOG.info(f"[{label}] 보유 중 청산된 종목 — 부실·사유불명 폐지 {vanished_delisted}건은 "
+                 f"-100%, 합병·완전자회사화·스팩해산 {vanished_transfer}건은 직전가 청산(0%), "
+                 f"그 외 유니버스 이탈 {vanished_other}건도 직전가 청산. "
                  f"조용히 사라지게 두지 않습니다(C2).")
+        if not dkind:
+            LOG.warn(f"[{label}] 폐지 사유 정보가 없어 **모든** 폐지를 -100% 로 계상했습니다. "
+                     f"실측상 폐지의 절반가량(흡수합병·스팩해산)은 전액손실이 아니므로 "
+                     f"성과가 과소평가됩니다 — 종목마스터에 delist_reason 이 실렸는지 확인하세요.")
     return {"returns": R, "holdings": H, "label": label,
             "vanished_delisted": vanished_delisted, "vanished_other": vanished_other}
 

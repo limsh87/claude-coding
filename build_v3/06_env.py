@@ -68,11 +68,73 @@ def mount_cache_v3() -> Tuple[str, str]:
             except Exception:
                 continue
     os.makedirs(local, exist_ok=True)
-    LOG.warn(f"구글드라이브 경로를 찾지 못해 로컬({local})에 저장합니다. "
-             f"드라이브에 남기려면 상단 GDRIVE_ROOT 를 실제 드라이브 경로로 바꾸세요 "
-             f"(예: Windows 'G:/내 드라이브/tcd_cache', macOS "
-             f"'~/Library/CloudStorage/GoogleDrive-<계정>/My Drive/tcd_cache').")
+    # ★ '못 찾았다'만 말하면 사용자는 무엇을 고쳐야 할지 모른다. 실제로 뒤진 경로를 보여준다.
+    tried = _gdrive_desktop_candidates()
+    LOG.warn(f"구글드라이브 경로를 찾지 못해 로컬({local})에 저장합니다.\n"
+             f"     뒤져본 경로 {len(tried)}개 중 앞부분: {tried[:6]}\n"
+             f"     드라이브에 남기려면 상단 GDRIVE_ROOT 를 실제 경로로 바꾸세요. 확인 방법:\n"
+             f"       · Windows 탐색기에서 구글 드라이브를 열고 주소창 경로를 복사\n"
+             f"         예)  GDRIVE_ROOT = r\"G:/내 드라이브/tcd_cache\"\n"
+             f"       · macOS  ~/Library/CloudStorage/GoogleDrive-<계정>/My Drive/tcd_cache\n"
+             f"     ※ 로컬에 저장해도 백테스트는 정상 동작합니다. 다음 실행에서 드라이브 경로를 "
+             f"지정하면 이 폴더를 GDRIVE_ADOPT_DIRS 에 넣어 그대로 흡수할 수 있습니다 "
+             f"(파일 이동·삭제 없음).")
     return local, "LOCAL"
+
+
+def _win_drivefs_roots() -> List[str]:
+    """구글드라이브(데스크톱)가 **스스로 기록해 둔** 마운트 지점을 읽는다.
+
+    ① 레지스트리 DefaultMountPoint — 정책(HKLM\\Policies) > 시스템 > 사용자 순.
+       드라이브 문자일 수도, '%USERPROFILE%\\GFS' 같은 확장 경로일 수도 있다.
+    ② %LOCALAPPDATA%\\Google\\DriveFS\\root_preference_sqlite.db
+       media.last_mount_point = 실제로 마운트했던 지점,
+       roots.last_seen_absolute_path = 미러링 폴더(문자 스캔으로는 절대 못 찾는 경로).
+    부팅 경로에서 도는 함수이므로 어떤 예외도 밖으로 내보내지 않는다.
+    """
+    out: List[str] = []
+    if platform.system() != "Windows":
+        return out
+    try:
+        import winreg                                            # type: ignore
+        for hive, sub in ((winreg.HKEY_LOCAL_MACHINE, r"Software\Policies\Google\DriveFS"),
+                          (winreg.HKEY_LOCAL_MACHINE, r"Software\Google\DriveFS"),
+                          (winreg.HKEY_CURRENT_USER, r"Software\Google\DriveFS")):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | view) as k:
+                        v, _ = winreg.QueryValueEx(k, "DefaultMountPoint")
+                        p = os.path.expandvars(str(v)).strip()
+                        if p:
+                            out.append(p + ":\\" if len(p.rstrip(":")) == 1 else p)
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    try:
+        import sqlite3
+        db = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "DriveFS",
+                          "root_preference_sqlite.db")
+        if os.path.isfile(db):
+            # 드라이브가 파일을 열어 두고 있으므로 반드시 읽기 전용·불변으로 연다.
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True, timeout=2)
+            try:
+                for q, colname in (("SELECT last_mount_point FROM media", 0),
+                                   ("SELECT last_seen_absolute_path FROM roots", 0)):
+                    try:
+                        for row in con.execute(q):
+                            p = str(row[colname] or "").strip()
+                            if p:
+                                out.append(p + ":\\" if len(p.rstrip(":")) == 1 else p)
+                    except Exception:
+                        continue
+            finally:
+                con.close()
+    except Exception:
+        pass
+    # 루트 아래의 '내 드라이브' 계열 하위폴더도 후보에 넣는다(폴더 마운트 대응).
+    kids = ("My Drive", "내 드라이브", "Shared drives", "공유 드라이브")
+    return out + [os.path.join(r, k) for r in list(out) for k in kids]
 
 
 def _gdrive_desktop_candidates() -> List[str]:
@@ -87,18 +149,23 @@ def _gdrive_desktop_candidates() -> List[str]:
     home = os.path.expanduser("~")
     roots: List[str] = []
     if platform.system() == "Windows":
-        # ★ 존재하지 않거나 '연결 끊긴 네트워크 드라이브'에 os.path.isdir 를 던지면 letter 당
-        #   수 초씩 블로킹된다. 비트마스크로 **실재하는 드라이브만** 먼저 걸러낸다.
-        letters = "GHIJKLMNOPQRSTUVWXYZ"
+        # ★ 드라이브 문자를 훑는 것만으로는 못 찾는다. 구글 드라이브는 (a) 드라이브 문자
+        #   (b) **임의의 빈 폴더** (c) 미러링 모드의 로컬 폴더 중 하나로 붙을 수 있고,
+        #   (b)(c)는 어떤 문자 스캔으로도 발견되지 않는다. 실제로 사용자 환경에서 못 찾았다.
+        #   → 드라이브 자신이 기록해 둔 설정을 먼저 읽는다. 추측보다 조회가 정확하다.
+        roots += _win_drivefs_roots()
+        letters = "DEFGHIJKLMNOPQRSTUVWXYZ"     # 기본은 G: 지만 사용자가 바꿀 수 있다
         try:
             import ctypes
             mask = ctypes.windll.kernel32.GetLogicalDrives()      # type: ignore[attr-defined]
-            letters = "".join(L for L in letters
-                              if mask >> (ord(L) - ord("A")) & 1)
+            live = "".join(L for L in letters if mask >> (ord(L) - ord("A")) & 1)
+            letters = live or letters          # 비트마스크는 '힌트'다. 실패해도 스캔은 한다.
         except Exception:
             pass
         for L in letters:
             roots += [f"{L}:/내 드라이브", f"{L}:/My Drive", f"{L}:/공유 드라이브"]
+        roots += [os.path.join(home, n) for n in
+                  ("My Drive", "내 드라이브", "Google Drive", "GoogleDrive")]
     roots += [os.path.join(home, "Google Drive", "My Drive"),
               os.path.join(home, "Google Drive", "MyDrive"),
               os.path.join(home, "GoogleDrive", "MyDrive"),

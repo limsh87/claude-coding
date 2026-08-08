@@ -21,10 +21,19 @@ _TOTAL_TOKENS = {"합계", "계", "소계", "총계", "합 계", "전체", "총 
 
 # 서킷브레이커 — 연속 실패가 이 수를 넘으면 남은 호출을 즉시 포기한다(§3).
 EMP_CIRCUIT_MAX = 15
+
+# 이번 실행에서 직원현황 수집이 잘렸는가. §6 커버리지 판정이 '미수집'을 'DART 결측'으로
+# 오독하지 않게 하는 근거. dropped>0 이면 자동 창 단축(COVERAGE_AUTO_TRIM)을 걸지 않는다.
+EMP_TRUNCATED: Dict[str, Any] = {"dropped": 0, "why": ""}
 _EMP_CB = {"consec": 0, "tripped": False, "lock": threading.Lock()}
 
 
 def _emp_cb_ok() -> bool:
+    # ★ 예산이 이미 바닥났으면 한 건도 시도하지 않는다. 예전엔 예산 거부(None)를 '실패'로
+    #   세어 서킷브레이커가 15건 만에 터질 때까지 헛돌았고, 각 호출마다 0.05~0.15초를
+    #   자고 있었다 — 14,000건이면 12스레드로도 2분을 아무 일 없이 태운다.
+    if dart_halt_reason():
+        return False
     with _EMP_CB["lock"]:
         return not _EMP_CB["tripped"]
 
@@ -37,9 +46,16 @@ def _emp_cb_mark(success: bool):
             _EMP_CB["consec"] += 1
             if _EMP_CB["consec"] >= EMP_CIRCUIT_MAX and not _EMP_CB["tripped"]:
                 _EMP_CB["tripped"] = True
-                LOG.warn(f"직원현황 수집 서킷브레이커 작동 — 연속 {EMP_CIRCUIT_MAX}건 실패. "
+                # ★ 사유를 추측하지 않는다. 예산 소진·인증 오류는 이미 기록돼 있으므로
+                #   "대개 …입니다" 같은 짐작 대신 실제 사유를 그대로 말한다. 짐작이 틀리면
+                #   사용자는 멀쩡한 키를 의심하거나 IP 차단을 걱정하며 시간을 버린다.
+                why = dart_halt_reason()
+                LOG.warn(f"직원현황 수집 중단 — 연속 {EMP_CIRCUIT_MAX}건 실패. "
                          f"남은 호출을 포기하고 여기까지 받은 것을 저장합니다. "
-                         f"(대개 일일 한도 소진 또는 IP 차단입니다. 내일 재실행하면 이어받습니다)")
+                         + (f"사유: {why}. 내일 재실행하면 이어받습니다."
+                            if why else
+                            "예산·인증에는 이상이 없습니다 — 네트워크 또는 DART 서버 상태를 "
+                            "확인하세요(이 경우는 데이터 부재가 아닙니다)."))
 
 
 def _emp_pick_rows(d: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
@@ -215,10 +231,17 @@ def fetch_emp_status(corp_codes: Sequence[str], years: Sequence[int],
             left = max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
             cap = max(0, min(total_needed, int(max_calls), left))
             if cap < total_needed:
+                # ★ 절단 사실을 기록해 둔다. §6 커버리지 판정이 이 표를 'DART 의 보유량'으로
+                #   오독해 백테스트 창을 영구히 잘라내는 것을 막기 위한 유일한 근거다.
+                EMP_TRUNCATED.update({
+                    "dropped": total_needed - cap,
+                    "why": (f"오늘 남은 DART 호출 {left:,}건" if left < int(max_calls)
+                            else f"상한 EMP_MAX_CALLS={int(max_calls):,}")})
                 jobs = jobs[:cap]
                 LOG.warn(f"직원현황 {total_needed:,}건 중 이번 실행은 {cap:,}건만 받습니다 "
                          f"(오늘 남은 DART 호출 {left:,}건 · 상한 EMP_MAX_CALLS={max_calls:,}). "
-                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다.")
+                         f"우선순위 상위 종목·최근 연도부터 채웠으며, 재실행하면 이어받습니다. "
+                         f"※ 미수집분이 있으므로 §6 커버리지 기반 자동 창 단축은 비활성화됩니다.")
         LOG.info(f"직원현황 신규 수집 {len(jobs):,}건 "
                  f"({len(corps):,}사 × {len(years)}년, 캐시 적중 {len(done):,}) — "
                  f"약 {len(jobs)/max(RATE_LIMIT_QPS.get('dart',8.0),1)/60:.0f}분 예상")
@@ -450,6 +473,25 @@ def coverage_verdict(C: pd.DataFrame) -> Tuple[Optional[pd.Timestamp], str]:
     """
     if C is None or C.empty:
         return None, "커버리지 표가 비어 판정을 유보합니다."
+
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ 이 판정의 전제: 커버리지 표가 'DART 가 실제로 보유한 양'을 잰다는 것.
+    #    예산에 걸려 잘린 실행에서는 그 전제가 깨진다. 수집 잡은 연도 내림차순이라
+    #    jobs[:cap] 은 **항상 오래된 연도부터** 버린다 → 커버리지는 최근이 두껍고 과거가
+    #    얇은 모양이 되고, 그건 DART 의 사실이 아니라 우리 지갑의 사실이다.
+    #    그 모양을 그대로 읽어 COVERAGE_AUTO_TRIM 이 창을 자르면, **일시적 예산 부족이
+    #    10년 백테스트를 영구히 단축**시키고 그 단축이 §6 데이터 근거로 리포트에 박힌다.
+    #  → 절단이 있었으면 자동 트림을 걸지 않는다. 자를지 말지는 완전 수집 후에 판단한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    trunc = EMP_TRUNCATED.get("dropped", 0)
+    if trunc:
+        return None, (
+            f"이번 실행에서 직원현황 수집이 {trunc:,}건 잘렸습니다"
+            f"({EMP_TRUNCATED.get('why', '호출 상한')}). 수집은 최근 연도부터 채우므로 "
+            f"아래 표의 과거 연도 부족분은 **DART 의 결측이 아니라 이번 실행의 미수집**입니다. "
+            f"이 표를 근거로 백테스트 창을 자르면 일시적 예산 부족이 10년 구간을 영구히 "
+            f"단축시킵니다 — 자동 트림을 걸지 않습니다. 재실행으로 수집을 완성한 뒤 재판정하세요.")
+
     good = C[C["valid"] >= COVERAGE_MIN_OBS_START]
     if good.empty:
         worst = int(C["valid"].max()) if len(C) else 0

@@ -134,10 +134,15 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 
 def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    # ★ 이름은 FDR 이지만 6자리 KRX 코드는 FinanceDataReader 내부에서 NaverDailyReader 로
+    #   라우팅된다(fchart.stock.naver.com). 즉 KRX 가 아니라 네이버다. 그런데 예전엔
+    #   krx 버킷(2.0 qps)의 토큰을 먹었다. RateLimiter 는 소스당 전역 단일 간격이라
+    #   12스레드가 0.5초 슬롯 하나를 나눠 쓰게 되고, 실효 동시성이 1로 떨어진다.
+    #   실측: 1,833건 × 0.5초 = 916.5초 ≈ 관측 916.7초 — 수집 시간의 100%가 이 대기였다.
     if fdr is None:
         return None
     try:
-        limiter("krx").wait()
+        limiter("naver").wait()
         d = fdr.DataReader(code, start, end)
     except Exception:
         return None
@@ -240,7 +245,8 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
     codes = sorted({c for c in map(to_code6, codes) if c})
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
@@ -281,6 +287,24 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
+    # ── 전 구간 재수집을 막는 두 가지 하한 ──────────────────────────────────────────────
+    #   ① 상장일 — 그 이전 봉은 존재하지 않는다.
+    #   ② 워터마크 — 전 구간을 요청했는데도 더 이전이 안 온 지점. 소스에 없다는 뜻이다.
+    listing_of: Dict[str, pd.Timestamp] = {}
+    if sec is not None and len(sec) and "listing_date" in getattr(sec, "columns", []):
+        try:
+            _s = sec.dropna(subset=["code"]).drop_duplicates("code")
+            listing_of = dict(zip(_s["code"].astype(str), as_ts_series(_s["listing_date"])))
+        except Exception:
+            listing_of = {}
+    watermark: Dict[str, pd.Timestamp] = {}
+    _wm = VAULT.get_table("price_earliest_available", scope="shared")
+    if _wm is not None and len(_wm):
+        try:
+            watermark = dict(zip(_wm["code"].astype(str), as_ts_series(_wm["earliest"])))
+        except Exception:
+            watermark = {}
+
     todo, n_back, n_fwd, n_skip = [], 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
@@ -294,7 +318,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
         #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
         #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
+        #
+        #   ★★ 다만 '요청 시작일'을 그대로 기준으로 삼으면 안 된다. 2021년에 상장한 종목은
+        #   2015년 봉이 **존재할 수 없으므로** 조건이 영원히 참이고, 매 실행 전 구간을 다시
+        #   받는다. 실측: 캐시 3,517종목 중 1,487종목(42%)이 매번 재수집 대상이 되어
+        #   가격 단계 992초 중 916초를 이미 갖고 있는 데이터를 다시 받는 데 썼다.
+        #   → 상장일과 '이 종목에서 실제로 받아진 최소일' 워터마크로 하한을 올린다.
+        want = start_ts
+        _ld = listing_of.get(c)
+        if _ld is not None and pd.notna(_ld):
+            want = max(want, as_ts(_ld))
+        _wm = watermark.get(c)
+        if _wm is not None and pd.notna(_wm):
+            want = max(want, _wm)          # 이미 '더 이전은 없다'가 확인된 지점
+        if mn is not None and mn > want + pd.Timedelta(days=10):
             todo.append((c, start))
             n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
@@ -330,13 +367,30 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
-        failed = []
+        failed, wm_rows = [], []
         for (c, st), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
+                # ★ 전 구간(start)을 요청했는데 이만큼만 왔다면 그 이전은 소스에 없다.
+                #   이 워터마크가 없으면 2021년 상장 종목은 2015년 봉이 영영 안 오므로
+                #   '앞 구간 결손'으로 판정되어 **매 실행 전 구간을 다시 받는다.**
+                if as_ts(st) <= start_ts + pd.Timedelta(days=1):
+                    _mn = as_ts_series(d["date"]).min()
+                    if pd.notna(_mn):
+                        wm_rows.append({"code": c, "earliest": _mn, "checked_at": _today})
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if wm_rows:
+            _wprev = VAULT.get_table("price_earliest_available", scope="shared")
+            _wall = pd.concat([_wprev, pd.DataFrame(wm_rows)], ignore_index=True) \
+                if _wprev is not None and len(_wprev) else pd.DataFrame(wm_rows)
+            _wall = (_wall.sort_values("checked_at")
+                          .drop_duplicates("code", keep="last").reset_index(drop=True))
+            VAULT.put_table("price_earliest_available", _wall, scope="shared", domain="price",
+                            source="fetch_prices: 소스가 보유한 최초 관측일 워터마크")
+            LOG.info(f"최초 관측일 워터마크 {len(wm_rows):,}종목 기록 — 다음 실행부터 이 종목들의 "
+                     f"전 구간 재수집을 건너뜁니다(상장 이전 구간은 존재하지 않습니다).")
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
@@ -403,7 +457,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
-        if src_used.get("naver", 0) or src_used.get("yfinance", 0):
+        if any(src_used.get(k, 0) for k in ("naver", "yfinance", "fdr")):
             LOG.warn("네이버/yfinance 경로로 받은 종목은 거래대금이 종가×거래량 근사입니다. "
                      "V6 유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향).")
     PIPE.io("OUT", "DRIVE", "krx_ohlcv_daily", px, source="price chain")

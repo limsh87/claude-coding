@@ -334,6 +334,95 @@ def run_contracts_v3(strict: bool = True) -> bool:
 
     _cc("§12-6", "수집 호출량 상한 — 4시간 계약", budget_bounded)
 
+    # ── §12-R : 자원 부족을 데이터 부재로 판정 금지 ───────────────────────────────────────
+    def resource_vs_data():
+        """★ 실제로 실행을 죽인 사고를 고정하는 회귀 테스트.
+
+        DART 일일 한도가 이미 소진된 상태로 시작한 실행에서, 모든 호출이 예산 게이트에
+        막혀 None 을 돌려줬다. CANARY 는 그것을 '데이터 없음'으로 읽어 K8 을 FAIL 시키고
+        §12-2 킬 기준을 발동해 실행을 중단했다 — 데이터는 멀쩡히 있었다.
+        더 나쁜 건 처방이었다: '백테스트 시작연도를 상향하라'. 오늘 호출권이 없다는
+        일시적 사실로 10년 백테스트 구간을 영구히 잘라낼 뻔했다.
+
+        이 계약은 (a) 자원 사유가 조회 가능하고 (b) 그 상태에서 CANARY 의 DART 검사가
+        FAIL 이 아니라 SKIP 이 되며 (c) 킬 기준이 발동하지 않음을 강제한다.
+        """
+        for fn in ("dart_halt_reason", "dart_note_halt", "dart_budget_left"):
+            if not callable(globals().get(fn)):
+                return False, f"{fn}() 이 없습니다 — 자원 사유를 구별할 방법이 없습니다"
+        saved = dict(DART_HALT)
+        saved_results = list(CANARY_RESULTS)
+        try:
+            # 사고 당시와 똑같은 상태를 만든다: K8 이 치명 FAIL 로 기록된 채 예산이 소진됨.
+            CANARY_RESULTS.clear()
+            _k("K8", "연간급여총액 기재율", False, "표본 0건", "≥70%",
+               "★ 임금프리미엄 계산 불가 — 중단(§12-2)", fatal=True)
+            _k("K7", "empSttus 응답", False, "0/191 (0%)", "≥80%", "")
+            _k("K5", "상장폐지 목록 확보", False, "폐지일 보유 0종목", "≥50종목", "", fatal=True)
+            dart_note_halt("테스트: 일일 한도 소진", "회귀 검정")
+            if not dart_halt_reason():
+                return False, "halt 를 기록했는데 dart_halt_reason() 이 None 입니다"
+            if not canary_resource_flip():
+                return False, "자원 사유가 있는데 canary_resource_flip() 이 되돌리지 않았습니다"
+            k8 = next(r for r in CANARY_RESULTS if r["id"] == "K8")
+            k7 = next(r for r in CANARY_RESULTS if r["id"] == "K7")
+            k5 = next(r for r in CANARY_RESULTS if r["id"] == "K5")
+            if k8["passed"] is not None or k8["fatal"]:
+                return False, "K8 이 여전히 치명 FAIL 입니다 — 실행이 또 킬 기준으로 죽습니다"
+            if k7["passed"] is not None:
+                return False, "K7 이 여전히 FAIL 입니다 (SKIP 이어야 함)"
+            # K5(상장폐지 목록)는 DART 와 무관하므로 절대 완화되면 안 된다.
+            if k5["passed"] is not False or not k5["fatal"]:
+                return False, "K5(생존자편향)까지 완화됐습니다 — DART 무관 검사는 건드리면 안 됩니다"
+            fatal_left = [r["id"] for r in CANARY_RESULTS if r["fatal"] and r["passed"] is False]
+            return True, (f"K7·K8 → SKIP 전환 · K5 는 치명 FAIL 유지 "
+                          f"(잔여 치명 {fatal_left}) · 킬 기준 오발동 차단")
+        finally:
+            DART_HALT.update(saved)
+            CANARY_RESULTS.clear()
+            CANARY_RESULTS.extend(saved_results)
+
+    _cc("§12-R", "자원 부족 ≠ 데이터 부재 (킬 기준 오발동 방지)", resource_vs_data)
+
+    # ── C2c : 폐지 유형별 청산가 ──────────────────────────────────────────────────────────
+    def delist_kinds():
+        """흡수합병·스팩해산을 -100% 로 계상하지 않는다. 단, 모르면 -100% 를 유지한다.
+
+        ★ 실측 근거(폐지목록 원본 Reason, 2016년 이후 폐지 주권 561건):
+          피흡수합병 60 · 스팩소멸합병 53 · 완전자회사화 43 → 인수기업 주식을 받는다.
+          스팩 예심 미제출·해산·존속기간만료 ~130 → 예치금이 공모가+이자로 반환된다.
+          이 308건(55%)을 전액손실로 계상하면 매년 -2%p 안팎의 없는 손실을 지어낸다.
+          이것은 '보수적'이 아니라 그냥 틀린 것이다. 반대로 사유를 모르면(unknown)
+          반드시 -100% 를 유지해야 한다 — 그쪽이 진짜 보수다(원칙7).
+        """
+        cases = {
+            "피흡수합병": "transfer", "피흡수합병(스팩소멸합병)": "transfer",
+            "지주회사(최대주주등)의 완전자회사화 등": "transfer", "타법인의 완전자회사로 편입": "transfer",
+            "신청에 의한 상장폐지": "transfer",
+            "상장예비심사 청구서 미제출로 관리종목 지정 후 1개월 이내 동 사유 미해소": "spac",
+            "해산 사유 발생": "spac", "존속기간 만료": "spac",
+            "감사의견 거절(감사범위 제한)": "distress",
+            "기업의 계속성 및 경영의 투명성 등을 종합적으로 고려하여 상장폐지기준에 해당한다고 결정": "distress",
+            "자본전액잠식": "distress", "최종부도": "distress",
+            "": "unknown", "사유 미상": "unknown",
+        }
+        wrong = [(k, classify_delisting(k), v) for k, v in cases.items()
+                 if classify_delisting(k) != v]
+        if wrong:
+            return False, f"폐지 사유 분류 오류: {wrong[:3]}"
+        # 모르면 전액손실이어야 한다 — 관대한 쪽으로 새면 성과가 부풀려진다.
+        if "unknown" in DELIST_NOT_WIPEOUT:
+            return False, "'unknown' 이 직전가 청산으로 분류돼 있습니다 — 모르면 -100% 여야 합니다"
+        src = _src_of(run_backtest) or ""
+        if src and "DELIST_NOT_WIPEOUT" not in src:
+            return False, "백테스트 엔진이 폐지 유형을 쓰지 않습니다 — 전부 -100% 로 계상됩니다"
+        if src and "-1.0" not in src:
+            return False, "백테스트 엔진에서 -100% 경로가 사라졌습니다(원칙7 위반)"
+        return True, (f"합병·완전자회사화·스팩해산 → 직전가 청산 · "
+                      f"부실·사유불명 → -100% 유지 (표본 {len(cases)}건 전부 일치)")
+
+    _cc("C2c", "폐지 유형별 청산가 (합병을 전액손실로 계상 금지)", delist_kinds)
+
     # ── 출력 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 34), "PASS" if r["pass"] else "FAIL",
              _trunc(r["msg"], 60)] for r in CONTRACT_V3]

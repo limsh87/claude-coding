@@ -133,6 +133,40 @@ def downcast_floats(P: pd.DataFrame) -> pd.DataFrame:
     return P
 
 
+def _flush_on_abort_v3():
+    """중단 경로에서도 원장과 진단표를 반드시 남긴다.
+
+    ★ 예전엔 DBUDGET.close() 와 report_http() 가 정상 종료 경로에만 있었다. 그래서
+      ① 중단된 실행이 오늘 쓴 DART 호출이 파일에 기록되지 않아 다음 실행이 없는 예산을
+         있다고 믿고 또 실패하고,
+      ② '이번 실행에서 DART 요청을 한 건도 못 보냈다'를 보여줄 유일한 표(HTTP 감사)가
+         하필 그게 가장 필요한 순간에 출력되지 않았다.
+      중단은 진단 정보가 가장 필요한 순간이다. 그때 정보를 끊으면 안 된다.
+    """
+    try:
+        if DBUDGET:
+            DBUDGET.close()
+    except Exception:
+        pass
+    try:
+        report_http()
+    except Exception:
+        pass
+    why = None
+    try:
+        why = dart_halt_reason()
+    except Exception:
+        pass
+    if why:
+        LOG.warn(f"참고 — 이번 실행의 DART 상태: {why}. "
+                 f"위 표에서 dart 요청 수가 0 이면 '데이터가 없어서'가 아니라 "
+                 f"'요청을 못 보내서'입니다. 한도는 매일 자정(KST)에 초기화됩니다.")
+    try:
+        VAULT.flush()
+    except Exception:
+        pass
+
+
 def announce_budget_v3():
     """수집을 시작하기 전에 '이번 실행이 몇 분짜리인지'를 먼저 못박아 보여준다.
 
@@ -164,16 +198,73 @@ def announce_budget_v3():
         LOG.warn("호출 상한이 None 인 단계가 있습니다 — 콜드빌드는 며칠이 걸리며 §12-6 의 "
                  "4시간 계약 밖입니다. 4시간 안에 끝내려면 숫자를 넣으세요 "
                  "(권장: EMP_MAX_CALLS=14000, DART_FS_MAX_CALLS=12000).")
-    if plan > left:
+    if plan > left and left > 0:
         LOG.warn(f"계획 호출({plan:,})이 오늘 잔여 한도({left:,})를 넘습니다 — 우선순위 상위부터 "
                  f"채우고 한도에서 멈춥니다. 커버리지는 재실행할 때마다 올라갑니다.")
+    return preflight_dart_v3()
+
+
+def preflight_dart_v3() -> str:
+    """이번 실행에서 DART 로 무엇을 할 수 있는지 **수집 시작 전에** 확정한다.
+
+    ★ 왜 필요한가. 직전 실행은 0.35초 시점에 이미 '잔여 0'을 알고 있었는데도 그대로
+      진행해, 16분 30초짜리 가격 수집을 끝낸 뒤 CANARY 에서 죽었다. 사용자는 17분을
+      쓰고 아무 산출물도 받지 못했다. 알 수 있었던 사실로 나중에 죽는 것은 설계 결함이다.
+
+    반환 "LIVE"(정상 수집) / "CACHE_ONLY"(캐시로 진행) / "BLOCKED"(진행 불가)
+    """
+    halt = dart_halt_reason()
+    if not halt:
+        return "LIVE"
+
+    have = {}
+    for t in ("dart_employees_ext", "dart_fnltt_raw", "dart_multi_raw"):
+        try:
+            d = VAULT.get_table(t, scope="shared")
+            have[t] = 0 if d is None else len(d)
+        except Exception:
+            have[t] = 0
+    total = sum(have.values())
+
+    LOG.table([[k, f"{v:,}행", "사용 가능" if v else "비어 있음"] for k, v in have.items()],
+              ["공용 캐시 테이블", "보유", "이번 실행"], ["l", "r", "c"],
+              title=f"DART 사전점검 — 지금 신규 수집 불가: {halt}")
+
+    if total > 0:
+        LOG.warn(
+            f"DART 신규 수집은 못 하지만 공용 캐시에 {total:,}행이 있어 **그것만으로 진행**합니다.\n"
+            f"     · 캐시에 없는 (회사×연도)는 결측으로 남습니다 — 0 으로 채우지 않습니다.\n"
+            f"     · CANARY 의 DART 항목은 판정 보류(SKIP)로 처리되며 킬 기준을 걸지 않습니다.\n"
+            f"     · 내일(또는 한도 회복 후) 재실행하면 정확히 이 지점부터 이어받습니다.")
+        return "CACHE_ONLY"
+
+    LOG.error(
+        f"DART 를 쓸 수 없고 공용 캐시도 비어 있습니다 — {halt}\n"
+        f"  이 상태로 계속하면 가격 수집에만 15~40분을 쓰고 결국 재무·직원현황이 전부 비어\n"
+        f"  백테스트가 성립하지 않습니다. 그래서 **지금** 멈춥니다.\n"
+        f"\n"
+        f"  선택지\n"
+        f"    ① 한도 회복 후 재실행 — DART 한도는 매일 자정(KST)에 초기화됩니다.\n"
+        f"       지금까지 받은 것은 전부 캐시에 있으므로 이어받습니다.\n"
+        f"    ② 가격·유니버스만 먼저 채우기 — DART_FS_MAX_CALLS=0, EMP_MAX_CALLS=0 으로 두고\n"
+        f"       실행하면 이 점검을 통과하고 가격 캐시를 미리 완성해 둘 수 있습니다.\n"
+        f"    ③ RUN_MODE='CACHED' — 신규 수집 없이 캐시만으로 재현합니다.\n"
+        f"    ④ 키가 문제라면 상단 DART_API_KEY 를 확인하세요 "
+        f"(https://opendart.fss.or.kr → 인증키 신청/관리).")
+    if (DART_FS_MAX_CALLS or 0) == 0 and (EMP_MAX_CALLS or 0) == 0:
+        LOG.warn("DART 상한이 둘 다 0 이므로 애초에 DART 를 쓰지 않는 실행입니다 — 계속합니다.")
+        return "CACHE_ONLY"
+    raise KillCriteria(
+        f"DART 사전점검 실패 — {halt} · 공용 캐시도 비어 있습니다. "
+        f"위 선택지 중 하나를 고른 뒤 재실행하세요. "
+        f"(17분을 쓰고 죽는 대신 지금 멈춥니다)")
 
 
 # ── L1 수집 ─────────────────────────────────────────────────────────────────────────────────
 def collect_all_v3(months: pd.DatetimeIndex) -> dict:
     ctx: Dict[str, Any] = {}
     t_ing = time.time()
-    announce_budget_v3()
+    ctx["dart_mode"] = announce_budget_v3()
 
     with PIPE.stage("L1.UNI", "종목 마스터 · PIT 유니버스", "L1", budget_s=900):
         snaps = fetch_pykrx_snapshots(months)
@@ -194,7 +285,7 @@ def collect_all_v3(months: pd.DatetimeIndex) -> dict:
             pass
         px = fetch_prices(ctx["sec"]["code"].tolist(),
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+                          BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
         ctx["panel"] = build_price_panel(px, months)
 
@@ -575,6 +666,7 @@ if __name__ == "__main__" or ENV["ipython"]:
         LOG.banner("⛔ 킬 기준으로 중단", "§12 — 파라미터를 조정해 통과시키지 마십시오")
         _safe_print(f"  {e}")
         PIPE.report_stages()
+        _flush_on_abort_v3()
         try:
             report_robustness_v3()
         except Exception:
@@ -582,6 +674,7 @@ if __name__ == "__main__" or ENV["ipython"]:
     except StageFailure as e:
         LOG.banner("실행 중단", "위의 '실패 지점' 상세와 아래 표에서 원인을 확인하세요")
         _safe_print(f"  {e}")
+        _flush_on_abort_v3()
         PIPE.report_stages(); PIPE.report_flow()
     except KeyboardInterrupt:
         LOG.warn("사용자 중단. 여기까지 수집된 데이터는 드라이브에 저장되어 있으며 "

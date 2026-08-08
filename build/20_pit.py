@@ -140,6 +140,59 @@ PIT = PITStore()
 LISTING_SEASONING_DAYS = 250          # 상장일 + 250거래일 ≈ 1년
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  상장폐지 '유형' 분류 — 청산가를 -100% 로 둘지 직전가로 둘지 가른다
+#
+#  ★ 왜 필요한가. 예전엔 모든 폐지를 -100% 로 처리했다. 그런데 폐지목록 원본의 Reason 을
+#    실측해 보면 2016년 이후 폐지된 주권 561건 중
+#      · 피흡수합병 60 · 스팩소멸합병 53 · 지주회사 완전자회사화 29 · 타법인 완전자회사 편입 14
+#        → 합병 대가로 인수기업 주식을 받는다. 0% 도 아니고 보통 프리미엄이 붙는다.
+#      · 스팩 예심청구서 미제출·해산 ~110  → 예치금이 공모가 + 이자로 반환된다(사실상 원금).
+#    즉 **절반 이상이 전액손실이 아닌데 전액손실로 계상**되고 있었다.
+#    U-MID 대역의 연 폐지율(~4.9%)과 25종목 포트폴리오로 환산하면 연 -2%p 안팎의
+#    '있지도 않은 손실'이다. 게다가 이것은 보수적인 방향이 아니라 **틀린** 방향이다.
+#
+#  ★ 그렇다고 프리미엄을 지어내지 않는다. 합병·해산 건은 **직전 관측가로 청산**한다.
+#    한국 시장의 합병 스프레드는 좁아 직전가가 편향 없는 추정치이고, 실제 프리미엄보다
+#    낮으므로 여전히 보수적이다. 부실 폐지(감사의견 거절·자본잠식·부도)는 종전대로
+#    정리매매가가 없으면 -100% 다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+DELIST_TRANSFER_PAT = (
+    r"흡수합병|피흡수|합병으로|완전자회사|지주회사|주식교환|주식의\s*포괄적|"
+    r"신청에\s*의한\s*상장폐지|상장폐지\s*신청|자진|공개매수|이전상장|재상장|시장이전")
+DELIST_SPAC_PAT = (
+    # 스팩 특유의 사유들. '청구서'와 '신청서'가 혼용되고, '존속기간 만료'는 스팩의
+    # 3년 존속기간이 끝나 예치금을 반환하고 해산하는 경우다(부실이 아니다).
+    r"스팩|기업인수목적|예비심사\s*(청구서|신청서)\s*미제출|합병상장예비심사신청서\s*미제출|"
+    r"해산\s*사유|존속기간\s*만료")
+DELIST_DISTRESS_PAT = (
+    # ★ '자본잠식' 을 그대로 쓰면 실제 표기인 '자본전액잠식'(전액이 사이에 낀다)을 놓친다.
+    #   계약 C2c 가 이 누락을 잡아냈다 — 사유 문자열은 KRX 표기 그대로 검증해야 한다.
+    r"감사의견|의견거절|부적정|자본\S*잠식|부도|파산|회생|영업정지|계속기업|"
+    r"상장폐지\s*기준에\s*해당|횡령|배임|사업보고서\s*미제출|주식\S*분산\s*미달|"
+    r"매출액\s*미달|시가총액\s*미달|거래량\s*미달")
+
+
+def classify_delisting(reason: Any) -> str:
+    """'transfer'(합병·자진) | 'spac'(스팩 해산) | 'distress'(부실) | 'unknown'"""
+    s = str(reason or "").strip()
+    if not s:
+        return "unknown"
+    # 부실을 먼저 본다. '스팩소멸합병'처럼 두 패턴이 겹칠 때 관대한 쪽으로 새지 않게
+    # 하려는 것이 아니라, 반대로 부실 신호가 있으면 무조건 부실로 보내기 위함이다.
+    if re.search(DELIST_DISTRESS_PAT, s):
+        return "distress"
+    if re.search(DELIST_TRANSFER_PAT, s):
+        return "transfer"
+    if re.search(DELIST_SPAC_PAT, s):
+        return "spac"
+    return "unknown"
+
+
+# 직전가 청산으로 볼 유형. 'unknown' 은 포함하지 않는다 — 모르면 보수적으로 -100%.
+DELIST_NOT_WIPEOUT = ("transfer", "spac")
+
+
 class Universe:
     def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame,
                  snap_window_days: int = 100):
@@ -241,6 +294,14 @@ class Universe:
 
     def delisting_map(self) -> Dict[str, pd.Timestamp]:
         return {r.code: r.delisting_date for r in self.sec.itertuples(index=False)
+                if pd.notna(r.delisting_date)}
+
+    def delist_kind_map(self) -> Dict[str, str]:
+        """종목 → 폐지 유형. 청산가를 -100% 로 둘지 직전가로 둘지 가른다."""
+        if "delist_reason" not in self.sec.columns:
+            return {}
+        return {r.code: classify_delisting(getattr(r, "delist_reason", ""))
+                for r in self.sec.itertuples(index=False)
                 if pd.notna(r.delisting_date)}
 
     def audit_row(self, stage: str, t, codes: Sequence[str]):

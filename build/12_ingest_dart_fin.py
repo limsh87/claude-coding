@@ -84,6 +84,38 @@ class DartBudget:
 
 DBUDGET: Optional[DartBudget] = None
 
+# ══════════════════════════════════════════════════════════════════════════════════════════
+#  ★ '지금 못 받는다' 와 '원래 없다' 를 구별하는 단일 진실
+#
+#  dart_api() 는 세 가지 전혀 다른 사건을 모두 None 으로 뭉갠다:
+#    ① 예산 게이트가 호출을 거부   ② 네트워크 실패   ③ API 가 '데이터 없음'(013) 응답
+#  호출자는 ①②를 ③으로 읽는다. 실제로 이것 때문에 실행이 죽었다 —
+#  일일 한도가 소진된 상태로 시작한 실행에서 CANARY 가 K8 을 '급여총액 미기재'로 판정하고
+#  §12-2 킬 기준을 발동시켰다. 데이터는 멀쩡히 있었고 오늘 호출권이 없었을 뿐이다.
+#  게다가 그 판정의 처방은 '백테스트 시작일 상향' — 일시적 조건으로 전략을 영구 훼손한다.
+#
+#  → 사유를 여기에 기록하고, 자원 조건으로 실패한 검사는 FAIL 이 아니라 SKIP 이어야 한다.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+DART_HALT: Dict[str, Optional[str]] = {"reason": None, "detail": None}
+
+
+def dart_note_halt(reason: str, detail: str = ""):
+    if DART_HALT["reason"] is None:
+        DART_HALT["reason"], DART_HALT["detail"] = reason, detail
+
+
+def dart_halt_reason() -> Optional[str]:
+    """지금 DART 를 쓸 수 없는 이유. None 이면 정상 — 즉 '응답 0건'은 진짜 데이터 부재다."""
+    if not DART_API_KEY:
+        return "DART_API_KEY 미입력"
+    if DBUDGET is not None and (DBUDGET.exhausted or DBUDGET.n >= DART_DAILY_LIMIT):
+        return f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})"
+    return DART_HALT["reason"]
+
+
+def dart_budget_left() -> int:
+    return max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0))
+
 
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2, no_data_ok: bool = False) -> Optional[dict]:
@@ -93,6 +125,8 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
     if not DART_API_KEY:
         return None
     if DBUDGET is not None and not DBUDGET.take(tries):
+        dart_note_halt(f"일일 호출 한도 소진 ({DBUDGET.n:,}/{DART_DAILY_LIMIT:,})",
+                       "내일 재실행하면 정확히 이 지점부터 이어받습니다.")
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
@@ -108,11 +142,17 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         if st in ("020", "021"):
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
+            dart_note_halt(f"DART 서버가 한도 초과 응답(status={st})",
+                           "내일 재실행하면 이어받습니다.")
             LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
                      f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
         elif st in ("010", "011", "012", "901"):
+            dart_note_halt(f"DART 인증 오류(status={st} · {DART_STATUS_MSG.get(st, '?')})",
+                           "DART_API_KEY 를 확인하세요. 데이터 부재가 아닙니다.")
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
+        elif st == "800":
+            dart_note_halt("DART 시스템 점검 중(status=800)", "점검 종료 후 재실행하세요.")
         elif st != "013":
             LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
         # ★ 013("조회된 데이터 없음")은 통신 실패가 아니라 **정상 응답**이다. 그런데 None 으로
@@ -143,9 +183,15 @@ _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
 
 def _fs_one(job) -> Optional[pd.DataFrame]:
     corp, year, reprt = job
+    # ★ 예산·인증이 이미 막혔으면 남은 잡을 즉시 포기한다. 계속 돌면 OFS/CFS 두 번씩
+    #   헛호출하며 큐 전체(최대 12,000건)를 소진하고, 로그만 실패로 채운다.
+    if dart_halt_reason():
+        return None
     js = dart_api("fnlttSinglAcntAll.json",
                   {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
     if not js or "list" not in js:
+        if dart_halt_reason():
+            return None
         js = dart_api("fnlttSinglAcntAll.json",
                       {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
@@ -197,6 +243,8 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
     def _one(job):
         batch, y, r = job
+        if dart_halt_reason():          # 예산·인증이 막히면 남은 배치를 즉시 포기
+            return None
         js = dart_api("fnlttMultiAcnt.json",
                       {"corp_code": ",".join(batch), "bsns_year": str(y), "reprt_code": r})
         if not js or not isinstance(js.get("list"), list) or not js["list"]:
@@ -564,21 +612,114 @@ DISCLOSURE_PATTERNS = {
 }
 
 
+DISCLOSURE_LEDGER = "dart_disclosure_months"
+
+
+def _disclosure_done_months(cached: Optional[pd.DataFrame]) -> set:
+    """완결이 **증명된** 달만 돌려준다.
+
+    기존 캐시에는 이 원장이 없다. 그렇다고 '캐시에 행이 있으니 완결'로 간주하면
+    이미 뚫려 있는 구멍을 그대로 물려받는다. 그래서 레거시 캐시는 (달 × 유형)당
+    1회짜리 값싼 탐침으로 total_count 를 받아 실제 보유 행수와 대조해 검증한다.
+    120개월이면 240회 — 전체 재수집(수천 회)에 비하면 무시할 수 있는 비용이고,
+    이 한 번으로 과거 실행이 남긴 조용한 결손이 드러난다.
+    """
+    led = VAULT.get_table(DISCLOSURE_LEDGER, scope="shared")
+    if led is not None and len(led) and "month" in led.columns:
+        d = led[led.get("complete", False).astype(bool)] if "complete" in led.columns else led
+        return set(d["month"].astype(str))
+    if cached is None or not len(cached):
+        return set()
+
+    have = cached["rcept_dt"].dt.to_period("M").astype(str).value_counts().to_dict()
+    if not have or not DART_API_KEY or RUN_MODE == "CACHED" or dart_halt_reason():
+        # 검증할 수 없으면 재수집 대상으로 둔다 — 조용히 '완결'로 승격시키지 않는다.
+        return set()
+
+    LOG.info(f"공시목록 캐시 {len(have)}개월의 완결성을 검증합니다 "
+             f"(달당 {len(DISCLOSURE_TYPES)}회 탐침 — 과거 실행이 페이지 중간에 끊겼는지 확인).")
+
+    def _probe(mk):
+        p = pd.Period(mk, freq="M")
+        total = 0
+        for ty in DISCLOSURE_TYPES:
+            js = dart_api("list.json", {
+                "bgn_de": p.start_time.strftime("%Y%m%d"), "end_de": p.end_time.strftime("%Y%m%d"),
+                "pblntf_ty": ty, "page_no": 1, "page_count": 1, "last_reprt_at": "N"},
+                no_data_ok=True)
+            if js is None:
+                return mk, None                       # 검증 실패 → 완결로 승격하지 않는다
+            total += int(js.get("total_count", 0) or 0)
+        return mk, total
+
+    res = pmap_io(_probe, sorted(have), workers=min(N_WORKERS_IO, 8), desc="공시 캐시 완결성 검증")
+    ok, holed, unknown = set(), [], 0
+    for r in res:
+        if not r:
+            unknown += 1
+            continue
+        mk, total = r
+        if total is None:
+            unknown += 1
+        elif have.get(mk, 0) >= total:
+            ok.add(mk)
+        else:
+            holed.append((mk, have.get(mk, 0), total))
+    if holed:
+        LOG.warn(f"과거 실행이 남긴 공시목록 결손 {len(holed)}개월을 찾았습니다 — "
+                 f"예: {[f'{m}: {h}/{t}행' for m, h, t in holed[:3]]}. "
+                 f"이 달들을 다시 받습니다. (그대로 뒀다면 유상증자·전환사채·자기주식 공시가 "
+                 f"'애초에 없었던 것'으로 백테스트에 들어갔습니다)")
+    if unknown:
+        LOG.info(f"  {unknown}개월은 검증하지 못해 재수집 대상으로 둡니다(안전한 방향).")
+    _save_disclosure_ledger(ok)
+    return ok
+
+
+def _save_disclosure_ledger(complete_months) -> None:
+    prev = VAULT.get_table(DISCLOSURE_LEDGER, scope="shared")
+    rows = set()
+    if prev is not None and len(prev) and "month" in prev.columns:
+        keep = prev[prev["complete"].astype(bool)] if "complete" in prev.columns else prev
+        rows |= set(keep["month"].astype(str))
+    rows |= {str(m) for m in complete_months}
+    if not rows:
+        return
+    VAULT.put_table(DISCLOSURE_LEDGER,
+                    pd.DataFrame({"month": sorted(rows), "complete": True}),
+                    scope="shared", domain="dart",
+                    source="공시목록 완결성 원장 — 페이지를 끝까지 훑은 달만 기록")
+
+
 def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     """월 단위로 시장 전체 공시목록을 훑는다. PACK-C(자사주/배당)와 V3(희석성 조달)의 입력."""
     if not DART_API_KEY:
         return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
     cached = VAULT.get_table("dart_disclosures", scope="shared")
-    have_months = set()
     if cached is not None and len(cached):
         cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
-        have_months = set(cached["rcept_dt"].dt.to_period("M").astype(str))
         LOG.info(f"공용 캐시에서 공시목록 {len(cached):,}행 재사용")
 
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    #  ★ '그 달에 행이 하나라도 있다' ≠ '그 달을 다 받았다'
+    #
+    #  예전에는 have_months 를 캐시 행의 rcept_dt 에서 유도했다. 그래서 12페이지짜리 달을
+    #  3페이지에서 예산·네트워크로 놓쳐도, 1~2페이지가 저장되는 순간 그 달은 영원히
+    #  '보유'로 표시되고 나머지 페이지는 **두 번 다시 시도되지 않았다.**
+    #  잃어버리는 것이 유상증자·전환사채·자기주식 공시라서, 하류(V3 희석 거부권·PACK-C)는
+    #  '이벤트 없음'이라는 **정상적인 값**을 읽는다 — 경고도 FAIL 도 뜨지 않고, 재실행할수록
+    #  그 거짓이 굳는다. 일시적 장애를 영구적 음성 관측으로 세탁하는 최악의 형태다.
+    #  → 완결 여부를 별도 원장에 명시적으로 기록하고, 그 원장만 신뢰한다.
+    # ══════════════════════════════════════════════════════════════════════════════════════
+    done_months = _disclosure_done_months(cached)
     months = pd.period_range(as_ts(start), as_ts(end), freq="M")
-    todo = [m for m in months if str(m) not in have_months]
+    todo = [m for m in months if str(m) not in done_months]
     if RUN_MODE == "CACHED":
         todo = []
+    elif todo and cached is not None and len(cached):
+        LOG.info(f"공시목록 미완결 {len(todo)}개월을 다시 받습니다 "
+                 f"(완결 확인 {len(done_months)}개월). 페이지 중간에 끊긴 달은 "
+                 f"'보유'로 세지 않습니다 — 그렇게 세면 빠진 공시가 영구히 없는 것이 됩니다.")
 
     # ★ 파이프라인이 실제로 소비하는 공시 유형을 전부 훑어야 한다.
     #   B(주요사항보고)만 훑으면 PACK-C 의 자사주·증자는 잡히지만
@@ -588,29 +729,48 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
 
     def _one(m):
-        rows = []
+        """(월, 행들, 완결여부). 한 페이지라도 못 받으면 그 달은 미완결이다."""
+        rows, complete = [], True
         for ty in DISCLOSURE_TYPES:
-            page = 1
+            page, walked = 1, False
             while page <= 100:
                 js = dart_api("list.json", {
                     "bgn_de": m.start_time.strftime("%Y%m%d"),
                     "end_de": m.end_time.strftime("%Y%m%d"),
                     "pblntf_ty": ty, "page_no": page, "page_count": 100,
-                    "last_reprt_at": "N"})
-                if not js or not isinstance(js.get("list"), list) or not js["list"]:
+                    "last_reprt_at": "N"}, no_data_ok=True)
+                if js is None:                       # 예산·네트워크·인증 → 이 달은 미완결
+                    complete = False
                     break
-                rows.extend(js["list"])
+                lst = js.get("list")
+                if not isinstance(lst, list) or not lst:
+                    walked = True                    # 정상 빈 응답 = 이 유형은 여기서 끝
+                    break
+                rows.extend(lst)
                 if page >= int(js.get("total_page", 1) or 1):
+                    walked = True
                     break
                 page += 1
-        return rows
+            else:
+                complete = False                     # 100페이지 상한 = 다 못 훑었다
+            if not walked and complete is not False:
+                complete = False
+        return str(m), rows, complete
 
-    new = []
+    new, ok_months, bad_months = [], [], []
     if todo:
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8), desc="DART 공시목록")
         for r in res:
-            if r:
-                new.extend(r)
+            if not r:
+                continue
+            mkey, rows, complete = r
+            new.extend(rows)
+            (ok_months if complete else bad_months).append(mkey)
+        if bad_months:
+            LOG.warn(f"공시목록 {len(bad_months)}개월이 미완결로 남았습니다 "
+                     f"(예: {bad_months[:3]}). 받은 부분은 저장하되 **완결로 표시하지 않으므로** "
+                     f"다음 실행에서 그 달부터 다시 받습니다. "
+                     + (f"사유: {dart_halt_reason()}" if dart_halt_reason() else ""))
 
     frames = ([cached] if cached is not None and len(cached) else [])
     if new:
@@ -629,6 +789,9 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
         D.loc[hit, "event"] = ev
     if new:
         VAULT.put_table("dart_disclosures", D, scope="shared", domain="dart", source="opendart list.json")
+    # 원장 갱신은 저장 뒤에. 완결로 표시한 달은 실제로 저장된 달이어야 한다.
+    if ok_months:
+        _save_disclosure_ledger(ok_months)
     D = pit_frame(D, "rcept_dt", "rcept_dt", source="dart")     # 접수일 = 공개일
     LOG.ok(f"공시목록 {len(D):,}건 — 이벤트 분류: " +
            ", ".join(f"{k}={int((D['event']==k).sum()):,}" for k in DISCLOSURE_PATTERNS if (D['event']==k).any()))

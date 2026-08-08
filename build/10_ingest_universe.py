@@ -17,7 +17,10 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
-                   "corp_code", "industry", "sector_src", "src"]
+                   "corp_code", "industry", "sector_src", "src",
+                   # 폐지 사유 — 백테스트가 청산가를 정할 때 쓴다. 흡수합병·완전자회사화·
+                   # 스팩해산을 -100% 로 처리하면 없는 손실을 매년 지어낸다(41_backtest).
+                   "delist_reason", "to_code"]
 
 # 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
 #   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
@@ -159,8 +162,11 @@ def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
                     "", "unnamed: 0", "unnamed:0", "index"):
                 df = df.drop(columns=[df.columns[0]])
             if len(df):
+                # ★ 컬럼 목록을 자르지 않는다. [:6] 으로 자른 로그가 delisting CSV 의
+                #   DelistingDate(7번째)를 가려, '상장일을 폐지일로 읽고 있다'는 오진을
+                #   유발했다. 진단 출력이 진단을 방해하면 없느니만 못하다.
                 LOG.debug(f"FDR GitHub 캐시 적중: {kind} @ {d.isoformat()} "
-                          f"({len(df):,}행 · 컬럼 {list(df.columns)[:6]})")
+                          f"({len(df):,}행 · 컬럼 {list(df.columns)})")
                 return df
         except Exception:
             continue
@@ -257,15 +263,49 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_raw = len(d)
     raw_codes = d[code_c].astype(str)
     codes = raw_codes.map(to_code6)
-    n_badcode = int(codes.isna().sum())
+    # ★ dl_c 폴백 목록에 "listingdate" 가 들어 있다. 업스트림이 DelistingDate 컬럼명을
+    #   바꾸는 순간 상장일이 폐지일로 읽히고, 모든 종목이 상장 첫날 폐지된 것으로 처리되어
+    #   유니버스가 통째로 비워진다 — 예외가 아니라 '그럴듯한 숫자'로 실패한다. 방어한다.
+    if dl_c and str(dl_c).strip().lower().replace("_", "") == "listingdate":
+        LOG.error("폐지목록에 폐지일 컬럼이 없어 상장일 컬럼을 쓸 뻔했습니다 — "
+                  f"상장일을 폐지일로 읽으면 전 종목이 즉시 폐지 처리됩니다. "
+                  f"폐지일 없이 진행합니다. 원본 컬럼: {list(d.columns)}")
+        dl_c = None
+    lst_c = next((col[k] for k in ("listingdate", "listing_date", "listdate") if k in col), None)
     t = pd.DataFrame({
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        # 폐지 종목의 상장일 — 상장 전 달에 유니버스로 새는 것(C13)과 시즈닝 면제를 막는다.
+        "listing_date": as_ts_series(d[lst_c]) if lst_c else pd.NaT,
+        # 폐지 '사유'. 흡수합병·완전자회사화·스팩해산은 -100% 가 아니다(41_backtest 가 소비).
+        "delist_reason": (d[col["reason"]].astype(str).str.strip() if "reason" in col else ""),
+        "to_code": (d[col["tosymbol"]].map(to_code6) if "tosymbol" in col else None),
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
-        "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
-                      else d[col["kind"]].astype(str) if "kind" in col else ""),
+        "secugroup": (d[col["secugroup"]].astype(str).str.strip() if "secugroup" in col
+                      else d[col["kind"]].astype(str).str.strip() if "kind" in col else ""),
     })
+    # ★ 탈락분의 정체를 반드시 증권종류로 분류한다.
+    #   업스트림 원본(4,172행)을 직접 확인한 결과, to_code6 이 떨어뜨리는 1,536행은
+    #   전부 신주인수권증서(857)·수익증권(521)·신주인수권증권(158)이고 **주권은 0건**이다.
+    #   그런데 예전 코드는 이를 "코드형식 불일치 → 생존자편향이 그만큼 남습니다"로 경고했다.
+    #   주식 전략의 유니버스가 아닌 파생·펀드 상품이 빠진 것을 편향으로 보고하면,
+    #   ① 멀쩡한 결과를 의심하게 만들고 ② 진짜 편향 경고까지 같이 무시하게 만든다.
+    #   → '정책적 제외'와 '진짜 유실'을 분리해서 세고, 주권이 유실될 때만 경고한다.
+    _EQUITY_SG = ("주권", "외국주권", "주식예탁증권")
+    sg = t["secugroup"].fillna("")
+    is_equity = sg.isin(_EQUITY_SG) if sg.str.len().gt(0).any() else pd.Series(True, index=t.index)
+    bad = t["code"].isna()
+    n_badcode = int(bad.sum())
+    n_lost_equity = int((bad & is_equity).sum())
+    n_nonequity = int((~bad & ~is_equity).sum())
+    if sg.str.len().gt(0).any() and n_badcode:
+        LOG.info(f"  코드 정규화 탈락 {n_badcode:,}건의 증권종류: "
+                 f"{dict(sg[bad].value_counts().head(5))} → 이 중 주권계열 {n_lost_equity:,}건")
+    # ★ 비주권(수익증권·리츠·투자회사 등)은 여기서 **버리지 않는다.**
+    #   폐지 기록을 지우면 그 종목이 유니버스에서 영원히 살아있는 것으로 보인다 — 제거하려던
+    #   생존자편향을 오히려 만드는 방향이다. 담을 수 없는 종목은 U-MID 의 유동성·규모 조건이
+    #   이미 걸러내므로, 여기서는 '분류해서 보고'만 하고 기록은 보존한다.
     t = t.dropna(subset=["code"])
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
@@ -273,15 +313,17 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
     n_nodate = int(t["delisting_date"].isna().sum())
 
-    LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
+    LOG.ok(f"상장폐지 목록 {len(t):,}건 (주권계열 {int(t['secugroup'].isin(_EQUITY_SG).sum()):,} · "
+           f"비주권 {n_nonequity:,}) — 생존자편향 제거 입력 확보")
     if n_raw - len(t):
         LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
-                 f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
+                 f"(증권종류상 코드체계가 다른 {n_badcode:,}건 제외 · 동일코드 중복 {n_dupe:,} 병합) · "
                  f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
-        if n_badcode > n_raw * 0.25:
-            LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
-                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
-                     f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
+    # ★ 경고는 '주권이 유실됐을 때'만 띄운다. 비주권 제외는 편향이 아니라 유니버스 정의다.
+    if n_lost_equity:
+        LOG.warn(f"폐지목록에서 **주권** {n_lost_equity:,}건이 코드 정규화에 실패했습니다 — "
+                 f"이만큼은 실제로 생존자편향으로 남습니다. "
+                 f"원본 코드 예시: {raw_codes[codes.isna() & is_equity].head(5).tolist()}")
     return t
 
 
@@ -506,8 +548,15 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market",
+                                   "listing_date", "delist_reason", "to_code"]).copy()
+        # ★ 예전엔 여기서 listing_date 를 pd.NaT 로 못박았다. 그런데 폐지목록 원본에는
+        #   ListingDate 가 4,172건 **전부** 들어 있다. 버리면 두 가지가 동시에 깨진다:
+        #     ① Universe.at 는 listing_date 결측을 '태초부터 상장'으로 읽는다 →
+        #        2016년 이후 상장했다가 폐지된 292종목이 상장 전 달의 유니버스에 낀다(C13 위반).
+        #     ② 250일 시즈닝 게이트는 listing_date 가 있을 때만 걸린다 → 결측인 종목만
+        #        면제된다. 그 면제 대상이 하필 '나중에 폐지된 종목'이라, 어느 종목이 게이트를
+        #        건너뛰는지가 **그 종목의 미래로 결정**된다. 실거래로는 재현 불가능한 유니버스다.
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
@@ -556,6 +605,8 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         listing_date=("listing_date", "min"),
         delisting_date=("delisting_date", "max"),
         industry=("industry", _first_str),
+        delist_reason=("delist_reason", _first_str),
+        to_code=("to_code", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
     )
     assert_no_dup_cols(agg, "security_master:agg")
