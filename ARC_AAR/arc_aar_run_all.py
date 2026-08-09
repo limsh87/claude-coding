@@ -139,8 +139,13 @@ class CFG:
     # ── 기간 (발주자 지시: 2016-08 ~ 2026-07 10년 백테스트) ────────────────
     BT_START_MONTH   = "2016-08"    # 백테스트 첫 보유월
     BT_END_MONTH     = "2026-07"    # 백테스트 마지막 보유월
-    META_START_MONTH = "2015-01"    # 리포트 메타 수집 시작 (계약 §5)
-    PRICE_START      = "2014-01-01" # 가격 수집 시작 (계약 §5)
+    # 리포트 메타 수집 시작 = BT 시작 − 워밍업.
+    #   워밍업 = 베이스라인 룩백 12M + 통제회귀 최소창 24M + 신호월 1M = 37M
+    #   → 2016-08 보유월의 신호(2016-07)가 실제로 산출되려면 2013-07부터 필요하다.
+    #   이를 계약 §5의 하한(2015-01)보다 앞당겨 잡아야 사전등록 10년 구간이
+    #   '조용히 2018년으로 잘리는' 일을 막는다(감사 지적 반영). 계약 하한의 상위집합.
+    META_START_MONTH = "2013-07"
+    PRICE_START      = "2013-01-01" # 가격 수집 시작 (메타 시작보다 앞서야 함)
 
     # ── 사전등록 신호 파라미터 [고정 — 계약 §6] ────────────────────────────
     N_MIN_REPORTS      = 3      # N(a,t) < 3 이면 해당 애널리스트-월 결측 (§6.1)
@@ -1934,8 +1939,10 @@ class KofiaCollector:
         df = self.store.load_df("parsed", rel, stage="ST05")
         if df is not None and len(df):
             return df
-        legacy = self.store.find_legacy_df(["kofia"], ["analyst"]) \
-            or self.store.find_legacy_df(["전문인력"], [])
+        # DataFrame 에 `or` 를 쓰면 진리값 모호성 예외가 난다(성공 시에만 터지는 함정)
+        legacy = self.store.find_legacy_df(["kofia"], ["analyst"])
+        if legacy is None:
+            legacy = self.store.find_legacy_df(["전문인력"], [])
         if legacy is not None:
             return legacy
         try:
@@ -2875,6 +2882,10 @@ def month_anchor_frames(close_wide, uni, log):
                     H.loc[m, t] = float(last_px[t] / entry_px.loc[m, t] - 1.0)
 
     # 스냅샷 폴백 수익률 (raw 종가 — 분할 가드로 mcap 수익률 대체)
+    # ※ 라벨 규약: S.loc[m] = EOM(m-1)→EOM(m) 수익률 = '월 m 중에 실현된 수익'.
+    #   H.loc[m](= 첫영업일(m)→첫영업일(m+1))와 같은 월을 가리켜야 하므로 반드시
+    #   shift(1) 로 나눈다. shift(-1) 을 쓰면 보유월에 '다음 달' 수익이 실리고,
+    #   상장폐지 직전월의 급락이 통째로 사라진다(감사 지적 반영).
     snap_c = uni.pivot_table(index="ym", columns="ticker", values="close",
                              aggfunc="last")
     snap_m = uni.pivot_table(index="ym", columns="ticker", values="mcap",
@@ -2882,8 +2893,8 @@ def month_anchor_frames(close_wide, uni, log):
     snap_c.index = [month_ord(x) for x in snap_c.index]
     snap_m.index = [month_ord(x) for x in snap_m.index]
     snap_c, snap_m = snap_c.sort_index(), snap_m.sort_index()
-    S_raw = snap_c.shift(-1) / snap_c - 1.0
-    S_mc = snap_m.shift(-1) / snap_m - 1.0
+    S_raw = snap_c / snap_c.shift(1) - 1.0
+    S_mc = snap_m / snap_m.shift(1) - 1.0
     split_like = (S_raw < -0.35) & (S_mc > S_raw + 0.25)
     S = S_raw.mask(split_like, S_mc)
     log.info(f"[S13] 앵커 프레임: {len(months)}개월, 스냅샷 폴백 행렬 {S.shape}, "
@@ -2983,11 +2994,17 @@ class BacktestEngine:
         if col not in self.sig.columns:
             self.sig[col] = self.sig[f"z_pos_{om}"] + lam * self.sig["z_neg"]
         months = sorted(self.sig["m"].unique())
+        if not len(months):
+            return {"config": config, "ts": pd.DataFrame(),
+                    "trades": pd.DataFrame(), "holdings": {}}
+        # 신호가 0건인 달도 '연속 월 그리드'로 순회한다. 건너뛰면 다중월 보유
+        # 트랜치의 해당 월 손익이 통째로 누락된다(감사 지적 반영).
+        month_iter = range(int(months[0]), int(months[-1]) + 1)
         bt_lo, bt_hi = month_ord(CFG.BT_START_MONTH), month_ord(CFG.BT_END_MONTH)
         tranches = [dict() for _ in range(hold)]
         rows, trade_log = [], []
         holdings = {}
-        for s in months:
+        for s in month_iter:
             h = s + 1                                    # 보유월(진입: h 첫 영업일 종가)
             if not (bt_lo <= h <= bt_hi):
                 continue
@@ -3021,19 +3038,27 @@ class BacktestEngine:
             port_ret = 0.0
             gross_w = 0.0
             n_fb_tot = 0
+            hd_h, sd_h = self._month_rows(h)
             for k in range(hold):
                 w = tranches[k]
                 if not w:
                     continue
                 rets, n_fb = self._month_ret(h, list(w))
                 n_fb_tot += n_fb
-                tr_ret = sum(w[t] * rets[t] for t in w)
+                tr_ret = sum(w[t] * rets[t] for t in w)   # 소멸 종목은 rets=0
                 cash_w = 1.0 - sum(w.values())
-                tr_tot = tr_ret                           # 현금 수익 0 가정
-                port_ret += (tr_tot) / hold
+                port_ret += tr_ret / hold                 # 현금 수익 0 가정
                 gross_w += sum(w.values()) / hold
-                newv = {t: w[t] * (1 + rets[t]) for t in w}
-                tot = sum(newv.values()) + cash_w
+                # 가격이 완전히 소멸한 종목(상폐 후 등)은 그 자리에서 현금 전환한다.
+                # 트랜치에 남겨두면 다음 리밸런싱에 '이미 현금인 포지션'에 매도
+                # 수수료·슬리피지·거래세가 부과된다(감사 지적 반영).
+                newv = {t: w[t] * (1 + rets[t]) for t in w
+                        if (t in hd_h) or (t in sd_h)}
+                dead_w = sum(w[t] for t in w if t not in hd_h and t not in sd_h)
+                tot = sum(newv.values()) + cash_w + dead_w
+                if tot <= 0:
+                    tranches[k] = {}
+                    continue
                 tranches[k] = {t: v / tot for t, v in newv.items() if v > 0}
             turn = sum(to_sell.values()) + sum(to_buy.values())
             rows.append({"m": h, "ym": ord_to_ym(h), "ret_gross": port_ret,
@@ -3595,11 +3620,18 @@ def evaluate_hypotheses(engine, grid, results, es_summary, granger_res,
     # M-EXIT 플라시보 (계약 §9-7): 기계적 철회군에서 유의 효과 '없어야' 통과
     if es_summary and "M-EXIT" in es_summary:
         tm = es_summary["M-EXIT"]["t60"]
-        placebo = {"t60": tm,
-                   "status": "PASS" if (tm == tm and abs(tm) < CFG.T_CRIT) else "FAIL",
-                   "desc": f"M-EXIT CAR60 t={tm:.2f} → "
-                           + ("귀무 유지(분해 성공)" if abs(tm) < CFG.T_CRIT
-                              else "유의 효과 발생(분해 실패 — 소외주 재발견)")}
+        if tm != tm:
+            # t 계산 불가(표본 1건/분산 0) — '실패'가 아니라 '검증 불가'다.
+            # FAIL 로 두면 표본 부족만으로 최종 판정이 KILL 로 떨어진다(감사 반영).
+            placebo = {"t60": None, "status": "UNTESTABLE",
+                       "desc": f"M-EXIT 표본 부족(n={es_summary['M-EXIT']['n']}) → "
+                               "플라시보 t 산출 불가"}
+        else:
+            placebo = {"t60": tm,
+                       "status": "PASS" if abs(tm) < CFG.T_CRIT else "FAIL",
+                       "desc": f"M-EXIT CAR60 t={tm:.2f} → "
+                               + ("귀무 유지(분해 성공)" if abs(tm) < CFG.T_CRIT
+                                  else "유의 효과 발생(분해 실패 — 소외주 재발견)")}
     else:
         placebo = {"t60": np.nan, "status": "UNTESTABLE",
                    "desc": "M-EXIT 표본/일별가격 부족"}
@@ -3870,7 +3902,7 @@ def synth_generate(store, log):
         log.info("[S18] SYNTH 데이터 기생성 — 재사용")
         return
     rng = np.random.default_rng(CFG.RANDOM_SEED)
-    months = month_range("2015-01", "2026-07")
+    months = month_range(CFG.META_START_MONTH, CFG.BT_END_MONTH)
     n_kospi, n_kosdaq = 200, 120
     tickers = [f"{100000 + i * 10:06d}" for i in range(n_kospi + n_kosdaq)]
     markets = {t: ("KOSPI" if i < n_kospi else "KOSDAQ")
@@ -3879,7 +3911,8 @@ def synth_generate(store, log):
     delist = set(rng.choice(tickers, size=24, replace=False))
     delist_m = {t: str(rng.choice(months[30:-6])) for t in delist}
 
-    cal = pd.bdate_range("2015-01-02", "2026-07-31")
+    cal = pd.bdate_range(month_end_date(CFG.META_START_MONTH)
+                         - pd.Timedelta(days=31), "2026-07-31")
     n_d, n_t = len(cal), len(tickers)
     mkt_f = rng.normal(0.0003, 0.009, n_d)
     eps_i = rng.normal(0, 0.02, (n_d, n_t))
@@ -3996,7 +4029,7 @@ def synth_generate(store, log):
         d = pd.DataFrame({"date": s.index.strftime("%Y-%m-%d"), "open": s.values,
                           "high": s.values, "low": s.values, "close": s.values,
                           "volume": 1e5, "src": "synth"})
-        d["asof"] = "2026-07-31"
+        d["asof"] = str(month_end_date(CFG.BT_END_MONTH).date())
         store.save_df(d, "parsed", f"prices/{t}.parquet", scope="common",
                       desc="SYNTH 가격", stage="SYNTH")
     rep = pd.DataFrame(reports, columns=["pub_date", "ym", "ticker", "broker",
@@ -4398,6 +4431,11 @@ def main():
         except SourceDown as e:
             stage_times[sid] = round(time.time() - t0, 1)
             log.warn(f"[{sid}] 소스 중단으로 부분 완료: {e}")
+            if critical:
+                # 필수 스테이지가 None 을 반환하면 하류에서 불가해한 언패킹 에러가
+                # 난다. 여기서 명확히 끊는다(감사 지적 반영).
+                errors.append({"stage": sid, "err": f"SourceDown: {e}"})
+                raise RuntimeError(f"치명 스테이지 소스 중단: {sid}") from e
             return None
         except Exception as e:
             stage_times[sid] = round(time.time() - t0, 1)
@@ -4583,8 +4621,10 @@ def main():
                    uni.groupby("ym")["ticker"].apply(set).items()}
         ew_rows = {}
         for m in sorted(members):
-            if m in S.index:
-                cols = [t for t in members[m] if t in S.columns]
+            # 월 m 수익의 구성원은 '직전 월말(m-1) 유니버스' — PIT 편입 시점 일치
+            prev = members.get(m - 1)
+            if m in S.index and prev:
+                cols = [t for t in prev if t in S.columns]
                 if cols:
                     ew_rows[m] = float(S.loc[m, cols].mean())
         bench["EW_UNIVERSE"] = pd.Series(ew_rows).sort_index()
@@ -4763,6 +4803,22 @@ def main():
     if annual is not None:
         log.table("주 구성 연도별 수익률(net, base)",
                   annual.to_frame("연수익률").round(4))
+    # 사전등록 구간이 실제로 채워졌는지 명시 검증 — 조용한 절단 방지(감사 반영)
+    if bt_span != "N/A":
+        got_start, got_end = [x.strip() for x in bt_span.split("~")]
+        short_head = month_ord(got_start) - month_ord(CFG.BT_START_MONTH)
+        short_tail = month_ord(CFG.BT_END_MONTH) - month_ord(got_end)
+        if short_head > 0 or short_tail > 0:
+            ctx["interim"] = True
+            msg = (f"사전등록 구간 {CFG.BT_START_MONTH}~{CFG.BT_END_MONTH} 대비 "
+                   f"실제 {bt_span} (앞 {max(short_head,0)}개월 / 뒤 "
+                   f"{max(short_tail,0)}개월 미충족)")
+            log.warn(f"[ST11] {msg} — INTERIM 로 표기")
+            open_questions_add("백테스트 구간 절단", msg +
+                               ". 원인: 워밍업(룩백 12M + 통제창 24M) 구간의 리포트 "
+                               "메타 미확보 또는 수집 타임박스. 재실행 시 자동 확장됨.")
+        else:
+            log.info(f"[ST11] 사전등록 10년 구간 충족: {bt_span}")
 
     # ── ST12: 비교전략(시총 하위 1000) ────────────────────────────────────
     stage("ST12", "비교전략 — 시가총액 하위 1000 압축 유니버스",
@@ -4809,8 +4865,8 @@ def _snap_only_frames(uni):
     snap_c.index = [month_ord(x) for x in snap_c.index]
     snap_m.index = [month_ord(x) for x in snap_m.index]
     snap_c, snap_m = snap_c.sort_index(), snap_m.sort_index()
-    S_raw = snap_c.shift(-1) / snap_c - 1.0
-    S_mc = snap_m.shift(-1) / snap_m - 1.0
+    S_raw = snap_c / snap_c.shift(1) - 1.0        # 라벨 규약: 월 m 중 실현 수익
+    S_mc = snap_m / snap_m.shift(1) - 1.0
     S = S_raw.mask((S_raw < -0.35) & (S_mc > S_raw + 0.25), S_mc)
     ft = {m: month_end_date(ord_to_ym(m)) for m in S.index}
     return S, ft
