@@ -184,6 +184,39 @@ for c in sec["code"]:
 check("v1.0 규칙이면 상장·폐지 종목까지 매번 재조회했다는 사실 확인",
       set(v10_todo) >= {"000020", "000030"}, f"v1.0 todo={v10_todo} vs v1.1 todo={sorted(tc)}")
 
+print("\n=== T4b 커버리지 계산이 기대구간 안에서만 세는지 ===")
+sec2 = pd.DataFrame({
+    "code":  ["000060", "000070", "000080"],
+    "name":  ["앞7년결손", "구간밖행", "중간공백"],
+    "market": ["KOSPI"] * 3,
+    "listing_date": [pd.Timestamp("2010-01-04"), pd.Timestamp("2022-01-03"),
+                     pd.Timestamp("2010-01-04")],
+    "delisting_date": [pd.NaT, pd.NaT, pd.NaT]})
+h2 = [
+    # 상장 2010 인데 캐시는 최근 3년만 → 앞 7년 결손이 반드시 잡혀야 한다
+    pd.DataFrame({"code": "000060", "date": win[win >= "2023-08-01"]}),
+    # 상장일이 2022 로 잘못 기록됐고 캐시에는 2015~2026 전체가 있다 → 구간 밖 행이
+    # 커버리지를 부풀리지 못해야 한다(부풀면 '충분'으로 오판)
+    pd.DataFrame({"code": "000070", "date": win}),
+    # 상장 2010, 캐시는 앞뒤 끝은 있고 가운데 6년이 비었다 → 내부공백으로 잡혀야 한다
+    pd.DataFrame({"code": "000080",
+                  "date": win[(win <= "2016-06-30") | (win >= "2024-01-02")]}),
+]
+pxc3 = pd.concat(h2, ignore_index=True).assign(close=1000.0, open=1000.0, high=1000.0,
+                                               low=1000.0, volume=1.0, amount=1000.0,
+                                               src="cache")
+M["LEDGER"] = M["AttemptLedger"]()
+todo2, stats2 = M["price_gap_plan"](sec2["code"].tolist(), "2015-05-01", "2026-07-31",
+                                    sec2, pxc3, cal_full)
+t2 = {c for c, _, _ in todo2}
+print("     stats:", stats2)
+check("★앞 7년 결손을 잡아낸다", "000060" in t2)
+check("★구간 밖 행이 커버리지를 부풀리지 않는다(잘못된 상장일)",
+      stats2.get("캐시충분", 0) == 1 and "000070" not in t2,
+      f"충분={stats2.get('캐시충분', 0)}, todo={sorted(t2)}")
+check("★가운데 6년 공백을 잡아낸다", "000080" in t2)
+check("결손 종목만 수집 대상", t2 == {"000060", "000080"}, str(sorted(t2)))
+
 print("\n=== T5 repair_price_cliffs ===")
 days = BDAYS[(BDAYS >= "2018-01-02") & (BDAYS <= "2018-12-28")]
 split_pos = 60
@@ -205,6 +238,46 @@ check("보정 방향이 맞다(분할 전 가격이 53,000 수준으로 내려�
       abs(float(s["close"].iloc[0]) - 53000.0) < 1.0, f"first={float(s['close'].iloc[0]):,.0f}")
 check("분할 후 가격은 그대로", abs(float(s["close"].iloc[-1]) - 53000.0) < 1.0)
 check("정리매매는 보정하지 않고 정리매매로 분류", cnt["정리매매"] >= 1 and cnt["기업행위보정"] == 1)
+
+print("\n=== T5b 절벽 보정 엣지 (분할2회·역분할·근접절벽·첫행·마지막행) ===")
+_days = pd.bdate_range("2018-01-02", "2020-12-31")
+_n = len(_days)
+
+
+def _mk(code, cl):
+    return pd.DataFrame({"code": code, "date": _days, "close": cl, "open": cl,
+                         "high": cl, "low": cl, "volume": 100.0, "amount": cl * 100,
+                         "src": "t"})
+
+
+_cases = {
+    # 분할 10:1 후 다시 5:1 (같은 종목 2회)
+    "000010": np.r_[np.full(200, 100000.0), np.full(300, 10000.0), np.full(_n - 500, 2000.0)],
+    # 첫 행이 절벽 → 직전 가격이 없어 계산 불가. 예외 없이 무시돼야 한다.
+    "000020": np.r_[np.full(1, 100000.0), np.full(_n - 1, 5000.0)],
+    # 마지막 행이 절벽 → 이후 표본이 없어 미분류로 남아야 한다(섣불리 보정 금지).
+    "000030": np.r_[np.full(_n - 1, 10000.0), np.full(1, 1000.0)],
+    # 병합(역분할): 가격이 5배로 뛴다.
+    "000040": np.r_[np.full(300, 2000.0), np.full(_n - 300, 10000.0)],
+    # 절벽 2개가 10거래일 안에 붙어 있다 → 20일 고정창이면 서로를 오염시켜 둘 다 미분류.
+    "000050": np.r_[np.full(200, 100000.0), np.full(10, 10000.0), np.full(_n - 210, 1000.0)],
+}
+_px = pd.concat([_mk(k, v) for k, v in _cases.items()], ignore_index=True)
+_out, _cnt = M["repair_price_cliffs"](_px.copy(), {})
+for _code, _label, _tail in (("000010", "분할 2회 연속", 2000.0),
+                             ("000040", "병합(역분할)", 10000.0),
+                             ("000050", "근접 절벽 2개", 1000.0)):
+    _s = _out[_out["code"] == _code].sort_values("date")
+    _r = float(_s["close"].pct_change().abs().max())
+    check(f"{_label}: 절벽 제거", _r < 0.05, f"max|r|={_r:.4f}")
+    check(f"{_label}: 전 구간이 최종 스케일로 통일",
+          abs(float(_s["close"].iloc[0]) - _tail) < 1.0
+          and abs(float(_s["close"].iloc[-1]) - _tail) < 1.0,
+          f"first={float(_s['close'].iloc[0]):,.0f} last={float(_s['close'].iloc[-1]):,.0f}")
+check("첫 행 절벽은 예외 없이 무시", len(_out[_out["code"] == "000020"]) == _n)
+check("마지막 행 절벽은 표본 부족 → 보정하지 않음",
+      abs(float(_out[_out["code"] == "000030"].sort_values("date")["close"].iloc[0])
+          - 10000.0) < 1.0)
 
 print("\n=== T6 build_universes 무예외 진행 ===")
 M["SEC"] = sec

@@ -1627,7 +1627,10 @@ class Vault:
             if keys:
                 d = pd.concat([f for _, f in frames], ignore_index=True)
                 before = len(d)
-                d = d.drop_duplicates(keys, keep="last").reset_index(drop=True)
+                # ★ frames 는 READ_ROOTS 순서(0번=쓰기/최우선 루트)로 쌓인다. 같은 키가 여러
+                #   루트에 있으면 '최우선 루트의 행'이 이겨야 한다 — 그 루트가 우리가 방금
+                #   갱신한 곳이다. keep="last" 로 두면 오래된 보조 루트가 최신본을 덮는다.
+                d = d.drop_duplicates(keys, keep="first").reset_index(drop=True)
                 p = " + ".join(os.path.basename(os.path.dirname(os.path.dirname(x)))
                                for x, _ in frames)
                 LOG.info(f"테이블 '{name}' 을 루트 {len(frames)}곳에서 합집합 병합: "
@@ -3863,17 +3866,8 @@ def price_gap_plan(codes: Sequence[str], start: str, end: str, sec: pd.DataFrame
         lst = {c: t for c, t in zip(sec["code"].astype(str), ls) if pd.notna(t)}
         dl = {c: t for c, t in zip(sec["code"].astype(str), ds) if pd.notna(t)}
 
-    # 보유 현황: 한 번의 groupby 로 종목별 (건수, 최소일, 최대일)
-    if pxc is not None and len(pxc):
-        sub = pxc[(pxc["date"] >= start_ts) & (pxc["date"] <= end_ts)]
-        g = sub.groupby("code", observed=True)["date"]
-        cnt = g.size().to_dict()
-        mn = g.min().to_dict()
-        mx = g.max().to_dict()
-    else:
-        cnt, mn, mx = {}, {}, {}
-
-    todo: List[Tuple[str, str, str]] = []
+    # ── 종목별 기대구간 [w0, w1] 을 먼저 확정한다 ────────────────────────────────────────────
+    keep_codes, w0s, w1s = [], [], []
     for c in codes:
         why = price_structural_skip(c, names.get(c, ""))
         if why:
@@ -3888,9 +3882,38 @@ def price_gap_plan(codes: Sequence[str], start: str, end: str, sec: pd.DataFrame
         if w1 <= w0:
             stats["구간외(상장전/폐지후)"] += 1
             continue
-        i0 = int(np.searchsorted(cal_ns, np.datetime64(w0), side="left"))
-        i1 = int(np.searchsorted(cal_ns, np.datetime64(w1), side="right"))
-        exp = max(i1 - i0, 0)
+        keep_codes.append(c)
+        w0s.append(w0)
+        w1s.append(w1)
+    if not keep_codes:
+        return [], dict(stats)
+    B = pd.DataFrame({"code": keep_codes, "w0": w0s, "w1": w1s})
+
+    # ★ 보유 건수는 반드시 '기대구간 안에서만' 센다. 구간 밖 행(잘못된 상장일, 재상장 등)이
+    #   섞이면 커버리지가 부풀어 실제로 7년이 빈 종목을 '충분'으로 오판할 수 있다.
+    #   (code,date) 중복도 먼저 제거 — 캐시와 marcap 이 같은 날을 함께 갖고 있으면 이중계상.
+    cnt: Dict[str, int] = {}
+    mn: Dict[str, pd.Timestamp] = {}
+    mx: Dict[str, pd.Timestamp] = {}
+    if pxc is not None and len(pxc):
+        sub = (pxc.loc[(pxc["date"] >= start_ts) & (pxc["date"] <= end_ts), ["code", "date"]]
+               .drop_duplicates(["code", "date"]))
+        sub = sub.merge(B, on="code", how="inner")
+        sub = sub[(sub["date"] >= sub["w0"]) & (sub["date"] <= sub["w1"])]
+        if len(sub):
+            g = sub.groupby("code", observed=True)["date"]
+            cnt = g.size().to_dict()
+            mn = g.min().to_dict()
+            mx = g.max().to_dict()
+
+    i0a = np.searchsorted(cal_ns, B["w0"].to_numpy(dtype="datetime64[ns]"), side="left")
+    i1a = np.searchsorted(cal_ns, B["w1"].to_numpy(dtype="datetime64[ns]"), side="right")
+    expa = np.maximum(i1a - i0a, 0)
+
+    todo: List[Tuple[str, str, str]] = []
+    for k, c in enumerate(B["code"]):
+        w0, w1 = pd.Timestamp(B["w0"].iloc[k]), pd.Timestamp(B["w1"].iloc[k])
+        i0, i1, exp = int(i0a[k]), int(i1a[k]), int(expa[k])
         if exp < 20:
             stats["기대거래일<20"] += 1
             continue
@@ -3954,7 +3977,8 @@ def repair_price_cliffs(px: pd.DataFrame, delist: Dict[str, Any]
         dt_arr = px.loc[idx, "date"].to_numpy()
         mask = hit.to_numpy()[px.index.get_indexer(idx)]
         dl_t = as_ts(delist.get(c)) if delist else None
-        for pos in np.flatnonzero(mask):
+        cliff_pos = np.flatnonzero(mask)
+        for j, pos in enumerate(cliff_pos):
             if pos == 0 or not np.isfinite(cl_arr[pos - 1]) or cl_arr[pos - 1] <= 0:
                 continue
             ratio = float(cl_arr[pos] / cl_arr[pos - 1])       # 절벽 당일 가격비
@@ -3964,11 +3988,16 @@ def repair_price_cliffs(px: pd.DataFrame, delist: Dict[str, Any]
             if dl_t is not None and pd.notna(dl_t) and -5 <= (dl_t - d).days <= 40:
                 out["정리매매"] += 1                            # 가격제한폭 없음 — 실제 급락
                 continue
-            pre = cl_arr[max(0, pos - 20):pos]
-            post = cl_arr[pos:pos + 20]
+            # ★ 수준비교 창은 '이웃 절벽에서 끊는다'. 20일 고정창을 쓰면 절벽 두 개가 20일
+            #   안에 붙어 있을 때(분할 후 곧 병합, 분할 직후 폭락 등) 서로의 중앙값을 오염시켜
+            #   둘 다 미분류로 흘러가고 보정이 아예 안 된다(엣지 시험에서 실측).
+            lo = int(cliff_pos[j - 1]) if j > 0 else 0
+            hi = int(cliff_pos[j + 1]) if j + 1 < len(cliff_pos) else len(cl_arr)
+            pre = cl_arr[max(lo, pos - 20):pos]
+            post = cl_arr[pos:min(hi, pos + 20)]
             pre = pre[np.isfinite(pre)]
             post = post[np.isfinite(post)]
-            if len(pre) >= 5 and len(post) >= 5:
+            if len(pre) >= 3 and len(post) >= 3:
                 lvl = float(np.median(post)) / max(float(np.median(pre)), 1e-9)
                 if abs(lvl / ratio - 1.0) < 0.20:
                     # 수준 이동이 지속 → 분할/병합. 절벽 이전 가격을 1/ratio 로 나눠(=×ratio)
@@ -4421,7 +4450,25 @@ def krx_net_purchases(frm: str, to: str, invst_tp: str,
     out = pd.DataFrame({"code": d["ISU_SRT_CD"].astype(str).map(to_code6),
                         "net_buy": _num_kr(d[net_c])})
     out = out.dropna(subset=["code"]).groupby("code", as_index=False)["net_buy"].sum()
-    return out if len(out) else None
+    if not len(out):
+        return None
+    # ★ 반쪽 시장 방어: mktId="ALL" 인데 KRX 가 조용히 KOSPI 만 돌려주면(과거 실제로 있던
+    #   동작) 코스닥 종목의 F6/F7 이 통째로 결측이 되고, 그 상태가 'cells_ok=2' 로 캐시에
+    #   영구 고착된다. ALL 요청의 최소 종목수를 확인하고 미달이면 시장별로 나눠 다시 받는다.
+    if str(mkt_id).upper() == "ALL" and len(out) < 1000:
+        parts = []
+        for mk in ("STK", "KSQ"):
+            r = krx_net_purchases(frm, to, invst_tp, mkt_id=mk)
+            if r is not None and len(r):
+                parts.append(r)
+        if parts:
+            merged = (pd.concat(parts, ignore_index=True)
+                        .groupby("code", as_index=False)["net_buy"].sum())
+            if len(merged) > len(out):
+                LOG.debug(f"순매수 ALL 응답이 {len(out)}종목뿐 → 시장별 재조회로 "
+                          f"{len(merged)}종목 확보")
+                return merged
+    return out
 
 
 def _pykrx_net_purchases(frm: str, to: str, market: str, investor: str
