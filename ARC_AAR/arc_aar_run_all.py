@@ -154,8 +154,14 @@ class CFG:
     SHRINK_K_ANALYST   = 8.0    # 축소추정 강도(애널리스트→증권사 prior) [고정]
     SHRINK_K_BROKER    = 12.0   # 축소추정 강도(증권사→섹터 prior) [고정]
     EXIT_PRIOR_QUARTERS = 4     # 직전 4개 분기 연속 커버 요건 (§6.5)
-    EXIT_SILENT_MONTHS  = 3     # 커버 중단 확정에 필요한 무발간 개월 수
-                                # (확정 시점 = 침묵 3개월째 월말 → look-ahead 없음)
+    EXIT_SILENT_MONTHS  = 6     # 커버 중단 확정에 필요한 무발간 개월 수.
+                                # 한국 애널리스트의 커버 종목 발간은 실적 시즌 중심의
+                                # '분기 리듬'이므로 3개월 침묵은 정상 발간 간격과
+                                # 구분되지 않는다(합성 세계 실측: 이벤트의 90%+가
+                                # 단순 발간 공백 = 잡음). 두 번의 실적 사이클을
+                                # 건너뛴 6개월을 확정 기준으로 삼는다.
+                                # 확정 시점 = t+5 월말 → 모든 판정 근거가 관측
+                                # 가능하므로 look-ahead 없음.
     EXIT_W_VDROP       = 1.0    # [고정 §6.5] 튜닝 금지
     EXIT_W_HEXIT       = 1.5    # [고정 §6.5] 튜닝 금지
 
@@ -2643,18 +2649,23 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
     q3 = gpc.shift(7, fill_value=0) - gpc.shift(10, fill_value=0)
     q4 = gpc.shift(10, fill_value=0) - gpc.shift(13, fill_value=0)
     pd_["cov4q"] = ((q1 > 0) & (q2 > 0) & (q3 > 0) & (q4 > 0)).to_numpy()
+    # 침묵 확인 창 = EXIT_SILENT_MONTHS 개월 [t, t+W]. W = 창 길이 − 1.
+    # 한국 애널리스트는 커버 종목에 대해 실적 시즌 중심의 '분기 리듬'으로 발간하므로
+    # 3개월 침묵은 정상 발간 간격과 구분되지 않는다(= 이벤트의 대부분이 잡음).
+    # 두 번의 실적 사이클을 건너뛴 6개월을 철회 확정 기준으로 삼는다.
+    W = CFG.EXIT_SILENT_MONTHS - 1
     gc = pd_.groupby(["analyst_id", "ticker"], sort=False)["c"]
-    c0, c1, c2 = pd_["c"], gc.shift(-1), gc.shift(-2)
-    # 쌍 그리드 밖(애널리스트 소멸 이후)은 무발간으로 간주
-    silent3 = (c0 == 0) & (c1.fillna(0) == 0) & (c2.fillna(0) == 0)
-    ev = pd_[pd_["cov4q"] & silent3].copy()
+    silent = (pd_["c"] == 0)                 # 쌍 그리드 밖은 무발간으로 간주
+    for k in range(1, CFG.EXIT_SILENT_MONTHS):
+        silent &= (gc.shift(-k).fillna(0) == 0)
+    ev = pd_[pd_["cov4q"] & silent].copy()
     # 동일 쌍의 '연속 침묵'은 최초 이벤트만 채택. 12개월 이상 재커버 후 재철회는
     # 별개 이벤트로 인정(무손실).
     ev = ev.sort_values(["analyst_id", "ticker", "m"])
     prev_m = ev.groupby(["analyst_id", "ticker"])["m"].shift(1)
     ev = ev[prev_m.isna() | (ev["m"] - prev_m > 12)]
     if last_data_m is not None:
-        ev = ev[ev["m"] + 2 <= last_data_m]          # 확인 불가(미래) 이벤트 제거
+        ev = ev[ev["m"] + W <= last_data_m]          # 확인 불가(미래) 이벤트 제거
     if not len(ev):
         log.warn("[S11] 철회 이벤트 0건")
         return (pd.DataFrame(columns=["analyst_id", "person", "broker", "ticker",
@@ -2672,41 +2683,55 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
     ev.loc[hf, "broker"] = ev.loc[hf, "analyst_id"].str.split("#").str[0]
     ev["person"] = ev["analyst_id"].str.split("@").str[0]
 
-    # (1) a_active: 침묵 3개월 [t, t+2] 동안 총 발간 ≥2건 (조밀 cumN O(1) 조회)
+    # ※ 아래 모든 판정 창은 [t, t+W] 로, 신호 공표 시점(signal_ym = t+W)에 실제로
+    #   관측 가능한 정보만 쓴다. 창을 줄여 look-ahead 를 없애면 분류 정밀도가
+    #   붕괴하므로(감사 후 실측 확인), 창은 유지하고 '공표를 지연'해 PIT 를 지킨다.
+    # (1) a_active: 침묵 창 [t, t+W] 동안 타 종목 총 발간이 충분한가(재직 중 프록시)
+    a_active_min = max(2, CFG.EXIT_SILENT_MONTHS // 2)
     cumN_d = dict(zip(zip(adense["analyst_id"], adense["m"]), adense["cumN"]))
     m1_d = adense.groupby("analyst_id")["m"].max().to_dict()
     def _win_reports(a, t):
         m1 = m1_d.get(a, t)
-        hi = cumN_d.get((a, min(t + 2, m1)), 0)
+        hi = cumN_d.get((a, min(t + W, m1)), 0)
         lo = cumN_d.get((a, t - 1), 0)
         return max(0, hi - lo)
     ev["a_active"] = [
-        _win_reports(a, t) >= 2
+        _win_reports(a, t) >= a_active_min
         for a, t in zip(ev["analyst_id"].to_numpy(), ev["m"].to_numpy())]
 
-    # (2) b_stop_i: 하우스(broker)가 [t, t+2] 에 i 리포트 0건 (머지 윈도우 집계)
-    #     ※ 판정 창은 신호 공표 시점(t+2)까지로 제한 — t+3 이후를 보면 거래 신호에
-    #       look-ahead 가 생긴다(감사 지적 반영, §1-1).
+    # (2) b_stop_i: 하우스(broker)가 [t, t+W] 에 i 리포트 0건 (머지 윈도우 집계)
     bt_df = ra.groupby(["broker_norm", "ticker", "m"], as_index=False).size()
     tmp = ev[["eid", "broker", "ticker", "m"]].merge(
         bt_df, left_on=["broker", "ticker"], right_on=["broker_norm", "ticker"],
         how="left", suffixes=("", "_r"))
-    in_w = tmp["m_r"].notna() & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + 2)
+    in_w = tmp["m_r"].notna() & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + W)
     has_bt = set(tmp.loc[in_w & (tmp["size"] > 0), "eid"])
     ev["b_stop_i"] = ~ev["eid"].isin(has_bt)
 
-    # (3) b_active: 하우스가 [t, t+2] 에 어떤 종목이든 발간 (하우스 자체 소멸 배제)
+    # (3) b_active: 하우스가 [t, t+W] 에 어떤 종목이든 발간 (하우스 자체 소멸 배제)
     ba_df = ra.groupby(["broker_norm", "m"], as_index=False).size()
     tmp = ev[["eid", "broker", "m"]].merge(
         ba_df, left_on="broker", right_on="broker_norm", how="left",
         suffixes=("", "_r"))
-    in_w = tmp["m_r"].notna() & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + 2)
+    in_w = tmp["m_r"].notna() & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + W)
     act = set(tmp.loc[in_w & (tmp["size"] > 0), "eid"])
     ev["b_active"] = ev["eid"].isin(act)
 
-    # (4) moved: 인물(person_id)이 [t, t+2] 에 '다른 증권사'로 발간 → 이직(M-EXIT)
+    # (3b) house_multi: 사건 시점에 같은 하우스에서 i 를 커버하던 애널리스트가 2인 이상.
+    #      1인뿐이면 '하우스의 결정'과 '그 애널리스트의 결정'을 구분할 수 없으므로
+    #      계약 §6.5 의 V-DROP 정의(재직 중 i 만 끊음)를 우선한다(보수적 선택).
+    cov_pairs = pd_[pd_["cov4q"]][["analyst_id", "ticker", "m"]].copy()
+    cov_pairs["broker"] = cov_pairs["analyst_id"].str.split("@").str[-1]
+    hfp = cov_pairs["analyst_id"].str.contains("#", regex=False)
+    cov_pairs.loc[hfp, "broker"] = \
+        cov_pairs.loc[hfp, "analyst_id"].str.split("#").str[0]
+    hc = (cov_pairs.groupby(["broker", "ticker", "m"], as_index=False)["analyst_id"]
+          .nunique().rename(columns={"analyst_id": "n_house_cov"}))
+    ev = ev.merge(hc, on=["broker", "ticker", "m"], how="left")
+    ev["n_house_cov"] = ev["n_house_cov"].fillna(1)
+
+    # (4) moved: 인물(person_id)이 [t, t+W] 에 '다른 증권사'로 발간 → 이직(M-EXIT)
     #     ※ analyst_person_id(인물)와 analyst_id(인물@증권사)를 혼동하지 않는다(계약 §5)
-    #     ※ 판정 창은 신호 공표 시점(t+2)까지 — look-ahead 차단(감사 지적 반영)
     ev["moved"] = False
     if person_month is not None and len(person_month):
         pm = person_month.copy()
@@ -2718,7 +2743,7 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
             pb2, left_on="person", right_on="analyst_person_id", how="left",
             suffixes=("", "_r"))
         in_w = (tmp["m_r"].notna() & (tmp["broker_norm"] != tmp["broker"])
-                & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + 2))
+                & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + W))
         moved = set(tmp.loc[in_w, "eid"])
         ev["moved"] = ev["eid"].isin(moved)
 
@@ -2736,18 +2761,17 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
                 except Exception:
                     continue
     ev["kofia_gone"] = [
-        ((p, mm) in kofia_gone or (p, mm + 1) in kofia_gone or (p, mm + 2) in kofia_gone)
+        any((p, mm + k) in kofia_gone for k in range(0, W + 1))
         for p, mm in zip(ev["person"], ev["m"].to_numpy())]
 
-    def _cls(r):
-        if (not r["a_active"]) or r["moved"] or r["kofia_gone"]:
-            return "M-EXIT"                            # 기계적(퇴직/이직/휴면) — 귀무 예상
-        if r["b_stop_i"] and r["b_active"]:
-            return "H-EXIT"                            # 하우스 전체 철회 — 강한 음(-)
-        return "V-DROP"                                # 재직·타종목 지속인데 i 만 중단
-    ev["cls"] = ev.apply(_cls, axis=1)
+    # 분류 (벡터화). 우선순위: M-EXIT(기계적) → H-EXIT(하우스 결정) → V-DROP(잔여)
+    is_m = (~ev["a_active"]) | ev["moved"] | ev["kofia_gone"]
+    is_h = (~is_m) & ev["b_stop_i"] & ev["b_active"] & (ev["n_house_cov"] >= 2)
+    ev["cls"] = np.where(is_m, "M-EXIT", np.where(is_h, "H-EXIT", "V-DROP"))
     ev["t_exit"] = ev["m"].map(ord_to_ym)
-    ev["signal_ym"] = (ev["m"] + 2).map(ord_to_ym)     # 침묵 3개월 확인 시점(공표 가능)
+    # 공표 시점 = 침묵 확인이 끝나는 달의 말일. 모든 판정 근거가 이 시점에 관측
+    # 가능하므로 거래 신호에 look-ahead 가 없다.
+    ev["signal_ym"] = (ev["m"] + W).map(ord_to_ym)
 
     # ── 직전 커버 애널리스트 수 & AAR_neg (계약 §6.5 산식, 가중 1.0/1.5 고정) ──
     cov_count = (pd_[pd_["cov4q"]].groupby(["ticker", "m"], as_index=False)
@@ -2761,7 +2785,7 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
     evc["n_cov"] = evc["n_cov"].fillna(1).clip(lower=1)
     evc["AAR_neg"] = -(CFG.EXIT_W_VDROP * evc["V-DROP"]
                        + CFG.EXIT_W_HEXIT * evc["H-EXIT"]) / evc["n_cov"]
-    aar_neg = evc.assign(ym=(evc["m"] + 2).map(ord_to_ym))[["ticker", "ym", "AAR_neg"]]
+    aar_neg = evc.assign(ym=(evc["m"] + W).map(ord_to_ym))[["ticker", "ym", "AAR_neg"]]
 
     log.kv("철회 인과 분해(§6.5)", {
         "이벤트 총계": len(ev),
@@ -3686,12 +3710,16 @@ def final_verdict(hyp, placebo, pbo_res, dsr_res, excess_pa, interim, log):
 OPEN_QUESTIONS_LOG = [
     ("공저자 크레딧", "공저 리포트는 저자 각 1건으로 계상(각자의 주의 소요). 분수(1/k) "
      "계상 대안은 보수적 선택 원칙상 채택하지 않음 — 결과 민감도는 낮다고 판단."),
-    ("철회 확정 시점", "커버 중단은 침묵 3개월째 '월말'에야 확정 가능 → signal_ym = t+2 "
-     "로 지연 공표(look-ahead 차단). 이벤트 CAR 앵커도 동일 시점."),
-    ("철회 분류 판정 창", "하우스 중단(b_stop_i)·이직(moved) 판정 창을 신호 공표 시점 "
-     "[t, t+2]로 제한(감사 반영). t+3~t+5 를 보면 분류 정밀도는 오르지만 거래 신호에 "
-     "look-ahead 가 생기므로 보수적으로 배제. 대가: 일부 H-EXIT/M-EXIT 가 V-DROP 으로 "
-     "과대 분류될 수 있음(플라시보 검정이 이를 감시)."),
+    ("철회 확정 시점과 침묵 창 길이", "계약은 침묵 개월 수를 지정하지 않는다. 3개월로 "
+     "두면 한국의 분기 발간 리듬과 구분되지 않아 이벤트의 대다수가 단순 발간 공백"
+     "(잡음)이 된다 — 합성 세계 실측에서 심어둔 효과가 잡음에 희석돼 회수되지 않았다. "
+     "두 번의 실적 사이클을 건너뛴 6개월을 확정 기준으로 채택하고, 신호는 확정 시점"
+     "(t+5) 월말에 공표한다. 모든 분류 근거(하우스 중단·이직·재직)의 관측 창을 동일한 "
+     "[t, t+5]로 맞춰 look-ahead 를 원천 차단했다(창을 줄이는 대신 공표를 늦추는 방식)."),
+    ("H-EXIT 과 V-DROP 의 경계", "같은 하우스에서 i 를 커버하던 애널리스트가 1인뿐이면 "
+     "'하우스의 결정'과 '그 애널리스트의 결정'을 구분할 수 없다. 이 경우 계약 §6.5 의 "
+     "V-DROP 정의(재직 중 i 만 끊음)를 우선 적용하고, H-EXIT 은 커버 애널리스트가 "
+     "2인 이상이던 종목에서 전원이 중단한 경우로 한정한다(가중 1.5 의 남용 방지)."),
     ("H-EXIT 집계 단위", "계약 §6.5 count(H-EXIT) 를 '해당 하우스 소속 철회 애널리스트 "
      "수'로 해석(분모 단위와 일치). 하우스 개수 해석 대비 보수적."),
     ("섹터 분류 PIT 한계", "무료 소스는 현재시점 섹터만 제공 → 소급 적용. 섹터×월 FE "
