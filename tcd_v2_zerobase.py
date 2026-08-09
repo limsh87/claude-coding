@@ -342,11 +342,17 @@ if HAVE.get("FinanceDataReader"):
         import FinanceDataReader as fdr            # type: ignore
     except Exception:
         fdr = None
+PKX_WHY = ""
 if HAVE.get("pykrx"):
     try:
         from pykrx import stock as pykrx_stock     # type: ignore
-    except Exception:
+    except Exception as _e:                        # noqa
         pykrx_stock = None
+        # ★임포트 실패를 조용히 삼키면 "왜 전종목 경로가 안 도나"를 알 수 없다.
+        #   최신 파이썬(3.13/3.14)에는 아직 휠이 없는 서드파티가 흔하다.
+        PKX_WHY = f"임포트 실패({type(_e).__name__}: {str(_e)[:70]})"
+else:
+    PKX_WHY = "미설치"
 if HAVE.get("yfinance"):
     try:
         import yfinance as yf                      # type: ignore
@@ -1718,6 +1724,9 @@ _UA_SET = [
 ]
 _NETLOCAL = threading.local()
 NET_STATS: Counter = Counter()
+# ★소스별 '마지막 응답 증거' — 상태코드와 본문 앞부분. 수집이 조용히 0행으로 끝났을 때
+#   "서버가 실제로 뭘 돌려줬는가"를 로그로 보여주기 위한 것. 이게 없어서 두 번을 헤맸다.
+NET_LAST: Dict[str, Tuple[Any, str]] = {}
 _NET_LK = threading.Lock()
 
 
@@ -1806,6 +1815,8 @@ def net_get(url: str, source: str = "generic", params: Optional[dict] = None,
             r = _sess().get(url, params=params, headers=hdr, timeout=timeout)
             with _NET_LK:
                 NET_STATS[f"{source}:{r.status_code}"] += 1
+                NET_LAST[source] = (r.status_code, (r.content[:220] or b"")
+                                    .decode("utf-8", "replace").replace("\n", " "))
             if r.status_code == 200:
                 return r.content if as_bytes else smart_decode(r.content, r.encoding, prefer_enc)
             if r.status_code in (429, 503):
@@ -1836,6 +1847,8 @@ def net_post(url: str, source: str = "generic", data: Optional[dict] = None,
             r = _sess().post(url, data=data, headers=hdr, timeout=timeout)
             with _NET_LK:
                 NET_STATS[f"{source}:P{r.status_code}"] += 1
+                NET_LAST[source] = (r.status_code, (r.content[:220] or b"")
+                                    .decode("utf-8", "replace").replace("\n", " "))
             if r.status_code == 200:
                 return r.content if as_bytes else smart_decode(r.content, r.encoding)
         except Exception as e:                                    # noqa
@@ -2517,7 +2530,10 @@ class KRXMarketplace:
         락을 잡지 않는 만큼 왕복 지연만 겹쳐 사라진다(2,700일 × 0.6초 대기가 통째로 증발)."""
         if not self.session_ok and not force:
             return None
-        body = {"bld": bld, "money": "1", "share": "1", "csvxls_isNo": "false", **params}
+        # ★locale 누락 수정 — data.krx.co.kr 의 bld 게이트웨이는 locale 이 없으면 200 을 주면서
+        #   내용은 빈/오류 페이로드를 돌려주는 경우가 있다. 정상 클라이언트는 항상 함께 보낸다.
+        body = {"bld": bld, "locale": "ko_KR", "money": "1", "share": "1",
+                "csvxls_isNo": "false", **params}
         if serial:
             with self._lk:
                 txt = net_post(self.JSON_URL, source="krx", data=body, referer=self.JSON_REF,
@@ -2535,6 +2551,19 @@ class KRXMarketplace:
             if isinstance(js, dict) and isinstance(js.get(key), list):
                 return js[key]
         return None
+
+
+    def bld_market_split(self, bld: str, **params) -> Optional[list]:
+        """mktId='ALL' 이 빈손이면 시장별로 쪼개 합친다 — 배포본에 따라 ALL 을 거부한다."""
+        got = self.bld(bld, serial=False, force=True, mktId="ALL", **params)
+        if got:
+            return got
+        out: List[dict] = []
+        for mk in ("STK", "KSQ", "KNX"):
+            r = self.bld(bld, serial=False, force=True, mktId=mk, **params)
+            if r:
+                out += r
+        return out or None
 
 
 KRX = KRXMarketplace(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW)
@@ -3417,8 +3446,8 @@ def _bulk_krx_mp(day: pd.Timestamp) -> Optional[pd.DataFrame]:
     로그인 세션이 있을 때 1순위. ★한 번 호출 = 그날 상장 전 종목."""
     # ★로그인 여부로 막지 않는다 — 전종목시세(MDCSTAT01501)는 세션 없이도 응답하는 경우가
     #   많고, 아니면 bld() 가 JSON 아님을 보고 None 을 돌려주므로 다음 소스로 넘어갈 뿐이다.
-    blk = KRX.bld("dbms/MDC/STAT/standard/MDCSTAT01501", mktId="ALL",
-                  trdDd=day.strftime("%Y%m%d"), serial=False, force=True)
+    blk = KRX.bld_market_split("dbms/MDC/STAT/standard/MDCSTAT01501",
+                               trdDd=day.strftime("%Y%m%d"))
     if not blk:
         return None
     rows = []
@@ -3482,7 +3511,105 @@ def _bulk_pykrx(day: pd.Timestamp) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PX_BULK_COLS) if len(d) else None
 
 
-BULK_CHAIN = [("krx_open", _bulk_krx_open), ("krx_mp", _bulk_krx_mp), ("pykrx", _bulk_pykrx)]
+def _bulk_fdrcache(day: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """FDR GitHub 일별 상장목록(raw.githubusercontent) — 로그인·키 불필요 날짜축 소스.
+    ★종가·시가총액·상장주식수만 있고 시·고·저·거래량이 없다. 그래서 '최후 보루'다:
+      거래대금이 없으면 V6 유동성 필터가 동작하지 않으므로, 이 소스만 살아 있는 경우
+      harvest_prices 가 그 사실을 경고로 명시한다."""
+    raw = net_get(_FDR_CACHE_URL.format(kind="listing/krx", date=day.strftime("%Y-%m-%d")),
+                  source="fdrcache", tries=1, as_bytes=True)
+    if not raw or len(raw) < 400:
+        return None
+    try:
+        d = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig",
+                        dtype={"Code": str, "Symbol": str})
+    except Exception:
+        return None
+    c = {str(x).strip().lower(): x for x in d.columns}
+    code_c = c.get("code") or c.get("symbol")
+    close_c = c.get("close")
+    if not code_c or not close_c:
+        return None
+    out = pd.DataFrame({
+        "code": d[code_c].map(code6),
+        "close": pd.to_numeric(d[close_c], errors="coerce"),
+        "mktcap": pd.to_numeric(d[c["marcap"]], errors="coerce") if "marcap" in c else np.nan,
+        "shares": pd.to_numeric(d[c["stocks"]], errors="coerce") if "stocks" in c else np.nan,
+    }).dropna(subset=["code", "close"])
+    if not len(out):
+        return None
+    out["open"] = out["high"] = out["low"] = out["close"]
+    out["volume"] = np.nan
+    out["value"] = np.nan
+    out["date"], out["origin"] = day, "fdrcache"
+    return out.reindex(columns=PX_BULK_COLS)
+
+
+BULK_CHAIN = [("krx_open", _bulk_krx_open), ("krx_mp", _bulk_krx_mp),
+              ("pykrx", _bulk_pykrx), ("fdrcache", _bulk_fdrcache)]
+
+
+def px_preflight(cal: pd.DatetimeIndex, n_universe: int = 0) -> List[Tuple[str, Callable]]:
+    """★대량 루프 전 소스 실측 — 이번 개편에서 가장 중요한 안전장치.
+
+    지난 두 번의 실패는 전부 같은 모양이었다: '되는 줄 알았던 소스'로 수천 번을 돌다가
+    빈 응답만 쌓이고, 로그에는 "데이터를 한 종목도 못 얻었다"는 결과만 남았다.
+    서버가 실제로 뭘 돌려줬는지가 어디에도 없어서 원인을 못 좁혔다.
+    → 이제는 실제 거래일 3개로 각 소스를 먼저 찔러 보고, 응답 행수와 실패 사유(HTTP 상태·
+      응답 앞부분)를 표로 찍은 뒤, ★측정된 결과로만★ 수집 체인을 정한다.
+    비용은 최대 소스수×3 회다.
+    """
+    probe = [d for d in cal[-40:][::-1]][:3] or list(cal[-3:])
+    # 판정 임계는 절대값이 아니라 '유니버스 대비 비율'이다. 전종목 스냅샷이라면 마스터의
+    # 최소 5% 는 나온다(마스터에는 상장폐지분이 절반쯤 섞여 있으므로 넉넉히 잡은 값).
+    thr = max(20, int(0.05 * max(n_universe, 0)))
+    rows, live = [], []
+    for name, fn in BULK_CHAIN:
+        best, err = 0, ""
+        for dd in probe:
+            try:
+                r = fn(dd)
+            except Exception as e:                                # noqa
+                err = err or f"{type(e).__name__}: {str(e)[:60]}"
+                r = None
+            if r is not None and len(r):
+                best = max(best, int(len(r)))
+        ok = best >= thr
+        if ok:
+            live.append((name, fn))
+        if not ok and not err:
+            st, head = NET_LAST.get({"krx_open": "krx", "krx_mp": "krx", "pykrx": "krx",
+                                     "fdrcache": "fdrcache"}.get(name, name), ("—", ""))
+            err = _preflight_why(name, st, head, best, thr)
+        rows.append([name, f"{best:,}" if best else "0", "✔ 사용" if ok else "✘ 미사용",
+                     ("" if ok else err[:78])])
+    L.grid(rows, ["벌크 소스", "응답 행수(최대)", "판정", "미사용 사유 / 서버가 돌려준 것"],
+           ["l", "r", "c", "l"],
+           title=f"가격 소스 프리플라이트 (실측 {len(probe)}거래일 · 합격선 {thr:,}행) "
+                 f"— 되는 것만 씁니다")
+    return live
+
+
+def _preflight_why(name: str, st: Any, head: str, got: int, thr: int = 0) -> str:
+    """되지 않는 이유를 사람이 바로 조치할 수 있는 말로 번역한다."""
+    if got and thr and got < thr:
+        return f"응답은 왔으나 {got:,}행뿐(합격선 {thr:,}) — 전종목 스냅샷이 아님"
+    if name == "krx_open":
+        if not KRX_OPENAPI_KEY:
+            return "KRX_OPENAPI_KEY 미입력(선택 항목 — 없어도 됩니다)"
+        return f"키는 있으나 사용 불가({KRXOA.state}) — 엔드포인트별 이용신청 승인 필요"
+    if name == "pykrx":
+        if pykrx_stock is None:
+            return f"pykrx 임포트 실패 — 파이썬 {ENVX['python']} 용 휠이 없을 수 있습니다"
+        if not _PKX_BULK:
+            return "설치된 pykrx 에 전종목 일봉 함수가 없습니다(구버전)"
+        return f"pykrx 호출이 빈손(HTTP {st}) · 응답머리: {head[:60]}"
+    if name == "krx_mp":
+        return (f"HTTP {st} · 응답머리: {head[:60]}" if head else
+                f"HTTP {st} — data.krx.co.kr 차단/세션 문제 추정")
+    if name == "fdrcache":
+        return f"해당 날짜 파일 없음(HTTP {st}) — 이 캐시는 최근분만 보관합니다"
+    return f"HTTP {st} · {head[:60]}"
 
 
 # ── ③ 잔여 보충용 종목축 소스 (벌크가 못 덮은 극소수 전용) ──────────────────────────────────
@@ -3650,13 +3777,100 @@ def apply_corporate_actions(px: pd.DataFrame) -> pd.DataFrame:
     return px
 
 
-def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
+def _sweep_per_stock(codes: Sequence[str], start: str, end: str,
+                     order_hint: Optional[pd.Series] = None) -> Optional[pd.DataFrame]:
+    """★종목당 정확히 1회 호출로 10년치를 받는 스윕 — 벌크가 전멸했을 때의 실질 폴백.
+
+    처음 참사가 난 종목축과 결정적으로 다르다:
+      · 그때는 종목 1개에 소스 5개 × 내부 재시도 × yfinance 이중접미사(.KS/.KQ) 였다.
+        죽은 종목 2,500개가 각각 5~7 왕복을 태워 4시간을 통째로 먹었다.
+      · 지금은 종목 1개 = 호출 1회(FDR). 실패하면 그 자리에서 음성캐시에 적히고 끝이다.
+        5,400종목 × 1회 = QPS 2.5 에서 약 36분. 예산 안에 충분히 들어간다.
+    시가총액 큰 순서로 돌기 때문에 시간예산에 잘려도 '거래 가능한 종목'이 먼저 채워진다.
+    """
+    codes = [c for c in dict.fromkeys(map(code6, codes)) if c]
+    if not codes:
+        return None
+    if order_hint is not None and len(order_hint):
+        rank = {str(k): i for i, k in enumerate(order_hint.index)}
+        codes.sort(key=lambda c: rank.get(c, 10 ** 9))
+    today_ts = pd.Timestamp(dtm.date.today())
+    neg = VAULT.load_table("price_fail_log", "shared")
+    skip: Dict[str, pd.Timestamp] = {}
+    if neg is not None and len(neg):
+        neg = neg.copy()
+        neg["tried_at"] = ds_(neg["tried_at"])
+        neg = neg.sort_values("tried_at").drop_duplicates("code", keep="last")
+        skip = {str(r.code): r.tried_at for r in neg.itertuples(index=False)}
+    todo = [c for c in codes
+            if not (c in skip and pd.notna(skip[c])
+                    and (today_ts - skip[c]).days < RETRY_FAILED_AFTER_D)]
+    if not todo:
+        return None
+    L.warn(f"벌크(날짜축) 소스가 하나도 살아 있지 않아 ★종목당 1회 스윕★ 으로 전환합니다 — "
+           f"{len(todo):,}종목 × 1회 (예상 {len(todo)/max(QPS_CAP.get('krx',2.5),0.1)/60:.0f}분). "
+           f"실패 종목은 즉시 음성캐시에 기록되어 다시 조회하지 않습니다.")
+    QUOTA.plan("krx", len(todo), "종목당 1회 스윕(벌크 전멸 폴백)")
+
+    def one(c):
+        for nm, fn in (("fdr", _px_fdr), ("naver", _px_naver)):
+            try:
+                d = fn(c, start, end)
+            except Exception:
+                d = None
+            if d is not None and len(d.dropna(subset=["date"])):
+                return c, d.dropna(subset=["date"])
+        return c, None
+
+    got: List[pd.DataFrame] = []
+    bad: List[dict] = []
+    n_done = 0
+    bar = tqdm(total=len(todo), desc="일봉(종목당 1회)", ncols=88, leave=False)
+    for batch in chunked(todo, 300):
+        if CLOCK.over():
+            CLOCK.cut(f"종목 스윕: {n_done:,}/{len(todo):,}종목에서 중단(이어받음)")
+            break
+        for item in pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True):
+            if not item:
+                continue
+            c, d = item
+            (got.append(d) if d is not None else bad.append({"code": c, "tried_at": today_ts}))
+        n_done += len(batch)
+        bar.update(len(batch))
+        if got:                       # ★배치마다 즉시 저장 — 도중에 끊겨도 남는다
+            add = _px_norm(pd.concat([g.reindex(columns=PX_BULK_COLS) for g in got],
+                                     ignore_index=True))
+            VAULT.save_shard("krx_ohlcv_daily", add,
+                             key=f"sweep_{dtm.datetime.now():%Y%m%d_%H%M%S}_{n_done}",
+                             scope="shared", domain="price", source="per_stock_sweep")
+            got = []
+        if bad:
+            base = VAULT.load_table("price_fail_log", "shared")
+            allf = pd.concat([base, pd.DataFrame(bad)], ignore_index=True) \
+                if base is not None and len(base) else pd.DataFrame(bad)
+            VAULT.save_table("price_fail_log",
+                             allf.sort_values("tried_at").drop_duplicates("code", keep="last"),
+                             "shared", domain="price", source="negative_cache")
+            bad = []
+    bar.close()
+    fresh = VAULT.load_frame("krx_ohlcv_daily", "shared")
+    return _px_norm(fresh) if fresh is not None and len(fresh) else None
+
+
+def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     """전 종목 일봉 — ★날짜축 벌크. 거래일 1회 호출 = 그날 상장 전 종목.
 
     · 이미 받은 거래일은 원장(price_dates_done)이 막아 두 번 다시 조회하지 않는다.
     · 신규분은 샤드(part-*.parquet)로만 append — 700만행 테이블을 매번 통째로 다시 쓰지 않는다.
     · 시간예산(CLOCK) 도달 시 받은 만큼 저장하고 중단 → 중간결과 경로.
     """
+    if isinstance(master, pd.DataFrame):
+        codes = master["code"].tolist()
+        cap_hint = (pd.to_numeric(master.get("marcap_now"), errors="coerce")
+                    .groupby(master["code"].astype(str)).max().dropna()
+                    .sort_values(ascending=False)) if "marcap_now" in master.columns else None
+    else:
+        codes, cap_hint = list(master), None
     want = sorted({c for c in map(code6, codes) if c})
     s_ts, e_ts = d_(start), d_(end)
 
@@ -3711,16 +3925,30 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     new_frames: List[pd.DataFrame] = []
     new_led: List[dict] = []
     used = Counter()
+    stop_bulk_empty = False
+    chain = BULK_CHAIN
+    if todo and RUN_MODE != "CACHED" and CLOCK.over():
+        CLOCK.cut("일봉: 시간예산 초과 상태로 진입 — 신규 수집 없이 캐시로 진행")
+        todo = []
+    if todo and RUN_MODE != "CACHED":
+        chain = px_preflight(cal, n_universe=len(want))   # ★측정 결과로만 체인을 정한다
+        if not chain:
+            # 벌크가 전멸 — 죽지 않는다. 종목당 1회 스윕으로 강등하고 이유를 남긴다.
+            todo = []
+            sw = _sweep_per_stock(want, s_ts.strftime("%Y-%m-%d"), e_ts.strftime("%Y-%m-%d"),
+                                  order_hint=cap_hint)
+            if sw is not None and len(sw):
+                cached = sw if cached is None or not len(cached) else \
+                    _px_norm(pd.concat([cached, sw], ignore_index=True))
     if todo:
         n_call = len(todo)
         eta_min = n_call / max(QPS_CAP.get("krx", 2.0), 0.1) / 60.0
-        L.info(f"일봉 신규 수집 — ★날짜축 {n_call:,}거래일 × 1회 = {n_call:,}회 "
-               f"(종목축이었다면 {len(want):,}종목 × 소스 = 최대 {len(want)*3:,}회) · "
-               f"예상 {eta_min:.0f}분 · 소스 " + "→".join(n for n, _ in BULK_CHAIN))
+        L.info(f"일봉 신규 수집 — ★날짜축 {n_call:,}거래일 × 1회 = {n_call:,}회 · "
+               f"예상 {eta_min:.0f}분 · 실측 생존 소스 " + "→".join(n for n, _ in chain))
         QUOTA.plan("krx", n_call, "일봉 전종목 스냅샷(날짜축)")
 
         def one(day):
-            for nm, fn in BULK_CHAIN:
+            for nm, fn in chain:
                 try:
                     d = fn(day)
                 except Exception:
@@ -3762,8 +3990,10 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 else:
                     blank_run += 1        # 정확 달력의 빈 응답 = 실패. 원장에 넣지 않는다.
             if blank_run >= 24:
-                L.warn("정확 거래일인데 빈 응답이 연속 24일 — 세션 끊김/차단으로 판단해 "
-                       "일봉 수집을 중단합니다(받은 만큼 저장). 잠시 뒤 재실행하면 이어받습니다.")
+                # 프리플라이트에서 살아 있다고 '실측된' 소스가 도중에 죽은 경우다
+                # (세션 만료·차단). 여기서 멈추고, 아래에서 종목 스윕으로 강등한다.
+                L.warn("프리플라이트를 통과한 소스가 연속 24거래일 빈손 — 세션 끊김/차단으로 "
+                       "판단해 벌크 수집을 중단합니다(받은 만큼 저장).")
                 stop = True
                 break
             if sum(len(x) for x in shard) >= 400_000:
@@ -3777,15 +4007,26 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             if shard:
                 new_frames.append(pd.concat(shard, ignore_index=True))
             shard, shard_days, new_led = [], [], []
+        stop_bulk_empty = stop
 
+    if stop_bulk_empty and RUN_MODE != "CACHED" and not (
+            cached is not None and len(cached)) and not new_frames:
+        # 벌크가 도중에 죽어 한 행도 못 얻은 경우 — 여기서도 종목 스윕으로 구제한다
+        sw = _sweep_per_stock(want, s_ts.strftime("%Y-%m-%d"), e_ts.strftime("%Y-%m-%d"),
+                              order_hint=cap_hint)
+        if sw is not None and len(sw):
+            cached = sw
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
-        raise RuntimeError(
-            "가격 데이터를 한 종목도 확보하지 못했습니다.\n"
-            "  ① data.krx.co.kr 접근 가능 여부(회사망 방화벽에서 자주 막힙니다)\n"
-            "  ② pykrx / FinanceDataReader 설치 여부\n"
-            "  ③ 드라이브 캐시(krx_ohlcv_daily) 존재 여부를 확인하세요.\n"
-            "  RUN_MODE='SMOKE' 는 네트워크 없이 배관 검증이 가능합니다.")
+        # ★죽지 않는다. 여기서 예외를 던지면 4시간짜리 실행이 진단 한 줄 없이 끝난다.
+        L.err("가격 데이터를 한 행도 확보하지 못했습니다. 위 '프리플라이트' 표의 "
+              "'서버가 돌려준 것' 열이 원인을 그대로 보여줍니다. 대개 다음 중 하나입니다:")
+        L.err("  ① data.krx.co.kr 이 방화벽/보안프로그램에 막힘 → 브라우저로 접속되는지 확인")
+        L.err(f"  ② pykrx 미설치·임포트 실패(현재 파이썬 {ENVX['python']}) → "
+              f"pip install -U pykrx 후 재실행")
+        L.err("  ③ FinanceDataReader 미설치 → pip install -U finance-datareader")
+        net_audit()
+        return pd.DataFrame(columns=PX_BULK_COLS)
     px = _px_norm(pd.concat([f.reindex(columns=PX_BULK_COLS) for f in frames],
                             ignore_index=True))
 
@@ -3911,6 +4152,11 @@ def _residual_fill(px: pd.DataFrame, want: Sequence[str], s_ts, e_ts) -> pd.Data
 def monthly_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
     """월말 신호 → ★다음 거래일 시가 체결(§10.1 — 당일 종가 체결은 미래누수).
     fwd_ret 은 '바로 다음 달'과만 짝짓는다(월 결손 시 몇 달 수익이 한 달로 둔갑하는 것 방지)."""
+    if px is None or not len(px):
+        empty_m = pd.DataFrame(columns=["code", "month", "signal_date", "close", "adv20",
+                                        "next_open", "next_date", "exec_ok", "exec_px",
+                                        "fwd_ret"])
+        return {"daily": pd.DataFrame(columns=PX_BULK_COLS), "monthly": empty_m}
     px = px.sort_values(["code", "date"]).copy()
     px["adv20"] = (px.groupby("code", observed=True)["value"]
                      .transform(lambda s: s.rolling(20, min_periods=10).mean()))
@@ -7973,8 +8219,14 @@ def main() -> dict:
     t_all = time.time()
     L.h1("TCD v2 ZERO-BASE — 트레이드오프 붕괴 탐지",
          f"백테스트 {BT_START}~{BT_END}(10년) · 활성 팩 {','.join(ACTIVE_PACKS)} · 모드 {RUN_MODE}")
+    _dep = []
+    for _nm, _ok, _why in (("FinanceDataReader", fdr is not None, "미설치/임포트 실패"),
+                           ("pykrx", pykrx_stock is not None, PKX_WHY or "미설치"),
+                           ("yfinance", yf is not None, "미설치(지수 폴백에만 사용)")):
+        _dep.append(f"{_nm}: " + ("✔" if _ok else f"✘ {_why}"))
     L.grid([["환경", "Colab" if ENVX["colab"] else ("Jupyter" if ENVX["notebook"] else "CLI")],
             ["파이썬", ENVX["python"]], ["코어", str(ENVX["cores"])],
+            ["수집 라이브러리", " · ".join(_dep)],
             ["병렬", f"IO {IO_THREADS}스레드 / CPU {N_CPU_WORKERS}"
                      + ("(fork)" if _FORK_OK else "(스레드 폴백)")],
             ["수집 시간예산", (f"{HARVEST_TIME_BUDGET_H:.1f}시간 — 도달 시 부분 데이터로 "
@@ -8016,9 +8268,17 @@ def main() -> dict:
         if RUN_MODE != "CACHED":
             KRXOA.probe()          # 정식 Open API 가 열려 있으면 벌크 1순위로 승격
             KRX.login()
-        px = harvest_prices(master["code"].tolist(),
+        px = harvest_prices(master,
                             (d_(BT_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d"),
                             BT_END)
+        if px is None or not len(px):
+            raise RuntimeError(
+                "가격을 한 행도 확보하지 못해 백테스트를 시작할 수 없습니다.\n"
+                "  ★위 '가격 소스 프리플라이트' 표의 마지막 열이 소스별 실패 원인을 그대로 "
+                "보여줍니다 — 거기부터 보세요.\n"
+                "  가장 흔한 순서: ① data.krx.co.kr 방화벽 차단 ② pykrx 미설치/휠 부재 "
+                "③ FinanceDataReader 미설치\n"
+                "  세 소스 중 하나만 살아나면 그대로 진행됩니다(종목당 1회 스윕 폴백 포함).")
         ctx["px"] = px
         ctx["panel"] = monthly_panel(px, months)
         # 유동성 우선순위(수집 순서 결정용) — 이후 스테이지가 실패해도 참조 가능하게 여기서 확정
