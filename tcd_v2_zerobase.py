@@ -2671,6 +2671,12 @@ def cell_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN) -> pd.Ser
     """winsorize(±2σ) → 셀 내 z. ★±inf 는 먼저 NaN 으로 — nanmean 은 inf 를 무시하지 않아
     셀에 inf 하나만 있어도 그 셀 전체 z 가 뭉개진다(비율·로그 지표의 흔한 사고)."""
     v = pd.to_numeric(values, errors="coerce").astype("float64").replace([np.inf, -np.inf], np.nan)
+    # ★열 전체가 상수면 그것은 '평균과 같다(z=0)'가 아니라 ★정보가 없다는 뜻이다.
+    #   실측: 자사주 소각 공시를 한 건도 수집하지 못해 p3 가 전량 0 이었는데, z 가 0.0 을
+    #   돌려주는 바람에 TP_P2 가 '관측 6,442행 · 발화율 0%'로 살아남아 E_C 를 희석했다.
+    #   결측으로 두면 nrow_mean 이 그 축을 빼고 평균하므로 남은 축이 제 무게를 갖는다.
+    if v.notna().sum() and not (float(v.std(skipna=True) or 0.0) > 0):
+        return pd.Series(np.nan, index=v.index, dtype="float32")
     grp = pd.Series(cells).astype(object).fillna("_NA_").to_numpy()
     g = v.groupby(grp, observed=True, dropna=False)
     n = g.transform("count")
@@ -2807,7 +2813,9 @@ def attach_cells(P: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
         still = n2v < CELL_MIN
         if still.any():
             P.loc[still, "cell"] = P.loc[still, "cell_all"]
-        CELL_AUDIT["fallback_rate"] = float((n1 + int(still.sum())) / max(len(P), 1))
+        # ★still 은 small 의 부분집합이다 — 더하면 같은 행을 두 번 센다(실측 50% ← 실제 37.7%).
+        CELL_AUDIT["fallback_rate"] = float(n1 / max(len(P), 1))
+        CELL_AUDIT["fallback_to_all"] = float(int(still.sum()) / max(len(P), 1))
         L.info(f"셀 폴백(C11): 1차 {n1:,}행 → 산업 상위 / 2차 {int(still.sum()):,}행 → 전체 "
                f"(표본<{CELL_MIN} 셀의 정상 폴백 — 로깅 의무)")
     for c in CELL_LADDER:
@@ -5259,18 +5267,25 @@ _BULK_SJ = {"BS": "BS", "PL": "IS", "CF": "CF"}          # CE(자본변동표)�
 
 
 def _bulk_amount_col(cols: Sequence[str], stmt: str) -> Optional[str]:
-    """'당기' 금액 컬럼 선택. 손익·현금흐름은 3개월분이 아니라 누적분을 써야 TTM 이 성립한다."""
-    cur = [c for c in cols if str(c).strip().startswith("당기")]
+    """일괄 ZIP 의 '당기' 금액 컬럼 고르기.
+
+    ★판정은 공백을 제거하고 하되 ★반환은 반드시 정규화된 이름으로 한다. 옛 구현은 strip 한
+      이름으로 판정하고 원본(비-strip)을 돌려줬는데, 호출부는 strip 된 컬럼과 대조하므로
+      헤더에 공백이 하나만 붙어도 `amt not in tb.columns` 가 되어 ★그 멤버 파일 전체가
+      조용히 스킵됐다. 손익계산서(PL) 헤더('당기 1분기 3개월' 등)가 가장 길어 가장 잘 걸린다 —
+      그러면 매출원가·법인세비용이 통째로 비고 TP_B1·eff_tax·V8 이 한꺼번에 죽는다.
+    """
+    norm = {str(c): re.sub(r"\s+", "", str(c)) for c in cols}
+    cur = [c for c in cols if norm[str(c)].startswith("당기")]
     if not cur:
         return None
     if stmt == "BS":
-        return cur[0]
-    acc = [c for c in cur if "누적" in re.sub(r"\s+", "", str(c))]
+        return str(cur[0]).strip()
+    acc = [c for c in cur if "누적" in norm[str(c)]]
     if acc:
-        return acc[0]
-    non3 = [c for c in cur if "3개월" not in re.sub(r"\s+", "", str(c))]
-    return non3[0] if non3 else cur[0]
-
+        return str(acc[0]).strip()
+    non3 = [c for c in cur if "3개월" not in norm[str(c)]]
+    return str((non3 or cur)[0]).strip()
 
 def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd.DataFrame:
     """(연도×보고서×제표) ZIP 을 받아 필요한 계정만 뽑아낸다. API 쿼터를 쓰지 않는다."""
@@ -5341,6 +5356,10 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
                             ic = next((c for c in ("항목코드", "계정ID") if c in tb.columns), None)
                             nc = next((c for c in ("항목명", "계정명") if c in tb.columns), None)
                             if not cc or not nc or amt not in tb.columns:
+                                # ★무성 스킵 금지 — 여기서 조용히 빠지면 그 제표(특히 손익계산서)가 통째로
+                                #   비고, 매출원가·법인세비용이 사라져 TP_B1·eff_tax·V8 이 함께 죽는다.
+                                L.warn(f"ZIP 멤버 스킵 {r.get('year')}/{r.get('report')}/"
+                                       f"{r.get('stmt')}: amt={amt!r} cols={list(tb.columns)[:6]}")
                                 continue
                             code = tb[cc].astype(str).str.replace(r"[\[\]\s]", "", regex=True) \
                                      .map(code6)
@@ -5680,16 +5699,16 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
 # 한국 XBRL 계정명은 회사마다 달라 정규식 다중 매칭으로 흡수한다.
 ACCT = {
     "revenue":       ("IS", [r"ifrs-full_Revenue$", r"^매출액$", r"^수익\(매출액\)$", r"^영업수익$"]),
-    "cogs":          ("IS", [r"CostOfSales", r"^매출원가$"]),
+    "cogs":          ("IS", [r"CostOfSales", r"^매출원가"]),
     "sgna":          ("IS", [r"SellingGeneralAndAdministrativeExpense", r"^판매비와관리비$"]),
     "rnd":           ("IS", [r"ResearchAndDevelopment", r"경상(연구)?개발비", r"^연구개발비"]),
     "op_income":     ("IS", [r"OperatingIncomeLoss", r"^영업이익"]),
     "net_income":    ("IS", [r"ProfitLoss$", r"^당기순이익"]),
-    "tax_expense":   ("IS", [r"IncomeTaxExpense", r"법인세비용$"]),
+    "tax_expense":   ("IS", [r"IncomeTaxExpense", r"법인세비용", r"^법인세등$"]),
     # '법인세비용차감전순이익'(전체재무제표)과 '법인세차감전 순이익'(주요계정 벌크) 둘 다 흡수
     "pretax_income": ("IS", [r"ProfitLossBeforeTax", r"법인세.{0,4}차감전"]),
     "other_income":  ("IS", [r"OtherIncome$", r"^기타수익$", r"^영업외수익$"]),
-    "inventory":     ("BS", [r"Inventories", r"^재고자산$"]),
+    "inventory":     ("BS", [r"Inventories", r"^재고자산"]),
     "receivable":    ("BS", [r"TradeAndOtherCurrentReceivables", r"^매출채권"]),
     "payable":       ("BS", [r"TradeAndOtherCurrentPayables", r"^매입채무"]),
     "assets":        ("BS", [r"ifrs-full_Assets$", r"^자산총계$"]),
@@ -5794,6 +5813,8 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
                            for rn, r, y in zip(W["rcept_no"], W["reprt_code"], W["bsns_year"])]
     qmap = {RQ["Q1"]: 1, RQ["H1"]: 2, RQ["Q3"]: 3, RQ["FY"]: 4}
     W["q"] = W["reprt_code"].astype(str).map(qmap)
+    # ★분기 통번호 — TTM 이 '연속 4분기'인지 판정하는 유일한 근거(행 기준 rolling 은 위험).
+    W["_qi"] = W["bsns_year"].astype(int) * 4 + W["q"].astype(int)
     W = W.sort_values(["corp_code", "bsns_year", "q"]).reset_index(drop=True)
     gk = ["corp_code", "bsns_year"]
     prev_q = W.groupby(gk, observed=True)["q"].shift(1)
@@ -5805,8 +5826,12 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
         # 누적 공시 → 분기 단독. 직전 분기가 실존할 때만 차분(결손 분기를 0 취급하면
         # 반기 누적이 분기 실적으로 둔갑한다 — fail-open 금지).
         W[c + "_q"] = np.where(W["q"] == 1, W[c], np.where(contig, W[c] - prev, np.nan))
+        # ★rolling 은 '행' 기준이다. 분기가 결손된 회사에서는 2017Q1·2018Q1·2019Q1·2020Q1
+        #   네 개가 합쳐져 TTM 으로 불린다(실행 재현됨). 분기 인덱스가 ★연속 4개일 때만
+        #   TTM 이 성립한다 — 아니면 결측으로 둔다(조용한 오계산보다 결측이 낫다).
+        _ok4 = (W.groupby("corp_code", observed=True)["_qi"].diff(3) == 3)
         W[c + "_ttm"] = (W.groupby("corp_code", observed=True)[c + "_q"]
-                          .transform(lambda s: s.rolling(4, min_periods=4).sum()))
+                          .transform(lambda s: s.rolling(4, min_periods=4).sum())).where(_ok4)
     for k in ACCT:                                    # BS 계정도 스키마 계약 보장
         if k not in W.columns:
             W[k] = np.nan
@@ -5817,6 +5842,13 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
     W["v2_streak_bad"] = (bad.groupby(W["corp_code"], observed=True)
                              .transform(lambda s: s.rolling(3, min_periods=3).min()))
     W["eff_tax"] = sdiv(colx(W, "tax_expense_ttm"), colx(W, "pretax_income_ttm"))
+    # ★'0건'만 보면 1행만 매칭돼도 침묵한다 — 정작 쓰는 것은 _ttm 이다. 커버리지로 본다.
+    _thin = {k: float(W[k].notna().mean()) for k in ACCT
+             if float(W[k].notna().mean()) < 0.05}
+    if _thin:
+        L.warn(f"계정 커버리지 5% 미만 {len(_thin)}개 — 이 계정에 의존하는 축은 사실상 "
+               f"결측입니다: " + ", ".join(f"{k}={v*100:.1f}%" for k, v in
+                                          sorted(_thin.items(), key=lambda x: x[1])[:10]))
     none_hit = [k for k in ACCT if W[k].notna().sum() == 0]
     if none_hit:
         L.warn(f"매칭 0건 계정 {len(none_hit)}개: {none_hit[:8]} — 해당 지표는 결측 유지"
@@ -6129,10 +6161,10 @@ DISCLOSURE_KINDS = {
     "bw":          r"신주인수권부사채",
     "reduction":   r"감자",
     "audit_flag":  r"감사보고서.*(한정|부적정|의견거절)|의견거절",
-    "annual_rpt":  r"^사업보고서",
+    "annual_rpt":  r"^(\[[^\]]*\])?\s*사업보고서",
     # ★정기보고서(분기·반기) — 그 자체를 쓰기보다, '어떤 조합에 재무가 존재하는가'를
     #   공짜로 알려 주는 사전 소거 지도로 쓴다(filed_report_set 참조).
-    "periodic_rpt": r"^(분기보고서|반기보고서)",
+    "periodic_rpt": r"^(\[[^\]]*\])?\s*(분기보고서|반기보고서)",
 }
 
 
@@ -6164,7 +6196,9 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = 0) -> pd.Dat
 
     def one(m):
         rows, complete = [], True
-        for ty in ("A", "B"):
+        # ★I=거래소공시 — 자기주식 소각결정·현금배당결정이 여기 있다(주요사항보고 대상 아님).
+        #   A/B 만 훑으면 tstock_burn 이 구조적으로 0건이 되고 TP_P2 가 절대 발화하지 않는다.
+        for ty in ("A", "B", "I"):
             page = 1
             while page <= 100:
                 js = dart_call("list.json", {"bgn_de": m.start_time.strftime("%Y%m%d"),
@@ -7408,7 +7442,10 @@ def axis_quality(P: pd.DataFrame) -> pd.DataFrame:
             if np.isfinite(w).all() else np.nan, raw=True))
     P["dio"] = sdiv(colx(P, "inventory"), colx(P, "cogs_ttm")) * 365.0
     P["dso"] = sdiv(colx(P, "receivable"), colx(P, "revenue_ttm")) * 365.0
-    P["turn_days"] = P["dio"] + P["dso"]
+    # ★덧셈 결측 전파 — 재고(dio)와 매출채권(dso) 중 ★한쪽만 비어도 turn_days 가 전량 NaN 이
+    #   되고 TP_B1 이 통째로 사라진다(실측: 발화 통계표에 TP_B1 이 아예 없었다). 가용한 것의
+    #   평균 × 2 로 스케일만 맞춘다 — 셀 내 상대값이라 수준은 무해하고, 둘 다 없으면 결측 유지.
+    P["turn_days"] = nrow_mean(P, ["dio", "dso"]) * 2.0
     P["d_turn"] = g("turn_days").diff(12)
     P["dlog_rev"] = g("revenue_ttm").transform(lambda s: dlog(s, 12))
     avg_assets = (colx(P, "assets") + g("assets").shift(12)) / 2.0
