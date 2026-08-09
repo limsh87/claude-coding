@@ -134,6 +134,11 @@ PX_ALLOW_YFINANCE     = False   # 종목별 폴백에 yfinance 사용 여부. �
 #                                 .KS/.KQ 두 왕복 + 내부 재시도를 태운다(수집 예산의 주범).
 #                                 지수 벤치마크에는 이 값과 무관하게 최후 폴백으로 쓴다.
 PX_RESIDUAL_MAX_CODES = 300     # 벌크가 못 덮은 종목의 종목축 구제 상한(0=무제한, 권장 300)
+PX_RESIDUAL_COV_SKIP  = 0.97    # ★벌크가 구간 거래일의 이 비율 이상을 덮었으면 '잔여 보충'을
+#                                 통째로 생략한다. 그 상태에서 시세가 없는 코드는 수집 실패가
+#                                 아니라 애초에 거래된 적이 없는 코드(폐지 우선주·ETF·ELW·
+#                                 스팩)라, 종목축으로 다시 물어봐야 전부 빈손이고 시간만 탄다.
+#                                 실측: 이 게이트가 없어 매 실행 300종목 × 3소스 = 5분을 버렸다.
 
 # ── ⑧-2 DART 수집 정책 (호출량은 '고정 예산'이 아니라 '실시간 잔여'로 관리) ───────────────────
 DART_BULK_ZIP    = True   # ★재무제표 '일괄 ZIP'(연도×보고서×제표 파일 하나에 전 상장사).
@@ -146,17 +151,23 @@ DART_MULTI_BATCH = 100    # 한 요청에 넣을 회사 수(공식 상한 100). 
 NPS_MAX_CALLS    = 30000  # PACK-N 국민연금은 (종목 × 월) 교차곱이라 냉시작이면 40만 회가 넘는다.
 #                           실시간 잔여량과 이 값 중 작은 쪽으로 잘라 유동성 상위·최근 월부터
 #                           채우고, 나머지는 재실행 때 이어받는다(0 = 잔여량까지 전부).
-# ★DART 하루치 잔여를 소비자별로 미리 나눈다. 순서로 해결하려 하면 앞에 선 놈이 다 먹는다
-#   (실제로 두 번 그렇게 무너졌다: 심층재무가 직원현황을, 다음엔 직원현황이 심층재무를).
-#   합이 1.0 이 되게 두면 되고, 남는 일은 재실행이 정확히 이어받는다.
+# ★DART 하루치 잔여를 소비자별로 나눈다. 가중치는 '아직 배정 안 받은 소비자들 사이의 상대값'
+#   이고, 배정은 수집 직전에 실잔여를 다시 재서 하며, 실수요보다 많이 주지 않는다.
+#   그래서 ①앞선 놈이 다 먹는 사고 ②할 일 없는 놈이 예산을 깔고 앉는 사고 를 동시에 막는다.
+#   (세 번 무너졌다: 심층재무가 직원현황을 → 직원현황이 심층재무를 → 일괄 ZIP 이 재무를 이미
+#    다 덮었는데도 deep+major 가 고정 65%를 선점해 직원현황이 800건에서 끊겼다.)
+#   ★배정 순서 = disclosure → employee → major → deep. '대체재가 없는 쪽'이 먼저다.
+#     재무는 일괄 ZIP(호출한도 0)이라는 무한 대체재가 있고, 직원현황은 이 API 말고는 없다.
 DART_BUDGET_SHARE = {
-    "disclosure": 0.15,   # 공시목록 시장전체 스윕 — V3/V5/PACK-C 입력(월 단위, 캐시 잘 듣는다)
-    "major":      0.15,   # 주요계정 벌크 — 전 시장을 싸게 덮는 바닥(회사 100개/호출)
-    "deep":       0.50,   # ★전체재무제표 — 재고·매출채권·CFO·CAPEX. B/C축의 핵심이라 최대 몫
-    "employee":   0.20,   # 직원현황 — C축 TP_C2·V8. size_bucket 은 시총 폴백이 있어 치명적이지 않다
+    "disclosure": 0.10,   # 공시목록 시장전체 스윕 — V3/V5/PACK-C 입력 + ★정기보고서 제출사실
+    #                       지도(이걸로 뒤 티어의 '태생적 빈손' 호출을 통째로 소거한다)
+    "employee":   0.55,   # ★직원현황 전수 — 대체재 없음. C축 TP_C2·V8·PACK-N·size_bucket 1순위
+    "major":      0.10,   # 주요계정 벌크 — ZIP 미포함분 바닥 깔기(회사 100개/호출)
+    "deep":       0.25,   # 전체재무제표 단건 — ZIP 이 못 준 연도·비제출사의 '꼬리 보충'
 }
-DART_DEEP_TOP_N  = 1500   # 전체재무제표(재고·매출채권·CFO·CAPEX)를 받을 유동성 상위 회사 수.
-#                           V6 유동성 하한을 통과할 수 없는 종목까지 심층 수집할 이유가 없다.
+DART_DEEP_TOP_N  = 1500   # 전체재무제표 '단건 꼬리 보충'을 받을 유동성 상위 회사 수.
+#                           V6 유동성 하한을 통과할 수 없는 종목까지 단건으로 태울 이유가 없다.
+#                           ※ 직원현황에는 적용하지 않는다 — 그쪽은 전수수집이 원칙이다.
 #                           0 = 전 종목(호출량이 매우 커집니다).
 
 # ── ⑨ 포지션·사이징 상수 (§8.5 — 드로다운 한가운데서 정하지 않도록 지금 못박음) ──────────────
@@ -958,6 +969,11 @@ class CallBudget:
       1차: 심층 재무가 잔여를 전부 먹어 직원현황이 매 실행 0건.
       2차: 순서를 뒤집었더니 직원현황(19,500건)이 전부 먹어 심층 재무가 0건.
       순서를 바꾸는 것은 해결이 아니라 문제를 옮기는 것이다. 몫을 정해 줘야 한다.
+      3차(★현재): 고정 비율이라 '일괄 ZIP 이 이미 덮어 할 일이 없는' 소비자가 예산의 65%를
+                  선점하고, 대체 수단이 전혀 없는 직원현황이 0.20 만 받아 800건에서 끊겼다.
+                  → 비율을 '아직 배정받지 않은 소비자들 사이의 상대 가중치'로 바꾸고,
+                    ①실제 잔여(pool)를 배정 직전에 다시 재고, ②수요(need)보다 많이 주지 않는다.
+                    덜 쓴 몫은 자동으로 뒤 소비자에게 흘러가므로 한 건도 놀지 않는다.
     각 수집기는 자기 몫을 넘기면 스스로 멈추고, 남은 일은 다음 실행이 이어받는다."""
 
     def __init__(self, src: str, share: Dict[str, float]):
@@ -965,10 +981,29 @@ class CallBudget:
         self.total = int(QUOTA.remaining(src))
         self.share = dict(share)
         self.alloc: Dict[str, int] = {}
+        self.need: Dict[str, int] = {}
         self._base = int(QUOTA.spent(src))
+        self._pending = [k for k in share]        # 아직 배정받지 않은 소비자
 
-    def take(self, name: str) -> int:
-        n = int(self.total * float(self.share.get(name, 0.0)))
+    def pool(self) -> int:
+        """지금 이 순간의 실잔여. ★고정값이 아니다 — 앞 소비자가 덜 쓰면 뒤가 그만큼 더 받는다."""
+        return max(0, self.total - self.spent())
+
+    def take(self, name: str, need: Optional[int] = None) -> int:
+        """수집 직전에 호출한다. 반환값이 이번 실행에서 이 수집기가 쓸 수 있는 상한.
+
+        need — 이 수집기가 '실제로 남겨둔 일'의 상한(대개 대상수×연도수). 주면 그보다
+               많이 배정하지 않으므로, 할 일이 없는 소비자가 예산을 깔고 앉지 못한다.
+        """
+        if name in self._pending:
+            self._pending.remove(name)
+        w = float(self.share.get(name, 0.0))
+        wsum = w + sum(float(self.share.get(k, 0.0)) for k in self._pending)
+        pool = self.pool()
+        n = int(pool * (w / wsum)) if wsum > 0 else pool
+        if need is not None and int(need) >= 0:
+            self.need[name] = int(need)
+            n = min(n, int(need))
         self.alloc[name] = n
         return n
 
@@ -976,12 +1011,21 @@ class CallBudget:
         return int(QUOTA.spent(self.src)) - self._base
 
     def table(self, labels: Dict[str, str]):
-        rows = [[labels.get(k, k), f"{self.share.get(k, 0)*100:.0f}%", f"{v:,}"]
-                for k, v in self.alloc.items()]
+        rows = [[labels.get(k, k), f"{self.share.get(k, 0)*100:.0f}%",
+                 f"{int(self.total*float(self.share.get(k,0.0))):,}"]
+                for k in self.share]
+        L.grid(rows, ["소비자", "가중치", "계획(참고)"], ["l", "r", "r"],
+               title=f"[{self.src}] 잔여 {self.total:,}건 배분계획 — 가중치는 '아직 배정 안 "
+                     f"받은 소비자들 사이의 상대값'이라, 앞이 덜 쓰면 뒤가 그만큼 더 받습니다")
+
+    def report(self, labels: Dict[str, str]):
+        """실제 배정·수요를 사후 정산해 보여준다(계획표만 있으면 왜 끊겼는지 알 수 없다)."""
+        rows = [[labels.get(k, k), f"{self.need.get(k, -1):,}" if k in self.need else "—",
+                 f"{v:,}"] for k, v in self.alloc.items()]
         rows.append(["─ 합계 ─", "", f"{sum(self.alloc.values()):,}"])
-        L.grid(rows, ["소비자", "몫", "이번 실행 배정"], ["l", "r", "r"],
-               title=f"[{self.src}] 잔여 {self.total:,}건을 소비자별로 배분 "
-                     f"(한쪽이 다 먹지 않게 — 남는 일은 다음 실행이 이어받음)")
+        L.grid(rows, ["소비자", "남은 수요", "이번 실행 배정"], ["l", "r", "r"],
+               title=f"[{self.src}] 실배분 정산 — 실사용 {self.spent():,}건 / "
+                     f"진입시 잔여 {self.total:,}건")
 
 
 def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
@@ -1355,6 +1399,19 @@ def warn_if_not_drive(mode: str, root: str):
         L.warn(f"구글드라이브를 찾지 못해 로컬({os.path.abspath(root)})에만 저장합니다.")
     L.warn("★ '신규 수집분은 구글드라이브 공용/전용 인덱스에 저장' = 절대 1원칙이므로 "
            "아래 중 하나로 반드시 바로잡으세요:")
+    # ★'못 찾았다'만 말하면 사용자가 할 수 있는 게 없다. 이 PC 에서 실제로 감지된 후보를
+    #   그대로 찍어 주면 복사·붙여넣기 한 번으로 끝난다(이 경고가 반복된 실측 이유).
+    try:
+        cands = [b for b in _drive_bases() if os.path.isdir(b)][:6]
+    except Exception:
+        cands = []
+    if cands:
+        L.warn("   ⓪ 이 PC 에서 감지된 드라이브 후보 — 아래를 그대로 GDRIVE_ROOT 에 넣으세요:")
+        for b in cands:
+            L.warn(f"        GDRIVE_ROOT = r\"{os.path.join(b, 'tcd_cache')}\"")
+    else:
+        L.warn("   ⓪ 이 PC 에서 구글드라이브 마운트를 하나도 감지하지 못했습니다"
+               "(드라이브 데스크톱 미실행이거나 스트리밍 드라이브 문자가 없음).")
     L.warn("   ① 구글드라이브 데스크톱을 설치·로그인한 뒤 다시 실행 (자동 감지합니다)")
     L.warn("   ② 코드 상단 GDRIVE_ROOT 를 직접 지정  예) "
            r'GDRIVE_ROOT = "G:/내 드라이브/tcd_cache"')
@@ -1937,6 +1994,12 @@ def euckr_quote(s: str) -> str:
         return quote(str(s))
 
 
+# ★봇차단 안내 페이지 지문 — '자동'과 '차단'이 같이 나오거나, 비정상 접근 안내 문구.
+#   짧은 응답에만 적용한다(정상 목록 페이지에 이 단어가 우연히 섞여도 오판하지 않게).
+_BOTWALL_RE = re.compile(r"(자동.{0,20}차단|비정상적인?\s*접근|robot|캡차|captcha|"
+                         r"접근이\s*제한|일시적으로\s*차단)", re.I)
+
+
 def net_get(url: str, source: str = "generic", params: Optional[dict] = None,
             headers: Optional[dict] = None, referer: Optional[str] = None,
             timeout: int = 25, tries: int = 3, as_bytes: bool = False,
@@ -1962,7 +2025,20 @@ def net_get(url: str, source: str = "generic", params: Optional[dict] = None,
                 NET_LAST[source] = (r.status_code, (r.content[:220] or b"")
                                     .decode("utf-8", "replace").replace("\n", " "))
             if r.status_code == 200:
-                return r.content if as_bytes else smart_decode(r.content, r.encoding, prefer_enc)
+                body = r.content if as_bytes else smart_decode(r.content, r.encoding, prefer_enc)
+                # ★HTTP 200 짜리 차단 — 국내 포털은 봇으로 판정하면 403 이 아니라 200 에
+                #   '자동 수집 차단' 안내 페이지를 실어 보낸다(다른 세션 실측). 상태코드만
+                #   보면 '정상 응답인데 파싱이 0건'으로 보여서 원인 진단이 불가능해진다.
+                if (not as_bytes) and isinstance(body, str) and len(body) < 20000 \
+                        and _BOTWALL_RE.search(body):
+                    with _NET_LK:
+                        NET_STATS[f"{source}:BOTWALL"] += 1
+                        NET_LAST[source] = (200, "봇차단 안내 페이지(HTTP 200) — "
+                                                 + body.strip()[:150].replace("\n", " "))
+                    time.sleep(min(30.0, 4.0 * 2 ** k) + random.random() * 2)
+                    last = requests.HTTPError(f"botwall200 {url}")
+                    continue
+                return body
             if r.status_code in (429, 503):
                 time.sleep(min(25.0, 2.0 * 2 ** k) + random.random())
             elif r.status_code in (401, 403):
@@ -4357,8 +4433,24 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
                             ignore_index=True))
 
     # ── 잔여 보충: 벌크가 한 행도 못 준 종목만, 상한을 걸고 종목축으로 구제 ──────────────
-    if not swept:                 # 스윕이 이미 전 종목을 훑었으면 잔여보충은 같은 일의 반복
-        px = _residual_fill(px, want, s_ts, e_ts)
+    # ★게이트가 'swept' 하나뿐이던 것이 실측 낭비를 냈다. 연도축(marcap)이 성공하면 swept 는
+    #   False 인데 패널은 이미 전 시장·전 거래일을 덮은 상태다. 그런데도 마스터에만 있고
+    #   시세가 없는 코드(폐지 우선주·ETF·ELW·스팩)를 1,278개씩 종목축으로 다시 물어봐서
+    #   5분을 통째로 버렸다. 판정 기준은 '어떤 소스를 썼나'가 아니라 ★'달력을 얼마나 덮었나'다.
+    cal_have = set(pd.DatetimeIndex(px["date"].unique()).normalize())
+    cal_want = [t for t in cal if s_ts <= t <= e_ts]
+    cov_day = len(cal_have & set(cal_want)) / max(len(cal_want), 1)
+    if swept or cov_day >= PX_RESIDUAL_COV_SKIP:
+        n_miss = len(set(want) - set(px["code"].astype(str)))
+        if n_miss:
+            L.info(f"잔여 보충 생략 — 벌크가 거래일의 {cov_day*100:.1f}%를 덮었습니다"
+                   f"(기준 {PX_RESIDUAL_COV_SKIP*100:.0f}%). 이 상태에서 시세가 없는 "
+                   f"{n_miss:,}종목은 '수집 실패'가 아니라 ★애초에 그 구간에 거래된 적이 없는 "
+                   f"종목입니다(폐지 우선주·ETF·ELW·스팩·구간 밖 상장분). 종목축으로 다시 "
+                   f"물어봐도 전부 빈손이고 시간만 태웁니다.")
+    else:
+        px = _residual_fill(px, want, s_ts, e_ts,
+                            master=master if isinstance(master, pd.DataFrame) else None)
     px = apply_corporate_actions(px)          # ★반드시 저장 뒤·사용 앞 (원본은 raw 로 남는다)
 
     px = px[(px["date"] >= s_ts) & (px["date"] <= e_ts)]
@@ -4398,12 +4490,16 @@ def _flush_px_shard(shard: List[pd.DataFrame], days: List[pd.Timestamp], led_row
                          note="수집 완료 거래일 — 재조회 방지 원장")
 
 
-def _residual_fill(px: pd.DataFrame, want: Sequence[str], s_ts, e_ts) -> pd.DataFrame:
+def _residual_fill(px: pd.DataFrame, want: Sequence[str], s_ts, e_ts,
+                   master: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """벌크 스냅샷에 한 행도 없는 종목만 종목축으로 구제한다.
     ★상한(PX_RESIDUAL_MAX_CODES)과 음성캐시를 반드시 건다 — 여기가 옛 설계의 늪이었다."""
     if RUN_MODE == "CACHED" or CLOCK.over():
         return px
     miss = sorted(set(want) - set(px["code"].astype(str)))
+    # ★소거의 1차 근거는 시계(음성캐시)가 아니라 사실이다 — 구간 시작 전에 폐지됐거나
+    #   구간 종료 후 상장된 종목은 어떤 소스에도 없다. 30일 유예를 기다릴 이유가 없다.
+    miss = _sweep_skip_by_fact(miss, master, s_ts, e_ts)
     if not miss:
         return px
     today_ts = pd.Timestamp(dtm.date.today())
@@ -4522,6 +4618,45 @@ def monthly_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, pd.Da
 # ── ⑤ 수급 — ★월 단위 전종목 일괄 ───────────────────────────────────────────────────────────
 FLOW_INVESTORS = [("inst_net", "기관합계"), ("forgn_net", "외국인")]
 
+# ── 수급 직통 경로(pykrx 없이) ────────────────────────────────────────────────────────────
+#   실측 로그에서 d3 가 매 실행 통째로 결측이었다. 원인은 데이터가 없어서가 아니라
+#   ★수집 경로가 pykrx 하나뿐이었기 때문이다(임포트 실패 = 축 하나 소실). 같은 표를
+#   KRX 정보데이터시스템이 직접 준다: [12009] 투자자별 순매수상위종목 — 기간·투자자 지정
+#   1회 호출에 전 종목 순매수가 나온다(월축 120개월 × 투자자 2 = 240회).
+FLOW_BLD = "dbms/MDC/STAT/standard/MDCSTAT02401"
+FLOW_INVST_CD = {"inst_net": "7050", "forgn_net": "9000"}   # 기관합계 / 외국인
+_FLOW_CODE_KEYS = ("ISU_SRT_CD", "ISU_CD", "ISU_ABBRV")
+_FLOW_VAL_KEYS = ("NETBID_TRDVAL", "NETBID_TRDVAL_1", "TRDVAL")
+
+
+def _flow_krx_month(m0: pd.Timestamp, m1: pd.Timestamp, col: str) -> Optional[pd.DataFrame]:
+    """KRX bld 직통 — 한 달 × 한 투자자 = 1회. 실패하면 None(상위가 다음 경로로 내린다)."""
+    rows = KRX.bld_market_split(FLOW_BLD, invstTpCd=FLOW_INVST_CD[col],
+                                strtDd=m0.strftime("%Y%m%d"), endDd=m1.strftime("%Y%m%d"),
+                                askBid="3", detailView="1", trdVolVal="2")
+    if not rows:
+        return None
+    d = pd.DataFrame(rows)
+    key = next((k for k in _FLOW_CODE_KEYS if k in d.columns), None)
+    val = next((k for k in _FLOW_VAL_KEYS if k in d.columns), None)
+    if key is None or val is None:
+        return None                     # ★컬럼 추측 금지 — 가짜 종목코드를 만드는 경로다
+    out = pd.DataFrame({
+        "code": d[key].astype(str).str.extract(r"(\d{6})")[0].map(code6),
+        col: pd.to_numeric(d[val].astype(str).str.replace(r"[^\d.\-]", "", regex=True),
+                           errors="coerce")}).dropna(subset=["code"])
+    return out if len(out) else None
+
+
+def _flow_krx_probe(m: pd.Timestamp) -> bool:
+    """쓰기 전에 한 달만 재 본다 — 레이아웃이 다르면 240회를 태우기 전에 여기서 멈춘다."""
+    t = _flow_krx_month(m.replace(day=1), m, "inst_net")
+    ok = t is not None and len(t) >= 100 and t["inst_net"].notna().sum() >= 50
+    if not ok:
+        st, head = NET_LAST.get("krx", ("—", ""))
+        L.warn(f"수급 KRX 직통 프리플라이트 실패 — 응답 {st} · {str(head)[:110]}")
+    return ok
+
 
 def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """기관·외국인 순매수(D축 d3) — ★날짜축(월) 전종목 일괄.
@@ -4557,7 +4692,14 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     fn = _pykrx_fn("get_market_net_purchases_of_equities",
                    "get_market_net_purchases_of_equities_by_ticker")
     months = [m for m in month_grid(start, end) if m.strftime("%Y-%m") not in have]
-    if fn is None or RUN_MODE == "CACHED" or CLOCK.over():
+    # ★경로가 하나뿐이면 그 하나가 없을 때 축이 통째로 사라진다. pykrx 가 없으면 KRX 직통.
+    use_krx = False
+    if months and RUN_MODE != "CACHED" and not CLOCK.over() and fn is None:
+        use_krx = _flow_krx_probe(months[-1])
+        if use_krx:
+            L.ok("수급: pykrx 없이 KRX 정보데이터시스템 직통 경로로 수집합니다"
+                 "(월축 1회 = 전 종목 · d3 복구).")
+    if (fn is None and not use_krx) or RUN_MODE == "CACHED" or CLOCK.over():
         months = []
         if fn is None and pykrx_stock is not None:
             L.warn("pykrx 에 전종목 순매수 함수가 없습니다(구버전) — d3 결측으로 진행합니다.")
@@ -4572,6 +4714,16 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 break
             f0 = m.replace(day=1)
             part: Optional[pd.DataFrame] = None
+            if use_krx:                                   # ★KRX 직통 (pykrx 부재 시)
+                for col, _inv in FLOW_INVESTORS:
+                    one = _flow_krx_month(f0, m, col)
+                    if one is None or not len(one):
+                        continue
+                    part = one if part is None else part.merge(one, on="code", how="outer")
+                if part is not None and len(part):
+                    part["month"] = m
+                    got.append(part)
+                continue
             for col, inv in FLOW_INVESTORS:
                 # ★market="ALL" 이 안 먹는 pykrx 버전에서는 KOSPI+KOSDAQ 을 '합쳐야' 한다.
                 #   먼저 성공한 하나로 break 하면 코스닥이 통째로 빠져 소형주 d3 가 전멸한다.
@@ -4604,7 +4756,10 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 newf[c] = np.nan
         frames.append(newf[["code", "month", "inst_net", "forgn_net"]])
     if not frames:
-        L.info("수급 미수집(pykrx 없음/CACHED/시간예산) — d3 결측, U 는 가용 축 평균으로 구성.")
+        L.warn("수급 미수집 — d3 결측, U 는 가용 축 평균으로 구성합니다. 경로 상태: "
+               f"pykrx={'가용' if fn is not None else '없음'} · "
+               f"KRX직통={'가용' if use_krx else '실패/미시도'} · 모드={RUN_MODE}"
+               + (" · 시간예산 초과" if CLOCK.over() else ""))
         return empty
     fl = pd.concat([f.reindex(columns=["code", "month", "inst_net", "forgn_net", "_legacy"])
                     for f in frames], ignore_index=True)
@@ -4621,7 +4776,8 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         #   have 에 그 월이 들어가 '전종목 월 수집'이 영영 돌지 않는다(선택편향 고착).
         keep = fl[~fl.index.isin(drop_idx)] if len(drop_idx) else fl
         VAULT.save_table("krx_flows_monthly", keep, "shared", domain="flow",
-                         source="pykrx:net_purchases", note="월간 전종목 순매수 — 전 전략 공용")
+                         source=("krx_bld:MDCSTAT02401" if use_krx else "pykrx:net_purchases"),
+                         note="월간 전종목 순매수 — 전 전략 공용")
     return shrink(fl)
 
 
@@ -4966,7 +5122,9 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
 
 
 def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
-                       max_calls: int = 0) -> pd.DataFrame:
+                       max_calls: int = 0,
+                       already: Optional[set] = None,
+                       filed: Optional[set] = None) -> pd.DataFrame:
     """★저가 벌크 티어 — 다중회사 주요계정(fnlttMultiAcnt): corp_code 를 100개까지 한 번에.
 
     옛 설계는 전 종목 전체재무제표만 썼다: 3,400사 × 12년 × 4보고서 ≈ 163,000회.
@@ -4988,12 +5146,21 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
     corps = [str(c) for c in dict.fromkeys(str(c) for c in corps if c)]
     yrs = sorted({int(y) for y in years}, reverse=True)
     bs = max(10, min(int(DART_MULTI_BATCH), 100))
+    # ★일괄 ZIP 이 이미 덮은 조합은 여기서도 다시 받지 않는다. ZIP 은 주요계정을 포함한
+    #   전체 재무제표라 상위집합이다 — 안 걸러 두면 이 티어가 예산을 통째로 헛되이 태운다.
+    skip = set(already or ())
     jobs: List[Tuple[int, str, List[str]]] = []
+    n_raw = 0
     for y in yrs:
         for r in RQ.values():
-            todo = [c for c in corps if (c, y, r) not in done]
+            todo = [c for c in corps if (c, y, r) not in done and (c, y, r) not in skip
+                    and (not filed or (c, y, r) in filed)]
+            n_raw += len(todo)
             for grp in chunked(todo, bs):
                 jobs.append((y, r, list(grp)))
+    if (skip or filed) and jobs:
+        L.info(f"주요계정 벌크: 일괄 ZIP·정기보고서 사실로 사전 소거 후 "
+               f"{n_raw:,}조합 → {len(jobs):,}회 (회사 {bs}개/호출)")
     if RUN_MODE == "CACHED":
         jobs = []
     if not jobs:
@@ -5080,7 +5247,8 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
 def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
                             priority: Sequence[str] = (),
                             max_calls: int = 0,
-                            already: Optional[set] = None) -> pd.DataFrame:
+                            already: Optional[set] = None,
+                            filed: Optional[set] = None) -> pd.DataFrame:
     """★심층 티어 — 전체 재무제표(fnlttSinglAcntAll). (회사×연도×보고서) 캐시 증분.
 
     · 수집 순서 = 유동성 상위·최근 연도 먼저: 한도로 끊겨도 '투자 가능한 종목의 최근
@@ -5142,19 +5310,28 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
     if have_zip:
         L.info(f"일괄 ZIP 이 덮은 {len(have_zip):,}조합은 단건 API 대상에서 제외 — "
                f"남은 단건 수집 {len(jobs):,}건")
+    # ★사전 소거 — 그 조합에 정기보고서가 아예 없으면 단건 API 도 100% 013 이다.
+    if filed:
+        n0 = len(jobs)
+        jobs = [j for j in jobs if j in filed]
+        if n0 - len(jobs) > 0:
+            L.info(f"정기보고서 제출 사실로 {n0-len(jobs):,}조합을 사전 소거 "
+                   f"(그 해에 보고서 자체가 없어 호출해도 빈손) — 실수집 대상 {len(jobs):,}건")
     if RUN_MODE == "CACHED":
         jobs = []
     got: List[pd.DataFrame] = []
     new_empty: List[dict] = []
     if jobs:
-        rem = QUOTA.remaining("dart")
-        L.info(f"DART 재무(심층) 신규 {len(jobs):,}건 — 실시간 잔여 호출 {rem:,}건 "
-               f"(잔여만큼 받고, 서버 020 수신 시 그 지점을 오늘 한도로 학습해 정지)")
-        QUOTA.plan("dart", len(jobs), "전체재무제표 심층(유동성 순)")
-        if rem and len(jobs) > rem:
-            L.info(f"→ 오늘 {rem:,}건까지 진행되고 나머지 {len(jobs)-rem:,}건은 다음 실행에서 "
-                   f"이어받습니다(약 {math.ceil(len(jobs)/max(rem,1))}일이면 전 구간 완비). "
-                   f"그 사이에도 주요계정 벌크 덕분에 전 종목 패널은 이미 살아 있습니다.")
+        cap = int(max_calls) if max_calls else int(QUOTA.remaining("dart"))
+        L.info(f"DART 재무(심층) 잔여 {len(jobs):,}조합 — 이번 실행 배정 {cap:,}건 "
+               f"(서버 020 수신 시 그 지점을 오늘 한도로 학습해 정지)")
+        QUOTA.plan("dart", min(len(jobs), cap), "전체재무제표 심층(꼬리 보충)")
+        if cap and len(jobs) > cap:
+            L.info(f"→ 이번 실행은 {cap:,}건까지. ★이 티어는 '꼬리 보충'이라 끊겨도 패널은 "
+                   f"멀쩡합니다 — 재고·매출채권·CFO·CAPEX 를 포함한 전체재무제표 본체는 "
+                   f"이미 일괄 ZIP(호출한도 0)이 덮었고, 여기 남은 것은 ZIP 이 제공하지 않는 "
+                   f"연도·비제출사의 잔여분입니다. 나머지 {len(jobs)-cap:,}건은 다음 실행이 "
+                   f"정확히 이어받습니다.")
 
         def one(job):
             c, y, r = job
@@ -5381,11 +5558,22 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
 
 def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
                            priority: Sequence[str] = (),
-                           max_calls: int = 0) -> pd.DataFrame:
+                           max_calls: int = 0,
+                           filed: Optional[set] = None) -> pd.DataFrame:
     """직원현황(empSttus) — 사업부문×성별 분해 + '합계' 소계행 이중계상 제거.
 
-    ★재무 심층 티어와 같은 쿼터를 나눠 쓴다. 전 종목(3,400사×12년≈41,000회)을 돌면
-      재무를 굶기므로 대상·순서를 유동성 기준으로 맞춘다(PACK-N·C2축의 dlog_emp 입력)."""
+    ★★2026-08 개편: '전수수집'이 원칙이다. 단, 전수를 '무작정 다 호출'로 달성하지 않는다.
+      empSttus 는 ★사업보고서에만 실린다. 그러므로 그 해에 사업보고서를 내지 않은 회사
+      (상장 전·폐지 후·비제출)를 호출하면 100% 013(데이터 없음)이 돌아온다 — 응답이
+      비어도 호출량은 정확히 1건씩 깎인다. 옛 코드는 이 낭비를 '유동성 상위 1,500사로
+      자르기'로 덮었는데, 그건 전수 포기이지 효율이 아니었다.
+
+      지금은 이미 공짜로 갖고 있는 ★공시목록 스윕(harvest_dart_disclosures)에서
+      (회사, 사업연도)별 사업보고서 제출 사실을 뽑아 filed 로 받고, 제출한 조합만 호출한다.
+      → 호출 1건당 적중률이 1.0 에 수렴하고, 전수 필요량 자체가 30~40% 줄어든다.
+      대상은 더 이상 자르지 않는다(전 상장사). 순서만 유동성 상위·최근 연도 우선이라
+      한도에 걸려 끊겨도 '투자 가능한 종목의 최근 데이터'부터 완성된다.
+    """
     empty = pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll",
                                   "period_end", "knowledge_date", "event_date"])
     if not DART_API_KEY:
@@ -5410,14 +5598,31 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
                    f"{EMPTY_RETRY_AFTER_D}일간 재호출하지 않습니다.")
     rank = {str(c): i for i, c in enumerate(priority)}
     clist = sorted((str(c) for c in corps), key=lambda c: (rank.get(c, 10 ** 9), c))
-    if DART_DEEP_TOP_N and rank and len(clist) > DART_DEEP_TOP_N:
-        clist = clist[:int(DART_DEEP_TOP_N)]
-    jobs = [(c, int(y)) for y in sorted({int(v) for v in years}, reverse=True)
-            for c in clist if (c, int(y)) not in done and (c, int(y)) not in empty_seen]
+    ylist = sorted({int(v) for v in years}, reverse=True)
+    universe = [(c, y) for y in ylist for c in clist]          # ★전수 모집단(자르지 않는다)
+    # ★사실 기반 소거 ①: 그 해에 사업보고서를 낸 조합만 남긴다(=empSttus 가 존재할 수 있는 조합).
+    n_all = len(universe)
+    if filed:
+        universe = [(c, y) for (c, y) in universe if (c, y) in filed]
+        if universe:
+            L.info(f"사업보고서 제출 사실로 사전 소거 — 전수 모집단 {n_all:,}조합 중 "
+                   f"{n_all-len(universe):,}조합은 그 해에 사업보고서 자체가 없어 호출을 "
+                   f"생략합니다(호출해도 100% '데이터 없음'). 실제 전수 대상 {len(universe):,}조합.")
+        else:
+            universe = [(c, y) for y in ylist for c in clist]   # 공시 스윕이 비었으면 되돌린다
+            L.warn("공시목록에서 사업보고서 제출 사실을 찾지 못해 사전 소거를 건너뜁니다.")
+    # ★사실 기반 소거 ②: 이미 받은 것 + 서버가 '없다'고 답한 것
+    jobs = [(c, y) for (c, y) in universe
+            if (c, y) not in done and (c, y) not in empty_seen]
+    n_target = len(universe)
+    n_have = n_target - len(jobs)
     if RUN_MODE == "CACHED":
         jobs = []
+    if n_target:
+        L.info(f"직원현황 전수 진척 {n_have:,}/{n_target:,}조합 "
+               f"({100.0*n_have/max(n_target,1):.1f}%) — 남은 {len(jobs):,}조합")
     if jobs:
-        QUOTA.plan("dart", len(jobs), "직원현황(유동성 순)")
+        QUOTA.plan("dart", len(jobs), "직원현황 전수(유동성·최근연도 순)")
 
     def one(job):
         c, y = job
@@ -5446,13 +5651,21 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
     got: List[dict] = []
     new_empty: List[dict] = []
     spent0 = QUOTA.spent("dart")
-    with stage_bar(len(jobs), "DART 직원현황") as bar:
+    with stage_bar(len(jobs), "DART 직원현황(전수)") as bar:
         for batch in chunked(jobs, 400):
             if CLOCK.over() or not QUOTA.allow("dart") or \
                     (max_calls and QUOTA.spent("dart") - spent0 >= max_calls):
                 why = ("시간예산" if CLOCK.over() else
                        "배정 소진" if max_calls else "호출 잔여량 소진")
-                CLOCK.cut(f"직원현황: {len(jobs)-bar.n:,}건 남기고 중단({why}) — 다음 실행 이어받음")
+                rest = len(jobs) - bar.n
+                pct = 100.0 * (n_have + bar.n) / max(n_target, 1)
+                cap_d = max(int(QUOTA.hint("dart")), 1)     # ★f-string 안에서 중첩 따옴표를
+                days = math.ceil(rest / cap_d) if rest else 0   # 쓰면 3.11 이하에서 죽는다
+                CLOCK.cut(f"직원현황: {rest:,}조합 남기고 중단({why}). "
+                          f"전수 진척 {n_have+bar.n:,}/{n_target:,} ({pct:.1f}%) — "
+                          f"내일 재실행하면 정확히 이어받아 약 {days}일이면 전수 완비"
+                          f"(하루 한도 {cap_d:,}건 기준). "
+                          f"그 사이에도 시가총액 폴백이 있어 셀 배정은 정상 동작합니다.")
                 break
             for r in pmap_net(one, batch, workers=min(IO_THREADS, 10), quiet=True):
                 if isinstance(r, tuple) and r and r[0] == "EMPTY":
@@ -5484,6 +5697,52 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
     return pit_mark(E, "period_end", "knowledge_date", origin="dart_emp")
 
 
+_RPT_YM_RE = re.compile(r"\((\d{4})[.\-/](\d{2})\)")
+#  결산기말 월 → 보고서 코드. 정기보고서 이름의 괄호가 그대로 알려 준다.
+_MONTH_TO_RQ = {3: RQ["Q1"], 6: RQ["H1"], 9: RQ["Q3"], 12: RQ["FY"]}
+
+
+def filed_report_set(disc: Optional[pd.DataFrame]) -> set:
+    """공시목록 스윕에서 (회사, 사업연도, 보고서코드) 정기보고서 제출 사실을 뽑는다.
+    ★추가 호출 0회 — 이미 받아 둔 공시목록에 공짜로 들어 있는 정보다.
+
+    이게 왜 결정적인가:
+      DART 재무·직원 단건 API 는 '그 보고서가 실제로 제출된 조합'에만 데이터가 있다.
+      상장 전·폐지 후·비제출 회사를 호출하면 100% status 013(데이터 없음)이 돌아오는데,
+      응답이 비어도 ★호출량은 정확히 1건 깎인다. 냉시작 전수 모집단의 30~45%가 이런
+      '태생적 빈손'이라, 사전 소거만으로 전수 완비 일수가 그만큼 줄어든다.
+      (전수를 포기해서 줄이는 게 아니라, 존재하지 않는 것을 안 물어봐서 줄이는 것이다.)
+
+    보고서명 '사업보고서 (2023.12)' / '분기보고서 (2024.03)' 의 괄호에서 사업연도·결산기말을
+    읽는다. 괄호가 없으면 사업보고서에 한해 접수일 -1년으로 근사한다(12월 결산이 절대다수).
+    틀려도 '호출을 한 번 더 하거나 덜 하는' 정도지 데이터가 왜곡되지는 않는다."""
+    if disc is None or not len(disc) or "kind" not in disc.columns:
+        return set()
+    d = disc[disc["kind"].astype(str).isin(("annual_rpt", "periodic_rpt"))]
+    if not len(d):
+        return set()
+    nm = (d["report_nm"].astype(str) if "report_nm" in d.columns
+          else pd.Series([""] * len(d), index=d.index))
+    ex = nm.str.extract(_RPT_YM_RE)
+    yr = pd.to_numeric(ex[0], errors="coerce")
+    mo = pd.to_numeric(ex[1], errors="coerce")
+    ann = d["kind"].astype(str).eq("annual_rpt")
+    if "rcept_dt" in d.columns:            # 괄호 없는 사업보고서만 접수일로 근사
+        rd = ds_(d["rcept_dt"])
+        fb = pd.Series(rd.dt.year - 1, index=d.index)
+        yr = yr.where(yr.notna() | ~ann, fb)
+        mo = mo.where(mo.notna() | ~ann, 12)
+    out = set()
+    for c, y, m in zip(d["corp_code"].astype(str), yr, mo):
+        if not (pd.notna(y) and pd.notna(m)):
+            continue
+        r = _MONTH_TO_RQ.get(int(m))
+        if r is None or not (1990 <= int(y) <= 2100):
+            continue
+        out.add((c, int(y), r))
+    return out
+
+
 DISCLOSURE_KINDS = {
     "tstock_acq":  r"자기주식\s*취득",
     "tstock_disp": r"자기주식\s*처분",
@@ -5495,6 +5754,9 @@ DISCLOSURE_KINDS = {
     "reduction":   r"감자",
     "audit_flag":  r"감사보고서.*(한정|부적정|의견거절)|의견거절",
     "annual_rpt":  r"^사업보고서",
+    # ★정기보고서(분기·반기) — 그 자체를 쓰기보다, '어떤 조합에 재무가 존재하는가'를
+    #   공짜로 알려 주는 사전 소거 지도로 쓴다(filed_report_set 참조).
+    "periodic_rpt": r"^(분기보고서|반기보고서)",
 }
 
 
@@ -5672,6 +5934,7 @@ def harvest_hankyung(start: str, end: str,
             break
         m1 = min(e_t, m0 + pd.offsets.MonthEnd(0))
         page = 1
+        seen_id: set = set()             # ★그 달에 이미 본 보고서 id
         while page <= 200:
             html = net_get(base, source="hankyung",
                            params={"skinType": "business", "search_report_type": "CO",
@@ -5682,7 +5945,16 @@ def harvest_hankyung(start: str, end: str,
             got = _hk_rows(html)
             if not got:
                 break                    # ★빈 페이지에서만 종료 — '80행 미만' 조기종료는
-            rows += got                  #   파싱 탈락이 낀 페이지에서 그 달 잔여분을 유실한다
+            #                              파싱 탈락이 낀 페이지에서 그 달 잔여분을 유실한다
+            # ★★한경은 마지막 페이지를 넘어가면 '빈 페이지'가 아니라 ★같은 페이지를 계속
+            #   돌려준다(실측). 빈 페이지만 기다리면 월마다 상한 200페이지를 그대로 태워
+            #   120개월 × 200 = 24,000요청이 전부 중복 수집이 된다. 종료 판정은 반드시
+            #   '신규 id 0건'이어야 한다(다른 세션에서도 같은 결론에 도달한 지점).
+            fresh = [r for r in got if r.get("src_id") not in seen_id]
+            if not fresh:
+                break
+            seen_id.update(r.get("src_id") for r in fresh)
+            rows += fresh
             page += 1
             if CLOCK.over():
                 break
@@ -5765,6 +6037,7 @@ def harvest_naver_research(start: str, end: str,
             L.info(f"네이버리서치: 캐시 이후분만 증분 수집 ({new_start.date()} ~ {e_t.date()})")
             s_t = new_start
     page = 1
+    seen_id: set = set()                 # ★네이버도 마지막 페이지를 반복 반환한다(한경과 동일)
     while page <= 3000:
         if CLOCK.over():
             CLOCK.cut(f"네이버리서치: {len(rows):,}건 수집 후 중단")
@@ -5777,7 +6050,11 @@ def harvest_naver_research(start: str, end: str,
         got, has_next = _nv_rows(html)
         if not got:
             break
-        rows += got
+        fresh = [r for r in got if r.get("src_id") not in seen_id]
+        if not fresh:
+            break                        # 신규 0건 = 마지막 페이지 반복. 여기서 끊지 않으면
+        seen_id.update(r.get("src_id") for r in fresh)   # 상한 3,000페이지를 그대로 태운다
+        rows += fresh
         if not has_next:
             break
         page += 1
@@ -8811,37 +9088,47 @@ def main() -> dict:
         c2corp = master.dropna(subset=["corp_code"]).set_index("code")["corp_code"] \
             .astype(str).to_dict()
         prio = [c2corp[c] for c in adv_rank.index if c in c2corp]
-        # ★호출량을 소비자별로 먼저 나눈다. 순서만 바꾸면 앞에 선 수집기가 잔여를 다 먹고
-        #   뒤는 매 실행 0건이 된다 — 실제로 그 사고를 두 방향으로 한 번씩 냈다.
+        # ★호출량 배분 — 고정 비율이 아니라 '배정 직전의 실잔여 × 남은 소비자 사이의
+        #   상대 가중치, 단 실수요 상한'. 순서만 바꾸면 앞선 수집기가 다 먹고, 비율만 고정하면
+        #   ★할 일이 없는 수집기가 예산을 깔고 앉는다(3차 사고: 일괄 ZIP 이 재무를 다 덮었는데도
+        #   deep+major 가 65%를 선점해 직원현황이 800건에서 끊겼다). 둘 다 막는다.
         budget = CallBudget("dart", DART_BUDGET_SHARE)
-        for _k in DART_BUDGET_SHARE:
-            budget.take(_k)
-        budget.table({"disclosure": "공시목록(시장 스윕)", "major": "주요계정 벌크",
-                      "deep": "전체재무제표(심층)", "employee": "직원현황"})
+        budget.table({"disclosure": "공시목록(시장 스윕)", "employee": "직원현황(전수)",
+                      "major": "주요계정 벌크", "deep": "전체재무제표(꼬리)"})
         disc = harvest_dart_disclosures(BT_START, BT_END,
-                                        max_calls=budget.alloc["disclosure"])
+                                        max_calls=budget.take("disclosure"))
         ctx["disclosures"] = disc
-        # ★2단 티어: ① 주요계정 벌크(회사 100개/호출)로 전 시장을 먼저 덮고
-        #             ② 남은 잔여 호출량을 유동성 상위 회사의 전체재무제표에 쏟는다.
+        # ★공시목록에서 '정기보고서 제출 사실'을 공짜로 뽑아 이후 모든 단건 티어의 사전
+        #   소거 지도로 쓴다. 존재하지 않는 조합을 묻지 않는 것이 전수수집의 유일한 지름길.
+        filedS = filed_report_set(disc)
+        filed_fy = {(c, y) for (c, y, r) in filedS if r == RQ["FY"]}
+        if filedS:
+            L.ok(f"정기보고서 제출 사실 {len(filedS):,}조합 확보(추가 호출 0회) — "
+                 f"사업보고서 {len(filed_fy):,}조합. 이후 단건 티어는 이 조합만 호출합니다.")
         # ★일괄 ZIP 이 심층 계정(재고·매출채권·CFO·CAPEX)을 호출한도 0으로 채운다.
         code2corp_all = (master.dropna(subset=["corp_code"])
                          .set_index("code")["corp_code"].astype(str).to_dict())
         fs_zip = harvest_dart_bulk_zip(code2corp_all, years)
-        fs_major = harvest_dart_multi(corps, years, max_calls=budget.alloc["major"])
-        # ★직원현황을 심층 재무보다 먼저. 심층은 잔여 쿼터를 전부 먹는 구조라 뒤에 두면
-        #   직원현황이 매 실행 0건이 되고, size_bucket 이 전부 '규모미상'이 되어 C11 셀이
-        #   (월,산업)으로 붕괴한다(규모 통제 소실). 직원현황은 심층의 1/4 규모다.
-        # 심층 재무가 먼저다(B/C축의 핵심). 배분이 있으므로 순서가 굶김을 만들지 않는다.
         zip_have = set()
         if fs_zip is not None and len(fs_zip):
             zip_have = set(zip(fs_zip["corp_code"].astype(str),
                                fs_zip["bsns_year"].astype(int),
                                fs_zip["reprt_code"].astype(str)))
+        # ★직원현황을 재무 단건보다 먼저 — 재무는 일괄 ZIP 이라는 무한도 대체재가 있지만
+        #   직원현황은 대체재가 없다(오직 이 API 뿐). '대체 불가'가 예산의 우선권을 갖는다.
+        #   size_bucket 이 전부 '규모미상'이 되면 C11 셀이 (월,산업)으로 붕괴해 규모 통제가
+        #   소실되고, C2축 dlog_emp·PACK-N 한계임금이 통째로 결측이 된다.
+        emp = harvest_dart_employees(
+            corps, years, priority=prio, filed=filed_fy,
+            max_calls=budget.take("employee",
+                                  need=len(filed_fy) if filed_fy else len(corps) * len(years)))
+        fs_major = harvest_dart_multi(corps, years, already=zip_have, filed=filedS,
+                                      max_calls=budget.take("major"))
         fs_deep = harvest_dart_financials(corps, years, priority=prio,
-                                          max_calls=budget.alloc["deep"],
-                                          already=zip_have)
-        emp = harvest_dart_employees(corps, years, priority=prio,
-                                     max_calls=budget.alloc["employee"])
+                                          already=zip_have, filed=filedS,
+                                          max_calls=budget.take("deep"))
+        budget.report({"disclosure": "공시목록(시장 스윕)", "employee": "직원현황(전수)",
+                       "major": "주요계정 벌크", "deep": "전체재무제표(꼬리)"})
         parts_fs = [x for x in (fs_deep, fs_zip, fs_major) if x is not None and len(x)]
         fs = pd.concat([x.reindex(columns=_FS_KEEP) for x in parts_fs],
                        ignore_index=True) if parts_fs else pd.DataFrame(columns=_FS_KEEP)
