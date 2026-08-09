@@ -118,7 +118,16 @@ KRX_MP_PW = ""            # 예: "********"            (환경변수 KRX_MP_PW)
 #    용도   : 실적발표월 플래그 + 월별 공시 건수(§6.3 통제변수).
 DART_API_KEYS = []        # 예: ["a1b2c3...", "d4e5f6..."]  (환경변수 DART_API_KEYS 콤마구분)
 
-# ── ③ 대화형 입력 허용 여부 ────────────────────────────────────────────────
+# ── ③ 구글 드라이브 루트 (절대 1원칙 — 신규 수집분은 전부 여기에 저장) ────
+#    Colab      : 비워 두면 자동으로 /content/drive/MyDrive 마운트.
+#    Windows/맥 : Google Drive for Desktop 이 설치돼 있으면 자동 탐지하지만,
+#                 탐지 실패 시 여기에 직접 지정하라. 지정하지 않으면 로컬에만
+#                 쌓이고 pending 큐에 남아 다음 실행에서 동기화된다.
+#    확인 방법  : 탐색기에서 '내 드라이브' 폴더의 주소창 경로를 그대로 붙여넣기.
+#    예)  GDRIVE_ROOT = r"G:\내 드라이브"      /  r"C:\Users\user\Google Drive\My Drive"
+GDRIVE_ROOT = ""          # 환경변수 GDRIVE_ROOT 로도 주입 가능
+
+# ── ④ 대화형 입력 허용 여부 ────────────────────────────────────────────────
 #    True 이고 위 값이 비어 있으며 노트북/터미널이 대화형이면 getpass 로 1회 질의.
 #    (자동화/배치 실행에서는 절대 블로킹하지 않도록 비대화형이면 건너뜀)
 PROMPT_FOR_MISSING_CREDENTIALS = True
@@ -233,23 +242,42 @@ class CFG:
     MAX_WORKERS        = 4         # ThreadPoolExecutor 상한(보수적)
     CB_MAX_CONSEC_FAIL = 10        # 서킷 브레이커: 연속 실패 10회 → 소스 중단
     HTTP_TIMEOUT       = 20
-    RETRY_BACKOFF      = [2, 4, 8, 16]   # 지수 백오프(초)
-    BASE_DELAY = {                 # 소스별 기본 랜덤 딜레이(초) — 차단 회피 겸 예의
-        "naver_research": (0.35, 0.9), "hankyung": (0.6, 1.4),
-        "pykrx": (0.25, 0.7), "krx": (0.5, 1.2), "dart": (0.05, 0.2),
-        "naver_chart": (0.15, 0.45), "fdr": (0.1, 0.3), "yfinance": (0.3, 0.8),
-        "kofia": (0.8, 1.6), "fnguide": (0.5, 1.2),
+    RETRY_BACKOFF      = [2, 4, 8]  # 지수 백오프(초). 403/404 는 여기 타지 않는다.
+    RATE_FACTOR_MIN    = 0.35      # 적응형 페이싱 하한(정상 구간에서 최대 ~3배 가속)
+    RATE_FACTOR_MAX    = 8.0       # 차단 신호 시 상한
+    BASE_DELAY = {                 # 소스별 기본 랜덤 딜레이(초) — 적응형으로 조정됨
+        "naver_research": (0.25, 0.6), "hankyung": (0.35, 0.8),
+        "pykrx": (0.20, 0.5), "krx": (0.35, 0.8), "dart": (0.04, 0.12),
+        "naver_chart": (0.12, 0.35), "fdr": (0.08, 0.25), "yfinance": (0.3, 0.8),
+        "kofia": (0.6, 1.2), "fnguide": (0.4, 0.9), "kind": (0.4, 0.9),
     }
+    PROGRESS_HEARTBEAT_S = 20      # 워치독 출력 주기(초) — 침묵 방지
+
+    # ── 요청 예산: '실행 전체' 기준. 월당 한도는 개월 수를 곱하면 폭발한다 ──
+    #   네이버 상세 페이지는 1요청당 리포트 1건 → 확장성이 없으므로 예산제로 묶고,
+    #   확장 가능한 경로(한경 리스트: 1요청당 최대 80건)를 주력으로 삼는다.
+    BUDGET_NAVER_DETAIL = 12000    # 상세 페이지 총 요청 상한
+    BUDGET_PDF          = 300      # PDF 다운로드 총 상한(기본 경로 아님)
+    PHASE0_DETAIL_PER_MONTH = 60   # Phase 0 확보율 측정용 표본(가볍게)
 
     # ── 기능 플래그 ────────────────────────────────────────────────────────
     AUTO_PIP                 = True    # 부족 의존성 pip 자동 설치(코랩/로컬 공통)
-    EXTRACT_ANALYST_FROM_PDF = True    # 네이버 PDF 1~2쪽에서 작성자 추출(재현율 보강)
-    PDF_MAX_MB               = 3.0
+    # PDF 작성자 추출은 요청당 산출량이 극도로 낮고(1건/수 MB), 증권사 PDF 상당수가
+    # 깨진 xref 를 가져 pypdf 경고를 대량 발생시킨다. 기본 비활성 — 확장 가능한
+    # 경로(한경 리스트, 네이버 상세)로 확보율이 부족할 때만 소량 보조로 켠다.
+    EXTRACT_ANALYST_FROM_PDF = False
+    PDF_MAX_MB               = 2.0
     COLLECT_INVESTOR_RATIO   = True    # H4 개인 매매비중(과중 시 프록시 폴백)
     RECURSIVE_CONTROLS       = True    # §6.3 통제회귀 확장윈도우 재귀추정(look-ahead 차단)
     CTRL_MIN_WINDOW_M        = 24      # 재귀추정 최소 표본 개월
     FORCE_STAGES             = set()   # 예: {"ST06"} 해당 스테이지 캐시 무시 재계산
     SAVE_PLOTS               = True    # matplotlib 있으면 CAR/에쿼티 곡선 png 저장
+
+    # ── 가격 수집(반복 조회 제거) ──────────────────────────────────────────
+    PRICE_INCREMENTAL     = True   # 캐시 마지막 날짜 다음날부터만 받아 append
+    PRICE_REFRESH_DAYS    = 5      # 캐시가 이 일수 이내면 아예 건드리지 않음
+    PRICE_NODATA_COOLDOWN = 30     # 데이터 없는 티커(상폐 등) 재시도 금지 일수
+    PRICE_BULK_BY_DATE    = True   # 증분 구간은 '날짜별 전종목' 1콜로 일괄 수집
 
     # ── 시간 예산 ──────────────────────────────────────────────────────────
     # 발주자 지시: 수집(다운로드) 단계에만 4시간 타임박스. 초과 시 수집을 우아하게
@@ -327,8 +355,19 @@ def ensure_dependencies():
 
 
 def mount_google_drive():
-    """구글드라이브 루트 탐지. Colab → drive.mount, 로컬 → Drive for Desktop 경로 프로브.
+    """구글드라이브 루트 탐지. 우선순위:
+       S00 GDRIVE_ROOT 직접 지정 → 환경변수 → Colab 마운트 → 데스크톱 앱 경로 프로브.
     반환: (drive_root: Path|None, how: str)"""
+    explicit = (GDRIVE_ROOT or os.environ.get("GDRIVE_ROOT") or "").strip().strip('"')
+    if explicit:
+        p = Path(explicit)
+        try:
+            if p.exists() and p.is_dir():
+                return p, "S00 직접지정"
+            p.mkdir(parents=True, exist_ok=True)
+            return p, "S00 직접지정(신규생성)"
+        except Exception as e:
+            print(f"[S02][경고] GDRIVE_ROOT 사용 불가({p}): {e}")
     if _in_colab():
         try:
             mp = Path("/content/drive")
@@ -340,24 +379,53 @@ def mount_google_drive():
         except Exception as e:
             print(f"[S02][경고] Colab 드라이브 마운트 실패: {e}")
         return None, "colab_mount_failed"
-    # 로컬(Windows/기타): Google Drive for Desktop 흔한 마운트 지점 프로브
-    candidates = []
-    for dl in "GHIJKLMNOPQRSTUVWXYZ":
-        candidates += [Path(f"{dl}:/내 드라이브"), Path(f"{dl}:/My Drive"),
-                       Path(f"{dl}:/내드라이브")]
+    # 로컬(Windows/맥/리눅스): Google Drive for Desktop 마운트 지점 프로브.
+    # 데스크톱 앱은 드라이브 문자 바로 아래 또는 '내 드라이브' 하위에 붙는다.
+    cands = []
+    if _is_windows():
+        for dl in "GHIJKLMNOPQRSTUVWXYZDEF":
+            base = Path(f"{dl}:/")
+            cands += [base / "내 드라이브", base / "My Drive", base / "내드라이브"]
+            # 스트리밍 모드: X:\<계정>\내 드라이브 형태
+            try:
+                if base.exists():
+                    for sub in list(base.iterdir())[:12]:
+                        if sub.is_dir():
+                            cands += [sub / "내 드라이브", sub / "My Drive"]
+            except Exception:
+                pass
     home = Path.home()
-    candidates += [home / "Google Drive" / "My Drive", home / "Google Drive" / "내 드라이브",
-                   home / "GoogleDrive" / "My Drive", home / "Google Drive"]
-    env_gd = os.environ.get("GDRIVE_ROOT")
-    if env_gd:
-        candidates.insert(0, Path(env_gd))
-    for c in candidates:
+    for nm in ("Google Drive", "GoogleDrive", "Google 드라이브"):
+        cands += [home / nm / "My Drive", home / nm / "내 드라이브", home / nm]
+    cands += [home / "Library" / "CloudStorage"]          # macOS
+    for c in cands:
         try:
             if c.exists() and c.is_dir():
                 return c, "desktop_drive"
         except Exception:
             continue
     return None, "not_found"
+
+
+def quiet_noisy_libraries():
+    """pypdf 등이 stdout/stderr 로 직접 쏟아내는 파싱 경고를 억제한다.
+    (증권사 PDF 상당수가 깨진 xref 를 가져 정상 동작 중에도 대량 출력된다)"""
+    import logging
+    import warnings
+    for name in ("pypdf", "PyPDF2", "pdfminer", "fontTools", "urllib3",
+                 "yfinance", "peewee"):
+        try:
+            logging.getLogger(name).setLevel(logging.CRITICAL)
+            logging.getLogger(name).propagate = False
+        except Exception:
+            pass
+    warnings.filterwarnings("ignore", category=UserWarning, module="pypdf")
+    warnings.filterwarnings("ignore", message=".*startxref.*")
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    try:
+        logging.captureWarnings(True)
+    except Exception:
+        pass
 
 
 def resolve_project_root():
@@ -887,16 +955,35 @@ class CheckpointManager:
             pass
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [S04] 네트워크 계층 — 레이트리밋 / 지수백오프 / 서킷브레이커 / 실시간 쿼터
+# [S04] 네트워크 계층 (전면 재작성)
+#   설계 원칙 — 이전 버전이 "조용히 멈춘 것처럼" 보였던 원인을 전부 제거한다.
+#   ① 침묵 금지 : 모든 장시간 루프는 Progress 에 등록되고, 워치독이 주기적으로
+#                 "지금 무엇을 하는 중 / 몇 개째 / 예상 잔여시간"을 출력한다.
+#   ② 빠른 포기 : 403/404 는 재시도해도 200 이 되지 않는다. 백오프 없이 즉시
+#                 헤더 프로파일을 한 번 바꿔 보고, 안 되면 소스를 끈다.
+#                 (이전: 403 하나에 재시도 5회 × 백오프 = 33초 낭비)
+#   ③ 적응형 페이싱 : 성공하면 딜레이를 서서히 줄이고, 429/403 이 나오면 즉시
+#                 늘린다. 고정 딜레이보다 빠르면서 차단 위험은 낮다.
+#   ④ 요청 예산 : 비싼 경로(상세 페이지)는 '월당 한도'가 아니라 '실행 전체 한도'로
+#                 관리한다. 월당 한도는 개월 수를 곱하면 폭발한다.
+#   ⑤ 실시간 쿼터 : 고정 상수(19,000/20,000)를 가정하지 않는다. 서버가 한도초과를
+#                 알리면 그 즉시 소진 처리하고, 그 전까지는 관측된 사용량만 센다.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SourceDown(Exception):
-    """서킷 브레이커 개방: 해당 소스 이번 실행에서 사용 중단."""
+    """서킷 브레이커 개방 또는 차단 확정: 해당 소스 이번 실행에서 사용 중단."""
+
+
+class QuotaExhausted(Exception):
+    """해당 소스/키의 호출 한도 소진(서버 응답으로 확인된 경우만)."""
+
+
+class BudgetExceeded(Exception):
+    """수집 타임박스 또는 요청 예산 초과 — 수집분으로 INTERIM 진행."""
 
 
 class TimeBudget:
-    """수집 단계 타임박스(발주자 지시: 4시간 초과 시 수집 중단 → 수집분만으로
-    중간(INTERIM) 백테스트 산출). 계산 단계에는 적용하지 않는다."""
+    """수집 단계 타임박스. 계산 단계에는 적용하지 않는다."""
     def __init__(self, hours):
         self.limit_s = float(hours) * 3600.0
         self.t0 = None
@@ -909,6 +996,9 @@ class TimeBudget:
     def elapsed(self):
         return 0.0 if self.t0 is None else time.time() - self.t0
 
+    def remaining(self):
+        return max(0.0, self.limit_s - self.elapsed())
+
     def exceeded(self):
         if self.t0 is None:
             return False
@@ -918,82 +1008,174 @@ class TimeBudget:
         return False
 
     def status(self):
-        return (f"수집경과 {self.elapsed()/60:.0f}분 / 한도 {self.limit_s/60:.0f}분"
-                + (" [초과→INTERIM 모드]" if self.tripped else ""))
+        return (f"수집 {self.elapsed()/60:.0f}분 경과 / 한도 {self.limit_s/60:.0f}분"
+                + (" [초과→INTERIM]" if self.tripped else ""))
 
 
-# 전역 수집 예산(오케스트레이터가 start). None 이면 무제한.
 COLLECT_BUDGET = TimeBudget(CFG.COLLECT_TIMEBOX_HOURS)
 
 
-class QuotaExhausted(Exception):
-    """해당 소스/키의 금일 호출 한도 소진."""
+# ──────────────────────────────────────────────────────────────────────────────
+# 진행 상황 방송기 + 워치독  (침묵 방지 — 이번 재작성의 1순위 목표)
+# ──────────────────────────────────────────────────────────────────────────────
+class Progress:
+    """현재 작업을 전역에 게시한다. 워치독 스레드가 이를 주기적으로 출력하므로
+    어떤 루프도 '멈춘 것처럼' 보이지 않는다."""
+    _lock = threading.Lock()
+    task = "(대기)"
+    done = 0
+    total = 0
+    t0 = time.time()
+    last_emit = 0.0
+    extra = ""
+
+    @classmethod
+    def begin(cls, task, total=0, extra=""):
+        with cls._lock:
+            cls.task, cls.total, cls.done = task, int(total), 0
+            cls.t0, cls.extra = time.time(), extra
+
+    @classmethod
+    def tick(cls, n=1, extra=None):
+        with cls._lock:
+            cls.done += n
+            if extra is not None:
+                cls.extra = extra
+
+    @classmethod
+    def snapshot(cls):
+        with cls._lock:
+            el = time.time() - cls.t0
+            rate = cls.done / el if el > 0.5 else 0.0
+            eta = (cls.total - cls.done) / rate if (rate > 0 and cls.total) else None
+            return cls.task, cls.done, cls.total, el, rate, eta, cls.extra
+
+    @classmethod
+    def line(cls):
+        task, done, total, el, rate, eta, extra = cls.snapshot()
+        s = f"⏳ {task}: {done}"
+        if total:
+            s += f"/{total} ({done/max(total,1)*100:.0f}%)"
+        s += f" | {rate:.1f}건/s | 경과 {el/60:.1f}분"
+        if eta:
+            s += f" | 잔여 ~{eta/60:.1f}분"
+        if extra:
+            s += f" | {extra}"
+        return s
 
 
-_UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36",
-]
+class Watchdog:
+    """N초마다 Progress 를 출력하는 데몬 스레드. 어떤 단계에서도 화면이 죽지 않는다."""
+    def __init__(self, log, period=None):
+        self.log = log
+        self.period = period or CFG.PROGRESS_HEARTBEAT_S
+        self._stop = threading.Event()
+        self._th = None
+
+    def start(self):
+        if self._th is not None:
+            return
+        def _run():
+            while not self._stop.wait(self.period):
+                try:
+                    _, done, _, el, _, _, _ = Progress.snapshot()
+                    if done > 0 or el > self.period:
+                        self.log.info(Progress.line() + f" | {COLLECT_BUDGET.status()}")
+                except Exception:
+                    pass
+        self._th = threading.Thread(target=_run, daemon=True, name="arc-watchdog")
+        self._th.start()
+
+    def stop(self):
+        self._stop.set()
 
 
-class RateLimiter:
-    """소스별 랜덤 딜레이(스레드 안전). 마지막 호출로부터 최소 간격을 보장."""
+# ──────────────────────────────────────────────────────────────────────────────
+# 레이트리밋 / 서킷 / 쿼터 / 요청예산
+# ──────────────────────────────────────────────────────────────────────────────
+class AdaptiveLimiter:
+    """성공하면 조금씩 빨라지고, 차단 신호(403/429)가 오면 즉시 느려진다.
+    고정 딜레이 대비 정상 구간에서 2~3배 빠르면서 차단 위험은 더 낮다."""
     def __init__(self, lo, hi):
-        self.lo, self.hi = lo, hi
+        self.base_lo, self.base_hi = lo, hi
+        self.factor = 1.0
         self._last = 0.0
         self._lock = threading.Lock()
 
     def wait(self):
         with self._lock:
-            gap = random.uniform(self.lo, self.hi)
+            gap = random.uniform(self.base_lo, self.base_hi) * self.factor
             due = self._last + gap
             now = time.time()
             if due > now:
                 time.sleep(due - now)
             self._last = time.time()
 
+    def on_success(self):
+        with self._lock:
+            self.factor = max(CFG.RATE_FACTOR_MIN, self.factor * 0.97)
+
+    def on_throttle(self):
+        with self._lock:
+            self.factor = min(CFG.RATE_FACTOR_MAX, self.factor * 2.0)
+
 
 class CircuitBreaker:
-    """연속 실패 CFG.CB_MAX_CONSEC_FAIL 회 → 즉시 개방(SourceDown), 상태 저장."""
+    """연속 실패 CB_MAX_CONSEC_FAIL 회 → 개방. 차단 확정(403 등)은 즉시 개방.
+    상태는 날짜 단위로 저장하되, 재실행 시 '오늘 이미 막힘'을 존중한다."""
     def __init__(self, source, state_dir, log):
         self.source, self.log = source, log
         self.path = Path(state_dir) / f"circuit_{source}.json"
         st = read_json_safe(self.path) or {}
+        today = datetime.now().strftime("%Y-%m-%d")
         self.consec = 0
-        self.open = bool(st.get("open_today") == datetime.now().strftime("%Y-%m-%d"))
+        self.open = bool(st.get("open_date") == today)
+        self.reason = st.get("reason", "") if self.open else ""
         self._lock = threading.Lock()
+        if self.open:
+            log.warn(f"[S04] {source}: 금일 차단 이력 있음({self.reason}) — 폴백 경로 사용")
 
     def check(self):
         if self.open:
-            raise SourceDown(f"{self.source}: 서킷 개방 상태(금일)")
+            raise SourceDown(f"{self.source}: {self.reason or '서킷 개방'}")
 
     def ok(self):
         with self._lock:
             self.consec = 0
+
+    def _persist(self, reason):
+        try:
+            atomic_write_json(self.path, {
+                "open_date": datetime.now().strftime("%Y-%m-%d"),
+                "at": datetime.now().isoformat(), "reason": reason})
+        except Exception:
+            pass
+
+    def trip_now(self, reason):
+        """재시도가 무의미한 차단(403/robots/로그인월) — 즉시 개방."""
+        with self._lock:
+            if not self.open:
+                self.open, self.reason = True, reason
+                self._persist(reason)
+                self.log.warn(f"[S04] {self.source}: 차단 확정({reason}) → 소스 비활성화")
+        raise SourceDown(f"{self.source}: {reason}")
 
     def fail(self):
         with self._lock:
             self.consec += 1
             if self.consec >= CFG.CB_MAX_CONSEC_FAIL and not self.open:
                 self.open = True
-                try:
-                    atomic_write_json(self.path, {
-                        "open_today": datetime.now().strftime("%Y-%m-%d"),
-                        "at": datetime.now().isoformat(), "consec": self.consec})
-                except Exception:
-                    pass
-                self.log.error(f"[S04] {self.source}: 연속 {self.consec}회 실패 → 서킷 개방(중단)")
+                self.reason = f"연속 실패 {self.consec}회"
+                self._persist(self.reason)
+                self.log.error(f"[S04] {self.source}: {self.reason} → 서킷 개방")
                 raise SourceDown(self.source)
 
 
 class QuotaTracker:
-    """실시간 잔여 호출량 추적. '처음부터 19,000건' 같은 고정 예산을 두지 않고,
-    (a) 금일 실제 사용량을 영속 카운트하고 (b) 서버가 한도초과를 알리는 즉시
-    해당 키를 소진 처리한다. remaining() 은 관측 기반 추정치."""
+    """실시간 잔여 호출량. 고정 예산(19,000 등)을 '가정'하지 않는다.
+    - used(key)      : 이번 날짜에 실제로 보낸 요청 수(영속)
+    - mark_exhausted : 서버가 한도초과를 알린 순간에만 호출된다
+    - budget_left    : 관측된 명목한도가 있으면 그것 기준, 없으면 무한대 취급"""
     def __init__(self, state_dir, log):
         self.path = Path(state_dir) / "quota_state.json"
         self.log = log
@@ -1001,7 +1183,8 @@ class QuotaTracker:
         self.doc = read_json_safe(self.path) or {}
         today = datetime.now().strftime("%Y-%m-%d")
         if self.doc.get("date") != today:
-            self.doc = {"date": today, "used": {}, "exhausted": {}}
+            self.doc = {"date": today, "used": {}, "exhausted": {}, "observed_limit": {}}
+        self.doc.setdefault("observed_limit", {})
 
     def _save(self):
         try:
@@ -1012,7 +1195,7 @@ class QuotaTracker:
     def record(self, key):
         with self._lock:
             self.doc["used"][key] = self.doc["used"].get(key, 0) + 1
-            if self.doc["used"][key] % 200 == 0:
+            if self.doc["used"][key] % 250 == 0:
                 self._save()
 
     def used(self, key):
@@ -1020,191 +1203,354 @@ class QuotaTracker:
 
     def mark_exhausted(self, key, why=""):
         with self._lock:
+            n = self.doc["used"].get(key, 0)
             self.doc["exhausted"][key] = {"at": datetime.now().isoformat(), "why": why}
+            # 소진 시점의 사용량 = 그 키의 실제 한도. 다음 실행의 계획에 쓴다.
+            self.doc["observed_limit"][key] = n
             self._save()
-        self.log.warn(f"[S04] 쿼터 소진 처리: {key} ({why}) — 사용량 {self.used(key)}건")
+        self.log.warn(f"[S04] 쿼터 소진: {key} ({why}) — 관측 한도 {n}건으로 기록")
 
     def is_exhausted(self, key):
         return key in self.doc.get("exhausted", {})
 
-    def remaining(self, key, nominal_limit):
-        """관측 기반 잔여량: 소진 플래그면 0, 아니면 명목한도-사용량(음수 방지).
-        명목한도는 참고치일 뿐 실제 판정은 서버 응답이 우선한다."""
+    def budget_left(self, key):
+        """관측된 한도가 있으면 그 기준 잔여, 없으면 None(=제한 미확인)."""
         if self.is_exhausted(key):
             return 0
-        return max(0, int(nominal_limit) - self.used(key))
+        lim = self.doc.get("observed_limit", {}).get(key)
+        return None if lim is None else max(0, int(lim) - self.used(key))
+
+    def summary(self):
+        return {"used": dict(self.doc.get("used", {})),
+                "exhausted": list(self.doc.get("exhausted", {})),
+                "observed_limit": dict(self.doc.get("observed_limit", {}))}
+
+
+class RequestBudget:
+    """비싼 경로(리포트 상세 페이지 등)의 '실행 전체' 요청 상한.
+    월당 한도는 개월 수를 곱하면 폭발하므로 전역으로만 관리한다."""
+    def __init__(self, name, limit, log):
+        self.name, self.limit, self.log = name, int(limit), log
+        self.used = 0
+        self._lock = threading.Lock()
+        self._warned = False
+
+    def take(self, n=1):
+        with self._lock:
+            if self.used + n > self.limit:
+                if not self._warned:
+                    self.log.warn(f"[S04] 요청예산 소진: {self.name} "
+                                  f"{self.used}/{self.limit} — 이후 해당 경로 생략")
+                    self._warned = True
+                return False
+            self.used += n
+            return True
+
+    def left(self):
+        return max(0, self.limit - self.used)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP 클라이언트 — 소스별 헤더 프로파일 + 세션 웜업 + 빠른 포기
+# ──────────────────────────────────────────────────────────────────────────────
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+]
+
+# 소스별 헤더 프로파일. 한경 403 의 통상 원인은 브라우저 유사 헤더 부재이므로
+# Referer/Accept/Sec-Fetch 를 갖춘 프로파일을 1순위로 쓰고, 실패 시 대체안을 1회 시도.
+_HEADER_PROFILES = {
+    "hankyung": [
+        {"Referer": "https://consensus.hankyung.com/analysis/list",
+         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+         "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+         "Sec-Fetch-Site": "same-origin", "Sec-Fetch-User": "?1",
+         "Upgrade-Insecure-Requests": "1", "Cache-Control": "no-cache"},
+        {"Referer": "https://consensus.hankyung.com/",
+         "Accept": "*/*", "X-Requested-With": "XMLHttpRequest",
+         "Accept-Language": "ko-KR,ko;q=0.9"},
+    ],
+    "naver_research": [
+        {"Referer": "https://finance.naver.com/research/company_list.naver",
+         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+         "Accept-Language": "ko-KR,ko;q=0.9"},
+    ],
+    "krx": [
+        {"Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
+         "Accept": "application/json, text/javascript, */*; q=0.01",
+         "X-Requested-With": "XMLHttpRequest",
+         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+    ],
+}
+
+# 세션 웜업 URL: 쿠키를 먼저 확보해야 200 을 주는 사이트 대응
+_WARMUP = {
+    "hankyung": "https://consensus.hankyung.com/",
+    "naver_research": "https://finance.naver.com/research/",
+    "krx": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201",
+    "kind": "https://kind.krx.co.kr/",
+}
+
+# 재시도해도 200 이 되지 않는 상태코드 — 백오프로 시간을 버리지 않는다
+_FAST_FAIL = {400, 401, 403, 404, 405, 410, 451}
 
 
 class HttpClient:
-    """소스별 세션: UA 로테이션 + 랜덤 딜레이 + 지수 백오프 + 서킷 + 쿼터 연동."""
-    def __init__(self, source, state_dir, log, quota=None):
+    def __init__(self, source, state_dir, log, quota=None, blocked=False):
         import requests
         self.requests = requests
         self.source, self.log = source, log
-        lo, hi = CFG.BASE_DELAY.get(source, (0.3, 0.8))
-        self.limiter = RateLimiter(lo, hi)
+        lo, hi = CFG.BASE_DELAY.get(source, (0.25, 0.6))
+        self.limiter = AdaptiveLimiter(lo, hi)
         self.breaker = CircuitBreaker(source, state_dir, log)
         self.quota = quota
         self.sess = requests.Session()
-        self.sess.headers.update({"User-Agent": random.choice(_UA_POOL),
-                                  "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5"})
-        self.n_ok = 0
-        self.n_fail = 0
+        self.sess.headers.update({
+            "User-Agent": random.choice(_UA_POOL),
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
+            "Connection": "keep-alive"})
+        try:                                  # 커넥션 풀 확대(워커 수 대응)
+            ad = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16,
+                                               max_retries=0)
+            self.sess.mount("https://", ad)
+            self.sess.mount("http://", ad)
+        except Exception:
+            pass
+        self.profiles = _HEADER_PROFILES.get(source, [{}])
+        self._pi = 0
+        self._warmed = False
+        self.n_ok = self.n_fail = 0
+        if blocked:
+            try:
+                self.breaker.trip_now("카나리 차단 감지")
+            except SourceDown:
+                pass
+
+    def warmup(self):
+        """쿠키 확보용 선요청. 실패해도 무시."""
+        if self._warmed:
+            return
+        self._warmed = True
+        url = _WARMUP.get(self.source)
+        if not url:
+            return
+        try:
+            self.limiter.wait()
+            self.sess.get(url, timeout=CFG.HTTP_TIMEOUT,
+                          headers=self.profiles[0] if self.profiles else {})
+        except Exception:
+            pass
 
     def get(self, url, params=None, encoding=None, referer=None, quota_key=None,
-            method="GET", data=None, allow_codes=(200,)):
+            method="GET", data=None, allow_codes=(200,), stream=False,
+            fast=False):
+        """fast=True 면 실패 시 재시도 없이 즉시 예외(대량 루프용)."""
         self.breaker.check()
         if self.quota is not None and quota_key and self.quota.is_exhausted(quota_key):
             raise QuotaExhausted(quota_key)
-        headers = {}
-        if referer:
-            headers["Referer"] = referer
+        self.warmup()
+        # 재시도 슬롯 = 백오프 단계 + '헤더 프로파일 전환' 몫(지연 0).
+        # 프로파일 전환에도 슬롯을 배정하지 않으면 fast 경로에서 전환 후 재시도가
+        # 일어나지 않아 대체 헤더를 시험해 볼 기회 자체가 사라진다.
+        backoffs = ([0] if fast else ([0] + list(CFG.RETRY_BACKOFF))) \
+            + [0] * max(0, len(self.profiles) - 1)
         last_err = None
-        for i, back in enumerate([0] + list(CFG.RETRY_BACKOFF)):
+        for back in backoffs:
             if back:
-                time.sleep(back + random.uniform(0, 0.7))
+                time.sleep(back + random.uniform(0, 0.5))
             self.limiter.wait()
+            headers = dict(self.profiles[self._pi % len(self.profiles)]) \
+                if self.profiles else {}
+            if referer:
+                headers["Referer"] = referer
             try:
                 if method == "POST":
                     r = self.sess.post(url, params=params, data=data, headers=headers,
-                                       timeout=CFG.HTTP_TIMEOUT)
+                                       timeout=CFG.HTTP_TIMEOUT, stream=stream)
                 else:
                     r = self.sess.get(url, params=params, headers=headers,
-                                      timeout=CFG.HTTP_TIMEOUT)
+                                      timeout=CFG.HTTP_TIMEOUT, stream=stream)
                 if self.quota is not None and quota_key:
                     self.quota.record(quota_key)
                 if r.status_code in allow_codes:
                     if encoding:
                         r.encoding = encoding
                     self.breaker.ok()
+                    self.limiter.on_success()
                     self.n_ok += 1
                     return r
-                if r.status_code in (403, 429):
-                    last_err = f"HTTP {r.status_code}"
-                    if i >= 2:                      # 지속 차단 → 실패 집계
-                        self.breaker.fail()
+                if r.status_code == 429:
+                    self.limiter.on_throttle()
+                    last_err = "HTTP 429"
                     continue
+                if r.status_code in _FAST_FAIL:
+                    # 헤더 프로파일을 한 번 바꿔 보고, 그래도 막히면 즉시 포기.
+                    # (이전 버전은 여기서 백오프 5회 = 33초를 버렸다)
+                    self.n_fail += 1
+                    if self._pi + 1 < len(self.profiles):
+                        self._pi += 1
+                        self.log.info(f"[S04] {self.source}: HTTP {r.status_code} → "
+                                      f"헤더 프로파일 #{self._pi} 로 재시도")
+                        continue
+                    self.limiter.on_throttle()
+                    self.breaker.trip_now(f"HTTP {r.status_code}")
                 last_err = f"HTTP {r.status_code}"
             except (SourceDown, QuotaExhausted):
                 raise
             except Exception as e:
-                last_err = str(e)[:160]
+                last_err = f"{type(e).__name__}: {str(e)[:100]}"
         self.n_fail += 1
         self.breaker.fail()
-        raise IOError(f"{self.source} GET 실패: {url} ({last_err})")
+        raise IOError(f"{self.source} 요청 실패: {url} ({last_err})")
 
 
 class ParallelFetcher:
-    """보수적 병렬 수집 러너: worker ≤4, 완료 키 영속 스킵(세션 지속성),
-    진행 로깅, 청크 flush 콜백. SourceDown/QuotaExhausted 시 전체 우아한 중단."""
+    """보수적 병렬 러너: worker 상한, 완료 키 영속 스킵, 진행률 방송,
+    타임박스/소스중단 시 우아한 조기 종료."""
     def __init__(self, name, store, log, max_workers=None):
         self.name, self.store, self.log = name, store, log
         self.max_workers = min(CFG.MAX_WORKERS, max_workers or CFG.MAX_WORKERS)
         self.reg_path = store.local_root / "state" / f"done_{name}.json"
         self.done = set(read_json_safe(self.reg_path) or [])
         self._lock = threading.Lock()
+        self._dirty = 0
 
     def _mark(self, key):
         with self._lock:
             self.done.add(key)
-            if len(self.done) % 50 == 0:
-                self._flush_registry()
+            self._dirty += 1
+            if self._dirty >= 100:
+                self._dirty = 0
+                self._flush()
 
-    def _flush_registry(self):
+    def _flush(self):
         try:
             atomic_write_json(self.reg_path, sorted(self.done))
         except Exception:
             pass
 
-    def run(self, items, worker_fn, key_fn, desc=""):
-        """items 각각에 worker_fn(item) 실행. 반환 목록(성공분). 완료 키는 스킵."""
+    def run(self, items, worker_fn, key_fn, desc=None):
         todo = [it for it in items if key_fn(it) not in self.done]
+        skipped = len(items) - len(todo)
+        if skipped:
+            self.log.info(f"[S04] {self.name}: 캐시 완료 {skipped}건 스킵")
         if not todo:
-            self.log.info(f"[S04] {self.name}: 전체 {len(items)}건 캐시 완료 — 수집 생략")
             return []
         if COLLECT_BUDGET.exceeded():
-            self.log.warn(f"[S04] {self.name}: 수집 타임박스 초과 — 신규 수집 생략"
-                          f"(캐시분만 사용, {COLLECT_BUDGET.status()})")
+            self.log.warn(f"[S04] {self.name}: 타임박스 초과 — 신규 수집 생략")
             return []
-        self.log.info(f"[S04] {self.name}: {len(items)}건 중 {len(todo)}건 수집 시작 "
+        Progress.begin(desc or self.name, total=len(todo))
+        self.log.info(f"[S04] {self.name}: {len(todo)}건 수집 시작 "
                       f"(workers={self.max_workers})")
         out, aborted = [], None
-        t0 = time.time()
         with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             futs = {ex.submit(worker_fn, it): it for it in todo}
-            for n, fut in enumerate(as_completed(futs), 1):
+            for fut in as_completed(futs):
                 it = futs[fut]
                 try:
                     res = fut.result()
                     if res is not None:
                         out.append(res)
                     self._mark(key_fn(it))
-                except (SourceDown, QuotaExhausted) as e:
-                    aborted = e
+                except (SourceDown, QuotaExhausted, BudgetExceeded) as e:
+                    aborted = str(e)[:100]
                     for f2 in futs:
                         f2.cancel()
                     break
                 except Exception as e:
-                    self.log.warn(f"{self.name} 항목 실패({key_fn(it)}): {str(e)[:140]}")
+                    self.log.warn(f"{self.name} 실패({key_fn(it)}): {str(e)[:110]}")
+                Progress.tick()
                 if COLLECT_BUDGET.exceeded():
                     aborted = "타임박스"
-                    self.log.warn(f"[S04] {self.name}: 수집 4시간 타임박스 도달 → "
-                                  "잔여 취소, 수집분으로 중간(INTERIM) 결과 진행")
                     for f2 in futs:
                         f2.cancel()
                     break
-                if n % 25 == 0 or n == len(todo):
-                    el = time.time() - t0
-                    rate = n / max(el, 1e-9)
-                    self.log.info(f"    {self.name}: {n}/{len(todo)} "
-                                  f"({rate:.1f}건/s, 경과 {el/60:.1f}분)")
-        self._flush_registry()
-        if aborted is not None:
-            self.log.warn(f"[S04] {self.name}: 조기 종료({aborted}) — 수집분까지만 사용")
+        self._flush()
+        if aborted:
+            self.log.warn(f"[S04] {self.name}: 조기 종료({aborted}) — 수집분 사용")
+        else:
+            self.log.info(f"[S04] {self.name}: 완료 {len(out)}건")
         return out
 
 
 def canary_check(log, state_dir):
-    """전체 실행 전 소규모 도달성 점검(계약 §2.3). 실패한 소스는 기록만 하고
-    본 수집에서 폴백 경로를 태운다."""
-    targets = {
-        "naver_research": "https://finance.naver.com/research/company_list.naver",
-        "hankyung":       "https://consensus.hankyung.com/analysis/list",
-        "dart":           "https://opendart.fss.or.kr/api/list.json",
-        "krx":            "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201",
-        "naver_chart":    "https://api.finance.naver.com/siseJson.naver?symbol=005930&requestType=1"
-                          "&startTime=20240102&endTime=20240105&timeframe=day",
-        "kofia":          "https://dis.kofia.or.kr",
-    }
-    result = {}
+    """본 수집 전 도달성 점검. 여기서 차단으로 판정된 소스는 처음부터 끄고 시작해
+    본 수집에서 시간을 낭비하지 않는다. 반환: {source: (ok, detail)}"""
     try:
         import requests
     except Exception:
-        return {k: "no_requests" for k in targets}
-    for src, url in targets.items():
-        try:
-            r = requests.get(url, timeout=8,
-                             headers={"User-Agent": _UA_POOL[0]})
-            result[src] = f"HTTP {r.status_code}"
-        except Exception as e:
-            result[src] = f"불가({type(e).__name__})"
+        return {}
+    targets = {
+        "naver_research": ("GET", "https://finance.naver.com/research/company_list.naver", None),
+        "hankyung": ("GET", "https://consensus.hankyung.com/analysis/list", None),
+        "dart": ("GET", "https://opendart.fss.or.kr/api/list.json", None),
+        "krx": ("GET", "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
+                {"menuId": "MDC0201"}),
+        "naver_chart": ("GET", "https://api.finance.naver.com/siseJson.naver",
+                        {"symbol": "005930", "requestType": "1",
+                         "startTime": "20240102", "endTime": "20240105",
+                         "timeframe": "day"}),
+        "kind": ("GET", "https://kind.krx.co.kr/", None),
+    }
+    result, blocked = {}, set()
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": _UA_POOL[0],
+                         "Accept-Language": "ko-KR,ko;q=0.9"})
+    for src, (method, url, params) in targets.items():
+        detail = ""
+        ok = False
+        for prof in (_HEADER_PROFILES.get(src, [{}]) or [{}]):
+            try:
+                if src in _WARMUP:               # 쿠키 확보 후 판정(403 오판 방지)
+                    try:
+                        sess.get(_WARMUP[src], timeout=6)
+                    except Exception:
+                        pass
+                r = sess.get(url, params=params, headers=prof, timeout=8)
+                detail = f"HTTP {r.status_code}"
+                if r.status_code == 200:
+                    ok = True
+                    break
+            except Exception as e:
+                detail = f"불가({type(e).__name__})"
+        result[src] = ("OK " if ok else "차단/불가 ") + detail
+        if not ok:
+            blocked.add(src)
     log.kv("카나리 도달성 점검", result)
+    if blocked:
+        log.warn(f"[S04] 차단 판정 소스: {sorted(blocked)} — 폴백 경로로 즉시 전환"
+                 "(본 수집에서 재시도하며 시간을 낭비하지 않음)")
     try:
         atomic_write_json(Path(state_dir) / "canary.json",
-                          {"at": datetime.now().isoformat(), "result": result})
+                          {"at": datetime.now().isoformat(), "result": result,
+                           "blocked": sorted(blocked)})
     except Exception:
         pass
-    return result
+    return result, blocked
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [S05] 시장데이터 허브 — 다중소스 폴백 체인 (pykrx → KRX직접(로그인) → FDR →
-#       네이버 차트 API → yfinance), 월말 PIT 스냅샷, 수정주가, 섹터, 벤치마크
+# [S05] 시장데이터 허브 (전면 재작성 — 반복 조회 제거가 최대 목표)
+#
+#   이전 버전의 낭비:
+#     · 완료 레지스트리 키에 종료월이 들어가 매달 2,500종목 × 12년 전체를 재수집
+#     · 데이터 없는 종목(상폐/오류)을 매 실행 재시도
+#     · build_price_matrix 가 매번 2,500개 parquet 를 개별 로드
+#   이번 설계:
+#     ① 증분 수집 : 캐시의 마지막 날짜 다음날부터만 받아 append
+#     ② 벌크 수집 : 증분 구간은 '날짜별 전종목' 1콜로 처리(20영업일이면 40콜)
+#     ③ 실패 기억 : 데이터 없는 티커는 쿨다운 기간 재시도 금지
+#     ④ 통합 행렬 : close 매트릭스를 단일 parquet 로 캐시하고 증분 갱신
+#   폴백 체인: pykrx → KRX(로그인) → FDR → 네이버차트 → yfinance
 # ══════════════════════════════════════════════════════════════════════════════
 
 class KRXAuthSession:
-    """data.krx.co.kr 로그인 세션(베스트에포트).
-    2025-12 이관 후 로그인 요구 화면 대응(계약 §2.6). 엔드포인트가 재변경되면
-    이 클래스만 수정하면 된다. 실패해도 pykrx/FDR/네이버 폴백으로 진행."""
+    """data.krx.co.kr 로그인 세션(베스트에포트). 실패해도 폴백 체인으로 진행."""
     LOGIN_URLS = [
         "https://data.krx.co.kr/contents/MMC/MMCLOGIN/mmcLogin.cmd",
         "https://data.krx.co.kr/comm/loginProc.cmd",
@@ -1217,38 +1563,34 @@ class KRXAuthSession:
 
     def login(self):
         if not (KRX_MP_ID and KRX_MP_PW):
-            self.log.info("[S05] KRX 계정 미입력 — 무로그인 시도 + 폴백 체인 사용")
+            self.log.info("[S05] KRX 계정 미입력 — 무로그인 + 폴백 체인 사용"
+                          "(대부분의 통계는 무로그인으로도 조회된다)")
             return False
         try:
-            self.http.get("https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd",
-                          params={"menuId": "MDC0201"})     # 쿠키 확보
+            self.http.warmup()
             for url in self.LOGIN_URLS:
                 try:
                     r = self.http.get(url, method="POST",
                                       data={"usrId": KRX_MP_ID, "usrPwd": KRX_MP_PW,
                                             "mbrId": KRX_MP_ID, "mbrPwd": KRX_MP_PW},
-                                      allow_codes=(200, 302))
-                    if r is not None and ("logout" in r.text.lower()
-                                          or r.status_code in (200, 302)):
+                                      allow_codes=(200, 302), fast=True)
+                    if r is not None:
                         self.logged_in = True
-                        self.log.info("[S05] KRX 마켓플레이스 로그인 시도 완료(세션 쿠키 확보)")
+                        self.log.info("[S05] KRX 로그인 세션 확보")
                         return True
                 except Exception:
                     continue
         except Exception as e:
-            self.log.warn(f"KRX 로그인 실패(폴백 진행): {str(e)[:120]}")
+            self.log.warn(f"KRX 로그인 실패(폴백 진행): {str(e)[:100]}")
         return False
 
     def fetch_snapshot(self, date_str):
-        """전종목 시세+시총 크로스섹션(JSON). 반환 DataFrame 또는 None."""
         try:
             r = self.http.get(self.GEN_URL, method="POST", data={
                 "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
                 "mktId": "ALL", "trdDd": date_str.replace("-", ""),
-                "share": "1", "money": "1", "csvxls_isNo": "false"},
-                referer="https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201")
-            js = r.json()
-            rows = js.get("OutBlock_1") or js.get("output") or []
+                "share": "1", "money": "1", "csvxls_isNo": "false"}, fast=True)
+            rows = (r.json().get("OutBlock_1") or r.json().get("output") or [])
             if not rows:
                 return None
             df = pd.DataFrame(rows)
@@ -1261,25 +1603,26 @@ class KRXAuthSession:
                             .str.replace("KOSDAQ GLOBAL", "KOSDAQ"),
                 "close": _num(df["TDD_CLSPRC"]),
                 "mcap": _num(df["MKTCAP"]),
-                "shares": _num(df.get("LIST_SHRS", pd.Series(dtype=str))),
-            })
+                "shares": _num(df.get("LIST_SHRS", pd.Series(dtype=str)))})
             return out[out["close"].notna() & (out["mcap"] > 0)]
         except Exception:
             return None
 
 
 class MarketDataHub:
-    """월말 PIT 스냅샷 / 일별 수정주가 / 벤치마크 / 섹터 / 개인비중."""
+    SNAP_MIN_ROWS_FULL = 300
+    SNAP_MIN_ROWS_SYNTH = 50
 
-    def __init__(self, store, log, quota):
+    def __init__(self, store, log, quota, blocked=None):
         self.store, self.log, self.quota = store, log, quota
+        self.blocked = blocked or set()
         self.state_dir = store.local_root / "state"
-        self._pykrx = None
-        self._fdr = None
-        self._http_naver = None
-        self._http_krx = None
-        self._krx_auth = None
-        self.src_stats = {}                      # 소스별 사용 통계(원장연결 점검표)
+        self._pykrx = self._fdr = None
+        self._http_naver = self._http_krx = self._krx_auth = None
+        self.src_stats = {}
+        self._nodata_path = self.state_dir / "price_nodata.json"
+        self._nodata = read_json_safe(self._nodata_path) or {}
+        self._nodata_lock = threading.Lock()
 
     # ── 지연 로더 ──────────────────────────────────────────────────────────
     def _get_pykrx(self):
@@ -1302,12 +1645,15 @@ class MarketDataHub:
 
     def _naver_http(self):
         if self._http_naver is None:
-            self._http_naver = HttpClient("naver_chart", self.state_dir, self.log, self.quota)
+            self._http_naver = HttpClient("naver_chart", self.state_dir, self.log,
+                                          self.quota,
+                                          blocked="naver_chart" in self.blocked)
         return self._http_naver
 
     def _krx(self):
         if self._krx_auth is None:
-            self._http_krx = HttpClient("krx", self.state_dir, self.log, self.quota)
+            self._http_krx = HttpClient("krx", self.state_dir, self.log, self.quota,
+                                        blocked="krx" in self.blocked)
             self._krx_auth = KRXAuthSession(self._http_krx, self.log)
             self._krx_auth.login()
         return self._krx_auth
@@ -1315,24 +1661,41 @@ class MarketDataHub:
     def _bump(self, src, n=1):
         self.src_stats[src] = self.src_stats.get(src, 0) + n
 
-    # ── 월말 PIT 스냅샷 (유니버스/시총/생존편향의 근간) ─────────────────────
-    SNAP_MIN_ROWS_FULL = 300        # 실데이터 절단 응답 방지용 하한
-    SNAP_MIN_ROWS_SYNTH = 50
-
     def _snap_min(self):
         return self.SNAP_MIN_ROWS_FULL if CFG.RUN_MODE == "FULL" \
             else self.SNAP_MIN_ROWS_SYNTH
 
+    # ── 실패 기억(반복 조회 제거) ──────────────────────────────────────────
+    def _is_nodata(self, ticker):
+        rec = self._nodata.get(ticker)
+        if not rec:
+            return False
+        try:
+            age = (datetime.now() - pd.Timestamp(rec)).days
+            return age < CFG.PRICE_NODATA_COOLDOWN
+        except Exception:
+            return False
+
+    def _mark_nodata(self, ticker):
+        with self._nodata_lock:
+            self._nodata[ticker] = datetime.now().strftime("%Y-%m-%d")
+
+    def flush_nodata(self):
+        try:
+            atomic_write_json(self._nodata_path, self._nodata)
+        except Exception:
+            pass
+
+    # ── 월말 PIT 스냅샷 (과거 월은 불변 → 한 번 받으면 영구 재사용) ─────────
     def monthly_snapshot(self, ym):
         rel = f"snapshots/{ym}.parquet"
         df = self.store.load_df("parsed", rel, stage="ST02")
         if df is not None and len(df) >= self._snap_min():
             return df
-        if CFG.RUN_MODE != "FULL":                      # SYNTH: 네트워크 절대 금지
-            self.log.warn(f"스냅샷 캐시 부재: {ym} (SYNTH — 네트워크 미시도)")
+        if CFG.RUN_MODE != "FULL":
             return df
         eom = month_end_date(ym)
-        for back in range(0, 10):                       # 월말 휴장 → 직전 영업일 탐색
+        for back in range(0, 10):
             d = eom - pd.Timedelta(days=back)
             if d.weekday() >= 5:
                 continue
@@ -1358,24 +1721,23 @@ class MarketDataHub:
                         c = c.reset_index()
                         c.columns = [str(x) for x in c.columns]
                         tick_col = "티커" if "티커" in c.columns else c.columns[0]
-                        f = pd.DataFrame({
+                        frames.append(pd.DataFrame({
                             "ticker": c[tick_col].astype(str).str.zfill(6),
                             "close": pd.to_numeric(c.get("종가"), errors="coerce"),
                             "mcap": pd.to_numeric(c.get("시가총액"), errors="coerce"),
                             "shares": pd.to_numeric(c.get("상장주식수"), errors="coerce"),
-                            "market": mkt})
-                        frames.append(f)
+                            "market": mkt}))
                     time.sleep(random.uniform(*CFG.BASE_DELAY["pykrx"]))
                 if frames:
                     out = pd.concat(frames, ignore_index=True)
-                    if len(out) > 300:
+                    if len(out) >= self._snap_min():
                         self._bump("snapshot:pykrx")
                         return out
             except Exception as e:
-                self.log.warn(f"pykrx 스냅샷 실패({ymd}): {str(e)[:100]}")
-        try:                                            # KRX 직접(로그인 세션)
+                self.log.warn(f"pykrx 스냅샷 실패({ymd}): {str(e)[:90]}")
+        try:
             snap = self._krx().fetch_snapshot(ymd)
-            if snap is not None and len(snap) > 300:
+            if snap is not None and len(snap) >= self._snap_min():
                 self._bump("snapshot:krx_direct")
                 return snap
         except (SourceDown, QuotaExhausted):
@@ -1384,92 +1746,106 @@ class MarketDataHub:
             pass
         return None
 
-    # ── 일별 수정주가 (폴백 체인) ──────────────────────────────────────────
-    def price_history(self, ticker, start, end, market_hint=""):
+    # ── 일별 수정주가: 증분 수집 ───────────────────────────────────────────
+    def _cached_price(self, ticker):
+        return self.store.load_df("parsed", f"prices/{ticker}.parquet", stage="ST03")
+
+    def price_history(self, ticker, start, end, market_hint="", force_full=False):
+        """캐시가 있으면 '마지막 날짜 다음날부터'만 받아 이어붙인다.
+        전체 히스토리를 다시 받는 일은 없다(사용자 최우선 불만 해소)."""
         rel = f"prices/{ticker}.parquet"
-        cached = self.store.load_df("parsed", rel, stage="ST03")
-        need_until = pd.Timestamp(end) - pd.Timedelta(days=10)
-        if cached is not None and len(cached) > 0:
+        cached = None if force_full else self._cached_price(ticker)
+        end_ts = pd.Timestamp(end)
+        if cached is not None and len(cached):
             try:
                 mx = pd.to_datetime(cached["date"]).max()
-                asof = pd.Timestamp(str(cached["asof"].iloc[-1])) \
-                    if "asof" in cached.columns else None
-                # 최신이거나, 과거에 최신화 시도가 이미 있었던(상폐 추정) 경우 재수집 생략
-                if mx >= need_until or (asof is not None and asof >= need_until):
-                    return cached
+                if (end_ts - mx).days <= CFG.PRICE_REFRESH_DAYS:
+                    return cached                      # 충분히 최신 → 네트워크 접촉 없음
+                if self._is_nodata(ticker):
+                    return cached                      # 상폐 등 — 쿨다운 중
+                if CFG.PRICE_INCREMENTAL:
+                    inc_start = (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    if pd.Timestamp(inc_start) > end_ts:
+                        return cached
+                    new = self._fetch_price_chain(ticker, inc_start, end, market_hint)
+                    if new is None or not len(new):
+                        self._mark_nodata(ticker)      # 더는 데이터가 없다(상폐 추정)
+                        return cached
+                    merged = self._merge_price(cached, new, ticker)
+                    self.store.save_df(merged, "parsed", rel, scope="common",
+                                       desc=f"일별 수정주가 {ticker}(증분)", stage="ST03")
+                    return merged
             except Exception:
                 pass
-        if CFG.RUN_MODE != "FULL":                       # SYNTH: 네트워크 금지
+        if CFG.RUN_MODE != "FULL":
             return cached
+        if cached is None and self._is_nodata(ticker):
+            return None
         df = self._fetch_price_chain(ticker, start, end, market_hint)
         if df is None or df.empty:
-            if cached is not None:
-                return cached                            # 옛 캐시라도 사용(상폐 등)
-            return None
+            self._mark_nodata(ticker)
+            return cached
         df = df.sort_values("date").drop_duplicates("date")
-        df["asof"] = pd.Timestamp(end).strftime("%Y-%m-%d")
+        df["asof"] = end_ts.strftime("%Y-%m-%d")
         self.store.save_df(df, "parsed", rel, scope="common",
                            desc=f"일별 수정주가 {ticker} src={df['src'].iloc[-1]}",
                            stage="ST03")
         return df
 
+    def _merge_price(self, cached, new, ticker):
+        """증분 병합 + 액면분할/무상증자 감지. 이어붙이는 지점에서 비정상 점프가
+        보이면 수정주가 기준이 달라진 것이므로 전체 재수집을 예약한다."""
+        out = pd.concat([cached, new], ignore_index=True)
+        out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+        out = out.sort_values("date").drop_duplicates("date", keep="last")
+        try:
+            c = pd.to_numeric(out["close"], errors="coerce")
+            jump = (c / c.shift(1) - 1).abs()
+            if (jump.tail(len(new) + 1) > 0.45).any():
+                full = self._fetch_price_chain(
+                    ticker, str(pd.to_datetime(out["date"]).min().date()),
+                    str(pd.to_datetime(out["date"]).max().date()))
+                if full is not None and len(full) > len(out) * 0.8:
+                    self.log.info(f"[S05] {ticker}: 수정주가 기준 변경 감지 → 전체 재수집")
+                    out = full.sort_values("date").drop_duplicates("date")
+        except Exception:
+            pass
+        out["asof"] = datetime.now().strftime("%Y-%m-%d")
+        return out
+
     def _fetch_price_chain(self, ticker, start, end, market_hint=""):
-        s8, e8 = start.replace("-", ""), end.replace("-", "")
+        s8, e8 = str(start).replace("-", ""), str(end).replace("-", "")
         stk = self._get_pykrx()
-        if stk is not None:                              # ① pykrx (수정주가)
+        if stk is not None and "pykrx" not in self.blocked:
             try:
                 d = stk.get_market_ohlcv(s8, e8, ticker, adjusted=True)
-                if d is not None and len(d):
-                    d = d.reset_index()
-                    d.columns = [str(c) for c in d.columns]
-                    date_col = d.columns[0]
-                    out = pd.DataFrame({
-                        "date": pd.to_datetime(d[date_col]).dt.strftime("%Y-%m-%d"),
-                        "open": pd.to_numeric(d.get("시가"), errors="coerce"),
-                        "high": pd.to_numeric(d.get("고가"), errors="coerce"),
-                        "low": pd.to_numeric(d.get("저가"), errors="coerce"),
-                        "close": pd.to_numeric(d.get("종가"), errors="coerce"),
-                        "volume": pd.to_numeric(d.get("거래량"), errors="coerce"),
-                        "src": "pykrx"})
-                    out = out[out["close"] > 0]
-                    if len(out) > 5:
-                        self._bump("price:pykrx")
-                        return out
+                out = self._norm_pykrx(d)
+                if out is not None:
+                    self._bump("price:pykrx")
+                    return out
             except Exception:
                 pass
         fdr = self._get_fdr()
-        if fdr is not None:                              # ② FinanceDataReader
+        if fdr is not None:
             try:
                 d = fdr.DataReader(ticker, start, end)
-                if d is not None and len(d) > 5:
-                    d = d.reset_index()
-                    d.columns = [str(c).lower() for c in d.columns]
-                    dc = "date" if "date" in d.columns else d.columns[0]
-                    out = pd.DataFrame({
-                        "date": pd.to_datetime(d[dc]).dt.strftime("%Y-%m-%d"),
-                        "open": pd.to_numeric(d.get("open"), errors="coerce"),
-                        "high": pd.to_numeric(d.get("high"), errors="coerce"),
-                        "low": pd.to_numeric(d.get("low"), errors="coerce"),
-                        "close": pd.to_numeric(d.get("close"), errors="coerce"),
-                        "volume": pd.to_numeric(d.get("volume"), errors="coerce"),
-                        "src": "fdr"})
-                    out = out[out["close"] > 0]
-                    if len(out) > 5:
-                        self._bump("price:fdr")
-                        return out
+                out = self._norm_generic(d, "fdr")
+                if out is not None:
+                    self._bump("price:fdr")
+                    return out
             except Exception:
                 pass
-        try:                                             # ③ 네이버 차트 API
+        try:
             r = self._naver_http().get(
                 "https://api.finance.naver.com/siseJson.naver",
                 params={"symbol": ticker, "requestType": "1", "startTime": s8,
-                        "endTime": e8, "timeframe": "day"})
-            txt = r.text.replace("'", '"')
-            rows = json.loads(re.sub(r",\s*]", "]", txt))
-            if len(rows) > 6:
+                        "endTime": e8, "timeframe": "day"}, fast=True)
+            rows = json.loads(re.sub(r",\s*]", "]", r.text.replace("'", '"')))
+            if len(rows) > 2:
                 body = pd.DataFrame(rows[1:], columns=[str(c).strip() for c in rows[0]])
                 out = pd.DataFrame({
-                    "date": pd.to_datetime(body["날짜"], format="%Y%m%d").dt.strftime("%Y-%m-%d"),
+                    "date": pd.to_datetime(body["날짜"], format="%Y%m%d")
+                              .dt.strftime("%Y-%m-%d"),
                     "open": pd.to_numeric(body["시가"], errors="coerce"),
                     "high": pd.to_numeric(body["고가"], errors="coerce"),
                     "low": pd.to_numeric(body["저가"], errors="coerce"),
@@ -1477,62 +1853,229 @@ class MarketDataHub:
                     "volume": pd.to_numeric(body["거래량"], errors="coerce"),
                     "src": "naver"})
                 out = out[out["close"] > 0]
-                if len(out) > 5:
+                if len(out):
                     self._bump("price:naver")
                     return out
         except (SourceDown, QuotaExhausted):
             pass
         except Exception:
             pass
-        try:                                             # ④ yfinance (최후)
+        try:
             import yfinance as yf
             for suf in ([".KQ", ".KS"] if market_hint == "KOSDAQ" else [".KS", ".KQ"]):
                 d = yf.download(ticker + suf, start=start, end=end, progress=False,
-                                auto_adjust=True)
-                if d is not None and len(d) > 5:
+                                auto_adjust=True, threads=False)
+                if d is not None and len(d):
                     d = d.reset_index()
                     if isinstance(d.columns, pd.MultiIndex):
                         d.columns = [c[0] for c in d.columns]
-                    out = pd.DataFrame({
-                        "date": pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d"),
-                        "open": d.get("Open"), "high": d.get("High"),
-                        "low": d.get("Low"), "close": d.get("Close"),
-                        "volume": d.get("Volume"), "src": "yfinance"})
-                    out = out[pd.to_numeric(out["close"], errors="coerce") > 0]
-                    if len(out) > 5:
+                    out = self._norm_generic(d, "yfinance")
+                    if out is not None:
                         self._bump("price:yfinance")
                         return out
         except Exception:
             pass
         return None
 
+    @staticmethod
+    def _norm_pykrx(d):
+        if d is None or not len(d):
+            return None
+        d = d.reset_index()
+        d.columns = [str(c) for c in d.columns]
+        out = pd.DataFrame({
+            "date": pd.to_datetime(d[d.columns[0]]).dt.strftime("%Y-%m-%d"),
+            "open": pd.to_numeric(d.get("시가"), errors="coerce"),
+            "high": pd.to_numeric(d.get("고가"), errors="coerce"),
+            "low": pd.to_numeric(d.get("저가"), errors="coerce"),
+            "close": pd.to_numeric(d.get("종가"), errors="coerce"),
+            "volume": pd.to_numeric(d.get("거래량"), errors="coerce"),
+            "src": "pykrx"})
+        out = out[out["close"] > 0]
+        return out if len(out) else None
+
+    @staticmethod
+    def _norm_generic(d, src):
+        if d is None or not len(d):
+            return None
+        d = d.reset_index()
+        d.columns = [str(c).lower() for c in d.columns]
+        dc = "date" if "date" in d.columns else d.columns[0]
+        out = pd.DataFrame({
+            "date": pd.to_datetime(d[dc]).dt.strftime("%Y-%m-%d"),
+            "open": pd.to_numeric(d.get("open"), errors="coerce"),
+            "high": pd.to_numeric(d.get("high"), errors="coerce"),
+            "low": pd.to_numeric(d.get("low"), errors="coerce"),
+            "close": pd.to_numeric(d.get("close"), errors="coerce"),
+            "volume": pd.to_numeric(d.get("volume"), errors="coerce"),
+            "src": src})
+        out = out[out["close"] > 0]
+        return out if len(out) else None
+
+    # ── 벌크 증분: '날짜별 전종목' 1콜로 최근 구간을 한 번에 채운다 ─────────
+    def bulk_recent_by_date(self, tickers, end, log):
+        """캐시된 종목들의 공통 결손 구간이 짧으면(수십 영업일) 종목별 호출 대신
+        날짜별 전종목 조회로 처리한다. 2,500콜 → 40콜."""
+        stk = self._get_pykrx()
+        if not (CFG.PRICE_BULK_BY_DATE and stk is not None and CFG.RUN_MODE == "FULL"):
+            return set()
+        last_by_t, cache_by_t = {}, {}
+        for t in tickers:
+            df = self._cached_price(t)
+            if df is not None and len(df):
+                cache_by_t[t] = df
+                last_by_t[t] = pd.to_datetime(df["date"]).max()
+        if len(last_by_t) < 50:
+            return set()
+        end_ts = pd.Timestamp(end)
+        stale = {t: d for t, d in last_by_t.items()
+                 if (end_ts - d).days > CFG.PRICE_REFRESH_DAYS
+                 and not self._is_nodata(t)}
+        if not stale:
+            return set(last_by_t)
+        start_ts = min(stale.values()) + pd.Timedelta(days=1)
+        days = pd.bdate_range(start_ts, end_ts)
+        if not len(days) or len(days) > 90:
+            return set()                      # 결손이 길면 종목별 증분이 더 정확
+        self.log.info(f"[S05] 벌크 증분: {len(stale)}종목 × {len(days)}영업일 → "
+                      f"{len(days)*2}콜로 처리(종목별이면 {len(stale)}콜)")
+        Progress.begin("가격 벌크 증분(날짜별 전종목)", total=len(days))
+        frames = []
+        for d in days:
+            if COLLECT_BUDGET.exceeded():
+                break
+            ymd = d.strftime("%Y%m%d")
+            for mkt in ("KOSPI", "KOSDAQ"):
+                try:
+                    x = stk.get_market_ohlcv_by_ticker(ymd, market=mkt)
+                    if x is None or not len(x):
+                        continue
+                    x = x.reset_index()
+                    x.columns = [str(c) for c in x.columns]
+                    tc = "티커" if "티커" in x.columns else x.columns[0]
+                    frames.append(pd.DataFrame({
+                        "ticker": x[tc].astype(str).str.zfill(6),
+                        "date": d.strftime("%Y-%m-%d"),
+                        "open": pd.to_numeric(x.get("시가"), errors="coerce"),
+                        "high": pd.to_numeric(x.get("고가"), errors="coerce"),
+                        "low": pd.to_numeric(x.get("저가"), errors="coerce"),
+                        "close": pd.to_numeric(x.get("종가"), errors="coerce"),
+                        "volume": pd.to_numeric(x.get("거래량"), errors="coerce"),
+                        "src": "pykrx_bulk"}))
+                except Exception:
+                    continue
+                time.sleep(random.uniform(*CFG.BASE_DELAY["pykrx"]))
+            Progress.tick()
+        if not frames:
+            return set()
+        allrows = pd.concat(frames, ignore_index=True)
+        allrows = allrows[allrows["close"] > 0]
+        self._bump("price:pykrx_bulk", len(days) * 2)
+        filled = set()
+        for t, g in allrows.groupby("ticker"):
+            if t not in cache_by_t:
+                continue
+            g = g.drop(columns=["ticker"])
+            merged = self._merge_price(cache_by_t[t], g, t)
+            self.store.save_df(merged, "parsed", f"prices/{t}.parquet", scope="common",
+                               desc=f"일별 수정주가 {t}(벌크증분)", stage="ST03")
+            filled.add(t)
+        self.log.info(f"[S05] 벌크 증분 반영 {len(filled)}종목")
+        return filled
+
     def collect_prices(self, tickers, start, end, market_map=None):
-        pf = ParallelFetcher("prices", self.store, self.log, max_workers=3)
+        """① 벌크 증분으로 최근 구간을 메우고 ② 남은 종목만 개별 수집."""
+        tickers = list(dict.fromkeys(tickers))
+        filled = self.bulk_recent_by_date(tickers, end, self.log)
         mm = market_map or {}
+        rest = [t for t in tickers if t not in filled and not self._is_nodata(t)]
+        skipped = len(tickers) - len(rest) - 0
+        if skipped:
+            self.log.info(f"[S05] 개별 수집 대상 {len(rest)}종목 "
+                          f"(벌크/쿨다운으로 {skipped}종목 생략)")
+        pf = ParallelFetcher("prices", self.store, self.log, max_workers=3)
         def _work(t):
             return self.price_history(t, start, end, mm.get(t, ""))
-        pf.run(list(tickers), _work, key_fn=lambda t: f"px_{t}_{end[:7]}")
-        # 반환은 필요 시 load_df 로 재조회(메모리 절약)
+        # 완료 키에 종료월을 넣지 않는다 — 넣으면 매달 전체가 미완료로 뒤집힌다.
+        # 최신성 판단은 캐시 내부의 마지막 날짜로 한다(위 price_history).
+        pf.run(rest, _work, key_fn=lambda t: f"px_{t}", desc="일별 수정주가 수집")
+        self.flush_nodata()
 
-    # ── 벤치마크 지수 ──────────────────────────────────────────────────────
+    # ── 통합 close 행렬 (매번 수천 파일을 읽지 않는다) ─────────────────────
+    def close_matrix(self, tickers, log):
+        rel = "close_matrix.parquet"
+        meta_p = self.store.local_root / "state" / "close_matrix_meta.json"
+        meta = read_json_safe(meta_p) or {}
+        cached = self.store.load_df("features", rel, stage="ST10")
+        want = set(tickers)
+        if cached is not None and len(cached):
+            try:
+                have = set(cached.columns) - {"date"}
+                if want <= have and meta.get("asof") == self._price_stamp(tickers):
+                    m = cached.set_index(pd.to_datetime(cached["date"])).drop(
+                        columns=["date"])
+                    log.info(f"[S05] close 행렬 캐시 적중: {m.shape[1]}종목 × "
+                             f"{m.shape[0]}일 (개별 파일 재로드 없음)")
+                    return m.astype("float32")
+            except Exception:
+                pass
+        Progress.begin("close 행렬 구성", total=len(tickers))
+        cols, miss = {}, 0
+        for t in tickers:
+            df = self._cached_price(t)
+            Progress.tick()
+            if df is None or not len(df):
+                miss += 1
+                continue
+            s = pd.Series(pd.to_numeric(df["close"], errors="coerce").to_numpy(),
+                          index=pd.to_datetime(df["date"]), name=t)
+            cols[t] = s[~s.index.duplicated()]
+        if not cols:
+            return None
+        wide = pd.DataFrame(cols).sort_index().astype("float32")
+        out = wide.reset_index().rename(columns={"index": "date"})
+        out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+        self.store.save_df(out, "features", rel, scope="dedicated",
+                           desc="통합 close 행렬", stage="ST10")
+        try:
+            atomic_write_json(meta_p, {"asof": self._price_stamp(tickers),
+                                       "n": len(cols)})
+        except Exception:
+            pass
+        log.info(f"[S05] close 행렬 구성: {wide.shape[1]}종목 × {wide.shape[0]}일 "
+                 f"(가격 미확보 {miss}종목 → 월간 스냅샷 폴백)")
+        return wide
+
+    def _price_stamp(self, tickers):
+        """가격 캐시 상태 지문 — 파일 개수 + 최근 수정시각으로 재구성 필요 판단."""
+        d = self.store.local_root / "cache" / "parsed" / "prices"
+        try:
+            files = list(d.glob("*.parquet")) + list(d.glob("*.pkl"))
+            if not files:
+                return "none"
+            mt = max(f.stat().st_mtime for f in files)
+            return f"{len(files)}@{int(mt)}@{len(tickers)}"
+        except Exception:
+            return "unknown"
+
+    # ── 벤치마크 / 섹터 / 개인비중 ─────────────────────────────────────────
     def benchmark_series(self, code, start, end):
         rel = f"benchmarks/{code}.parquet"
         df = self.store.load_df("parsed", rel, stage="ST03")
-        if df is not None and pd.to_datetime(df["date"]).max() >= \
-           pd.Timestamp(end) - pd.Timedelta(days=10):
-            return df
-        if CFG.RUN_MODE != "FULL":                       # SYNTH: 네트워크 금지
-            return df
-        fdr = self._get_fdr()
+        if df is not None and len(df):
+            try:
+                if (pd.Timestamp(end) - pd.to_datetime(df["date"]).max()).days \
+                        <= CFG.PRICE_REFRESH_DAYS:
+                    return df
+            except Exception:
+                pass
         out = None
+        fdr = self._get_fdr()
         if fdr is not None:
             try:
-                d = fdr.DataReader(code, start, end).reset_index()
-                d.columns = [str(c).lower() for c in d.columns]
-                dc = "date" if "date" in d.columns else d.columns[0]
-                out = pd.DataFrame({"date": pd.to_datetime(d[dc]).dt.strftime("%Y-%m-%d"),
-                                    "close": pd.to_numeric(d["close"], errors="coerce"),
-                                    "src": "fdr"})
+                out = self._norm_generic(fdr.DataReader(code, start, end), "fdr")
+                if out is not None:
+                    out = out[["date", "close", "src"]]
             except Exception:
                 out = None
         if out is None:
@@ -1540,11 +2083,10 @@ class MarketDataHub:
                 import yfinance as yf
                 sym = {"KS11": "^KS11", "KQ11": "^KQ11"}.get(code, code)
                 d = yf.download(sym, start=start, end=end, progress=False,
-                                auto_adjust=True).reset_index()
-                if isinstance(d.columns, pd.MultiIndex):
-                    d.columns = [c[0] for c in d.columns]
-                out = pd.DataFrame({"date": pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d"),
-                                    "close": d["Close"], "src": "yfinance"})
+                                auto_adjust=True, threads=False)
+                o = self._norm_generic(d.reset_index() if d is not None else None,
+                                       "yfinance")
+                out = o[["date", "close", "src"]] if o is not None else None
             except Exception:
                 out = None
         if out is not None and len(out):
@@ -1552,7 +2094,6 @@ class MarketDataHub:
                                desc=f"지수 {code}", stage="ST03")
         return out
 
-    # ── 섹터 분류 (현재 시점 분류를 소급 적용 — 한계는 OPEN_QUESTIONS 기재) ──
     def sector_map(self):
         rel = "sectors/krx_sector_map.parquet"
         df = self.store.load_df("parsed", rel, stage="ST05")
@@ -1565,14 +2106,14 @@ class MarketDataHub:
                     d = fdr.StockListing(lst)
                     d.columns = [str(c).lower() for c in d.columns]
                     code_c = "code" if "code" in d.columns else "symbol"
-                    sec_c = "sector" if "sector" in d.columns else \
-                            ("industry" if "industry" in d.columns else None)
-                    if sec_c is None:
+                    sec_c = next((c for c in ("sector", "industry", "sectorname")
+                                  if c in d.columns), None)
+                    if sec_c is None or code_c not in d.columns:
                         continue
                     out = pd.DataFrame({
                         "ticker": d[code_c].astype(str).str.zfill(6),
-                        "sector": d[sec_c].astype(str).fillna("UNKNOWN").replace("nan", "UNKNOWN")})
-                    out = out.drop_duplicates("ticker")
+                        "sector": d[sec_c].astype(str).fillna("UNKNOWN")
+                                    .replace("nan", "UNKNOWN")}).drop_duplicates("ticker")
                     if len(out) > 500:
                         self.store.save_df(out, "parsed", rel, scope="common",
                                            desc=f"섹터맵({lst}) — 현재분류 소급적용",
@@ -1583,18 +2124,17 @@ class MarketDataHub:
                     continue
         return pd.DataFrame(columns=["ticker", "sector"])
 
-    # ── 개인 매매 비중 (H4) — 과중 시 프록시 폴백 ──────────────────────────
     def investor_ratio(self, tickers, years):
         rel = "investor/individual_ratio.parquet"
         df = self.store.load_df("parsed", rel, stage="ST05")
         if df is not None and len(df):
             return df
-        est_calls = len(tickers) * len(years)
-        if (not CFG.COLLECT_INVESTOR_RATIO) or est_calls > 8000 or self._get_pykrx() is None:
-            self.log.warn(f"개인비중 직접수집 생략(예상 {est_calls}건) → 시장/사이즈 프록시 사용")
-            return None
         stk = self._get_pykrx()
-        rows = []
+        est = len(tickers) * len(years)
+        if (not CFG.COLLECT_INVESTOR_RATIO) or stk is None or est > 6000:
+            self.log.info(f"[S05] 개인비중 직접수집 생략(예상 {est}건) → "
+                          "KOSDAQ×소형 프록시 사용(mechanism_tests.md 에 명시)")
+            return None
         pf = ParallelFetcher("inv_ratio", self.store, self.log, max_workers=2)
         items = [(t, y) for t in tickers for y in years]
         def _work(it):
@@ -1605,30 +2145,41 @@ class MarketDataHub:
                     return None
                 d = d.reset_index()
                 d.columns = [str(c) for c in d.columns]
-                icol, vcol = d.columns[0], ("거래대금" if "거래대금" in d.columns
-                                            else d.columns[-1])
+                icol = d.columns[0]
+                vcol = "거래대금" if "거래대금" in d.columns else d.columns[-1]
                 tot = pd.to_numeric(d[vcol], errors="coerce").abs().sum()
                 ind = pd.to_numeric(
                     d.loc[d[icol].astype(str).str.contains("개인"), vcol],
                     errors="coerce").abs().sum()
                 if tot > 0:
-                    return {"ticker": t, "year": int(y),
-                            "indiv_ratio": float(ind / tot)}
+                    return {"ticker": t, "year": int(y), "indiv_ratio": float(ind / tot)}
             except Exception:
                 return None
             return None
-        got = pf.run(items, _work, key_fn=lambda it: f"iv_{it[0]}_{it[1]}")
-        rows = [g for g in got if g]
-        if rows:
-            out = pd.DataFrame(rows)
+        got = [g for g in pf.run(items, _work, key_fn=lambda it: f"iv_{it[0]}_{it[1]}",
+                                 desc="개인 매매비중") if g]
+        if got:
+            out = pd.DataFrame(got)
             self.store.save_df(out, "parsed", rel, scope="common",
                                desc="연도별 개인 매매비중(pykrx)", stage="ST05")
             return out
         return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [S06] 리포트 메타 수집 — 네이버 금융 리서치 + 한경 컨센서스 (계약 §3 지정 소스)
-#       + 금투협 전문인력(베스트에포트) + DART 공시/실적월 + 컨센서스 EPS
+# [S06] 리포트 메타 수집 (전면 재작성)
+#
+#   ■ 수집 전략의 핵심 — 요청당 산출량(reports per request)으로 경로를 고른다.
+#     · 한경 컨센서스 리스트 : 1요청 = 최대 80건 + 작성자 포함  → 확장 가능 ★주력
+#       157개월 × 약 30페이지 ≈ 4,700요청 ≈ 45분. 이것이 유일하게 완주 가능한 경로.
+#     · 네이버 리스트        : 1요청 = 약 30건, 작성자 없음(증권사만) → 항상 수집
+#     · 네이버 상세 페이지   : 1요청 = 1건, 작성자 있음 → 확장 불가, 전역 예산제
+#     · PDF 본문             : 1요청 = 1건 + 수 MB + 파싱 실패 빈발 → 기본 비활성
+#     이전 버전은 상세/PDF 를 '월당 한도'로 돌려 157개월이면 31만 요청(48시간)이
+#     필요했다. 시간 예산의 문제가 아니라 경로 선택의 문제였다.
+#
+#   ■ 한경이 막히면(403/로그인월) 계약 §3 의 공식 폴백인 broker×sector(하우스 단위)로
+#     내려간다. 네이버 리스트만으로 증권사는 100% 확보되므로 폴백은 항상 실행 가능하다.
+#
 #   식별자 규약(계약 §5): analyst_id = f"{analyst}@{broker}" (고정),
 #                         analyst_person_id = 정규화 인명(이직 추적용) — 혼동 금지.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1638,19 +2189,18 @@ _ANALYST_TITLE_RE = re.compile(
     r"파트장|이사|상무|본부장|센터장|RA|CFA|Ph\.?D)\.?")
 _HANGUL_NAME_RE = re.compile(r"^[가-힣]{2,4}$")
 
-# 증권사 리브랜딩 별칭(하우스 연속성 유지 — 누락 시 개명이 가짜 H-EXIT 으로 보임.
-# 미포함 개명 가능성은 OPEN_QUESTIONS 에 기록된다)
+# 증권사 리브랜딩 별칭(하우스 연속성 유지 — 누락 시 개명이 가짜 H-EXIT 으로 보인다)
 _BROKER_ALIAS = {
     "미래에셋대우": "미래에셋", "미래에셋증권": "미래에셋", "대우": "미래에셋",
     "KB투자": "KB", "현대": "KB",                     # 현대증권→KB증권(2017 합병)
     "HMC투자": "현대차", "현대차투자": "현대차",
     "동부": "DB금융투자", "DB": "DB금융투자", "DB금투": "DB금융투자",
     "메리츠종금": "메리츠", "메리츠종합금융": "메리츠",
-    "하이투자": "하이", "아이엠": "하이",              # 하이투자→iM증권(2024)
-    "이베스트투자": "이베스트", "LS": "이베스트",       # 이베스트→LS증권(2024)
+    "하이투자": "하이", "아이엠": "하이", "iM": "하이",   # 하이투자→iM증권(2024)
+    "이베스트투자": "이베스트", "LS": "이베스트",         # 이베스트→LS증권(2024)
     "케이프투자": "케이프", "신한금융투자": "신한", "신한투자": "신한",
     "삼성증권": "삼성", "한국투자": "한투", "한국": "한투", "한화투자": "한화",
-    "유안타": "유안타", "동양": "유안타",              # 동양증권→유안타(2014)
+    "유안타": "유안타", "동양": "유안타",                # 동양증권→유안타(2014)
     "SK": "SK", "키움": "키움", "NH투자": "NH", "우리투자": "NH",
 }
 
@@ -1661,8 +2211,7 @@ def norm_broker(name):
     return _BROKER_ALIAS.get(s, s)
 
 def norm_analysts(raw):
-    """작성자 문자열 → 정규화 인명 리스트. 공저자는 [ ,/·;] 로 분리해 각자 1건 인정
-    (근거: 각자의 주의가 실제 소요됨 — OPEN_QUESTIONS 기재)."""
+    """작성자 문자열 → 정규화 인명 리스트. 공저자는 각자 1건 인정(§OPEN_QUESTIONS)."""
     if raw is None:
         return []
     s = unicodedata.normalize("NFKC", str(raw))
@@ -1676,26 +2225,171 @@ def norm_analysts(raw):
     return out
 
 
+def _try_import(mod):
+    try:
+        __import__(mod)
+        return True
+    except Exception:
+        return False
+
+
+def _soup(html):
+    from bs4 import BeautifulSoup
+    return BeautifulSoup(html, "lxml" if _try_import("lxml") else "html.parser")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 한경 컨센서스 — 주력 경로(리스트에 작성자 포함)
+# ──────────────────────────────────────────────────────────────────────────────
+class HankyungConsensusCollector:
+    """엔드포인트/파라미터 변형을 순차 시도하고, 첫 성공 형태를 고정해 재사용한다.
+    403·로그인월은 재시도 없이 즉시 폴백으로 넘긴다(시간 낭비 금지)."""
+
+    ENDPOINTS = [
+        # (url, 파라미터 빌더)  — 사이트 개편 이력을 감안해 복수 형태를 준비
+        ("https://consensus.hankyung.com/analysis/list",
+         lambda d0, d1, pg: {"sdate": d0, "edate": d1, "now_page": pg,
+                             "pagenum": 80, "report_type": "CO", "search_text": ""}),
+        ("https://consensus.hankyung.com/analysis/list",
+         lambda d0, d1, pg: {"sdate": d0, "edate": d1, "now_page": pg,
+                             "pagenum": 80, "reportType": "CO"}),
+        ("https://consensus.hankyung.com/apps.analysis/analysis.list",
+         lambda d0, d1, pg: {"sdate": d0, "edate": d1, "now_page": pg,
+                             "pagenum": 80, "report_type": "CO"}),
+    ]
+
+    def __init__(self, store, log, quota, blocked=False):
+        self.store, self.log = store, log
+        self.http = HttpClient("hankyung", store.local_root / "state", log, quota,
+                               blocked=blocked)
+        self.blocked = blocked
+        self.endpoint_idx = None
+        self._probe_done = False
+
+    def _probe(self):
+        """어떤 엔드포인트 형태가 살아 있는지 1회만 탐색하고 고정한다."""
+        if self._probe_done:
+            return self.endpoint_idx is not None
+        self._probe_done = True
+        d0, d1 = "2024-11-01", "2024-11-30"
+        for i, (url, mk) in enumerate(self.ENDPOINTS):
+            try:
+                r = self.http.get(url, params=mk(d0, d1, 1), fast=True)
+                if self._parse_list(r.text):
+                    self.endpoint_idx = i
+                    self.log.info(f"[S06] 한경 컨센서스 엔드포인트 #{i} 확인 — 주력 경로 사용")
+                    return True
+            except SourceDown:
+                self.blocked = True
+                self.log.warn("[S06] 한경 차단 확정 → 네이버 경로 + 하우스 단위 폴백 검토")
+                return False
+            except Exception:
+                continue
+        self.blocked = True
+        self.log.warn("[S06] 한경 유효 엔드포인트 없음 → 네이버 경로로 전환")
+        return False
+
+    def available(self):
+        return (not self.blocked) and self._probe()
+
+    def collect_month(self, ym):
+        rel = f"reports_meta/hankyung/{ym}.parquet"
+        df = self.store.load_df("parsed", rel, stage="ST04")
+        if df is not None:
+            return df
+        if not self.available():
+            return pd.DataFrame()
+        url, mk = self.ENDPOINTS[self.endpoint_idx]
+        p = pd.Period(ym, freq="M")
+        d0 = p.to_timestamp(how="start").strftime("%Y-%m-%d")
+        d1 = p.to_timestamp(how="end").strftime("%Y-%m-%d")
+        rows, seen_sig = [], set()
+        for page in range(1, 120):
+            if COLLECT_BUDGET.exceeded():
+                break
+            try:
+                r = self.http.get(url, params=mk(d0, d1, page))
+            except (SourceDown, QuotaExhausted):
+                self.blocked = True
+                break
+            except Exception:
+                break
+            if "로그인" in r.text[:3000] and "작성일" not in r.text[:8000]:
+                self.log.warn("[S06] 한경 로그인월 감지 → 소스 차단 처리")
+                self.blocked = True
+                break
+            page_rows = self._parse_list(r.text)
+            if not page_rows:
+                break
+            sig = sha1_text(str(page_rows[0]) + str(len(page_rows)))
+            if sig in seen_sig:            # 페이지 파라미터 무시하고 같은 내용 반환 방지
+                break
+            seen_sig.add(sig)
+            rows += page_rows
+            Progress.tick(len(page_rows))
+            if len(page_rows) < 40:
+                break
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).drop_duplicates(subset=["nid"])
+        df["ym"] = ym
+        df["source"] = "hankyung"
+        self.store.save_df(df, "parsed", rel, scope="common",
+                           desc=f"한경 컨센서스 {ym} ({len(df)}건)", stage="ST04")
+        return df
+
+    def _parse_list(self, html):
+        out = []
+        if not html or "<" not in html:
+            return out
+        try:
+            soup = _soup(html)
+            for tr in soup.find_all("tr"):
+                tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                if len(tds) < 5:
+                    continue
+                joined = " ".join(tds)
+                date_txt = next((t for t in tds
+                                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t)), "")
+                if not date_txt:
+                    continue
+                mt = re.search(r"\((\d{6})\)", joined)
+                if not mt:
+                    continue
+                # 제목: 종목코드가 포함된 셀. 작성자/증권사: 뒤쪽 두 셀이 관례.
+                title = next((t for t in tds if "(" + mt.group(1) + ")" in t), tds[-4])
+                writer = tds[-3] if len(tds) >= 3 else ""
+                origin = tds[-2] if len(tds) >= 2 else ""
+                if not norm_analysts(writer) and norm_analysts(origin):
+                    writer, origin = origin, writer     # 열 순서 변형 방어
+                out.append({"pub_date": date_txt, "ticker": mt.group(1),
+                            "title": title, "broker": origin,
+                            "analyst_raw": writer,
+                            "nid": sha1_text(date_txt + title + origin),
+                            "pdf_url": ""})
+        except Exception:
+            return out
+        return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 네이버 금융 리서치 — 항상 수집(증권사 100%), 작성자는 예산 내 보조 확보
+# ──────────────────────────────────────────────────────────────────────────────
 class NaverResearchCollector:
-    """네이버 금융 리서치(종목분석 리스트). 리스트 뷰에는 애널리스트명이 없어
-    (계약 §3) 상세/PDF 에서 보강 추출한다(재현율 한계 인지)."""
     LIST_URL = "https://finance.naver.com/research/company_list.naver"
     READ_URL = "https://finance.naver.com/research/company_read.naver"
 
-    def __init__(self, store, log, quota):
+    def __init__(self, store, log, quota, detail_budget=None, pdf_budget=None,
+                 blocked=False):
         self.store, self.log = store, log
-        self.http = HttpClient("naver_research", store.local_root / "state", log, quota)
-        try:
-            from bs4 import BeautifulSoup            # noqa
-            self._bs = True
-        except Exception:
-            self._bs = False
+        self.http = HttpClient("naver_research", store.local_root / "state", log,
+                               quota, blocked=blocked)
+        self.detail_budget = detail_budget or RequestBudget(
+            "naver_detail", CFG.BUDGET_NAVER_DETAIL, log)
+        self.pdf_budget = pdf_budget or RequestBudget("naver_pdf", CFG.BUDGET_PDF, log)
 
-    def _soup(self, html):
-        from bs4 import BeautifulSoup
-        return BeautifulSoup(html, "lxml" if _try_import("lxml") else "html.parser")
-
-    def collect_month(self, ym, want_analyst=True, pdf_budget=0):
+    # ── 리스트(싸다) ───────────────────────────────────────────────────────
+    def collect_month(self, ym):
         rel = f"reports_meta/naver/{ym}.parquet"
         df = self.store.load_df("parsed", rel, stage="ST04")
         if df is not None:
@@ -1703,8 +2397,8 @@ class NaverResearchCollector:
         p = pd.Period(ym, freq="M")
         d0 = p.to_timestamp(how="start").strftime("%Y-%m-%d")
         d1 = p.to_timestamp(how="end").strftime("%Y-%m-%d")
-        rows = []
-        for page in range(1, 300):
+        rows, prev_sig = [], None
+        for page in range(1, 200):
             if COLLECT_BUDGET.exceeded():
                 break
             try:
@@ -1718,122 +2412,151 @@ class NaverResearchCollector:
             page_rows = self._parse_list(r.text)
             if not page_rows:
                 break
+            sig = sha1_text(str(page_rows[0]))
+            if sig == prev_sig:            # 마지막 페이지 이후 동일 내용 반복 방지
+                break
+            prev_sig = sig
             rows += page_rows
+            Progress.tick(len(page_rows))
             if len(page_rows) < 5:
                 break
         if not rows:
-            self.log.warn(f"네이버 리서치 {ym}: 0건")
             return pd.DataFrame()
         df = pd.DataFrame(rows).drop_duplicates(subset=["nid"])
         df["ym"] = ym
         df["source"] = "naver"
-        if want_analyst and pdf_budget > 0:
-            df = self._enrich_analyst(df, pdf_budget)
-        else:
-            df["analyst_raw"] = ""
+        df["analyst_raw"] = ""
         self.store.save_df(df, "parsed", rel, scope="common",
-                           desc=f"네이버 리서치 목록 {ym}", stage="ST04")
+                           desc=f"네이버 리서치 {ym} ({len(df)}건)", stage="ST04")
         return df
 
     def _parse_list(self, html):
         out = []
-        if self._bs:
-            try:
-                soup = self._soup(html)
-                for tr in soup.select("table.type_1 tr"):
-                    tds = tr.find_all("td")
-                    if len(tds) < 5:
-                        continue
-                    a_code = tr.select_one("a[href*='item/main']")
-                    a_read = tr.select_one("a[href*='company_read']")
-                    if a_code is None or a_read is None:
-                        continue
-                    m = re.search(r"code=(\d{6})", a_code.get("href", ""))
-                    nid = re.search(r"nid=(\d+)", a_read.get("href", ""))
-                    pdf = tr.select_one("a[href$='.pdf']")
-                    date_txt = ""
-                    for td in tds:
-                        if re.match(r"^\d{2}\.\d{2}\.\d{2}$", td.get_text(strip=True)):
-                            date_txt = td.get_text(strip=True)
-                            break
-                    if not (m and nid and date_txt):
-                        continue
-                    broker = tds[2].get_text(strip=True) if len(tds) > 2 else ""
-                    out.append({
-                        "pub_date": "20" + date_txt.replace(".", "-"),
-                        "ticker": m.group(1), "title": a_read.get_text(strip=True),
-                        "broker": broker, "nid": nid.group(1),
-                        "pdf_url": pdf.get("href") if pdf else ""})
-            except Exception:
-                return out
-        else:                                          # bs4 부재 시 정규식 폴백
-            pat = re.compile(
-                r"code=(\d{6})[^>]*>([^<]+)</a>.*?company_read\.naver\?nid=(\d+)[^>]*>"
-                r"([^<]*)</a>\s*</td>\s*<td[^>]*>([^<]*)</td>.*?(\d{2}\.\d{2}\.\d{2})",
-                re.S)
-            for m in pat.finditer(html):
-                out.append({"pub_date": "20" + m.group(6).replace(".", "-"),
-                            "ticker": m.group(1), "title": m.group(4).strip(),
-                            "broker": m.group(5).strip(), "nid": m.group(3),
-                            "pdf_url": ""})
+        if not html:
+            return out
+        try:
+            soup = _soup(html)
+            for tr in soup.select("table.type_1 tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 5:
+                    continue
+                a_code = tr.select_one("a[href*='item/main']")
+                a_read = tr.select_one("a[href*='company_read']")
+                if a_code is None or a_read is None:
+                    continue
+                m = re.search(r"code=(\d{6})", a_code.get("href", ""))
+                nid = re.search(r"nid=(\d+)", a_read.get("href", ""))
+                pdf = tr.select_one("a[href$='.pdf']")
+                date_txt = next((td.get_text(strip=True) for td in tds
+                                 if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}",
+                                                 td.get_text(strip=True))), "")
+                if not (m and nid and date_txt):
+                    continue
+                out.append({
+                    "pub_date": "20" + date_txt.replace(".", "-"),
+                    "ticker": m.group(1), "title": a_read.get_text(strip=True),
+                    "broker": tds[2].get_text(strip=True) if len(tds) > 2 else "",
+                    "nid": nid.group(1),
+                    "pdf_url": pdf.get("href") if pdf else ""})
+        except Exception:
+            return out
         return out
 
-    def _enrich_analyst(self, df, pdf_budget):
-        """상세페이지 본문 + (예산 내) PDF 1~2쪽에서 작성자 추출."""
+    # ── 상세(비싸다: 1요청=1건) — 전역 예산 안에서만 ──────────────────────
+    def enrich_analysts(self, df, max_items, tag=""):
+        """df 의 일부 행에 대해 상세 페이지에서 작성자를 추출한다.
+        반환: (갱신된 df, 시도건수). 예산/타임박스 초과 시 즉시 중단."""
+        if df is None or not len(df):
+            return df, 0
         df = df.copy()
-        df["analyst_raw"] = ""
-        used_pdf = 0
-        for idx in df.index:
+        if "analyst_raw" not in df.columns:
+            df["analyst_raw"] = ""
+        need = df[df["analyst_raw"].astype(str).str.len() == 0]
+        idxs = list(need.index)[:max(0, int(max_items))]
+        if not idxs:
+            return df, 0
+        Progress.begin(f"네이버 상세 작성자 추출{tag}", total=len(idxs),
+                       extra=f"예산잔여 {self.detail_budget.left()}")
+        tried = 0
+        lock = threading.Lock()
+
+        def _work(idx):
+            nonlocal tried
             if COLLECT_BUDGET.exceeded():
-                break
+                raise BudgetExceeded("타임박스")
             nid = df.at[idx, "nid"]
             cache_key = f"naver_read/{nid}"
             html = self.store.load_raw_text(cache_key)
             if html is None:
-                try:
-                    r = self.http.get(self.READ_URL, params={"nid": nid, "page": "1"},
-                                      encoding="euc-kr")
-                    html = r.text
-                    self.store.save_raw_text(cache_key, html)
-                except (SourceDown, QuotaExhausted):
-                    break
-                except Exception:
-                    continue
+                if not self.detail_budget.take():
+                    raise BudgetExceeded("상세 요청예산")
+                r = self.http.get(self.READ_URL, params={"nid": nid, "page": "1"},
+                                  encoding="euc-kr", fast=True)
+                html = r.text
+                self.store.save_raw_text(cache_key, html)
             names = self._names_from_text(html)
-            if not names and CFG.EXTRACT_ANALYST_FROM_PDF and used_pdf < pdf_budget:
-                pdf_url = str(df.at[idx, "pdf_url"] or "")
-                if not pdf_url:
+            if not names and CFG.EXTRACT_ANALYST_FROM_PDF:
+                url = str(df.at[idx, "pdf_url"] or "")
+                if not url:
                     m = re.search(r"href=[\"']([^\"']+\.pdf)[\"']", html or "")
-                    pdf_url = m.group(1) if m else ""
-                if pdf_url.startswith("http"):
-                    used_pdf += 1
-                    names = self._names_from_pdf(pdf_url)
-            if names:
-                df.at[idx, "analyst_raw"] = ",".join(names)
-        return df
+                    url = m.group(1) if m else ""
+                if url.startswith("http") and self.pdf_budget.take():
+                    names = self._names_from_pdf(url)
+            with lock:
+                tried += 1
+            return (idx, ",".join(names) if names else "")
+
+        results = []
+        try:
+            with ThreadPoolExecutor(max_workers=CFG.MAX_WORKERS) as ex:
+                futs = {ex.submit(_work, i): i for i in idxs}
+                for fut in as_completed(futs):
+                    try:
+                        results.append(fut.result())
+                    except (BudgetExceeded, SourceDown, QuotaExhausted):
+                        for f2 in futs:
+                            f2.cancel()
+                        break
+                    except Exception:
+                        pass
+                    Progress.tick()
+        except Exception as e:
+            self.log.warn(f"[S06] 상세 추출 중단: {str(e)[:100]}")
+        for idx, val in results:
+            if val:
+                df.at[idx, "analyst_raw"] = val
+        return df, tried
 
     def _names_from_text(self, html):
         if not html:
             return []
         txt = re.sub(r"<[^>]+>", " ", html)
         cands = []
-        for pat in (r"([가-힣]{2,4})\s*(?:수석)?연구원", r"([가-힣]{2,4})\s*애널리스트",
-                    r"Analyst[:\s]*([가-힣]{2,4})", r"작성자[:\s]*([가-힣]{2,4})"):
+        for pat in (r"([가-힣]{2,4})\s*(?:수석|책임|선임)?\s*연구원",
+                    r"([가-힣]{2,4})\s*애널리스트", r"Analyst[:\s]*([가-힣]{2,4})",
+                    r"작성자[:\s]*([가-힣]{2,4})"):
             cands += re.findall(pat, txt)
         return norm_analysts(",".join(cands[:4]))
 
     def _names_from_pdf(self, url):
+        """PDF 1~2쪽 작성자 추출. 깨진 PDF 가 많아 pypdf 가 대량 경고를 내므로
+        stdout/stderr 를 통째로 삼킨다(정상 동작 중 화면 오염 방지)."""
         try:
+            import io as _io
+            import contextlib
             import pypdf
-            r = self.http.get(url)
-            if len(r.content) > CFG.PDF_MAX_MB * 1e6:
+            r = self.http.get(url, fast=True, stream=True)
+            blob = r.content
+            if len(blob) > CFG.PDF_MAX_MB * 1e6:
                 return []
-            reader = pypdf.PdfReader(io.BytesIO(r.content))
-            txt = ""
-            for pg in reader.pages[:2]:
-                txt += pg.extract_text() or ""
+            sink = _io.StringIO()
+            with contextlib.redirect_stderr(sink), contextlib.redirect_stdout(sink):
+                reader = pypdf.PdfReader(_io.BytesIO(blob), strict=False)
+                txt = ""
+                for pg in reader.pages[:2]:
+                    txt += pg.extract_text() or ""
             cands = []
-            for pat in (r"([가-힣]{2,4})\s*(?:수석|책임|선임)?연구원",
+            for pat in (r"([가-힣]{2,4})\s*(?:수석|책임|선임)?\s*연구원",
                         r"Analyst\s*([가-힣]{2,4})", r"([가-힣]{2,4})\s*Analyst"):
                 cands += re.findall(pat, txt)
             return norm_analysts(",".join(cands[:4]))
@@ -1841,101 +2564,10 @@ class NaverResearchCollector:
             return []
 
 
-def _try_import(mod):
-    try:
-        __import__(mod)
-        return True
-    except Exception:
-        return False
-
-
-class HankyungConsensusCollector:
-    """한경 컨센서스 목록 — 리스트에 '작성자' 컬럼이 있어 analyst_id 의 1차 소스.
-    SPA 전환/로그인 월/robots 차단(계약 §3) 감지 시 blocked 플래그 후 우아한 스킵."""
-    LIST_URL = "https://consensus.hankyung.com/analysis/list"
-
-    def __init__(self, store, log, quota):
-        self.store, self.log = store, log
-        self.http = HttpClient("hankyung", store.local_root / "state", log, quota)
-        self.blocked = False
-
-    def collect_month(self, ym):
-        if self.blocked:
-            return pd.DataFrame()
-        rel = f"reports_meta/hankyung/{ym}.parquet"
-        df = self.store.load_df("parsed", rel, stage="ST04")
-        if df is not None:
-            return df
-        p = pd.Period(ym, freq="M")
-        d0 = p.to_timestamp(how="start").strftime("%Y-%m-%d")
-        d1 = p.to_timestamp(how="end").strftime("%Y-%m-%d")
-        rows = []
-        for page in range(1, 200):
-            try:
-                r = self.http.get(self.LIST_URL, params={
-                    "sdate": d0, "edate": d1, "now_page": page,
-                    "search_text": "", "pagenum": 80, "report_type": "CO"})
-            except (SourceDown, QuotaExhausted):
-                self.blocked = True
-                break
-            except Exception:
-                break
-            if ("login" in r.url.lower()) or ("로그인" in r.text[:4000]
-                                              and "작성일" not in r.text):
-                self.log.warn("한경 컨센서스: 로그인 월 감지 → 소스 차단 플래그")
-                self.blocked = True
-                break
-            page_rows = self._parse_list(r.text)
-            if not page_rows:
-                break
-            rows += page_rows
-            if len(page_rows) < 10:
-                break
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows)
-        df["ym"] = ym
-        df["source"] = "hankyung"
-        self.store.save_df(df, "parsed", rel, scope="common",
-                           desc=f"한경 컨센서스 목록 {ym}", stage="ST04")
-        return df
-
-    def _parse_list(self, html):
-        out = []
-        try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "lxml" if _try_import("lxml") else "html.parser")
-            table = soup.find("table")
-            if table is None:
-                return out
-            for tr in table.find_all("tr"):
-                tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-                if len(tds) < 6:
-                    continue
-                date_txt = next((t for t in tds if re.match(r"^\d{4}-\d{2}-\d{2}$", t)), "")
-                if not date_txt:
-                    continue
-                title = tds[2] if len(tds) > 2 else ""
-                mt = re.search(r"\((\d{6})\)", " ".join(tds))
-                if not mt:
-                    continue
-                writer, origin = "", ""
-                if len(tds) >= 7:
-                    writer, origin = tds[-3], tds[-2]
-                out.append({"pub_date": date_txt, "ticker": mt.group(1),
-                            "title": title, "broker": origin,
-                            "analyst_raw": writer, "nid": sha1_text(date_txt + title),
-                            "pdf_url": ""})
-        except Exception:
-            pass
-        return out
-
-
+# ──────────────────────────────────────────────────────────────────────────────
+# 금융투자협회 전문인력 (베스트에포트 — 실패 시 계약 §3 의 재직 프록시로 대체)
+# ──────────────────────────────────────────────────────────────────────────────
 class KofiaCollector:
-    """금융투자협회 전문인력 등록/말소/소속 이력 조회(베스트에포트 — 계약 §3).
-    dis.kofia.or.kr 은 WebSquare SPA 로 무인증 정형 API 가 불안정하다.
-    실패 시 None 반환 → §6.5 는 '재직 중 프록시'(동일 인물이 타 종목 계속 커버)로
-    자동 대체되며 이는 계약이 명시한 공식 폴백이다."""
     def __init__(self, store, log, quota):
         self.store, self.log = store, log
         self.http = HttpClient("kofia", store.local_root / "state", log, quota)
@@ -1945,24 +2577,20 @@ class KofiaCollector:
         df = self.store.load_df("parsed", rel, stage="ST05")
         if df is not None and len(df):
             return df
-        # DataFrame 에 `or` 를 쓰면 진리값 모호성 예외가 난다(성공 시에만 터지는 함정)
         legacy = self.store.find_legacy_df(["kofia"], ["analyst"])
         if legacy is None:
             legacy = self.store.find_legacy_df(["전문인력"], [])
         if legacy is not None:
             return legacy
-        try:
-            r = self.http.get("https://dis.kofia.or.kr", allow_codes=(200, 301, 302))
-            _ = r
-            self.log.warn("금투협 조회: 정형 엔드포인트 미확보 → 재직 프록시로 대체(계약 폴백)")
-        except Exception as e:
-            self.log.warn(f"금투협 접속 불가({str(e)[:80]}) → 재직 프록시로 대체(계약 폴백)")
+        self.log.info("[S06] 금투협 정형 API 미확보 → 재직 프록시 사용(계약 §3 공식 폴백): "
+                      "'동일 인물이 같은 기간 다른 종목을 계속 커버 중인가'")
         return None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# DART — 월별 공시집계(§6.3 통제변수). 총 페이지 수를 먼저 알아내 병렬로 받는다.
+# ──────────────────────────────────────────────────────────────────────────────
 class DartCollector:
-    """DART 공시 메타: 실적발표월 플래그 + 월별 공시 건수(§6.3 통제변수).
-    복수 키 라운드로빈 + 실시간 쿼터: status '020'(한도초과) 즉시 키 소진 처리."""
     BASE = "https://opendart.fss.or.kr/api"
     _EARN_RE = re.compile(r"사업보고서|반기보고서|분기보고서|영업\s*\(?잠정\)?\s*실적|"
                           r"매출액또는손익구조|연결재무제표기준영업")
@@ -1972,20 +2600,36 @@ class DartCollector:
         self.http = HttpClient("dart", store.local_root / "state", log, quota)
         self.keys = [k for k in DART_API_KEYS if k]
         self._ki = 0
+        self._lock = threading.Lock()
 
     def _key(self):
-        alive = [k for k in self.keys
-                 if not self.quota.is_exhausted(f"dart:{k[:8]}")]
-        if not alive:
-            raise QuotaExhausted("dart: 모든 키 금일 한도 소진")
-        self._ki = self._ki % len(alive)
-        return alive[self._ki]
+        with self._lock:
+            alive = [k for k in self.keys
+                     if not self.quota.is_exhausted(f"dart:{k[:8]}")]
+            if not alive:
+                raise QuotaExhausted("dart: 모든 키 소진")
+            self._ki = (self._ki + 1) % len(alive)
+            return alive[self._ki]
 
     def available(self):
+        if not self.keys:
+            return False
         try:
-            return bool(self.keys) and self._key() is not None
+            self._key()
+            return True
         except QuotaExhausted:
             return False
+
+    def quota_note(self):
+        """남은 호출량을 '관측 기반'으로 보고한다(고정 상수 가정 없음)."""
+        out = {}
+        for k in self.keys:
+            kk = f"dart:{k[:8]}"
+            left = self.quota.budget_left(kk)
+            out[kk] = (f"사용 {self.quota.used(kk)}건, "
+                       + ("소진" if left == 0 else
+                          (f"잔여 {left}건" if left is not None else "한도 미관측")))
+        return out
 
     def corp_map(self):
         rel = "dart/corp_map.parquet"
@@ -2007,10 +2651,28 @@ class DartCollector:
             df = pd.DataFrame(rows).drop_duplicates("corp_code")
             self.store.save_df(df, "parsed", rel, scope="common",
                                desc="DART corp_code→ticker 맵", stage="ST05")
+            self.log.info(f"[S06] DART 종목 매핑 {len(df)}건 확보")
             return dict(zip(df["corp_code"], df["ticker"]))
         except Exception as e:
-            self.log.warn(f"DART corp_map 실패: {str(e)[:100]}")
+            self.log.warn(f"DART corp_map 실패: {str(e)[:110]}")
             return {}
+
+    def _page(self, b, e, page):
+        key = self._key()
+        r = self.http.get(f"{self.BASE}/list.json", params={
+            "crtfc_key": key, "bgn_de": b, "end_de": e,
+            "page_no": page, "page_count": 100}, quota_key=f"dart:{key[:8]}",
+            fast=(page > 1))
+        js = r.json()
+        st = js.get("status")
+        if st == "020":
+            self.quota.mark_exhausted(f"dart:{key[:8]}", "status 020(한도초과)")
+            raise QuotaExhausted("dart key exhausted")
+        if st == "013":
+            return [], 0
+        if st != "000":
+            raise IOError(f"DART status={st} {str(js.get('message'))[:60]}")
+        return js.get("list", []), int(js.get("total_page", 1))
 
     def monthly_disclosures(self, ym, cmap):
         rel = f"dart/{ym}.parquet"
@@ -2020,58 +2682,101 @@ class DartCollector:
         if not self.available() or not cmap:
             return None
         p = pd.Period(ym, freq="M")
-        b, e = p.to_timestamp(how="start").strftime("%Y%m%d"), \
-               p.to_timestamp(how="end").strftime("%Y%m%d")
-        items = []
-        page = 1
-        while page <= 400:
-            try:
-                key = self._key()
-                r = self.http.get(f"{self.BASE}/list.json", params={
-                    "crtfc_key": key, "bgn_de": b, "end_de": e,
-                    "page_no": page, "page_count": 100},
-                    quota_key=f"dart:{key[:8]}")
-                js = r.json()
-            except QuotaExhausted:
-                self.log.warn(f"DART {ym}: 쿼터 소진 — 수집분까지 사용")
-                break
-            except Exception:
-                break
-            st = js.get("status")
-            if st == "020":                          # 실시간 잔여량 판정(서버 우선)
-                key = self._key()
-                self.quota.mark_exhausted(f"dart:{key[:8]}", "status 020")
-                self._ki += 1
-                continue
-            if st == "013":                          # 데이터 없음
-                break
-            if st != "000":
-                self.log.warn(f"DART {ym} status={st} ({js.get('message', '')[:60]})")
-                break
-            for it in js.get("list", []):
-                t = cmap.get(it.get("corp_code"))
-                if t:
-                    items.append({"ticker": t, "report_nm": it.get("report_nm", "")})
-            if page >= int(js.get("total_page", 1)):
-                break
-            page += 1
+        b = p.to_timestamp(how="start").strftime("%Y%m%d")
+        e = p.to_timestamp(how="end").strftime("%Y%m%d")
+        try:
+            first, total_page = self._page(b, e, 1)
+        except QuotaExhausted:
+            raise
+        except Exception as ex:
+            self.log.warn(f"DART {ym} 1페이지 실패: {str(ex)[:90]}")
+            return None
+        items = list(first)
+        if total_page > 1:
+            pages = list(range(2, min(total_page, 400) + 1))
+            with ThreadPoolExecutor(max_workers=CFG.MAX_WORKERS) as ex_:
+                futs = {ex_.submit(self._page, b, e, pg): pg for pg in pages}
+                for fut in as_completed(futs):
+                    try:
+                        lst, _ = fut.result()
+                        items += lst
+                    except QuotaExhausted:
+                        for f2 in futs:
+                            f2.cancel()
+                        break
+                    except Exception:
+                        pass
         if not items:
             return None
-        raw = pd.DataFrame(items)
+        raw = pd.DataFrame([{"corp_code": it.get("corp_code"),
+                             "report_nm": it.get("report_nm", "")} for it in items])
+        raw["ticker"] = raw["corp_code"].map(cmap)
+        raw = raw[raw["ticker"].notna()]
+        if not len(raw):
+            return None
         raw["is_earn"] = raw["report_nm"].str.contains(self._EARN_RE).astype("int8")
         g = raw.groupby("ticker", as_index=False).agg(
             n_disc=("report_nm", "size"), earnings_flag=("is_earn", "max"))
         g["ym"] = ym
         self.store.save_df(g, "parsed", rel, scope="common",
-                           desc=f"DART 월별 공시집계 {ym}", stage="ST05")
+                           desc=f"DART 월별 공시집계 {ym} ({len(g)}종목)", stage="ST05")
         return g
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# KIND — 상장폐지 이력(생존편향 교차검증용 독립 소스)
+# ──────────────────────────────────────────────────────────────────────────────
+class KindCollector:
+    URL = "https://kind.krx.co.kr/investwarn/delistingcompany.do"
+
+    def __init__(self, store, log, quota, blocked=False):
+        self.store, self.log = store, log
+        self.http = HttpClient("kind", store.local_root / "state", log, quota,
+                               blocked=blocked)
+
+    def delisted(self, start_ym, end_ym):
+        rel = "kind/delisted.parquet"
+        df = self.store.load_df("parsed", rel, stage="ST05")
+        if df is not None and len(df):
+            return df
+        d0 = pd.Period(start_ym, freq="M").to_timestamp(how="start").strftime("%Y%m%d")
+        d1 = pd.Period(end_ym, freq="M").to_timestamp(how="end").strftime("%Y%m%d")
+        rows = []
+        try:
+            r = self.http.get(self.URL, method="POST", data={
+                "method": "searchDelistingCompany", "currentPageSize": "3000",
+                "pageIndex": "1", "forward": "delistingcompany_down",
+                "fromDate": d0, "toDate": d1, "marketType": "",
+                "searchCorpName": ""}, fast=True)
+            soup = _soup(r.text)
+            for tr in soup.find_all("tr"):
+                tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                if len(tds) < 3:
+                    continue
+                code = next((re.sub(r"\D", "", t) for t in tds
+                             if re.fullmatch(r"\d{6}", re.sub(r"\D", "", t))), None)
+                dt = next((t for t in tds
+                           if re.fullmatch(r"\d{4}[-./]\d{2}[-./]\d{2}", t)), None)
+                if code and dt:
+                    rows.append({"ticker": code,
+                                 "delist_date": dt.replace(".", "-").replace("/", "-")})
+        except Exception as e:
+            self.log.info(f"[S06] KIND 상장폐지 조회 미확보({str(e)[:70]}) — "
+                          "스냅샷 소멸 기반 추론으로 대체(계약 §1-3 충족)")
+            return None
+        if not rows:
+            return None
+        out = pd.DataFrame(rows).drop_duplicates("ticker")
+        self.store.save_df(out, "parsed", rel, scope="common",
+                           desc=f"KIND 상장폐지 이력 {len(out)}건", stage="ST05")
+        self.log.info(f"[S06] KIND 상장폐지 {len(out)}건 확보(생존편향 교차검증)")
+        return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 컨센서스 EPS (H5) — 레거시 캐시 재활용 우선, 없으면 당월 스냅샷 전향 축적
+# ──────────────────────────────────────────────────────────────────────────────
 class ConsensusEPSCollector:
-    """컨센서스 EPS (H5 선행성 검정용).
-    ① 드라이브 공용/레거시 캐시 재활용(발주자: 기존 캐시 적극 참조)
-    ② 없으면 이번 달 스냅샷을 수집·적재해 '전향적으로' 이력을 쌓는다
-       (과거 무료 이력 소스 부재 시 H5 는 UNTESTABLE 로 정직하게 표기 — 계약 §3 취지)"""
     def __init__(self, store, log, quota):
         self.store, self.log = store, log
         self.http = HttpClient("fnguide", store.local_root / "state", log, quota)
@@ -2082,40 +2787,52 @@ class ConsensusEPSCollector:
             return df
         for kws in (["consensus", "eps"], ["컨센서스"], ["estimate", "eps"]):
             legacy = self.store.find_legacy_df(kws, ["ticker"])
-            if legacy is not None:
-                cols = {str(c).lower(): c for c in legacy.columns}
-                eps_c = next((cols[c] for c in cols if "eps" in c), None)
-                ym_c = next((cols[c] for c in cols
-                             if c in ("ym", "month", "yearmonth", "연월")), None)
-                if eps_c and ym_c:
-                    out = legacy.rename(columns={eps_c: "eps_fy1", ym_c: "ym"})
-                    out["ticker"] = out[cols.get("ticker", "ticker")].astype(str).str.zfill(6)
-                    out = out[["ticker", "ym", "eps_fy1"]].dropna()
-                    self.store.save_df(out, "parsed", "consensus/eps_monthly.parquet",
-                                       scope="common", desc="컨센서스EPS(레거시 재활용)",
-                                       stage="ST05")
-                    return out
+            if legacy is None:
+                continue
+            cols = {str(c).lower(): c for c in legacy.columns}
+            eps_c = next((cols[c] for c in cols if "eps" in c), None)
+            ym_c = next((cols[c] for c in cols
+                         if c in ("ym", "month", "yearmonth", "연월")), None)
+            tk_c = cols.get("ticker")
+            if eps_c and ym_c and tk_c:
+                out = legacy.rename(columns={eps_c: "eps_fy1", ym_c: "ym"})
+                out["ticker"] = out[tk_c].astype(str).str.zfill(6)
+                out = out[["ticker", "ym", "eps_fy1"]].dropna()
+                self.store.save_df(out, "parsed", "consensus/eps_monthly.parquet",
+                                   scope="common", desc="컨센서스EPS(레거시 재활용)",
+                                   stage="ST05")
+                self.log.info(f"[S06] 컨센서스 EPS 레거시 캐시 재활용 {len(out)}행")
+                return out
         return None
 
-    def snapshot_current(self, tickers, max_n=600):
-        """FnGuide 하이라이트에서 당월 컨센서스 EPS 스냅샷 축적(전향 이력 구축)."""
+    def snapshot_current(self, tickers, max_n=400):
         ym = datetime.now().strftime("%Y-%m")
         rel = f"consensus/snapshot_{ym}.parquet"
         if self.store.load_df("parsed", rel, stage="ST05") is not None:
             return
+        items = list(tickers)[:max_n]
+        Progress.begin("컨센서스 EPS 당월 스냅샷", total=len(items))
         rows = []
-        for t in list(tickers)[:max_n]:
-            try:
-                r = self.http.get("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp",
-                                  params={"pGB": "1", "gicode": "A" + t})
-                m = re.search(r"EPS.{0,400}?([\-0-9,]{2,12})\s*<", r.text, re.S)
-                if m:
-                    v = float(m.group(1).replace(",", ""))
-                    rows.append({"ticker": t, "ym": ym, "eps_fy1": v})
-            except (SourceDown, QuotaExhausted):
-                break
-            except Exception:
-                continue
+        def _work(t):
+            r = self.http.get("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp",
+                              params={"pGB": "1", "gicode": "A" + t}, fast=True)
+            m = re.search(r"EPS.{0,400}?([\-0-9,]{2,12})\s*<", r.text, re.S)
+            if m:
+                return {"ticker": t, "ym": ym,
+                        "eps_fy1": float(m.group(1).replace(",", ""))}
+            return None
+        with ThreadPoolExecutor(max_workers=CFG.MAX_WORKERS) as ex:
+            futs = [ex.submit(_work, t) for t in items]
+            for fut in as_completed(futs):
+                try:
+                    v = fut.result()
+                    if v:
+                        rows.append(v)
+                except Exception:
+                    pass
+                Progress.tick()
+                if COLLECT_BUDGET.exceeded():
+                    break
         if rows:
             df = pd.DataFrame(rows)
             self.store.save_df(df, "parsed", rel, scope="common",
@@ -2128,16 +2845,14 @@ class ConsensusEPSCollector:
                                scope="common", desc="컨센서스EPS 월별 누적", stage="ST05")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [S07] PIT 유니버스 (월말 스냅샷 기반, 생존편향 제거 — 상장폐지 종목 포함)
+# [S07] PIT 유니버스 (월말 스냅샷, 생존편향 제거 — 상장폐지 종목 포함)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _NAME_EXCL_RE = re.compile(r"스팩|SPAC|제\s*\d+\s*호|ETN|ETF|리츠|REIT|"
                            r"인프라|우선주|\d*우(B|C)?$|채권|선물|레버리지|인버스", re.I)
 
 def _is_common_stock(ticker, name=""):
-    """보통주 판별: 6자리 코드 & 끝자리 '0'(우선주 5/7/9/K 배제).
-    이름이 있으면 스팩/ETF/ETN/리츠 등 추가 배제. 이름 부재 시 코드 규칙만 적용
-    (잔존 오염은 커버리지 요건에서 자연 배제 — OPEN_QUESTIONS 기재)."""
+    """보통주 판별: 6자리 & 끝자리 '0'. 이름이 있으면 스팩/ETF/리츠 등 추가 배제."""
     t = str(ticker)
     if not re.match(r"^\d{6}$", t) or not t.endswith("0"):
         return False
@@ -2147,26 +2862,31 @@ def _is_common_stock(ticker, name=""):
 
 
 def build_pit_universe(hub, store, log, months):
-    """월별 PIT 유니버스 패널: (ym, ticker, market, close, mcap, mcap_rank,
-    kospi_rank, kosdaq_rank, in_k200p, in_kq150p). 스냅샷에 존재=당시 상장.
-    ※ 계약 §2.6: pykrx 지수 PDF 호출은 사용 금지 → 시총 순위 프록시로 지수 이벤트 산출."""
+    """월별 PIT 유니버스 패널. 스냅샷에 존재 = 당시 상장(상폐 종목 자동 포함).
+    ※ 계약 §2.6: pykrx 지수 PDF 호출 금지 → 시총 순위 프록시로 지수 이벤트 산출."""
     cached = store.load_df("features", "universe_panel.parquet", stage="ST02")
     if cached is not None and cached["ym"].nunique() >= len(months) - 1:
+        log.info(f"[S07] 유니버스 패널 캐시 적중 ({cached['ym'].nunique()}개월)")
         return cached
+    Progress.begin("월말 PIT 스냅샷", total=len(months))
     frames = []
-    for i, ym in enumerate(months):
+    for ym in months:
         if COLLECT_BUDGET.exceeded():
-            log.warn(f"[S07] 타임박스 — 유니버스 스냅샷 {ym} 이후 중단(수집분 사용)")
+            log.warn(f"[S07] 타임박스 — 스냅샷 {ym} 이후 중단(수집분 사용)")
             break
         snap = hub.monthly_snapshot(ym)
+        Progress.tick(extra=f"{ym}")
         if snap is None or not len(snap):
             continue
         s = snap.copy()
         s["ticker"] = s["ticker"].astype(str).str.zfill(6)
         if "name" not in s.columns:
             s["name"] = ""
-        keep = s.apply(lambda r: _is_common_stock(r["ticker"], r.get("name", "")), axis=1)
-        s = s[keep & (pd.to_numeric(s["mcap"], errors="coerce") > 0)].copy()
+        keep = [_is_common_stock(t, n) for t, n in zip(s["ticker"], s["name"])]
+        s = s[pd.Series(keep, index=s.index)
+              & (pd.to_numeric(s["mcap"], errors="coerce") > 0)].copy()
+        if not len(s):
+            continue
         s["ym"] = ym
         s["mcap"] = pd.to_numeric(s["mcap"], errors="coerce")
         s["close"] = pd.to_numeric(s["close"], errors="coerce")
@@ -2181,8 +2901,6 @@ def build_pit_universe(hub, store, log, months):
         s["in_kq150p"] = ((s["market"] == "KOSDAQ") & (s["kosdaq_rank"] <= 150)).astype("int8")
         frames.append(s[["ym", "ticker", "market", "close", "mcap", "mcap_rank",
                          "in_k200p", "in_kq150p"]])
-        if (i + 1) % 12 == 0:
-            log.info(f"[S07] 스냅샷 {i+1}/{len(months)} ({ym}) 종목 {len(s)}")
     if not frames:
         return None
     uni = pd.concat(frames, ignore_index=True)
@@ -2191,99 +2909,126 @@ def build_pit_universe(hub, store, log, months):
     return uni
 
 
-def delist_events_from_universe(uni, months):
-    """스냅샷 소멸 = 상장폐지(또는 거래정지 장기화) 추론 — 소스 독립적 PIT 방식."""
+def delist_events_from_universe(uni, months, kind_df=None, log=None):
+    """스냅샷 소멸 = 상장폐지 추론. KIND 이력이 있으면 교차검증 결과를 로그로 남긴다."""
     last = uni.groupby("ticker")["ym"].max().reset_index()
     last.columns = ["ticker", "last_ym"]
-    final_ym = max(m for m in months if m in set(uni["ym"].unique()))
+    present = set(uni["ym"].unique())
+    final_ym = max(m for m in months if m in present)
     ev = last[last["last_ym"] < final_ym].copy()
     ev["delist_after"] = ev["last_ym"]
+    if kind_df is not None and len(kind_df) and log is not None:
+        k = set(kind_df["ticker"].astype(str).str.zfill(6))
+        inferred = set(ev["ticker"])
+        log.kv("상장폐지 교차검증(스냅샷 추론 vs KIND)", {
+            "스냅샷 추론": len(inferred), "KIND 이력": len(k),
+            "양측 일치": len(inferred & k),
+            "KIND 만 존재(스냅샷 누락)": len(k - inferred),
+            "추론만 존재(장기거래정지 등 포함)": len(inferred - k)})
     return ev
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [S06b] 월별 리포트 수집 오케스트레이션 (한경=작성자 1차 소스, 네이버=리콜 보강)
+# [S06b] 리포트 수집 오케스트레이션
+#   전략: 한경(확장 가능, 작성자 포함)을 주력으로 전 기간 수집.
+#         네이버 리스트는 항상 병행(증권사 100% 확보 → 하우스 단위 폴백 보장).
+#         네이버 상세는 '전역 예산' 안에서 한경이 못 채운 부분만 보조.
 # ══════════════════════════════════════════════════════════════════════════════
 
-NAVER_DETAIL_CAP_PER_MONTH = 250     # 한경 미매칭분만 상세/PDF 보강(효율 목적)
-NAVER_PDF_CAP_PER_MONTH = 120
-
 def collect_reports_month(ym, naver, hk, store, log):
-    """반환: (naver_df, hk_df). 네이버 상세/PDF 보강은 한경에 작성자가 없는
-    (date,ticker,broker) 조합에 한정한다 — 호출량 최소화.
-    수집기가 None(오프라인/SYNTH)이면 캐시만 읽는다."""
+    """월 단위 리스트 수집(싸다). 상세 추출은 여기서 하지 않는다."""
     if hk is not None:
         hk_df = hk.collect_month(ym)
     else:
         hk_df = store.load_df("parsed", f"reports_meta/hankyung/{ym}.parquet",
                               stage="ST04")
     if naver is not None:
-        nv_df = naver.collect_month(ym, want_analyst=False)
+        nv_df = naver.collect_month(ym)
     else:
-        nv_df = store.load_df("parsed", f"reports_meta/naver/{ym}.parquet",
-                              stage="ST04")
-    if nv_df is None:
-        nv_df = pd.DataFrame()
-    if hk_df is None:
-        hk_df = pd.DataFrame()
-    enr_key = f"nv_enr_{ym}"
-    reg_path = store.local_root / "state" / "done_enrich.json"
-    done = set(read_json_safe(reg_path) or [])
-    if naver is not None and len(nv_df) and enr_key not in done \
-            and not COLLECT_BUDGET.exceeded():
-        if "analyst_raw" not in nv_df.columns:
-            nv_df["analyst_raw"] = ""
-        covered = set()
-        if len(hk_df) and "analyst_raw" in hk_df.columns:
-            h = hk_df[hk_df["analyst_raw"].astype(str).str.len() > 0]
-            covered = set(zip(h["pub_date"], h["ticker"]))
-        need = nv_df[~nv_df.apply(
-            lambda r: (r["pub_date"], r["ticker"]) in covered, axis=1)].head(
-            NAVER_DETAIL_CAP_PER_MONTH)
-        if len(need):
-            enriched = naver._enrich_analyst(need.copy(), NAVER_PDF_CAP_PER_MONTH)
-            nv_df.loc[enriched.index, "analyst_raw"] = enriched["analyst_raw"]
-            store.save_df(nv_df, "parsed", f"reports_meta/naver/{ym}.parquet",
-                          scope="common", desc=f"네이버 리서치(작성자 보강) {ym}",
-                          stage="ST04")
-        done.add(enr_key)
-        try:
-            atomic_write_json(reg_path, sorted(done))
-        except Exception:
-            pass
-    return nv_df, hk_df
+        nv_df = store.load_df("parsed", f"reports_meta/naver/{ym}.parquet", stage="ST04")
+    return (nv_df if nv_df is not None else pd.DataFrame(),
+            hk_df if hk_df is not None else pd.DataFrame())
 
 
 def collect_all_reports(months, naver, hk, store, log):
+    """전 기간 리스트 수집. 월 단위는 서로 독립이므로 진행률을 방송하며 순회한다.
+    (동일 소스에 대한 과도한 동시 요청은 차단을 부르므로 월 병렬화는 하지 않고,
+     페이지 단위 지연을 적응형으로 줄여 처리량을 확보한다)"""
+    Progress.begin("리포트 메타 수집(월별)", total=len(months))
+    n_hk = n_nv = 0
     for i, ym in enumerate(months):
         if COLLECT_BUDGET.exceeded():
-            log.warn(f"[S06b] 수집 타임박스 도달 — {ym} 이후 리포트 수집 중단"
-                     "(캐시분으로 INTERIM 진행)")
+            log.warn(f"[S06b] 타임박스 도달 — {ym} 이후 중단(캐시분으로 INTERIM 진행)")
             break
-        collect_reports_month(ym, naver, hk, store, log)
-        if (i + 1) % 6 == 0:
-            log.info(f"[S06b] 리포트 메타 진행 {i+1}/{len(months)}개월 "
+        nv, hkd = collect_reports_month(ym, naver, hk, store, log)
+        n_nv += len(nv) if nv is not None else 0
+        n_hk += len(hkd) if hkd is not None else 0
+        Progress.tick(extra=f"{ym} | 한경 {n_hk} / 네이버 {n_nv}")
+        if (i + 1) % 12 == 0:
+            log.info(f"[S06b] {i+1}/{len(months)}개월 — 한경 {n_hk}건 / 네이버 {n_nv}건 "
                      f"({COLLECT_BUDGET.status()})")
+    log.kv("리포트 리스트 수집 결과", {
+        "한경(작성자 포함)": n_hk, "네이버(증권사)": n_nv,
+        "한경 사용가능": (hk.available() if hk is not None else False)})
+    return n_hk, n_nv
+
+
+def enrich_missing_analysts(months, naver, store, log, budget_total=None):
+    """한경이 채우지 못한 월에 대해 네이버 상세로 작성자를 보조 확보한다.
+    전역 예산을 개월 수로 균등 배분해 특정 구간만 채워지는 편향을 막는다."""
+    if naver is None or CFG.RUN_MODE != "FULL":
+        return
+    left = budget_total if budget_total is not None else naver.detail_budget.left()
+    if left <= 0:
+        return
+    targets = []
+    for ym in months:
+        nv = store.load_df("parsed", f"reports_meta/naver/{ym}.parquet", stage="ST04")
+        if nv is None or not len(nv):
+            continue
+        hk = store.load_df("parsed", f"reports_meta/hankyung/{ym}.parquet", stage="ST04")
+        hk_ok = 0
+        if hk is not None and len(hk) and "analyst_raw" in hk.columns:
+            hk_ok = int((hk["analyst_raw"].astype(str).str.len() > 0).sum())
+        if hk_ok >= len(nv) * 0.7:            # 한경이 이미 충분히 채움 → 생략
+            continue
+        targets.append(ym)
+    if not targets:
+        log.info("[S06b] 한경으로 작성자 확보 충분 — 네이버 상세 보조 불필요")
+        return
+    per = max(5, left // len(targets))
+    log.info(f"[S06b] 네이버 상세 보조: {len(targets)}개월 × 약 {per}건 "
+             f"(전역 예산 {left}건)")
+    for ym in targets:
+        if COLLECT_BUDGET.exceeded() or naver.detail_budget.left() <= 0:
+            break
+        rel = f"reports_meta/naver/{ym}.parquet"
+        nv = store.load_df("parsed", rel, stage="ST04")
+        if nv is None or not len(nv):
+            continue
+        upd, tried = naver.enrich_analysts(nv, per, tag=f" {ym}")
+        if tried:
+            store.save_df(upd, "parsed", rel, scope="common",
+                          desc=f"네이버 리서치(작성자 보강) {ym}", stage="ST04")
 
 
 def merge_report_meta(months, store, log):
-    """월별 캐시(한경+네이버)를 통합해 리포트/애널리스트 단위 테이블 생성.
-    dedup 키 = (pub_date, ticker, broker_norm, 제목두부) — 작성자 보유 행 우선."""
+    """월별 캐시(한경+네이버)를 통합 → 리포트/애널리스트 단위 테이블.
+    dedup 키 = (pub_date, ticker, broker_norm, 제목두부), 작성자 보유 행 우선."""
     frames = []
     for ym in months:
         for src in ("hankyung", "naver"):
             df = store.load_df("parsed", f"reports_meta/{src}/{ym}.parquet", stage="ST06")
-            if df is not None and len(df):
-                need = {"pub_date", "ticker", "broker", "title"}
-                if not need <= set(df.columns):
-                    continue
-                d = df.copy()
-                if "analyst_raw" not in d.columns:
-                    d["analyst_raw"] = ""
-                d["source"] = src
-                d["ym"] = ym
-                frames.append(d[["pub_date", "ym", "ticker", "broker",
-                                 "analyst_raw", "title", "source"]])
+            if df is None or not len(df):
+                continue
+            if not {"pub_date", "ticker", "broker", "title"} <= set(df.columns):
+                continue
+            d = df.copy()
+            if "analyst_raw" not in d.columns:
+                d["analyst_raw"] = ""
+            d["source"], d["ym"] = src, ym
+            frames.append(d[["pub_date", "ym", "ticker", "broker",
+                             "analyst_raw", "title", "source"]])
     if not frames:
         return None, None
     allr = pd.concat(frames, ignore_index=True)
@@ -2298,7 +3043,6 @@ def merge_report_meta(months, store, log):
                                         "title_head"], keep="first")
     allr["analysts"] = allr["analyst_raw"].map(norm_analysts)
     allr["n_authors"] = allr["analysts"].map(len).astype("int8")
-    # 애널리스트 단위 전개 (공저자 각 1건 — OPEN_QUESTIONS 근거 기재)
     ex = allr[allr["n_authors"] > 0][
         ["pub_date", "ym", "ticker", "broker_norm", "analysts", "source"]].explode("analysts")
     ex = ex.rename(columns={"analysts": "analyst_person_id"})
@@ -2310,12 +3054,15 @@ def merge_report_meta(months, store, log):
         "애널리스트-행": len(ex),
         "고유 애널리스트(analyst_id)": ex["analyst_id"].nunique() if len(ex) else 0,
         "고유 인물(person_id)": ex["analyst_person_id"].nunique() if len(ex) else 0,
-        "고유 증권사": allr["broker_norm"].nunique()})
+        "고유 증권사": allr["broker_norm"].nunique(),
+        "커버 개월": allr["ym"].nunique()})
     return allr.drop(columns=["title_head"]), ex
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [S08] Phase 0 데이터 실현가능성 게이트 (계약 §3 — 타임박스 16h, 표본 3개월×300)
+# [S08] Phase 0 데이터 실현가능성 게이트 (계약 §3)
+#   재작성 포인트: 확보율 '측정'이 목적이므로 비싼 경로를 최소로 쓴다.
+#   (이전 버전은 여기서 월당 250 상세 + 120 PDF 를 돌려 20~45분간 침묵했다)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Phase0Gate:
@@ -2332,50 +3079,64 @@ class Phase0Gate:
         prior = self.prior_decision()
         if prior and prior.get("mode"):
             self.log.info(f"[S08] Phase 0 기결정 재사용: {prior['mode']} "
-                          f"(확보율 {prior.get('rate', float('nan'))})")
+                          f"(확보율 {prior.get('rate')}) — 재측정하려면 "
+                          "state/phase0_decision.json 삭제")
             return prior
+        hk_ok = hk.available() if hk is not None else False
+        self.log.info(f"[S08] 주력 경로(한경 컨센서스) 사용가능: {hk_ok}")
         stats = []
         for ym in CFG.PHASE0_SAMPLE_MONTHS:
+            if COLLECT_BUDGET.exceeded():
+                break
             nv_df, hk_df = collect_reports_month(ym, naver, hk, self.store, self.log)
+            n_hk = len(hk_df) if hk_df is not None else 0
+            n_nv = len(nv_df) if nv_df is not None else 0
             rows = []
-            for df, src in ((hk_df, "hankyung"), (nv_df, "naver")):
-                if df is None or not len(df):
-                    continue
-                d = df.copy()
+            if n_hk:
+                d = hk_df.copy()
                 if "analyst_raw" not in d.columns:
                     d["analyst_raw"] = ""
                 d["ok"] = d["analyst_raw"].map(lambda x: len(norm_analysts(x)) > 0)
-                rows.append(d[["pub_date", "ticker", "ok"]].assign(src=src))
+                rows.append(d[["pub_date", "ticker", "ok"]])
+            if n_nv and not hk_ok:
+                # 한경이 없을 때만 네이버 상세를 '소량' 표본 추출해 확보율을 측정
+                samp = nv_df.sample(n=min(len(nv_df), CFG.PHASE0_DETAIL_PER_MONTH),
+                                    random_state=CFG.RANDOM_SEED).copy()
+                samp, _ = naver.enrich_analysts(samp, CFG.PHASE0_DETAIL_PER_MONTH,
+                                                tag=f" Phase0 {ym}") \
+                    if naver is not None else (samp, 0)
+                samp["ok"] = samp["analyst_raw"].map(
+                    lambda x: len(norm_analysts(x)) > 0)
+                rows.append(samp[["pub_date", "ticker", "ok"]])
             if not rows:
-                stats.append({"ym": ym, "n": 0, "rate": np.nan})
+                stats.append({"ym": ym, "n": 0, "rate": np.nan,
+                              "n_hk": n_hk, "n_nv": n_nv})
                 continue
             merged = pd.concat(rows, ignore_index=True)
             merged = merged.sort_values("ok", ascending=False).drop_duplicates(
                 subset=["pub_date", "ticker"], keep="first")
-            # 확보율 표본은 반드시 '무작위' 추출 — 식별성공 우선 정렬 상태로 head 를
-            # 뜨면 확보율이 상향 편향된다(감사 지적 반영).
-            n_s = min(CFG.PHASE0_SAMPLE_SIZE, len(merged))
-            samp = merged.sample(n=n_s, random_state=CFG.RANDOM_SEED) \
-                if n_s > 0 else merged
+            # 정렬된 상태에서 head 를 뽑으면 확보율이 100% 로 왜곡된다 → 무작위 표본
+            samp = merged.sample(n=min(len(merged), CFG.PHASE0_SAMPLE_SIZE),
+                                 random_state=CFG.RANDOM_SEED)
             stats.append({"ym": ym, "n": int(len(samp)),
                           "rate": float(samp["ok"].mean()) if len(samp) else np.nan,
-                          "n_hk": int((merged["src"] == "hankyung").sum()),
-                          "n_nv": int((merged["src"] == "naver").sum())})
-            self.log.info(f"[S08] Phase0 {ym}: 표본 {len(samp)}건, "
-                          f"확보율 {samp['ok'].mean()*100 if len(samp) else 0:.1f}%")
+                          "n_hk": n_hk, "n_nv": n_nv})
+            self.log.info(f"[S08] {ym}: 표본 {len(samp)}건, 확보율 "
+                          f"{(samp['ok'].mean()*100 if len(samp) else 0):.1f}% "
+                          f"(한경 {n_hk} / 네이버 {n_nv})")
         valid = [s for s in stats if s["n"] > 0]
         rate = float(np.mean([s["rate"] for s in valid])) if valid else 0.0
         kofia_ok = kofia.try_fetch_registry() is not None
         if not valid:
             mode = "ABORT"
-        elif rate >= CFG.PHASE0_OK_RATE:
+        elif rate >= CFG.PHASE0_OK_RATE and hk_ok:
             mode = "ANALYST"
         elif rate >= CFG.PHASE0_FALLBACK_RATE:
-            mode = "ANALYST_IPW"                      # 진행 + §6.7 결측 민감도 필수
+            mode = "ANALYST_IPW"
         else:
-            mode = "HOUSE_FALLBACK"                   # broker×sector 격하(계약 §3)
+            mode = "HOUSE_FALLBACK"
         decision = {"mode": mode, "rate": round(rate, 4), "stats": stats,
-                    "kofia_available": kofia_ok,
+                    "hankyung_available": hk_ok, "kofia_available": kofia_ok,
                     "elapsed_min": round((time.time() - t0) / 60, 1),
                     "at": datetime.now().isoformat()}
         try:
@@ -2386,34 +3147,42 @@ class Phase0Gate:
         return decision
 
     def _write_report(self, dec, canary_result):
-        lines = ["# PHASE0_DATA_FEASIBILITY.md", "",
-                 f"- 실행시각: {dec['at']}  (타임박스 {CFG.PHASE0_TIMEBOX_HOURS}h, "
-                 f"소요 {dec['elapsed_min']}분)",
-                 f"- **판정 모드: `{dec['mode']}`** (평균 analyst_id 확보율 "
-                 f"{dec['rate']*100:.1f}%)", "",
-                 "| 표본월 | 표본 n | 확보율 | 한경 건수 | 네이버 건수 |",
-                 "|---|---|---|---|---|"]
+        L = ["# PHASE0_DATA_FEASIBILITY.md", "",
+             f"- 실행시각: {dec['at']} (타임박스 {CFG.PHASE0_TIMEBOX_HOURS}h, "
+             f"소요 {dec['elapsed_min']}분)",
+             f"- **판정 모드: `{dec['mode']}`** (평균 analyst_id 확보율 "
+             f"{dec['rate']*100:.1f}%)",
+             f"- 주력 경로(한경 컨센서스, 1요청=최대 80건+작성자) 사용가능: "
+             f"**{dec['hankyung_available']}**", "",
+             "| 표본월 | 표본 n | 확보율 | 한경 건수 | 네이버 건수 |", "|---|---|---|---|---|"]
         for s in dec["stats"]:
-            lines.append(f"| {s['ym']} | {s['n']} | "
-                         f"{(s['rate']*100 if s['rate'] == s['rate'] else 0):.1f}% | "
-                         f"{s.get('n_hk', 0)} | {s.get('n_nv', 0)} |")
-        lines += ["",
-                  f"- 판정 기준: ≥{CFG.PHASE0_OK_RATE*100:.0f}% 정상 / "
-                  f"{CFG.PHASE0_FALLBACK_RATE*100:.0f}~{CFG.PHASE0_OK_RATE*100:.0f}% "
-                  "진행+IPW 민감도(§6.7) / 미만 → broker×sector 폴백(하우스 단위 재정의)",
-                  f"- 금투협 전문인력 조회 가능 여부: "
-                  f"{'가능' if dec['kofia_available'] else '불가 → 재직 프록시 사용(계약 §3 폴백)'}",
-                  f"- 소스 도달성 카나리: {canary_result}", ""]
+            r = s["rate"]
+            L.append(f"| {s['ym']} | {s['n']} | "
+                     f"{(r*100 if r == r else 0):.1f}% | {s.get('n_hk',0)} | "
+                     f"{s.get('n_nv',0)} |")
+        L += ["",
+              f"- 판정 기준: ≥{CFG.PHASE0_OK_RATE*100:.0f}% 정상 / "
+              f"{CFG.PHASE0_FALLBACK_RATE*100:.0f}~{CFG.PHASE0_OK_RATE*100:.0f}% "
+              "진행+IPW 민감도(§6.7) / 미만 → broker×sector 폴백",
+              f"- 금투협 전문인력 조회: "
+              f"{'가능' if dec['kofia_available'] else '불가 → 재직 프록시(계약 §3 폴백)'}",
+              f"- 소스 도달성: {canary_result}", "",
+              "### 수집 경로 설계 근거",
+              "요청당 산출량이 경로 선택을 지배한다. 한경 리스트는 1요청에 최대 80건과 "
+              "작성자를 함께 주므로 157개월을 약 4,700요청으로 완주할 수 있다. 반면 "
+              "네이버 상세 페이지는 1요청당 1건이라 전 기간을 채우려면 31만 요청이 "
+              "필요해 어떤 시간 예산으로도 불가능하다. 따라서 상세 경로는 전역 예산"
+              f"({CFG.BUDGET_NAVER_DETAIL}건)으로 묶어 보조로만 쓴다."]
         if dec["mode"] == "HOUSE_FALLBACK":
-            lines += ["", "> **⚠ 폴백 선언: 애널리스트 단위 확보 실패로 신호 단위를 "
-                      "`broker_id × sector`(하우스 단위 주의 재배분)로 격하한다. "
-                      "이하 모든 산출물은 애널리스트 단위 결과가 아니다.**"]
+            L += ["", "> **⚠ 폴백 선언: 애널리스트 단위 확보 실패로 신호 단위를 "
+                  "`broker_id × sector`(하우스 단위 주의 재배분)로 격하한다. "
+                  "이하 모든 산출물은 애널리스트 단위 결과가 아니다.**"]
         if dec["mode"] == "ABORT":
-            lines += ["", "> **✖ 리포트 메타 자체 확보 실패 — 계약 §3에 따라 보고 후 중단.**"]
-        txt = "\n".join(lines)
+            L += ["", "> **✖ 리포트 메타 확보 실패 — 계약 §3 에 따라 보고 후 중단.**"]
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        (self.out_dir / "PHASE0_DATA_FEASIBILITY.md").write_text(txt, encoding="utf-8")
-        self.log.info("[S08] PHASE0_DATA_FEASIBILITY.md 작성 완료 (최우선 제출물)")
+        (self.out_dir / "PHASE0_DATA_FEASIBILITY.md").write_text(
+            "\n".join(L) + "\n", encoding="utf-8")
+        self.log.info("[S08] PHASE0_DATA_FEASIBILITY.md 작성 완료(최우선 제출물)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [S09] 주의 배분 패널 — N, share, base, EA (계약 §6.1~6.2)
@@ -2854,26 +3623,6 @@ def make_config_grid():
 # [S13] 백테스트 엔진 (계약 §7/§8) — 익영업일 종가 진입, 월간 리밸런싱,
 #        3M 은 중첩 트랜치(Jegadeesh-Timan), 연도별 거래세, 상폐 현금화
 # ══════════════════════════════════════════════════════════════════════════════
-
-def build_price_matrix(store, tickers, log):
-    """캐시된 일별 수정주가 → wide close 행렬(date × ticker, float32)."""
-    cols = {}
-    miss = 0
-    for t in tickers:
-        df = store.load_df("parsed", f"prices/{t}.parquet", stage="ST10")
-        if df is None or not len(df):
-            miss += 1
-            continue
-        s = pd.Series(pd.to_numeric(df["close"], errors="coerce").to_numpy(),
-                      index=pd.to_datetime(df["date"]), name=t)
-        cols[t] = s[~s.index.duplicated()]
-    if not cols:
-        return None
-    wide = pd.DataFrame(cols).sort_index().astype("float32")
-    log.info(f"[S13] 일별 가격 행렬: {wide.shape[1]}종목 × {wide.shape[0]}일 "
-             f"(가격 미확보 {miss}종목 → 스냅샷 폴백)")
-    return wide
-
 
 def month_anchor_frames(close_wide, uni, log):
     """entry_px: (월 ordinal × ticker) 익월 첫 영업일 종가(=익영업일 앵커).
@@ -4426,6 +5175,7 @@ def save_plots(ctx):
 
 def main():
     avail = ensure_dependencies()
+    quiet_noisy_libraries()
     local_root = resolve_project_root()
     log = RunLogger(local_root / "logs")
     log.banner("ARC-AAR", f"애널리스트 주의 재배분 백테스트 — 모드 {CFG.RUN_MODE} / "
@@ -4437,19 +5187,28 @@ def main():
                     "colab": _in_colab(), "notebook": _in_notebook(),
                     "project_root": str(local_root),
                     "google_drive": f"{drive_root} ({how})" if drive_root
-                    else "미탐지(로컬+pending 큐 → 재실행 시 자동 동기화)",
+                    else "✖ 미탐지",
                     "pandas": pd.__version__, "numpy": np.__version__})
+    if drive_root is None:
+        log.warn("구글 드라이브를 찾지 못했습니다. 신규 수집분은 로컬에 저장되고 "
+                 "pending 큐에 적재되어 다음 실행에서 자동 동기화됩니다.")
+        log.warn("지금 바로 드라이브에 저장하려면 파일 최상단 [S00] 의 "
+                 "GDRIVE_ROOT 에 '내 드라이브' 폴더 경로를 붙여넣고 재실행하세요. "
+                 r"(예: GDRIVE_ROOT = r'G:\내 드라이브')")
     store.sync_pending_to_drive()
     store.discover_legacy_indexes()
     out_dir = local_root / "outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     state_dir = store.local_root / "state"
     quota = QuotaTracker(state_dir, log)
+    watchdog = Watchdog(log)
+    watchdog.start()                       # 이후 어떤 단계에서도 화면이 죽지 않는다
     stage_times, errors = {}, []
     ctx = {"store": store, "log": log, "out_dir": out_dir, "interim": False}
 
     def stage(sid, title, fn, critical=True):
         log.banner(sid, title)
+        Progress.begin(f"[{sid}] {title}")     # 워치독이 이 단계를 방송한다
         t0 = time.time()
         try:
             r = fn()
@@ -4476,19 +5235,30 @@ def main():
             return None
 
     # ── ST00: 카나리/수집기 준비 ───────────────────────────────────────────
-    canary_res = {}
-    naver = hk = kofia_c = dart_c = cons_c = None
+    canary_res, blocked = {}, set()
+    naver = hk = kofia_c = dart_c = cons_c = kind_c = None
     if CFG.RUN_MODE in ("FULL", "CANARY"):
-        canary_res = stage("ST00", "소스 도달성 카나리",
-                           lambda: canary_check(log, state_dir), critical=False) or {}
+        res = stage("ST00", "소스 도달성 카나리(차단 소스는 즉시 폴백 전환)",
+                    lambda: canary_check(log, state_dir), critical=False)
+        if res:
+            canary_res, blocked = res
         if CFG.RUN_MODE == "CANARY":
             log.info("CANARY 모드 종료")
+            watchdog.stop()
             return
-        naver = NaverResearchCollector(store, log, quota)
-        hk = HankyungConsensusCollector(store, log, quota)
+        det_budget = RequestBudget("naver_detail", CFG.BUDGET_NAVER_DETAIL, log)
+        pdf_budget = RequestBudget("naver_pdf", CFG.BUDGET_PDF, log)
+        naver = NaverResearchCollector(store, log, quota, det_budget, pdf_budget,
+                                       blocked="naver_research" in blocked)
+        hk = HankyungConsensusCollector(store, log, quota,
+                                        blocked="hankyung" in blocked)
         kofia_c = KofiaCollector(store, log, quota)
         dart_c = DartCollector(store, log, quota)
         cons_c = ConsensusEPSCollector(store, log, quota)
+        kind_c = KindCollector(store, log, quota, blocked="kind" in blocked)
+        if not DART_API_KEYS:
+            log.warn("DART 키 미입력 — §6.3 통제변수(실적월/공시건수)가 축소됩니다. "
+                     "https://opendart.fss.or.kr 에서 무료 발급 후 [S00] 에 입력하세요.")
     else:
         stage("ST00", "SYNTH 합성 세계 생성(자가검증)",
               lambda: synth_generate(store, log))
@@ -4516,19 +5286,23 @@ def main():
     ctx["house_fb"] = house_fb
 
     # ── ST02: PIT 유니버스 ────────────────────────────────────────────────
-    hub = MarketDataHub(store, log, quota)
+    hub = MarketDataHub(store, log, quota, blocked=blocked)
     uni = stage("ST02", "PIT 유니버스 월말 스냅샷(생존편향 제거)",
                 lambda: build_pit_universe(hub, store, log, months_meta))
     if uni is None or not len(uni):
         raise RuntimeError("유니버스 구축 실패 — KRX/pykrx/FDR 모두 불가")
-    delist_ev = delist_events_from_universe(uni, months_meta)
+    kind_df = kind_c.delisted(months_meta[0], months_meta[-1]) if kind_c else None
+    delist_ev = delist_events_from_universe(uni, months_meta, kind_df, log)
     log.info(f"[ST02] 유니버스 {uni['ym'].nunique()}개월 / "
              f"고유종목 {uni['ticker'].nunique()} / 상폐추론 {len(delist_ev)}종목")
 
-    # ── ST04: 리포트 메타 수집 → 통합 ─────────────────────────────────────
+    # ── ST04: 리포트 메타 수집 → 보조 확보 → 통합 ─────────────────────────
     if CFG.RUN_MODE == "FULL":
-        stage("ST04", "리포트 메타 수집(한경+네이버, 타임박스 4h)",
+        stage("ST04", "리포트 리스트 수집(한경 주력 + 네이버 병행)",
               lambda: collect_all_reports(months_meta, naver, hk, store, log),
+              critical=False)
+        stage("ST04a", "작성자 보조 확보(네이버 상세, 전역 예산제)",
+              lambda: enrich_missing_analysts(months_meta, naver, store, log),
               critical=False)
     reports_all, ex = stage("ST04b", "리포트 메타 통합/식별자 부여",
                             lambda: merge_report_meta(months_meta, store, log))
@@ -4545,17 +5319,27 @@ def main():
     dart_frames = []
     def _dart_all():
         cmap = dart_c.corp_map() if dart_c is not None else {}
+        Progress.begin("DART 월별 공시집계", total=len(months_meta))
         for ym in months_meta:
             if COLLECT_BUDGET.exceeded():
                 log.warn("[ST05] 타임박스 — DART 수집 중단(수집분 사용)")
                 break
-            g = None
-            if dart_c is not None:
-                g = dart_c.monthly_disclosures(ym, cmap)
-            else:
-                g = store.load_df("parsed", f"dart/{ym}.parquet", stage="ST05")
+            try:
+                if dart_c is not None:
+                    g = dart_c.monthly_disclosures(ym, cmap)
+                else:
+                    g = store.load_df("parsed", f"dart/{ym}.parquet", stage="ST05")
+            except QuotaExhausted:
+                log.warn("[ST05] DART 키 소진 — 수집분까지 사용(다음 실행에서 이어서)")
+                break
+            except Exception as e:
+                log.warn(f"[ST05] DART {ym} 실패: {str(e)[:90]}")
+                g = None
             if g is not None and len(g):
                 dart_frames.append(g)
+            Progress.tick(extra=ym)
+        if dart_c is not None:
+            log.kv("DART 호출량(관측 기반)", dart_c.quota_note())
         return len(dart_frames)
     stage("ST05b", "DART 공시/실적월(§6.3 통제변수)", _dart_all, critical=False)
     eps_hist = cons_c.load_history() if cons_c is not None else \
@@ -4577,12 +5361,11 @@ def main():
                  str(month_end_date(CFG.BT_END_MONTH) + pd.Timedelta(days=40))[:10])
     mkt_map = dict(uni.sort_values("ym").groupby("ticker")["market"].last())
     if CFG.RUN_MODE == "FULL":
-        stage("ST03", f"일별 수정주가 수집({len(covered)}종목, 폴백체인)",
+        stage("ST03", f"일별 수정주가 수집({len(covered)}종목, 증분+벌크)",
               lambda: hub.collect_prices(covered, CFG.PRICE_START, end_px, mkt_map),
               critical=False)
-    close_wide = stage("ST03b", "가격 행렬 적재",
-                       lambda: build_price_matrix(store, covered, log),
-                       critical=False)
+    close_wide = stage("ST03b", "통합 close 행렬 적재(캐시)",
+                       lambda: hub.close_matrix(covered, log), critical=False)
     if close_wide is not None and len(close_wide.columns) < max(30, len(covered) * 0.1):
         log.warn("일별 가격 커버리지 10% 미만 — 월간 스냅샷 폴백 중심 INTERIM 결과")
     if close_wide is None:
@@ -4867,7 +5650,11 @@ def main():
         "verdict": verdict, "verdict_why": why,
         "stage_times_s": stage_times, "errors": errors,
         "collect_budget": COLLECT_BUDGET.status(),
-        "quota_used": quota.doc.get("used", {}),
+        "quota": quota.summary(),
+        "request_budgets": ({"naver_detail_used": naver.detail_budget.used,
+                             "naver_detail_limit": naver.detail_budget.limit,
+                             "pdf_used": naver.pdf_budget.used}
+                            if naver is not None else {}),
         "src_stats": hub.src_stats,
         "ipw_diag": ipw_diag, "ipw_recheck": ipw_recheck,
         "n_reports": int(len(reports_all)), "n_analyst_rows": int(len(ex)),
@@ -4876,11 +5663,17 @@ def main():
           lambda: (write_all_outputs(ctx), save_plots(ctx),
                    print_final_tables(ctx)), critical=False)
     store.save_indexes()
-    store.sync_pending_to_drive()
+    n_sync = store.sync_pending_to_drive()
+    watchdog.stop()
     log.banner("완료", f"ARC-AAR 종료 — 판정 {verdict} / INTERIM={ctx['interim']} "
                        f"/ 산출물: {out_dir}")
-    log.info("재실행 시 캐시·완료 레지스트리 기반으로 이어서 수집/확장됩니다. "
-             "드라이브 공용·전용 인덱스는 append-only 로 보존됩니다.")
+    log.kv("마무리", {
+        "드라이브 저장": (f"{store.drive_root}" if store.have_drive
+                          else "미연결 — pending 큐 보관(다음 실행에서 동기화)"),
+        "이번 실행 동기화": f"{n_sync}건",
+        "수집 예산": COLLECT_BUDGET.status(),
+        "재실행 시": "완료분은 스킵하고 미완료분만 이어서 수집합니다"})
+    log.info("드라이브 공용·전용 인덱스는 append-only 로 보존됩니다(기존 항목 무손상).")
     return ctx
 
 
