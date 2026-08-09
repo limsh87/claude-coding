@@ -235,22 +235,26 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-try:
-    import scipy.stats as _scistats
-except Exception:
-    _scistats = None
-try:
-    import FinanceDataReader as fdr
-except Exception:
-    fdr = None
-try:
-    from pykrx import stock as pykrx_stock
-except Exception:
-    pykrx_stock = None
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
+# ★ 선택 패키지는 '설치되어 있음'과 '실제로 import 됨'이 다르다.
+#   pykrx 는 import 시점에 KRX 로그인을 시도하므로, 그 안에서 예외가 나면 설치돼 있어도
+#   import 자체가 실패한다. 예전 버전은 이 실패를 조용히 None 으로 삼켜서, 수집이
+#   "네트워크를 한 번도 부르지 않고" 0행을 반환했다 — 로그만 보면 원인을 알 수 없었다.
+#   그래서 실패 사유를 문자열로 남기고 환경표에 그대로 출력한다.
+IMPORT_ERR: Dict[str, str] = {}
+
+
+def _opt_import(label: str, fn: Callable):
+    try:
+        return fn()
+    except BaseException as e:                 # SystemExit 까지 포함해 잡는다
+        IMPORT_ERR[label] = f"{type(e).__name__}: {e}"[:160]
+        return None
+
+
+_scistats = _opt_import("scipy", lambda: __import__("scipy.stats", fromlist=["stats"]))
+fdr = _opt_import("FinanceDataReader", lambda: __import__("FinanceDataReader"))
+pykrx_stock = _opt_import("pykrx", lambda: __import__("pykrx.stock", fromlist=["stock"]))
+yf = _opt_import("yfinance", lambda: __import__("yfinance"))
 try:
     import fitz as _fitz                      # pymupdf
 except Exception:
@@ -1357,21 +1361,89 @@ DEADLINE = CollectDeadline(COLLECT_HOURS_BUDGET)
 # ║  캐시: 날짜 단면은 전략과 무관한 원본이므로 **공용 인덱스**에 적재한다.                     ║
 # ║        다른 전략이 같은 날짜를 다시 받을 필요가 없다(연 단위 파티션 parquet).               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
-XSEC_COLS = ["date", "code", "close", "volume", "value", "mktcap", "shares", "market"]
+XSEC_COLS = ["date", "code", "name", "close", "volume", "value", "mktcap",
+             "shares", "market"]
 XSEC_TABLE = "xsec_daily_krx"          # 공용 인덱스 테이블 접두어 (연 단위 파티션)
 XSEC_WORKERS = 2                       # KRX 는 계정 단위로 차단한다 — 병렬을 낮게 유지
 RET_TABLE = "krx_period_return"        # 구간 수익률(수정주가·상폐 포함) 공용 캐시
 
 
+class _PykrxGate:
+    """pykrx 호출의 유일한 통로 — 명시 로그인 1회 + 직렬화 + 스로틀 + 실패 계수.
+
+    ★ 다른 파이프라인에서 검증된 방식을 그대로 가져왔다. pykrx 는 import 시점에
+      로그인을 시도하는데, 그때 실패하면 이후 모든 호출이 조용히 빈 결과를 준다.
+      여기서 get_auth_session() 으로 세션을 '명시적으로' 잡고 결과를 보고한다.
+      또한 모든 호출을 직렬화해 중복로그인(CD011)으로 서로를 밀어내는 것을 막는다.
+    """
+
+    def __init__(self):
+        self._lk = threading.RLock()
+        self.authed = False
+        self.warm = False
+        self.calls = 0
+        self.fails = 0
+        self.note = ""
+        self._t = 0.0
+
+    def warmup(self) -> bool:
+        if pykrx_stock is None:
+            self.note = IMPORT_ERR.get("pykrx", "import 실패")
+            return False
+        with self._lk:
+            if self.warm:
+                return self.authed
+            self.warm = True
+            has_cred = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
+            try:
+                from pykrx.website.comm.auth import get_auth_session   # type: ignore
+                s = get_auth_session()
+                self.authed = s is not None and bool(getattr(s, "is_authenticated", True))
+                self.note = "세션 확보" if self.authed else "세션 인증 실패"
+            except ImportError:
+                self.authed = True          # 구버전 pykrx = 로그인 개념 자체가 없음
+                self.note = "구버전(로그인 불필요)"
+            except Exception as e:
+                self.authed = False
+                self.note = f"{type(e).__name__}: {e}"[:60]
+            self._t = time.time()
+            if has_cred and self.authed:
+                CON.ok("KRX 세션 확보 — pykrx 호출을 직렬화해 중복로그인(CD011) 충돌을 막습니다")
+            elif has_cred:
+                CON.warn(f"KRX 자격증명은 있으나 세션 인증 실패({self.note}) — "
+                         f"pykrx 경로는 건너뛰고 무인증 벌크 소스로 진행합니다")
+            else:
+                CON.say("KRX 자격증명 미입력 — 무인증 벌크 소스로 진행합니다(정확도 동일)")
+            return self.authed
+
+    def call(self, fn: Callable, *a, **k):
+        if pykrx_stock is None:
+            return None
+        with self._lk:
+            if self.authed and time.time() - self._t > 45 * 60:
+                try:
+                    from pykrx.website.comm.auth import get_auth_session   # type: ignore
+                    get_auth_session()
+                    self._t = time.time()
+                except Exception:
+                    pass
+            THROTTLE.wait("krx")
+            QUOTA.spend("krx")
+            self.calls += 1
+            try:
+                return fn(*a, **k)
+            except Exception as e:
+                self.fails += 1
+                if self.fails <= 3:      # 처음 몇 건은 사유를 보여 준다(조용한 실패 방지)
+                    CON.debug(f"pykrx 실패({type(e).__name__}: {e})"[:150])
+                return None
+
+
+PYKRX = _PykrxGate()
+
+
 def _pykrx_call(fn: Callable, *a, **k):
-    """pykrx 호출 1회 — 스로틀 + 쿼터 카운트 + 예외 흡수. 실패는 None(폴백이 받는다)."""
-    THROTTLE.wait("krx")
-    QUOTA.spend("krx")
-    try:
-        return fn(*a, **k)
-    except Exception as e:
-        CON.debug(f"pykrx 실패({type(e).__name__}): {getattr(fn, '__name__', fn)} {a[:2]}")
-        return None
+    return PYKRX.call(fn, *a, **k)
 
 
 class KrxMarketplace:
@@ -1575,8 +1647,138 @@ def _xsec_fdr(day: pd.Timestamp) -> Optional[pd.DataFrame]:
     return out
 
 
-_XSEC_CHAIN = [("pykrx", _xsec_pykrx), ("krx_marketplace", lambda d: KRXM.xsec(d)),
-               ("fdr", _xsec_fdr)]
+# ── 무인증 벌크 소스 ────────────────────────────────────────────────────────────────────────
+#  ★ pykrx 는 import 시점에 KRX 로그인을 하므로 그것이 막히면 통째로 죽는다. 그때 대안이
+#    없으면 파이프라인 전체가 0행으로 멈춘다(실제로 그렇게 멈췄다). 그래서 **인증도
+#    라이브러리도 필요 없는 HTTP 벌크 소스**를 1순위에 둔다.
+#    marcap 은 연 단위 CSV 한 개에 그 해 전 종목·전 거래일의
+#    [종가·거래량·거래대금·시가총액·상장주식수]가 들어 있다 → 10년치가 파일 10개.
+#    실측 확인(2026-08): 형식은 parquet, 브랜치는 master 만 유효(csv/csv.gz/main 은 404).
+#    1995~2026 전 연도 존재 · 연 18MB · 상장폐지 종목이 '거래되던 날짜에' 그대로 포함
+#    (= 생존자편향 없음) · Marcap == Close×Stocks 정확 일치 · 분할일에 Stocks 재계산.
+MARCAP_URLS = [
+    "https://raw.githubusercontent.com/FinanceData/marcap/master/data/marcap-{y}.parquet",
+    "https://media.githubusercontent.com/media/FinanceData/marcap/master/data/marcap-{y}.parquet",
+]
+#  FDR 이 실제로 읽는 GitHub 캐시를 **라이브러리를 거치지 않고 직접** 읽는다.
+#  (fdr.StockListing 은 최신영업일을 알아내려 data.krx.co.kr 을 찌르는데, 로그인 벽에
+#   막히면 CSV 는 멀쩡한데도 통째로 실패한다. 다른 파이프라인에서 검증된 우회 경로다.)
+FDR_CACHE_URL = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+                 "refs/heads/{br}/data/{kind}/{date}.csv")
+FDRCACHE_URLS = [FDR_CACHE_URL.replace("{br}", "master").replace("{kind}", "listing/krx"),
+                 FDR_CACHE_URL.replace("{br}", "main").replace("{kind}", "listing/krx")]
+
+
+def fdr_cache_csv(kind: str, back_days: int = 21,
+                  asof: Optional[pd.Timestamp] = None) -> Optional[pd.DataFrame]:
+    """영업일 CSV만 존재하므로 기준일부터 거꾸로 훑는다. 인증 불필요."""
+    base = (asof or pd.Timestamp.today()).normalize()
+    for i in range(back_days):
+        d = base - pd.Timedelta(i, "D")
+        if d.weekday() >= 5:
+            continue
+        for br in ("master", "main"):
+            raw = fetch(FDR_CACHE_URL.format(br=br, kind=kind, date=f"{d:%Y-%m-%d}"),
+                        source="generic", as_bytes=True, tries=1, timeout=30)
+            if not raw or len(raw) < 200 or raw[:15].lstrip().startswith(b"404"):
+                continue
+            try:
+                df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", low_memory=False,
+                                 dtype={"Code": str, "Symbol": str, "ToSymbol": str,
+                                        "MarketId": str, "Market": str, "ISU_CD": str,
+                                        "Unnamed: 0": str})
+            except Exception:
+                continue
+            # ★ index_col=0 을 무조건 주면 안 된다. listing 은 이름없는 인덱스가 있지만
+            #   delisting 은 없을 수 있어, 그때 첫 실컬럼(Symbol)이 인덱스로 먹혀
+            #   상장폐지 종목이 통째로 사라진다 — 그게 곧 생존자편향이다.
+            if len(df.columns) and str(df.columns[0]).strip().lower() in (
+                    "", "unnamed: 0", "unnamed:0", "index"):
+                df = df.drop(columns=[df.columns[0]])
+            if len(df):
+                CON.debug(f"FDR GitHub 캐시 적중: {kind} @ {d:%Y-%m-%d} ({len(df):,}행)")
+                return df
+    return None
+
+
+def _norm_xsec_frame(d: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """어느 소스에서 왔든 XSEC_COLS 스키마로 정규화한다(컬럼명 표기 차이 흡수)."""
+    if d is None or not len(d):
+        return None
+    lc = {str(c).strip().lower(): c for c in d.columns}
+
+    def pick(*names, numeric=True):
+        for n in names:
+            if n in lc:
+                v = d[lc[n]]
+                return pd.to_numeric(v, errors="coerce") if numeric else v.astype(str)
+        return pd.Series(np.nan if numeric else "", index=d.index)
+
+    code_c = lc.get("code") or lc.get("symbol") or lc.get("종목코드") or lc.get("티커")
+    if code_c is None:
+        return None
+    out = pd.DataFrame({"code": d[code_c].map(code6)})
+    out["close"] = pick("close", "종가")
+    out["volume"] = pick("volume", "거래량")
+    out["value"] = pick("amount", "거래대금", "value")
+    out["mktcap"] = pick("marcap", "시가총액", "mktcap", "marketcap")
+    out["shares"] = pick("stocks", "상장주식수", "shares", "listedshares")
+    out["market"] = pick("market", "시장구분", numeric=False)
+    out["name"] = pick("name", "종목명", "회사명", numeric=False)   # PIT 종목명(그 날짜 기준)
+    date_c = lc.get("date") or lc.get("날짜")
+    out.insert(0, "date", ts_col(d[date_c]) if date_c else pd.NaT)
+    out = out.dropna(subset=["code"])
+    out = out[(out["close"] > 0) | (out["mktcap"] > 0)]
+    return out if len(out) else None
+
+
+def bulk_marcap_year(year: int) -> Optional[pd.DataFrame]:
+    """연 단위 벌크 다운로드 — 그 해 전 거래일 × 전 종목 단면을 한 번에."""
+    for tmpl in MARCAP_URLS:
+        raw = fetch(tmpl.format(y=year), source="generic", as_bytes=True, tries=2,
+                    timeout=240)
+        if not raw or len(raw) < 5000:
+            continue
+        try:
+            if raw[:4] == b"PAR1":
+                d = pd.read_parquet(io.BytesIO(raw))
+            else:
+                if raw[:2] == b"\x1f\x8b":
+                    import gzip
+                    raw = gzip.decompress(raw)
+                d = pd.read_csv(io.BytesIO(raw), low_memory=False)
+        except Exception as e:
+            CON.debug(f"marcap {year} 파싱 실패({type(e).__name__})")
+            continue
+        out = _norm_xsec_frame(d)
+        if out is not None and out["date"].notna().any():
+            CON.ok(f"벌크 단면 확보: {year}년 {len(out):,}행 · "
+                   f"거래일 {out['date'].nunique():,}일 · 종목 {out['code'].nunique():,} "
+                   f"(무인증 1회 다운로드)")
+            return out
+    return None
+
+
+def _xsec_fdrcache(day: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """일 단위 무인증 캐시 CSV(FDR 공개 캐시) — 벌크가 못 덮는 최근분 보완."""
+    for tmpl in FDRCACHE_URLS:
+        txt = fetch(tmpl.format(d=f"{day:%Y-%m-%d}"), source="generic", as_bytes=True,
+                    tries=1, timeout=40)
+        if not txt or len(txt) < 500:
+            continue
+        try:
+            d = pd.read_csv(io.BytesIO(txt), low_memory=False)
+        except Exception:
+            continue
+        out = _norm_xsec_frame(d)
+        if out is not None:
+            out["date"] = pd.Timestamp(day).normalize()
+            return out
+    return None
+
+
+_XSEC_CHAIN = [("무인증캐시", _xsec_fdrcache), ("pykrx", _xsec_pykrx),
+               ("krx마켓플레이스", lambda d: KRXM.xsec(d)), ("fdr", _xsec_fdr)]
 
 
 def _period_return_krx(d0: pd.Timestamp, d1: pd.Timestamp) -> Optional[pd.DataFrame]:
@@ -1664,8 +1866,12 @@ class ReturnHub:
         for i in range(0, len(todo), CHUNK):
             if DEADLINE.over("구간 수익률"):
                 break
-            got = [g for g in pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS,
-                                   label="구간수익률") if g is not None]
+            got = [g for g in pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS)
+                   if g is not None]
+            if not got and i == 0:
+                CON.warn("구간 수익률 소스가 응답하지 않습니다 — 단면 파생 수익률로 "
+                         "진행합니다(분할 보정이 휴리스틱이 됩니다).")
+                break
             if got:
                 self.df = pd.concat([self.df] + got, ignore_index=True).drop_duplicates(
                     ["from_date", "to_date", "code"], keep="last")
@@ -1700,6 +1906,7 @@ class MarketHub:
         self.loaded_years: set = set()
         self.have_dates: set = set()
         self.new_years: set = set()
+        self._bulk_tried: set = set()
         self._lk = threading.RLock()
 
     # ── 캐시 ───────────────────────────────────────────────────────────────────────────
@@ -1768,12 +1975,36 @@ class MarketHub:
         return pd.DatetimeIndex(sorted(set(days)))
 
     # ── 단면 수집 ──────────────────────────────────────────────────────────────────────
+    def _bulk_fill(self, missing: Sequence[pd.Timestamp]) -> int:
+        """부족한 날짜를 연 단위 벌크로 한 번에 메운다 — 연당 1회 다운로드.
+        날짜별로 두드리는 것보다 압도적으로 빠르고 차단 위험도 없다(무인증 정적 파일)."""
+        years = sorted({pd.Timestamp(d).year for d in missing})
+        filled = 0
+        for y in years:
+            if DEADLINE.over("벌크 단면"):
+                break
+            if y in self._bulk_tried:
+                continue
+            self._bulk_tried.add(y)
+            d = bulk_marcap_year(y)
+            if d is None or not len(d):
+                CON.debug(f"벌크 단면 {y}년 미확보 — 날짜별 소스로 넘어갑니다")
+                continue
+            self._absorb([d])
+            self.flush()
+            filled += 1
+        return filled
+
     def ensure(self, dates: Sequence[pd.Timestamp]) -> "pd.DataFrame":
         """요청 날짜들의 전종목 단면을 보장한다. 캐시에 있는 날짜는 절대 다시 받지 않는다."""
         want = sorted({pd.Timestamp(d).normalize() for d in dates})
         for y in sorted({d.year for d in want}):
             self._load_year(y)
         todo = [d for d in want if d not in self.have_dates]
+        if todo and RUN_MODE != "CACHED":
+            if self._bulk_fill(todo):
+                todo = [d for d in want if d not in self.have_dates]
+                CON.say(f"벌크 적재 후 잔여 미보유 {len(todo)}일")
         if todo and RUN_MODE == "CACHED":
             CON.warn(f"CACHED 모드 — 미보유 단면 {len(todo)}일은 건너뜁니다")
             todo = []
@@ -1801,7 +2032,7 @@ class MarketHub:
             for i in range(0, len(todo), CHUNK):
                 if DEADLINE.over("전종목 단면 수집"):
                     break
-                part = pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS, label="단면수집")
+                part = pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS)
                 for d in part:
                     if d is None or not len(d):
                         continue
@@ -1813,9 +2044,17 @@ class MarketHub:
                     batch = []
                     self.flush()
                 done = min(i + CHUNK, len(todo))
-                rate = done / max(time.time() - t0, 1e-9)
-                CON.say(f"  단면 {done}/{len(todo)}일 ({rate*60:.0f}일/분, "
-                        f"잔여 {max(0,(len(todo)-done)/max(rate,1e-9))/60:.1f}분)")
+                el = time.time() - t0
+                if got_n == 0 and done >= min(20, len(todo)):
+                    # ★ 초반부터 단 한 건도 못 받으면 남은 수백 일을 계속 두드리지 않는다.
+                    #   되지 않는 이유가 소스에 있는 것이므로, 즉시 멈추고 원인을 보고한다.
+                    CON.warn(f"단면 {done}일 연속 실패 — 남은 {len(todo)-done}일 시도를 "
+                             f"중단합니다(원인은 아래 소스 진단표 참조)")
+                    break
+                if el > 3:
+                    rate = done / el
+                    CON.say(f"  단면 {done}/{len(todo)}일 · 성공 {got_n} "
+                            f"({rate*60:.0f}일/분, 잔여 {(len(todo)-done)/max(rate,1e-9)/60:.1f}분)")
             if src_tally:
                 CON.grid([[k, f"{v:,}"] for k, v in src_tally.items()],
                          ["단면 소스", "성공 일수"], ["l", "r"])
@@ -1839,9 +2078,49 @@ class MarketHub:
                 self.have_dates |= set(d["date"].unique())
                 self.new_years.add(y)
 
+    # ── 분할 보정 (일별 데이터로 계산해야 정확하다) ─────────────────────────────────────
+    def compute_adjusted(self):
+        """전 캐시 일별 단면에서 액면분할·무상증자를 탐지해 연속 총수익 가격을 만든다.
+
+        ★ 인접 '거래일' 사이에서 판정하므로 오탐이 거의 없다. 월 간격으로 판정하면
+          그 사이 주가 변동이 섞여 유상증자를 분할로 오인하거나 진짜 분할을 놓친다.
+          판정: 상장주식수가 5% 넘게 변했는데 주가가 그 역수만큼 움직여 시가총액이
+          연속인 경우 = 자본 유입 없는 주식수 변경 = 분할/무상증자.
+        """
+        if not self.frames:
+            return
+        allf = pd.concat([f[["date", "code", "close", "shares"]] for f in self.frames.values()
+                          if len(f)], ignore_index=True)
+        allf = allf.drop_duplicates(["date", "code"], keep="last")
+        allf = allf.sort_values(["code", "date"], kind="mergesort")
+        g = allf.groupby("code", observed=True, sort=False)
+        p_sh = g["shares"].shift()
+        p_px = g["close"].shift()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = allf["shares"].to_numpy(float) / p_sh.to_numpy(float)
+            pr = allf["close"].to_numpy(float) / p_px.to_numpy(float)
+        split = (np.isfinite(ratio) & np.isfinite(pr) & (np.abs(ratio - 1.0) > 0.05)
+                 & (np.abs(pr * ratio - 1.0) < 0.15))
+        allf["_f"] = np.where(split, ratio, 1.0)
+        allf["_g"] = allf.groupby("code", observed=True, sort=False)["_f"].cumprod()
+        allf["adj_close"] = allf["close"].to_numpy(float) * allf["_g"].to_numpy(float)
+        n_split = int(split.sum())
+        if n_split:
+            CON.say(f"액면분할·무상증자 {n_split:,}건 탐지 — 일별 인접 거래일 기준으로 "
+                    f"보정해 연속 총수익 가격을 만들었습니다")
+        key = allf.set_index(["date", "code"])["adj_close"]
+        for y, f in self.frames.items():
+            idx = pd.MultiIndex.from_arrays([f["date"], f["code"]])
+            f["adj_close"] = key.reindex(idx).to_numpy(float)
+            self.frames[y] = f
+
     def slice(self, dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
         want = {pd.Timestamp(d).normalize() for d in dates}
-        parts = [f[f["date"].isin(want)] for f in self.frames.values() if len(f)]
+        cols = XSEC_COLS + ["adj_close"]
+        parts = [f.reindex(columns=[c for c in cols if c in f.columns])[
+                     f["date"].isin(want).to_numpy()]
+                 for f in self.frames.values() if len(f)]
+        parts = [p for p in parts if len(p)]
         if not parts:
             return pd.DataFrame(columns=XSEC_COLS)
         out = pd.concat(parts, ignore_index=True)
@@ -1870,12 +2149,12 @@ def _is_common_stock(code: str, name: str) -> bool:
 
 
 def _fdr_listing() -> Optional[pd.DataFrame]:
-    if fdr is None:
-        return None
-    try:
-        d = fdr.StockListing("KRX")
-    except Exception:
-        return None
+    d = fdr_cache_csv("listing/krx")          # 1순위: 무인증 GitHub 캐시 직접 읽기
+    if (d is None or not len(d)) and fdr is not None:
+        try:
+            d = fdr.StockListing("KRX")       # 2순위: 라이브러리(내부에서 KRX 를 찌른다)
+        except Exception:
+            d = None
     if d is None or not len(d):
         return None
     lc = {str(c).lower(): c for c in d.columns}
@@ -1890,12 +2169,12 @@ def _fdr_listing() -> Optional[pd.DataFrame]:
 
 
 def _fdr_delisting() -> Optional[pd.DataFrame]:
-    if fdr is None:
-        return None
-    try:
-        d = fdr.StockListing("KRX-DELISTING")
-    except Exception:
-        return None
+    d = fdr_cache_csv("listing/delisting")    # 1순위: 무인증 GitHub 캐시(생존자편향의 핵심)
+    if (d is None or not len(d)) and fdr is not None:
+        try:
+            d = fdr.StockListing("KRX-DELISTING")
+        except Exception:
+            d = None
     if d is None or not len(d):
         return None
     lc = {str(c).lower(): c for c in d.columns}
@@ -1938,6 +2217,72 @@ def _kind_listing() -> Optional[pd.DataFrame]:
                         ).dropna(subset=["code"])
 
 
+def probe_market_sources(cal: "TradingCal") -> pd.DataFrame:
+    """수집 전에 각 소스를 '실제로 한 번' 호출해 살아있는지 확인하고 표로 보여준다.
+
+    ★ 이 단계가 없어서, pykrx import 가 실패했는데도 코드가 조용히 0행을 만들며
+      수백 일을 헛돌았다. 무엇이 되고 무엇이 안 되는지 먼저 못박고 시작한다.
+    """
+    probe_day = None
+    for back in range(0, 40):
+        cand = cal.days[max(0, len(cal.days) - 260 - back)]   # 1년쯤 전 거래일
+        if cand is not None:
+            probe_day = pd.Timestamp(cand)
+            break
+    rows = []
+    ok_any = False
+    PYKRX.warmup()
+    # 1) 벌크(무인증)
+    y = int(probe_day.year)
+    t0 = time.time()
+    b = bulk_marcap_year(y) if RUN_MODE != "CACHED" else None
+    rows.append(["벌크 연단위(무인증)", f"marcap {y}",
+                 "정상" if b is not None else "불가",
+                 f"{len(b):,}행" if b is not None else "-", f"{time.time()-t0:.1f}s"])
+    ok_any |= b is not None
+    if b is not None:
+        MARKET_PROBE_BULK.append(b)
+    # 2) 일단위 무인증 캐시
+    t0 = time.time()
+    c = _xsec_fdrcache(probe_day) if RUN_MODE != "CACHED" else None
+    rows.append(["일단위 캐시(무인증)", f"{probe_day:%Y-%m-%d}",
+                 "정상" if c is not None else "불가",
+                 f"{len(c):,}행" if c is not None else "-", f"{time.time()-t0:.1f}s"])
+    ok_any |= c is not None
+    # 3) pykrx
+    if pykrx_stock is None:
+        rows.append(["pykrx", "import 실패",
+                     "불가", IMPORT_ERR.get("pykrx", "사유 미상")[:44], "-"])
+    else:
+        t0 = time.time()
+        p = _xsec_pykrx(probe_day) if RUN_MODE != "CACHED" else None
+        rows.append(["pykrx 단면", f"{probe_day:%Y-%m-%d}",
+                     "정상" if p is not None else "불가",
+                     (f"{len(p):,}행" if p is not None else PYKRX.note[:44]),
+                     f"{time.time()-t0:.1f}s"])
+        ok_any |= p is not None
+    # 4) KRX 마켓플레이스
+    rows.append(["KRX 정보데이터시스템", KRXM.state,
+                 "비활성" if KRXM.disabled else "대기", KRXM.reason[:40] or "-", "-"])
+    # 5) FDR / 기타
+    rows.append(["FinanceDataReader", "import",
+                 "정상" if fdr is not None else "불가",
+                 IMPORT_ERR.get("FinanceDataReader", "")[:40] or "-", "-"])
+    CON.grid(rows, ["소스", "대상", "판정", "비고", "소요"], ["l", "l", "l", "l", "r"],
+             title="시장데이터 소스 자가진단 (되는 것만 씁니다)")
+    if not ok_any and RUN_MODE != "CACHED":
+        raise HaltRun(
+            "시장데이터 소스가 하나도 응답하지 않습니다. 확인 순서: "
+            "① 인터넷/프록시(사내망이면 raw.githubusercontent.com 차단 여부) "
+            "② pykrx import 오류 메시지(위 표) — KRX 로그인 실패가 원인이면 "
+            "KRX_MARKETPLACE_ID/PW 를 확인하거나 비워두고 재실행 "
+            "③ RUN_MODE='CACHED' 로 기존 캐시만으로 재현")
+    return pd.DataFrame(rows, columns=["source", "target", "verdict", "note", "sec"])
+
+
+MARKET_PROBE_BULK: List[pd.DataFrame] = []
+
+
 def build_security_master(xsec: pd.DataFrame) -> pd.DataFrame:
     """종목마스터 = 단면에서 관측된 실체 + 이름/시장/상장·폐지일 보강(다중소스 교차검증).
 
@@ -1949,6 +2294,13 @@ def build_security_master(xsec: pd.DataFrame) -> pd.DataFrame:
     g = xsec.groupby("code", observed=True)["date"]
     sec = pd.DataFrame({"code": g.min().index, "first_seen": g.min().to_numpy(),
                         "last_seen": g.max().to_numpy()})
+    # ★ 단면에 종목명이 있으면 그것이 가장 정확하다(그 시점에 실제로 쓰이던 이름).
+    if "name" in xsec.columns:
+        nm_x = (xsec.loc[xsec["name"].astype(str).str.strip() != "",
+                         ["date", "code", "name"]]
+                .sort_values("date").drop_duplicates("code", keep="last")[["code", "name"]])
+        if len(nm_x):
+            sec = sec.merge(nm_x, on="code", how="left")
     names = DEPOT.table_load("krx_security_names",
                              foreign_patterns=["security_master", "krx_names"],
                              need_cols=["code", "name"])
@@ -1968,8 +2320,15 @@ def build_security_master(xsec: pd.DataFrame) -> pd.DataFrame:
     if frames:
         nm = pd.concat(frames, ignore_index=True).dropna(subset=["code"])
         nm = nm[nm["name"].astype(str).str.strip() != ""]
-        nm = nm.drop_duplicates("code", keep="first")
+        nm = nm.drop_duplicates("code", keep="first").rename(columns={"name": "name_ext"})
         sec = sec.merge(nm, on="code", how="left")
+        if "name" in sec.columns:      # 단면 이름을 우선하고 빈 곳만 외부 목록으로 채움
+            sec["name"] = sec["name"].fillna("").astype(str)
+            blank = sec["name"].str.strip() == ""
+            sec.loc[blank, "name"] = sec.loc[blank, "name_ext"]
+        else:
+            sec["name"] = sec["name_ext"]
+        sec = sec.drop(columns=[c for c in ("name_ext",) if c in sec.columns])
         DEPOT.table_save("krx_security_names", nm, scope="공용", domain="universe",
                          source="fdr+kind", note="종목명/시장/상장일 (공용 재사용)")
     for c in ("name", "market"):
@@ -2094,6 +2453,19 @@ class PriceMatrix:
         self.shares = _al("shares")
         self.mcap = _al("mktcap")
         self.value = _al("value")
+        if "adj_close" in xsec.columns and xsec["adj_close"].notna().any():
+            # 일별 데이터로 이미 보정된 연속가격이 있으면 그것을 쓴다(가장 정확)
+            self.adj = _al("adj_close")
+            self.cum = (self.adj.to_numpy(float) /
+                        np.where(self.close.to_numpy(float) == 0, np.nan,
+                                 self.close.to_numpy(float)))
+            self.n_adjusted = int(np.nansum(np.abs(self.cum - 1.0) > 1e-9))
+            self.cols = np.array(self.close.columns.values, dtype="datetime64[ns]")
+            self.row_of = {c: i for i, c in enumerate(self.close.index)}
+            self._adj_np = self.adj.to_numpy(float)
+            self.daily_adjusted = True     # 일별 인접 거래일 기준 보정 = 추정이 아님
+            return
+        self.daily_adjusted = False
         fac = _adjust_factor(self.shares, self.close, self.mcap)
         self.n_adjusted = int((fac.to_numpy() != 1.0).sum())
         if self.n_adjusted:
@@ -2230,10 +2602,11 @@ def build_month_panel(have_dates: Sequence[pd.Timestamp], xsec: pd.DataFrame,
                 + " (서버 수정주가가 분할·상폐를 이미 반영합니다)")
         tot = sum(src_tally.values())
         derived = src_tally.get("단면파생", 0)
-        if tot and derived / tot > 0.30:
-            CON.warn(f"구간의 {derived/tot*100:.0f}%가 단면 파생 수익률입니다 — 분할 보정이 "
-                     f"휴리스틱이므로 정확도가 떨어집니다. 재실행해 구간 수익률을 채우면 "
-                     f"서버 수정주가로 자동 대체됩니다.")
+        precise = pm is not None and getattr(pm, "daily_adjusted", False)
+        if tot and derived / tot > 0.30 and not precise:
+            CON.warn(f"구간의 {derived/tot*100:.0f}%가 월 간격 추정 보정입니다 — 분할 판정이 "
+                     f"휴리스틱이라 정확도가 떨어집니다. 벌크 일별 데이터를 확보하면 "
+                     f"자동으로 정확한 보정으로 대체됩니다.")
     # 잔여 생존자편향 점검: 살아 있었는데 다음 달 수익률이 결측인 종목 비율
     nan_ratio = float(P["fwd_1m"].isna().mean()) if len(P) else 0.0
     if nan_ratio > 0.10:
@@ -4330,7 +4703,7 @@ def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dic
                 lead_shift = -25 if is_leader[a_i] else 0
                 for q in range(5):        # 분기 4회 + 4Q 프리뷰(11월) — 발표 전 180일 안쪽
                     d0 = ts(f"{y}-01-20") + pd.Timedelta(
-                        days=72 * q + int(rng.integers(0, 10)) + lead_shift)
+                        int(72 * q + rng.integers(0, 10) + lead_shift), "D")
                     if d0 > days[-1] or d0 < days[0]:
                         continue
                     conv = (q + 1) / 5.0                       # 대중의 수렴 속도
@@ -4644,7 +5017,13 @@ def run_all() -> dict:
              f"{'/'.join(STRATS)} · 비교 시총하위{COMPARE_BOTTOM_N}")
     CON.grid([["환경", "Colab" if RIG["colab"] else ("Jupyter" if RIG["ipython"] else "CLI")],
               ["파이썬/OS", f"{RIG['python']} / {RIG['os']} {RIG['cpu']}코어"],
-              ["선택 패키지", ", ".join(k for k, v in HAVE.items() if v) or "없음"],
+              ["사용 가능 패키지",
+               ", ".join(n for n, m in (("scipy", _scistats), ("FinanceDataReader", fdr),
+                                        ("pykrx", pykrx_stock), ("yfinance", yf),
+                                        ("pymupdf", _fitz), ("pdfplumber", _pdfplumber))
+                         if m is not None) or "없음"],
+              ["import 실패", "; ".join(f"{k}({v.split(':')[0]})"
+                                        for k, v in IMPORT_ERR.items()) or "없음"],
               ["수집 시간예산", f"{COLLECT_HOURS_BUDGET:.1f}시간 (초과 시 중간결과 산출)"],
               ["KRX 마켓플레이스", "ID 입력됨" if KRX_MARKETPLACE_ID else "미입력(폴백 사용)"],
               ["DART 키", "입력됨" if DART_API_KEY else "미입력(네이버 실적 폴백)"]],
@@ -4706,6 +5085,12 @@ def run_all() -> dict:
                     ret_pairs.append((d0, pd.Timestamp(dh)))
         snap_dates = sorted(set(snap_dates))
         ret_pairs = list(dict.fromkeys(ret_pairs))
+        probe_market_sources(cal)
+        if MARKET_PROBE_BULK:          # 진단에서 받은 벌크는 버리지 않고 그대로 적재
+            HUB._load_year(int(MARKET_PROBE_BULK[0]["date"].iloc[0].year))
+            HUB._absorb(MARKET_PROBE_BULK)
+            HUB._bulk_tried.add(int(MARKET_PROBE_BULK[0]["date"].iloc[0].year))
+            HUB.flush()
         CON.grid([["신호일 단면", f"{len(snap_dates):,}콜", "전 종목 가격·시총·주식수"],
                   ["구간 수익률", f"{len(ret_pairs):,}콜",
                    "전 종목 수정주가 등락률(상폐 -100% 포함)"],
@@ -4715,18 +5100,23 @@ def run_all() -> dict:
         FLOW.io("출", "메모리", "호출계획", snap_dates + ret_pairs)
 
     with FLOW.part("S4b", "전종목 단면 + 구간 수익률 수집", budget_s=3600 * 2):
-        xsec = HUB.ensure(snap_dates)
+        # 벌크가 일별 전체를 주므로, 필요한 날짜만 뽑지 말고 지평 날짜까지 함께 확보한다
+        # (이미 받은 데이터 안에 있으므로 추가 호출이 0이다).
+        want_dates = sorted(set(snap_dates) | {pd.Timestamp(b) for _, b in ret_pairs})
+        HUB.ensure(want_dates)
+        HUB.compute_adjusted()          # 일별 인접 거래일로 분할보정(가장 정확)
+        xsec = HUB.slice(want_dates)
         HUB.flush()
-        RET.ensure(ret_pairs)
-        RET.flush()
-        cov = len(RET.have & set(ret_pairs)) / max(len(ret_pairs), 1)
-        CON.say(f"구간 수익률 커버리지 {cov*100:.0f}%")
-        if cov < 0.5:
-            CON.warn("구간 수익률 커버리지가 낮습니다 — 지평 날짜 단면을 추가로 받아 "
-                     "단면 파생 수익률로 보완합니다")
-            extra = sorted({pd.Timestamp(b) for _, b in ret_pairs})
-            xsec = HUB.ensure(sorted(set(snap_dates) | set(extra)))
-            HUB.flush()
+        have_adj = ("adj_close" in xsec.columns and xsec["adj_close"].notna().mean() > 0.9)
+        if have_adj:
+            CON.ok("일별 분할보정 가격을 확보했습니다 — 구간 수익률 API 호출 "
+                   f"{len(ret_pairs)}건을 생략합니다(같은 값을 이미 갖고 있으므로 "
+                   f"불필요한 반복 조회를 하지 않습니다).")
+        else:
+            RET.ensure(ret_pairs)
+            RET.flush()
+            cov = len(RET.have & set(ret_pairs)) / max(len(ret_pairs), 1)
+            CON.say(f"구간 수익률 커버리지 {cov*100:.0f}%")
         FLOW.io("출", "메모리", "전종목단면", xsec)
         sec = build_security_master(xsec)
         FLOW.io("출", "메모리", "종목마스터", sec)
