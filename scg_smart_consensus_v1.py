@@ -94,7 +94,7 @@ COLLECT_HOURS_BUDGET = 4.0        # ★ 수집 시간예산(시간). 초과하�
                                   #   지금까지 모은 데이터만으로 '중간 백테스트 결과'를 출력한다.
                                   #   (수집은 전부 증분 캐시라 재실행하면 멈춘 곳부터 이어받는다)
 N_IO_THREADS   = 12               # 네트워크 병렬(스레드). 차단이 의심되면 6으로.
-QPS = {"krx": 2.0, "dart": 8.0, "hankyung": 2.0, "naver": 2.5, "kind": 2.0,
+QPS = {"krx": 1.5, "dart": 8.0, "hankyung": 2.0, "naver": 2.5, "kind": 2.0,
        "fdr": 4.0, "yahoo": 3.0, "generic": 3.0}   # 소스별 초당 요청 상한(차단 방지)
 MEM_SOFT_GB    = 6.0              # 이 수준을 넘보면 청크 처리로 전환
 COST_BPS_ONEWAY = 15.0            # 십분위 성과의 왕복비용 가정(수수료+세금+슬리피지, 편도 bp)
@@ -528,6 +528,13 @@ def month_ends(a, b) -> pd.DatetimeIndex:
         return pd.date_range(ts(a), ts(b), freq="M")
 
 
+def _resample_me(s: pd.Series) -> pd.Series:
+    try:
+        return s.resample("ME").last()
+    except ValueError:                       # pandas < 2.2
+        return s.resample("M").last()
+
+
 def h1(*parts) -> str:
     return hashlib.sha1("\x1e".join(str(p) for p in parts).encode("utf-8")).hexdigest()
 
@@ -693,13 +700,19 @@ def mem_mb(df: pd.DataFrame) -> float:
 
 
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
     m = np.isfinite(a) & np.isfinite(b)
     if m.sum() < 3:
         return float("nan")
+    av, bv = a[m], b[m]
+    # 상수 입력이면 상관계수가 정의되지 않는다 — 경고를 흘리지 말고 NaN 으로 명시한다
+    if np.all(av == av[0]) or np.all(bv == bv[0]):
+        return float("nan")
     if _scistats is not None:
-        return float(_scistats.spearmanr(a[m], b[m]).statistic)
-    ra = pd.Series(a[m]).rank().to_numpy()
-    rb = pd.Series(b[m]).rank().to_numpy()
+        return float(_scistats.spearmanr(av, bv).statistic)
+    ra = pd.Series(av).rank().to_numpy()
+    rb = pd.Series(bv).rank().to_numpy()
     ra -= ra.mean(); rb -= rb.mean()
     den = math.sqrt((ra**2).sum() * (rb**2).sum())
     return float((ra * rb).sum() / den) if den > 0 else float("nan")
@@ -1315,119 +1328,542 @@ class CollectDeadline:
 DEADLINE = CollectDeadline(COLLECT_HOURS_BUDGET)
 
 
+
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║ [S4-a] KRX 마켓플레이스 세션 + 시가총액 스냅샷                                             ║
+# ║ [S4-a] 시장 데이터 허브 — '날짜 단면(cross-section)' 수집                                   ║
+# ║                                                                                          ║
+# ║  ★ 이 설계가 이 파일에서 가장 중요한 성능/정확성 결정이다.                                  ║
+# ║                                                                                          ║
+# ║  월 리밸런싱 백테스트에 실제로 필요한 것은 '전 종목의 전체 일별 시계열'이 아니라             ║
+# ║  '몇 개 날짜의 전 종목 단면'뿐이다:                                                        ║
+# ║      · 신호일(월말) 120개  · 각 신호일의 +20/+60/+120 거래일(IC 지평)                      ║
+# ║    → 중복 제거 후 약 400~500개 날짜.                                                      ║
+# ║                                                                                          ║
+# ║  pykrx 의 get_market_cap(date, market="ALL") 은 한 번의 호출로 그 날짜의                   ║
+# ║  전 종목 [종가·시가총액·상장주식수·거래량·거래대금] 을 반환한다.                            ║
+# ║      종목별 시계열 방식: 5,400종목 × 1콜 = 5,400콜  (수 시간)                              ║
+# ║      날짜 단면 방식:      480날짜 × 1콜 =   480콜  (수 분)     ← 10배 이상 절감            ║
+# ║                                                                                          ║
+# ║  부수효과가 더 중요하다:                                                                  ║
+# ║   · 생존자편향이 구조적으로 사라진다 — 스냅샷에는 '그 날 실제로 상장돼 거래된 종목'만        ║
+# ║     들어 있다. 상장/폐지 목록의 정확도에 의존하지 않는다(목록은 교차검증용으로만 쓴다).      ║
+# ║   · 시가총액이 매 신호일에 실측으로 존재한다 → 시총 하위 1000 비교전략이 정확해진다.        ║
+# ║   · 상장주식수가 함께 오므로 액면분할/무상증자를 탐지해 수익률을 보정할 수 있다.             ║
+# ║                                                                                          ║
+# ║  캐시: 날짜 단면은 전략과 무관한 원본이므로 **공용 인덱스**에 적재한다.                     ║
+# ║        다른 전략이 같은 날짜를 다시 받을 필요가 없다(연 단위 파티션 parquet).               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
-class KrxSession:
-    LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
+XSEC_COLS = ["date", "code", "close", "volume", "value", "mktcap", "shares", "market"]
+XSEC_TABLE = "xsec_daily_krx"          # 공용 인덱스 테이블 접두어 (연 단위 파티션)
+XSEC_WORKERS = 2                       # KRX 는 계정 단위로 차단한다 — 병렬을 낮게 유지
+RET_TABLE = "krx_period_return"        # 구간 수익률(수정주가·상폐 포함) 공용 캐시
+
+
+def _pykrx_call(fn: Callable, *a, **k):
+    """pykrx 호출 1회 — 스로틀 + 쿼터 카운트 + 예외 흡수. 실패는 None(폴백이 받는다)."""
+    THROTTLE.wait("krx")
+    QUOTA.spend("krx")
+    try:
+        return fn(*a, **k)
+    except Exception as e:
+        CON.debug(f"pykrx 실패({type(e).__name__}): {getattr(fn, '__name__', fn)} {a[:2]}")
+        return None
+
+
+class KrxMarketplace:
+    """KRX 정보데이터시스템(data.krx.co.kr) 세션 — **보강용 2순위 소스**.
+
+    ★ 회로차단기(circuit breaker)가 이 클래스의 핵심이다.
+      이전 버전은 '로그인 성공' 판정이 느슨해 거짓 성공을 반환했고, 데이터 요청이
+      로그인 HTML 을 받을 때마다 재로그인 → 재시도 → 재실패를 월마다 6회씩 반복해
+      24분을 실패에만 썼다. 이제 연속 실패가 임계에 닿으면 **이 소스를 영구 비활성화**하고
+      즉시 pykrx 로 넘긴다. 되지 않는 것을 계속 두드리지 않는다.
+    """
     HOME = "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201"
+    LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
     LOGIN_POST = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
     DATA = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+    MAX_FAILS = 3                       # 연속 실패 임계 — 넘으면 영구 비활성
 
     def __init__(self, user: str, pw: str):
-        self.user, self.pw = user, pw
+        self.user, self.pw = user or "", pw or ""
         self.state = "미시도"
-        self._t_login = 0.0
+        self.fails = 0
+        self.disabled = not bool(user)
+        self.reason = "ID 미입력" if not user else ""
         self._lk = threading.RLock()
+        self._t_login = 0.0
 
     def login(self) -> bool:
         with self._lk:
-            if not self.user:
-                self.state = "자격증명없음"
-                CON.say("KRX 마켓플레이스 ID 미입력 — 시총 스냅샷은 pykrx/FDR 폴백으로 진행합니다.")
+            if self.disabled:
                 return False
-            fetch(self.HOME, source="krx")                      # 쿠키 웜업(없으면 POST 거절)
+            fetch(self.HOME, source="krx")               # 쿠키 웜업(없으면 POST 거절)
             fetch(self.LOGIN_PAGE, source="krx")
             body = {"mbrId": self.user, "pw": self.pw, "telNo": "", "mbrNm": "",
                     "certType": "", "di": ""}
-            for extra in ({}, {"skipDup": "Y"}):                # 중복로그인(CD011)이면 기존 세션 정리
+            for extra in ({}, {"skipDup": "Y"}):        # 중복로그인(CD011) 시 기존 세션 정리
                 THROTTLE.wait("krx")
                 try:
                     r = _sess().post(self.LOGIN_POST, data={**body, **extra},
-                                     headers={"Referer": self.LOGIN_PAGE}, timeout=20)
-                    txt = r.text[:800]
+                                     headers={"Referer": self.LOGIN_PAGE,
+                                              "X-Requested-With": "XMLHttpRequest"},
+                                     timeout=20)
+                    txt = (r.text or "")[:1200]
                 except Exception as e:
                     self.state = f"접속실패:{type(e).__name__}"
                     return False
                 if re.search(r"CD011|중복\s*로그인", txt):
                     continue
-                if not re.search(r"실패|불일치|오류|password|fail", txt, re.I):
+                # ★ 성공을 '실패 문자열의 부재'로 판정하지 않는다 — 그 느슨함이 거짓 성공의
+                #   원인이었다. 로그인 폼이 그대로 돌아왔는지를 적극적으로 확인한다.
+                looks_like_form = bool(re.search(r"login\.jsp|mbrId|비밀번호|아이디를", txt))
+                looks_bad = bool(re.search(r"실패|불일치|오류|error|fail|잠금|탈퇴", txt, re.I))
+                if not looks_like_form and not looks_bad:
                     self.state, self._t_login = "로그인성공", time.time()
-                    CON.ok("KRX 마켓플레이스 로그인 성공")
+                    CON.ok("KRX 정보데이터시스템 로그인 성공")
                     return True
             self.state = "로그인실패"
-            CON.warn("KRX 로그인 실패 — ID/PW 확인. 시총 스냅샷은 폴백 소스로 진행합니다.")
             return False
 
-    def _fresh(self):
-        if self.state == "로그인성공" and time.time() - self._t_login > 45 * 60:
-            CON.debug("KRX 세션 45분 경과 — 선제 재로그인")
-            self.login()
+    def _kill(self, why: str):
+        if not self.disabled:
+            self.disabled = True
+            self.reason = why
+            CON.warn(f"KRX 정보데이터시스템 보강을 중단합니다 — {why}. "
+                     f"시세·시총은 pykrx 단면 수집으로 계속 진행합니다(정확도 동일). "
+                     f"ID/PW 를 다시 확인하거나, 브라우저에서 data.krx.co.kr 로그아웃 후 "
+                     f"재실행하면 이 소스가 다시 쓰입니다.")
 
     def jsondata(self, bld: str, **params) -> Optional[dict]:
-        if self.state != "로그인성공":
+        if self.disabled:
             return None
-        self._fresh()
+        if self.state != "로그인성공":
+            if not self.login():
+                self.fails += 1
+                if self.fails >= self.MAX_FAILS:
+                    self._kill(f"로그인 {self.fails}회 연속 실패")
+                return None
+        if time.time() - self._t_login > 45 * 60:       # 세션 만료 선제 갱신
+            self.login()
         THROTTLE.wait("krx")
         QUOTA.spend("krx")
         try:
             r = _sess().post(self.DATA, data={"bld": bld, **params},
-                             headers={"Referer": self.HOME}, timeout=25)
-            t = r.text.lstrip()
-            if not t.startswith("{"):                # 로그인 HTML → 세션 만료
-                CON.debug("KRX JSON 대신 HTML 수신 — 재로그인 후 1회 재시도")
-                if self.login():
-                    r = _sess().post(self.DATA, data={"bld": bld, **params},
-                                     headers={"Referer": self.HOME}, timeout=25)
-                    t = r.text.lstrip()
-            return json.loads(t) if t.startswith("{") else None
+                             headers={"Referer": self.HOME,
+                                      "X-Requested-With": "XMLHttpRequest"}, timeout=25)
+            txt = (r.text or "").lstrip()
         except Exception:
-            return None
+            txt = ""
+        if txt.startswith("{"):
+            self.fails = 0
+            try:
+                return json.loads(txt)
+            except Exception:
+                return None
+        # JSON 이 아니면(로그인 HTML/차단 페이지) 실패로 계수 — 재시도 루프를 만들지 않는다
+        self.fails += 1
+        self.state = "세션무효"
+        if self.fails >= self.MAX_FAILS:
+            self._kill(f"JSON 대신 HTML 응답 {self.fails}회 연속")
+        return None
 
-    def mktcap_snapshot(self, day: pd.Timestamp) -> Optional[pd.DataFrame]:
+    def xsec(self, day: pd.Timestamp) -> Optional[pd.DataFrame]:
         js = self.jsondata("dbms/MDC/STAT/standard/MDCSTAT01501",
-                           mktId="ALL", trdDd=f"{day:%Y%m%d}",
-                           share="1", money="1", csvxls_isNo="false")
+                           mktId="ALL", trdDd=f"{day:%Y%m%d}", share="1", money="1",
+                           csvxls_isNo="false")
         rows = (js or {}).get("OutBlock_1") or []
         if not rows:
             return None
+
+        def _n(x):
+            try:
+                return float(str(x).replace(",", ""))
+            except Exception:
+                return np.nan
+
         rec = []
         for r in rows:
             c = code6(r.get("ISU_SRT_CD"))
             if not c:
                 continue
-            def _num(x):
-                try:
-                    return float(str(x).replace(",", ""))
-                except Exception:
-                    return np.nan
-            rec.append((c, str(r.get("ISU_ABBRV", "")), str(r.get("MKT_NM", "")),
-                        _num(r.get("TDD_CLSPRC")), _num(r.get("MKTCAP")),
-                        _num(r.get("LIST_SHRS"))))
-        return pd.DataFrame(rec, columns=["code", "name", "market", "close", "mktcap", "shares"])
-
-
-KRXS = KrxSession(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW)
-
-
-def _pykrx_call(fn: Callable, *a, **k):
-    """pykrx 호출 직렬화 + 스로틀 — KRX 는 병렬 요청에 세션을 끊는다."""
-    with _PYKRX_LOCK:
-        THROTTLE.wait("krx")
-        QUOTA.spend("krx")
-        try:
-            return fn(*a, **k)
-        except Exception as e:
-            CON.debug(f"pykrx 실패({type(e).__name__}): {getattr(fn, '__name__', fn)}")
+            rec.append((c, _n(r.get("TDD_CLSPRC")), _n(r.get("ACC_TRDVOL")),
+                        _n(r.get("ACC_TRDVAL")), _n(r.get("MKTCAP")),
+                        _n(r.get("LIST_SHRS")), str(r.get("MKT_NM", ""))))
+        if not rec:
             return None
+        d = pd.DataFrame(rec, columns=["code", "close", "volume", "value",
+                                       "mktcap", "shares", "market"])
+        d.insert(0, "date", pd.Timestamp(day).normalize())
+        return d
 
 
-_PYKRX_LOCK = threading.RLock()
+KRXM = KrxMarketplace(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW)
+
+
+def _xsec_pykrx(day: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """1순위: pykrx 전종목 단면. get_market_cap 한 번에 종가·시총·주식수·거래대금이 온다."""
+    if pykrx_stock is None:
+        return None
+    d8 = f"{day:%Y%m%d}"
+    cap = None
+    for fname in ("get_market_cap", "get_market_cap_by_ticker"):   # 버전별 이름 차이 흡수
+        fn = getattr(pykrx_stock, fname, None)
+        if fn is None:
+            continue
+        cap = _pykrx_call(fn, d8, market="ALL")
+        if cap is not None and len(cap):
+            break
+        cap = None
+    if cap is None or not len(cap):
+        return None
+    cap = cap.reset_index()
+    lc = {str(c): c for c in cap.columns}
+    tick = lc.get("티커") or lc.get("ticker") or cap.columns[0]
+    out = pd.DataFrame({"code": cap[tick].map(code6)})
+
+    def _col(*names):
+        for n in names:
+            if n in lc:
+                return pd.to_numeric(cap[lc[n]], errors="coerce")
+        return pd.Series(np.nan, index=cap.index)
+
+    out["close"] = _col("종가")
+    out["volume"] = _col("거래량")
+    out["value"] = _col("거래대금")
+    out["mktcap"] = _col("시가총액")
+    out["shares"] = _col("상장주식수")
+    out["market"] = ""
+    out = out.dropna(subset=["code"])
+    out = out[(out["mktcap"] > 0) | (out["close"] > 0)]
+    if not len(out):
+        return None
+    out.insert(0, "date", pd.Timestamp(day).normalize())
+    return out
+
+
+def _xsec_fdr(day: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """3순위: FDR 상장목록의 시총 스냅샷(당일에 한함). 과거 날짜는 지원하지 않으므로
+    '오늘' 근처에서만 의미가 있다 — 최근월 결손을 메우는 용도."""
+    if fdr is None or (pd.Timestamp.today().normalize() - pd.Timestamp(day)).days > 5:
+        return None
+    try:
+        d = fdr.StockListing("KRX")
+    except Exception:
+        return None
+    if d is None or not len(d):
+        return None
+    lc = {str(c).lower(): c for c in d.columns}
+    if "marcap" not in lc and "close" not in lc:
+        return None
+    out = pd.DataFrame({
+        "code": d[lc.get("code", lc.get("symbol", d.columns[0]))].map(code6),
+        "close": pd.to_numeric(d[lc["close"]], errors="coerce") if "close" in lc else np.nan,
+        "volume": pd.to_numeric(d[lc["volume"]], errors="coerce") if "volume" in lc else np.nan,
+        "value": np.nan,
+        "mktcap": pd.to_numeric(d[lc["marcap"]], errors="coerce") if "marcap" in lc else np.nan,
+        "shares": pd.to_numeric(d[lc["stocks"]], errors="coerce") if "stocks" in lc else np.nan,
+        "market": d[lc["market"]].astype(str) if "market" in lc else "",
+    }).dropna(subset=["code"])
+    if not len(out):
+        return None
+    out.insert(0, "date", pd.Timestamp(day).normalize())
+    return out
+
+
+_XSEC_CHAIN = [("pykrx", _xsec_pykrx), ("krx_marketplace", lambda d: KRXM.xsec(d)),
+               ("fdr", _xsec_fdr)]
+
+
+def _period_return_krx(d0: pd.Timestamp, d1: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """구간 [d0, d1] 의 전종목 **수정주가 등락률** — KRX 서버가 직접 계산해 준다.
+
+    ★ 이것이 수익률의 1순위 소스인 이유:
+      · 액면분할·무상증자가 서버측에서 이미 반영된다(내 휴리스틱 보정이 필요 없다).
+      · 구간 중 상장폐지된 종목이 등락률 -100% 로 **포함되어** 돌아온다.
+        → 생존자편향이 데이터 소스 단계에서 제거된다. 이보다 나은 보장은 없다.
+    호출 1회로 전 종목이 오므로, 종목별 조회는 어떤 경우에도 하지 않는다.
+    """
+    if pykrx_stock is None:
+        return None
+    fn = getattr(pykrx_stock, "get_market_price_change", None) or \
+        getattr(pykrx_stock, "get_market_price_change_by_ticker", None)
+    if fn is None:
+        return None
+    d = _pykrx_call(fn, f"{d0:%Y%m%d}", f"{d1:%Y%m%d}", market="ALL", adjusted=True)
+    if d is None or not len(d):
+        return None
+    d = d.reset_index()
+    lc = {str(c): c for c in d.columns}
+    tick = lc.get("티커") or d.columns[0]
+    rc = lc.get("등락률")
+    if rc is None:
+        return None
+    out = pd.DataFrame({"code": d[tick].map(code6),
+                        "ret": pd.to_numeric(d[rc], errors="coerce") / 100.0})
+    out = out.dropna(subset=["code"])
+    # 시작가 0(구간 시작 시점 미상장)은 수익률로 쓸 수 없다 — 결측으로 둔다
+    if "시가" in lc:
+        base = pd.to_numeric(d[lc["시가"]], errors="coerce").to_numpy()
+        out.loc[~np.isfinite(base) | (base <= 0), "ret"] = np.nan
+    return out[np.isfinite(out["ret"])] if len(out) else None
+
+
+class ReturnHub:
+    """구간 수익률 캐시 — (시작일, 종료일) 쌍당 1회만 받고 공용 인덱스에 적재한다."""
+
+    def __init__(self, depot: "Depot"):
+        self.depot = depot
+        self.df: Optional[pd.DataFrame] = None
+        self.have: set = set()
+        self.dirty = False
+
+    def load(self):
+        if self.df is not None:
+            return
+        d = self.depot.table_load(RET_TABLE, need_cols=["from_date", "to_date", "code", "ret"])
+        if d is not None and len(d):
+            d["from_date"] = ts_col(d["from_date"])
+            d["to_date"] = ts_col(d["to_date"])
+            d["code"] = d["code"].astype(str).str.zfill(6)
+            # 같은 (구간, 종목)이 두 번 들어오면 하류의 reindex 가 깨진다 — 여기서 정규화
+            d = d.drop_duplicates(["from_date", "to_date", "code"], keep="last")
+            self.df = d
+            self.have = set(zip(d["from_date"], d["to_date"]))
+        else:
+            self.df = pd.DataFrame(columns=["from_date", "to_date", "code", "ret"])
+
+    def ensure(self, pairs: Sequence[Tuple[pd.Timestamp, pd.Timestamp]]):
+        self.load()
+        pairs = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in pairs
+                 if a is not None and b is not None and a < b]
+        todo = [p for p in dict.fromkeys(pairs) if p not in self.have]
+        if todo and RUN_MODE == "CACHED":
+            CON.warn(f"CACHED 모드 — 미보유 구간수익률 {len(todo)}건은 단면 파생값으로 대체")
+            return
+        if not todo:
+            return
+        CON.say(f"구간 수익률(수정주가·상폐포함) 수집: 신규 {len(todo)}구간 "
+                f"/ 캐시 {len(pairs)-len(todo)}구간 — 구간당 1콜, 전 종목 동시")
+
+        def _one(p):
+            if DEADLINE.over("구간 수익률"):
+                return None
+            d = _period_return_krx(p[0], p[1])
+            if d is None or not len(d):
+                return None
+            d["from_date"], d["to_date"] = p[0], p[1]
+            return d
+
+        CHUNK = 40
+        for i in range(0, len(todo), CHUNK):
+            if DEADLINE.over("구간 수익률"):
+                break
+            got = [g for g in pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS,
+                                   label="구간수익률") if g is not None]
+            if got:
+                self.df = pd.concat([self.df] + got, ignore_index=True).drop_duplicates(
+                    ["from_date", "to_date", "code"], keep="last")
+                self.have |= {(g["from_date"].iloc[0], g["to_date"].iloc[0]) for g in got}
+                self.dirty = True
+                self.flush()
+            CON.say(f"  구간 {min(i+CHUNK, len(todo))}/{len(todo)}")
+
+    def flush(self):
+        if self.dirty and self.df is not None and len(self.df):
+            self.depot.table_save(RET_TABLE, self.df, scope="공용", domain="market",
+                                  source="pykrx_price_change(adjusted)",
+                                  note="구간 수정주가 등락률 · 상폐 -100% 포함")
+            self.dirty = False
+
+    def get(self, d0, d1) -> Optional[pd.Series]:
+        if self.df is None or not len(self.df):
+            return None
+        m = self.df[(self.df["from_date"] == pd.Timestamp(d0))
+                    & (self.df["to_date"] == pd.Timestamp(d1))]
+        if not len(m):
+            return None
+        return m.drop_duplicates("code", keep="last").set_index("code")["ret"]
+
+
+class MarketHub:
+    """날짜 단면 시장데이터 허브 — 캐시(로컬/드라이브) 우선, 부족한 날짜만 신규 수집."""
+
+    def __init__(self, depot: "Depot"):
+        self.depot = depot
+        self.frames: Dict[int, pd.DataFrame] = {}       # 연도 → 단면 프레임
+        self.loaded_years: set = set()
+        self.have_dates: set = set()
+        self.new_years: set = set()
+        self._lk = threading.RLock()
+
+    # ── 캐시 ───────────────────────────────────────────────────────────────────────────
+    def _load_year(self, y: int):
+        if y in self.loaded_years:
+            return
+        self.loaded_years.add(y)
+        d = self.depot.table_load(f"{XSEC_TABLE}_{y}",
+                                  foreign_patterns=[f"xsec_daily_krx_{y}", f"krx_xsec_{y}"],
+                                  need_cols=["date", "code", "close"])
+        if d is not None and len(d):
+            d["date"] = ts_col(d["date"])
+            d["code"] = d["code"].astype(str).str.zfill(6)
+            for c in XSEC_COLS:
+                if c not in d.columns:
+                    d[c] = np.nan
+            self.frames[y] = d[XSEC_COLS]
+            self.have_dates |= set(d["date"].unique())
+
+    def _save_year(self, y: int):
+        if y in self.frames and len(self.frames[y]):
+            self.depot.table_save(f"{XSEC_TABLE}_{y}", self.frames[y], scope="공용",
+                                  domain="market", source="pykrx+krx+fdr",
+                                  note="date-cross-section (공용: 어느 전략이든 재사용)")
+
+    def flush(self):
+        for y in sorted(self.new_years):
+            self._save_year(y)
+        self.new_years.clear()
+
+    # ── 거래일 캘린더 (1콜) ────────────────────────────────────────────────────────────
+    def calendar(self, start, end) -> pd.DatetimeIndex:
+        cached = self.depot.table_load("krx_trading_calendar",
+                                       foreign_patterns=["trading_calendar", "krx_calendar"],
+                                       need_cols=["date"])
+        days: Optional[pd.DatetimeIndex] = None
+        if cached is not None and len(cached) > 500:
+            days = pd.DatetimeIndex(ts_col(cached["date"]).dropna().unique())
+        need_lo, need_hi = ts(start), ts(end)
+        if days is None or days.min() > need_lo + pd.Timedelta(10, "D") or \
+                days.max() < min(need_hi, pd.Timestamp.today().normalize()) - pd.Timedelta(10, "D"):
+            got = None
+            if pykrx_stock is not None:
+                idx = _pykrx_call(pykrx_stock.get_index_ohlcv,
+                                  f"{need_lo:%Y%m%d}", f"{need_hi:%Y%m%d}", "1001")
+                if idx is not None and len(idx):
+                    got = pd.DatetimeIndex(pd.to_datetime(idx.index)).normalize()
+            if got is None and fdr is not None:
+                try:
+                    d = fdr.DataReader("KS11", need_lo, need_hi)
+                    if d is not None and len(d):
+                        got = pd.DatetimeIndex(pd.to_datetime(d.index)).normalize()
+                except Exception:
+                    got = None
+            if got is not None and len(got) > 100:
+                days = got if days is None else pd.DatetimeIndex(
+                    sorted(set(days) | set(got)))
+                self.depot.table_save("krx_trading_calendar",
+                                      pd.DataFrame({"date": days}), scope="공용",
+                                      domain="market", source="krx_index_1001")
+        if days is None or len(days) < 100:
+            CON.warn("거래일 캘린더를 지수에서 얻지 못해 영업일(주말 제외) 근사로 대체합니다 "
+                     "— 공휴일이 포함되어 지평 계산이 며칠 어긋날 수 있습니다.")
+            days = pd.bdate_range(need_lo, need_hi)
+        days = days[(days >= need_lo - pd.Timedelta(400, "D")) & (days <= need_hi)]
+        return pd.DatetimeIndex(sorted(set(days)))
+
+    # ── 단면 수집 ──────────────────────────────────────────────────────────────────────
+    def ensure(self, dates: Sequence[pd.Timestamp]) -> "pd.DataFrame":
+        """요청 날짜들의 전종목 단면을 보장한다. 캐시에 있는 날짜는 절대 다시 받지 않는다."""
+        want = sorted({pd.Timestamp(d).normalize() for d in dates})
+        for y in sorted({d.year for d in want}):
+            self._load_year(y)
+        todo = [d for d in want if d not in self.have_dates]
+        if todo and RUN_MODE == "CACHED":
+            CON.warn(f"CACHED 모드 — 미보유 단면 {len(todo)}일은 건너뜁니다")
+            todo = []
+        if todo:
+            CON.say(f"전종목 단면 수집: 신규 {len(todo)}일 / 요청 {len(want)}일 "
+                    f"(캐시 재사용 {len(want)-len(todo)}일) — 날짜당 1콜")
+            got_n, src_tally = 0, Counter()
+            batch: List[pd.DataFrame] = []
+            t0 = time.time()
+
+            def _one(day):
+                if DEADLINE.over("전종목 단면 수집"):
+                    return None
+                for src, fn in _XSEC_CHAIN:
+                    try:
+                        d = fn(day)
+                    except Exception:
+                        d = None
+                    if d is not None and len(d) > 100:      # 부분응답(사고)은 채택하지 않는다
+                        d["src"] = src
+                        return d
+                return None
+
+            CHUNK = 60
+            for i in range(0, len(todo), CHUNK):
+                if DEADLINE.over("전종목 단면 수집"):
+                    break
+                part = pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS, label="단면수집")
+                for d in part:
+                    if d is None or not len(d):
+                        continue
+                    src_tally[d["src"].iloc[0]] += 1
+                    batch.append(d.drop(columns=["src"]))
+                    got_n += 1
+                if batch:                                   # 청크마다 적재+저장(중단 내성)
+                    self._absorb(batch)
+                    batch = []
+                    self.flush()
+                done = min(i + CHUNK, len(todo))
+                rate = done / max(time.time() - t0, 1e-9)
+                CON.say(f"  단면 {done}/{len(todo)}일 ({rate*60:.0f}일/분, "
+                        f"잔여 {max(0,(len(todo)-done)/max(rate,1e-9))/60:.1f}분)")
+            if src_tally:
+                CON.grid([[k, f"{v:,}"] for k, v in src_tally.items()],
+                         ["단면 소스", "성공 일수"], ["l", "r"])
+            miss = [d for d in todo if d not in self.have_dates]
+            if miss:
+                CON.warn(f"단면 미수집 {len(miss)}일 — 해당 신호일은 직전 영업일 단면으로 "
+                         f"대체되거나 제외됩니다(예: {miss[0]:%Y-%m-%d})")
+        return self.slice(want)
+
+    def _absorb(self, frames: List[pd.DataFrame]):
+        with self._lk:
+            for d in frames:
+                y = int(d["date"].iloc[0].year)
+                for c in XSEC_COLS:
+                    if c not in d.columns:
+                        d[c] = np.nan
+                cur = self.frames.get(y)
+                d = d[XSEC_COLS]
+                self.frames[y] = d if cur is None else pd.concat([cur, d], ignore_index=True)
+                self.frames[y] = self.frames[y].drop_duplicates(["date", "code"], keep="last")
+                self.have_dates |= set(d["date"].unique())
+                self.new_years.add(y)
+
+    def slice(self, dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
+        want = {pd.Timestamp(d).normalize() for d in dates}
+        parts = [f[f["date"].isin(want)] for f in self.frames.values() if len(f)]
+        if not parts:
+            return pd.DataFrame(columns=XSEC_COLS)
+        out = pd.concat(parts, ignore_index=True)
+        return out.drop_duplicates(["date", "code"], keep="last")
+
+    def all_dates(self) -> List[pd.Timestamp]:
+        return sorted(self.have_dates)
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║ [S4-b] PIT 유니버스 — 상장/상폐 이력 + 월별 시총 스냅샷 (생존자편향 제거의 뼈대)            ║
+# ║ [S4-b] PIT 유니버스 · 종목마스터 — 단면이 곧 유니버스다                                     ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+_SPECIAL_NAME = re.compile(r"스팩|SPAC|ETN|ETF|리츠|REIT|인프라|우$|우B$|\d+호(?![가-힣])", re.I)
+
+
+def _is_common_stock(code: str, name: str) -> bool:
+    """보통주만 남긴다 — 우선주(6자리 숫자코드 끝자리≠0)·스팩·ETF/ETN·리츠 제외.
+    제외 규칙은 이 함수 한 곳에만 둔다(여기저기 흩어지면 유니버스가 조용히 달라진다)."""
+    if not code:
+        return False
+    if re.fullmatch(r"\d{6}", code) and not code.endswith("0"):
+        return False
+    if _SPECIAL_NAME.search(str(name) or ""):
+        return False
+    return True
+
+
 def _fdr_listing() -> Optional[pd.DataFrame]:
     if fdr is None:
         return None
@@ -1438,12 +1874,13 @@ def _fdr_listing() -> Optional[pd.DataFrame]:
     if d is None or not len(d):
         return None
     lc = {str(c).lower(): c for c in d.columns}
-    out = pd.DataFrame({
-        "code": d[lc.get("code", lc.get("symbol", list(d.columns)[0]))].map(code6),
-        "name": d[lc["name"]].astype(str) if "name" in lc else "",
-        "market": d[lc["market"]].astype(str) if "market" in lc else "",
-        "list_date": ts_col(d[lc["listingdate"]]) if "listingdate" in lc else pd.NaT,
-    })
+    code_c = lc.get("code") or lc.get("symbol")
+    if code_c is None:
+        return None
+    out = pd.DataFrame({"code": d[code_c].map(code6)})
+    out["name"] = d[lc["name"]].astype(str) if "name" in lc else ""
+    out["market"] = d[lc["market"]].astype(str) if "market" in lc else ""
+    out["list_date"] = ts_col(d[lc["listingdate"]]) if "listingdate" in lc else pd.NaT
     return out.dropna(subset=["code"])
 
 
@@ -1457,9 +1894,9 @@ def _fdr_delisting() -> Optional[pd.DataFrame]:
     if d is None or not len(d):
         return None
     lc = {str(c).lower(): c for c in d.columns}
-    code_c = lc.get("symbol", lc.get("code"))
-    del_c = lc.get("delistingdate", lc.get("delistdate"))
-    if not code_c or not del_c:
+    code_c = lc.get("symbol") or lc.get("code")
+    del_c = lc.get("delistingdate") or lc.get("delistdate")
+    if code_c is None or del_c is None:
         return None
     out = pd.DataFrame({"code": d[code_c].map(code6),
                         "name": d[lc["name"]].astype(str) if "name" in lc else "",
@@ -1469,19 +1906,17 @@ def _fdr_delisting() -> Optional[pd.DataFrame]:
 
 
 def _kind_listing() -> Optional[pd.DataFrame]:
-    """KIND 상장법인목록 — FDR 불능 시 폴백."""
-    url = "https://kind.krx.co.kr/corpgeneral/corpList.do"
-    raw = fetch(url, source="kind", params={"method": "download", "searchType": "13"},
-                as_bytes=True)
+    """KIND 상장법인목록 — 종목명 보강용(폴백)."""
+    raw = fetch("https://kind.krx.co.kr/corpgeneral/corpList.do", source="kind",
+                params={"method": "download", "searchType": "13"}, as_bytes=True)
     if not raw:
         return None
-    try:
-        tables = pd.read_html(io.BytesIO(raw), encoding="euc-kr")
-    except Exception:
+    for enc in ("euc-kr", "cp949", "utf-8"):
         try:
-            tables = pd.read_html(io.BytesIO(raw), encoding="cp949")
+            tables = pd.read_html(io.BytesIO(raw), encoding=enc)
+            break
         except Exception:
-            return None
+            tables = None
     if not tables:
         return None
     d = tables[0]
@@ -1491,361 +1926,326 @@ def _kind_listing() -> Optional[pd.DataFrame]:
     dc = next((cols[c] for c in cols if "상장일" in c), None)
     if cc is None:
         return None
-    return pd.DataFrame({"code": d[cc].map(code6), "name": d[nc].astype(str) if nc else "",
-                         "market": "", "list_date": ts_col(d[dc]) if dc else pd.NaT}
+    return pd.DataFrame({"code": d[cc].map(code6),
+                         "name": d[nc].astype(str) if nc else "",
+                         "market": "",
+                         "list_date": ts_col(d[dc]) if dc else pd.NaT}
                         ).dropna(subset=["code"])
 
 
-_SPECIAL_NAME = re.compile(r"스팩|SPAC|ETN|ETF|리츠|REIT|인프라|우$|우B$|\d호(?![가-힣])", re.I)
+def build_security_master(xsec: pd.DataFrame) -> pd.DataFrame:
+    """종목마스터 = 단면에서 관측된 실체 + 이름/시장/상장·폐지일 보강(다중소스 교차검증).
 
+    유니버스 membership 자체는 단면이 정한다(그 날 거래된 종목). 상장/폐지 목록은
+    ① 이름·시장 보강 ② 사라진 종목이 '폐지'인지 '결손'인지 판별 — 두 용도로만 쓴다.
+    """
+    if not len(xsec):
+        raise HaltRun("단면 데이터가 비어 있습니다 — 시장 데이터 수집을 확인하세요")
+    g = xsec.groupby("code", observed=True)["date"]
+    sec = pd.DataFrame({"code": g.min().index, "first_seen": g.min().to_numpy(),
+                        "last_seen": g.max().to_numpy()})
+    names = DEPOT.table_load("krx_security_names",
+                             foreign_patterns=["security_master", "krx_names"],
+                             need_cols=["code", "name"])
+    frames = []
+    if names is not None and len(names):
+        n = names.copy()
+        n["code"] = n["code"].map(code6)
+        frames.append(n[["code", "name"] + ([c for c in ("market", "list_date") if c in n.columns])])
+    if RUN_MODE != "CACHED":
+        for fn in (_fdr_listing, _kind_listing):
+            try:
+                d = fn()
+            except Exception:
+                d = None
+            if d is not None and len(d):
+                frames.append(d)
+    if frames:
+        nm = pd.concat(frames, ignore_index=True).dropna(subset=["code"])
+        nm = nm[nm["name"].astype(str).str.strip() != ""]
+        nm = nm.drop_duplicates("code", keep="first")
+        sec = sec.merge(nm, on="code", how="left")
+        DEPOT.table_save("krx_security_names", nm, scope="공용", domain="universe",
+                         source="fdr+kind", note="종목명/시장/상장일 (공용 재사용)")
+    for c in ("name", "market"):
+        if c not in sec.columns:
+            sec[c] = ""
+        sec[c] = sec[c].fillna("").astype(str)
+    if "list_date" not in sec.columns:
+        sec["list_date"] = pd.NaT
+    sec["list_date"] = ts_col(sec["list_date"])
 
-def _is_common_stock(code: str, name: str) -> bool:
-    """보통주만 남긴다 — 우선주(코드 끝자리 0 아님)·스팩·ETF/ETN·리츠 제외.
-    (컨센서스 전략의 대상은 보통주다. 제외 규칙은 여기 한 곳에만 둔다)"""
-    if not code:
-        return False
-    if re.fullmatch(r"\d{6}", code) and not code.endswith("0"):
-        return False
-    if _SPECIAL_NAME.search(str(name) or ""):
-        return False
-    return True
+    # 시장 구분 보강: 단면의 market 값(있으면) → 이름 소스 → 미상
+    mk = (xsec[xsec["market"].astype(str) != ""]
+          .drop_duplicates("code", keep="last")[["code", "market"]]
+          .rename(columns={"market": "market_x"}))
+    sec = sec.merge(mk, on="code", how="left")
+    sec["market"] = np.where(sec["market"].astype(str) != "", sec["market"],
+                             sec["market_x"].fillna(""))
+    sec = sec.drop(columns=["market_x"])
 
-
-def collect_universe(months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
-    """반환 sec: code·name·market·list_date·delist_date / mcap: month·code·mktcap·shares·close"""
-    sec = DEPOT.table_load("scg_security_master",
-                           foreign_patterns=["security_master"],
-                           need_cols=["code", "name"])
-    if sec is not None:
-        sec = sec.rename(columns={"listing_date": "list_date",
-                                  "delisting_date": "delist_date"})
-        for c in ("list_date", "delist_date"):
-            sec[c] = ts_col(sec[c]) if c in sec.columns else pd.NaT
-        sec["code"] = sec["code"].map(code6)
-        sec = sec.dropna(subset=["code"])
-        # ★ 캐시된 마스터에 상폐 이력이 없으면 그대로 쓰는 순간 생존자편향이다.
-        #   신선한 상폐 목록을 덧입히고, 그래도 없으면 크게 경고한다.
-        if int(sec["delist_date"].notna().sum()) < 200:
-            dl = _fdr_delisting() if RUN_MODE != "CACHED" else None
-            if dl is not None and len(dl):
-                dmap = dl.set_index("code")["delist_date"].to_dict()
-                sec["delist_date"] = sec["delist_date"].fillna(
-                    sec["code"].map(dmap))
-                CON.ok(f"캐시 마스터에 상폐 이력 보강: {int(sec['delist_date'].notna().sum()):,}건")
-            else:
-                CON.warn("캐시된 종목마스터에 상폐 이력이 거의 없습니다(<200) — "
-                         "생존자편향 위험. 온라인 재실행으로 보강을 권장합니다.")
+    # 폐지일: FDR 목록 + '마지막 관측 이후 재등장 없음'의 교차검증
+    dl = _fdr_delisting() if RUN_MODE != "CACHED" else None
+    if dl is None:
+        dl = DEPOT.table_load("krx_delisting", need_cols=["code", "delist_date"])
     else:
-        lst = _fdr_listing()
-        if lst is None or len(lst) < 500:
-            lst = _kind_listing()
-        if lst is None or not len(lst):
-            raise HaltRun("상장목록을 어느 소스에서도 얻지 못했습니다(FDR/KIND) — 네트워크 확인")
-        dl = _fdr_delisting()
-        FLOW.io("입", "HTTP", "상장목록", lst, src="FDR/KIND")
-        FLOW.io("입", "HTTP", "상폐목록", dl, src="FDR")
-        sec = lst.copy()
-        if dl is not None and len(dl):
-            sec = sec.merge(dl[["code", "delist_date"]], on="code", how="outer")
-            nm = dl.set_index("code")["name"].to_dict()
-            sec["name"] = sec["name"].fillna(sec["code"].map(nm))
-        else:
-            sec["delist_date"] = pd.NaT
-            CON.warn("상폐목록 없음 — 생존자편향 제거가 불완전합니다(스냅샷 유니온으로 보강)")
-        sec["name"] = sec["name"].fillna("")
-        sec["market"] = sec.get("market", pd.Series("", index=sec.index)).fillna("")
-        n_del = int(sec["delist_date"].notna().sum())
-        CON.say(f"종목마스터 {len(sec):,}개 (상폐이력 {n_del:,}건 포함)")
-        if n_del < 200:
-            CON.warn("상폐 이력이 200건 미만 — 상폐 데이터 소스를 확인하세요(생존자편향 위험)")
-        DEPOT.table_save("scg_security_master", sec, scope="공용", domain="universe",
-                         source="FDR+KIND")
-    # ★ 이전상장(예: 코스닥→코스피)은 '상폐'가 아니다. 상폐일이 (재)상장일 근처이거나
-    #   그보다 앞서면 이전으로 간주하고 상폐 기록을 무효화한다 — 이걸 안 하면
-    #   멀쩡히 거래되는 대형주가 이전일 이후 유니버스에서 조용히 사라진다.
-    xfer = (sec["delist_date"].notna() & sec["list_date"].notna()
-            & (sec["delist_date"] <= sec["list_date"] + pd.Timedelta(days=30)))
-    if xfer.any():
-        CON.say(f"이전상장으로 판정된 상폐기록 {int(xfer.sum()):,}건 무효화(시장이동≠상폐)")
-        sec.loc[xfer, "delist_date"] = pd.NaT
-    sec = sec[[_is_common_stock(c, n) for c, n in zip(sec["code"], sec["name"])]]
-    sec = sec.drop_duplicates("code").reset_index(drop=True)
-
-    # ── 월별 시총 스냅샷 (KRX 마켓플레이스 → pykrx 폴백) — 비교전략(하위1000)의 기준 ──────
-    mcap = DEPOT.table_load("scg_mcap_monthly",
-                            foreign_patterns=["mktcap", "marketcap", "mcap_month"],
-                            need_cols=["month", "code", "mktcap", "shares"])
-    have_m = set()
-    if mcap is not None and len(mcap):
-        mcap["month"] = ts_col(mcap["month"])
-        have_m = set(mcap["month"].unique())
-    todo = [m for m in months if m not in have_m]
-    if todo and RUN_MODE != "CACHED":
-        CON.say(f"시총 스냅샷 수집: {len(todo)}개월 (캐시 {len(have_m)}개월 재사용)")
-        krx_ok = KRXS.login() if KRXS.state == "미시도" else (KRXS.state == "로그인성공")
-        frames = [] if mcap is None else [mcap]
-        for m in todo:
-            if DEADLINE.over("시총 스냅샷"):
-                break
-            snap = None
-            day = m
-            if krx_ok:
-                for back in range(6):                       # 월말 휴장 대비 최근 거래일 탐색
-                    snap = KRXS.mktcap_snapshot(day - pd.Timedelta(days=back))
-                    if snap is not None and len(snap) > 100:
-                        break
-            if (snap is None or not len(snap)) and pykrx_stock is not None:
-                d8 = None
-                try:
-                    d8 = _pykrx_call(pykrx_stock.get_nearest_business_day_in_a_week,
-                                     f"{m:%Y%m%d}")
-                except Exception:
-                    d8 = f"{m:%Y%m%d}"
-                cap = _pykrx_call(pykrx_stock.get_market_cap_by_ticker, d8 or f"{m:%Y%m%d}",
-                                  market="ALL")
-                if cap is not None and len(cap):
-                    cap = cap.reset_index()
-                    lc = {str(c): c for c in cap.columns}
-                    snap = pd.DataFrame({
-                        "code": cap[lc.get("티커", list(cap.columns)[0])].map(code6),
-                        "name": "", "market": "",
-                        "close": pd.to_numeric(cap[lc["종가"]], errors="coerce")
-                        if "종가" in lc else np.nan,
-                        "mktcap": pd.to_numeric(cap[lc["시가총액"]], errors="coerce")
-                        if "시가총액" in lc else np.nan,
-                        "shares": pd.to_numeric(cap[lc["상장주식수"]], errors="coerce")
-                        if "상장주식수" in lc else np.nan})
-            if snap is None or not len(snap):
-                CON.warn(f"{m:%Y-%m} 시총 스냅샷 실패 — 해당 월은 직전 스냅샷으로 대체됩니다")
-                continue
-            snap = snap.dropna(subset=["code"])
-            snap.insert(0, "month", m)
-            frames.append(snap[["month", "code", "mktcap", "shares", "close"]])
-            FLOW.io("입", "HTTP", f"시총스냅샷:{m:%Y-%m}", snap,
-                    src="KRX마켓플레이스" if krx_ok else "pykrx")
-        mcap = pd.concat(frames, ignore_index=True) if frames else mcap
-        if mcap is not None and len(mcap):
-            mcap = mcap.drop_duplicates(["month", "code"], keep="last")
-            DEPOT.table_save("scg_mcap_monthly", mcap, scope="공용", domain="universe",
-                             source="krx_marketplace+pykrx")
-    if mcap is None:
-        mcap = pd.DataFrame(columns=["month", "code", "mktcap", "shares", "close"])
-    mcap["month"] = ts_col(mcap["month"])
-    return {"sec": sec, "mcap": mcap}
-
-
-UNIVERSE_SEASONING_DAYS = 0   # 명세 §31(추가 하드게이트 금지) 준수: 기본 0.
-                              # IPO 직후 왜곡을 배제한 별도 실험을 원할 때만 250 등으로.
-
-
-def universe_at(T: pd.Timestamp, sec: pd.DataFrame, mcap: pd.DataFrame) -> pd.Index:
-    """시점 T의 PIT 유니버스: T에 상장돼 있고 아직 상폐 전인 보통주.
-    시총 스냅샷이 있는 달은 그 달 스냅샷과 유니온(스냅샷 결손이 종목을 죽이지 않게)."""
-    ld = sec["list_date"]
-    dd = sec["delist_date"]
-    ok = ((ld.isna() | (ld + pd.Timedelta(days=UNIVERSE_SEASONING_DAYS) <= T))
-          & (dd.isna() | (dd > T)))
-    base = set(sec.loc[ok, "code"])
-    snap = mcap[mcap["month"] == (T + pd.offsets.MonthEnd(0))]
-    if len(snap):
-        # 스냅샷과 교차 검증: 스냅샷에 있는데 base 에 없으면(마스터 누락) 추가하되 상폐자는 제외
-        extra = set(snap["code"]) - base
-        dmap = sec.set_index("code")["delist_date"].to_dict()
-        for c in extra:
-            d = dmap.get(c, pd.NaT)
-            if (pd.isna(d) or d > T) and _is_common_stock(c, ""):
-                base.add(c)
-    return pd.Index(sorted(base))
+        DEPOT.table_save("krx_delisting", dl, scope="공용", domain="universe", source="fdr")
+    sec["delist_date"] = pd.NaT
+    if dl is not None and len(dl):
+        dmap = dl.set_index("code")["delist_date"].to_dict()
+        sec["delist_date"] = ts_col(sec["code"].map(dmap))
+        # 이전상장(코스닥→코스피)은 폐지가 아니다 — 폐지일 이후에도 단면에 계속 보이면 무효화
+        bogus = sec["delist_date"].notna() & (sec["last_seen"] > sec["delist_date"] + pd.Timedelta(10, "D"))
+        if bogus.any():
+            CON.say(f"이전상장·재상장으로 판정된 폐지기록 {int(bogus.sum()):,}건 무효화 "
+                    f"(폐지일 이후에도 단면에 계속 관측됨)")
+            sec.loc[bogus, "delist_date"] = pd.NaT
+    # 단면 기준 사망 추정: 데이터 끝보다 충분히 앞서 사라졌는데 폐지기록이 없는 종목
+    data_end = xsec["date"].max()
+    vanished = (sec["delist_date"].isna() &
+                (sec["last_seen"] < data_end - pd.Timedelta(90, "D")))
+    if vanished.any():
+        sec.loc[vanished, "delist_date"] = sec.loc[vanished, "last_seen"] + pd.Timedelta(1, "D")
+        CON.say(f"단면에서 사라진 뒤 재등장 없는 종목 {int(vanished.sum()):,}건을 "
+                f"폐지로 간주(생존자편향 방지 — 마지막 관측 다음날로 기록)")
+    sec["is_common"] = [_is_common_stock(c, n) for c, n in zip(sec["code"], sec["name"])]
+    CON.say(f"종목마스터 {len(sec):,}개 (보통주 {int(sec['is_common'].sum()):,} · "
+            f"폐지이력 {int(sec['delist_date'].notna().sum()):,})")
+    if int(sec["delist_date"].notna().sum()) < 100:
+        CON.warn("폐지 이력이 100건 미만입니다 — 생존자편향 위험. FDR 상폐목록 접근을 확인하세요.")
+    return sec
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║ [S4-c] 가격 수집 — pykrx→FDR→네이버→야후 4중 폴백, 종목 단위 단일소스 원칙                 ║
-# ║        (소스를 섞어 이어붙이면 수정주가 기준이 달라 가짜 수익률이 생긴다)                   ║
+# ║ [S4-c] 월간 수익률 패널 — 단면에서 벡터화로 조립 (파이썬 루프 없음)                          ║
+# ║                                                                                          ║
+# ║  · 액면분할/무상증자 보정: 상장주식수 비율과 주가의 역방향 동시변동을 탐지해 보정한다.       ║
+# ║    (유상증자처럼 '실제로 희석된' 경우는 보정하지 않는다 — 그건 진짜 손실이다)               ║
+# ║  · 상장폐지: 단면에서 사라지고 폐지일이 확인되면 그 구간 수익률 -100%. 누락 금지.           ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
-def _px_pykrx(code: str, s: str, e: str) -> Optional[pd.DataFrame]:
-    if pykrx_stock is None:
-        return None
-    d = _pykrx_call(pykrx_stock.get_market_ohlcv, s.replace("-", ""), e.replace("-", ""),
-                    code, adjusted=True)
-    if d is None or not len(d):
-        return None
-    d = d.reset_index()
-    lc = {str(c): c for c in d.columns}
-    dtc = next((lc[c] for c in lc if "날짜" in c or "date" in c.lower()), d.columns[0])
-    out = pd.DataFrame({"date": ts_col(d[dtc]),
-                        "close": pd.to_numeric(d[lc.get("종가", "종가")], errors="coerce")
-                        if "종가" in lc else np.nan,
-                        "volume": pd.to_numeric(d.get(lc.get("거래량"), np.nan), errors="coerce")})
-    return out.dropna(subset=["date", "close"])
+SPLIT_MIN_RATIO = 1.35        # 주식수 비율이 이보다 크게(또는 역수보다 작게) 변할 때만 후보
+SPLIT_PRICE_TOL = 0.35        # 보정 후 가격변화가 이 범위 안이면 분할/무상증자로 판정
 
 
-def _px_fdr(code: str, s: str, e: str) -> Optional[pd.DataFrame]:
-    if fdr is None:
-        return None
-    try:
-        d = fdr.DataReader(code, s, e)
-    except Exception:
-        return None
-    if d is None or not len(d):
-        return None
-    d = d.reset_index()
-    lc = {str(c).lower(): c for c in d.columns}
-    return pd.DataFrame({"date": ts_col(d[lc.get("date", d.columns[0])]),
-                         "close": pd.to_numeric(d[lc["close"]], errors="coerce"),
-                         "volume": pd.to_numeric(d.get(lc.get("volume"), np.nan),
-                                                 errors="coerce")}).dropna(subset=["date", "close"])
+def _pivot(xsec: pd.DataFrame, col: str, dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
+    d = xsec[xsec["date"].isin(set(dates))]
+    if not len(d):
+        return pd.DataFrame(index=pd.Index([], name="code"))
+    p = d.pivot_table(index="code", columns="date", values=col, aggfunc="last")
+    return p.reindex(columns=pd.DatetimeIndex(sorted(set(dates))))
 
 
-def _px_naver(code: str, s: str, e: str) -> Optional[pd.DataFrame]:
-    n_days = max(30, (ts(e) - ts(s)).days + 10)
-    t = fetch("https://fchart.stock.naver.com/siseJson.naver", source="naver",
-              params={"symbol": code, "requestType": "1", "count": str(n_days),
-                      "startTime": s.replace("-", ""), "endTime": e.replace("-", ""),
-                      "timeframe": "day"})
-    if not t:
-        return None
-    rows = re.findall(r'\["(\d{8})",\s*([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*(\d+)', t)
-    if not rows:
-        return None
-    out = pd.DataFrame(rows, columns=["d", "o", "h", "l", "c", "v"])
-    return pd.DataFrame({"date": ts_col(out["d"]),
-                         "close": pd.to_numeric(out["c"], errors="coerce"),
-                         "volume": pd.to_numeric(out["v"], errors="coerce")}
-                        ).dropna(subset=["date", "close"])
+def _adjust_factor(shares: pd.DataFrame, close: pd.DataFrame) -> pd.DataFrame:
+    """열(날짜) 간 분할계수 f: 다음 시점 가격에 곱하면 분할 전후가 연속이 되는 값.
+    f = shares_{t+1}/shares_t 를 '가격이 역방향으로 움직였을 때만' 적용한다."""
+    sh = shares.to_numpy(float)
+    px = close.to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = sh[:, 1:] / sh[:, :-1]
+        pr = px[:, 1:] / px[:, :-1]
+    cand = np.isfinite(ratio) & ((ratio >= SPLIT_MIN_RATIO) | (ratio <= 1 / SPLIT_MIN_RATIO))
+    ok = cand & np.isfinite(pr) & (np.abs(pr * ratio - 1.0) < SPLIT_PRICE_TOL)
+    f = np.ones_like(ratio)
+    f[ok] = ratio[ok]
+    return pd.DataFrame(f, index=close.index, columns=close.columns[1:])
 
 
-def _px_yahoo(code: str, s: str, e: str) -> Optional[pd.DataFrame]:
-    if yf is None:
-        return None
-    for suf in (".KS", ".KQ"):
-        try:
-            THROTTLE.wait("yahoo")
-            d = yf.download(code + suf, start=s, end=e, auto_adjust=True,
-                            progress=False, threads=False)
-        except Exception:
-            d = None
-        if d is not None and len(d):
-            d = d.reset_index()
-            cols = {str(c[0]) if isinstance(c, tuple) else str(c): c for c in d.columns}
-            return pd.DataFrame({"date": ts_col(d[cols.get("Date", d.columns[0])]),
-                                 "close": pd.to_numeric(d[cols["Close"]].squeeze(),
-                                                        errors="coerce"),
-                                 "volume": pd.to_numeric(d[cols.get("Volume")].squeeze(),
-                                                         errors="coerce")
-                                 if "Volume" in cols else np.nan}
-                                ).dropna(subset=["date", "close"])
-    return None
+class PriceMatrix:
+    """단면 → (종목 × 날짜) 행렬. 분할·무상증자 보정을 한 번만 계산해 재사용한다.
+
+    adj[code, date] 의 두 시점 비율이 곧 총수익률이다. 백테스트 수익률, IC 지평,
+    목표주가 만기 조회가 모두 이 하나의 행렬을 쓴다 — 가격 조회를 반복하지 않는다.
+    """
+
+    def __init__(self, xsec: pd.DataFrame, dates: Sequence[pd.Timestamp]):
+        dates = sorted({pd.Timestamp(d).normalize() for d in dates if d is not None})
+        self.close = _pivot(xsec, "close", dates)
+        if self.close.empty:
+            raise HaltRun("단면에서 가격 행렬을 만들지 못했습니다 — 시장 데이터 수집 확인")
+        self.shares = _pivot(xsec, "shares", dates).reindex(columns=self.close.columns)
+        self.mcap = _pivot(xsec, "mktcap", dates).reindex(columns=self.close.columns)
+        self.value = _pivot(xsec, "value", dates).reindex(columns=self.close.columns)
+        fac = _adjust_factor(self.shares, self.close)
+        self.n_adjusted = int((fac.to_numpy() != 1.0).sum())
+        if self.n_adjusted:
+            CON.say(f"액면분할·무상증자 보정 {self.n_adjusted:,}건 "
+                    f"(상장주식수 비율 × 역방향 가격변동 동시 탐지)")
+        cum = np.cumprod(np.hstack([np.ones((len(fac), 1)), fac.to_numpy()]), axis=1)
+        self.adj = pd.DataFrame(self.close.to_numpy() * cum, index=self.close.index,
+                                columns=self.close.columns)
+        self.cols = np.array(self.close.columns.values, dtype="datetime64[ns]")
+        self._row = {c: i for i, c in enumerate(self.close.index)}
+        self._adj_np = self.adj.to_numpy(float)
+
+    def asof(self, code: str, when, tol_days: int = 20) -> float:
+        """as-of 조정가 조회 — 단면이 없는 날짜는 직전 보유 단면으로(허용오차 내)."""
+        i = self._row.get(str(code))
+        if i is None:
+            return np.nan
+        j = int(np.searchsorted(self.cols, np.datetime64(pd.Timestamp(when)),
+                                side="right")) - 1
+        if j < 0:
+            return np.nan
+        if (pd.Timestamp(when) - pd.Timestamp(self.cols[j])).days > tol_days:
+            return np.nan
+        return float(self._adj_np[i, j])
 
 
-_PX_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yahoo", _px_yahoo)]
+def build_month_panel(have_dates: Sequence[pd.Timestamp], xsec: pd.DataFrame,
+                      sec: pd.DataFrame, months: Sequence[pd.Timestamp],
+                      cal: "TradingCal", pm: Optional["PriceMatrix"] = None,
+                      rethub: Optional["ReturnHub"] = None
+                      ) -> Tuple[pd.DataFrame, "PriceMatrix"]:
+    """월간 패널: code·month·close·mktcap·value·fwd_1m·fwd_20/60/120td.
 
+    수익률 우선순위:
+      1순위 ReturnHub — KRX 서버측 수정주가 등락률(분할 반영 + 상폐 -100% 포함)
+      2순위 단면 파생 — 상장주식수 비율로 분할을 탐지해 보정(1순위 실패 구간의 폴백)
+    반환 (패널, PriceMatrix) — 행렬은 목표주가 만기 조회 등에서 재사용된다."""
+    months = list(pd.DatetimeIndex(months))
+    have = np.array(sorted({pd.Timestamp(d).normalize() for d in have_dates}),
+                    dtype="datetime64[ns]")
+    if not len(have):
+        raise HaltRun("보유 단면이 없습니다 — 시장 데이터 수집을 확인하세요")
 
-def collect_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """일별 수정종가 패널 code·date·close·volume·src. 캐시 우선 + 부족 종목만 신규."""
-    cached = DEPOT.table_load("scg_px_daily",
-                              foreign_patterns=["ohlcv_daily", "px_daily", "price_daily"],
-                              need_cols=["code", "date", "close"])
-    frames: List[pd.DataFrame] = []
-    have: Dict[str, pd.Timestamp] = {}
-    if cached is not None and len(cached):
-        cached["code"] = cached["code"].map(code6)
-        cached["date"] = ts_col(cached["date"])
-        cached = cached.dropna(subset=["code", "date", "close"])
-        if "src" not in cached.columns:
-            cached["src"] = "cache"
-        cached = cached[cached["date"] >= ts(start) - pd.Timedelta(days=7)]
-        frames.append(cached[["code", "date", "close", "volume", "src"]]
-                      if "volume" in cached.columns else
-                      cached.assign(volume=np.nan)[["code", "date", "close", "volume", "src"]])
-        g = cached.groupby("code")["date"]
-        have = {c: (mn, mx) for c, mn, mx in zip(g.min().index, g.min(), g.max())}
-        CON.say(f"가격 캐시 재사용: {cached['code'].nunique():,}종목 {len(cached):,}행")
-    end_t = ts(end)
-    todo = []
-    for c in codes:
-        rng = have.get(c)
-        if rng is None:
-            todo.append((c, start, end))
-        elif rng[1] < end_t - pd.Timedelta(days=9) or rng[0] > ts(start) + pd.Timedelta(days=35):
-            # ★ 꼬리만 이어붙이면 (a) 소스가 섞이고 (b) 그 사이 액면분할/배당으로
-            #   수정주가 기준이 달라져 이음새에 가짜 수익률이 생긴다. 갱신이 필요한
-            #   종목은 전 구간을 한 소스에서 다시 받아 통째로 교체한다(종목당 1콜).
-            #   앞머리가 비어 있는 캐시(뒤 구간만 있는 외부 캐시)도 같은 경로로 채운다.
-            todo.append((c, start, end))
-    if RUN_MODE == "CACHED":
-        todo = []
-    if todo:
-        CON.say(f"가격 신규 수집 {len(todo):,}종목/구간 (폴백사슬 pykrx→FDR→네이버→야후)")
-
-        def _one(job):
-            if DEADLINE.over("가격 수집"):
-                return None
-            c, s, e = job
-            for src, fn in _PX_CHAIN:
-                try:
-                    d = fn(c, s, e)
-                except Exception:      # 한 소스의 어댑터 예외가 나머지 폴백을 막으면 안 된다
-                    d = None
-                if d is not None and len(d) >= 2:
-                    d.insert(0, "code", c)
-                    d["src"] = src
-                    return d
+    def _resolve(t, tol: int = 12) -> Optional[pd.Timestamp]:
+        if t is None:
             return None
+        i = int(np.searchsorted(have, np.datetime64(pd.Timestamp(t)), side="right")) - 1
+        if i < 0:
+            return None
+        got = pd.Timestamp(have[i])
+        return got if (pd.Timestamp(t) - got).days <= tol else None
 
-        got = pmap(_one, todo, label="가격수집")
-        got = [g for g in got if g is not None]
-        if got:
-            frames.append(pd.concat(got, ignore_index=True))
-        CON.say(f"가격 신규 수집 완료: {len(got):,}/{len(todo):,}종목")
+    snap_of = {m: _resolve(m, tol=10) for m in months}
+    use_months = [m for m in months if snap_of[m] is not None]
+    if not use_months:
+        raise HaltRun("신호일에 대응하는 단면이 하나도 없습니다")
+    md = [snap_of[m] for m in use_months]
+    # ★ 지평 날짜는 '실제 거래일'을 그대로 쓴다. ReturnHub 가 그 구간의 수익률을 직접
+    #   주기 때문에 그 날짜의 단면을 받을 필요가 없다(호출량 급감). 단면이 마침 있으면
+    #   폴백 계산에도 쓰이고, 없으면 그 지평만 결측이 된다.
+    horiz = {h: [cal.shift(d0, h) for d0 in md] for h in (20, 60, 120)}
+    nxt = [md[i + 1] if i + 1 < len(md) else None for i in range(len(md))]
+
+    have_set = set(pd.Timestamp(d) for d in have)
+    all_dates = sorted({d for d in md if d is not None}
+                       | {d for v in horiz.values() for d in v
+                          if d is not None and pd.Timestamp(d) in have_set}
+                       | {d for d in nxt if d is not None})
+    if pm is None:
+        pm = PriceMatrix(xsec, all_dates)
+    close, adj, mcap, value = pm.close, pm.adj, pm.mcap, pm.value
+
+    dl = (sec.drop_duplicates("code").set_index("code")["delist_date"]
+          .reindex(close.index))
+    dl_np = dl.to_numpy("datetime64[ns]")
+    dl_ok = dl.notna().to_numpy()
+    rows = []
+    nan_col = np.full(len(close.index), np.nan)
+    src_tally = Counter()
+
+    def _ret(d_from, d_to, c0_np, alive0):
+        """1순위 서버 수정주가, 2순위 단면 파생. 어느 쪽이든 상폐는 -100%."""
+        if d_to is None:
+            return np.full(len(close.index), np.nan), "없음"
+        if rethub is not None:
+            s = rethub.get(d_from, d_to)
+            if s is not None and len(s):
+                r = s.reindex(close.index).to_numpy(float)
+                # 서버 응답에 없는데 그 사이 폐지된 종목은 전손으로 채운다
+                miss = alive0 & ~np.isfinite(r)
+                dead = miss & dl_ok & (dl_np > np.datetime64(d_from))
+                r = np.where(dead, -1.0, r)
+                src_tally["서버수정주가"] += 1
+                return r, "서버"
+        ch = adj[d_to].to_numpy() if d_to in adj.columns else np.full(len(close.index), np.nan)
+        r = ch / c0_np - 1.0
+        gone = alive0 & ~np.isfinite(ch)
+        dead = gone & dl_ok & (dl_np > np.datetime64(d_from))
+        src_tally["단면파생"] += 1
+        return np.where(dead, -1.0, r), "단면"
+    for i, m in enumerate(use_months):
+        d0 = md[i]
+        c0 = adj[d0]
+        base = pd.DataFrame({"code": close.index, "month": m,
+                             "close": close[d0].to_numpy(),
+                             "mktcap": (mcap[d0].to_numpy() if d0 in mcap.columns
+                                        else nan_col),
+                             "value": (value[d0].to_numpy() if d0 in value.columns
+                                       else nan_col)})
+        c0_np = c0.to_numpy()
+        alive0 = np.isfinite(c0_np)
+        base["fwd_1m"] = _ret(d0, nxt[i], c0_np, alive0)[0]
+        for h in (20, 60, 120):
+            base[f"fwd_{h}td"] = _ret(d0, horiz[h][i], c0_np, alive0)[0]
+        rows.append(base[alive0])
+    P = pd.concat(rows, ignore_index=True)
+    P = P[np.isfinite(P["close"]) & (P["close"] > 0)]
+    if src_tally:
+        CON.say("수익률 출처: " + " · ".join(f"{k} {v:,}구간" for k, v in src_tally.items())
+                + " (서버 수정주가가 분할·상폐를 이미 반영합니다)")
+    CON.say(f"월간 패널 {len(P):,}행 · 종목 {P['code'].nunique():,} · 월 {len(use_months)} · "
+            f"{mem_mb(P):.0f}MB")
+    return shrink(P), pm
+
+
+def universe_frame(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
+    """PIT 유니버스 = 그 달 단면에 실재한 보통주. (상장/폐지 목록에 의존하지 않는다)"""
+    common = set(sec.loc[sec["is_common"], "code"])
+    U = P.loc[P["code"].isin(common), ["code", "month", "mktcap"]].copy()
+    U = U.rename(columns={"code": "stock_id", "month": "signal_date"})
+    U["in_uni"] = True
+    return U
+
+
+def collect_benchmark(hub: "MarketHub", months: Sequence[pd.Timestamp]
+                      ) -> Dict[str, pd.Series]:
+    """벤치마크 월간 수익률 — 지수 시계열 1콜씩."""
+    out: Dict[str, pd.Series] = {}
+    midx = pd.DatetimeIndex(months)
+    lo, hi = midx.min() - pd.Timedelta(70, "D"), midx.max()
+    cached = DEPOT.table_load("krx_index_monthly", need_cols=["name", "date", "close"])
+    frames = [cached] if cached is not None and len(cached) else []
+    fresh = []
+    if RUN_MODE != "CACHED":
+        for name, kcode, fsym in (("KOSPI", "1001", "KS11"), ("KOSDAQ", "2001", "KQ11")):
+            s = None
+            if pykrx_stock is not None:
+                d = _pykrx_call(pykrx_stock.get_index_ohlcv, f"{lo:%Y%m%d}", f"{hi:%Y%m%d}",
+                                kcode)
+                if d is not None and len(d):
+                    col = "종가" if "종가" in d.columns else d.columns[-1]
+                    s = pd.Series(pd.to_numeric(d[col], errors="coerce").to_numpy(),
+                                  index=pd.DatetimeIndex(d.index).normalize())
+            if s is None and fdr is not None:
+                try:
+                    d = fdr.DataReader(fsym, lo, hi)
+                    if d is not None and len(d):
+                        s = pd.Series(pd.to_numeric(d["Close"], errors="coerce").to_numpy(),
+                                      index=pd.DatetimeIndex(d.index).normalize())
+                except Exception:
+                    s = None
+            if s is not None and len(s):
+                fresh.append(pd.DataFrame({"name": name, "date": s.index,
+                                           "close": s.to_numpy()}))
+    if fresh:
+        frames.extend(fresh)
     if not frames:
-        raise HaltRun("가격 데이터가 전혀 없습니다 — 네트워크/캐시를 확인하세요")
-    px = pd.concat(frames, ignore_index=True)
-    px = (px.dropna(subset=["code", "date", "close"])
-            .sort_values(["code", "date"])
-            .drop_duplicates(["code", "date"], keep="last").reset_index(drop=True))
-    px = px[px["close"] > 0]
-    if todo:
-        DEPOT.table_save("scg_px_daily", px, scope="공용", domain="price",
-                         source="pykrx+fdr+naver+yahoo")
-    return shrink(px)
-
-
-def _resample_me(s: pd.Series) -> pd.Series:
-    try:
-        return s.resample("ME").last()
-    except ValueError:                     # pandas < 2.2
-        return s.resample("M").last()
-
-
-def collect_benchmark(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
-    out = {}
-    for nm, sym, ysym in (("KOSPI", "KS11", "^KS11"), ("KOSDAQ", "KQ11", "^KQ11")):
-        ser = None
-        if fdr is not None:
-            try:
-                d = fdr.DataReader(sym, months[0] - pd.offsets.MonthEnd(2), months[-1])
-                if d is not None and len(d):
-                    d = d.reset_index()
-                    lc = {str(c).lower(): c for c in d.columns}
-                    dd = pd.DataFrame({"date": ts_col(d[lc.get("date", d.columns[0])]),
-                                       "close": pd.to_numeric(d[lc["close"]], errors="coerce")})
-                    m = _resample_me(dd.set_index("date")["close"])
-                    ser = m.pct_change().reindex(months)
-            except Exception:
-                ser = None
-        if ser is None and yf is not None:
-            try:
-                d = yf.download(ysym, start=str(months[0].date() - _dt.timedelta(days=70)),
-                                end=str(months[-1].date()), auto_adjust=True, progress=False)
-                if d is not None and len(d):
-                    m = _resample_me(d["Close"].squeeze())
-                    m.index = pd.DatetimeIndex(m.index).normalize()
-                    ser = m.pct_change().reindex(months)
-            except Exception:
-                ser = None
-        if ser is not None:
-            out[nm] = ser
+        CON.warn("벤치마크 지수를 얻지 못했습니다 — 초과수익 열은 비어 있게 됩니다")
+        return out
+    B = pd.concat(frames, ignore_index=True)
+    B["date"] = ts_col(B["date"])
+    B = B.dropna(subset=["date", "close"]).drop_duplicates(["name", "date"], keep="last")
+    if fresh:
+        DEPOT.table_save("krx_index_monthly", B, scope="공용", domain="market",
+                         source="pykrx+fdr")
+    for name, g in B.groupby("name"):
+        s = g.set_index("date")["close"].sort_index()
+        m = _resample_me(s)
+        out[str(name)] = m.pct_change().reindex(midx)
     return out
+
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -2045,8 +2445,8 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
     rep = pd.concat(frames, ignore_index=True)
     rep["date"] = ts_col(rep["date"])
     rep = rep.dropna(subset=["date"])
-    rep = rep[(rep["date"] >= ts(start) - pd.Timedelta(days=400))
-              & (rep["date"] <= ts(end) + pd.Timedelta(days=7))]
+    rep = rep[(rep["date"] >= ts(start) - pd.Timedelta(400, "D"))
+              & (rep["date"] <= ts(end) + pd.Timedelta(7, "D"))]
     rep = rep.drop_duplicates(subset=["source", "rid"], keep="last").reset_index(drop=True)
     DEPOT.table_save("scg_reports_raw", rep, scope="공용", domain="research",
                      source="hankyung+naver+cache")
@@ -2354,7 +2754,7 @@ def _naver_annual_eps(code: str) -> Optional[pd.DataFrame]:
         return None
 
 
-def collect_actual_eps(sec: pd.DataFrame, mcap: pd.DataFrame,
+def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
                        start: str, end: str) -> pd.DataFrame:
     """actuals: stock_id·fiscal_period(YYYYFY)·EPS·발표일.
     DART: 연결우선 당기순이익 ÷ FY말 상장주식수, 발표일 = 사업보고서 접수일(PIT 정확).
@@ -2378,12 +2778,17 @@ def collect_actual_eps(sec: pd.DataFrame, mcap: pd.DataFrame,
     if len(cm) and QUOTA.alive("dart") and RUN_MODE != "CACHED":
         code2corp = cm.set_index("code")["corp_code"].to_dict()
         codes = [c for c in sec["code"] if c in code2corp]
+        # 상장주식수는 단면에 이미 들어 있다 — 별도 조회 없이 (연도, 종목) 로 접는다.
         shares_map, first_shares = {}, {}
-        if len(mcap) and "shares" in mcap.columns:
-            for (mth, c), sh in (mcap.sort_values("month")
-                                 .set_index(["month", "code"])["shares"].items()):
-                shares_map[(mth.year, c)] = sh
-                first_shares.setdefault(c, sh)   # 창 이전 회계연도의 폴백(최초 스냅샷)
+        if len(xsec) and "shares" in xsec.columns:
+            sh = xsec.loc[xsec["shares"].notna() & (xsec["shares"] > 0),
+                          ["date", "code", "shares"]].sort_values("date")
+            sh["y"] = sh["date"].dt.year
+            last_of_year = sh.drop_duplicates(["y", "code"], keep="last")
+            shares_map = dict(zip(zip(last_of_year["y"], last_of_year["code"]),
+                                  last_of_year["shares"]))
+            first_of_code = sh.drop_duplicates("code", keep="first")
+            first_shares = dict(zip(first_of_code["code"], first_of_code["shares"]))
         ni_rows: List[dict] = []
         corps = [code2corp[c] for c in codes]
         B = 100
@@ -2705,31 +3110,42 @@ def build_forecasts(R: pd.DataFrame, L: pd.DataFrame) -> pd.DataFrame:
     return fc
 
 
-def tp_actuals_from_prices(fc: pd.DataFrame, px_close: pd.DataFrame,
+def tp_actuals_from_prices(fc: pd.DataFrame, pm: "PriceMatrix",
                            cal: "TradingCal") -> pd.DataFrame:
     """TP12M 정확도 사건용 실측치: 각 보고서의 '12개월 뒤 실제 주가'.
-    (EPS 실적발표일에 해당하는 것이 '만기일' — 만기가 지난 사건만 정확도에 쓰인다)"""
+    (EPS 의 실적발표일에 해당하는 것이 목표주가의 '만기일' — 만기가 지난 사건만 쓴다)
+
+    ★ 가격은 이미 만들어 둔 PriceMatrix 에서 벡터로 뽑는다. 종목별 재조회를 하지 않는다.
+    단면은 월말 중심이므로 만기 허용오차를 25일까지 둔다(12개월 목표가의 성격상 무해)."""
+    cols = ["report_id", "matured_at", "actual_price"]
     if not len(fc):
-        return pd.DataFrame(columns=["report_id", "matured_at", "actual_price"])
+        return pd.DataFrame(columns=cols)
     tp = fc[fc["forecast_metric"] == "TP12M"]
+    if not len(tp) or pm is None:
+        return pd.DataFrame(columns=cols)
+    mat_map = {d: cal.shift(d, 252) for d in tp["report_date"].unique()}
+    mat = tp["report_date"].map(mat_map)
+    ok = mat.notna()
+    tp = tp[ok.to_numpy()]
+    mat = mat[ok.to_numpy()]
     if not len(tp):
-        return pd.DataFrame(columns=["report_id", "matured_at", "actual_price"])
-    px = px_close
-    out = []
-    for sid, g in tp.groupby("stock_id", observed=True):
-        s = px.get(sid)
-        if s is None:
-            continue
-        dates, vals = s
-        for rid, rd in zip(g["report_id"], g["report_date"]):
-            mat = cal.shift(rd, 252)
-            if mat is None:
-                continue
-            i = int(np.searchsorted(dates, np.datetime64(mat), side="right")) - 1
-            if i < 0 or (mat - pd.Timestamp(dates[i])).days > 15:
-                continue
-            out.append((rid, mat, float(vals[i])))
-    return pd.DataFrame(out, columns=["report_id", "matured_at", "actual_price"])
+        return pd.DataFrame(columns=cols)
+    ri = pd.Index(tp["stock_id"].astype(str)).map(
+        {c: i for i, c in enumerate(pm.close.index)})
+    ci = np.searchsorted(pm.cols, mat.to_numpy("datetime64[ns]"), side="right") - 1
+    row = np.asarray(ri, dtype=float)
+    good = np.isfinite(row) & (ci >= 0)
+    if not good.any():
+        return pd.DataFrame(columns=cols)
+    ri_i = row[good].astype(int)
+    ci_i = ci[good]
+    gap = (mat.to_numpy("datetime64[ns]")[good] - pm.cols[ci_i]).astype("timedelta64[D]")
+    within = gap.astype(int) <= 25
+    px = pm.adj.to_numpy(float)[ri_i[within], ci_i[within]]
+    out = pd.DataFrame({"report_id": tp["report_id"].to_numpy()[good][within],
+                        "matured_at": pd.DatetimeIndex(pm.cols[ci_i[within]]),
+                        "actual_price": px})
+    return out[np.isfinite(out["actual_price"])].reset_index(drop=True)
 
 
 def choose_metric(fc: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
@@ -2861,7 +3277,7 @@ def with_validity(fc: pd.DataFrame, cfg: SCGParams) -> pd.DataFrame:
     대체하므로 (stock,analyst,fp,metric,T) 활성표는 최대 1개 — TEST 8 이 구조로 보장된다."""
     fc = fc.sort_values(FC_KEY + ["report_date"], kind="mergesort").reset_index(drop=True)
     nxt = fc.groupby(FC_KEY, observed=True, sort=False)["report_date"].shift(-1)
-    exp = fc["report_date"] + pd.Timedelta(days=int(cfg.MAX_FORECAST_AGE_DAYS) + 1)
+    exp = fc["report_date"] + pd.Timedelta(int(cfg.MAX_FORECAST_AGE_DAYS) + 1, "D")
     fc["valid_until"] = np.minimum(nxt.fillna(pd.Timestamp("2262-01-01")).to_numpy(),
                                    exp.to_numpy())
     return fc
@@ -3303,75 +3719,6 @@ def diag_weight_conc(W: pd.DataFrame) -> pd.DataFrame:
 # ║ [S8] 백테스트 — 십분위(부족 시 오분위) · 4전략 side-by-side · IC · 단조성                  ║
 # ║  임계값 최적화 금지(§36): bucket 은 rank 등분이며 전략 간 유니버스는 동일(§30).            ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
-def build_price_book(px: pd.DataFrame) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-    """code → (일자배열, 종가배열). 이후 모든 조회는 이 북에서 O(log n)."""
-    book = {}
-    for c, g in px.groupby("code", observed=True, sort=False):
-        g = g.sort_values("date")
-        book[str(c)] = (g["date"].to_numpy("datetime64[ns]"),
-                        g["close"].to_numpy(float))
-    return book
-
-
-def _px_asof(book, code: str, day, max_gap_days: int = 12) -> float:
-    s = book.get(str(code))
-    if s is None:
-        return np.nan
-    d, v = s
-    i = int(np.searchsorted(d, np.datetime64(pd.Timestamp(day)), side="right")) - 1
-    if i < 0:
-        return np.nan
-    if (pd.Timestamp(day) - pd.Timestamp(d[i])).days > max_gap_days:
-        return np.nan
-    return float(v[i])
-
-
-def build_month_panel(book: Dict, sec: pd.DataFrame, months, cal: "TradingCal"
-                      ) -> pd.DataFrame:
-    """월별 code 패널: close · fwd_1m(다음달) · fwd_20/60/120td(거래일 지평, IC용).
-    상장폐지 처리(생존자편향 금지): 다음달 내 상폐 & 가격 없음 → -100%. 누락 처리 금지."""
-    delist = sec.set_index("code")["delist_date"].to_dict()
-    months = list(pd.DatetimeIndex(months))
-    rows = []
-    for code, (d, v) in book.items():
-        dd = delist.get(code, pd.NaT)
-        last_px_day = pd.Timestamp(d[-1])
-        for i, m in enumerate(months):
-            c0 = _px_asof(book, code, m)
-            if not np.isfinite(c0):
-                continue
-            # ★ 정지→상폐 경로: 마지막 체결 후 가격이 다시는 나오지 않고 상폐가 예정돼
-            #   있으면, '마지막 체결이 속한 달'에 전손(-100%)을 기록한다. 이 손실을
-            #   어느 달에도 안 적으면 하위분위 수익률이 조용히 과대평가된다(생존자편향).
-            #   단, 상폐일이 '이력 끝 근처'일 때만 — 수집이 중간에 잘린 이력(시간예산
-            #   부분수집 등)에 가짜 전손을 찍으면 중간결과 모드가 왜곡된다.
-            dying = (pd.notna(dd) and dd > m
-                     and (last_px_day - pd.Timestamp(m)).days <= 45
-                     and dd <= last_px_day + pd.Timedelta(days=45))
-            nxt = months[i + 1] if i + 1 < len(months) else None
-            fwd1 = np.nan
-            if nxt is not None:
-                c1 = _px_asof(book, code, nxt)
-                if np.isfinite(c1):
-                    fwd1 = c1 / c0 - 1.0
-                elif dying or (pd.notna(dd) and m < dd <= nxt + pd.Timedelta(days=5)):
-                    fwd1 = -1.0                    # 정리매매 최종가 없으면 전손 처리(보수적)
-            r = {"code": code, "month": m, "close": c0, "fwd_1m": fwd1}
-            for h in (20, 60, 120):
-                th = cal.shift(m, h)
-                ch = _px_asof(book, code, th) if th is not None else np.nan
-                if np.isfinite(ch):
-                    r[f"fwd_{h}td"] = ch / c0 - 1.0
-                else:
-                    # IC 지평에도 같은 규칙 — 생존자만으로 IC 를 재지 않는다
-                    r[f"fwd_{h}td"] = -1.0 if dying else np.nan
-            rows.append(r)
-    P = pd.DataFrame(rows)
-    CON.say(f"월간 수익률 패널 {len(P):,}행 · 종목 {P['code'].nunique():,} · "
-            f"메모리 {mem_mb(P):.0f}MB")
-    return shrink(P)
-
-
 def alphas_in_universe(sig: pd.DataFrame, members: pd.Series, cfg: SCGParams
                        ) -> pd.DataFrame:
     """평가 유니버스(예: 시총 하위1000) 안에서 raw 신호를 '재랭크'해 알파를 만든다.
@@ -3767,11 +4114,11 @@ def run_contracts(strict: bool = True) -> bool:
     def t4():   # 동일 정확도, A 수정 후 동료가 따라옴 → lead_A > lead_B, weight_A > weight_B
         rows = []
         for k in range(5):
-            m0 = ts("2020-01-15") + pd.Timedelta(days=60 * k)
+            m0 = ts("2020-01-15") + pd.Timedelta(60 * k, "D")
             # 추종 지연 10일(≈7거래일) — 20거래일 관측창 '안'이어야 리더십이 관측된다.
             # 리더의 다음 수정(+60일)은 추종자 창 밖이라 역방향 오염이 없다.
             rows += [_fc_row("S", "leader", f"{m0:%Y-%m-%d}", "2021FY", 100.0 + 10 * k),
-                     _fc_row("S", "follower", f"{(m0 + pd.Timedelta(days=10)):%Y-%m-%d}",
+                     _fc_row("S", "follower", f"{(m0 + pd.Timedelta(10, 'D')):%Y-%m-%d}",
                              "2021FY", 100.0 + 10 * k)]
         fc = validate_forecasts(pd.DataFrame(rows))
         le = lead_events(fc, cal, cfg, "EPS")
@@ -3921,8 +4268,9 @@ def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dic
                     fc_rows.append(_fc_row(sid, aid, f"{d0:%Y-%m-%d}", f"{y}FY", est))
     fc = pd.DataFrame(fc_rows)
     actuals = pd.DataFrame(act_rows)
+    # 가격을 '날짜 단면' 형태로 만든다 — 실경로와 동일한 자료형이어야 스모크가 의미를 갖는다
     px_rows = []
-    for sid in stocks:
+    for j, sid in enumerate(stocks):
         p = 10000.0 * float(rng_px.uniform(0.5, 3))
         arr = []
         for d in days:
@@ -3930,22 +4278,30 @@ def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dic
             pull = 0.0022 * mis                    # 갭과 같은 앵커 → 신호가 수익을 예측
             p *= math.exp(rng_px.normal(0.0002, 0.010) + pull)
             arr.append(p)
-        px_rows.append(pd.DataFrame({"code": sid, "date": days, "close": arr,
-                                     "volume": 1e5, "src": "synth"}))
-    px = pd.concat(px_rows, ignore_index=True)
+        sh = np.full(len(days), 1e6)
+        arr = np.array(arr, float)
+        if j == 0:                                  # 액면분할 1건 심기(보정 경로 검증)
+            k = len(days) // 2
+            arr[k:] /= 5.0
+            sh[k:] *= 5.0
+        px_rows.append(pd.DataFrame({"date": days, "code": sid, "close": arr,
+                                     "volume": 1e5, "value": arr * 1e5,
+                                     "mktcap": arr * sh, "shares": sh,
+                                     "market": "KOSPI"}))
+    xsec = pd.concat(px_rows, ignore_index=True)
+    months = month_ends(days[0], days[-1])
+    # 일부 종목 중도상폐 심기(생존자편향 경로 검증) — 단면에서도 사라지게 한다
+    dead_codes = stocks[-3:]
+    dead_at = ts("2022-06-15")
+    xsec = xsec[~(xsec["code"].isin(dead_codes) & (xsec["date"] > dead_at))]
     sec = pd.DataFrame({"code": stocks, "name": [f"합성{i}" for i in range(n_stocks)],
                         "market": "KOSPI", "list_date": ts("2010-01-01"),
-                        "delist_date": pd.NaT})
-    # 일부 종목 중도상폐 심기(생존자편향 경로 검증)
-    sec.loc[sec.index[-3:], "delist_date"] = ts("2022-06-15")
-    mcap_rows = []
-    months = month_ends(days[0], days[-1])
-    for m in months:
-        for i, sid in enumerate(stocks):
-            mcap_rows.append(dict(month=m, code=sid, mktcap=1e10 * (i + 1),
-                                  shares=1e6, close=np.nan))
-    return dict(fc=fc, actuals=actuals, px=px, sec=sec,
-                mcap=pd.DataFrame(mcap_rows), cal=cal, months=months)
+                        "delist_date": pd.NaT,
+                        "first_seen": days[0], "last_seen": days[-1], "is_common": True})
+    sec.loc[sec["code"].isin(dead_codes), "delist_date"] = dead_at
+    sec.loc[sec["code"].isin(dead_codes), "last_seen"] = dead_at
+    return dict(fc=fc, actuals=actuals, xsec=xsec, sec=sec, cal=cal, months=months,
+                have_dates=sorted(set(days)))
 
 
 def run_smoke(full: bool) -> bool:
@@ -3965,9 +4321,11 @@ def run_smoke(full: bool) -> bool:
     cons, W = smart_consensus(fcv, sc, months, cfg, "EPS")
     cons = pick_primary_fp(cons, S["actuals"], "EPS")
     sig = rank_alphas(scg_signals(cons, months, S["cal"], cfg), cfg)
-    sig = sig.rename(columns={"stock_id": "stock_id"})
-    book = build_price_book(S["px"])
-    panel = build_month_panel(book, S["sec"], months, S["cal"])
+    panel, pmx = build_month_panel(S["have_dates"], S["xsec"], S["sec"], months, S["cal"])
+    # (스모크는 ReturnHub 없이 단면 파생 경로를 태운다 — 폴백이 살아 있는지 검증)
+    tp_act = tp_actuals_from_prices(fc.assign(forecast_metric="TP12M").head(50), pmx,
+                                    S["cal"])          # TP 경로도 스모크에서 한 번 태운다
+    CON.debug(f"합성 TP 만기 실측 {len(tp_act):,}건 · 분할보정 {pmx.n_adjusted}건")
     suites = run_suite(sig[sig["primary"]], panel, "합성")
     bt = suites["SCG_LS"]
     if bt.get("empty"):
@@ -4147,15 +4505,17 @@ def interpretation_tables(metric: str):
     ], ["구성요소", "정의"], ["l", "l"], title="산식 요약(감사용)")
 
 
-def coverage_table(fc: pd.DataFrame, R: pd.DataFrame, px: pd.DataFrame,
+def coverage_table(fc: pd.DataFrame, R: pd.DataFrame, xsec: pd.DataFrame,
                    actuals: pd.DataFrame):
     rows = [["보고서 원장", f"{len(R):,}건",
              f"{R['date'].min():%Y-%m}~{R['date'].max():%Y-%m}" if len(R) else "-"],
             ["예측 테이블", f"{len(fc):,}행",
              f"{fc['report_date'].min():%Y-%m}~{fc['report_date'].max():%Y-%m}"
              if len(fc) else "-"],
-            ["가격 패널", f"{px['code'].nunique():,}종목",
-             f"{px['date'].min():%Y-%m}~{px['date'].max():%Y-%m}" if len(px) else "-"],
+            ["전종목 단면", f"{xsec['code'].nunique():,}종목 / "
+                            f"{xsec['date'].nunique():,}일",
+             f"{xsec['date'].min():%Y-%m}~{xsec['date'].max():%Y-%m}"
+             if len(xsec) else "-"],
             ["실적(actual)", f"{len(actuals):,}건", ""],
             ["수집 상태", "중간결과(시간예산 소진 — 재실행 시 이어받음)"
              if DEADLINE.tripped else "정상 완료", ""]]
@@ -4245,17 +4605,58 @@ def run_all() -> dict:
     months = month_ends(BACKTEST_START, BACKTEST_END)
     DEADLINE.start()
 
-    with FLOW.part("S4a", "PIT 유니버스 + 월별 시총", budget_s=3600):
-        U = collect_universe(months)
-        sec, mcap = U["sec"], U["mcap"]
-        FLOW.io("출", "메모리", "종목마스터", sec)
+    with FLOW.part("S4a", "거래일 캘린더 + 필요 호출 산출", budget_s=900):
+        HUB = MarketHub(DEPOT)
+        RET = ReturnHub(DEPOT)
+        cal_days = HUB.calendar((ts(BACKTEST_START) - pd.DateOffset(months=15)
+                                 ).strftime("%Y-%m-%d"), BACKTEST_END)
+        cal = TradingCal(cal_days)
+        # ★ 필요한 호출만 정확히 계산한다 — 종목별 시계열은 단 한 번도 받지 않는다.
+        #   ① 신호일(월말) 단면 : 유니버스·시총·주식수·가격    → 월당 1콜
+        #   ② 구간 수익률       : 신호일→(익월/20/60/120td)   → 월당 4콜, 전 종목 동시
+        snap_dates, ret_pairs = [], []
+        anchors = []
+        for m in months:
+            p = cal.pos(m)
+            if p < 0:
+                continue
+            d0 = pd.Timestamp(cal.days[p])
+            anchors.append(d0)
+            snap_dates.append(d0)
+        for i, d0 in enumerate(anchors):
+            if i + 1 < len(anchors):
+                ret_pairs.append((d0, anchors[i + 1]))
+            for h in (20, 60, 120):
+                dh = cal.shift(d0, h)
+                if dh is not None:
+                    ret_pairs.append((d0, pd.Timestamp(dh)))
+        snap_dates = sorted(set(snap_dates))
+        ret_pairs = list(dict.fromkeys(ret_pairs))
+        CON.grid([["신호일 단면", f"{len(snap_dates):,}콜", "전 종목 가격·시총·주식수"],
+                  ["구간 수익률", f"{len(ret_pairs):,}콜",
+                   "전 종목 수정주가 등락률(상폐 -100% 포함)"],
+                  ["종목별 시계열", "0콜", "쓰지 않음 — 이전 설계의 병목이었습니다"]],
+                 ["호출 종류", "예상 호출", "무엇을 받는가"], ["l", "r", "l"],
+                 title="시장 데이터 호출 계획 (캐시 적중분은 실제로 호출되지 않습니다)")
+        FLOW.io("출", "메모리", "호출계획", snap_dates + ret_pairs)
 
-    with FLOW.part("S4b", "가격 수집(수정주가·상폐 포함)", budget_s=3600 * 2):
-        codes = sec["code"].tolist()
-        px = collect_prices(codes, (ts(BACKTEST_START) - pd.DateOffset(months=15)
-                                    ).strftime("%Y-%m-%d"), BACKTEST_END)
-        cal = TradingCal(px["date"].unique())
-        bench = collect_benchmark(months)
+    with FLOW.part("S4b", "전종목 단면 + 구간 수익률 수집", budget_s=3600 * 2):
+        xsec = HUB.ensure(snap_dates)
+        HUB.flush()
+        RET.ensure(ret_pairs)
+        RET.flush()
+        cov = len(RET.have & set(ret_pairs)) / max(len(ret_pairs), 1)
+        CON.say(f"구간 수익률 커버리지 {cov*100:.0f}%")
+        if cov < 0.5:
+            CON.warn("구간 수익률 커버리지가 낮습니다 — 지평 날짜 단면을 추가로 받아 "
+                     "단면 파생 수익률로 보완합니다")
+            extra = sorted({pd.Timestamp(b) for _, b in ret_pairs})
+            xsec = HUB.ensure(sorted(set(snap_dates) | set(extra)))
+            HUB.flush()
+        FLOW.io("출", "메모리", "전종목단면", xsec)
+        sec = build_security_master(xsec)
+        FLOW.io("출", "메모리", "종목마스터", sec)
+        bench = collect_benchmark(HUB, months)
 
     with FLOW.part("S4c", "애널리스트 리포트 수집(한경+네이버)", budget_s=3600 * 2,
                    skip=not RESEARCH_COLLECT and RUN_MODE != "CACHED",
@@ -4268,7 +4669,7 @@ def run_all() -> dict:
                                     "actual_value", "actual_announcement_date"])
     with FLOW.part("S4d", "실적 EPS·발표일(DART→네이버 폴백)", budget_s=3600,
                    critical=False):
-        actuals = collect_actual_eps(sec, mcap, BACKTEST_START, BACKTEST_END)
+        actuals = collect_actual_eps(sec, xsec, BACKTEST_START, BACKTEST_END)
 
     with FLOW.part("S5", "원장 구축 + 연결 감사", budget_s=600):
         R, A, L = build_ledger(rep_raw, sec)
@@ -4293,14 +4694,16 @@ def run_all() -> dict:
                          source="ledger+pdf")
         metric, mtab = choose_metric(fc_all)
         cfg = SCGParams()
-        fc = validate_forecasts(fc_all, asof=ts(BACKTEST_END) + pd.Timedelta(days=7))
+        fc = validate_forecasts(fc_all, asof=ts(BACKTEST_END) + pd.Timedelta(7, "D"))
         fcv = with_validity(fc, cfg)
-        book = build_price_book(px)
-        tp_act = tp_actuals_from_prices(fc, book, cal) if metric == "TP12M" else \
+        sig_months = [m for m in months if m >= fc["report_date"].min()]
+        # 가격 행렬을 여기서 한 번만 만들고, 이후 백테스트·IC·목표가 만기가 전부 재사용한다
+        panel, PMX = build_month_panel(HUB.all_dates(), xsec, sec, sig_months, cal,
+                                       rethub=RET)
+        tp_act = tp_actuals_from_prices(fc, PMX, cal) if metric == "TP12M" else \
             pd.DataFrame(columns=["report_id", "matured_at", "actual_price"])
 
     with FLOW.part("S7", "SCG 엔진(사건→PIT점수→스마트컨센서스→신호)", budget_s=3600):
-        sig_months = [m for m in months if m >= fc["report_date"].min()]
         if metric == "EPS":
             acc_ev = acc_events_eps(fc, actuals, cfg)
         else:
@@ -4317,13 +4720,8 @@ def run_all() -> dict:
                    signal_dates=sig_months, cal=cal, actuals=actuals, sig=sig)
 
     with FLOW.part("S8", "백테스트 — 전체 PIT 유니버스", budget_s=1800):
-        panel = build_month_panel(book, sec, sig_months, cal)
-        uni_members = []
-        for T in sig_months:
-            uni_members.append(pd.DataFrame({"signal_date": T,
-                                             "stock_id": universe_at(T, sec, mcap)}))
-        uni_df = pd.concat(uni_members, ignore_index=True)
-        uni_df["in_uni"] = True
+        # PIT 유니버스 = 그 달 단면에 실재한 보통주. 상장/폐지 목록 정확도에 의존하지 않는다.
+        uni_df = universe_frame(panel, sec)
         sigp = sig[sig["primary"]].merge(uni_df, on=["signal_date", "stock_id"], how="left")
         sig_full = sigp[sigp["in_uni"].fillna(False)]
         CON.say(f"신호×유니버스 교집합: {len(sig_full):,}행 "
@@ -4335,19 +4733,14 @@ def run_all() -> dict:
     suites_small: Dict[str, dict] = {}
     with FLOW.part("S9", f"비교전략 — 시총 하위{COMPARE_BOTTOM_N}", budget_s=1200,
                    critical=False):
-        small_members = []
-        if len(mcap):
-            mc = mcap.dropna(subset=["mktcap"]).sort_values("month")
-            for T in sig_months:
-                snap = mc[mc["month"] <= T]
-                if not len(snap):
-                    continue
-                last_m = snap["month"].max()
-                s = snap[snap["month"] == last_m].nsmallest(COMPARE_BOTTOM_N, "mktcap")
-                small_members.append(pd.DataFrame({"signal_date": T,
-                                                   "stock_id": s["code"].map(code6)}))
-        if small_members:
-            sm = pd.concat(small_members, ignore_index=True)
+        # 시총은 각 신호일 단면에 실측으로 들어 있다 — 그 달의 유니버스 안에서 하위 N.
+        uu = uni_df.dropna(subset=["mktcap"])
+        sm = None
+        if len(uu):
+            sm = (uu.sort_values("mktcap")
+                    .groupby("signal_date", observed=True, sort=False)
+                    .head(COMPARE_BOTTOM_N)[["signal_date", "stock_id"]].copy())
+        if sm is not None and len(sm):
             sm["in_small"] = True
             sigs = sig_full.merge(sm, on=["signal_date", "stock_id"], how="left")
             mask = sigs["in_small"].fillna(False)
@@ -4359,8 +4752,7 @@ def run_all() -> dict:
             R_subperiod(suites_small)
             R_concentration(suites_small)
         else:
-            suites_small = {}
-            CON.warn("시총 스냅샷이 없어 비교전략을 건너뜁니다 — KRX 로그인/pykrx 를 확인하세요")
+            CON.warn("단면에 시가총액이 없어 비교전략을 건너뜁니다 — pykrx 수집을 확인하세요")
 
     with FLOW.part("S10", "강건성 검사(전체 유니버스)", budget_s=3600 * 2, critical=False):
         R_sensitivity(ENG, panel)
@@ -4374,7 +4766,7 @@ def run_all() -> dict:
     with FLOW.part("S11", "해석표 · 저장(공용/전용 인덱스) · 다운로드", budget_s=900,
                    critical=False):
         interpretation_tables(metric)
-        coverage_table(fc, R, px, actuals)
+        coverage_table(fc, R, xsec, actuals)
         outdir = os.path.join(DEPOT.ns["전용"], "report")
         stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         outs = []
