@@ -2755,10 +2755,16 @@ def attach_cells(P: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
             q = (pd.to_numeric(P[col], errors="coerce")
                  .groupby(P["month"], observed=True)
                  .transform(lambda s: s.rank(pct=True) if s.notna().sum() >= 8 else np.nan))
-            alt = pd.Series(np.where(q.isna(), np.nan,
-                                     np.where(q < 1 / 3, f"{lab}소",
-                                              np.where(q < 2 / 3, f"{lab}중", f"{lab}대"))),
-                            index=P.index)
+            # ★numpy 2.x 는 np.where(cond, np.nan, "문자열") 의 dtype 승격을 거부한다
+            #   (DTypePromotionError: _PyFloatDType could not be promoted by StrDType).
+            #   numpy 1.x 는 조용히 object 로 올려 줬기 때문에 그 시절 코드가 그대로 남아 있었고,
+            #   계약검정 C4 는 직원수가 전부 채워진 합성데이터라 이 사다리를 타지 않아
+            #   ★실데이터에서만 터졌다(L.PANEL 전체 중단). 판정은 pandas 로만 한다 —
+            #   버전에 무관하고, 결측을 결측으로 남기는 의미도 코드에 그대로 드러난다.
+            alt = pd.Series(pd.NA, index=P.index, dtype=object)
+            alt = (alt.mask(q < 1 / 3, f"{lab}소")
+                      .mask((q >= 1 / 3) & (q < 2 / 3), f"{lab}중")
+                      .mask(q >= 2 / 3, f"{lab}대"))
             sb = sb.fillna(alt)
     P["size_bucket"] = sb.fillna("규모미상").astype(str)
     if (P["size_bucket"] == "규모미상").mean() > 0.5:
@@ -2818,6 +2824,15 @@ class KRXMarketplace:
     WARM = "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201"
     LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
     LOGIN_POST = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+    # ★로그인 엔드포인트·필드명은 KRX 개편 때마다 바뀐다. 하나를 찍어 맞히는 대신 후보를
+    #   순서대로 시도하고 ★서버가 JSON 으로 CD001 을 줄 때만 성공으로 본다. 실측 로그에서
+    #   현행 단일 경로는 '에러페이지 - 한국거래소' HTML 을 돌려주었다.
+    LOGIN_CANDS = [
+        ("https://data.krx.co.kr/comm/member/mbrLoginSubmit.cmd", "pwd"),
+        ("https://data.krx.co.kr/comm/member/mbrLoginSubmit.cmd", "pw"),
+        ("https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd", "pw"),
+        ("https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd", "pwd"),
+    ]
     JSON_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
     JSON_REF = "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd"
 
@@ -2845,37 +2860,45 @@ class KRXMarketplace:
             #   찍힌 채 이후 모든 bld 조회가 로그인 HTML 을 받아 F.CAP 48초·G.FLOW 4.6초를
             #   통째로 버렸다(120회·12회 × 0.4초로 산술이 정확히 맞는다). KRX 정본은 CD001 만
             #   성공으로 본다.
-            for extra in ({}, {"skipDup": "Y"}):
-                body = {"mbrId": self.uid, "pw": self.pw, "mbrNm": "", "telNo": "",
-                        "di": "", "certType": "", **extra}
-                txt = net_post(self.LOGIN_POST, source="krx", data=body, referer=self.LOGIN_PAGE,
-                               headers={"X-Requested-With": "XMLHttpRequest"})
-                if txt is None:
-                    continue
-                ec = em = ""
-                try:
-                    js = json.loads(txt)
-                    ec, em = str(js.get("_error_code", "")), str(js.get("_error_message", ""))
-                except Exception:
-                    if re.search(r"CD011|중복\s*로그인", str(txt)):
-                        ec = "CD011"
-                    else:
-                        L.warn("KRX 로그인 응답이 JSON 이 아닙니다(차단 또는 레이아웃 변경) — "
-                               f"{str(txt)[:120]}")
+            for url, pwf in self.LOGIN_CANDS:
+                for extra in ({}, {"skipDup": "Y"}):
+                    body = {"mbrId": self.uid, pwf: self.pw, "mbrNm": "", "telNo": "",
+                            "di": "", "certType": "", **extra}
+                    txt = net_post(url, source="krx", data=body, referer=self.LOGIN_PAGE,
+                                   headers={"X-Requested-With": "XMLHttpRequest"})
+                    if txt is None:
                         continue
-                if ec == "CD011":
-                    L.warn("KRX 중복 로그인(CD011) — 브라우저/다른 노트북의 같은 계정 로그인이 "
-                           "세션을 끊습니다. skipDup 으로 재시도합니다.")
-                    continue
-                if ec == "CD001":
-                    self.session_ok = True
-                    self.state = "로그인 성공"
-                    _krx_capture_cookies()      # ★워커 스레드가 상속할 수 있게 쿠키를 공유한다
-                    L.ok("KRX 마켓플레이스 로그인 성공(CD001) — 시가총액·수급을 정식 경로로 수집합니다.")
-                    return True
-                L.warn(f"KRX 로그인 거부 — code={ec or '?'} msg={em[:80]}")
+                    ec = em = ""
+                    try:
+                        js = json.loads(txt)
+                        ec = str(js.get("_error_code", ""))
+                        em = str(js.get("_error_message", ""))
+                    except Exception:
+                        if re.search(r"CD011|중복\s*로그인", str(txt)):
+                            ec = "CD011"
+                        else:
+                            continue           # 이 후보는 JSON 을 안 준다 — 다음 후보로
+                    if ec == "CD011":
+                        L.warn("KRX 중복 로그인(CD011) — 브라우저/다른 노트북의 같은 계정 "
+                               "로그인이 세션을 끊습니다. skipDup 으로 재시도합니다.")
+                        continue
+                    if ec == "CD001":
+                        self.session_ok = True
+                        self.state = "로그인 성공"
+                        self.LOGIN_POST = url
+                        _krx_capture_cookies()   # ★워커 스레드가 상속할 수 있게 쿠키를 공유
+                        L.ok(f"KRX 마켓플레이스 로그인 성공(CD001 · {url.rsplit('/', 1)[-1]}) — "
+                             f"시가총액·수급을 정식 경로로 수집합니다.")
+                        return True
+                    L.warn(f"KRX 로그인 거부 — code={ec or '?'} msg={em[:80]}")
+                    if ec:
+                        break                  # 서버가 정식 코드를 줬으면 이 후보는 유효한 경로
             self.state = "로그인 실패"
-            L.warn("KRX 마켓플레이스 로그인 실패 — ID/PW 확인. 폴백 체인으로 정상 진행합니다.")
+            L.warn("KRX 마켓플레이스 로그인 실패 — 후보 엔드포인트 "
+                   f"{len(self.LOGIN_CANDS)}개가 모두 JSON(_error_code)을 주지 않았습니다. "
+                   "① ID/PW 확인 ② 브라우저에서 같은 계정 로그아웃 ③ KRX 개편으로 로그인 경로가 "
+                   "또 바뀐 경우입니다. 가격·시총은 marcap 연도축이 이미 덮으므로 백테스트는 "
+                   "정상 진행되며, 영향은 수급(d3) 한 축에 한정됩니다.")
             return False
 
     def bld(self, bld: str, serial: bool = True, force: bool = False, **params) -> Optional[list]:
@@ -6236,6 +6259,34 @@ def parse_target_price(raw: Any) -> Optional[float]:
 
 _TITLE_CODE = re.compile(r"\((\d{6}|\d{4}[0-9A-HJ-NP-TV-Z][0KLMN])\)")
 
+# ★한경 목록 파라미터 조합 후보. 실측에서 현행 조합이 ★HTTP 500(응답길이 0)을 받았다 —
+#   서버가 report_type 과 search_report_type 을 동시에 받으면 거부하는 것으로 보인다.
+#   검증된 구현들이 서로 다른 이름을 쓰므로 하나를 찍지 말고 실측으로 고른다.
+HK_PARAM_VARIANTS = [
+    ("v25", {"skinType": "business", "report_type": "CO", "search_text": ""}),
+    ("v4", {"skinType": "business", "search_report_type": "CO", "order_type": "",
+            "pagenum": "80", "search_text": ""}),
+    ("plain", {"report_type": "CO", "search_text": ""}),
+    ("full", {"skinType": "business", "report_type": "CO", "search_report_type": "CO",
+              "order_type": "", "pagenum": "80", "search_text": ""}),
+]
+
+
+def _hk_pick_variant(base: str, m0: pd.Timestamp, m1: pd.Timestamp) -> Optional[dict]:
+    """쓰기 전에 한 달로 조합을 고른다 — 틀린 조합으로 120개월을 태우지 않기 위해서다."""
+    for name, pv in HK_PARAM_VARIANTS:
+        prm = dict(pv)
+        prm.update({"now_page": "1", "sdate": m0.strftime("%Y-%m-%d"),
+                    "edate": m1.strftime("%Y-%m-%d")})
+        got, why = _hk_rows(net_get(base, source="hankyung", params=prm,
+                                    referer="https://consensus.hankyung.com/"))
+        if got:
+            L.ok(f"한경 파라미터 조합 '{name}' 채택 — {len(got)}건 확인({m0:%Y-%m}).")
+            return dict(pv)
+        st, _ = NET_LAST.get("hankyung", ("—", ""))
+        L.info(f"한경 조합 '{name}' 미채택(HTTP {st} · 사유 {why}) — 다음 조합을 시도합니다.")
+    return None
+
 REPORT_COLS = ["rid", "source", "src_id", "pub_date", "stock_code", "stock_name", "title",
                "broker_raw", "broker_id", "broker_name", "analyst_raw", "target_price",
                "opinion", "pdf_url"]
@@ -6252,6 +6303,7 @@ def harvest_hankyung(start: str, end: str,
     skip_months = skip_months or set()
     n_skip = 0
     n_alarm = [0]                        # 레이아웃 경보는 한 번만(120개월 × 경고는 소음)
+    variant: List[Optional[dict]] = [None]
     for m0 in pd.date_range(s_t, e_t, freq="MS"):
         if m0.strftime("%Y-%m") in skip_months:
             n_skip += 1
@@ -6260,19 +6312,21 @@ def harvest_hankyung(start: str, end: str,
             CLOCK.cut(f"한경컨센서스: {len(rows):,}건 수집 후 중단")
             break
         m1 = min(e_t, m0 + pd.offsets.MonthEnd(0))
+        if variant[0] is None:               # ★첫 유효 월에서 조합을 한 번만 고른다
+            variant[0] = _hk_pick_variant(base, m0, m1) or {}
+            if not variant[0]:
+                st, head = NET_LAST.get("hankyung", ("—", ""))
+                L.warn(f"한경: 파라미터 조합 {len(HK_PARAM_VARIANTS)}개가 모두 실패 "
+                       f"(HTTP {st} · 응답머리 {str(head)[:110]}) — 이번 실행은 건너뜁니다. "
+                       f"사이트 개편 또는 일시 장애입니다. 캐시 원장은 그대로 보존됩니다.")
+                break
         page = 1
         seen_id: set = set()             # ★그 달에 이미 본 보고서 id
         while page <= 200:
-            html = net_get(base, source="hankyung",
-                           params={"skinType": "business",
-                                   # ★검증된 구현 3종이 쓰는 이름은 report_type 이다.
-                                   #   search_report_type 만 보내면 서버가 필터를 인식하지
-                                   #   못해 빈 표가 오고, 우리는 그걸 '데이터 없음'으로 오해한다.
-                                   "report_type": "CO", "search_report_type": "CO",
-                                   "order_type": "",
-                                   "pagenum": "80", "now_page": str(page),
-                                   "sdate": m0.strftime("%Y-%m-%d"),
-                                   "edate": m1.strftime("%Y-%m-%d"), "search_text": ""},
+            _prm = dict(variant[0])
+            _prm.update({"now_page": str(page), "sdate": m0.strftime("%Y-%m-%d"),
+                         "edate": m1.strftime("%Y-%m-%d")})
+            html = net_get(base, source="hankyung", params=_prm,
                            referer="https://consensus.hankyung.com/")
             got, why = _hk_rows(html)
             if not got:
@@ -9004,9 +9058,16 @@ def contract_selftests(strict: bool = True) -> bool:
 
     def c4():
         n = 400
+        # ★직원수를 '절반만' 채운다. 전부 채우면 규모버킷 사다리(시총·거래대금)를 타지 않아
+        #   그 경로가 검정되지 않는다 — 실제로 그 구멍 때문에 numpy 2.x 의 dtype 승격 오류를
+        #   계약검정이 통과시키고 L.PANEL 에서 56분 뒤에 터졌다. 실데이터 조건을 재현한다.
+        emp = rng.integers(10, 5000, n).astype(float)
+        emp[n // 2:] = np.nan
         P = pd.DataFrame({"code": [f"{i:06d}" for i in range(n)],
                           "month": d_("2020-06-30"),
-                          "employees": rng.integers(10, 5000, n).astype(float),
+                          "employees": emp,
+                          "mktcap": np.linspace(1e10, 5e12, n),
+                          "adv20": np.linspace(1e8, 9e9, n),
                           "x": rng.normal(size=n)})
         m = pd.DataFrame({"code": P["code"],
                           "industry": rng.choice(["화학", "전자", "건설"], n)})
@@ -9018,7 +9079,13 @@ def contract_selftests(strict: bool = True) -> bool:
         for cname, g in C.assign(z=z).groupby("cell", observed=True):
             if g["z"].notna().sum() >= CELL_MIN and abs(float(g["z"].mean())) > 0.15:
                 return False, f"셀 {cname} z 평균 이탈"
-        return True, f"cell 3요소 · 셀 내 z 평균≈0 ({C['cell'].nunique()}셀)"
+        sbs = set(C["size_bucket"].astype(str))
+        if not ({"시총소", "시총중", "시총대"} & sbs):
+            return False, f"★규모버킷 사다리 미작동(직원수 결측이 시총으로 안 내려감): {sorted(sbs)[:5]}"
+        if float((C["size_bucket"].astype(str) == "규모미상").mean()) > 0.10:
+            return False, "★규모버킷 미상 과다 — C11 셀이 (월,산업)으로 붕괴"
+        return True, (f"cell 3요소 · 셀 내 z 평균≈0 ({C['cell'].nunique()}셀) · "
+                      f"규모 사다리(직원수→시총) 작동")
 
     _ct("C4/C11", "셀 정의·횡단면 연산", c4)
 
