@@ -150,9 +150,14 @@ GDRIVE_DESKTOP_OVERRIDE = ""
 # ── ④ 백테스트 구간 · 실행 모드 ─────────────────────────────────────────────────────────────
 BACKTEST_START = "2016-08-01"
 BACKTEST_END   = "2026-07-31"
-#    "SMOKE"  = 합성데이터로 전 출력물 예행연습(네트워크·키 불필요, 수 분). 처음엔 이걸로.
-#    "FULL"   = 스모크 → 실데이터 수집 → 백테스트 → 강건성 → 해석표 (기본값)
-#    "CACHED" = 신규 수집 없이 캐시만으로 재현(오프라인)
+#    "SMOKE"   = 합성데이터로 전 출력물 예행연습(네트워크·키 불필요, 수 분). 처음엔 이걸로.
+#    "FULL"    = 스모크 → 실데이터 수집 → 백테스트 → 강건성 → 해석표 (기본값)
+#    "CACHED"  = 신규 수집 없이 캐시만으로 재현(오프라인)
+#    "COLLECT" = **수집만** 하고 백테스트를 건너뜁니다. 전수수집을 여러 번에 나눠 완성할 때.
+#      ▸ 왜 필요한가: 한경은 실행당 요청 상한(차단 회피) 때문에 한 번에 120개월을 다 받을
+#        수 없고, PDF 도 수만 건이라 한 실행에 끝나지 않습니다. 그런데 매번 백테스트까지
+#        돌리면 수집에 쓸 수 있는 시간이 그만큼 깎입니다. COLLECT 로 몇 번 돌려 원장을
+#        채운 뒤 FULL(또는 CACHED)로 한 번 돌리는 것이 **전수수집의 정석 경로**입니다.
 RUN_MODE = "FULL"
 
 # ── ⑤ 애널리스트 리포트 수집 ────────────────────────────────────────────────────────────────
@@ -176,6 +181,10 @@ PDF_PROGRESS_EVERY     = 25       # 이만큼 처리할 때마다 진행 한 줄
 #      확보(네트워크)와 파싱(CPU)을 분리해 파싱만 프로세스로 내보냅니다.
 PDF_PARSE_PROCESSES    = True    # False 면 스레드로만(디버깅용). 자동으로 폴백도 합니다
 PDF_PARSE_WORKERS      = 0       # 0 = 자동(코어수-2, 최대 12)
+#    ★ 차단은 '영원히'가 아니라 '당분간'이어야 한다. 지난 실행에서 실행 142분 지점에
+#      네트워크가 순단되자 세 소스의 회로가 한꺼번에 열렸고, 회로가 다시 닫히는 경로가
+#      구조적으로 없어 남은 수집이 전부 포기됐다(실적 0건의 직접 원인 중 하나).
+CIRCUIT_RETRY_SEC      = 120      # 차단 후 이만큼 지나면 1건만 보내 살아났는지 확인
 SOURCE_CIRCUIT_FAILS   = 8        # ★ 한 소스에서 연속 실패가 이만큼 쌓이면 그 소스를 즉시 차단.
                                   #   403 으로 막힌 사이트에 단계 예산을 통째로 헌납하는 사고를
                                   #   막는다(멈춘 것처럼 보이던 진짜 원인). 성공하면 즉시 복구.
@@ -188,6 +197,31 @@ SOURCE_CIRCUIT_FAILS   = 8        # ★ 한 소스에서 연속 실패가 이만
 FORECAST_METRIC_MODE   = "BOTH"   # "BOTH" | "AUTO" | "EPS" | "TP12M"
 #    ▸ 빠른 버전만 원하면 아래 한 줄을 True 로. PDF 단계를 통째로 건너뜁니다(수 분 내 완주).
 QUICK_TP12M_ONLY       = False
+
+# ── ⑤-3 신뢰도 게이트 — "표본이 이만큼은 돼야 숫자를 인쇄한다" ──────────────────────────────
+#    ★ 지난 실행이 남긴 가장 비싼 교훈입니다. 목표주가 커버리지가 2018년부터 0% 라
+#      TP12M 트랙의 유효구간이 **16개월**뿐이었는데, 코드는 그걸 모르고 '10년 백테스트'의
+#      연율 수익률·Sharpe·MDD 를 그대로 인쇄했습니다. 하위1000 트랙은 **87행/18종목**,
+#      EPS 하위1000 은 **1행**이었는데도 "질문3: SCG_LSA > SCG_LS ? YES" 라는 판정문까지
+#      찍혔습니다. 숫자가 나왔다는 사실이 곧 신뢰의 근거처럼 읽히므로, 이것은 단순한
+#      미관 문제가 아니라 **잘못된 결론을 유도하는 결함**입니다.
+#      → 이제 미달 표본에서는 숫자를 계산하되 **인쇄하지 않고 사유를 대신 출력**합니다.
+#    근거(자의적 미학이 아니라 명세와 통계에서 옵니다):
+#      · MIN_XS_STOCKS=20  — §36 오분위의 최소 단위. 그 아래는 분위 자체가 성립하지 않음
+#      · MIN_MONTHS_ANN=24 — 월수익률 24개 미만에서 연율화(복리 환산)는 표본오차가
+#        추정치를 압도합니다. Sharpe 의 표준오차 ≈ √((1+SR²/2)/N) 이라 N=16 이면 ±0.25,
+#        N=24 이면 ±0.20, N=36 이면 ±0.17 — 24 를 실용 하한으로 잡습니다
+#      · MIN_MONTHS_VERDICT=36 — '어느 전략이 낫다'는 **비교 판정**은 더 엄격해야 합니다
+#      · MIN_IC_MONTHS=24  — §40 IC 의 t값이 의미를 가지려면 월 표본이 필요합니다
+MIN_XS_STOCKS       = 20    # 단면(월평균) 종목 하한 — 미달 시 그 트랙 전체를 '참고'로 강등
+MIN_MONTHS_ANN      = 24    # 연율화·Sharpe·MDD 인쇄 하한(개월)
+MIN_MONTHS_VERDICT  = 36    # 전략 간 우열 판정문 인쇄 하한(개월)
+MIN_IC_MONTHS       = 24    # IC 평균·t값 인쇄 하한(개월)
+MIN_ACTUALS_FOR_EPS = 200   # EPS 트랙의 정확도 사건(§7~§10)이 성립하기 위한 실적 최소 건수
+                            #   0 건이면 품질승수(§20-22)가 리더십 단독으로 축약되어
+                            #   **합의된 산식과 다른 지표**가 됩니다 — 그 사실을 낙인찍습니다
+GATE_STRICT         = True  # False 로 두면 게이트가 경고만 하고 숫자를 그대로 인쇄합니다
+                            #   (진단용. 기본값 True 를 권장합니다)
 
 # ── ⑥ 성능/자원 ─────────────────────────────────────────────────────────────────────────────
 COLLECT_HOURS_BUDGET = 4.0        # ★ 수집 시간예산(시간). 초과하면 수집을 그 자리에서 멈추고
@@ -210,6 +244,15 @@ HANKYUNG_COOLDOWN_MIN  = 180     # IP 차단 감지 후 이 시간 동안은 아
 #      한 실행에서 이 횟수까지만 받고 멈춥니다(진행분은 저장되어 다음 실행이 이어받습니다).
 #      차단당하면 3시간을 통째로 잃으므로, 조금 덜 받는 쪽이 항상 이득입니다.
 HANKYUNG_MAX_REQ_PER_RUN = 200
+#    ★ 위 200 은 **초기값일 뿐**이고, 실제 상한은 실행 결과로 학습합니다.
+#      고정값의 문제: 너무 낮으면 전수수집에 필요한 실행 횟수가 쓸데없이 늘고,
+#      너무 높으면 차단당해 3시간을 통째로 잃습니다. 어느 쪽인지는 **해보기 전엔
+#      알 수 없고**, 사이트의 임계치도 시기에 따라 변합니다.
+#      → 차단 없이 상한까지 갔으면 다음 실행은 ×1.5, 차단당했으면 ÷2.
+#        차단선 바로 아래로 수렴하며, 학습값은 공용 인덱스에 남아 다음 실행이 이어받습니다.
+HANKYUNG_REQ_ADAPT   = True
+HANKYUNG_REQ_FLOOR   = 80
+HANKYUNG_REQ_CEIL    = 600
 MEM_SOFT_GB    = 6.0              # 이 수준을 넘보면 청크 처리로 전환
 COST_BPS_ONEWAY = 15.0            # 십분위 성과의 왕복비용 가정(수수료+세금+슬리피지, 편도 bp)
 
@@ -226,7 +269,15 @@ if QUICK_TP12M_ONLY:              # 빠른 버전 스위치 — PDF 단계를 �
     FORECAST_METRIC_MODE = "TP12M"
     RESEARCH_DOWNLOAD_PDF = False
 
-SCG_BUILD = "scg_v1.20260809c"
+# ★ COLLECT 는 '수집 경로는 FULL 과 완전히 동일하되 백테스트만 건너뛰는' 모드다.
+#   하류 코드가 RUN_MODE 를 문자열로 비교하는 곳이 많아, 별도 플래그로 분리해 두면
+#   `RUN_MODE != "CACHED"` 같은 기존 조건들이 전부 그대로 옳게 동작한다
+#   (모드를 하나 늘릴 때마다 조건문 수십 곳을 고치는 것이 사고의 온상이었다).
+COLLECT_ONLY = (RUN_MODE == "COLLECT")
+if COLLECT_ONLY:
+    RUN_MODE = "FULL"
+
+SCG_BUILD = "scg_v1.20260809d"
 STRATEGY_TAG = "scg_v1"           # 전용 인덱스 네임스페이스 이름
 
 
@@ -555,6 +606,10 @@ class Orchestra:
         if skip:
             rec.update(status="건너뜀", note=why, t1=time.time())
             CON.warn(f"[{pid}] {title} — 건너뜀: {why}")
+            # ★ 건너뛴 단계를 예산 원장에 등록하지 않으면, 그 단계의 가중치가
+            #   '아직 안 쓴 몫'으로 남아 뒤 단계의 배정이 그만큼 작아진다.
+            #   (건너뛴 시간은 뒤 단계가 가져가야 한다)
+            BUDGET.leave(pid)
             # contextmanager 구조상 with 본문 자체를 생략할 수는 없다 — 본문 함수들이
             # 내부 플래그로 무동작하도록 짜여 있고, 여기서는 예외만 흡수해 원장에 남긴다.
             try:
@@ -565,13 +620,17 @@ class Orchestra:
             return
         prev, self.cur = self.cur, pid
         CON.line(f"[{pid}] {title}")
+        BUDGET.enter(pid)                  # ★ 예산은 선언이 아니라 집행이다
         try:
             with CON.inside(pid):
                 yield
             rec.update(status="완료", t1=time.time())
             dur = rec["t1"] - rec["t0"]
-            if budget_s and dur > budget_s:
-                rec["note"] = f"예산 {budget_s:.0f}s 초과({dur:.0f}s)"
+            if pid in BUDGET.tripped:
+                rec["note"] = (f"단계 예산 소진 — 신규 수집 중단(수집분 저장됨, "
+                               f"재실행 시 이어받음)")
+            elif budget_s and dur > budget_s:
+                rec["note"] = f"참고: 상한 {budget_s:.0f}s 초과({dur:.0f}s)"
             CON.ok(f"[{pid}] {title} — {dur:.1f}s")
         except (HaltRun, RuleBreak, KeyboardInterrupt):
             rec.update(status="실패", t1=time.time(),
@@ -586,6 +645,7 @@ class Orchestra:
             rec["status"] = "경고"
             CON.warn(f"[{pid}] 비치명 단계 실패 — 파이프라인은 계속합니다: {rec['err']}")
         finally:
+            BUDGET.leave(pid)
             self.cur = prev
 
     def io(self, way: str, medium: str, name: str, obj=None, src: str = "", note: str = ""):
@@ -991,6 +1051,7 @@ class Depot:
         self.write_root = os.path.abspath(
             os.path.expanduser(droot or "./scg_cache"))
         self.on_drive = droot is not None
+        self._backed_up: set = set()   # 테이블별 세션 1회 백업
         self.ns = {"공용": os.path.join(self.write_root, "shared"),
                    "전용": os.path.join(self.write_root, STRATEGY_TAG)}
         for p in self.ns.values():
@@ -1196,7 +1257,18 @@ class Depot:
             return None
         path = os.path.join(self.ns[scope], "table", f"{name}.parquet")
         self._guard_write(path)
-        if os.path.exists(path):
+        # ★ 백업은 '이 실행이 처음 이 테이블을 건드릴 때' 한 번이면 충분하다.
+        #   지금까지는 저장할 때마다 기존 parquet 를 통째로 복사했다. 이 함수는
+        #   수집 중 반복 호출된다 — 단면 flush 가 청크마다(수십 회), PDF 체크포인트가
+        #   120초마다(2시간이면 60회 × 표 2개). 매번 '전량 복사 + 전량 기록'이라
+        #   실제 디스크 쓰기가 2배가 되고, 백업 파일이 세션당 수백 개씩 무한 누적됐다
+        #   (드라이브 용량과 동기화 시간을 그대로 잡아먹는다).
+        #   원본 보호 목적은 첫 백업 하나로 달성되고, 인덱스 저널이 별도 원천이다.
+        _bk = getattr(self, "_backed_up", None)
+        if _bk is None:                      # Depot.__new__ 경로(리허설) 방어
+            _bk = self._backed_up = set()
+        if os.path.exists(path) and name not in _bk:
+            _bk.add(name)
             bak = os.path.join(self.ns[scope], "index", "_backup",
                                f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
             try:
@@ -1415,15 +1487,50 @@ class SourceCircuit:
       성공이 한 번이라도 나오면 카운터는 0으로 복구된다(일시적 장애와 구분).
     """
 
-    def __init__(self, limit: int = 8, quiet: bool = False):
+    def __init__(self, limit: int = 8, quiet: bool = False,
+                 retry_s: float = CIRCUIT_RETRY_SEC):
         self.limit = int(limit)
         self.quiet = bool(quiet)
+        self.retry_s = float(retry_s)
         self._streak: Counter = Counter()
         self.opened: "OrderedDict[str, str]" = OrderedDict()
+        self._since: Dict[str, float] = {}
+        self._gen: Counter = Counter()
+        self._probe: Dict[str, float] = {}
         self._lk = threading.Lock()
 
     def blocked(self, source: str) -> bool:
-        return source in self.opened
+        """차단 여부. **쿨다운이 지나면 1건만 통과시켜 재탐색한다(반개방).**
+
+        ★ 이전 구현은 `source in self.opened` 뿐이었다. 그런데 fetch 는
+              if CIRCUIT.blocked(source): return None
+          로 **요청 자체를 보내지 않으므로**, 성공 시 호출되는 CIRCUIT.ok() 에
+          도달할 방법이 구조적으로 없었다. 즉 "성공하면 즉시 복구된다"는 주석은
+          도달 불가능한 약속이었고, 한 번 열린 회로는 프로세스가 죽을 때까지
+          닫히지 않았다. 지난 실행에서 142분 지점에 네트워크가 순단되자
+          generic·naver·dart 회로가 한꺼번에 열렸고 **끝까지 그대로였다** —
+          네트워크가 몇 초 뒤 돌아왔더라도 남은 수집은 전부 포기된 상태였다.
+
+        재탐색 간격은 실패할 때마다 2배로 늘린다(최대 16배) — 진짜로 막힌 곳을
+        계속 두드려 차단을 연장시키지 않기 위해서다.
+        """
+        with self._lk:
+            if source not in self.opened:
+                return False
+            now = time.time()
+            pr = self._probe.get(source)
+            if pr is not None:
+                if now - pr < 60.0:        # 재탐색 1건이 아직 진행 중
+                    return True
+                self._probe.pop(source, None)   # 응답 없이 사라진 재탐색은 무효화
+            wait = self.retry_s * (2 ** min(int(self._gen.get(source, 0)), 4))
+            if now - self._since.get(source, now) < wait:
+                return True
+            self._probe[source] = now
+        if not self._mute(source):
+            CON.say(f"[{source}] 차단 후 {wait/60:.0f}분 경과 — 살아났는지 "
+                    f"재탐색 1건을 보냅니다(실패하면 대기가 2배로 늘어납니다)")
+        return False
 
     def _mute(self, source: str) -> bool:
         return self.quiet or str(source).startswith("__")
@@ -1432,17 +1539,26 @@ class SourceCircuit:
         with self._lk:
             if self._streak.get(source):
                 self._streak[source] = 0
+            self._probe.pop(source, None)
             if source in self.opened:            # 되살아났다 — 차단 해제
                 self.opened.pop(source, None)
+                self._since.pop(source, None)
+                self._gen[source] = 0
                 if not self._mute(source):
                     CON.ok(f"[{source}] 응답이 돌아왔습니다 — 차단을 해제합니다")
 
     def fail(self, source: str, why: str) -> bool:
         with self._lk:
+            if self._probe.pop(source, None) is not None:
+                # 재탐색이 실패했다 — 대기를 2배로 늘리고 다시 닫는다
+                self._gen[source] += 1
+                self._since[source] = time.time()
+                return True
             self._streak[source] += 1
             n = self._streak[source]
             if n >= self.limit and source not in self.opened:
                 self.opened[source] = f"{why} (연속 {n}회)"
+                self._since[source] = time.time()
                 if not self._mute(source):
                     CON.warn(f"[{source}] 연속 실패 {n}회 — 이 소스를 차단합니다({why}). "
                              f"남은 요청은 즉시 건너뛰고 다른 소스/캐시로 진행합니다.")
@@ -1453,6 +1569,7 @@ class SourceCircuit:
         with self._lk:
             if source not in self.opened:
                 self.opened[source] = why
+                self._since[source] = time.time()
         if not self._mute(source):
             CON.warn(f"[{source}] 사전 점검 실패 — 차단하고 진행합니다({why})")
 
@@ -1561,8 +1678,16 @@ def fetch(url: str, source: str = "generic", params: Optional[dict] = None,
         except Exception as e:
             last = type(e).__name__
             HTTP_TALLY[f"{source}:EXC"] += 1
-            counted = True
-            if CIRCUIT.fail(source, last):
+            # ★ 이전에는 재시도마다 CIRCUIT.fail 을 불러 **URL 하나의 실패가 3회로**
+            #   계수됐다. HTTP 오류 경로는 1회만 세도록 이미 막아 두었는데(counted),
+            #   예외 경로만 빠져 있었다. 한도 8 이면 ConnectionError 를 내는 URL
+            #   **3건만으로** 멀쩡한 소스가 통째로 끊긴다 — 순단 한 번에 소스가
+            #   죽어버리는 과민 반응의 실제 원인이다.
+            if not counted:
+                counted = True
+                if CIRCUIT.fail(source, last):
+                    break
+            elif CIRCUIT.blocked(source):
                 break
             time.sleep(min(10.0, 1.6 ** k) + random.random() * 0.3)
     else:
@@ -1756,6 +1881,92 @@ class CollectDeadline:
 
 
 DEADLINE = CollectDeadline(COLLECT_HOURS_BUDGET)
+
+
+class StageBudget:
+    """수집 총예산을 단계에 **배분하고 실제로 집행**한다.
+
+    ★ 왜 만드는가. 지난 실행 로그의 한 줄이 이 클래스의 존재 이유다:
+
+        [S4c] 애널리스트 리포트 수집 — 8537.4s   예산 7200s 초과(8537s)
+
+      예산을 넘겼다는 **비고만 남고 아무 일도 일어나지 않았다.** 초과한 1,337초는
+      그대로 다음 단계(S4d·DART 실적)의 시간을 잡아먹었고, S4d 는 결국 네트워크가
+      끊긴 시각에 도달해 `연속 실패 8회 — 차단(ConnectionError)` 으로 끝났다.
+      실적 0건 → 정확도 사건 0건 → **정확도 성분이 빠진 점수가 인쇄됨**.
+      즉 '집행되지 않은 예산' 하나가 치명적 결함의 첫 도미노였다.
+
+    설계 원칙 두 가지:
+      ① **가중치로 배분하되, 진입 시점에 계산한다.** 앞 단계가 일찍 끝나면 남은
+         시간이 그대로 뒤 단계의 몫으로 커진다 — 고정 초 단위로 못박으면 그 회수가
+         불가능하다(합계가 총예산을 넘는 모순도 사라진다. 기존 S4b 2h + S4c 2h +
+         S4d 1h = 5h 는 4시간 예산과 애초에 앞뒤가 맞지 않았다).
+      ② **백테스트 유보분을 먼저 뗀다.** 수집이 아무리 급해도 결과를 못 내면 무의미하다.
+
+    강제 방식은 **협조적 폴링**이다 — 실행 중인 블록을 밖에서 끊을 수는 없으므로,
+    수집 루프들이 `BUDGET.over()` 를 확인해 스스로 멈춘다. 지금까지 수집분은 전부
+    증분 캐시에 저장되어 있으므로 멈춘 자리에서 다음 실행이 이어받는다.
+    """
+
+    # 실측 기반 가중치 — S4c(리포트+PDF)가 압도적으로 무겁다
+    W = OrderedDict([("S4a", 0.04), ("S4b", 0.20), ("S4c", 0.52), ("S4d", 0.24)])
+
+    def __init__(self, dl: "CollectDeadline"):
+        self.dl = dl
+        self.cur: Optional[str] = None
+        self.end: Optional[float] = None
+        self.done: set = set()
+        self.tripped: set = set()
+        self.alloc: Dict[str, float] = {}
+
+    def enter(self, pid: str):
+        self.cur, self.end = pid, None
+        w = self.W.get(pid)
+        if w is None or self.dl.t0 is None:
+            return
+        left = self.dl.remaining_s() - BACKTEST_RESERVE_MIN * 60.0
+        rem_w = sum(v for k, v in self.W.items() if k not in self.done) or w
+        share = max(60.0, left * (w / rem_w))
+        self.end = time.time() + share
+        self.alloc[pid] = share
+        CON.say(f"단계 예산 {share/60:.0f}분 배정 "
+                f"(수집 잔여 {max(self.dl.remaining_s(),0)/60:.0f}분 · "
+                f"백테스트 유보 {BACKTEST_RESERVE_MIN}분 제외 후 가중배분)")
+
+    def leave(self, pid: str):
+        self.done.add(pid)
+        if self.cur == pid:
+            self.cur, self.end = None, None
+
+    def over(self, where: str = "") -> bool:
+        """전역 수집예산 **또는** 현재 단계 예산 중 하나라도 넘었으면 True."""
+        if self.dl.over(where):
+            return True
+        if self.end is not None and time.time() > self.end:
+            if self.cur not in self.tripped:
+                self.tripped.add(self.cur)
+                CON.warn(f"⏱ [{self.cur}] 단계 예산 소진 — 이 단계의 신규 수집을 여기서 "
+                         f"멈춥니다. 수집분은 저장되어 다음 실행이 이어받고, 남은 시간은 "
+                         f"다음 단계로 넘어갑니다"
+                         + (f" (지점: {where})" if where else ""))
+            return True
+        return False
+
+    def remaining_s(self) -> float:
+        g = self.dl.remaining_s() if self.dl.t0 is not None else float("inf")
+        st = (self.end - time.time()) if self.end is not None else float("inf")
+        return min(g, st)
+
+    def table(self):
+        if not self.alloc:
+            return
+        rows = [[k, f"{v/60:.0f}분", "소진" if k in self.tripped else "여유"]
+                for k, v in self.alloc.items()]
+        CON.grid(rows, ["단계", "배정 예산", "결과"], ["l", "r", "l"],
+                 title="수집 단계 예산 집행 결과 (선언이 아니라 집행입니다)")
+
+
+BUDGET = StageBudget(DEADLINE)
 
 
 
@@ -2247,6 +2458,8 @@ class ReturnHub:
     """구간 수익률 캐시 — (시작일, 종료일) 쌍당 1회만 받고 공용 인덱스에 적재한다."""
 
     def __init__(self, depot: "Depot"):
+        self._idx: Optional[Dict[tuple, pd.Series]] = None   # 구간키 → 종목별 수익률
+        self._idx_n = -1
         self.depot = depot
         self.df: Optional[pd.DataFrame] = None
         self.have: set = set()
@@ -2281,7 +2494,7 @@ class ReturnHub:
                 f"/ 캐시 {len(pairs)-len(todo)}구간 — 구간당 1콜, 전 종목 동시")
 
         def _one(p):
-            if DEADLINE.over("구간 수익률"):
+            if BUDGET.over("구간 수익률"):
                 return None
             d = _period_return_krx(p[0], p[1])
             if d is None or not len(d):
@@ -2291,7 +2504,7 @@ class ReturnHub:
 
         CHUNK = 40
         for i in range(0, len(todo), CHUNK):
-            if DEADLINE.over("구간 수익률"):
+            if BUDGET.over("구간 수익률"):
                 break
             got = [g for g in pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS)
                    if g is not None]
@@ -2303,6 +2516,7 @@ class ReturnHub:
                 self.df = pd.concat([self.df] + got, ignore_index=True).drop_duplicates(
                     ["from_date", "to_date", "code"], keep="last")
                 self.have |= {(g["from_date"].iloc[0], g["to_date"].iloc[0]) for g in got}
+                self._idx = None                      # 캐시 무효화
                 self.dirty = True
                 self.flush()
             CON.say(f"  구간 {min(i+CHUNK, len(todo))}/{len(todo)}")
@@ -2315,13 +2529,18 @@ class ReturnHub:
             self.dirty = False
 
     def get(self, d0, d1) -> Optional[pd.Series]:
+        """★ 예전에는 조회 1회가 125만행짜리 불리언 비교 2개 + AND + 복사 +
+          drop_duplicates 였다. build_month_panel 이 월×지평으로 480회 조회하므로
+          6억 행-연산이 된다. 구간키로 한 번만 그룹핑해 두면 조회가 사전 접근이다.
+        """
         if self.df is None or not len(self.df):
             return None
-        m = self.df[(self.df["from_date"] == pd.Timestamp(d0))
-                    & (self.df["to_date"] == pd.Timestamp(d1))]
-        if not len(m):
-            return None
-        return m.drop_duplicates("code", keep="last").set_index("code")["ret"]
+        if self._idx is None or self._idx_n != len(self.df):
+            g = self.df.drop_duplicates(["from_date", "to_date", "code"], keep="last")
+            self._idx = {k: v.set_index("code")["ret"]
+                         for k, v in g.groupby(["from_date", "to_date"], sort=False)}
+            self._idx_n = len(self.df)
+        return self._idx.get((pd.Timestamp(d0), pd.Timestamp(d1)))
 
 
 class MarketHub:
@@ -2334,6 +2553,7 @@ class MarketHub:
         self.have_dates: set = set()
         self.new_years: set = set()
         self._bulk_tried: set = set()
+        self._pend: Dict[int, List[pd.DataFrame]] = {}     # 병합 대기열(O(n²) 회피)
         self._lk = threading.RLock()
 
     # ── 캐시 ───────────────────────────────────────────────────────────────────────────
@@ -2354,12 +2574,14 @@ class MarketHub:
             self.have_dates |= set(d["date"].unique())
 
     def _save_year(self, y: int):
+        self._settle(y)
         if y in self.frames and len(self.frames[y]):
             self.depot.table_save(f"{XSEC_TABLE}_{y}", self.frames[y], scope="공용",
                                   domain="market", source="pykrx+krx+fdr",
                                   note="date-cross-section (공용: 어느 전략이든 재사용)")
 
     def flush(self):
+        self._settle()
         for y in sorted(self.new_years):
             self._save_year(y)
         self.new_years.clear()
@@ -2408,7 +2630,7 @@ class MarketHub:
         years = sorted({pd.Timestamp(d).year for d in missing})
         filled = 0
         for y in years:
-            if DEADLINE.over("벌크 단면"):
+            if BUDGET.over("벌크 단면"):
                 break
             if y in self._bulk_tried:
                 continue
@@ -2443,7 +2665,7 @@ class MarketHub:
             t0 = time.time()
 
             def _one(day):
-                if DEADLINE.over("전종목 단면 수집"):
+                if BUDGET.over("전종목 단면 수집"):
                     return None
                 for src, fn in _XSEC_CHAIN:
                     try:
@@ -2457,7 +2679,7 @@ class MarketHub:
 
             CHUNK = 60
             for i in range(0, len(todo), CHUNK):
-                if DEADLINE.over("전종목 단면 수집"):
+                if BUDGET.over("전종목 단면 수집"):
                     break
                 part = pmap(_one, todo[i:i + CHUNK], workers=XSEC_WORKERS)
                 for d in part:
@@ -2492,18 +2714,37 @@ class MarketHub:
         return self.slice(want)
 
     def _absorb(self, frames: List[pd.DataFrame]):
+        """★ 여기가 수집 단계에서 가장 큰 O(n²) 였다.
+
+        하루치 단면을 넣을 때마다 **그 해 누적 프레임 전체를 concat 으로 복사하고
+        drop_duplicates 로 다시 해시**했다. 한 해 250거래일 × 전종목 2,600행이면
+        k번째 날에 k×2,600행을 두 번 훑으므로 한 해에만 약 1.6억 행-연산이 쌓인다
+        (10년이면 16억). 실제로 하는 일은 '리스트에 덧붙이기'뿐인데.
+        → 대기열에 쌓아 두고 **읽는 시점에 한 번만** 합친다.
+        """
         with self._lk:
             for d in frames:
                 y = int(d["date"].iloc[0].year)
                 for c in XSEC_COLS:
                     if c not in d.columns:
                         d[c] = np.nan
-                cur = self.frames.get(y)
                 d = d[XSEC_COLS]
-                self.frames[y] = d if cur is None else pd.concat([cur, d], ignore_index=True)
-                self.frames[y] = self.frames[y].drop_duplicates(["date", "code"], keep="last")
+                self._pend.setdefault(y, []).append(d)
                 self.have_dates |= set(d["date"].unique())
                 self.new_years.add(y)
+
+    def _settle(self, y: Optional[int] = None):
+        """대기열을 실제 프레임에 반영한다(읽기 직전에 1회)."""
+        with self._lk:
+            years = [y] if y is not None else list(self._pend.keys())
+            for yy in years:
+                pend = self._pend.pop(yy, None)
+                if not pend:
+                    continue
+                cur = self.frames.get(yy)
+                parts = ([cur] if cur is not None and len(cur) else []) + pend
+                out = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+                self.frames[yy] = out.drop_duplicates(["date", "code"], keep="last")
 
     # ── 분할 보정 (일별 데이터로 계산해야 정확하다) ─────────────────────────────────────
     def compute_adjusted(self):
@@ -2514,6 +2755,7 @@ class MarketHub:
           판정: 상장주식수가 5% 넘게 변했는데 주가가 그 역수만큼 움직여 시가총액이
           연속인 경우 = 자본 유입 없는 주식수 변경 = 분할/무상증자.
         """
+        self._settle()
         if not self.frames:
             return
         allf = pd.concat([f[["date", "code", "close", "shares"]] for f in self.frames.values()
@@ -2542,6 +2784,7 @@ class MarketHub:
             self.frames[y] = f
 
     def slice(self, dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
+        self._settle()
         want = {pd.Timestamp(d).normalize() for d in dates}
         cols = XSEC_COLS + ["adj_close"]
         parts = [f.reindex(columns=[c for c in cols if c in f.columns])[
@@ -2554,6 +2797,7 @@ class MarketHub:
         return out.drop_duplicates(["date", "code"], keep="last")
 
     def all_dates(self) -> List[pd.Timestamp]:
+        self._settle()
         return sorted(self.have_dates)
 
 
@@ -2884,7 +3128,7 @@ class PriceMatrix:
             self.n_adjusted = int(np.nansum(np.abs(self.cum - 1.0) > 1e-9))
             self.cols = np.array(self.close.columns.values, dtype="datetime64[ns]")
             self.row_of = {c: i for i, c in enumerate(self.close.index)}
-            self._adj_np = self.adj.to_numpy(float)
+            pass   # (구) self._adj_np — 읽는 곳이 없어 제거(수십 MB 상시 점유)
             self.daily_adjusted = True     # 일별 인접 거래일 기준 보정 = 추정이 아님
             return
         self.daily_adjusted = False
@@ -2898,7 +3142,7 @@ class PriceMatrix:
                                 columns=self.close.columns)
         self.cols = np.array(self.close.columns.values, dtype="datetime64[ns]")
         self.row_of = {c: i for i, c in enumerate(self.close.index)}
-        self._adj_np = self.adj.to_numpy(float)
+        # (구) self._adj_np — 읽는 곳이 없어 제거
 
 
 def build_month_panel(have_dates: Sequence[pd.Timestamp], xsec: pd.DataFrame,
@@ -3118,7 +3362,7 @@ _HK_CANDIDATES = [
 ]
 HK: Dict[str, Any] = {"name": _HK_CANDIDATES[0][0], "list": _HK_CANDIDATES[0][1],
                       "pdf": _HK_CANDIDATES[0][2], "probed": False, "alive": False,
-                      "req": 0, "capped": False}
+                      "req": 0, "capped": False, "cap": HANKYUNG_MAX_REQ_PER_RUN}
 _HK_LK = threading.Lock()
 _HK_BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
@@ -3242,6 +3486,64 @@ def _hk_block_state(save: Optional[dict] = None) -> Optional[dict]:
         return None
 
 
+def _hk_cap_state(save: Optional[dict] = None) -> Optional[dict]:
+    """실행당 요청 상한의 **학습값**을 영속화한다(공용 인덱스)."""
+    if DEPOT is None:
+        return None
+    fp = os.path.join(DEPOT.ns["공용"], "index", "hankyung_reqcap.json")
+    if save is not None:
+        try:
+            write_atomic_text(fp, json.dumps(save, ensure_ascii=False))
+        except Exception:
+            pass
+        return save
+    try:
+        return json.loads(open(fp, encoding="utf-8").read())
+    except Exception:
+        return None
+
+
+def hk_cap_load() -> int:
+    """이번 실행에 쓸 요청 상한. 학습값이 있으면 그것을, 없으면 설정값을 쓴다."""
+    if not HANKYUNG_REQ_ADAPT:
+        return int(HANKYUNG_MAX_REQ_PER_RUN)
+    st = _hk_cap_state() or {}
+    cap = int(st.get("cap") or HANKYUNG_MAX_REQ_PER_RUN)
+    cap = max(HANKYUNG_REQ_FLOOR, min(HANKYUNG_REQ_CEIL, cap))
+    HK["cap"] = cap
+    if st:
+        CON.say(f"한경 요청 상한 학습값 {cap}회 "
+                f"(마지막 조정: {st.get('why', '-')} · {st.get('at', '-')})")
+    return cap
+
+
+def hk_cap_learn():
+    """이번 실행의 결과로 상한을 조정한다 — **차단선 바로 아래로 수렴시킨다**.
+
+    ★ 고정 상한의 딜레마: 낮으면 전수수집에 필요한 실행 횟수가 늘고, 높으면 차단당해
+      3시간을 통째로 잃는다. 어느 쪽인지는 해보기 전엔 알 수 없고 사이트의 임계치도
+      시기에 따라 변한다. 그래서 **결과로 배운다** — 차단 없이 상한까지 갔으면 올리고,
+      차단당했으면 절반으로 내린다. 몇 번의 실행이면 임계치 바로 아래에 붙는다.
+    """
+    if not HANKYUNG_REQ_ADAPT or DEPOT is None:
+        return
+    cap = int(HK.get("cap") or HANKYUNG_MAX_REQ_PER_RUN)
+    used, blocked, capped = int(HK.get("req", 0)), CIRCUIT.blocked("hankyung"), HK.get("capped")
+    if not used:
+        return
+    if blocked:
+        new = max(HANKYUNG_REQ_FLOOR, int(min(cap, used) * 0.5))
+        why = f"차단(요청 {used}회 시점) → 절반으로"
+    elif capped:
+        new = min(HANKYUNG_REQ_CEIL, int(cap * 1.5))
+        why = f"상한 {cap}회까지 무사 도달 → 1.5배로"
+    else:
+        new, why = cap, f"수집 완료(요청 {used}회) → 유지"
+    if new != cap or not _hk_cap_state():
+        _hk_cap_state(save=dict(cap=int(new), why=why, at=_now_iso(), last_used=used))
+    CON.say(f"한경 요청 상한 학습: {cap} → {new}회 ({why})")
+
+
 def hk_probe() -> bool:
     """한경컨센서스 진단 — '왜 수집이 안 되는가'를 추측하지 않고 **실측**해서 표로 보여준다.
 
@@ -3274,7 +3576,21 @@ def hk_probe() -> bool:
 
     warm, home_ok = "-", False
     try:                                    # ⓑ 대비: 홈을 먼저 열어 세션 쿠키를 받는다
-        sc, hb, _e, nck = _probe_get(_HK_HOME, timeout=15)
+        # ★ 단 1회 GET 으로 '차단'을 확정하던 자리. VPN 재접속·프록시 재기동·DNS
+        #   순단이 한 번만 나도 home_ok=False 가 되고, 그러면 후보 루프가 한 번도
+        #   돌지 않은 채 **3시간짜리 쿨다운**이 '403/차단'이라는 거짓 사유로 기록된다.
+        #   그 3시간 동안 한경은 유일한 목표주가 공급원인데도 손을 대지 못한다.
+        sc, hb, _e, nck, _pex = 0, b"", None, 0, None
+        for _try in range(3):
+            try:
+                sc, hb, _e, nck = _probe_get(_HK_HOME, timeout=15)
+            except Exception as _ex:
+                _pex, sc = _ex, 0
+            if sc:                          # 응답 코드를 받았다 = 네트워크는 살아 있다
+                break
+            time.sleep(1.5 * (_try + 1))
+        if not sc and _pex is not None:
+            raise _pex
         warm = f"HTTP {sc} · 쿠키 {nck}개"
         home_ok = (sc == 200)
         if not home_ok:
@@ -3325,19 +3641,27 @@ def hk_probe() -> bool:
     return bool(HK["alive"])
 
 
-def _hk_collect_month(y: int, m: int) -> List[dict]:
+def _hk_collect_month(y: int, m: int) -> Tuple[List[dict], bool]:
+    """반환 (행, **이 달을 끝까지 훑었는가**).
+
+    ★ 두 번째 것이 핵심이다. 페이지 3에서 요청이 실패하거나 요청 상한에 걸려
+      멈추면 1~2페이지 분량만 손에 남는데, 지금까지는 그 부분 행이 그대로 저장되고
+      다음 실행이 '이 (월×소스)에는 데이터가 있으니 완료' 로 판정해 **영원히**
+      다시 가지 않았다. (월×소스) 단위로 고쳤던 바로 그 결함이 한 층 아래
+      (월 안의 페이지)에 그대로 남아 있었다.
+    """
     if not HK["alive"] or CIRCUIT.blocked("hankyung"):
-        return []
+        return [], False
     sdate, edate = f"{y}-{m:02d}-01", f"{y}-{m:02d}-{pd.Timestamp(y, m, 1).days_in_month:02d}"
-    out, page, empty_streak = [], 1, 0
+    out, page, empty_streak, complete = [], 1, 0, False
     while page <= 120 and empty_streak < 2:
         if CIRCUIT.blocked("hankyung"):
             break
         with _HK_LK:                       # ★ 실행당 요청 상한 — 차단을 '예방'한다
-            if HK["req"] >= HANKYUNG_MAX_REQ_PER_RUN:
+            if HK["req"] >= int(HK.get("cap") or HANKYUNG_MAX_REQ_PER_RUN):
                 if not HK["capped"]:
                     HK["capped"] = True
-                    CON.warn(f"한경 요청이 이번 실행 상한({HANKYUNG_MAX_REQ_PER_RUN}회)에 "
+                    CON.warn(f"한경 요청이 이번 실행 상한({HK.get('cap')}회)에 "
                              f"도달했습니다 — 여기서 멈춥니다. 실측상 300회 부근에서 IP "
                              f"차단(3시간)이 걸리므로, 조금 덜 받고 다음 실행이 이어받는 "
                              f"편이 항상 빠릅니다. 수집분은 이미 저장되어 있습니다.")
@@ -3346,16 +3670,23 @@ def _hk_collect_month(y: int, m: int) -> List[dict]:
         html = fetch(HK["list"], source="hankyung", referer=_HK_HOME,
                      headers=_HK_BROWSER_HEADERS,
                      params=_hk_params(sdate, edate, page))
-        rows = _hk_parse_page(html) if html else []
+        if html is None:            # 수신 실패 — '목록 끝'과 절대 혼동하면 안 된다
+            break
+        rows = _hk_parse_page(html)
         if not rows:
             empty_streak += 1
+            if empty_streak >= 2:
+                complete = True         # 빈 페이지 2연속 = 자연스러운 끝
         else:
             empty_streak = 0
             out.extend(rows)
             if len(rows) < 20:
+                complete = True         # 마지막 페이지(정원 미달) = 자연스러운 끝
                 break
         page += 1
-    return out
+    else:
+        complete = True                 # while 조건으로 정상 종료
+    return out, complete
 
 
 def _nv_parse_page(html: str) -> List[dict]:
@@ -3397,22 +3728,60 @@ def _nv_parse_page(html: str) -> List[dict]:
     return rows
 
 
-def _nv_collect_month(y: int, m: int) -> List[dict]:
+def _nv_collect_month(y: int, m: int) -> Tuple[List[dict], bool]:
+    """반환 (행, 이 달을 끝까지 훑었는가). 한경과 같은 이유로 완료 여부를 분리한다."""
     sdate = f"{y}-{m:02d}-01"
     edate = f"{y}-{m:02d}-{pd.Timestamp(y, m, 1).days_in_month:02d}"
-    out, page = [], 1
+    out, page, complete = [], 1, False
     while page <= 200:
         html = fetch(_NV_LIST, source="naver",
                      params={"searchType": "writeDate", "writeFromDate": sdate,
                              "writeToDate": edate, "page": str(page)})
-        rows = _nv_parse_page(html) if html else []
+        if html is None:            # ★ 수신 실패를 '목록 끝'으로 오인하던 자리
+            break
+        rows = _nv_parse_page(html)
         if not rows:
+            complete = True         # 빈 목록 = 진짜 끝
             break
         out.extend(rows)
         if len(rows) < 25:
+            complete = True
             break
         page += 1
+    else:
+        complete = True
+    return out, complete
+
+
+RESEARCH_DONE_TABLE = "scg_research_done"
+
+
+def _load_research_done() -> Dict[Tuple[str, str], bool]:
+    """(월, 소스) → 끝까지 훑었는가. 같은 키가 여러 번이면 **한 번이라도 완료면 완료**."""
+    d = DEPOT.table_load(RESEARCH_DONE_TABLE, need_cols=["ym", "source", "complete"])
+    out: Dict[Tuple[str, str], bool] = {}
+    if d is None or not len(d):
+        return out
+    for ym, src, comp in zip(d["ym"].astype(str), d["source"].astype(str),
+                             d["complete"]):
+        k = (ym, src.lower())
+        out[k] = bool(out.get(k, False) or bool(comp))
     return out
+
+
+def _save_research_done(rows: List[dict]):
+    if not rows:
+        return
+    old = DEPOT.table_load(RESEARCH_DONE_TABLE, need_cols=["ym", "source", "complete"])
+    new = pd.DataFrame(rows)
+    fr = [f for f in (old, new) if f is not None and len(f)]
+    allr = pd.concat(fr, ignore_index=True)
+    # 같은 (월,소스) 는 완료 기록을 우선 보존한다
+    allr["_c"] = allr["complete"].astype(bool).astype(int)
+    allr = (allr.sort_values("_c").drop_duplicates(["ym", "source"], keep="last")
+                .drop(columns=["_c"]))
+    DEPOT.table_save(RESEARCH_DONE_TABLE, allr, scope="공용", domain="research",
+                     source="collect_research", note="(월×소스) 전수 완료 원장")
 
 
 def collect_research(start: str, end: str) -> pd.DataFrame:
@@ -3443,6 +3812,21 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
                         done_ms.add((_m_, tok))
             CON.say(f"보고서 캐시 재사용 {len(cached):,}건 ({len(done_m)}개월분 · "
                     f"소스×월 조합 {len(done_ms):,})")
+    # ★ 완료 원장이 데이터 존재 추정을 **덮어쓴다**. 부분 수집으로 끝난 (월×소스)는
+    #   행이 있어도 미완료이므로 다시 간다. 원장이 없는 과거 캐시는 기존 추정을
+    #   그대로 존중한다(안 그러면 5만여 건을 처음부터 다시 받게 된다).
+    _led = _load_research_done()
+    if _led:
+        _n_re = 0
+        for k, comp in _led.items():
+            if comp:
+                done_ms.add(k)
+            elif k in done_ms:
+                done_ms.discard(k)
+                _n_re += 1
+        if _n_re:
+            CON.say(f"부분 수집으로 끝났던 (월×소스) {_n_re}건을 다시 대상에 넣습니다 "
+                    f"— 행이 좀 있다고 완료로 치면 그 달은 영원히 안 채워집니다")
     if RESEARCH_COLLECT and RUN_MODE != "CACHED":
         hk_probe()                       # ★ 먼저 진단하고 시작한다 — 막힌 곳을 두드리지 않는다
         months = pd.period_range(ts(start), ts(end), freq="M")
@@ -3463,15 +3847,23 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
                      f"막혀 있던 기간에 모은 달은 네이버 행만 들어 있어, '월 완료'로만 "
                      f"보면 전수수집이 구조적으로 불가능했습니다.")
         fmap = dict(srcs)
+        hk_cap_load()
+
+        done_rows: List[dict] = []
+        _dlk = threading.Lock()
 
         def _one(job):
             p, nm = job
-            if DEADLINE.over("리포트 수집"):
+            if BUDGET.over("리포트 수집"):
                 return None
-            rows = fmap[nm](p.year, p.month)
+            rows, complete = fmap[nm](p.year, p.month)
+            with _dlk:
+                done_rows.append(dict(ym=str(p), source=nm, complete=bool(complete),
+                                      n_rows=len(rows), at=_now_iso()))
             return pd.DataFrame(rows) if rows else None
 
         got = pmap(_one, todo_ms, workers=min(4, N_IO_THREADS), label="리포트수집")
+        _save_research_done(done_rows)
         # ★ 전부 NA 인 열만 가진 프레임이 섞이면 판다스가 dtype 추론 경고를 낸다.
         #   그런 프레임은 정보가 없으므로 애초에 제외한다(경고가 아니라 원인을 없앤다).
         got = [g for g in got
@@ -3502,7 +3894,7 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
                 tp_rate = f"{sub['target_price'].notna().mean()*100:.0f}%"
             note = ("사용" if on else "건너뜀(차단/쿨다운)")
             if src_name == "hankyung":
-                note += f" · 요청 {HK['req']}/{HANKYUNG_MAX_REQ_PER_RUN}회"
+                note += f" · 요청 {HK['req']}/{HK.get('cap')}회"
                 if CIRCUIT.blocked("hankyung"):
                     note += " · 차단됨"
                 elif HK["capped"]:
@@ -3512,6 +3904,12 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
                  ["l", "l", "r", "r"],
                  title=f"리포트 신규 수집 결과 ({len(todo)}개월 대상 · "
                        f"캐시 {len(cached) if cached is not None else 0:,}건은 별도)")
+        hk_cap_learn()
+        if miss.get("hankyung", 0) > 3 or HK.get("capped") or CIRCUIT.blocked("hankyung"):
+            CON.say("한경 잔여분이 남았습니다 — `RUN_MODE = \"COLLECT\"` 로 몇 번 더 "
+                    "돌리면 백테스트 시간을 쓰지 않고 수집만 이어받아 채웁니다. "
+                    "목표주가는 한경 리스트와 PDF 표지에서만 나오므로, 이 잔여분이 "
+                    "곧 TP12M 트랙의 유효구간입니다.")
     if not frames:
         return pd.DataFrame(columns=["source", "rid", "date", "title", "stock_code",
                                      "stock_name", "broker", "analyst", "target_price",
@@ -3605,6 +4003,17 @@ def _pdf_text(data: bytes, max_pages: int = 3) -> str:
 
 
 _EPS_LINE = re.compile(r"EPS[^\n]{0,120}", re.I)
+# ★ 목표주가 — TP12M 트랙이 10년을 덮으려면 **이것 하나가 결정적이다.**
+#   지난 실행에서 TP12M 은 사실상 2016-10~2018-01, 16개월짜리 백테스트였다. 원인은
+#   목표가를 싣는 소스가 한경 리스트뿐이고(적정가격 칸) 한경 수집분이 2016~17 에
+#   몰려 있었기 때문이다 — 네이버 리서치 목록에는 목표가 칸이 아예 없다.
+#   그런데 **PDF 본문 표지에는 거의 항상 목표주가가 있다.** 이미 수만 건을 내려받아
+#   EPS 를 파싱하면서 바로 옆에 있는 목표가를 그냥 버리고 있었다.
+#   → 같은 파일, 같은 텍스트, 추가 다운로드 0건으로 2018년 이후 96개월이 살아난다.
+_TP_PAT = re.compile(
+    r"(?:목\s*표\s*(?:주\s*가|가\b|가격)|적\s*정\s*(?:주\s*가|가격)|"
+    r"T\.?\s?P\.?(?![A-Za-z])|Target\s*Price)"
+    r"[^0-9\-]{0,25}?([0-9][0-9,]{2,12}(?:\.\d+)?)", re.I)
 _YEAR_HDR = re.compile(r"(20\d{2})\s*(?:\.?12)?\s*[EFP]?")
 _NUM_TOK = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d+)?")
 _ANALYST_TOK = re.compile(r"([가-힣]{2,4})\s*(?:연구원|애널리스트|수석|책임|선임)?\s*"
@@ -3642,6 +4051,38 @@ def _eps_from_text(text: str, report_year: int) -> Dict[str, float]:
         if out:
             break
     return out
+
+
+def _tp_from_text(text: str) -> Optional[float]:
+    """리포트 표지에서 목표주가를 뽑는다. 없으면 None.
+
+    두 가지 함정을 피한다:
+      · **상향/하향 문구** — "목표주가를 45,000원에서 52,000원으로 상향"처럼 옛 값과
+        새 값이 같이 나온다. 표지 박스의 새 값은 본문에서 한 번 더 반복되는 것이
+        보통이므로 **최빈값**을 취하고, 동률이면 먼저 나온 것을 쓴다.
+      · **비율·여력** — "목표주가 대비 상승여력 25.3%" 의 25.3 같은 값. 원화 주가의
+        상식 범위(500원~1,000만원)를 벗어나면 버린다.
+    """
+    if not text:
+        return None
+    head = text[:4000]                     # 표지 + 요약. 본문 표까지 갈 필요가 없다
+    cands: List[float] = []
+    for m in _TP_PAT.finditer(head):
+        raw = m.group(1).replace(",", "")
+        try:
+            v = float(raw)
+        except Exception:
+            continue
+        if 500.0 <= v <= 1e7:
+            cands.append(v)
+    if not cands:
+        return None
+    best, best_n, best_i = None, 0, 10 ** 9
+    for i, v in enumerate(cands):
+        n = cands.count(v)
+        if n > best_n or (n == best_n and i < best_i):
+            best, best_n, best_i = v, n, i
+    return best
 
 
 def h1_trail(*parts) -> str:
@@ -3835,8 +4276,13 @@ def _balanced_by_year(df: pd.DataFrame, cap: int, date_col: str = "date") -> pd.
 
 # PDF 처리 결과의 '종결' 상태 — 이 상태는 파서 버전이 같은 한 다시 시도하지 않는다.
 # (일시적 실패는 여기 없다: 다음 실행에서 자연히 재시도된다)
-PDF_TERMINAL = frozenset({"EPS_OK", "NO_EPS_TABLE", "NO_TEXT_LAYER", "NOT_PDF", "NO_URL"})
-PDF_PARSER_VERSION = "SCG_EPS_V2"
+PDF_TERMINAL = frozenset({"EPS_OK", "TP_ONLY", "NO_EPS_TABLE", "NO_TEXT_LAYER",
+                          "NOT_PDF", "NO_URL"})
+# ★ 버전을 올리면 종결 원장이 무효가 되어 **이미 받아 둔 PDF 를 다시 파싱**한다.
+#   다운로드는 다시 하지 않는다(로컬에 있는 것만 재파싱) — 목표주가를 회수하는 데
+#   드는 비용은 CPU 몇 분뿐이고, 그 대가로 TP12M 트랙이 16개월에서 10년이 된다.
+PDF_PARSER_VERSION = "SCG_FACT_V3"
+PDF_EX_VER = "SCG_FACT_V3"
 
 
 PDF_CHUNK = 40          # 체크포인트 단위. 500이면 첫 줄까지 몇 분 — 그게 '멈춤'으로 보였다
@@ -3851,7 +4297,14 @@ def _pdf_stage_minutes() -> float:
     """
     if PDF_STAGE_BUDGET_MIN > 0:
         return float(PDF_STAGE_BUDGET_MIN)
-    left = DEADLINE.remaining_s() / 60.0
+    # ★ 여기가 지난 실행에서 S4c 를 예산 7,200초 대비 8,537초로 넘기게 만든 자리다.
+    #   `DEADLINE.remaining_s()` 는 **전역 수집 잔여**라, PDF 단계가 자기 몫(52%)이
+    #   아니라 남은 시간 전부를 가져갔다. 그 초과분이 그대로 S4d(실적 수집)의
+    #   시간을 잡아먹었고, S4d 는 네트워크가 끊긴 시각에 도달해 실적 0건으로 끝났다.
+    #   BUDGET.remaining_s() 는 min(전역 잔여, 이 단계 배정)이라 배분이 지켜진다.
+    left = BUDGET.remaining_s() / 60.0
+    if not np.isfinite(left):
+        left = DEADLINE.remaining_s() / 60.0
     return float(max(5.0, left - BACKTEST_RESERVE_MIN))
 
 
@@ -3988,9 +4441,11 @@ def _pdf_extract_one(data: bytes, year: int) -> Tuple[str, dict]:
     if not text or len(text.strip()) < 40:
         return "NO_TEXT_LAYER", {}
     eps = _eps_from_text(text, int(year))
+    tp = _tp_from_text(text)
     an = ",".join(dict.fromkeys(_ANALYST_TOK.findall(text[:2500])))[:80]
-    payload = dict(pdf_analysts=an, eps_json=json.dumps(eps, ensure_ascii=False))
-    return ("EPS_OK" if eps else "NO_EPS_TABLE"), payload
+    payload = dict(pdf_analysts=an, eps_json=json.dumps(eps, ensure_ascii=False),
+                   pdf_tp=(float(tp) if tp else None), ex_ver=PDF_EX_VER)
+    return ("EPS_OK" if eps else ("TP_ONLY" if tp else "NO_EPS_TABLE")), payload
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -4038,10 +4493,12 @@ def _pdf_worker_source() -> str:
         parts.append(f"try:\n    import {mod} as {alias}\nexcept BaseException:\n"
                      f"    {alias} = None")
     parts.append(f"_ENGINE = {json.dumps(_PDF_ENGINE.get('name') or '')}")
-    for name in ("_NUM_TOK", "_ANALYST_TOK", "_YEAR_HDR", "_EPS_LINE"):
+    parts.append(f"PDF_EX_VER = {json.dumps(PDF_EX_VER)}")
+    for name in ("_NUM_TOK", "_ANALYST_TOK", "_YEAR_HDR", "_EPS_LINE", "_TP_PAT"):
         parts.append(f"{name} = re.compile({globals()[name].pattern!r}, "
                      f"{globals()[name].flags})")
-    for fn in (_pdf_text_with, _pdf_text, _eps_from_text, _pdf_extract_one):
+    for fn in (_pdf_text_with, _pdf_text, _eps_from_text, _tp_from_text,
+               _pdf_extract_one):
         parts.append(inspect.getsource(fn))
     parts.append(
         "def work(job):\n"
@@ -4276,7 +4733,18 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     status_rows: List[dict] = [] if st is None else st.to_dict("records")
 
     has_url = rep["pdf_url"].astype(str).str.startswith("http")
-    need = rep[has_url & ~rep["ruid"].isin(settled) & ~rep["ruid"].isin(done.keys())]
+    # ★ 구버전(목표주가 이전)으로 추출된 건은 **다시 파싱**해야 목표가를 회수한다.
+    #   단 다운로드는 다시 하지 않는다 — 아래에서 로컬에 있는 것만 작업에 넣는다.
+    stale = {k for k, v in done.items()
+             if str((v or {}).get("ex_ver", "")) != PDF_EX_VER}
+    fresh = set(done.keys()) - stale
+    never = rep[has_url & ~rep["ruid"].isin(settled) & ~rep["ruid"].isin(done.keys())]
+    redo = rep[has_url & rep["ruid"].isin(stale)]
+    if len(redo):
+        CON.say(f"구버전 추출물 {len(redo):,}건 — 이미 받아 둔 PDF 만 재파싱해 "
+                f"목표주가를 회수합니다(신규 다운로드 없음)")
+    need = pd.concat([never.assign(_redo=False), redo.assign(_redo=True)],
+                     ignore_index=True) if len(redo) else never.assign(_redo=False)
 
     if not (RESEARCH_DOWNLOAD_PDF and RUN_MODE != "CACHED") or not len(need):
         return _attach_pdf_columns(rep, done)
@@ -4322,7 +4790,9 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     cap = PDF_MAX_NEW_PER_RUN if PDF_MAX_NEW_PER_RUN > 0 else len(need)
     # 로컬에 이미 있는 건 네트워크 상한과 무관하게 전부 처리한다(공짜다)
     work_local = need[local_hit.to_numpy()]
-    work_net = _balanced_by_year(need[~local_hit.to_numpy()], cap)
+    # 재파싱 대상은 로컬에 없으면 그냥 포기한다(네트워크를 다시 쓰지 않는다)
+    _net_pool = need[(~local_hit.to_numpy()) & (~need["_redo"].to_numpy())]
+    work_net = _balanced_by_year(_net_pool, cap)
     # ★ 다운로드가 필요한 건은 **먼저 호스트가 살아 있는지 1건씩 실측**하고 시작한다.
     #   막힌 호스트를 6,000번 두드리는 게 '멈춘 것처럼 보이던' 진짜 원인이었다.
     alive = _pdf_preflight(work_net)
@@ -4390,7 +4860,7 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
         """[1단계] **확보만** 한다 — 로컬 재사용 또는 다운로드. IO 라 스레드가 맞다.
         반환: (ruid, 로컬경로 or None, 연도, 상태or None)"""
         ruid, url, y, total = row
-        if time.time() > stage_end or DEADLINE.over("PDF 확보"):
+        if time.time() > stage_end or BUDGET.over("PDF 확보"):
             return None
         p = keymap.get(str(ruid))
         if p and os.path.exists(p):
@@ -4422,8 +4892,20 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
         with lock:
             counter["net"] += 1
             _tick(total, "확보")
-        return (ruid, np_ if (np_ and os.path.exists(np_)) else None, y,
-                None if np_ else "DOWNLOAD_FAIL")
+        if np_ and os.path.exists(np_):
+            return (ruid, np_, y, None)
+        # ★ 저장에 실패해도 **바이트는 손에 있다**. 예전에는 여기서 파싱조차 하지
+        #   않고 버리면서 카운터에는 '신규 다운로드 성공'으로 넣었다 — 드라이브
+        #   동기화 폴더의 PermissionError 하나로 다운로드가 통째로 헛수고가 된다.
+        #   임시 파일로 떨어뜨려서라도 이번 실행에서는 반드시 파싱한다.
+        try:
+            tmpd = os.path.join(tempfile.gettempdir(), "scg_pdf_fallback")
+            os.makedirs(tmpd, exist_ok=True)
+            tp = os.path.join(tmpd, f"{ruid}.pdf")
+            write_atomic_bytes(tp, data)
+            return (ruid, tp, y, None)
+        except Exception:
+            return (ruid, None, y, "DOWNLOAD_FAIL")
 
     n_jobs = len(work)
     jobs = list(zip(work["ruid"], work["pdf_url"],
@@ -4523,7 +5005,7 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
 
     fut = _pre.submit(_acq_chunk, jobs[0:chunk_n]) if jobs else None
     for i in range(0, len(jobs), chunk_n):
-        if time.time() > stage_end or DEADLINE.over("PDF 추출"):
+        if time.time() > stage_end or BUDGET.over("PDF 추출"):
             CON.warn(f"PDF 단계 예산 소진 — {i:,}/{len(jobs):,}건에서 중단합니다. "
                      f"종결 원장에 진행분이 기록되어 다음 실행이 이어받습니다.")
             _pdf_checkpoint(done, status_rows)
@@ -4552,7 +5034,9 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
                 or i + chunk_n >= len(jobs)):
             ck["t"] = time.time()
             _pdf_checkpoint(done, status_rows)
-        _eta_report(i + chunk_n, n_jobs, t0, stage_end)
+        # ★ i+chunk_n 은 '착수한 작업 수'다. 실패·건너뜀이 섞이면 실제 처리량보다
+        #   커져 속도와 완주 추정이 부풀려진다 — 실제로 종결된 건수를 쓴다.
+        _eta_report(counter["n"] or (i + chunk_n), n_jobs, t0, stage_end)
         # 남은 작업이 전부 차단된 호스트라면 더 돌 이유가 없다
         rest = [j for j in jobs[i + chunk_n:] if not keymap.get(str(j[0]))]
         if rest and all(CIRCUIT.blocked(_pdf_src(j[1])) for j in rest):
@@ -4573,19 +5057,46 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
 
 
 def _attach_pdf_columns(rep: pd.DataFrame, done: Dict[str, dict]) -> pd.DataFrame:
-    ex = (pd.DataFrame(list(done.values())) if done else
-          pd.DataFrame(columns=["ruid", "pdf_analysts", "eps_json"]))
-    for c in ("ruid", "pdf_analysts", "eps_json"):
+    """PDF 추출물(작성자·EPS·목표주가)을 원장에 붙인다.
+
+    ★ 여기서 출처(analyst_src / tp_src)를 **채우는 그 순간에** 기록한다.
+      지난 실행의 감사표가 `PDF연결 비중 0%` 라는 거짓을 찍은 이유가 이것이다:
+      원장 단계에서 `link_src = "리스트" if analyst else "PDF"` 로 사후 판정했는데,
+      그 시점엔 이 함수가 이미 analyst 를 채워 놓았으므로 **구조적으로 항상 '리스트'**
+      였다. 45% 를 파싱해 놓고도 기여도를 볼 수 없었다 — 계측이 없으면 개선도 없다.
+    """
+    keep = ["ruid", "pdf_analysts", "eps_json", "pdf_tp"]
+    ex = (pd.DataFrame(list(done.values())) if done else pd.DataFrame(columns=keep))
+    for c in keep:
         if c not in ex.columns:
             ex[c] = pd.Series(dtype="object")
-    ex = ex[["ruid", "pdf_analysts", "eps_json"]].drop_duplicates("ruid", keep="last")
+    ex = ex[keep].drop_duplicates("ruid", keep="last")
     ex["ruid"] = ex["ruid"].astype("object")
+    ex["pdf_tp"] = pd.to_numeric(ex["pdf_tp"], errors="coerce")
     rep = rep.merge(ex, on="ruid", how="left")
-    fill = (rep["analyst"].astype(str).str.strip() == "") & rep["pdf_analysts"].notna()
+
+    if "analyst_src" not in rep.columns:
+        rep["analyst_src"] = np.where(
+            rep["analyst"].astype(str).str.strip() != "", "리스트", "")
+    fill = (rep["analyst"].astype(str).str.strip() == "") & rep["pdf_analysts"].notna()         & (rep["pdf_analysts"].astype(str).str.strip() != "")
     rep.loc[fill, "analyst"] = rep.loc[fill, "pdf_analysts"]
+    rep.loc[fill, "analyst_src"] = "PDF"
     if fill.any():
         CON.ok(f"PDF 본문에서 작성자 {int(fill.sum()):,}건 보강"
                f"(네이버 리스트에는 작성자가 없습니다)")
+
+    if "target_price" not in rep.columns:
+        rep["target_price"] = np.nan
+    rep["target_price"] = pd.to_numeric(rep["target_price"], errors="coerce")
+    if "tp_src" not in rep.columns:
+        rep["tp_src"] = np.where(rep["target_price"].notna(), "리스트", "")
+    tfill = rep["target_price"].isna() & rep["pdf_tp"].notna()
+    rep.loc[tfill, "target_price"] = rep.loc[tfill, "pdf_tp"]
+    rep.loc[tfill, "tp_src"] = "PDF"
+    if tfill.any():
+        CON.ok(f"PDF 표지에서 목표주가 {int(tfill.sum()):,}건 보강 — "
+               f"네이버 리스트에는 목표가 칸이 없어, 이것이 2018년 이후 TP12M 트랙의 "
+               f"유일한 공급원입니다(지난 실행에서 이 구간의 목표가 보유율은 0% 였습니다)")
     return rep
 
 
@@ -4654,13 +5165,17 @@ def _dart_filing_dates(start: str, end: str) -> pd.DataFrame:
         for p in pd.period_range(ts(start), ts(end), freq="M"):
             if str(p) in have and p < pd.Timestamp.today().to_period("M") - 1:
                 continue
-            if DEADLINE.over("DART 접수일 수집"):
+            if BUDGET.over("DART 접수일 수집"):
                 break
             page, month_rows, month_complete = 1, [], False
-            while QUOTA.alive("dart") and not DEADLINE.over("DART 접수일 수집"):
+            while QUOTA.alive("dart") and not BUDGET.over("DART 접수일 수집"):
                 js = _dart_json("list.json", bgn_de=f"{p.start_time:%Y%m%d}",
                                 end_de=f"{p.end_time:%Y%m%d}", pblntf_ty="A",
                                 page_no=str(page), page_count="100")
+                if js is None:
+                    # ★ 수신 실패를 '마지막 페이지'로 오인하면(빈 리스트 → len<100 →
+                    #   month_complete=True) 부분 달이 완료로 캐시에 봉인된다.
+                    break
                 lst = (js or {}).get("list") or []
                 for it in lst:
                     nm = str(it.get("report_nm", ""))
@@ -4726,28 +5241,220 @@ def _naver_annual_eps(code: str) -> Optional[pd.DataFrame]:
         return None
 
 
+FUND_TABLE = "krx_fundamental_me"     # 공용 인덱스 — 월말 전종목 투자지표(EPS/BPS/PER/PBR)
+
+
+def _fund_xsec_pykrx(day: pd.Timestamp) -> Optional[pd.DataFrame]:
+    """그 날짜의 **전 종목** 투자지표를 한 번의 호출로. (EPS·BPS·PER·PBR)"""
+    if pykrx_stock is None:
+        return None
+    d8 = f"{day:%Y%m%d}"
+    for fname in ("get_market_fundamental", "get_market_fundamental_by_ticker"):
+        fn = getattr(pykrx_stock, fname, None)
+        if fn is None:
+            continue
+        d = _pykrx_call(fn, d8, market="ALL")
+        if d is None or not len(d):
+            continue
+        d = d.reset_index()
+        ren = {}
+        for c in d.columns:
+            cs = str(c).strip()
+            if cs in ("티커", "ticker", "index", "종목코드"):
+                ren[c] = "code"
+            elif cs.upper() == "EPS":
+                ren[c] = "eps"
+            elif cs.upper() == "BPS":
+                ren[c] = "bps"
+        d = d.rename(columns=ren)
+        if "code" not in d.columns or "eps" not in d.columns:
+            continue
+        d["code"] = d["code"].map(code6)
+        d = d.dropna(subset=["code"])
+        if not len(d):
+            continue
+        out = d[["code", "eps"]].copy()
+        out["eps"] = pd.to_numeric(out["eps"], errors="coerce")
+        out.insert(0, "date", pd.Timestamp(day).normalize())
+        return out
+    return None
+
+
+def collect_krx_fundamental(dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
+    """월말 전종목 EPS 패널 — 캐시 우선, 부족한 날짜만 신규 수집.
+
+    ★ 왜 이걸 새로 만드는가. 지난 실행에서 DART 가 네트워크 장애로 끊기자 실적이
+      **0건**이 되었고, 그 결과 EPS 트랙의 정확도 사건(§7~§10)이 통째로 사라진 채
+      점수가 계산됐다. 단일 소스에 실적 전체를 걸어 둔 설계 자체가 원인이다.
+      KRX 투자지표는 **날짜 단면 1콜로 전 종목 EPS**를 준다 — 이 파일이 이미 쓰고 있는
+      가격 단면과 완전히 같은 방식이라 구조를 늘리지 않고, 월말 120개 날짜면 10년이
+      덮인다(초당 1.5회로 약 80초). 생존자편향도 같은 이유로 구조적으로 없다.
+    """
+    dates = sorted({pd.Timestamp(d).normalize() for d in dates})
+    cached = DEPOT.table_load(FUND_TABLE,
+                              foreign_patterns=["krx_fundamental", "fundamental_daily"],
+                              need_cols=["date", "code", "eps"])
+    df = pd.DataFrame(columns=["date", "code", "eps"])
+    have: set = set()
+    if cached is not None and len(cached):
+        cached["date"] = ts_col(cached["date"])
+        cached["code"] = cached["code"].astype(str).str.zfill(6)
+        cached["eps"] = pd.to_numeric(cached["eps"], errors="coerce")
+        df = cached[["date", "code", "eps"]].dropna(subset=["date"])
+        have = set(df["date"].unique())
+    todo = [d for d in dates if d not in have]
+    if not todo or RUN_MODE == "CACHED" or pykrx_stock is None:
+        if todo and pykrx_stock is None:
+            CON.warn("pykrx 미설치 — KRX 투자지표(전종목 EPS) 소스를 쓸 수 없습니다")
+        CON.say(f"KRX 투자지표: 캐시 {len(have)}일 · 신규 0일")
+        return df
+    CON.say(f"KRX 투자지표(전종목 EPS) 수집: 신규 {len(todo)}일 "
+            f"/ 캐시 {len(dates)-len(todo)}일 — 하루당 1콜, 전 종목 동시")
+
+    def _one(d):
+        if BUDGET.over("KRX 투자지표"):
+            return None
+        return _fund_xsec_pykrx(d)
+
+    got, CH = [], 40
+    for i in range(0, len(todo), CH):
+        if BUDGET.over("KRX 투자지표"):
+            CON.warn(f"시간예산으로 KRX 투자지표 수집 중단 — {len(got)}일까지 저장합니다")
+            break
+        part = [g for g in pmap(_one, todo[i:i + CH], workers=XSEC_WORKERS,
+                                label="KRX지표") if g is not None and len(g)]
+        got.extend(part)
+        CON.say(f"  투자지표 {min(i+CH, len(todo))}/{len(todo)}일")
+    if got:
+        df = (pd.concat([df] + got, ignore_index=True)
+                .drop_duplicates(["date", "code"], keep="last"))
+        DEPOT.table_save(FUND_TABLE, df, scope="공용", domain="market",
+                         source="pykrx_market_fundamental",
+                         note="월말 전종목 투자지표 · 공용(어느 전략이든 재사용)")
+    return df
+
+
+def actuals_from_krx_fundamental(fund: pd.DataFrame) -> pd.DataFrame:
+    """KRX 공표 EPS 의 **계단 변화**에서 (회계연도, 실적 EPS, 공표일)을 복원한다.
+
+    KRX 의 EPS 는 최근 결산 실적 기준이라 1년에 한 번, 사업보고서가 반영되는 시점
+    (통상 4월 초)에 값이 바뀐다. 따라서 '값이 바뀐 첫 관측일' = 그 실적이 시장에
+    공표된 날이다. 이것은 DART 접수일보다 **늦거나 같으므로** 미래누수가 구조적으로
+    불가능하다(보수적 방향의 오차만 남는다).
+
+    한계는 정직하게 적는다: KRX 는 적자기업의 EPS 를 0 으로 표기한다. 0 을 실적으로
+    받으면 적자기업의 정확도 사건이 통째로 왜곡되므로 **결측으로 처리**한다.
+    그 구멍은 DART(당기순이익, 음수 포함)가 메운다 — 그래서 DART 를 버리지 않고
+    우선순위만 바꾼다.
+    """
+    cols = ["stock_id", "fiscal_period", "forecast_metric", "actual_value",
+            "actual_announcement_date"]
+    if fund is None or not len(fund):
+        return pd.DataFrame(columns=cols)
+    f = fund.dropna(subset=["date", "code"]).copy()
+    f["eps"] = pd.to_numeric(f["eps"], errors="coerce")
+    f = f[f["eps"].notna() & (f["eps"] != 0)]          # 0 = 적자 표기 → 결측 처리
+    if not len(f):
+        return pd.DataFrame(columns=cols)
+    f = f.sort_values(["code", "date"], kind="mergesort")
+    prev = f.groupby("code", sort=False)["eps"].shift(1)
+    # 값이 바뀐 지점(그리고 각 종목의 첫 관측일)이 '새 실적이 보이기 시작한 날'
+    f["is_start"] = prev.isna() | (prev != f["eps"])
+    st = f[f["is_start"]].copy()
+    # 회계연도 규칙: 4월 이후에 보이기 시작했으면 직전 사업연도, 그 전이면 그 전년도
+    mo, yr = st["date"].dt.month, st["date"].dt.year
+    st["fy"] = np.where(mo >= 4, yr - 1, yr - 2)
+    # (종목, 회계연도)당 **가장 이른** 시작일만 채택 — 분할·증자로 인한 연중 EPS 변동이
+    # 가짜 공표일로 잡히는 것을 막는다(같은 FY 에 매핑되어 첫 건에 흡수된다)
+    st = (st.sort_values(["code", "fy", "date"], kind="mergesort")
+            .drop_duplicates(["code", "fy"], keep="first"))
+    out = pd.DataFrame({
+        "stock_id": st["code"].to_numpy(),
+        "fiscal_period": [f"{int(y)}FY" for y in st["fy"]],
+        "forecast_metric": "EPS",
+        "actual_value": st["eps"].astype(float).to_numpy(),
+        "actual_announcement_date": st["date"].to_numpy(),
+    })
+    return out[cols]
+
+
+def _naver_actuals_bulk(codes: Sequence[str], label: str = "네이버실적") -> pd.DataFrame:
+    """네이버 요약표 EPS — 최후 폴백. 종목당 1페이지라 비싸므로 예산을 지킨다."""
+    cols = ["stock_id", "fiscal_period", "forecast_metric", "actual_value",
+            "actual_announcement_date"]
+
+    def _one(c):
+        if BUDGET.over("네이버 실적"):
+            return None
+        return _naver_annual_eps(c)
+
+    got = [g for g in pmap(_one, list(codes), workers=min(6, N_IO_THREADS), label=label)
+           if g is not None and len(g)]
+    return pd.concat(got, ignore_index=True) if got else pd.DataFrame(columns=cols)
+
+
 def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
                        start: str, end: str) -> pd.DataFrame:
     """actuals: stock_id·fiscal_period(YYYYFY)·EPS·발표일.
-    DART: 연결우선 당기순이익 ÷ FY말 상장주식수, 발표일 = 사업보고서 접수일(PIT 정확).
-    폴백: 네이버 요약표 EPS + 보수적 발표일(FY말+90일)."""
+
+    ★ 소스 우선순위(뒤에 오는 것이 앞을 덮어쓴다 — 정밀한 쪽이 이긴다):
+        ① KRX 투자지표 단면 — 전 종목·저비용·PIT 보수적. **폭**을 담당한다.
+        ② 네이버 요약표     — ①②가 모자랄 때만. 발표일이 거칠다(FY말+90일 가정).
+        ③ DART 정밀        — 당기순이익÷주식수, 발표일=사업보고서 접수일. **정확도**를 담당.
+
+    ★ 지난 실행의 치명적 결함을 여기서 끊는다. 폴백이 `elif not DART_API_KEY` 에 묶여
+      있어서, **키는 있는데 DART 가 죽은** 경우(네트워크 단절 → 회로차단)에는 폴백이
+      아예 발동하지 않았다. 그 결과 실적 0건 → 정확도 사건 0건 → 정확도 성분이 빠진
+      점수가 '정밀판(EPS)'이라는 이름으로 인쇄됐다.
+      → 이제 폴백은 **키의 유무가 아니라 결과의 양**으로 결정한다.
+    """
+    cols = ["stock_id", "fiscal_period", "forecast_metric", "actual_value",
+            "actual_announcement_date"]
     cached = DEPOT.table_load("scg_actual_eps",
                               need_cols=["stock_id", "fiscal_period", "actual_value",
                                          "actual_announcement_date"])
     if cached is not None and len(cached) > 500 and RUN_MODE == "CACHED":
         cached["actual_announcement_date"] = ts_col(cached["actual_announcement_date"])
+        CON.say(f"실적 캐시 {len(cached):,}건을 그대로 사용합니다(CACHED 모드)")
         return cached
     y0, y1 = ts(start).year - 2, ts(end).year
     out_frames: List[pd.DataFrame] = []
+    prov: List[List[str]] = []
     if cached is not None and len(cached):
         cached["actual_announcement_date"] = ts_col(cached["actual_announcement_date"])
-        out_frames.append(cached)
-    have_keys = set()
-    if out_frames:
-        have_keys = set(zip(out_frames[0]["stock_id"], out_frames[0]["fiscal_period"]))
+        out_frames.append(cached[[c for c in cols if c in cached.columns]])
+        prov.append(["캐시(이전 실행·타 전략)", f"{len(cached):,}건", "-"])
 
-    cm = _dart_corpmap(sec)
-    if len(cm) and QUOTA.alive("dart") and RUN_MODE != "CACHED":
+    def _n_have() -> int:
+        return int(sum(len(f) for f in out_frames))
+
+    # ── ① KRX 투자지표 단면 ────────────────────────────────────────────────
+    try:
+        me_dates = []
+        if xsec is not None and len(xsec):
+            xd = pd.DataFrame({"date": ts_col(xsec["date"]).dropna().unique()})
+            xd["ym"] = xd["date"].dt.to_period("M")
+            me_dates = sorted(xd.sort_values("date").drop_duplicates("ym", keep="last")
+                              ["date"].tolist())
+        if me_dates:
+            fund = collect_krx_fundamental(me_dates)
+            kf = actuals_from_krx_fundamental(fund)
+            kf = kf[(kf["fiscal_period"].str[:4].astype(int) >= y0)
+                    & (kf["fiscal_period"].str[:4].astype(int) <= y1)]
+            if len(kf):
+                out_frames.append(kf)
+                CON.ok(f"KRX 투자지표 실적 EPS {len(kf):,}건 "
+                       f"(발표일 = 공표 반영일 · 적자기업은 결측 처리)")
+            prov.append(["KRX 투자지표 단면", f"{len(kf):,}건",
+                         "전종목·저비용·PIT 보수적(적자 제외)"])
+    except Exception as e:
+        CON.warn(f"KRX 투자지표 경로 실패({type(e).__name__}: {e}) — 다음 소스로 진행합니다")
+        prov.append(["KRX 투자지표 단면", "0건", f"실패 {type(e).__name__}"])
+
+    # ── ③ DART 정밀 (마지막에 붙여 우선권을 갖는다) ────────────────────────
+    dart_rows = pd.DataFrame(columns=cols)
+    cm = _dart_corpmap(sec) if DART_API_KEY else pd.DataFrame(columns=["corp_code", "code"])
+    if len(cm) and QUOTA.alive("dart") and RUN_MODE != "CACHED" and not BUDGET.over("DART"):
         code2corp = cm.set_index("code")["corp_code"].to_dict()
         codes = [c for c in sec["code"] if c in code2corp]
         # 상장주식수는 단면에 이미 들어 있다 — 별도 조회 없이 (연도, 종목) 로 접는다.
@@ -4768,14 +5475,21 @@ def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
         jobs = [(y, corps[i:i + B], codes[i:i + B]) for y in years
                 for i in range(0, len(corps), B)]
         CON.say(f"DART 당기순이익 배치 수집: {len(jobs)}회 예정(연도 {y0}~{y1}, 100사/회)")
+        n_null = 0
         for y, cbatch, kbatch in jobs:
             if not QUOTA.alive("dart"):
                 CON.warn("DART 한도 신호로 잔여 배치를 중단 — 받은 만큼으로 진행합니다")
                 break
-            if DEADLINE.over("DART 실적 수집"):
+            if CIRCUIT.blocked("dart"):
+                CON.warn(f"DART 회로 차단으로 잔여 배치를 중단 — {len(ni_rows):,}행까지 "
+                         f"확보. 실적은 KRX/네이버 소스가 메웁니다.")
+                break
+            if BUDGET.over("DART 실적 수집"):
                 break
             js = _dart_json("fnlttMultiAcnt.json", corp_code=",".join(cbatch),
                             bsns_year=str(y), reprt_code="11011")
+            if js is None:
+                n_null += 1
             for it in (js or {}).get("list") or []:
                 if "당기순이익" not in str(it.get("account_nm", "")):
                     continue
@@ -4787,6 +5501,9 @@ def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
                 ni_rows.append(dict(code=c, year=y, ni=amt,
                                     fs=str(it.get("fs_div", "")),
                                     rcept=str(it.get("rcept_no", ""))[:8]))
+        if n_null and not ni_rows:
+            CON.warn(f"DART 응답이 {n_null}회 연속 비었습니다 — 키·네트워크·회로 상태를 "
+                     f"확인하세요. 실적은 다른 소스로 계속 채웁니다(중단하지 않습니다).")
         if ni_rows:
             ni = pd.DataFrame(ni_rows).dropna(subset=["code"])
             ni["fs_rank"] = (ni["fs"] == "CFS").astype(int)      # 연결(CFS) 우선
@@ -4815,39 +5532,67 @@ def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
                 rows.append(dict(stock_id=r["code"], fiscal_period=f"{y}FY",
                                  forecast_metric="EPS", actual_value=float(r["ni"]) / float(sh),
                                  actual_announcement_date=ann))
-            new = pd.DataFrame(rows)
-            new = new[~new.apply(lambda r: (r["stock_id"], r["fiscal_period"]) in have_keys,
-                                 axis=1)] if have_keys and len(new) else new
+            dart_rows = pd.DataFrame(rows, columns=cols) if rows else dart_rows
             if n_no_shares:
                 CON.say(f"주식수 스냅샷 부재로 제외된 실적 {n_no_shares:,}건 "
                         f"(초기 연도 커버리지 한계 — 표에 정직하게 남깁니다)")
-            if len(new):
-                out_frames.append(new)
-                CON.ok(f"DART 실적 EPS {len(new):,}건 (발표일=사업보고서 접수일)")
+            if len(dart_rows):
+                CON.ok(f"DART 실적 EPS {len(dart_rows):,}건 (발표일=사업보고서 접수일)")
     elif not DART_API_KEY:
-        if out_frames and len(out_frames[0]) > 500:
-            CON.say("DART 키 없음 — 캐시된 실적을 그대로 사용합니다(재수집 생략)")
-        else:
-            CON.warn("DART 키 없음 — EPS 실적은 네이버 요약표 폴백(발표일 보수적 FY말+90일). "
-                     "정확도 점수의 시차 정밀도가 낮아집니다.")
+        CON.say("DART 키 없음 — KRX 투자지표를 주 실적원으로 씁니다"
+                "(적자기업 EPS 는 결측이 되며, 그만큼 정확도 사건이 줄어듭니다)")
+    prov.append(["DART 정밀(당기순이익÷주식수)", f"{len(dart_rows):,}건",
+                 "발표일=접수일 · 적자 포함" if len(dart_rows) else
+                 ("키 미입력" if not DART_API_KEY else "수신 실패/차단")])
 
-            def _one_eps(c):
-                if DEADLINE.over("네이버 실적"):
-                    return None
-                return _naver_annual_eps(c)
+    # ── ② 네이버 폴백 — **키 유무가 아니라 결과의 양**으로 발동한다 ────────
+    n_before_nv = _n_have() + len(dart_rows)
+    if n_before_nv < MIN_ACTUALS_FOR_EPS and RUN_MODE != "CACHED" and not BUDGET.over("네이버 실적"):
+        CON.warn(f"확보된 실적이 {n_before_nv:,}건으로 하한({MIN_ACTUALS_FOR_EPS:,}건)에 "
+                 f"못 미칩니다 — 네이버 요약표 폴백을 발동합니다. "
+                 f"(정확도 사건이 0 이면 EPS 트랙은 합의된 산식이 아니게 됩니다)")
+        # 커버리지가 큰 종목부터 — 중간에 멈춰도 표본이 쓸모 있게 남는다
+        order = sec["code"].tolist()
+        if xsec is not None and len(xsec) and "mktcap" in xsec.columns:
+            big = (xsec.dropna(subset=["mktcap"]).groupby("code")["mktcap"].median()
+                     .sort_values(ascending=False).index.tolist())
+            order = big + [c for c in order if c not in set(big)]
+        nv = _naver_actuals_bulk(order[:2000])
+        if len(nv):
+            out_frames.append(nv)
+            CON.ok(f"네이버 폴백 실적 EPS {len(nv):,}건 (발표일 보수적: FY말+90일)")
+        prov.append(["네이버 요약표 폴백", f"{len(nv):,}건", "발표일 거칢(FY말+90일)"])
+    else:
+        prov.append(["네이버 요약표 폴백", "0건",
+                     "미발동(다른 소스로 충분)" if n_before_nv >= MIN_ACTUALS_FOR_EPS
+                     else "미발동(시간예산/CACHED)"])
 
-            got = pmap(_one_eps, list(sec["code"])[:1500],
-                       workers=min(6, N_IO_THREADS), label="네이버실적")
-            got = [g for g in got if g is not None]
-            if got:
-                out_frames.append(pd.concat(got, ignore_index=True))
+    if len(dart_rows):
+        out_frames.append(dart_rows)          # 마지막 = 최우선(뒤가 앞을 덮는다)
+
+    CON.grid(prov, ["실적 소스", "확보", "성격"], ["l", "r", "l"],
+             title="실적(actual) 조달 원장 — 단일 소스 의존을 끊었습니다")
+
     if not out_frames:
-        return pd.DataFrame(columns=["stock_id", "fiscal_period", "forecast_metric",
-                                     "actual_value", "actual_announcement_date"])
-    out = (pd.concat(out_frames, ignore_index=True)
-             .drop_duplicates(["stock_id", "fiscal_period", "forecast_metric"], keep="last"))
+        CON.err("실적(actual)이 **0건**입니다. EPS 트랙의 정확도 사건(§7~§10)이 "
+                "성립하지 않으므로, 이대로 계산하면 품질승수(§20-22)가 리더십 단독으로 "
+                "축약되어 **합의된 SCG 산식과 다른 지표**가 됩니다. "
+                "S6 입력 게이트가 이 트랙에 낙인을 찍고, 성과표는 '참고'로 강등됩니다.")
+        return pd.DataFrame(columns=cols)
+    out = pd.concat([f[[c for c in cols if c in f.columns]] for f in out_frames],
+                    ignore_index=True)
+    out = out.dropna(subset=["stock_id", "fiscal_period", "actual_value"])
+    out["actual_announcement_date"] = ts_col(out["actual_announcement_date"])
+    out = out.drop_duplicates(["stock_id", "fiscal_period", "forecast_metric"], keep="last")
+    if len(out) < MIN_ACTUALS_FOR_EPS:
+        CON.warn(f"실적 {len(out):,}건 — 하한 {MIN_ACTUALS_FOR_EPS:,}건 미달. "
+                 f"EPS 트랙의 정확도 성분이 얕습니다(결과는 '참고'로 표시됩니다).")
+    else:
+        CON.ok(f"실적(actual) 총 {len(out):,}건 확보 "
+               f"(종목 {out['stock_id'].nunique():,} · 회계연도 "
+               f"{out['fiscal_period'].nunique()}개)")
     DEPOT.table_save("scg_actual_eps", out, scope="공용", domain="fundamental",
-                     source="dart+naver")
+                     source="krx_fundamental+dart+naver")
     return out
 
 
@@ -4923,9 +5668,13 @@ def build_ledger(rep: pd.DataFrame, sec: pd.DataFrame
     if "ruid" not in rep.columns:
         rep["ruid"] = [h1(s, r) for s, r in zip(rep["source"], rep["rid"])]
     # NaN 문자열화 사고 방지 — float NaN 이 'nan' 이름의 유령 애널리스트가 되지 않게
-    for c in ("analyst", "title", "opinion", "broker", "stock_name", "pdf_url"):
+    for c in ("analyst", "title", "opinion", "broker", "stock_name", "pdf_url",
+              "analyst_src", "tp_src"):
         if c in rep.columns:
             rep[c] = rep[c].fillna("").astype(str).replace({"nan": "", "None": ""})
+    for c in ("analyst_src", "tp_src"):          # 상류가 안 붙였어도 모양은 보장한다
+        if c not in rep.columns:
+            rep[c] = ""
     bk = rep["broker"].map(broker_canon)
     rep["broker_id"] = [b[0] for b in bk]
     rep["broker_name"] = [b[1] for b in bk]
@@ -4951,6 +5700,12 @@ def build_ledger(rep: pd.DataFrame, sec: pd.DataFrame
            "broker_id": "first", "broker_name": "first",
            "analyst": lambda s: max(s.fillna("").astype(str), key=len),
            "target_price": "max", "opinion": "first", "pdf_url": "first",
+           # ★ 출처는 '이 병합 보고서의 정보에 PDF 추출분이 포함되는가' 로 읽는다.
+           #   다중소스 병합에서 어느 한 쪽이라도 PDF 에서 왔으면 PDF 기여로 계수한다.
+           "analyst_src": lambda s: "PDF" if "PDF" in set(s) else
+                                    ("리스트" if "리스트" in set(s) else ""),
+           "tp_src": lambda s: "PDF" if "PDF" in set(s) else
+                               ("리스트" if "리스트" in set(s) else ""),
            "eps_json": lambda s: max((str(x) for x in s
                                       if pd.notna(x) and str(x) not in
                                       ("", "{}", "None", "nan")), key=len, default=None)}
@@ -4970,7 +5725,9 @@ def build_ledger(rep: pd.DataFrame, sec: pd.DataFrame
                               name=nm, role="주저자" if i == 0 else "공저자",
                               analyst_id=h1("an", r.broker_id, nm)[:14],
                               target_price=r.target_price,
-                              link_src="리스트" if getattr(r, "analyst", "") else "PDF"))
+                              # ★ 사후 추정 금지. _attach_pdf_columns 가 **채우는 순간에**
+                              #   남긴 기록을 그대로 쓴다(지난 실행이 항상 0% 를 찍던 자리).
+                              link_src=(getattr(r, "analyst_src", "") or "리스트")))
     L = pd.DataFrame(links) if links else pd.DataFrame(
         columns=["ruid", "stock_code", "date", "broker_id", "broker_name", "name",
                  "role", "analyst_id", "target_price", "link_src"])
@@ -5015,10 +5772,27 @@ def audit_ledger(R: pd.DataFrame, A: pd.DataFrame, L: pd.DataFrame):
     src_rows = [[s, f"{n:,}"] for s, n in R["source"].value_counts().items()]
     CON.grid(src_rows, ["소스(병합 후)", "건수"], ["l", "r"],
              title="원장 연결 감사 ② — 다중소스 병합 상태 ('한경+네이버' = 양쪽에서 수집되어 1건으로 병합)")
+
+    # ★ 목표가가 **어디서** 왔는지를 연도별로 본다. 지난 실행에서 2018~2025 목표가
+    #   보유율이 0% 였고, 그 사실이 TP12M 트랙을 16개월짜리로 만들었다. 그런데 그때의
+    #   감사표는 '보유율'만 보여줘서 **왜** 0인지(=네이버에는 목표가 칸이 없다)를
+    #   읽어낼 수 없었다. 공급원을 나눠 찍으면 원인이 표에서 바로 드러난다.
+    if "tp_src" in R.columns:
+        tp_rows = []
+        for y, g in R.groupby("y"):
+            has = g["target_price"].notna()
+            n_l = int((has & g["tp_src"].eq("리스트")).sum())
+            n_p = int((has & g["tp_src"].eq("PDF")).sum())
+            tp_rows.append([int(y), f"{len(g):,}", f"{int(has.sum()):,}",
+                            f"{has.mean()*100:.0f}%", f"{n_l:,}", f"{n_p:,}"])
+        CON.grid(tp_rows, ["연도", "보고서", "목표가 보유", "보유율",
+                           "리스트(한경)", "PDF 표지"], ["r"] * 6,
+                 title="원장 연결 감사 ②-b — 목표주가 공급원 (TP12M 트랙의 유효구간을 결정합니다)")
     if len(A):
         amb = int(A["name_ambiguous"].sum())
         CON.grid([[f"{len(A):,}", f"{A['n_reports'].median():.0f}",
-                   f"{amb:,}", f"{L['link_src'].eq('PDF').mean()*100 if len(L) else 0:.0f}%"]],
+                   f"{amb:,}",
+                   f"{L['link_src'].eq('PDF').mean()*100 if len(L) else 0:.0f}%"]],
                  ["식별 애널리스트", "인당 보고서(중앙값)", "동명이인(타사)", "PDF연결 비중"],
                  ["r"] * 4, title="원장 연결 감사 ③ — 애널리스트 실체")
         CON.say("한계 명시: analyst_id 는 (증권사,이름) 단위 — 이직 시 새 실체가 됩니다. "
@@ -5041,6 +5815,7 @@ def build_forecasts(R: pd.DataFrame, L: pd.DataFrame) -> pd.DataFrame:
     if not len(R) or not len(L):
         return pd.DataFrame(columns=FC_KEY + ["broker_id", "report_id", "report_date",
                                               "forecast_value"])
+    _n_badjson = [0]                 # 조용한 소실 방지 — 파싱 실패를 세어 보고한다
     lead = L[L["role"] == "주저자"].drop_duplicates("ruid")
     # broker_id 는 원장(R)에 이미 있으므로 링크에서는 analyst_id 만 가져온다
     # (양쪽에서 겹쳐 오면 _x/_y 로 갈라져 하류가 조용히 깨진다)
@@ -5061,6 +5836,7 @@ def build_forecasts(R: pd.DataFrame, L: pd.DataFrame) -> pd.DataFrame:
                 d = json.loads(ej)
             except Exception:
                 d = {}
+                _n_badjson[0] += 1
             for fp, v in d.items():
                 try:
                     v = float(v)
@@ -5076,6 +5852,9 @@ def build_forecasts(R: pd.DataFrame, L: pd.DataFrame) -> pd.DataFrame:
         fc = (fc.sort_values("report_date")
                 .drop_duplicates(FC_KEY + ["report_date"], keep="last")
                 .reset_index(drop=True))
+    if _n_badjson[0]:
+        CON.warn(f"eps_json 파싱 실패 {_n_badjson[0]:,}건 — 해당 보고서의 EPS 전망이 "
+                 f"통째로 누락됩니다(PDF 추출 산출물의 형식을 확인하세요)")
     CON.say(f"예측 테이블: {len(fc):,}행 "
             f"(EPS {int((fc['forecast_metric']=='EPS').sum()) if len(fc) else 0:,} / "
             f"TP12M {int((fc['forecast_metric']=='TP12M').sum()) if len(fc) else 0:,})")
@@ -5198,13 +5977,21 @@ def coverage_verdict(fc_all: pd.DataFrame, rep: pd.DataFrame,
         ex0 = DEPOT.table_load("scg_pdf_extract", need_cols=["ruid"])
         n_done = int(len(ex0)) if ex0 is not None else 0
     pct = n_done / max(n_tot, 1) * 100
+    # ★ 기존 추정은 ⓐ 다운로드 QPS 만 보고(파싱이 병목이면 틀리고) ⓑ 수집예산
+    #   전부를 PDF 에 쓴다고 가정했다. 실제로는 PDF 단계 몫(가중치 52%)에서
+    #   백테스트 유보분을 뺀 만큼만 쓴다 — 그래서 '재실행 N회'가 늘 낙관적이었다.
     rate = float(THROTTLE.qps("naver_pdf"))
     left_h = max(0, n_tot - n_done) / max(rate, 0.1) / 3600
+    _pdf_share = float(StageBudget.W.get("S4c", 0.5))
+    _per_run_h = max(0.1, (COLLECT_HOURS_BUDGET * _pdf_share)
+                     - BACKTEST_RESERVE_MIN / 60.0)
     pct = min(100.0, pct)          # 추출물이 원장보다 많을 수 있다(과거 수집분 포함)
     CON.grid(rows + [["PDF 원문", f"{min(n_done, n_tot):,}/{n_tot:,}", "-", f"{pct:.0f}%",
                       ("✔ 전수 완료" if pct >= 99 else
                        f"진행 중 — 남은 {n_tot-n_done:,}건에 약 {left_h:.1f}시간 "
-                       f"(재실행 {math.ceil(left_h/max(COLLECT_HOURS_BUDGET,0.1)):d}회)")]],
+                       f"(실행당 PDF 몫 {_per_run_h:.1f}h 기준 재실행 "
+                       f"{math.ceil(left_h/_per_run_h):d}회 · "
+                       f"RUN_MODE='COLLECT' 로 돌리면 더 빨리 수렴)")]],
              ["지표", "예측행수", "월중앙 2인이상 종목", "월 커버리지", "판정"],
              ["l", "r", "r", "r", "l"],
              title="신뢰도 판정 — 지금 결과를 믿어도 되는가 (§31 2인 · §36 십분위 60종목)")
@@ -5247,7 +6034,7 @@ class SCGParams:
     """공식 V1 파라미터(§42) — 단일 출처. 민감도는 variant() 사본으로만 돌린다.
     '가장 좋았던 조합을 사후 채택'하는 것은 §41이 금지한다: 공식값은 45/6/20 고정."""
     V1 = dict(
-        MIN_ANALYSTS=2, MAX_FORECAST_AGE_DAYS=180,
+        MIN_ANALYSTS=2, MAX_FORECAST_AGE_DAYS=180, PEER_WINDOW_DAYS=45,
         FORECAST_HALFLIFE_DAYS=45.0,
         ACCURACY_HISTORY_HALFLIFE_DAYS=365.0, LEAD_HISTORY_HALFLIFE_DAYS=365.0,
         K_ACC=6.0, K_LEAD=6.0, ACC_WEIGHT=0.60, LEAD_WEIGHT=0.40,
@@ -5374,33 +6161,71 @@ def active_at(fcv: pd.DataFrame, T: pd.Timestamp) -> pd.DataFrame:
 
 
 # ── Accuracy 사건 (§7~8) ────────────────────────────────────────────────────────────────────
-def acc_events_eps(fc: pd.DataFrame, actuals: pd.DataFrame, cfg: SCGParams) -> pd.DataFrame:
-    cols = ["analyst_id", "stock_id", "fiscal_period", "forecast_metric",
-            "completion_date", "acc_event", "n_forecasters"]
-    f = fc[fc["forecast_metric"] == "EPS"]
-    a = actuals[actuals["forecast_metric"] == "EPS"] if len(actuals) else actuals
-    if not len(f) or a is None or not len(a):
-        return pd.DataFrame(columns=cols)
-    m = f.merge(a[["stock_id", "fiscal_period", "forecast_metric", "actual_value",
-                   "actual_announcement_date"]], on=CS_KEY, how="inner")
-    age = (m["actual_announcement_date"] - m["report_date"]).dt.days
-    m = m[(age > 0) & (age <= cfg.MAX_FORECAST_AGE_DAYS)]      # 발표 '전' 최신 + stale 제외
-    if not len(m):
-        return pd.DataFrame(columns=cols)
-    m = (m.sort_values("report_date", kind="stable")
-          .drop_duplicates(FC_KEY, keep="last"))               # 애널리스트당 1표(§2.1)
-    return _acc_from_snapshot(m, cfg, cols)
+def _peer_window_stats(df: pd.DataFrame, key: str, dcol: str, vcol: str,
+                       days: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """같은 key 안에서 **±days 이내**에 발행된 동료들의 (평균, |값|중앙값, 인원수).
+
+    ★ 기존 구현은 주석에 '±45일'이라고 써 놓고 실제로는 **달력 월 버킷**으로 근사했다.
+      3월 31일과 4월 1일에 나온 목표가가 서로 남남이 되고, 3월 1일과 3월 31일은
+      한 묶음이 된다 — 같은 '동료'의 정의가 날짜에 따라 최대 30일씩 흔들렸다.
+      정확도 사건은 '동료 컨센서스 대비 누가 더 잘 맞혔는가'이므로, 동료 집합이
+      흔들리면 사건값 자체가 흔들린다. 진짜 슬라이딩 윈도우로 바로잡는다.
+    """
+    n = len(df)
+    C = np.full(n, np.nan)
+    M = np.full(n, np.nan)
+    N = np.zeros(n, dtype=int)
+    if not n:
+        return C, M, N
+    dvals = pd.to_datetime(df[dcol]).to_numpy("datetime64[D]").astype(np.int64)
+    vvals = pd.to_numeric(df[vcol], errors="coerce").to_numpy(float)
+    for _, pos in df.groupby(key, observed=True, sort=False).indices.items():
+        pos = np.asarray(pos)
+        t, v = dvals[pos], vvals[pos]
+        o = np.argsort(t, kind="mergesort")
+        t, v, pos = t[o], v[o], pos[o]
+        lo = np.searchsorted(t, t - days, side="left")
+        hi = np.searchsorted(t, t + days, side="right")
+        cs = np.concatenate([[0.0], np.nancumsum(v)])
+        av = np.abs(v)
+        for j in range(len(t)):
+            a, b = int(lo[j]), int(hi[j])
+            cnt = b - a
+            if cnt <= 0:
+                continue
+            C[pos[j]] = (cs[b] - cs[a]) / cnt
+            M[pos[j]] = float(np.median(av[a:b]))
+            N[pos[j]] = cnt
+    return C, M, N
 
 
-def _acc_from_snapshot(m: pd.DataFrame, cfg: SCGParams, cols: List[str]) -> pd.DataFrame:
-    g = m.groupby(CS_KEY + ["actual_announcement_date"], observed=True, sort=False)
-    m = m.assign(_C=g["forecast_value"].transform("mean"),
-                 _MAF=g["forecast_value"].transform(
-                     lambda s: float(np.median(np.abs(s)))),
-                 _N=g["forecast_value"].transform("size"))
-    # n=1 이면 C≡F_j 라 산식이 자연히 0 사건을 낳는다 — §10 의 λ=n/(n+K) 는 이 관측도
-    # 세므로, 억지로 걸러 n 을 줄이지 않는다(명세 산술 그대로).
+def _acc_finalize(m: pd.DataFrame, cfg: SCGParams, cols: List[str],
+                  tag: str) -> pd.DataFrame:
+    """정확도 사건의 **단일 산식 출처**(§8). EPS·TP12M 이 같은 코드를 쓴다.
+
+    ★ n=1 사건을 배제하는 이유 — 이것이 지난 실행에서 드러나지 않은 결함이다.
+      동료가 자기 혼자면 컨센서스 C 가 자기 전망 F_j 와 **정확히 같아지므로**
+          acc_event = log( (|C-A|+ε) / (|F_j-A|+ε) ) = log(1) = 0
+      이 항상 0이 된다. 정보량이 0인 관측인데, §10 의 수축 λ=n/(n+K) 에서는
+      **관측 1건으로 계상**된다. 결과적으로 혼자 커버하는 종목이 많은 애널리스트일수록
+      ⓐ λ 가 커져 신뢰도가 높다고 취급되고 ⓑ 평균은 0으로 희석된다 — 두 방향의
+      왜곡이 동시에 일어나 순위가 뒤틀린다.
+      명세 §31(MIN_ANALYSTS=2)은 애초에 '컨센서스가 성립하는 최소 단위'를 2로 못박고
+      있다. 1인 컨센서스는 컨센서스가 아니므로 사건이 아니다 — 이 배제는 산식에서
+      벗어나는 것이 아니라 §31 을 정확도 사건에도 적용해 **복원**하는 것이다.
+    """
     if not len(m):
+        return pd.DataFrame(columns=cols)
+    n_all = len(m)
+    m = m[m["_N"].to_numpy(float) >= float(cfg.MIN_ANALYSTS)]
+    n_drop = n_all - len(m)
+    if n_drop:
+        CON.say(f"[{tag}] 정확도 사건 중 단독 전망 {n_drop:,}건 제외 "
+                f"(§31 — 동료가 없으면 컨센서스 대비 오차가 구조적으로 0이라 "
+                f"정보가 없는데도 수축의 관측수만 늘립니다)")
+    if not len(m):
+        CON.warn(f"[{tag}] 2인 이상 동료가 있는 정확도 사건이 하나도 없습니다 "
+                 f"— 커버리지가 얇습니다")
         return pd.DataFrame(columns=cols)
     eps = cfg.EPSILON
     A = m["actual_value"].to_numpy(float)
@@ -5417,41 +6242,79 @@ def _acc_from_snapshot(m: pd.DataFrame, cfg: SCGParams, cols: List[str]) -> pd.D
     return out.reset_index(drop=True)
 
 
+def acc_events_eps(fc: pd.DataFrame, actuals: pd.DataFrame, cfg: SCGParams) -> pd.DataFrame:
+    cols = ["analyst_id", "stock_id", "fiscal_period", "forecast_metric",
+            "completion_date", "acc_event", "n_forecasters"]
+    f = fc[fc["forecast_metric"] == "EPS"]
+    a = actuals[actuals["forecast_metric"] == "EPS"] if (
+        actuals is not None and len(actuals)) else actuals
+    if not len(f):
+        CON.warn("[EPS] 예측 테이블에 EPS 행이 없습니다 — 정확도 사건 0건")
+        return pd.DataFrame(columns=cols)
+    if a is None or not len(a):
+        # ★ 조용히 빈 프레임을 돌려주던 자리. 이 침묵이 지난 실행에서 §7~§10 전체가
+        #   빠진 점수를 '정밀판(EPS)'으로 인쇄하게 만든 첫 단추였다.
+        CON.err("[EPS] 실적(actual)이 0건이라 정확도 사건을 만들 수 없습니다 — "
+                "S4d(실적 수집)의 결과를 확인하세요. 이 상태로 계산하면 품질승수가 "
+                "리더십 단독으로 축약되어 합의된 산식과 다른 지표가 됩니다.")
+        return pd.DataFrame(columns=cols)
+    m = f.merge(a[["stock_id", "fiscal_period", "forecast_metric", "actual_value",
+                   "actual_announcement_date"]], on=CS_KEY, how="inner")
+    if not len(m):
+        CON.warn("[EPS] 예측과 실적의 (종목·회계연도) 교집합이 비었습니다 — "
+                 "fiscal_period 라벨 형식(YYYYFY)을 확인하세요")
+        return pd.DataFrame(columns=cols)
+    age = (m["actual_announcement_date"] - m["report_date"]).dt.days
+    m = m[(age > 0) & (age <= cfg.MAX_FORECAST_AGE_DAYS)]      # 발표 '전' 최신 + stale 제외
+    if not len(m):
+        return pd.DataFrame(columns=cols)
+    m = (m.sort_values("report_date", kind="stable")
+          .drop_duplicates(FC_KEY, keep="last"))               # 애널리스트당 1표(§2.1)
+    g = m.groupby(CS_KEY + ["actual_announcement_date"], observed=True, sort=False)
+    m = m.assign(_C=g["forecast_value"].transform("mean"),
+                 _MAF=g["forecast_value"].transform(
+                     lambda s: float(np.median(np.abs(s)))),
+                 _N=g["forecast_value"].transform("size"))
+    return _acc_finalize(m, cfg, cols, "EPS")
+
+
+def _acc_from_snapshot(m: pd.DataFrame, cfg: SCGParams, cols: List[str]) -> pd.DataFrame:
+    """구버전 진입점 — 계약/리허설 호환용. 산식은 _acc_finalize 하나뿐이다."""
+    if not len(m):
+        return pd.DataFrame(columns=cols)
+    if "_N" not in m.columns:
+        g = m.groupby(CS_KEY + ["actual_announcement_date"], observed=True, sort=False)
+        m = m.assign(_C=g["forecast_value"].transform("mean"),
+                     _MAF=g["forecast_value"].transform(
+                         lambda s: float(np.median(np.abs(s)))),
+                     _N=g["forecast_value"].transform("size"))
+    return _acc_finalize(m, cfg, cols, "EPS")
+
+
 def acc_events_tp(fc: pd.DataFrame, tp_act: pd.DataFrame, cfg: SCGParams) -> pd.DataFrame:
     """TP12M 정확도: 만기(발행+252거래일)가 지난 목표가만, '당시 동료 컨센서스 대비'
     실제 주가를 누가 더 잘 맞혔는지. EPS 산식(§8)과 동일 구조 — 만기일이 완결일."""
     cols = ["analyst_id", "stock_id", "fiscal_period", "forecast_metric",
             "completion_date", "acc_event", "n_forecasters"]
     f = fc[fc["forecast_metric"] == "TP12M"]
-    if not len(f) or tp_act is None or not len(tp_act):
+    if not len(f):
+        CON.warn("[TP12M] 예측 테이블에 목표주가 행이 없습니다 — 정확도 사건 0건")
+        return pd.DataFrame(columns=cols)
+    if tp_act is None or not len(tp_act):
+        CON.warn("[TP12M] 만기가 도래한 목표가가 없습니다 — 정확도 사건 0건 "
+                 "(백테스트 종료일 기준 12개월이 지난 목표가만 사건이 됩니다)")
         return pd.DataFrame(columns=cols)
     m = f.merge(tp_act, on="report_id", how="inner")
     if not len(m):
         return pd.DataFrame(columns=cols)
-    # '같은 만기 무렵'의 동료 = 같은 종목에서 ±45일 내 발행된 목표가들 → 발행월 버킷으로 근사
-    m = m.assign(_bucket=m["report_date"].dt.to_period("M").astype(str))
-    g = m.groupby(["stock_id", "_bucket"], observed=True, sort=False)
-    m = m.assign(_C=g["forecast_value"].transform("mean"),
-                 _MAF=g["forecast_value"].transform(lambda s: float(np.median(np.abs(s)))),
-                 _N=g["forecast_value"].transform("size"),
+    # ★ 동료 = 같은 종목에서 **±45일 이내** 발행된 목표가(진짜 슬라이딩 윈도우)
+    C, MAF, N = _peer_window_stats(m, "stock_id", "report_date", "forecast_value",
+                                   int(cfg.PEER_WINDOW_DAYS))
+    m = m.assign(_C=C, _MAF=MAF, _N=N,
                  actual_value=m["actual_price"],
                  actual_announcement_date=m["matured_at"])
-    # EPS 쪽과 같은 이유로 n=1 사건도 유지(값은 자연히 0) — §10 관측수 산술 보존
-    if not len(m):
-        return pd.DataFrame(columns=cols)
-    eps = cfg.EPSILON
-    A = m["actual_value"].to_numpy(float)
-    Fj = m["forecast_value"].to_numpy(float)
-    C = m["_C"].to_numpy(float)
-    scale = np.maximum.reduce([np.abs(A), m["_MAF"].to_numpy(float),
-                               np.full(len(m), eps)])
-    ev = np.clip(np.log((np.abs(C - A) / scale + eps) / (np.abs(Fj - A) / scale + eps)),
-                 -cfg.ACC_EVENT_CLIP, cfg.ACC_EVENT_CLIP)
-    out = m[["analyst_id", "stock_id", "fiscal_period", "forecast_metric"]].copy()
-    out["completion_date"] = m["actual_announcement_date"].to_numpy()
-    out["acc_event"] = ev
-    out["n_forecasters"] = m["_N"].to_numpy()
-    return out.reset_index(drop=True)
+    m = m[np.isfinite(m["_C"].to_numpy(float))]
+    return _acc_finalize(m, cfg, cols, "TP12M")
 
 
 # ── Leadership 사건 (§11~16) ────────────────────────────────────────────────────────────────
@@ -5533,6 +6396,7 @@ class DecayBook:
 
     def __init__(self, ev: pd.DataFrame, col: str, halflife: float):
         self.by: Dict[Any, tuple] = {}
+        self.hl = float(halflife)
         if ev is None or not len(ev):
             return
         ev = ev.sort_values("completion_date", kind="mergesort")
@@ -5542,15 +6406,50 @@ class DecayBook:
             v = g[col].to_numpy(float)
             self.by[aid] = (t, np.cumsum(w * v), np.cumsum(w))
 
-    def at(self, aid, T_day: float) -> Tuple[float, int]:
+    def n_eff(self, aid, T_day: float) -> float:
+        """**감쇠 반영 유효 관측수** — 진단 전용.
+
+        §10 의 λ=n/(n+K) 는 명세 그대로 '원시 사건 수'를 쓴다(합의 산식을 바꾸지
+        않는다). 다만 그 결과로, 8년 전 사건만 20건 가진 애널리스트가 최근 사건
+        3건을 가진 애널리스트보다 높은 신뢰도를 받는다 — §19 의 최근성 취지와
+        어긋나는 지점이다. 바꾸는 대신 **보이게** 만든다: n_eff 가 n 보다 크게
+        작으면 그 점수는 과거 유물이다. (변형은 §41 민감도에서만 다룬다)
+        """
         rec = self.by.get(aid)
         if rec is None:
-            return np.nan, 0
+            return 0.0
+        t, cn, cd = rec
+        i = int(np.searchsorted(t, T_day, side="left"))
+        if i <= 0:
+            return 0.0
+        try:
+            return float(cd[i - 1] / np.power(2.0, T_day / float(self.hl)))
+        except Exception:
+            return float(i)
+
+    def at(self, aid, T_day: float) -> Tuple[float, int]:
+        r, n, _ = self.at3(aid, T_day)
+        return r, n
+
+    def at3(self, aid, T_day: float) -> Tuple[float, int, float]:
+        """(감쇠평균, 원시 관측수, 유효 관측수)를 **한 번의 searchsorted 로** 돌려준다.
+
+        ★ at() 과 n_eff() 를 따로 부르면 (애널리스트 5,000 × signal date 120 =)
+          60만 반복에서 searchsorted 가 2배로 돈다. 같은 값을 두 번 구하는 낭비다.
+        """
+        rec = self.by.get(aid)
+        if rec is None:
+            return np.nan, 0, 0.0
         t, cn, cd = rec
         i = int(np.searchsorted(t, T_day, side="left"))    # 완결일 < T 만(§16, §3)
         if i <= 0:
-            return np.nan, 0
-        return (cn[i - 1] / cd[i - 1] if cd[i - 1] > 0 else np.nan), i
+            return np.nan, 0, 0.0
+        r = (cn[i - 1] / cd[i - 1]) if cd[i - 1] > 0 else np.nan
+        try:
+            ne = float(cd[i - 1] / np.power(2.0, T_day / self.hl))
+        except Exception:
+            ne = float(i)
+        return r, i, ne
 
 
 def analyst_scores(signal_dates, acc_ev: pd.DataFrame, led_ev: pd.DataFrame,
@@ -5563,18 +6462,20 @@ def analyst_scores(signal_dates, acc_ev: pd.DataFrame, led_ev: pd.DataFrame,
     for T in signal_dates:
         Td = float(_daynum([T])[0])
         for aid in aids:
-            ar, an = A.at(aid, Td)
-            lr, ln = Ld.at(aid, Td)
+            ar, an, a_ne = A.at3(aid, Td)
+            lr, ln, l_ne = Ld.at3(aid, Td)
             al = an / (an + cfg.K_ACC) if an else 0.0          # §10 수축
             ll = ln / (ln + cfg.K_LEAD) if ln else 0.0         # §17
             a_star = al * ar if an else 0.0                    # prior=0
             l_star = ll * lr if ln else 0.0
             rows.append((pd.Timestamp(T), aid, ar if an else np.nan, an, al, a_star,
                          lr if ln else np.nan, ln, ll, l_star,
-                         cfg.ACC_WEIGHT * a_star + cfg.LEAD_WEIGHT * l_star))   # §18
+                         cfg.ACC_WEIGHT * a_star + cfg.LEAD_WEIGHT * l_star,
+                         a_ne, l_ne))                                          # §18
     return pd.DataFrame(rows, columns=[
         "signal_date", "analyst_id", "acc_raw", "acc_n", "acc_lambda", "acc_star",
-        "lead_raw", "lead_n", "lead_lambda", "lead_star", "quality_score_ls"])
+        "lead_raw", "lead_n", "lead_lambda", "lead_star", "quality_score_ls",
+        "acc_n_eff", "lead_n_eff"])
 
 
 # ── Smart Consensus (§19~23) ───────────────────────────────────────────────────────────────
@@ -5665,9 +6566,18 @@ def pick_primary_fp(cons: pd.DataFrame, actuals: pd.DataFrame, metric: str) -> p
             ann[(r.stock_id, r.fiscal_period)] = r.actual_announcement_date
     year = d["fiscal_period"].astype(str).str.extract(r"(20\d{2})", expand=False)
     d["_fy"] = pd.to_numeric(year, errors="coerce")
-    d = d[d["_fy"].notna()]
-    if not len(d):                      # 빈 프레임의 object dtype 에 .dt 를 쓰면 죽는다
-        return d.assign(primary=False)
+    # ★ 연도 라벨을 못 읽은 행은 **삭제하지 않고 primary=False 로 표시**한다.
+    #   삭제하면 진단표(§34.1 커버리지 분포)에서도 사라져, 얼마나 잃었는지조차
+    #   알 수 없게 된다 — 조용한 표본 축소는 그 자체가 사고다.
+    n_bad = int(d["_fy"].isna().sum())
+    if n_bad:
+        CON.warn(f"fiscal_period 에서 연도를 읽지 못한 예측 {n_bad:,}행 — "
+                 f"대표기간 후보에서 제외합니다(행은 보존, 관측 라벨: "
+                 f"{', '.join(map(str, d.loc[d['_fy'].isna(),'fiscal_period'].astype(str).unique()[:4]))})")
+    d_ok = d[d["_fy"].notna()].copy()
+    if not len(d_ok):                   # 빈 프레임의 object dtype 에 .dt 를 쓰면 죽는다
+        return d.drop(columns=["_fy"]).assign(primary=False)
+    d = d_ok
     d["signal_date"] = ts_col(d["signal_date"])
     T_year = d["signal_date"].dt.year
 
@@ -5736,6 +6646,12 @@ def scg_signals(cons: pd.DataFrame, signal_dates, cal: TradingCal,
                                           d["forecast_metric"]])
     p_scg = snap["scg_ls"].reindex(key_prev).to_numpy(float)
     p_c = snap["consensus_equal_weight"].reindex(key_prev).to_numpy(float)
+    # ★ t-20 시점의 상태도 검사한다. 현재 행의 status 만 보면, 20거래일 전에
+    #   애널리스트가 1명뿐이라 status=INSUFFICIENT_ANALYSTS 였던 종목의
+    #   '1인 컨센서스'가 BASE_REV(§29)의 기준선이 된다 — 컨센서스 수정폭을 재야 할
+    #   지표가 '한 사람이 처음 낸 숫자로부터의 거리'를 재게 된다.
+    p_ok = snap["status"].reindex(key_prev).to_numpy() == "OK"
+    p_c = np.where(p_ok, p_c, np.nan)
     d["scg_accel_20d"] = d["scg_ls"].to_numpy(float) - p_scg                # §25
     bden = np.maximum.reduce([np.abs(p_c),
                               (cfg.DENOM_FLOOR_RATIO * d["_mad"]).fillna(0).to_numpy(float),
@@ -5827,6 +6743,121 @@ def alphas_in_universe(sig: pd.DataFrame, members: pd.Series, cfg: SCGParams
     return d
 
 
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║ [게이트] 표본이 결론을 지탱하는가 — 숫자를 인쇄해도 되는지 판정하는 계층                    ║
+# ║                                                                                          ║
+# ║  ★ 이 계층이 없어서 지난 실행이 이런 결과를 내놓았다:                                      ║
+# ║      · TP12M 트랙의 유효구간은 **16개월**(2016-10~2018-01)이었는데 '10년 백테스트'의        ║
+# ║        연율 수익률·Sharpe·MDD 가 그대로 인쇄됐다. 2018·2022 두 번의 약세장이 표본에서       ║
+# ║        통째로 빠진 상태였다 — 즉 숫자의 크기뿐 아니라 **방향까지** 신뢰할 수 없었다.        ║
+# ║      · 시총하위1000 트랙은 **87행/18종목**(EPS 는 1행)이었는데도                            ║
+# ║        "질문3 SCG_LSA > SCG_LS ? YES" 라는 판정문까지 찍혔다.                              ║
+# ║      · 정작 같은 실행의 신뢰도 표에는 '✘ 표본 부족' 이 이미 찍혀 있었다.                    ║
+# ║        **판정해 놓고 그 판정을 쓰지 않은 것**이다.                                          ║
+# ║                                                                                          ║
+# ║  설계 원칙: 계산은 그대로 하고 **저장도 그대로 한다**(returns CSV 는 온전히 남는다).        ║
+# ║            막는 것은 오직 '근거 없는 결론의 인쇄'다. 데이터를 숨기는 게 아니라              ║
+# ║            정당화되지 않는 요약통계와 우열 판정을 막는다.                                    ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+def stat_gate(bt: dict) -> dict:
+    """백테스트 결과 하나에서 **어디까지 인쇄해도 되는가**를 판정한다.
+
+    반환 키:
+      months   유효 월수(L/S 수익률이 존재하는 달)
+      xs       월별 단면 종목수의 중앙값
+      ann      연율화·Sharpe·MDD 를 인쇄해도 되는가
+      verdict  전략 간 우열 판정문을 인쇄해도 되는가
+      ic       IC 평균·t값을 인쇄해도 되는가
+      grade    '신뢰' | '참고' | '불가'
+      why      막힌 이유(사람이 읽는 한 문장)
+    """
+    base = dict(months=0, xs=0.0, ann=False, verdict=False, ic=False,
+                grade="불가", why="백테스트 결과가 없습니다")
+    if not bt or bt.get("empty", True):
+        return base
+    R = bt.get("returns")
+    if R is None or not len(R):
+        return base
+    n_m = int(np.isfinite(R["ls"].to_numpy(float)).sum())
+    xs = float(pd.to_numeric(R["n_xs"], errors="coerce").median()) if "n_xs" in R else 0.0
+    if not np.isfinite(xs):
+        xs = 0.0
+    ic_n = 0
+    try:
+        ic_n = int((bt.get("ic") or {}).get(20, {}).get("n_dates", 0) or 0)
+    except Exception:
+        ic_n = 0
+    ann = (n_m >= MIN_MONTHS_ANN) and (xs >= MIN_XS_STOCKS)
+    verdict = (n_m >= MIN_MONTHS_VERDICT) and (xs >= MIN_XS_STOCKS)
+    ic_ok = (ic_n >= MIN_IC_MONTHS) and (xs >= MIN_XS_STOCKS)
+    why = []
+    if n_m < MIN_MONTHS_VERDICT:
+        why.append(f"유효 {n_m}개월 < 판정하한 {MIN_MONTHS_VERDICT}")
+    if xs < MIN_XS_STOCKS:
+        why.append(f"월평균 단면 {xs:.0f}종목 < §36 오분위 최소 {MIN_XS_STOCKS}")
+    if ic_n < MIN_IC_MONTHS:
+        why.append(f"IC 표본 {ic_n}개월 < {MIN_IC_MONTHS}")
+    return dict(months=n_m, xs=xs, ic_n=ic_n, ann=ann, verdict=verdict, ic=ic_ok,
+                grade=("신뢰" if verdict else ("참고" if ann else "불가")),
+                why=" · ".join(why) or "요건 충족")
+
+
+def gate_block(g: dict, need: str) -> bool:
+    """이 항목의 인쇄를 막아야 하는가. GATE_STRICT=False 면 절대 막지 않는다(진단용)."""
+    return bool(GATE_STRICT) and not bool(g.get(need, False))
+
+
+def track_input_gate(metric: str, actuals: pd.DataFrame, acc_ev: pd.DataFrame,
+                     led_ev: pd.DataFrame) -> dict:
+    """트랙이 **합의된 산식대로** 계산될 수 있는 상태인지 판정한다.
+
+    ★ 지난 실행의 1번 치명 결함이 여기서 걸린다. DART 가 네트워크 장애로 끊겨
+      실적이 0건이 되자 `acc_events_eps` 가 **경고 없이 빈 프레임**을 반환했고,
+      파이프라인은 그것을 정상으로 알고 계속 갔다. 그 결과 §7~§10(정확도)이 통째로
+      빠지고 품질승수(§20-22)가 리더십 단독으로 축약된 지표가 '정밀판(EPS)'이라는
+      이름으로 인쇄됐다. 모양(컬럼)은 맞았고 예외도 없었으므로 아무도 막지 못했다.
+      → **모양이 아니라 의미**를 검사한다. 성분이 결손이면 결과에 낙인을 찍는다.
+    """
+    n_act = int(len(actuals)) if actuals is not None else 0
+    n_acc = int(len(acc_ev)) if acc_ev is not None else 0
+    n_led = int(len(led_ev)) if led_ev is not None else 0
+    issues: List[Tuple[str, str]] = []
+    if metric == "EPS":
+        if n_act == 0:
+            issues.append(("치명", "실적(actual) 0건 — 정확도 사건(§7~§8)의 원재료가 없습니다"))
+        elif n_act < MIN_ACTUALS_FOR_EPS:
+            issues.append(("주의", f"실적 {n_act:,}건 < 하한 {MIN_ACTUALS_FOR_EPS:,}건 "
+                                   f"— 정확도 성분이 얕습니다"))
+        if n_acc == 0:
+            issues.append(("치명", "정확도 사건 0건 — 품질승수(§20-22)가 리더십 단독으로 "
+                                   "축약되어 **합의된 SCG 산식과 다른 지표**가 됩니다"))
+    else:
+        if n_acc == 0:
+            issues.append(("치명", "목표가 만기 사건 0건 — 정확도 성분이 없습니다"
+                                   "(만기 도래분이 없거나 목표가 자체가 없습니다)"))
+    if n_led == 0:
+        issues.append(("치명", "리더십 사건 0건 — §11~§16 성분이 없습니다"))
+    fatal = any(k == "치명" for k, _ in issues)
+    return dict(metric=metric, n_actuals=n_act, n_acc=n_acc, n_lead=n_led,
+                issues=issues, fatal=fatal,
+                grade=("불완전" if fatal else ("주의" if issues else "정상")),
+                badge=(" ⚠산식결손" if fatal else (" ⚠주의" if issues else "")))
+
+
+def report_input_gate(gi: dict):
+    if gi.get("grade") == "정상":
+        CON.ok(f"[{gi['metric']}] 입력 완전성 정상 — 정확도 {gi['n_acc']:,} · "
+               f"리더십 {gi['n_lead']:,} 사건")
+        return
+    rows = [[k, v] for k, v in gi["issues"]]
+    CON.grid(rows, ["등급", "무엇이 비었고 그래서 무엇이 달라지는가"], ["l", "l"],
+             title=f"[{gi['metric']}] 입력 완전성 게이트 — 판정 {gi['grade']}")
+    if gi["fatal"]:
+        CON.err(f"[{gi['metric']}] 이 트랙의 결과는 **합의된 산식의 산출물이 아닙니다**. "
+                f"아래 모든 표에 '{gi['badge'].strip()}' 낙인을 붙이고, 우열 판정문은 "
+                f"인쇄하지 않습니다. 성능이 좋게 나오더라도 그것은 다른 지표의 성능입니다.")
+
+
 def bucket_backtest(sig: pd.DataFrame, panel: pd.DataFrame, strat: str,
                     cost_bps: float = COST_BPS_ONEWAY,
                     nq_override: Optional[int] = None) -> dict:
@@ -5844,10 +6875,21 @@ def bucket_backtest(sig: pd.DataFrame, panel: pd.DataFrame, strat: str,
     d["bucket"] = (d.groupby("signal_date")[a_col]
                    .transform(lambda s: np.ceil(s.rank(method="first", pct=True) * nq)
                               .clip(1, nq)))
+    # ★ 얇은 달을 그대로 집계하면 '상위 분위'가 1~2종목짜리 포트폴리오가 된다.
+    #   지난 실행의 시총하위1000 트랙이 정확히 그 상태였다(87행·18종목에서
+    #   L/S +61.80%, Sharpe +0.84). 한 종목만 바뀌어도 두 자릿수 %p 가 흔들리는
+    #   숫자를 300종목짜리 달과 같은 무게로 평균에 넣고 있었다.
+    #   기준: 각 극단 분위에 최소 2종목이 들어가야 하고(§36 분위의 최소 요건),
+    #        동시에 §36 오분위 하한 20종목을 넘어야 한다.
+    min_xs = max(int(MIN_XS_STOCKS), nq * 2)
+    n_thin = 0
     rows, hold_prev, hold_log = [], set(), []
     for T, g in d.groupby("signal_date", observed=True, sort=True):
         g_ok = g[np.isfinite(g["fwd_1m"])]
         if not len(g_ok):
+            continue
+        if len(g_ok) < min_xs:
+            n_thin += 1
             continue
         top = g_ok[g_ok["bucket"] == nq]
         bot = g_ok[g_ok["bucket"] == 1]
@@ -5869,9 +6911,16 @@ def bucket_backtest(sig: pd.DataFrame, panel: pd.DataFrame, strat: str,
     #   KeyError('ls') 로 죽는다. 모양을 계약으로 고정한다.
     R = pd.DataFrame(rows, columns=["month", "top", "bot", "ls", "top_net",
                                     "n_xs", "n_top", "turnover", "cost"])
+    if n_thin:
+        CON.say(f"[{strat}] 단면이 {min_xs}종목 미만인 {n_thin}개월을 수익률 계열에서 "
+                f"제외했습니다 — 그런 달의 '상위 분위'는 1~2종목이라 성과가 아니라 "
+                f"잡음입니다(계산에서 뺄 뿐, 신호 자체는 보존됩니다)")
     if not len(R):
         return {"strategy": strat, "empty": True,
-                "note": "유효 수익률이 있는 신호일이 없습니다"}
+                "n_thin": n_thin,
+                "note": (f"단면 {min_xs}종목 이상인 달이 하나도 없습니다"
+                         f"(얇은 달 {n_thin}개월 제외)" if n_thin else
+                         "유효 수익률이 있는 신호일이 없습니다")}
     dec = (d[np.isfinite(d["fwd_1m"])].groupby("bucket")["fwd_1m"]
            .agg(["mean", "count"]).reset_index()
            .rename(columns={"mean": "mean_fwd_1m", "count": "n"}))
@@ -5891,7 +6940,8 @@ def bucket_backtest(sig: pd.DataFrame, panel: pd.DataFrame, strat: str,
                       n_dates=int(len(per)))
     return {"strategy": strat, "empty": False, "returns": R, "decile": dec, "nq": nq,
             "ic": ics, "holdings": pd.DataFrame(hold_log),
-            "n_signals": int(len(d)), "n_unique_stocks": int(d["stock_id"].nunique())}
+            "n_signals": int(len(d)), "n_unique_stocks": int(d["stock_id"].nunique()),
+            "n_thin": n_thin, "min_xs": min_xs}
 
 
 def perf_summary(bt: dict, bench: Optional[pd.Series] = None, leg: str = "ls") -> dict:
@@ -5932,6 +6982,11 @@ def monotonicity(bt: dict) -> Tuple[float, bool]:
     if bt.get("empty") or not len(bt["decile"]):
         return np.nan, False
     dec = bt["decile"].sort_values("bucket")
+    # ★ 분위 하나가 관측 두세 개면 그 분위의 평균은 종목 하나에 좌우된다.
+    #   그 위에서 계산한 Spearman ρ 는 단조성이 아니라 잡음의 순서다.
+    if "n" in dec.columns and float(pd.to_numeric(dec["n"], errors="coerce").min()
+                                    or 0) < float(MIN_XS_STOCKS):
+        return np.nan, False
     rho = spearman(dec["bucket"].to_numpy(float), dec["mean_fwd_1m"].to_numpy(float))
     top_gt = bool(dec["mean_fwd_1m"].iloc[-1] > dec["mean_fwd_1m"].iloc[0])
     return rho, top_gt
@@ -5978,6 +7033,8 @@ def build_track(metric: str, fc: pd.DataFrame, fcv: pd.DataFrame, actuals: pd.Da
               else acc_events_tp(fc, tp_act, cfg))
     led_ev = lead_events(fcv, cal, cfg, metric)
     CON.say(f"[{metric}] 사건 테이블: 정확도 {len(acc_ev):,} · 리더십 {len(led_ev):,}")
+    gate_in = track_input_gate(metric, actuals, acc_ev, led_ev)
+    report_input_gate(gate_in)
     FLOW.io("출", "메모리", f"정확도사건_{metric}", acc_ev)
     FLOW.io("출", "메모리", f"리더십사건_{metric}", led_ev)
     scores = analyst_scores(sig_months, acc_ev, led_ev, cfg)
@@ -5986,7 +7043,9 @@ def build_track(metric: str, fc: pd.DataFrame, fcv: pd.DataFrame, actuals: pd.Da
     sig = rank_alphas(scg_signals(cons, sig_months, cal, cfg), cfg)
     ENG = dict(cfg=cfg, fcv=fcv, acc_ev=acc_ev, lead_ev=led_ev, metric=metric,
                signal_dates=sig_months, cal=cal, actuals=actuals, sig=sig)
-    return dict(metric=metric, label=TRACK_LABEL.get(metric, metric), ENG=ENG, sig=sig,
+    return dict(metric=metric,
+                label=TRACK_LABEL.get(metric, metric) + gate_in["badge"],
+                gate_in=gate_in, ENG=ENG, sig=sig,
                 scores=scores, W=W, cons=cons, acc_ev=acc_ev, lead_ev=led_ev,
                 tp_act=tp_act, build_sec=time.time() - t0)
 
@@ -6041,13 +7100,18 @@ def _track_row(trk: dict, suites_key: str, strat: str,
     ps = perf_summary(bt, (bench or {}).get("KOSPI"), leg="ls")
     rho, _ = monotonicity(bt)
     ic = (bt.get("ic") or {}).get(20, {})
+    g = stat_gate(bt)
+
+    def _q(v, need="ann", p="{:+.2%}"):
+        return "표본부족" if gate_block(g, need) else _fmt(v, p)
+
     return [f"{ps.get('n_signals', 0):,}",
             f"{ps.get('n_unique_stocks', 0):,}",
-            _fmt(ps.get("annualized_return")),
-            _fmt(ps.get("Sharpe"), "{:+.2f}"),
-            _fmt(ps.get("MDD")),
-            _fmt(ic.get("mean_ic"), "{:+.3f}"),
-            _fmt(rho, "{:+.2f}")]
+            _q(ps.get("annualized_return")),
+            _q(ps.get("Sharpe"), "ann", "{:+.2f}"),
+            _q(ps.get("MDD")),
+            _q(ic.get("mean_ic"), "ic", "{:+.3f}"),
+            _q(rho, "ann", "{:+.2f}")]
 
 
 def track_compare(tracks: "OrderedDict[str, dict]",
@@ -6098,7 +7162,22 @@ def track_compare(tracks: "OrderedDict[str, dict]",
         a_tp, a_eps = _ann("TP12M"), _ann("EPS")
         n_tp = METRIC_COV.get("TP12M", {}).get("cov", 0)
         n_eps = METRIC_COV.get("EPS", {}).get("cov", 0)
-        if np.isfinite(a_tp) and np.isfinite(a_eps):
+        # ★ 두 트랙 모두 판정 하한을 넘고, 입력 완전성 낙인도 없어야 비교가 성립한다
+        _blk = []
+        for _m in ("TP12M", "EPS"):
+            _bt = (tracks[_m].get("suites_full") or {}).get("SCG_LS", {})
+            _g = stat_gate(_bt)
+            if gate_block(_g, "verdict"):
+                _blk.append(f"{_m}: {_g['why']}")
+            _gi = tracks[_m].get("gate_in") or {}
+            if _gi.get("fatal"):
+                _blk.append(f"{_m}: 입력 산식 결손({_gi['n_acc']}개 정확도 사건)")
+        if _blk:
+            CON.warn("트랙 비교 판정 보류 — 다음 조건이 충족되지 않았습니다:\n      · "
+                     + "\n      · ".join(_blk)
+                     + "\n    두 트랙의 표본 기간·성분이 다르면 'PDF 파싱이 성과로 "
+                       "회수되는가' 라는 질문 자체가 성립하지 않습니다.")
+        elif np.isfinite(a_tp) and np.isfinite(a_eps):
             gap = a_eps - a_tp
             CON.ok(f"판정: SCG_LS 연율 기준 EPS {a_eps*100:+.1f}% vs TP12M {a_tp*100:+.1f}% "
                    f"(차이 {gap*100:+.1f}%p). 커버리지는 EPS {n_eps} vs TP12M {n_tp}종목/월. "
@@ -6177,10 +7256,17 @@ def R_subperiod(suites: Dict[str, dict]):
         R = bt["returns"].dropna(subset=["ls"]).copy()
         R["y"] = pd.DatetimeIndex(R["month"]).year
         for y, g in R.groupby("y"):
-            rows.append([st, int(y), f"{g['ls'].mean()*12*100:+.1f}%",
-                         f"{(g['ls'] > 0).mean()*100:.0f}%", len(g)])
-    CON.grid(rows, ["전략", "연도", "L/S 연환산", "월승률", "개월"],
-             ["l", "r", "r", "r", "r"], title="강건성 R2 — 연도별 서브기간 (특정 1~2년 의존 점검 §47-질문4)")
+            # ★ 3개월짜리 '연도'를 ×12 해서 '연환산'이라 부르면 안 된다. 지난 실행의
+            #   R2 표에는 2016(3개월)·2018(1개월) 행이 다른 해와 같은 자격으로 찍혔고,
+            #   그 표를 보고 '연도별로 고르다/편중됐다'를 판단하게 되어 있었다.
+            n_m = len(g)
+            mmean = float(g["ls"].mean())
+            ann = f"{mmean*12*100:+.1f}%" if n_m >= 6 else "—(부분연도)"
+            rows.append([st, int(y), ann, f"{mmean*100:+.2f}%",
+                         f"{(g['ls'] > 0).mean()*100:.0f}%", n_m])
+    CON.grid(rows, ["전략", "연도", "L/S 연환산", "월평균", "월승률", "개월"],
+             ["l", "r", "r", "r", "r", "r"],
+             title="강건성 R2 — 연도별 서브기간 (6개월 미만은 연율화하지 않습니다 §47-질문4)")
     ok = None
     ls_by_year = defaultdict(list)
     for r in rows:
@@ -6220,18 +7306,32 @@ def R_placebo(sig: pd.DataFrame, panel: pd.DataFrame, n_iter: int = 200):
     a = d[ALPHA_COL[st]].to_numpy(float)
     f = d["fwd_1m"].to_numpy(float)
     gidx = d.groupby("signal_date", observed=True).indices
+    # ★ 순열은 그룹 **안에서 값을 재배열만** 하므로 그 그룹의 분위수는 절대 변하지
+    #   않는다. 그런데 기존 코드는 순열 200회마다 분위수를 다시 계산해, 24,120회 중
+    #   24,000회가 완전히 같은 답을 다시 구하는 낭비였다. 한 번만 구해 재사용한다.
+    _grp = []
+    for _, ix in gidx.items():
+        if len(ix) < max(10, int(MIN_XS_STOCKS)):
+            continue
+        q_hi, q_lo = np.nanquantile(a[ix], [0.9, 0.1])
+        _grp.append((np.asarray(ix), float(q_hi), float(q_lo)))
+
     def _spread(alpha):
+        # ★ n=0 일 때 `s / max(n,1)` 은 0.0 을 돌려준다 — '스프레드가 0' 과
+        #   '측정할 달이 하나도 없음' 이 같은 값이 되어, 존재하지 않는 검정 결과
+        #   (실제 0.00%, 귀무도 전부 0.00% → p=1.000)가 표에 찍힌다.
         s = 0.0; n = 0
-        for _, ix in gidx.items():
+        for ix, q_hi, q_lo in _grp:
             av, fv = alpha[ix], f[ix]
-            if len(ix) < 10:
-                continue
-            q_hi, q_lo = np.nanquantile(av, [0.9, 0.1])
             hi, lo = fv[av >= q_hi], fv[av <= q_lo]
             if len(hi) and len(lo):
                 s += float(np.nanmean(hi) - np.nanmean(lo)); n += 1
-        return s / max(n, 1)
+        return (s / n) if n else np.nan
     real = _spread(a)
+    if not np.isfinite(real):
+        _rb("R4", "플라시보(무작위 재배열)", None,
+            f"단면 {max(10, int(MIN_XS_STOCKS))}종목 이상인 달이 없어 검정 불가")
+        return
     null = []
     rng = np.random.default_rng(SEED)
     for _ in range(n_iter):
@@ -6269,9 +7369,25 @@ def R_lag(sig: pd.DataFrame, panel: pd.DataFrame):
     base, lagged = out.get("동시(기본)", np.nan), out.get("1개월 지연", np.nan)
     verdict = None
     detail = f"기본 {base*100:+.2f}%/월 vs 지연 {lagged*100:+.2f}%/월"
-    if np.isfinite(base) and np.isfinite(lagged):
-        verdict = bool(lagged < base * 1.5)     # 지연이 크게 '더 좋으면' 시점정렬 의심
-        detail += " — 지연 신호가 유의하게 우월하면 시점 정렬(누수)을 의심해야 합니다"
+    # ★ 두 가지를 고친다.
+    #  ⓐ **부호 함정** — 기존 판정식 `lagged < base * 1.5` 는 base 가 음수면
+    #     임계값이 더 음수가 되어(예: base −0.59% → 임계 −0.885%) 정상 결과까지
+    #     '실패'로 낙인찍는다. 지난 실행의 R5 '실패'가 정확히 이 경우였다.
+    #     곱셈 여유 대신 **덧셈 여유**를 쓰면 부호와 무관하게 뜻이 보존된다.
+    #  ⓑ **선행조건** — 기본 신호가 무작위와 구분되지 않으면(R4 미통과) 기본과 지연은
+    #     둘 다 잡음이다. 잡음 둘을 비교해 '누수' 를 논하는 것은 의미가 없다.
+    r4 = ROBUST.get("R4") or {}
+    r4_ok = (r4.get("ok") is True)
+    if not np.isfinite(base) or not np.isfinite(lagged):
+        detail += " — 표본 부족으로 판정 불가"
+    elif not r4_ok:
+        detail += (" — R4(플라시보)가 통과되지 않아 판정 보류합니다. 기본 신호 자체가 "
+                   "무작위와 구분되지 않으면 지연 비교는 잡음 대 잡음입니다")
+    else:
+        margin = max(abs(base) * 0.5, 0.005)    # 월 0.5%p 또는 기본값의 50% 중 큰 쪽
+        verdict = bool(lagged <= base + margin)
+        detail += (f" (여유 {margin*100:.2f}%p) — 지연 신호가 이 여유를 넘어 우월하면 "
+                   f"시점 정렬(누수)을 의심해야 합니다")
     _rb("R5", "신호 지연 검사(누수 반증)", verdict, detail)
 
 
@@ -6282,8 +7398,11 @@ def R_cost_stress(sig: pd.DataFrame, panel: pd.DataFrame, nq: Optional[int] = No
         if bt.get("empty"):
             continue
         ps = perf_summary(bt, leg="top_net")
-        rows.append([f"{bps:.0f}bp", f"{ps.get('CAGR', np.nan)*100:+.1f}%",
-                     f"{ps.get('Sharpe', np.nan):.2f}"])
+        g = stat_gate(bt)
+        rows.append([f"{bps:.0f}bp",
+                     "표본부족" if gate_block(g, "ann") else _fmt(ps.get("CAGR")),
+                     "표본부족" if gate_block(g, "ann")
+                     else _fmt(ps.get("Sharpe"), "{:+.2f}")])
     CON.grid(rows, ["편도비용", "상위십분위 CAGR", "Sharpe"], ["r", "r", "r"],
              title="강건성 R6 — 거래비용 스트레스(상위 십분위, 비용 차감)")
     _rb("R6", "비용 스트레스", None, "0/25/50bp 표 출력")
@@ -6295,6 +7414,13 @@ def robustness_verdict():
              r["detail"][:64]] for r in ROBUST.values()]
     CON.grid(rows, ["검사", "이름", "판정", "세부"], ["l", "l", "l", "l"],
              title="강건성 종합")
+    r4 = ROBUST.get("R4") or {}
+    if r4.get("ok") is False:
+        CON.err("R4(플라시보) 미통과 — 이 신호는 **무작위 재배열과 구분되지 않습니다**. "
+                "위 성과표의 어떤 숫자도 '전략이 작동한다'의 근거가 될 수 없고, "
+                "R5 이하의 판정도 해석하지 마십시오.")
+    elif r4.get("ok") is None:
+        CON.warn("R4(플라시보)를 수행하지 못했습니다 — 강건성 결론을 내릴 수 없습니다.")
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -6529,6 +7655,148 @@ def run_contracts(strict: bool = True) -> bool:
         return (not bad), (f"{len(cases)}개 경우 통과" if not bad
                            else "실패: " + "; ".join(bad)[:60])
     _ct("C-경로", "경로 포함 판정(절대1원칙 방어선)", c_path)
+
+    # ── 이번 라운드에 신설한 방어선들을 계약으로 못박는다 ─────────────────────
+    #    지난 실행의 사고는 전부 '검사는 있었는데 그 결과를 쓰지 않았다' 유형이었다.
+    #    계약이 없으면 다음 개편에서 조용히 되돌아간다.
+    def c_gate():
+        """표본 미달이면 요약통계·판정문이 실제로 막히는가."""
+        def _bt(n_months, n_xs, ic_n=99):
+            R = pd.DataFrame({"month": pd.date_range("2020-01-31", periods=n_months,
+                                                     freq="ME"),
+                              "ls": np.linspace(0.01, 0.02, n_months),
+                              "n_xs": [n_xs] * n_months})
+            return {"strategy": "SCG_LS", "empty": False, "returns": R,
+                    "ic": {20: {"n_dates": ic_n}}}
+        thin_m = stat_gate(_bt(MIN_MONTHS_ANN - 1, 100))
+        thin_x = stat_gate(_bt(120, MIN_XS_STOCKS - 1))
+        mid = stat_gate(_bt(MIN_MONTHS_ANN, 100))
+        full = stat_gate(_bt(MIN_MONTHS_VERDICT, 100))
+        if thin_m["ann"] or thin_m["verdict"]:
+            return False, f"{MIN_MONTHS_ANN-1}개월인데 연율/판정이 열렸다"
+        if thin_x["ann"] or thin_x["verdict"]:
+            return False, f"단면 {MIN_XS_STOCKS-1}종목인데 연율이 열렸다"
+        if not mid["ann"] or mid["verdict"]:
+            return False, "연율은 열리고 판정은 닫혀야 하는 구간이 어긋났다"
+        if not (full["ann"] and full["verdict"]):
+            return False, f"{MIN_MONTHS_VERDICT}개월에서 판정이 닫혀 있다"
+        if not gate_block(thin_m, "ann") or gate_block(full, "ann"):
+            return False, "gate_block 이 게이트를 반영하지 않는다"
+        return True, (f"{MIN_MONTHS_ANN-1}월/{MIN_XS_STOCKS-1}종목 차단 · "
+                      f"{MIN_MONTHS_VERDICT}월 통과")
+
+    def c_input():
+        """실적 0건이면 EPS 트랙에 '산식결손' 낙인이 찍히는가(지난 실행의 1번 치명)."""
+        empty = pd.DataFrame(columns=["stock_id", "fiscal_period", "forecast_metric",
+                                      "actual_value", "actual_announcement_date"])
+        ev = pd.DataFrame({"analyst_id": ["a"], "acc_event": [0.1]})
+        led = pd.DataFrame({"analyst_id": ["a"], "lead_event": [0.1]})
+        g0 = track_input_gate("EPS", empty, pd.DataFrame(columns=["acc_event"]), led)
+        if not g0["fatal"] or "결손" not in g0["badge"]:
+            return False, "실적 0건인데 낙인이 없다"
+        g1 = track_input_gate("EPS", pd.DataFrame({"x": range(MIN_ACTUALS_FOR_EPS)}),
+                              ev, led)
+        if g1["fatal"]:
+            return False, "정상 입력인데 결손으로 판정됐다"
+        return True, f"실적 0건→'{g0['badge'].strip()}' · 정상→{g1['grade']}"
+
+    def c_solo():
+        """단독 전망(n=1)이 정확도 사건에서 배제되는가 — 구조적 0이 수축을 오염시키던 자리."""
+        cfg = SCGParams()
+        fc = pd.DataFrame([
+            _fc_row("A", "a1", "2020-02-01", "2020FY", 100.0),
+            _fc_row("A", "a2", "2020-02-02", "2020FY", 120.0),
+            _fc_row("B", "a1", "2020-02-01", "2020FY", 50.0),      # 단독
+        ])
+        act = pd.DataFrame([
+            dict(stock_id="A", fiscal_period="2020FY", forecast_metric="EPS",
+                 actual_value=110.0, actual_announcement_date=ts("2020-03-20")),
+            dict(stock_id="B", fiscal_period="2020FY", forecast_metric="EPS",
+                 actual_value=55.0, actual_announcement_date=ts("2020-03-20")),
+        ])
+        ev = acc_events_eps(fc, act, cfg)
+        if len(ev) and (ev["n_forecasters"] < 2).any():
+            return False, "단독 전망이 사건으로 남았다"
+        if "B" in set(ev["stock_id"]):
+            return False, "단독 커버 종목 B 가 사건에 포함됐다"
+        if len(ev) != 2:
+            return False, f"2인 커버 종목의 사건 수가 2가 아니다({len(ev)})"
+        return True, f"단독 1건 배제 · 2인 사건 {len(ev)}건 유지"
+
+    def c_thin():
+        """얇은 달이 수익률 계열에서 빠지는가 — 87행/18종목이 +61.8% 를 만들던 자리."""
+        months = pd.date_range("2020-01-31", periods=6, freq="ME")
+        rows = []
+        for i, m in enumerate(months):
+            n = 200 if i < 3 else 6           # 뒤 3개월은 6종목뿐
+            for j in range(n):
+                rows.append({"signal_date": m, "stock_id": f"{j:06d}",
+                             ALPHA_COL["SCG_LS"]: float(j)})
+        sig = pd.DataFrame(rows)
+        pan = sig[["stock_id", "signal_date"]].rename(
+            columns={"stock_id": "code", "signal_date": "month"}).copy()
+        pan["fwd_1m"] = 0.01
+        for h in (20, 60, 120):
+            pan[f"fwd_{h}td"] = 0.01
+        bt = bucket_backtest(sig, pan, "SCG_LS")
+        if bt.get("empty"):
+            return False, "정상 달까지 사라졌다"
+        n_m = len(bt["returns"])
+        if n_m != 3:
+            return False, f"얇은 달이 걸러지지 않았다(월수 {n_m}, 기대 3)"
+        return True, f"200종목 3개월만 채택 · 6종목 3개월 제외(n_thin={bt.get('n_thin', 0)})"
+
+    def c_circuit():
+        """회로가 쿨다운 뒤 스스로 재탐색하는가 — '열리면 영구'가 아니어야 한다."""
+        cc = SourceCircuit(limit=2, quiet=True, retry_s=0.05)
+        cc.fail("__t", "x")
+        cc.fail("__t", "x")
+        if not cc.blocked("__t"):
+            return False, "연속 실패 후에도 열리지 않았다"
+        time.sleep(0.08)
+        if cc.blocked("__t"):
+            return False, "쿨다운이 지났는데 재탐색을 안 보낸다(영구 차단)"
+        cc.ok("__t")
+        if cc.blocked("__t"):
+            return False, "재탐색 성공 후에도 차단이 유지된다"
+        return True, "차단 → 쿨다운 후 반개방 1건 → 성공 시 해제"
+
+    def c_tp():
+        """PDF 표지에서 목표주가를 뽑는가 — 2018년 이후 TP12M 의 유일한 공급원."""
+        cases = [("목표주가 52,000원 (상향)\n목표주가를 45,000원에서 52,000원으로", 52000.0),
+                 ("투자의견\nBUY\n목표주가(원)\n38,500", 38500.0),
+                 ("목표주가 대비 상승여력 25.3%", None),
+                 ("TPS 3,400 처리량", None)]
+        for txt, want in cases:
+            got = _tp_from_text(txt)
+            if (want is None and got is not None) or (
+                    want is not None and (got is None or abs(got - want) > 1e-6)):
+                return False, f"'{txt[:18]}…' → {got} (기대 {want})"
+        return True, f"{len(cases)}개 표본 정확 · 상향개정은 최빈값 채택"
+
+    def c_lag():
+        """R5 판정식이 기준 스프레드의 **부호에 흔들리지 않는가**."""
+        # 기존 식 `lagged < base*1.5` 는 base<0 이면 임계가 더 음수가 되어 뒤집혔다.
+        def _v(base, lagged):
+            margin = max(abs(base) * 0.5, 0.005)
+            return bool(lagged <= base + margin)
+        if not _v(-0.0059, -0.004):
+            return False, "음수 기준에서 소폭 개선을 실패로 판정한다"
+        if _v(-0.0059, 0.02):
+            return False, "음수 기준에서 큰 우월을 통과시킨다"
+        if not _v(0.02, 0.021):
+            return False, "양수 기준에서 소폭 개선을 실패로 판정한다"
+        if _v(0.02, 0.05):
+            return False, "양수 기준에서 큰 우월을 통과시킨다"
+        return True, "부호 무관 — 덧셈 여유로 대칭 동작"
+
+    _ct("C-게이트", "표본 미달 시 요약통계·판정 차단", c_gate)
+    _ct("C-입력", "산식 성분 결손 낙인(실적 0건)", c_input)
+    _ct("C-단독", "단독 전망(n=1) 정확도 사건 배제 §31", c_solo)
+    _ct("C-얇은달", "단면 미달 월 수익률 배제", c_thin)
+    _ct("C-회로", "회로차단 반개방 재탐색", c_circuit)
+    _ct("C-목표가", "PDF 표지 목표주가 추출", c_tp)
+    _ct("C-지연", "R5 판정식 부호 안정성", c_lag)
     bad = [c for c in CONTRACTS if not c["ok"]]
     CON.grid([[c["id"], c["name"], "통과" if c["ok"] else "실패", c["msg"]]
               for c in CONTRACTS], ["ID", "계약", "판정", "근거"], ["l", "l", "l", "l"],
@@ -6733,6 +8001,7 @@ def _rehearsal_depot(tmp: str) -> "Depot":
     dep._foreign_parquets = []
     dep._foreign_fingerprint = {}
     dep._foreign_pdfs = {}
+    dep._backed_up = set()
     return dep
 
 
@@ -7210,31 +8479,62 @@ def report_all(suites: Dict[str, dict], bench: Optional[Dict[str, pd.Series]],
     CON.head(f"성과 검증 — {label}{part_note}",
              f"metric 파라미터: {cfg.tag()} · 비용 {COST_BPS_ONEWAY:.0f}bp 편도(상위분위 net)")
     kospi = (bench or {}).get("KOSPI") if bench else None
+
+    # ── 게이트 먼저 ─────────────────────────────────────────────────────────
+    #    "이 표를 어디까지 믿어도 되는가" 를 성과표 **위에** 둔다. 아래에 두면
+    #    숫자를 먼저 읽고 결론을 내린 뒤에야 단서를 보게 된다.
+    gates = {st: stat_gate(suites.get(st, {})) for st in STRATS}
+    grows = [[st, f"{g['months']}개월", f"{g['xs']:.0f}종목", f"{g.get('ic_n',0)}개월",
+              g["grade"], g["why"]] for st, g in gates.items()]
+    CON.grid(grows, ["전략", "유효 월수", "월평균 단면", "IC 표본", "판정",
+                     "사유(막힌 항목)"], ["l", "r", "r", "r", "l", "l"],
+             title=f"신뢰 게이트 — {label} "
+                   f"(연율 {MIN_MONTHS_ANN}개월 · 판정 {MIN_MONTHS_VERDICT}개월 · "
+                   f"단면 {MIN_XS_STOCKS}종목 이상)")
+    _worst = min((g["grade"] for g in gates.values()),
+                 key=lambda x: {"신뢰": 0, "참고": 1, "불가": 2}.get(x, 3), default="불가")
+    if _worst != "신뢰" and GATE_STRICT:
+        CON.warn("표본이 하한에 못 미치는 항목은 숫자 대신 '표본부족' 으로 인쇄됩니다. "
+                 "계산과 저장은 그대로 이루어지므로 returns CSV 에는 온전히 남습니다 — "
+                 "막는 것은 **근거 없는 결론**이지 데이터가 아닙니다.")
+
+    def _g(st, v, need="ann", p="{:+.2%}"):
+        return "표본부족" if gate_block(gates[st], need) else _fmt(v, p)
+
     rows = []
     for st in STRATS:
         bt = suites.get(st, {})
         if bt.get("empty", True):
-            rows.append([st] + ["-"] * 10)
+            rows.append([st] + ["-"] * 12)
             continue
         ps_ls = perf_summary(bt, kospi, leg="ls")
         ps_tp = perf_summary(bt, kospi, leg="top_net")
         rows.append([st, f"{ps_ls.get('n_signals', 0):,}",
                      f"{ps_ls.get('n_unique_stocks', 0):,}",
-                     _fmt(ps_ls.get("annualized_return")), _fmt(ps_ls.get("CAGR")),
-                     _fmt(ps_ls.get("volatility")),
-                     _fmt(ps_ls.get("Sharpe"), "{:+.2f}"), _fmt(ps_ls.get("MDD")),
-                     _fmt(ps_ls.get("hit_rate"), "{:.0%}"),
+                     f"{ps_ls.get('months', 0)}",
+                     _g(st, ps_ls.get("t_HAC"), "ann", "{:+.2f}"),
+                     _g(st, ps_ls.get("annualized_return")), _g(st, ps_ls.get("CAGR")),
+                     _g(st, ps_ls.get("volatility")),
+                     _g(st, ps_ls.get("Sharpe"), "ann", "{:+.2f}"),
+                     _g(st, ps_ls.get("MDD")),
+                     _g(st, ps_ls.get("hit_rate"), "ann", "{:.0%}"),
                      _fmt(ps_ls.get("turnover"), "{:.0%}"),
                      _fmt(ps_ls.get("average_holdings"), "{:.0f}")])
         rows.append(["  └ 상위분위(비용차감)", "", "",
-                     _fmt(ps_tp.get("annualized_return")), _fmt(ps_tp.get("CAGR")),
-                     _fmt(ps_tp.get("volatility")),
-                     _fmt(ps_tp.get("Sharpe"), "{:+.2f}"), _fmt(ps_tp.get("MDD")),
-                     _fmt(ps_tp.get("hit_rate"), "{:.0%}"), "",
-                     _fmt(ps_tp.get("excess_vs_bench_ann"))])
-    CON.grid(rows, ["전략(L/S=상위-하위)", "n_signals", "n_stocks", "연환산", "CAGR",
-                    "변동성", "Sharpe", "MDD", "월승률", "회전율", "평균종목/벤치초과"],
-             ["l"] + ["r"] * 10, title=f"§37 전략별 성과 — {label}")
+                     f"{ps_tp.get('months', 0)}",
+                     _g(st, ps_tp.get("t_HAC"), "ann", "{:+.2f}"),
+                     _g(st, ps_tp.get("annualized_return")), _g(st, ps_tp.get("CAGR")),
+                     _g(st, ps_tp.get("volatility")),
+                     _g(st, ps_tp.get("Sharpe"), "ann", "{:+.2f}"),
+                     _g(st, ps_tp.get("MDD")),
+                     _g(st, ps_tp.get("hit_rate"), "ann", "{:.0%}"), "",
+                     _g(st, ps_tp.get("excess_vs_bench_ann"))])
+    CON.grid(rows, ["전략(L/S=상위-하위)", "n_signals", "n_stocks", "표본(월)",
+                    "t(HAC)", "연환산", "CAGR", "변동성", "Sharpe", "MDD", "월승률",
+                    "회전율", "평균종목/벤치초과"],
+             ["l"] + ["r"] * 12, title=f"§37 전략별 성과 — {label}")
+    CON.say("t(HAC) 는 Newey-West 보정 t값입니다 — |t|<2 면 그 수익률은 0과 구분되지 "
+            "않습니다. 연환산 숫자만 보고 판단하지 마십시오.")
 
     ic_rows = []
     for st in STRATS:
@@ -7243,10 +8543,12 @@ def report_all(suites: Dict[str, dict], bench: Optional[Dict[str, pd.Series]],
             continue
         for h in (20, 60, 120):
             ic = bt["ic"][h]
-            ic_rows.append([st, f"{h}일", _fmt(ic["mean_ic"], "{:+.4f}"),
-                            _fmt(ic["median_ic"], "{:+.4f}"),
-                            _fmt(ic["ic_std"], "{:.4f}"), _fmt(ic["ic_ir"], "{:+.2f}"),
-                            _fmt(ic["positive_ic_ratio"], "{:.0%}"), ic["n_dates"]])
+            ic_rows.append([st, f"{h}일", _g(st, ic["mean_ic"], "ic", "{:+.4f}"),
+                            _g(st, ic["median_ic"], "ic", "{:+.4f}"),
+                            _g(st, ic["ic_std"], "ic", "{:.4f}"),
+                            _g(st, ic["ic_ir"], "ic", "{:+.2f}"),
+                            _g(st, ic["positive_ic_ratio"], "ic", "{:.0%}"),
+                            ic["n_dates"]])
     CON.grid(ic_rows, ["전략", "지평", "mean_ic", "median_ic", "ic_std", "ic_ir",
                        "IC>0 비율", "표본"],
              ["l", "r", "r", "r", "r", "r", "r", "r"],
@@ -7261,7 +8563,9 @@ def report_all(suites: Dict[str, dict], bench: Optional[Dict[str, pd.Series]],
         dec = bt["decile"].sort_values("bucket")
         dec_str = " ".join(f"{v*100:+.1f}" for v in dec["mean_fwd_1m"])
         mono_rows.append([st, f"{bt['nq']}분위", dec_str,
-                          _fmt(rho, "{:+.2f}"), "예" if top_ok else "아니오"])
+                          _g(st, rho, "ann", "{:+.2f}"),
+                          ("표본부족" if gate_block(gates[st], "ann")
+                           else ("예" if top_ok else "아니오"))])
     CON.grid(mono_rows, ["전략", "분위수", "분위별 평균수익(%/월, 하위→상위)",
                          "Spearman", "상위>하위"],
              ["l", "l", "l", "r", "l"], title=f"§39 단조성 검증 — {label}")
@@ -7282,14 +8586,26 @@ def report_all(suites: Dict[str, dict], bench: Optional[Dict[str, pd.Series]],
                     ("질문3 SCG_LSA > SCG_LS ?", "SCG_LSA", "SCG_LS")):
         la, lb = _mean_ls(a), _mean_ls(b)
         ia, ib = _ic20(a), _ic20(b)
-        verdict = "YES" if (np.isfinite(la) and np.isfinite(lb) and la > lb
-                            and np.isfinite(ia) and np.isfinite(ib) and ia > ib) else \
-            ("혼재" if (np.isfinite(la) and np.isfinite(lb) and (la > lb) != (ia > ib))
-             else "NO")
-        inc.append([q, f"{_fmt(la)} vs {_fmt(lb)}",
-                    f"{_fmt(ia, '{:+.4f}')} vs {_fmt(ib, '{:+.4f}')}", verdict])
+        # ★ 우열 판정은 두 전략이 **모두** 판정 하한을 넘을 때만 낸다.
+        #   지난 실행은 87행·18종목·16개월에서 "질문3 ... YES" 를 찍었다.
+        blocked = gate_block(gates.get(a, {}), "verdict") or \
+            gate_block(gates.get(b, {}), "verdict")
+        if blocked:
+            verdict = "판정보류"
+        else:
+            verdict = "YES" if (np.isfinite(la) and np.isfinite(lb) and la > lb
+                                and np.isfinite(ia) and np.isfinite(ib) and ia > ib) else \
+                ("혼재" if (np.isfinite(la) and np.isfinite(lb) and (la > lb) != (ia > ib))
+                 else "NO")
+        inc.append([q, f"{_g(a, la)} vs {_g(b, lb)}",
+                    f"{_g(a, ia, 'ic', '{:+.4f}')} vs {_g(b, ib, 'ic', '{:+.4f}')}",
+                    verdict])
     CON.grid(inc, ["§47 핵심 연구질문", "L/S 연환산 (좌>우?)", "IC20 (좌>우?)", "판정"],
              ["l", "r", "r", "c"], title=f"§38 증분 기여 검증 — {label}")
+    if any(r[3] == "판정보류" for r in inc):
+        CON.warn(f"'판정보류' 는 두 전략 중 하나 이상이 판정 하한"
+                 f"({MIN_MONTHS_VERDICT}개월 · {MIN_XS_STOCKS}종목)에 미달했다는 뜻입니다. "
+                 f"이 표본에서 우열을 말하면 종목 한두 개 교체로 뒤집히는 결론이 됩니다.")
 
     if mtab is not None:
         pass  # 주지표 선택 근거표는 S6 에서 이미 출력
@@ -7446,7 +8762,8 @@ def run_all() -> dict:
     global DEPOT
     t_all = time.time()
     CON.head(f"SCG Smart Consensus Gap 백테스트  [{SCG_BUILD}]",
-             f"{BACKTEST_START} ~ {BACKTEST_END} · 모드 {RUN_MODE} · 4전략 "
+             f"{BACKTEST_START} ~ {BACKTEST_END} · 모드 "
+             f"{'COLLECT(수집전용)' if COLLECT_ONLY else RUN_MODE} · 4전략 "
              f"{'/'.join(STRATS)} · 비교 시총하위{COMPARE_BOTTOM_N}")
     CON.grid([["환경", "Colab" if RIG["colab"] else ("Jupyter" if RIG["ipython"] else "CLI")],
               ["파이썬/OS", f"{RIG['python']} / {RIG['os']} {RIG['cpu']}코어"],
@@ -7531,7 +8848,11 @@ def run_all() -> dict:
                     ret_pairs.append((d0, pd.Timestamp(dh)))
         snap_dates = sorted(set(snap_dates))
         ret_pairs = list(dict.fromkeys(ret_pairs))
-        probe_market_sources(cal)
+        if BUDGET.over("S4a 소스 진단"):
+            CON.warn("S4a 예산이 이미 소진되어 소스 진단을 건너뜁니다 — "
+                     "캐시/벌크 경로로 바로 진행합니다")
+        else:
+            probe_market_sources(cal)
         if MARKET_PROBE_BULK:          # 진단에서 받은 벌크는 버리지 않고 그대로 적재
             HUB._load_year(int(MARKET_PROBE_BULK[0]["date"].iloc[0].year))
             HUB._absorb(MARKET_PROBE_BULK)
@@ -7603,6 +8924,22 @@ def run_all() -> dict:
         DEPOT.table_save("scg_analyst_forecasts", fc_all, scope="공용", domain="research",
                          source="ledger+pdf")
         coverage_verdict(fc_all, rep_raw, months)
+        if COLLECT_ONLY:
+            # ★ 수집 전용 모드: 백테스트를 건너뛰고 '얼마나 더 채워야 하는가'만 보고한다.
+            #   전수수집은 여러 번의 실행으로 완성되는데, 매번 백테스트까지 돌리면
+            #   그만큼 수집에 쓸 시간이 깎인다. 원장·캐시는 모두 저장된 상태다.
+            CON.head("수집 전용 모드 완료",
+                     "백테스트는 건너뛰었습니다 — 위 커버리지 표가 '몇 번 더 돌리면 "
+                     "되는가'의 답입니다. 충분해지면 RUN_MODE 를 'FULL' 로 바꾸세요")
+            DEPOT.snapshot_indexes()
+            BUDGET.table()
+            QUOTA.report()
+            http_report()
+            CIRCUIT.table()
+            DEPOT.audit_table()
+            FLOW.parts_table()
+            return {"mode": "COLLECT", "reports": int(len(rep_raw)),
+                    "forecasts": int(len(fc_all)), "actuals": int(len(actuals))}
         metric, track_metrics, mtab = plan_tracks(fc_all)
         cfg = SCGParams()
         fc = validate_forecasts(fc_all, asof=ts(BACKTEST_END) + pd.Timedelta(7, "D"))
@@ -7682,6 +9019,7 @@ def run_all() -> dict:
         write_atomic_text(logp, "\n".join(CON.buffer))
         outs.append(logp)
         DEPOT.snapshot_indexes()
+        BUDGET.table()
         QUOTA.report()
         http_report()
         CIRCUIT.table()
