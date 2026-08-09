@@ -3440,14 +3440,19 @@ RESIDUAL_CHAIN = [("naver", _px_naver), ("fdr", _px_fdr), ("yfinance", _px_yf)]
 def _px_norm(px: pd.DataFrame) -> pd.DataFrame:
     px = px.copy()
     px["date"] = ds_(px["date"])
-    if px["code"].dtype.name != "category":
-        px["code"] = px["code"].astype(str)
     for c in ("open", "high", "low", "close", "volume", "value", "mktcap", "shares"):
         if c in px.columns:
             px[c] = pd.to_numeric(px[c], errors="coerce")
     px = px.dropna(subset=["code", "date", "close"])
-    return (px.sort_values(["code", "date"])
-              .drop_duplicates(["code", "date"], keep="last").reset_index(drop=True))
+    px = (px.sort_values(["code", "date"])
+            .drop_duplicates(["code", "date"], keep="last").reset_index(drop=True))
+    # ★범주형 접기 — 700만행 패널에서 code/origin 은 고유값이 수천 개뿐인데 행마다 별개
+    #   문자열 객체로 남으면 그것만 수백 MB 다. 팩터화하면 행당 2바이트로 줄고,
+    #   groupby(observed=True)·merge 는 그대로 동작한다(Colab RAM 방어).
+    for c in ("code", "origin"):
+        if c in px.columns and px[c].dtype.name != "category":
+            px[c] = px[c].astype("category")
+    return px
 
 
 def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
@@ -3577,11 +3582,12 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if used:
         L.grid([[k, f"{v:,}"] for k, v in used.most_common()], ["벌크 소스", "거래일수"],
                ["l", "r"], title="가격 소스 감사 (날짜축 · 1회=전종목)")
+    if "code" in px.columns and px["code"].dtype.name == "category":
+        px["code"] = px["code"].cat.remove_unused_categories()
     cov = px["code"].nunique()
     L.ok(f"일봉 확보 {len(px):,}행 · {cov:,}종목 · 거래일 {px['date'].nunique():,}일 "
          f"(마스터 {len(want):,}종목 중 {100*cov/max(len(want),1):.0f}% — 나머지는 "
          f"ETF/ELW/스팩 등 비보통주이거나 구간 밖 상장분)")
-    px["code"] = px["code"].astype("category")
     return shrink(px)
 
 
@@ -4325,8 +4331,12 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
     return shrink(W)
 
 
-def harvest_dart_employees(corps: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    """직원현황(empSttus) — 사업부문×성별 분해 + '합계' 소계행 이중계상 제거."""
+def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
+                           priority: Sequence[str] = ()) -> pd.DataFrame:
+    """직원현황(empSttus) — 사업부문×성별 분해 + '합계' 소계행 이중계상 제거.
+
+    ★재무 심층 티어와 같은 쿼터를 나눠 쓴다. 전 종목(3,400사×12년≈41,000회)을 돌면
+      재무를 굶기므로 대상·순서를 유동성 기준으로 맞춘다(PACK-N·C2축의 dlog_emp 입력)."""
     empty = pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll",
                                   "period_end", "knowledge_date", "event_date"])
     if not DART_API_KEY:
@@ -4336,9 +4346,16 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int]) -> pd.Dat
     if cached is not None and len(cached):
         done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
         L.info(f"캐시 재사용: 직원현황 {len(cached):,}행")
-    jobs = [(str(c), int(y)) for c in corps for y in years if (str(c), int(y)) not in done]
+    rank = {str(c): i for i, c in enumerate(priority)}
+    clist = sorted((str(c) for c in corps), key=lambda c: (rank.get(c, 10 ** 9), c))
+    if DART_DEEP_TOP_N and rank and len(clist) > DART_DEEP_TOP_N:
+        clist = clist[:int(DART_DEEP_TOP_N)]
+    jobs = [(c, int(y)) for y in sorted({int(v) for v in years}, reverse=True)
+            for c in clist if (c, int(y)) not in done]
     if RUN_MODE == "CACHED":
         jobs = []
+    if jobs:
+        QUOTA.plan("dart", len(jobs), "직원현황(유동성 순)")
 
     def one(job):
         c, y = job
@@ -4444,6 +4461,9 @@ def harvest_dart_disclosures(start: str, end: str) -> pd.DataFrame:
                 complete = False
         return rows, (str(m) if complete else None)
 
+    if todo:
+        # 월당 페이지 수는 시장 상황에 따라 달라 사전 확정이 안 된다 — 관측 평균으로 추정치만.
+        QUOTA.plan("dart", len(todo) * 24, f"공시목록 시장전체 스윕({len(todo)}개월·추정)")
     fresh: List[dict] = []
     done_new: List[str] = []
     for batch in chunked(todo, 24):
@@ -7664,7 +7684,7 @@ def main() -> dict:
         fs = pd.concat([x.reindex(columns=_FS_KEEP) for x in parts_fs],
                        ignore_index=True) if parts_fs else pd.DataFrame(columns=_FS_KEEP)
         fin = refine_financials(fs)
-        emp = harvest_dart_employees(corps, years)
+        emp = harvest_dart_employees(corps, years, priority=prio)
         if len(fin):
             PITX.put("dart_fin", fin, keys=["corp_code"])
         if len(emp):
