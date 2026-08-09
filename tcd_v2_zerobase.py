@@ -139,6 +139,9 @@ PX_RESIDUAL_MAX_CODES = 300     # 벌크가 못 덮은 종목의 종목축 구�
 DART_BULK_MULTI  = True   # 다중회사 주요계정(fnlttMultiAcnt): 회사 100개를 한 번에 조회.
 #                           전 시장 12년을 약 1,600회로 덮는다(단건이면 16만회).
 DART_MULTI_BATCH = 100    # 한 요청에 넣을 회사 수(공식 상한 100). status 021 이 나면 낮추세요.
+NPS_MAX_CALLS    = 30000  # PACK-N 국민연금은 (종목 × 월) 교차곱이라 냉시작이면 40만 회가 넘는다.
+#                           실시간 잔여량과 이 값 중 작은 쪽으로 잘라 유동성 상위·최근 월부터
+#                           채우고, 나머지는 재실행 때 이어받는다(0 = 잔여량까지 전부).
 DART_DEEP_TOP_N  = 1500   # 전체재무제표(재고·매출채권·CFO·CAPEX)를 받을 유동성 상위 회사 수.
 #                           V6 유동성 하한을 통과할 수 없는 종목까지 심층 수집할 이유가 없다.
 #                           0 = 전 종목(호출량이 매우 커집니다).
@@ -306,6 +309,14 @@ if KRX_MARKETPLACE_ID and KRX_MARKETPLACE_PW:
 
 HAVE = _boot_dependencies()
 
+# ★서드파티(pykrx·FinanceDataReader·yfinance)는 자체 requests 로 나가며 타임아웃이 없다.
+#   한 소켓이 멈추면 스레드풀·메인스레드가 같이 멈추고 수집 시간예산이 영영 발화하지 않는다.
+#   임포트 전에 전역 소켓 타임아웃을 걸어 그 경로 전부에 상한을 상속시킨다.
+import socket as _socket
+try:
+    _socket.setdefaulttimeout(90)
+except Exception:
+    pass
 import numpy as np
 import pandas as pd
 import requests
@@ -900,6 +911,9 @@ def with_retry(times: int = 3, base: float = 1.7):
     return deco
 
 
+NET_TASK_TIMEOUT_S = 300      # 병렬 작업 1건의 상한(초)
+
+
 def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
              label: str = "", quiet: bool = False) -> List[Any]:
     """네트워크 병렬(스레드). 예외는 None 으로 흡수하되 유형별 건수를 로그로 남긴다.
@@ -921,7 +935,8 @@ def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
         for fu in it:
             i = futs[fu]
             try:
-                out[i] = fu.result()
+                # ★상한 필수 — 무한대기 하나가 전체 수집을 멈추고 시간예산까지 무력화한다
+                out[i] = fu.result(timeout=NET_TASK_TIMEOUT_S)
             except Exception as e:                                # noqa
                 errs[type(e).__name__] += 1
     if errs:
@@ -1081,6 +1096,13 @@ STRATEGY_TAG = "TCD_V2_ZB"
 _DRIVE_SUBS = ("내 드라이브", "My Drive", "MyDrive", "내드라이브")
 
 
+def _fsize(p: str) -> int:
+    try:
+        return os.path.getsize(p)
+    except Exception:
+        return -1
+
+
 def _drive_bases() -> List[str]:
     """구글드라이브 '베이스'(마운트 지점) 후보를 넓게 훑는다.
     ★옛 판정의 결함: tcd_cache 폴더가 '이미 존재'해야만 드라이브로 인정 → 처음 쓰는 사람은
@@ -1101,7 +1123,10 @@ def _drive_bases() -> List[str]:
     roots = ["~/Google Drive", "~/GoogleDrive", "~/Google 드라이브",
              "/Volumes/GoogleDrive", "/mnt/g", "/mnt/google_drive"]
     if os.name == "nt" or os.path.isdir("/mnt/c"):
-        for letter in "GHIJKLDEF":                 # 구글드라이브 데스크톱 기본은 G:
+        # ★D/E/F 는 넣지 않는다 — 사양상 로컬 '읽기 전용' 캐시 위치다. 거기에 오래된
+        #   드라이브 마운트 흔적이나 백업 사본이 있으면 신규 수집분을 전부 그쪽에 쓰면서
+        #   로그에는 SYNCED_DRIVE 라고 초록불을 켜 절대 1원칙이 조용히 깨진다.
+        for letter in "GHIJKL":                    # 구글드라이브 데스크톱 기본은 G:
             roots += [f"{letter}:/", f"/mnt/{letter.lower()}/"]
     for base in roots:
         b = os.path.expanduser(base)
@@ -1121,7 +1146,14 @@ def locate_primary_root() -> Tuple[str, str]:
         if gr and not gr.startswith("/content/") and (
                 os.path.isdir(gr) or os.path.isdir(os.path.dirname(gr.rstrip("/\\")))):
             os.makedirs(gr, exist_ok=True)
-            return gr, "SYNCED_DRIVE"
+            # ★지정 경로가 실제로 드라이브 마운트 아래인지 확인한다. 확인 없이 SYNCED_DRIVE 를
+            #   돌려주면 그냥 로컬 폴더인데도 경고가 꺼져 절대 1원칙이 지켜진 줄 알게 된다.
+            real = os.path.realpath(gr)
+            on_drive = any(real.startswith(os.path.realpath(b)) for b in _drive_bases()) or \
+                any(t in real.replace("\\", "/") for t in ("/내 드라이브/", "/My Drive/",
+                                                           "/MyDrive/", "/GoogleDrive/",
+                                                           "/Google Drive/"))
+            return gr, ("SYNCED_DRIVE" if on_drive else "USER_PATH")
     except Exception:
         pass
     if ENVX["colab"]:
@@ -1141,9 +1173,18 @@ def locate_primary_root() -> Tuple[str, str]:
         p = os.path.join(base, os.path.basename(str(GDRIVE_ROOT).rstrip("/\\")) or "tcd_cache")
         if os.path.isdir(p):
             return p, "SYNCED_DRIVE"
-    for base in _drive_bases():                            # ② 없으면 베이스 아래 새로 만든다
-        p = os.path.join(base, "tcd_cache")
+    hunt_real = set()
+    for h in LOCAL_CACHE_HUNT_DIRS:
         try:
+            hunt_real.add(os.path.realpath(os.path.expanduser(h)))
+        except Exception:
+            pass
+    for base in _drive_bases():                            # ② 없으면 베이스 아래 새로 만든다
+        p = os.path.join(base, os.path.basename(str(GDRIVE_ROOT).rstrip("/\\")) or "tcd_cache")
+        try:
+            if any(os.path.realpath(base).startswith(h) or h.startswith(os.path.realpath(base))
+                   for h in hunt_real):
+                continue                                   # 읽기 전용 보조 캐시 위치는 저장처가 아니다
             os.makedirs(p, exist_ok=True)
             L.ok(f"구글드라이브 감지 — 캐시 루트를 새로 만들었습니다: {p}")
             return p, "SYNCED_DRIVE"
@@ -1157,7 +1198,11 @@ def warn_if_not_drive(mode: str, root: str):
     if mode in ("COLAB_DRIVE", "SYNCED_DRIVE"):
         return
     L.warn("─" * 84)
-    L.warn(f"구글드라이브를 찾지 못해 로컬({os.path.abspath(root)})에만 저장합니다.")
+    if mode == "USER_PATH":
+        L.warn(f"GDRIVE_ROOT 로 지정한 {os.path.abspath(root)} 가 구글드라이브 마운트 아래가 "
+               f"아닙니다 — 저장은 정상이지만 '드라이브 동기화'는 일어나지 않습니다.")
+    else:
+        L.warn(f"구글드라이브를 찾지 못해 로컬({os.path.abspath(root)})에만 저장합니다.")
     L.warn("★ '신규 수집분은 구글드라이브 공용/전용 인덱스에 저장' = 절대 1원칙이므로 "
            "아래 중 하나로 반드시 바로잡으세요:")
     L.warn("   ① 구글드라이브 데스크톱을 설치·로그인한 뒤 다시 실행 (자동 감지합니다)")
@@ -1476,13 +1521,17 @@ class VaultArchive:
         """모놀리식 테이블 ∪ 샤드 전체 — primary(드라이브) + 로컬 보조 루트 양쪽에서 모은다.
         구버전이 남긴 단일 parquet 도 그대로 흡수하므로 하위호환이 깨지지 않는다."""
         frames: List[pd.DataFrame] = []
-        seen: set = set()
+        seen: set = set()          # 경로 기준
+        seen_id: set = set()       # ★내용 기준(파일명+크기) — D드라이브가 드라이브의 '거울'인
+        #                            경우가 정상 사용법이라, 경로로만 걸러내면 같은 샤드를 두 번
+        #                            읽어 행수와 램이 정확히 두 배가 된다.
         roots = [(self.root, "GDRIVE")] + [(h, "LOCAL_HUNT") for h in self.hunt]
         for root, tag in roots:
             for sc in (scope, "private" if scope == "shared" else "shared"):
                 mono = self._table_path(root, sc, name)
-                if os.path.exists(mono) and mono not in seen:
-                    seen.add(mono)
+                mid = (os.path.basename(mono), _fsize(mono))
+                if os.path.exists(mono) and mono not in seen and mid not in seen_id:
+                    seen.add(mono); seen_id.add(mid)
                     d = read_parquet_soft(mono, quarantine=(tag != "LOCAL_HUNT"))
                     if d is not None and len(d):
                         frames.append(d)
@@ -1497,9 +1546,10 @@ class VaultArchive:
                 n_ok = 0
                 for fn in parts:
                     p2 = os.path.join(sd, fn)
-                    if p2 in seen:
+                    pid = (fn, _fsize(p2))
+                    if p2 in seen or pid in seen_id:
                         continue
-                    seen.add(p2)
+                    seen.add(p2); seen_id.add(pid)
                     d = read_parquet_soft(p2, quarantine=(tag != "LOCAL_HUNT"))
                     if d is not None and len(d):
                         frames.append(d)
@@ -1557,18 +1607,23 @@ class VaultArchive:
         이동·개명·삭제는 절대 하지 않는다."""
         seen: set = set()
         n_all = 0
+        # ★자기 캐시 루트는 훑지 않는다 — 샤드·blob 수만 개를 FUSE 위에서 매 실행 재순회하면
+        #   수 분이 그냥 날아가고, 이미 인덱스에 있는 것을 다시 등록하는 셈이다.
+        skip_roots = {os.path.realpath(self.root)}
         for dd in list(dirs) + self.hunt:
             try:
                 dd = os.path.expanduser(str(dd))
                 real = os.path.realpath(dd)
             except Exception:
                 continue
-            if not os.path.isdir(dd) or real in seen:
+            if not os.path.isdir(dd) or real in seen or real in skip_roots:
                 continue
             seen.add(real)
             n_dir = 0
             for base, subdirs, files in os.walk(dd):
-                subdirs[:] = [s for s in subdirs if not s.startswith(".") and s != "_backup"]
+                subdirs[:] = [s for s in subdirs
+                              if not s.startswith(".") and s != "_backup"
+                              and not s.endswith(".shards") and s not in ("raw", "manifest")]
                 for fn in files:
                     if n_all >= cap:
                         break
@@ -1593,8 +1648,12 @@ class VaultArchive:
                             continue
                     m = self._DATE_IN_NAME.search(fn) or self._DATE_IN_NAME.search(base)
                     ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+                    # relpath 는 '루트 상대'여야 한다. 절대경로를 박으면 공용 인덱스에
+                    # 이 PC 에서만 유효한 경로가 섞여 다른 전략·다른 PC 에서 못 푼다.
+                    rel = (os.path.relpath(fp, self.root)
+                           if os.path.abspath(fp).startswith(os.path.abspath(self.root)) else "")
                     self._enqueue("shared", {"uid": uid, "domain": "adopted", "kind": kind,
-                                             "key": fn, "relpath": fp, "abspath": fp,
+                                             "key": fn, "relpath": rel, "abspath": fp,
                                              "fmt": os.path.splitext(fn)[1].lstrip("."),
                                              "bytes": size, "event_date": ed or "",
                                              "knowledge_date": ed or "",
@@ -2333,7 +2392,29 @@ def attach_cells(P: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
     ind = master.set_index("code")["industry"].astype(str).to_dict()
     P = P.copy()
     P["industry"] = P["code"].map(ind).fillna("미분류").astype(str).replace("", "미분류")
-    P["size_bucket"] = P["employees"].map(emp_bucket) if "employees" in P.columns else "규모미상"
+    # ★규모버킷 사다리 — 직원수(DART) → 시가총액 → 20일 거래대금 → 규모미상.
+    #   옛 코드는 직원수 하나에만 매달려 있었다. DART 일일 한도가 재무 심층 티어에 먼저
+    #   쓰이면 직원현황이 통째로 비고, 그러면 모든 행이 '규모미상'이 되어 C11 셀이
+    #   (월, 산업)으로 붕괴한다 — 규모 통제가 사라진 채 z·랭크가 계산되는데 로그엔 아무
+    #   표시도 안 난다. 규모 대리변수는 시총·거래대금으로도 충분히 만들 수 있다.
+    sb = (P["employees"].map(emp_bucket) if "employees" in P.columns
+          else pd.Series("규모미상", index=P.index))
+    sb = sb.where(sb.notna() & (sb != "규모미상"))
+    for col, lab in (("mktcap", "시총"), ("adv20", "거래대금")):
+        if sb.isna().any() and col in P.columns and P[col].notna().any():
+            q = (pd.to_numeric(P[col], errors="coerce")
+                 .groupby(P["month"], observed=True)
+                 .transform(lambda s: s.rank(pct=True) if s.notna().sum() >= 8 else np.nan))
+            alt = pd.Series(np.where(q.isna(), np.nan,
+                                     np.where(q < 1 / 3, f"{lab}소",
+                                              np.where(q < 2 / 3, f"{lab}중", f"{lab}대"))),
+                            index=P.index)
+            sb = sb.fillna(alt)
+    P["size_bucket"] = sb.fillna("규모미상").astype(str)
+    if (P["size_bucket"] == "규모미상").mean() > 0.5:
+        L.warn(f"규모버킷 미상 {100*float((P['size_bucket']=='규모미상').mean()):.0f}% — "
+               f"C11 셀이 (월,산업)으로 사실상 붕괴합니다. 직원현황/시총 수집 상태를 "
+               f"확인하세요(규모 통제 없이 계산된 z·랭크는 해석에 주의).")
     ym = P["month"].dt.strftime("%Y%m")
     P["cell"] = ym + "|" + P["industry"] + "|" + P["size_bucket"]
     P["cell_up"] = ym + "|" + P["industry"].str.slice(0, 4) + "|ALL"
@@ -2428,13 +2509,13 @@ class KRXMarketplace:
             L.warn("KRX 마켓플레이스 로그인 실패 — ID/PW 확인. 폴백 체인으로 정상 진행합니다.")
             return False
 
-    def bld(self, bld: str, serial: bool = True, **params) -> Optional[list]:
+    def bld(self, bld: str, serial: bool = True, force: bool = False, **params) -> Optional[list]:
         """마켓플레이스 표 조회. 세션 없으면 None(상위 폴백). JSON 아닌 응답(로그인 페이지)도 차단.
 
         serial=False — 날짜축 벌크 수집처럼 '읽기 전용 조회를 수천 번' 하는 경로용.
         전역 속도는 pace('krx') 가 이미 QPS 로 묶고 있어 서버 부하는 동일하고,
         락을 잡지 않는 만큼 왕복 지연만 겹쳐 사라진다(2,700일 × 0.6초 대기가 통째로 증발)."""
-        if not self.session_ok:
+        if not self.session_ok and not force:
             return None
         body = {"bld": bld, "money": "1", "share": "1", "csvxls_isNo": "false", **params}
         if serial:
@@ -2508,11 +2589,24 @@ class KRXOpenAPI:
         while dd.weekday() >= 5:
             dd -= dtm.timedelta(days=1)
         for mode in ("query", "header"):
-            rows = self._call("sto", "stk_bydd_trd", dd.strftime("%Y%m%d"), mode)
-            if rows:
+            # ★엔드포인트별로 이용신청이 따로 승인된다. 코스피만 승인된 상태(승인 대기 중의
+            #   정상 상태다)에서 ok=True 로 켜면 벌크 1순위가 '코스피만' 을 돌려주고,
+            #   그 반쪽 응답이 전 거래일에 걸쳐 완료로 굳는다 → 코스닥이 통째로 증발한다.
+            #   그래서 DAILY 전 엔드포인트가 다 살아 있을 때만 켠다.
+            oks = [bool(self._call(cat, ep, dd.strftime("%Y%m%d"), mode))
+                   for cat, ep in self.DAILY]
+            if all(oks):
                 self.ok, self.mode, self.state = True, mode, f"사용 가능({mode})"
-                L.ok(f"KRX Open API 사용 가능 (AUTH_KEY 전달 {mode}) — 날짜축 벌크 1순위로 씁니다.")
+                L.ok(f"KRX Open API 사용 가능 (AUTH_KEY 전달 {mode}, 엔드포인트 "
+                     f"{len(self.DAILY)}종 전부 승인) — 날짜축 벌크 1순위로 씁니다.")
                 return True
+            if any(oks):
+                self.state = "일부 엔드포인트만 승인"
+                L.warn(f"KRX Open API 가 {sum(oks)}/{len(self.DAILY)} 엔드포인트만 응답합니다"
+                       f"(코스피만 승인된 상태로 추정). 반쪽 시장이 전 기간에 굳는 것을 막기 위해 "
+                       f"이 경로를 쓰지 않고 마켓플레이스/pykrx 로 진행합니다 — 나머지 "
+                       f"엔드포인트 이용신청이 승인되면 자동으로 1순위가 됩니다.")
+                return False
         self.state = "이용신청 미승인/거부"
         L.warn("KRX Open API 키는 있으나 호출이 거부되었습니다. 이 API 는 엔드포인트별 "
                "'이용신청'이 따로 필요하고 승인에 하루 정도 걸립니다 — 승인 전까지는 "
@@ -2821,10 +2915,29 @@ def _mktcap_from_px(px: Optional[pd.DataFrame], months: pd.DatetimeIndex) -> pd.
     d = d[d["month"].isin(months)]
     if not len(d):
         return pd.DataFrame(columns=["code", "month", "mktcap", "shares", "cap_src"])
+    # ★월말 근접성 — mktcap 이 실리는 소스(krx_open/krx_mp)와 안 실리는 소스(pykrx)가 섞이면
+    #   '그 달에서 시총이 있었던 마지막 날'이 3주 전일 수 있다. 월말 5영업일 안쪽만 인정한다.
+    d = d[(d["month"] - d["date"]).dt.days <= 8]
+    if not len(d):
+        return pd.DataFrame(columns=["code", "month", "mktcap", "shares", "cap_src"])
     d = (d.sort_values(["code", "month", "date"])
            .drop_duplicates(["code", "month"], keep="last"))
     d["code"] = d["code"].astype(str)
     d["cap_src"] = "krx_bulk_px"
+    # ★횡단면 폭 — 한 종목만 있어도 그 달을 완료로 찍으면 '시총 하위 1000' 유니버스가
+    #   40종목에서 뽑히고도 감사표엔 최고 신뢰 등급(snapshot)으로 찍힌다.
+    # 절대 임계가 아니라 '그 달 일봉에 나타난 종목수 대비 비율' — 시장 규모·테스트 규모에
+    # 모두 맞는 척도다(절대값 500 은 소규모 유니버스에서 전부 탈락시킨다).
+    base = px.assign(_m=ds_(px["date"]) + pd.offsets.MonthEnd(0)) \
+             .groupby("_m")["code"].nunique()
+    wide = d.groupby("month")["code"].size()
+    need = (wide.index.map(base).astype(float) * 0.5).fillna(np.inf)
+    keep_m = set(wide.index[wide.to_numpy() >= need.to_numpy()])
+    thin = len(wide) - len(keep_m)
+    if thin:
+        L.info(f"일봉 동봉 시총 중 횡단면이 얕은 {thin}개월은 채택하지 않고 정식 스냅샷 "
+               f"경로로 넘깁니다(비교전략 유니버스 왜곡 방지).")
+    d = d[d["month"].isin(keep_m)]
     return d[["code", "month", "mktcap", "shares", "cap_src"]].reset_index(drop=True)
 
 
@@ -2901,7 +3014,7 @@ def harvest_mktcap(months: pd.DatetimeIndex, px: Optional[pd.DataFrame] = None) 
     cap["month"] = ds_(cap["month"])
     cap = (cap.dropna(subset=["code", "month"])
               .drop_duplicates(["code", "month"], keep="last").reset_index(drop=True))
-    if rows or len(free):
+    if rows:                     # ★len(free) 로 저장하면 새 월이 없어도 매 실행 전체 재기록
         keep = cap.copy()
         srcs = dict(src_used)
         if len(free):
@@ -3185,6 +3298,25 @@ def _num(x) -> float:
         return np.nan
 
 
+def _pick_code_col(d: pd.DataFrame) -> Optional[str]:
+    """종목코드 컬럼을 이름으로 찾고, 없으면 첫 컬럼을 '값 형태'로 검증한 뒤에만 받아들인다.
+
+    ★reset_index() 로 생긴 정수 인덱스를 코드로 추측해 받으면 code6 의 zfill 을 타고
+      0→'000000', 1→'000001' 같은 가짜 종목이 가격·수급 패널에 진짜처럼 들어온다.
+      길이 5 미만 값이 섞이면 코드 컬럼이 아니라고 판정한다."""
+    cc = {str(c).strip(): c for c in d.columns}
+    for k in ("티커", "종목코드", "code", "Code", "단축코드", "ISU_SRT_CD"):
+        if k in cc:
+            return cc[k]
+    if not len(d.columns) or not len(d):
+        return None
+    first = d.columns[0]
+    smp = d[first].astype(str).str.strip().head(50)
+    if float((smp.str.len() >= 5).mean()) > 0.9 and float(smp.map(code6).notna().mean()) > 0.9:
+        return first
+    return None
+
+
 def _pykrx_fn(*names) -> Optional[Callable]:
     """pykrx 는 버전마다 함수명이 갈린다(get_market_ohlcv / _by_ticker / _by_date).
     존재하는 첫 이름을 쓰고, 하나도 없으면 그 경로만 비활성화한다(죽지 않는다)."""
@@ -3283,10 +3415,10 @@ def _bulk_krx_open(day: pd.Timestamp) -> Optional[pd.DataFrame]:
 def _bulk_krx_mp(day: pd.Timestamp) -> Optional[pd.DataFrame]:
     """KRX 전종목 시세(MDCSTAT01501) — 시가총액·상장주식수까지 한 번에.
     로그인 세션이 있을 때 1순위. ★한 번 호출 = 그날 상장 전 종목."""
-    if not KRX.session_ok:
-        return None
+    # ★로그인 여부로 막지 않는다 — 전종목시세(MDCSTAT01501)는 세션 없이도 응답하는 경우가
+    #   많고, 아니면 bld() 가 JSON 아님을 보고 None 을 돌려주므로 다음 소스로 넘어갈 뿐이다.
     blk = KRX.bld("dbms/MDC/STAT/standard/MDCSTAT01501", mktId="ALL",
-                  trdDd=day.strftime("%Y%m%d"), serial=False)
+                  trdDd=day.strftime("%Y%m%d"), serial=False, force=True)
     if not blk:
         return None
     rows = []
@@ -3335,7 +3467,10 @@ def _bulk_pykrx(day: pd.Timestamp) -> Optional[pd.DataFrame]:
            "종가": "close", "거래량": "volume", "거래대금": "value"}
     d = d.rename(columns={k: v for k, v in ren.items() if k in d.columns})
     if "code" not in d.columns:
-        d = d.rename(columns={d.columns[0]: "code"})
+        cc = _pick_code_col(d)
+        if cc is None:
+            return None                 # 추측 금지 — 가짜 코드 생성 경로
+        d = d.rename(columns={cc: "code"})
     d["code"] = d["code"].map(code6)
     for c in ("open", "high", "low", "close", "volume", "value"):
         d[c] = pd.to_numeric(d[c], errors="coerce") if c in d.columns else np.nan
@@ -3461,6 +3596,60 @@ def _px_norm(px: pd.DataFrame) -> pd.DataFrame:
     return px
 
 
+CA_SHARES_MIN = 0.15     # 주식수 변동 15% 이상만 자본변동 후보
+CA_PROD_TOL = 0.12       # (주식수비 × 가격비) 가 1 에서 ±12% 안이면 '가격이 정확히 반대로 움직임'
+
+
+def apply_corporate_actions(px: pd.DataFrame) -> pd.DataFrame:
+    """★수정주가 복원 — 날짜축 개편이 만든 가장 위험한 부작용을 여기서 되돌린다.
+
+    구 종목축 경로는 수정주가를 명시적으로 요청했다(KRX adjStkprc='2', pykrx adjusted=True).
+    그런데 날짜축 전종목 스냅샷은 '그날 실제 체결가'다. 그대로 두면
+      5:1 액면분할 → 종가 100,000 → 20,000 → fwd_ret = -80%  (실제 손익은 0%)
+    가 되고, dlog_P 가 무너지면서 d1(=-dlog_M, U 축에서 가장 무거운 성분)이 그 종목을
+    상위 5% 로 밀어 올린다. 순수 기업행위 아티팩트로 매수가 발생하고 성과·강건성이 전부 오염된다.
+
+    복원 방법: 같은 응답에 실려 오는 상장주식수(LIST_SHRS)로 '조인트 테스트'를 한다.
+      · 액면분할/병합·무상증자 = 주식수가 k배 되면서 가격이 정확히 1/k 로 움직인다
+        → (주식수비 × 가격비) ≈ 1
+      · 유상증자·CB전환 = 주식수는 늘지만 가격은 그만큼 떨어지지 않는다
+        → (주식수비 × 가격비) 가 1 에서 벗어난다 → 조정하지 않는다(정상 수익률)
+    과거 가격을 '그 시점 이후 발생한 k 들의 곱'으로 나눠 최신 기준으로 소급 조정한다.
+    ★원본(raw)은 그대로 샤드에 저장하고 조정은 읽을 때마다 다시 계산한다 — 이중조정 불가.
+    """
+    if px is None or not len(px) or "shares" not in px.columns:
+        return px
+    sh = pd.to_numeric(px["shares"], errors="coerce")
+    if float(sh.notna().mean()) < 0.20:      # '거의 비었나'는 비율로 판정(절대 건수는 규모의존)
+        L.warn("상장주식수가 거의 비어 수정주가 복원을 건너뜁니다 — 액면분할이 있는 종목은 "
+               "그 달 수익률이 인위적으로 튑니다(KRX 로그인/Open API 를 넣으면 자동 해결).")
+        return px
+    px = px.sort_values(["code", "date"]).reset_index(drop=True)
+    g = px.groupby("code", observed=True)
+    sr = sh / g["shares"].transform(lambda s: pd.to_numeric(s, errors="coerce").shift(1))
+    pr = px["close"] / g["close"].shift(1)
+    prod = sr * pr
+    is_ca = (sr.notna() & pr.notna() & (sr > 0) & (pr > 0) &
+             (np.abs(np.log(sr.where(sr > 0))) > np.log(1 + CA_SHARES_MIN)) &
+             (np.abs(np.log(prod.where(prod > 0))) < np.log(1 + CA_PROD_TOL)))
+    n_ca = int(is_ca.sum())
+    if not n_ca:
+        return px
+    k = pd.Series(np.where(is_ca.fillna(False), sr, 1.0), index=px.index).astype(float)
+    cum = k.groupby(px["code"], observed=True).cumprod()
+    tot = k.groupby(px["code"], observed=True).transform("prod")
+    div = (tot / cum).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    touched = int((div != 1.0).sum())
+    for c in ("open", "high", "low", "close"):
+        if c in px.columns:
+            px[c] = px[c] / div
+    if "volume" in px.columns:
+        px["volume"] = px["volume"] * div      # 거래대금(value)·시총은 통화라 조정 대상 아님
+    L.ok(f"수정주가 복원 — 자본변동 {n_ca:,}건 감지({px.loc[is_ca, 'code'].nunique():,}종목), "
+         f"과거 {touched:,}행 소급 조정. 조정 없이 두면 액면분할이 그대로 월수익률이 됩니다.")
+    return px
+
+
 def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """전 종목 일봉 — ★날짜축 벌크. 거래일 1회 호출 = 그날 상장 전 종목.
 
@@ -3485,7 +3674,20 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     led = VAULT.load_table("price_dates_done", "shared")
     done_dates: set = set()
     if led is not None and len(led) and "date" in led.columns:
-        done_dates = set(ds_(led["date"]).dropna().dt.strftime("%Y-%m-%d"))
+        lg = led.copy()
+        lg["date"] = ds_(lg["date"])
+        lg = lg.dropna(subset=["date"])
+        lg["n_rows"] = pd.to_numeric(lg.get("n_rows"), errors="coerce").fillna(0)
+        nz = lg.loc[lg["n_rows"] > 0, "n_rows"]
+        # ★행수 게이트 — 응답이 왔다는 사실만으로 완료 처리하면, 코스닥 레그가 죽어
+        #   950행만 온 날이 2,600 종목짜리 거래일로 영원히 굳는다(재수집 경로가 없다).
+        floor = max(30.0, 0.6 * float(nz.median())) if len(nz) else 0.0
+        good = (lg["n_rows"] == 0) | (lg["n_rows"] >= floor)
+        thin = int((~good).sum())
+        done_dates = set(lg.loc[good, "date"].dt.strftime("%Y-%m-%d"))
+        if thin:
+            L.info(f"원장의 '반쪽 응답' {thin:,}거래일(행수 {floor:,.0f} 미만)은 완료로 보지 않고 "
+                   f"다시 받습니다 — 부분 수집이 영구 동결되는 것을 막습니다.")
     if cached is not None and len(cached):
         n_day = int(cached["date"].nunique())
         if not done_dates:
@@ -3500,6 +3702,9 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     cal, cal_src = trading_calendar(s_ts, e_ts)
     approx_cal = (cal_src == "bdate_approx")
     todo = [t for t in cal if t.strftime("%Y-%m-%d") not in done_dates]
+    # ★최근 → 과거 순. 오름차순이면 시간예산에 잘렸을 때 '가장 오래된 몇 년'만 남고 최근이
+    #   비어, 중간결과의 10년 Sharpe·MDD 가 전략이 한 번도 거래하지 않은 구간에서 계산된다.
+    todo = todo[::-1]
     if RUN_MODE == "CACHED":
         todo = []
 
@@ -3586,6 +3791,7 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     # ── 잔여 보충: 벌크가 한 행도 못 준 종목만, 상한을 걸고 종목축으로 구제 ──────────────
     px = _residual_fill(px, want, s_ts, e_ts)
+    px = apply_corporate_actions(px)          # ★반드시 저장 뒤·사용 앞 (원본은 raw 로 남는다)
 
     px = px[(px["date"] >= s_ts) & (px["date"] <= e_ts)]
     if used:
@@ -3603,12 +3809,18 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 def _flush_px_shard(shard: List[pd.DataFrame], days: List[pd.Timestamp], led_rows: List[dict]):
     """샤드 1개 + 거래일 원장을 즉시 드라이브에 기록 — 도중에 죽어도 받은 만큼은 남는다.
     ★샤드가 비어도(전부 휴장) 원장은 반드시 남긴다 — 안 그러면 그 날짜를 영원히 재조회한다."""
+    saved = None
     if shard and days:
         ch = pd.concat(shard, ignore_index=True)
         d0, d1 = min(days), max(days)
-        VAULT.save_shard("krx_ohlcv_daily", ch, key=f"{d0:%Y%m%d}_{d1:%Y%m%d}", scope="shared",
-                         domain="price", source="krx_bulk_by_date",
-                         note="날짜축 전종목 스냅샷 — 전 전략 공용")
+        saved = VAULT.save_shard("krx_ohlcv_daily", ch, key=f"{d0:%Y%m%d}_{d1:%Y%m%d}",
+                                 scope="shared", domain="price", source="krx_bulk_by_date",
+                                 note="날짜축 전종목 스냅샷 — 전 전략 공용")
+        if saved is None:
+            # ★샤드가 디스크에 안 앉았는데 원장에 완료를 찍으면 그 날짜들은 영원히 사라진다.
+            L.warn(f"샤드 저장 실패 — {len(days):,}거래일을 완료로 기록하지 않습니다"
+                   f"(다음 실행에서 다시 받습니다).")
+            return
     if led_rows:
         base = VAULT.load_table("price_dates_done", "shared")
         allf = pd.concat([base, pd.DataFrame(led_rows)], ignore_index=True) \
@@ -3763,8 +3975,11 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         lg["month"] = ds_(lg["date"]) + pd.offsets.MonthEnd(0)
         lg = (lg.dropna(subset=["code", "month"])
                 .groupby(["code", "month"], as_index=False)[["inst_net", "forgn_net"]].sum())
+        lg["_legacy"] = True
         frames.append(lg)
-        L.info(f"구버전 일간 수급 캐시 {len(legacy):,}행을 월 집계로 승계했습니다(재수집 없음).")
+        L.info(f"구버전 일간 수급 캐시 {len(legacy):,}행을 월 집계로 승계했습니다. "
+               f"단, 이 월들은 '수집 완료'로 치지 않습니다 — 구 수집기가 종목 일부에서 잘린 "
+               f"상태라 그대로 완료 처리하면 나머지 종목이 영구 결손으로 굳습니다.")
 
     fn = _pykrx_fn("get_market_net_purchases_of_equities",
                    "get_market_net_purchases_of_equities_by_ticker")
@@ -3798,10 +4013,10 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                     continue
                 d = d.reset_index()
                 cc = {str(c).strip(): c for c in d.columns}
-                key = cc.get("티커") or d.columns[0]
+                key = _pick_code_col(d)
                 val = cc.get("순매수거래대금") or cc.get("순매수금액")
-                if val is None:
-                    continue
+                if val is None or key is None:
+                    continue          # ★코드 컬럼 추측 금지(가짜 코드 생성 경로)
                 one = pd.DataFrame({"code": d[key].map(code6),
                                     col: pd.to_numeric(d[val], errors="coerce")}).dropna(
                                         subset=["code"])
@@ -3818,14 +4033,21 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if not frames:
         L.info("수급 미수집(pykrx 없음/CACHED/시간예산) — d3 결측, U 는 가용 축 평균으로 구성.")
         return empty
-    fl = pd.concat([f.reindex(columns=["code", "month", "inst_net", "forgn_net"])
+    fl = pd.concat([f.reindex(columns=["code", "month", "inst_net", "forgn_net", "_legacy"])
                     for f in frames], ignore_index=True)
+    fl["_legacy"] = fl["_legacy"].fillna(False).astype(bool)
     fl["month"] = ds_(fl["month"]) + pd.offsets.MonthEnd(0)
     fl = (fl.dropna(subset=["code", "month"])
-            .sort_values(["code", "month"])
+            .sort_values(["code", "month", "_legacy"], ascending=[True, True, False])
+            # ↑ 승계분(True)을 앞에, 신규(False)를 뒤에 → keep="last" 가 신규를 남긴다
             .drop_duplicates(["code", "month"], keep="last").reset_index(drop=True))
+    drop_idx = fl.index[fl["_legacy"]]
+    fl = fl.drop(columns=["_legacy"])
     if got:
-        VAULT.save_table("krx_flows_monthly", fl, "shared", domain="flow",
+        # ★승계분(구버전 일간 캐시 파생)은 월간 테이블에 저장하지 않는다. 저장하면 다음 실행의
+        #   have 에 그 월이 들어가 '전종목 월 수집'이 영영 돌지 않는다(선택편향 고착).
+        keep = fl[~fl.index.isin(drop_idx)] if len(drop_idx) else fl
+        VAULT.save_table("krx_flows_monthly", keep, "shared", domain="flow",
                          source="pykrx:net_purchases", note="월간 전종목 순매수 — 전 전략 공용")
     return shrink(fl)
 
@@ -3938,6 +4160,39 @@ DART_MSG = {"000": "정상", "010": "미등록 키", "011": "사용불가 키", 
             "901": "계정 폐쇄"}
 
 
+_ACCT_RX: Optional[Any] = None
+
+
+def acct_keep(d: pd.DataFrame) -> pd.DataFrame:
+    """★수집 즉시 '쓰는 계정'만 남긴다.
+
+    fnlttSinglAcntAll 은 회사·기간당 200~300 계정을 통째로 준다. 그런데 이 전략이 실제로
+    읽는 계정은 ACCT 의 24개뿐이다. 전부 들고 있으면
+      1,500사 × 13년 × 4보고서 × 250계정 ≈ 1,950만 행 × 문자열 8컬럼 ≈ 수 GB
+    가 되어 H.DART 가 램에서 죽고(그 단계는 critical=False 라 조용히 통과한다)
+    B축·C축이 통째로 빈 채 백테스트가 돌아간다. 90% 이상을 여기서 버린다 —
+    드라이브 샤드 용량도 같은 비율로 줄어든다.
+    """
+    global _ACCT_RX
+    if d is None or not len(d):
+        return d
+    if _ACCT_RX is None:
+        _ACCT_RX = re.compile("|".join(p for _, pats in ACCT.values() for p in pats), re.I)
+    aid = d["account_id"].astype(str)
+    anm = d["account_nm"].astype(str).str.replace(r"\s+", "", regex=True)
+    return d[aid.str.contains(_ACCT_RX, na=False) | anm.str.contains(_ACCT_RX, na=False)]
+
+
+def fs_compact(d: pd.DataFrame) -> pd.DataFrame:
+    """반복값이 대부분인 문자열 컬럼을 범주형으로 — 누적 재무 테이블의 램/디스크 방어."""
+    if d is None or not len(d):
+        return d
+    for c in ("corp_code", "reprt_code", "sj_div", "account_id", "account_nm", "fs_kind"):
+        if c in d.columns and d[c].dtype == object:
+            d[c] = d[c].astype("category")
+    return d
+
+
 def dart_call(ep: str, params: dict) -> Optional[dict]:
     """DART 호출 단일 통로 — 쿼터 계수(실제 시도 횟수 기준) + 020 학습 + 진단.
 
@@ -3953,9 +4208,11 @@ def dart_call(ep: str, params: dict) -> Optional[dict]:
                   referer="https://opendart.fss.or.kr/",
                   count_cb=lambda: QUOTA.charge("dart"))
     if not isinstance(js, dict):
-        return None
+        return None                     # ★통신 실패 — '데이터 없음'과 절대 같지 않다
     st = str(js.get("status", ""))
     if st and st != "000":
+        if st == "013":
+            return {"status": "013"}    # ★서버가 '진짜 없다'고 답한 것만 음성캐시 대상
         if st == "020":
             QUOTA.server_says_limit("dart")
         elif st == "021":
@@ -4022,6 +4279,8 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int]) -> pd.DataFra
            f"{sum(len(g) for _, _, g in jobs):,}회) · 실시간 잔여 {QUOTA.remaining('dart'):,}건")
     QUOTA.plan("dart", len(jobs), f"주요계정 벌크(회사 {bs}개/호출)")
 
+    seen_rows: List[pd.DataFrame] = []
+
     def _fetch(grp: List[str], y: int, r: str) -> Optional[pd.DataFrame]:
         js = dart_call("fnlttMultiAcnt.json",
                        {"corp_code": ",".join(grp), "bsns_year": str(y), "reprt_code": r})
@@ -4035,7 +4294,7 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int]) -> pd.DataFra
         d["fs_kind"] = d["fs_div"].astype(str) if "fs_div" in d.columns else "CFS"
         d["tier"] = 1
         d["corp_code"] = d["corp_code"].astype(str)
-        return d[_FS_KEEP]
+        return acct_keep(d[_FS_KEEP])
 
     def one(job):
         y, r, grp = job
@@ -4057,16 +4316,31 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int]) -> pd.DataFra
             why = "시간예산" if CLOCK.over() else "호출 잔여량 소진"
             CLOCK.cut(f"DART 주요계정 벌크: {sum(len(x) for x in got):,}행 수집 후 중단({why})")
             break
-        got += [d for d in pmap_net(one, batch, workers=min(IO_THREADS, 8),
-                                    label="DART 주요계정(벌크)") if d is not None and len(d)]
-    frames = ([cached] if cached is not None and len(cached) else []) + got
+        res = pmap_net(one, batch, workers=min(IO_THREADS, 8), label="DART 주요계정(벌크)")
+        got += [d for d in res if d is not None and len(d)]
+        # ★응답에 안 나온 회사도 '조회는 했다'로 남긴다 — 안 그러면 미제출 회사·연도 조합을
+        #   매 실행 다시 묶어 보내며 하루 한도의 5% 를 영구히 태운다.
+        for (y, r, grp), d in zip(batch, res):
+            got_c = set(d["corp_code"].astype(str)) if d is not None and len(d) else set()
+            miss = [c for c in grp if c not in got_c]
+            if miss:
+                seen_rows.append(pd.DataFrame({"corp_code": miss, "bsns_year": int(y),
+                                               "reprt_code": r, "sj_div": None,
+                                               "account_id": None, "account_nm": None,
+                                               "thstrm_amount": None, "rcept_no": None,
+                                               "fs_kind": "NONE", "tier": 1}))
+    frames = ([cached] if cached is not None and len(cached) else []) + got + seen_rows
     if not frames:
         return empty
     M = pd.concat([f.reindex(columns=_FS_KEEP) for f in frames], ignore_index=True)
-    M = M.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div", "account_nm"],
-                          keep="last")
-    if got:
-        VAULT.save_shard("dart_fnltt_major", pd.concat(got, ignore_index=True),
+    # ★fs_kind 를 키에 넣는다. 빼면 fnlttMultiAcnt 가 돌려준 연결/별도 중 하나가 응답 순서에
+    #   따라 임의로 버려지고, 회사별 기준(모달)을 고를 수 없게 된다.
+    M = fs_compact(M.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div",
+                                      "account_nm", "fs_kind"], keep="last"))
+    if got or seen_rows:
+        VAULT.save_shard("dart_fnltt_major",
+                         pd.concat([x.reindex(columns=_FS_KEEP) for x in got + seen_rows],
+                                   ignore_index=True),
                          key=f"{dtm.datetime.now():%Y%m%d_%H%M%S}", scope="shared",
                          domain="dart", source="opendart:fnlttMultiAcnt",
                          note="주요계정 벌크 — 전 전략 공용")
@@ -4150,7 +4424,7 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
             pref = fs_kind_pref.get(c)
             # ★연결(CFS) 우선 — 국내 상장사 대다수가 연결 기준이라 첫 호출 적중률이 높다
             order = [pref] if pref in ("OFS", "CFS") else ["CFS", "OFS"]
-            js, used_kind = None, None
+            js, used_kind, all_013 = None, None, True
             for fk in order:
                 js = dart_call("fnlttSinglAcntAll.json",
                                {"corp_code": c, "bsns_year": str(y), "reprt_code": r,
@@ -4158,9 +4432,14 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
                 if js and isinstance(js.get("list"), list) and js["list"]:
                     used_kind = fk
                     break
+                # ★'013 데이터 없음'(서버가 진짜 없다고 답함)과 통신 실패를 구분한다.
+                #   구분 없이 음성캐시에 넣으면 60초짜리 네트워크 장애가 수백 회사·연도를
+                #   90일간 영구 결손으로 만든다.
+                if not (isinstance(js, dict) and str(js.get("status")) == "013"):
+                    all_013 = False
                 js = None
             if js is None:
-                if QUOTA.allow("dart"):                    # 한도 소진이 아니라 '진짜 없음'일 때만
+                if all_013 and QUOTA.allow("dart"):        # 한도 소진·통신 실패가 아닐 때만
                     return ("EMPTY", c, y, r)
                 return None
             d = pd.DataFrame(js["list"])
@@ -4170,7 +4449,7 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
             d["corp_code"], d["bsns_year"], d["reprt_code"] = c, int(y), r
             d["fs_kind"] = used_kind
             d["tier"] = 0
-            return d[_FS_KEEP]
+            return acct_keep(d[_FS_KEEP])
 
         for batch in chunked(jobs, 400):
             if CLOCK.over() or not QUOTA.allow("dart"):
@@ -4197,8 +4476,8 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
     if not frames:
         return pd.DataFrame(columns=_FS_KEEP)
     fs = pd.concat([f.reindex(columns=_FS_KEEP) for f in frames], ignore_index=True)
-    fs = fs.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div",
-                             "account_id", "account_nm"], keep="last")
+    fs = fs_compact(fs.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div",
+                                        "account_id", "account_nm"], keep="last"))
     if got:
         # ★샤드 append — 수십만행 테이블을 매 실행마다 통째로 다시 쓰지 않는다
         VAULT.save_shard("dart_fnltt_raw", pd.concat(got, ignore_index=True),
@@ -4253,21 +4532,37 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
     if fs is None or fs.empty:
         return pd.DataFrame(columns=["corp_code", "period_end", "knowledge_date"])
     d = fs.copy()
+    # ★범주형 해제 — 누적 저장용으로 접어둔 컬럼을 그대로 쓰면 map/뺄셈/pivot 이 조용히
+    #   깨진다(Categorical - Categorical TypeError, pivot_table 의 카테고리 전개 폭발).
+    #   여기서 쓰는 부분집합은 계정 필터를 이미 통과해 작으므로 되돌리는 비용이 싸다.
+    for c in ("corp_code", "reprt_code", "sj_div", "account_id", "account_nm", "fs_kind"):
+        if c in d.columns and str(d[c].dtype) == "category":
+            d[c] = d[c].astype(str)
     if "tier" not in d.columns:
         d["tier"] = 0
     d["tier"] = pd.to_numeric(d["tier"], errors="coerce").fillna(0).astype(int)
     # ★별도(OFS)/연결(CFS) 혼합 방어 — 한 회사의 기간별 기준이 섞이면 분기 차분·TTM·Δlog 가
     #   회계 기준 점프를 실적 변화로 오인한다(V1·TP_B1 오탐). 회사별 최빈 기준만 남긴다.
     if "fs_kind" in d.columns and d["fs_kind"].notna().any():
-        base = d[(d["tier"] == 0) & d["fs_kind"].astype(str).isin(("OFS", "CFS"))]
-        if len(base):
-            modal = (base.groupby(base["corp_code"].astype(str))["fs_kind"]
-                         .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else None).to_dict())
+        known = d[d["fs_kind"].astype(str).isin(("OFS", "CFS"))]
+        # ★기준(연결/별도)은 심층 티어로 먼저 정하고, 심층이 없는 회사만 벌크로 정한다.
+        #   그리고 정한 기준을 ★모든 티어에 적용한다. 옛 코드는 tier0 에만 적용했는데,
+        #   심층은 쿼터 때문에 항상 '최근 몇 년'만 있고 그 이전은 벌크가 채운다. 즉 모든
+        #   회사의 시계열 한가운데에 티어 경계가 있다. 거기서 기준이 갈리면
+        #   (연결 2,000억 → 별도 800억) 분기차분·TTM 이 +150% 실적 점프를 만들어내고
+        #   dlog_E>0 → D_state='목표상태(진입)' 로 그 종목을 사게 된다.
+        modal: Dict[str, str] = {}
+        if len(known):
+            deep_k = known[known["tier"] == 0]
+            for src in (known, deep_k):          # 벌크로 먼저 채우고 심층으로 덮어쓴다
+                if len(src):
+                    modal.update(src.groupby(src["corp_code"].astype(str))["fs_kind"]
+                                 .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else None)
+                                 .dropna().to_dict())
+        if modal:
             pref = d["corp_code"].astype(str).map(modal)
-            # 벌크 티어(tier1)는 기준 판정 대상이 아니다 — 심층이 없는 회사를 메우는 보조라
-            # 여기서 잘라내면 '주요계정으로 전 시장을 덮는다'는 설계가 무너진다.
-            mixed = ((d["tier"] == 0) & d["fs_kind"].notna() & pref.notna() &
-                     (d["fs_kind"] != pref))
+            mixed = (d["fs_kind"].astype(str).isin(("OFS", "CFS")) & pref.notna() &
+                     (d["fs_kind"].astype(str) != pref))
             if mixed.any():
                 n_corp = d.loc[mixed, "corp_code"].nunique()
                 L.info(f"재무 기준 혼합 {n_corp:,}사 — 회사별 최빈 기준(별도/연결)만 사용하고 "
@@ -4300,7 +4595,7 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["corp_code", "period_end", "knowledge_date"])
     tall = pd.concat(picked, ignore_index=True)
     W = tall.pivot_table(index=["corp_code", "bsns_year", "reprt_code"], columns="item",
-                         values="amount", aggfunc="first").reset_index()
+                         values="amount", aggfunc="first", observed=True).reset_index()
     rc = (tall.sort_values("rcept_no")
               .groupby(["corp_code", "bsns_year", "reprt_code"])["rcept_no"].first().reset_index())
     W = W.merge(rc, on=["corp_code", "bsns_year", "reprt_code"], how="left")
@@ -4309,7 +4604,7 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
     W["knowledge_date"] = [_kd_from_rcept(rn, r, int(y))
                            for rn, r, y in zip(W["rcept_no"], W["reprt_code"], W["bsns_year"])]
     qmap = {RQ["Q1"]: 1, RQ["H1"]: 2, RQ["Q3"]: 3, RQ["FY"]: 4}
-    W["q"] = W["reprt_code"].map(qmap)
+    W["q"] = W["reprt_code"].astype(str).map(qmap)
     W = W.sort_values(["corp_code", "bsns_year", "q"]).reset_index(drop=True)
     gk = ["corp_code", "bsns_year"]
     prev_q = W.groupby(gk, observed=True)["q"].shift(1)
@@ -4358,12 +4653,25 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
     if cached is not None and len(cached):
         done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
         L.info(f"캐시 재사용: 직원현황 {len(cached):,}행")
+    # 음성 캐시 — empSttus 는 '사업보고서에만' 있어 진행 중인 연도·비제출 회사는 영구히 빈다.
+    # 이걸 기록하지 않으면 매 실행 8,000회를 같은 빈 키에 태운다(하루 한도의 40%).
+    empty_seen: set = set()
+    negE = VAULT.load_table("dart_emp_empty_log", "shared")
+    today_ts = pd.Timestamp(dtm.date.today())
+    if negE is not None and len(negE):
+        negE = negE.copy()
+        negE["tried_at"] = ds_(negE["tried_at"])
+        fr = negE[(today_ts - negE["tried_at"]).dt.days < EMPTY_RETRY_AFTER_D]
+        empty_seen = set(zip(fr["corp_code"].astype(str), fr["bsns_year"].astype(int)))
+        if empty_seen:
+            L.info(f"음성 캐시: 직원현황 '데이터 없음' {len(empty_seen):,}조합은 "
+                   f"{EMPTY_RETRY_AFTER_D}일간 재호출하지 않습니다.")
     rank = {str(c): i for i, c in enumerate(priority)}
     clist = sorted((str(c) for c in corps), key=lambda c: (rank.get(c, 10 ** 9), c))
     if DART_DEEP_TOP_N and rank and len(clist) > DART_DEEP_TOP_N:
         clist = clist[:int(DART_DEEP_TOP_N)]
     jobs = [(c, int(y)) for y in sorted({int(v) for v in years}, reverse=True)
-            for c in clist if (c, int(y)) not in done]
+            for c in clist if (c, int(y)) not in done and (c, int(y)) not in empty_seen]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
@@ -4374,6 +4682,8 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
         js = dart_call("empSttus.json", {"corp_code": c, "bsns_year": str(y),
                                          "reprt_code": RQ["FY"]})
         if not js or not isinstance(js.get("list"), list):
+            if isinstance(js, dict) and str(js.get("status")) == "013":
+                return ("EMPTY", c, y)      # 서버가 '없다'고 답한 것만 음성캐시
             return None
         d = pd.DataFrame(js["list"])
         for col in ("fo_bbm", "sexdstn"):
@@ -4392,12 +4702,23 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
                 "rcept_no": rn}
 
     got: List[dict] = []
+    new_empty: List[dict] = []
     for batch in chunked(jobs, 400):
         if CLOCK.over() or not QUOTA.allow("dart"):
             CLOCK.cut(f"직원현황: {len(got):,}건 수집 후 중단")
             break
-        got += [r for r in pmap_net(one, batch, workers=min(IO_THREADS, 10),
-                                    label="직원현황") if r]
+        for r in pmap_net(one, batch, workers=min(IO_THREADS, 10), label="직원현황"):
+            if isinstance(r, tuple) and r and r[0] == "EMPTY":
+                new_empty.append({"corp_code": r[1], "bsns_year": r[2], "tried_at": today_ts})
+            elif r:
+                got.append(r)
+    if new_empty:
+        alle = pd.concat([negE, pd.DataFrame(new_empty)], ignore_index=True) \
+            if negE is not None and len(negE) else pd.DataFrame(new_empty)
+        VAULT.save_table("dart_emp_empty_log",
+                         alle.sort_values("tried_at")
+                             .drop_duplicates(["corp_code", "bsns_year"], keep="last"),
+                         "shared", domain="dart", source="negative_cache")
     frames = ([cached] if cached is not None and len(cached) else []) + \
              ([pd.DataFrame(got)] if got else [])
     if not frames:
@@ -5029,6 +5350,21 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
             and (str(r.code), m.strftime("%Y%m")) not in empty_seen]
     if RUN_MODE == "CACHED":
         jobs = []
+    # ★상한 — 이 수집기는 (종목 × 월) 교차곱이라 냉시작이면 4,000종목 × 120개월 = 48만 회다.
+    #   가격에서 없앤 종목축 폭주와 정확히 같은 구조이며, 공공데이터포털 일 한도(1만)로는
+    #   40일이 넘게 걸린다. 실시간 잔여량과 NPS_MAX_CALLS 중 작은 쪽으로 자르고, 유동성
+    #   상위(priority)부터 최근 월부터 채운다 — 끊겨도 '거래 가능한 종목의 최근'이 먼저 완성.
+    if jobs:
+        jobs.sort(key=lambda j: (rank.get(j[0], 10 ** 9), -j[2].toordinal()))
+        room = QUOTA.remaining("datagokr")
+        cap_n = min(int(NPS_MAX_CALLS) or len(jobs), room if room > 0 else len(jobs))
+        if len(jobs) > cap_n:
+            L.info(f"PACK-N 대상 {len(jobs):,}건 중 이번 실행은 {cap_n:,}건만 진행합니다"
+                   f"(유동성 상위·최근 월 우선 · 실시간 잔여 {room:,}). "
+                   f"나머지는 재실행 시 정확히 이어받습니다 — 약 "
+                   f"{max(1, -(-len(jobs) // max(cap_n, 1)))}회 실행이면 전 구간 완비.")
+            jobs = jobs[:cap_n]
+        QUOTA.plan("datagokr", len(jobs), "국민연금 사업장(종목×월)")
 
     def one(job):
         code, nm, m = job
@@ -5572,8 +5908,18 @@ def axis_discount(P: pd.DataFrame, flows: pd.DataFrame, cons: pd.DataFrame) -> p
                   .sort_values(["code", "month"]))
             # 6개월(≈120거래일) 누적 순매수. ★shift(1) — KRX 투자자별 확정 수급은 T+1 공표라
             # 월말 당월분은 월말 종가 시점에 '알 수 없다'(C1). 당월을 빼고 t-6..t-1 만 쓴다.
+            # ★월 격자를 채운 뒤 굴린다. 결손월이 있는 종목에서 위치기반 rolling(6) 은
+            #   몇 년치를 합쳐 놓고 '6개월 누적'이라 부르고, shift(1) 도 1개월이 아니라
+            #   1행(최대 수십 개월)을 민다 — 종목마다 단위가 달라진 값이 adv×250 으로
+            #   나뉘어 셀 랭크에 들어간다.
+            grid = pd.date_range(f["month"].min(), f["month"].max(), freq="ME")
+            f = (f.set_index("month").groupby("code", observed=True)["net"]
+                   .apply(lambda s: s.reindex(grid))
+                   .rename("net").reset_index())
+            f.columns = ["code", "month", "net"]
             f["cum6m"] = (f.groupby("code", observed=True)["net"]
                            .transform(lambda s: s.rolling(6, min_periods=3).sum().shift(1)))
+            f = f.dropna(subset=["cum6m"])
             P["code"] = P["code"].astype(str)
             P = P.merge(f[["code", "month", "cum6m"]], on=["code", "month"], how="left")
             # 시총 미상 구간 대비 연간 거래대금(adv×250)으로 정규화 — 셀 내 상대비교라 무해
@@ -7476,7 +7822,14 @@ def _feature_chain(P0: pd.DataFrame, master: pd.DataFrame, ctx: dict,
     P = axis_discount(P, flows, cons)
     P = axis_discount_u(P)
     for p in packs_on():
-        P = p["features"](P, ctx)
+        try:
+            P = p["features"](P, ctx)
+        except Exception as e:                            # noqa
+            # ★수집기는 _try 로 격리해 놓고 피처는 안 해두면, 부분 수집된 팩 테이블의
+            #   스키마 차이 하나가 L.PANEL(critical)을 깨고 백테스트·리포트·저장까지 전부
+            #   날린다. 팩 하나를 끄는 편이 언제나 낫다(§8.4 자동 비활성화와 같은 취급).
+            pack_off(p["id"], f"피처 계산 실패({type(e).__name__}: {str(e)[:100]}) — "
+                              f"해당 팩만 제외하고 계속합니다")
     P = apply_vetoes(P, ctx)
     P = assemble_signal(P)
     return shrink(P)
@@ -7695,12 +8048,17 @@ def main() -> dict:
         # ★2단 티어: ① 주요계정 벌크(회사 100개/호출)로 전 시장을 먼저 덮고
         #             ② 남은 잔여 호출량을 유동성 상위 회사의 전체재무제표에 쏟는다.
         fs_major = harvest_dart_multi(corps, years)
+        # ★직원현황을 심층 재무보다 먼저. 심층은 잔여 쿼터를 전부 먹는 구조라 뒤에 두면
+        #   직원현황이 매 실행 0건이 되고, size_bucket 이 전부 '규모미상'이 되어 C11 셀이
+        #   (월,산업)으로 붕괴한다(규모 통제 소실). 직원현황은 심층의 1/4 규모다.
+        emp = harvest_dart_employees(corps, years, priority=prio)
         fs_deep = harvest_dart_financials(corps, years, priority=prio)
         parts_fs = [x for x in (fs_deep, fs_major) if x is not None and len(x)]
         fs = pd.concat([x.reindex(columns=_FS_KEEP) for x in parts_fs],
                        ignore_index=True) if parts_fs else pd.DataFrame(columns=_FS_KEEP)
+        del fs_deep, fs_major, parts_fs
+        gc.collect()
         fin = refine_financials(fs)
-        emp = harvest_dart_employees(corps, years, priority=prio)
         if len(fin):
             PITX.put("dart_fin", fin, keys=["corp_code"])
         if len(emp):
@@ -7797,10 +8155,12 @@ def main() -> dict:
         cons = build_consensus_monthly(ctx.get("links", pd.DataFrame()), months)
         ctx["consensus"] = cons
         P = _feature_chain(P0, master, ctx, ctx.get("flows"), cons)
-        VAULT.save_table(f"l1_features_{STRATEGY_TAG}", P, "private", domain="features",
-                         source="L1")
+        VAULT.save_table(f"l1_features_{STRATEGY_TAG}" + ("_INTERIM" if CLOCK.tripped else ""),
+                         P, "private", domain="features", source="L1",
+                         note="시간예산 중단분" if CLOCK.tripped else "")
 
-    with RUN.step("M.POLICY", "정책 캘린더(C12)", "L2"):
+    with RUN.step("M.POLICY", "정책 캘린더(C12)", "L2", critical=False):
+        ctx.setdefault("policy", pd.DataFrame())
         cal = policy_calendar()
         m_mask = policy_mask(cal, [p["id"] for p in packs_on()], months)
         L.info(f"정책 이벤트 ±6M 구간 {int(m_mask.sum())}/{len(months)}개월 — R10 검정 C 입력")
@@ -7812,11 +8172,18 @@ def main() -> dict:
 
     with RUN.step("N.BT", "백테스트 L3", "L3"):
         bt = run_fn(P, tag="MAIN", audit=True)
-        VAULT.save_table(f"l3_returns_{STRATEGY_TAG}", bt["returns"], "private",
-                         domain="backtest", source="MAIN")
+        # ★중간(잠정) 결과는 별도 키로 저장한다. 같은 키에 덮으면 어제의 완전본이
+        #   오늘의 반쪽 실행으로 조용히 교체된다(전용 인덱스의 '현행본' 오염).
+        sfx = "_INTERIM" if CLOCK.tripped else ""
+        VAULT.save_table(f"l3_returns_{STRATEGY_TAG}{sfx}", bt["returns"], "private",
+                         domain="backtest", source="MAIN",
+                         note=("시간예산 중단분 · " + " / ".join(CLOCK.cuts[:3])
+                               if CLOCK.tripped else ""))
 
     interim = CLOCK.tripped
-    with RUN.step("O.PERF", "성과 검증", "L6"):
+    # ★O.PERF 는 순수 리포팅이다. 중간결과처럼 표본이 퇴화한 실행에서 통계량이 터지면
+    #   S.PERSIST 가 못 돌아 4시간 수집 산출물이 통째로 사라진다 — critical 이면 안 된다.
+    with RUN.step("O.PERF", "성과 검증", "L6", critical=False):
         try:
             bench = harvest_benchmarks(months)     # 네트워크 실패가 성과표를 막지 않게 격리
         except Exception as e:                     # noqa
