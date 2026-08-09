@@ -15,15 +15,48 @@
 #     [S4] 데이터 수집(유니버스→가격→리포트→실적) — 캐시 우선, 부족분만 신규
 #     [S5] 보고서↔애널리스트↔종목 원장 연결 감사
 #     [S6] 예측 테이블 구축(EPS/목표가)   [S7] SCG 엔진(정확도·리더십·스마트컨센서스)
-#     [S8] 백테스트+성과검증(4전략)       [S9] 시총 하위1000 비교전략(별도 전체 출력)
+#     [S8] 백테스트+성과검증(4전략 × 전체/시총하위1000 × 트랙별 전체 출력)
+#     [S9] 트랙 비교 — 빠른판(TP12M) vs 정밀판(EPS·PDF)
 #     [S10] 강건성 검사(민감도/서브기간/집중도/플라시보/지연)
 #     [S11] 해석표 · 드라이브 저장(공용/전용 인덱스) · 다운로드 링크
+#
+#   ▣ 이중 트랙 (FORECAST_METRIC_MODE="BOTH", 기본값)
+#     · 빠른판(TP12M) — 리스트 페이지의 '적정가격'만 쓴다. **PDF 원문이 필요 없어** 수 분에
+#       10년치 4전략 백테스트가 완주한다. PDF 수집이 막혀도 결과가 항상 나온다.
+#     · 정밀판(EPS)  — PDF 원문에서 EPS 추정치를 파싱한다(명세 §1 기본). 느리고 비싸다.
+#     · 두 트랙은 **같은 가격행렬·같은 유니버스·같은 파라미터**를 공유한다. 트랙을 늘려도
+#       시장데이터 조회는 1건도 늘지 않는다. 차이는 '예측 대상 지표' 하나뿐이므로
+#       S9 비교표가 곧 "PDF 파싱이 성과로 회수되는가"의 답이 된다.
+#
+#   ▣ 막힌 소스에 시간을 쓰지 않는다 (회로차단 · 사전점검 · 진행표시)
+#     · 소스별 회로차단기: 연속 실패가 쌓이면 그 소스를 끊고, 이후 요청은 대기 0초로 통과.
+#     · PDF 단계는 시작 전에 호스트를 실측(최대 3건)하고, 막혔으면 계획에서 제외한다.
+#     · 한경컨센서스는 실행 시점에 경로 후보를 두드려 보고(신/구 라우트 × http/https)
+#       살아 있는 것을 자동 선택한다. 전부 403이면 **응답 본문을 표로 찍고** 캐시+네이버로
+#       계속 간다 — 여기서 멈추지 않는다.
 #
 #   ▣ 캐시 절대 1원칙
 #     · 기존 구글드라이브 캐시(어느 전략이 만든 것이든)는 **읽기 전용**으로만 탐색·재활용.
 #     · 신규 수집분은 전부 이 전략의 쓰기 루트에 저장하고 공용/전용 인덱스(append-only
 #       JSONL 저널)에 등재. 기존 인덱스 파일에는 **쓰기 자체를 하지 않으므로** 훼손이
 #       구조적으로 불가능합니다. (실행 후 실측 검증까지 수행 — S2 계약 C-보존)
+#
+#   ▣ 반복 오류의 행동패턴 감사 — 왜 같은 종류의 사고가 계속 났는가
+#     지금까지 사용자 환경에서 터진 사고를 원인별로 묶으면 딱 두 갈래였다.
+#       (A) **한 번도 실행해 본 적 없는 경로를 배포** — URL 자리표시자 불일치(KeyError),
+#           존재하지 않는 파일 확장자(.csv.gz→404), 내 컨테이너에서 검증 불가능한 검사를
+#           차단 게이트로 넣은 것, 그리고 이번의 'PDF 계획표에서 멈춤'.
+#       (B) **외부 의존을 무경계로 신뢰** — KRX 재로그인 무한루프, pykrx 단일 의존 붕괴,
+#           PDF 단계가 4시간 예산 전부 소모, 네이티브 확장 예외(PanicException)로 전체 사망.
+#     공통 뿌리는 하나다: *검증되지 않은 가정을 검증된 사실처럼 다뤘다*.
+#     구조적 대응(이 파일에 내장):
+#       ① S2 자체계약 — 계산 규칙을 실행으로 증명. 실패하면 실데이터를 만지지 않는다.
+#       ② S2b 실경로 리허설 — 네트워크만 픽스처로 바꾸고 수집 함수를 **실물 실행**.
+#          이 환경에서 확인 불가능한 항목은 반드시 ⓘ(비차단)로 표시 — 내 검사가 남의
+#          실행을 막는 사고를 두 번 내지 않기 위해서다.
+#       ③ S3 합성 스모크 — 심어둔 알파를 실제로 복원하는지 확인(플라시보·지연 검사 포함).
+#       ④ 확인할 수 없는 것은 **코드가 스스로 진단하고 강등**한다 — 추측해서 하드코딩하지
+#          않는다(한경 경로 자동탐색, 호스트 사전점검, 회로차단, 진행표시).
 #
 #   ⚠ 연구·검증용 코드입니다. 투자자문이 아닙니다.
 # ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -91,17 +124,31 @@ RESEARCH_PDF_CAP_MONTH = 0        # (구) 월별 상한 — 아래 두 값이 �
 PDF_STAGE_BUDGET_MIN   = 60       # 이 단계가 쓸 수 있는 시간(분). 백테스트 시간을 지킵니다
 PDF_MAX_NEW_PER_RUN    = 6000     # 한 실행에서 새로 '내려받을' PDF 상한(연도 균형 샘플)
                                   #   0 = 무제한. 이미 로컬에 있는 PDF 는 이 상한과 무관합니다
-FORECAST_METRIC_MODE   = "AUTO"   # "AUTO" | "EPS" | "TP12M"
-#    AUTO: EPS 추정치 커버리지가 충분하면 EPS(명세 §1 기본), 부족하면 목표주가 12M(TP12M)
-#          를 주 지표로 쓰고 두 경우 모두 커버리지 근거를 표로 출력합니다.
+PDF_PROGRESS_EVERY     = 25       # 이만큼 처리할 때마다 진행 한 줄. '멈춘 것처럼 보임' 방지
+SOURCE_CIRCUIT_FAILS   = 8        # ★ 한 소스에서 연속 실패가 이만큼 쌓이면 그 소스를 즉시 차단.
+                                  #   403 으로 막힌 사이트에 단계 예산을 통째로 헌납하는 사고를
+                                  #   막는다(멈춘 것처럼 보이던 진짜 원인). 성공하면 즉시 복구.
+
+# ── ⑤-2 주지표(예측 대상) 선택 ─────────────────────────────────────────────────────────────
+#    "TP12M" = 목표주가 12개월. 리스트 페이지의 '적정가격'만으로 계산 → **PDF 불필요, 빠름**
+#    "EPS"   = PDF 원문에서 추출한 EPS 추정치. 명세 §1 기본이지만 PDF 파싱이 필요 → 느림
+#    "BOTH"  = 두 트랙을 한 번에 돌리고 **나란히 비교표**까지 출력 (권장·기본값)
+#    "AUTO"  = 커버리지를 보고 한쪽만 자동 선택 (구버전 동작)
+FORECAST_METRIC_MODE   = "BOTH"   # "BOTH" | "AUTO" | "EPS" | "TP12M"
+#    ▸ 빠른 버전만 원하면 아래 한 줄을 True 로. PDF 단계를 통째로 건너뜁니다(수 분 내 완주).
+QUICK_TP12M_ONLY       = False
 
 # ── ⑥ 성능/자원 ─────────────────────────────────────────────────────────────────────────────
 COLLECT_HOURS_BUDGET = 4.0        # ★ 수집 시간예산(시간). 초과하면 수집을 그 자리에서 멈추고
                                   #   지금까지 모은 데이터만으로 '중간 백테스트 결과'를 출력한다.
                                   #   (수집은 전부 증분 캐시라 재실행하면 멈춘 곳부터 이어받는다)
 N_IO_THREADS   = 12               # 네트워크 병렬(스레드). 차단이 의심되면 6으로.
+#    소스별 초당 요청 상한(차단 방지) — **전역** 상한이라 스레드를 늘려도 이 값을 못 넘습니다.
+#    PDF 는 검색질의가 아니라 정적 파일이라 목록 조회보다 여유롭게 둡니다. 서버가 429/503 로
+#    속도를 낮추라고 하면 즉시 절반으로 줄고, 성공이 이어지면 천천히 되돌립니다.
 QPS = {"krx": 1.5, "dart": 8.0, "hankyung": 2.0, "naver": 2.5, "kind": 2.0,
-       "fdr": 4.0, "yahoo": 3.0, "generic": 3.0}   # 소스별 초당 요청 상한(차단 방지)
+       "fdr": 4.0, "yahoo": 3.0, "generic": 3.0,
+       "hankyung_pdf": 5.0, "naver_pdf": 5.0}
 MEM_SOFT_GB    = 6.0              # 이 수준을 넘보면 청크 처리로 전환
 COST_BPS_ONEWAY = 15.0            # 십분위 성과의 왕복비용 가정(수수료+세금+슬리피지, 편도 bp)
 
@@ -114,7 +161,11 @@ VERBOSE = True
 #   설정 끝 — 아래부터는 수정할 필요가 없습니다.
 # ═══════════════════════════════════════════════════════════════════════════════════════════
 
-SCG_BUILD = "scg_v1.20260809"
+if QUICK_TP12M_ONLY:              # 빠른 버전 스위치 — PDF 단계를 아예 걸지 않는다
+    FORECAST_METRIC_MODE = "TP12M"
+    RESEARCH_DOWNLOAD_PDF = False
+
+SCG_BUILD = "scg_v1.20260809c"
 STRATEGY_TAG = "scg_v1"           # 전용 인덱스 네임스페이스 이름
 
 
@@ -220,7 +271,11 @@ def _boot_deps() -> Dict[str, bool]:
     have: Dict[str, bool] = {}
     want = [(m, p) for m, p, _w in _NICE if _find_spec_safe(m.split(".")[0]) is None]
     if want and not os.environ.get("SCG_NO_PIP"):
-        _pip([p for _m, p in want])
+        # ★ 한 번에 몰아서 설치하면 **하나가 실패할 때 나머지도 전부 안 깔린다**.
+        #   사용자 로그에서 yfinance 와 pymupdf 가 동시에 없던 것이 정확히 이 모양이었고,
+        #   그 탓에 PDF 파싱이 몇 배 느린 2순위 라이브러리로만 돌았다. 하나씩 설치한다.
+        for _m, _p in want:
+            _pip([_p])
     for m, p, why in _NICE:
         have[m] = _find_spec_safe(m.split(".")[0]) is not None
         if not have[m]:
@@ -648,20 +703,44 @@ def jsonl_append(path: str, rows: Iterable[dict]):
 
 
 class Throttle:
-    """소스별 초당 요청 상한 — 차단 방지의 1차 방어선."""
+    """소스별 초당 요청 상한 — 차단 방지의 1차 방어선.
+
+    ★ 이 상한은 **전역 게이트**다. 스레드를 6개 띄워도 초당 처리량은 QPS 를 못 넘는다.
+      그래서 '병렬 12'라는 표시만 믿으면 실제 소요를 크게 잘못 예측한다(PDF 6,000건이
+      2건/초면 50분이다). 계획 표에 예상 소요를 함께 찍는 이유다.
+      429/503(=서버가 속도를 낮추라고 말한 것)이 오면 즉시 절반으로 낮추고,
+      성공이 이어지면 원래 값까지 천천히 되돌린다.
+    """
     def __init__(self):
         self._lk = threading.Lock()
         self._next: Dict[str, float] = {}
+        self._factor: Dict[str, float] = {}
+
+    def qps(self, source: str) -> float:
+        base = float(QPS.get(source, QPS["generic"]))
+        return max(0.1, base * self._factor.get(source, 1.0))
 
     def wait(self, source: str):
-        qps = float(QPS.get(source, QPS["generic"]))
-        gap = 1.0 / max(qps, 0.1)
+        gap = 1.0 / self.qps(source)
         with self._lk:
             now = time.time()
             t = max(self._next.get(source, 0.0), now)
             self._next[source] = t + gap
         if t > now:
             time.sleep(t - now)
+
+    def slow_down(self, source: str):
+        with self._lk:
+            f = self._factor.get(source, 1.0) * 0.5
+            self._factor[source] = max(0.1, f)
+        CON.warn(f"[{source}] 서버가 속도 제한을 알렸습니다 — 요청 속도를 "
+                 f"{self.qps(source):.1f}건/초로 낮춥니다")
+
+    def speed_ok(self, source: str):
+        f = self._factor.get(source, 1.0)
+        if f < 1.0:
+            with self._lk:
+                self._factor[source] = min(1.0, f * 1.15)
 
 
 THROTTLE = Throttle()
@@ -1134,6 +1213,83 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 _TL = threading.local()
 HTTP_TALLY: Counter = Counter()
+# ★ 세션은 스레드로컬이다. 워밍업(홈 방문)으로 받은 쿠키가 메인 스레드에만 남으면
+#   정작 다운로드를 수행하는 워커 스레드는 쿠키 없이 요청해 403 을 맞는다.
+#   그래서 쿠키는 전역 씨앗에 모아두고 새 세션마다 심어 준다.
+_COOKIE_SEED: Dict[str, str] = {}
+_COOKIE_LK = threading.Lock()
+
+
+def cookie_seed_update(sess: requests.Session):
+    with _COOKIE_LK:
+        try:
+            _COOKIE_SEED.update({c.name: c.value for c in sess.cookies})
+        except Exception:
+            pass
+
+
+class SourceCircuit:
+    """소스별 회로차단기 — '막힌 곳에 시간을 쓰지 않는다'는 단 하나의 목적.
+
+    ★ 이것이 없어서 사고가 났다. 한경컨센서스가 403 을 돌려주는 상태에서 PDF
+      6,000건을 그대로 시도했고, 건당 (스로틀 0.5s × 2회 + 403 대기 1.5s+3.0s)
+      ≈ 5초씩 소모하며 60분 예산을 전부 태웠다. 화면에는 아무 줄도 찍히지
+      않으니 사용자에게는 '멈춤'으로 보인다. 연속 실패가 쌓이면 즉시 끊고,
+      이후 요청은 네트워크도 대기도 없이 곧바로 None 을 돌려준다.
+      성공이 한 번이라도 나오면 카운터는 0으로 복구된다(일시적 장애와 구분).
+    """
+
+    def __init__(self, limit: int = 8, quiet: bool = False):
+        self.limit = int(limit)
+        self.quiet = bool(quiet)
+        self._streak: Counter = Counter()
+        self.opened: "OrderedDict[str, str]" = OrderedDict()
+        self._lk = threading.Lock()
+
+    def blocked(self, source: str) -> bool:
+        return source in self.opened
+
+    def _mute(self, source: str) -> bool:
+        return self.quiet or str(source).startswith("__")
+
+    def ok(self, source: str):
+        with self._lk:
+            if self._streak.get(source):
+                self._streak[source] = 0
+            if source in self.opened:            # 되살아났다 — 차단 해제
+                self.opened.pop(source, None)
+                if not self._mute(source):
+                    CON.ok(f"[{source}] 응답이 돌아왔습니다 — 차단을 해제합니다")
+
+    def fail(self, source: str, why: str) -> bool:
+        with self._lk:
+            self._streak[source] += 1
+            n = self._streak[source]
+            if n >= self.limit and source not in self.opened:
+                self.opened[source] = f"{why} (연속 {n}회)"
+                if not self._mute(source):
+                    CON.warn(f"[{source}] 연속 실패 {n}회 — 이 소스를 차단합니다({why}). "
+                             f"남은 요청은 즉시 건너뛰고 다른 소스/캐시로 진행합니다.")
+                return True
+        return False
+
+    def open_now(self, source: str, why: str):
+        with self._lk:
+            if source not in self.opened:
+                self.opened[source] = why
+        if not self._mute(source):
+            CON.warn(f"[{source}] 사전 점검 실패 — 차단하고 진행합니다({why})")
+
+    def table(self):
+        self.opened = OrderedDict((k, v) for k, v in self.opened.items()
+                                  if not str(k).startswith("__"))
+        if not self.opened:
+            return
+        CON.grid([[k, v] for k, v in self.opened.items()], ["차단된 소스", "사유"],
+                 ["l", "l"], title="회로차단 현황 (해당 소스는 캐시로만 진행했습니다)")
+
+
+CIRCUIT = SourceCircuit(SOURCE_CIRCUIT_FAILS)
 
 
 def _sess() -> requests.Session:
@@ -1142,6 +1298,12 @@ def _sess() -> requests.Session:
         s = requests.Session()
         s.headers.update({"User-Agent": _UA, "Accept-Language": "ko-KR,ko;q=0.9",
                           "Accept": "*/*", "Connection": "keep-alive"})
+        with _COOKIE_LK:
+            for k, v in _COOKIE_SEED.items():
+                try:
+                    s.cookies.set(k, v)
+                except Exception:
+                    pass
         try:
             from requests.adapters import HTTPAdapter
             ad = HTTPAdapter(pool_connections=max(8, N_IO_THREADS),
@@ -1183,10 +1345,15 @@ def fetch(url: str, source: str = "generic", params: Optional[dict] = None,
           as_bytes: bool = False, tries: int = 3, timeout: float = 25.0,
           headers: Optional[dict] = None, referer: Optional[str] = None,
           on_attempt: Optional[Callable[[], None]] = None) -> Optional[Any]:
+    if CIRCUIT.blocked(source):
+        # ★ 차단된 소스는 대기도 하지 않는다 — 여기가 '멈춘 것처럼 보이던' 지점이다.
+        HTTP_TALLY[f"{source}:SKIP"] += 1
+        return None
     hd = dict(headers or {})
     if referer:
         hd["Referer"] = referer
     last = ""
+    counted = False          # 이 URL 의 실패를 회로차단 카운터에 이미 반영했는가
     for k in range(tries):
         THROTTLE.wait(source)
         if on_attempt:
@@ -1195,19 +1362,62 @@ def fetch(url: str, source: str = "generic", params: Optional[dict] = None,
             r = _sess().get(url, params=params, headers=hd, timeout=timeout)
             HTTP_TALLY[f"{source}:{r.status_code}"] += 1
             if r.status_code == 200:
+                CIRCUIT.ok(source)
+                THROTTLE.speed_ok(source)
                 return r.content if as_bytes else decode_kr(r.content, r.encoding)
-            if r.status_code in (429, 503):
-                time.sleep(min(30.0, 2.0 * (2 ** k)) + random.random())
-            elif r.status_code in (401, 403):
-                time.sleep(1.5 * (k + 1))
             last = f"HTTP {r.status_code}"
+            if r.status_code in (429, 503):
+                THROTTLE.slow_down(source)
+                time.sleep(min(30.0, 2.0 * (2 ** k)) + random.random())
+            elif r.status_code in (404, 410):
+                # 그 문서 하나가 없는 것이지 사이트가 막힌 게 아니다.
+                # ★ 이걸 회로차단에 넣으면 오래된 리포트 몇 건 때문에 멀쩡한 소스가
+                #   통째로 끊긴다 — 개별 자원 부재는 카운터에 넣지 않고 즉시 포기한다.
+                break
+            elif r.status_code in (401, 403):
+                # 권한 거부는 같은 요청을 되풀이해도 바뀌지 않는다. 재시도로
+                # 시간을 태우는 대신 한 번만 짧게 물러서고 끝낸다.
+                counted = True
+                if CIRCUIT.fail(source, last) or k >= min(1, tries - 1):
+                    break
+                time.sleep(0.4)
+                continue
         except Exception as e:
             last = type(e).__name__
             HTTP_TALLY[f"{source}:EXC"] += 1
+            counted = True
+            if CIRCUIT.fail(source, last):
+                break
             time.sleep(min(10.0, 1.6 ** k) + random.random() * 0.3)
+    else:
+        if not counted:      # 같은 실패를 두 번 세면 멀쩡한 소스가 일찍 끊긴다
+            CIRCUIT.fail(source, last or "재시도 소진")
     HTTP_TALLY[f"{source}:FAIL"] += 1
     CON.debug(f"수신 실패[{source}] {last}: {url[:90]}")
     return None
+
+
+_PROBE_SESS: List[requests.Session] = []
+
+
+def _probe_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None,
+               timeout: float = 20.0) -> Tuple[int, bytes, Optional[str], int]:
+    """진단 전용 GET — 스로틀·회로차단·재시도를 **전부 우회**한다.
+
+    ★ 진단은 '지금 이 순간 서버가 무엇을 돌려주는가'를 있는 그대로 봐야 한다.
+      `fetch` 를 쓰면 재시도가 결과를 뭉개고, 진단이 회로차단을 건드려 서로를 오염시킨다.
+      반환에 상태코드와 **원문 바이트**를 그대로 실어 보내는 이유도 같다 —
+      403 의 본문을 봐야 '사이트 WAF' 와 '사내 프록시' 를 구분할 수 있다.
+      (리허설은 이 함수 하나만 바꿔치기해 실제 네트워크 없이 배선을 검증한다.)
+    """
+    if not _PROBE_SESS:
+        s = requests.Session()
+        s.headers.update({"User-Agent": _UA, **_HK_BROWSER_HEADERS})
+        _PROBE_SESS.append(s)
+    s = _PROBE_SESS[0]
+    r = s.get(url, params=params, headers=headers or {}, timeout=timeout)
+    cookie_seed_update(s)
+    return r.status_code, r.content, r.encoding, len(s.cookies)
 
 
 def fetch_json(url: str, source: str = "generic", **kw) -> Optional[Any]:
@@ -2708,7 +2918,30 @@ def collect_benchmark(hub: "MarketHub", months: Sequence[pd.Timestamp]
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║ [S4-d] 애널리스트 리포트 수집 — 한경컨센서스 + 네이버리서치 (다중소스 원장)                ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
-_HK_LIST = "https://consensus.hankyung.com/analysis/list"
+_HK_HOME = "https://consensus.hankyung.com/"
+# ★ 한경컨센서스는 라우트를 바꾼 이력이 있고(구 `/apps.analysis/analysis.list` →
+#   신 `/analysis/list`), 앞단 WAF 가 '브라우저처럼 보이지 않는' 요청에 403 을 준다.
+#   어느 쪽이 살아 있는지는 **실행 환경마다 다르다**(사내망/해외IP/데이터센터IP).
+#   그래서 하드코딩하지 않고 실행 시점에 후보를 차례로 두드려 보고 고른다.
+_HK_CANDIDATES = [
+    ("신 라우트(https)", "https://consensus.hankyung.com/analysis/list",
+     "https://consensus.hankyung.com/analysis/downpdf?report_idx={rid}"),
+    ("구 라우트(https)", "https://consensus.hankyung.com/apps.analysis/analysis.list",
+     "https://consensus.hankyung.com/apps.analysis/analysis.downpdf?report_idx={rid}"),
+    ("구 라우트(http)", "http://consensus.hankyung.com/apps.analysis/analysis.list",
+     "http://consensus.hankyung.com/apps.analysis/analysis.downpdf?report_idx={rid}"),
+]
+HK: Dict[str, Any] = {"name": _HK_CANDIDATES[0][0], "list": _HK_CANDIDATES[0][1],
+                      "pdf": _HK_CANDIDATES[0][2], "probed": False, "alive": False}
+_HK_BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+              "image/webp,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin", "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 _NV_LIST = "https://finance.naver.com/research/company_list.naver"
 
 _TITLE_CODE = re.compile(r"\((\d{6})\)")
@@ -2772,7 +3005,7 @@ def _hk_parse_page(html: str) -> List[dict]:
             if m:
                 rid = m.group(1) or m.group(2)
                 break
-        pdf = f"https://consensus.hankyung.com/analysis/downpdf?report_idx={rid}" if rid else ""
+        pdf = HK["pdf"].format(rid=rid) if rid else ""
         d = _date_kr(_cell(i_dt))
         mcode = _TITLE_CODE.search(title)
         rows.append(dict(source="hankyung", rid=str(rid or h1("hk", title, str(d))[:12]),
@@ -2785,14 +3018,83 @@ def _hk_parse_page(html: str) -> List[dict]:
     return rows
 
 
+def _hk_params(sdate: str, edate: str, page: int, n: int = 80) -> dict:
+    return {"skinType": "business", "search_text": "", "pagenum": str(n),
+            "sdate": sdate, "edate": edate, "now_page": str(page), "report_type": "CO"}
+
+
+def hk_probe() -> bool:
+    """한경컨센서스 진단 — '왜 수집이 안 되는가'를 추측하지 않고 **실측**해서 표로 보여준다.
+
+    ★ 사용자 로그의 `수신 실패[hankyung] HTTP 403` 은 그 자체로는 원인이 아니다.
+      403 을 만들 수 있는 원인은 최소 네 가지이고, 각각 처방이 다르다:
+        ⓐ 라우트가 바뀌어 옛 경로가 죽음        → 후보 경로를 순회하면 해결
+        ⓑ WAF 가 비브라우저 요청을 거부         → 브라우저 헤더 + 홈 워밍업 쿠키
+        ⓒ 발신 IP 자체를 차단(데이터센터/해외)   → 어떤 헤더로도 안 됨. 캐시로 진행
+        ⓓ 회사/기관 방화벽·프록시가 가로챔       → 본문에 안내문이 담겨 있어 구분 가능
+      그래서 후보별 상태코드와 **본문 앞부분**까지 찍는다. 본문을 봐야 ⓒ와 ⓓ가 갈린다.
+      진단은 `fetch` 를 쓰지 않는다(회로차단·스로틀에 영향을 주고받지 않기 위해).
+    """
+    if HK["probed"]:
+        return bool(HK["alive"])
+    HK["probed"] = True
+    ed = _dt.date.today()
+    sd = ed - _dt.timedelta(days=20)
+    rows, winner = [], None
+
+    warm = "-"
+    try:                                    # ⓑ 대비: 홈을 먼저 열어 세션 쿠키를 받는다
+        sc, _b, _e, nck = _probe_get(_HK_HOME, timeout=15)
+        warm = f"HTTP {sc} · 쿠키 {nck}개"
+    except Exception as e:
+        warm = f"실패({type(e).__name__})"
+
+    for name, lurl, purl in _HK_CANDIDATES:
+        try:
+            sc, content, enc, _ = _probe_get(
+                lurl, params=_hk_params(sd.isoformat(), ed.isoformat(), 1, 20),
+                headers={"Referer": _HK_HOME}, timeout=20)
+            text = decode_kr(content, enc)
+            nrow = len(_hk_parse_page(text)) if sc == 200 else 0
+            hint = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text[:4000])).strip()[:70]
+            rows.append([name, f"HTTP {sc}", f"{len(content):,}B", f"{nrow}행",
+                         hint or "-"])
+            if sc == 200 and nrow > 0 and winner is None:
+                winner = (name, lurl, purl)
+        except Exception as e:
+            rows.append([name, f"예외 {type(e).__name__}", "-", "-", str(e)[:70]])
+
+    if winner:
+        HK.update(name=winner[0], list=winner[1], pdf=winner[2], alive=True)
+    CON.grid(rows + [["세션 워밍업(홈 방문)", warm, "-", "-",
+                      "쿠키를 전역 씨앗에 심어 모든 워커 스레드가 공유합니다"]],
+             ["후보 경로", "응답", "본문크기", "파싱행수", "본문/사유 앞부분"],
+             ["l", "l", "r", "r", "l"],
+             title="한경컨센서스 접속 진단 (실측 · 추측 아님)")
+    if winner:
+        CON.ok(f"한경컨센서스 사용 경로: {winner[0]} — {winner[1]}")
+    else:
+        CIRCUIT.open_now("hankyung",
+                         "모든 후보 경로가 403/차단 — 발신 IP 또는 WAF 정책으로 판단")
+        CON.warn("한경컨센서스 신규 수집을 건너뜁니다. 원인은 위 표의 본문에서 확인하세요. "
+                 "▸ '허용되지 않은 접근/Forbidden' 계열이면 사이트 WAF 차단(해외·데이터센터 "
+                 "IP 또는 자동화 탐지)이고, 회사 프록시 안내문이면 사내 방화벽입니다. "
+                 "▸ 어느 쪽이든 **기존 드라이브 캐시 + 네이버리서치로 백테스트는 그대로 "
+                 "진행됩니다** — 이 단계에서 멈추지 않습니다.")
+    return bool(HK["alive"])
+
+
 def _hk_collect_month(y: int, m: int) -> List[dict]:
+    if not HK["alive"] or CIRCUIT.blocked("hankyung"):
+        return []
     sdate, edate = f"{y}-{m:02d}-01", f"{y}-{m:02d}-{pd.Timestamp(y, m, 1).days_in_month:02d}"
     out, page, empty_streak = [], 1, 0
     while page <= 120 and empty_streak < 2:
-        html = fetch(_HK_LIST, source="hankyung",
-                     params={"skinType": "business", "search_text": "", "pagenum": "80",
-                             "sdate": sdate, "edate": edate, "now_page": str(page),
-                             "report_type": "CO"})
+        if CIRCUIT.blocked("hankyung"):
+            break
+        html = fetch(HK["list"], source="hankyung", referer=_HK_HOME,
+                     headers=_HK_BROWSER_HEADERS,
+                     params=_hk_params(sdate, edate, page))
         rows = _hk_parse_page(html) if html else []
         if not rows:
             empty_streak += 1
@@ -2876,11 +3178,13 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
             done_m = set(cached["date"].dropna().dt.to_period("M").astype(str))
             CON.say(f"보고서 캐시 재사용 {len(cached):,}건 ({len(done_m)}개월분)")
     if RESEARCH_COLLECT and RUN_MODE != "CACHED":
+        hk_probe()                       # ★ 먼저 진단하고 시작한다 — 막힌 곳을 두드리지 않는다
         months = pd.period_range(ts(start), ts(end), freq="M")
         cur = pd.Timestamp.today().to_period("M")
         todo = [p for p in months if (str(p) not in done_m) or (p >= cur - 1)]
         CON.say(f"리포트 신규 수집 대상: {len(todo)}개월 "
-                f"(robots 제한 소스 — 사용자 지시에 따라 보수 속도로 수집)")
+                f"(robots 제한 소스 — 사용자 지시에 따라 보수 속도로 수집) · "
+                f"한경 {'사용' if HK['alive'] else '건너뜀'} · 네이버 사용")
 
         def _one(p):
             if DEADLINE.over("리포트 수집"):
@@ -3021,6 +3325,17 @@ def _pdf_key_index() -> Dict[str, str]:
       해법은 인덱스 저널을 읽는 것이다 — 거기에 key(report_uid) → path 가 들어 있다.
     """
     idx: Dict[str, str] = {}
+    # ★ 매칭률이 1%(10,119건 중 124건)에 그쳤던 이유: 저널의 key 는 그것을 저장한
+    #   빌드/전략의 report_uid 해시라, 소스가 병합된 원장(예: 'hankyung+naver')에서
+    #   다시 계산한 해시와 절대 같아지지 않는다. 그런데 같은 저널에는 **원본 URL**이
+    #   source 로 남아 있고, 거기에는 보고서 번호가 그대로 들어 있다.
+    #   → URL 질의문자열에서 번호를 뽑아 별칭 키로 심는다(원장의 rid 와 바로 맞는다).
+    #   파일명은 내용해시라 숫자를 뽑으면 오매칭 위험이 있어 **쓰지 않는다**.
+    #   한 번호가 서로 다른 파일 두 개를 가리키면 모호하므로 아예 버린다 —
+    #   엉뚱한 PDF 에서 EPS 를 뽑는 것보다 못 찾는 편이 낫다.
+    alias: Dict[str, set] = defaultdict(set)
+    id_re = re.compile(r"(?:report_idx|report_id|nid|idx|no|seq)=(\d{3,})",
+                       re.IGNORECASE)
     roots = [DEPOT.write_root] + list(DEPOT.read_roots)
     seen_files = 0
     t_walk = time.time()
@@ -3048,11 +3363,23 @@ def _pdf_key_index() -> Dict[str, str]:
                     if not os.path.isabs(p):
                         p = os.path.join(os.path.dirname(os.path.dirname(dirpath)), p)
                     idx.setdefault(key, p)
+                    for fld in ("source", "url", "src_url"):
+                        for mm in id_re.finditer(str(rec.get(fld) or "")):
+                            alias[mm.group(1)].add(p)
             if len(idx) > 400_000:
                 break
+    n_key = len(idx)
+    n_alias = 0
+    for rid, paths in alias.items():
+        if len(paths) == 1 and rid not in idx:
+            idx[rid] = next(iter(paths))
+            n_alias += 1
+    ambig = sum(1 for v in alias.values() if len(v) > 1)
     if idx:
         CON.ok(f"기존 인덱스에서 PDF {len(idx):,}건의 '보고서키 → 경로' 지도를 복원했습니다 "
-               f"(저널 {seen_files}개) — 이미 받은 PDF 는 다시 받지 않습니다")
+               f"(저널 {seen_files}개 · 저장키 {n_key:,} + URL 번호 별칭 {n_alias:,}"
+               + (f" · 모호해서 버림 {ambig:,}" if ambig else "")
+               + ") — 이미 받은 PDF 는 다시 받지 않습니다")
     return idx
 
 
@@ -3096,6 +3423,92 @@ def _balanced_by_year(df: pd.DataFrame, cap: int, date_col: str = "date") -> pd.
 # (일시적 실패는 여기 없다: 다음 실행에서 자연히 재시도된다)
 PDF_TERMINAL = frozenset({"EPS_OK", "NO_EPS_TABLE", "NO_TEXT_LAYER", "NOT_PDF", "NO_URL"})
 PDF_PARSER_VERSION = "SCG_EPS_V2"
+
+
+PDF_CHUNK = 40          # 체크포인트 단위. 500이면 첫 줄까지 몇 분 — 그게 '멈춤'으로 보였다
+
+
+def _pdf_src(url) -> str:
+    """★ 목록 조회와 **다른 소스명**을 쓴다. PDF 는 정적 파일이라 속도 상한이 다르고,
+    목록이 막혔다고 PDF 까지 못 받는 것도 아니다(그 반대도 마찬가지). 회로차단도 따로 돈다."""
+    u = str(url or "")
+    return ("hankyung_pdf" if "hankyung" in u else
+            ("naver_pdf" if "naver" in u else "generic"))
+
+
+_PDF_URL_REWRITE: List[Tuple[str, str]] = []
+_HK_PDF_ROUTES = ("/analysis/downpdf", "/apps.analysis/analysis.downpdf")
+
+
+def pdf_url_fix(u) -> str:
+    """캐시에 남은 옛 경로를 살아 있는 경로로 바꿔 준다.
+
+    ★ 드라이브 캐시의 원장 5만여 건은 **예전 빌드가 만든 URL**을 그대로 갖고 있다.
+      사이트가 라우트를 바꾸면 그 URL 은 전부 죽는데, 원장을 다시 만들 수는 없다
+      (수집을 처음부터 다시 하라는 뜻이 된다). 그래서 다운로드 직전에 치환한다.
+    """
+    s = str(u or "")
+    for a, b in _PDF_URL_REWRITE:
+        if a in s:
+            s = s.replace(a, b)
+    return s
+
+
+def _pdf_alt_urls(u: str) -> List[Tuple[str, str, str]]:
+    """같은 문서를 가리키는 다른 경로 후보 — (옛조각, 새조각, 치환된 URL)."""
+    out: List[Tuple[str, str, str]] = []
+    for a in _HK_PDF_ROUTES:
+        if a in u:
+            for b in _HK_PDF_ROUTES:
+                if b != a:
+                    out.append((a, b, u.replace(a, b)))
+    return out
+
+
+def _pdf_preflight(work_net: Optional[pd.DataFrame]) -> Dict[str, bool]:
+    """호스트별로 최대 3건만 실제로 받아 보고 '살아 있는지'를 판정한다.
+
+    ★ 개별 문서가 지워져 404 인 경우와 호스트 자체가 막힌 경우를 구분해야 한다.
+      그래서 1건이 아니라 3건까지 본다(3건 연속 실패면 개별 사정이 아니다).
+      여기서 3~6초를 쓰는 대신 뒤에서 60분을 아낀다.
+      전부 실패하면 포기하기 전에 **다른 라우트**로 한 번 더 확인한다 —
+      캐시에 남은 옛 URL 때문에 멀쩡한 소스를 죽은 것으로 오판하지 않기 위해서다.
+    """
+    out: Dict[str, bool] = {}
+    if work_net is None or not len(work_net):
+        return out
+    for src, g in work_net.groupby(work_net["pdf_url"].map(_pdf_src)):
+        src = str(src)
+        if CIRCUIT.blocked(src):
+            out[src] = False
+            continue
+        ref = _HK_HOME if src.startswith("hankyung") else None
+        sample = [str(x) for x in g["pdf_url"].head(3)]
+        ok = False
+        for u in sample:
+            b = fetch(pdf_url_fix(u), source=src, as_bytes=True, tries=1, timeout=20,
+                      referer=ref)
+            if b and b[:5].startswith(b"%PDF"):
+                ok = True
+                break
+        if not ok:                                  # 라우트 교차 재확인
+            for u in sample:
+                for a, bb, alt in _pdf_alt_urls(u):
+                    d = fetch(alt, source=src, as_bytes=True, tries=1, timeout=20,
+                              referer=ref)
+                    if d and d[:5].startswith(b"%PDF"):
+                        if (a, bb) not in _PDF_URL_REWRITE:
+                            _PDF_URL_REWRITE.append((a, bb))
+                        CON.ok(f"PDF 경로 치환 발견: '{a}' → '{bb}' — 캐시에 남은 옛 "
+                               f"URL 을 살아 있는 경로로 바꿔 내려받습니다")
+                        ok = True
+                        break
+                if ok:
+                    break
+        out[src] = ok
+        if not ok:
+            CIRCUIT.open_now(src, "PDF 사전점검 3건 연속 실패(대체 경로 포함)")
+    return out
 
 
 def _pdf_extract_one(data: bytes, year: int) -> Tuple[str, dict]:
@@ -3183,21 +3596,65 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     # 로컬에 이미 있는 건 네트워크 상한과 무관하게 전부 처리한다(공짜다)
     work_local = need[local_hit.to_numpy()]
     work_net = _balanced_by_year(need[~local_hit.to_numpy()], cap)
-    work = pd.concat([work_local, work_net], ignore_index=True)
+    # ★ 다운로드가 필요한 건은 **먼저 호스트가 살아 있는지 1건씩 실측**하고 시작한다.
+    #   막힌 호스트를 6,000번 두드리는 게 '멈춘 것처럼 보이던' 진짜 원인이었다.
+    alive = _pdf_preflight(work_net)
+    if work_net is not None and len(work_net):
+        keep = work_net["pdf_url"].map(lambda u: alive.get(_pdf_src(u), True))
+        dropped = int((~keep).sum())
+        if dropped:
+            CON.warn(f"PDF 신규 다운로드 {dropped:,}건은 호스트가 막혀 있어 계획에서 뺐습니다 "
+                     f"(시도해도 전부 실패하며 시간만 소모합니다). "
+                     f"차단 해제 후 재실행하면 그대로 이어받습니다.")
+        work_net = work_net[keep.to_numpy()]
+    work = pd.concat([work_local, work_net], ignore_index=True)   # 로컬 먼저 → 즉시 성과
     stage_end = time.time() + PDF_STAGE_BUDGET_MIN * 60
-    CON.grid([["기존 파일 재사용", f"{len(work_local):,}건", "네트워크 0회"],
+    # ★ 예상 소요를 **먼저** 보여준다. 속도 상한은 전역이라 스레드 수와 무관하고,
+    #   이 산수를 안 보여준 탓에 사용자는 '멈췄다'고 볼 수밖에 없었다.
+    qps_eff = sum(THROTTLE.qps(s) for s, v in alive.items() if v) or 1.0
+    eta_min = len(work_net) / qps_eff / 60.0 + len(work_local) / 600.0
+    reach = min(len(work), int((len(work_local) + qps_eff * PDF_STAGE_BUDGET_MIN * 60)))
+    CON.grid([["기존 파일 재사용", f"{len(work_local):,}건", "네트워크 0회 — 먼저 처리합니다"],
               ["신규 다운로드", f"{len(work_net):,}건",
                f"연도 균형 샘플 (전체 대상 {len(need):,}건 중)"],
+              ["호스트 사전점검", ", ".join(f"{k}={'OK' if v else '차단'}"
+                                            for k, v in alive.items()) or "대상 없음",
+               "1건씩 실측 후 결정 (막힌 곳에는 시간을 쓰지 않습니다)"],
+              ["속도 상한", f"{qps_eff:.1f}건/초",
+               "전역 상한 — 스레드를 늘려도 이 값을 못 넘습니다(차단 방지)"],
+              ["예상 소요", f"{eta_min:.0f}분",
+               f"이번 예산({PDF_STAGE_BUDGET_MIN}분) 안에 약 {reach:,}건 처리 예상"],
               ["단계 예산", f"{PDF_STAGE_BUDGET_MIN}분",
                "초과 시 여기서 멈추고 다음 실행이 이어받음"]],
              ["PDF 처리 계획", "규모", "비고"], ["l", "r", "l"],
              title="PDF 추출 계획 (재개 가능 · 종결 원장 기반)")
+    if _fitz is None and _pdfplumber is not None:
+        CON.warn("PDF 파서가 2순위(pdfplumber)뿐입니다 — 1순위(pymupdf)보다 몇 배 느립니다. "
+                 "`pip install pymupdf` 후 재실행하면 같은 예산으로 훨씬 많이 처리합니다.")
+    if len(need) > len(work):
+        CON.say(f"남는 {len(need) - len(work):,}건은 다음 실행이 이어받습니다 — "
+                f"전체를 채우려면 이 속도로 약 "
+                f"{len(need)/max(qps_eff,0.1)/3600:.1f}시간(누적)이 필요합니다. "
+                f"그동안에도 빠른판(TP12M) 백테스트는 매 실행마다 완결됩니다.")
 
     lock = threading.Lock()
-    counter = {"n": 0, "new": 0, "hit": 0}
+    counter = {"n": 0, "new": 0, "hit": 0, "net": 0, "fail": 0}
+    t0 = time.time()
+
+    def _tick(total: int):
+        """★ 진행 한 줄을 **처리 도중에도** 찍는다. 예전에는 500건 청크가 끝나야
+          첫 줄이 나와서, 실제로는 돌고 있는데도 화면이 몇 분간 멈춰 보였다."""
+        c = counter["n"] + counter["fail"]
+        if c % PDF_PROGRESS_EVERY:
+            return
+        el = max(time.time() - t0, 1e-9)
+        CON.say(f"  PDF {c:,}/{total:,} · EPS추출 {counter['new']:,} · "
+                f"기존파일 {counter['hit']:,} · 신규 {counter['net']:,} · "
+                f"실패 {counter['fail']:,} · {c/el*60:.0f}건/분 · "
+                f"잔여예산 {max(0, stage_end - time.time())/60:.0f}분")
 
     def _one(row):
-        ruid, url, y = row
+        ruid, url, y, total = row
         if time.time() > stage_end or DEADLINE.over("PDF 추출"):
             return None
         data = None
@@ -3212,12 +3669,23 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
         if data is None:
             data = DEPOT.blob_bytes("research_pdf", ruid)
         if data is None:
-            data = fetch(url, source="hankyung" if "hankyung" in str(url) else "naver",
-                         as_bytes=True, tries=2)
+            src = _pdf_src(url)
+            if CIRCUIT.blocked(src):                    # 즉시 반환 — 대기 0초
+                with lock:
+                    counter["fail"] += 1
+                    _tick(total)
+                return (ruid, "DOWNLOAD_FAIL", None)
+            data = fetch(pdf_url_fix(url), source=src, as_bytes=True, tries=2,
+                         referer=_HK_HOME if src.startswith("hankyung") else None)
             if data and data[:5].startswith(b"%PDF"):
                 DEPOT.blob_save("research_pdf", ruid, data, "pdf", source=str(url))
+                with lock:
+                    counter["net"] += 1
             else:
-                return (ruid, "DOWNLOAD_FAIL", None)       # 비종결 — 다음 실행에서 재시도
+                with lock:
+                    counter["fail"] += 1
+                    _tick(total)
+                return (ruid, "DOWNLOAD_FAIL", None)   # 비종결 — 다음 실행에서 재시도
         status, payload = _pdf_extract_one(data, y)
         if payload:
             payload["ruid"] = ruid
@@ -3225,18 +3693,24 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
             counter["n"] += 1
             if status == "EPS_OK":
                 counter["new"] += 1
+            _tick(total)
         return (ruid, status, payload)
 
+    n_jobs = len(work)
     jobs = list(zip(work["ruid"], work["pdf_url"],
-                    ts_col(work["date"]).dt.year.fillna(2020).astype(int)))
-    CHUNK = 500                                     # 체크포인트 단위(중단 내성)
-    t0 = time.time()
-    for i in range(0, len(jobs), CHUNK):
+                    ts_col(work["date"]).dt.year.fillna(2020).astype(int),
+                    [n_jobs] * n_jobs))
+    if not n_jobs:
+        CON.say("PDF 처리 대상이 없습니다 — 이 단계를 건너뜁니다")
+        return _attach_pdf_columns(rep, done)
+    CON.say(f"PDF 처리를 시작합니다 — {n_jobs:,}건 · 병렬 {min(6, N_IO_THREADS)} · "
+            f"{PDF_PROGRESS_EVERY}건마다 진행 표시 · 체크포인트 {PDF_CHUNK}건마다 저장")
+    for i in range(0, len(jobs), PDF_CHUNK):
         if time.time() > stage_end or DEADLINE.over("PDF 추출"):
             CON.warn(f"PDF 단계 예산 소진 — {i:,}/{len(jobs):,}건에서 중단합니다. "
                      f"종결 원장에 진행분이 기록되어 다음 실행이 이어받습니다.")
             break
-        got = pmap(_one, jobs[i:i + CHUNK], workers=min(6, N_IO_THREADS))
+        got = pmap(_one, jobs[i:i + PDF_CHUNK], workers=min(6, N_IO_THREADS))
         for it in got:
             if not it:
                 continue
@@ -3252,13 +3726,16 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
         DEPOT.table_save("scg_pdf_status",
                          pd.DataFrame(status_rows).drop_duplicates("ruid", keep="last"),
                          scope="공용", domain="research", source="pdf_status")
-        el = max(time.time() - t0, 1e-9)
-        dn = min(i + CHUNK, len(jobs))
-        CON.say(f"  PDF {dn:,}/{len(jobs):,} · EPS추출 {counter['new']:,} · "
-                f"기존파일 재사용 {counter['hit']:,} · {dn/el*60:.0f}건/분 · "
-                f"잔여예산 {max(0, stage_end - time.time())/60:.0f}분")
-    CON.ok(f"PDF 단계 종료 — 처리 {counter['n']:,} · EPS 확보 {counter['new']:,} · "
-           f"누적 추출 {len(done):,}건")
+        # 남은 작업이 전부 차단된 호스트라면 더 돌 이유가 없다
+        rest = [j for j in jobs[i + PDF_CHUNK:] if not keymap.get(str(j[0]))]
+        if rest and all(CIRCUIT.blocked(_pdf_src(j[1])) for j in rest):
+            CON.warn(f"남은 {len(rest):,}건은 모두 차단된 호스트 대상이라 중단합니다 "
+                     f"(무의미한 재시도로 예산을 태우지 않습니다).")
+            break
+    CON.ok(f"PDF 단계 종료 — 파싱 {counter['n']:,} · EPS 확보 {counter['new']:,} · "
+           f"기존파일 {counter['hit']:,} · 신규다운로드 {counter['net']:,} · "
+           f"수신실패 {counter['fail']:,} · 누적 추출 {len(done):,}건 · "
+           f"{(time.time()-t0)/60:.1f}분")
     return _attach_pdf_columns(rep, done)
 
 
@@ -3833,6 +4310,8 @@ def choose_metric(fc: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     CON.grid(tab.values.tolist(), list(tab.columns), ["l", "r", "r"],
              title="주지표 선택 근거 (FORECAST_METRIC_MODE="
                    f"{FORECAST_METRIC_MODE})")
+    METRIC_COV.clear()
+    METRIC_COV.update({r[0]: dict(cov=int(r[1]), rows=int(r[2])) for r in stats})
     if FORECAST_METRIC_MODE in ("EPS", "TP12M"):
         return FORECAST_METRIC_MODE, tab
     eps_cov = tab.loc[tab["metric"] == "EPS", "월중앙_2인이상_종목수"].iloc[0]
@@ -3842,6 +4321,35 @@ def choose_metric(fc: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
            f"(EPS 커버리지 {eps_cov} vs TP12M {tp_cov} — 기준: EPS≥40 이고 TP의 30% 이상. "
            f"명세 §1 기본은 EPS, TP12M 은 커버리지 부족 시의 검증 경로)")
     return met, tab
+
+
+METRIC_COV: Dict[str, dict] = {}
+TRACK_LABEL = {"TP12M": "빠른판(TP12M·목표주가 · PDF 불필요)",
+               "EPS": "정밀판(EPS · PDF 원문 파싱)"}
+
+
+def plan_tracks(fc_all: pd.DataFrame) -> Tuple[str, List[str], pd.DataFrame]:
+    """어떤 지표로 몇 개의 트랙을 돌릴지 결정한다.
+
+    ★ 사용자 요구: "PDF 직접 파싱이 어렵다면 목표주가 버전으로 빠르게 백테스트하고,
+      빠른 버전과 PDF 파싱 버전을 서로 비교해봐."
+      → BOTH 모드에서는 **빠른 쪽(TP12M)을 먼저** 돌린다. PDF 트랙이 커버리지 부족으로
+        비어도 최소 한 벌의 완결된 결과가 이미 나와 있게 하기 위해서다.
+    """
+    primary, tab = choose_metric(fc_all)
+    if FORECAST_METRIC_MODE != "BOTH":
+        return primary, [primary], tab
+    order = [m for m in ("TP12M", "EPS") if METRIC_COV.get(m, {}).get("rows", 0) > 0]
+    thin = [m for m in order if METRIC_COV[m]["cov"] < 5]
+    for m in thin:
+        CON.warn(f"[{m}] 트랙 커버리지가 너무 얕습니다"
+                 f"(월중앙 2인이상 종목 {METRIC_COV[m]['cov']}개) — 이 트랙은 건너뜁니다")
+    order = [m for m in order if m not in thin] or [primary]
+    if primary not in order:
+        primary = order[0]
+    CON.ok("이중 트랙 실행: " + " → ".join(f"{m}({TRACK_LABEL[m]})" for m in order)
+           + f" · 주 트랙 {primary}")
+    return primary, order, tab
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -4251,7 +4759,18 @@ def pick_primary_fp(cons: pd.DataFrame, actuals: pd.DataFrame, metric: str) -> p
     d = cons.copy()
     d["primary"] = False
     if metric == "TP12M":
-        d["primary"] = d["fiscal_period"] == "12M"
+        d["primary"] = d["fiscal_period"].astype(str) == "12M"
+        if len(d) and not d["primary"].any():
+            # ★ 조용한 0행 방지. 다른 전략이 만든 캐시는 TP 행의 fiscal_period 라벨이
+            #   '12M' 이 아닐 수 있다(예: 'TP', '12개월', 연도표기). 라벨 하나 때문에
+            #   트랙 전체가 빈 결과로 나오면 원인을 찾는 데만 한나절이 든다.
+            lab = ", ".join(map(str, d["fiscal_period"].astype(str).unique()[:4]))
+            CON.warn(f"TP12M 대표기간 라벨이 '12M' 이 아닙니다(관측: {lab}) — "
+                     f"종목·시점당 1행을 대표로 승격해 트랙을 살립니다")
+            idx = (d.sort_values("fiscal_period")
+                   .groupby(["signal_date", "stock_id"], observed=True, sort=False)
+                   .head(1).index)
+            d.loc[idx, "primary"] = True
         return d
     ann: Dict[Tuple[str, str], pd.Timestamp] = {}
     if actuals is not None and len(actuals):
@@ -4554,6 +5073,153 @@ def run_suite(sig: pd.DataFrame, panel: pd.DataFrame, label: str) -> Dict[str, d
         out[s] = bucket_backtest(common_sig, panel, s, nq_override=nq_common)
         out[s]["label"] = label
     return out
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║ [S7~S9] 트랙 — 지표 하나를 '사건→점수→신호→백테스트'까지 완주시키는 단위                   ║
+# ║  ★ 같은 가격행렬·같은 패널·같은 유니버스를 공유한다. 트랙을 늘려도 시장데이터 호출은        ║
+# ║    단 한 번도 늘지 않는다(사용자 지시: 쓸데없이 가격조회를 반복하지 말 것).                 ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+def build_track(metric: str, fc: pd.DataFrame, fcv: pd.DataFrame, actuals: pd.DataFrame,
+                cal: "TradingCal", sig_months: List, cfg: "SCGParams",
+                PMX: "PriceMatrix") -> dict:
+    """지표 하나에 대한 SCG 엔진 전체(§7~§29)."""
+    t0 = time.time()
+    tp_act = (tp_actuals_from_prices(fc, PMX, cal) if metric == "TP12M" else
+              pd.DataFrame(columns=["report_id", "matured_at", "actual_price"]))
+    acc_ev = (acc_events_eps(fc, actuals, cfg) if metric == "EPS"
+              else acc_events_tp(fc, tp_act, cfg))
+    led_ev = lead_events(fcv, cal, cfg, metric)
+    CON.say(f"[{metric}] 사건 테이블: 정확도 {len(acc_ev):,} · 리더십 {len(led_ev):,}")
+    FLOW.io("출", "메모리", f"정확도사건_{metric}", acc_ev)
+    FLOW.io("출", "메모리", f"리더십사건_{metric}", led_ev)
+    scores = analyst_scores(sig_months, acc_ev, led_ev, cfg)
+    cons, W = smart_consensus(fcv, scores, sig_months, cfg, metric)
+    cons = pick_primary_fp(cons, actuals, metric)
+    sig = rank_alphas(scg_signals(cons, sig_months, cal, cfg), cfg)
+    ENG = dict(cfg=cfg, fcv=fcv, acc_ev=acc_ev, lead_ev=led_ev, metric=metric,
+               signal_dates=sig_months, cal=cal, actuals=actuals, sig=sig)
+    return dict(metric=metric, label=TRACK_LABEL.get(metric, metric), ENG=ENG, sig=sig,
+                scores=scores, W=W, cons=cons, acc_ev=acc_ev, lead_ev=led_ev,
+                tp_act=tp_act, build_sec=time.time() - t0)
+
+
+def eval_track(trk: dict, panel: pd.DataFrame, uni_df: pd.DataFrame,
+               bench: Optional[Dict[str, pd.Series]], mtab: Optional[pd.DataFrame],
+               cfg: "SCGParams", full_report: bool = True, report: bool = True) -> dict:
+    """트랙 하나를 전체 유니버스 + 시총하위N 두 유니버스에서 백테스트한다."""
+    met, lbl = trk["metric"], trk["label"]
+    sigp = trk["sig"][trk["sig"]["primary"]].merge(uni_df, on=["signal_date", "stock_id"],
+                                                   how="left")
+    sig_full = sigp[sigp["in_uni"].fillna(False)]
+    n_months = max(sig_full["signal_date"].nunique(), 1) if len(sig_full) else 1
+    CON.say(f"[{met}] 신호×유니버스 교집합: {len(sig_full):,}행 "
+            f"(월평균 {len(sig_full)/n_months:.0f}종목)")
+    suites_full = run_suite(sig_full, panel, f"{lbl} · 전체 유니버스")
+    if report:
+        report_all(suites_full, bench, sig_full, trk["scores"], trk["W"], trk["cons"],
+                   f"{lbl} · 전체 유니버스", mtab if full_report else None, cfg)
+
+    suites_small, sig_small = {}, pd.DataFrame()
+    uu = uni_df.dropna(subset=["mktcap"])
+    if len(uu) and len(sig_full):
+        sm = (uu.sort_values("mktcap").groupby("signal_date", observed=True, sort=False)
+                .head(COMPARE_BOTTOM_N)[["signal_date", "stock_id"]].copy())
+        sm["in_small"] = True
+        sigs = sig_full.merge(sm, on=["signal_date", "stock_id"], how="left")
+        sig_small = alphas_in_universe(sigs, sigs["in_small"].fillna(False), cfg)
+        CON.say(f"[{met}] 시총하위{COMPARE_BOTTOM_N} 유니버스 신호: {len(sig_small):,}행")
+        suites_small = run_suite(sig_small, panel, f"{lbl} · 시총하위{COMPARE_BOTTOM_N}")
+        if report:
+            report_all(suites_small, bench, sig_small, trk["scores"], trk["W"],
+                       trk["cons"], f"{lbl} · 시총 하위{COMPARE_BOTTOM_N} 비교전략",
+                       None, cfg)
+    elif not len(sig_full):
+        CON.warn(f"[{met}] 이 트랙의 신호가 0행이라 시총하위{COMPARE_BOTTOM_N} 비교를 "
+                 f"건너뜁니다 — 위 '신호×유니버스' 줄과 예측 커버리지를 확인하세요")
+    else:
+        CON.warn(f"[{met}] 단면 시가총액이 없어 시총하위{COMPARE_BOTTOM_N} 비교를 건너뜁니다")
+    trk.update(sig_full=sig_full, suites_full=suites_full,
+               suites_small=suites_small, sig_small=sig_small)
+    return trk
+
+
+def _track_row(trk: dict, suites_key: str, strat: str,
+               bench: Optional[Dict[str, pd.Series]]) -> List[str]:
+    bt = (trk.get(suites_key) or {}).get(strat, {})
+    if not bt or bt.get("empty", True):
+        return ["-"] * 7
+    ps = perf_summary(bt, (bench or {}).get("KOSPI"), leg="ls")
+    rho, _ = monotonicity(bt)
+    ic = (bt.get("ic") or {}).get(20, {})
+    return [f"{ps.get('n_signals', 0):,}",
+            f"{ps.get('n_unique_stocks', 0):,}",
+            _fmt(ps.get("annualized_return")),
+            _fmt(ps.get("Sharpe"), "{:+.2f}"),
+            _fmt(ps.get("MDD")),
+            _fmt(ic.get("mean_ic"), "{:+.3f}"),
+            _fmt(rho, "{:+.2f}")]
+
+
+def track_compare(tracks: "OrderedDict[str, dict]",
+                  bench: Optional[Dict[str, pd.Series]], primary: str):
+    """★ 사용자 요구의 핵심 산출물 — '빠른 판(TP12M)' vs 'PDF 파싱 판(EPS)' 정면 비교.
+
+    PDF 원문 파싱은 비싸다(수만 건 다운로드·수 시간). 그 비용이 **성과로 회수되는가**를
+    수치로 보여주지 않으면 계속 태울지 말지 판단할 근거가 없다. 그래서 같은 가격·같은
+    유니버스·같은 파라미터 위에서 두 트랙을 나란히 놓는다. 차이의 원인은 오직 '무엇을
+    예측 대상으로 삼았는가' 하나뿐이다.
+    """
+    if len(tracks) < 2:
+        return
+    CON.head("트랙 비교 — 빠른판(목표주가) vs 정밀판(PDF·EPS)",
+             "같은 가격·같은 유니버스·같은 파라미터 · 차이는 '예측 대상 지표' 하나뿐입니다")
+    heads = ["트랙", "유니버스", "전략", "신호행", "종목수", "L/S 연율", "Sharpe",
+             "MDD", "IC20", "단조성ρ"]
+    rows = []
+    for met, trk in tracks.items():
+        tag = f"{met}{' ★주' if met == primary else ''}"
+        for ukey, uname in (("suites_full", "전체"),
+                            ("suites_small", f"하위{COMPARE_BOTTOM_N}")):
+            if not trk.get(ukey):
+                continue
+            for st in STRATS:
+                rows.append([tag, uname, st] + _track_row(trk, ukey, st, bench))
+        rows.append(["", "", "", "", "", "", "", "", "", ""])
+    CON.grid(rows, heads, ["l", "l", "l", "r", "r", "r", "r", "r", "r", "r"],
+             title=f"4전략 × 2유니버스 × {len(tracks)}트랙 동시 비교 (§30 동일표본 정렬 적용)")
+
+    cost = []
+    for met, trk in tracks.items():
+        cv = METRIC_COV.get(met, {})
+        cost.append([met, TRACK_LABEL.get(met, met), f"{cv.get('rows', 0):,}행",
+                     f"{cv.get('cov', 0)}개",
+                     "불필요" if met == "TP12M" else "필요(다운로드+파싱)",
+                     f"{trk.get('build_sec', 0):.0f}초"])
+    CON.grid(cost, ["지표", "트랙", "예측행수", "월중앙 2인이상 종목", "PDF 원문",
+                    "엔진 소요"], ["l", "l", "r", "r", "l", "r"],
+             title="트랙별 조달 비용 — 'PDF를 계속 태울 가치가 있는가'의 판단 근거")
+
+    if "TP12M" in tracks and "EPS" in tracks:
+        def _ann(m):
+            bt = (tracks[m].get("suites_full") or {}).get("SCG_LS", {})
+            if not bt or bt.get("empty", True):
+                return np.nan
+            return perf_summary(bt, None, leg="ls").get("annualized_return", np.nan)
+        a_tp, a_eps = _ann("TP12M"), _ann("EPS")
+        n_tp = METRIC_COV.get("TP12M", {}).get("cov", 0)
+        n_eps = METRIC_COV.get("EPS", {}).get("cov", 0)
+        if np.isfinite(a_tp) and np.isfinite(a_eps):
+            gap = a_eps - a_tp
+            CON.ok(f"판정: SCG_LS 연율 기준 EPS {a_eps*100:+.1f}% vs TP12M {a_tp*100:+.1f}% "
+                   f"(차이 {gap*100:+.1f}%p). 커버리지는 EPS {n_eps} vs TP12M {n_tp}종목/월. "
+                   + ("PDF 파싱이 성과로 회수됩니다 — 계속 채우십시오."
+                      if gap > 0.02 and n_eps >= 0.5 * max(n_tp, 1) else
+                      "현 커버리지에서 PDF 파싱의 성과 이득이 확인되지 않습니다 — "
+                      "빠른판(TP12M)으로 운용하고 PDF는 배경에서 천천히 채우십시오."))
+        else:
+            CON.warn("판정 보류 — 한쪽 트랙의 백테스트가 비어 비교할 수 없습니다 "
+                     "(위 표에서 어느 쪽이 비었는지 확인하세요)")
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -4926,6 +5592,27 @@ def run_contracts(strict: bool = True) -> bool:
     _ct("C-보존", "기존 캐시 쓰기 차단", c_depot)
     _ct("C-결정", "결정성(시드)", c_det)
     _ct("C-URL", "URL 템플릿 배선", c_url)
+
+    def c_track():
+        """★ 트랙이 '조용히 0행'으로 끝나지 않는가.
+        TP12M 트랙이 스모크에서 통째로 비었던 원인이 정확히 이것이었다:
+        대표 회계기간 라벨이 '12M' 이 아니면 primary 가 전부 False 가 되고,
+        그 뒤 모든 표가 '-' 로 찍히는데 어디서 비었는지는 아무 데도 안 나온다."""
+        base = pd.DataFrame({"signal_date": [ts("2021-06-30")] * 2,
+                             "stock_id": ["005930", "000660"],
+                             "fiscal_period": ["12M", "12M"],
+                             "forecast_metric": "TP12M", "smart": [1.0, 2.0]})
+        n_ok = int(pick_primary_fp(base, pd.DataFrame(), "TP12M")["primary"].sum())
+        odd = base.assign(fiscal_period=["12개월", "TP"])
+        n_odd = int(pick_primary_fp(odd, pd.DataFrame(), "TP12M")["primary"].sum())
+        eps = pd.DataFrame({"signal_date": [ts("2021-06-30")] * 2,
+                            "stock_id": ["005930"] * 2,
+                            "fiscal_period": ["2021FY", "2022FY"],
+                            "forecast_metric": "EPS", "smart": [1.0, 2.0]})
+        n_eps = int(pick_primary_fp(eps, pd.DataFrame(), "EPS")["primary"].sum())
+        ok = (n_ok == 2 and n_odd == 2 and n_eps == 1)
+        return ok, f"TP정상 {n_ok}/2 · TP라벨이상 {n_odd}/2 · EPS 대표 {n_eps}/1"
+    _ct("C-트랙", "대표기간 승격(트랙 공백 방지)", c_track)
     bad = [c for c in CONTRACTS if not c["ok"]]
     CON.grid([[c["id"], c["name"], "통과" if c["ok"] else "실패", c["msg"]]
               for c in CONTRACTS], ["ID", "계약", "판정", "근거"], ["l", "l", "l", "l"],
@@ -5137,7 +5824,7 @@ def run_rehearsal(strict: bool = True) -> bool:
     """수집·정제 함수를 픽스처 네트워크로 실물 실행한다(라이브러리 없는 최악 조건)."""
     G = globals()
     keys = ("fetch", "fetch_json", "fdr", "pykrx_stock", "DART_API_KEY", "RUN_MODE",
-            "DEPOT", "RESEARCH_DOWNLOAD_PDF", "RESEARCH_COLLECT")
+            "DEPOT", "RESEARCH_DOWNLOAD_PDF", "RESEARCH_COLLECT", "_probe_get")
     saved_robust = list(ROBUST.items())
     saved = {k: G.get(k) for k in keys}
     net = _FixtureNet()
@@ -5150,8 +5837,86 @@ def run_rehearsal(strict: bool = True) -> bool:
         G["RUN_MODE"] = "FULL"
         G["RESEARCH_DOWNLOAD_PDF"] = True
         G["RESEARCH_COLLECT"] = True
+
+        def _probe_fx(url, params=None, headers=None, timeout=20.0):
+            """진단 전송을 픽스처로 바꿔치기 — 실제 네트워크 없이 배선만 검증한다."""
+            if "apps.analysis" in str(url):        # 구 라우트는 죽은 것으로 가정
+                return 403, b"<html><body>Forbidden</body></html>", "utf-8", 0
+            if str(url).rstrip("/") == _HK_HOME.rstrip("/"):
+                return 200, b"<html>home</html>", "utf-8", 2
+            return 200, _fx_hankyung_html().encode("utf-8"), "utf-8", 2
+        G["_probe_get"] = _probe_fx
+        HK.update(probed=False, alive=False, name=_HK_CANDIDATES[0][0],
+                  list=_HK_CANDIDATES[0][1], pdf=_HK_CANDIDATES[0][2])
         dep = _rehearsal_depot(tmp)
         G["DEPOT"] = dep
+
+        # ── 회로차단기 — '막힌 소스에 시간을 쓰지 않는다'는 배선 자체를 증명한다 ──
+        #  ★ 차단(blocking) 검사다. 순수 로직이라 어떤 환경에서도 동일하게 판정된다.
+        #    이게 없어서 403 사이트에 60분 예산을 통째로 헌납하고 화면은 멈춰 보였다.
+        def _circuit_wiring():
+            cb = SourceCircuit(limit=3, quiet=True)
+            assert not cb.blocked("x")
+            for _ in range(2):
+                cb.fail("x", "HTTP 403")
+            assert not cb.blocked("x"), "한도 전에 차단되면 정상 소스가 끊긴다"
+            cb.fail("x", "HTTP 403")
+            assert cb.blocked("x"), "한도 도달 시 차단되어야 한다"
+            cb.ok("x")
+            assert not cb.blocked("x"), "성공하면 즉시 복구되어야 한다"
+            cb.fail("y", "EXC"); cb.ok("y")          # 연속이 끊기면 카운터 초기화
+            for _ in range(2):
+                cb.fail("y", "EXC")
+            assert not cb.blocked("y"), "성공으로 끊긴 연속은 누적되면 안 된다"
+            return 1
+        _rh("회로차단기 배선(연속실패→차단→복구)", _circuit_wiring)
+
+        def _fetch_skip_is_instant():
+            """차단된 소스는 대기 없이 즉시 None — 이 즉시성이 핵심이다."""
+            G_fetch = saved["fetch"]                  # 픽스처가 아닌 진짜 fetch
+            CIRCUIT.open_now("__rh__", "리허설")
+            t0 = time.time()
+            r = G_fetch("https://example.invalid/x", source="__rh__", tries=3)
+            el = time.time() - t0
+            CIRCUIT.opened.pop("__rh__", None)
+            assert r is None and el < 0.5, f"차단 소스가 {el:.2f}s 를 소모했다"
+            return 1
+        _rh("차단 소스는 즉시 건너뜀(대기 0초)", _fetch_skip_is_instant)
+
+        def _pdf_route_rewrite():
+            """캐시에 남은 옛 PDF 경로를 살아 있는 경로로 치환하는 배선."""
+            _PDF_URL_REWRITE.clear()
+            u = "https://consensus.hankyung.com/analysis/downpdf?report_idx=7"
+            assert pdf_url_fix(u) == u, "치환 규칙이 없으면 원문 그대로여야 한다"
+            alts = _pdf_alt_urls(u)
+            assert alts and "apps.analysis/analysis.downpdf" in alts[0][2]
+            _PDF_URL_REWRITE.append((alts[0][0], alts[0][1]))
+            assert "apps.analysis/analysis.downpdf" in pdf_url_fix(u)
+            assert pdf_url_fix("https://finance.naver.com/x.pdf").endswith("x.pdf")
+            _PDF_URL_REWRITE.clear()
+            return 1
+        _rh("PDF 경로 치환(구/신 라우트 교차)", _pdf_route_rewrite)
+
+        def _pdf_alias_index():
+            """저장키가 안 맞아도 URL 의 보고서번호로 기존 PDF 를 찾아내는가.
+            ★ 매칭률 1%(10,119건 중 124건)의 원인을 겨눈 검사다. 동시에 '한 번호가
+              서로 다른 파일을 가리키면 버린다'는 안전장치도 함께 확인한다 —
+              엉뚱한 PDF 에서 EPS 를 뽑는 것이 못 찾는 것보다 훨씬 나쁘다."""
+            base = "https://consensus.hankyung.com/analysis/downpdf?report_idx="
+            dep.blob_save("research_pdf", "KEY_A", b"%PDF-1.4 alpha\n", "pdf",
+                          source=base + "770001")
+            dep.blob_save("research_pdf", "KEY_B", b"%PDF-1.4 bravo\n", "pdf",
+                          source=base + "770002")
+            dep.blob_save("research_pdf", "KEY_C", b"%PDF-1.4 charlie\n", "pdf",
+                          source=base + "770002")          # 같은 번호, 다른 파일 → 모호
+            km = _pdf_key_index()
+            assert "770001" in km, "URL 번호 별칭이 심어지지 않았다"
+            assert "770002" not in km, "모호한 번호는 버려야 한다(오매칭 방지)"
+            assert km["770001"].endswith(".pdf") and os.path.exists(km["770001"])
+            return 1
+        _rh("PDF 별칭 색인(URL 번호 → 파일)", _pdf_alias_index)
+        _rh("ⓘ 한경 접속 진단(경로 자동선택)", lambda: (hk_probe(), HK["alive"])[1],
+            expect_rows=False, blocking=False)
 
         _rh("무인증 캐시(listing)", lambda: fdr_cache_csv("listing/krx", back_days=3))
         _rh("무인증 캐시(delisting)", lambda: fdr_cache_csv("listing/delisting", back_days=3))
@@ -5265,6 +6030,12 @@ def run_rehearsal(strict: bool = True) -> bool:
     finally:
         for k, v in saved.items():
             G[k] = v
+        # ★ 리허설이 픽스처로 정한 한경 경로를 실행분으로 흘려보내면 안 된다 — 초기화.
+        HK.update(probed=False, alive=False, name=_HK_CANDIDATES[0][0],
+                  list=_HK_CANDIDATES[0][1], pdf=_HK_CANDIDATES[0][2])
+        CIRCUIT.opened.clear()
+        CIRCUIT._streak.clear()
+        _PDF_URL_REWRITE.clear()
         ROBUST.clear()                 # 리허설이 남긴 강건성 결과는 실행분과 섞지 않는다
         ROBUST.update(dict(saved_robust))
         shutil.rmtree(tmp, ignore_errors=True)
@@ -5316,17 +6087,52 @@ def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dic
     mis_map: Dict[Tuple[str, int], float] = {}
     fc_rows, act_rows = [], []
     fy_years = sorted({d.year for d in days})
-    for s_i, sid in enumerate(stocks):
-        base = rng.uniform(500, 5000)
-        cover = rng.choice(n_analysts, size=int(rng.integers(4, 8)), replace=False)
+    base_map: Dict[str, float] = {}
+    cover_map: Dict[str, Any] = {}
+    # ── ① 진실값(mis)·커버리지를 먼저 확정한다 ──
+    #    ★ 목표주가(TP12M)는 '보고서 시점 주가'에 정박해야 실제와 같은 모양이 된다.
+    #      그러려면 가격이 예측보다 먼저 있어야 한다 — 그래서 순서를 이렇게 나눈다.
+    for sid in stocks:
+        base_map[sid] = float(rng.uniform(500, 5000))
+        cover_map[sid] = rng.choice(n_analysts, size=int(rng.integers(4, 8)),
+                                    replace=False)
         for y in fy_years:
-            mis = float(np.clip(rng.normal(0.0, 0.30), -0.8, 0.8))
-            tv = base * (1 + mis)
-            mis_map[(sid, y)] = mis
+            mis_map[(sid, y)] = float(np.clip(rng.normal(0.0, 0.30), -0.8, 0.8))
             act_rows.append(dict(stock_id=sid, fiscal_period=f"{y}FY",
-                                 forecast_metric="EPS", actual_value=tv,
+                                 forecast_metric="EPS",
+                                 actual_value=base_map[sid] * (1 + mis_map[(sid, y)]),
                                  actual_announcement_date=ts(f"{y+1}-03-20")))
-            for a_i in cover:
+    # ── ② 가격을 '날짜 단면' 형태로 ── 실경로와 동일한 자료형이어야 스모크가 의미를 갖는다
+    px_rows, px_ser = [], {}
+    for j, sid in enumerate(stocks):
+        p = 10000.0 * float(rng_px.uniform(0.5, 3))
+        arr = []
+        for d in days:
+            mis = mis_map.get((sid, d.year), 0.0)
+            # 심어둔 알파의 세기. 이건 전략 파라미터가 아니라 **시험용 신호 세기**다.
+            # 약하면 플라시보(R4)·지연(R5) 검사가 잡음에 묻혀 스모크가 증명력을 잃는다.
+            pull = 0.0045 * mis                    # 갭과 같은 앵커 → 신호가 수익을 예측
+            p *= math.exp(rng_px.normal(0.0002, 0.010) + pull)
+            arr.append(p)
+        sh = np.full(len(days), 1e6)
+        arr = np.array(arr, float)
+        if j == 0:                                  # 액면분할 1건 심기(보정 경로 검증)
+            k = len(days) // 2
+            arr[k:] /= 5.0
+            sh[k:] *= 5.0
+        px_ser[sid] = pd.Series(arr, index=days)
+        px_rows.append(pd.DataFrame({"date": days, "code": sid, "close": arr,
+                                     "volume": 1e5, "value": arr * 1e5,
+                                     "mktcap": arr * sh, "shares": sh,
+                                     "market": "KOSPI"}))
+    # ── ③ 예측 — 같은 정보(est)를 EPS 와 TP12M 두 형태로 동시에 낸다 ──
+    #    현실의 리포트가 바로 이렇다: 본문 표에 EPS 추정치, 표지에 목표주가.
+    #    두 트랙 비교가 의미를 가지려면 스모크에서도 두 지표가 함께 있어야 한다.
+    for sid in stocks:
+        base = base_map[sid]
+        for y in fy_years:
+            mis = mis_map[(sid, y)]
+            for a_i in cover_map[sid]:
                 aid = analysts[a_i]
                 lead_shift = -25 if is_leader[a_i] else 0
                 for q in range(5):        # 분기 4회 + 4Q 프리뷰(11월) — 발표 전 180일 안쪽
@@ -5340,28 +6146,16 @@ def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dic
                     noise = rng.normal(0, 0.18 * (1.05 - skill[a_i]))
                     est = base * (1 + mis * conv + noise)
                     fc_rows.append(_fc_row(sid, aid, f"{d0:%Y-%m-%d}", f"{y}FY", est))
+                    p_now = float(px_ser[sid].asof(d0))
+                    if np.isfinite(p_now):
+                        r = fc_rows[-1].copy()
+                        r["forecast_metric"] = "TP12M"
+                        r["fiscal_period"] = "12M"      # 실경로(build_forecasts)와 동일
+                        r["forecast_value"] = max(100.0, p_now * (1 + 0.5 * (est / base - 1)
+                                                                 + 0.05))
+                        fc_rows.append(r)
     fc = pd.DataFrame(fc_rows)
     actuals = pd.DataFrame(act_rows)
-    # 가격을 '날짜 단면' 형태로 만든다 — 실경로와 동일한 자료형이어야 스모크가 의미를 갖는다
-    px_rows = []
-    for j, sid in enumerate(stocks):
-        p = 10000.0 * float(rng_px.uniform(0.5, 3))
-        arr = []
-        for d in days:
-            mis = mis_map.get((sid, d.year), 0.0)
-            pull = 0.0022 * mis                    # 갭과 같은 앵커 → 신호가 수익을 예측
-            p *= math.exp(rng_px.normal(0.0002, 0.010) + pull)
-            arr.append(p)
-        sh = np.full(len(days), 1e6)
-        arr = np.array(arr, float)
-        if j == 0:                                  # 액면분할 1건 심기(보정 경로 검증)
-            k = len(days) // 2
-            arr[k:] /= 5.0
-            sh[k:] *= 5.0
-        px_rows.append(pd.DataFrame({"date": days, "code": sid, "close": arr,
-                                     "volume": 1e5, "value": arr * 1e5,
-                                     "mktcap": arr * sh, "shares": sh,
-                                     "market": "KOSPI"}))
     xsec = pd.concat(px_rows, ignore_index=True)
     months = month_ends(days[0], days[-1])
     # 일부 종목 중도상폐 심기(생존자편향 경로 검증) — 단면에서도 사라지게 한다
@@ -5385,21 +6179,24 @@ def run_smoke(full: bool) -> bool:
     fc = validate_forecasts(S["fc"])
     fcv = with_validity(fc, cfg)
     FLOW.io("입", "합성", "forecasts", fc, src="synth_world")
-    ae = acc_events_eps(fc, S["actuals"], cfg)
-    le = lead_events(fc, S["cal"], cfg, "EPS")
-    CON.say(f"합성 사건: 정확도 {len(ae):,} · 리더십 {len(le):,}")
+    panel, pmx = build_month_panel(S["have_dates"], S["xsec"], S["sec"], months, S["cal"])
+    # (스모크는 ReturnHub 없이 단면 파생 경로를 태운다 — 폴백이 살아 있는지 검증)
+    uni_df = universe_frame(panel, S["sec"])
+
+    # ★ 스모크가 **이중 트랙 전 경로**를 그대로 태운다. 실행부에서 처음 도는 코드가
+    #   하나도 없어야 한다 — 사용자 환경에서만 터지는 사고를 이 자리에서 끝낸다.
+    _, track_metrics, mtab = plan_tracks(fc)
+    TR: "OrderedDict[str, dict]" = OrderedDict()
+    for m in track_metrics:
+        TR[m] = build_track(m, fc, fcv, S["actuals"], S["cal"], months, cfg, pmx)
+    if "EPS" not in TR:                    # 합성세계의 정답 트랙은 EPS 다
+        TR["EPS"] = build_track("EPS", fc, fcv, S["actuals"], S["cal"], months, cfg, pmx)
+    CON.debug(f"합성 분할보정 {pmx.n_adjusted}건 · 트랙 {list(TR)}")
+    sc, W, cons = TR["EPS"]["scores"], TR["EPS"]["W"], TR["EPS"]["cons"]
+    sig, ae, le = TR["EPS"]["sig"], TR["EPS"]["acc_ev"], TR["EPS"]["lead_ev"]
     if not len(ae) or not len(le):
         CON.err("합성 사건 생성 실패")
         return False
-    sc = analyst_scores(months, ae, le, cfg)
-    cons, W = smart_consensus(fcv, sc, months, cfg, "EPS")
-    cons = pick_primary_fp(cons, S["actuals"], "EPS")
-    sig = rank_alphas(scg_signals(cons, months, S["cal"], cfg), cfg)
-    panel, pmx = build_month_panel(S["have_dates"], S["xsec"], S["sec"], months, S["cal"])
-    # (스모크는 ReturnHub 없이 단면 파생 경로를 태운다 — 폴백이 살아 있는지 검증)
-    tp_act = tp_actuals_from_prices(fc.assign(forecast_metric="TP12M").head(50), pmx,
-                                    S["cal"])          # TP 경로도 스모크에서 한 번 태운다
-    CON.debug(f"합성 TP 만기 실측 {len(tp_act):,}건 · 분할보정 {pmx.n_adjusted}건")
     suites = run_suite(sig[sig["primary"]], panel, "합성")
     bt = suites["SCG_LS"]
     if bt.get("empty"):
@@ -5410,16 +6207,23 @@ def run_smoke(full: bool) -> bool:
     ok = bool(top_ok and np.isfinite(ic20) and ic20 > 0)
     CON.say(f"합성 검증: D상위>D하위={top_ok} · 단조성 ρ={rho:+.2f} · IC20={ic20:+.3f}")
     if full:
-        report_all(suites, None, sig, sc, W, cons, "합성(스모크)", None, cfg)
-        R_sensitivity(dict(cfg=cfg, fcv=fcv, acc_ev=ae, lead_ev=le, metric="EPS",
-                           signal_dates=months, cal=S["cal"], actuals=S["actuals"],
-                           sig=sig), panel)
+        for m, trk in TR.items():          # 트랙 평가 + 비교표까지 실물 실행
+            eval_track(trk, panel, uni_df, None, mtab if m == "EPS" else None, cfg,
+                       full_report=(m == "EPS"))
+        track_compare(TR, None, "EPS")
+        R_sensitivity(TR["EPS"]["ENG"], panel)
         R_subperiod(suites)
         R_concentration(suites)
         R_placebo(sig[sig["primary"]], panel, n_iter=60)
         R_lag(sig[sig["primary"]], panel)
         robustness_verdict()
         ROBUST.clear()
+    else:
+        # 빠른 스모크에서도 비교 경로를 실물로 태운다 — 표만 조용히(보고블록 생략).
+        for m, trk in TR.items():
+            eval_track(trk, panel, uni_df, None, None, cfg, full_report=False,
+                       report=False)
+        track_compare(TR, None, "EPS")
     if ok:
         CON.ok("전체 스모크 통과 — 계산 경로가 심어둔 알파를 복원했습니다")
     else:
@@ -5789,69 +6593,43 @@ def run_all() -> dict:
                           "종목코드 형식(6자리)과 마스터 수집을 확인하세요.")
         DEPOT.table_save("scg_analyst_forecasts", fc_all, scope="공용", domain="research",
                          source="ledger+pdf")
-        metric, mtab = choose_metric(fc_all)
+        metric, track_metrics, mtab = plan_tracks(fc_all)
         cfg = SCGParams()
         fc = validate_forecasts(fc_all, asof=ts(BACKTEST_END) + pd.Timedelta(7, "D"))
         fcv = with_validity(fc, cfg)
         sig_months = [m for m in months if m >= fc["report_date"].min()]
-        # 가격 행렬을 여기서 한 번만 만들고, 이후 백테스트·IC·목표가 만기가 전부 재사용한다
+        # 가격 행렬을 여기서 한 번만 만들고, 이후 백테스트·IC·목표가 만기·**모든 트랙**이
+        # 전부 재사용한다 — 트랙을 늘려도 시장데이터 조회는 1회도 늘지 않는다.
         panel, PMX = build_month_panel(HUB.all_dates(), xsec, sec, sig_months, cal,
                                        rethub=RET, anchors=anchor_of)
-        tp_act = tp_actuals_from_prices(fc, PMX, cal) if metric == "TP12M" else \
-            pd.DataFrame(columns=["report_id", "matured_at", "actual_price"])
-
-    with FLOW.part("S7", "SCG 엔진(사건→PIT점수→스마트컨센서스→신호)", budget_s=3600):
-        if metric == "EPS":
-            acc_ev = acc_events_eps(fc, actuals, cfg)
-        else:
-            acc_ev = acc_events_tp(fc, tp_act, cfg)
-        led_ev = lead_events(fcv, cal, cfg, metric)
-        CON.say(f"사건 테이블: 정확도 {len(acc_ev):,} · 리더십 {len(led_ev):,}")
-        FLOW.io("출", "메모리", "정확도사건", acc_ev)
-        FLOW.io("출", "메모리", "리더십사건", led_ev)
-        scores = analyst_scores(sig_months, acc_ev, led_ev, cfg)
-        cons, W = smart_consensus(fcv, scores, sig_months, cfg, metric)
-        cons = pick_primary_fp(cons, actuals, metric)
-        sig = rank_alphas(scg_signals(cons, sig_months, cal, cfg), cfg)
-        ENG = dict(cfg=cfg, fcv=fcv, acc_ev=acc_ev, lead_ev=led_ev, metric=metric,
-                   signal_dates=sig_months, cal=cal, actuals=actuals, sig=sig)
-
-    with FLOW.part("S8", "백테스트 — 전체 PIT 유니버스", budget_s=1800):
-        # PIT 유니버스 = 그 달 단면에 실재한 보통주. 상장/폐지 목록 정확도에 의존하지 않는다.
         uni_df = universe_frame(panel, sec)
-        sigp = sig[sig["primary"]].merge(uni_df, on=["signal_date", "stock_id"], how="left")
-        sig_full = sigp[sigp["in_uni"].fillna(False)]
-        CON.say(f"신호×유니버스 교집합: {len(sig_full):,}행 "
-                f"(월평균 {len(sig_full)/max(len(sig_months),1):.0f}종목)")
-        suites_full = run_suite(sig_full, panel, "전체 유니버스")
-        report_all(suites_full, bench, sig_full, scores, W, cons,
-                   "전체 유니버스", mtab, cfg)
 
-    suites_small: Dict[str, dict] = {}
-    with FLOW.part("S9", f"비교전략 — 시총 하위{COMPARE_BOTTOM_N}", budget_s=1200,
-                   critical=False):
-        # 시총은 각 신호일 단면에 실측으로 들어 있다 — 그 달의 유니버스 안에서 하위 N.
-        uu = uni_df.dropna(subset=["mktcap"])
-        sm = None
-        if len(uu):
-            sm = (uu.sort_values("mktcap")
-                    .groupby("signal_date", observed=True, sort=False)
-                    .head(COMPARE_BOTTOM_N)[["signal_date", "stock_id"]].copy())
-        if sm is not None and len(sm):
-            sm["in_small"] = True
-            sigs = sig_full.merge(sm, on=["signal_date", "stock_id"], how="left")
-            mask = sigs["in_small"].fillna(False)
-            sig_small = alphas_in_universe(sigs, mask, cfg)
-            CON.say(f"하위{COMPARE_BOTTOM_N} 유니버스 신호: {len(sig_small):,}행")
-            suites_small = run_suite(sig_small, panel, f"시총하위{COMPARE_BOTTOM_N}")
-            report_all(suites_small, bench, sig_small, scores, W, cons,
-                       f"시총 하위{COMPARE_BOTTOM_N} 비교전략", None, cfg)
-            R_subperiod(suites_small)
-            R_concentration(suites_small)
-        else:
-            CON.warn("단면에 시가총액이 없어 비교전략을 건너뜁니다 — pykrx 수집을 확인하세요")
+    TRACKS: "OrderedDict[str, dict]" = OrderedDict()
+    with FLOW.part("S7", "SCG 엔진(사건→PIT점수→스마트컨센서스→신호)", budget_s=3600):
+        for _m in track_metrics:
+            TRACKS[_m] = build_track(_m, fc, fcv, actuals, cal, sig_months, cfg, PMX)
+        if metric not in TRACKS:            # 방어: 주 트랙이 비면 만들어진 것 중 첫째로
+            metric = next(iter(TRACKS))
+        ENG = TRACKS[metric]["ENG"]
+        sig, scores, W, cons = (TRACKS[metric]["sig"], TRACKS[metric]["scores"],
+                                TRACKS[metric]["W"], TRACKS[metric]["cons"])
 
-    with FLOW.part("S10", "강건성 검사(전체 유니버스)", budget_s=3600 * 2, critical=False):
+    with FLOW.part("S8", f"백테스트 — 전체 PIT 유니버스 + 시총하위{COMPARE_BOTTOM_N} "
+                         f"(트랙 {len(TRACKS)}개)", budget_s=3600):
+        # PIT 유니버스 = 그 달 단면에 실재한 보통주. 상장/폐지 목록 정확도에 의존하지 않는다.
+        for _m, _trk in TRACKS.items():
+            eval_track(_trk, panel, uni_df, bench, mtab if _m == metric else None,
+                       cfg, full_report=(_m == metric))
+        sig_full = TRACKS[metric]["sig_full"]
+        suites_full = TRACKS[metric]["suites_full"]
+        suites_small = TRACKS[metric]["suites_small"]
+
+    with FLOW.part("S9", "트랙 비교 — 빠른판(TP12M) vs 정밀판(EPS·PDF)", budget_s=600,
+                   critical=False, skip=len(TRACKS) < 2,
+                   why="단일 트랙 (FORECAST_METRIC_MODE≠BOTH 또는 한쪽 커버리지 부족)"):
+        track_compare(TRACKS, bench, metric)
+
+    with FLOW.part("S10", "강건성 검사(주 트랙)", budget_s=3600 * 2, critical=False):
         R_sensitivity(ENG, panel)
         R_subperiod(suites_full)
         R_concentration(suites_full)
@@ -5859,6 +6637,9 @@ def run_all() -> dict:
         R_lag(sig_full, panel)
         R_cost_stress(sig_full, panel,
                       nq=suites_full.get("SCG_LS", {}).get("nq"))
+        if suites_small:
+            R_subperiod(suites_small)
+            R_concentration(suites_small)
         robustness_verdict()
 
     with FLOW.part("S11", "해석표 · 저장(공용/전용 인덱스) · 다운로드", budget_s=900,
@@ -5879,18 +6660,21 @@ def run_all() -> dict:
             if len(df):
                 df.to_csv(p, index=False, encoding="utf-8-sig")
                 outs.append(p)
-        for st, bt in {**suites_full, **{f"small_{k}": v for k, v in
-                                         (suites_small or {}).items()}}.items():
-            if isinstance(bt, dict) and not bt.get("empty", True):
-                p = os.path.join(outdir, f"returns_{st}_{stamp}.csv")
-                bt["returns"].to_csv(p, index=False, encoding="utf-8-sig")
-                outs.append(p)
+        for _m, _trk in TRACKS.items():          # 트랙별 · 유니버스별 수익률 전부 저장
+            allbt = {**(_trk.get("suites_full") or {}),
+                     **{f"small_{k}": v for k, v in (_trk.get("suites_small") or {}).items()}}
+            for st, bt in allbt.items():
+                if isinstance(bt, dict) and not bt.get("empty", True):
+                    p = os.path.join(outdir, f"returns_{_m}_{st}_{stamp}.csv")
+                    bt["returns"].to_csv(p, index=False, encoding="utf-8-sig")
+                    outs.append(p)
         logp = os.path.join(outdir, f"log_{stamp}.txt")
         write_atomic_text(logp, "\n".join(CON.buffer))
         outs.append(logp)
         DEPOT.snapshot_indexes()
         QUOTA.report()
         http_report()
+        CIRCUIT.table()
         DEPOT.audit_table()
         FLOW.parts_table()
         FLOW.io_table()
@@ -5903,7 +6687,8 @@ def run_all() -> dict:
              + (" · 재실행하면 수집을 이어받아 완전한 결과를 만듭니다"
                 if DEADLINE.tripped else ""))
     return {"suites_full": suites_full, "suites_small": suites_small, "sig": sig,
-            "scores": scores, "metric": metric, "partial": DEADLINE.tripped}
+            "scores": scores, "metric": metric, "tracks": TRACKS,
+            "partial": DEADLINE.tripped}
 
 
 if __name__ == "__main__" or RIG["ipython"]:
