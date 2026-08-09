@@ -3144,6 +3144,41 @@ class PriceMatrix:
         self.row_of = {c: i for i, c in enumerate(self.close.index)}
         # (구) self._adj_np — 읽는 곳이 없어 제거
 
+    def shares_ratio(self, codes: Sequence[str], d_from: Sequence,
+                     d_to: Sequence) -> np.ndarray:
+        """두 시점 사이의 **상장주식수 배수**(액면분할·무상증자). 못 구하면 1.0.
+
+        ★ EPS 정확도 사건의 단위를 맞추기 위해 필요하다. 실적 EPS 는 결산 시점
+          주식수로 나눈 값이고, 애널리스트 전망은 발간 시점 주식수 기준이다.
+          그 사이에 10:1 액면분할이 있었다면 두 숫자는 **10배 차이나는 단위**인데
+          그대로 빼면 '완전히 틀린 전망'이 되어 정확도 점수가 통째로 뒤집힌다.
+          목표주가 쪽은 pm.cum 으로 이미 되돌리고 있었는데 EPS 쪽에만 없었다.
+        """
+        n = len(codes)
+        out = np.ones(n, dtype=float)
+        if not n or self.shares is None or self.shares.empty:
+            return out
+        sh = self.shares.to_numpy(float)
+        cf = np.asarray(pd.to_datetime(pd.Series(list(d_from))).to_numpy(),
+                        dtype="datetime64[ns]")
+        ct = np.asarray(pd.to_datetime(pd.Series(list(d_to))).to_numpy(),
+                        dtype="datetime64[ns]")
+        ri = np.array([self.row_of.get(c, -1) for c in codes], dtype=int)
+        i_f = np.searchsorted(self.cols, cf, side="right") - 1
+        i_t = np.searchsorted(self.cols, ct, side="right") - 1
+        ok = (ri >= 0) & (i_f >= 0) & (i_t >= 0)
+        if not ok.any():
+            return out
+        a = sh[ri[ok], i_f[ok]]
+        b = sh[ri[ok], i_t[ok]]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = b / a
+        r = np.where(np.isfinite(r) & (r > 0), r, 1.0)
+        # 5% 미만 변화는 유상증자·자사주 등 자본거래일 수 있으므로 건드리지 않는다
+        r = np.where(np.abs(r - 1.0) > 0.05, r, 1.0)
+        out[ok] = r
+        return out
+
 
 def build_month_panel(have_dates: Sequence[pd.Timestamp], xsec: pd.DataFrame,
                       sec: pd.DataFrame, months: Sequence[pd.Timestamp],
@@ -3284,10 +3319,62 @@ def build_month_panel(have_dates: Sequence[pd.Timestamp], xsec: pd.DataFrame,
     return shrink(P), pm
 
 
-def universe_frame(P: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
-    """PIT 유니버스 = 그 달 단면에 실재한 보통주. (상장/폐지 목록에 의존하지 않는다)"""
+def _pit_common_flags(xsec: pd.DataFrame) -> pd.DataFrame:
+    """(날짜, 종목) 시점의 **그때 이름**으로 보통주 여부를 판정한다.
+
+    ★ 기존 종목마스터는 종목명을 keep="last"(≈현재 이름)로 하나만 잡아 10년 전
+      구간에까지 소급 적용했다. 그러면 2017년에 '케이비제17호기업인수목적'이던
+      스팩이 2019년 합병 후 'OO테크'로 개명한 경우, **2017년 유니버스에 보통주로
+      들어간다** — '나중에 진짜 회사가 된 스팩'만 골라 담는 셈이라 미래정보로
+      멤버십이 정해진다. 반대로 우선주로 개명한 종목은 과거까지 통째로 빠진다.
+    """
+    if xsec is None or not len(xsec) or "name" not in xsec.columns:
+        return pd.DataFrame(columns=["date", "code", "pit_common"])
+    d = xsec[["date", "code", "name"]].dropna(subset=["date", "code"]).copy()
+    # 같은 (코드, 이름) 조합은 한 번만 판정한다 — 문자열 정규식은 비싸다
+    uniq = d[["code", "name"]].drop_duplicates()
+    uniq["pit_common"] = [_is_common_stock(c, n)
+                          for c, n in zip(uniq["code"], uniq["name"].astype(str))]
+    return d.merge(uniq, on=["code", "name"], how="left")[["date", "code", "pit_common"]]
+
+
+def universe_frame(P: pd.DataFrame, sec: pd.DataFrame,
+                   xsec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """PIT 유니버스 = 그 달 단면에 실재한 보통주. (상장/폐지 목록에 의존하지 않는다)
+
+    ★ 보통주 판정을 **그 시점의 종목명**으로 한다. 종목마스터의 is_common 은
+      keep="last" 로 잡은 이름(≈현재 이름)을 10년 전까지 소급 적용하므로,
+      2017년의 스팩이 2019년 합병 후 개명하면 2017년 유니버스에도 보통주로 들어간다
+      — '나중에 진짜 회사가 된 스팩'만 골라 담게 되어 멤버십이 미래정보로 정해진다.
+      시점별 이름이 있으면 그것을 쓰고, 없으면 기존 마스터 판정으로 물러선다.
+    """
     common = set(sec.loc[sec["is_common"], "code"])
-    U = P.loc[P["code"].isin(common), ["code", "month", "mktcap"]].copy()
+    U = P[["code", "month", "mktcap"]].copy()
+    pit = _pit_common_flags(xsec) if xsec is not None else None
+    used_pit = False
+    if pit is not None and len(pit):
+        # 월 앵커(거래일) 기준 판정을 그 달에 붙인다
+        pit = pit.copy()
+        pit["month"] = pit["date"].dt.to_period("M")
+        pit = (pit.sort_values("date").drop_duplicates(["month", "code"], keep="last")
+                  [["month", "code", "pit_common"]])
+        U["_m"] = pd.PeriodIndex(U["month"], freq="M")
+        U = U.merge(pit.rename(columns={"month": "_m"}), on=["_m", "code"], how="left")
+        U = U.drop(columns=["_m"])
+        # 그 달에 이름 관측이 없으면 마스터 판정으로 보수적 폴백
+        fb = U["pit_common"].isna()
+        U.loc[fb, "pit_common"] = U.loc[fb, "code"].isin(common)
+        n_diff = int((U["pit_common"].eq(True) != U["code"].isin(common)).sum())
+        if n_diff:
+            CON.say(f"시점별 종목명 기준 보통주 판정으로 {n_diff:,}개 (종목×월) 이 "
+                    f"마스터 판정과 달라졌습니다 — 개명(스팩 합병·우선주 전환 등)이 "
+                    f"과거 유니버스에 소급되던 것을 막습니다")
+        U = U[U["pit_common"].eq(True)].drop(columns=["pit_common"])
+        used_pit = True
+    else:
+        U = U[U["code"].isin(common)]
+    if not used_pit:
+        CON.debug("시점별 종목명이 없어 종목마스터 보통주 판정을 사용합니다")
     U = U.rename(columns={"code": "stock_id", "month": "signal_date"})
     U["in_uni"] = True
     return U
@@ -4014,7 +4101,12 @@ _TP_PAT = re.compile(
     r"(?:목\s*표\s*(?:주\s*가|가\b|가격)|적\s*정\s*(?:주\s*가|가격)|"
     r"T\.?\s?P\.?(?![A-Za-z])|Target\s*Price)"
     r"[^0-9\-]{0,25}?([0-9][0-9,]{2,12}(?:\.\d+)?)", re.I)
-_YEAR_HDR = re.compile(r"(20\d{2})\s*(?:\.?12)?\s*[EFP]?")
+# ★ 연도 헤더의 **꼬리표까지** 잡는다. 예전 패턴은 `[EFP]?` 가 선택적이라 A/E 를
+#   전혀 구분하지 못했고, 2018-03 발간 리포트의 표 '2016A 2017A 2018E 2019E' 에서
+#   **이미 발표된 실적(A)** 까지 예측치로 수확했다. 그 값은 실적과 일치할 수밖에
+#   없으므로 정확도 사건이 '완벽한 예측'으로 계상된다 — 전형적인 미래누수다.
+#   (채택 범위가 report_year-2 부터라 2016A·2017A 가 그대로 들어왔다)
+_YEAR_HDR = re.compile(r"(20\d{2})\s*(?:\.?12)?\s*([AEFP])?", re.I)
 _NUM_TOK = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d+)?")
 _ANALYST_TOK = re.compile(r"([가-힣]{2,4})\s*(?:연구원|애널리스트|수석|책임|선임)?\s*"
                           r"(?:☎|Tel|T\.|\d{2,3}[-.)\s]\d{3,4})", re.I)
@@ -4035,17 +4127,23 @@ def _eps_from_text(text: str, report_year: int) -> Dict[str, float]:
         if len(nums) < 2:
             continue
         years: List[int] = []
+        marks: List[str] = []
         for back in range(1, 7):                      # 위쪽 몇 줄에서 연도 헤더 찾기
             if i - back < 0:
                 break
-            ys = [int(y) for y in _YEAR_HDR.findall(lines[i - back])
-                  if 2010 <= int(y) <= 2035]
-            if len(ys) >= 2:
-                years = ys
+            hits = [(int(y), (mk or "").upper())
+                    for y, mk in _YEAR_HDR.findall(lines[i - back])
+                    if 2010 <= int(y) <= 2035]
+            if len(hits) >= 2:
+                years = [h[0] for h in hits]
+                marks = [h[1] for h in hits]
                 break
         if not years:
             years = list(range(report_year - 1, report_year - 1 + len(nums)))
-        for y, v in zip(years, nums):
+            marks = [""] * len(years)
+        for y, v, mk in zip(years, nums, marks + [""] * len(years)):
+            if mk == "A":
+                continue                  # ★ 확정 실적 열 — 예측이 아니다(누수 차단)
             if report_year - 2 <= y <= report_year + 3:
                 out[f"{y}FY"] = v
         if out:
@@ -5233,9 +5331,13 @@ def _naver_annual_eps(code: str) -> Optional[pd.DataFrame]:
             v = pd.to_numeric(str(eps_row.iloc[0][cname]).replace(",", ""), errors="coerce")
             if pd.notna(v):
                 y = int(m.group(1))
+                # ★ §0.1 주의: 네이버 요약표는 **오늘 시점의 수정 후 최종값**이다.
+                #   그때 발표된 값이 아니므로 소급 간주 위험이 있다. 발표일도
+                #   고정 추정(FY말+3개월)이라 여유를 크게 잡아 사건 채택을 보수화한다.
                 rows.append(dict(stock_id=code, fiscal_period=f"{y}FY",
                                  forecast_metric="EPS", actual_value=float(v),
-                                 actual_announcement_date=ts(f"{y+1}-03-31")))
+                                 actual_announcement_date=ts(f"{y+1}-03-31"),
+                                 ann_lag_days=90.0))
         return pd.DataFrame(rows) if rows else None
     except Exception:
         return None
@@ -5348,7 +5450,7 @@ def actuals_from_krx_fundamental(fund: pd.DataFrame) -> pd.DataFrame:
     우선순위만 바꾼다.
     """
     cols = ["stock_id", "fiscal_period", "forecast_metric", "actual_value",
-            "actual_announcement_date"]
+            "actual_announcement_date", "ann_lag_days"]
     if fund is None or not len(fund):
         return pd.DataFrame(columns=cols)
     f = fund.dropna(subset=["date", "code"]).copy()
@@ -5374,8 +5476,12 @@ def actuals_from_krx_fundamental(fund: pd.DataFrame) -> pd.DataFrame:
         "forecast_metric": "EPS",
         "actual_value": st["eps"].astype(float).to_numpy(),
         "actual_announcement_date": st["date"].to_numpy(),
+        # ★ 이 발표일은 '월말 단면에서 값이 바뀐 첫 관측일'이라 실제 공표보다
+        #   최대 한 달 늦다. 늦다는 것은 그 사이에 나온 리포트를 '예측'으로
+        #   오인할 수 있다는 뜻이므로(=미래누수), 그만큼의 여유를 요구하게 표시한다.
+        "ann_lag_days": 35.0,
     })
-    return out[cols]
+    return out[[c for c in cols] + ["ann_lag_days"]]
 
 
 def _naver_actuals_bulk(codes: Sequence[str], label: str = "네이버실적") -> pd.DataFrame:
@@ -5530,8 +5636,10 @@ def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
                     n_no_shares += 1
                     continue
                 rows.append(dict(stock_id=r["code"], fiscal_period=f"{y}FY",
-                                 forecast_metric="EPS", actual_value=float(r["ni"]) / float(sh),
-                                 actual_announcement_date=ann))
+                                 forecast_metric="EPS",
+                                 actual_value=float(r["ni"]) / float(sh),
+                                 actual_announcement_date=ann,
+                                 ann_lag_days=0.0))   # 접수일 = 실제 공표일
             dart_rows = pd.DataFrame(rows, columns=cols) if rows else dart_rows
             if n_no_shares:
                 CON.say(f"주식수 스냅샷 부재로 제외된 실적 {n_no_shares:,}건 "
@@ -5572,6 +5680,10 @@ def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
 
     CON.grid(prov, ["실적 소스", "확보", "성격"], ["l", "r", "l"],
              title="실적(actual) 조달 원장 — 단일 소스 의존을 끊었습니다")
+    CON.say("한계 명시: 네이버 요약표는 **오늘 시점의 수정 후 최종값**입니다. 정정공시·"
+            "소급 재작성이 있었던 종목은 '그때 발표된 값'과 다를 수 있어 §0.1 위반 소지가 "
+            "있습니다 — 그래서 발표일 여유를 90일로 크게 잡아 사건 채택을 보수화하고, "
+            "DART·KRX 가 확보되면 그쪽이 덮어씁니다.")
 
     if not out_frames:
         CON.err("실적(actual)이 **0건**입니다. EPS 트랙의 정확도 사건(§7~§10)이 "
@@ -5583,6 +5695,9 @@ def collect_actual_eps(sec: pd.DataFrame, xsec: pd.DataFrame,
                     ignore_index=True)
     out = out.dropna(subset=["stock_id", "fiscal_period", "actual_value"])
     out["actual_announcement_date"] = ts_col(out["actual_announcement_date"])
+    if "ann_lag_days" not in out.columns:
+        out["ann_lag_days"] = 0.0
+    out["ann_lag_days"] = pd.to_numeric(out["ann_lag_days"], errors="coerce").fillna(0.0)
     out = out.drop_duplicates(["stock_id", "fiscal_period", "forecast_metric"], keep="last")
     if len(out) < MIN_ACTUALS_FOR_EPS:
         CON.warn(f"실적 {len(out):,}건 — 하한 {MIN_ACTUALS_FOR_EPS:,}건 미달. "
@@ -6242,7 +6357,8 @@ def _acc_finalize(m: pd.DataFrame, cfg: SCGParams, cols: List[str],
     return out.reset_index(drop=True)
 
 
-def acc_events_eps(fc: pd.DataFrame, actuals: pd.DataFrame, cfg: SCGParams) -> pd.DataFrame:
+def acc_events_eps(fc: pd.DataFrame, actuals: pd.DataFrame, cfg: SCGParams,
+                   pm: Optional["PriceMatrix"] = None) -> pd.DataFrame:
     cols = ["analyst_id", "stock_id", "fiscal_period", "forecast_metric",
             "completion_date", "acc_event", "n_forecasters"]
     f = fc[fc["forecast_metric"] == "EPS"]
@@ -6258,18 +6374,52 @@ def acc_events_eps(fc: pd.DataFrame, actuals: pd.DataFrame, cfg: SCGParams) -> p
                 "S4d(실적 수집)의 결과를 확인하세요. 이 상태로 계산하면 품질승수가 "
                 "리더십 단독으로 축약되어 합의된 산식과 다른 지표가 됩니다.")
         return pd.DataFrame(columns=cols)
-    m = f.merge(a[["stock_id", "fiscal_period", "forecast_metric", "actual_value",
-                   "actual_announcement_date"]], on=CS_KEY, how="inner")
+    _acols = ["stock_id", "fiscal_period", "forecast_metric", "actual_value",
+              "actual_announcement_date"]
+    if "ann_lag_days" in a.columns:
+        _acols.append("ann_lag_days")
+    m = f.merge(a[_acols], on=CS_KEY, how="inner")
+    if "ann_lag_days" not in m.columns:
+        m["ann_lag_days"] = 0.0
     if not len(m):
         CON.warn("[EPS] 예측과 실적의 (종목·회계연도) 교집합이 비었습니다 — "
                  "fiscal_period 라벨 형식(YYYYFY)을 확인하세요")
         return pd.DataFrame(columns=cols)
     age = (m["actual_announcement_date"] - m["report_date"]).dt.days
-    m = m[(age > 0) & (age <= cfg.MAX_FORECAST_AGE_DAYS)]      # 발표 '전' 최신 + stale 제외
+    # ★ '발표일'이 대용치인 소스는 그 불확실성만큼 여유를 둔다. 발표일이 실제보다
+    #   늦게 잡혀 있으면, 이미 공표된 실적을 보고 쓴 리포트가 '예측'으로 계상되어
+    #   정확도 점수에 미래정보가 들어간다(§0.1·§35.6). 정밀한 DART 접수일은 여유 0,
+    #   월말 단면 추정은 35일, 네이버 고정 추정은 90일.
+    lag = pd.to_numeric(m["ann_lag_days"], errors="coerce").fillna(0.0)
+    fresh = age <= cfg.MAX_FORECAST_AGE_DAYS
+    keep_old = (age > 0) & fresh            # 여유를 두기 전의 채택 집합
+    keep = (age > lag) & fresh
+    n_lag_drop = int(keep_old.sum() - keep.sum())    # ★ 순수하게 '여유' 때문에 빠진 것만
+    m = m[keep]                              # 발표 '전' 최신 + stale 제외
+    if n_lag_drop > 0:
+        CON.say(f"[EPS] 발표일 대용 오차 여유로 제외한 예측 {n_lag_drop:,}건 "
+                f"(전체 채택 후보 {int(keep_old.sum()):,}건 중) — 이미 공표된 실적을 "
+                f"보고 쓴 리포트가 '예측'으로 섞이는 것을 막습니다")
     if not len(m):
         return pd.DataFrame(columns=cols)
     m = (m.sort_values("report_date", kind="stable")
           .drop_duplicates(FC_KEY, keep="last"))               # 애널리스트당 1표(§2.1)
+    # ★ 액면분할 단위 정합 — 실적(결산 시점 주식수 기준)을 전망 시점 주식수 기준으로
+    #   되돌린다. 안 하면 분할을 낀 종목의 정확도 사건이 통째로 거짓이 된다.
+    if pm is not None and len(m):
+        try:
+            rr = pm.shares_ratio(m["stock_id"].tolist(),
+                                 m["report_date"].tolist(),
+                                 m["actual_announcement_date"].tolist())
+            n_adj = int((np.abs(rr - 1.0) > 1e-9).sum())
+            if n_adj:
+                m = m.assign(actual_value=m["actual_value"].to_numpy(float) * rr)
+                CON.say(f"[EPS] 예측·실적 사이의 주식수 변경(액면분할·무상증자) "
+                        f"{n_adj:,}건을 정규화했습니다 — 안 하면 그 종목의 정확도가 "
+                        f"단위 차이만큼 완전히 틀린 값이 됩니다")
+        except Exception as e:
+            CON.warn(f"[EPS] 주식수 정규화 생략({type(e).__name__}) — "
+                     f"분할 종목의 정확도 사건에 단위 오차가 남을 수 있습니다")
     g = m.groupby(CS_KEY + ["actual_announcement_date"], observed=True, sort=False)
     m = m.assign(_C=g["forecast_value"].transform("mean"),
                  _MAF=g["forecast_value"].transform(
@@ -6307,6 +6457,17 @@ def acc_events_tp(fc: pd.DataFrame, tp_act: pd.DataFrame, cfg: SCGParams) -> pd.
     m = f.merge(tp_act, on="report_id", how="inner")
     if not len(m):
         return pd.DataFrame(columns=cols)
+    # ★ 애널리스트당 1표(§2.1). EPS 경로에는 있었는데 TP 경로에만 빠져 있었다 —
+    #   그 결과 _N 이 '동료 수'가 아니라 '보고서 수'가 되어, 한 사람이 45일 안에
+    #   3건을 내면 §31(2인 이상) 게이트가 혼자서 뚫렸다(동료 컨센서스 = 자기 자신).
+    n_raw = len(m)
+    m = m.sort_values("report_date", kind="stable")
+    m = (m.assign(_w=m["report_date"].dt.to_period("M").astype(str))
+          .drop_duplicates(["stock_id", "analyst_id", "_w"], keep="last")
+          .drop(columns=["_w"]))
+    if n_raw != len(m):
+        CON.say(f"[TP12M] 같은 애널리스트의 같은 달 중복 발간 {n_raw - len(m):,}건을 "
+                f"최신 1건으로 접었습니다(§2.1 1인 1표 — 동료 수 계산의 전제)")
     # ★ 동료 = 같은 종목에서 **±45일 이내** 발행된 목표가(진짜 슬라이딩 윈도우)
     C, MAF, N = _peer_window_stats(m, "stock_id", "report_date", "forecast_value",
                                    int(cfg.PEER_WINDOW_DAYS))
@@ -7029,7 +7190,7 @@ def build_track(metric: str, fc: pd.DataFrame, fcv: pd.DataFrame, actuals: pd.Da
     t0 = time.time()
     tp_act = (tp_actuals_from_prices(fc, PMX, cal) if metric == "TP12M" else
               pd.DataFrame(columns=["report_id", "matured_at", "actual_price"]))
-    acc_ev = (acc_events_eps(fc, actuals, cfg) if metric == "EPS"
+    acc_ev = (acc_events_eps(fc, actuals, cfg, PMX) if metric == "EPS"
               else acc_events_tp(fc, tp_act, cfg))
     led_ev = lead_events(fcv, cal, cfg, metric)
     CON.say(f"[{metric}] 사건 테이블: 정확도 {len(acc_ev):,} · 리더십 {len(led_ev):,}")
@@ -8949,7 +9110,7 @@ def run_all() -> dict:
         # 전부 재사용한다 — 트랙을 늘려도 시장데이터 조회는 1회도 늘지 않는다.
         panel, PMX = build_month_panel(HUB.all_dates(), xsec, sec, sig_months, cal,
                                        rethub=RET, anchors=anchor_of)
-        uni_df = universe_frame(panel, sec)
+        uni_df = universe_frame(panel, sec, xsec)
 
     TRACKS: "OrderedDict[str, dict]" = OrderedDict()
     with FLOW.part("S7", "SCG 엔진(사건→PIT점수→스마트컨센서스→신호)", budget_s=3600):
