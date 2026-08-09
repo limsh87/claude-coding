@@ -1036,10 +1036,11 @@ class CallBudget:
         """실제 배정·수요를 사후 정산해 보여준다(계획표만 있으면 왜 끊겼는지 알 수 없다)."""
         rows = [[labels.get(k, k), f"{self.need.get(k, -1):,}" if k in self.need else "—",
                  f"{v:,}"] for k, v in self.alloc.items()]
-        rows.append(["─ 합계 ─", "", f"{sum(self.alloc.values()):,}"])
-        L.grid(rows, ["소비자", "남은 수요", "이번 실행 배정"], ["l", "r", "r"],
-               title=f"[{self.src}] 실배분 정산 — 실사용 {self.spent():,}건 / "
-                     f"진입시 잔여 {self.total:,}건")
+        L.grid(rows, ["소비자", "남은 수요", "배정 상한"], ["l", "r", "r"],
+               title=f"[{self.src}] 실배분 정산 — ★실사용 {self.spent():,}건 / 진입시 잔여 "
+                     f"{self.total:,}건. 배정 상한은 각자 '자기 차례의 실잔여'로 계산하므로 "
+                     f"단순 합계가 잔여를 넘을 수 있습니다(앞이 덜 쓴 만큼 뒤가 더 받음). "
+                     f"실제로 소비된 것은 '실사용' 한 줄뿐입니다.")
 
 
 def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
@@ -1700,7 +1701,8 @@ class VaultArchive:
         return os.path.join(root, nsdir, "data", f"{name}.shards")
 
     def save_shard(self, name: str, df: pd.DataFrame, key: str, scope: str = "shared",
-                   domain: str = "table", source: str = "", note: str = "") -> Optional[str]:
+                   domain: str = "table", source: str = "", note: str = "",
+                   ver: int = 1) -> Optional[str]:
         """★증분 샤드 저장 — 기존 파일을 건드리는 코드 경로가 아예 없다(덮어쓰기·백업 불필요).
 
         일봉처럼 700만행짜리 테이블을 체크포인트마다 통째로 다시 쓰면
@@ -1714,7 +1716,15 @@ class VaultArchive:
             os.makedirs(sd, exist_ok=True)
         except Exception:
             return None
-        fn = "part-" + re.sub(r"[^0-9A-Za-z_.\-]", "_", str(key)) + ".parquet"
+        # ★스키마 버전 — 같은 키의 샤드가 이미 있으면 쓰지 않는 것이 이 금고의 규칙이고
+        #   그것이 절대 1원칙(기존 캐시 무훼손)을 지키는 방식이다. 그런데 그 규칙에는
+        #   조용한 함정이 하나 있었다: ★수집 코드가 컬럼을 늘려도 디스크에는 영원히 반영되지
+        #   않는다. 실측 사고 — marcap 에 시가총액·상장주식수를 추가한 뒤에도 이전 버전이 쓴
+        #   샤드가 그 자리에 있어서, 1회차는 메모리 덕에 수정주가가 복원됐지만 2회차부터는
+        #   주식수가 없어 액면분할 종목의 월수익률이 통째로 왜곡됐다(백테스트 타당성 직결).
+        #   해결은 '덮어쓰기'가 아니라 '새 이름으로 추가'다 — 옛 파일은 손대지 않는다.
+        kk = str(key) if int(ver) <= 1 else f"{key}.v{int(ver)}"
+        fn = "part-" + re.sub(r"[^0-9A-Za-z_.\-]", "_", kk) + ".parquet"
         path = os.path.join(sd, fn)
         if os.path.exists(path):
             self.tally["shard_dedup"] += 1
@@ -1724,8 +1734,8 @@ class VaultArchive:
         except Exception as e:                              # noqa
             L.warn(f"샤드 저장 실패({type(e).__name__}): {name}/{fn}")
             return None
-        self._enqueue(scope, {"uid": h40("shard", scope, name, key), "domain": domain,
-                              "kind": "shard", "key": f"{name}/{key}",
+        self._enqueue(scope, {"uid": h40("shard", scope, name, kk), "domain": domain,
+                              "kind": "shard", "key": f"{name}/{kk}",
                               "relpath": os.path.relpath(path, self.root), "abspath": path,
                               "fmt": "parquet", "bytes": os.path.getsize(path),
                               "source": source, "adopted": False,
@@ -2172,6 +2182,8 @@ class QuotaBook:
         self.learned_cap: Dict[str, int] = {}
         self.blocked: Dict[str, bool] = {}
         self.planned: List[dict] = []
+        self.soft: Dict[str, int] = {}      # 공식치를 넘겨 '실측으로 넓힌' 상한(이번 실행 한정)
+        self.ok_run: Dict[str, int] = {}    # 마지막 상향 이후 서버 정상 응답 수
         self._loaded = False
 
     def _fp(self, src: str) -> str:
@@ -2243,25 +2255,70 @@ class QuotaBook:
         """표시용 잔여 추정 — 실측 한도가 학습됐으면 정확값, 아니면 공식치 기준 추정."""
         return max(0, self.hint(src) - self.spent(src))
 
+    PROBE_STEP = 0.10       # 공식치를 넘겼을 때 한 번에 더 허용할 폭(공식치 대비)
+    PROBE_MIN_OK = 40       # 상향하려면 그 구간에서 서버가 이만큼은 정상 응답해야 한다
+
+    def ceiling(self, src: str) -> int:
+        """지금 이 순간의 실효 상한. 서버가 알려준 실측치 > 실측 상향치 > 공식치 순."""
+        lc = self.learned(src)
+        if lc is not None:
+            return int(lc)
+        key = f"{src}:{self._fp(src)}"
+        return int(self.soft.get(key) or self.HINT.get(src, 10 ** 8))
+
+    def ok(self, src: str, n: int = 1):
+        """서버가 정상 응답했다 — 실측 상향의 근거가 된다(호출 성공 카운터)."""
+        key = f"{src}:{self._fp(src)}"
+        with self._lk:
+            self.ok_run[key] = self.ok_run.get(key, 0) + int(n)
+
     def allow(self, src: str, n: int = 1) -> bool:
-        """호출 전 확인.
-        ★사전 예산으로 막지 않는다 — 서버가 한도초과를 말하기 전까지는 계속 쓴다.
-          (사용자 지시: '남은 호출량을 실시간으로 체크해서 그만큼 쓰게 하라')"""
+        """호출 전 확인 — ★공식치를 실효 상한으로 삼되, 이 키의 실한도가 더 크면 실측으로 넓힌다.
+
+        옛 구현은 폭주 안전판(공식치×4)까지 통과시켰다. 그래서 하루 20,000 짜리 키로
+        22,000 을, 10,000 짜리 키로 20,000 을 태우고도 멈추지 않았다(실측: 국민연금 수집이
+        잔여 0 인 상태로 67분을 더 돌았다). 반대로 공식치에서 딱 끊으면, 실제로 한도가 더 큰
+        키에서 남은 용량을 버리게 된다. 그래서 둘 다 만족시킨다:
+          · 기본 상한 = 공식치(또는 서버가 알려준 실측 한도)
+          · 공식치에 닿았는데 그 직전 구간에서 서버가 계속 정상 응답했다면 → 한 스텝(10%)씩
+            넓히고 그 사실을 로그로 남긴다. 서버가 020 을 보내면 즉시 그 지점을 학습하고 정지.
+          · 폭주 안전판(공식치×RUNAWAY_X)은 그대로 최후 방어선으로 남는다.
+        """
         if not self._loaded:
             self.load()
         key = f"{src}:{self._fp(src)}"
         with self._lk:
             if self.blocked.get(key):
                 return False
-            if self.used[key] + n > self.cap(src):
+            used = self.used[key]
+            if used + n <= self.ceiling(src):
+                return True
+            hard = self.cap(src)
+            if used + n > hard or self.learned(src) is not None:
                 if not self.blocked.get(key):
                     self.blocked[key] = True
-                    L.warn(f"[{src}] 폭주 안전판 도달(사용 {self.used[key]:,} > 공식치 "
-                           f"{self.HINT.get(src, 0):,}×{self.RUNAWAY_X:g}) — 서버가 한도초과를 "
-                           f"알린 적이 없는데도 이만큼 썼다면 호출 루프를 의심해야 합니다. "
-                           f"받은 만큼 저장하고 이 소스를 멈춥니다.")
+                    L.warn(f"[{src}] 상한 도달(사용 {used:,} / 공식치 "
+                           f"{self.HINT.get(src, 0):,}) — 받은 만큼 저장하고 이 소스를 멈춥니다. "
+                           f"남은 일은 다음 실행이 정확히 이어받습니다.")
                 return False
-            return True
+            if self.ok_run.get(key, 0) >= self.PROBE_MIN_OK:
+                step = max(int(self.HINT.get(src, 0) * self.PROBE_STEP), 200)
+                self.soft[key] = min(int(self.ceiling(src)) + step, hard)
+                self.ok_run[key] = 0
+                nxt = self.soft[key]
+                blocked = False
+            else:
+                self.blocked[key] = True
+                blocked = True
+                nxt = 0
+        if blocked:
+            L.warn(f"[{src}] 공식치 {self.HINT.get(src, 0):,}건에 도달했고 그 뒤 정상 응답이 "
+                   f"충분치 않아 정지합니다. 남은 일은 다음 실행이 이어받습니다.")
+            return False
+        L.info(f"[{src}] 공식치 {self.HINT.get(src, 0):,}건을 넘겼는데 서버가 계속 정상 응답 — "
+               f"이 키의 실한도가 더 큰 것으로 보고 상한을 {nxt:,}건으로 넓힙니다"
+               f"(서버가 한도초과를 알리면 그 지점에서 즉시 멈춥니다).")
+        return True
 
     # ── 수집 계획 ─────────────────────────────────────────────────────────────────────
     def plan(self, src: str, n: int, what: str):
@@ -3673,10 +3730,25 @@ def _marcap_year(y: int) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PX_BULK_COLS)
 
 
+MARCAP_SHARD_VER = 2      # ★스키마 버전. 올리면 그 연도를 한 번 다시 받아 새 이름으로 추가한다
+#                           (옛 샤드는 손대지 않음 = 절대 1원칙). v2 = 시가총액·상장주식수 포함.
+
+
 def harvest_marcap(years: Sequence[int]) -> Optional[pd.DataFrame]:
-    """연도축 수집 — 연도당 1회. 이미 받은 연도는 원장이 막는다."""
+    """연도축 수집 — 연도당 1회. 이미 받은 연도는 원장이 막는다.
+    단 ★원장에 기록된 스키마 버전이 낮으면 그 연도만 다시 받는다(연 12회짜리 자가치유)."""
     led = VAULT.load_table("marcap_years_done", "shared")
-    done = set(int(x) for x in led["year"]) if led is not None and len(led) else set()
+    done: set = set()
+    if led is not None and len(led):
+        vv = (pd.to_numeric(led["ver"], errors="coerce").fillna(0)
+              if "ver" in led.columns else pd.Series(0, index=led.index))
+        done = {int(y) for y, v in zip(led["year"], vv) if int(v) >= MARCAP_SHARD_VER}
+        stale = {int(y) for y in led["year"]} - done
+        if stale:
+            L.info(f"연도축 캐시 스키마 갱신 — {len(stale)}개 연도({min(stale)}~{max(stale)})는 "
+                   f"시가총액·상장주식수가 없는 구버전 샤드입니다. 그 연도만 다시 받아 "
+                   f"새 샤드로 추가합니다(옛 샤드는 그대로 보존 · 총 {len(stale)}회). "
+                   f"이게 없으면 수정주가 복원과 시가총액이 재실행마다 죽습니다.")
     todo = [int(y) for y in years if int(y) not in done]
     if RUN_MODE == "CACHED" or CLOCK.over():
         todo = []
@@ -3701,12 +3773,18 @@ def harvest_marcap(years: Sequence[int]) -> Optional[pd.DataFrame]:
             ok_years.append(y)
             VAULT.save_shard("krx_ohlcv_daily", d, key=f"marcap_{y}", scope="shared",
                              domain="price", source="FinanceData/marcap",
-                             note="연도축 전 시장 일봉 — 전 전략 공용")
+                             note="연도축 전 시장 일봉 — 전 전략 공용",
+                             ver=MARCAP_SHARD_VER)
             base = VAULT.load_table("marcap_years_done", "shared")
-            allf = pd.concat([base, pd.DataFrame({"year": [y]})], ignore_index=True) \
-                if base is not None and len(base) else pd.DataFrame({"year": [y]})
-            VAULT.save_table("marcap_years_done", allf.drop_duplicates("year"), "shared",
-                             domain="price", source="year_ledger")
+            row = pd.DataFrame({"year": [y], "ver": [MARCAP_SHARD_VER]})
+            allf = pd.concat([base, row], ignore_index=True) \
+                if base is not None and len(base) else row
+            if "ver" not in allf.columns:
+                allf["ver"] = 0
+            allf["ver"] = pd.to_numeric(allf["ver"], errors="coerce").fillna(0).astype(int)
+            VAULT.save_table("marcap_years_done",
+                             allf.sort_values("ver").drop_duplicates("year", keep="last"),
+                             "shared", domain="price", source="year_ledger")
     if not got:
         L.warn("marcap 연도축 수집 실패 — 날짜축/종목축 경로로 진행합니다.")
         return None
@@ -4093,8 +4171,16 @@ def _px_norm(px: pd.DataFrame) -> pd.DataFrame:
         if c in px.columns:
             px[c] = pd.to_numeric(px[c], errors="coerce")
     px = px.dropna(subset=["code", "date", "close"])
-    px = (px.sort_values(["code", "date"])
-            .drop_duplicates(["code", "date"], keep="last").reset_index(drop=True))
+    # ★같은 (종목,날짜)가 여러 샤드에 있으면 ★정보가 많은 행을 남긴다. 스키마를 올려 새로 받은
+    #   샤드(시총·주식수 포함)와 구버전 샤드가 공존할 때, 파일명 정렬 순서에 운명을 맡기면
+    #   조용히 빈 쪽이 이긴다 — 그러면 스키마를 올린 의미가 사라진다.
+    _rich = pd.Series(0, index=px.index, dtype="int8")
+    for _c in ("shares", "mktcap", "value"):
+        if _c in px.columns:
+            _rich = _rich + px[_c].notna().astype("int8")
+    px = (px.assign(_rich=_rich).sort_values(["code", "date", "_rich"])
+            .drop_duplicates(["code", "date"], keep="last")
+            .drop(columns="_rich").reset_index(drop=True))
     # ★범주형 접기 — 700만행 패널에서 code/origin 은 고유값이 수천 개뿐인데 행마다 별개
     #   문자열 객체로 남으면 그것만 수백 MB 다. 팩터화하면 행당 2바이트로 줄고,
     #   groupby(observed=True)·merge 는 그대로 동작한다(Colab RAM 방어).
@@ -4996,6 +5082,7 @@ def dart_call(ep: str, params: dict) -> Optional[dict]:
         elif st in ("010", "011", "012", "901"):
             L.err(f"DART 인증 오류 status={st}({DART_MSG.get(st, '?')}) — DART_API_KEY 확인")
         return None
+    QUOTA.ok("dart")      # ★정상 응답 — 공식치를 넘겼을 때 '실측 상향'의 근거가 된다
     return js
 
 
@@ -6488,6 +6575,7 @@ def datagokr_call(url: str, params: dict, src: str = "datagokr") -> Optional[dic
     if "SERVICE_KEY_IS_NOT_REGISTERED" in blob or "SERVICE ERROR" in blob:
         L.warn("공공데이터포털 키 오류 — 활용신청 승인 여부와 Decoding 키 여부를 확인하세요.")
         return None
+    QUOTA.ok(src)         # ★정상 응답 — 공식치를 넘겼을 때 '실측 상향'의 근거가 된다
     return js
 
 
