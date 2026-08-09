@@ -819,6 +819,12 @@ def code6(x: Any) -> Optional[str]:
         s = s[1:]
     if _CODE_OK.match(s):
         return s
+    # ★ISIN(KR7005930003) → 단축코드(005930). 폐지목록에는 ISIN 표기가 섞여 오는데
+    #   숫자만 뽑으면 10자리가 되어 통째로 탈락했다 — 그만큼 폐지종목이 유니버스에서
+    #   빠지고 그것이 그대로 ★상향 드리프트(생존자편향)가 된다. 실측 탈락률 37%.
+    m = re.match(r"^KR[0-9A-Z]([0-9A-Z]{6})\d{3}$", s)
+    if m and _CODE_OK.match(m.group(1)):
+        return m.group(1)
     digits = re.sub(r"\D", "", s)
     if digits and len(digits) <= 6:
         z = digits.zfill(6)
@@ -1095,6 +1101,13 @@ def pmap_calc(fn: Callable, items: Sequence, label: str = "") -> List[Any]:
     except Exception as e:                                        # noqa
         L.warn(f"프로세스 병렬 실패({type(e).__name__}) — 순차 실행 폴백(결과 동일)")
         return [fn(x) for x in items]
+
+
+# ★드리프트 감사용 집계 — 편향은 '있다/없다'가 아니라 ★방향과 크기로 재야 판단이 된다.
+#   각 단계가 자기가 버린 것·고친 것을 여기에 적어 두고, 마지막에 상향/하향으로 나눠 본다.
+UNI_AUDIT: Dict[str, Any] = {}
+PIT_AUDIT: Counter = Counter()
+CELL_AUDIT: Dict[str, Any] = {}
 
 
 def shrink(df: pd.DataFrame) -> pd.DataFrame:
@@ -2534,8 +2547,16 @@ def pit_mark(df: pd.DataFrame, event, knowledge, origin: str = "") -> pd.DataFra
     out["knowledge_date"] = _resolve(knowledge)
     bad = out["knowledge_date"] < out["event_date"]
     if bad.any():
+        # ★보정 방향이 중요하다 — knowledge 를 event 로 '미래 쪽으로' 민다. 반대로 당기면
+        #   아직 알 수 없는 정보를 아는 것이 되어 그대로 미래참조(상향 드리프트)가 된다.
         out.loc[bad, "knowledge_date"] = out.loc[bad, "event_date"]
+        PIT_AUDIT["kd_lt_ed_fixed"] += int(bad.sum())
         RUN.note(f"WARN: knowledge<event {int(bad.sum())}행 보정({origin})")
+    # ★미래 knowledge — 오늘 이후 날짜가 박히면 PIT 관문이 절단하므로 누수는 아니지만,
+    #   그 행은 백테스트 전 구간에서 '영원히 안 보이는' 데이터가 된다(조용한 결손).
+    _fut = out["knowledge_date"] > pd.Timestamp(dtm.date.today())
+    if _fut.any():
+        PIT_AUDIT["future_knowledge"] += int(_fut.sum())
     out = out.dropna(subset=["knowledge_date"])
     if origin:
         out["_origin"] = origin
@@ -2775,6 +2796,8 @@ def attach_cells(P: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
     P["cell"] = ym + "|" + P["industry"] + "|" + P["size_bucket"]
     P["cell_up"] = ym + "|" + P["industry"].str.slice(0, 4) + "|ALL"
     P["cell_all"] = ym + "|ALL|ALL"
+    CELL_AUDIT["n_cells"] = int(P["cell"].nunique())
+    CELL_AUDIT["unknown_size"] = float((P["size_bucket"] == "규모미상").mean())
     n = P.groupby("cell", observed=True)["code"].transform("size")
     small = n < CELL_MIN
     n1 = int(small.sum())
@@ -2784,6 +2807,7 @@ def attach_cells(P: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
         still = n2v < CELL_MIN
         if still.any():
             P.loc[still, "cell"] = P.loc[still, "cell_all"]
+        CELL_AUDIT["fallback_rate"] = float((n1 + int(still.sum())) / max(len(P), 1))
         L.info(f"셀 폴백(C11): 1차 {n1:,}행 → 산업 상위 / 2차 {int(still.sum()):,}행 → 전체 "
                f"(표본<{CELL_MIN} 셀의 정상 폴백 — 로깅 의무)")
     for c in CELL_LADDER:
@@ -3175,11 +3199,18 @@ def harvest_delisting() -> pd.DataFrame:
     # 재상장→재폐지 중복 코드는 '가장 늦은 폐지일'을 남긴다(이르면 재상장 구간이 통째로 빠짐)
     out = out.sort_values("delisting_date").drop_duplicates("code", keep="last")
     n_bad = int(codes.isna().sum())
+    UNI_AUDIT["delist_raw"] = int(n0)
+    UNI_AUDIT["delist_dropped"] = n_bad
+    UNI_AUDIT["delist_drop_rate"] = n_bad / max(n0, 1)
     L.ok(f"상장폐지 목록 {len(out):,}건 확보 (원본 {n0:,} · 코드형식 탈락 {n_bad:,} — "
          f"탈락분은 ETF/ELW/스팩 등 비보통주가 대부분)")
-    if n_bad > n0 * 0.35:
-        L.warn(f"폐지목록의 {100*n_bad/max(n0,1):.0f}% 가 코드 정규화에서 탈락 — 비율이 크면 "
-               f"그만큼 생존자편향이 남습니다.")
+    if n_bad > n0 * 0.20:
+        # ★'대부분 비보통주'라는 설명은 가설일 뿐이다. 실제로 무엇이 탈락했는지 보여준다 —
+        #   보통주가 섞여 있으면 그만큼이 그대로 생존자편향(상향 드리프트)으로 남는다.
+        bad = d.loc[codes.isna(), code_c].astype(str)
+        samp = ", ".join(bad.drop_duplicates().head(8).tolist())
+        L.warn(f"폐지목록의 {100*n_bad/max(n0,1):.0f}% 가 코드 정규화에서 탈락 — 그만큼 "
+               f"생존자편향(성과 과대)이 남습니다. 탈락 표본: {samp}")
     return out
 
 
@@ -7390,8 +7421,19 @@ def axis_quality(P: pd.DataFrame) -> pd.DataFrame:
 def axis_quality_tp(P: pd.DataFrame) -> pd.DataFrame:
     P["TP_B1"] = tp_pair(zx(P, "dlog_rev"), -zx(P, "d_turn"))       # 매출↑ 인데 회전 유지
     P["TP_B2"] = tp_pair(zx(P, "dlog_rev"), -zx(P, "d_accruals"))   # 매출↑ 인데 발생액 유지
-    P["E_AXB"] = 0.5 * nrow_mean(P, ["TP_B1", "TP_B2"]) + \
-        0.5 * nrow_mean(pd.DataFrame({"a": zx(P, "b1"), "b": zx(P, "b4")}), ["a", "b"])
+    # ★★결측 전파 차단 — 이 한 줄이 백테스트 전체를 무의미하게 만들고 있었다.
+    #   옛 식은 0.5*A + 0.5*B 였다. nrow_mean 은 자기 컬럼 안의 결측만 건너뛸 뿐이고,
+    #   블록 하나가 통째로 결측이면 ★덧셈에서 NaN 이 전파돼 살아 있는 블록까지 죽는다.
+    #   실측: TP_B2 가 179,186행 관측인데 E_AXB 는 33,339행(11.3%)에 그쳤다 — 추세블록
+    #   (b1: 12개월 연속 유한 gpm 요구 · b4: 계약부채라는 희소 계정)이 결측인 행에서
+    #   재무축이 통째로 사라진 것이다. 그 결과 하한선이 (E_C 단독)으로 붕괴하고
+    #   유니버스가 1,274 → 100 (7.9%)로 잘렸다. 성과·강건성 판정 전체가 여기서 왜곡됐다.
+    #   블록 간에도 nrow_mean 을 쓰면 '둘 다 있으면 반반, 하나만 있으면 그것으로'가 되어
+    #   C7(동일가중)을 지키면서 결측에 견딘다. §7.3 '결측을 0으로 채우지 않는다'와도 일치.
+    P["E_AXB"] = nrow_mean(pd.DataFrame({
+        "tp": nrow_mean(P, ["TP_B1", "TP_B2"]),
+        "trend": nrow_mean(pd.DataFrame({"a": zx(P, "b1"), "b": zx(P, "b4")}), ["a", "b"]),
+    }), ["tp", "trend"])
     return P
 
 
@@ -7422,8 +7464,12 @@ def axis_resource(P: pd.DataFrame) -> pd.DataFrame:
 def axis_resource_tp(P: pd.DataFrame) -> pd.DataFrame:
     P["TP_C1"] = tp_pair(zx(P, "dlog_ic"), zx(P, "d_roic"))         # 확장↑ 인데 ROIC 유지
     P["TP_C2"] = tp_pair(zx(P, "dlog_emp"), zx(P, "d_va_emp"))      # 인원↑ 인데 생산성 유지
-    P["E_AXC"] = 0.5 * nrow_mean(P, ["TP_C1", "TP_C2"]) + \
-        0.5 * nrow_mean(pd.DataFrame({"a": zx(P, "c3")}), ["a"])
+    # ★E_AXB 와 같은 결측 전파 결함. c3(=CAPEX/감가상각)는 두 계정이 모두 있어야 하는데
+    #   그 한 항목 때문에 TP_C1(182,657행)·TP_C2(232,908행)가 통째로 버려졌다(E_AXC 15.8%).
+    P["E_AXC"] = nrow_mean(pd.DataFrame({
+        "tp": nrow_mean(P, ["TP_C1", "TP_C2"]),
+        "trend": nrow_mean(pd.DataFrame({"a": zx(P, "c3")}), ["a"]),
+    }), ["tp", "trend"])
     return P
 
 
@@ -7991,8 +8037,62 @@ def assemble_signal(P: pd.DataFrame) -> pd.DataFrame:
     if keep < 0.03:
         L.warn(f"하한선 잔존율 {100*keep:.1f}% — 축이 많을수록 기하급수적으로 좁아집니다"
                f"(대략 0.5^k). 활성 팩 수를 줄이는 편이 스펙 의도('표본 붕괴 없이')에 가깝습니다.")
+    P.attrs["input_health"] = input_health(P, axes)
     RUN.io("OUT", "MEM", "signal_panel", P)
     return P
+
+
+# ── 입력 충분성 게이트 ──────────────────────────────────────────────────────────────────────
+#   ★이것이 없어서 가장 위험한 오판이 났다. 실측 실행에서 E_AXB 11.3% · E_AXC 15.8% ·
+#     U 가 d1 단독인 상태로 R2(킬 게이트)가 돌아가 "TP 가 나이브를 못 이김 — 패러다임 근거
+#     소멸"이라고 단정했다. 그건 ★전략에 대한 판정이 아니라 입력 결손에 대한 판정이다.
+#     계약 §15 의 킬은 '온전한 입력에서 이겼는가'를 묻는 것이므로, 입력이 기준 미달이면
+#     판정 자체를 보류하고 무엇이 비었는지 보고해야 한다(결과를 좋게 만드는 게 아니라,
+#     틀린 사형선고를 막는 것이다).
+INPUT_MIN_AXIS_COV = 0.30      # 증거층 축 하나가 이 미만이면 그 축은 사실상 없는 것
+INPUT_MIN_D_AXES = 2           # U(미반영도)가 단일 축이면 U 는 '미반영도'가 아니라 그 축 자체
+INPUT_MIN_FLOOR = 0.02         # 하한선 잔존율
+
+
+def input_health(P: pd.DataFrame, axes: Sequence[str]) -> dict:
+    """이 패널로 '전략을 판정'해도 되는가. 판정하면 안 되는 이유를 구체적으로 모은다."""
+    cov = {c: float(P[c].notna().mean()) for c in axes if c in P.columns}
+    thin = sorted([c for c, v in cov.items() if v < INPUT_MIN_AXIS_COV])
+    d_have = [c for c in ("d1", "d2", "d3", "d4")
+              if c in P.columns and float(P[c].notna().mean()) > 0.01]
+    floor = float(P["FLOOR"].mean()) if "FLOOR" in P.columns and len(P) else 0.0
+    why = []
+    if thin:
+        why.append("증거층 축 " + ", ".join(f"{c}({cov[c]*100:.0f}%)" for c in thin)
+                   + f" 가 기준 {INPUT_MIN_AXIS_COV*100:.0f}% 미만")
+    if len(d_have) < INPUT_MIN_D_AXES:
+        why.append(f"U 구성 축이 {len(d_have)}개뿐({'·'.join(d_have) or '없음'}) — "
+                   f"U 가 '미반영도'가 아니라 그 축 자체가 됩니다")
+    if floor < INPUT_MIN_FLOOR:
+        why.append(f"하한선 잔존율 {floor*100:.1f}%")
+    return {"ok": not why, "why": why, "axis_cov": cov, "d_axes": d_have, "floor": floor}
+
+
+def report_input_health(h: Optional[dict]):
+    """강건성 스위트 앞에서 한 번 — 판정의 전제가 성립하는지 먼저 보여준다."""
+    if not h:
+        return
+    rows = [[c, f"{v*100:.1f}%", "✔" if v >= INPUT_MIN_AXIS_COV else "✘ 기준미달"]
+            for c, v in h["axis_cov"].items()]
+    rows.append(["U 구성 축", f"{len(h['d_axes'])}개 ({'·'.join(h['d_axes']) or '없음'})",
+                 "✔" if len(h["d_axes"]) >= INPUT_MIN_D_AXES else "✘ 기준미달"])
+    rows.append(["하한선 잔존", f"{h['floor']*100:.1f}%",
+                 "✔" if h["floor"] >= INPUT_MIN_FLOOR else "✘ 기준미달"])
+    L.grid(rows, ["입력", "값", "판정"], ["l", "r", "l"],
+           title="입력 충분성 — ★'전략을 판정해도 되는가'를 먼저 묻는다")
+    if h["ok"]:
+        L.ok("입력 충분 — 강건성 킬 게이트의 판정을 전략에 대한 판정으로 읽어도 됩니다.")
+        return
+    L.warn("입력 부족 — 아래 이유로 이번 실행의 킬 게이트는 ★'판정 불가'로 보고됩니다.")
+    for w in h["why"]:
+        L.warn(f"   · {w}")
+    L.warn("   ※ 성과 수치는 그대로 보고하되, 그것은 '입력이 이만큼 빈 상태의 성과'이지 "
+           "전략의 성과가 아닙니다. 결손을 메운 뒤 다시 판정하세요.")
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════════════════╗
@@ -8226,11 +8326,20 @@ def tail_dependence(bt: dict) -> dict:
 # ╚══════════════════════════════════════════════════════════════════════════════════════════╝
 
 RB: "OrderedDict[str, dict]" = OrderedDict()
+_IH: dict = {"ok": True, "why": []}      # 이번 스위트의 입력 충분성(assemble_signal 이 채움)
 
 
 def _rb_put(rid: str, name: str, passed: Optional[bool], detail: str, kill: bool = False,
             metrics: Optional[dict] = None):
     passed = None if passed is None else bool(passed)     # np.bool_ 은 `is False` 비교가 깨진다
+    # ★입력이 기준 미달이면 킬 게이트는 '실패'가 아니라 '판정 불가'다. 계약 §15 의 킬은
+    #   '온전한 입력에서 이겼는가'를 묻는 것이고, 축 절반이 빈 패널에서의 패배는 전략이
+    #   아니라 데이터에 대한 진술이다. 성과 수치는 그대로 두고 판정만 보류한다
+    #   (좋게 보이게 만드는 것이 아니라, 틀린 사형선고를 막는 것 — §16 과 충돌하지 않는다).
+    if kill and passed is False and not _IH.get("ok", True):
+        detail = ("★판정 불가(입력 부족) — " + " / ".join(_IH.get("why", []))
+                  + ". 아래는 그 상태에서 측정된 값입니다: " + detail)
+        passed = None
     RB[rid] = {"id": rid, "name": name, "pass": passed, "detail": detail, "kill": kill,
                "metrics": metrics or {}}
     icon = {True: "✔ 통과", False: "✘ 실패", None: "— 판정불가"}[passed]
@@ -8604,8 +8713,18 @@ def R9_costs(P: pd.DataFrame, run_fn):
             metrics={"s_gross": sg, "s_net": sn})
 
 
+def set_input_health(P: pd.DataFrame):
+    """강건성 스위트 시작 전에 호출 — 킬 게이트가 '전략'을 판정해도 되는지 정한다."""
+    global _IH
+    _IH = dict(getattr(P, "attrs", {}).get("input_health") or {"ok": True, "why": []})
+    report_input_health(_IH)
+
+
 def robustness_report(title_suffix: str = ""):
     L.h1("강건성 검사 요약 (R1~R11)" + title_suffix, "킬 게이트 ⭐ · 실패는 그대로 보고")
+    if not _IH.get("ok", True):
+        L.warn("※ 이번 스위트의 킬 게이트는 입력 부족으로 '판정 불가' 처리되었습니다 — "
+               "전략이 기각된 것이 아니라, 판정의 전제가 성립하지 않았습니다.")
     order = ["R1", "R2", "R2b", "R3", "R4", "R10", "R5", "R11", "R6", "R7", "R8", "R9"]
     rows = []
     for rid in order:
@@ -8910,6 +9029,98 @@ def run_comparison(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex, uni: "P
     interpretation_report(Pc, title="해석 참조표 — 비교전략(시총 하위 1000)")
     diagnostic_cards(Pc, master, top_n=3, title="진단 카드 — 비교전략 상위 3")
     return {"backtest": bt_c, "panel_rows": len(Pc), "robust": cmp_rb, "axes": axes}
+
+
+# ── 드리프트 감사 — 상향(성과 과대) vs 하향(성과 과소) ──────────────────────────────────────
+#   "성과가 나빴다"는 두 갈래다: ①전략이 나쁘다 ②측정이 아래로 치우쳤다.
+#   구분하지 않으면 멀쩡한 전략을 죽이거나(하향 과다), 없는 알파를 믿는다(상향 과다).
+#   그래서 방향별로 요인을 세우고, 환산 가능한 것은 수익률 영향(bp/월)으로 크기를 비교한다.
+def drift_audit(P: pd.DataFrame, bt: Optional[pd.DataFrame] = None,
+                master: Optional[pd.DataFrame] = None) -> dict:
+    up: List[list] = []      # 상향 드리프트(성과를 좋게 만드는 쪽)
+    dn: List[list] = []      # 하향 드리프트(성과를 나쁘게 만드는 쪽)
+    h = dict(getattr(P, "attrs", {}).get("input_health") or {})
+
+    # ── 상향 ① 생존자편향 잔존: 폐지목록에서 코드 정규화로 탈락한 종목 ────────────
+    n_lost = float(UNI_AUDIT.get("delist_dropped", 0) or 0)
+    drop_r = float(UNI_AUDIT.get("delist_drop_rate", 0.0) or 0.0)
+    n_uni = float(P["code"].nunique()) if "code" in P.columns else 0.0
+    if n_lost > 0:
+        # 탈락 종목이 유니버스에 남았다면 그 종목의 마지막 달 수익은 -100% 였다.
+        # 상한 추정: (탈락수/유니버스) × 100%p 를 120개월에 분산 — 실제 발현은 이보다 훨씬 작다.
+        bp = 1e4 * (n_lost / max(n_uni, 1.0)) / 120.0
+        up.append(["생존자편향 잔존(폐지 코드 탈락)",
+                   f"{n_lost:,.0f}종목 · 폐지목록의 {drop_r*100:.0f}%",
+                   f"최대 +{bp:.1f}bp/월", "상한 — 실제 선정됐을 확률만큼만 발현"])
+
+    # ── 상향 ② PIT 스탬프 이상 ───────────────────────────────────────────────────
+    n_fut = int(PIT_AUDIT.get("future_knowledge", 0))
+    n_fix = int(PIT_AUDIT.get("kd_lt_ed_fixed", 0))
+    if n_fut or n_fix:
+        up.append(["PIT 스탬프 이상",
+                   f"미래 knowledge {n_fut:,}행 · knowledge<event 보정 {n_fix:,}행",
+                   "정성(작음)",
+                   "보정은 미래 쪽으로만 하고 PIT 관문이 as_of 절단 — 누수로는 이어지지 않음"])
+
+    # ── 하향 ① U 가 단일축일 때의 구조적 편향 ────────────────────────────────────
+    d_axes = list(h.get("d_axes") or [])
+    sel = P[P["FLOOR"].fillna(False).astype(bool)] if "FLOOR" in P.columns else P.iloc[0:0]
+    dlm = float(pd.to_numeric(sel["dlog_M"], errors="coerce").mean()) \
+        if len(sel) and "dlog_M" in sel.columns else float("nan")
+    if len(d_axes) < 2:
+        dn.append([f"U 가 단일축({'·'.join(d_axes) or '없음'})",
+                   (f"선정군 ΔlogM 평균 {dlm:+.2f}" if np.isfinite(dlm) else "—"),
+                   "정성(매우 큼)",
+                   "U 가 '미반영도'가 아니라 '많이 떨어진 주식' 자체가 됨 — 하락추종으로 변질"])
+
+    # ── 하향 ② 증거층 축 결측 ────────────────────────────────────────────────────
+    thin = [c for c, v in (h.get("axis_cov") or {}).items() if v < INPUT_MIN_AXIS_COV]
+    floor = float(h.get("floor", float("nan")))
+    if thin:
+        dn.append(["증거층 축 결측", ", ".join(thin), "정성(매우 큼)",
+                   f"하한선 잔존 {floor*100:.1f}% — 축이 빈 행은 통과 자체가 불가"])
+
+    # ── 하향 ③ 셀 폴백(규모·산업 통제 상실) ──────────────────────────────────────
+    fb = float(CELL_AUDIT.get("fallback_rate", float("nan")))
+    if np.isfinite(fb) and fb > 0.25:
+        dn.append(["셀 폴백 과다", f"{fb*100:.0f}% 가 산업상위/전체로 강등", "정성(중간)",
+                   "규모·산업 통제가 그만큼 사라진 상태의 z·랭크"])
+
+    # ── 하향 ④ 비용 · ⑤ 집중도 ───────────────────────────────────────────────────
+    if bt is not None and len(bt):
+        if "cost" in bt.columns:
+            c_m = float(pd.to_numeric(bt["cost"], errors="coerce").mean())
+            dn.append(["거래비용", f"월 {c_m*100:.3f}%p", f"-{c_m*1e4:.0f}bp/월",
+                       "편향이 아니라 실비 — 회전율이 높으면 성과를 지배"])
+        if "n_hold" in bt.columns:
+            nh = float(pd.to_numeric(bt["n_hold"], errors="coerce").mean())
+            if nh < MIN_NAMES * 2:
+                dn.append(["보유 집중", f"평균 {nh:.1f}종목 (상한 {MAX_NAMES})", "정성(큼)",
+                           "표본이 적어 성과가 개별 종목 운에 지배 — 신뢰구간이 매우 넓다"])
+
+    L.grid(up or [["—", "—", "—", "감지된 상향 요인 없음"]],
+           ["상향 요인(성과 과대)", "규모", "추정 영향", "비고"], ["l", "l", "r", "l"],
+           title="드리프트 감사 ① 상향 — 성과를 좋게 만드는 편향")
+    L.grid(dn or [["—", "—", "—", "감지된 하향 요인 없음"]],
+           ["하향 요인(성과 과소)", "규모", "추정 영향", "비고"], ["l", "l", "r", "l"],
+           title="드리프트 감사 ② 하향 — 성과를 나쁘게 만드는 편향")
+
+    big = lambda rows: any("큼" in str(r[2]) for r in rows)
+    ub, db = big(up), big(dn)
+    if db and not ub:
+        v = ("★하향 드리프트가 압도적으로 심합니다. 이 상태의 음(-)의 성과는 전략의 성질이 "
+             "아니라 입력 결손이 만든 것입니다 — 결손을 메우기 전의 킬 판정을 전략에 대한 "
+             "판정으로 읽으면 안 됩니다.")
+    elif ub and not db:
+        v = ("★상향 드리프트가 우세합니다. 양(+)의 성과를 액면 그대로 믿지 마세요 — "
+             "생존자편향·PIT 이상을 먼저 제거하고 재측정해야 합니다.")
+    elif ub and db:
+        v = ("양방향 드리프트가 모두 큽니다. 부호조차 신뢰할 수 없으므로 성과 해석 이전에 "
+             "데이터 결손부터 해소하세요.")
+    else:
+        v = "양방향 모두 지배적 요인이 없습니다 — 성과를 전략의 성질로 읽어도 되는 수준입니다."
+    (L.warn if (ub or db) else L.ok)(v)
+    return {"up": up, "down": dn, "verdict": v}
 
 
 def comparison_table(bt_main: dict, bt_cmp: dict, bench: Dict[str, pd.Series]):
@@ -9836,9 +10047,13 @@ def main() -> dict:
         performance_report(bt, bench, label="본전략(TCD v2)", interim=interim)
         uni.funnel_table()
 
+    with RUN.step("O2.DRIFT", "드리프트 감사(상향/하향 편향)", "L6", critical=False):
+        ctx["drift"] = drift_audit(P, bt, master)
+
     with RUN.step("P.ROBUST", "강건성 검사 R1~R11", "L5", critical=False):
         variants = {}
         try:
+            set_input_health(P)     # ★킬 게이트가 '전략'을 판정해도 되는지 먼저 확정
             R1_leak_probe(P, months, uni, master, run_fn,
                           rebuild_fn=lambda sh: _feature_chain(
                               P0, master, ctx, ctx.get("flows"), cons, kd_shift=sh))
