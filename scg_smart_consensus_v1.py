@@ -398,7 +398,13 @@ class Orchestra:
         if skip:
             rec.update(status="건너뜀", note=why, t1=time.time())
             CON.warn(f"[{pid}] {title} — 건너뜀: {why}")
-            yield
+            # contextmanager 구조상 with 본문 자체를 생략할 수는 없다 — 본문 함수들이
+            # 내부 플래그로 무동작하도록 짜여 있고, 여기서는 예외만 흡수해 원장에 남긴다.
+            try:
+                yield
+            except Exception as e:
+                rec.update(status="경고", err=f"{type(e).__name__}: {e}")
+                CON.warn(f"[{pid}] 건너뜀 단계 내부 예외 무시: {type(e).__name__}: {e}")
             return
         prev, self.cur = self.cur, pid
         CON.line(f"[{pid}] {title}")
@@ -838,12 +844,14 @@ class Depot:
                      "public_index.json", "private_index.json", "index.parquet",
                      "journal.jsonl", "snapshot.parquet")
         for root in self.read_roots:
-            n_dirs = 0
+            n_dirs, t0 = 0, time.time()
             for dirpath, dirs, files in os.walk(root):
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
                 n_dirs += 1
-                if n_dirs > 25000:
-                    CON.warn(f"기존 캐시 스캔 상한 도달({root}) — 일부만 인덱싱했습니다")
+                # 드라이브 FUSE 는 디렉터리 나열이 초 단위다 — 개수와 '시간' 양쪽으로 상한
+                if n_dirs > 25000 or time.time() - t0 > 150:
+                    CON.warn(f"기존 캐시 스캔 상한 도달({root}, {n_dirs:,}dir "
+                             f"{time.time()-t0:.0f}s) — 일부만 인덱싱했습니다")
                     break
                 for fn in files:
                     fl = fn.lower()
@@ -1025,11 +1033,11 @@ class Depot:
     def scan_adopt_pdfs(self, cap: int = 400_000):
         for key, p in self._foreign_pdfs.items():          # 1회 스캔 결과 재사용
             self._adopted.setdefault(("research_pdf", key), p)
-        n_dirs = 0
+        n_dirs, t0 = 0, time.time()
         for dirpath, dirs, files in os.walk(self.write_root):
             dirs[:] = [x for x in dirs if not x.startswith(".")]
             n_dirs += 1
-            if n_dirs > 25000 or len(self._adopted) >= cap:
+            if n_dirs > 25000 or len(self._adopted) >= cap or time.time() - t0 > 150:
                 break
             for fn in files:
                 if fn.lower().endswith(".pdf"):
@@ -1566,7 +1574,7 @@ def collect_universe(months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
     # ── 월별 시총 스냅샷 (KRX 마켓플레이스 → pykrx 폴백) — 비교전략(하위1000)의 기준 ──────
     mcap = DEPOT.table_load("scg_mcap_monthly",
                             foreign_patterns=["mktcap", "marketcap", "mcap_month"],
-                            need_cols=["month", "code", "mktcap"])
+                            need_cols=["month", "code", "mktcap", "shares"])
     have_m = set()
     if mcap is not None and len(mcap):
         mcap["month"] = ts_col(mcap["month"])
@@ -1758,8 +1766,12 @@ def collect_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
         rng = have.get(c)
         if rng is None:
             todo.append((c, start, end))
-        elif rng[1] < end_t - pd.Timedelta(days=9):        # 최근분 갱신
-            todo.append((c, (rng[1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), end))
+        elif rng[1] < end_t - pd.Timedelta(days=9) or rng[0] > ts(start) + pd.Timedelta(days=35):
+            # ★ 꼬리만 이어붙이면 (a) 소스가 섞이고 (b) 그 사이 액면분할/배당으로
+            #   수정주가 기준이 달라져 이음새에 가짜 수익률이 생긴다. 갱신이 필요한
+            #   종목은 전 구간을 한 소스에서 다시 받아 통째로 교체한다(종목당 1콜).
+            #   앞머리가 비어 있는 캐시(뒤 구간만 있는 외부 캐시)도 같은 경로로 채운다.
+            todo.append((c, start, end))
     if RUN_MODE == "CACHED":
         todo = []
     if todo:
@@ -1770,7 +1782,10 @@ def collect_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 return None
             c, s, e = job
             for src, fn in _PX_CHAIN:
-                d = fn(c, s, e)
+                try:
+                    d = fn(c, s, e)
+                except Exception:      # 한 소스의 어댑터 예외가 나머지 폴백을 막으면 안 된다
+                    d = None
                 if d is not None and len(d) >= 2:
                     d.insert(0, "code", c)
                     d["src"] = src
@@ -1795,6 +1810,13 @@ def collect_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     return shrink(px)
 
 
+def _resample_me(s: pd.Series) -> pd.Series:
+    try:
+        return s.resample("ME").last()
+    except ValueError:                     # pandas < 2.2
+        return s.resample("M").last()
+
+
 def collect_benchmark(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
     out = {}
     for nm, sym, ysym in (("KOSPI", "KS11", "^KS11"), ("KOSDAQ", "KQ11", "^KQ11")):
@@ -1807,7 +1829,7 @@ def collect_benchmark(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
                     lc = {str(c).lower(): c for c in d.columns}
                     dd = pd.DataFrame({"date": ts_col(d[lc.get("date", d.columns[0])]),
                                        "close": pd.to_numeric(d[lc["close"]], errors="coerce")})
-                    m = dd.set_index("date")["close"].resample("ME").last()
+                    m = _resample_me(dd.set_index("date")["close"])
                     ser = m.pct_change().reindex(months)
             except Exception:
                 ser = None
@@ -1816,7 +1838,7 @@ def collect_benchmark(months: pd.DatetimeIndex) -> Dict[str, pd.Series]:
                 d = yf.download(ysym, start=str(months[0].date() - _dt.timedelta(days=70)),
                                 end=str(months[-1].date()), auto_adjust=True, progress=False)
                 if d is not None and len(d):
-                    m = d["Close"].squeeze().resample("ME").last()
+                    m = _resample_me(d["Close"].squeeze())
                     m.index = pd.DatetimeIndex(m.index).normalize()
                     ser = m.pct_change().reindex(months)
             except Exception:
@@ -2035,13 +2057,14 @@ def _adapt_foreign_reports(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """다른 전략이 만든 보고서 원장(컬럼명이 다른)을 이 코드의 표준 스키마로 변환."""
     if df is None or not len(df):
         return None
+    df = df.reset_index(drop=True)      # 외부 캐시의 중복 인덱스가 reindex 를 깨뜨린다
     m = {str(c).lower(): c for c in df.columns}
 
     def pick(*names):
         for n in names:
             if n in m:
                 return df[m[n]]
-        return pd.Series([None] * len(df))
+        return pd.Series([None] * len(df), index=df.index)
 
     out = pd.DataFrame({
         "source": pick("source").fillna("cache").astype(str),
@@ -2058,6 +2081,14 @@ def _adapt_foreign_reports(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         "detail_url": pick("detail_url").astype(str),
     })
     out = out.dropna(subset=["date"])
+    # rid 가 없는 외부 원장은 그대로 두면 drop_duplicates(source,rid) 가 전체를
+    # 소스당 1행으로 붕괴시킨다 — 행 내용으로 rid 를 합성해 이력을 보존한다.
+    bad_rid = out["rid"].isin(("None", "nan", "", "NaT")) | out["rid"].isna()
+    if bad_rid.any():
+        out.loc[bad_rid, "rid"] = [
+            h1(s, str(d), t[:60], b) for s, d, t, b in
+            zip(out.loc[bad_rid, "source"], out.loc[bad_rid, "date"],
+                out.loc[bad_rid, "title"], out.loc[bad_rid, "broker"])]
     return out if len(out) else None
 
 
@@ -2253,8 +2284,8 @@ def _dart_filing_dates(start: str, end: str) -> pd.DataFrame:
                 continue
             if DEADLINE.over("DART 접수일 수집"):
                 break
-            page = 1
-            while QUOTA.alive("dart"):
+            page, month_rows, month_complete = 1, [], False
+            while QUOTA.alive("dart") and not DEADLINE.over("DART 접수일 수집"):
                 js = _dart_json("list.json", bgn_de=f"{p.start_time:%Y%m%d}",
                                 end_de=f"{p.end_time:%Y%m%d}", pblntf_ty="A",
                                 page_no=str(page), page_count="100")
@@ -2263,12 +2294,17 @@ def _dart_filing_dates(start: str, end: str) -> pd.DataFrame:
                     nm = str(it.get("report_nm", ""))
                     if not re.search(r"사업보고서|반기보고서|분기보고서", nm):
                         continue
-                    rows_new.append(dict(stock_code=code6(it.get("stock_code")),
-                                         corp_code=it.get("corp_code"),
-                                         report_nm=nm, rcept_dt=ts(it.get("rcept_dt"))))
+                    month_rows.append(dict(stock_code=code6(it.get("stock_code")),
+                                           corp_code=it.get("corp_code"),
+                                           report_nm=nm, rcept_dt=ts(it.get("rcept_dt"))))
                 if len(lst) < 100 or page >= int((js or {}).get("total_page", 1)):
+                    month_complete = True
                     break
                 page += 1
+            # ★ 한도/시간예산으로 달 중간에 끊겼으면 그 달의 부분 페이지는 버린다 —
+            #   부분 행이 캐시에 남으면 다음 실행이 그 달을 '완료'로 오인해 영영 안 채운다.
+            if month_complete:
+                rows_new.extend(month_rows)
     fr = [f for f in (cached, pd.DataFrame(rows_new) if rows_new else None)
           if f is not None and len(f)]
     if not fr:
@@ -2324,7 +2360,8 @@ def collect_actual_eps(sec: pd.DataFrame, mcap: pd.DataFrame,
     DART: 연결우선 당기순이익 ÷ FY말 상장주식수, 발표일 = 사업보고서 접수일(PIT 정확).
     폴백: 네이버 요약표 EPS + 보수적 발표일(FY말+90일)."""
     cached = DEPOT.table_load("scg_actual_eps",
-                              need_cols=["stock_id", "fiscal_period", "actual_value"])
+                              need_cols=["stock_id", "fiscal_period", "actual_value",
+                                         "actual_announcement_date"])
     if cached is not None and len(cached) > 500 and RUN_MODE == "CACHED":
         cached["actual_announcement_date"] = ts_col(cached["actual_announcement_date"])
         return cached
@@ -2341,10 +2378,12 @@ def collect_actual_eps(sec: pd.DataFrame, mcap: pd.DataFrame,
     if len(cm) and QUOTA.alive("dart") and RUN_MODE != "CACHED":
         code2corp = cm.set_index("code")["corp_code"].to_dict()
         codes = [c for c in sec["code"] if c in code2corp]
-        shares_map = {}
-        if len(mcap):
-            for (mth, c), sh in mcap.set_index(["month", "code"])["shares"].items():
+        shares_map, first_shares = {}, {}
+        if len(mcap) and "shares" in mcap.columns:
+            for (mth, c), sh in (mcap.sort_values("month")
+                                 .set_index(["month", "code"])["shares"].items()):
                 shares_map[(mth.year, c)] = sh
+                first_shares.setdefault(c, sh)   # 창 이전 회계연도의 폴백(최초 스냅샷)
         ni_rows: List[dict] = []
         corps = [code2corp[c] for c in codes]
         B = 100
@@ -2385,13 +2424,16 @@ def collect_actual_eps(sec: pd.DataFrame, mcap: pd.DataFrame,
                 for _, r in fy_fil.dropna(subset=["stock_code", "y"]).iterrows():
                     ann_map[(r["stock_code"], int(r["y"]))] = r["rcept_dt"]
             rows = []
+            n_no_shares = 0
             for _, r in ni.iterrows():
                 y = int(r["year"])
                 ann = ann_map.get((r["code"], y))
                 if ann is None:
                     ann = ts(r["rcept"]) or ts(f"{y+1}-03-31")   # 접수번호 앞 8자리 = 접수일
-                sh = shares_map.get((y, r["code"])) or shares_map.get((y + 1, r["code"]))
+                sh = (shares_map.get((y, r["code"])) or shares_map.get((y + 1, r["code"]))
+                      or first_shares.get(r["code"]))            # 백테스트 창 이전 FY 폴백
                 if not sh or not np.isfinite(sh) or sh <= 0:
+                    n_no_shares += 1
                     continue
                 rows.append(dict(stock_id=r["code"], fiscal_period=f"{y}FY",
                                  forecast_metric="EPS", actual_value=float(r["ni"]) / float(sh),
@@ -2399,6 +2441,9 @@ def collect_actual_eps(sec: pd.DataFrame, mcap: pd.DataFrame,
             new = pd.DataFrame(rows)
             new = new[~new.apply(lambda r: (r["stock_id"], r["fiscal_period"]) in have_keys,
                                  axis=1)] if have_keys and len(new) else new
+            if n_no_shares:
+                CON.say(f"주식수 스냅샷 부재로 제외된 실적 {n_no_shares:,}건 "
+                        f"(초기 연도 커버리지 한계 — 표에 정직하게 남깁니다)")
             if len(new):
                 out_frames.append(new)
                 CON.ok(f"DART 실적 EPS {len(new):,}건 (발표일=사업보고서 접수일)")
@@ -3298,8 +3343,11 @@ def build_month_panel(book: Dict, sec: pd.DataFrame, months, cal: "TradingCal"
             # ★ 정지→상폐 경로: 마지막 체결 후 가격이 다시는 나오지 않고 상폐가 예정돼
             #   있으면, '마지막 체결이 속한 달'에 전손(-100%)을 기록한다. 이 손실을
             #   어느 달에도 안 적으면 하위분위 수익률이 조용히 과대평가된다(생존자편향).
+            #   단, 상폐일이 '이력 끝 근처'일 때만 — 수집이 중간에 잘린 이력(시간예산
+            #   부분수집 등)에 가짜 전손을 찍으면 중간결과 모드가 왜곡된다.
             dying = (pd.notna(dd) and dd > m
-                     and (last_px_day - pd.Timestamp(m)).days <= 45)
+                     and (last_px_day - pd.Timestamp(m)).days <= 45
+                     and dd <= last_px_day + pd.Timedelta(days=45))
             nxt = months[i + 1] if i + 1 < len(months) else None
             fwd1 = np.nan
             if nxt is not None:
@@ -4215,6 +4263,9 @@ def run_all() -> dict:
         rep_raw = collect_research(BACKTEST_START, BACKTEST_END)
         rep_raw = enrich_with_pdf(rep_raw)
 
+    # 비치명 단계가 실패해도 하류가 NameError 로 죽지 않도록 먼저 빈 값으로 바인딩
+    actuals = pd.DataFrame(columns=["stock_id", "fiscal_period", "forecast_metric",
+                                    "actual_value", "actual_announcement_date"])
     with FLOW.part("S4d", "실적 EPS·발표일(DART→네이버 폴백)", budget_s=3600,
                    critical=False):
         actuals = collect_actual_eps(sec, mcap, BACKTEST_START, BACKTEST_END)
@@ -4235,6 +4286,9 @@ def run_all() -> dict:
             raise HaltRun("예측 테이블이 비었습니다 — 리포트 수집/PDF 추출을 확인하세요. "
                           "(RUN_MODE='SMOKE' 로 계산 경로는 검증 가능합니다)")
         fc_all = fc_all[fc_all["stock_id"].isin(set(sec["code"]))]
+        if not len(fc_all):
+            raise HaltRun("예측 테이블과 종목마스터의 교집합이 비었습니다 — "
+                          "종목코드 형식(6자리)과 마스터 수집을 확인하세요.")
         DEPOT.table_save("scg_analyst_forecasts", fc_all, scope="공용", domain="research",
                          source="ledger+pdf")
         metric, mtab = choose_metric(fc_all)
