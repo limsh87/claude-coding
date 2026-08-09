@@ -318,7 +318,14 @@ def _is_windows():
 
 def ensure_dependencies():
     """필수/선택 의존성 확인, 부족분은 (허용 시) pip 자동 설치.
-    실패해도 폴백 경로가 있으므로 가능한 한 진행한다."""
+    실패해도 폴백 경로가 있으므로 가능한 한 진행한다.
+
+    ★ 반드시 export_krx_env() 이후에 호출할 것.
+      pykrx 는 모듈 로드 시점에 build_krx_session() 을 실행하고, 그 함수의 기본인자가
+      os.getenv("KRX_ID") 로 '임포트 시각에' 바인딩된다. 순서가 뒤집히면 계정을
+      입력했더라도 비인증 세션이 만들어지고, 콘솔에는
+      'KRX 로그인 실패: KRX_ID 또는 KRX_PW 환경 변수가 설정되지 않았습니다' 가 찍힌다.
+      그래서 가용성 확인도 __import__ 가 아니라 find_spec 으로 한다(모듈을 실행하지 않음)."""
     global np, pd
     required = {"numpy": "numpy", "pandas": "pandas"}
     optional = {
@@ -328,9 +335,12 @@ def ensure_dependencies():
         "pypdf": "pypdf", "tqdm": "tqdm", "matplotlib": "matplotlib",
     }
     def _try(mod):
+        """설치 여부만 본다 — 모듈을 '실행'하지 않는다.
+        pykrx 처럼 import 부작용(로그인 시도)이 있는 패키지를 여기서 실행하면
+        자격증명 주입 순서가 무의미해진다."""
         try:
-            __import__(mod)
-            return True
+            import importlib.util as _ilu
+            return _ilu.find_spec(mod) is not None
         except Exception:
             return False
     def _pip(pkgs):
@@ -461,6 +471,14 @@ def resolve_project_root():
     return p
 
 
+# Windows cp949 콘솔에서 인코딩 불가한 문자의 ASCII 대체표
+_ASCII_FALLBACK = str.maketrans({
+    "═": "=", "║": "|", "─": "-", "│": "|", "■": "#", "·": ".",
+    "⏳": "...", "✔": "OK", "✖": "X", "⚠": "!", "★": "*", "→": "->",
+    "①": "(1)", "②": "(2)", "③": "(3)", "④": "(4)", "⑤": "(5)",
+})
+
+
 class RunLogger:
     """콘솔 + 파일 동시 로깅. 스테이지 배너/키값 요약/에러 위치 특정 지원."""
     def __init__(self, log_dir):
@@ -483,6 +501,17 @@ class RunLogger:
         with self._lock:
             try:
                 print(line, flush=True)
+            except UnicodeEncodeError:
+                # Windows cp949 콘솔은 罫線(═║)·기호(⏳✔⚠)를 인코딩하지 못해
+                # 첫 배너에서 즉사한다. 실패한 경우에만 ASCII 로 낮춘다.
+                try:
+                    print(line.translate(_ASCII_FALLBACK), flush=True)
+                except Exception:
+                    try:
+                        print(line.encode("ascii", "replace").decode("ascii"),
+                              flush=True)
+                    except Exception:
+                        pass
             except Exception:
                 try:
                     sys.stdout.write(line + "\n")
@@ -608,6 +637,18 @@ def _maybe_prompt_credentials(log):
         log.warn(f"자격증명 대화형 입력 건너뜀: {e}")
     finally:
         _export_krx_env(log)
+
+
+def export_krx_env_early():
+    """어떤 서드파티 import 보다도 먼저 실행되어야 하는 최소 주입부.
+    로거가 아직 없으므로 print 로만 알린다."""
+    kid = (KRX_MP_ID or os.environ.get("KRX_MP_ID") or "").strip()
+    kpw = (KRX_MP_PW or os.environ.get("KRX_MP_PW") or "").strip()
+    if kid and kpw:
+        os.environ.setdefault("KRX_ID", kid)
+        os.environ.setdefault("KRX_PW", kpw)
+        return True
+    return False
 
 
 def _export_krx_env(log):
@@ -1199,17 +1240,22 @@ class AdaptiveLimiter:
     def __init__(self, lo, hi):
         self.base_lo, self.base_hi = lo, hi
         self.factor = 1.0
-        self._last = 0.0
+        self._next = 0.0
         self._lock = threading.Lock()
 
     def wait(self):
+        """'티켓 예약' 방식: 락 안에서는 자기 차례(시각)만 예약하고, 실제 대기는
+        락을 놓은 뒤에 한다. 락을 쥔 채 sleep 하면 모든 워커가 하나의 뮤텍스 뒤에
+        직렬화되어 병렬성이 통째로 사라진다(워커를 늘려도 처리량이 그대로).
+        time.monotonic() 을 써서 시스템 시계 조정(NTP 등)에도 영향받지 않는다."""
         with self._lock:
             gap = random.uniform(self.base_lo, self.base_hi) * self.factor
-            due = self._last + gap
-            now = time.time()
-            if due > now:
-                time.sleep(due - now)
-            self._last = time.time()
+            now = time.monotonic()
+            start = max(now, self._next)
+            self._next = start + gap
+            delay = start - now
+        if delay > 0:
+            time.sleep(delay)
 
     def on_success(self):
         with self._lock:
@@ -1218,6 +1264,12 @@ class AdaptiveLimiter:
     def on_throttle(self):
         with self._lock:
             self.factor = min(CFG.RATE_FACTOR_MAX, self.factor * 2.0)
+
+
+# KRX 계열(pykrx / data.krx.co.kr)은 '중복 로그인 시 이전 세션을 끊는' 정책이라
+# 여러 스레드가 각자 인증하면 서로를 밀어내며, 증상은 엉뚱한 파서에서 나는
+# JSONDecodeError 로 나타난다. 인증 세션을 쓰는 호출은 전부 이 락으로 직렬화한다.
+KRX_CALL_LOCK = threading.RLock()
 
 
 class CircuitBreaker:
@@ -1400,6 +1452,27 @@ _WARMUP = {
 # 재시도해도 200 이 되지 않는 상태코드 — 백오프로 시간을 버리지 않는다
 _FAST_FAIL = {400, 401, 403, 404, 405, 410, 451}
 
+# 생성된 HttpClient 를 소스명으로 모아 둔다(실행 종료 시 상태코드 분포 보고용).
+HTTP_REGISTRY = {}
+
+
+def http_status_report():
+    """소스별 상태코드 분포 + 서킷 상태. '진짜로 차단당한 것인지, 파싱을 잘못한
+    것인지'를 재실행 없이 가려내기 위한 진단 표."""
+    rows = []
+    for src, cli in HTTP_REGISTRY.items():
+        tot = sum(cli.status_hist.values())
+        if not tot and not cli.n_fail:
+            continue
+        hist = ", ".join(f"{k}:{v}" for k, v in sorted(cli.status_hist.items()))
+        rows.append({"source": src, "요청": tot,
+                     "성공": cli.n_ok, "실패": cli.n_fail,
+                     "상태코드": hist or "-",
+                     "차단": ("예(" + (cli.breaker.reason or "?") + ")")
+                             if cli.breaker.open else "아니오",
+                     "페이싱배속": round(cli.limiter.factor, 2)})
+    return pd.DataFrame(rows) if rows else None
+
 
 class HttpClient:
     def __init__(self, source, state_dir, log, quota=None, blocked=False):
@@ -1426,6 +1499,8 @@ class HttpClient:
         self._pi = 0
         self._warmed = False
         self.n_ok = self.n_fail = 0
+        self.status_hist = {}          # 상태코드 분포 — 실행 후 원인 규명용
+        HTTP_REGISTRY[source] = self
         if blocked:
             try:
                 self.breaker.trip_now("카나리 차단 감지")
@@ -1481,6 +1556,8 @@ class HttpClient:
                                       timeout=tmo, stream=stream)
                 if self.quota is not None and quota_key:
                     self.quota.record(quota_key)
+                self.status_hist[r.status_code] = \
+                    self.status_hist.get(r.status_code, 0) + 1
                 if r.status_code in allow_codes:
                     if encoding:
                         r.encoding = encoding
@@ -1654,10 +1731,12 @@ def canary_check(log, state_dir):
 
 class KRXAuthSession:
     """data.krx.co.kr 로그인 세션(베스트에포트). 실패해도 폴백 체인으로 진행."""
-    LOGIN_URLS = [
-        "https://data.krx.co.kr/contents/MMC/MMCLOGIN/mmcLogin.cmd",
-        "https://data.krx.co.kr/comm/loginProc.cmd",
-    ]
+    # 2025-12 마켓플레이스 이관 후의 실제 로그인 경로/필드(pykrx 1.2.8 의 auth 흐름과 동일).
+    # 워밍업 없이 바로 POST 하면 세션 쿠키가 없어 항상 실패한다.
+    WARM1 = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+    WARM2 = ("https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp"
+             "?site=mdc")
+    LOGIN_POST = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
     GEN_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 
     def __init__(self, http, log):
@@ -1670,19 +1749,34 @@ class KRXAuthSession:
                           "(대부분의 통계는 무로그인으로도 조회된다)")
             return False
         try:
-            self.http.warmup()
-            for url in self.LOGIN_URLS:
+            for w in (self.WARM1, self.WARM2):       # 쿠키(JSESSIONID) 확보
                 try:
-                    r = self.http.get(url, method="POST",
-                                      data={"usrId": KRX_MP_ID, "usrPwd": KRX_MP_PW,
-                                            "mbrId": KRX_MP_ID, "mbrPwd": KRX_MP_PW},
-                                      allow_codes=(200, 302), fast=True)
-                    if r is not None:
-                        self.logged_in = True
-                        self.log.info("[S05] KRX 로그인 세션 확보")
-                        return True
+                    self.http.get(w, fast=True)
+                except Exception:
+                    pass
+            # CD011(중복 로그인)이면 skipDup=Y 로 한 번 더 — 그냥 두면 이전 세션이
+            # 살아 있어 계속 거절된다.
+            for extra in ({}, {"skipDup": "Y"}):
+                try:
+                    r = self.http.get(
+                        self.LOGIN_POST, method="POST", referer=self.WARM2,
+                        data={"mbrId": KRX_MP_ID, "pw": KRX_MP_PW, "mbrNm": "",
+                              "telNo": "", "di": "", "certType": "", **extra},
+                        allow_codes=(200, 302), fast=True)
                 except Exception:
                     continue
+                txt = getattr(r, "text", "") or ""
+                if re.search(r"CD011|중복\s*로그인", txt):
+                    self.log.warn("[S05] KRX 중복 로그인 감지 — 같은 계정이 브라우저나 "
+                                  "다른 노트북에서 이미 로그인돼 있습니다. 재시도합니다.")
+                    continue
+                if "CD010" in txt:
+                    self.log.warn("[S05] KRX 비밀번호 변경 요구(CD010) — "
+                                  "data.krx.co.kr 에서 변경 후 재실행하세요.")
+                    return False
+                self.logged_in = True
+                self.log.info("[S05] KRX 로그인 세션 확보")
+                return True
         except Exception as e:
             self.log.warn(f"KRX 로그인 실패(폴백 진행): {str(e)[:100]}")
         return False
@@ -1739,8 +1833,19 @@ class FdrPublicCache:
         return self._http
 
     def _csv(self, url):
+        """★ dtype 을 문자열로 고정한다. 지정하지 않으면 pandas 가 Symbol/Code 를
+        int64 로 추론해 '005930' 이 5930 이 되고, 신형 영숫자 티커('45014K')와
+        섞이면 열 전체가 뒤틀린다. index_col 은 주지 않는다 — delisting CSV 는
+        무명 인덱스 열이 없을 수 있고, 그때 Symbol 이 인덱스로 먹혀 상장폐지
+        종목이 통째로 사라진다(= 생존편향)."""
         r = self._get_http().get(url, fast=True)
-        return pd.read_csv(io.StringIO(r.text))
+        df = pd.read_csv(io.StringIO(r.text),
+                         dtype={"Code": str, "Symbol": str, "ToSymbol": str,
+                                "ISU_CD": str, "MarketId": str, "Market": str})
+        if len(df.columns) and str(df.columns[0]).strip().lower() in (
+                "", "unnamed: 0", "unnamed:0", "index"):
+            df = df.drop(columns=[df.columns[0]])
+        return df
 
     def snapshot_near(self, date_ts, back_days=5):
         """해당 일자(또는 직전 영업일)의 전종목 스냅샷. 최근 구간에만 유효."""
@@ -1876,19 +1981,30 @@ class MarketDataHub:
             else self.SNAP_MIN_ROWS_SYNTH
 
     # ── 실패 기억(반복 조회 제거) ──────────────────────────────────────────
-    def _is_nodata(self, ticker):
+    #   ※ '언제 실패했는가' 뿐 아니라 '어느 시작일로 요청해서 실패했는가'를 함께
+    #     기록한다. 그러지 않으면 최근 구간만 요청해 실패한 기록이, 이후의 더 이른
+    #     구간 요청까지 억제해 과거 데이터를 영구히 못 받게 만든다.
+    def _is_nodata(self, ticker, want_from=None):
         rec = self._nodata.get(ticker)
         if not rec:
             return False
+        if isinstance(rec, str):                     # 구버전 포맷 호환
+            rec = {"at": rec, "frm": None}
         try:
-            age = (datetime.now() - pd.Timestamp(rec)).days
-            return age < CFG.PRICE_NODATA_COOLDOWN
+            if want_from is not None and rec.get("frm"):
+                if pd.Timestamp(rec["frm"]) > pd.Timestamp(want_from):
+                    return False                     # 더 이른 구간은 새 요청이다
+            return (datetime.now() - pd.Timestamp(rec["at"])).days \
+                < CFG.PRICE_NODATA_COOLDOWN
         except Exception:
             return False
 
-    def _mark_nodata(self, ticker):
+    def _mark_nodata(self, ticker, want_from=None):
         with self._nodata_lock:
-            self._nodata[ticker] = datetime.now().strftime("%Y-%m-%d")
+            self._nodata[ticker] = {
+                "at": datetime.now().strftime("%Y-%m-%d"),
+                "frm": (str(pd.Timestamp(want_from).date())
+                        if want_from is not None else None)}
 
     def flush_nodata(self):
         try:
@@ -1938,7 +2054,8 @@ class MarketDataHub:
             try:
                 frames = []
                 for mkt in ("KOSPI", "KOSDAQ"):
-                    c = stk.get_market_cap_by_ticker(ymd, market=mkt)
+                    with KRX_CALL_LOCK:
+                        c = stk.get_market_cap_by_ticker(ymd, market=mkt)
                     if c is not None and len(c):
                         c = c.reset_index()
                         c.columns = [str(x) for x in c.columns]
@@ -1977,13 +2094,29 @@ class MarketDataHub:
         전체 히스토리를 다시 받는 일은 없다(사용자 최우선 불만 해소)."""
         rel = f"prices/{ticker}.parquet"
         cached = None if force_full else self._cached_price(ticker)
-        end_ts = pd.Timestamp(end)
+        end_ts, start_ts = pd.Timestamp(end), pd.Timestamp(start)
         if cached is not None and len(cached):
             try:
-                mx = pd.to_datetime(cached["date"]).max()
+                dts = pd.to_datetime(cached["date"])
+                mx, mn = dts.max(), dts.min()
+                # ★ 과거 방향 백필을 반드시 함께 본다.
+                #   앞선 실행이 최근 구간만 캐시했다면(예: 2023~2026), max 만 보고
+                #   판단하는 순간 2013~2022 를 영원히 못 받는다. 10년 백테스트인데
+                #   앞 7년이 조용히 비어 버리는 사고가 되고, 예외도 로그도 없다.
+                if mn > start_ts + pd.Timedelta(days=10) and not self._is_nodata(
+                        ticker, start_ts):
+                    full = self._fetch_price_chain(ticker, start, end, market_hint)
+                    if full is not None and len(full):
+                        merged = self._merge_price(cached, full, ticker)
+                        self.store.save_df(merged, "parsed", rel, scope="common",
+                                           desc=f"일별 수정주가 {ticker}(과거 백필)",
+                                           stage="ST03")
+                        self._bump("price:backfill")
+                        return merged
+                    self._mark_nodata(ticker, start_ts)
                 if (end_ts - mx).days <= CFG.PRICE_REFRESH_DAYS:
                     return cached                      # 충분히 최신 → 네트워크 접촉 없음
-                if self._is_nodata(ticker):
+                if self._is_nodata(ticker, start_ts):
                     return cached                      # 상폐 등 — 쿨다운 중
                 if CFG.PRICE_INCREMENTAL:
                     inc_start = (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
@@ -2001,11 +2134,11 @@ class MarketDataHub:
                 pass
         if CFG.RUN_MODE != "FULL":
             return cached
-        if cached is None and self._is_nodata(ticker):
+        if cached is None and self._is_nodata(ticker, start_ts):
             return None
         df = self._fetch_price_chain(ticker, start, end, market_hint)
         if df is None or df.empty:
-            self._mark_nodata(ticker)
+            self._mark_nodata(ticker, start_ts)
             return cached
         df = df.sort_values("date").drop_duplicates("date")
         df["asof"] = end_ts.strftime("%Y-%m-%d")
@@ -2084,7 +2217,10 @@ class MarketDataHub:
         stk = self._get_pykrx()
         if stk is not None and "pykrx" not in self.blocked:
             try:
-                d = stk.get_market_ohlcv(s8, e8, ticker, adjusted=True)
+                # KRX 는 중복 로그인 시 이전 세션을 끊는다. 워커별로 각자 인증하면
+                # 서로를 밀어내고, 증상은 엉뚱한 파서의 JSONDecodeError 로 나타난다.
+                with KRX_CALL_LOCK:
+                    d = stk.get_market_ohlcv(s8, e8, ticker, adjusted=True)
                 out = self._norm_pykrx(d)
                 if out is not None:
                     self._bump("price:pykrx")
@@ -2213,7 +2349,8 @@ class MarketDataHub:
             ymd = d.strftime("%Y%m%d")
             for mkt in ("KOSPI", "KOSDAQ"):
                 try:
-                    x = stk.get_market_ohlcv_by_ticker(ymd, market=mkt)
+                    with KRX_CALL_LOCK:
+                        x = stk.get_market_ohlcv_by_ticker(ymd, market=mkt)
                     if x is None or not len(x):
                         continue
                     x = x.reset_index()
@@ -2254,7 +2391,8 @@ class MarketDataHub:
         tickers = list(dict.fromkeys(tickers))
         filled = self.bulk_recent_by_date(tickers, end, self.log)
         mm = market_map or {}
-        rest = [t for t in tickers if t not in filled and not self._is_nodata(t)]
+        rest = [t for t in tickers
+                if t not in filled and not self._is_nodata(t, pd.Timestamp(start))]
         skipped = len(tickers) - len(rest) - 0
         if skipped:
             self.log.info(f"[S05] 개별 수집 대상 {len(rest)}종목 "
@@ -2406,7 +2544,9 @@ class MarketDataHub:
         def _work(it):
             t, y = it
             try:
-                d = stk.get_market_trading_value_by_investor(f"{y}0101", f"{y}1231", t)
+                with KRX_CALL_LOCK:
+                    d = stk.get_market_trading_value_by_investor(
+                        f"{y}0101", f"{y}1231", t)
                 if d is None or not len(d):
                     return None
                 d = d.reset_index()
@@ -2477,12 +2617,17 @@ def norm_broker(name):
     return _BROKER_ALIAS.get(s, s)
 
 def norm_analysts(raw):
-    """작성자 문자열 → 정규화 인명 리스트. 공저자는 각자 1건 인정(§OPEN_QUESTIONS)."""
+    """작성자 문자열 → 정규화 인명 리스트. 공저자는 각자 1건 인정(§OPEN_QUESTIONS).
+
+    ※ 구분자에 '단일 공백'을 포함해야 한다. 한경 작성자 칸은 '홍길동 김철수' 처럼
+      공백 하나로 공저자를 붙여 주는 경우가 흔한데, 다중공백(\\s{2,})만 구분자로
+      두면 두 이름이 '홍길동김철수'(6자)로 합쳐져 이름 검증에서 탈락하고 그 행의
+      애널리스트가 통째로 사라진다(또는 존재하지 않는 인물이 만들어진다)."""
     if raw is None:
         return []
     s = unicodedata.normalize("NFKC", str(raw))
     s = _ANALYST_TITLE_RE.sub(" ", s)
-    parts = re.split(r"[,/·;·&]|\s{2,}", s)
+    parts = re.split(r"[,/·;·&\s]+", s)
     out = []
     for p in parts:
         p = re.sub(r"[^가-힣]", "", p.strip())
@@ -2647,6 +2792,16 @@ class HankyungConsensusCollector:
         try:
             soup = _soup(html)
             trs = soup.select("div.table_style01 table tbody tr") or soup.find_all("tr")
+            # 헤더 텍스트로 열 위치를 먼저 찾는다. 고정 인덱스는 사이트가 열을 하나
+            # 끼워 넣는 순간 조용히 어긋나는데, 헤더 매핑은 그 변경을 견딘다.
+            hdr = [th.get_text(" ", strip=True)
+                   for th in (soup.find_all("th") or [])]
+            def _hidx(*names):
+                for i, h in enumerate(hdr):
+                    if any(n in h for n in names):
+                        return i
+                return None
+            i_an, i_bk = _hidx("작성자", "애널리스트"), _hidx("제공출처", "증권사", "출처")
             for tr in trs:
                 tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
                 if len(tds) < 6:
@@ -2660,7 +2815,9 @@ class HankyungConsensusCollector:
                 if not mt:
                     continue
                 title = next((t for t in tds if "(" + mt.group(1) + ")" in t), tds[1])
-                writer, origin = tds[4], tds[5]
+                ia = i_an if (i_an is not None and i_an < len(tds)) else 4
+                ib = i_bk if (i_bk is not None and i_bk < len(tds)) else 5
+                writer, origin = tds[ia], tds[ib]
                 if not norm_analysts(writer):
                     # 열 구조가 바뀐 경우: 인명처럼 보이는 셀을 작성자로,
                     # 그 다음 비어 있지 않은 셀을 증권사로 채택
@@ -3225,8 +3382,26 @@ def build_pit_universe(hub, store, log, months):
     if not frames:
         return None
     uni = pd.concat(frames, ignore_index=True)
+    # ★ 부분 응답 격리: 이웃 월 대비 종목수가 급감한 스냅샷은 '진실'이 아니라 '사고'다.
+    #   그대로 두면 그 달 유니버스가 조용히 쪼그라들어 곧바로 선택편향이 된다.
+    size = uni.groupby("ym")["ticker"].size().sort_index()
+    med = float(size.median()) if len(size) else 0.0
+    bad = size[size < med * 0.80]
+    if len(bad) and med > 0:
+        log.warn(f"[S07] 부분 응답 의심 스냅샷 {len(bad)}개월 격리 "
+                 f"(중위 {med:.0f}종목 대비 80% 미만): {list(bad.index)[:8]}"
+                 + (" …" if len(bad) > 8 else ""))
+        log.warn("      해당 월은 유니버스에서 제외합니다 — 부분 응답을 진실로 "
+                 "받아들이면 그 달의 선택편향이 됩니다. 재실행 시 재수집됩니다.")
+        for ym in bad.index:                      # 다음 실행에서 다시 받도록 캐시 무효화
+            try:
+                (store.local_root / "cache" / "parsed" / "snapshots"
+                 / f"{ym}.parquet").unlink(missing_ok=True)
+            except Exception:
+                pass
+        uni = uni[~uni["ym"].isin(set(bad.index))]
     store.save_df(uni, "features", "universe_panel.parquet", scope="common",
-                  desc="PIT 월별 유니버스 패널(상폐 포함)", stage="ST02")
+                  desc="PIT 월별 유니버스 패널(상폐 포함, 부분응답 격리)", stage="ST02")
     return uni
 
 
@@ -3384,8 +3559,14 @@ def merge_report_meta(months, store, log):
                                         "title_head"], keep="first")
     allr["analysts"] = allr["analyst_raw"].map(norm_analysts)
     allr["n_authors"] = allr["analysts"].map(len).astype("int8")
+    _n_before = len(allr)
     ex = allr[allr["n_authors"] > 0][
         ["pub_date", "ym", "ticker", "broker_norm", "analysts", "source"]].explode("analysts")
+    # explode 는 공저자 수만큼 행을 늘리는 것이 '의도'다. 다만 의도치 않은 폭증
+    # (파싱 오류로 한 셀에서 수십 명이 추출되는 경우)은 즉시 드러나야 한다.
+    if len(ex) > _n_before * 4:
+        log.warn(f"애널리스트 전개 행수가 비정상적으로 큽니다 "
+                 f"({_n_before:,}건 → {len(ex):,}행). 작성자 파싱 점검 필요.")
     ex = ex.rename(columns={"analysts": "analyst_person_id"})
     ex["analyst_id"] = ex["analyst_person_id"] + "@" + ex["broker_norm"]
     log.kv("리포트 메타 통합", {
@@ -5467,6 +5648,9 @@ def print_final_tables(ctx):
     rows.append({"항목": "최종판정(§11)", "내용": ctx.get("verdict_why", "")[:44],
                  "상태": v, "통계량": None})
     log.table("기타해석표", pd.DataFrame(rows), max_rows=20)
+    hs = http_status_report()
+    if hs is not None:
+        log.table("HTTP 소스별 상태코드 분포(차단 여부 규명용)", hs)
     lin = ctx["store"].lineage_df()
     if len(lin):
         agg = (lin.groupby(["stage", "tier", "scope"], as_index=False)
@@ -5533,6 +5717,11 @@ def save_plots(ctx):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # ★ 순서 고정: 자격증명 주입 → 의존성 확인/설치.
+    #   pykrx 는 import 시점에 KRX 로그인을 시도하고 KRX_ID/KRX_PW 를 그때 읽는다.
+    #   뒤집으면 계정을 넣어도 비인증 세션이 만들어지고 콘솔에
+    #   'KRX 로그인 실패: … 환경 변수가 설정되지 않았습니다' 가 먼저 찍힌다.
+    export_krx_env_early()
     avail = ensure_dependencies()
     quiet_noisy_libraries()
     local_root = resolve_project_root()
