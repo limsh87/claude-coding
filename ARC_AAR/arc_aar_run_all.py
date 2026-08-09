@@ -2339,7 +2339,11 @@ class Phase0Gate:
             merged = pd.concat(rows, ignore_index=True)
             merged = merged.sort_values("ok", ascending=False).drop_duplicates(
                 subset=["pub_date", "ticker"], keep="first")
-            samp = merged.head(CFG.PHASE0_SAMPLE_SIZE)
+            # 확보율 표본은 반드시 '무작위' 추출 — 식별성공 우선 정렬 상태로 head 를
+            # 뜨면 확보율이 상향 편향된다(감사 지적 반영).
+            n_s = min(CFG.PHASE0_SAMPLE_SIZE, len(merged))
+            samp = merged.sample(n=n_s, random_state=CFG.RANDOM_SEED) \
+                if n_s > 0 else merged
             stats.append({"ym": ym, "n": int(len(samp)),
                           "rate": float(samp["ok"].mean()) if len(samp) else np.nan,
                           "n_hk": int((merged["src"] == "hankyung").sum()),
@@ -2673,12 +2677,14 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
         _win_reports(a, t) >= 2
         for a, t in zip(ev["analyst_id"].to_numpy(), ev["m"].to_numpy())]
 
-    # (2) b_stop_i: 하우스(broker)가 [t, t+5] 에 i 리포트 0건 (머지 윈도우 집계)
+    # (2) b_stop_i: 하우스(broker)가 [t, t+2] 에 i 리포트 0건 (머지 윈도우 집계)
+    #     ※ 판정 창은 신호 공표 시점(t+2)까지로 제한 — t+3 이후를 보면 거래 신호에
+    #       look-ahead 가 생긴다(감사 지적 반영, §1-1).
     bt_df = ra.groupby(["broker_norm", "ticker", "m"], as_index=False).size()
     tmp = ev[["eid", "broker", "ticker", "m"]].merge(
         bt_df, left_on=["broker", "ticker"], right_on=["broker_norm", "ticker"],
         how="left", suffixes=("", "_r"))
-    in_w = tmp["m_r"].notna() & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + 5)
+    in_w = tmp["m_r"].notna() & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + 2)
     has_bt = set(tmp.loc[in_w & (tmp["size"] > 0), "eid"])
     ev["b_stop_i"] = ~ev["eid"].isin(has_bt)
 
@@ -2691,8 +2697,9 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
     act = set(tmp.loc[in_w & (tmp["size"] > 0), "eid"])
     ev["b_active"] = ev["eid"].isin(act)
 
-    # (4) moved: 인물(person_id)이 [t, t+5] 에 '다른 증권사'로 발간 → 이직(M-EXIT)
+    # (4) moved: 인물(person_id)이 [t, t+2] 에 '다른 증권사'로 발간 → 이직(M-EXIT)
     #     ※ analyst_person_id(인물)와 analyst_id(인물@증권사)를 혼동하지 않는다(계약 §5)
+    #     ※ 판정 창은 신호 공표 시점(t+2)까지 — look-ahead 차단(감사 지적 반영)
     ev["moved"] = False
     if person_month is not None and len(person_month):
         pm = person_month.copy()
@@ -2704,7 +2711,7 @@ def classify_coverage_exits(pair_dense, adense, reports_all, person_month,
             pb2, left_on="person", right_on="analyst_person_id", how="left",
             suffixes=("", "_r"))
         in_w = (tmp["m_r"].notna() & (tmp["broker_norm"] != tmp["broker"])
-                & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + 5))
+                & (tmp["m_r"] >= tmp["m"]) & (tmp["m_r"] <= tmp["m"] + 2))
         moved = set(tmp.loc[in_w, "eid"])
         ev["moved"] = ev["eid"].isin(moved)
 
@@ -3463,6 +3470,49 @@ def ipw_sensitivity(reports_all, uni, log):
     return sub[["pub_date", "ticker", "broker_norm", "ipw"]], diag
 
 
+def ipw_h1_recheck(vas_panel, aar_neg, ipw_w, engine, log):
+    """§6.7 후속: 식별확률 역수(IPW)로 재가중한 AAR_pos 로 H1 스프레드 '재추정 병기'.
+    가중치는 증권사×월 평균 IPW(선택편향 스트라타 프록시)를 VAS 집계에 적용."""
+    if ipw_w is None or not len(ipw_w):
+        return None
+    try:
+        w = ipw_w.copy()
+        w["m"] = w["pub_date"].astype(str).str[:7].map(month_ord)
+        bw = (w.groupby(["broker_norm", "m"])["ipw"].mean()
+              .rename("ipw_bm").reset_index())
+        need = ["analyst_id", "ticker", "m", "VAS", "broker"]
+        v = vas_panel[vas_panel["VAS"].notna()][need].copy()
+        v = v.merge(bw, left_on=["broker", "m"], right_on=["broker_norm", "m"],
+                    how="left")
+        v["ipw_bm"] = v["ipw_bm"].fillna(1.0)
+        num = (v["VAS"] * v["ipw_bm"]).groupby([v["ticker"], v["m"]]).sum()
+        den = v["ipw_bm"].groupby([v["ticker"], v["m"]]).sum()
+        sig = (num / den).rename("pos_ipw").reset_index()
+        sig["ym"] = sig["m"].map(ord_to_ym)
+        mu = sig.groupby("m")["pos_ipw"].transform("mean")
+        sd = sig.groupby("m")["pos_ipw"].transform("std").replace(0, np.nan)
+        sig["z_pos_ew"] = ((sig["pos_ipw"] - mu) / sd).fillna(0.0)
+        for c in ("z_pos_npub", "z_pos_breadth"):
+            sig[c] = sig["z_pos_ew"]
+        sig = sig.merge(aar_neg, on=["ticker", "ym"], how="left")
+        sig["AAR_neg"] = sig["AAR_neg"].fillna(0.0)
+        muN = sig.groupby("m")["AAR_neg"].transform("mean")
+        sdN = sig.groupby("m")["AAR_neg"].transform("std").replace(0, np.nan)
+        sig["z_neg"] = ((sig["AAR_neg"] - muN) / sdN).fillna(0.0)
+        eng = BacktestEngine(sig, engine.H, engine.S, engine.uni, log)
+        sp = eng.quintile_spread(PRIMARY_CFG)
+        t, p, n = newey_west_tstat(sp["spread"], CFG.NW_LAGS_1M)
+        res = {"t_ipw": float(t) if t == t else None, "n": int(n),
+               "p_two": float(min(max(2 * (1 - norm_cdf(abs(t))), 0), 1))
+               if t == t else None}
+        log.kv("§6.7 IPW 재추정 H1(병기)", {"NW t(IPW 재가중)": res["t_ipw"],
+                                           "n": n})
+        return res
+    except Exception as e:
+        log.warn(f"IPW 재추정 실패(진단만 병기): {str(e)[:120]}")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # [S15b] 가설 판정 H1~H5 + 플라시보 + 최종 수용/폐기 (계약 §4, §9, §11)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3606,6 +3656,10 @@ OPEN_QUESTIONS_LOG = [
      "계상 대안은 보수적 선택 원칙상 채택하지 않음 — 결과 민감도는 낮다고 판단."),
     ("철회 확정 시점", "커버 중단은 침묵 3개월째 '월말'에야 확정 가능 → signal_ym = t+2 "
      "로 지연 공표(look-ahead 차단). 이벤트 CAR 앵커도 동일 시점."),
+    ("철회 분류 판정 창", "하우스 중단(b_stop_i)·이직(moved) 판정 창을 신호 공표 시점 "
+     "[t, t+2]로 제한(감사 반영). t+3~t+5 를 보면 분류 정밀도는 오르지만 거래 신호에 "
+     "look-ahead 가 생기므로 보수적으로 배제. 대가: 일부 H-EXIT/M-EXIT 가 V-DROP 으로 "
+     "과대 분류될 수 있음(플라시보 검정이 이를 감시)."),
     ("H-EXIT 집계 단위", "계약 §6.5 count(H-EXIT) 를 '해당 하우스 소속 철회 애널리스트 "
      "수'로 해석(분모 단위와 일치). 하우스 개수 해석 대비 보수적."),
     ("섹터 분류 PIT 한계", "무료 소스는 현재시점 섹터만 제공 → 소급 적용. 섹터×월 FE "
@@ -4061,6 +4115,10 @@ def write_all_outputs(ctx):
     WD("metrics_all_configs.csv", ctx.get("metrics_df"), "12구성×비용 성과")
     WD("equity_curves.parquet", ctx.get("equity_df"), "에쿼티 곡선")
     WD("trade_log.parquet", ctx.get("trades_df"), "트레이드 로그")
+    ann_df = ctx.get("annual_df")
+    if ann_df is not None and len(ann_df):
+        WD("annual_returns.csv", ann_df.set_index(["series", "year"]),
+           "연도별 수익률(전 구성+벤치마크, §8)")
 
     hyp, placebo, fdr = ctx.get("hyp", {}), ctx.get("placebo", {}), ctx.get("fdr", {})
     boot, pbo, dsr = ctx.get("boot", {}), ctx.get("pbo", {}), ctx.get("dsr", {})
@@ -4074,6 +4132,12 @@ def write_all_outputs(ctx):
               f"- 상태: **{h.get('status')}** | 통계량 {h.get('stat')} | "
               f"p={h.get('p')} | FDR보정 p={h.get('fdr', {}).get('p_adj')}",
               f"- 상세: {h.get('desc', h.get('detail', ''))}", ""]
+    ipr = ctx.get("ipw_recheck")
+    if ipr:
+        L += [f"### §6.7 IPW 재추정 병기 (식별률<70% 경로)",
+              f"- IPW 재가중 H1 스프레드 NW t = {ipr.get('t_ipw')} "
+              f"(n={ipr.get('n')}, 양측 p={ipr.get('p_two')}) — 비가중 결과와 비교해 "
+              "선택편향 방향/크기를 판단할 것.", ""]
     L += ["## 다중검정/과적합 게이트",
           f"- BH-FDR(q={CFG.FDR_Q}): {json.dumps({k: v.get('reject_null') for k, v in fdr.items()}, ensure_ascii=False)}",
           f"- 블록 부트스트랩(21d×{CFG.BOOT_N}): P(SR≤0)={boot.get('p_sr_le_0')}, "
@@ -4580,9 +4644,10 @@ def main():
         h2, h4 = h2_h4_series(engine, log, cov_count, invr)
         vas_tm = signals[["ticker", "m", "pos_ew"]]
         granger_res = granger_lead_lag(vas_tm, eps_hist, log)
-        ipw_w, ipw_diag = (None, None)
+        ipw_w, ipw_diag, ipw_recheck = None, None, None
         if decision["mode"] == "ANALYST_IPW" or decision.get("rate", 1) < 0.70:
             ipw_w, ipw_diag = ipw_sensitivity(reports_all, uni, log)
+            ipw_recheck = ipw_h1_recheck(vas_panel, aar_neg, ipw_w, engine, log)
         hyp, placebo, fdr = evaluate_hypotheses(engine, grid, res_by_scen,
                                                 es_summary, granger_res, h2, h4, log)
         # 초과수익(기본비용, EW 유니버스 대비 연율)
@@ -4591,13 +4656,13 @@ def main():
         excess_pa = float((prim_net.reindex(common) - ew.reindex(common)).mean() * 12) \
             if len(common) > 12 else np.nan
         return (boot, pbo, dsr, wf_oos, wf_info, h2, h4, granger_res,
-                ipw_diag, hyp, placebo, fdr, excess_pa, dcurve)
+                ipw_diag, ipw_recheck, hyp, placebo, fdr, excess_pa, dcurve)
     (boot, pbo, dsr, wf_oos, wf_info, h2s, h4s, granger_res, ipw_diag,
-     hyp, placebo, fdr, excess_pa, dcurve) = stage(
+     ipw_recheck, hyp, placebo, fdr, excess_pa, dcurve) = stage(
         "ST10", "통계 검증 게이트(§9 전항목) + 가설 판정", _stats_all)
     ctx.update({"boot": boot, "pbo": pbo, "dsr": dsr, "wf_info": wf_info,
                 "granger_res": granger_res, "hyp": hyp, "placebo": placebo,
-                "fdr": fdr})
+                "fdr": fdr, "ipw_recheck": ipw_recheck})
 
     verdict, why = final_verdict(hyp, placebo, pbo, dsr, excess_pa,
                                  ctx["interim"], log)
@@ -4668,19 +4733,33 @@ def main():
         prim_ts = res_by_scen["base"][PRIMARY_CFG["name"]]["ts"]
         bt_span = f"{prim_ts['ym'].min()} ~ {prim_ts['ym'].max()}" \
             if len(prim_ts) else "N/A"
+        # 연도별 수익률(§8 지표) — 전체 구성(base) + 벤치마크, 산출물로도 저장
+        def _annual(s_ym):
+            yr = pd.Series(s_ym.values, index=[str(y)[:4] for y in s_ym.index])
+            return yr.groupby(level=0).apply(lambda x: float((1 + x).prod() - 1))
+        ann_rows = []
+        for name, r in res_by_scen["base"].items():
+            if len(r["ts"]):
+                for y, vv in _annual(r["ts"].set_index("ym")["ret_net"]).items():
+                    ann_rows.append({"series": name, "year": y, "annual_ret": vv})
+        for nm, s0 in bench.items():
+            s_ym = pd.Series(s0.values, index=[ord_to_ym(m) for m in s0.index])
+            for y, vv in _annual(s_ym).items():
+                ann_rows.append({"series": f"BENCH:{nm}", "year": y,
+                                 "annual_ret": vv})
+        annual_df = pd.DataFrame(ann_rows)
         ann = None
         if len(prim_ts):
             s = prim_ts.set_index("ym")["ret_net"]
-            yr = pd.Series(s.values, index=[y[:4] for y in s.index])
-            ann = yr.groupby(level=0).apply(lambda x: float((1 + x).prod() - 1))
+            ann = _annual(s)
         return (met_df, pd.DataFrame(eq_rows),
                 pd.concat(tr_frames, ignore_index=True) if tr_frames else None,
-                cost_table, bt_span, ann)
-    met_df, equity_df, trades_df, cost_table, bt_span, annual = stage(
+                cost_table, bt_span, ann, annual_df)
+    met_df, equity_df, trades_df, cost_table, bt_span, annual, annual_df = stage(
         "ST11", "성과/비용/에쿼티 표 구성", _collect_outputs)
     ctx.update({"metrics_df": met_df, "equity_df": equity_df,
                 "trades_df": trades_df, "cost_table": cost_table,
-                "bt_span": bt_span})
+                "bt_span": bt_span, "annual_df": annual_df})
     if annual is not None:
         log.table("주 구성 연도별 수익률(net, base)",
                   annual.to_frame("연수익률").round(4))
@@ -4706,7 +4785,7 @@ def main():
         "collect_budget": COLLECT_BUDGET.status(),
         "quota_used": quota.doc.get("used", {}),
         "src_stats": hub.src_stats,
-        "ipw_diag": ipw_diag,
+        "ipw_diag": ipw_diag, "ipw_recheck": ipw_recheck,
         "n_reports": int(len(reports_all)), "n_analyst_rows": int(len(ex)),
         "grid": [g["name"] for g in grid]}
     stage("ST13", "산출물 기록(§10) + 최종 표 출력",
