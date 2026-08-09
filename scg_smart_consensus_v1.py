@@ -39,6 +39,15 @@
 #     · 종결 원장으로 재개가 보장되어 재실행할수록 100% 로 수렴한다. 매 실행마다
 #       '지금 결과를 믿어도 되는가'를 커버리지 표로 판정해 출력한다.
 #
+#   ▣ 윈도우·주피터에서만 터지는 것들 (리눅스에선 절대 재현되지 않는다)
+#     · 경로 포함 판정을 `realpath().startswith()` 로 하면 윈도우에서 오탐한다
+#       (대소문자 · 8.3 단축명 · 확장길이 접두 · 아직 없는 경로). 절대1원칙의 방어선이
+#       정상 쓰기를 막아 실행이 통째로 멈췄다 → normcase+commonpath 로 판정(계약 C-경로).
+#     · 파싱 프로세스 풀이 `BrokenProcessPool` 로 죽었다. spawn 자식은 기동 직후
+#       **부모의 __main__ 을 다시 실행**하는데 주피터의 __main__ 은 디스크에 없다.
+#       __file__ 을 잠시 치우고 워커를 전부 미리 띄운 뒤 복구한다(__spec__ 은 None 으로 —
+#       지우면 multiprocessing 이 AttributeError 를 낸다).
+#
 #   ▣ 막힌 소스에 시간을 쓰지 않는다 (회로차단 · 사전점검 · 진행표시)
 #     · 소스별 회로차단기: 연속 실패가 쌓이면 그 소스를 끊고, 이후 요청은 대기 0초로 통과.
 #     · PDF 단계는 시작 전에 호스트를 실측(최대 3건)하고, 막혔으면 계획에서 제외한다.
@@ -682,7 +691,9 @@ def write_atomic_text(path: str, text: str):
 
 def write_atomic_parquet(df: pd.DataFrame, path: str):
     _mkdirs(path)
-    tmp = f"{path}.tmp.{os.getpid()}.parquet"
+    # ★ 스레드 식별자까지 넣는다 — 같은 프로세스의 두 스레드가 같은 표를
+    #   동시에 저장하면 임시파일이 겹쳐 윈도우에서 os.replace 가 깨진다.
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}.parquet"
     try:
         df.to_parquet(tmp, compression="zstd", index=False)
     except Exception:
@@ -928,7 +939,8 @@ class Depot:
     def __init__(self):
         droot, self.drive_mode = _gdrive_mount()
         # 쓰기 루트: 드라이브가 있으면 드라이브, 없으면 로컬(경고와 함께)
-        self.write_root = os.path.abspath(droot or os.path.expanduser("./scg_cache"))
+        self.write_root = os.path.abspath(
+            os.path.expanduser(droot or "./scg_cache"))
         self.on_drive = droot is not None
         self.ns = {"공용": os.path.join(self.write_root, "shared"),
                    "전용": os.path.join(self.write_root, STRATEGY_TAG)}
@@ -977,13 +989,57 @@ class Depot:
                 continue
         return out
 
+    @staticmethod
+    def _norm_forms(p: str) -> List[str]:
+        """경로 비교용 정규형 — **realpath 와 abspath 두 형태를 모두** 돌려준다.
+
+        ★ 여기가 실행을 통째로 막았다. 윈도우에서 `realpath(...).startswith(...)` 는
+          네 가지 이유로 조용히 어긋난다:
+            ⓐ 대소문자 (윈도우 파일시스템은 대소문자를 구분하지 않는다)
+            ⓑ 8.3 단축명 — TEMP 가 단축명이면 realpath 가 긴 이름으로 바꿔 놓는다.
+            ⓒ 확장길이 접두 — _getfinalpathname 이 붙여 돌려줄 때가 있다.
+            ⓓ 존재하지 않는 경로 — realpath 는 '존재하는 접두까지'만 해석한다.
+               쓰기 **직전**의 검사라 대상 파일은 아직 없다. 부모와 자식이 서로
+               다른 지점까지만 해석되면 접두 비교가 깨진다.
+          그래서 한 형태에만 기대지 않고 두 형태를 모두 만들어 비교한다.
+        """
+        out: List[str] = []
+        for f in (os.path.abspath, os.path.realpath):
+            try:
+                q = str(f(p))
+            except Exception:
+                continue
+            if q.startswith("\\\\?\\"):
+                q = q[4:]
+            out.append(os.path.normcase(os.path.normpath(q)))
+        return list(dict.fromkeys(out)) or [os.path.normcase(os.path.normpath(str(p)))]
+
+    @staticmethod
+    def _inside(child: str, parent: str) -> bool:
+        """child 가 parent **안**인가.
+
+        ★ 문자열 startswith 는 형제 디렉터리를 안으로 오판한다
+          ('scg_cache2' 가 'scg_cache' 로 시작한다). commonpath 로 판정한다.
+        """
+        for c in Depot._norm_forms(child):
+            for q in Depot._norm_forms(parent):
+                try:
+                    if c == q or os.path.commonpath([c, q]) == q:
+                        return True
+                except ValueError:          # 드라이브가 다르면 commonpath 가 예외
+                    continue
+        return False
+
     def _guard_write(self, path: str):
-        rp = os.path.realpath(path)
+        # ★ 순서가 의미를 만든다: 읽기전용 루트는 **한 형태라도 안이면 거부**(보수),
+        #   쓰기 루트는 **한 형태라도 안이면 허용**(오탐 제거). 절대1원칙은 앞의
+        #   검사로 지켜지고, 뒤의 검사는 정상 쓰기를 막지 않는 역할만 한다.
         for ro in self.read_roots:
-            if rp.startswith(ro + os.sep) or rp == ro:
+            if self._inside(path, ro):
                 raise RuleBreak(f"[절대1원칙] 읽기전용 캐시 루트에 쓰기 시도: {path}")
-        if not rp.startswith(os.path.realpath(self.write_root)):
-            raise RuleBreak(f"[절대1원칙] 쓰기 루트 밖 기록 시도: {path}")
+        if not self._inside(path, self.write_root):
+            raise RuleBreak(f"[절대1원칙] 쓰기 루트 밖 기록 시도: {path} "
+                            f"(쓰기 루트: {self.write_root})")
 
     def _scan_roots_once(self):
         """기존 캐시 루트를 '한 번만' 걷는다 — 대형 blob 트리를 테이블 조회 때마다
@@ -3810,7 +3866,8 @@ def _pdf_extract_one(data: bytes, year: int) -> Tuple[str, dict]:
 # ║  import 가능하게 만들고 **자가시험 후 실패하면 스레드로 조용히 되돌아간다**.               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 _PDF_ENGINE: Dict[str, Any] = {"name": "", "rate": 0.0, "measured": False, "table": []}
-_PDF_POOL: Dict[str, Any] = {"ex": None, "mode": "", "checked": False}
+_PDF_POOL: Dict[str, Any] = {"ex": None, "mode": "", "checked": False,
+                             "fn": None, "why": ""}
 
 
 def _pdf_worker_source() -> str:
@@ -3845,12 +3902,73 @@ def _pdf_worker_source() -> str:
         "        return ('READ_FAIL', {})\n"
         "    return _pdf_extract_one(data, year)\n")
     parts.append("def selftest():\n    return 'ok'\n")
+    # ★ 워커를 '실제로 여러 개' 띄워 보기 위한 함수. 풀은 게을러서 작업이 밀려야
+    #   프로세스를 늘리는데, 우리는 __main__ 을 중화해 둔 **지금** 전부 띄워야 한다.
+    parts.append("import time as _t, os as _o\n"
+                 "def spin(_x=0):\n    _t.sleep(0.25)\n    return _o.getpid()\n")
     return "\n\n".join(parts)
+
+
+_MAIN_SHIELD: Dict[str, Any] = {}
+
+
+def _pdf_pool_close():
+    """풀을 정리하고 상태를 초기화한다(유휴 워커가 남지 않게)."""
+    ex = _PDF_POOL.get("ex")
+    if ex is not None:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    _PDF_POOL.update(ex=None, fn=None, checked=False)
+
+
+def _pdf_main_shield(on: bool):
+    """spawn 자식이 부모 __main__ 을 재실행하지 않도록 잠시 가린다(복구 보장)."""
+    mm = sys.modules.get("__main__")
+    if mm is None:
+        return
+    if on:
+        # ★ __file__ 은 **지운다**(있으면 자식이 그 파일을 다시 실행한다).
+        #   __spec__ 은 **None 으로 둔다** — multiprocessing 이 이 속성을 무조건
+        #   읽으므로 지워 버리면 AttributeError 로 풀 생성 자체가 실패한다.
+        #   (실제로 지웠다가 이 오류를 냈다. 둘의 취급이 다르다.)
+        if hasattr(mm, "__file__"):
+            _MAIN_SHIELD["__file__"] = mm.__file__
+            try:
+                del mm.__file__
+            except Exception:
+                _MAIN_SHIELD.pop("__file__", None)
+        _MAIN_SHIELD["__spec__"] = getattr(mm, "__spec__", None)
+        try:
+            mm.__spec__ = None
+        except Exception:
+            _MAIN_SHIELD.pop("__spec__", None)
+    else:
+        for a, v in list(_MAIN_SHIELD.items()):
+            try:
+                setattr(mm, a, v)
+            except Exception:
+                pass
+        _MAIN_SHIELD.clear()
 
 
 def _pdf_pool(workers: int):
     """프로세스 풀을 만들되 **반드시 자가시험을 통과한 것만** 돌려준다.
-    실패하면 None → 호출부가 스레드로 진행한다(느릴 뿐, 멈추지 않는다)."""
+    실패하면 None → 호출부가 스레드로 진행한다(느릴 뿐, 멈추지 않는다).
+
+    ★ 사용자 환경(Windows + JupyterLab + py3.14)에서 `BrokenProcessPool` 로 죽어
+      지난 라운드의 병렬화 이득이 통째로 0이 됐다. 원인은 spawn 방식의 구조다:
+        · 윈도우는 fork 가 없어 자식이 **새 인터프리터로 시작**한다.
+        · 자식은 부모가 넘긴 함수를 pickle 로 복원하는데, 그 함수가 `__main__` 에
+          정의돼 있으면 `__main__` 을 import 하려 한다. Jupyter 커널에는 import
+          가능한 `__main__` 파일이 없다 → 자식이 즉시 죽고 BrokenProcessPool.
+        · `initializer` 로 sys.path 를 심으려 해도, 그 initializer 자체를 복원하려면
+          이미 경로가 필요하다 — 순환이라 해결이 안 된다.
+      그래서 ① 넘기는 함수는 **생성된 워커 모듈의 top-level 함수**만 쓰고,
+      ② 자식이 그 모듈을 찾도록 **PYTHONPATH 환경변수**로 경로를 물려준다
+      (spawn 자식은 부모 환경을 상속하고, 인터프리터가 기동하며 sys.path 에 넣는다).
+    """
     if _PDF_POOL["checked"]:
         return _PDF_POOL["ex"]
     _PDF_POOL["checked"] = True
@@ -3859,44 +3977,58 @@ def _pdf_pool(workers: int):
         _PDF_POOL["mode"] = "스레드(워커 부족)"
         return None
     try:
+        import multiprocessing as _mp
         from concurrent.futures import ProcessPoolExecutor
         d = os.path.join(tempfile.gettempdir(), f"scg_pdfw_{os.getpid()}")
         os.makedirs(d, exist_ok=True)
         write_atomic_text(os.path.join(d, "scg_pdf_worker.py"), _pdf_worker_source())
         if d not in sys.path:
             sys.path.insert(0, d)
+        # ★ 자식이 워커 모듈을 import 할 수 있도록 경로를 환경변수로 물려준다.
+        pp = os.environ.get("PYTHONPATH", "")
+        if d not in pp.split(os.pathsep):
+            os.environ["PYTHONPATH"] = (d + os.pathsep + pp) if pp else d
         import importlib
         w = importlib.import_module("scg_pdf_worker")
         importlib.reload(w)
-        ex = ProcessPoolExecutor(max_workers=workers,
-                                 initializer=_pdf_pool_init, initargs=(d,))
-        fu = ex.submit(_pdf_pool_probe)
-        if fu.result(timeout=90) != "ok":
-            raise RuntimeError("자가시험 응답 불일치")
-        _PDF_POOL["ex"], _PDF_POOL["mode"] = ex, f"프로세스×{workers}"
+        try:
+            ctx = _mp.get_context("spawn")     # 모든 OS 에서 동일하게 동작시킨다
+        except Exception:
+            ctx = None
+        # ★★ 여기가 BrokenProcessPool 의 진짜 원인이다.
+        #    spawn 자식은 기동 직후 **부모의 __main__ 을 다시 실행**한다
+        #    (multiprocessing.spawn._fixup_main_from_path). 그런데 Jupyter 의
+        #    __main__ 은 디스크에 없는 가짜 경로라 자식이 즉시 죽는다
+        #    → "A process in the process pool was terminated abruptly".
+        #    __main__ 의 __file__/__spec__ 을 잠시 치우면 자식은 main 재실행을
+        #    아예 건너뛰고, PYTHONPATH 로 워커 모듈만 import 한다(기동도 훨씬 빠르다).
+        #    치운 상태에서 워커를 **전부 미리 띄워** 두고 원상복구한다 —
+        #    나중에 게으르게 늘어나는 워커가 같은 함정에 빠지지 않게.
+        _pdf_main_shield(True)
+        try:
+            ex = (ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+                  if ctx is not None else ProcessPoolExecutor(max_workers=workers))
+            # 넘기는 것은 모듈의 top-level 함수다 — 'scg_pdf_worker.selftest' 로
+            # pickle 되고, 자식은 PYTHONPATH 덕에 그 모듈을 찾는다.
+            if ex.submit(w.selftest).result(timeout=120) != "ok":
+                raise RuntimeError("자가시험 응답 불일치")
+            pids = set(ex.map(w.spin, range(workers * 2)))
+        finally:
+            _pdf_main_shield(False)
+        _PDF_POOL["ex"] = ex
+        _PDF_POOL["mode"] = f"프로세스×{workers}(실기동 {len(pids)})"
+        _PDF_POOL["fn"] = w.work
         return ex
     except BaseException as e:
-        _PDF_POOL["mode"] = f"스레드(프로세스풀 불가: {type(e).__name__})"
+        why = f"{type(e).__name__}: {str(e)[:60]}"
+        _PDF_POOL["mode"] = f"스레드(프로세스풀 불가 · {why})"
+        _PDF_POOL["why"] = why
         try:
-            ex.shutdown(wait=False, cancel_futures=True)      # type: ignore[has-type]
+            if ex is not None:
+                ex.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
         return None
-
-
-def _pdf_pool_init(worker_dir: str):
-    if worker_dir not in sys.path:
-        sys.path.insert(0, worker_dir)
-
-
-def _pdf_pool_probe():
-    import scg_pdf_worker
-    return scg_pdf_worker.selftest()
-
-
-def _pdf_pool_work(job):
-    import scg_pdf_worker
-    return scg_pdf_worker.work(job)
 
 
 def bench_pdf_engines(samples: List[bytes]) -> str:
@@ -4155,38 +4287,50 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     #    섞어 돌렸다. 파싱은 순수 CPU 라 GIL 이 직렬화하므로 16코어에서 24건/분이
     #    나왔다(6,249건에 260분). 확보(IO)와 파싱(CPU)을 분리하고 파싱을 프로세스로
     #    내보내면 코어 수만큼 실제로 병렬이 된다.
-    smp = []
-    for j in jobs[:6]:
-        q = keymap.get(str(j[0])) or DEPOT.blob_path("research_pdf", j[0])
-        if q and os.path.exists(q):
-            try:
-                smp.append(open(q, "rb").read())
-            except Exception:
-                pass
-    eng = bench_pdf_engines(smp)
-    globals()["_ENGINE"] = eng
+    # ★ 추출기 실측은 **파일이 실제로 손에 들어온 뒤**에 한다.
+    #   이전 빌드는 '이미 로컬에 있는 파일'만 표본으로 삼았는데, 신규 다운로드만
+    #   있는 실행에서는 표본이 0개라 벤치가 통째로 건너뛰어졌다("선택: 없음").
+    #   그러면 실측이 아니라 고정 순서로 돌아가 이 개선의 의미가 사라진다.
     n_par = PDF_PARSE_WORKERS or max(2, min(12, (RIG["cpu"] or 4) - 2))
     pool = _pdf_pool(n_par) if PDF_PARSE_PROCESSES else None
-    if _PDF_ENGINE["table"]:
-        CON.grid(_PDF_ENGINE["table"], ["추출기", "설치", "실측 속도", "비고"],
-                 ["l", "l", "r", "l"],
-                 title=f"PDF 텍스트 추출기 실측 — 선택: {eng or '없음'} "
-                       f"(추측 아님 · 이 장비에서 잰 값)")
     CON.say(f"PDF 처리를 시작합니다 — {n_jobs:,}건 · 확보(IO) 스레드 "
             f"{min(6, N_IO_THREADS)} · 파싱(CPU) {_PDF_POOL['mode'] or f'스레드×{n_par}'}"
             f" · {PDF_PROGRESS_EVERY}건마다 진행 표시 · 체크포인트 {PDF_CHUNK}건")
 
     def _parse_batch(items: List[tuple]) -> List[tuple]:
         """[2단계] 파싱 — CPU 바운드. 프로세스 풀이 살아 있으면 그쪽으로."""
+        nonlocal pool
         if not items:
             return []
         pj = [(pth, int(y)) for _r, pth, y, _st in items]
+        if not _PDF_ENGINE["measured"]:            # 첫 배치의 실물 파일로 실측
+            smp = []
+            for q, _y in pj[:4]:
+                b = _read_bytes(q)
+                if b:
+                    smp.append(b)
+            eng = bench_pdf_engines(smp)
+            globals()["_ENGINE"] = eng
+            if _PDF_ENGINE["table"]:
+                CON.grid(_PDF_ENGINE["table"], ["추출기", "설치", "실측 속도", "비고"],
+                         ["l", "l", "r", "l"],
+                         title=f"PDF 텍스트 추출기 실측 — 선택: {eng or '없음'} "
+                               f"(추측 아님 · 이 장비에서 잰 값)")
+            if pool is not None and eng:
+                # 워커 모듈에 박아 둔 엔진 이름을 실측 결과로 갱신해 다시 띄운다
+                _PDF_POOL.update(checked=False, ex=None, fn=None)
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+                pool = _pdf_pool(n_par)
         if pool is not None:
             try:
-                res = list(pool.map(_pdf_pool_work, pj, chunksize=4))
+                res = list(pool.map(_PDF_POOL["fn"], pj, chunksize=4))
             except BaseException as e:
                 CON.warn(f"프로세스 파싱 실패({type(e).__name__}) — 스레드로 계속합니다")
                 _PDF_POOL["ex"], _PDF_POOL["mode"] = None, "스레드(프로세스 중단)"
+                pool = None          # ★ 다음 배치가 죽은 풀을 다시 두드리지 않게
                 res = pmap(lambda a: _pdf_extract_one(_read_bytes(a[0]), a[1]), pj,
                            workers=n_par)
         else:
@@ -4242,11 +4386,7 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
                      f"(무의미한 재시도로 예산을 태우지 않습니다).")
             _pdf_checkpoint(done, status_rows)
             break
-    try:
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
-    except Exception:
-        pass
+    _pdf_pool_close()
     CON.ok(f"PDF 단계 종료 — 파싱 {counter['n']:,} · EPS 확보 {counter['new']:,} · "
            f"기존파일 {counter['hit']:,} · 신규다운로드 {counter['net']:,} · "
            f"수신실패 {counter['fail']:,} · 누적 추출 {len(done):,}건 · "
@@ -6182,6 +6322,33 @@ def run_contracts(strict: bool = True) -> bool:
         ok = (n_ok == 2 and n_odd == 2 and n_eps == 1)
         return ok, f"TP정상 {n_ok}/2 · TP라벨이상 {n_odd}/2 · EPS 대표 {n_eps}/1"
     _ct("C-트랙", "대표기간 승격(트랙 공백 방지)", c_track)
+
+    def c_path():
+        """★ 경로 포함 판정 — 실행을 통째로 막았던 자리다.
+
+        윈도우 사용자 환경에서 `realpath(...).startswith(...)` 가 오탐해
+        '쓰기 루트 밖 기록 시도'로 리허설이 죽었다. 순수 로직이라 어떤 OS 에서도
+        같은 답이 나와야 하고, 절대1원칙의 최후 방어선이므로 계약으로 못박는다.
+        """
+        base = os.path.abspath(os.path.join(tempfile.gettempdir(), "scg_ct"))
+        ins = os.path.join(base, "shared", "blob", "research_pdf", "01", "x.pdf")
+        cases = [
+            (ins, base, True, "존재하지 않는 하위 경로도 '안'으로 봐야 한다"),
+            (base, base, True, "자기 자신은 안이다"),
+            (base + "2", base, False, "형제 디렉터리를 안으로 오판하면 안 된다"),
+            (os.path.join(base, ".", "shared", "..", "shared", "a.txt"), base, True,
+             "정규화 전 형태도 같은 답이어야 한다"),
+            (os.path.abspath(os.sep + "elsewhere" + os.sep + "x"), base, False,
+             "완전히 다른 경로는 밖이다"),
+        ]
+        bad = [w for c, q, want, w in cases if Depot._inside(c, q) is not want]
+        if not bad and os.name != "nt":       # 대소문자 무시 판정(윈도우 규칙) 확인
+            up = base.upper()
+            if os.path.normcase("A") == os.path.normcase("a") and                     not Depot._inside(ins, up):
+                bad.append("대소문자 차이를 흡수하지 못한다")
+        return (not bad), (f"{len(cases)}개 경우 통과" if not bad
+                           else "실패: " + "; ".join(bad)[:60])
+    _ct("C-경로", "경로 포함 판정(절대1원칙 방어선)", c_path)
     bad = [c for c in CONTRACTS if not c["ok"]]
     CON.grid([[c["id"], c["name"], "통과" if c["ok"] else "실패", c["msg"]]
               for c in CONTRACTS], ["ID", "계약", "판정", "근거"], ["l", "l", "l", "l"],
@@ -6371,7 +6538,7 @@ def _rh(name: str, fn: Callable, expect_rows: bool = True, blocking: bool = True
 def _rehearsal_depot(tmp: str) -> "Depot":
     """실제 캐시를 절대 건드리지 않는 임시 금고."""
     dep = Depot.__new__(Depot)
-    dep.write_root = tmp
+    dep.write_root = os.path.abspath(tmp)
     dep.on_drive = False
     dep.drive_mode = "리허설"
     dep.ns = {"공용": os.path.join(tmp, "shared"), "전용": os.path.join(tmp, "scg_v1")}
@@ -6505,7 +6672,15 @@ def run_rehearsal(strict: bool = True) -> bool:
             assert h1("hankyung", "12345") != want, "두 규칙은 달라야 정상이다"
             return 1
         _rh("타 전략 저장키 규칙 재현(PDF 재사용)", _tcd_key_rule)
-        _rh("ⓘ PDF 파싱 프로세스 풀 기동", lambda: (_pdf_pool(2) is not None) or None,
+        def _pool_probe():
+            """★ 리허설이 띄운 워커를 그대로 두면 유휴 프로세스가 실행 내내 남는다.
+            띄워 보고 **반드시 정리**한다. 사유는 표에 남겨 조치할 수 있게 한다."""
+            ok = _pdf_pool(2) is not None
+            _pdf_pool_close()
+            if not ok and _PDF_POOL.get("why"):
+                CON.debug(f"프로세스 풀 사용 불가 사유: {_PDF_POOL['why']}")
+            return ok or None
+        _rh("ⓘ PDF 파싱 프로세스 풀 기동", _pool_probe,
             expect_rows=False, blocking=False)
         _rh("ⓘ 한경 접속 진단(경로 자동선택)", lambda: (hk_probe(), HK["alive"])[1],
             expect_rows=False, blocking=False)
@@ -6637,7 +6812,7 @@ def run_rehearsal(strict: bool = True) -> bool:
         CIRCUIT.opened.clear()
         CIRCUIT._streak.clear()
         _PDF_URL_REWRITE.clear()
-        _PDF_POOL.update(ex=None, mode="", checked=False)
+        _PDF_POOL.update(ex=None, mode="", checked=False, fn=None, why="")
         _PDF_ENGINE.update(measured=False, name="", table=[])
         ROBUST.clear()                 # 리허설이 남긴 강건성 결과는 실행분과 섞지 않는다
         ROBUST.update(dict(saved_robust))
