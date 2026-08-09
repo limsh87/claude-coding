@@ -136,6 +136,10 @@ PX_ALLOW_YFINANCE     = False   # 종목별 폴백에 yfinance 사용 여부. �
 PX_RESIDUAL_MAX_CODES = 300     # 벌크가 못 덮은 종목의 종목축 구제 상한(0=무제한, 권장 300)
 
 # ── ⑧-2 DART 수집 정책 (호출량은 '고정 예산'이 아니라 '실시간 잔여'로 관리) ───────────────────
+DART_BULK_ZIP    = True   # ★재무제표 '일괄 ZIP'(연도×보고서×제표 파일 하나에 전 상장사).
+#                           단건 API 78,000회를 약 150회 다운로드로 대체하며, 이 경로는
+#                           crtfc_key 를 쓰지 않아 ★일일 호출한도를 전혀 소비하지 않는다.
+#                           재고자산·매출채권·영업CF·CAPEX 가 십수 분 만에 채워진다.
 DART_BULK_MULTI  = True   # 다중회사 주요계정(fnlttMultiAcnt): 회사 100개를 한 번에 조회.
 #                           전 시장 12년을 약 1,600회로 덮는다(단건이면 16만회).
 DART_MULTI_BATCH = 100    # 한 요청에 넣을 회사 수(공식 상한 100). status 021 이 나면 낮추세요.
@@ -1170,7 +1174,7 @@ def _fsize(p: str) -> int:
 
 
 def _win_drivefs_roots() -> List[str]:
-    """★[다른 세션에서 이식] 구글드라이브 데스크톱이 '스스로 기록해 둔' 마운트 지점을 읽는다.
+    r"""★[다른 세션에서 이식] 구글드라이브 데스크톱이 '스스로 기록해 둔' 마운트 지점을 읽는다.
 
     문자 스캔만으로는 못 찾는다. 구글드라이브는
       (a) 드라이브 문자(G: 등)  (b) 임의의 빈 폴더  (c) 미러링 모드의 로컬 폴더
@@ -3498,6 +3502,119 @@ def _pykrx_fn(*names) -> Optional[Callable]:
     return None
 
 
+# ── ⓪ ★연도축 벌크 — FinanceData/marcap (전 시장 일봉 + 시총 + 주식수, 상장폐지 포함) ──────
+#
+#   지금까지의 축 변천:  종목축(27,000회) → 날짜축(2,760회) → ★연도축(10회)
+#
+#   marcap 은 KRX 전 종목의 일별 시세를 '연도별 파일 하나'로 공개한다. 10년이면 10개다.
+#   · 상장폐지 종목이 그대로 들어 있다 → 생존자편향(C2)이 소스 차원에서 해결된다
+#   · Amount(거래대금)가 진값 → V6 유동성 필터의 근사오차가 사라진다
+#   · Marcap·Stocks 동봉 → 시가총액 스냅샷(F.CAP)이 공짜, 수정주가 복원의 주식수도 확보
+#   · 로그인·인증키·레이트리밋 무관 → KRX 차단/pykrx 미설치와 완전히 독립
+MARCAP_URLS = [
+    "https://raw.githubusercontent.com/FinanceData/marcap/master/data/marcap-{y}.csv.gz",
+    "https://raw.githubusercontent.com/FinanceData/marcap/master/data/marcap-{y}.parquet",
+    "https://media.githubusercontent.com/media/FinanceData/marcap/master/data/marcap-{y}.csv.gz",
+]
+_MARCAP_COLS = {"Date": "date", "Code": "code", "Name": "name", "Market": "market",
+                "Open": "open", "High": "high", "Low": "low", "Close": "close",
+                "Volume": "volume", "Amount": "value", "Marcap": "mktcap",
+                "Stocks": "shares"}
+
+
+def _marcap_year(y: int) -> Optional[pd.DataFrame]:
+    """marcap-{연도} 파일 하나 = 그 해 전 종목 전 거래일. 원본 바이트도 공용 인덱스에 보관."""
+    raw = None
+    used = ""
+    for tpl in MARCAP_URLS:
+        url = tpl.format(y=y)
+        raw = net_get(url, source="fdrcache", tries=2, as_bytes=True)
+        # ★크기로 판정하지 않는다 — 404 HTML 을 거르려는 의도였지만 정상 파일까지 놓친다.
+        #   매직바이트가 정확한 판정이다(gzip 1f8b / parquet PAR1).
+        if raw and (raw[:2] == b"\x1f\x8b" or raw[:4] == b"PAR1"):
+            used = url
+            break
+        raw = None
+    if raw is None:
+        return None
+    try:
+        if used.endswith(".parquet"):
+            d = pd.read_parquet(io.BytesIO(raw))
+        else:
+            d = pd.read_csv(io.BytesIO(raw), compression="gzip", low_memory=False)
+    except Exception as e:                                        # noqa
+        L.warn(f"marcap-{y} 파싱 실패({type(e).__name__}) — 다음 소스로 넘어갑니다.")
+        return None
+    if d is None or not len(d):
+        return None
+    d = d.rename(columns={k: v for k, v in _MARCAP_COLS.items() if k in d.columns})
+    if "date" not in d.columns and isinstance(d.index, pd.DatetimeIndex):
+        d = d.reset_index().rename(columns={d.index.name or "index": "date"})
+    if "date" not in d.columns or "code" not in d.columns or "close" not in d.columns:
+        L.warn(f"marcap-{y} 스키마가 예상과 다릅니다({list(d.columns)[:8]}) — 건너뜁니다.")
+        return None
+    d["date"] = ds_(d["date"])
+    d["code"] = d["code"].map(code6)
+    for c in ("open", "high", "low", "close", "volume", "value", "mktcap", "shares"):
+        d[c] = pd.to_numeric(d[c], errors="coerce") if c in d.columns else np.nan
+    d = d.dropna(subset=["date", "code", "close"])
+    d = d[d["close"] > 0]
+    if not len(d):
+        return None
+    d["origin"] = "marcap"
+    # 원본 보관 — 다른 전략도 그대로 재사용할 수 있게 공용 인덱스에 등록(절대 1원칙)
+    try:
+        VAULT.save_raw("price", "marcap_year", str(y), raw,
+                       "parquet" if used.endswith(".parquet") else "csv.gz",
+                       source=used, event_date=f"{y}-12-31", knowledge_date=f"{y}-12-31")
+    except Exception:
+        pass
+    return d.reindex(columns=PX_BULK_COLS)
+
+
+def harvest_marcap(years: Sequence[int]) -> Optional[pd.DataFrame]:
+    """연도축 수집 — 연도당 1회. 이미 받은 연도는 원장이 막는다."""
+    led = VAULT.load_table("marcap_years_done", "shared")
+    done = set(int(x) for x in led["year"]) if led is not None and len(led) else set()
+    todo = [int(y) for y in years if int(y) not in done]
+    if RUN_MODE == "CACHED" or CLOCK.over():
+        todo = []
+    if not todo:
+        return None
+    L.info(f"★연도축 수집 — marcap {len(todo)}개 연도 × 1회 = {len(todo)}회 "
+           f"(종목축이었다면 수천 회, 날짜축이어도 {len(todo)*246:,}회). "
+           f"상장폐지 종목·거래대금·시가총액·상장주식수가 전부 포함됩니다.")
+    QUOTA.plan("krx", len(todo), "marcap 연도축(전 시장 일봉+시총)")
+    got: List[pd.DataFrame] = []
+    ok_years: List[int] = []
+    with stage_bar(len(todo), "일봉(연도축 marcap)") as bar:
+        for y in todo:
+            if CLOCK.over():
+                CLOCK.cut(f"marcap: {len(todo)-bar.n}개 연도 남기고 중단")
+                break
+            d = _marcap_year(y)
+            bar.update(1)
+            if d is None or not len(d):
+                continue
+            got.append(d)
+            ok_years.append(y)
+            VAULT.save_shard("krx_ohlcv_daily", d, key=f"marcap_{y}", scope="shared",
+                             domain="price", source="FinanceData/marcap",
+                             note="연도축 전 시장 일봉 — 전 전략 공용")
+            base = VAULT.load_table("marcap_years_done", "shared")
+            allf = pd.concat([base, pd.DataFrame({"year": [y]})], ignore_index=True) \
+                if base is not None and len(base) else pd.DataFrame({"year": [y]})
+            VAULT.save_table("marcap_years_done", allf.drop_duplicates("year"), "shared",
+                             domain="price", source="year_ledger")
+    if not got:
+        L.warn("marcap 연도축 수집 실패 — 날짜축/종목축 경로로 진행합니다.")
+        return None
+    out = pd.concat(got, ignore_index=True)
+    L.ok(f"marcap {len(ok_years)}개 연도 확보 — {len(out):,}행 · {out['code'].nunique():,}종목 "
+         f"(호출 {len(ok_years)}회)")
+    return out
+
+
 # ── ① 거래일 달력 ───────────────────────────────────────────────────────────────────────────
 def _cal_from_sources(s: pd.Timestamp, e: pd.Timestamp) -> Tuple[Optional[pd.DatetimeIndex], str]:
     """지수 시계열 1개만 받으면 KRX 정확 거래일이 나온다(휴장일 조회 낭비 제거).
@@ -3909,10 +4026,18 @@ def apply_corporate_actions(px: pd.DataFrame) -> pd.DataFrame:
     """
     if px is None or not len(px) or "shares" not in px.columns:
         return px
-    sh = pd.to_numeric(px["shares"], errors="coerce")
+    # ★소스별로 '조정이 필요한지'가 다르다. 네이버/FDR 은 이미 수정주가를 돌려주므로
+    #   여기서 또 조정하면 이중조정이 된다. 원시 체결가를 주는 소스만 대상으로 한다.
+    RAW_SRC = ("marcap", "krx_open", "krx_mp", "pykrx")
+    org = px["origin"].astype(str) if "origin" in px.columns else pd.Series("", index=px.index)
+    raw_rows = org.isin(RAW_SRC)
+    if not raw_rows.any():
+        L.info("가격이 전부 수정주가 소스(네이버/FDR)에서 왔습니다 — 추가 조정 불필요.")
+        return px
+    sh = pd.to_numeric(px["shares"], errors="coerce").where(raw_rows)
     if float(sh.notna().mean()) < 0.20:      # '거의 비었나'는 비율로 판정(절대 건수는 규모의존)
-        L.warn("상장주식수가 거의 비어 수정주가 복원을 건너뜁니다 — 액면분할이 있는 종목은 "
-               "그 달 수익률이 인위적으로 튑니다(KRX 로그인/Open API 를 넣으면 자동 해결).")
+        L.warn("원시 체결가 소스인데 상장주식수가 비어 수정주가 복원을 건너뜁니다 — 액면분할이 "
+               "있는 종목은 그 달 수익률이 인위적으로 튑니다(marcap 경로가 살아나면 자동 해결).")
         return px
     px = px.sort_values(["code", "date"]).reset_index(drop=True)
     g = px.groupby("code", observed=True)
@@ -4102,6 +4227,14 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
                    f"전종목 수집 완료 거래일 {len(done_dates):,}일 "
                    f"(캐시 보유 거래일 {n_day:,}일)")
 
+    # ⓪ 연도축 먼저 — 성공하면 날짜축 2,760회가 통째로 불필요해진다
+    mc = harvest_marcap(range(s_ts.year, e_ts.year + 1))
+    if mc is not None and len(mc):
+        cached = mc if cached is None or not len(cached) else \
+            _px_norm(pd.concat([cached, mc], ignore_index=True))
+        have_now = set(ds_(cached["date"]).dt.strftime("%Y-%m-%d"))
+        done_dates |= have_now          # marcap 이 덮은 거래일은 날짜축 재조회 불필요
+
     cal, cal_src = trading_calendar(s_ts, e_ts)
     approx_cal = (cal_src == "bdate_approx")
     todo = [t for t in cal if t.strftime("%Y-%m-%d") not in done_dates]
@@ -4115,6 +4248,7 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     new_led: List[dict] = []
     used = Counter()
     stop_bulk_empty = False
+    swept = False
     chain = BULK_CHAIN
     if todo and RUN_MODE != "CACHED" and CLOCK.over():
         CLOCK.cut("일봉: 시간예산 초과 상태로 진입 — 신규 수집 없이 캐시로 진행")
@@ -4124,6 +4258,7 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
         if not chain:
             # 벌크가 전멸 — 죽지 않는다. 종목당 1회 스윕으로 강등하고 이유를 남긴다.
             todo = []
+            swept = True
             sw = _sweep_per_stock(want, s_ts.strftime("%Y-%m-%d"),
                                   e_ts.strftime("%Y-%m-%d"), order_hint=cap_hint,
                                   master=master if isinstance(master, pd.DataFrame) else None)
@@ -4222,7 +4357,8 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
                             ignore_index=True))
 
     # ── 잔여 보충: 벌크가 한 행도 못 준 종목만, 상한을 걸고 종목축으로 구제 ──────────────
-    px = _residual_fill(px, want, s_ts, e_ts)
+    if not swept:                 # 스윕이 이미 전 종목을 훑었으면 잔여보충은 같은 일의 반복
+        px = _residual_fill(px, want, s_ts, e_ts)
     px = apply_corporate_actions(px)          # ★반드시 저장 뒤·사용 앞 (원본은 raw 로 남는다)
 
     px = px[(px["date"] >= s_ts) & (px["date"] <= e_ts)]
@@ -4673,11 +4809,160 @@ def _kd_from_rcept(rcept: Any, rq: str, year: int) -> pd.Timestamp:
 
 _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id", "account_nm",
             "thstrm_amount", "rcept_no", "fs_kind", "tier"]
-# tier 0 = 전체 재무제표(fnlttSinglAcntAll · 회사당 1회, 계정 전부)
-# tier 1 = 다중회사 주요계정(fnlttMultiAcnt · 회사 100개당 1회, 핵심 6~13계정)
-#          → 같은 (회사·기간·계정)이 겹치면 tier 0 이 이긴다.
+# tier 0 = 단건 전체재무제표(fnlttSinglAcntAll) — 실제 접수일자를 갖는 유일한 경로
+# tier 1 = 재무제표 일괄 ZIP — 전 상장사·전 계정, 접수번호 없음(법정기한 추정)
+# tier 2 = 다중회사 주요계정(fnlttMultiAcnt) — 핵심 6~13계정
+#          같은 (회사·기간·계정)이 겹치면 낮은 tier 가 이긴다.
 EMPTY_RETRY_AFTER_D = 90        # '데이터 없음(013)' 조합의 재시도 유예 — 매일 같은 빈 키에
 #                                 한도를 태우지 않기 위한 음성 캐시(90일 뒤 자동 재시도)
+
+
+# ── ★재무제표 일괄 ZIP — 단건 API 78,000회를 약 150회 다운로드로 대체 ──────────────────────
+#
+#   DART 는 '재무제표 원본파일'을 (연도 × 보고서 × 재무제표) 단위 ZIP 으로 공개한다.
+#   한 파일에 그 기간 전 상장사가 들어 있다.
+#     12년 × 4보고서 × 3제표(BS/PL/CF) ≈ 144회 다운로드  vs  1,500사 × 13년 × 4 = 78,000 API 호출
+#   ★게다가 이 경로는 crtfc_key 를 쓰지 않아 ★일일 호출한도를 소비하지 않는다★.
+#   → 심층 계정(재고자산·매출채권·영업CF·CAPEX)이 하루가 아니라 십수 분 만에 채워진다.
+#
+#   ⚠ PIT 주의: 일괄 파일은 '최신 정정본'을 담을 수 있다. 접수번호가 없으므로
+#     knowledge_date 를 법정 제출기한(분기 45일 / 사업보고서 90일)으로 보수 추정한다.
+#     실제 접수일을 가진 단건 API 행이 있으면 그쪽(tier 0)이 항상 우선한다.
+DART_BULK_LIST = "https://opendart.fss.or.kr/disclosureinfo/fnltt/dwld/list.do"
+DART_BULK_DL = "https://opendart.fss.or.kr/cmm/downloadFnlttZip.do"
+_BULK_LINK_RE = re.compile(
+    r"download_ext002\('(?P<year>\d{4})','(?P<report>FQ|HY|TQ|FY)',\s*"
+    r"'(?P<stmt>BS|PL|CF|CE)',\s*'(?P<file>[^']+\.zip)'")
+_BULK_RQ = {"FQ": RQ["Q1"], "HY": RQ["H1"], "TQ": RQ["Q3"], "FY": RQ["FY"]}
+_BULK_SJ = {"BS": "BS", "PL": "IS", "CF": "CF"}          # CE(자본변동표)는 쓰지 않는다
+
+
+def _bulk_amount_col(cols: Sequence[str], stmt: str) -> Optional[str]:
+    """'당기' 금액 컬럼 선택. 손익·현금흐름은 3개월분이 아니라 누적분을 써야 TTM 이 성립한다."""
+    cur = [c for c in cols if str(c).strip().startswith("당기")]
+    if not cur:
+        return None
+    if stmt == "BS":
+        return cur[0]
+    acc = [c for c in cur if "누적" in re.sub(r"\s+", "", str(c))]
+    if acc:
+        return acc[0]
+    non3 = [c for c in cur if "3개월" not in re.sub(r"\s+", "", str(c))]
+    return non3[0] if non3 else cur[0]
+
+
+def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd.DataFrame:
+    """(연도×보고서×제표) ZIP 을 받아 필요한 계정만 뽑아낸다. API 쿼터를 쓰지 않는다."""
+    empty = pd.DataFrame(columns=_FS_KEEP)
+    if not DART_BULK_ZIP or RUN_MODE == "CACHED":
+        return empty
+    cached = VAULT.load_frame("dart_fnltt_bulkzip", "shared")
+    done: set = set()
+    led = VAULT.load_table("dart_bulkzip_done", "shared")
+    if led is not None and len(led):
+        done = set(zip(led["year"].astype(int), led["report"].astype(str),
+                       led["stmt"].astype(str)))
+        L.info(f"캐시 재사용: 재무 일괄 ZIP {len(done):,}개 파일 · "
+               f"{0 if cached is None else len(cached):,}행")
+    txt = net_post(DART_BULK_LIST, source="dart",
+                   referer="https://opendart.fss.or.kr/disclosureinfo/fnltt/dwld/main.do")
+    if not txt:
+        txt = net_get(DART_BULK_LIST, source="dart", tries=2,
+                      referer="https://opendart.fss.or.kr/disclosureinfo/fnltt/dwld/main.do")
+    rows = [m.groupdict() for m in _BULK_LINK_RE.finditer(str(txt or ""))]
+    if not rows:
+        L.warn("재무제표 일괄 ZIP 목록을 파싱하지 못했습니다 — 단건 API 경로로 진행합니다"
+               "(느립니다). opendart.fss.or.kr 접근 가능 여부를 확인하세요.")
+        return cached if cached is not None else empty
+    yrs = {int(y) for y in years}
+    todo = [r for r in rows if int(r["year"]) in yrs and r["stmt"] in _BULK_SJ
+            and (int(r["year"]), r["report"], r["stmt"]) not in done]
+    todo.sort(key=lambda r: (-int(r["year"]), r["report"], r["stmt"]))
+    if not todo:
+        return cached if cached is not None else empty
+    L.info(f"★재무제표 일괄 ZIP {len(todo)}개 다운로드 — 단건 API 였다면 수만 회. "
+           f"이 경로는 일일 호출한도를 쓰지 않습니다.")
+    keep_codes = set(code2corp)
+    got: List[pd.DataFrame] = []
+    new_done: List[dict] = []
+    with stage_bar(len(todo), "DART 재무 일괄 ZIP") as bar:
+        for r in todo:
+            if CLOCK.over():
+                CLOCK.cut(f"재무 일괄 ZIP: {len(todo)-bar.n}개 남기고 중단")
+                break
+            raw = net_get(DART_BULK_DL, source="dart", params={"fl_nm": r["file"]},
+                          tries=2, as_bytes=True, referer=DART_BULK_LIST)
+            bar.update(1)
+            if not raw or raw[:2] != b"PK":
+                continue
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(raw))
+            except Exception:
+                continue
+            parts = []
+            for mem in zf.namelist():
+                try:
+                    with zf.open(mem) as fh:
+                        head = pd.read_csv(fh, sep="\t", encoding="cp949",
+                                           encoding_errors="replace", dtype=str,
+                                           nrows=0, on_bad_lines="skip")
+                    amt = _bulk_amount_col(list(head.columns), r["stmt"])
+                    if amt is None:
+                        continue
+                    with zf.open(mem) as fh:
+                        for tb in pd.read_csv(fh, sep="\t", encoding="cp949",
+                                              encoding_errors="replace", dtype=str,
+                                              chunksize=200_000, on_bad_lines="skip",
+                                              low_memory=False):
+                            tb.columns = [str(c).strip() for c in tb.columns]
+                            cc = next((c for c in ("종목코드", "stock_code")
+                                       if c in tb.columns), None)
+                            ic = next((c for c in ("항목코드", "계정ID") if c in tb.columns), None)
+                            nc = next((c for c in ("항목명", "계정명") if c in tb.columns), None)
+                            if not cc or not nc or amt not in tb.columns:
+                                continue
+                            code = tb[cc].astype(str).str.replace(r"[\[\]\s]", "", regex=True) \
+                                     .map(code6)
+                            m = code.isin(keep_codes)
+                            if not m.any():
+                                continue
+                            sub = pd.DataFrame({
+                                "corp_code": code[m].map(code2corp).astype(str),
+                                "bsns_year": int(r["year"]),
+                                "reprt_code": _BULK_RQ[r["report"]],
+                                "sj_div": _BULK_SJ[r["stmt"]],
+                                "account_id": (tb.loc[m, ic].astype(str) if ic else ""),
+                                "account_nm": tb.loc[m, nc].astype(str),
+                                "thstrm_amount": tb.loc[m, amt].astype(str),
+                                "rcept_no": "",      # 일괄 파일엔 접수번호 없음 → 법정기한 추정
+                                "fs_kind": "BULKZIP", "tier": 1})
+                            parts.append(acct_keep(sub))
+                except Exception:
+                    continue
+            if parts:
+                got.append(pd.concat(parts, ignore_index=True))
+            new_done.append({"year": int(r["year"]), "report": r["report"], "stmt": r["stmt"]})
+    if new_done:
+        base = VAULT.load_table("dart_bulkzip_done", "shared")
+        allf = pd.concat([base, pd.DataFrame(new_done)], ignore_index=True) \
+            if base is not None and len(base) else pd.DataFrame(new_done)
+        VAULT.save_table("dart_bulkzip_done",
+                         allf.drop_duplicates(["year", "report", "stmt"]), "shared",
+                         domain="dart", source="bulkzip_ledger")
+    if got:
+        add = fs_compact(pd.concat(got, ignore_index=True))
+        VAULT.save_shard("dart_fnltt_bulkzip", add,
+                         key=f"{dtm.datetime.now():%Y%m%d_%H%M%S}", scope="shared",
+                         domain="dart", source="opendart:fnltt_bulk_zip",
+                         note="재무제표 일괄 ZIP — 전 전략 공용")
+        L.ok(f"재무 일괄 ZIP {len(new_done)}파일에서 {len(add):,}행 확보 "
+             f"({add['corp_code'].nunique():,}사) — 호출한도 소비 0")
+    frames = [x for x in (cached, pd.concat(got, ignore_index=True) if got else None)
+              if x is not None and len(x)]
+    if not frames:
+        return empty
+    return fs_compact(pd.concat([f.reindex(columns=_FS_KEEP) for f in frames],
+                                ignore_index=True))
 
 
 def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
@@ -4730,7 +5015,7 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
                 d[col] = None
         d["bsns_year"], d["reprt_code"] = int(y), r
         d["fs_kind"] = d["fs_div"].astype(str) if "fs_div" in d.columns else "CFS"
-        d["tier"] = 1
+        d["tier"] = 2
         d["corp_code"] = d["corp_code"].astype(str)
         return acct_keep(d[_FS_KEEP])
 
@@ -4771,7 +5056,7 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
                                                    "reprt_code": r, "sj_div": None,
                                                    "account_id": None, "account_nm": None,
                                                    "thstrm_amount": None, "rcept_no": None,
-                                                   "fs_kind": "NONE", "tier": 1}))
+                                                   "fs_kind": "NONE", "tier": 2}))
     frames = ([cached] if cached is not None and len(cached) else []) + got + seen_rows
     if not frames:
         return empty
@@ -4794,7 +5079,8 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
 
 def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
                             priority: Sequence[str] = (),
-                            max_calls: int = 0) -> pd.DataFrame:
+                            max_calls: int = 0,
+                            already: Optional[set] = None) -> pd.DataFrame:
     """★심층 티어 — 전체 재무제표(fnlttSinglAcntAll). (회사×연도×보고서) 캐시 증분.
 
     · 수집 순서 = 유동성 상위·최근 연도 먼저: 한도로 끊겨도 '투자 가능한 종목의 최근
@@ -4846,9 +5132,16 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
         L.info(f"심층 재무 대상을 유동성 상위 {len(corp_sorted):,}사로 한정합니다"
                f"(전체 {n_all:,}사). 잘린 회사는 주요계정 벌크가 덮으며, V6 유동성 하한"
                f"({MIN_ADV_KRW/1e8:.0f}억)을 통과 못 하는 종목은 어차피 편입되지 않습니다.")
+    # ★일괄 ZIP 이 이미 덮은 (회사·연도·보고서)는 단건 API 로 다시 받지 않는다.
+    #   이것이 '78,000회 = 12일' 을 사실상 0 으로 만드는 지점이다.
+    have_zip = already or set()
     jobs = [(c, int(y), r) for y in sorted(set(int(v) for v in years), reverse=True)
             for c in corp_sorted for r in RQ.values()
-            if (c, int(y), r) not in done and (c, int(y), r) not in empty_seen]
+            if (c, int(y), r) not in done and (c, int(y), r) not in empty_seen
+            and (c, int(y), r) not in have_zip]
+    if have_zip:
+        L.info(f"일괄 ZIP 이 덮은 {len(have_zip):,}조합은 단건 API 대상에서 제외 — "
+               f"남은 단건 수집 {len(jobs):,}건")
     if RUN_MODE == "CACHED":
         jobs = []
     got: List[pd.DataFrame] = []
@@ -8530,19 +8823,29 @@ def main() -> dict:
         ctx["disclosures"] = disc
         # ★2단 티어: ① 주요계정 벌크(회사 100개/호출)로 전 시장을 먼저 덮고
         #             ② 남은 잔여 호출량을 유동성 상위 회사의 전체재무제표에 쏟는다.
+        # ★일괄 ZIP 이 심층 계정(재고·매출채권·CFO·CAPEX)을 호출한도 0으로 채운다.
+        code2corp_all = (master.dropna(subset=["corp_code"])
+                         .set_index("code")["corp_code"].astype(str).to_dict())
+        fs_zip = harvest_dart_bulk_zip(code2corp_all, years)
         fs_major = harvest_dart_multi(corps, years, max_calls=budget.alloc["major"])
         # ★직원현황을 심층 재무보다 먼저. 심층은 잔여 쿼터를 전부 먹는 구조라 뒤에 두면
         #   직원현황이 매 실행 0건이 되고, size_bucket 이 전부 '규모미상'이 되어 C11 셀이
         #   (월,산업)으로 붕괴한다(규모 통제 소실). 직원현황은 심층의 1/4 규모다.
         # 심층 재무가 먼저다(B/C축의 핵심). 배분이 있으므로 순서가 굶김을 만들지 않는다.
+        zip_have = set()
+        if fs_zip is not None and len(fs_zip):
+            zip_have = set(zip(fs_zip["corp_code"].astype(str),
+                               fs_zip["bsns_year"].astype(int),
+                               fs_zip["reprt_code"].astype(str)))
         fs_deep = harvest_dart_financials(corps, years, priority=prio,
-                                          max_calls=budget.alloc["deep"])
+                                          max_calls=budget.alloc["deep"],
+                                          already=zip_have)
         emp = harvest_dart_employees(corps, years, priority=prio,
                                      max_calls=budget.alloc["employee"])
-        parts_fs = [x for x in (fs_deep, fs_major) if x is not None and len(x)]
+        parts_fs = [x for x in (fs_deep, fs_zip, fs_major) if x is not None and len(x)]
         fs = pd.concat([x.reindex(columns=_FS_KEEP) for x in parts_fs],
                        ignore_index=True) if parts_fs else pd.DataFrame(columns=_FS_KEEP)
-        del fs_deep, fs_major, parts_fs
+        del fs_deep, fs_zip, fs_major, parts_fs
         gc.collect()
         fin = refine_financials(fs)
         if len(fin):
