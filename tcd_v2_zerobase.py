@@ -154,9 +154,15 @@ DART_BULK_ZIP    = True   # ★재무제표 '일괄 ZIP'(연도×보고서×제�
 DART_BULK_MULTI  = True   # 다중회사 주요계정(fnlttMultiAcnt): 회사 100개를 한 번에 조회.
 #                           전 시장 12년을 약 1,600회로 덮는다(단건이면 16만회).
 DART_MULTI_BATCH = 100    # 한 요청에 넣을 회사 수(공식 상한 100). status 021 이 나면 낮추세요.
-NPS_MAX_CALLS    = 30000  # PACK-N 국민연금은 (종목 × 월) 교차곱이라 냉시작이면 40만 회가 넘는다.
-#                           실시간 잔여량과 이 값 중 작은 쪽으로 잘라 유동성 상위·최근 월부터
-#                           채우고, 나머지는 재실행 때 이어받는다(0 = 잔여량까지 전부).
+NPS_MAX_CALLS    = 0      # PACK-N 종목 상한(0 = 실시간 잔여가 허용하는 만큼).
+#                           ★2026-08 재설계로 (종목 × 월) 교차곱이 사라졌다 — 월은 요청이 아니라
+#                           응답에서 나온다. 종목당 검색 1 + 기간 1 + 상세 ≤3 회이므로 전 종목이
+#                           약 2만 회에 끝난다(옛 구현은 647,760회 = 65일이었고 그나마 0행이었다).
+DATAGOKR_BUDGET_SHARE = {  # ★공공데이터포털 하루치를 팩별로 나눈다. 하나가 다 먹으면 나머지가
+    "nps":     0.55,       #   매 실행 0건이 된다(DART 에서 세 번 겪은 사고와 같은 구조).
+    "procure": 0.35,       #   PACK-P 조달 — 월축이라 수요가 작지만 완주 원장이 있어 잘 이어받는다
+    "customs": 0.10,       #   PACK-X 관세 — HS 매핑이 있어야만 동작하므로 대개 수요 0
+}
 # ★DART 하루치 잔여를 소비자별로 나눈다. 가중치는 '아직 배정 안 받은 소비자들 사이의 상대값'
 #   이고, 배정은 수집 직전에 실잔여를 다시 재서 하며, 실수요보다 많이 주지 않는다.
 #   그래서 ①앞선 놈이 다 먹는 사고 ②할 일 없는 놈이 예산을 깔고 앉는 사고 를 동시에 막는다.
@@ -1970,6 +1976,7 @@ def _sess() -> requests.Session:
                           "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
                           "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"})
         _NETLOCAL.s = s
+        _krx_apply_cookies(s)      # ★새 워커 스레드도 메인의 KRX 로그인 세션을 상속한다
     return s
 
 
@@ -2034,6 +2041,34 @@ def looks_botwalled(body: str) -> bool:
     if not body or len(body) > 20000:
         return False
     return bool(_BOTWALL_RE.search(_STRIP_TAG_RE.sub(" ", body)))
+
+
+KRX_COOKIES: Dict[str, str] = {}
+
+
+def _krx_capture_cookies():
+    """로그인 성공 직후 data.krx 쿠키를 전역에 복사한다.
+
+    ★_sess() 는 스레드-로컬이다. 메인 스레드에서 로그인해도 워커 스레드의 세션에는 쿠키가
+      없어서, 날짜축 벌크(8워커)가 전부 '비인증 요청'이 된다. 그러면 서버는 JSON 대신
+      로그인 HTML 을 돌려주고, 심하면 중복로그인으로 메인 세션까지 끊긴다.
+      실측에서 프리플라이트(메인 스레드)는 통과하는데 본 수집만 전멸하는 비대칭이 그것이다."""
+    try:
+        for c in _sess().cookies:
+            if "krx.co.kr" in (c.domain or ""):
+                KRX_COOKIES[c.name] = c.value
+    except Exception:
+        pass
+
+
+def _krx_apply_cookies(s):
+    if not KRX_COOKIES:
+        return
+    try:
+        for k, v in KRX_COOKIES.items():
+            s.cookies.set(k, v, domain=".krx.co.kr", path="/")
+    except Exception:
+        pass
 
 
 def net_get(url: str, source: str = "generic", params: Optional[dict] = None,
@@ -2791,6 +2826,7 @@ class KRXMarketplace:
         self.session_ok = False
         self.state = "미시도"
         self._lk = threading.RLock()
+        self._relog = False        # 세션 만료 재로그인은 실행당 1회(무한 재귀 방지)
 
     def login(self) -> bool:
         """메인 스레드 1회 로그인. 이후 조회는 락으로 직렬화(중복로그인 CD011 자기충돌 방지)."""
@@ -2804,22 +2840,40 @@ class KRXMarketplace:
                 return False
             net_get(self.WARM, source="krx", tries=1)
             net_get(self.LOGIN_PAGE, source="krx", tries=1, referer=self.WARM)
+            # ★성공 판정은 반드시 서버가 주는 _error_code 로 한다. '부정 키워드가 없으면 성공'
+            #   이라는 옛 판정은 근거가 없었고, 실제로 거짓 양성을 냈다 — 로그에는 '로그인 성공'이
+            #   찍힌 채 이후 모든 bld 조회가 로그인 HTML 을 받아 F.CAP 48초·G.FLOW 4.6초를
+            #   통째로 버렸다(120회·12회 × 0.4초로 산술이 정확히 맞는다). KRX 정본은 CD001 만
+            #   성공으로 본다.
             for extra in ({}, {"skipDup": "Y"}):
                 body = {"mbrId": self.uid, "pw": self.pw, "mbrNm": "", "telNo": "",
-                        "certType": "", **extra}
+                        "di": "", "certType": "", **extra}
                 txt = net_post(self.LOGIN_POST, source="krx", data=body, referer=self.LOGIN_PAGE,
                                headers={"X-Requested-With": "XMLHttpRequest"})
                 if txt is None:
                     continue
-                if re.search(r"CD011|중복\s*로그인", str(txt)):
-                    L.warn("KRX 중복 로그인 감지 — 브라우저/다른 노트북의 같은 계정 로그인이 "
-                           "세션을 끊습니다. skipDup 재시도 후 진행합니다.")
+                ec = em = ""
+                try:
+                    js = json.loads(txt)
+                    ec, em = str(js.get("_error_code", "")), str(js.get("_error_message", ""))
+                except Exception:
+                    if re.search(r"CD011|중복\s*로그인", str(txt)):
+                        ec = "CD011"
+                    else:
+                        L.warn("KRX 로그인 응답이 JSON 이 아닙니다(차단 또는 레이아웃 변경) — "
+                               f"{str(txt)[:120]}")
+                        continue
+                if ec == "CD011":
+                    L.warn("KRX 중복 로그인(CD011) — 브라우저/다른 노트북의 같은 계정 로그인이 "
+                           "세션을 끊습니다. skipDup 으로 재시도합니다.")
                     continue
-                if not re.search(r"(비밀번호|불일치|실패|오류|error|fail)", str(txt)[:500], re.I):
+                if ec == "CD001":
                     self.session_ok = True
                     self.state = "로그인 성공"
-                    L.ok("KRX 마켓플레이스 로그인 성공 — 시가총액·스냅샷을 정식 경로로 수집합니다.")
+                    _krx_capture_cookies()      # ★워커 스레드가 상속할 수 있게 쿠키를 공유한다
+                    L.ok("KRX 마켓플레이스 로그인 성공(CD001) — 시가총액·수급을 정식 경로로 수집합니다.")
                     return True
+                L.warn(f"KRX 로그인 거부 — code={ec or '?'} msg={em[:80]}")
             self.state = "로그인 실패"
             L.warn("KRX 마켓플레이스 로그인 실패 — ID/PW 확인. 폴백 체인으로 정상 진행합니다.")
             return False
@@ -2844,6 +2898,18 @@ class KRXMarketplace:
             txt = net_post(self.JSON_URL, source="krx", data=body, referer=self.JSON_REF,
                            headers={"X-Requested-With": "XMLHttpRequest"})
         if not txt or txt.lstrip()[:1] not in "{[":
+            # ★HTML 이 왔다 = 세션이 없거나 끊겼다. 조용히 None 을 돌려주면 상위는 '데이터 없음'
+            #   으로 오해하고 120개월을 전부 헛돈다(실측 48초). 진단을 남기고 한 번만 재로그인한다.
+            with _NET_LK:
+                NET_STATS["krx:NOTJSON"] += 1
+                NET_LAST["krx"] = (200, f"bld={bld} 비JSON 응답(로그인 HTML 추정): "
+                                        f"{str(txt)[:130]}")
+            if self.session_ok and not self._relog:
+                self._relog = True
+                self.session_ok = False
+                L.warn("KRX 조회가 JSON 대신 HTML 을 받았습니다 — 세션 만료로 보고 1회 재로그인합니다.")
+                if self.login():
+                    return self.bld(bld, serial=serial, force=force, **params)
             return None
         try:
             js = json.loads(txt)
@@ -4760,9 +4826,10 @@ _FLOW_VAL_KEYS = ("NETBID_TRDVAL", "NETBID_TRDVAL_1", "TRDVAL")
 
 def _flow_krx_month(m0: pd.Timestamp, m1: pd.Timestamp, col: str) -> Optional[pd.DataFrame]:
     """KRX bld 직통 — 한 달 × 한 투자자 = 1회. 실패하면 None(상위가 다음 경로로 내린다)."""
+    # ★askBid/detailView/trdVolVal 은 MDCSTAT02303(개별종목 상세)의 파라미터이지 02401 의
+    #   것이 아니다. 잉여 파라미터는 게이트웨이에서 거부를 유발할 수 있어 보내지 않는다.
     rows = KRX.bld_market_split(FLOW_BLD, invstTpCd=FLOW_INVST_CD[col],
-                                strtDd=m0.strftime("%Y%m%d"), endDd=m1.strftime("%Y%m%d"),
-                                askBid="3", detailView="1", trdVolVal="2")
+                                strtDd=m0.strftime("%Y%m%d"), endDd=m1.strftime("%Y%m%d"))
     if not rows:
         return None
     d = pd.DataFrame(rows)
@@ -4826,8 +4893,19 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     months = [m for m in month_grid(start, end) if m.strftime("%Y-%m") not in have]
     # ★경로가 하나뿐이면 그 하나가 없을 때 축이 통째로 사라진다. pykrx 가 없으면 KRX 직통.
     use_krx = False
-    if months and RUN_MODE != "CACHED" and not CLOCK.over() and fn is None:
-        use_krx = _flow_krx_probe(months)
+    if months and RUN_MODE != "CACHED" and not CLOCK.over():
+        if fn is None:
+            use_krx = _flow_krx_probe(months)
+        else:
+            # ★pykrx 가 '있는데 빈손'인 경우도 있다(신버전은 KRX_ID/KRX_PW 로그인을 요구한다).
+            #   함수 존재 여부만 보고 축을 통째로 포기하지 않는다 — 한 달만 재 보고 갈아탄다.
+            _pb = PKX.call(fn, months[-1].replace(day=1).strftime("%Y%m%d"),
+                           months[-1].strftime("%Y%m%d"), "ALL", FLOW_INVESTORS[0][1])
+            if _pb is None or not len(_pb):
+                L.warn("pykrx 순매수 함수가 빈손입니다 — KRX 직통 경로로 전환을 시도합니다.")
+                use_krx = _flow_krx_probe(months)
+                if use_krx:
+                    fn = None
         if use_krx:
             L.ok("수급: pykrx 없이 KRX 정보데이터시스템 직통 경로로 수집합니다"
                  "(월축 1회 = 전 종목 · d3 복구).")
@@ -6173,6 +6251,7 @@ def harvest_hankyung(start: str, end: str,
     s_t, e_t = d_(start), d_(end)
     skip_months = skip_months or set()
     n_skip = 0
+    n_alarm = [0]                        # 레이아웃 경보는 한 번만(120개월 × 경고는 소음)
     for m0 in pd.date_range(s_t, e_t, freq="MS"):
         if m0.strftime("%Y-%m") in skip_months:
             n_skip += 1
@@ -6185,13 +6264,24 @@ def harvest_hankyung(start: str, end: str,
         seen_id: set = set()             # ★그 달에 이미 본 보고서 id
         while page <= 200:
             html = net_get(base, source="hankyung",
-                           params={"skinType": "business", "search_report_type": "CO",
+                           params={"skinType": "business",
+                                   # ★검증된 구현 3종이 쓰는 이름은 report_type 이다.
+                                   #   search_report_type 만 보내면 서버가 필터를 인식하지
+                                   #   못해 빈 표가 오고, 우리는 그걸 '데이터 없음'으로 오해한다.
+                                   "report_type": "CO", "search_report_type": "CO",
+                                   "order_type": "",
                                    "pagenum": "80", "now_page": str(page),
                                    "sdate": m0.strftime("%Y-%m-%d"),
                                    "edate": m1.strftime("%Y-%m-%d"), "search_text": ""},
                            referer="https://consensus.hankyung.com/")
-            got = _hk_rows(html)
+            got, why = _hk_rows(html)
             if not got:
+                if why in ("layout", "nohtml") and not n_alarm[0]:
+                    n_alarm[0] = 1
+                    st, head = NET_LAST.get("hankyung", ("—", ""))
+                    L.warn(f"한경 목록 파싱 실패({why}) — HTTP {st} · 응답길이 "
+                           f"{len(html or ''):,} · 첫 실패 {m0:%Y-%m} · 응답머리 "
+                           f"{str(head)[:120]}. 레이아웃·파라미터 변경 가능성이 큽니다.")
                 break                    # ★빈 페이지에서만 종료 — '80행 미만' 조기종료는
             #                              파싱 탈락이 낀 페이지에서 그 달 잔여분을 유실한다
             # ★★한경은 마지막 페이지를 넘어가면 '빈 페이지'가 아니라 ★같은 페이지를 계속
@@ -6211,27 +6301,39 @@ def harvest_hankyung(start: str, end: str,
     d = pd.DataFrame(rows)
     if len(d):
         L.ok(f"한경컨센서스 {len(d):,}건 수집")
+    elif not n_skip:
+        # ★0건도 반드시 말한다. 이 침묵 때문에 '목표주가 0% · 작성자 0%'의 원인을 못 찾았다 —
+        #   네이버 파서는 두 값을 하드코딩으로 비워 두므로, 한경이 죽으면 D축 d2 가 통째로 죽는다.
+        st, head = NET_LAST.get("hankyung", ("—", ""))
+        L.warn(f"한경컨센서스 0건 — ★목표주가·작성자의 유일한 소스라 D축 d2(목표가 리비전)가 "
+               f"통째로 결측이 됩니다. HTTP {st} · 응답머리 {str(head)[:120]}")
     return d
 
 
-def _hk_rows(html: Optional[str]) -> List[dict]:
+def _hk_rows(html: Optional[str]) -> Tuple[List[dict], str]:
+    """반환 (행들, 사유). 사유 ∈ {ok, empty, nohtml, layout} — ★0건의 이유를 구분한다.
+    구분이 없으면 '데이터 없음'과 '레이아웃 변경'과 '차단'이 전부 같은 빈 리스트가 되어,
+    한경이 통째로 죽어도 로그에 아무 흔적이 남지 않는다(실측에서 실제로 그랬다)."""
     sp = soupify(html)
     if sp is None:
-        return []
+        return [], "nohtml"
     table = None
+    # ★'td 가 있는 첫 표'는 검색폼·탭·공지 표를 집을 수 있다. 헤더 내용으로 고른다.
     for t in sp.find_all("table"):
-        if t.find("td"):
+        head = " ".join(th.get_text(" ", strip=True) for th in t.find_all("th"))
+        if "작성일" in head and ("제공출처" in head or "작성자" in head or "적정" in head):
             table = t
             break
     if table is None:
-        return []
-    heads = [clean_txt(th.get_text()) for th in table.find_all("th")]
-    idx = {h: i for i, h in enumerate(heads)}
+        blob = (html or "")[:4000]
+        return [], ("empty" if ("없습니다" in blob or "결과가 없" in blob) else "layout")
+    heads = [th.get_text(" ", strip=True) for th in table.find_all("th")]
 
     def pick(cells, *names, default=None):
-        for nm in names:
-            if nm in idx and idx[nm] < len(cells):
-                return cells[idx[nm]]
+        for nm in names:                     # ★부분포함 — '적정가격(원)' 같은 변형을 견딘다
+            for i, h in enumerate(heads):
+                if nm in h and i < len(cells):
+                    return cells[i]
         return default
 
     out = []
@@ -6254,8 +6356,16 @@ def _hk_rows(html: Optional[str]) -> List[dict]:
         if c_title_td is None:
             continue
         title = c_title_td.get_text(" ", strip=True)
-        a = c_title_td.find("a")
-        href = (a.get("href") or "") if a else ""
+        href = ""
+        for td in tds:                       # ★링크가 별도 '첨부' 셀에 있는 레이아웃도 있다
+            a = td.find("a", href=True)
+            if a and ("report_idx" in a["href"] or "downpdf" in a["href"]
+                      or a["href"].lower().endswith(".pdf")):
+                href = a["href"]
+                break
+        if not href:
+            a = c_title_td.find("a")
+            href = (a.get("href") or "") if a else ""
         m_id = re.search(r"report_idx=(\d+)", href)
         m_cd = _TITLE_CODE.search(title)
         pub = parse_kr_date(c_date)
@@ -6270,7 +6380,7 @@ def _hk_rows(html: Optional[str]) -> List[dict]:
                     "broker_name": bname, "analyst_raw": clean_txt(c_an)[:40],
                     "target_price": parse_target_price(c_tp), "opinion": str(c_op or "")[:16],
                     "pdf_url": ("https://consensus.hankyung.com" + href) if href else None})
-    return out
+    return out, ("ok" if out else "empty")
 
 
 def harvest_naver_research(start: str, end: str,
@@ -6593,118 +6703,203 @@ def _dg_items(js: Optional[dict]) -> List[dict]:
 
 
 # ── PACK-N: 국민연금 가입 사업장 (월별) ─────────────────────────────────────────────────────
-NPS_URL = "https://apis.data.go.kr/B552015/NpsBplcInfoInqireService/getBassInfoSearch"
+# ★2026-08 전면 재작성 — 옛 구현은 ★구조적으로 0행이었다(실측: 20,000호출 → 0행 → 다음
+#   실행이 같은 10,000건을 또 태우는 무한반복. 사용자 로그에서 67분을 그렇게 썼다).
+#   원인 세 가지가 전부 '스펙 불일치'였고 네트워크 문제가 아니었다:
+#     ① data_crt_ym 은 getBassInfoSearch 의 ★요청변수가 아니다(응답 필드다).
+#        월별로 120번 부르면 서버는 그 값을 무시하고 같은 응답을 120번 준다
+#        → (종목 5,398 × 월 120 = 647,760) 교차곱이 통째로 헛것이었다.
+#     ② jnngpCnt(가입자수)·crrmmNtcAmt(당월고지금액)는 이 오퍼레이션 응답에 없다.
+#        상세(getDetailInfoSearch)와 기간별(getPdAcctoSttusInfoSearch)에만 있다.
+#        → members 가 항상 0 → 전건 탈락 → 호출당 수확 0행.
+#     ③ V2 는 camelCase(wkplNm). 구현은 snake_case(wkpl_nm)를 보냈다.
+#   재설계: ★종목축 1회 검색으로 (사업장 seq × 자료생성년월)을 통째로 받고, seq 기준
+#   기간별 조회 1회로 월별 시계열 전체를 받는다. 종목당 2~4회 → 전 구간 약 2만 회.
+NPS_BASE = "https://apis.data.go.kr/B552015/NpsBplcInfoInqireServiceV2"
+NPS_SEARCH = NPS_BASE + "/getBassInfoSearchV2"          # 사업장명 → (seq, dataCrtYm) 목록
+NPS_DETAIL = NPS_BASE + "/getDetailInfoSearchV2"        # seq → 가입자수·당월고지금액
+NPS_PERIOD = NPS_BASE + "/getPdAcctoSttusInfoSearchV2"  # seq → 월별 취득/상실 시계열
 NPS_CONTRIB_RATE = 0.09                                  # 국민연금 보험료율(시행 상수)
+NPS_SIM_MIN = 80                                         # 상호 유사도 하한
+NPS_MAX_SITES = 3                                        # 한 종목이 들고 갈 사업장 수 상한
+
+
+def _nps_num(x) -> float:
+    v = pd.to_numeric(str(x).replace(",", "") if x is not None else None, errors="coerce")
+    return float(v) if pd.notna(v) else 0.0
+
+
+def _nps_sites(nm: str) -> Optional[List[dict]]:
+    """사업장명 검색 1회 — 반환은 (seq, 자료생성년월, 사업장명) 목록. None = 통신 실패."""
+    js = datagokr_call(NPS_SEARCH, {"wkplNm": str(nm)[:30], "numOfRows": 100, "pageNo": 1})
+    if js is None:
+        return None
+    return _dg_items(js)
+
+
+def _nps_preflight(names: Sequence[Tuple[str, str]]) -> bool:
+    """★쓰기 전에 재 본다. 옛 구현이 한 시간을 태운 뒤에야 '0행'을 알려줬기 때문이다.
+    상위 몇 종목만 실제로 조회해 (a) 응답이 오는지 (b) seq 가 들어 있는지 확인한다."""
+    for code, nm in list(names)[:4]:
+        it = _nps_sites(nm)
+        if it and any(str(x.get("seq") or "").strip() for x in it):
+            return True
+    st, head = NET_LAST.get("datagokr", ("—", ""))
+    L.warn(f"PACK-N 프리플라이트 실패 — 응답 {st} · {str(head)[:140]}")
+    L.warn("국민연금 팩을 이번 실행에서 비활성화합니다(호출을 더 태우지 않습니다). "
+           "확인 사항: ① 공공데이터포털에서 '국민연금 가입 사업장 내역' 활용신청 승인 여부 "
+           "② DATA_GO_KR_KEY 가 ★Decoding 키인지(Encoding 키를 넣으면 전건 실패합니다).")
+    return False
 
 
 def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
-                priority: Sequence[str] = ()) -> pd.DataFrame:
-    """상장사명으로 사업장 검색 → 상호 유사도 매칭 → (code, month) 패널.
-    knowledge_date = 귀속월 + 2개월(공공데이터포털 월 파일 공개 지연의 보수 추정 — 늦게 알았다
-    방향이므로 미래누수를 만들지 않는다). 캐시 증분·쿼터·시간예산 준수."""
-    cols = ["code", "month", "nps_members", "nps_amt", "nps_new", "nps_lost", "n_sites",
-            "match_conf"]
+                priority: Sequence[str] = (), max_calls: int = 0) -> pd.DataFrame:
+    """상장사명 → 사업장 seq → 월별 가입자·고지금액 패널.
+
+    ★축: 종목축 1회 검색 + seq 당 상세/기간 조회. 월은 ★응답에서 나오지 요청에 넣지 않는다.
+    ★원장: 성공·무매칭·통신실패를 구분해 기록한다. 옛 구현은 '호출했지만 빈손'을 어느 원장에도
+      남기지 않아, 다음 실행이 정확히 같은 잡을 같은 순서로 다시 태웠다(진척 0의 직접 원인).
+    """
+    cols = ["code", "month", "nps_members", "nps_amt", "nps_new", "nps_lost",
+            "n_sites", "match_conf"]
     if not DATA_GO_KR_KEY:
         L.info("PACK-N: DATA_GO_KR_KEY 미입력 — 국민연금 팩 자동 비활성(§8.4).")
         return pd.DataFrame(columns=cols)
     cached = VAULT.load_table("nps_corp_monthly", "shared")
-    have = set()
     if cached is not None and len(cached):
         cached = cached.copy()
         cached["month"] = ds_(cached["month"])
-        have = set(zip(cached["code"].astype(str), cached["month"].dt.strftime("%Y%m")))
-        L.info(f"캐시 재사용: 국민연금 패널 {len(cached):,}행")
+        L.info(f"캐시 재사용: 국민연금 패널 {len(cached):,}행 · "
+               f"{cached['code'].nunique():,}종목")
+    # ★원장은 '종목 단위'다 — 한 번 조회하면 그 종목의 전 기간이 한꺼번에 들어오기 때문이다.
+    done_codes: set = set()
+    led = VAULT.load_table("nps_codes_done", "shared")
+    today_ts = pd.Timestamp(dtm.date.today())
+    if led is not None and len(led):
+        led = led.copy()
+        led["tried_at"] = ds_(led["tried_at"])
+        fr = led[(today_ts - led["tried_at"]).dt.days < 90]
+        done_codes = set(fr["code"].astype(str))
+        L.info(f"PACK-N 원장: {len(done_codes):,}종목은 이미 처리(성공·무매칭 포함) — "
+               f"90일간 재조회하지 않습니다.")
     names = master.dropna(subset=["code"])
     names = names[names["name"].astype(str).str.strip() != ""]
     rank = {c: i for i, c in enumerate(priority)}
     names = names.assign(_r=names["code"].map(lambda c: rank.get(c, 10 ** 9))) \
                  .sort_values("_r")
-    # 음성 캐시 — 무매칭 (code×월) 조합을 90일간 재호출하지 않는다(잔여 쿼터 보호)
-    empty_seen: set = set()
-    neg = VAULT.load_table("nps_empty_log", "shared")
-    today_ts = pd.Timestamp(dtm.date.today())
-    if neg is not None and len(neg):
-        neg = neg.copy()
-        neg["tried_at"] = ds_(neg["tried_at"])
-        fresh_neg = neg[(today_ts - neg["tried_at"]).dt.days < 90]
-        empty_seen = set(zip(fresh_neg["code"].astype(str), fresh_neg["ym"].astype(str)))
-        if empty_seen:
-            L.info(f"PACK-N 음성 캐시: 무매칭 {len(empty_seen):,}조합 90일 재시도 유예")
-    jobs = [(r.code, r.name, m) for r in names.itertuples(index=False)
-            for m in months if (str(r.code), m.strftime("%Y%m")) not in have
-            and (str(r.code), m.strftime("%Y%m")) not in empty_seen]
-    if RUN_MODE == "CACHED":
+    jobs = [(str(r.code), str(r.name)) for r in names.itertuples(index=False)
+            if str(r.code) not in done_codes]
+    if RUN_MODE == "CACHED" or CLOCK.over():
         jobs = []
-    # ★상한 — 이 수집기는 (종목 × 월) 교차곱이라 냉시작이면 4,000종목 × 120개월 = 48만 회다.
-    #   가격에서 없앤 종목축 폭주와 정확히 같은 구조이며, 공공데이터포털 일 한도(1만)로는
-    #   40일이 넘게 걸린다. 실시간 잔여량과 NPS_MAX_CALLS 중 작은 쪽으로 자르고, 유동성
-    #   상위(priority)부터 최근 월부터 채운다 — 끊겨도 '거래 가능한 종목의 최근'이 먼저 완성.
+    got: List[dict] = []
+    new_led: List[dict] = []
+    if jobs and not _nps_preflight(jobs):
+        jobs = []
     if jobs:
-        jobs.sort(key=lambda j: (rank.get(j[0], 10 ** 9), -j[2].toordinal()))
-        room = QUOTA.remaining("datagokr")
-        cap_n = min(int(NPS_MAX_CALLS) or len(jobs), room if room > 0 else len(jobs))
-        if len(jobs) > cap_n:
-            L.info(f"PACK-N 대상 {len(jobs):,}건 중 이번 실행은 {cap_n:,}건만 진행합니다"
-                   f"(유동성 상위·최근 월 우선 · 실시간 잔여 {room:,}). "
-                   f"나머지는 재실행 시 정확히 이어받습니다 — 약 "
-                   f"{max(1, -(-len(jobs) // max(cap_n, 1)))}회 실행이면 전 구간 완비.")
+        # ★잡 1건 ≠ 호출 1건. net_get(tries=2) 이라 실패 시 2회까지 계수되고, 잡마다
+        #   검색 1 + 기간 1 + 상세 ≤NPS_MAX_SITES 를 쓴다. 잔여를 잡 수로 그대로 쓰면
+        #   실제로는 몇 배를 쏜다(실측: 10,000잡 캡으로 20,000호출을 태웠다).
+        per_job = 2 + NPS_MAX_SITES
+        room = max(0, min(int(max_calls) or 10 ** 9, QUOTA.remaining("datagokr")))
+        cap_n = min(int(NPS_MAX_CALLS) or len(jobs),
+                    (room // per_job) if room else len(jobs))
+        if cap_n <= 0:
+            L.info("PACK-N: datagokr 잔여 호출이 없어 이번 실행은 건너뜁니다"
+                   "(다음 실행이 정확히 이어받습니다).")
+            jobs = []
+        elif len(jobs) > cap_n:
+            L.info(f"PACK-N 대상 {len(jobs):,}종목 중 이번 실행은 {cap_n:,}종목"
+                   f"(유동성 상위 우선 · 실시간 잔여 {room:,}호출 ÷ 종목당 {per_job}호출). "
+                   f"나머지는 재실행이 정확히 이어받습니다 — 약 "
+                   f"{max(1, -(-len(jobs) // max(cap_n, 1)))}회 실행이면 전 종목 완비.")
             jobs = jobs[:cap_n]
-        QUOTA.plan("datagokr", len(jobs), "국민연금 사업장(종목×월)")
+    if jobs:
+        QUOTA.plan("datagokr", len(jobs) * (2 + NPS_MAX_SITES), "국민연금 사업장(종목축)")
 
     def one(job):
-        code, nm, m = job
-        js = datagokr_call(NPS_URL, {"wkpl_nm": str(nm)[:30], "numOfRows": 60, "pageNo": 1,
-                                     "data_crt_ym": m.strftime("%Y%m")})
-        items = _dg_items(js)
-        if not items:
+        code, nm = job
+        if not QUOTA.allow("datagokr"):        # ★배치 안에서도 발사 직전 확인
             return None
+        items = _nps_sites(nm)
+        if items is None:
+            return None                        # 통신 실패 — 원장에 아무것도 남기지 않는다
         tgt = clean_corp(nm)
-        members = amt = new = lost = 0.0
-        sites = 0
-        best = 0.0
+        best: Dict[str, Tuple[float, str]] = {}      # seq → (유사도, 사업장명)
         for it in items:
-            wn = str(it.get("wkplNm", ""))
-            sim = name_sim(wn, tgt)
-            if sim < 80:
+            sq = str(it.get("seq") or "").strip()
+            if not sq:
                 continue
-            best = max(best, sim)
-            sites += 1
-            members += float(pd.to_numeric(it.get("jnngpCnt"), errors="coerce") or 0)
-            amt += float(pd.to_numeric(it.get("crrmmNtcAmt"), errors="coerce") or 0)
-            new += float(pd.to_numeric(it.get("nwAcqzrCnt"), errors="coerce") or 0)
-            lost += float(pd.to_numeric(it.get("lssJnngpCnt"), errors="coerce") or 0)
-        if sites == 0 or members <= 0:
-            return {"_empty": (code, m.strftime("%Y%m"))} if QUOTA.allow(
-                "datagokr") else None
-        return {"code": code, "month": m, "nps_members": members, "nps_amt": amt,
-                "nps_new": new, "nps_lost": lost, "n_sites": float(sites),
-                "match_conf": best / 100.0}
+            sim = float(name_sim(str(it.get("wkplNm", "")), tgt))
+            if sim < NPS_SIM_MIN:
+                continue
+            if sq not in best or sim > best[sq][0]:
+                best[sq] = (sim, str(it.get("wkplNm", "")))
+        if not best:
+            return {"_none": code}             # ★서버가 '없다'고 답한 것은 반드시 기록한다
+        seqs = [s for s, _ in sorted(best.items(), key=lambda kv: -kv[1][0])][:NPS_MAX_SITES]
+        conf = max(v[0] for v in best.values()) / 100.0
+        agg: Dict[str, dict] = {}              # YYYYMM → 합산
+        for sq in seqs:
+            if not QUOTA.allow("datagokr"):
+                break
+            # 기간별 현황 — dataCrtYm 을 ★생략하면 그 사업장의 월별 시계열 전체가 온다
+            pj = datagokr_call(NPS_PERIOD, {"seq": sq, "numOfRows": 300, "pageNo": 1})
+            for it in _dg_items(pj):
+                ym = str(it.get("dataCrtYm") or "").strip()
+                if len(ym) != 6:
+                    continue
+                a = agg.setdefault(ym, {"m": 0.0, "amt": 0.0, "new": 0.0,
+                                        "lost": 0.0, "n": 0})
+                a["m"] += _nps_num(it.get("jnngpCnt"))
+                a["amt"] += _nps_num(it.get("crrmmNtcAmt"))
+                a["new"] += _nps_num(it.get("nwAcqzrCnt"))
+                a["lost"] += _nps_num(it.get("lssJnngpCnt"))
+                a["n"] += 1
+            if not agg and QUOTA.allow("datagokr"):
+                dj = datagokr_call(NPS_DETAIL, {"seq": sq, "numOfRows": 100, "pageNo": 1})
+                for it in _dg_items(dj):
+                    ym = str(it.get("dataCrtYm") or "").strip()
+                    if len(ym) != 6:
+                        continue
+                    a = agg.setdefault(ym, {"m": 0.0, "amt": 0.0, "new": 0.0,
+                                            "lost": 0.0, "n": 0})
+                    a["m"] += _nps_num(it.get("jnngpCnt"))
+                    a["amt"] += _nps_num(it.get("crrmmNtcAmt"))
+                    a["n"] += 1
+        rows = [{"code": code, "month": pd.Timestamp(f"{ym[:4]}-{ym[4:]}-01")
+                 + pd.offsets.MonthEnd(0), "nps_members": v["m"], "nps_amt": v["amt"],
+                 "nps_new": v["new"], "nps_lost": v["lost"], "n_sites": float(v["n"]),
+                 "match_conf": conf}
+                for ym, v in agg.items() if v["m"] > 0]
+        return {"_rows": rows, "_code": code} if rows else {"_none": code}
 
-    got: List[dict] = []
-    new_empty: List[dict] = []
     if jobs:
-        L.info(f"PACK-N 수집 대상 {len(jobs):,}건 (실시간 잔여 호출 "
-               f"{QUOTA.remaining('datagokr'):,}건 — 잔여만큼만 사용)")
-    for batch in chunked(jobs, 300):
-        if CLOCK.over() or not QUOTA.allow("datagokr"):
-            CLOCK.cut(f"국민연금: {len(got):,}건 수집 후 중단")
-            break
-        for r in pmap_net(one, batch, workers=min(IO_THREADS, 8), label="국민연금 사업장"):
-            if not r:
-                continue
-            if "_empty" in r:
-                new_empty.append({"code": r["_empty"][0], "ym": r["_empty"][1],
-                                  "tried_at": today_ts})
-            else:
-                got.append(r)
-    if new_empty:
-        base = neg if neg is not None and len(neg) else None
-        alle = pd.concat([base, pd.DataFrame(new_empty)], ignore_index=True) \
-            if base is not None else pd.DataFrame(new_empty)
-        VAULT.save_table("nps_empty_log",
-                         alle.sort_values("tried_at").drop_duplicates(["code", "ym"],
-                                                                      keep="last"),
-                         "shared", domain="nps", source="negative_cache")
+        L.info(f"PACK-N 수집 — ★종목축 {len(jobs):,}종목 (월은 응답에서 나옵니다. "
+               f"옛 구현은 월을 요청에 넣어 {len(jobs)*len(months):,}회를 헛돌았습니다).")
+        with stage_bar(len(jobs), "국민연금 사업장(종목축)") as bar:
+            for batch in chunked(jobs, 200):
+                if CLOCK.over() or not QUOTA.allow("datagokr"):
+                    CLOCK.cut(f"국민연금: {len(jobs)-bar.n:,}종목 남기고 중단 "
+                              f"({len(got):,}행 수집 · 재실행 시 이어받음)")
+                    break
+                for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+                    if not r:
+                        continue                       # 통신 실패 — 원장 미기록(재시도 대상)
+                    if "_none" in r:
+                        new_led.append({"code": r["_none"], "n_rows": 0,
+                                        "tried_at": today_ts})
+                    else:
+                        got += r["_rows"]
+                        new_led.append({"code": r["_code"], "n_rows": len(r["_rows"]),
+                                        "tried_at": today_ts})
+                bar.update(len(batch))
+    if new_led:
+        allf = pd.concat([led, pd.DataFrame(new_led)], ignore_index=True) \
+            if led is not None and len(led) else pd.DataFrame(new_led)
+        VAULT.save_table("nps_codes_done",
+                         allf.sort_values("tried_at").drop_duplicates("code", keep="last"),
+                         "shared", domain="nps", source="code_ledger",
+                         note="처리 완료 종목 — 성공·무매칭 모두 기록(재조회 방지)")
     frames = ([cached] if cached is not None and len(cached) else []) + \
              ([pd.DataFrame(got)] if got else [])
     if not frames:
@@ -6714,7 +6909,8 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
     N = N.dropna(subset=["code", "month"]).drop_duplicates(["code", "month"], keep="last")
     if got:
         VAULT.save_table("nps_corp_monthly", N, "shared", domain="nps",
-                         source="data.go.kr NpsBplcInfoInqireService")
+                         source="data.go.kr NpsBplcInfoInqireServiceV2")
+        L.ok(f"국민연금 {len(got):,}행 신규 · 누적 {len(N):,}행 · {N['code'].nunique():,}종목")
     return N.reindex(columns=cols)
 
 
@@ -6723,7 +6919,7 @@ G2B_URL = ("https://apis.data.go.kr/1230000/ao/ScsbidInfoService/"
            "getScsbidListSttusThngPPSSrch")
 
 
-def harvest_procurement(months: pd.DatetimeIndex) -> pd.DataFrame:
+def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = 0) -> pd.DataFrame:
     """낙찰정보 월 스윕 — 낙찰업체명·낙찰가/예정가(낙찰률)·발주기관. 사업자번호 직접 식별."""
     cols = ["ym", "corp_nm", "biz_no", "award_amt", "plan_amt", "rate", "org", "item_cls"]
     if not DATA_GO_KR_KEY:
@@ -6742,7 +6938,14 @@ def harvest_procurement(months: pd.DatetimeIndex) -> pd.DataFrame:
 
     def one(m):
         rows, page, complete = [], 1, True
+        if not QUOTA.allow("datagokr"):
+            return [], None
         while page <= 60:
+            # ★한 잡이 최대 60페이지를 돈다 — 배치 경계에서만 검사하면 한도 소진 후에도
+            #   배치당 수백 발이 더 나간다(PACK-N 이 같은 구조로 67분을 태웠다).
+            if not QUOTA.allow("datagokr"):
+                complete = False
+                break
             js = datagokr_call(G2B_URL, {"inqryDiv": "1", "type": "json",
                                          "inqryBgnDt": m.replace(day=1).strftime("%Y%m%d") + "0000",
                                          "inqryEndDt": m.strftime("%Y%m%d") + "2359",
@@ -6771,18 +6974,22 @@ def harvest_procurement(months: pd.DatetimeIndex) -> pd.DataFrame:
 
     got: List[dict] = []
     done_new: List[str] = []
-    for batch in chunked(todo, 6):
-        if CLOCK.over() or not QUOTA.allow("datagokr"):
-            CLOCK.cut(f"조달 낙찰: {len(got):,}행 수집 후 중단(완주 월만 완료 처리)")
-            break
-        for item in pmap_net(one, batch, workers=min(IO_THREADS, 6), label="조달 낙찰"):
-            if not item:
-                continue
-            r, ok_ym = item
-            if r:
-                got += r
-            if ok_ym:
-                done_new.append(ok_ym)
+    _sp0 = QUOTA.spent("datagokr")
+    with stage_bar(len(todo), "조달 낙찰(월축)") as bar:
+        for batch in chunked(todo, 6):
+            if CLOCK.over() or not QUOTA.allow("datagokr") or \
+                    (max_calls and QUOTA.spent("datagokr") - _sp0 >= max_calls):
+                CLOCK.cut(f"조달 낙찰: {len(got):,}행 수집 후 중단(완주 월만 완료 처리)")
+                break
+            for item in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+                if not item:
+                    continue
+                r, ok_ym = item
+                if r:
+                    got += r
+                if ok_ym:
+                    done_new.append(ok_ym)
+            bar.update(len(batch))
     if done_new:
         base = done_tbl if done_tbl is not None and len(done_tbl) else None
         alld = pd.concat([base, pd.DataFrame({"ym": done_new})], ignore_index=True) \
@@ -6817,7 +7024,8 @@ def load_hs_map() -> pd.DataFrame:
     return m
 
 
-def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str]) -> pd.DataFrame:
+def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
+                    max_calls: int = 0) -> pd.DataFrame:
     """HS별 월 수출 중량/금액/국가군. 키·매핑 없으면 빈 결과(팩 비활성)."""
     cols = ["ym", "hs", "grp", "exp_usd", "exp_kg"]
     if not (CUSTOMS_API_KEY or DATA_GO_KR_KEY) or not hs_codes:
@@ -6858,13 +7066,17 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str]) -> pd.Dat
         return rows
 
     got: List[dict] = []
-    for batch in chunked(jobs, 200):
-        if CLOCK.over() or not QUOTA.allow(key_src):
-            CLOCK.cut(f"관세 통관: {len(got):,}행 수집 후 중단")
-            break
-        for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), label="관세 통관"):
-            if r:
-                got += r
+    _sx0 = QUOTA.spent(key_src)
+    with stage_bar(len(jobs), "관세 통관(월×HS축)") as bar:
+        for batch in chunked(jobs, 200):
+            if CLOCK.over() or not QUOTA.allow(key_src) or \
+                    (max_calls and QUOTA.spent(key_src) - _sx0 >= max_calls):
+                CLOCK.cut(f"관세 통관: {len(got):,}행 수집 후 중단")
+                break
+            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+                if r:
+                    got += r
+            bar.update(len(batch))
     frames = ([cached] if cached is not None and len(cached) else []) + \
              ([pd.DataFrame(got)] if got else [])
     if not frames:
@@ -6927,13 +7139,15 @@ def harvest_doc_texts(disc: pd.DataFrame, master: pd.DataFrame,
         return out
 
     got: List[dict] = []
-    for batch in chunked(todo, 100):
-        if CLOCK.over() or not QUOTA.allow("dart"):
-            CLOCK.cut(f"공시원문: {len(got)//3:,}건 수집 후 중단")
-            break
-        for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), label="공시원문 BOW"):
-            if r:
-                got += r
+    with stage_bar(len(todo), "공시원문 BOW") as bar:
+        for batch in chunked(todo, 100):
+            if CLOCK.over() or not QUOTA.allow("dart"):
+                CLOCK.cut(f"공시원문: {len(got)//3:,}건 수집 후 중단")
+                break
+            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+                if r:
+                    got += r
+            bar.update(len(batch))
     frames = ([cached] if cached is not None and len(cached) else []) + \
              ([pd.DataFrame(got)] if got else [])
     if not frames:
@@ -9430,7 +9644,9 @@ def main() -> dict:
                 cr["pub_date"] = ds_(cr["pub_date"])
                 hk = cr[cr["source"].astype(str).str.contains("hankyung")]
                 cnt = hk.groupby(hk["pub_date"].dt.strftime("%Y-%m")).size()
-                hk_skip = set(cnt[cnt >= 30].index)      # 월 30건 이상이면 '덮인 월'로 간주
+                # ★문턱 30 은 너무 낮다. 한경은 월 1,000건 규모라, 수집이 40건에서 끊긴 달이
+                #   영구히 '덮인 월'로 동결된다(다른 세션이 실측으로 겪고 교정한 지점).
+                hk_skip = set(cnt[cnt >= 300].index)
                 nv = cr[cr["source"].astype(str).str.contains("naver")]
                 if len(nv):
                     nv_since = nv["pub_date"].max()
@@ -9455,6 +9671,10 @@ def main() -> dict:
         ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, Lk
 
     with RUN.step("J.PACKS", "팩 전용 수집(NPS·조달·관세·공시원문)", "L1", critical=False):
+        # ★공공데이터포털 잔여도 DART 와 같은 배분기로 나눈다. 국민연금이 잔여를 다 먹으면
+        #   조달·관세가 매 실행 0건이 된다(실측: NPS 가 20,000회를 태우는 동안 나머지는 굶었다).
+        dgb = CallBudget("datagokr", DATAGOKR_BUDGET_SHARE)
+        dgb.table({"nps": "국민연금 사업장", "procure": "조달 낙찰", "customs": "관세 통관"})
         # ★수집기별 개별 격리 — 한 팩의 예외가 나머지 팩 수집까지 무산시키지 않게 한다
         def _try(tag, fn):
             try:
@@ -9467,20 +9687,25 @@ def main() -> dict:
         _ar = ctx.get("adv_rank", pd.Series(dtype=float))
         prio_codes = list(_ar.index) if len(_ar) else master["code"].tolist()
         if "N" in ACTIVE_PACKS:
-            nps = _try("NPS", lambda: harvest_nps(master, months, priority=prio_codes))
+            nps = _try("NPS", lambda: harvest_nps(master, months, priority=prio_codes,
+                                                  max_calls=dgb.take("nps")))
             if nps is not None and len(nps):
                 _try("NPS등록", lambda: PITX.put(
                     "nps_monthly",
                     pit_mark(nps, "month", ds_(nps["month"]) + pd.offsets.MonthEnd(2),
                              origin="nps"), keys=["code"]))
         if "P" in ACTIVE_PACKS:
-            ctx["procurement"] = _try("조달", lambda: harvest_procurement(months))
+            ctx["procurement"] = _try("조달",
+                                      lambda: harvest_procurement(months,
+                                                                  max_calls=dgb.take("procure")))
         if "X" in ACTIVE_PACKS:
             ctx["hs_map"] = _try("HS매핑", load_hs_map)
             hs_list = (ctx["hs_map"]["hs"].astype(str).unique().tolist()
                        if ctx.get("hs_map") is not None and len(ctx["hs_map"]) else [])
             if hs_list:
-                ctx["customs"] = _try("관세", lambda: harvest_customs(months, hs_list))
+                ctx["customs"] = _try("관세",
+                                      lambda: harvest_customs(months, hs_list,
+                                                              max_calls=dgb.take("customs")))
             else:
                 pack_off("X", "HS↔기업 매핑 테이블(hs_corp_map) 부재 — 5단계 매핑은 자동구축 "
                               "대상이 아님(§6.3). 드라이브 공용 인덱스에 넣으면 활성화됩니다.")
