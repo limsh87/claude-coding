@@ -277,7 +277,7 @@ COLLECT_ONLY = (RUN_MODE == "COLLECT")
 if COLLECT_ONLY:
     RUN_MODE = "FULL"
 
-SCG_BUILD = "scg_v1.20260809d"
+SCG_BUILD = "scg_v1.20260810a"
 STRATEGY_TAG = "scg_v1"           # 전용 인덱스 네임스페이스 이름
 
 
@@ -460,11 +460,16 @@ _pypdf = _opt_import("pypdf", lambda: __import__("pypdf"))
 
 # PDF 파서(pdfminer)는 폰트 메타가 조금만 이상해도 경고를 줄줄이 찍는다.
 # 내용 추출에는 영향이 없고 stderr 만 채우므로 조용히 시킨다.
+# ★ 실측 로그에서 확인: pypdf 가 한국 리포트 PDF(한글 폰트명·깨진 xref)를 만나면
+#   PdfReadError 를 **로거로 줄줄이 쏟아내** 화면을 뒤덮고 진짜 진행 상황을 가린다.
+#   실패는 상태값(PARSE_FAIL/NO_TEXT_LAYER)으로 이미 집계하므로 로거는 침묵시킨다.
 import logging as _logging
 for _nm in ("pdfminer", "pdfminer.pdfinterp", "pdfminer.pdffont", "pdfminer.pdfpage",
-            "pdfminer.converter", "pdfplumber", "fitz", "PIL"):
+            "pdfminer.pdfparser", "pdfminer.pdfdocument", "pdfminer.converter",
+            "pdfplumber", "pypdf", "PyPDF2", "fontTools", "fitz", "PIL"):
     try:
-        _logging.getLogger(_nm).setLevel(_logging.ERROR)
+        _logging.getLogger(_nm).setLevel(_logging.CRITICAL)
+        _logging.getLogger(_nm).propagate = False
     except Exception:
         pass
 
@@ -3842,6 +3847,29 @@ def _nv_collect_month(y: int, m: int) -> Tuple[List[dict], bool]:
 
 RESEARCH_DONE_TABLE = "scg_research_done"
 
+# 보고서 원시 프레임의 **고정 스키마** — 소스마다 다른 결측 패턴이 dtype 을 흔들지
+# 않게 한다(판다스 concat 경고의 근본 원인 제거).
+REPORT_SCHEMA: "OrderedDict[str, str]" = OrderedDict([
+    ("source", "object"), ("rid", "object"), ("date", "datetime64[ns]"),
+    ("title", "object"), ("stock_code", "object"), ("stock_name", "object"),
+    ("broker", "object"), ("analyst", "object"), ("target_price", "float64"),
+    ("opinion", "object"), ("pdf_url", "object"), ("detail_url", "object"),
+])
+
+
+def _norm_report_frame(g: pd.DataFrame) -> pd.DataFrame:
+    """보고서 프레임을 고정 스키마로 맞춘다 — 열 구성·dtype 을 소스와 무관하게 통일."""
+    out = {}
+    for c, dt in REPORT_SCHEMA.items():
+        col = g[c] if c in g.columns else pd.Series([None] * len(g), index=g.index)
+        if dt == "float64":
+            out[c] = pd.to_numeric(col, errors="coerce").astype("float64")
+        elif dt.startswith("datetime"):
+            out[c] = ts_col(col)
+        else:
+            out[c] = col.astype("object")
+    return pd.DataFrame(out, index=g.index)
+
 
 def _load_research_done() -> Dict[Tuple[str, str], bool]:
     """(월, 소스) → 끝까지 훑었는가. 같은 키가 여러 번이면 **한 번이라도 완료면 완료**."""
@@ -3951,10 +3979,12 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
 
         got = pmap(_one, todo_ms, workers=min(4, N_IO_THREADS), label="리포트수집")
         _save_research_done(done_rows)
-        # ★ 전부 NA 인 열만 가진 프레임이 섞이면 판다스가 dtype 추론 경고를 낸다.
-        #   그런 프레임은 정보가 없으므로 애초에 제외한다(경고가 아니라 원인을 없앤다).
-        got = [g for g in got
-               if g is not None and len(g) and not g.dropna(axis=1, how="all").empty]
+        # ★ 경고의 진짜 원인은 '전부 NA 인 프레임'이 아니라 **전부 NA 인 열**이다.
+        #   네이버 파서는 target_price 를 항상 None 으로 채우므로 그 열이 object
+        #   dtype 의 all-NA 가 되고, 한경 프레임(float64)과 합쳐질 때 판다스가
+        #   dtype 을 추론하며 경고한다. 지난 라운드에 '프레임 단위'로만 걸러서
+        #   경고가 그대로 남았다 — 이번엔 **스키마를 고정**해 뿌리를 없앤다.
+        got = [_norm_report_frame(g) for g in got if g is not None and len(g)]
         if got:
             newdf = pd.concat(got, ignore_index=True)
             newdf["date"] = ts_col(newdf["date"])
@@ -4075,18 +4105,30 @@ def _adapt_foreign_reports(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 _ENGINE = ""          # bench_pdf_engines 가 채운다(워커 모듈에는 리터럴로 박힌다)
 
 
-def _pdf_text(data: bytes, max_pages: int = 3) -> str:
-    """실측으로 고른 추출기를 먼저, 실패하면 나머지를 차례로."""
+def _pdf_text(data: bytes, max_pages: int = 3) -> Optional[str]:
+    """실측으로 고른 추출기를 먼저, 실패하면 나머지를 차례로.
+
+    반환 규약이 중요하다:
+      · 문자열  — 텍스트를 얻었다
+      · ""      — 파서는 정상 동작했지만 **텍스트층이 없다**(스캔 이미지) → 종결
+      · None    — 모든 파서가 **예외로 실패**했다(손상 PDF·미지원 폰트) → 종결 아님
+    지난 실행에서 둘을 구분하지 않아, 파서를 바꾸면 살아날 파일까지 '텍스트 없음'
+    으로 종결 처리될 뻔했다. pymupdf 를 설치하면 그중 상당수가 복구된다.
+    """
+    n_exc = 0
+    n_try = 0
     for eng in dict.fromkeys([_ENGINE, "pymupdf", "pypdf", "pdfplumber"]):
         if not eng:
             continue
+        n_try += 1
         try:
             t = _pdf_text_with(eng, data, max_pages)
         except Exception:
+            n_exc += 1
             continue
         if t and t.strip():
             return t
-    return ""
+    return None if (n_try and n_exc == n_try) else ""
 
 
 _EPS_LINE = re.compile(r"EPS[^\n]{0,120}", re.I)
@@ -4374,6 +4416,8 @@ def _balanced_by_year(df: pd.DataFrame, cap: int, date_col: str = "date") -> pd.
 
 # PDF 처리 결과의 '종결' 상태 — 이 상태는 파서 버전이 같은 한 다시 시도하지 않는다.
 # (일시적 실패는 여기 없다: 다음 실행에서 자연히 재시도된다)
+# ★ PARSE_FAIL 은 **종결이 아니다** — 파서를 바꾸거나 pymupdf 를 설치하면 살아난다.
+#   다음 실행에서 다시 시도하도록 종결 집합에서 뺀다.
 PDF_TERMINAL = frozenset({"EPS_OK", "TP_ONLY", "NO_EPS_TABLE", "NO_TEXT_LAYER",
                           "NOT_PDF", "NO_URL"})
 # ★ 버전을 올리면 종결 원장이 무효가 되어 **이미 받아 둔 PDF 를 다시 파싱**한다.
@@ -4537,7 +4581,9 @@ def _pdf_extract_one(data: bytes, year: int) -> Tuple[str, dict]:
         return "NOT_PDF", {}
     text = _pdf_text(data)
     if not text or len(text.strip()) < 40:
-        return "NO_TEXT_LAYER", {}
+        # ★ 텍스트가 안 나오는 이유는 두 가지로 갈린다: 스캔 이미지(텍스트층 없음)와
+        #   파서가 손상 PDF 를 못 읽은 것. 후자는 파서를 바꾸면 살아나므로 구분한다.
+        return ("NO_TEXT_LAYER" if text is not None else "PARSE_FAIL"), {}
     eps = _eps_from_text(text, int(year))
     tp = _tp_from_text(text)
     an = ",".join(dict.fromkeys(_ANALYST_TOK.findall(text[:2500])))[:80]
@@ -4788,7 +4834,11 @@ def _pdf_text_with(engine: str, data: bytes, max_pages: int = 3) -> str:
         finally:
             doc.close()
     if engine == "pypdf" and _pypdf is not None:
-        rd = _pypdf.PdfReader(io.BytesIO(data))
+        # ★ strict=False — 한국 리포트 PDF 는 xref 가 깨졌거나 폰트명이 CP949 로
+        #   들어간 경우가 흔하다. 엄격 모드면 그런 파일을 통째로 포기하지만,
+        #   느슨한 모드는 본문 텍스트를 대부분 살려낸다(우리는 EPS/목표가 한 줄만
+        #   찾으면 된다). 실측 로그에서 PdfReadError 가 쏟아진 원인이 이것이다.
+        rd = _pypdf.PdfReader(io.BytesIO(data), strict=False)
         return "\n".join((rd.pages[i].extract_text() or "")
                          for i in range(min(max_pages, len(rd.pages))))
     if engine == "pdfplumber" and _pdfplumber is not None:
@@ -4837,10 +4887,19 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
              if str((v or {}).get("ex_ver", "")) != PDF_EX_VER}
     fresh = set(done.keys()) - stale
     never = rep[has_url & ~rep["ruid"].isin(settled) & ~rep["ruid"].isin(done.keys())]
-    redo = rep[has_url & rep["ruid"].isin(stale)]
-    if len(redo):
-        CON.say(f"구버전 추출물 {len(redo):,}건 — 이미 받아 둔 PDF 만 재파싱해 "
-                f"목표주가를 회수합니다(신규 다운로드 없음)")
+    # ★ 재파싱의 목적은 **목표주가 회수 하나**다. 리스트에서 이미 목표가를 받은 건
+    #   (한경: 실측 보유율 86%)은 재파싱해도 얻을 것이 없다. 전부 재파싱하면
+    #   단계 예산을 그대로 태우고 정작 필요한 네이버 건에 시간이 안 남는다.
+    _tp = pd.to_numeric(rep["target_price"], errors="coerce") \
+        if "target_price" in rep.columns else pd.Series(np.nan, index=rep.index)
+    _stale_all = rep["ruid"].isin(stale)
+    redo = rep[has_url & _stale_all & _tp.isna()]
+    _skip = int((has_url & _stale_all & _tp.notna()).sum())
+    if len(redo) or _skip:
+        CON.say(f"구버전 추출물 재파싱 {len(redo):,}건 — 이미 받아 둔 PDF 만 다시 열어 "
+                f"목표주가를 회수합니다(신규 다운로드 없음). "
+                f"리스트에서 이미 목표가를 받은 {_skip:,}건은 재파싱하지 않습니다 "
+                f"— 얻을 것이 없는데 예산만 태웁니다.")
     need = pd.concat([never.assign(_redo=False), redo.assign(_redo=True)],
                      ignore_index=True) if len(redo) else never.assign(_redo=False)
 
@@ -4908,16 +4967,33 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     # ★ 예상 소요를 **먼저** 보여준다. 속도 상한은 전역이라 스레드 수와 무관하고,
     #   이 산수를 안 보여준 탓에 사용자는 '멈췄다'고 볼 수밖에 없었다.
     qps_eff = sum(THROTTLE.qps(s) for s, v in alive.items() if v) or 1.0
-    eta_min = len(work_net) / qps_eff / 60.0 + len(work_local) / 600.0
-    reach = min(len(work), int((len(work_local) + qps_eff * stage_min * 60)))
+    # ★ 파싱 속도를 실측값으로 잡는다(없으면 보수적 기본값). 이전 산식은 파싱 시간을
+    #   0 으로 놓아 "170분 걸리는데 107분 예산 안에 98% 처리" 라는 모순을 인쇄했다.
+    _one_rate = float(_PDF_ENGINE.get("rate") or 0.0)
+    _n_par = PDF_PARSE_WORKERS or max(2, min(12, (RIG["cpu"] or 4) - 2))
+    parse_rate = max(0.5, (_one_rate if _one_rate > 0 else 1.0)
+                     * (_n_par if _PDF_POOL.get("ex") is not None else 1.0))
+    stage_s = stage_min * 60.0
+    t_local = len(work_local) / parse_rate                   # 로컬은 파싱만
+    net_rate = min(qps_eff, parse_rate)                      # 신규는 둘 중 느린 쪽
+    eta_min = (t_local + len(work_net) / max(net_rate, 1e-9)) / 60.0
+    if t_local >= stage_s:
+        reach = int(stage_s * parse_rate)
+    else:
+        reach = len(work_local) + int(max(0.0, stage_s - t_local) * net_rate)
+    reach = min(len(work), max(0, reach))
     CON.grid([["기존 파일 재사용", f"{len(work_local):,}건", "네트워크 0회 — 먼저 처리합니다"],
               ["신규 다운로드", f"{len(work_net):,}건",
                f"연도 균형 샘플 (전체 대상 {len(need):,}건 중)"],
               ["호스트 사전점검", ", ".join(f"{k}={'OK' if v else '차단'}"
                                             for k, v in alive.items()) or "대상 없음",
                "1건씩 실측 후 결정 (막힌 곳에는 시간을 쓰지 않습니다)"],
-              ["속도 상한", f"{qps_eff:.1f}건/초",
+              ["네트워크 상한", f"{qps_eff:.1f}건/초",
                "전역 상한 — 스레드를 늘려도 이 값을 못 넘습니다(차단 방지)"],
+              ["파싱 처리량", f"{parse_rate:.1f}건/초",
+               f"실측 {_one_rate:.1f}건/초 × {_n_par}"
+               + ("프로세스" if _PDF_POOL.get("ex") is not None else "(스레드·직렬)")
+               + " — 둘 중 **느린 쪽**이 실제 병목입니다"],
               ["예상 소요", f"{eta_min:.0f}분",
                f"이번 예산({stage_min:.0f}분) 안에 약 {reach:,}건 처리 예상"],
               ["단계 예산", f"{stage_min:.0f}분"
@@ -5147,10 +5223,34 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         pass
     _pdf_pool_close()
-    CON.ok(f"PDF 단계 종료 — 파싱 {counter['n']:,} · EPS 확보 {counter['new']:,} · "
+    CON.ok(f"PDF 단계 종료 — 파싱 {counter['n']:,} · 사실 확보 {counter['new']:,} · "
            f"기존파일 {counter['hit']:,} · 신규다운로드 {counter['net']:,} · "
            f"수신실패 {counter['fail']:,} · 누적 추출 {len(done):,}건 · "
            f"{(time.time()-t0)/60:.1f}분")
+    # ★ '왜 못 뽑았는가'를 표로 남긴다. 지난 실행은 파싱 실패가 stderr 로만 쏟아져
+    #   무엇이 얼마나 실패했는지 알 수 없었다 — 개선할 대상을 못 고른다는 뜻이다.
+    try:
+        _stat = Counter(str(r.get("status", "?")) for r in status_rows[-200000:])
+        _why = {"EPS_OK": "EPS 표 추출 성공", "TP_ONLY": "목표주가만 추출",
+                "NO_EPS_TABLE": "본문은 읽었으나 추정치 표 없음",
+                "NO_TEXT_LAYER": "텍스트층 없음(스캔 이미지) — 종결",
+                "PARSE_FAIL": "파서가 열지 못함 — 종결 아님(pymupdf 설치 시 상당수 복구)",
+                "DOWNLOAD_FAIL": "내려받기 실패 — 다음 실행에서 재시도",
+                "NOT_PDF": "PDF 가 아님", "READ_FAIL": "파일 읽기 실패"}
+        if _stat:
+            _tot = sum(_stat.values()) or 1
+            CON.grid([[k, f"{v:,}", f"{v/_tot*100:.1f}%", _why.get(k, "-")]
+                      for k, v in _stat.most_common()],
+                     ["상태", "건수", "비중", "의미"], ["l", "r", "r", "l"],
+                     title="PDF 추출 결과 분포 — 실패도 숨기지 않습니다")
+            _pf = _stat.get("PARSE_FAIL", 0)
+            if _pf and _fitz is None:
+                CON.warn(f"파서가 열지 못한 PDF {_pf:,}건 — 이 파일들은 종결 처리하지 "
+                         f"않았으므로 pymupdf 설치 후 재실행하면 그대로 회수됩니다. "
+                         f"파이썬 3.14 용 휠이 없으면 3.12 커널을 쓰거나 "
+                         f"`%pip install pymupdf --pre` 를 시도하십시오.")
+    except Exception:
+        pass
     return _attach_pdf_columns(rep, done)
 
 
@@ -6133,7 +6233,16 @@ def plan_tracks(fc_all: pd.DataFrame) -> Tuple[str, List[str], pd.DataFrame]:
     for m in thin:
         CON.warn(f"[{m}] 트랙 커버리지가 너무 얕습니다"
                  f"(월중앙 2인이상 종목 {METRIC_COV[m]['cov']}개) — 이 트랙은 건너뜁니다")
-    order = [m for m in order if m not in thin] or [primary]
+    kept = [m for m in order if m not in thin]
+    if not kept:
+        # ★ 예전에는 `or [primary]` 로 방금 '건너뜁니다' 라고 경고한 트랙을 되살렸다.
+        #   커버리지 0인 트랙이 그대로 실행돼 빈 결과가 성과표로 인쇄됐다.
+        #   되살리되 **낙인을 찍는다** — 결과가 나오는 것과 믿을 만한 것은 다르다.
+        CON.err(f"모든 트랙이 커버리지 하한 미달입니다(월중앙 2인이상 종목 <5). "
+                f"{primary} 트랙을 '참고용'으로만 실행하며, 신뢰 게이트가 성과표의 "
+                f"요약통계와 우열 판정을 차단합니다.")
+        kept = [primary]
+    order = kept
     if primary not in order:
         primary = order[0]
     CON.ok("이중 트랙 실행: " + " → ".join(f"{m}({TRACK_LABEL[m]})" for m in order)
@@ -7286,8 +7395,13 @@ def track_compare(tracks: "OrderedDict[str, dict]",
     """
     if len(tracks) < 2:
         return
-    CON.head("트랙 비교 — 빠른판(목표주가) vs 정밀판(PDF·EPS)",
-             "같은 가격·같은 유니버스·같은 파라미터 · 차이는 '예측 대상 지표' 하나뿐입니다")
+    if SYNTH_MODE["on"]:
+        CON.head("‼ 합성데이터 트랙 비교 — 실제 성과가 아닙니다",
+                 "아래 숫자는 **가짜 시장에 알파를 심어 놓고 그것을 되찾는지** 확인하는 "
+                 "계산 경로 검증용입니다. 실제 백테스트 결과는 S8~S9 에 나옵니다.")
+    else:
+        CON.head("트랙 비교 — 빠른판(목표주가) vs 정밀판(PDF·EPS)",
+                 "같은 가격·같은 유니버스·같은 파라미터 · 차이는 '예측 대상 지표' 하나뿐입니다")
     heads = ["트랙", "유니버스", "전략", "신호행", "종목수", "L/S 연율", "Sharpe",
              "MDD", "IC20", "단조성ρ"]
     rows = []
@@ -7301,7 +7415,13 @@ def track_compare(tracks: "OrderedDict[str, dict]",
                 rows.append([tag, uname, st] + _track_row(trk, ukey, st, bench))
         rows.append(["", "", "", "", "", "", "", "", "", ""])
     CON.grid(rows, heads, ["l", "l", "l", "r", "r", "r", "r", "r", "r", "r"],
-             title=f"4전략 × 2유니버스 × {len(tracks)}트랙 동시 비교 (§30 동일표본 정렬 적용)")
+             title=(("‼합성(가짜) — " if SYNTH_MODE["on"] else "")
+                    + f"4전략 × 2유니버스 × {len(tracks)}트랙 동시 비교 "
+                      f"(§30 동일표본 정렬 적용)"))
+    if SYNTH_MODE["on"]:
+        CON.warn("위 표는 **합성데이터**입니다. 심어둔 알파를 계산 경로가 복원하는지 "
+                 "보는 것이 목적이라 수치가 실제보다 훨씬 큽니다(실제 시장에는 이런 "
+                 "신호가 없습니다). 실제 성과는 [S8] 이후 표를 보십시오.")
 
     cost = []
     for met, trk in tracks.items():
@@ -7958,6 +8078,80 @@ def run_contracts(strict: bool = True) -> bool:
     _ct("C-회로", "회로차단 반개방 재탐색", c_circuit)
     _ct("C-목표가", "PDF 표지 목표주가 추출", c_tp)
     _ct("C-지연", "R5 판정식 부호 안정성", c_lag)
+
+    def c_schema():
+        """소스별 결측 패턴이 dtype 을 흔들지 않는가 — concat 경고의 뿌리.
+
+        ★ 이 계약이 없어서 같은 경고를 **두 라운드 연속** 놓쳤다. 지난번엔
+          '전부 NA 인 프레임'만 걸렀는데, 진짜 원인은 '전부 NA 인 **열**'이었다
+          (네이버 파서는 target_price 를 항상 None 으로 채운다).
+        """
+        import warnings
+        hk = pd.DataFrame([dict(source="hankyung", rid="1", date=ts("2020-01-02"),
+                                title="t", stock_code="005930", stock_name="s",
+                                broker="b", analyst="a", target_price=50000.0,
+                                opinion="BUY", pdf_url="u", detail_url="d")])
+        nv = pd.DataFrame([dict(source="naver", rid="2", date=ts("2020-01-03"),
+                                title="t2", stock_code="000660", stock_name="s2",
+                                broker="b2", analyst="", target_price=None,
+                                opinion="", pdf_url="u2", detail_url="d2")])
+        parts = [_norm_report_frame(g) for g in (hk, nv)]
+        if str(parts[1]["target_price"].dtype) != "float64":
+            return False, f"정규화 후에도 target_price dtype={parts[1]['target_price'].dtype}"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            out = pd.concat(parts, ignore_index=True)
+            bad = [x for x in w if "empty or all-NA" in str(x.message)]
+        if bad:
+            return False, f"concat 경고가 여전히 발생: {str(bad[0].message)[:60]}"
+        if len(out) != 2 or str(out["target_price"].dtype) != "float64":
+            return False, "병합 결과의 모양/타입이 어긋났다"
+        return True, "스키마 고정 → all-NA 열 dtype 경고 소멸 확인"
+
+    def c_pituni():
+        """보통주 판정이 **그 시점 이름**으로 이루어지는가(개명 소급 차단)."""
+        days = pd.to_datetime(["2020-01-31", "2020-02-29", "2020-03-31"])
+        rows = []
+        for d in days:
+            # ★ 코드 끝자리 0 이어야 보통주다(우선주 규칙) — 하네스도 그 규칙을 지킨다
+            for c, nm in (("000010", "합성스팩1호" if d < days[-1] else "정상회사"),
+                          ("000020", "그냥회사")):
+                rows.append(dict(date=d, code=c, name=nm))
+        xs = pd.DataFrame(rows)
+        P = pd.DataFrame([dict(code=c, month=d, mktcap=1e9)
+                          for d in days for c in ("000010", "000020")])
+        sec = pd.DataFrame([dict(code="000010", name="정상회사", is_common=True),
+                            dict(code="000020", name="그냥회사", is_common=True)])
+        U = universe_frame(P, sec, xs)
+        got = {(r.stock_id, pd.Timestamp(r.signal_date).strftime("%m"))
+               for r in U.itertuples(index=False)}
+        if ("000010", "01") in got or ("000010", "02") in got:
+            return False, "스팩 시절(1·2월)의 000010 이 유니버스에 남았다"
+        if ("000010", "03") not in got:
+            return False, "개명 후(3월) 000010 이 유니버스에서 빠졌다"
+        if len({g for g in got if g[0] == "000020"}) != 3:
+            return False, "무관 종목이 영향을 받았다"
+        return True, "스팩 구간 제외 · 개명 후 편입 · 타 종목 불변"
+
+    def c_ptext():
+        """_pdf_text 가 '파서 실패(None)'와 '텍스트층 없음("")'을 구분하는가."""
+        if _pdf_text(b"", 1) is not None and _pdf_text(b"", 1) != "":
+            return False, "빈 입력의 반환 규약이 어긋났다"
+        # 파서가 하나도 없으면 규약상 "" (시도 0회) — 있으면 손상 입력에 None
+        broken = b"%PDF-1.4\n" + b"\x00" * 64
+        r = _pdf_text(broken, 1)
+        if r not in (None, ""):
+            return False, f"손상 PDF 반환이 예상 밖: {type(r)}"
+        st, _ = _pdf_extract_one(broken, 2020)
+        if st not in ("PARSE_FAIL", "NO_TEXT_LAYER"):
+            return False, f"손상 PDF 상태가 {st}"
+        if "PARSE_FAIL" in PDF_TERMINAL:
+            return False, "PARSE_FAIL 이 종결 집합에 들어 있다(재시도 불가가 된다)"
+        return True, f"손상 PDF → {st} · PARSE_FAIL 은 비종결(파서 교체 시 회수)"
+
+    _ct("C-스키마", "소스별 결측이 dtype 을 흔들지 않음", c_schema)
+    _ct("C-PIT유니버스", "시점별 종목명으로 보통주 판정", c_pituni)
+    _ct("C-파싱실패", "파서 실패와 텍스트층 없음 구분", c_ptext)
     bad = [c for c in CONTRACTS if not c["ok"]]
     CON.grid([[c["id"], c["name"], "통과" if c["ok"] else "실패", c["msg"]]
               for c in CONTRACTS], ["ID", "계약", "판정", "근거"], ["l", "l", "l", "l"],
@@ -8333,7 +8527,8 @@ def run_rehearsal(strict: bool = True) -> bool:
                                                hub.slice(hub.all_dates()), sec,
                                                months, cal)[0], expect_rows=False)
             if pr is not None and len(pr):
-                _rh("유니버스 프레임", lambda: universe_frame(pr, sec), expect_rows=False)
+                _rh("유니버스 프레임",
+                    lambda: universe_frame(pr, sec, xs), expect_rows=False)
         _rh("ⓘ 벤치마크", lambda: collect_benchmark(hub, month_ends("2020-01-01",
                                                                   "2020-03-31")),
             expect_rows=False, blocking=False)
@@ -8459,6 +8654,18 @@ def run_rehearsal(strict: bool = True) -> bool:
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║ [S3] 합성데이터 스모크 — 실데이터 전에 '계산 전 경로'를 끝까지 태워본다                     ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+SYNTH_MODE: Dict[str, bool] = {"on": False}     # 합성 스모크 구간 표시(출력 낙인용)
+
+
+@contextmanager
+def synth_banner():
+    SYNTH_MODE["on"] = True
+    try:
+        yield
+    finally:
+        SYNTH_MODE["on"] = False
+
+
 def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dict:
     """알파가 '실제로 존재'하는 합성세계.
     · 각 종목의 올해 진실 EPS(tv)는 기준치(base) 대비 mis = (tv-base)/base 만큼 괴리.
@@ -8510,7 +8717,15 @@ def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dic
             arr[k:] /= 5.0
             sh[k:] *= 5.0
         px_ser[sid] = pd.Series(arr, index=days)
-        px_rows.append(pd.DataFrame({"date": days, "code": sid, "close": arr,
+        # ★ 종목명을 넣는다. 없으면 universe_frame 이 '시점별 종목명 없음' 폴백으로
+        #   빠져 **PIT 보통주 판정 경로가 스모크에서 한 번도 실행되지 않는다**
+        #   (실측 로그에서 S2b·S3 모두 폴백 메시지가 찍혔다 = 검증 공백).
+        #   개명 시나리오도 심는다: j==1 종목은 전반부에 스팩 이름을 쓴다.
+        nm = np.array([f"합성{sid[-3:]}"] * len(days), dtype=object)
+        if j == 1:
+            nm[:len(days) // 2] = "합성스팩1호"        # 전반부 스팩 → 후반부 개명
+        px_rows.append(pd.DataFrame({"date": days, "code": sid, "name": nm,
+                                     "close": arr,
                                      "volume": 1e5, "value": arr * 1e5,
                                      "mktcap": arr * sh, "shares": sh,
                                      "market": "KOSPI"}))
@@ -8562,6 +8777,11 @@ def synth_world(n_stocks: int = 60, n_analysts: int = 28, years: int = 4) -> dic
 
 
 def run_smoke(full: bool) -> bool:
+    with synth_banner():
+        return _run_smoke_inner(full)
+
+
+def _run_smoke_inner(full: bool) -> bool:
     S = synth_world()
     cfg = SCGParams()
     months = [m for m in S["months"]][6:-2]
@@ -8570,7 +8790,9 @@ def run_smoke(full: bool) -> bool:
     FLOW.io("입", "합성", "forecasts", fc, src="synth_world")
     panel, pmx = build_month_panel(S["have_dates"], S["xsec"], S["sec"], months, S["cal"])
     # (스모크는 ReturnHub 없이 단면 파생 경로를 태운다 — 폴백이 살아 있는지 검증)
-    uni_df = universe_frame(panel, S["sec"])
+    # ★ xsec 을 넘겨야 PIT(시점별 종목명) 보통주 판정 경로가 실제로 실행된다.
+    #   안 넘기면 스모크가 그 경로를 한 줄도 태우지 않는다 = 검증 공백.
+    uni_df = universe_frame(panel, S["sec"], S.get("xsec"))
 
     # ★ 스모크가 **이중 트랙 전 경로**를 그대로 태운다. 실행부에서 처음 도는 코드가
     #   하나도 없어야 한다 — 사용자 환경에서만 터지는 사고를 이 자리에서 끝낸다.
@@ -8637,6 +8859,8 @@ def report_all(suites: Dict[str, dict], bench: Optional[Dict[str, pd.Series]],
                cons: pd.DataFrame, label: str, mtab: Optional[pd.DataFrame],
                cfg: SCGParams):
     part_note = " ⚠중간결과(수집 시간예산 소진 — 부분 데이터)" if DEADLINE.tripped else ""
+    if SYNTH_MODE["on"]:
+        part_note = "  ‼ 합성데이터(가짜) — 실제 성과가 아닙니다" + part_note
     CON.head(f"성과 검증 — {label}{part_note}",
              f"metric 파라미터: {cfg.tag()} · 비용 {COST_BPS_ONEWAY:.0f}bp 편도(상위분위 net)")
     kospi = (bench or {}).get("KOSPI") if bench else None
