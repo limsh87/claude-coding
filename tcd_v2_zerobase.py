@@ -3472,27 +3472,30 @@ def harvest_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     s_ts, e_ts = d_(start), d_(end)
 
     cached = VAULT.load_frame("krx_ohlcv_daily", "shared")
-    have_dates: set = set()
     if cached is not None and len(cached):
         cached = _px_norm(cached)
-        per = cached.groupby(cached["date"])["code"].size()
-        med = float(per.median()) if len(per) else 0.0
-        # ★'그 날짜에 행이 있다' 로 완료 판정하면 안 된다 — 잔여보충으로 몇 종목만 들어온 날이
-        #   전종목 수집 완료로 오인되어 그 거래일이 영구히 반쪽으로 굳는다(부분수집 동결).
-        #   전시장 스냅샷다운 행수(중앙값의 50% 이상)를 가진 날만 완료로 본다.
-        full = per[per >= max(30.0, med * 0.5)]
-        have_dates = set(pd.DatetimeIndex(full.index).strftime("%Y-%m-%d"))
-        thin = len(per) - len(full)
-        L.info(f"캐시 재사용: 일봉 {len(cached):,}행 · {cached['code'].nunique():,}종목 · "
-               f"전종목 거래일 {len(have_dates):,}일"
-               + (f" (행수가 얕은 {thin:,}일은 부분수집으로 보고 다시 채웁니다)" if thin else ""))
 
-    # 거래일 원장 — '조회했고 결과가 있었다/휴장이었다'를 모두 기록. 재조회 원천 차단.
+    # ── 거래일 원장 = '이 날짜는 전종목 스냅샷으로 받았다'의 유일한 근거 ────────────────
+    # ★캐시에 그 날짜 행이 있다는 사실로 완료 판정하면 안 된다. 두 가지가 걸린다:
+    #   ① 잔여보충으로 몇 종목만 들어온 날이 완료로 오인되어 영구히 반쪽으로 굳는다.
+    #   ② 구버전(종목축) 캐시는 '일부 종목 × 전 기간' 이라 모든 날짜에 고르게 행이 있다.
+    #      행수 중앙값 같은 상대 기준으로는 이걸 절대 걸러낼 수 없다(전 날짜가 완료로 보인다).
+    #   원장은 신설 날짜축 경로만 쓴다 → 원장이 없으면 그 캐시는 구버전이라는 뜻이고,
+    #   날짜축으로 한 번 훑어야 한다. 2,700회(≈20분)면 되고, 구버전 행은 그대로 합쳐 쓴다.
     led = VAULT.load_table("price_dates_done", "shared")
     done_dates: set = set()
     if led is not None and len(led) and "date" in led.columns:
         done_dates = set(ds_(led["date"]).dropna().dt.strftime("%Y-%m-%d"))
-    done_dates |= have_dates
+    if cached is not None and len(cached):
+        n_day = int(cached["date"].nunique())
+        if not done_dates:
+            L.info(f"캐시 재사용: 일봉 {len(cached):,}행 · {cached['code'].nunique():,}종목 "
+                   f"(구버전 종목축 캐시로 판단 — 행은 그대로 쓰고, 전종목 커버리지 확보를 위해 "
+                   f"날짜축으로 한 번 훑습니다. 이후 실행부터는 원장이 막아 재조회하지 않습니다.)")
+        else:
+            L.info(f"캐시 재사용: 일봉 {len(cached):,}행 · {cached['code'].nunique():,}종목 · "
+                   f"전종목 수집 완료 거래일 {len(done_dates):,}일 "
+                   f"(캐시 보유 거래일 {n_day:,}일)")
 
     cal, cal_src = trading_calendar(s_ts, e_ts)
     approx_cal = (cal_src == "bdate_approx")
@@ -7671,6 +7674,10 @@ def main() -> dict:
 
     with RUN.step("F.CAP", "시가총액 스냅샷(비교전략 입력)", "L1", critical=False):
         ctx["mktcap"] = harvest_mktcap(months, px=ctx.get("px"))
+        # 원본 일봉은 여기까지만 쓰인다. 700만행 프레임을 끝까지 들고 가면 월간패널 사본과
+        # 합쳐 수백 MB 를 그냥 점유한다 — 이후 단계는 panel['daily'] 만 본다(Colab RAM).
+        ctx["px"] = None
+        gc.collect()
 
     with RUN.step("G.FLOW", "기관·외국인 수급(★월축 전종목 일괄)", "L1", critical=False):
         ctx["flows"] = harvest_flows(master["code"].tolist(), BT_START, BT_END)
