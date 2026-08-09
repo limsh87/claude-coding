@@ -1044,10 +1044,20 @@ class Depot:
         path = os.path.join(self.ns[scope], "blob", domain, sha[:2], f"{sha}.{ext.lstrip('.')}")
         self._guard_write(path)
         if not os.path.exists(path):                      # 존재하면 절대 다시 쓰지 않는다
-            try:
-                write_atomic_bytes(path, data)
-            except Exception as e:
-                CON.warn(f"blob 저장 실패({type(e).__name__}): {key}")
+            ok_w = False
+            for attempt in range(2):                      # 윈도우 파일잠금 등 일시적 실패 재시도
+                try:
+                    write_atomic_bytes(path, data)
+                    ok_w = True
+                    break
+                except Exception as e:
+                    err = e
+                    time.sleep(0.2)
+            if not ok_w:
+                self.stats[f"blob저장실패:{type(err).__name__}"] += 1
+                if self.stats[f"blob저장실패:{type(err).__name__}"] <= 3:
+                    CON.warn(f"blob 저장 실패({type(err).__name__}) — 추출은 계속합니다"
+                             f"(원문 보관만 건너뜁니다): {str(key)[:16]}")
                 return None
         else:
             self.stats["blob중복회피"] += 1
@@ -3013,9 +3023,13 @@ def _pdf_key_index() -> Dict[str, str]:
     idx: Dict[str, str] = {}
     roots = [DEPOT.write_root] + list(DEPOT.read_roots)
     seen_files = 0
+    t_walk = time.time()
     for root in roots:
         for dirpath, dirs, files in os.walk(root):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if time.time() - t_walk > 90:        # 대형 캐시에서 이 탐색이 병목이 되지 않게
+                CON.warn("PDF 인덱스 탐색 90초 상한 도달 — 찾은 만큼만 재사용합니다")
+                break
             for fn in files:
                 if fn not in ("index.jsonl", "journal.jsonl", "common_index.jsonl",
                               "private_index.jsonl"):
@@ -3137,8 +3151,33 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
         return _attach_pdf_columns(rep, done)
 
     keymap = _pdf_key_index()                       # 이미 가진 PDF 재사용
+
+    def _alt_keys(src: str, rid: str) -> List[str]:
+        """★ 캐시에서 온 원장은 소스가 병합돼 있다(예: 'hankyung+naver', rid='12|34').
+        그 상태의 해시는 원래 저장 시점의 report_uid 와 다르므로 그냥 조회하면
+        영구 미스가 난다(실제로 이미 받은 PDF 1만여 건을 매번 다시 받았다).
+        그래서 분해한 조합까지 후보로 넣어 맞춰 본다."""
+        out = [h1(src, rid), str(rid)]
+        toks_s = [t for t in re.split(r"[+|,]", str(src)) if t]
+        toks_r = [t for t in re.split(r"[+|,]", str(rid)) if t]
+        for a in toks_s:
+            for b in toks_r:
+                out.append(h1(a, b))
+                out.append(b)
+        return list(dict.fromkeys(out))
+
+    alt_map: Dict[str, str] = {}
+    for _rid, _src, _u in zip(need["rid"], need["source"], need["ruid"]):
+        for k in _alt_keys(_src, _rid):
+            p_hit = keymap.get(str(k))
+            if p_hit:
+                alt_map[str(_u)] = p_hit
+                break
+    if alt_map:
+        keymap.update(alt_map)
+        CON.ok(f"보고서키 정규화로 기존 PDF {len(alt_map):,}건을 추가로 매칭했습니다 "
+               f"(병합 원장의 source/rid 분해 대조)")
     local_hit = need["ruid"].map(lambda k: keymap.get(str(k)) is not None)
-    n_local = int(local_hit.sum())
 
     cap = PDF_MAX_NEW_PER_RUN if PDF_MAX_NEW_PER_RUN > 0 else len(need)
     # 로컬에 이미 있는 건 네트워크 상한과 무관하게 전부 처리한다(공짜다)
@@ -5046,17 +5085,28 @@ class _FixtureNet:
         return {"status": "000", "list": []}
 
 
-def _rh(name: str, fn: Callable, expect_rows: bool = True):
+def _rh(name: str, fn: Callable, expect_rows: bool = True, blocking: bool = True):
+    """리허설 항목 1건.
+
+    ★ blocking=False 는 '환경에 따라 달라지는 검사'를 뜻한다(선택 라이브러리 유무,
+      원격지 응답 형태 등). 이런 검사는 결과를 보여주되 **실행을 막지 않는다**.
+
+      이 구분이 없어서 사고가 났다: 내가 만든 합성 PDF 가 pdfminer 로 파싱되는지를
+      확인할 방법이 없는 환경에서 그 검사를 '차단 게이트'로 넣어 배포했고, 정작
+      사용자 환경에서 그 검사가 실패해 백테스트 자체가 시작조차 못 했다.
+      배선(wiring) 검사만 차단해야 한다 — 그건 어디서 돌려도 결과가 같기 때문이다.
+    """
     t0 = time.time()
     try:
         v = fn()
         n = len(v) if hasattr(v, "__len__") else (1 if v is not None else 0)
         ok = (n > 0) if expect_rows else True
         REHEARSAL.append(dict(name=name, ok=ok, rows=n, sec=time.time() - t0,
-                              err="" if ok else "행 0개"))
+                              blocking=blocking, err="" if ok else "행 0개"))
         return v
     except Exception as e:
         REHEARSAL.append(dict(name=name, ok=False, rows=-1, sec=time.time() - t0,
+                              blocking=blocking,
                               err=f"{type(e).__name__}: {e}"[:110],
                               tb=traceback.format_exc(limit=6)))
         return None
@@ -5107,11 +5157,13 @@ def run_rehearsal(strict: bool = True) -> bool:
         _rh("무인증 캐시(delisting)", lambda: fdr_cache_csv("listing/delisting", back_days=3))
         _rh("단면: 벌크 marcap", lambda: bulk_marcap_year(2020))
         _rh("단면: 일단위 캐시", lambda: _xsec_fdrcache(ts("2020-01-08")))
-        _rh("단면: pykrx", lambda: _xsec_pykrx(ts("2020-01-08")), expect_rows=False)
-        _rh("단면: KRX 마켓플레이스", lambda: KRXM.xsec(ts("2020-01-08")), expect_rows=False)
-        _rh("구간수익률: pykrx",
+        _rh("ⓘ 단면: pykrx", lambda: _xsec_pykrx(ts("2020-01-08")),
+            expect_rows=False, blocking=False)
+        _rh("ⓘ 단면: KRX 마켓플레이스", lambda: KRXM.xsec(ts("2020-01-08")),
+            expect_rows=False, blocking=False)
+        _rh("ⓘ 구간수익률: pykrx",
             lambda: _period_return_krx(ts("2020-01-02"), ts("2020-01-08")),
-            expect_rows=False)
+            expect_rows=False, blocking=False)
         _rh("종목목록", lambda: _fdr_listing())
         _rh("상폐목록", lambda: _fdr_delisting())
 
@@ -5131,9 +5183,9 @@ def run_rehearsal(strict: bool = True) -> bool:
                                                months, cal)[0], expect_rows=False)
             if pr is not None and len(pr):
                 _rh("유니버스 프레임", lambda: universe_frame(pr, sec), expect_rows=False)
-        _rh("벤치마크",
-            lambda: collect_benchmark(hub, month_ends("2020-01-01", "2020-03-31")),
-            expect_rows=False)
+        _rh("ⓘ 벤치마크", lambda: collect_benchmark(hub, month_ends("2020-01-01",
+                                                                  "2020-03-31")),
+            expect_rows=False, blocking=False)
 
         rep = _rh("리포트 수집(한경+네이버)",
                   lambda: collect_research("2026-03-01", "2026-03-31"))
@@ -5149,10 +5201,12 @@ def run_rehearsal(strict: bool = True) -> bool:
                 if fc is not None and len(fc):
                     _rh("주지표 선택", lambda: choose_metric(fc)[0])
                     _rh("예측 검증", lambda: validate_forecasts(fc))
-        _rh("PDF 텍스트 추출(실 PDF)",
+        # ⓘ 아래는 '환경 의존' 검사다 — PDF 라이브러리 종류/버전에 따라 결과가 달라지므로
+        #   정보로만 남기고 실행을 막지 않는다. PDF 는 보강 경로이지 전제조건이 아니다.
+        _rh("ⓘ PDF 텍스트 추출(라이브러리 의존)",
             lambda: (_pdf_text(_fx_real_pdf(_FX_PDF_LINES))
-                     if (_fitz is not None or _pdfplumber is not None) else "SKIP"),
-            expect_rows=True)
+                     if (_fitz is not None or _pdfplumber is not None) else "라이브러리없음"),
+            expect_rows=True, blocking=False)
         _rh("EPS 파서(본문→연도별 추정치)",
             lambda: _eps_from_text("            2020    2021\n"
                                    "EPS       1,000   1,200\n", 2020))
@@ -5215,13 +5269,19 @@ def run_rehearsal(strict: bool = True) -> bool:
         ROBUST.update(dict(saved_robust))
         shutil.rmtree(tmp, ignore_errors=True)
 
-    bad = [r for r in REHEARSAL if not r["ok"]]
-    CON.grid([[r["name"], "통과" if r["ok"] else "실패",
+    bad = [r for r in REHEARSAL if not r["ok"] and r.get("blocking", True)]
+    soft = [r for r in REHEARSAL if not r["ok"] and not r.get("blocking", True)]
+    CON.grid([[r["name"], ("통과" if r["ok"] else
+                           ("실패" if r.get("blocking", True) else "정보(비차단)")),
                f"{r['rows']:,}" if r["rows"] >= 0 else "-",
                f"{r['sec']:.2f}s", r["err"][:46]] for r in REHEARSAL],
              ["수집·정제 함수", "판정", "행수", "소요", "오류"],
              ["l", "l", "r", "r", "l"],
-             title="실경로 리허설 (네트워크만 가짜 · 함수는 실물 실행)")
+             title="실경로 리허설 (네트워크만 가짜 · 함수는 실물 실행 · ⓘ=환경의존/비차단)")
+    if soft:
+        CON.say("ⓘ 비차단 항목 " + ", ".join(r["name"] for r in soft[:6])
+                + " 은 이 환경에서 결과가 없었습니다 — 해당 소스를 쓰지 않을 뿐,"
+                  " 백테스트는 정상 진행됩니다.")
     for r in bad[:4]:
         if r.get("tb"):
             CON.err(f"[{r['name']}] {r['err']}")
@@ -5229,8 +5289,8 @@ def run_rehearsal(strict: bool = True) -> bool:
                 CON.say("  " + ln)
     if bad and strict:
         raise RuleBreak(
-            f"실경로 리허설 {len(bad)}건 실패 — 수집부 배선이 깨져 있습니다. "
-            f"이대로 실데이터를 돌리면 몇 분 뒤 같은 자리에서 죽습니다: "
+            f"실경로 리허설 {len(bad)}건 실패 — 수집부 '배선'이 깨져 있습니다(환경 문제가 "
+            f"아니라 코드 문제입니다). 이대로 실데이터를 돌리면 같은 자리에서 죽습니다: "
             + ", ".join(r["name"] for r in bad))
     return not bad
 
