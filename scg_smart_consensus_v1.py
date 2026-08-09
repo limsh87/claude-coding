@@ -28,12 +28,24 @@
 #       시장데이터 조회는 1건도 늘지 않는다. 차이는 '예측 대상 지표' 하나뿐이므로
 #       S9 비교표가 곧 "PDF 파싱이 성과로 회수되는가"의 답이 된다.
 #
+#   ▣ 전수수집을 목표로, 그러나 시간 안에 (§31·§36 기준 신뢰도 판정 동반)
+#     · PDF 파싱은 **순수 CPU 작업**이라 스레드로는 GIL 이 코어를 못 쓴다(실측 24건/분).
+#       확보(네트워크·스레드)와 파싱(CPU·프로세스)을 분리하고, 추출기는 이 장비에서
+#       **실측해서** 빠른 것을 고른다(pymupdf → pypdf → pdfplumber).
+#     · 단계 예산은 '남은 수집예산 − 백테스트 유보(30분)' 전부를 쓴다. 고정 60분은
+#       4시간 중 3시간을 놀려 전수까지 필요한 실행 횟수를 늘릴 뿐이었다.
+#     · 같은 예산이면 **(종목,월)에 2인 이상이 되는 칸부터** 받는다(§31) — 다운로드
+#       1건당 쓸 수 있는 신호가 최대가 되고, 중간에 멈춰도 표본이 쓸모 있게 남는다.
+#     · 종결 원장으로 재개가 보장되어 재실행할수록 100% 로 수렴한다. 매 실행마다
+#       '지금 결과를 믿어도 되는가'를 커버리지 표로 판정해 출력한다.
+#
 #   ▣ 막힌 소스에 시간을 쓰지 않는다 (회로차단 · 사전점검 · 진행표시)
 #     · 소스별 회로차단기: 연속 실패가 쌓이면 그 소스를 끊고, 이후 요청은 대기 0초로 통과.
 #     · PDF 단계는 시작 전에 호스트를 실측(최대 3건)하고, 막혔으면 계획에서 제외한다.
-#     · 한경컨센서스는 실행 시점에 경로 후보를 두드려 보고(신/구 라우트 × http/https)
-#       살아 있는 것을 자동 선택한다. 전부 403이면 **응답 본문을 표로 찍고** 캐시+네이버로
-#       계속 간다 — 여기서 멈추지 않는다.
+#     · 한경컨센서스는 실행 시점에 경로 후보를 두드려 보고 살아 있는 것을 자동 선택한다.
+#       홈조차 403이면 경로 문제가 아니라 **발신 IP 차단**이 확정되므로 더 두드리지 않고,
+#       차단 사실을 캐시에 남겨 쿨다운(기본 3시간) 동안은 아예 접근하지 않는다
+#       (재시도가 차단 기간을 늘린다). 그동안 캐시+네이버로 백테스트는 그대로 진행된다.
 #
 #   ▣ 캐시 절대 1원칙
 #     · 기존 구글드라이브 캐시(어느 전략이 만든 것이든)는 **읽기 전용**으로만 탐색·재활용.
@@ -121,10 +133,18 @@ RESEARCH_PDF_CAP_MONTH = 0        # (구) 월별 상한 — 아래 두 값이 �
 #    ▸ PDF 추출은 예전에 파이프라인 전체를 삼켰습니다(대상 5만건 → 4시간 소진).
 #      이제 '단계 예산'과 '한 실행당 신규 상한'으로 못박고, 종결 원장에 진행분을
 #      기록해 **다음 실행이 이어받습니다**. 여러 번 돌리면 자연히 100%로 수렴합니다.
-PDF_STAGE_BUDGET_MIN   = 60       # 이 단계가 쓸 수 있는 시간(분). 백테스트 시간을 지킵니다
-PDF_MAX_NEW_PER_RUN    = 6000     # 한 실행에서 새로 '내려받을' PDF 상한(연도 균형 샘플)
-                                  #   0 = 무제한. 이미 로컬에 있는 PDF 는 이 상한과 무관합니다
+#    ▸ **전수수집을 목표로 하되 시간은 지킨다**: 0 이면 '남은 수집예산 − 백테스트 유보분'
+#      을 이 단계에 전부 씁니다. 60 같은 고정값은 4시간 예산 중 1시간만 쓰고 3시간을
+#      놀리게 만들어, 전수까지 필요한 실행 횟수를 쓸데없이 늘렸습니다.
+PDF_STAGE_BUDGET_MIN   = 0        # 0 = 자동(권장) · 양수면 그 분(minutes)으로 고정
+BACKTEST_RESERVE_MIN   = 30       # 백테스트·강건성·저장에 남겨 둘 시간(분)
+PDF_MAX_NEW_PER_RUN    = 0        # 0 = 무제한(시간예산이 실제 통제자입니다)
+                                  #   이미 로컬에 있는 PDF 는 이 상한과 무관합니다
 PDF_PROGRESS_EVERY     = 25       # 이만큼 처리할 때마다 진행 한 줄. '멈춘 것처럼 보임' 방지
+#    ▸ PDF 파싱은 **순수 CPU 작업**이라 스레드로는 GIL 때문에 코어를 못 씁니다(실측 24건/분).
+#      확보(네트워크)와 파싱(CPU)을 분리해 파싱만 프로세스로 내보냅니다.
+PDF_PARSE_PROCESSES    = True    # False 면 스레드로만(디버깅용). 자동으로 폴백도 합니다
+PDF_PARSE_WORKERS      = 0       # 0 = 자동(코어수-2, 최대 12)
 SOURCE_CIRCUIT_FAILS   = 8        # ★ 한 소스에서 연속 실패가 이만큼 쌓이면 그 소스를 즉시 차단.
                                   #   403 으로 막힌 사이트에 단계 예산을 통째로 헌납하는 사고를
                                   #   막는다(멈춘 것처럼 보이던 진짜 원인). 성공하면 즉시 복구.
@@ -146,9 +166,14 @@ N_IO_THREADS   = 12               # 네트워크 병렬(스레드). 차단이 �
 #    소스별 초당 요청 상한(차단 방지) — **전역** 상한이라 스레드를 늘려도 이 값을 못 넘습니다.
 #    PDF 는 검색질의가 아니라 정적 파일이라 목록 조회보다 여유롭게 둡니다. 서버가 429/503 로
 #    속도를 낮추라고 하면 즉시 절반으로 줄고, 성공이 이어지면 천천히 되돌립니다.
-QPS = {"krx": 1.5, "dart": 8.0, "hankyung": 2.0, "naver": 2.5, "kind": 2.0,
+#    ★ 한경은 이미 이 PC 의 IP 를 차단했습니다(본문: "Access Denied: Your IP is blocked").
+#      다시 차단당하지 않는 것이 최우선이라, 같은 사이트를 오래 수집해 본 다른 전략의
+#      실측 정중값(초당 0.8회·동시 2)을 그대로 채택합니다. 빠르게 긁어서 다시 막히면
+#      복구에 며칠이 걸리고, 그동안 신규 수집이 통째로 불가능해집니다.
+QPS = {"krx": 1.5, "dart": 8.0, "hankyung": 0.8, "naver": 1.5, "kind": 2.0,
        "fdr": 4.0, "yahoo": 3.0, "generic": 3.0,
-       "hankyung_pdf": 5.0, "naver_pdf": 5.0}
+       "hankyung_pdf": 1.2, "naver_pdf": 4.0}
+HANKYUNG_COOLDOWN_MIN  = 180     # IP 차단 감지 후 이 시간 동안은 아예 두드리지 않습니다
 MEM_SOFT_GB    = 6.0              # 이 수준을 넘보면 청크 처리로 전환
 COST_BPS_ONEWAY = 15.0            # 십분위 성과의 왕복비용 가정(수수료+세금+슬리피지, 편도 bp)
 
@@ -242,7 +267,8 @@ _NICE = [("scipy", "scipy", "스피어만 IC 정밀계산(없으면 자체 구�
          ("pykrx", "pykrx", "KRX 시세·시총 스냅샷(1순위 가격/시총 소스)"),
          ("yfinance", "yfinance", "가격 최후 폴백"),
          ("fitz", "pymupdf", "PDF 텍스트 추출(EPS 추정치) 1순위"),
-         ("pdfplumber", "pdfplumber", "PDF 텍스트 추출 2순위")]
+         ("pypdf", "pypdf", "PDF 텍스트 추출 2순위(순수 파이썬 — 새 파이썬에서도 설치됨)"),
+         ("pdfplumber", "pdfplumber", "PDF 텍스트 추출 3순위(가장 느림)")]
 
 
 def _pip(pkgs: List[str]) -> bool:
@@ -321,6 +347,7 @@ yf = _opt_import("yfinance", lambda: __import__("yfinance"))
 #   런 전체가 죽는다. 실제로 그렇게 죽었다 — 그래서 BaseException 까지 잡는 통로로 보낸다.
 _fitz = _opt_import("pymupdf", lambda: __import__("fitz"))
 _pdfplumber = _opt_import("pdfplumber", lambda: __import__("pdfplumber"))
+_pypdf = _opt_import("pypdf", lambda: __import__("pypdf"))
 
 # PDF 파서(pdfminer)는 폰트 메타가 조금만 이상해도 경고를 줄줄이 찍는다.
 # 내용 추출에는 영향이 없고 stderr 만 채우므로 조용히 시킨다.
@@ -762,6 +789,10 @@ def pmap(fn: Callable, items: Sequence, workers: Optional[int] = None,
             i = futs[fu]
             try:
                 out[i] = fu.result()
+            except (RuleBreak, HaltRun):
+                # ★ 계약 위반과 중단 지시는 '부분 실패'가 아니다. 이걸 삼켰더니
+                #   리허설 로그에 'RuleBreak 2건'만 남고 원인이 사라졌다 — 재전파한다.
+                raise
             except Exception as e:
                 errs[type(e).__name__] += 1
             done += 1
@@ -1092,8 +1123,9 @@ class Depot:
             d = read_parquet_soft(p)
             if d is not None and len(d):
                 if need_cols and not set(need_cols).issubset(d.columns):
-                    CON.warn(f"캐시 {name} 의 스키마가 예전 버전입니다(필요 컬럼 누락) — "
-                             f"무시하고 새로 만듭니다(기존 파일은 그대로 둡니다).")
+                    CON.debug(f"캐시 {name}(내 쓰기루트) 스키마가 예전 버전 — "
+                              f"건너뛰고 다른 루트를 계속 찾습니다"
+                              f"(기존 파일은 그대로 둡니다).")
                     continue
                 FLOW.io("입", "드라이브" if self.on_drive else "로컬", f"표:{name}", d, src=f"쓰기루트/{sc}")
                 self.stats["캐시적중:쓰기루트"] += 1
@@ -1132,6 +1164,12 @@ class Depot:
                 except Exception as e:
                     err = e
                     time.sleep(0.2)
+            if not ok_w and os.path.exists(path):
+                # ★ 같은 내용(=같은 sha)을 다른 스레드가 방금 썼다. 윈도우에서 이때
+                #   os.replace 가 PermissionError 를 내는데, 파일은 멀쩡히 있다.
+                #   이걸 실패로 세면 멀쩡한 PDF 를 버리게 된다.
+                ok_w = True
+                self.stats["blob동시쓰기회피"] += 1
             if not ok_w:
                 self.stats[f"blob저장실패:{type(err).__name__}"] += 1
                 if self.stats[f"blob저장실패:{type(err).__name__}"] <= 3:
@@ -1141,10 +1179,43 @@ class Depot:
         else:
             self.stats["blob중복회피"] += 1
         uid = h1("blob", domain, key, sha)
+        bm = getattr(self, "_blobmap", None)
+        if bm is not None and domain in bm:
+            bm[domain][str(key)] = path            # 사전을 최신으로 유지
         self._register(scope, dict(uid=uid, domain=domain, key=str(key),
                                    path=os.path.relpath(path, self.write_root),
                                    fmt=ext, bytes=len(data), sha1=sha, source=source))
         return uid
+
+    def _blob_map(self, domain: str) -> Dict[str, str]:
+        """도메인별 key→경로 사전을 **한 번만** 만든다.
+        ★ 항목마다 인덱스 DataFrame 을 필터링하면 6,000건 처리에서만 6천만 번의
+          문자열 변환이 일어난다 — 조용히 몇 분을 먹는 병목이라 사전으로 바꾼다."""
+        cache = getattr(self, "_blobmap", None)
+        if cache is None:
+            cache = self._blobmap = {}
+        if domain in cache:
+            return cache[domain]
+        out: Dict[str, str] = {}
+        idx = self.index_frame("공용")
+        if len(idx):
+            m = idx[idx["domain"] == domain]
+            for k, pth, ab in zip(m["key"].astype(str), m["path"].astype(str),
+                                  (m["abs_path"].astype(str) if "abs_path" in m.columns
+                                   else [""] * len(m))):
+                if k not in out:
+                    out[k] = os.path.join(self.write_root, pth) if pth else str(ab)
+        cache[domain] = out
+        return out
+
+    def blob_path(self, domain: str, key: str) -> Optional[str]:
+        """★ 바이트가 아니라 **경로**를 돌려준다. 파싱을 별도 프로세스로 보낼 때
+        수백 KB 를 프로세스 간에 실어 보내는 대신 경로 한 줄만 넘기기 위해서다."""
+        p = self._blob_map(domain).get(str(key))
+        if p and os.path.exists(p):
+            return p
+        p = self._adopted.get((domain, str(key)))
+        return p if (p and os.path.exists(p)) else None
 
     def blob_bytes(self, domain: str, key: str) -> Optional[bytes]:
         idx = self.index_frame("공용")
@@ -1913,10 +1984,19 @@ FDR_CACHE_URL = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cac
                  "refs/heads/{br}/data/{kind}/{date}.csv")
 
 
+FDR_CACHE_LISTING_FROM = "2026-03-08"   # 이 저장소의 listing 계열 최초 존재일(실측)
+
+
 def fdr_cache_csv(kind: str, back_days: int = 21,
                   asof: Optional[pd.Timestamp] = None) -> Optional[pd.DataFrame]:
     """영업일 CSV만 존재하므로 기준일부터 거꾸로 훑는다. 인증 불필요."""
     base = (asof or pd.Timestamp.today()).normalize()
+    # ★ 이 저장소의 listing 계열은 2026-03-08 부터만 존재한다. 그 이전 날짜로 물으면
+    #   404 만 6번 찍히고(로그 오염) 시간도 버린다 — 애초에 시도하지 않는다.
+    if str(kind).startswith("listing/krx") and base < ts(FDR_CACHE_LISTING_FROM):
+        CON.debug(f"FDR 캐시 {kind}: {base:%Y-%m-%d} 은 저장소 시작일"
+                  f"({FDR_CACHE_LISTING_FROM}) 이전 — 조회 생략")
+        return None
     for i in range(back_days):
         d = base - pd.Timedelta(i, "D")
         if d.weekday() >= 5:
@@ -2976,8 +3056,20 @@ def _hk_parse_page(html: str) -> List[dict]:
     sp = soup(html)
     if sp is None:
         return []
-    table = sp.select_one("div.table_style01 table") or sp.find("table")
+    # ★ 첫 테이블을 그냥 집으면 상단 검색폼/배너 표를 잡는다. 오래 수집해 본 다른
+    #   전략은 '작성일 + (제공출처|작성자)' 헤더로 표를 식별한다 — 그 규칙을 따른다.
+    table = None
+    for t in sp.find_all("table"):
+        head = " ".join(th.get_text(strip=True) for th in t.find_all("th"))
+        if "작성일" in head and ("제공출처" in head or "작성자" in head):
+            table = t
+            break
+    table = table or sp.select_one("div.table_style01 table") or sp.find("table")
     if table is None:
+        return []
+    # 결과없음 페이지는 colspan 안내행 하나뿐이다 — 레이아웃 변경으로 오판하지 않는다
+    body_txt = table.get_text(" ", strip=True)
+    if "없습니다" in body_txt or "결과가 없" in body_txt:
         return []
     heads = [th.get_text(strip=True) for th in table.select("thead th")] or \
             [th.get_text(strip=True) for th in table.find_all("th")]
@@ -3019,8 +3111,28 @@ def _hk_parse_page(html: str) -> List[dict]:
 
 
 def _hk_params(sdate: str, edate: str, page: int, n: int = 80) -> dict:
+    # ★ report_type / search_report_type — 사이트가 이름을 바꾼 이력이 있어 둘 다 싣는다.
+    #   서버는 모르는 파라미터를 무시하므로 부작용이 없고, 한 번의 요청으로 양쪽을 만족한다.
     return {"skinType": "business", "search_text": "", "pagenum": str(n),
-            "sdate": sdate, "edate": edate, "now_page": str(page), "report_type": "CO"}
+            "sdate": sdate, "edate": edate, "now_page": str(page),
+            "report_type": "CO", "search_report_type": "CO", "order_type": ""}
+
+
+def _hk_block_state(save: Optional[dict] = None) -> Optional[dict]:
+    """한경 차단 상태를 공용 인덱스에 영속화(다음 실행이 이어받는다)."""
+    if DEPOT is None:
+        return None
+    fp = os.path.join(DEPOT.ns["공용"], "index", "hankyung_block.json")
+    if save is not None:
+        try:
+            write_atomic_text(fp, json.dumps(save, ensure_ascii=False))
+        except Exception:
+            pass
+        return save
+    try:
+        return json.loads(open(fp, encoding="utf-8").read())
+    except Exception:
+        return None
 
 
 def hk_probe() -> bool:
@@ -3038,18 +3150,37 @@ def hk_probe() -> bool:
     if HK["probed"]:
         return bool(HK["alive"])
     HK["probed"] = True
+    # ★ 차단 상태를 캐시에 남겨 둔다. 차단된 IP 를 매 실행 다시 두드리는 것은
+    #   시간 낭비일 뿐 아니라 **차단 기간을 연장시키는 행동**이다.
+    st = _hk_block_state()
+    if st and st.get("until", 0) > time.time():
+        left = (st["until"] - time.time()) / 60.0
+        CON.warn(f"한경컨센서스: 직전 실행에서 IP 차단이 확인되어 쿨다운 중입니다 "
+                 f"(약 {left:.0f}분 남음 · 사유: {str(st.get('why'))[:60]}). "
+                 f"이번 실행은 두드리지 않고 캐시+네이버로 진행합니다 — "
+                 f"차단을 더 길게 만들지 않기 위해서입니다.")
+        CIRCUIT.open_now("hankyung", f"쿨다운 {left:.0f}분 남음")
+        return False
     ed = _dt.date.today()
     sd = ed - _dt.timedelta(days=20)
     rows, winner = [], None
 
-    warm = "-"
+    warm, home_ok = "-", False
     try:                                    # ⓑ 대비: 홈을 먼저 열어 세션 쿠키를 받는다
-        sc, _b, _e, nck = _probe_get(_HK_HOME, timeout=15)
+        sc, hb, _e, nck = _probe_get(_HK_HOME, timeout=15)
         warm = f"HTTP {sc} · 쿠키 {nck}개"
+        home_ok = (sc == 200)
+        if not home_ok:
+            # ★ 홈조차 막혔다면 목록 경로를 세 번 더 두드릴 이유가 없다.
+            #   경로 문제가 아니라 **발신 IP 문제**임이 이 한 번으로 확정된다.
+            body = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ",
+                                              decode_kr(hb, _e)[:400])).strip()[:70]
+            rows.append(["홈(추가 시도 생략)", f"HTTP {sc}", f"{len(hb):,}B", "-",
+                         body or "-"])
     except Exception as e:
         warm = f"실패({type(e).__name__})"
 
-    for name, lurl, purl in _HK_CANDIDATES:
+    for name, lurl, purl in (_HK_CANDIDATES if home_ok else []):
         try:
             sc, content, enc, _ = _probe_get(
                 lurl, params=_hk_params(sd.isoformat(), ed.isoformat(), 1, 20),
@@ -3074,6 +3205,9 @@ def hk_probe() -> bool:
     if winner:
         CON.ok(f"한경컨센서스 사용 경로: {winner[0]} — {winner[1]}")
     else:
+        why = next((r[4] for r in rows if r[4] and r[4] != "-"), "403/차단")
+        _hk_block_state(save=dict(until=time.time() + HANKYUNG_COOLDOWN_MIN * 60,
+                                  why=why, at=_now_iso()))
         CIRCUIT.open_now("hankyung",
                          "모든 후보 경로가 403/차단 — 발신 IP 또는 WAF 정책으로 판단")
         CON.warn("한경컨센서스 신규 수집을 건너뜁니다. 원인은 위 표의 본문에서 확인하세요. "
@@ -3256,24 +3390,20 @@ def _adapt_foreign_reports(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║ [S4-e] PDF 원문 — 다운로드(blob) + EPS 추정치·작성자 추출                                  ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+_ENGINE = ""          # bench_pdf_engines 가 채운다(워커 모듈에는 리터럴로 박힌다)
+
+
 def _pdf_text(data: bytes, max_pages: int = 3) -> str:
-    if not data or not data[:5].startswith(b"%PDF"):
-        return ""
-    if _fitz is not None:
+    """실측으로 고른 추출기를 먼저, 실패하면 나머지를 차례로."""
+    for eng in dict.fromkeys([_ENGINE, "pymupdf", "pypdf", "pdfplumber"]):
+        if not eng:
+            continue
         try:
-            doc = _fitz.open(stream=data, filetype="pdf")
-            t = "\n".join(doc[i].get_text() for i in range(min(max_pages, doc.page_count)))
-            doc.close()
+            t = _pdf_text_with(eng, data, max_pages)
+        except Exception:
+            continue
+        if t and t.strip():
             return t
-        except Exception:
-            pass
-    if _pdfplumber is not None:
-        try:
-            with _pdfplumber.open(io.BytesIO(data)) as pdf:
-                return "\n".join((pg.extract_text() or "")
-                                 for pg in pdf.pages[:max_pages])
-        except Exception:
-            pass
     return ""
 
 
@@ -3317,6 +3447,63 @@ def _eps_from_text(text: str, report_year: int) -> Dict[str, float]:
     return out
 
 
+def h1_trail(*parts) -> str:
+    """구분자를 **각 조각 뒤에 붙이는** 해시 — 다른 전략(TCD v2 계열)의 report_uid 규칙.
+
+    ★ 이게 매칭률 2.4%(10,244건 중 249건)의 진짜 원인이었다. 내 h1 은 조각들을
+      \x1e 로 **사이에** 이어 붙이는데, 저쪽은 \x1f 를 **마지막 조각 뒤에도** 붙인다.
+      규칙이 한 글자 다르면 해시는 영원히 안 맞는다. 그래서 이미 디스크에 있는
+      PDF 1만 건을 매 실행 다시 받고 있었다. 두 규칙을 모두 후보로 넣는다.
+    """
+    h = hashlib.sha1()
+    for x in parts:
+        h.update(str(x).encode("utf-8", "ignore"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def _pdf_alias_from_master(roots: List[str]) -> Dict[str, str]:
+    """다른 전략의 보고서 마스터에서 '(source,rid) → report_uid' 를 **읽어 온다**.
+
+    ★ 해시 규칙을 재현하는 것보다 확실하다 — 저쪽이 직접 적어 둔 대응표를 쓰는 것이니
+      규칙이 또 바뀌어도 안 깨진다. (research_report_master.parquet 계열)
+    """
+    out: Dict[str, str] = {}
+    pats = ("research_report_master", "report_master", "reports_master")
+    seen, t_lim = 0, time.time() + 60          # 대형 캐시에서 이 탐색이 병목이 되지 않게
+    for root in roots:
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if time.time() > t_lim:
+                break
+            for fn in files:
+                if not fn.endswith(".parquet") or not any(t in fn for t in pats):
+                    continue
+                try:
+                    df = pd.read_parquet(os.path.join(dirpath, fn))
+                except Exception:
+                    continue
+                cols = {str(c).lower(): c for c in df.columns}
+                cu = cols.get("report_uid")
+                cs, cr = cols.get("source"), cols.get("src_report_id") or cols.get("rid")
+                if not (cu and cr):
+                    continue
+                seen += 1
+                for u, sr, rr in zip(df[cu].astype(str),
+                                     df[cs].astype(str) if cs else ["" ] * len(df),
+                                     df[cr].astype(str)):
+                    if not u or u == "nan":
+                        continue
+                    for b in [t for t in re.split(r"[+|,]", rr) if t]:
+                        out.setdefault(b, u)
+                        for a in [t for t in re.split(r"[+|,]", sr) if t]:
+                            out.setdefault(f"{a}\x00{b}", u)
+    if out:
+        CON.ok(f"타 전략 보고서 마스터 {seen}개에서 '(소스,보고서번호) → 저장키' "
+               f"대응 {len(out):,}건을 읽었습니다 — 해시 규칙 추측 없이 직접 대조합니다")
+    return out
+
+
 def _pdf_key_index() -> Dict[str, str]:
     """기존 캐시(내 것 + 다른 전략 것)의 '보고서키 → PDF 실제경로' 지도.
 
@@ -3356,12 +3543,21 @@ def _pdf_key_index() -> Dict[str, str]:
                     key = str(rec.get("key") or "").strip()
                     if not key:
                         continue
-                    p = rec.get("abs_path") or rec.get("path")
+                    # ★ abs_path 는 **저장한 그 PC** 기준으로 박혀 있다(콜랩이면
+                    #   /content/drive/... 이라 이 PC 엔 없다). 그래서 존재를 확인해
+                    #   고르고, 없으면 캐시루트+상대경로로 되돌린다.
+                    cands = []
+                    rel = rec.get("path")
+                    if rel:
+                        rel = str(rel)
+                        cands.append(rel if os.path.isabs(rel) else os.path.join(
+                            os.path.dirname(os.path.dirname(dirpath)), rel))
+                    if rec.get("abs_path"):
+                        cands.append(str(rec["abs_path"]))
+                    p = next((c for c in cands if os.path.exists(c)),
+                             cands[0] if cands else "")
                     if not p:
                         continue
-                    p = str(p)
-                    if not os.path.isabs(p):
-                        p = os.path.join(os.path.dirname(os.path.dirname(dirpath)), p)
                     idx.setdefault(key, p)
                     for fld in ("source", "url", "src_url"):
                         for mm in id_re.finditer(str(rec.get(fld) or "")):
@@ -3383,6 +3579,25 @@ def _pdf_key_index() -> Dict[str, str]:
     return idx
 
 
+def _priority_by_coverage(df: pd.DataFrame) -> pd.DataFrame:
+    """같은 예산이면 **성과검증에 실제로 쓰이는 칸**부터 채운다.
+
+    ★ SCG 는 (종목, 신호월)에 애널리스트가 **2명 이상**이라야 컨센서스가 성립한다(§31).
+      1명뿐인 칸을 100건 받아 봐야 신호는 0개다. 그래서 같은 (종목,월)에 보고서가
+      여러 건 있는 것부터 받는다 — 다운로드 1건당 '쓸 수 있는 신호'가 최대가 된다.
+      전수수집이 끝나면 결과는 어차피 같고, 중간에 멈춰도 표본이 쓸모 있게 남는다.
+    """
+    if df is None or df.empty or "stock_code" not in df.columns:
+        return df
+    d = df.copy()
+    d["_m"] = ts_col(d["date"]).dt.to_period("M").astype(str)
+    grp = d.groupby(["stock_code", "_m"], observed=True)["rid"].transform("size")
+    d["_cell"] = grp.fillna(1)
+    # 칸 밀도 내림차순 → 같은 밀도면 날짜순(결정적)
+    d = d.sort_values(["_cell", "date"], ascending=[False, True], kind="stable")
+    return d.drop(columns=["_m", "_cell"], errors="ignore")
+
+
 def _balanced_by_year(df: pd.DataFrame, cap: int, date_col: str = "date") -> pd.DataFrame:
     """연도별 균형 샘플 — 예산이 모자라도 10년이 고르게 채워지게 한다.
 
@@ -3393,7 +3608,7 @@ def _balanced_by_year(df: pd.DataFrame, cap: int, date_col: str = "date") -> pd.
     if df.empty or cap <= 0:
         return df.iloc[0:0]
     if len(df) <= cap:
-        return df
+        return _priority_by_coverage(df)
     w = df.copy()
     w["_y"] = ts_col(w[date_col]).dt.year.fillna(0).astype(int)
     years = [y for y in sorted(w["_y"].unique()) if y > 0]
@@ -3402,9 +3617,11 @@ def _balanced_by_year(df: pd.DataFrame, cap: int, date_col: str = "date") -> pd.
     per = max(1, math.ceil(cap / len(years)))
     parts = []
     for y in years:
-        g = w[w["_y"] == y].sort_values([date_col], kind="stable")
+        g = _priority_by_coverage(w[w["_y"] == y])
+        if g is None or not len(g):
+            continue
         if len(g) > per:
-            g = g.iloc[np.unique(np.linspace(0, len(g) - 1, per, dtype=int))]
+            g = g.iloc[:per]          # 이미 '쓸모 순'으로 정렬돼 있다
         parts.append(g.reset_index(drop=True))
     out, i = [], 0
     while sum(len(p) for p in parts) > 0 and len(out) < cap:      # 라운드로빈 인터리브
@@ -3426,6 +3643,61 @@ PDF_PARSER_VERSION = "SCG_EPS_V2"
 
 
 PDF_CHUNK = 40          # 체크포인트 단위. 500이면 첫 줄까지 몇 분 — 그게 '멈춤'으로 보였다
+
+
+def _pdf_stage_minutes() -> float:
+    """이 단계에 줄 시간(분). 자동이면 **남은 수집예산에서 백테스트 몫만 떼고 전부**.
+
+    ★ 고정 60분은 4시간 예산 중 1시간만 쓰고 3시간을 놀렸다. 전수(53,658건)까지
+      필요한 실행 횟수가 그만큼 늘어난다. 시간을 남기는 게 목적이 아니라,
+      '백테스트가 반드시 돌 시간'만 지키는 게 목적이다.
+    """
+    if PDF_STAGE_BUDGET_MIN > 0:
+        return float(PDF_STAGE_BUDGET_MIN)
+    left = DEADLINE.remaining_s() / 60.0
+    return float(max(5.0, left - BACKTEST_RESERVE_MIN))
+
+
+PDF_CHECKPOINT_SEC = 120        # 체크포인트 간격(초). 청크마다 저장하면 O(n²) 가 된다
+
+
+def _pdf_checkpoint(done: Dict[str, dict], status_rows: List[dict]):
+    """진행분 영속화 — 중단돼도 여기까지는 남고, 다음 실행이 이어받는다."""
+    try:
+        DEPOT.table_save("scg_pdf_extract", pd.DataFrame(list(done.values())),
+                         scope="공용", domain="research", source="pdf_parse")
+        DEPOT.table_save("scg_pdf_status",
+                         pd.DataFrame(status_rows).drop_duplicates("ruid", keep="last"),
+                         scope="공용", domain="research", source="pdf_status")
+    except Exception as e:
+        CON.warn(f"PDF 진행분 저장 실패({type(e).__name__}) — 추출은 계속합니다")
+
+
+def _read_bytes(path: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return b""
+
+
+def _eta_report(done_n: int, total: int, t0: float, stage_end: float):
+    """★ 계획표의 ETA 는 네트워크 속도만 보고 계산해서 20배 틀렸다(13분 → 실측 260분).
+    파싱이 병목이면 네트워크 산수는 의미가 없다. 그래서 **실측 속도로 다시 계산**해
+    한 번 더 알려준다 — 사용자가 '이 실행에서 어디까지 가는지' 알 수 있게."""
+    done_n = min(done_n, total)
+    el = time.time() - t0
+    if done_n < 40 or el < 20:
+        return
+    rate = done_n / el                                   # 건/초 (실측)
+    left_budget = max(0.0, stage_end - time.time())
+    reach = min(total, done_n + int(rate * left_budget))
+    if getattr(_eta_report, "_last", -1) == reach:
+        return
+    _eta_report._last = reach                            # type: ignore[attr-defined]
+    CON.say(f"  ↳ 실측 {rate*60:.0f}건/분 → 이번 예산 안에 약 {reach:,}/{total:,}건 "
+            f"({reach/max(total,1)*100:.0f}%) 처리 예상 · 전체 완주엔 "
+            f"{total/max(rate,1e-9)/3600:.1f}시간 필요")
 
 
 def _pdf_src(url) -> str:
@@ -3524,6 +3796,169 @@ def _pdf_extract_one(data: bytes, year: int) -> Tuple[str, dict]:
     return ("EPS_OK" if eps else "NO_EPS_TABLE"), payload
 
 
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║ PDF 파싱 가속 — 진짜 병목은 네트워크가 아니라 **CPU + GIL** 이었다                        ║
+# ║                                                                                          ║
+# ║  ★ 실측(사용자 로그): 병렬 6 으로 돌렸는데 24건/분. 6,249건에 260분, 전체 53,658건이면    ║
+# ║    37시간이다. 원인을 분해하면 두 겹이다:                                                 ║
+# ║      ⓐ `pmap` 은 **스레드**다. PDF 파싱은 순수 CPU 작업이라 GIL 이 직렬화한다.            ║
+# ║         16코어 장비에서 사실상 1코어만 쓰고 있었다.                                       ║
+# ║      ⓑ pdfplumber 는 문자 단위 레이아웃 객체를 전부 만든다 — 우리는 'EPS' 한 줄만          ║
+# ║         찾으면 되는데 가장 비싼 방식으로 읽고 있었다. pymupdf 는 py3.14 휠이 없어 ImportError. ║
+# ║  그래서 ① 추출기를 실측해서 빠른 것을 고르고 ② 파싱을 **프로세스 풀**로 내보낸다.          ║
+# ║  프로세스 풀은 Jupyter(Windows spawn)에서 잘 깨지므로, 워커 모듈을 런타임에 파일로 써서    ║
+# ║  import 가능하게 만들고 **자가시험 후 실패하면 스레드로 조용히 되돌아간다**.               ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+_PDF_ENGINE: Dict[str, Any] = {"name": "", "rate": 0.0, "measured": False, "table": []}
+_PDF_POOL: Dict[str, Any] = {"ex": None, "mode": "", "checked": False}
+
+
+def _pdf_worker_source() -> str:
+    """워커 모듈 소스를 **현재 함수들의 실제 소스에서** 생성한다.
+    ★ 손으로 복제하면 본체와 워커가 서서히 갈라진다(그 자체가 다음 사고다).
+      inspect 로 뽑아 쓰면 파서 로직의 단일 원천이 유지된다."""
+    import inspect
+    parts = ["# 자동 생성 — SCG PDF 파싱 워커 (수정 금지: 본체에서 재생성됨)",
+             "import re, io, os, json",
+             # ★ 본체 함수는 타입 주석을 쓴다(Dict/List/Tuple/Optional). 이걸 빼먹어
+             #   워커 import 가 NameError 로 죽었고, 자가시험이 그걸 잡아 스레드로
+             #   되돌아갔다 — 안전망은 동작했지만 병렬화 이득은 0이었다.
+             "from typing import Any, Callable, Dict, List, Optional, "
+             "Sequence, Tuple"]
+    for mod, alias in (("fitz", "_fitz"), ("pdfplumber", "_pdfplumber"),
+                       ("pypdf", "_pypdf")):
+        parts.append(f"try:\n    import {mod} as {alias}\nexcept BaseException:\n"
+                     f"    {alias} = None")
+    parts.append(f"_ENGINE = {json.dumps(_PDF_ENGINE.get('name') or '')}")
+    for name in ("_NUM_TOK", "_ANALYST_TOK", "_YEAR_HDR", "_EPS_LINE"):
+        parts.append(f"{name} = re.compile({globals()[name].pattern!r}, "
+                     f"{globals()[name].flags})")
+    for fn in (_pdf_text_with, _pdf_text, _eps_from_text, _pdf_extract_one):
+        parts.append(inspect.getsource(fn))
+    parts.append(
+        "def work(job):\n"
+        "    path, year = job\n"
+        "    try:\n"
+        "        with open(path, 'rb') as f:\n"
+        "            data = f.read()\n"
+        "    except Exception:\n"
+        "        return ('READ_FAIL', {})\n"
+        "    return _pdf_extract_one(data, year)\n")
+    parts.append("def selftest():\n    return 'ok'\n")
+    return "\n\n".join(parts)
+
+
+def _pdf_pool(workers: int):
+    """프로세스 풀을 만들되 **반드시 자가시험을 통과한 것만** 돌려준다.
+    실패하면 None → 호출부가 스레드로 진행한다(느릴 뿐, 멈추지 않는다)."""
+    if _PDF_POOL["checked"]:
+        return _PDF_POOL["ex"]
+    _PDF_POOL["checked"] = True
+    ex = None
+    if workers < 2:
+        _PDF_POOL["mode"] = "스레드(워커 부족)"
+        return None
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+        d = os.path.join(tempfile.gettempdir(), f"scg_pdfw_{os.getpid()}")
+        os.makedirs(d, exist_ok=True)
+        write_atomic_text(os.path.join(d, "scg_pdf_worker.py"), _pdf_worker_source())
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import importlib
+        w = importlib.import_module("scg_pdf_worker")
+        importlib.reload(w)
+        ex = ProcessPoolExecutor(max_workers=workers,
+                                 initializer=_pdf_pool_init, initargs=(d,))
+        fu = ex.submit(_pdf_pool_probe)
+        if fu.result(timeout=90) != "ok":
+            raise RuntimeError("자가시험 응답 불일치")
+        _PDF_POOL["ex"], _PDF_POOL["mode"] = ex, f"프로세스×{workers}"
+        return ex
+    except BaseException as e:
+        _PDF_POOL["mode"] = f"스레드(프로세스풀 불가: {type(e).__name__})"
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)      # type: ignore[has-type]
+        except Exception:
+            pass
+        return None
+
+
+def _pdf_pool_init(worker_dir: str):
+    if worker_dir not in sys.path:
+        sys.path.insert(0, worker_dir)
+
+
+def _pdf_pool_probe():
+    import scg_pdf_worker
+    return scg_pdf_worker.selftest()
+
+
+def _pdf_pool_work(job):
+    import scg_pdf_worker
+    return scg_pdf_worker.work(job)
+
+
+def bench_pdf_engines(samples: List[bytes]) -> str:
+    """가용 추출기를 **실측**해서 가장 빠른 것을 고른다.
+
+    ★ 어느 라이브러리가 빠른지 내가 이 환경에서 확인할 수 없다(여기엔 PDF 라이브러리가
+      하나도 없다). 그러니 추측해서 하드코딩하는 대신 사용자 장비에서 재보고 고른다.
+      같은 이유로 결과를 표로 찍는다 — 왜 그걸 골랐는지 보이게.
+    """
+    if _PDF_ENGINE["measured"]:
+        return str(_PDF_ENGINE["name"])
+    _PDF_ENGINE["measured"] = True
+    cand = [(n, m) for n, m in (("pymupdf", _fitz), ("pypdf", _pypdf),
+                                ("pdfplumber", _pdfplumber)) if m is not None]
+    use = [s for s in samples if s and s[:5].startswith(b"%PDF")][:4]
+    rows, best, best_rate = [], "", 0.0
+    for name, _m in cand:
+        if not use:
+            rows.append([name, "가용", "-", "-"])
+            continue
+        t0, chars, okn = time.time(), 0, 0
+        for s in use:
+            try:
+                t = _pdf_text_with(name, s)
+            except Exception:
+                t = ""
+            chars += len(t or "")
+            okn += 1 if (t and len(t.strip()) >= 40) else 0
+        el = max(time.time() - t0, 1e-6)
+        rate = len(use) / el
+        rows.append([name, "가용", f"{rate:.1f}건/초", f"{okn}/{len(use)}건 성공"])
+        if okn and rate > best_rate:
+            best, best_rate = name, rate
+    for name in ("pymupdf", "pypdf", "pdfplumber"):
+        if not any(r[0] == name for r in rows):
+            rows.append([name, "없음", "-",
+                         "pip install " + ("pymupdf" if name == "pymupdf" else name)])
+    _PDF_ENGINE.update(name=best, rate=best_rate, table=rows)
+    return best
+
+
+def _pdf_text_with(engine: str, data: bytes, max_pages: int = 3) -> str:
+    """추출기 하나를 지정해서 텍스트만 뽑는다(벤치·워커 공용)."""
+    if not data or not data[:5].startswith(b"%PDF"):
+        return ""
+    if engine == "pymupdf" and _fitz is not None:
+        doc = _fitz.open(stream=data, filetype="pdf")
+        try:
+            return "\n".join(doc[i].get_text()
+                             for i in range(min(max_pages, doc.page_count)))
+        finally:
+            doc.close()
+    if engine == "pypdf" and _pypdf is not None:
+        rd = _pypdf.PdfReader(io.BytesIO(data))
+        return "\n".join((rd.pages[i].extract_text() or "")
+                         for i in range(min(max_pages, len(rd.pages))))
+    if engine == "pdfplumber" and _pdfplumber is not None:
+        with _pdfplumber.open(io.BytesIO(data)) as pdf:
+            return "\n".join((pg.extract_text() or "") for pg in pdf.pages[:max_pages])
+    return ""
+
+
 def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     """PDF 에서 (a) 작성자(네이버 건 보강) (b) EPS 추정치를 추출해 원장에 붙인다.
 
@@ -3570,15 +4005,24 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
         그 상태의 해시는 원래 저장 시점의 report_uid 와 다르므로 그냥 조회하면
         영구 미스가 난다(실제로 이미 받은 PDF 1만여 건을 매번 다시 받았다).
         그래서 분해한 조합까지 후보로 넣어 맞춰 본다."""
-        out = [h1(src, rid), str(rid)]
+        out = [h1(src, rid), h1_trail(src, rid), str(rid)]
         toks_s = [t for t in re.split(r"[+|,]", str(src)) if t]
         toks_r = [t for t in re.split(r"[+|,]", str(rid)) if t]
+        pair_uids = []
         for a in toks_s:
             for b in toks_r:
                 out.append(h1(a, b))
+                out.append(h1_trail(a, b))        # 다른 전략의 규칙(구분자·후행)
                 out.append(b)
+                pair_uids.append(h1_trail(a, b))
+                u = master_map.get(f"{a}\x00{b}") or master_map.get(b)
+                if u:
+                    out.append(u)                 # 저쪽이 직접 적어 둔 저장키
+        if pair_uids:
+            out.append(min(pair_uids))            # 병합행은 min(uid) 로 저장된다
         return list(dict.fromkeys(out))
 
+    master_map = _pdf_alias_from_master([DEPOT.write_root] + list(DEPOT.read_roots))
     alt_map: Dict[str, str] = {}
     for _rid, _src, _u in zip(need["rid"], need["source"], need["ruid"]):
         for k in _alt_keys(_src, _rid):
@@ -3608,12 +4052,13 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
                      f"차단 해제 후 재실행하면 그대로 이어받습니다.")
         work_net = work_net[keep.to_numpy()]
     work = pd.concat([work_local, work_net], ignore_index=True)   # 로컬 먼저 → 즉시 성과
-    stage_end = time.time() + PDF_STAGE_BUDGET_MIN * 60
+    stage_min = _pdf_stage_minutes()
+    stage_end = time.time() + stage_min * 60
     # ★ 예상 소요를 **먼저** 보여준다. 속도 상한은 전역이라 스레드 수와 무관하고,
     #   이 산수를 안 보여준 탓에 사용자는 '멈췄다'고 볼 수밖에 없었다.
     qps_eff = sum(THROTTLE.qps(s) for s, v in alive.items() if v) or 1.0
     eta_min = len(work_net) / qps_eff / 60.0 + len(work_local) / 600.0
-    reach = min(len(work), int((len(work_local) + qps_eff * PDF_STAGE_BUDGET_MIN * 60)))
+    reach = min(len(work), int((len(work_local) + qps_eff * stage_min * 60)))
     CON.grid([["기존 파일 재사용", f"{len(work_local):,}건", "네트워크 0회 — 먼저 처리합니다"],
               ["신규 다운로드", f"{len(work_net):,}건",
                f"연도 균형 샘플 (전체 대상 {len(need):,}건 중)"],
@@ -3623,9 +4068,11 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
               ["속도 상한", f"{qps_eff:.1f}건/초",
                "전역 상한 — 스레드를 늘려도 이 값을 못 넘습니다(차단 방지)"],
               ["예상 소요", f"{eta_min:.0f}분",
-               f"이번 예산({PDF_STAGE_BUDGET_MIN}분) 안에 약 {reach:,}건 처리 예상"],
-              ["단계 예산", f"{PDF_STAGE_BUDGET_MIN}분",
-               "초과 시 여기서 멈추고 다음 실행이 이어받음"]],
+               f"이번 예산({stage_min:.0f}분) 안에 약 {reach:,}건 처리 예상"],
+              ["단계 예산", f"{stage_min:.0f}분"
+                            + ("(자동)" if PDF_STAGE_BUDGET_MIN <= 0 else ""),
+               f"남은 수집예산 − 백테스트 유보 {BACKTEST_RESERVE_MIN}분"
+               if PDF_STAGE_BUDGET_MIN <= 0 else "고정값"]],
              ["PDF 처리 계획", "규모", "비고"], ["l", "r", "l"],
              title="PDF 추출 계획 (재개 가능 · 종결 원장 기반)")
     if _fitz is None and _pdfplumber is not None:
@@ -3640,61 +4087,60 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     lock = threading.Lock()
     counter = {"n": 0, "new": 0, "hit": 0, "net": 0, "fail": 0}
     t0 = time.time()
+    ck = {"t": time.time()}
 
-    def _tick(total: int):
+    def _tick(total: int, phase: str = ""):
         """★ 진행 한 줄을 **처리 도중에도** 찍는다. 예전에는 500건 청크가 끝나야
           첫 줄이 나와서, 실제로는 돌고 있는데도 화면이 몇 분간 멈춰 보였다."""
-        c = counter["n"] + counter["fail"]
-        if c % PDF_PROGRESS_EVERY:
+        c = (counter["n"] if phase == "파싱" else
+             counter["hit"] + counter["net"] + counter["fail"])
+        if c % PDF_PROGRESS_EVERY or not c:
             return
         el = max(time.time() - t0, 1e-9)
-        CON.say(f"  PDF {c:,}/{total:,} · EPS추출 {counter['new']:,} · "
-                f"기존파일 {counter['hit']:,} · 신규 {counter['net']:,} · "
-                f"실패 {counter['fail']:,} · {c/el*60:.0f}건/분 · "
-                f"잔여예산 {max(0, stage_end - time.time())/60:.0f}분")
+        CON.say(f"  PDF[{phase or '진행'}] {c:,}/{total:,} · EPS추출 "
+                f"{counter['new']:,} · 기존파일 {counter['hit']:,} · 신규 "
+                f"{counter['net']:,} · 실패 {counter['fail']:,} · "
+                f"{c/el*60:.0f}건/분 · 잔여예산 "
+                f"{max(0, stage_end - time.time())/60:.0f}분")
 
-    def _one(row):
+    def _acquire(row):
+        """[1단계] **확보만** 한다 — 로컬 재사용 또는 다운로드. IO 라 스레드가 맞다.
+        반환: (ruid, 로컬경로 or None, 연도, 상태or None)"""
         ruid, url, y, total = row
-        if time.time() > stage_end or DEADLINE.over("PDF 추출"):
+        if time.time() > stage_end or DEADLINE.over("PDF 확보"):
             return None
-        data = None
         p = keymap.get(str(ruid))
         if p and os.path.exists(p):
-            try:
-                data = open(p, "rb").read()
-                with lock:
-                    counter["hit"] += 1
-            except Exception:
-                data = None
-        if data is None:
-            data = DEPOT.blob_bytes("research_pdf", ruid)
-        if data is None:
-            src = _pdf_src(url)
-            if CIRCUIT.blocked(src):                    # 즉시 반환 — 대기 0초
-                with lock:
-                    counter["fail"] += 1
-                    _tick(total)
-                return (ruid, "DOWNLOAD_FAIL", None)
-            data = fetch(pdf_url_fix(url), source=src, as_bytes=True, tries=2,
-                         referer=_HK_HOME if src.startswith("hankyung") else None)
-            if data and data[:5].startswith(b"%PDF"):
-                DEPOT.blob_save("research_pdf", ruid, data, "pdf", source=str(url))
-                with lock:
-                    counter["net"] += 1
-            else:
-                with lock:
-                    counter["fail"] += 1
-                    _tick(total)
-                return (ruid, "DOWNLOAD_FAIL", None)   # 비종결 — 다음 실행에서 재시도
-        status, payload = _pdf_extract_one(data, y)
-        if payload:
-            payload["ruid"] = ruid
+            with lock:
+                counter["hit"] += 1
+                _tick(total, "확보")
+            return (ruid, p, y, None)
+        p = DEPOT.blob_path("research_pdf", ruid)
+        if p and os.path.exists(p):
+            with lock:
+                counter["hit"] += 1
+                _tick(total, "확보")
+            return (ruid, p, y, None)
+        src = _pdf_src(url)
+        if CIRCUIT.blocked(src):                        # 즉시 반환 — 대기 0초
+            with lock:
+                counter["fail"] += 1
+                _tick(total, "확보")
+            return (ruid, None, y, "DOWNLOAD_FAIL")
+        data = fetch(pdf_url_fix(url), source=src, as_bytes=True, tries=2,
+                     referer=_HK_HOME if src.startswith("hankyung") else None)
+        if not (data and data[:5].startswith(b"%PDF")):
+            with lock:
+                counter["fail"] += 1
+                _tick(total, "확보")
+            return (ruid, None, y, "DOWNLOAD_FAIL")     # 비종결 — 다음 실행에서 재시도
+        DEPOT.blob_save("research_pdf", ruid, data, "pdf", source=str(url))
+        np_ = DEPOT.blob_path("research_pdf", ruid)
         with lock:
-            counter["n"] += 1
-            if status == "EPS_OK":
-                counter["new"] += 1
-            _tick(total)
-        return (ruid, status, payload)
+            counter["net"] += 1
+            _tick(total, "확보")
+        return (ruid, np_ if (np_ and os.path.exists(np_)) else None, y,
+                None if np_ else "DOWNLOAD_FAIL")
 
     n_jobs = len(work)
     jobs = list(zip(work["ruid"], work["pdf_url"],
@@ -3703,35 +4149,104 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     if not n_jobs:
         CON.say("PDF 처리 대상이 없습니다 — 이 단계를 건너뜁니다")
         return _attach_pdf_columns(rep, done)
-    CON.say(f"PDF 처리를 시작합니다 — {n_jobs:,}건 · 병렬 {min(6, N_IO_THREADS)} · "
-            f"{PDF_PROGRESS_EVERY}건마다 진행 표시 · 체크포인트 {PDF_CHUNK}건마다 저장")
+
+    # ── 추출기 실측 → 파싱 병렬화 방식 결정 ──────────────────────────────────
+    #  ★ 여기가 이번 개편의 핵심이다. 이전 빌드는 다운로드와 파싱을 한 스레드풀에
+    #    섞어 돌렸다. 파싱은 순수 CPU 라 GIL 이 직렬화하므로 16코어에서 24건/분이
+    #    나왔다(6,249건에 260분). 확보(IO)와 파싱(CPU)을 분리하고 파싱을 프로세스로
+    #    내보내면 코어 수만큼 실제로 병렬이 된다.
+    smp = []
+    for j in jobs[:6]:
+        q = keymap.get(str(j[0])) or DEPOT.blob_path("research_pdf", j[0])
+        if q and os.path.exists(q):
+            try:
+                smp.append(open(q, "rb").read())
+            except Exception:
+                pass
+    eng = bench_pdf_engines(smp)
+    globals()["_ENGINE"] = eng
+    n_par = PDF_PARSE_WORKERS or max(2, min(12, (RIG["cpu"] or 4) - 2))
+    pool = _pdf_pool(n_par) if PDF_PARSE_PROCESSES else None
+    if _PDF_ENGINE["table"]:
+        CON.grid(_PDF_ENGINE["table"], ["추출기", "설치", "실측 속도", "비고"],
+                 ["l", "l", "r", "l"],
+                 title=f"PDF 텍스트 추출기 실측 — 선택: {eng or '없음'} "
+                       f"(추측 아님 · 이 장비에서 잰 값)")
+    CON.say(f"PDF 처리를 시작합니다 — {n_jobs:,}건 · 확보(IO) 스레드 "
+            f"{min(6, N_IO_THREADS)} · 파싱(CPU) {_PDF_POOL['mode'] or f'스레드×{n_par}'}"
+            f" · {PDF_PROGRESS_EVERY}건마다 진행 표시 · 체크포인트 {PDF_CHUNK}건")
+
+    def _parse_batch(items: List[tuple]) -> List[tuple]:
+        """[2단계] 파싱 — CPU 바운드. 프로세스 풀이 살아 있으면 그쪽으로."""
+        if not items:
+            return []
+        pj = [(pth, int(y)) for _r, pth, y, _st in items]
+        if pool is not None:
+            try:
+                res = list(pool.map(_pdf_pool_work, pj, chunksize=4))
+            except BaseException as e:
+                CON.warn(f"프로세스 파싱 실패({type(e).__name__}) — 스레드로 계속합니다")
+                _PDF_POOL["ex"], _PDF_POOL["mode"] = None, "스레드(프로세스 중단)"
+                res = pmap(lambda a: _pdf_extract_one(_read_bytes(a[0]), a[1]), pj,
+                           workers=n_par)
+        else:
+            res = pmap(lambda a: _pdf_extract_one(_read_bytes(a[0]), a[1]), pj,
+                       workers=n_par)
+        out = []
+        for (ruid, _p, _y, _s), r in zip(items, res):
+            status, payload = r if r else ("READ_FAIL", {})
+            if payload:
+                payload = dict(payload)
+                payload["ruid"] = ruid
+            with lock:
+                counter["n"] += 1
+                if status == "EPS_OK":
+                    counter["new"] += 1
+                _tick(n_jobs, "파싱")
+            out.append((ruid, status, payload or None))
+        return out
+
     for i in range(0, len(jobs), PDF_CHUNK):
         if time.time() > stage_end or DEADLINE.over("PDF 추출"):
             CON.warn(f"PDF 단계 예산 소진 — {i:,}/{len(jobs):,}건에서 중단합니다. "
                      f"종결 원장에 진행분이 기록되어 다음 실행이 이어받습니다.")
+            _pdf_checkpoint(done, status_rows)
             break
-        got = pmap(_one, jobs[i:i + PDF_CHUNK], workers=min(6, N_IO_THREADS))
-        for it in got:
-            if not it:
-                continue
+        got = [g for g in pmap(_acquire, jobs[i:i + PDF_CHUNK],
+                               workers=min(6, N_IO_THREADS)) if g]
+        for ruid, _p, _y, st in got:                     # 확보 실패는 여기서 기록
+            if st:
+                status_rows.append(dict(ruid=ruid, status=st,
+                                        parser_version=PDF_PARSER_VERSION,
+                                        updated_at=_now_iso()))
+        for it in _parse_batch([g for g in got if g[1]]):
             ruid, status, payload = it
             status_rows.append(dict(ruid=ruid, status=status,
                                     parser_version=PDF_PARSER_VERSION,
                                     updated_at=_now_iso()))
             if payload:
                 done[ruid] = payload
-        # 청크마다 즉시 영속화 — 중단돼도 여기까지는 남는다
-        DEPOT.table_save("scg_pdf_extract", pd.DataFrame(list(done.values())),
-                         scope="공용", domain="research", source="pdf_parse")
-        DEPOT.table_save("scg_pdf_status",
-                         pd.DataFrame(status_rows).drop_duplicates("ruid", keep="last"),
-                         scope="공용", domain="research", source="pdf_status")
+        # ★ 체크포인트는 **시간 기준**이다(청크마다가 아니라).
+        #   상한을 풀어 53,000건을 한 실행에서 돌리면 40건마다 저장 = 1,341회이고,
+        #   매번 5만 행짜리 표를 통째로 다시 쓰므로 O(n²) 가 된다 — 조용히 수 GB 를
+        #   쓰며 수집보다 저장이 더 오래 걸리는 상태가 된다.
+        if (time.time() - ck["t"] > PDF_CHECKPOINT_SEC
+                or i + PDF_CHUNK >= len(jobs)):
+            ck["t"] = time.time()
+            _pdf_checkpoint(done, status_rows)
+        _eta_report(i + PDF_CHUNK, n_jobs, t0, stage_end)
         # 남은 작업이 전부 차단된 호스트라면 더 돌 이유가 없다
         rest = [j for j in jobs[i + PDF_CHUNK:] if not keymap.get(str(j[0]))]
         if rest and all(CIRCUIT.blocked(_pdf_src(j[1])) for j in rest):
             CON.warn(f"남은 {len(rest):,}건은 모두 차단된 호스트 대상이라 중단합니다 "
                      f"(무의미한 재시도로 예산을 태우지 않습니다).")
+            _pdf_checkpoint(done, status_rows)
             break
+    try:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     CON.ok(f"PDF 단계 종료 — 파싱 {counter['n']:,} · EPS 확보 {counter['new']:,} · "
            f"기존파일 {counter['hit']:,} · 신규다운로드 {counter['net']:,} · "
            f"수신실패 {counter['fail']:,} · 누적 추출 {len(done):,}건 · "
@@ -4326,6 +4841,60 @@ def choose_metric(fc: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
 METRIC_COV: Dict[str, dict] = {}
 TRACK_LABEL = {"TP12M": "빠른판(TP12M·목표주가 · PDF 불필요)",
                "EPS": "정밀판(EPS · PDF 원문 파싱)"}
+
+
+def coverage_verdict(fc_all: pd.DataFrame, rep: pd.DataFrame,
+                     months: Sequence) -> bool:
+    """**지금 이 결과를 믿어도 되는가**를 수치로 판정한다.
+
+    ★ 사용자 요구의 핵심: "가능하면 전수수집으로 신뢰할만한 결과를, 그렇다고 무한정
+      길게 끌지는 말고." 그 둘을 잇는 다리가 이 표다. 커버리지가 판정선을 넘으면
+      '이번 결과는 신뢰 가능', 못 넘으면 '몇 번 더 돌리면 되는지'를 같이 알려준다.
+      기준은 자의적 미학이 아니라 명세에서 나온다 —
+        · §31 MIN_ANALYSTS=2 : 컨센서스가 성립하는 최소 단위
+        · §36 십분위          : 월 60종목 이상이라야 십분위, 그 아래는 오분위
+        · §40 IC             : 월 표본이 얇으면 IC 의 표준오차가 결론을 못 낸다
+    """
+    rows, ok_all = [], True
+    n_month = max(len(months), 1)
+    for met in ("EPS", "TP12M"):
+        f = fc_all[fc_all["forecast_metric"] == met]
+        if not len(f):
+            rows.append([met, "0", "0", "0%", "✘ 표본 없음"])
+            ok_all = False if met == "EPS" else ok_all
+            continue
+        g = (f.assign(m=f["report_date"].dt.to_period("M"))
+              .groupby(["m", "stock_id"], observed=True)["analyst_id"].nunique())
+        per_m = g[g >= 2].groupby("m").size()
+        med = int(per_m.median()) if len(per_m) else 0
+        cov_m = min(1.0, len(per_m) / n_month)
+        verdict = ("✔ 십분위 가능(신뢰)" if med >= 60 else
+                   "△ 오분위 수준(참고)" if med >= 20 else "✘ 표본 부족")
+        rows.append([met, f"{len(f):,}", f"{med}", f"{cov_m*100:.0f}%", verdict])
+    # PDF 진척 — 전수까지 얼마나 남았는가
+    st = DEPOT.table_load("scg_pdf_status", need_cols=["ruid", "status"])
+    n_tot = int(len(rep)) if rep is not None else 0
+    n_done = int(st["status"].astype(str).isin(PDF_TERMINAL).sum()) if (
+        st is not None and len(st)) else 0
+    if not n_done:          # 상태원장이 없는 캐시(타 전략 산출물)면 추출물 수로 센다
+        ex0 = DEPOT.table_load("scg_pdf_extract", need_cols=["ruid"])
+        n_done = int(len(ex0)) if ex0 is not None else 0
+    pct = n_done / max(n_tot, 1) * 100
+    rate = float(THROTTLE.qps("naver_pdf"))
+    left_h = max(0, n_tot - n_done) / max(rate, 0.1) / 3600
+    pct = min(100.0, pct)          # 추출물이 원장보다 많을 수 있다(과거 수집분 포함)
+    CON.grid(rows + [["PDF 원문", f"{min(n_done, n_tot):,}/{n_tot:,}", "-", f"{pct:.0f}%",
+                      ("✔ 전수 완료" if pct >= 99 else
+                       f"진행 중 — 남은 {n_tot-n_done:,}건에 약 {left_h:.1f}시간 "
+                       f"(재실행 {math.ceil(left_h/max(COLLECT_HOURS_BUDGET,0.1)):d}회)")]],
+             ["지표", "예측행수", "월중앙 2인이상 종목", "월 커버리지", "판정"],
+             ["l", "r", "r", "r", "l"],
+             title="신뢰도 판정 — 지금 결과를 믿어도 되는가 (§31 2인 · §36 십분위 60종목)")
+    if pct < 99:
+        CON.say("전수수집은 종결원장으로 **이어받기**가 보장됩니다 — 같은 파일을 다시 "
+                "실행하면 남은 것부터 채우고, 이미 종결된 건은 다시 열지 않습니다. "
+                "그동안에도 매 실행이 완결된 백테스트를 산출합니다.")
+    return ok_all
 
 
 def plan_tracks(fc_all: pd.DataFrame) -> Tuple[str, List[str], pd.DataFrame]:
@@ -5111,7 +5680,7 @@ def eval_track(trk: dict, panel: pd.DataFrame, uni_df: pd.DataFrame,
     met, lbl = trk["metric"], trk["label"]
     sigp = trk["sig"][trk["sig"]["primary"]].merge(uni_df, on=["signal_date", "stock_id"],
                                                    how="left")
-    sig_full = sigp[sigp["in_uni"].fillna(False)]
+    sig_full = sigp[sigp["in_uni"].fillna(False).astype(bool)]
     n_months = max(sig_full["signal_date"].nunique(), 1) if len(sig_full) else 1
     CON.say(f"[{met}] 신호×유니버스 교집합: {len(sig_full):,}행 "
             f"(월평균 {len(sig_full)/n_months:.0f}종목)")
@@ -5127,7 +5696,7 @@ def eval_track(trk: dict, panel: pd.DataFrame, uni_df: pd.DataFrame,
                 .head(COMPARE_BOTTOM_N)[["signal_date", "stock_id"]].copy())
         sm["in_small"] = True
         sigs = sig_full.merge(sm, on=["signal_date", "stock_id"], how="left")
-        sig_small = alphas_in_universe(sigs, sigs["in_small"].fillna(False), cfg)
+        sig_small = alphas_in_universe(sigs, sigs["in_small"].fillna(False).astype(bool), cfg)
         CON.say(f"[{met}] 시총하위{COMPARE_BOTTOM_N} 유니버스 신호: {len(sig_small):,}행")
         suites_small = run_suite(sig_small, panel, f"{lbl} · 시총하위{COMPARE_BOTTOM_N}")
         if report:
@@ -5915,16 +6484,48 @@ def run_rehearsal(strict: bool = True) -> bool:
             assert km["770001"].endswith(".pdf") and os.path.exists(km["770001"])
             return 1
         _rh("PDF 별칭 색인(URL 번호 → 파일)", _pdf_alias_index)
+
+        def _worker_module_compiles():
+            """파싱 워커 모듈이 **문법·이름 모두 성립**하는가 — 순수 로직이라 차단검사다.
+            ★ 실제로 여기서 걸렸다: 본체 함수의 타입주석(Dict/List)을 워커 헤더에
+              import 하지 않아 워커가 NameError 로 죽었고, 프로세스 병렬이 조용히
+              스레드로 되돌아가 병렬화 이득이 0이 됐다. 컴파일만으로 잡힌다."""
+            src = _pdf_worker_source()
+            ns: Dict[str, Any] = {}
+            exec(compile(src, "<scg_pdf_worker>", "exec"), ns)
+            assert callable(ns.get("work")) and ns.get("selftest")() == "ok"
+            assert ns["_pdf_extract_one"](b"not a pdf", 2020)[0] == "NOT_PDF"
+            return 1
+        _rh("PDF 파싱 워커 모듈 생성·컴파일", _worker_module_compiles)
+
+        def _tcd_key_rule():
+            """다른 전략(TCD v2)의 저장키 규칙을 정확히 재현하는가."""
+            want = hashlib.sha1(b"hankyung\x1f12345\x1f").hexdigest()
+            assert h1_trail("hankyung", "12345") == want, "구분자/후행 규칙 불일치"
+            assert h1("hankyung", "12345") != want, "두 규칙은 달라야 정상이다"
+            return 1
+        _rh("타 전략 저장키 규칙 재현(PDF 재사용)", _tcd_key_rule)
+        _rh("ⓘ PDF 파싱 프로세스 풀 기동", lambda: (_pdf_pool(2) is not None) or None,
+            expect_rows=False, blocking=False)
         _rh("ⓘ 한경 접속 진단(경로 자동선택)", lambda: (hk_probe(), HK["alive"])[1],
             expect_rows=False, blocking=False)
 
         _rh("무인증 캐시(listing)", lambda: fdr_cache_csv("listing/krx", back_days=3))
+        _rh("무인증 캐시: 저장소 시작일 이전은 조회하지 않음",
+            lambda: (fdr_cache_csv("listing/krx", back_days=3,
+                                   asof=ts("2019-06-03")) is None) or None,
+            expect_rows=True)
         _rh("무인증 캐시(delisting)", lambda: fdr_cache_csv("listing/delisting", back_days=3))
         _rh("단면: 벌크 marcap", lambda: bulk_marcap_year(2020))
-        _rh("단면: 일단위 캐시", lambda: _xsec_fdrcache(ts("2020-01-08")))
+        _rh("단면: 일단위 캐시",
+            lambda: _xsec_fdrcache(ts(FDR_CACHE_LISTING_FROM) + pd.Timedelta(30, "D")))
         _rh("ⓘ 단면: pykrx", lambda: _xsec_pykrx(ts("2020-01-08")),
             expect_rows=False, blocking=False)
-        _rh("ⓘ 단면: KRX 마켓플레이스", lambda: KRXM.xsec(ts("2020-01-08")),
+        # ★ 리허설이 **실제 KRX 로그인**을 하면 본 실행의 세션을 빼앗는다.
+        #   KRX 는 중복 로그인 시 기존 세션을 끊기 때문에, 리허설 직후 본 실행이
+        #   '세션무효'를 맞는다(로그에서 실제로 그렇게 나타났다). 배선만 확인한다.
+        _rh("ⓘ 단면: KRX 마켓플레이스(로그인 없이 배선만)",
+            lambda: KrxMarketplace("", "").xsec(ts("2020-01-08")),
             expect_rows=False, blocking=False)
         _rh("ⓘ 구간수익률: pykrx",
             lambda: _period_return_krx(ts("2020-01-02"), ts("2020-01-08")),
@@ -6036,6 +6637,8 @@ def run_rehearsal(strict: bool = True) -> bool:
         CIRCUIT.opened.clear()
         CIRCUIT._streak.clear()
         _PDF_URL_REWRITE.clear()
+        _PDF_POOL.update(ex=None, mode="", checked=False)
+        _PDF_ENGINE.update(measured=False, name="", table=[])
         ROBUST.clear()                 # 리허설이 남긴 강건성 결과는 실행분과 섞지 않는다
         ROBUST.update(dict(saved_robust))
         shutil.rmtree(tmp, ignore_errors=True)
@@ -6593,6 +7196,7 @@ def run_all() -> dict:
                           "종목코드 형식(6자리)과 마스터 수집을 확인하세요.")
         DEPOT.table_save("scg_analyst_forecasts", fc_all, scope="공용", domain="research",
                          source="ledger+pdf")
+        coverage_verdict(fc_all, rep_raw, months)
         metric, track_metrics, mtab = plan_tracks(fc_all)
         cfg = SCGParams()
         fc = validate_forecasts(fc_all, asof=ts(BACKTEST_END) + pd.Timedelta(7, "D"))
