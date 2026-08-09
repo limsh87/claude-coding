@@ -161,9 +161,13 @@ NPS_MAX_CALLS    = 30000  # PACK-N 국민연금은 (종목 × 월) 교차곱이�
 DART_BUDGET_SHARE = {
     "disclosure": 0.10,   # 공시목록 시장전체 스윕 — V3/V5/PACK-C 입력 + ★정기보고서 제출사실
     #                       지도(이걸로 뒤 티어의 '태생적 빈손' 호출을 통째로 소거한다)
-    "employee":   0.55,   # ★직원현황 전수 — 대체재 없음. C축 TP_C2·V8·PACK-N·size_bucket 1순위
-    "major":      0.10,   # 주요계정 벌크 — ZIP 미포함분 바닥 깔기(회사 100개/호출)
-    "deep":       0.25,   # 전체재무제표 단건 — ZIP 이 못 준 연도·비제출사의 '꼬리 보충'
+    "employee":   0.70,   # ★직원현황 전수 — 대체재 없음. C축 TP_C2·V8·PACK-N·size_bucket 1순위
+    #                       하루 한도의 대부분을 여기 쏟아야 전수 완비가 2일 안에 끝난다.
+    "major":      0.10,   # 주요계정 벌크 — ZIP 미포함분 바닥 깔기(회사 100개/호출).
+    #                       전 시장 13년을 1,900회면 덮으므로 이 몫을 다 쓸 일이 없다.
+    "deep":       0.10,   # 전체재무제표 단건 — ZIP 이 못 준 연도·비제출사의 '꼬리 보충'.
+    #                       ★몫이 작은 이유: 같은 계정을 일괄 ZIP 이 호출한도 0 으로 이미
+    #                       채운다. 여기에 예산을 주는 것은 '이미 가진 것을 다시 사는' 일이다.
 }
 DART_DEEP_TOP_N  = 1500   # 전체재무제표 '단건 꼬리 보충'을 받을 유동성 상위 회사 수.
 #                           V6 유동성 하한을 통과할 수 없는 종목까지 단건으로 태울 이유가 없다.
@@ -5603,7 +5607,21 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
     rank = {str(c): i for i, c in enumerate(priority)}
     clist = sorted((str(c) for c in corps), key=lambda c: (rank.get(c, 10 ** 9), c))
     ylist = sorted({int(v) for v in years}, reverse=True)
-    universe = [(c, y) for y in ylist for c in clist]          # ★전수 모집단(자르지 않는다)
+    # ★사실 기반 소거 ⓪: 사업연도 Y 의 사업보고서는 Y+1년 3월 말에야 접수된다. 아직 오지
+    #   않은 연도는 어떤 회사도 제출할 수 없으므로 전 종목이 013 이다. 음성캐시에 맡기면
+    #   첫 실행에 3,500회를 태우고 90일마다 또 태운다 — 달력만 봐도 아는 것을 묻지 않는다.
+    y_max = dtm.date.today().year - 1
+    drop_y = [y for y in ylist if y > y_max]
+    if drop_y:
+        ylist = [y for y in ylist if y <= y_max]
+        L.info(f"사업보고서가 아직 존재할 수 없는 연도 {drop_y} 는 조회하지 않습니다"
+               f"(사업연도 Y 는 Y+1년 3월 접수 — 전 종목이 '데이터 없음'으로 돌아옵니다).")
+    # ★전수 모집단(자르지 않는다). 순서는 ★회사 우선(유동성 상위부터) × 연도 내림차순.
+    #   연도 우선으로 돌면 한도에 걸렸을 때 '최근 6년은 전 종목, 초기 6년은 전멸' 이 되어
+    #   10년 백테스트의 앞 절반에서 C2축 dlog_emp 가 통째로 사라진다(평가가 깨진다).
+    #   회사 우선이면 '거래 가능한 상위 회사의 10년 전 구간'이 먼저 완성되므로, 중간에
+    #   끊겨도 그 시점까지의 결과가 그대로 신뢰할 수 있는 부분집합이 된다.
+    universe = [(c, y) for c in clist for y in ylist]
     # ★사실 기반 소거 ①: 그 해에 사업보고서를 낸 조합만 남긴다(=empSttus 가 존재할 수 있는 조합).
     n_all = len(universe)
     if filed:
