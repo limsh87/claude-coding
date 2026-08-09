@@ -773,10 +773,23 @@ def _gdrive_mount() -> Tuple[Optional[str], str]:
     home = os.path.expanduser("~")
     cands = [os.path.join(home, "Google Drive", "My Drive"),
              os.path.join(home, "Google Drive", "내 드라이브"),
-             os.path.join(home, "GoogleDrive"), "G:/My Drive", "G:/내 드라이브"]
+             os.path.join(home, "GoogleDrive")]
+    if RIG["windows"]:
+        # Google Drive for Desktop 은 보통 G: 로 붙지만 문자가 바뀔 수 있다 — 전 드라이브를 훑는다.
+        for letter in "GHIJKLMNOPQRSTUVWXYZDEF":
+            for leaf in ("내 드라이브", "My Drive"):
+                cands.append(f"{letter}:\\{leaf}")
+    else:
+        cands += ["/Volumes/GoogleDrive/My Drive",
+                  os.path.join(home, "Library", "CloudStorage")]
     for c in cands:
-        if os.path.isdir(c):
-            return os.path.join(c, os.path.basename(GDRIVE_WRITE_ROOT)), "데스크톱동기화"
+        try:
+            if os.path.isdir(c):
+                root = os.path.join(c, os.path.basename(GDRIVE_WRITE_ROOT))
+                CON.say(f"구글드라이브 자동 인식: {c}")
+                return root, "데스크톱동기화"
+        except Exception:
+            continue
     # 사용자가 GDRIVE_WRITE_ROOT 에 로컬 경로를 직접 넣은 경우 그대로 존중한다.
     # (콜랩 전용 경로 /content/... 는 로컬에서 의미가 없으므로 제외)
     if GDRIVE_WRITE_ROOT and not GDRIVE_WRITE_ROOT.startswith("/content/"):
@@ -1665,8 +1678,6 @@ MARCAP_URLS = [
 #   막히면 CSV 는 멀쩡한데도 통째로 실패한다. 다른 파이프라인에서 검증된 우회 경로다.)
 FDR_CACHE_URL = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
                  "refs/heads/{br}/data/{kind}/{date}.csv")
-FDRCACHE_URLS = [FDR_CACHE_URL.replace("{br}", "master").replace("{kind}", "listing/krx"),
-                 FDR_CACHE_URL.replace("{br}", "main").replace("{kind}", "listing/krx")]
 
 
 def fdr_cache_csv(kind: str, back_days: int = 21,
@@ -1760,21 +1771,19 @@ def bulk_marcap_year(year: int) -> Optional[pd.DataFrame]:
 
 
 def _xsec_fdrcache(day: pd.Timestamp) -> Optional[pd.DataFrame]:
-    """일 단위 무인증 캐시 CSV(FDR 공개 캐시) — 벌크가 못 덮는 최근분 보완."""
-    for tmpl in FDRCACHE_URLS:
-        txt = fetch(tmpl.format(d=f"{day:%Y-%m-%d}"), source="generic", as_bytes=True,
-                    tries=1, timeout=40)
-        if not txt or len(txt) < 500:
-            continue
-        try:
-            d = pd.read_csv(io.BytesIO(txt), low_memory=False)
-        except Exception:
-            continue
-        out = _norm_xsec_frame(d)
-        if out is not None:
-            out["date"] = pd.Timestamp(day).normalize()
-            return out
-    return None
+    """일 단위 무인증 캐시 CSV(FDR 공개 캐시) — 벌크가 못 덮는 최근분 보완.
+
+    ★ 이 캐시는 최근 몇 달치만 존재한다(과거 날짜는 404). 그래서 벌크(marcap)가
+      1순위이고 이건 '최근분 보완'용이다. 파일은 UTF-8 BOM + 무명 인덱스 컬럼.
+    """
+    d = fdr_cache_csv("listing/krx", back_days=5, asof=pd.Timestamp(day))
+    if d is None:
+        return None
+    out = _norm_xsec_frame(d)
+    if out is None:
+        return None
+    out["date"] = pd.Timestamp(day).normalize()     # 이 캐시엔 날짜 컬럼이 없다(파일명이 날짜)
+    return out
 
 
 _XSEC_CHAIN = [("무인증캐시", _xsec_fdrcache), ("pykrx", _xsec_pykrx),
@@ -2223,12 +2232,7 @@ def probe_market_sources(cal: "TradingCal") -> pd.DataFrame:
     ★ 이 단계가 없어서, pykrx import 가 실패했는데도 코드가 조용히 0행을 만들며
       수백 일을 헛돌았다. 무엇이 되고 무엇이 안 되는지 먼저 못박고 시작한다.
     """
-    probe_day = None
-    for back in range(0, 40):
-        cand = cal.days[max(0, len(cal.days) - 260 - back)]   # 1년쯤 전 거래일
-        if cand is not None:
-            probe_day = pd.Timestamp(cand)
-            break
+    probe_day = pd.Timestamp(cal.days[max(0, len(cal.days) - 260)])   # 1년쯤 전 거래일
     rows = []
     ok_any = False
     PYKRX.warmup()
@@ -2603,7 +2607,7 @@ def build_month_panel(have_dates: Sequence[pd.Timestamp], xsec: pd.DataFrame,
         tot = sum(src_tally.values())
         derived = src_tally.get("단면파생", 0)
         precise = pm is not None and getattr(pm, "daily_adjusted", False)
-        if tot and derived / tot > 0.30 and not precise:
+        if tot and derived / tot > 0.30 and not precise and RUN_MODE != "SMOKE":
             CON.warn(f"구간의 {derived/tot*100:.0f}%가 월 간격 추정 보정입니다 — 분할 판정이 "
                      f"휴리스틱이라 정확도가 떨어집니다. 벌크 일별 데이터를 확보하면 "
                      f"자동으로 정확한 보정으로 대체됩니다.")
@@ -4656,8 +4660,20 @@ def run_contracts(strict: bool = True) -> bool:
     _ct("TEST7", "leave-one-out(§35.7)", t7)
     _ct("TEST8", "중복 전망 금지(§35.8)", t8)
     _ct("TEST9", "표본 보존(§35.9)", t9)
+    def c_url():   # URL 템플릿 ↔ 호출부 인자 이름 일치 (런타임 KeyError 원천 차단)
+        checks = [(MARCAP_URLS[0], {"y": 2020}), (FDR_CACHE_URL,
+                                                  {"br": "master", "kind": "listing/krx",
+                                                   "date": "2026-08-07"})]
+        for tmpl, kw in checks:
+            need = set(re.findall(r"\{(\w+)[^}]*\}", tmpl))
+            if need != set(kw):
+                return False, f"템플릿 자리표시자 {sorted(need)} ≠ 호출 인자 {sorted(kw)}"
+            tmpl.format(**kw)
+        return True, f"URL 템플릿 {len(checks)}종 자리표시자 일치"
+
     _ct("C-보존", "기존 캐시 쓰기 차단", c_depot)
     _ct("C-결정", "결정성(시드)", c_det)
+    _ct("C-URL", "URL 템플릿 배선", c_url)
     bad = [c for c in CONTRACTS if not c["ok"]]
     CON.grid([[c["id"], c["name"], "통과" if c["ok"] else "실패", c["msg"]]
               for c in CONTRACTS], ["ID", "계약", "판정", "근거"], ["l", "l", "l", "l"],
@@ -4666,6 +4682,259 @@ def run_contracts(strict: bool = True) -> bool:
         raise RuleBreak(f"자체계약 {len(bad)}건 실패 — 실데이터로 진행하지 않습니다: "
                         + ", ".join(c["id"] for c in bad))
     return not bad
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║ [S2b] 실경로 리허설 — 네트워크만 가짜, 수집 함수는 '실물'로 실행한다                        ║
+# ║                                                                                          ║
+# ║  ★ 이 계층이 없어서 같은 유형의 사고가 반복됐다:                                           ║
+# ║    수집부를 고쳐도 SMOKE(합성)·CACHED(캐시)는 그 코드를 한 줄도 타지 않으므로              ║
+# ║    사용자의 실행이 곧 '첫 실행'이 되고, URL 자리표시자 이름 하나가 틀린 것 같은            ║
+# ║    사소한 배선 오류가 몇 분 뒤 KeyError 로 터졌다. py_compile 로는 절대 안 잡힌다.         ║
+# ║                                                                                          ║
+# ║  그래서 fetch/fetch_json 만 픽스처로 바꿔치고 수집·정제 함수를 전부 호출해 본다.            ║
+# ║  통과 못 하면 실데이터 수집을 시작하지 않는다.                                             ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+REHEARSAL: List[dict] = []
+
+
+def _fx_marcap_parquet() -> bytes:
+    # 월말(신호일)과 +120거래일 지평이 모두 들어가도록 넉넉히 잡는다
+    days = pd.bdate_range("2019-11-01", "2020-06-30")
+    rows = []
+    for c in ("005930", "000660", "900110"):
+        for i, d in enumerate(days):
+            rows.append(dict(Date=d, Code=c, Name=f"테스트{c}", Close=1000 + i * 10,
+                             Open=1000, High=1010, Low=990, Volume=1e5, Amount=1e8,
+                             Marcap=(1000 + i * 10) * 1e6, Stocks=1e6,
+                             Market="KOSPI", MarketId="STK", Dept="", ChangeCode="0",
+                             Changes=0.0, ChangesRatio=0.0, Rank=1))
+    buf = io.BytesIO()
+    pd.DataFrame(rows).to_parquet(buf, index=False)
+    return buf.getvalue()
+
+
+def _fx_fdrcache_csv() -> bytes:
+    hdr = (",Code,ISU_CD,Name,Market,Dept,Close,ChangeCode,Changes,ChagesRatio,"
+           "Open,High,Low,Volume,Amount,Marcap,Stocks,MarketId\n")
+    body = "".join(f"{i},{c},KR7{c}003,테스트{c},KOSPI,,1000,0,0,0.0,1000,1010,990,"
+                   f"100000,100000000,1000000000,1000000,STK\n"
+                   for i, c in enumerate(("005930", "000660")))
+    return ("﻿" + hdr + body).encode("utf-8")
+
+
+def _fx_delisting_csv() -> bytes:
+    hdr = (",Symbol,Name,Market,SecuGroup,Kind,ListingDate,DelistingDate,Reason,"
+           "ArrantEnforceDate,ArrantEndDate,Industry,ParValue,ListingShares,"
+           "ToSymbol,ToName\n")
+    body = ("0,900110,폐지테스트,KOSPI,주권,,2010-01-01,2021-06-16,감사의견,,,,"
+            "5000,1000000,,\n")
+    return ("﻿" + hdr + body).encode("utf-8")
+
+
+def _fx_hankyung_html() -> str:
+    rows = "".join(
+        f"<tr><td>26.03.1{i}</td><td><a href='/analysis/downpdf?report_idx={900+i}'>"
+        f"테스트기업(00593{i}) 목표가 상향</a></td><td>12,000</td><td>매수</td>"
+        f"<td>김애널</td><td>테스트증권</td></tr>" for i in range(1, 4))
+    return ("<div class='table_style01'><table><thead><tr><th>작성일</th><th>제목</th>"
+            "<th>적정가격</th><th>투자의견</th><th>작성자</th><th>제공출처</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></div>")
+
+
+def _fx_naver_html() -> str:
+    rows = "".join(
+        f"<tr><td><a class='stock_item' href='/item/main.naver?code=00593{i}'>테스트{i}</a>"
+        f"</td><td><a href='/research/company_read.naver?nid={700+i}'>실적 리뷰</a></td>"
+        f"<td>테스트증권</td><td><a href='http://x/y.pdf'>pdf</a></td>"
+        f"<td>26.03.1{i}</td><td>123</td></tr>" for i in range(1, 4))
+    return f"<div class='box_type_m'><table class='type_1'>{rows}</table></div>"
+
+
+class _FixtureNet:
+    """네트워크만 가짜. 어떤 URL이 오든 그럴듯한 응답을 돌려준다."""
+
+    def __init__(self):
+        self.hits: Counter = Counter()
+
+    def get(self, url, source="generic", params=None, as_bytes=False, **kw):
+        self.hits[source] += 1
+        u = str(url)
+        if "marcap" in u:
+            return _fx_marcap_parquet()
+        if "fdr_krx_data_cache" in u:
+            raw = _fx_delisting_csv() if "delisting" in u else _fx_fdrcache_csv()
+            return raw if as_bytes else raw.decode("utf-8")
+        if "consensus.hankyung" in u and "downpdf" in u:
+            return ("%PDF-1.4\nEPS\n2020 2021\n1,000 1,200\n"
+                    "김애널 연구원 02-000-0000").encode("utf-8")
+        if "consensus.hankyung" in u:
+            return _fx_hankyung_html()
+        if "finance.naver.com/research" in u:
+            return _fx_naver_html()
+        if u.lower().endswith(".pdf"):
+            return b"%PDF-1.4\nEPS\n2020 2021\n1,000 1,200\n"
+        if "corpCode" in u:
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                z.writestr("CORPCODE.xml",
+                           "<result><list><corp_code>00126380</corp_code>"
+                           "<corp_name>테스트</corp_name>"
+                           "<stock_code>005930</stock_code></list></result>")
+            return buf.getvalue()
+        return b"" if as_bytes else ""
+
+    def json(self, url, source="generic", params=None, **kw):
+        self.hits[source] += 1
+        u = str(url)
+        if "list.json" in u:
+            return {"status": "000", "total_page": 1,
+                    "list": [{"corp_code": "00126380", "stock_code": "005930",
+                              "report_nm": "사업보고서 (2020.12)",
+                              "rcept_dt": "20210315"}]}
+        if "fnlttMultiAcnt" in u:
+            return {"status": "000",
+                    "list": [{"stock_code": "005930", "account_nm": "당기순이익",
+                              "thstrm_amount": "1,000,000,000", "fs_div": "CFS",
+                              "rcept_no": "20210315000123"}]}
+        return {"status": "000", "list": []}
+
+
+def _rh(name: str, fn: Callable, expect_rows: bool = True):
+    t0 = time.time()
+    try:
+        v = fn()
+        n = len(v) if hasattr(v, "__len__") else (1 if v is not None else 0)
+        ok = (n > 0) if expect_rows else True
+        REHEARSAL.append(dict(name=name, ok=ok, rows=n, sec=time.time() - t0,
+                              err="" if ok else "행 0개"))
+        return v
+    except Exception as e:
+        REHEARSAL.append(dict(name=name, ok=False, rows=-1, sec=time.time() - t0,
+                              err=f"{type(e).__name__}: {e}"[:110],
+                              tb=traceback.format_exc(limit=6)))
+        return None
+
+
+def _rehearsal_depot(tmp: str) -> "Depot":
+    """실제 캐시를 절대 건드리지 않는 임시 금고."""
+    dep = Depot.__new__(Depot)
+    dep.write_root = tmp
+    dep.on_drive = False
+    dep.drive_mode = "리허설"
+    dep.ns = {"공용": os.path.join(tmp, "shared"), "전용": os.path.join(tmp, "scg_v1")}
+    for p in dep.ns.values():
+        for sub in ("index", "index/_backup", "table", "blob", "report"):
+            os.makedirs(os.path.join(p, sub), exist_ok=True)
+    dep.read_roots = []
+    dep._idx_cache = {}
+    dep._lk = threading.RLock()
+    dep.stats = Counter()
+    dep._adopted = {}
+    dep._foreign_parquets = []
+    dep._foreign_fingerprint = {}
+    dep._foreign_pdfs = {}
+    return dep
+
+
+def run_rehearsal(strict: bool = True) -> bool:
+    """수집·정제 함수를 픽스처 네트워크로 실물 실행한다(라이브러리 없는 최악 조건)."""
+    G = globals()
+    keys = ("fetch", "fetch_json", "fdr", "pykrx_stock", "DART_API_KEY", "RUN_MODE",
+            "DEPOT", "RESEARCH_DOWNLOAD_PDF", "RESEARCH_COLLECT")
+    saved = {k: G.get(k) for k in keys}
+    net = _FixtureNet()
+    tmp = tempfile.mkdtemp(prefix="scg_rehearsal_")
+    try:
+        G["fetch"], G["fetch_json"] = net.get, net.json
+        G["fdr"] = None                    # 선택 라이브러리가 전부 없어도 통과해야 한다
+        G["pykrx_stock"] = None
+        G["DART_API_KEY"] = "REHEARSAL"
+        G["RUN_MODE"] = "FULL"
+        G["RESEARCH_DOWNLOAD_PDF"] = True
+        G["RESEARCH_COLLECT"] = True
+        dep = _rehearsal_depot(tmp)
+        G["DEPOT"] = dep
+
+        _rh("무인증 캐시(listing)", lambda: fdr_cache_csv("listing/krx", back_days=3))
+        _rh("무인증 캐시(delisting)", lambda: fdr_cache_csv("listing/delisting", back_days=3))
+        _rh("단면: 벌크 marcap", lambda: bulk_marcap_year(2020))
+        _rh("단면: 일단위 캐시", lambda: _xsec_fdrcache(ts("2020-01-08")))
+        _rh("단면: pykrx", lambda: _xsec_pykrx(ts("2020-01-08")), expect_rows=False)
+        _rh("단면: KRX 마켓플레이스", lambda: KRXM.xsec(ts("2020-01-08")), expect_rows=False)
+        _rh("구간수익률: pykrx",
+            lambda: _period_return_krx(ts("2020-01-02"), ts("2020-01-08")),
+            expect_rows=False)
+        _rh("종목목록", lambda: _fdr_listing())
+        _rh("상폐목록", lambda: _fdr_delisting())
+
+        hub = MarketHub(dep)
+        _rh("거래일 캘린더", lambda: hub.calendar("2020-01-01", "2020-01-13"))
+        xs = _rh("허브 단면 적재",
+                 lambda: hub.ensure(list(pd.bdate_range("2019-12-02", periods=6))))
+        _rh("허브 분할보정", lambda: (hub.compute_adjusted(), 1)[1])
+        sec = _rh("종목마스터 조립",
+                  lambda: build_security_master(hub.slice(hub.all_dates())))
+        if sec is not None and len(sec) and xs is not None and len(xs):
+            cal = TradingCal(pd.bdate_range("2019-06-01", "2020-06-30"))
+            months = list(month_ends("2019-12-01", "2020-02-29"))
+            pr = _rh("월간 패널 조립",
+                     lambda: build_month_panel(hub.all_dates(),
+                                               hub.slice(hub.all_dates()), sec,
+                                               months, cal)[0], expect_rows=False)
+            if pr is not None and len(pr):
+                _rh("유니버스 프레임", lambda: universe_frame(pr, sec), expect_rows=False)
+        _rh("벤치마크",
+            lambda: collect_benchmark(hub, month_ends("2020-01-01", "2020-03-31")),
+            expect_rows=False)
+
+        rep = _rh("리포트 수집(한경+네이버)",
+                  lambda: collect_research("2026-03-01", "2026-03-31"))
+        if rep is not None and len(rep):
+            rep2 = _rh("PDF 추출·작성자 보강", lambda: enrich_with_pdf(rep))
+            if rep2 is not None and len(rep2):
+                secx = (sec if sec is not None and len(sec)
+                        else pd.DataFrame({"code": ["005931"], "name": ["테스트"]}))
+                R, A, L = build_ledger(rep2, secx)
+                _rh("원장 구축", lambda: R)
+                _rh("원장 감사", lambda: (audit_ledger(R, A, L), 1)[1])
+                fc = _rh("예측 테이블", lambda: build_forecasts(R, L), expect_rows=False)
+                if fc is not None and len(fc):
+                    _rh("주지표 선택", lambda: choose_metric(fc)[0])
+                    _rh("예측 검증", lambda: validate_forecasts(fc))
+        _rh("DART corpCode",
+            lambda: _dart_corpmap(pd.DataFrame({"code": ["005930"]})))
+        _rh("DART 접수일", lambda: _dart_filing_dates("2021-01-01", "2021-03-31"))
+        _rh("DART 실적 EPS",
+            lambda: collect_actual_eps(
+                pd.DataFrame({"code": ["005930"], "name": ["테스트"]}),
+                hub.slice(hub.all_dates()), "2020-01-01", "2021-12-31"),
+            expect_rows=False)
+    finally:
+        for k, v in saved.items():
+            G[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    bad = [r for r in REHEARSAL if not r["ok"]]
+    CON.grid([[r["name"], "통과" if r["ok"] else "실패",
+               f"{r['rows']:,}" if r["rows"] >= 0 else "-",
+               f"{r['sec']:.2f}s", r["err"][:46]] for r in REHEARSAL],
+             ["수집·정제 함수", "판정", "행수", "소요", "오류"],
+             ["l", "l", "r", "r", "l"],
+             title="실경로 리허설 (네트워크만 가짜 · 함수는 실물 실행)")
+    for r in bad[:4]:
+        if r.get("tb"):
+            CON.err(f"[{r['name']}] {r['err']}")
+            for ln in r["tb"].strip().splitlines()[-6:]:
+                CON.say("  " + ln)
+    if bad and strict:
+        raise RuleBreak(
+            f"실경로 리허설 {len(bad)}건 실패 — 수집부 배선이 깨져 있습니다. "
+            f"이대로 실데이터를 돌리면 몇 분 뒤 같은 자리에서 죽습니다: "
+            + ", ".join(r["name"] for r in bad))
+    return not bad
+
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -5044,6 +5313,11 @@ def run_all() -> dict:
 
     with FLOW.part("S2", "자체계약 검증(TEST1~9 + 구조계약)", budget_s=240):
         run_contracts(strict=True)
+
+    # ★ 계약(S2)은 '계산 규칙'을, 리허설(S2b)은 '수집 배선'을 증명한다. 둘은 겹치지 않는다.
+    #   S2b 가 없던 빌드가 S2·S3 를 다 통과하고도 실행 2분 만에 수집부 한 줄 때문에 죽었다.
+    with FLOW.part("S2b", "실경로 리허설(수집 함수 실물 실행)", budget_s=300):
+        run_rehearsal(strict=True)
 
     with FLOW.part("S3", "합성데이터 전체경로 스모크", budget_s=1800):
         if not run_smoke(full=(RUN_MODE == "SMOKE")):
