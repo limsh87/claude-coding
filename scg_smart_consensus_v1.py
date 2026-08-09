@@ -1515,6 +1515,18 @@ def collect_universe(months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
             sec[c] = ts_col(sec[c]) if c in sec.columns else pd.NaT
         sec["code"] = sec["code"].map(code6)
         sec = sec.dropna(subset=["code"])
+        # ★ 캐시된 마스터에 상폐 이력이 없으면 그대로 쓰는 순간 생존자편향이다.
+        #   신선한 상폐 목록을 덧입히고, 그래도 없으면 크게 경고한다.
+        if int(sec["delist_date"].notna().sum()) < 200:
+            dl = _fdr_delisting() if RUN_MODE != "CACHED" else None
+            if dl is not None and len(dl):
+                dmap = dl.set_index("code")["delist_date"].to_dict()
+                sec["delist_date"] = sec["delist_date"].fillna(
+                    sec["code"].map(dmap))
+                CON.ok(f"캐시 마스터에 상폐 이력 보강: {int(sec['delist_date'].notna().sum()):,}건")
+            else:
+                CON.warn("캐시된 종목마스터에 상폐 이력이 거의 없습니다(<200) — "
+                         "생존자편향 위험. 온라인 재실행으로 보강을 권장합니다.")
     else:
         lst = _fdr_listing()
         if lst is None or len(lst) < 500:
@@ -1540,6 +1552,14 @@ def collect_universe(months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
             CON.warn("상폐 이력이 200건 미만 — 상폐 데이터 소스를 확인하세요(생존자편향 위험)")
         DEPOT.table_save("scg_security_master", sec, scope="공용", domain="universe",
                          source="FDR+KIND")
+    # ★ 이전상장(예: 코스닥→코스피)은 '상폐'가 아니다. 상폐일이 (재)상장일 근처이거나
+    #   그보다 앞서면 이전으로 간주하고 상폐 기록을 무효화한다 — 이걸 안 하면
+    #   멀쩡히 거래되는 대형주가 이전일 이후 유니버스에서 조용히 사라진다.
+    xfer = (sec["delist_date"].notna() & sec["list_date"].notna()
+            & (sec["delist_date"] <= sec["list_date"] + pd.Timedelta(days=30)))
+    if xfer.any():
+        CON.say(f"이전상장으로 판정된 상폐기록 {int(xfer.sum()):,}건 무효화(시장이동≠상폐)")
+        sec.loc[xfer, "delist_date"] = pd.NaT
     sec = sec[[_is_common_stock(c, n) for c, n in zip(sec["code"], sec["name"])]]
     sec = sec.drop_duplicates("code").reset_index(drop=True)
 
@@ -1606,15 +1626,16 @@ def collect_universe(months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
     return {"sec": sec, "mcap": mcap}
 
 
-LISTING_SEASON_DAYS = 250     # 신규상장 시즈닝 — 상장 직후 컨센서스 왜곡 방지(상장일 기준)
+UNIVERSE_SEASONING_DAYS = 0   # 명세 §31(추가 하드게이트 금지) 준수: 기본 0.
+                              # IPO 직후 왜곡을 배제한 별도 실험을 원할 때만 250 등으로.
 
 
 def universe_at(T: pd.Timestamp, sec: pd.DataFrame, mcap: pd.DataFrame) -> pd.Index:
-    """시점 T의 PIT 유니버스: T에 상장돼 있고(시즈닝 충족) 아직 상폐 전인 보통주.
+    """시점 T의 PIT 유니버스: T에 상장돼 있고 아직 상폐 전인 보통주.
     시총 스냅샷이 있는 달은 그 달 스냅샷과 유니온(스냅샷 결손이 종목을 죽이지 않게)."""
     ld = sec["list_date"]
     dd = sec["delist_date"]
-    ok = ((ld.isna() | (ld + pd.Timedelta(days=LISTING_SEASON_DAYS) <= T))
+    ok = ((ld.isna() | (ld + pd.Timedelta(days=UNIVERSE_SEASONING_DAYS) <= T))
           & (dd.isna() | (dd > T)))
     base = set(sec.loc[ok, "code"])
     snap = mcap[mcap["month"] == (T + pd.offsets.MonthEnd(0))]
@@ -2431,7 +2452,10 @@ _BROKER_ALIASES = [
     (r"신영", "신영증권"), (r"흥국", "흥국증권"), (r"상상인", "상상인증권"),
     (r"BNK", "BNK투자증권"), (r"케이프", "케이프투자증권"), (r"리딩", "리딩투자증권"),
     (r"NH선물|나무", "NH투자증권"), (r"골드만|Goldman", "골드만삭스"),
-    (r"모간|모건|Morgan", "모건스탠리"), (r"JP모간|JPMorgan|J\.P\.", "JP모간"),
+    # ★ JP모간을 모건스탠리보다 먼저 — 순서를 바꾸면 '모간' 패턴이 JP모간을 삼켜
+    #   두 회사 동명 애널리스트가 한 실체로 병합된다(§45.1 위반)
+    (r"JP모간|JP모건|JPMorgan|J\.P\.", "JP모간"),
+    (r"모간스탠리|모건스탠리|Morgan\s*Stanley|모간|모건", "모건스탠리"),
     (r"UBS", "UBS"), (r"CLSA", "CLSA"), (r"노무라|Nomura", "노무라"),
 ]
 _BROKER_RE = [(re.compile(p), c) for p, c in _BROKER_ALIASES]
@@ -2836,7 +2860,8 @@ def _acc_from_snapshot(m: pd.DataFrame, cfg: SCGParams, cols: List[str]) -> pd.D
                  _MAF=g["forecast_value"].transform(
                      lambda s: float(np.median(np.abs(s)))),
                  _N=g["forecast_value"].transform("size"))
-    m = m[m["_N"] >= cfg.MIN_ANALYSTS]        # n=1 이면 C≡F 라 사건이 항등 0 — 무정보 미생성
+    # n=1 이면 C≡F_j 라 산식이 자연히 0 사건을 낳는다 — §10 의 λ=n/(n+K) 는 이 관측도
+    # 세므로, 억지로 걸러 n 을 줄이지 않는다(명세 산술 그대로).
     if not len(m):
         return pd.DataFrame(columns=cols)
     eps = cfg.EPSILON
@@ -2873,7 +2898,7 @@ def acc_events_tp(fc: pd.DataFrame, tp_act: pd.DataFrame, cfg: SCGParams) -> pd.
                  _N=g["forecast_value"].transform("size"),
                  actual_value=m["actual_price"],
                  actual_announcement_date=m["matured_at"])
-    m = m[m["_N"] >= cfg.MIN_ANALYSTS]
+    # EPS 쪽과 같은 이유로 n=1 사건도 유지(값은 자연히 0) — §10 관측수 산술 보존
     if not len(m):
         return pd.DataFrame(columns=cols)
     eps = cfg.EPSILON
@@ -3094,16 +3119,19 @@ def pick_primary_fp(cons: pd.DataFrame, actuals: pd.DataFrame, metric: str) -> p
     d = d[d["_fy"].notna()]
     T_year = d["signal_date"].dt.year
 
-    def _rank(row_fy, row_T, key):
+    def _rank(row_fy, row_T_year, T_sig, key):
         a = ann.get(key)
-        unannounced = (a is None) or pd.isna(a)
+        # PIT: '그 시점 T 에 이미 발표되었는가'만 본다 — 최종 DB 에 발표기록이 있다는
+        # 사실 자체를 쓰면 §0.1(수정된 최종 DB 소급 간주 금지) 위반이다.
+        unannounced = (a is None) or pd.isna(a) or (a >= T_sig)
         # FY1 = signal 연도, 다음해, 그 다음해, 전년(미발표시) 순
-        offset = row_fy - row_T
+        offset = row_fy - row_T_year
         base = {0: 0, 1: 1, 2: 2, -1: 3}.get(int(offset), 9)
         return base + (0 if unannounced else 0.5)
 
-    d["_rank"] = [_rank(fy, ty, (s, fp)) for fy, ty, s, fp in
-                  zip(d["_fy"], T_year, d["stock_id"], d["fiscal_period"])]
+    d["_rank"] = [_rank(fy, ty, tsg, (s, fp)) for fy, ty, tsg, s, fp in
+                  zip(d["_fy"], T_year, d["signal_date"], d["stock_id"],
+                      d["fiscal_period"])]
     idx = (d.sort_values(["_rank"])
            .groupby(["signal_date", "stock_id"], observed=True, sort=False)
            .head(1).index)
@@ -3262,23 +3290,33 @@ def build_month_panel(book: Dict, sec: pd.DataFrame, months, cal: "TradingCal"
     rows = []
     for code, (d, v) in book.items():
         dd = delist.get(code, pd.NaT)
+        last_px_day = pd.Timestamp(d[-1])
         for i, m in enumerate(months):
             c0 = _px_asof(book, code, m)
             if not np.isfinite(c0):
                 continue
+            # ★ 정지→상폐 경로: 마지막 체결 후 가격이 다시는 나오지 않고 상폐가 예정돼
+            #   있으면, '마지막 체결이 속한 달'에 전손(-100%)을 기록한다. 이 손실을
+            #   어느 달에도 안 적으면 하위분위 수익률이 조용히 과대평가된다(생존자편향).
+            dying = (pd.notna(dd) and dd > m
+                     and (last_px_day - pd.Timestamp(m)).days <= 45)
             nxt = months[i + 1] if i + 1 < len(months) else None
             fwd1 = np.nan
             if nxt is not None:
                 c1 = _px_asof(book, code, nxt)
                 if np.isfinite(c1):
                     fwd1 = c1 / c0 - 1.0
-                elif pd.notna(dd) and m < dd <= nxt + pd.Timedelta(days=5):
+                elif dying or (pd.notna(dd) and m < dd <= nxt + pd.Timedelta(days=5)):
                     fwd1 = -1.0                    # 정리매매 최종가 없으면 전손 처리(보수적)
             r = {"code": code, "month": m, "close": c0, "fwd_1m": fwd1}
             for h in (20, 60, 120):
                 th = cal.shift(m, h)
                 ch = _px_asof(book, code, th) if th is not None else np.nan
-                r[f"fwd_{h}td"] = ch / c0 - 1.0 if np.isfinite(ch) else np.nan
+                if np.isfinite(ch):
+                    r[f"fwd_{h}td"] = ch / c0 - 1.0
+                else:
+                    # IC 지평에도 같은 규칙 — 생존자만으로 IC 를 재지 않는다
+                    r[f"fwd_{h}td"] = -1.0 if dying else np.nan
             rows.append(r)
     P = pd.DataFrame(rows)
     CON.say(f"월간 수익률 패널 {len(P):,}행 · 종목 {P['code'].nunique():,} · "
@@ -3303,7 +3341,8 @@ def alphas_in_universe(sig: pd.DataFrame, members: pd.Series, cfg: SCGParams
 
 
 def bucket_backtest(sig: pd.DataFrame, panel: pd.DataFrame, strat: str,
-                    cost_bps: float = COST_BPS_ONEWAY) -> dict:
+                    cost_bps: float = COST_BPS_ONEWAY,
+                    nq_override: Optional[int] = None) -> dict:
     """단일 전략의 십분위 백테스트. 반환: returns(월별)·decile_mean·ic·holdings·nq"""
     a_col = ALPHA_COL[strat]
     d = sig.dropna(subset=[a_col]).merge(
@@ -3312,7 +3351,9 @@ def bucket_backtest(sig: pd.DataFrame, panel: pd.DataFrame, strat: str,
     if not len(d):
         return {"strategy": strat, "empty": True}
     xs_n = d.groupby("signal_date")["stock_id"].size()
-    nq = 10 if xs_n.median() >= 60 else 5            # 표본 작으면 오분위 자동 폴백(§36)
+    # 표본 작으면 오분위 자동 폴백(§36). 4전략 비교표에서는 run_suite 가 공통 단면으로
+    # nq 를 한 번만 정해 넘긴다 — 전략마다 분위수가 달라지면 §37 비교가 어긋난다.
+    nq = int(nq_override) if nq_override else (10 if xs_n.median() >= 60 else 5)
     d["bucket"] = (d.groupby("signal_date")[a_col]
                    .transform(lambda s: np.ceil(s.rank(method="first", pct=True) * nq)
                               .clip(1, nq)))
@@ -3405,10 +3446,15 @@ def monotonicity(bt: dict) -> Tuple[float, bool]:
 
 def run_suite(sig: pd.DataFrame, panel: pd.DataFrame, label: str,
               bench: Optional[pd.Series] = None) -> Dict[str, dict]:
-    """4전략을 동일 유니버스·동일 시점에서 나란히(§30·§37)."""
+    """4전략을 동일 유니버스·동일 시점·동일 분위수에서 나란히(§30·§37)."""
+    common = sig.merge(panel[["code", "month"]],
+                       left_on=["stock_id", "signal_date"],
+                       right_on=["code", "month"], how="inner")
+    xs = common.groupby("signal_date")["stock_id"].size()
+    nq_common = 10 if (len(xs) and xs.median() >= 60) else 5
     out = {}
     for s in STRATS:
-        out[s] = bucket_backtest(sig, panel, s)
+        out[s] = bucket_backtest(sig, panel, s, nq_override=nq_common)
         out[s]["label"] = label
     return out
 
