@@ -287,7 +287,7 @@ def _ensure_deps() -> Dict[str, bool]:
                   + err + "\n" + "=" * 88)
             raise SystemExit(1)
         importlib.invalidate_caches()
-    if miss_opt and RUN_MODE != "SMOKE":
+    if miss_opt and RUN_MODE not in ("SMOKE", "CACHED"):     # CACHED: network=0 약속 준수
         print(f"[부트스트랩] 선택 패키지 설치: {', '.join(miss_opt)}")
         _pip_install(miss_opt)                    # 실패해도 계속 — 기능별로 개별 degrade
         importlib.invalidate_caches()
@@ -846,12 +846,25 @@ def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
     try:
         return pd.read_parquet(path)
     except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 격리 후 재생성 대상: {os.path.basename(path)} "
-                 f"({type(e).__name__})")
-        try:                                   # 손상 파일도 지우지 않고 격리 보관 (원본 보호)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
+        # ★ 격리(개명)는 '우리 소유' 캐시에만. adopt 로 참조 등록된 외부 파일을 개명하면
+        #   원위치에서 사라져 다른 전략의 조회가 전부 미스난다(절대 1원칙 위반 — 감사 HIGH).
+        #   외부 파일은 그대로 두고 None + 경고만 돌려준다(일과성 오류면 다음 실행에 복구).
+        owned = False
+        try:
+            v = globals().get("VAULT")
+            owned = v is not None and os.path.abspath(path).startswith(v.root + os.sep)
         except Exception:
-            pass
+            owned = False
+        if owned:
+            LOG.warn(f"parquet 손상 추정 — 격리 후 재생성 대상: {os.path.basename(path)} "
+                     f"({type(e).__name__})")
+            try:                               # 지우지 않고 격리 보관 (원본 보호)
+                os.replace(path, path + f".corrupt.{int(time.time())}")
+            except Exception:
+                pass
+        else:
+            LOG.warn(f"외부/참조 parquet 읽기 실패({type(e).__name__}) — 훼손 방지를 위해 "
+                     f"손대지 않고 건너뜁니다: {path}")
         return None
 
 
@@ -2180,7 +2193,8 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         "market": d[cl["market"]].astype(str) if "market" in cl else "KRX",
     }).dropna(subset=["code"])
     # 재상장/재폐지 중복은 '가장 늦은 폐지일'을 남긴다 (이른 것을 남기면 재상장 구간 유실)
-    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    # na_position="first" — NaT 가 맨 뒤로 가서 실제 폐지일을 이기는 사고 방지(감사 중간)
+    t = t.sort_values("delisting_date", na_position="first").drop_duplicates("code", keep="last")
     if cached is None or not len(cached):
         VAULT.put_table("fdr_cache_listing_delisting", d, scope="shared", domain="universe",
                         source="fdr_github_cache")
@@ -2672,10 +2686,41 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
 
+def _marcap_split_adjust(px: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    """marcap 실종가의 액면분할/병합 절벽 보정.
+    ★ marcap 은 무수정 실종가라 삼성전자 50:1(2018-05) 같은 분할이 하루 -98% 수익으로
+      들어간다(감사 CRITICAL). '주식수 점프 × 시총 연속' 시그니처가 동시에 맞을 때만
+      소급계수를 적용한다 — 유상증자(주식수↑·시총도↑)는 보정하지 않는다."""
+    if "shares" not in px.columns or px["shares"].notna().sum() == 0:
+        return px, 0
+    px = px.sort_values(["code", "date"], kind="mergesort").reset_index(drop=True)
+    g = px.groupby("code", observed=True)
+    r_p = px["close"] / g["close"].shift(1)
+    r_s = px["shares"] / g["shares"].shift(1)
+    ev = (r_s.notna() & r_p.notna() & ((r_s > 1.2) | (r_s < 1 / 1.2)) &
+          ((r_p * r_s - 1).abs() < 0.25))
+    n_ev = int(ev.sum())
+    if not n_ev:
+        return px, 0
+    factor = pd.Series(1.0, index=px.index)
+    factor[ev] = r_s[ev].astype(float)
+    # 각 시점 이전 가격을 '이후 발생한 분할계수의 곱'으로 나눠 최종(현재) 스케일로 통일.
+    # 역순 누적곱 = 접미사 곱; 자기 행 계수는 자기 이전 가격에만 적용되므로 한 칸 제외.
+    rev_code = px["code"].iloc[::-1]
+    suffix = factor.iloc[::-1].groupby(rev_code, observed=True).cumprod().iloc[::-1]
+    fut = (suffix / factor).astype(float)      # 행 t 이후(exclusive) 이벤트 계수의 곱
+    for c in ("open", "high", "low", "close"):
+        if c in px.columns:
+            px[c] = pd.to_numeric(px[c], errors="coerce") / fut
+    if "volume" in px.columns:
+        px["volume"] = pd.to_numeric(px["volume"], errors="coerce") * fut
+    return px, n_ev
+
+
 def prices_from_marcap(codes: set, start: str, end: str) -> Optional[pd.DataFrame]:
     """marcap 연도별 parquet(폐지종목 포함 일별 시세·시총)에서 일봉을 뽑는다 — 신규 수집 0건
     경로. 공용 캐시에 이미 marcap_YYYY 가 쌓여 있으면 KRX 를 한 번도 찌르지 않고 10년
-    일봉이 나온다. (시가 컬럼이 있으면 함께 취한다)"""
+    일봉이 나온다. 실종가 분할절벽은 _marcap_split_adjust 로 소급 보정한다."""
     y0, y1 = as_ts(start).year, as_ts(end).year
     frames = []
     for y in range(y0, y1 + 1):
@@ -2684,13 +2729,17 @@ def prices_from_marcap(codes: set, start: str, end: str) -> Optional[pd.DataFram
             return None                       # 한 해라도 빠지면 이 경로 포기(부분 사용은 편향)
         sub = d[d["code"].isin(codes)] if codes else d
         keep = pd.DataFrame({
-            "code": sub["code"], "date": sub["date"],
+            "code": sub["code"].astype(str), "date": sub["date"],
             "open": col(sub, "open"), "high": col(sub, "high"), "low": col(sub, "low"),
             "close": col(sub, "close"), "volume": col(sub, "volume"),
-            "amount": col(sub, "amount"), "src": "marcap"})
+            "amount": col(sub, "amount"), "shares": col(sub, "shares"), "src": "marcap"})
         frames.append(keep)
     px = pd.concat(frames, ignore_index=True)
     px = px.dropna(subset=["code", "date", "close"])
+    px, n_ev = _marcap_split_adjust(px)
+    if n_ev:
+        LOG.ok(f"marcap 분할/병합 절벽 {n_ev:,}건 소급 보정 (주식수 점프 × 시총 연속 시그니처)")
+    px = px.drop(columns=["shares"], errors="ignore")
     MARCAP.evict(())                          # 연도 캐시 해제 — 시총 단면 단계에서 재로드
     return px if len(px) else None
 
@@ -2802,12 +2851,29 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = px.dropna(subset=["code", "date", "close"])
     for c in ("open", "high", "low", "close", "volume", "amount"):
         px[c] = pd.to_numeric(col(px, c), errors="coerce")
-    px = (px.sort_values(["code", "date"])
-            .drop_duplicates(["code", "date"], keep="last").reset_index(drop=True))
-    px = px[(px["date"] >= start_ts - pd.Timedelta(days=420)) & (px["date"] <= end_ts)]
+    # ★ (code,date) 중복은 '소스 우선순위'로 결정적으로 해소한다 — 수정주가 소스(pykrx/fdr/
+    #   naver/yf) > 보정된 marcap. 비안정 정렬에 맡기면 실행마다 다른 소스가 살아남는다.
+    _prio = {"pykrx": 0, "fdr": 1, "naver": 2, "yfinance": 3, "marcap": 4}
+    px["_prio"] = px["src"].astype(str).map(_prio).fillna(5).astype(int) \
+        if "src" in px.columns else 5
+    px = (px.sort_values(["code", "date", "_prio"], kind="mergesort")
+            .drop_duplicates(["code", "date"], keep="first")
+            .drop(columns=["_prio"]).reset_index(drop=True))
+    # ★ 공용 캐시 저장은 '날짜 절단 전' 병합 전체본으로 — 이 전략 구간으로 자른 것을 저장하면
+    #   다른 전략이 쌓아둔 앞뒤 구간 행이 활성 테이블에서 사라진다(캐시 훼손 — 감사 중간).
     if new_frames:
         VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
-                        source="cache+marcap+chain")
+                        source="cache+marcap(분할보정)+chain")
+    px = px[(px["date"] >= start_ts - pd.Timedelta(days=420)) & (px["date"] <= end_ts)]
+    # 잔여 절벽 감사: 하루 |수익|>50% 는 정리매매(제한폭 없음) 외에는 분할 미보정 신호다.
+    r1 = px.groupby("code", observed=True)["close"].pct_change()
+    n_cliff = int((r1.abs() > 0.5).sum())
+    if n_cliff:
+        bad = px.loc[r1.abs() > 0.5, "code"].value_counts().head(5)
+        LOG.warn(f"일간 |수익|>50% 절벽 {n_cliff:,}건 잔존 — 정리매매(정상)일 수도, 분할 "
+                 f"미보정(왜곡)일 수도 있습니다. 다발 종목: "
+                 f"{', '.join(f'{k}×{v}' for k, v in bad.items())} — 산출물 커버리지에 기록.")
+    globals()["_PX_CLIFF_COUNT"] = n_cliff
     PIPE.io("OUT", "MEM", "prices_daily", px, source="krx_ohlcv_daily")
     return downcast(px)
 
@@ -2928,20 +2994,41 @@ def build_k200_membership(sch: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
         observed[as_ts(k)] = v
 
     method = ""
-    # ── 정적 멤버십 검증: 과거·최근 시점의 구성이 사실상 동일하면 소급 복사로 판단 ─────────
-    if observed:
+    # ── 정적 멤버십 검증 ① — 시점 간 변화율: 관측이 2개 이상이면 커버리지와 무관하게 검사.
+    #    K200 연간 교체율은 통상 5~10% 이므로, 1년+ 간격에서 99.5%+ / 3년+ 간격에서 97%+
+    #    동일하면 '현재 구성의 소급 복사'로 판단하고 전량 폐기한다(생존자편향 방지).
+    if len(observed) >= 2:
         obs_dates = sorted(observed)
-        cover = [d for d in dates if d in observed]
-        if len(cover) >= max(4, int(len(dates) * 0.5)):
-            first, last = observed[obs_dates[0]], observed[obs_dates[-1]]
-            span_days = (obs_dates[-1] - obs_dates[0]).days
-            overlap = len(set(first) & set(last)) / max(len(set(first) | set(last)), 1)
-            if span_days > 365 * 3 and overlap > 0.97:
-                LOG.warn(f"지수구성 관측치가 {span_days // 365}년 간 {overlap:.1%} 동일 — "
-                         f"'현재 구성의 소급 복사'로 판단하고 폐기합니다(생존자편향 방지).")
-                observed = {}
-            else:
-                method = "krx_observed_pdf"
+        first, last = observed[obs_dates[0]], observed[obs_dates[-1]]
+        span_days = (obs_dates[-1] - obs_dates[0]).days
+        overlap = len(set(first) & set(last)) / max(len(set(first) | set(last)), 1)
+        static_like = (span_days > 365 and overlap > 0.995) or \
+                      (span_days > 365 * 3 and overlap > 0.97)
+        if static_like:
+            LOG.warn(f"지수구성 관측치가 {span_days}일 간 {overlap:.1%} 동일 — "
+                     f"'현재 구성의 소급 복사'로 판단하고 폐기합니다(생존자편향 방지).")
+            observed = {}
+    # ── 정적 멤버십 검증 ② — 시총 교차검증: 각 관측 스냅샷이 그 시점 시총 상위권과
+    #    충분히 겹치는지 확인. 겹침<60% 면 그 시점 관측만 폐기(재구성으로 폴백).
+    if observed:
+        bad_pts = []
+        for d in list(observed):
+            snap = marketcap_at(d)
+            if snap is None or not len(snap):
+                continue
+            top300 = set(snap.dropna(subset=["marcap"])
+                         .sort_values("marcap", ascending=False).head(300)["code"].astype(str))
+            obs_set = set(map(str, observed[d]))
+            ratio = len(obs_set & top300) / max(len(obs_set), 1)
+            if ratio < 0.60:
+                bad_pts.append((d, ratio))
+                observed.pop(d)
+        if bad_pts:
+            LOG.warn(f"지수구성 관측 {len(bad_pts)}개 시점이 당시 시총 상위300 과 60% 미만 "
+                     f"겹침 — 소급 복사 의심으로 해당 시점만 폐기: "
+                     f"{[(f'{d:%Y-%m}', f'{r:.0%}') for d, r in bad_pts[:4]]}")
+        if observed:
+            method = "krx_observed_pdf"
 
     if new_rows and method == "krx_observed_pdf":
         allr = ([cached] if cached is not None and len(cached) else []) + [pd.DataFrame(new_rows)]
@@ -3047,7 +3134,15 @@ def fetch_flow_windows(sch: pd.DataFrame, cal: np.ndarray) -> pd.DataFrame:
     have = set()
     if cached is not None and len(cached):
         cached["signal_date"] = as_ts_series(cached["signal_date"])
-        have = set(cached["signal_date"].dt.strftime("%Y-%m-%d"))
+        # 완결성 판정: cells_ok(시장×투자자 4셀) 메타가 있으면 4셀 완비 시점만 '보유'로
+        # 인정한다 — 반쪽(예: KOSPI만) 캐시가 영구 고착되는 것을 방지. 메타가 없는 구캐시는
+        # 완결로 간주(재수집 폭주 방지).
+        if "cells_ok" in cached.columns:
+            ok_pts = (cached.groupby(cached["signal_date"].dt.strftime("%Y-%m-%d"))["cells_ok"]
+                      .max())
+            have = set(ok_pts[ok_pts.fillna(4) >= 4].index)
+        else:
+            have = set(cached["signal_date"].dt.strftime("%Y-%m-%d"))
         LOG.info(f"공용 캐시에서 수급 윈도우 {len(have)}개 시점 재사용")
 
     cal_idx = pd.DatetimeIndex(cal)
@@ -3065,12 +3160,14 @@ def fetch_flow_windows(sch: pd.DataFrame, cal: np.ndarray) -> pd.DataFrame:
             frm = pd.Timestamp(cal_idx[frm_pos]).strftime("%Y%m%d")
             to = pd.Timestamp(cal_idx[pos]).strftime("%Y%m%d")
             parts = []
+            n_cells = 0
             for investor, colname in (("기관합계", "inst_net"), ("외국인", "forg_net")):
                 per_mkt = []
                 for mkt in ("KOSPI", "KOSDAQ"):
                     r = _flow_window_once(frm, to, mkt, investor)
                     if r is not None:
                         per_mkt.append(r)
+                        n_cells += 1
                 if not per_mkt:
                     continue
                 rr = (pd.concat(per_mkt, ignore_index=True)
@@ -3083,6 +3180,10 @@ def fetch_flow_windows(sch: pd.DataFrame, cal: np.ndarray) -> pd.DataFrame:
             for p in parts[1:]:
                 merged = merged.merge(p, on="code", how="outer")
             merged["signal_date"] = d
+            merged["cells_ok"] = n_cells          # 4 미만이면 다음 실행에서 재수집 대상
+            if n_cells < 4:
+                LOG.warn(f"{d:%Y-%m-%d} 수급 윈도우 부분수집({n_cells}/4셀) — 이번엔 쓰되 "
+                         f"다음 실행에서 자동 재수집합니다.")
             new_frames.append(merged)
     elif todo:
         LOG.warn(f"수급 윈도우 미수집 {len(todo)}개 시점 (CACHED 모드 또는 pykrx 없음) — "
@@ -3212,9 +3313,10 @@ def tidy_dart_earnings(raw: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
         hit = d[d["account_nm"].str.contains(pat, regex=True, na=False)].copy()
         if hit.empty:
             continue
-        # 연결(CFS) 우선, 없으면 별도(OFS) — 같은 (사·기간)에 둘 다 있으면 CFS 승
+        # 연결(CFS) 우선, 없으면 별도(OFS) — 같은 (사·기간)에 둘 다 있으면 CFS 승.
+        # kind="stable" — 동순위 중복행의 생존자가 정렬 구현에 좌우되지 않게(재현성).
         hit["_pri"] = np.where(hit["fs_div"].str.contains("CFS"), 0, 1)
-        hit = (hit.sort_values(["_pri"])
+        hit = (hit.sort_values(["_pri"], kind="stable")
                   .drop_duplicates(["corp_code", "bsns_year", "reprt_code"], keep="first"))
         picked.append(hit.assign(item=item)[["corp_code", "bsns_year", "reprt_code",
                                              "rcept_no", "item", "amount"]])
@@ -3487,11 +3589,11 @@ def hankyung_collect(start: str, end: str, page_size: int = 80, max_pages: int =
             if not html:
                 break
             batch = _hk_parse(html)
-            if not batch:
-                break
             fresh = [b for b in batch if b["src_report_id"] not in seen]
             seen.update(b["src_report_id"] for b in fresh)
             got.extend(fresh)
+            # 빈 파싱(일시 차단/레이아웃 요동)도 '새 항목 0건'과 동일하게 연속 2회일 때만
+            # 중단한다 — 한 페이지 실패로 그 해 전체가 잘리는 무음 과소수집 방지.
             if not fresh:
                 empty_streak += 1
                 if empty_streak >= 2:
@@ -3652,6 +3754,9 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         return pd.DataFrame(columns=REPORT_COLS)
     allcols = sorted(set().union(*[set(map(str, f.columns)) for f in frames]))
     d = pd.concat([f.reindex(columns=allcols) for f in frames], ignore_index=True)
+    for c in REPORT_COLS:                     # adopt 전용 입력(열 부족)에서도 KeyError 없이
+        if c not in d.columns:
+            d[c] = None
     n0 = len(d)
     d["pub_date"] = as_ts_series(d["pub_date"])
     lo, hi = as_ts("1999-01-01"), as_ts(BACKTEST_END) + pd.Timedelta(days=400)
@@ -3803,12 +3908,18 @@ class ConsensusStore:
             return
         x = L.dropna(subset=["stock_code", "pub_date", "target_price"]).copy()
         x["pub_date"] = as_ts_series(x["pub_date"])
+        x["stock_code"] = x["stock_code"].astype(str)
         x = x.dropna(subset=["pub_date"])
         if not len(x):
             self.ok = False
             self.L = pd.DataFrame()
             return
-        px = px_close.sort_values(["code", "date"])
+        # ★ merge_asof 는 by-키 dtype 불일치(object vs category)에 MergeError 를 던진다 —
+        #   downcast 가 px.code 를 category 로 바꾸므로 여기서 반드시 str 로 통일한다.
+        #   (이걸 놓치면 FULL 모드가 F4 전멸 → 'L3.BT 빈 결과' 오진으로 죽는다 — 감사 치명)
+        px = px_close[["code", "date", "close"]].copy()
+        px["code"] = px["code"].astype(str)
+        px = px.sort_values(["code", "date"])
         # 발간일 종가 / 12개월 후 종가를 merge_asof 로 일괄 결합 (루프 금지 — 속도)
         x = x.sort_values("pub_date")
         p0 = pd.merge_asof(x, px.rename(columns={"date": "pub_date", "close": "px0"})
@@ -3919,8 +4030,13 @@ def detect_exact_vendor_mode() -> dict:
             detail.append(f"{label}: 필수 컬럼 결측 {sorted(missing)[:4]}… → 벤더 데이터 아님")
             continue
         if not vendor_marked:
-            detail.append(f"{label}: 컬럼 형태는 유사하나 vendor 마커 없음 → "
-                          f"프록시 산출물로 분류(EXACT 불인정)")
+            # 완전 스키마인데 마커만 없는 파일 — '미확인 후보'로 보고(자동 활성화는 안 함:
+            # 다른 전략이 만든 프록시일 가능성이 높다. 진짜 벤더 파일이면 vendor 컬럼에
+            # 'fnguide' 를 채워 재실행하라고 안내).
+            detail.append(f"{label}: 계약 스키마와 일치하나 vendor 마커 없음 → 미확인 후보. "
+                          f"진짜 FnGuide 원본이면 vendor='fnguide' 컬럼을 추가해 재실행하세요.")
+            cov_rows.append({"item": label, "quarters": 0, "tickers": 0,
+                             "verdict": "UNVERIFIED_CANDIDATE"})
             continue
         kd = as_ts_series(d[[c for c in d.columns if str(c).lower() == "known_at"][0]])
         n_q = kd.dt.to_period("Q").nunique()
@@ -3936,15 +4052,23 @@ def detect_exact_vendor_mode() -> dict:
         cov_rows.append({"item": label, "quarters": int(n_q), "tickers": int(n_tk),
                          "verdict": "OK"})
 
-    status = "EXACT_VENDOR_MODE_ACTIVE" if active else "EXACT_COMPOSITE_NOT_PUBLICLY_IDENTIFIED"
+    # ★ 벤더 '계산 파이프라인'은 이 코드에 없다. 데이터가 실재해도 EXACT 를 실행한 척하지
+    #   않도록(계약 §EXACT 역방향 위반 방지) 항상 재구성 모드로 계산하고, 그 사실을 STATUS 로
+    #   정직하게 남긴다.
+    if active:
+        status = "EXACT_DATA_PRESENT_PIPELINE_NOT_IMPLEMENTED"
+        detail.append("벤더 데이터는 검증 통과했으나 벤더 composite 재현 파이프라인은 이 코드에 "
+                      "구현되어 있지 않음 — 계산은 RECONSTRUCTED 로만 수행하고 라벨을 혼용하지 "
+                      "않는다.")
+    else:
+        status = "EXACT_COMPOSITE_NOT_PUBLICLY_IDENTIFIED"
     if not candidates:
         detail.append("벤더 후보 파일 자체가 캐시에 없음 (fnguide_factor_history.parquet 등)")
     LOG.banner("EXACT_VENDOR_MODE 판정", f"STATUS = {status}")
     for ln in detail:
         LOG.info("  · " + ln)
-    if not active:
-        LOG.info("→ RECONSTRUCTED_PUBLIC_MODE 로만 진행합니다. 아래 재구성 규칙은 "
-                 "'공개정보 재구성'이며 신한 원문에 명시된 공식이 아닙니다.")
+    LOG.info("→ 계산은 RECONSTRUCTED_PUBLIC_MODE 로만 수행합니다. 재구성 규칙은 '공개정보 "
+             "재구성'이며 신한 원문에 명시된 공식이 아닙니다.")
     return {"active": active, "status": status, "detail": detail, "coverage_rows": cov_rows}
 
 
@@ -4206,18 +4330,33 @@ class PriceBook:
                                      aggfunc="last").sort_index().astype("float32")
         self.dates = self.close.index
 
-    def px_at(self, code: str, date: pd.Timestamp, kind: str = "open") -> float:
-        """date 당일 시가(결측이면 당일 종가 → 직전 종가) — 체결가 근사."""
-        tab = self.open_ if kind == "open" else self.close
-        if code not in tab.columns:
-            return np.nan
+    def px_at(self, code: str, date: pd.Timestamp, kind: str = "open",
+              strict_day: bool = False) -> float:
+        """date 당일 시가(결측 시 당일 종가) 조회.
+        strict_day=True: 당일 실체결 프린트가 없으면 NaN — '정지 전 과거가로 매수' 방지.
+        strict_day=False: 직전 종가 폴백 허용(매도 평가용 — 정지종목은 별도 헤어컷)."""
         v = np.nan
-        if date in tab.index:
+        if code in self.open_.columns and date in self.open_.index:
+            tab = self.open_ if kind == "open" else self.close
             v = tab.at[date, code]
-        if (v is None or not np.isfinite(v)) and code in self.close.columns:
+            if (v is None or not np.isfinite(v)) and kind == "open":
+                v = self.close.at[date, code]          # 당일 시가 결측 → 당일 종가
+        if (v is None or not np.isfinite(v)) and not strict_day \
+                and code in self.close.columns:
             s = self.close[code].loc[:date].dropna()
             v = float(s.iloc[-1]) if len(s) else np.nan
         return float(v) if v is not None and np.isfinite(v) else np.nan
+
+    def last_trade_pos_gap(self, code: str, upto: pd.Timestamp) -> int:
+        """upto 까지 마지막 실거래일로부터의 거래일 간격 (정지/폐지 감지용). 없으면 큰 값."""
+        if code not in self.close.columns:
+            return 10 ** 6
+        s = self.close[code].loc[:upto].dropna()
+        if not len(s):
+            return 10 ** 6
+        li = self.dates.searchsorted(s.index[-1])
+        ui = self.dates.searchsorted(upto, side="right") - 1
+        return max(0, int(ui - li))
 
     def last_close_between(self, code: str, d0: pd.Timestamp, d1: pd.Timestamp) -> float:
         if code not in self.close.columns:
@@ -4248,17 +4387,24 @@ def run_backtest(portfolios: Dict[pd.Timestamp, pd.DataFrame], sch: pd.DataFrame
     q_rows, hold_rows = [], []
     prev_val: Dict[str, float] = {}          # 직전 리밸런스 직후부터 드리프트된 보유가치(비중)
 
+    n_sch = len(sch)
     for i, r in sch.iterrows():
         sig, ex, nx = r["signal_date"], r["exec_date"], r["next_exec"]
+        is_last = (i == n_sch - 1)
         port = portfolios.get(sig)
         tgt = {} if port is None or not len(port) else dict(zip(port["code"], port["weight"]))
 
         # ── 체결가: next_open(기본) / paper_close(신호일 종가 — 계약 별도 산출) ─────────
+        #    strict_day=True — 체결일 당일 실체결이 없는 종목(정지)은 편입하지 않는다.
         entry_px: Dict[str, float] = {}
         for c in tgt:
-            p0 = book.px_at(c, ex, "open") if exec_mode == "next_open" \
-                else book.px_at(c, sig, "close")
+            p0 = book.px_at(c, ex, "open", strict_day=True) if exec_mode == "next_open" \
+                else book.px_at(c, sig, "close", strict_day=True)
             entry_px[c] = p0
+        n_drop = sum(1 for c in tgt if not np.isfinite(entry_px.get(c, np.nan)))
+        if n_drop:
+            LOG.debug(f"{pd.Timestamp(sig):%Y-%m-%d} 체결일 무거래로 제외 {n_drop}종목 "
+                      f"(정지 전 과거가 매수 방지)")
         tgt = {c: w for c, w in tgt.items() if np.isfinite(entry_px.get(c, np.nan))}
         if tgt:                                # 체결 불가 종목 제외 후 동일가중 재정규화
             s = sum(tgt.values())
@@ -4282,8 +4428,12 @@ def run_backtest(portfolios: Dict[pd.Timestamp, pd.DataFrame], sch: pd.DataFrame
                 cost += abs(dw) * (COMMISSION_BPS / 1e4 + sl + tx)
         cost *= cost_mult
 
-        # ── 보유구간 [ex, nx] 일별 가치 경로 ────────────────────────────────────────────
-        period_dates = book.dates[(book.dates >= ex) & (book.dates <= nx)]
+        # ── 보유구간 일별 가치 경로 ─────────────────────────────────────────────────────
+        #   ★ 반개구간 [ex, nx) 로 돌고, nx(다음 리밸런스 체결일)에는 '매도가(시가)'로
+        #     마지막 1회 평가한다. nx 를 종가까지 들고 있으면 다음 포트폴리오의 같은 날
+        #     장중수익과 이중계상된다(감사 CRITICAL — 40회 리밸런스 누적 왜곡).
+        #     마지막 스케줄 행만 매도 없이 nx 종가 평가로 마감한다.
+        period_dates = book.dates[(book.dates >= ex) & (book.dates < nx)]
         vals = dict(tgt)                       # 비중 = 가치 (구간 시작 시 1로 정규화된 포트)
         period_ret = 0.0
         if len(period_dates) and vals:
@@ -4326,6 +4476,28 @@ def run_backtest(portfolios: Dict[pd.Timestamp, pd.DataFrame], sch: pd.DataFrame
                 day_val = sum(v.values()) + cash
                 daily_rows.append((d, day_val / port_val_prev - 1.0))
                 port_val_prev = day_val
+            # ── nx 매도 평가: 직전종가→매도가(시가). 마지막 행은 종가 마감(매도 없음) ──
+            sale_kind = "close" if is_last else "open"
+            stale_cut = []
+            for c in list(v):
+                if c in dead:
+                    continue
+                sp = book.px_at(c, nx, sale_kind, strict_day=False)
+                lp = last_px.get(c)
+                if np.isfinite(sp) and lp is not None and np.isfinite(lp) and lp > 0:
+                    v[c] *= sp / lp
+                # 장기 무거래(정지) 종목: 정지 전 가격에 전량 매도했다고 가정하면 낙관 편향.
+                # 40거래일 이상 실거래가 없으면 보수적으로 50% 헤어컷 후 현금화 처리.
+                if book.last_trade_pos_gap(c, pd.Timestamp(nx)) > 40:
+                    v[c] *= 0.5
+                    stale_cut.append(c)
+            if stale_cut:
+                LOG.warn(f"{pd.Timestamp(sig):%Y-%m-%d} 분기 매도 시점에 40거래일+ 무거래 "
+                         f"{len(stale_cut)}종목({','.join(stale_cut[:4])}…)에 50% 헤어컷 적용 "
+                         f"(정지 전 가격 전량매도 가정의 낙관 편향 방지)")
+            day_val = sum(v.values()) + cash
+            daily_rows.append((pd.Timestamp(nx), day_val / port_val_prev - 1.0))
+            port_val_prev = day_val
             period_ret = port_val_prev - 1.0
             tot = max(port_val_prev, 1e-12)
             prev_val = {c: vv / tot for c, vv in v.items() if vv > 0}
@@ -4335,8 +4507,9 @@ def run_backtest(portfolios: Dict[pd.Timestamp, pd.DataFrame], sch: pd.DataFrame
                 daily_rows.append((d, 0.0))
 
         # 체결일 수익에서 비용 차감 (일별 곡선·분기수익 동시 반영)
-        if cost > 0 and len(period_dates):
-            di = len(daily_rows) - len(period_dates)
+        n_rows_this = len(period_dates) + (1 if (len(period_dates) and vals) else 0)
+        if cost > 0 and n_rows_this:
+            di = len(daily_rows) - n_rows_this
             d0, r0 = daily_rows[di]
             daily_rows[di] = (d0, r0 - cost)
             period_ret -= cost
@@ -4348,7 +4521,10 @@ def run_backtest(portfolios: Dict[pd.Timestamp, pd.DataFrame], sch: pd.DataFrame
 
     D = pd.DataFrame(daily_rows, columns=["date", "ret"])
     if len(D):
-        D = D.groupby("date", as_index=False)["ret"].sum().sort_values("date")
+        # 같은 날짜에 구포트(매도 오버나이트)와 신포트(당일 장중) 두 구간이 겹칠 수 있다 —
+        # 같은 자본의 순차 구간이므로 합이 아니라 '복리'로 결합한다.
+        D = (D.groupby("date")["ret"].apply(lambda s: float(np.prod(1.0 + s.values) - 1.0))
+              .reset_index().sort_values("date"))
         D["equity"] = (1.0 + D["ret"]).cumprod()
     Q = pd.DataFrame(q_rows)
     if len(Q):
@@ -4480,6 +4656,13 @@ def perf_stats_daily(D: pd.DataFrame, Q: pd.DataFrame,
         out["분기평균 회전율(편도)"] = float(Q["turnover"].mean())
         out["분기평균 비용"] = float(Q["cost"].mean())
         out["평균 종목수"] = float(Q["n"].mean())
+        n_inv = int((Q["n"] > 0).sum())
+        out["투자 분기"] = f"{n_inv}/{len(Q)}"
+        if n_inv < len(Q) * 0.7:
+            out["⚠ 경고"] = (f"투자 분기가 {n_inv}/{len(Q)} 뿐 — 상당 구간이 현금입니다. "
+                            f"커버리지 리포트에서 어느 입력이 비었는지 확인하세요.")
+            LOG.warn(f"투자 분기 {n_inv}/{len(Q)} — 대부분 현금인 구간의 성과입니다. "
+                     f"입력 커버리지를 반드시 확인하세요(01_coverage_report.csv).")
         mu, t = hac_tstat(qr.to_numpy())
         out["분기평균수익"] = mu
         out["t통계량(HAC)"] = t
@@ -4654,6 +4837,10 @@ class StrategyRun:
             scored_frames.append(sc)
             if len(pick):
                 ports[pd.Timestamp(sig)] = pick[["code", "weight"]]
+            elif method == "baseline" and not drop_factor:
+                n_e = int(sc["eligible"].sum()) if "eligible" in sc.columns else 0
+                LOG.warn(f"{pd.Timestamp(sig):%Y-%m-%d} 편입 보류(현금): 적격 "
+                         f"{n_e}<{MIN_ELIGIBLE}종목 — 입력 커버리지를 확인하세요.")
         scored_all = pd.concat(scored_frames, ignore_index=True) if scored_frames \
             else pd.DataFrame()
         return ports, scored_all
@@ -4695,8 +4882,10 @@ def forward_returns_from_bt(sr: StrategyRun) -> pd.DataFrame:
             pos = int(idx.searchsorted(ts, side="right")) - 1
             if pos < 0:
                 return None, None
-            exact = idx[pos] == ts
-            o = book.open_.iloc[pos] if exact else None
+            d0 = idx[pos]
+            # ★ open 피벗은 close 피벗과 행이 다를 수 있다(open 전결측 날짜 탈락) —
+            #   위치(iloc)가 아니라 라벨(loc)로만 접근한다(감사 높음: 오정렬/IndexError).
+            o = book.open_.loc[d0] if (d0 == ts and d0 in book.open_.index) else None
             cfb = closef.iloc[pos]
             return o, cfb
 
@@ -5041,13 +5230,26 @@ def write_outputs(outdir: str, ctx: dict) -> List[str]:
     rob = ctx.get("robust_table", pd.DataFrame())
     _try(lambda: _csv(os.path.join(outdir, "09_robustness.csv"), rob), "09_robustness")
 
+    def _costs():
+        p = os.path.join(outdir, "cost_schedule.parquet")
+        rows = [{"item": "sell_tax", "effective_from": d, "rate": t} for d, t in TAX_SCHEDULE]
+        rows.append({"item": "commission_oneway_bps", "effective_from": "ALL",
+                     "rate": COMMISSION_BPS})
+        rows.append({"item": "slippage_sqrt_k", "effective_from": "ALL", "rate": SLIPPAGE_K})
+        rows.append({"item": "account_krw_for_participation", "effective_from": "ALL",
+                     "rate": float(ACCOUNT_KRW)})
+        atomic_write_parquet(pd.DataFrame(rows), p)
+        return p
+    _try(_costs, "cost_schedule")
+
     def _md():
         p = os.path.join(outdir, "10_exact_vs_reconstructed.md")
         v = ctx.get("vendor", {})
         lines = [
             "# EXACT vs RECONSTRUCTED",
             f"\nSTATUS = **{v.get('status', '?')}**\n",
-            f"- 실행 모드: {'EXACT_VENDOR_MODE' if v.get('active') else RECON_LABEL}",
+            f"- 실행(계산) 모드: {RECON_LABEL} — 벤더 데이터 존재 여부와 무관하게 이 실행의 "
+            f"모든 수치는 재구성 규칙으로 계산되었다(모드 혼합 금지).",
             f"- universe_definition = `{ctx.get('universe_def', '')}` "
             f"(method: {ctx.get('universe_method', '')})",
             "- 재구성 규칙(사전고정): 각 리밸런스 횡단면에서 z=(x-μ)/σ(모집단 ddof=0), "
@@ -5092,14 +5294,17 @@ def write_outputs(outdir: str, ctx: dict) -> List[str]:
     def _cfg():
         p = os.path.join(outdir, "config.yaml")
         cfg = {"strategy_id": STRATEGY_ID, "strategy_name": STRATEGY_NAME,
-               "mode": RECON_LABEL if not ctx.get("vendor", {}).get("active")
-               else "EXACT_VENDOR_MODE",
+               "mode": RECON_LABEL,          # 계산은 항상 재구성 — 벤더 상태는 별도 필드
+               "vendor_status": ctx.get("vendor", {}).get("status", ""),
                "backtest": {"start": BACKTEST_START, "end": BACKTEST_END,
                             "rebalance": "quarterly last trading day of 3/6/9/12",
                             "signal": "after close", "execution": "next open",
                             "top_n": TOP_N, "weighting": "equal"},
                "normalization": {"z": "population std (ddof=0)", "winsorization": "none",
-                                 "composite": "mean of 7 z", "eligibility": "all 7 valid"},
+                                 "composite": "mean of 7 z", "eligibility": "all 7 valid",
+                                 "f5_proxy": "TP-consensus 1M revision → DART TTM revision "
+                                             "fallback (계약식 EPS12MF 시계열 공개 미가용 — "
+                                             "혼합 비중은 01_coverage 의 F5_src_* 행 참조)"},
                "universe_definition": ctx.get("universe_def", ""),
                "universe_method": ctx.get("universe_method", ""),
                "comparison": {"universe": f"bottom {CMP_BOTTOM_N} by marketcap",
@@ -5145,7 +5350,10 @@ def write_outputs(outdir: str, ctx: dict) -> List[str]:
                  "- EPS 성장 프록시는 순이익 성장(주식수 변동 미반영)이며 컨센서스 추정치가 아닌 "
                  "실적 기지치 기반.",
                  "- 과거 관리종목/거래정지 이력은 공개 소급 불가 → 유니버스 필터에 미반영.",
-                 "- KOSPI200 멤버십은 관측 실패 시 시총 상위 200 재구성(정확 지수 규칙과 상이)."]
+                 "- KOSPI200 멤버십은 관측 실패 시 시총 상위 200 재구성(정확 지수 규칙과 상이).",
+                 "- 가격 소스 혼합: 수정주가 소스(pykrx/FDR/네이버)와 분할보정 marcap 을 "
+                 "우선순위 병합. 서로 다른 시기에 수집된 수정주가 구간의 접합부 불연속은 "
+                 "|일수익|>50% 절벽 감사로 탐지해 커버리지에 기록한다(완전 재수정은 아님)."]
         atomic_write_text(p, "\n".join(lines))
         return p
     _try(_dd, "data_dictionary.md")
@@ -5343,11 +5551,10 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
+    vendor: dict = {"active": False, "status": "EXACT_COMPOSITE_NOT_PUBLICLY_IDENTIFIED",
+                    "detail": ["판정 스테이지 실패 — 기본값 사용"], "coverage_rows": []}
     with PIPE.stage("L0.VENDOR", "EXACT_VENDOR_MODE 판정", "L0", critical=False):
         vendor = detect_exact_vendor_mode()
-    if not isinstance(vendor, dict):
-        vendor = {"active": False, "status": "EXACT_COMPOSITE_NOT_PUBLICLY_IDENTIFIED",
-                  "detail": [], "coverage_rows": []}
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0"):
         if not run_smoke(full_outputs=(RUN_MODE == "SMOKE")):
@@ -5366,7 +5573,7 @@ def main() -> dict:
         globals()["SEC"] = SEC
 
     with PIPE.stage("L1.PX", "일봉 가격 (캐시→marcap→체인)", "L1"):
-        if KRX_MARKETPLACE_ID:
+        if KRX_MARKETPLACE_ID and RUN_MODE != "CACHED":     # CACHED: network=0 약속 준수
             KRX.login()
         px = fetch_prices(SEC["code"].tolist(),
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=15)).strftime("%Y-%m-%d"),
@@ -5437,6 +5644,11 @@ def main() -> dict:
         if len(snaps) and allv.sum() < TOP_N * 10:
             LOG.warn("7팩터 완전 유효 표본이 매우 적습니다 — 커버리지 리포트를 확인하세요. "
                      "(리서치/실적/수급 중 어느 입력이 비었는지가 원인입니다)")
+        tot_gb = (mem_mb(px) + mem_mb(snaps)) / 1000.0
+        if np.isfinite(tot_gb) and tot_gb > MEM_BUDGET_GB * 0.6:
+            LOG.warn(f"상주 메모리 추정 {tot_gb:.1f}GB — MEM_BUDGET_GB({MEM_BUDGET_GB})의 "
+                     f"60% 초과. 이후 단계는 보유종목 피벗만 쓰므로 통상 감소하지만, "
+                     f"부족하면 INCLUDE_COMPARISON=False 로 낮추세요.")
 
     snaps_cmp = pd.DataFrame()
     if INCLUDE_COMPARISON and len(cmp_mem):
@@ -5571,6 +5783,8 @@ def main() -> dict:
         if bt_cmp is not None and len(snaps_cmp):
             _interpretation_tables(sr_cmp, bt_cmp, snaps_cmp, bench_daily, CMP_LABEL)
 
+    outs: List[str] = []
+    coverage = pd.DataFrame()
     with PIPE.stage("L0.PERSIST", "산출물 저장 (전용 인덱스) + 드라이브 재적재", "L0",
                     critical=False):
         stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -5580,11 +5794,47 @@ def main() -> dict:
                      for s, n in (("prices_rows", len(px)), ("earnings_rows", len(earn)),
                                   ("flow_rows", len(flows)),
                                   ("consensus_ok", int(cons.ok)))]
+        extra_cov.append({"signal_date": "AUDIT", "factor": "px_cliff_gt50pct_days",
+                          "grade": "audit", "n_universe": len(px),
+                          "n_valid": int(globals().get("_PX_CLIFF_COUNT", 0)),
+                          "valid_pct": np.nan})
+        if "f5_src" in snaps.columns and len(snaps):
+            for sig_, g_ in snaps.groupby("signal_date"):
+                mix = g_["f5_src"].replace("", "none").value_counts()
+                for k_, v_ in mix.items():
+                    extra_cov.append({"signal_date": pd.Timestamp(sig_).strftime("%Y-%m-%d"),
+                                      "factor": f"F5_src_{k_}", "grade": "mix",
+                                      "n_universe": len(g_), "n_valid": int(v_),
+                                      "valid_pct": round(100.0 * v_ / len(g_), 1)})
         coverage = _coverage_report(snaps, vendor, extra_cov)
         perf_rows = [{"strategy": RECON_LABEL, "metric": k, "value": v}
                      for k, v in st_main.items()]
         perf_rows += [{"strategy": CMP_LABEL, "metric": k, "value": v}
                       for k, v in (st_cmp or {}).items()]
+        # 계약 [성과] 항목의 기계가독 영속화 — 로그 전용이던 표들을 07 에 long 포맷으로 병합
+        try:
+            for y_, row_ in annual_table(bt["daily"], bench_daily).iterrows():
+                for cn_, v_ in row_.items():
+                    perf_rows.append({"strategy": RECON_LABEL,
+                                      "metric": f"연간_{y_}_{cn_}", "value": v_})
+            for r_ in rolling12m_table(bt["daily"]).to_dict("records"):
+                perf_rows.append({"strategy": RECON_LABEL,
+                                  "metric": f"롤링12M_{r_['stat']}",
+                                  "value": r_["rolling_12m"]})
+            for r_ in run_lofo(sr, bench_daily).to_dict("records"):
+                perf_rows.append({"strategy": RECON_LABEL,
+                                  "metric": f"LOFO_dCAGR_{r_['dropped']}",
+                                  "value": r_.get("dCAGR")})
+            for r_ in factor_contribution_table(bt.get("scored", pd.DataFrame())
+                                                ).to_dict("records"):
+                perf_rows.append({"strategy": RECON_LABEL,
+                                  "metric": f"기여_{r_['factor']}",
+                                  "value": r_["contribution"]})
+            for r_ in concentration_table(bt, SEC).to_dict("records"):
+                perf_rows.append({"strategy": RECON_LABEL,
+                                  "metric": f"집중도_{r_['항목']}", "value": r_["값"]})
+        except Exception as e_:                                     # noqa
+            LOG.warn(f"성과 확장표 영속화 일부 실패({type(e_).__name__}) — 로그에는 있음.")
         trades = bt["quarterly"].copy()
         trades["strategy"] = RECON_LABEL
         if bt_cmp is not None and len(bt_cmp["quarterly"]):
