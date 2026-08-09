@@ -84,7 +84,13 @@ RUN_MODE = "FULL"
 #    추출합니다. 드라이브에 이미 캐시된 원장·PDF는 재수집하지 않고 그대로 씁니다.
 RESEARCH_COLLECT       = True
 RESEARCH_DOWNLOAD_PDF  = True     # PDF 원문 수집(EPS 추출 정확도↑, 용량·시간↑)
-RESEARCH_PDF_CAP_MONTH = 0        # 월별 PDF 다운로드 상한. 0 = 무제한, 테스트 시 50 권장
+RESEARCH_PDF_CAP_MONTH = 0        # (구) 월별 상한 — 아래 두 값이 실제 제어를 담당합니다
+#    ▸ PDF 추출은 예전에 파이프라인 전체를 삼켰습니다(대상 5만건 → 4시간 소진).
+#      이제 '단계 예산'과 '한 실행당 신규 상한'으로 못박고, 종결 원장에 진행분을
+#      기록해 **다음 실행이 이어받습니다**. 여러 번 돌리면 자연히 100%로 수렴합니다.
+PDF_STAGE_BUDGET_MIN   = 60       # 이 단계가 쓸 수 있는 시간(분). 백테스트 시간을 지킵니다
+PDF_MAX_NEW_PER_RUN    = 6000     # 한 실행에서 새로 '내려받을' PDF 상한(연도 균형 샘플)
+                                  #   0 = 무제한. 이미 로컬에 있는 PDF 는 이 상한과 무관합니다
 FORECAST_METRIC_MODE   = "AUTO"   # "AUTO" | "EPS" | "TP12M"
 #    AUTO: EPS 추정치 커버리지가 충분하면 EPS(명세 §1 기본), 부족하면 목표주가 12M(TP12M)
 #          를 주 지표로 쓰고 두 경우 모두 커버리지 근거를 표로 출력합니다.
@@ -255,14 +261,21 @@ _scistats = _opt_import("scipy", lambda: __import__("scipy.stats", fromlist=["st
 fdr = _opt_import("FinanceDataReader", lambda: __import__("FinanceDataReader"))
 pykrx_stock = _opt_import("pykrx", lambda: __import__("pykrx.stock", fromlist=["stock"]))
 yf = _opt_import("yfinance", lambda: __import__("yfinance"))
-try:
-    import fitz as _fitz                      # pymupdf
-except Exception:
-    _fitz = None
-try:
-    import pdfplumber as _pdfplumber
-except Exception:
-    _pdfplumber = None
+# ★ PDF 라이브러리는 네이티브 확장에 의존해서, 설치가 깨지면 평범한 Exception 이 아니라
+#   인터프리터 수준 패닉(BaseException)을 던진다. except Exception 으로는 못 잡아
+#   런 전체가 죽는다. 실제로 그렇게 죽었다 — 그래서 BaseException 까지 잡는 통로로 보낸다.
+_fitz = _opt_import("pymupdf", lambda: __import__("fitz"))
+_pdfplumber = _opt_import("pdfplumber", lambda: __import__("pdfplumber"))
+
+# PDF 파서(pdfminer)는 폰트 메타가 조금만 이상해도 경고를 줄줄이 찍는다.
+# 내용 추출에는 영향이 없고 stderr 만 채우므로 조용히 시킨다.
+import logging as _logging
+for _nm in ("pdfminer", "pdfminer.pdfinterp", "pdfminer.pdffont", "pdfminer.pdfpage",
+            "pdfminer.converter", "pdfplumber", "fitz", "PIL"):
+    try:
+        _logging.getLogger(_nm).setLevel(_logging.ERROR)
+    except Exception:
+        pass
 
 random.seed(SEED)
 np.random.seed(SEED % (2**32 - 1))
@@ -2990,66 +3003,240 @@ def _eps_from_text(text: str, report_year: int) -> Dict[str, float]:
     return out
 
 
+def _pdf_key_index() -> Dict[str, str]:
+    """기존 캐시(내 것 + 다른 전략 것)의 '보고서키 → PDF 실제경로' 지도.
+
+    ★ 이전 버전은 파일명(=내용해시)만 보고 참조등록해서, 정작 report_uid 로 찾을 때
+      항상 미스가 났다. 그래서 이미 디스크에 있는 PDF 1만여 건을 매번 다시 받았다.
+      해법은 인덱스 저널을 읽는 것이다 — 거기에 key(report_uid) → path 가 들어 있다.
+    """
+    idx: Dict[str, str] = {}
+    roots = [DEPOT.write_root] + list(DEPOT.read_roots)
+    seen_files = 0
+    for root in roots:
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                if fn not in ("index.jsonl", "journal.jsonl", "common_index.jsonl",
+                              "private_index.jsonl"):
+                    continue
+                seen_files += 1
+                for rec in jsonl_read(os.path.join(dirpath, fn)):
+                    if str(rec.get("fmt", "")).lower().lstrip(".") != "pdf":
+                        continue
+                    key = str(rec.get("key") or "").strip()
+                    if not key:
+                        continue
+                    p = rec.get("abs_path") or rec.get("path")
+                    if not p:
+                        continue
+                    p = str(p)
+                    if not os.path.isabs(p):
+                        p = os.path.join(os.path.dirname(os.path.dirname(dirpath)), p)
+                    idx.setdefault(key, p)
+            if len(idx) > 400_000:
+                break
+    if idx:
+        CON.ok(f"기존 인덱스에서 PDF {len(idx):,}건의 '보고서키 → 경로' 지도를 복원했습니다 "
+               f"(저널 {seen_files}개) — 이미 받은 PDF 는 다시 받지 않습니다")
+    return idx
+
+
+def _balanced_by_year(df: pd.DataFrame, cap: int, date_col: str = "date") -> pd.DataFrame:
+    """연도별 균형 샘플 — 예산이 모자라도 10년이 고르게 채워지게 한다.
+
+    ★ 앞에서부터 자르면 2016~2017 만 채워진 채 10년 백테스트를 하게 된다.
+      연도마다 균등 간격으로 뽑고 라운드로빈으로 섞어, 어느 시점에 중단되든
+      표본이 기간 전체에 퍼져 있도록 만든다(결정적 — 시드 불필요).
+    """
+    if df.empty or cap <= 0:
+        return df.iloc[0:0]
+    if len(df) <= cap:
+        return df
+    w = df.copy()
+    w["_y"] = ts_col(w[date_col]).dt.year.fillna(0).astype(int)
+    years = [y for y in sorted(w["_y"].unique()) if y > 0]
+    if not years:
+        return w.sort_values(date_col, kind="stable").head(cap).drop(columns=["_y"])
+    per = max(1, math.ceil(cap / len(years)))
+    parts = []
+    for y in years:
+        g = w[w["_y"] == y].sort_values([date_col], kind="stable")
+        if len(g) > per:
+            g = g.iloc[np.unique(np.linspace(0, len(g) - 1, per, dtype=int))]
+        parts.append(g.reset_index(drop=True))
+    out, i = [], 0
+    while sum(len(p) for p in parts) > 0 and len(out) < cap:      # 라운드로빈 인터리브
+        p = parts[i % len(parts)]
+        if len(p):
+            out.append(p.iloc[[0]])
+            parts[i % len(parts)] = p.iloc[1:]
+        i += 1
+        if i > cap * 4 + len(parts) * 2:
+            break
+    res = pd.concat(out, ignore_index=True) if out else w.head(cap)
+    return res.head(cap).drop(columns=["_y"], errors="ignore")
+
+
+# PDF 처리 결과의 '종결' 상태 — 이 상태는 파서 버전이 같은 한 다시 시도하지 않는다.
+# (일시적 실패는 여기 없다: 다음 실행에서 자연히 재시도된다)
+PDF_TERMINAL = frozenset({"EPS_OK", "NO_EPS_TABLE", "NO_TEXT_LAYER", "NOT_PDF", "NO_URL"})
+PDF_PARSER_VERSION = "SCG_EPS_V2"
+
+
+def _pdf_extract_one(data: bytes, year: int) -> Tuple[str, dict]:
+    """단일 PDF → (상태, 추출결과). 상태는 재개 원장에 그대로 쓰인다."""
+    if not data or not data[:5].startswith(b"%PDF"):
+        return "NOT_PDF", {}
+    text = _pdf_text(data)
+    if not text or len(text.strip()) < 40:
+        return "NO_TEXT_LAYER", {}
+    eps = _eps_from_text(text, int(year))
+    an = ",".join(dict.fromkeys(_ANALYST_TOK.findall(text[:2500])))[:80]
+    payload = dict(pdf_analysts=an, eps_json=json.dumps(eps, ensure_ascii=False))
+    return ("EPS_OK" if eps else "NO_EPS_TABLE"), payload
+
+
 def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     """PDF 에서 (a) 작성자(네이버 건 보강) (b) EPS 추정치를 추출해 원장에 붙인다.
-    추출 결과는 표로 캐시되어 재실행 시 파싱을 건너뛴다."""
-    cache = DEPOT.table_load("scg_pdf_extract", need_cols=["ruid"])
-    done: Dict[str, dict] = {}
-    if cache is not None and len(cache):
-        for _, r in cache.iterrows():
-            done[str(r["ruid"])] = r.to_dict()
-        CON.say(f"PDF 추출 캐시 재사용 {len(done):,}건")
+
+    ★ 이 단계는 예전에 파이프라인 전체를 삼켰다(대상 53,658건 → 4시간 예산 소진).
+      세 가지로 바로잡는다:
+        ① **단계 예산** — 이 단계가 쓸 수 있는 시간을 따로 못박는다.
+        ② **종결 원장** — EPS 표가 없는 PDF 등은 '종결'로 기록해 다시 열지 않는다.
+           이게 없으면 매 실행이 같은 파일을 다시 파싱해 영원히 수렴하지 않는다.
+        ③ **연도 균형 + 재개** — 상한만큼만 하되 10년에 고르게 퍼뜨리고,
+           다음 실행이 남은 것을 이어받는다.
+    """
     rep = rep.copy()
-    # 0행이면 리스트 컴프리헨션이 float64 컬럼을 만들어, object 인 캐시와 merge 시 죽는다
     rep["ruid"] = pd.Series([h1(s, r) for s, r in zip(rep["source"], rep["rid"])],
                             index=rep.index, dtype="object")
-    need = rep[(rep["pdf_url"].astype(str).str.startswith("http"))
-               & (~rep["ruid"].isin(done.keys()))]
-    if RESEARCH_DOWNLOAD_PDF and RUN_MODE != "CACHED" and len(need):
-        cap = RESEARCH_PDF_CAP_MONTH
-        if cap and cap > 0:
-            need = (need.assign(_m=need["date"].dt.to_period("M"))
-                    .groupby("_m", group_keys=False).head(cap))
-        CON.say(f"PDF 신규 수집·추출 대상 {len(need):,}건")
 
-        def _one(row):
-            if DEADLINE.over("PDF 추출"):
-                return None
-            ruid, url, y = row
+    ex = DEPOT.table_load("scg_pdf_extract", need_cols=["ruid"])
+    done: Dict[str, dict] = {}
+    if ex is not None and len(ex):
+        for r in ex.to_dict("records"):
+            done[str(r.get("ruid"))] = r
+        CON.say(f"PDF 추출 캐시 재사용 {len(done):,}건")
+
+    st = DEPOT.table_load("scg_pdf_status", need_cols=["ruid", "status"])
+    settled: set = set()
+    if st is not None and len(st):
+        if "parser_version" not in st.columns:
+            st["parser_version"] = PDF_PARSER_VERSION
+        m = (st["parser_version"].astype(str) == PDF_PARSER_VERSION) & \
+            st["status"].astype(str).isin(PDF_TERMINAL)
+        settled = set(st.loc[m, "ruid"].astype(str))
+        CON.say(f"PDF 종결 원장 {len(settled):,}건 — 같은 파서 버전에서는 다시 열지 않습니다")
+    status_rows: List[dict] = [] if st is None else st.to_dict("records")
+
+    has_url = rep["pdf_url"].astype(str).str.startswith("http")
+    need = rep[has_url & ~rep["ruid"].isin(settled) & ~rep["ruid"].isin(done.keys())]
+
+    if not (RESEARCH_DOWNLOAD_PDF and RUN_MODE != "CACHED") or not len(need):
+        return _attach_pdf_columns(rep, done)
+
+    keymap = _pdf_key_index()                       # 이미 가진 PDF 재사용
+    local_hit = need["ruid"].map(lambda k: keymap.get(str(k)) is not None)
+    n_local = int(local_hit.sum())
+
+    cap = PDF_MAX_NEW_PER_RUN if PDF_MAX_NEW_PER_RUN > 0 else len(need)
+    # 로컬에 이미 있는 건 네트워크 상한과 무관하게 전부 처리한다(공짜다)
+    work_local = need[local_hit.to_numpy()]
+    work_net = _balanced_by_year(need[~local_hit.to_numpy()], cap)
+    work = pd.concat([work_local, work_net], ignore_index=True)
+    stage_end = time.time() + PDF_STAGE_BUDGET_MIN * 60
+    CON.grid([["기존 파일 재사용", f"{len(work_local):,}건", "네트워크 0회"],
+              ["신규 다운로드", f"{len(work_net):,}건",
+               f"연도 균형 샘플 (전체 대상 {len(need):,}건 중)"],
+              ["단계 예산", f"{PDF_STAGE_BUDGET_MIN}분",
+               "초과 시 여기서 멈추고 다음 실행이 이어받음"]],
+             ["PDF 처리 계획", "규모", "비고"], ["l", "r", "l"],
+             title="PDF 추출 계획 (재개 가능 · 종결 원장 기반)")
+
+    lock = threading.Lock()
+    counter = {"n": 0, "new": 0, "hit": 0}
+
+    def _one(row):
+        ruid, url, y = row
+        if time.time() > stage_end or DEADLINE.over("PDF 추출"):
+            return None
+        data = None
+        p = keymap.get(str(ruid))
+        if p and os.path.exists(p):
+            try:
+                data = open(p, "rb").read()
+                with lock:
+                    counter["hit"] += 1
+            except Exception:
+                data = None
+        if data is None:
             data = DEPOT.blob_bytes("research_pdf", ruid)
-            if data is None:
-                data = fetch(url, source="hankyung" if "hankyung" in url else "naver",
-                             as_bytes=True)
-                if data and data[:5].startswith(b"%PDF"):
-                    DEPOT.blob_save("research_pdf", ruid, data, "pdf", source=url)
-                else:
-                    data = None
-            if data is None:
-                return (ruid, None)
-            text = _pdf_text(data)
-            eps = _eps_from_text(text, int(y))
-            an = ",".join(dict.fromkeys(_ANALYST_TOK.findall(text[:2500])))[:80]
-            return (ruid, dict(ruid=ruid, pdf_analysts=an,
-                               eps_json=json.dumps(eps, ensure_ascii=False)))
+        if data is None:
+            data = fetch(url, source="hankyung" if "hankyung" in str(url) else "naver",
+                         as_bytes=True, tries=2)
+            if data and data[:5].startswith(b"%PDF"):
+                DEPOT.blob_save("research_pdf", ruid, data, "pdf", source=str(url))
+            else:
+                return (ruid, "DOWNLOAD_FAIL", None)       # 비종결 — 다음 실행에서 재시도
+        status, payload = _pdf_extract_one(data, y)
+        if payload:
+            payload["ruid"] = ruid
+        with lock:
+            counter["n"] += 1
+            if status == "EPS_OK":
+                counter["new"] += 1
+        return (ruid, status, payload)
 
-        jobs = list(zip(need["ruid"], need["pdf_url"], need["date"].dt.year))
-        got = pmap(_one, jobs, workers=min(6, N_IO_THREADS), label="PDF추출")
-        n_new = 0
+    jobs = list(zip(work["ruid"], work["pdf_url"],
+                    ts_col(work["date"]).dt.year.fillna(2020).astype(int)))
+    CHUNK = 500                                     # 체크포인트 단위(중단 내성)
+    t0 = time.time()
+    for i in range(0, len(jobs), CHUNK):
+        if time.time() > stage_end or DEADLINE.over("PDF 추출"):
+            CON.warn(f"PDF 단계 예산 소진 — {i:,}/{len(jobs):,}건에서 중단합니다. "
+                     f"종결 원장에 진행분이 기록되어 다음 실행이 이어받습니다.")
+            break
+        got = pmap(_one, jobs[i:i + CHUNK], workers=min(6, N_IO_THREADS))
         for it in got:
-            if it and it[1]:
-                done[it[0]] = it[1]
-                n_new += 1
-        CON.say(f"PDF 추출 신규 {n_new:,}건 (누적 {len(done):,})")
-        if n_new:
-            DEPOT.table_save("scg_pdf_extract", pd.DataFrame(list(done.values())),
-                             scope="공용", domain="research", source="pdf_parse")
-    ex = pd.DataFrame(list(done.values())) if done else \
-        pd.DataFrame(columns=["ruid", "pdf_analysts", "eps_json"])
+            if not it:
+                continue
+            ruid, status, payload = it
+            status_rows.append(dict(ruid=ruid, status=status,
+                                    parser_version=PDF_PARSER_VERSION,
+                                    updated_at=_now_iso()))
+            if payload:
+                done[ruid] = payload
+        # 청크마다 즉시 영속화 — 중단돼도 여기까지는 남는다
+        DEPOT.table_save("scg_pdf_extract", pd.DataFrame(list(done.values())),
+                         scope="공용", domain="research", source="pdf_parse")
+        DEPOT.table_save("scg_pdf_status",
+                         pd.DataFrame(status_rows).drop_duplicates("ruid", keep="last"),
+                         scope="공용", domain="research", source="pdf_status")
+        el = max(time.time() - t0, 1e-9)
+        dn = min(i + CHUNK, len(jobs))
+        CON.say(f"  PDF {dn:,}/{len(jobs):,} · EPS추출 {counter['new']:,} · "
+                f"기존파일 재사용 {counter['hit']:,} · {dn/el*60:.0f}건/분 · "
+                f"잔여예산 {max(0, stage_end - time.time())/60:.0f}분")
+    CON.ok(f"PDF 단계 종료 — 처리 {counter['n']:,} · EPS 확보 {counter['new']:,} · "
+           f"누적 추출 {len(done):,}건")
+    return _attach_pdf_columns(rep, done)
+
+
+def _attach_pdf_columns(rep: pd.DataFrame, done: Dict[str, dict]) -> pd.DataFrame:
+    ex = (pd.DataFrame(list(done.values())) if done else
+          pd.DataFrame(columns=["ruid", "pdf_analysts", "eps_json"]))
+    for c in ("ruid", "pdf_analysts", "eps_json"):
+        if c not in ex.columns:
+            ex[c] = pd.Series(dtype="object")
+    ex = ex[["ruid", "pdf_analysts", "eps_json"]].drop_duplicates("ruid", keep="last")
+    ex["ruid"] = ex["ruid"].astype("object")
     rep = rep.merge(ex, on="ruid", how="left")
     fill = (rep["analyst"].astype(str).str.strip() == "") & rep["pdf_analysts"].notna()
     rep.loc[fill, "analyst"] = rep.loc[fill, "pdf_analysts"]
     if fill.any():
-        CON.ok(f"PDF 본문에서 작성자 {int(fill.sum()):,}건 보강(네이버 리스트에는 작성자가 없음)")
+        CON.ok(f"PDF 본문에서 작성자 {int(fill.sum()):,}건 보강"
+               f"(네이버 리스트에는 작성자가 없습니다)")
     return rep
 
 
@@ -4724,6 +4911,39 @@ def run_contracts(strict: bool = True) -> bool:
 REHEARSAL: List[dict] = []
 
 
+def _fx_real_pdf(lines: Sequence[str]) -> bytes:
+    """xref 까지 갖춘 '진짜' 최소 PDF — 픽스처가 실제 파서를 태우게 하려면 필요하다.
+    (바이트만 %PDF 로 시작하는 가짜를 쓰면 파서 경로가 검증되지 않는다)"""
+    objs = [b"<</Type/Catalog/Pages 2 0 R>>",
+            b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R"
+            b"/Resources<</Font<</F1 5 0 R>>>>>>"]
+    body = ["BT /F1 11 Tf 40 740 Td 14 TL"]
+    for ln in lines:
+        esc = str(ln).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        body.append(f"({esc}) Tj T*")
+    body.append("ET")
+    stream = "\n".join(body).encode("latin-1", "replace")
+    objs.append(b"<</Length " + str(len(stream)).encode() + b">>stream\n"
+                + stream + b"\nendstream")
+    objs.append(b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>")
+    out = bytearray(b"%PDF-1.4\n")
+    offs = []
+    for i, o in enumerate(objs, 1):
+        offs.append(len(out))
+        out += f"{i} 0 obj".encode() + o + b"endobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs)+1}\n0000000000 65535 f \n".encode()
+    for off in offs:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer<</Size {len(objs)+1}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+_FX_PDF_LINES = ["            2026    2027", "EPS       1,000   1,200",
+                 "Kim Analyst  02-000-0000"]
+
+
 def _fx_marcap_parquet() -> bytes:
     # 월말(신호일)과 +120거래일 지평이 모두 들어가도록 넉넉히 잡는다
     days = pd.bdate_range("2019-11-01", "2020-06-30")
@@ -4792,14 +5012,13 @@ class _FixtureNet:
             raw = _fx_delisting_csv() if "delisting" in u else _fx_fdrcache_csv()
             return raw if as_bytes else raw.decode("utf-8")
         if "consensus.hankyung" in u and "downpdf" in u:
-            return ("%PDF-1.4\nEPS\n2020 2021\n1,000 1,200\n"
-                    "김애널 연구원 02-000-0000").encode("utf-8")
+            return _fx_real_pdf(_FX_PDF_LINES)
         if "consensus.hankyung" in u:
             return _fx_hankyung_html()
         if "finance.naver.com/research" in u:
             return _fx_naver_html()
         if u.lower().endswith(".pdf"):
-            return b"%PDF-1.4\nEPS\n2020 2021\n1,000 1,200\n"
+            return _fx_real_pdf(_FX_PDF_LINES)
         if "corpCode" in u:
             import zipfile
             buf = io.BytesIO()
@@ -4930,6 +5149,13 @@ def run_rehearsal(strict: bool = True) -> bool:
                 if fc is not None and len(fc):
                     _rh("주지표 선택", lambda: choose_metric(fc)[0])
                     _rh("예측 검증", lambda: validate_forecasts(fc))
+        _rh("PDF 텍스트 추출(실 PDF)",
+            lambda: (_pdf_text(_fx_real_pdf(_FX_PDF_LINES))
+                     if (_fitz is not None or _pdfplumber is not None) else "SKIP"),
+            expect_rows=True)
+        _rh("EPS 파서(본문→연도별 추정치)",
+            lambda: _eps_from_text("            2020    2021\n"
+                                   "EPS       1,000   1,200\n", 2020))
         _rh("DART corpCode",
             lambda: _dart_corpmap(pd.DataFrame({"code": ["005930"]})))
         _rh("DART 접수일", lambda: _dart_filing_dates("2021-01-01", "2021-03-31"))
