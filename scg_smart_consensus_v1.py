@@ -46,12 +46,20 @@
 #     · 종결 원장으로 재개가 보장되어 재실행할수록 100% 로 수렴한다. 매 실행마다
 #       '지금 결과를 믿어도 되는가'를 커버리지 표로 판정해 출력한다.
 #
+#   ▣ 한경컨센서스는 '속도'가 아니라 **누적 요청 수**에 반응한다
+#     실측: 초당 0.8회로 6분 9초(약 295회) 수집한 시점부터 403 이 시작됐다. 속도만
+#     낮춰서는 못 피한다. 그래서 실행당 요청 상한(기본 200회)을 두고 거기서 멈춘다 —
+#     차단당하면 3시간을 통째로 잃으므로 조금 덜 받고 다음 실행이 이어받는 편이 항상
+#     빠르다. 수집 도중 차단되면 그 사실도 캐시에 남겨 다음 실행이 쿨다운을 지킨다.
+#
 #   ▣ PDF 라이브러리 이름 함정 — 설치했는데도 계속 못 쓰던 이유
 #     PyMuPDF 는 1.24.3+ 부터 정식 모듈명이 `pymupdf` 이고 `fitz` 는 하위호환 별칭이다.
 #     최신 배포에서는 그 별칭이 없다. 게다가 PyPI 에는 PyMuPDF 와 무관한 `fitz`
 #     패키지가 따로 있어, 그게 깔려 있으면 엉뚱한 것을 집는다. `fitz` 만 시도하던
 #     코드는 설치 여부와 무관하게 실패할 수밖에 없었다 → 정식 이름을 먼저 시도하고
-#     실패 사유 전문을 환경표에 남긴다(성능에 직결되므로 추측 금지).
+#     실패 사유 전문을 **전용 진단표**로 남긴다. 예외 타입만 찍으면 'No module named'
+#     (다른 파이썬에 설치 — Jupyter 에서 가장 흔함)과 'DLL load failed'(휠 불일치)를
+#     구분할 수 없어 매번 추측하게 된다. 커널의 파이썬 경로도 함께 찍는다.
 #
 #   ▣ 윈도우·주피터에서만 터지는 것들 (리눅스에선 절대 재현되지 않는다)
 #     · 경로 포함 판정을 `realpath().startswith()` 로 하면 윈도우에서 오탐한다
@@ -193,10 +201,15 @@ N_IO_THREADS   = 12               # 네트워크 병렬(스레드). 차단이 �
 #      다시 차단당하지 않는 것이 최우선이라, 같은 사이트를 오래 수집해 본 다른 전략의
 #      실측 정중값(초당 0.8회·동시 2)을 그대로 채택합니다. 빠르게 긁어서 다시 막히면
 #      복구에 며칠이 걸리고, 그동안 신규 수집이 통째로 불가능해집니다.
-QPS = {"krx": 1.5, "dart": 8.0, "hankyung": 0.8, "naver": 1.5, "kind": 2.0,
+QPS = {"krx": 1.5, "dart": 8.0, "hankyung": 0.6, "naver": 1.5, "kind": 2.0,
        "fdr": 4.0, "yahoo": 3.0, "generic": 3.0,
        "hankyung_pdf": 1.2, "naver_pdf": 4.0}
 HANKYUNG_COOLDOWN_MIN  = 180     # IP 차단 감지 후 이 시간 동안은 아예 두드리지 않습니다
+#    ★ 실측: 초당 0.8회로 6분 9초(약 295회) 수집한 시점부터 403 이 시작됐습니다.
+#      한경은 **누적 요청 수**에 반응합니다 — 속도만 낮춰서는 못 피합니다.
+#      한 실행에서 이 횟수까지만 받고 멈춥니다(진행분은 저장되어 다음 실행이 이어받습니다).
+#      차단당하면 3시간을 통째로 잃으므로, 조금 덜 받는 쪽이 항상 이득입니다.
+HANKYUNG_MAX_REQ_PER_RUN = 200
 MEM_SOFT_GB    = 6.0              # 이 수준을 넘보면 청크 처리로 전환
 COST_BPS_ONEWAY = 15.0            # 십분위 성과의 왕복비용 가정(수수료+세금+슬리피지, 편도 bp)
 
@@ -3104,7 +3117,9 @@ _HK_CANDIDATES = [
      "http://consensus.hankyung.com/apps.analysis/analysis.downpdf?report_idx={rid}"),
 ]
 HK: Dict[str, Any] = {"name": _HK_CANDIDATES[0][0], "list": _HK_CANDIDATES[0][1],
-                      "pdf": _HK_CANDIDATES[0][2], "probed": False, "alive": False}
+                      "pdf": _HK_CANDIDATES[0][2], "probed": False, "alive": False,
+                      "req": 0, "capped": False}
+_HK_LK = threading.Lock()
 _HK_BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
               "image/webp,*/*;q=0.8",
@@ -3318,6 +3333,16 @@ def _hk_collect_month(y: int, m: int) -> List[dict]:
     while page <= 120 and empty_streak < 2:
         if CIRCUIT.blocked("hankyung"):
             break
+        with _HK_LK:                       # ★ 실행당 요청 상한 — 차단을 '예방'한다
+            if HK["req"] >= HANKYUNG_MAX_REQ_PER_RUN:
+                if not HK["capped"]:
+                    HK["capped"] = True
+                    CON.warn(f"한경 요청이 이번 실행 상한({HANKYUNG_MAX_REQ_PER_RUN}회)에 "
+                             f"도달했습니다 — 여기서 멈춥니다. 실측상 300회 부근에서 IP "
+                             f"차단(3시간)이 걸리므로, 조금 덜 받고 다음 실행이 이어받는 "
+                             f"편이 항상 빠릅니다. 수집분은 이미 저장되어 있습니다.")
+                break
+            HK["req"] += 1
         html = fetch(HK["list"], source="hankyung", referer=_HK_HOME,
                      headers=_HK_BROWSER_HEADERS,
                      params=_hk_params(sdate, edate, page))
@@ -3447,12 +3472,24 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
             return pd.DataFrame(rows) if rows else None
 
         got = pmap(_one, todo_ms, workers=min(4, N_IO_THREADS), label="리포트수집")
-        got = [g for g in got if g is not None and len(g)]
+        # ★ 전부 NA 인 열만 가진 프레임이 섞이면 판다스가 dtype 추론 경고를 낸다.
+        #   그런 프레임은 정보가 없으므로 애초에 제외한다(경고가 아니라 원인을 없앤다).
+        got = [g for g in got
+               if g is not None and len(g) and not g.dropna(axis=1, how="all").empty]
         if got:
             newdf = pd.concat(got, ignore_index=True)
             newdf["date"] = ts_col(newdf["date"])
             frames.append(newdf)
             FLOW.io("입", "HTTP", "리포트신규", newdf, src="한경+네이버")
+        # ★ 수집 도중 차단당한 경우에도 쿨다운을 남긴다. 진단(hk_probe)에서만 저장하면,
+        #   다음 실행이 '차단 이력 없음'으로 보고 곧바로 다시 두드려 차단을 연장시킨다.
+        if CIRCUIT.blocked("hankyung") and HK["alive"]:
+            _hk_block_state(save=dict(until=time.time() + HANKYUNG_COOLDOWN_MIN * 60,
+                                      why=f"수집 중 차단(요청 {HK['req']}회 시점)",
+                                      at=_now_iso()))
+            CON.warn(f"한경이 수집 도중 차단됐습니다(요청 {HK['req']}회 시점). "
+                     f"{HANKYUNG_COOLDOWN_MIN}분 쿨다운을 기록했습니다 — 다음 실행은 "
+                     f"그 시간까지 두드리지 않고 남은 월부터 이어받습니다.")
         # ★ '한경이 실제로 수집됐는가'가 로그에서 보이지 않아 매번 되물어야 했다.
         #   소스별 신규 건수와 목표가 보유율을 표로 못박는다(0건이면 그 자체가 답이다).
         cnt = (newdf.groupby("source").size().to_dict() if got else {})
@@ -3463,9 +3500,14 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
             if got and n_new:
                 sub = newdf[newdf["source"] == src_name]
                 tp_rate = f"{sub['target_price'].notna().mean()*100:.0f}%"
-            rows_src.append([src_name,
-                             "사용" if on else "건너뜀(차단/쿨다운)",
-                             f"{n_new:,}건", tp_rate])
+            note = ("사용" if on else "건너뜀(차단/쿨다운)")
+            if src_name == "hankyung":
+                note += f" · 요청 {HK['req']}/{HANKYUNG_MAX_REQ_PER_RUN}회"
+                if CIRCUIT.blocked("hankyung"):
+                    note += " · 차단됨"
+                elif HK["capped"]:
+                    note += " · 상한도달"
+            rows_src.append([src_name, note, f"{n_new:,}건", tp_rate])
         CON.grid(rows_src, ["소스", "이번 실행", "신규 수집", "목표가 보유율"],
                  ["l", "l", "r", "r"],
                  title=f"리포트 신규 수집 결과 ({len(todo)}개월 대상 · "
@@ -6946,7 +6988,8 @@ def run_rehearsal(strict: bool = True) -> bool:
             G[k] = v
         # ★ 리허설이 픽스처로 정한 한경 경로를 실행분으로 흘려보내면 안 된다 — 초기화.
         HK.update(probed=False, alive=False, name=_HK_CANDIDATES[0][0],
-                  list=_HK_CANDIDATES[0][1], pdf=_HK_CANDIDATES[0][2])
+                  list=_HK_CANDIDATES[0][1], pdf=_HK_CANDIDATES[0][2],
+                  req=0, capped=False)
         CIRCUIT.opened.clear()
         CIRCUIT._streak.clear()
         _PDF_URL_REWRITE.clear()
@@ -7357,6 +7400,48 @@ def offer_downloads(paths: List[str]):
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║ 오케스트레이터 — 전체 실행                                                                 ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+def pdf_lib_report():
+    """★ "분명히 설치했는데 왜 안 되나" 를 끝내기 위한 표.
+
+    지금까지 환경표는 `pymupdf(ImportError)` 처럼 **예외 타입만** 찍었다. 정작
+    필요한 것은 그 뒤의 문장이다 — 'No module named' 인지 'DLL load failed' 인지에
+    따라 처방이 정반대다:
+      · No module named …  → **다른 파이썬에 깔렸다**. Windows+Jupyter 에서 터미널로
+        pip 를 돌리면 커널과 다른 인터프리터에 설치되는 것이 가장 흔한 원인이다.
+        해결: 노트북 셀에서 `%pip install pymupdf` (커널과 같은 파이썬에 설치)
+      · DLL load failed / ImportError(네이티브) → 파이썬 버전용 휠이 없어 잘못 깔렸다.
+        해결: 다른 파이썬 버전을 쓰거나 pypdf 로 진행(성능만 손해)
+    그래서 사유 **전문**과 **이 커널의 파이썬 경로**를 같이 찍는다.
+    """
+    rows = []
+    for name, mod, why in (("pymupdf", _fitz, "1순위 — 가장 빠름"),
+                           ("pypdf", _pypdf, "2순위 — 순수 파이썬"),
+                           ("pdfplumber", _pdfplumber, "3순위 — 가장 느림")):
+        if mod is not None:
+            loc = getattr(mod, "__file__", "") or "-"
+            rows.append([name, "사용 가능", why, os.path.dirname(str(loc))[-52:]])
+        else:
+            # ★ 사유는 **잘리면 쓸모가 없다**. 'No module named'(다른 파이썬에 설치)와
+            #   'DLL load failed'(휠 불일치)를 구분하는 것이 이 표의 존재 이유다.
+            raw = IMPORT_ERR.get(name, "설치되어 있지 않음")
+            raw = re.sub(r"^\w*Error:\s*", "", raw)
+            rows.append([name, "사용 불가", why, raw[:88]])
+    CON.grid(rows, ["PDF 라이브러리", "상태", "역할", "설치 위치 / 실패 사유"],
+             ["l", "l", "l", "l"],
+             title="PDF 텍스트 추출기 진단 — 설치했는데 안 잡히면 여기를 보세요")
+    if _fitz is None:
+        err = IMPORT_ERR.get("pymupdf", "")
+        if "No module named" in err:
+            CON.warn("pymupdf 가 **이 커널의 파이썬에는 없습니다**. 터미널에서 설치하면 "
+                     "다른 인터프리터에 깔립니다 — 노트북 셀에서 아래를 실행하세요:\n"
+                     "      %pip install pymupdf\n"
+                     f"    (이 커널의 파이썬: {sys.executable})")
+        elif err:
+            CON.warn(f"pymupdf 가 설치는 되어 있으나 로드에 실패했습니다: {err[:120]}\n"
+                     "    파이썬 3.14 용 휠이 아직 없을 수 있습니다. pypdf 로 진행해도 "
+                     "결과는 같고 속도만 손해입니다(현 설정으로도 예산 내 완주 가능).")
+
+
 def run_all() -> dict:
     global DEPOT
     t_all = time.time()
@@ -7377,10 +7462,13 @@ def run_all() -> dict:
                                         ("pdfplumber", _pdfplumber)) if m is not None)
                or "없음 — EPS 추출 불가",
                ],
+              ["이 노트북의 파이썬", sys.executable],
               ["수집 시간예산", f"{COLLECT_HOURS_BUDGET:.1f}시간 (초과 시 중간결과 산출)"],
               ["KRX 마켓플레이스", "ID 입력됨" if KRX_MARKETPLACE_ID else "미입력(폴백 사용)"],
               ["DART 키", "입력됨" if DART_API_KEY else "미입력(네이버 실적 폴백)"]],
              ["항목", "값"], ["l", "l"], title="실행 환경")
+
+    pdf_lib_report()
 
     with FLOW.part("S1", "캐시 금고 연결(로컬 D드라이브+구글드라이브 다중루트)", budget_s=300):
         DEPOT = Depot()
