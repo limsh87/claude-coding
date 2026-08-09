@@ -12,6 +12,9 @@
 #         [B] 계약 자가검정 C1~C12  → 합성데이터 스모크(계산경로 증명)
 #         [C] 데이터수집부  (캐시: 로컬D드라이브+구글드라이브 탐색 → 부족분만 신규 수집
 #                            → ★신규 수집분은 전부 구글드라이브 공용/전용 인덱스에 저장)
+#             ★수집은 '날짜축'이다: 하루 1회 호출 = 그날 상장된 전 종목.
+#               10년 ≈ 2,700 거래일이면 끝나고, 받은 거래일은 원장에 남아 두 번 다시
+#               조회하지 않는다. 상장폐지 종목은 '당시 상장돼 있던 날'에 자동 포함된다.
 #         [D] 정제부        (PIT 정련·재무 tidy·셀 구성)
 #         [E] 백테스트부    (피처 L1 → 스코어 L2 → 백테스트 L3)
 #         [F] 성과검증      → [G] 강건성검사 R1~R11 → [H] 해석표·진단카드
@@ -1083,27 +1086,30 @@ def _drive_bases() -> List[str]:
     ★옛 판정의 결함: tcd_cache 폴더가 '이미 존재'해야만 드라이브로 인정 → 처음 쓰는 사람은
       드라이브를 붙여놨는데도 LOCAL_ONLY 로 떨어져 절대1원칙(신규분 드라이브 저장)이 깨졌다.
       이제는 베이스만 있으면 그 아래 캐시 폴더를 만들어 쓴다."""
-    outs: List[str] = []
+    # ★깊은 쪽('내 드라이브')이 먼저다. 마운트 루트(~/Google Drive)에 바로 쓰면 구글드라이브
+    #   데스크톱이 동기화하지 않거나 쓰기를 거부한다 — 실제 동기화 대상은 그 아래다.
+    deep: List[str] = []
+    shallow: List[str] = []
 
-    def add(p):
+    def add(lst, p):
         try:
-            if p and os.path.isdir(p) and p not in outs:
-                outs.append(p)
+            if p and os.path.isdir(p) and p not in lst:
+                lst.append(p)
         except Exception:
             pass
 
-    for base in ("~/Google Drive", "~/GoogleDrive", "~/Google 드라이브",
-                 "/Volumes/GoogleDrive", "/mnt/g", "/mnt/google_drive"):
-        b = os.path.expanduser(base)
-        add(b)
-        for sub in _DRIVE_SUBS:
-            add(os.path.join(b, sub))
+    roots = ["~/Google Drive", "~/GoogleDrive", "~/Google 드라이브",
+             "/Volumes/GoogleDrive", "/mnt/g", "/mnt/google_drive"]
     if os.name == "nt" or os.path.isdir("/mnt/c"):
         for letter in "GHIJKLDEF":                 # 구글드라이브 데스크톱 기본은 G:
-            for pre in (f"{letter}:/", f"/mnt/{letter.lower()}/"):
-                for sub in _DRIVE_SUBS:
-                    add(pre + sub)
-    return outs
+            roots += [f"{letter}:/", f"/mnt/{letter.lower()}/"]
+    for base in roots:
+        b = os.path.expanduser(base)
+        for sub in _DRIVE_SUBS:
+            add(deep, os.path.join(b, sub))
+        if not base.endswith((":/", "/")) or base.startswith("~"):
+            add(shallow, b)                        # 드라이브문자 루트 자체는 후보가 아니다
+    return deep + shallow
 
 
 def locate_primary_root() -> Tuple[str, str]:
