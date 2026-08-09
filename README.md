@@ -192,3 +192,21 @@ python3 tools/smoke.py     # 6개 파일 전부 실제 실행 검증
 ---
 
 *본 문서와 코드는 전략 설계·검증용이며 투자자문이 아니다.*
+
+---
+
+# 부록 — SHINHAN_EARNINGS_SURPRISE_7F_V1 (별도 전략)
+
+`strategies/shinhan_7f_earnings_surprise_v1.py` — 신한투자증권 「4분기 서프라이즈 포트폴리오」
+(이정빈, 2023-01-06) 원문 기반 **7팩터 어닝서프라이즈 전략의 10년(2016-08~2026-07) PIT 백테스트**.
+TCD 와 무관한 독립 전략이지만 **같은 구글드라이브 공용 인덱스(`_shared`)를 재사용**하고,
+전용 인덱스는 `shinhan_7f/` 를 쓴다. 원셀 실행형(Colab/JupyterLab 겸용).
+
+- 팩터: F1 서프라이즈확률(프록시) · F2/F3 EPS성장(프록시) · F4 스마트-일반 컨센서스 갭(프록시)
+  · F5 12MF EPS 1개월 변화(프록시) · F6/F7 기관·외국인 20거래일 순매수강도(공개 정확)
+- 벤더(FnGuide) 데이터 부재 시 `EXACT_COMPOSITE_NOT_PUBLICLY_IDENTIFIED` 를 출력하고
+  `SHINHAN_7F_RECONSTRUCTED`(사전고정 z·ddof0·winsor 없음·상위30 동일가중)로만 진행 — 혼합 금지.
+- 분기(3/6/9/12월 말 거래일) 신호 → 익거래일 시가 체결. paper-close 는 강건성 별도 산출.
+- 비교전략: **시가총액 하위 1000 유니버스** 동일 산식 백테스트를 나란히 출력.
+- 산출물: 계약 지정 `01_coverage_report.csv` ~ `11_runtime_profile.json` + `config.yaml`
+  + `data_dictionary.md` (전용 인덱스 `shinhan_7f/reports/run_*/`).
