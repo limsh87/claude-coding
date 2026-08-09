@@ -36,8 +36,8 @@ from __future__ import annotations
 # ── ① KRX 데이터 마켓플레이스 로그인 (가격·시가총액·관리종목 스냅샷) ──────────────────────────
 #     가입(무료): https://data.krx.co.kr → 회원가입 → 아래에 로그인 ID/비밀번호 입력
 #     ▶ 2025-12 인증 개편 이후 KRX 정식 조회는 로그인 세션이 필요합니다.
-#     ▶ 비워도 됩니다: FDR→pykrx→네이버→yfinance 폴백 체인이 가격을 대신 확보하고,
-#       시가총액은 주식수 역산/거래대금 보정 프록시로 대체합니다(감사표에 소스가 표시됩니다).
+#     ▶ 비워도 됩니다: pykrx 전종목 스냅샷이 같은 날짜축 경로를 대신 타고,
+#       못 채운 종목만 네이버/FDR 로 보충합니다(감사표에 소스가 표시됩니다).
 #     ⚠ 같은 계정을 브라우저에서 동시에 로그인해 두면 KRX 가 이전 세션을 끊어(중복로그인)
 #       수집이 실패합니다. 실행 중에는 브라우저 로그인을 피하세요.
 KRX_MARKETPLACE_ID = ""
@@ -253,7 +253,7 @@ _MUST_HAVE = [("numpy", "numpy"), ("pandas", "pandas"), ("pyarrow", "pyarrow"),
               ("tqdm", "tqdm")]
 _NICE_HAVE = [("FinanceDataReader", "finance-datareader", "가격·상장/상폐 목록 1순위 폴백"),
               ("pykrx", "pykrx", "KRX 스냅샷·시가총액·수급 (마켓플레이스 계정 연동)"),
-              ("yfinance", "yfinance", "가격 최종 폴백"),
+              ("yfinance", "yfinance", "지수 벤치마크 최종 폴백"),
               ("rapidfuzz", "rapidfuzz", "상호/애널리스트명 고속 유사도 매칭")]
 
 
@@ -2397,8 +2397,8 @@ class KRXMarketplace:
                 return True
             if not (self.uid and self.pw):
                 self.state = "자격증명 미입력"
-                L.info("KRX 마켓플레이스 ID/PW 미입력 — 로그인 없이 폴백 체인(FDR→pykrx→네이버→"
-                       "yfinance)으로 진행합니다. 시가총액은 프록시로 대체되며 감사표에 표시됩니다.")
+                L.info("KRX 마켓플레이스 ID/PW 미입력 — 로그인 없이 날짜축 벌크(pykrx 전종목 "
+                       "스냅샷)로 진행합니다. 시가총액은 프록시로 대체되며 감사표에 표시됩니다.")
                 return False
             net_get(self.WARM, source="krx", tries=1)
             net_get(self.LOGIN_PAGE, source="krx", tries=1, referer=self.WARM)
@@ -3776,12 +3776,15 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             f0 = m.replace(day=1)
             part: Optional[pd.DataFrame] = None
             for col, inv in FLOW_INVESTORS:
-                d = None
-                for mkt in ("ALL", "KOSPI"):
-                    d = PKX.call(fn, f0.strftime("%Y%m%d"), m.strftime("%Y%m%d"),
-                                 mkt, inv)
-                    if d is not None and len(d):
-                        break
+                # ★market="ALL" 이 안 먹는 pykrx 버전에서는 KOSPI+KOSDAQ 을 '합쳐야' 한다.
+                #   먼저 성공한 하나로 break 하면 코스닥이 통째로 빠져 소형주 d3 가 전멸한다.
+                d = PKX.call(fn, f0.strftime("%Y%m%d"), m.strftime("%Y%m%d"), "ALL", inv)
+                if d is None or len(d) == 0:
+                    subs = [x for x in (PKX.call(fn, f0.strftime("%Y%m%d"),
+                                                 m.strftime("%Y%m%d"), mk, inv)
+                                        for mk in ("KOSPI", "KOSDAQ"))
+                            if x is not None and len(x)]
+                    d = pd.concat(subs) if subs else None
                 if d is None or len(d) == 0:
                     continue
                 d = d.reset_index()
