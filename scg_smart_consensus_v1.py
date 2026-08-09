@@ -32,12 +32,26 @@
 #     · PDF 파싱은 **순수 CPU 작업**이라 스레드로는 GIL 이 코어를 못 쓴다(실측 24건/분).
 #       확보(네트워크·스레드)와 파싱(CPU·프로세스)을 분리하고, 추출기는 이 장비에서
 #       **실측해서** 빠른 것을 고른다(pymupdf → pypdf → pdfplumber).
+#     · 분리만으로는 부족했다 — 청크 40건을 워커 12개에 나누면 대부분 놀고, '확보 끝나야
+#       파싱 시작' 이라 네트워크와 CPU 가 서로를 기다리며 각각 절반씩 쉬었다(기대 936건/분,
+#       관측 111건/분). 청크를 워커 수에 맞춰 키우고 **다음 청크 확보를 현재 청크
+#       파싱과 겹쳐서** 돌린다.
+#     · 리포트 수집 완료 판정은 (월 × 소스) 단위다. '월 단위'로 보면 한경이 막혀 있던
+#       기간에 모은 달은 네이버 행만 들어 있는데도 완료로 취급돼 **전수수집이 구조적으로
+#       불가능**했다.
 #     · 단계 예산은 '남은 수집예산 − 백테스트 유보(30분)' 전부를 쓴다. 고정 60분은
 #       4시간 중 3시간을 놀려 전수까지 필요한 실행 횟수를 늘릴 뿐이었다.
 #     · 같은 예산이면 **(종목,월)에 2인 이상이 되는 칸부터** 받는다(§31) — 다운로드
 #       1건당 쓸 수 있는 신호가 최대가 되고, 중간에 멈춰도 표본이 쓸모 있게 남는다.
 #     · 종결 원장으로 재개가 보장되어 재실행할수록 100% 로 수렴한다. 매 실행마다
 #       '지금 결과를 믿어도 되는가'를 커버리지 표로 판정해 출력한다.
+#
+#   ▣ PDF 라이브러리 이름 함정 — 설치했는데도 계속 못 쓰던 이유
+#     PyMuPDF 는 1.24.3+ 부터 정식 모듈명이 `pymupdf` 이고 `fitz` 는 하위호환 별칭이다.
+#     최신 배포에서는 그 별칭이 없다. 게다가 PyPI 에는 PyMuPDF 와 무관한 `fitz`
+#     패키지가 따로 있어, 그게 깔려 있으면 엉뚱한 것을 집는다. `fitz` 만 시도하던
+#     코드는 설치 여부와 무관하게 실패할 수밖에 없었다 → 정식 이름을 먼저 시도하고
+#     실패 사유 전문을 환경표에 남긴다(성능에 직결되므로 추측 금지).
 #
 #   ▣ 윈도우·주피터에서만 터지는 것들 (리눅스에선 절대 재현되지 않는다)
 #     · 경로 포함 판정을 `realpath().startswith()` 로 하면 윈도우에서 오탐한다
@@ -275,7 +289,7 @@ _NICE = [("scipy", "scipy", "스피어만 IC 정밀계산(없으면 자체 구�
          ("FinanceDataReader", "finance-datareader", "상장/상폐 목록·지수·가격 폴백"),
          ("pykrx", "pykrx", "KRX 시세·시총 스냅샷(1순위 가격/시총 소스)"),
          ("yfinance", "yfinance", "가격 최후 폴백"),
-         ("fitz", "pymupdf", "PDF 텍스트 추출(EPS 추정치) 1순위"),
+         ("pymupdf", "pymupdf", "PDF 텍스트 추출(EPS 추정치) 1순위 — 가장 빠름"),
          ("pypdf", "pypdf", "PDF 텍스트 추출 2순위(순수 파이썬 — 새 파이썬에서도 설치됨)"),
          ("pdfplumber", "pdfplumber", "PDF 텍스트 추출 3순위(가장 느림)")]
 
@@ -354,7 +368,29 @@ yf = _opt_import("yfinance", lambda: __import__("yfinance"))
 # ★ PDF 라이브러리는 네이티브 확장에 의존해서, 설치가 깨지면 평범한 Exception 이 아니라
 #   인터프리터 수준 패닉(BaseException)을 던진다. except Exception 으로는 못 잡아
 #   런 전체가 죽는다. 실제로 그렇게 죽었다 — 그래서 BaseException 까지 잡는 통로로 보낸다.
-_fitz = _opt_import("pymupdf", lambda: __import__("fitz"))
+def _import_pymupdf():
+    """★ 사용자가 분명히 설치했는데도 매번 'pymupdf(ImportError)' 가 났다. 원인은
+    **모듈 이름 하나**다:
+      · PyMuPDF 1.24.3+ 는 정식 모듈명이 `pymupdf` 이고 `fitz` 는 하위호환 별칭이다.
+        최신 배포에서는 `fitz` 별칭이 빠지거나 경고와 함께 실패한다.
+      · 게다가 PyPI 에는 PyMuPDF 와 **무관한 `fitz` 패키지**가 따로 있어서, 그게
+        깔려 있으면 `import fitz` 가 그 엉뚱한 패키지를 집고 의존성 부재로 죽는다.
+    이 코드는 `fitz` 만 시도했기 때문에 설치 여부와 상관없이 실패할 수밖에 없었다.
+    정식 이름을 **먼저** 시도하고, 실패 사유는 전문을 남겨 다음엔 추측하지 않게 한다.
+    """
+    err = []
+    for mod in ("pymupdf", "fitz"):
+        try:
+            m = __import__(mod)
+            if not hasattr(m, "open"):        # 동명이인 패키지 방어
+                raise ImportError(f"{mod}: PyMuPDF 가 아닌 동명 패키지로 보입니다")
+            return m
+        except BaseException as e:
+            err.append(f"{mod}→{type(e).__name__}: {e}")
+    raise ImportError(" | ".join(err)[:300])
+
+
+_fitz = _opt_import("pymupdf", _import_pymupdf)
 _pdfplumber = _opt_import("pdfplumber", lambda: __import__("pdfplumber"))
 _pypdf = _opt_import("pypdf", lambda: __import__("pypdf"))
 
@@ -3361,34 +3397,79 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
                               need_cols=None)
     frames: List[pd.DataFrame] = []
     done_m: set = set()
+    done_ms: set = set()
     if cached is not None and len(cached):
         cached = _adapt_foreign_reports(cached)
         if cached is not None and len(cached):
             frames.append(cached)
             done_m = set(cached["date"].dropna().dt.to_period("M").astype(str))
-            CON.say(f"보고서 캐시 재사용 {len(cached):,}건 ({len(done_m)}개월분)")
+            # ★ '월 단위 완료'로만 보면 **소스 누락을 영원히 못 채운다**.
+            #   한경이 막혀 있던 기간에 수집한 달은 네이버 행만 들어 있는데, 그 달이
+            #   done_m 에 있으니 한경이 되살아나도 다시 가지 않는다. 실제로 캐시
+            #   57,622건의 상당수가 그 상태일 수 있다 — 전수수집이 구조적으로 불가능해진다.
+            #   그래서 (월 × 소스) 단위로 완료를 판정한다.
+            _cd = cached.dropna(subset=["date"]).copy()
+            _cd["_m"] = _cd["date"].dt.to_period("M").astype(str)
+            _cd["_s"] = _cd["source"].astype(str).str.lower()
+            done_ms = set()
+            for _m_, _s_ in zip(_cd["_m"], _cd["_s"]):
+                for tok in re.split(r"[+|,]", _s_):
+                    if tok:
+                        done_ms.add((_m_, tok))
+            CON.say(f"보고서 캐시 재사용 {len(cached):,}건 ({len(done_m)}개월분 · "
+                    f"소스×월 조합 {len(done_ms):,})")
     if RESEARCH_COLLECT and RUN_MODE != "CACHED":
         hk_probe()                       # ★ 먼저 진단하고 시작한다 — 막힌 곳을 두드리지 않는다
         months = pd.period_range(ts(start), ts(end), freq="M")
         cur = pd.Timestamp.today().to_period("M")
-        todo = [p for p in months if (str(p) not in done_m) or (p >= cur - 1)]
-        CON.say(f"리포트 신규 수집 대상: {len(todo)}개월 "
-                f"(robots 제한 소스 — 사용자 지시에 따라 보수 속도로 수집) · "
-                f"한경 {'사용' if HK['alive'] else '건너뜀'} · 네이버 사용")
+        # (월, 소스) 단위 미수집분 — 최근 2개월은 갱신을 위해 항상 다시 본다
+        srcs = ([("hankyung", _hk_collect_month)] if HK["alive"] else []) \
+            + [("naver", _nv_collect_month)]
+        todo_ms = [(p, nm) for p in months for nm, _f in srcs
+                   if (str(p), nm) not in done_ms or p >= cur - 1]
+        miss = {nm: sum(1 for p, n2 in todo_ms if n2 == nm) for nm, _f in srcs}
+        todo = sorted({p for p, _nm in todo_ms})
+        CON.say(f"리포트 신규 수집 대상: {len(todo)}개월 × 소스 {len(todo_ms)}건 "
+                f"(robots 제한 소스 — 보수 속도) · "
+                + " · ".join(f"{nm} {miss.get(nm, 0)}개월" for nm, _f in srcs)
+                + (" · 한경 건너뜀(차단/쿨다운)" if not HK["alive"] else ""))
+        if HK["alive"] and miss.get("hankyung", 0) > 3:
+            CON.warn(f"한경 누락 {miss['hankyung']}개월을 이번 실행에서 채웁니다 — "
+                     f"막혀 있던 기간에 모은 달은 네이버 행만 들어 있어, '월 완료'로만 "
+                     f"보면 전수수집이 구조적으로 불가능했습니다.")
+        fmap = dict(srcs)
 
-        def _one(p):
+        def _one(job):
+            p, nm = job
             if DEADLINE.over("리포트 수집"):
                 return None
-            rows = _hk_collect_month(p.year, p.month) + _nv_collect_month(p.year, p.month)
+            rows = fmap[nm](p.year, p.month)
             return pd.DataFrame(rows) if rows else None
 
-        got = pmap(_one, todo, workers=min(4, N_IO_THREADS), label="리포트수집")
+        got = pmap(_one, todo_ms, workers=min(4, N_IO_THREADS), label="리포트수집")
         got = [g for g in got if g is not None and len(g)]
         if got:
             newdf = pd.concat(got, ignore_index=True)
             newdf["date"] = ts_col(newdf["date"])
             frames.append(newdf)
             FLOW.io("입", "HTTP", "리포트신규", newdf, src="한경+네이버")
+        # ★ '한경이 실제로 수집됐는가'가 로그에서 보이지 않아 매번 되물어야 했다.
+        #   소스별 신규 건수와 목표가 보유율을 표로 못박는다(0건이면 그 자체가 답이다).
+        cnt = (newdf.groupby("source").size().to_dict() if got else {})
+        rows_src = []
+        for src_name, on in (("hankyung", HK["alive"]), ("naver", True)):
+            n_new = int(cnt.get(src_name, 0))
+            tp_rate = "-"
+            if got and n_new:
+                sub = newdf[newdf["source"] == src_name]
+                tp_rate = f"{sub['target_price'].notna().mean()*100:.0f}%"
+            rows_src.append([src_name,
+                             "사용" if on else "건너뜀(차단/쿨다운)",
+                             f"{n_new:,}건", tp_rate])
+        CON.grid(rows_src, ["소스", "이번 실행", "신규 수집", "목표가 보유율"],
+                 ["l", "l", "r", "r"],
+                 title=f"리포트 신규 수집 결과 ({len(todo)}개월 대상 · "
+                       f"캐시 {len(cached) if cached is not None else 0:,}건은 별도)")
     if not frames:
         return pd.DataFrame(columns=["source", "rid", "date", "title", "stock_code",
                                      "stock_name", "broker", "analyst", "target_price",
@@ -3402,6 +3483,22 @@ def collect_research(start: str, end: str) -> pd.DataFrame:
     DEPOT.table_save("scg_reports_raw", rep, scope="공용", domain="research",
                      source="hankyung+naver+cache")
     return rep
+
+
+def _norm_source(x) -> str:
+    """소스명을 표준 토큰으로 — 'NAVER_RESEARCH'→'naver', 'HANKYUNG'→'hankyung'."""
+    t = str(x or "").strip().lower()
+    parts = []
+    for tok in re.split(r"[+|,/\s]+", t):
+        if not tok:
+            continue
+        if "hankyung" in tok or tok in ("hk", "한경"):
+            parts.append("hankyung")
+        elif "naver" in tok or tok in ("nv", "네이버"):
+            parts.append("naver")
+        else:
+            parts.append(tok)
+    return "+".join(dict.fromkeys(parts)) or "cache"
 
 
 def _adapt_foreign_reports(df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -3418,7 +3515,9 @@ def _adapt_foreign_reports(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         return pd.Series([None] * len(df), index=df.index)
 
     out = pd.DataFrame({
-        "source": pick("source").fillna("cache").astype(str),
+        # ★ 다른 전략은 소스명을 'HANKYUNG' / 'NAVER_RESEARCH' 처럼 쓴다. 그대로 두면
+        #   (월×소스) 완료 판정이 안 맞아 120개월을 통째로 재수집하게 된다.
+        "source": pick("source").fillna("cache").astype(str).map(_norm_source),
         "rid": pick("rid", "src_report_id", "report_uid", "report_id").astype(str),
         "date": ts_col(pick("date", "pub_date", "report_date", "event_date")),
         "title": pick("title", "report_title").astype(str),
@@ -3882,8 +3981,18 @@ def _pdf_worker_source() -> str:
              #   되돌아갔다 — 안전망은 동작했지만 병렬화 이득은 0이었다.
              "from typing import Any, Callable, Dict, List, Optional, "
              "Sequence, Tuple"]
-    for mod, alias in (("fitz", "_fitz"), ("pdfplumber", "_pdfplumber"),
-                       ("pypdf", "_pypdf")):
+    # ★ 파싱은 **워커 프로세스**가 한다. 부모만 고치고 워커가 여전히 `fitz` 를
+    #   찾으면 정작 일하는 쪽이 pymupdf 를 못 쓴다 — 정식 이름을 먼저 시도한다.
+    parts.append("_fitz = None\n"
+                 "for _m in ('pymupdf', 'fitz'):\n"
+                 "    try:\n"
+                 "        _c = __import__(_m)\n"
+                 "        if hasattr(_c, 'open'):\n"
+                 "            _fitz = _c\n"
+                 "            break\n"
+                 "    except BaseException:\n"
+                 "        pass")
+    for mod, alias in (("pdfplumber", "_pdfplumber"), ("pypdf", "_pypdf")):
         parts.append(f"try:\n    import {mod} as {alias}\nexcept BaseException:\n"
                      f"    {alias} = None")
     parts.append(f"_ENGINE = {json.dumps(_PDF_ENGINE.get('name') or '')}")
@@ -4295,7 +4404,8 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
     pool = _pdf_pool(n_par) if PDF_PARSE_PROCESSES else None
     CON.say(f"PDF 처리를 시작합니다 — {n_jobs:,}건 · 확보(IO) 스레드 "
             f"{min(6, N_IO_THREADS)} · 파싱(CPU) {_PDF_POOL['mode'] or f'스레드×{n_par}'}"
-            f" · {PDF_PROGRESS_EVERY}건마다 진행 표시 · 체크포인트 {PDF_CHUNK}건")
+            f" · {PDF_PROGRESS_EVERY}건마다 진행 표시 · "
+            f"확보/파싱 동시진행 · 저장 {PDF_CHECKPOINT_SEC}초마다")
 
     def _parse_batch(items: List[tuple]) -> List[tuple]:
         """[2단계] 파싱 — CPU 바운드. 프로세스 풀이 살아 있으면 그쪽으로."""
@@ -4316,7 +4426,10 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
                          ["l", "l", "r", "l"],
                          title=f"PDF 텍스트 추출기 실측 — 선택: {eng or '없음'} "
                                f"(추측 아님 · 이 장비에서 잰 값)")
-            if pool is not None and eng:
+            # ★ 워커 재기동은 12 프로세스를 다시 띄우는 일이라 공짜가 아니다.
+            #   워커의 폴백 순서가 이미 pymupdf → pypdf → pdfplumber 이므로,
+            #   실측 승자가 pymupdf 면 다시 띄울 이유가 없다.
+            if pool is not None and eng and eng != "pymupdf":
                 # 워커 모듈에 박아 둔 엔진 이름을 실측 결과로 갱신해 다시 띄운다
                 _PDF_POOL.update(checked=False, ex=None, fn=None)
                 try:
@@ -4326,7 +4439,8 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
                 pool = _pdf_pool(n_par)
         if pool is not None:
             try:
-                res = list(pool.map(_PDF_POOL["fn"], pj, chunksize=4))
+                cs = max(1, min(8, len(pj) // max(n_par * 4, 1)))
+                res = list(pool.map(_PDF_POOL["fn"], pj, chunksize=cs))
             except BaseException as e:
                 CON.warn(f"프로세스 파싱 실패({type(e).__name__}) — 스레드로 계속합니다")
                 _PDF_POOL["ex"], _PDF_POOL["mode"] = None, "스레드(프로세스 중단)"
@@ -4350,14 +4464,32 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
             out.append((ruid, status, payload or None))
         return out
 
-    for i in range(0, len(jobs), PDF_CHUNK):
+    # ★★ 배치 장벽 제거 — 여기가 12배 손실의 자리였다.
+    #    실측: 프로세스 12개, pypdf 단일 1.3건/초 → 기대 936건/분. 관측 111건/분.
+    #    원인은 파싱 속도가 아니라 **일감 배분 구조**였다:
+    #      ⓐ 청크 40건을 워커 12개에 나누면 워커당 3건 — 띄워 놓고 대부분 논다.
+    #      ⓑ '확보(네트워크) 끝 → 파싱 시작 → 파싱 끝 → 다시 확보' 로 교대해서
+    #         네트워크와 CPU 가 **서로를 기다리며 각각 절반씩 놀았다**.
+    #    → 청크를 워커 수에 맞춰 키우고(체크포인트는 이미 시간 기준이라 안전),
+    #      다음 청크의 '확보'를 현재 청크 '파싱'과 **겹쳐서** 돌린다.
+    chunk_n = max(PDF_CHUNK, n_par * 24)
+    io_w = min(6, N_IO_THREADS)
+    _pre = ThreadPoolExecutor(max_workers=1)      # 선취 구동용(중첩 데드락 방지)
+
+    def _acq_chunk(sl):
+        return [g for g in pmap(_acquire, sl, workers=io_w) if g]
+
+    fut = _pre.submit(_acq_chunk, jobs[0:chunk_n]) if jobs else None
+    for i in range(0, len(jobs), chunk_n):
         if time.time() > stage_end or DEADLINE.over("PDF 추출"):
             CON.warn(f"PDF 단계 예산 소진 — {i:,}/{len(jobs):,}건에서 중단합니다. "
                      f"종결 원장에 진행분이 기록되어 다음 실행이 이어받습니다.")
             _pdf_checkpoint(done, status_rows)
             break
-        got = [g for g in pmap(_acquire, jobs[i:i + PDF_CHUNK],
-                               workers=min(6, N_IO_THREADS)) if g]
+        got = fut.result() if fut is not None else []
+        nxt = jobs[i + chunk_n:i + 2 * chunk_n]
+        # 다음 청크 확보를 **지금 시작**한다 — 아래 파싱과 동시에 진행된다
+        fut = _pre.submit(_acq_chunk, nxt) if nxt else None
         for ruid, _p, _y, st in got:                     # 확보 실패는 여기서 기록
             if st:
                 status_rows.append(dict(ruid=ruid, status=st,
@@ -4375,17 +4507,21 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
         #   매번 5만 행짜리 표를 통째로 다시 쓰므로 O(n²) 가 된다 — 조용히 수 GB 를
         #   쓰며 수집보다 저장이 더 오래 걸리는 상태가 된다.
         if (time.time() - ck["t"] > PDF_CHECKPOINT_SEC
-                or i + PDF_CHUNK >= len(jobs)):
+                or i + chunk_n >= len(jobs)):
             ck["t"] = time.time()
             _pdf_checkpoint(done, status_rows)
-        _eta_report(i + PDF_CHUNK, n_jobs, t0, stage_end)
+        _eta_report(i + chunk_n, n_jobs, t0, stage_end)
         # 남은 작업이 전부 차단된 호스트라면 더 돌 이유가 없다
-        rest = [j for j in jobs[i + PDF_CHUNK:] if not keymap.get(str(j[0]))]
+        rest = [j for j in jobs[i + chunk_n:] if not keymap.get(str(j[0]))]
         if rest and all(CIRCUIT.blocked(_pdf_src(j[1])) for j in rest):
             CON.warn(f"남은 {len(rest):,}건은 모두 차단된 호스트 대상이라 중단합니다 "
                      f"(무의미한 재시도로 예산을 태우지 않습니다).")
             _pdf_checkpoint(done, status_rows)
             break
+    try:
+        _pre.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     _pdf_pool_close()
     CON.ok(f"PDF 단계 종료 — 파싱 {counter['n']:,} · EPS 확보 {counter['new']:,} · "
            f"기존파일 {counter['hit']:,} · 신규다운로드 {counter['net']:,} · "
@@ -5820,7 +5956,9 @@ def eval_track(trk: dict, panel: pd.DataFrame, uni_df: pd.DataFrame,
     met, lbl = trk["metric"], trk["label"]
     sigp = trk["sig"][trk["sig"]["primary"]].merge(uni_df, on=["signal_date", "stock_id"],
                                                    how="left")
-    sig_full = sigp[sigp["in_uni"].fillna(False).astype(bool)]
+    # ★ object dtype 에 fillna(False) 를 걸면 판다스가 다운캐스팅 경고를 낸다.
+    #   비교 연산은 결측을 자동으로 False 로 만들어 경고 없이 같은 답을 준다.
+    sig_full = sigp[sigp["in_uni"].eq(True)]
     n_months = max(sig_full["signal_date"].nunique(), 1) if len(sig_full) else 1
     CON.say(f"[{met}] 신호×유니버스 교집합: {len(sig_full):,}행 "
             f"(월평균 {len(sig_full)/n_months:.0f}종목)")
@@ -5836,7 +5974,7 @@ def eval_track(trk: dict, panel: pd.DataFrame, uni_df: pd.DataFrame,
                 .head(COMPARE_BOTTOM_N)[["signal_date", "stock_id"]].copy())
         sm["in_small"] = True
         sigs = sig_full.merge(sm, on=["signal_date", "stock_id"], how="left")
-        sig_small = alphas_in_universe(sigs, sigs["in_small"].fillna(False).astype(bool), cfg)
+        sig_small = alphas_in_universe(sigs, sigs["in_small"].eq(True), cfg)
         CON.say(f"[{met}] 시총하위{COMPARE_BOTTOM_N} 유니버스 신호: {len(sig_small):,}행")
         suites_small = run_suite(sig_small, panel, f"{lbl} · 시총하위{COMPARE_BOTTOM_N}")
         if report:
@@ -7234,6 +7372,11 @@ def run_all() -> dict:
                          if m is not None) or "없음"],
               ["import 실패", "; ".join(f"{k}({v.split(':')[0]})"
                                         for k, v in IMPORT_ERR.items()) or "없음"],
+              ["PDF 라이브러리",
+               ", ".join(n for n, m in (("pymupdf", _fitz), ("pypdf", _pypdf),
+                                        ("pdfplumber", _pdfplumber)) if m is not None)
+               or "없음 — EPS 추출 불가",
+               ],
               ["수집 시간예산", f"{COLLECT_HOURS_BUDGET:.1f}시간 (초과 시 중간결과 산출)"],
               ["KRX 마켓플레이스", "ID 입력됨" if KRX_MARKETPLACE_ID else "미입력(폴백 사용)"],
               ["DART 키", "입력됨" if DART_API_KEY else "미입력(네이버 실적 폴백)"]],
