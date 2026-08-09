@@ -5,7 +5,7 @@
 응답 스키마는 설치된 pykrx 1.2.x 소스의 docstring 예시에서 그대로 가져왔다.
 이 시험이 깨지면 사용자 환경에서 시총·지수구성·수급이 조용히 전멸한다.
 """
-import os, sys, types
+import os, sys, types, json
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "shinhan_7f_earnings_surprise_v1.py")
 src = open(SRC, encoding="utf-8").read()
@@ -88,16 +88,16 @@ API_OK = {"OutBlock_1": [
     {"ISU_SRT_CD": "005930", "MKTCAP": "533698559970000", "LIST_SHRS": "5969782550",
      "TDD_CLSPRC": "89400"}]}
 API_ERR = {"respMsg": "Unauthorized Key", "respCode": "401"}
-def fake_json(url, source="generic", **kw):
+def fake_get(url, source="generic", **kw):
     calls["n"] += 1
-    return API_ERR if calls["n"] == 1 else API_OK
-M["http_json"] = fake_json
+    return json.dumps(API_ERR if calls["n"] == 1 else API_OK)
+M["http_get"] = fake_get
 ck("Open API 오류(respCode=401)를 데이터로 오인하지 않는다",
    (lambda r: r is not None and len(r) == 1)(M["krx_openapi_quotes"]("20210125")),
    "첫 엔드포인트는 401 → 버리고 두 번째만 채택")
-M["http_json"] = lambda url, source="generic", **kw: API_ERR
+M["http_get"] = lambda url, source="generic", **kw: json.dumps(API_ERR)
 ck("전 엔드포인트 오류면 None", M["krx_openapi_quotes"]("20210125") is None)
-M["http_json"] = lambda url, source="generic", **kw: {"OutBlock_1": []}
+M["http_get"] = lambda url, source="generic", **kw: json.dumps({"OutBlock_1": []})
 ck("빈 응답을 '휴장'으로 추론하지 않고 실패 처리",
    M["krx_openapi_quotes"]("20210125") is None)
 
@@ -162,6 +162,44 @@ ck("★두 번째 실행은 캐시만으로 전 분기 확보(네트워크 불�
    _sp2.n_by_src.get("cache", 0) == len(_sig), str(dict(_sp2.n_by_src)))
 M["RUN_MODE"] = "CACHED"
 _sh.rmtree(_root, ignore_errors=True)
+
+# ── KRX IP 차단 시나리오 (실운행 사고 2회차 그대로) ─────────────────────────────────────────
+print("\n=== KRX IP 차단: 감지 즉시 전 경로 봉인 (150초 낭비 제거) ===")
+_BLOCK_HTML = """<html><head><title>에러페이지 - 한국거래소 | Data Marketplace</title></head>
+<body><div class="ip-block-page"><h2 class="ip-block-title">KDM 이용 제한 안내</h2>
+<p>자동화 수단을 통한 비정상 대량 조회가 감지되어 해당 IP의 접속이 일시적으로 제한되었습니다.</p>
+<p>KRX Data Marketplace 이용약관 제10조 제2호는 ...</p></div></body></html>"""
+M["KRX"].__dict__.pop("json_data", None)   # 앞 절에서 인스턴스에 덮어쓴 mock 제거
+M["KRXBLOCK"].blocked = False
+M["KRXBLOCK"].reported = False
+M["KRXBLOCK"].calls = 0
+M["KRXBLOCK"].budget_warned = False
+_posts = {"n": 0}
+M["http_post"] = lambda *a, **k: (_posts.__setitem__("n", _posts["n"] + 1), _BLOCK_HTML)[1]
+M["KRX"].session_ok = True
+ck("차단 안내페이지를 데이터로 오인하지 않는다",
+   M["KRX"].json_data("dbms/MDC/STAT/standard/MDCSTAT01501", mktId="ALL", trdDd="20210125")
+   is None)
+ck("★차단이 감지되어 상태가 세워진다", M["KRXBLOCK"].blocked is True)
+_n_after_detect = _posts["n"]
+for _ in range(20):
+    M["KRX"].json_data("dbms/MDC/STAT/standard/MDCSTAT01501", mktId="ALL", trdDd="20210125")
+ck("★차단 이후에는 HTTP 요청을 아예 보내지 않는다(차단 연장 방지)",
+   _posts["n"] == _n_after_detect, f"추가 요청 {_posts['n'] - _n_after_detect}건")
+ck("지수구성 경로도 즉시 None", M["krx_index_members"]("20210125") is None)
+ck("수급 경로도 즉시 None", M["krx_net_purchases"]("20210101", "20210131", "7050") is None)
+_sp4 = M["MarketcapSpine"]()
+M["RUN_MODE"] = "FULL"
+M["MARCAP"] = M["MarcapStore"]()
+M["MARCAP_AUTO_DOWNLOAD"] = False        # 오프라인 가정
+M["MCAP_SPINE_SOURCES"].clear()
+M["MCAP_SPINE_SOURCES"].extend(["krx_bld", "pykrx"])
+_before = _posts["n"]
+_p4 = _sp4.build(_sig[:5], pxc=None)
+ck("★차단 상태에서 시총 스파인이 KRX 를 40번 찌르지 않는다",
+   _posts["n"] == _before, f"요청 {_posts['n'] - _before}건 (v1.1 초안은 40+40+80건)")
+ck("차단 상태에서도 예외 없이 빈 패널 반환", isinstance(_p4, pd.DataFrame))
+M["RUN_MODE"] = "CACHED"
 
 print("\n" + "=" * 70)
 print(f"실패 {len(F)}건: {F}" if F else "KRX 응답 파싱 시험 전체 통과")

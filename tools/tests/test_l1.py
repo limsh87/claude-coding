@@ -255,14 +255,27 @@ _cases = {
     "000010": np.r_[np.full(200, 100000.0), np.full(300, 10000.0), np.full(_n - 500, 2000.0)],
     # 첫 행이 절벽 → 직전 가격이 없어 계산 불가. 예외 없이 무시돼야 한다.
     "000020": np.r_[np.full(1, 100000.0), np.full(_n - 1, 5000.0)],
-    # 마지막 행이 절벽 → 이후 표본이 없어 미분류로 남아야 한다(섣불리 보정 금지).
+    # 마지막 행이 절벽이고 비율이 단순비(1/10) → 표본이 없어도 기업행위로 인정한다(M3).
     "000030": np.r_[np.full(_n - 1, 10000.0), np.full(1, 1000.0)],
+    # 마지막 행 절벽인데 단순비가 아니다(×0.37) → 실제 급락일 수 있으므로 보정 금지.
+    "000060": np.r_[np.full(_n - 1, 10000.0), np.full(1, 3700.0)],
+    # 18개월 데이터 공백 뒤 -75% → 거래일이 인접하지 않으므로 기업행위로 보지 않는다(C3).
+    "000070": np.r_[np.full(200, 10000.0), np.full(_n - 200, 2500.0)],
+    # 폐지일 미기록 정리매매(1000→300, 단순비 아님) → 실제 손실을 지워서는 안 된다(C3).
+    "000080": np.r_[np.full(300, 1000.0), np.full(_n - 300, 300.0)],
     # 병합(역분할): 가격이 5배로 뛴다.
     "000040": np.r_[np.full(300, 2000.0), np.full(_n - 300, 10000.0)],
     # 절벽 2개가 10거래일 안에 붙어 있다 → 20일 고정창이면 서로를 오염시켜 둘 다 미분류.
     "000050": np.r_[np.full(200, 100000.0), np.full(10, 10000.0), np.full(_n - 210, 1000.0)],
 }
-_px = pd.concat([_mk(k, v) for k, v in _cases.items()], ignore_index=True)
+_gapdays = pd.DatetimeIndex(list(_days[:200]) + list(_days[200:] + pd.Timedelta(days=550)))
+_frames_t = []
+for _k, _v in _cases.items():
+    _dd = _gapdays if _k == "000070" else _days
+    _frames_t.append(pd.DataFrame({"code": _k, "date": _dd, "close": _v, "open": _v,
+                                   "high": _v, "low": _v, "volume": 100.0,
+                                   "amount": _v * 100, "src": "t"}))
+_px = pd.concat(_frames_t, ignore_index=True)
 _out, _cnt = M["repair_price_cliffs"](_px.copy(), {})
 for _code, _label, _tail in (("000010", "분할 2회 연속", 2000.0),
                              ("000040", "병합(역분할)", 10000.0),
@@ -275,9 +288,23 @@ for _code, _label, _tail in (("000010", "분할 2회 연속", 2000.0),
           and abs(float(_s["close"].iloc[-1]) - _tail) < 1.0,
           f"first={float(_s['close'].iloc[0]):,.0f} last={float(_s['close'].iloc[-1]):,.0f}")
 check("첫 행 절벽은 예외 없이 무시", len(_out[_out["code"] == "000020"]) == _n)
-check("마지막 행 절벽은 표본 부족 → 보정하지 않음",
+check("마지막 행 절벽 + 단순비(1/10) → 기업행위로 보정(M3)",
       abs(float(_out[_out["code"] == "000030"].sort_values("date")["close"].iloc[0])
-          - 10000.0) < 1.0)
+          - 1000.0) < 1.0,
+      f"first={float(_out[_out['code'] == '000030'].sort_values('date')['close'].iloc[0]):,.0f}")
+check("★단순비가 아닌 마지막 행 급락은 보정하지 않는다",
+      abs(float(_out[_out["code"] == "000060"].sort_values("date")["close"].iloc[0])
+          - 10000.0) < 1.0,
+      f"first={float(_out[_out['code'] == '000060'].sort_values('date')['close'].iloc[0]):,.0f}")
+# ★ C3: 데이터 공백 뒤 급락을 기업행위로 오분류하면 실제 손실이 0% 로 지워진다
+_g = _out[_out["code"] == "000070"].sort_values("date")
+check("★18개월 공백 뒤 -75% 를 기업행위로 오분류하지 않는다(실손실 보존)",
+      abs(float(_g["close"].iloc[0]) - 10000.0) < 1.0,
+      f"first={float(_g['close'].iloc[0]):,.0f} (보정되면 2,500 이 된다)")
+_h = _out[_out["code"] == "000080"].sort_values("date")
+check("★폐지일 미기록 정리매매(-70%)를 지우지 않는다",
+      abs(float(_h["close"].iloc[0]) - 1000.0) < 1.0,
+      f"first={float(_h['close'].iloc[0]):,.0f} (보정되면 300 이 된다)")
 
 print("\n=== T6 build_universes 무예외 진행 ===")
 M["SEC"] = sec
