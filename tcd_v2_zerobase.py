@@ -139,6 +139,12 @@ PX_RESIDUAL_COV_SKIP  = 0.97    # ★벌크가 구간 거래일의 이 비율 �
 #                                 아니라 애초에 거래된 적이 없는 코드(폐지 우선주·ETF·ELW·
 #                                 스팩)라, 종목축으로 다시 물어봐야 전부 빈손이고 시간만 탄다.
 #                                 실측: 이 게이트가 없어 매 실행 300종목 × 3소스 = 5분을 버렸다.
+PX_RESIDUAL_COV_CODES = 0.35    # ★위 게이트의 두 번째 조건 — 하루 평균 마스터의 이 비율 이상이
+#                                 실제로 들어와 있어야 한다. 날짜 커버리지만 보면 '일부 종목 ×
+#                                 전 기간'짜리 구 캐시가 100%를 만들어, 반쪽 패널을 '전부
+#                                 수집됨'으로 선언한다(막으려는 대상이 종목축이므로 축이 맞아야
+#                                 한다). 마스터에는 ETF/ELW/스팩·비보통주가 섞여 있어 정상
+#                                 상태의 실측 커버리지가 60~75% 수준이라 0.35 를 바닥으로 둔다.
 
 # ── ⑧-2 DART 수집 정책 (호출량은 '고정 예산'이 아니라 '실시간 잔여'로 관리) ───────────────────
 DART_BULK_ZIP    = True   # ★재무제표 '일괄 ZIP'(연도×보고서×제표 파일 하나에 전 상장사).
@@ -999,12 +1005,16 @@ class CallBudget:
         need — 이 수집기가 '실제로 남겨둔 일'의 상한(대개 대상수×연도수). 주면 그보다
                많이 배정하지 않으므로, 할 일이 없는 소비자가 예산을 깔고 앉지 못한다.
         """
+        if name in self.alloc:
+            return self.alloc[name]        # ★재호출은 재배정이 아니다(이중 배정·정산 오류 방지)
         if name in self._pending:
             self._pending.remove(name)
         w = float(self.share.get(name, 0.0))
         wsum = w + sum(float(self.share.get(k, 0.0)) for k in self._pending)
         pool = self.pool()
-        n = int(pool * (w / wsum)) if wsum > 0 else pool
+        # ★몫이 없는 소비자(share 미등재·오타)는 0 이어야 한다. 마지막 순번에서 wsum==0 이면
+        #   잔여 전량을 넘기는 폴백은 '등록되지 않은 소비자가 예산을 통째로 먹는' 경로다.
+        n = int(pool * (w / wsum)) if wsum > 0 else 0
         if need is not None and int(need) >= 0:
             self.need[name] = int(need)
             n = min(n, int(need))
@@ -1998,10 +2008,22 @@ def euckr_quote(s: str) -> str:
         return quote(str(s))
 
 
-# ★봇차단 안내 페이지 지문 — '자동'과 '차단'이 같이 나오거나, 비정상 접근 안내 문구.
-#   짧은 응답에만 적용한다(정상 목록 페이지에 이 단어가 우연히 섞여도 오판하지 않게).
-_BOTWALL_RE = re.compile(r"(자동.{0,20}차단|비정상적인?\s*접근|robot|캡차|captcha|"
-                         r"접근이\s*제한|일시적으로\s*차단)", re.I)
+# ★봇차단 안내 페이지 지문. ★오탐이 미탐보다 훨씬 위험하다 — 정상 페이지를 차단으로 오판하면
+#   그 소스가 통째로 '데이터 없음'이 되고, 한경은 그 달의 남은 페이지를 유실한 채 30건 이상이면
+#   다음 실행부터 영구 스킵되며, DART 일괄 ZIP 목록이 실패하면 무료 재무 경로가 사라진다.
+#   그래서 ①맨 단어 'robot'(→ <meta name="robots"> 에 그대로 걸린다) 같은 무앵커 토큰을 빼고
+#         ②head/script 를 제거한 본문에만 적용한다.
+_BOTWALL_RE = re.compile(r"(자동[^<>]{0,20}차단|비정상적인?\s*접근|접근이\s*제한|"
+                         r"일시적으로\s*차단|자동입력\s*방지|보안문자|"
+                         r"unusual\s+traffic|automated\s+access|are\s+a\s+robot)", re.I)
+_STRIP_TAG_RE = re.compile(r"(?is)<(head|script|style|noscript)\b.*?</\1>")
+
+
+def looks_botwalled(body: str) -> bool:
+    """HTTP 200 인데 내용이 봇차단 안내인가. head/script 를 걷어낸 본문에서만 판정한다."""
+    if not body or len(body) > 20000:
+        return False
+    return bool(_BOTWALL_RE.search(_STRIP_TAG_RE.sub(" ", body)))
 
 
 def net_get(url: str, source: str = "generic", params: Optional[dict] = None,
@@ -2033,8 +2055,7 @@ def net_get(url: str, source: str = "generic", params: Optional[dict] = None,
                 # ★HTTP 200 짜리 차단 — 국내 포털은 봇으로 판정하면 403 이 아니라 200 에
                 #   '자동 수집 차단' 안내 페이지를 실어 보낸다(다른 세션 실측). 상태코드만
                 #   보면 '정상 응답인데 파싱이 0건'으로 보여서 원인 진단이 불가능해진다.
-                if (not as_bytes) and isinstance(body, str) and len(body) < 20000 \
-                        and _BOTWALL_RE.search(body):
+                if (not as_bytes) and isinstance(body, str) and looks_botwalled(body):
                     with _NET_LK:
                         NET_STATS[f"{source}:BOTWALL"] += 1
                         NET_LAST[source] = (200, "봇차단 안내 페이지(HTTP 200) — "
@@ -4307,15 +4328,27 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
                    f"전종목 수집 완료 거래일 {len(done_dates):,}일 "
                    f"(캐시 보유 거래일 {n_day:,}일)")
 
+    cal, cal_src = trading_calendar(s_ts, e_ts)
+
     # ⓪ 연도축 먼저 — 성공하면 날짜축 2,760회가 통째로 불필요해진다
     mc = harvest_marcap(range(s_ts.year, e_ts.year + 1))
     if mc is not None and len(mc):
         cached = mc if cached is None or not len(cached) else \
             _px_norm(pd.concat([cached, mc], ignore_index=True))
-        have_now = set(ds_(cached["date"]).dt.strftime("%Y-%m-%d"))
-        done_dates |= have_now          # marcap 이 덮은 거래일은 날짜축 재조회 불필요
-
-    cal, cal_src = trading_calendar(s_ts, e_ts)
+    # ★커버리지 판정의 근거는 '연도 원장'이지 캐시에 행이 있는 날짜가 아니다. 두 번 틀렸다.
+    #   ① cached(= 구 종목축 캐시 + marcap 병합본)에서 날짜를 뽑으면, 300종목짜리 옛 캐시가
+    #      전 거래일에 행을 갖고 있다는 이유만으로 marcap 이 못 받은 연도까지 '완료'가 된다
+    #      → 그 연도가 반쪽 패널로 굳고 그 위에서 10년 Sharpe/MDD 가 계산된다(선택편향).
+    #   ② harvest_marcap 은 전 연도가 이미 캐시에 있으면 None 을 반환한다. mc 성공 여부로
+    #      판정하면 ★2회차 실행부터 done_dates 가 비어 날짜축 2,700일을 전량 재수집한다
+    #      (연도축 개편의 성과가 재실행에서 통째로 사라진다).
+    _mled = VAULT.load_table("marcap_years_done", "shared")
+    mc_years = set(int(x) for x in _mled["year"]) if _mled is not None and len(_mled) else set()
+    if mc_years:
+        cov_y = {t.strftime("%Y-%m-%d") for t in cal if t.year in mc_years}
+        done_dates |= cov_y
+        L.info(f"연도축 원장이 {len(mc_years)}개 연도({min(mc_years)}~{max(mc_years)}) · "
+               f"거래일 {len(cov_y):,}일을 덮었습니다 — 날짜축 재조회 대상에서 제외.")
     approx_cal = (cal_src == "bdate_approx")
     todo = [t for t in cal if t.strftime("%Y-%m-%d") not in done_dates]
     # ★최근 → 과거 순. 오름차순이면 시간예산에 잘렸을 때 '가장 오래된 몇 년'만 남고 최근이
@@ -4444,11 +4477,17 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     cal_have = set(pd.DatetimeIndex(px["date"].unique()).normalize())
     cal_want = [t for t in cal if s_ts <= t <= e_ts]
     cov_day = len(cal_have & set(cal_want)) / max(len(cal_want), 1)
-    if swept or cov_day >= PX_RESIDUAL_COV_SKIP:
+    # ★날짜 커버리지만으로 판정하면 안 된다 — 막으려는 대상(_residual_fill)은 ★종목축이다.
+    #   '일부 종목 × 전 기간' 짜리 구 캐시는 모든 거래일에 행이 있어 cov_day=1.0 을 만든다.
+    #   그 상태에서 잔여보충을 생략하면 반쪽 패널을 '전부 수집됐다'고 선언하는 셈이다.
+    #   그래서 하루 평균 몇 종목이 들어와 있는지(종목축 커버리지)를 함께 본다.
+    cov_code = float(px.groupby("date")["code"].nunique().median()) / max(len(want), 1)
+    if swept or (cov_day >= PX_RESIDUAL_COV_SKIP and cov_code >= PX_RESIDUAL_COV_CODES):
         n_miss = len(set(want) - set(px["code"].astype(str)))
         if n_miss:
-            L.info(f"잔여 보충 생략 — 벌크가 거래일의 {cov_day*100:.1f}%를 덮었습니다"
-                   f"(기준 {PX_RESIDUAL_COV_SKIP*100:.0f}%). 이 상태에서 시세가 없는 "
+            L.info(f"잔여 보충 생략 — 벌크가 거래일의 {cov_day*100:.1f}%를, 하루 평균 마스터의 "
+                   f"{cov_code*100:.1f}%를 덮었습니다(기준 {PX_RESIDUAL_COV_SKIP*100:.0f}% · "
+                   f"{PX_RESIDUAL_COV_CODES*100:.0f}%). 이 상태에서 시세가 없는 "
                    f"{n_miss:,}종목은 '수집 실패'가 아니라 ★애초에 그 구간에 거래된 적이 없는 "
                    f"종목입니다(폐지 우선주·ETF·ELW·스팩·구간 밖 상장분). 종목축으로 다시 "
                    f"물어봐도 전부 빈손이고 시간만 태웁니다.")
@@ -4652,14 +4691,17 @@ def _flow_krx_month(m0: pd.Timestamp, m1: pd.Timestamp, col: str) -> Optional[pd
     return out if len(out) else None
 
 
-def _flow_krx_probe(m: pd.Timestamp) -> bool:
-    """쓰기 전에 한 달만 재 본다 — 레이아웃이 다르면 240회를 태우기 전에 여기서 멈춘다."""
-    t = _flow_krx_month(m.replace(day=1), m, "inst_net")
-    ok = t is not None and len(t) >= 100 and t["inst_net"].notna().sum() >= 50
-    if not ok:
-        st, head = NET_LAST.get("krx", ("—", ""))
-        L.warn(f"수급 KRX 직통 프리플라이트 실패 — 응답 {st} · {str(head)[:110]}")
-    return ok
+def _flow_krx_probe(months: Sequence[pd.Timestamp]) -> bool:
+    """쓰기 전에 재 본다 — 레이아웃이 다르면 240회를 태우기 전에 여기서 멈춘다.
+    ★한 달만 보면 안 된다. 그 달이 미래·휴장·일시오류면 정상 경로인데도 120개월 전체를
+      포기해 d3 축이 통째로 사라진다(단일 표본으로 축 하나를 버리는 판정)."""
+    for m in list(months)[-3:][::-1]:
+        t = _flow_krx_month(m.replace(day=1), m, "inst_net")
+        if t is not None and len(t) >= 100 and t["inst_net"].notna().sum() >= 50:
+            return True
+    st, head = NET_LAST.get("krx", ("—", ""))
+    L.warn(f"수급 KRX 직통 프리플라이트 실패(최근 3개월 모두) — 응답 {st} · {str(head)[:110]}")
+    return False
 
 
 def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
@@ -4699,7 +4741,7 @@ def harvest_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     # ★경로가 하나뿐이면 그 하나가 없을 때 축이 통째로 사라진다. pykrx 가 없으면 KRX 직통.
     use_krx = False
     if months and RUN_MODE != "CACHED" and not CLOCK.over() and fn is None:
-        use_krx = _flow_krx_probe(months[-1])
+        use_krx = _flow_krx_probe(months)
         if use_krx:
             L.ok("수급: pykrx 없이 KRX 정보데이터시스템 직통 경로로 수집합니다"
                  "(월축 1회 = 전 종목 · d3 복구).")
@@ -5129,7 +5171,8 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
                        max_calls: int = 0,
                        already: Optional[set] = None,
                        filed: Optional[set] = None,
-                       trusted: Optional[set] = None) -> pd.DataFrame:
+                       trusted: Optional[set] = None,
+                       exempt: Optional[set] = None) -> pd.DataFrame:
     """★저가 벌크 티어 — 다중회사 주요계정(fnlttMultiAcnt): corp_code 를 100개까지 한 번에.
 
     옛 설계는 전 종목 전체재무제표만 썼다: 3,400사 × 12년 × 4보고서 ≈ 163,000회.
@@ -5159,8 +5202,9 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
     for y in yrs:
         for r in RQ.values():
             trust_y = bool(filed) and y in (trusted or set())
+            _ex = exempt or set()
             todo = [c for c in corps if (c, y, r) not in done and (c, y, r) not in skip
-                    and (not trust_y or (c, y, r) in filed)]
+                    and (not trust_y or c in _ex or (c, y, r) in filed)]
             n_raw += len(todo)
             for grp in chunked(todo, bs):
                 jobs.append((y, r, list(grp)))
@@ -5255,7 +5299,8 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
                             max_calls: int = 0,
                             already: Optional[set] = None,
                             filed: Optional[set] = None,
-                            trusted: Optional[set] = None) -> pd.DataFrame:
+                            trusted: Optional[set] = None,
+                            exempt: Optional[set] = None) -> pd.DataFrame:
     """★심층 티어 — 전체 재무제표(fnlttSinglAcntAll). (회사×연도×보고서) 캐시 증분.
 
     · 수집 순서 = 유동성 상위·최근 연도 먼저: 한도로 끊겨도 '투자 가능한 종목의 최근
@@ -5320,7 +5365,7 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
     # ★사전 소거 — 그 조합에 정기보고서가 아예 없으면 단건 API 도 100% 013 이다.
     if filed:
         n0 = len(jobs)
-        jobs = _apply_filed(jobs, filed, trusted, yi=1)
+        jobs = _apply_filed(jobs, filed, trusted, yi=1, exempt=exempt)
         if n0 - len(jobs) > 0:
             L.info(f"정기보고서 제출 사실로 {n0-len(jobs):,}조합을 사전 소거 "
                    f"(그 해에 보고서 자체가 없어 호출해도 빈손) — 실수집 대상 {len(jobs):,}건")
@@ -5567,7 +5612,8 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
                            priority: Sequence[str] = (),
                            max_calls: int = 0,
                            filed: Optional[set] = None,
-                           trusted: Optional[set] = None) -> pd.DataFrame:
+                           trusted: Optional[set] = None,
+                           exempt: Optional[set] = None) -> pd.DataFrame:
     """직원현황(empSttus) — 사업부문×성별 분해 + '합계' 소계행 이중계상 제거.
 
     ★★2026-08 개편: '전수수집'이 원칙이다. 단, 전수를 '무작정 다 호출'로 달성하지 않는다.
@@ -5625,8 +5671,8 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
     # ★사실 기반 소거 ①: 그 해에 사업보고서를 낸 조합만 남긴다(=empSttus 가 존재할 수 있는 조합).
     n_all = len(universe)
     if filed:
-        kept = _apply_filed(universe, filed, trusted, yi=1)
-        if kept:
+        kept = _apply_filed(universe, filed, trusted, yi=1, exempt=exempt)
+        if kept and len(kept) < n_all:
             skipped_y = sorted(set(ylist) - set(trusted or ()))
             universe = kept
             L.info(f"사업보고서 제출 사실로 사전 소거 — 전수 모집단 {n_all:,}조합 중 "
@@ -5744,11 +5790,36 @@ def filed_report_set(disc: Optional[pd.DataFrame]) -> set:
     보고서명 '사업보고서 (2023.12)' / '분기보고서 (2024.03)' 의 괄호에서 사업연도·결산기말을
     읽는다. 괄호가 없으면 사업보고서에 한해 접수일 -1년으로 근사한다(12월 결산이 절대다수).
     틀려도 '호출을 한 번 더 하거나 덜 하는' 정도지 데이터가 왜곡되지는 않는다."""
-    if disc is None or not len(disc) or "kind" not in disc.columns:
-        return set()
+    filed, _ = _filed_scan(disc)
+    return filed
+
+
+def filed_exempt_corps(disc: Optional[pd.DataFrame]) -> set:
+    """★소거 면제 회사 — 제출 이력을 '확신을 갖고' 해석하지 못한 회사는 절대 소거하지 않는다.
+
+    괄호 안 월은 ★결산기말이지 보고서 종류가 아니다. 3월 결산 회사의 '사업보고서 (2024.03)'
+    를 월만 보고 매핑하면 Q1 이 되어, 그 회사는 사업보고서를 낸 적이 없는 것으로 판정되고
+    직원현황·재무가 전 연도 소거된다(대체 경로가 없어 영구 결손). 12월 결산이 절대다수라
+    평소엔 드러나지 않다가 특정 회사에서만 조용히 데이터가 사라지는, 가장 나쁜 형태의 결함이다.
+
+    그래서 이름과 결산월이 12월 결산 패턴으로 ★일치할 때만 지도에 넣고, 하나라도 어긋나면
+    그 회사를 통째로 면제 목록에 넣는다. 모르는 것은 소거하지 않는다 — 이것이 원칙이다."""
+    _, exempt = _filed_scan(disc)
+    return exempt
+
+
+#  이름 → 보고서 코드(12월 결산 기준의 정상 결산기말 월)
+_NAME_RQ = {"사업보고서": (RQ["FY"], (12,)), "반기보고서": (RQ["H1"], (6,)),
+            "분기보고서": (None, (3, 9))}      # 분기보고서는 3월=Q1 / 9월=Q3
+
+
+def _filed_scan(disc: Optional[pd.DataFrame]) -> Tuple[set, set]:
+    if disc is None or not len(disc) or "kind" not in disc.columns \
+            or "corp_code" not in disc.columns:
+        return set(), set()
     d = disc[disc["kind"].astype(str).isin(("annual_rpt", "periodic_rpt"))]
     if not len(d):
-        return set()
+        return set(), set()
     nm = (d["report_nm"].astype(str) if "report_nm" in d.columns
           else pd.Series([""] * len(d), index=d.index))
     ex = nm.str.extract(_RPT_YM_RE)
@@ -5760,18 +5831,27 @@ def filed_report_set(disc: Optional[pd.DataFrame]) -> set:
         fb = pd.Series(rd.dt.year - 1, index=d.index)
         yr = yr.where(yr.notna() | ~ann, fb)
         mo = mo.where(mo.notna() | ~ann, 12)
-    out = set()
-    for c, y, m in zip(d["corp_code"].astype(str), yr, mo):
-        if not (pd.notna(y) and pd.notna(m)):
+    filed, exempt = set(), set()
+    for c, n, y, m in zip(d["corp_code"].astype(str), nm, yr, mo):
+        head = str(n).strip()[:5]
+        spec = next((v for k, v in _NAME_RQ.items() if head.startswith(k)), None)
+        if spec is None or not (pd.notna(y) and pd.notna(m)) or not (1990 <= int(y) <= 2100):
+            exempt.add(c)                              # 해석 실패 → 이 회사는 소거하지 않는다
             continue
-        r = _MONTH_TO_RQ.get(int(m))
-        if r is None or not (1990 <= int(y) <= 2100):
+        rq_fixed, ok_months = spec
+        if int(m) not in ok_months:                    # ★비12월 결산(또는 결산월 변경)
+            exempt.add(c)
             continue
-        out.add((c, int(y), r))
-    return out
+        r = rq_fixed if rq_fixed is not None else _MONTH_TO_RQ.get(int(m))
+        if r is None:
+            exempt.add(c)
+            continue
+        filed.add((c, int(y), r))
+    return filed, exempt
 
 
-def filed_trusted_years(disc: Optional[pd.DataFrame]) -> set:
+def filed_trusted_years(disc: Optional[pd.DataFrame],
+                        done_months: Optional[set] = None) -> set:
     """★사전 소거를 '적용해도 되는' 사업연도만 고른다 — 이 가드가 없으면 소거가 곧 누락이다.
 
     제출사실 지도는 공시목록 스윕이 그 연도의 ★제출 창구를 전부 훑었을 때만 완전하다.
@@ -5780,35 +5860,44 @@ def filed_trusted_years(disc: Optional[pd.DataFrame]) -> set:
     보고서를 낸 회사를 '없다'고 잘라 버려 영구 결손이 된다. 그래서 창구 월이 하나라도
     비어 있는 연도는 소거 대상에서 제외하고, 그 연도는 종전대로 전부 조회한다
     (호출을 조금 더 쓰더라도 '데이터가 사라지는 것'보다 언제나 낫다)."""
-    if disc is None or not len(disc) or "rcept_dt" not in disc.columns:
+    # ★판정 근거는 '완주 월 원장'이어야 한다 — "그 달에 행이 있나"로 보면 안 된다.
+    #   공시 스윕은 한도·오류로 반쪽만 받아도 받은 행을 캐시에 남긴다(설계상 정상). 시장 전체
+    #   스윕이라 어느 달이든 행은 반드시 있으므로, 행 존재로 판정하면 ★모든 달이 완주로 보이고
+    #   미조회 페이지에 있던 실제 제출사가 '그 해에 보고서 없음'으로 잘린다. 그래서
+    #   harvest_dart_disclosures 가 따로 관리하는 완주 원장(dart_disclosures_done)만 믿는다.
+    if not done_months:
         return set()
-    rd = ds_(disc["rcept_dt"]).dropna()
-    if not len(rd):
+    have = {str(x)[:7] for x in done_months}
+    if not have:
         return set()
-    have = set(rd.dt.strftime("%Y-%m"))
-    lo, hi = rd.min(), rd.max()
+    yrs = sorted({int(w[:4]) for w in have if w[:4].isdigit()})
+    if not yrs:
+        return set()
     out = set()
-    lo_s, hi_s = lo.strftime("%Y-%m"), hi.strftime("%Y-%m")
-    for y in range(int(lo.year) - 1, int(hi.year) + 1):
-        # Y년 1~12월 + Y+1년 1~6월이 모두 스윕돼 있어야 그 사업연도 지도를 신뢰한다.
-        # ★창구를 스윕 범위로 '잘라서' 판정하면 안 된다 — 가장자리 연도(스윕 시작 직전·
-        #   종료 직후)가 반쪽 창구만 보고 신뢰 판정을 받아, 실제 제출사를 잘라내게 된다.
+    for y in range(yrs[0] - 1, yrs[-1] + 1):
+        # 사업연도 Y 의 제출 창구 = Y년 1~12월(분기·반기) + Y+1년 1~6월(사업보고서).
+        # ★창구를 스윕 범위로 '잘라서' 판정하면 안 된다 — 가장자리 연도가 반쪽 창구만 보고
+        #   신뢰 판정을 받아 실제 제출사를 잘라내게 된다. 창구 전체가 완주 원장에 있어야 한다.
         win = [f"{y:04d}-{m:02d}" for m in range(1, 13)] + \
               [f"{y+1:04d}-{m:02d}" for m in range(1, 7)]
-        if win[0] < lo_s or win[-1] > hi_s:       # 창구가 스윕 범위 밖으로 나가면 신뢰 불가
-            continue
         if all(w in have for w in win):
             out.add(y)
     return out
 
 
 def _apply_filed(jobs: Sequence, filed: Optional[set], trusted: Optional[set],
-                 yi: int = 1) -> List:
-    """제출사실 소거를 '신뢰 연도'에만 적용한다. yi = job 튜플에서 연도의 위치."""
+                 yi: int = 1, exempt: Optional[set] = None) -> List:
+    """제출사실 소거를 '신뢰 연도 × 해석 성공 회사'에만 적용한다.
+
+    yi     — job 튜플에서 연도의 위치(회사는 항상 0번).
+    exempt — 제출 이력을 확신 있게 해석하지 못한 회사(비12월 결산 등). 절대 소거하지 않는다.
+    """
     if not filed:
         return list(jobs)
     tr = trusted if trusted is not None else set()
-    return [j for j in jobs if int(j[yi]) not in tr or tuple(j) in filed]
+    ex = exempt if exempt is not None else set()
+    return [j for j in jobs
+            if int(j[yi]) not in tr or str(j[0]) in ex or tuple(j) in filed]
 
 
 DISCLOSURE_KINDS = {
@@ -5847,6 +5936,10 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = 0) -> pd.Dat
         have = set(cached["rcept_dt"].dt.to_period("M").astype(str))
     months = pd.period_range(d_(start), d_(end), freq="M")
     todo = [m for m in months if str(m) not in have]
+    # ★최근 월 우선. 오름차순으로 소비하면 배정이 가장 오래된 달에 먼저 소진되고, 정작
+    #   전략이 거래하는 최근 연도가 미완주로 남아 ①그 연도가 소거 대상에서 빠지고
+    #   ②자사주·증자·배당(V3/PACK-C 입력)이 통째로 비게 된다. 같은 함정을 일봉에서 이미 겪었다.
+    todo = todo[::-1]
     if RUN_MODE == "CACHED":
         todo = []
 
@@ -6082,7 +6175,8 @@ def _hk_rows(html: Optional[str]) -> List[dict]:
         if not pub:
             continue
         bid, bname = broker_norm(c_br)
-        out.append({"source": "hankyung", "src_id": m_id.group(1) if m_id else h40(title, pub)[:12],
+        out.append({"source": "hankyung", "src_id": (m_id.group(1) if m_id
+                               else h40(title, pub, c_br or "", href)[:16]),
                     "pub_date": pub, "stock_code": code6(m_cd.group(1)) if m_cd else None,
                     "stock_name": title.split("(")[0].strip()[:40] if m_cd else "",
                     "title": title[:160], "broker_raw": c_br or "", "broker_id": bid,
@@ -6174,7 +6268,10 @@ def _nv_rows(html: Optional[str]) -> Tuple[List[dict], bool]:
         if not pub:
             continue
         bid, bname = broker_norm(broker)
-        out.append({"source": "naver", "src_id": nid or h40(title, pub)[:12], "pub_date": pub,
+        # ★해시 폴백 키에 증권사·종목을 포함 — 같은 날 서로 다른 증권사의 동일 제목이 같은
+        #   id 가 되면 '신규 0건' 종료 판정에 걸려 그 페이지 이후가 통째로 유실된다.
+        out.append({"source": "naver",
+                    "src_id": nid or h40(title, pub, broker, code or "")[:16], "pub_date": pub,
                     "stock_code": code, "stock_name": (a_st.get("title") or
                                                        a_st.get_text(strip=True))[:40]
                     if a_st else "", "title": title[:160], "broker_raw": broker,
@@ -9173,14 +9270,23 @@ def main() -> dict:
         #   소거 지도로 쓴다. 존재하지 않는 조합을 묻지 않는 것이 전수수집의 유일한 지름길.
         filedS = filed_report_set(disc)
         filed_fy = {(c, y) for (c, y, r) in filedS if r == RQ["FY"]}
-        # ★소거는 '공시 스윕이 그 연도의 제출 창구를 전부 훑은' 연도에만 적용한다.
-        #   지도가 불완전한 상태의 소거는 절약이 아니라 영구 결손이다.
-        trustY = filed_trusted_years(disc)
+        # ★비12월 결산 등 제출 이력을 확신 있게 해석하지 못한 회사는 소거 대상에서 제외한다.
+        #   괄호 안 월은 결산기말이지 보고서 종류가 아니라서, 3월 결산사의 사업보고서를
+        #   월만 보고 매핑하면 '사업보고서를 낸 적 없는 회사'가 되어 조용히 전 연도가 사라진다.
+        exemptC = filed_exempt_corps(disc)
+        # ★소거는 '공시 스윕이 그 연도의 제출 창구를 완주한' 연도에만 적용한다. 판정 근거는
+        #   행 존재가 아니라 ★완주 원장이다 — 반쪽만 받은 달도 행은 남기 때문에, 행으로
+        #   판정하면 모든 달이 완주로 보이고 미조회분의 제출사가 통째로 잘린다.
+        _dm = VAULT.load_table("dart_disclosures_done", "shared")
+        doneM = set(_dm["ym"].astype(str)) if _dm is not None and len(_dm) else set()
+        trustY = filed_trusted_years(disc, doneM)
         if filedS:
             L.ok(f"정기보고서 제출 사실 {len(filedS):,}조합 확보(추가 호출 0회) — "
-                 f"사업보고서 {len(filed_fy):,}조합 · 소거 적용 연도 {len(trustY)}개"
-                 f"({min(trustY) if trustY else '-'}~{max(trustY) if trustY else '-'}). "
-                 f"나머지 연도는 소거 없이 전부 조회합니다.")
+                 f"사업보고서 {len(filed_fy):,}조합 · 완주 월 {len(doneM):,}개 · "
+                 f"소거 적용 연도 {len(trustY)}개"
+                 f"({min(trustY) if trustY else '-'}~{max(trustY) if trustY else '-'}) · "
+                 f"결산월 해석 불가로 소거 면제한 회사 {len(exemptC):,}사. "
+                 f"나머지는 소거 없이 전부 조회합니다.")
         # ★일괄 ZIP 이 심층 계정(재고·매출채권·CFO·CAPEX)을 호출한도 0으로 채운다.
         code2corp_all = (master.dropna(subset=["corp_code"])
                          .set_index("code")["corp_code"].astype(str).to_dict())
@@ -9195,14 +9301,17 @@ def main() -> dict:
         #   size_bucket 이 전부 '규모미상'이 되면 C11 셀이 (월,산업)으로 붕괴해 규모 통제가
         #   소실되고, C2축 dlog_emp·PACK-N 한계임금이 통째로 결측이 된다.
         emp = harvest_dart_employees(
-            corps, years, priority=prio, filed=filed_fy, trusted=trustY,
-            max_calls=budget.take("employee",
-                                  need=len(filed_fy) if filed_fy else len(corps) * len(years)))
+            corps, years, priority=prio, filed=filed_fy, trusted=trustY, exempt=exemptC,
+            max_calls=budget.take("employee"))
+        #  ↑ need 를 넘기지 않는다. 실수요는 '신뢰 연도의 filed 교집합 + 비신뢰 연도의 전 종목'
+        #    이라 바깥에서 정확히 셀 수 없고, 잘못 세면 소거는 안 되면서 예산만 깎여 굶는다.
+        #    배정은 어차피 실사용분만 소비되고, 뒤 소비자는 take() 시점에 실잔여를 다시 잰다.
         fs_major = harvest_dart_multi(corps, years, already=zip_have, filed=filedS,
-                                      trusted=trustY, max_calls=budget.take("major"))
+                                      trusted=trustY, exempt=exemptC,
+                                      max_calls=budget.take("major"))
         fs_deep = harvest_dart_financials(corps, years, priority=prio,
                                           already=zip_have, filed=filedS,
-                                          trusted=trustY,
+                                          trusted=trustY, exempt=exemptC,
                                           max_calls=budget.take("deep"))
         budget.report({"disclosure": "공시목록(시장 스윕)", "employee": "직원현황(전수)",
                        "major": "주요계정 벌크", "deep": "전체재무제표(꼬리)"})
