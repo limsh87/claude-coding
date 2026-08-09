@@ -3000,7 +3000,9 @@ def enrich_with_pdf(rep: pd.DataFrame) -> pd.DataFrame:
             done[str(r["ruid"])] = r.to_dict()
         CON.say(f"PDF 추출 캐시 재사용 {len(done):,}건")
     rep = rep.copy()
-    rep["ruid"] = [h1(s, r) for s, r in zip(rep["source"], rep["rid"])]
+    # 0행이면 리스트 컴프리헨션이 float64 컬럼을 만들어, object 인 캐시와 merge 시 죽는다
+    rep["ruid"] = pd.Series([h1(s, r) for s, r in zip(rep["source"], rep["rid"])],
+                            index=rep.index, dtype="object")
     need = rep[(rep["pdf_url"].astype(str).str.startswith("http"))
                & (~rep["ruid"].isin(done.keys()))]
     if RESEARCH_DOWNLOAD_PDF and RUN_MODE != "CACHED" and len(need):
@@ -3712,6 +3714,11 @@ def validate_forecasts(fc: pd.DataFrame, asof=None) -> pd.DataFrame:
 
 
 def with_validity(fc: pd.DataFrame, cfg: SCGParams) -> pd.DataFrame:
+    if not len(fc):
+        out = fc.copy()
+        out["report_date"] = pd.Series(dtype="datetime64[ns]")
+        out["valid_until"] = pd.Series(dtype="datetime64[ns]")
+        return out
     """각 전망의 활성 구간 [발표일, 다음 전망일 또는 +180일). 같은 키의 새 전망이 옛 것을
     대체하므로 (stock,analyst,fp,metric,T) 활성표는 최대 1개 — TEST 8 이 구조로 보장된다."""
     fc = fc.sort_values(FC_KEY + ["report_date"], kind="mergesort").reset_index(drop=True)
@@ -3723,15 +3730,25 @@ def with_validity(fc: pd.DataFrame, cfg: SCGParams) -> pd.DataFrame:
 
 
 def active_at(fcv: pd.DataFrame, T: pd.Timestamp) -> pd.DataFrame:
+    cols = (FC_KEY + ["broker_id", "report_id", "report_date", "forecast_value"]
+            if "broker_id" in fcv.columns else
+            FC_KEY + ["report_id", "report_date", "forecast_value"])
+    if not len(fcv):
+        # ★ 빈 프레임은 dtype 이 object 라 아래의 날짜 뺄셈·.dt 가 죽는다.
+        #   '입력이 없다'는 정상 상태이므로, 모양과 dtype 을 갖춘 빈 결과를 돌려준다.
+        out = pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+        out["report_date"] = pd.Series(dtype="datetime64[ns]")
+        out["forecast_value"] = pd.Series(dtype="float64")
+        out.insert(0, "signal_date", pd.Series(dtype="datetime64[ns]"))
+        out["forecast_age_days"] = pd.Series(dtype="int64")
+        return out
     t = np.datetime64(pd.Timestamp(T).normalize())
     rd = fcv["report_date"].to_numpy("datetime64[ns]")
     vu = fcv["valid_until"].to_numpy("datetime64[ns]")
-    sub = fcv.loc[(rd <= t) & (t < vu),
-                  FC_KEY + ["broker_id", "report_id", "report_date", "forecast_value"]
-                  if "broker_id" in fcv.columns else
-                  FC_KEY + ["report_id", "report_date", "forecast_value"]].copy()
+    sub = fcv.loc[(rd <= t) & (t < vu), cols].copy()
     sub.insert(0, "signal_date", pd.Timestamp(T).normalize())
-    sub["forecast_age_days"] = (sub["signal_date"] - sub["report_date"]).dt.days
+    sub["forecast_age_days"] = (ts_col(sub["signal_date"])
+                                - ts_col(sub["report_date"])).dt.days
     return sub
 
 
@@ -4017,6 +4034,9 @@ def pick_primary_fp(cons: pd.DataFrame, actuals: pd.DataFrame, metric: str) -> p
     year = d["fiscal_period"].astype(str).str.extract(r"(20\d{2})", expand=False)
     d["_fy"] = pd.to_numeric(year, errors="coerce")
     d = d[d["_fy"].notna()]
+    if not len(d):                      # 빈 프레임의 object dtype 에 .dt 를 쓰면 죽는다
+        return d.assign(primary=False)
+    d["signal_date"] = ts_col(d["signal_date"])
     T_year = d["signal_date"].dt.year
 
     def _rank(row_fy, row_T_year, T_sig, key):
@@ -4055,8 +4075,9 @@ def _lookback_pairs(signal_dates, cal: TradingCal, n_td: int) -> Dict:
 
 def scg_signals(cons: pd.DataFrame, signal_dates, cal: TradingCal,
                 cfg: SCGParams) -> pd.DataFrame:
-    if not len(cons):
-        return cons
+    if not len(cons):                   # 하류(rank_alphas)가 요구하는 컬럼을 갖춰 돌려준다
+        return cons.assign(**{c: np.nan for c in
+                              ("scg0", "scg_ls", "scg_accel_20d", "base_revision_20d")})
     eps = cfg.EPSILON
     d = cons.copy()
     ok = d["status"] == "OK"
@@ -4212,7 +4233,13 @@ def bucket_backtest(sig: pd.DataFrame, panel: pd.DataFrame, strat: str,
         for _, r in top.iterrows():
             hold_log.append(dict(month=T, code=r["stock_id"], ret=r["fwd_1m"]))
         hold_prev = top_codes
-    R = pd.DataFrame(rows)
+    # ★ rows 가 비면 '컬럼조차 없는' 프레임이 되어, empty=False 를 믿는 하류가
+    #   KeyError('ls') 로 죽는다. 모양을 계약으로 고정한다.
+    R = pd.DataFrame(rows, columns=["month", "top", "bot", "ls", "top_net",
+                                    "n_xs", "n_top", "turnover", "cost"])
+    if not len(R):
+        return {"strategy": strat, "empty": True,
+                "note": "유효 수익률이 있는 신호일이 없습니다"}
     dec = (d[np.isfinite(d["fwd_1m"])].groupby("bucket")["fwd_1m"]
            .agg(["mean", "count"]).reset_index()
            .rename(columns={"mean": "mean_fwd_1m", "count": "n"}))
@@ -4278,8 +4305,7 @@ def monotonicity(bt: dict) -> Tuple[float, bool]:
     return rho, top_gt
 
 
-def run_suite(sig: pd.DataFrame, panel: pd.DataFrame, label: str,
-              bench: Optional[pd.Series] = None) -> Dict[str, dict]:
+def run_suite(sig: pd.DataFrame, panel: pd.DataFrame, label: str) -> Dict[str, dict]:
     """4전략을 동일 표본·동일 시점·동일 분위수에서 나란히(§30·§37).
 
     ★ 네 알파 중 하나라도 결측인 행은 전부 제외한다. BASE_REV 는 t-20 컨센서스가
@@ -4843,6 +4869,7 @@ def run_rehearsal(strict: bool = True) -> bool:
     G = globals()
     keys = ("fetch", "fetch_json", "fdr", "pykrx_stock", "DART_API_KEY", "RUN_MODE",
             "DEPOT", "RESEARCH_DOWNLOAD_PDF", "RESEARCH_COLLECT")
+    saved_robust = list(ROBUST.items())
     saved = {k: G.get(k) for k in keys}
     net = _FixtureNet()
     tmp = tempfile.mkdtemp(prefix="scg_rehearsal_")
@@ -4911,9 +4938,55 @@ def run_rehearsal(strict: bool = True) -> bool:
                 pd.DataFrame({"code": ["005930"], "name": ["테스트"]}),
                 hub.slice(hub.all_dates()), "2020-01-01", "2021-12-31"),
             expect_rows=False)
+
+        # ── 퇴화경로(degenerate) 리허설 ────────────────────────────────────────────
+        #  ★ 감사에서 확인된 결함 4건이 모두 '빈 결과 분기가 다른 모양의 프레임을
+        #    반환한다'는 한 가지 뿌리였다. 정상경로만 태우면 절대 안 잡힌다.
+        #    그래서 '수집은 됐는데 내용이 비었다'는 상태를 일부러 만들어 S7~S10 을 태운다.
+        cfgz = SCGParams()
+        empty_fc = pd.DataFrame(columns=FC_KEY + ["broker_id", "report_id",
+                                                  "report_date", "forecast_value"])
+        mz = list(month_ends("2020-01-01", "2020-03-31"))
+        calz = TradingCal(pd.bdate_range("2019-06-01", "2020-12-31"))
+        consz = _rh("퇴화: 빈 컨센서스",
+                    lambda: smart_consensus(with_validity(empty_fc, cfgz), pd.DataFrame(),
+                                            mz, cfgz, "EPS")[0], expect_rows=False)
+        prim = _rh("퇴화: 대표 회계기간 선정",
+                   lambda: pick_primary_fp(consz, pd.DataFrame(), "EPS"),
+                   expect_rows=False)
+        sigz = _rh("퇴화: 신호 산출",
+                   lambda: scg_signals(prim, mz, calz, cfgz), expect_rows=False)
+        alz = _rh("퇴화: 알파 랭크",
+                  lambda: rank_alphas(sigz, cfgz), expect_rows=False)
+        # 전 종목 수익률이 전부 결측인 패널(수집이 끊긴 최악의 중간결과 상태)
+        panz = pd.DataFrame({"code": ["005930", "000660"] * len(mz),
+                             "month": np.repeat(mz, 2), "close": 1000.0,
+                             "mktcap": 1e9, "value": 1e8, "fwd_1m": np.nan,
+                             "fwd_20td": np.nan, "fwd_60td": np.nan, "fwd_120td": np.nan})
+        sig_nz = pd.DataFrame({"signal_date": np.repeat(mz, 2),
+                               "stock_id": ["005930", "000660"] * len(mz),
+                               "primary": True})
+        for c in ALPHA_COL.values():
+            sig_nz[c] = 0.5
+        for c in ("base_revision_20d", "scg0", "scg_ls", "scg_accel_20d"):
+            sig_nz[c] = 0.0
+        stz = _rh("퇴화: 백테스트(전 수익률 결측)",
+                  lambda: run_suite(sig_nz, panz, "퇴화"), expect_rows=False)
+        if stz:
+            _rh("퇴화: 성과요약", lambda: perf_summary(stz["SCG_LS"]) or {1: 1},
+                expect_rows=False)
+            _rh("퇴화: 보고표", lambda: (report_all(stz, None, sig_nz, pd.DataFrame(),
+                                                  pd.DataFrame(), consz, "퇴화", None,
+                                                  cfgz), 1)[1])
+            _rh("퇴화: 강건성(서브기간·집중도)",
+                lambda: (R_subperiod(stz), R_concentration(stz), 1)[2])
+            _rh("퇴화: 비용 스트레스", lambda: (R_cost_stress(sig_nz, panz), 1)[1])
+        _rh("퇴화: 단조성", lambda: (monotonicity({"empty": True}), 1)[1])
     finally:
         for k, v in saved.items():
             G[k] = v
+        ROBUST.clear()                 # 리허설이 남긴 강건성 결과는 실행분과 섞지 않는다
+        ROBUST.update(dict(saved_robust))
         shutil.rmtree(tmp, ignore_errors=True)
 
     bad = [r for r in REHEARSAL if not r["ok"]]
@@ -5464,7 +5537,7 @@ def run_all() -> dict:
         sig_full = sigp[sigp["in_uni"].fillna(False)]
         CON.say(f"신호×유니버스 교집합: {len(sig_full):,}행 "
                 f"(월평균 {len(sig_full)/max(len(sig_months),1):.0f}종목)")
-        suites_full = run_suite(sig_full, panel, "전체 유니버스", bench)
+        suites_full = run_suite(sig_full, panel, "전체 유니버스")
         report_all(suites_full, bench, sig_full, scores, W, cons,
                    "전체 유니버스", mtab, cfg)
 
@@ -5484,7 +5557,7 @@ def run_all() -> dict:
             mask = sigs["in_small"].fillna(False)
             sig_small = alphas_in_universe(sigs, mask, cfg)
             CON.say(f"하위{COMPARE_BOTTOM_N} 유니버스 신호: {len(sig_small):,}행")
-            suites_small = run_suite(sig_small, panel, f"시총하위{COMPARE_BOTTOM_N}", bench)
+            suites_small = run_suite(sig_small, panel, f"시총하위{COMPARE_BOTTOM_N}")
             report_all(suites_small, bench, sig_small, scores, W, cons,
                        f"시총 하위{COMPARE_BOTTOM_N} 비교전략", None, cfg)
             R_subperiod(suites_small)
