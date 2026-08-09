@@ -5124,7 +5124,8 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
 def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
                        max_calls: int = 0,
                        already: Optional[set] = None,
-                       filed: Optional[set] = None) -> pd.DataFrame:
+                       filed: Optional[set] = None,
+                       trusted: Optional[set] = None) -> pd.DataFrame:
     """★저가 벌크 티어 — 다중회사 주요계정(fnlttMultiAcnt): corp_code 를 100개까지 한 번에.
 
     옛 설계는 전 종목 전체재무제표만 썼다: 3,400사 × 12년 × 4보고서 ≈ 163,000회.
@@ -5153,8 +5154,9 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
     n_raw = 0
     for y in yrs:
         for r in RQ.values():
+            trust_y = bool(filed) and y in (trusted or set())
             todo = [c for c in corps if (c, y, r) not in done and (c, y, r) not in skip
-                    and (not filed or (c, y, r) in filed)]
+                    and (not trust_y or (c, y, r) in filed)]
             n_raw += len(todo)
             for grp in chunked(todo, bs):
                 jobs.append((y, r, list(grp)))
@@ -5248,7 +5250,8 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
                             priority: Sequence[str] = (),
                             max_calls: int = 0,
                             already: Optional[set] = None,
-                            filed: Optional[set] = None) -> pd.DataFrame:
+                            filed: Optional[set] = None,
+                            trusted: Optional[set] = None) -> pd.DataFrame:
     """★심층 티어 — 전체 재무제표(fnlttSinglAcntAll). (회사×연도×보고서) 캐시 증분.
 
     · 수집 순서 = 유동성 상위·최근 연도 먼저: 한도로 끊겨도 '투자 가능한 종목의 최근
@@ -5313,7 +5316,7 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
     # ★사전 소거 — 그 조합에 정기보고서가 아예 없으면 단건 API 도 100% 013 이다.
     if filed:
         n0 = len(jobs)
-        jobs = [j for j in jobs if j in filed]
+        jobs = _apply_filed(jobs, filed, trusted, yi=1)
         if n0 - len(jobs) > 0:
             L.info(f"정기보고서 제출 사실로 {n0-len(jobs):,}조합을 사전 소거 "
                    f"(그 해에 보고서 자체가 없어 호출해도 빈손) — 실수집 대상 {len(jobs):,}건")
@@ -5559,7 +5562,8 @@ def refine_financials(fs: pd.DataFrame) -> pd.DataFrame:
 def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
                            priority: Sequence[str] = (),
                            max_calls: int = 0,
-                           filed: Optional[set] = None) -> pd.DataFrame:
+                           filed: Optional[set] = None,
+                           trusted: Optional[set] = None) -> pd.DataFrame:
     """직원현황(empSttus) — 사업부문×성별 분해 + '합계' 소계행 이중계상 제거.
 
     ★★2026-08 개편: '전수수집'이 원칙이다. 단, 전수를 '무작정 다 호출'로 달성하지 않는다.
@@ -5603,13 +5607,19 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
     # ★사실 기반 소거 ①: 그 해에 사업보고서를 낸 조합만 남긴다(=empSttus 가 존재할 수 있는 조합).
     n_all = len(universe)
     if filed:
-        universe = [(c, y) for (c, y) in universe if (c, y) in filed]
-        if universe:
+        kept = _apply_filed(universe, filed, trusted, yi=1)
+        if kept:
+            skipped_y = sorted(set(ylist) - set(trusted or ()))
+            universe = kept
             L.info(f"사업보고서 제출 사실로 사전 소거 — 전수 모집단 {n_all:,}조합 중 "
                    f"{n_all-len(universe):,}조합은 그 해에 사업보고서 자체가 없어 호출을 "
-                   f"생략합니다(호출해도 100% '데이터 없음'). 실제 전수 대상 {len(universe):,}조합.")
+                   f"생략합니다(호출해도 100% '데이터 없음'). 실제 전수 대상 {len(universe):,}조합."
+                   + (f" ※ 공시 스윕이 덜 끝난 {len(skipped_y)}개 연도"
+                      f"({', '.join(str(y) for y in skipped_y[:6])}"
+                      f"{' 외' if len(skipped_y) > 6 else ''})는 소거하지 않고 전부 조회합니다"
+                      f" — 지도가 불완전한 상태의 소거는 곧 영구 결손이기 때문입니다."
+                      if skipped_y else ""))
         else:
-            universe = [(c, y) for y in ylist for c in clist]   # 공시 스윕이 비었으면 되돌린다
             L.warn("공시목록에서 사업보고서 제출 사실을 찾지 못해 사전 소거를 건너뜁니다.")
     # ★사실 기반 소거 ②: 이미 받은 것 + 서버가 '없다'고 답한 것
     jobs = [(c, y) for (c, y) in universe
@@ -5741,6 +5751,46 @@ def filed_report_set(disc: Optional[pd.DataFrame]) -> set:
             continue
         out.add((c, int(y), r))
     return out
+
+
+def filed_trusted_years(disc: Optional[pd.DataFrame]) -> set:
+    """★사전 소거를 '적용해도 되는' 사업연도만 고른다 — 이 가드가 없으면 소거가 곧 누락이다.
+
+    제출사실 지도는 공시목록 스윕이 그 연도의 ★제출 창구를 전부 훑었을 때만 완전하다.
+    사업연도 Y 의 정기보고서는 Y년 5·8·11월(분기·반기·3분기)과 ★Y+1년 3월(사업보고서)에
+    접수된다. 스윕이 한도·시간에 걸려 중간에 끊긴 상태에서 그 지도로 소거하면, 실제로
+    보고서를 낸 회사를 '없다'고 잘라 버려 영구 결손이 된다. 그래서 창구 월이 하나라도
+    비어 있는 연도는 소거 대상에서 제외하고, 그 연도는 종전대로 전부 조회한다
+    (호출을 조금 더 쓰더라도 '데이터가 사라지는 것'보다 언제나 낫다)."""
+    if disc is None or not len(disc) or "rcept_dt" not in disc.columns:
+        return set()
+    rd = ds_(disc["rcept_dt"]).dropna()
+    if not len(rd):
+        return set()
+    have = set(rd.dt.strftime("%Y-%m"))
+    lo, hi = rd.min(), rd.max()
+    out = set()
+    lo_s, hi_s = lo.strftime("%Y-%m"), hi.strftime("%Y-%m")
+    for y in range(int(lo.year) - 1, int(hi.year) + 1):
+        # Y년 1~12월 + Y+1년 1~6월이 모두 스윕돼 있어야 그 사업연도 지도를 신뢰한다.
+        # ★창구를 스윕 범위로 '잘라서' 판정하면 안 된다 — 가장자리 연도(스윕 시작 직전·
+        #   종료 직후)가 반쪽 창구만 보고 신뢰 판정을 받아, 실제 제출사를 잘라내게 된다.
+        win = [f"{y:04d}-{m:02d}" for m in range(1, 13)] + \
+              [f"{y+1:04d}-{m:02d}" for m in range(1, 7)]
+        if win[0] < lo_s or win[-1] > hi_s:       # 창구가 스윕 범위 밖으로 나가면 신뢰 불가
+            continue
+        if all(w in have for w in win):
+            out.add(y)
+    return out
+
+
+def _apply_filed(jobs: Sequence, filed: Optional[set], trusted: Optional[set],
+                 yi: int = 1) -> List:
+    """제출사실 소거를 '신뢰 연도'에만 적용한다. yi = job 튜플에서 연도의 위치."""
+    if not filed:
+        return list(jobs)
+    tr = trusted if trusted is not None else set()
+    return [j for j in jobs if int(j[yi]) not in tr or tuple(j) in filed]
 
 
 DISCLOSURE_KINDS = {
@@ -9095,16 +9145,24 @@ def main() -> dict:
         budget = CallBudget("dart", DART_BUDGET_SHARE)
         budget.table({"disclosure": "공시목록(시장 스윕)", "employee": "직원현황(전수)",
                       "major": "주요계정 벌크", "deep": "전체재무제표(꼬리)"})
-        disc = harvest_dart_disclosures(BT_START, BT_END,
+        # ★스윕 시작을 재무 대상 연도의 첫 해로 당긴다. 월 단위 시장 전체 스윕이라 추가비용이
+        #   수십 회에 불과한데, 그 대가로 초기 2~3년치가 '제출사실 소거' 대상에 들어온다
+        #   (소거는 창구가 스윕 범위 안에 통째로 들어온 연도에만 적용되기 때문).
+        disc = harvest_dart_disclosures(f"{min(years)}-01-01", BT_END,
                                         max_calls=budget.take("disclosure"))
         ctx["disclosures"] = disc
         # ★공시목록에서 '정기보고서 제출 사실'을 공짜로 뽑아 이후 모든 단건 티어의 사전
         #   소거 지도로 쓴다. 존재하지 않는 조합을 묻지 않는 것이 전수수집의 유일한 지름길.
         filedS = filed_report_set(disc)
         filed_fy = {(c, y) for (c, y, r) in filedS if r == RQ["FY"]}
+        # ★소거는 '공시 스윕이 그 연도의 제출 창구를 전부 훑은' 연도에만 적용한다.
+        #   지도가 불완전한 상태의 소거는 절약이 아니라 영구 결손이다.
+        trustY = filed_trusted_years(disc)
         if filedS:
             L.ok(f"정기보고서 제출 사실 {len(filedS):,}조합 확보(추가 호출 0회) — "
-                 f"사업보고서 {len(filed_fy):,}조합. 이후 단건 티어는 이 조합만 호출합니다.")
+                 f"사업보고서 {len(filed_fy):,}조합 · 소거 적용 연도 {len(trustY)}개"
+                 f"({min(trustY) if trustY else '-'}~{max(trustY) if trustY else '-'}). "
+                 f"나머지 연도는 소거 없이 전부 조회합니다.")
         # ★일괄 ZIP 이 심층 계정(재고·매출채권·CFO·CAPEX)을 호출한도 0으로 채운다.
         code2corp_all = (master.dropna(subset=["corp_code"])
                          .set_index("code")["corp_code"].astype(str).to_dict())
@@ -9119,13 +9177,14 @@ def main() -> dict:
         #   size_bucket 이 전부 '규모미상'이 되면 C11 셀이 (월,산업)으로 붕괴해 규모 통제가
         #   소실되고, C2축 dlog_emp·PACK-N 한계임금이 통째로 결측이 된다.
         emp = harvest_dart_employees(
-            corps, years, priority=prio, filed=filed_fy,
+            corps, years, priority=prio, filed=filed_fy, trusted=trustY,
             max_calls=budget.take("employee",
                                   need=len(filed_fy) if filed_fy else len(corps) * len(years)))
         fs_major = harvest_dart_multi(corps, years, already=zip_have, filed=filedS,
-                                      max_calls=budget.take("major"))
+                                      trusted=trustY, max_calls=budget.take("major"))
         fs_deep = harvest_dart_financials(corps, years, priority=prio,
                                           already=zip_have, filed=filedS,
+                                          trusted=trustY,
                                           max_calls=budget.take("deep"))
         budget.report({"disclosure": "공시목록(시장 스윕)", "employee": "직원현황(전수)",
                        "major": "주요계정 벌크", "deep": "전체재무제표(꼬리)"})
