@@ -870,3 +870,55 @@ def shares_from_cap_snapshots(snaps: Optional[pd.DataFrame],
     S = (S.sort_values(["corp_code", "knowledge_date"], kind="stable")
           .drop_duplicates(["corp_code", "knowledge_date"], keep="last"))
     return S[cols].reset_index(drop=True)
+
+
+def candidate_year_span(snaps: Optional[pd.DataFrame], sec: pd.DataFrame,
+                        signal_dates: Sequence[pd.Timestamp], n_target: int,
+                        buffer_mult: float, lookback_years: int = 3) -> Dict[str, set]:
+    """corp_code → 실제로 재무가 필요한 회계연도 집합.
+
+    ★ 왜 필요한가: 예전에는 (후보 전체) × (전 기간 연도)의 데카르트 곱을 요청했다.
+      2,980사 × 15년 × 4보고서 = 178,800회 — 회사별 API 로는 9일이 걸린다. 그런데 어떤
+      회사가 2018~2021 에만 시총 하위권이었다면 2012년이나 2026년 재무는 어디에도 쓰이지
+      않는다. 그 회사가 '후보였던 기간'과 3년 소급(roic_std3y·share_growth3y·TTM)만 받는다.
+
+    반환: {corp_code: {연도, ...}}
+    """
+    out: Dict[str, set] = {}
+    if snaps is None or not len(snaps) or sec is None or not len(sec):
+        return out
+    m = sec[["code", "corp_code"]].dropna().astype(str).drop_duplicates("code")
+    c2corp = dict(zip(m["code"], m["corp_code"]))
+    S = snaps.copy()
+    S["code"] = S["code"].astype(str)
+    S["snap_date"] = as_ts_series(S["snap_date"])
+    S["mktcap"] = pd.to_numeric(S["mktcap"], errors="coerce")
+    S = S.dropna(subset=["code", "snap_date", "mktcap"])
+    K = int(max(n_target, round(n_target * float(buffer_mult))))
+    span: Dict[str, List[int]] = {}
+    for d in sorted({as_ts(x) for x in signal_dates}):
+        g = S[S["snap_date"] == d]
+        if not len(g):
+            # 그 날짜 스냅샷이 없으면 가장 가까운 과거 스냅샷을 쓴다(없으면 건너뜀).
+            prev = S[S["snap_date"] <= d]
+            if not len(prev):
+                continue
+            d2 = prev["snap_date"].max()
+            g = S[S["snap_date"] == d2]
+        sel = g.nsmallest(K, "mktcap")["code"]
+        y = int(as_ts(d).year)
+        for c in sel:
+            cc = c2corp.get(str(c))
+            if not cc:
+                continue
+            r = span.get(cc)
+            if r is None:
+                span[cc] = [y, y]
+            else:
+                if y < r[0]:
+                    r[0] = y
+                if y > r[1]:
+                    r[1] = y
+    for cc, (y0, y1) in span.items():
+        out[cc] = set(range(y0 - int(lookback_years), y1 + 1))
+    return out

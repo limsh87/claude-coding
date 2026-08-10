@@ -136,6 +136,29 @@ U1000_N          = 1000             # PIT 시가총액 랭크 '하위' N종목 (
 #      약 20% 탈락)를 근거로 2.0 을 기본으로 둔다. 게이트 탈락률이 50% 를 넘는 시장 국면이면
 #      경고가 뜨고, 그때 이 값을 올려 재실행하면 된다.
 CANDIDATE_BUFFER_MULT = 2.0
+
+#  ▸ Tier-2(전체 재무제표) 수집 빈도.  "annual" | "quarterly"
+#    ★ 이 한 줄이 콜드빌드 기간을 좌우한다. Tier-2 는 회사별 API 라 (회사×연도×보고서)마다
+#      1호출이다 — 후보 3,000사 × 15년 × 4분기 = 180,000회 = 하루 2만 한도로 9일이다.
+#    ★ Tier-2 가 Tier-1(주요계정 배치, 100사/호출)보다 '더' 주는 것은 매출원가(gp_a)와
+#      영업활동현금흐름(PCR·발생액) 둘뿐이다. 나머지 V/Q 지표와 자본잠식 판정은 Tier-1 로 끝난다.
+#    ★ 이 둘은 모두 '느리게 변하는 품질 지표'다. Novy-Marx(gp_a) · Sloan(발생액) 원논문도
+#      연간 재무로 정의하고, 국내 소형주 분기재무는 비감사라 잡음이 크다. 따라서 연간(FY)이
+#      타협이 아니라 오히려 표준 설계다 — 대신 TTM 이 연 1회 갱신된다는 점은 명시한다.
+#    → "annual" 이면 콜드빌드가 하루 안에 끝난다. "quarterly" 로 바꾸면 며칠에 걸쳐
+#      이어받기로 완성되며, 중간에 끊겨도 캐시는 그대로 남는다(진행률이 로그에 표시됨).
+DART_TIER2_FREQ = "annual"
+
+#  ▸ Tier-2 대상 버퍼. 가격용 버퍼(CANDIDATE_BUFFER_MULT)와 '따로' 둔다.
+#    가격은 후보를 넉넉히 받아도 호출이 종목당 1회지만, Tier-2 는 (회사 × 연도)마다 1회라
+#    버퍼를 키우면 콜드빌드 기간이 그만큼 늘어난다. 게이트 실측 탈락률(전체상장 186 → 적격
+#    148, 약 20%)을 덮는 1.25 면 충분하다. 모자라면 해당 종목은 gp_a·PCR·발생액만 결측이
+#    되고 나머지 축은 Tier-1 으로 그대로 산출된다(선정에서 사라지지 않는다).
+DART_TIER2_BUFFER_MULT = 1.25
+
+#  ▸ Tier-2 소급 연수. 연간(FY) 기준에서 roic_std3y 는 3개 관측(Y, Y-1, Y-2)이면 되므로 2 다.
+#    share_growth3y 는 이제 DART 가 아니라 KRX 시총 스냅샷의 상장주식수를 쓰므로 무관하다.
+DART_TIER2_LOOKBACK_Y = 2
 ADTV_WINDOW_DAYS = 60               # §3.2 직전 60거래일
 MIN_ADTV_KRW     = 100_000_000      # §3.2 1억원
 SEASONING_DAYS   = 250              # §3.3 상장 12개월 미만 제외 (≈250거래일)
@@ -245,7 +268,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0940"
+BUILD_VERSION      = "qvf1.20260810.1021"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -4629,7 +4652,9 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
 
 def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
-                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                          priority: Optional[Sequence[str]] = None,
+                          only_years: Optional[Dict[str, set]] = None,
+                          reprt_codes: Optional[Sequence[str]] = None) -> pd.DataFrame:
     """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
 
     priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
@@ -4646,16 +4671,22 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
-    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
-              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    reprts = list(reprt_codes) if reprt_codes else (
+        [REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
+        else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
     # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
     corp_sorted = sorted((str(c) for c in corp_codes),
                          key=lambda c: (order.get(c, 10 ** 9), c))
+    # ★ only_years 가 있으면 '그 회사가 실제로 후보였던 기간(+소급)'만 요청한다. 예전에는
+    #   (회사 전체) × (전 기간 연도)의 데카르트 곱이라 2,980사 × 15년 × 4보고서 = 178,800회,
+    #   회사별 API 로 9일짜리 작업이었다. 2018~2021 에만 하위권이던 회사의 2012년 재무는
+    #   어느 리밸런싱 시점에서도 읽히지 않는다.
     jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
-            if (c, int(y), str(r)) not in done]
+            if (c, int(y), str(r)) not in done
+            and (only_years is None or int(y) in only_years.get(str(c), ()))]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
@@ -7149,6 +7180,58 @@ def shares_from_cap_snapshots(snaps: Optional[pd.DataFrame],
     S = (S.sort_values(["corp_code", "knowledge_date"], kind="stable")
           .drop_duplicates(["corp_code", "knowledge_date"], keep="last"))
     return S[cols].reset_index(drop=True)
+
+
+def candidate_year_span(snaps: Optional[pd.DataFrame], sec: pd.DataFrame,
+                        signal_dates: Sequence[pd.Timestamp], n_target: int,
+                        buffer_mult: float, lookback_years: int = 3) -> Dict[str, set]:
+    """corp_code → 실제로 재무가 필요한 회계연도 집합.
+
+    ★ 왜 필요한가: 예전에는 (후보 전체) × (전 기간 연도)의 데카르트 곱을 요청했다.
+      2,980사 × 15년 × 4보고서 = 178,800회 — 회사별 API 로는 9일이 걸린다. 그런데 어떤
+      회사가 2018~2021 에만 시총 하위권이었다면 2012년이나 2026년 재무는 어디에도 쓰이지
+      않는다. 그 회사가 '후보였던 기간'과 3년 소급(roic_std3y·share_growth3y·TTM)만 받는다.
+
+    반환: {corp_code: {연도, ...}}
+    """
+    out: Dict[str, set] = {}
+    if snaps is None or not len(snaps) or sec is None or not len(sec):
+        return out
+    m = sec[["code", "corp_code"]].dropna().astype(str).drop_duplicates("code")
+    c2corp = dict(zip(m["code"], m["corp_code"]))
+    S = snaps.copy()
+    S["code"] = S["code"].astype(str)
+    S["snap_date"] = as_ts_series(S["snap_date"])
+    S["mktcap"] = pd.to_numeric(S["mktcap"], errors="coerce")
+    S = S.dropna(subset=["code", "snap_date", "mktcap"])
+    K = int(max(n_target, round(n_target * float(buffer_mult))))
+    span: Dict[str, List[int]] = {}
+    for d in sorted({as_ts(x) for x in signal_dates}):
+        g = S[S["snap_date"] == d]
+        if not len(g):
+            # 그 날짜 스냅샷이 없으면 가장 가까운 과거 스냅샷을 쓴다(없으면 건너뜀).
+            prev = S[S["snap_date"] <= d]
+            if not len(prev):
+                continue
+            d2 = prev["snap_date"].max()
+            g = S[S["snap_date"] == d2]
+        sel = g.nsmallest(K, "mktcap")["code"]
+        y = int(as_ts(d).year)
+        for c in sel:
+            cc = c2corp.get(str(c))
+            if not cc:
+                continue
+            r = span.get(cc)
+            if r is None:
+                span[cc] = [y, y]
+            else:
+                if y < r[0]:
+                    r[0] = y
+                if y > r[1]:
+                    r[1] = y
+    for cc, (y0, y1) in span.items():
+        out[cc] = set(range(y0 - int(lookback_years), y1 + 1))
+    return out
 
 
 
@@ -12007,7 +12090,9 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
             corps = _sec["corp_code"].dropna().astype(str).unique().tolist()
             LOG.warn(f"U-1000 후보를 못 만들어 전 상장사 {len(corps):,}개로 DART 를 받습니다 — "
                      f"호출량이 수만 회로 늘어납니다. 시총 스냅샷 단계를 먼저 확인하세요.")
-        years = list(range(as_ts(BACKTEST_START).year - 4, as_ts(BACKTEST_END).year + 1))
+        # 3년 소급이면 충분하다(roic_std3y · share_growth3y · TTM). 예전 -4 는 2012년을
+        # 통째로 받았는데 어느 리밸런싱 시점에서도 읽히지 않는 연도였다.
+        years = list(range(as_ts(BACKTEST_START).year - 3, as_ts(BACKTEST_END).year + 1))
         # ★★ priority 를 한 번도 넘기지 않고 있었다 ★★
         #   fetch_dart_financials 는 "끊겼을 때 남아 있는 것이 투자 가능한 종목의 최근
         #   데이터가 되도록" priority 순으로 받게 설계돼 있는데(12_ingest:248), 호출부가
@@ -12025,8 +12110,37 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
             _prio = _pm["corp_code"].dropna().astype(str).drop_duplicates().tolist()
             LOG.info(f"DART 수집 우선순위: 시총 낮은 순 {len(_prio):,}사 — 한도로 끊겨도 "
                      f"U-1000 편입 가능성이 높은 종목부터 완성됩니다.")
-        multi = fetch_dart_multi_accounts(corps, years)
-        fs = fetch_dart_financials(corps, years, priority=_prio)
+        multi = fetch_dart_multi_accounts(corps, years)   # 100사 배치라 싸다 — 전 범위 유지
+
+        # ★★ Tier-2 를 '수요 기반'으로 좁힌다 ★★
+        #   예전: (후보 2,980사) × (15년) × (4보고서) = 178,800회 → 하루 2만이면 9일.
+        #   지금: 그 회사가 실제로 시총 하위권이던 기간(+3년 소급) × 연간보고서.
+        #   Tier-2 가 Tier-1 보다 더 주는 것은 매출원가(gp_a)와 영업CF(PCR·발생액) 둘뿐이고,
+        #   둘 다 원논문(Novy-Marx · Sloan)이 연간으로 정의한다.
+        _span = candidate_year_span(ctx.get("snaps_cap"), _sec,
+                                    as_ts_series(ctx["cal"]["signal_date"]),
+                                    U1000_N, DART_TIER2_BUFFER_MULT,
+                                    lookback_years=DART_TIER2_LOOKBACK_Y)
+        _rc = ([REPRT_CODES["FY"]] if str(DART_TIER2_FREQ).lower() == "annual"
+               else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+        _yrs = sum(len(_span.get(c, ())) for c in corps) or (len(corps) * len(years))
+        _naive, _scoped = len(corps) * len(years) * 4, _yrs * len(_rc)
+        _lim = DBUDGET.remaining_calls() if DBUDGET is not None else None
+        _d = float(_lim or DART_DAILY_LIMIT_HINT)
+        LOG.table([["예전 (회사 × 전연도 × 4분기)", f"{_naive:,}", f"{_naive/_d:.1f}일"],
+                   [f"대상=U-1000×{DART_TIER2_BUFFER_MULT} · 소급 {DART_TIER2_LOOKBACK_Y}년",
+                    f"{_yrs*4:,}", f"{_yrs*4/_d:.1f}일"],
+                   [f"+ Tier-2 빈도 = {DART_TIER2_FREQ}", f"{_scoped:,}", f"{_scoped/_d:.1f}일"],
+                   ["오늘 잔여 호출", f"{_lim:,}" if _lim is not None else "미확정", ""]],
+                  headers=["Tier-2 수집 계획", "필요 호출", "예상"],
+                  title="DART Tier-2 — 회사별 API 라 job 수가 곧 콜드빌드 기간이다")
+        if _lim and _scoped > _lim:
+            LOG.warn(f"그래도 오늘 잔여({_lim:,})를 넘습니다. 시총 낮은 순으로 받으므로 오늘 "
+                     f"확보되는 분은 U-1000 편입 가능성이 높은 종목부터입니다. Tier-1(주요계정)은 "
+                     f"이미 전량 확보되어 V축·부채비율·자본잠식 판정은 오늘 백테스트가 그대로 "
+                     f"돌아가고, gp_a·PCR·발생액만 커버리지가 낮게 시작합니다.")
+        fs = fetch_dart_financials(corps, years, priority=_prio,
+                                   only_years=_span, reprt_codes=_rc)
         fin = tidy_financials(merge_financial_tiers(fs, multi))
         ctx["fin"] = apply_t_plus_1(fin, "재무제표")
         # ★ 주식총수는 DART 로 받지 않는다. (corp × year) 마다 1호출이라 후보 2,000사 × 11년
@@ -12335,6 +12449,29 @@ def main() -> dict:
                 "1차+ΔNONFIN만 — 애널리스트 축 기여"),
                ("X4", dict(use_rule3a=False), "1차+2차, 3-A 없음 — 3-A 기여")]
         abl_names = []
+        # ★ X0 = 스몰캡 벤치마크. U-1000 을 그대로 동일가중으로 담는다(1·2·3차 필터 전부 없음).
+        #   깔때기의 초과수익을 '시장'이 아니라 '같은 유니버스의 무선별 보유'와 비교해야
+        #   §10.2 귀속이 성립한다. KOSPI 대비 초과는 소형주 프리미엄일 뿐일 수 있다.
+        try:
+            _P0 = P.copy()
+            _P0["u1000_all"] = _P0["in_u1000"].fillna(False).astype(bool) \
+                if "in_u1000" in _P0.columns else True
+            b0 = run_qbacktest(_P0, cal, "u1000_all", fwd, label="X0",
+                               delist=ctx.get("delist_map") or {})
+            # ★ EXPERIMENTS / abl_names 에는 넣지 않는다. 그 둘은 §8.3 BH-FDR 다중검정
+            #   패밀리를 이룬다 — 벤치마크는 검정 대상 가설이 아니라 비교 기준선이므로
+            #   패밀리에 섞으면 보정 대상 수만 부풀려 실제 가설들의 검정력을 깎는다.
+            ctx["x0_smallcap"] = b0
+            _s0 = qperf_stats(b0["returns"])
+            LOG.table([["분기 평균 종목수", f"{float(b0['returns']['n'].mean()):,.0f}"],
+                       ["CAGR (비용차감)", f"{_s0.get('cagr', float('nan')):+.2%}"],
+                       ["Sharpe", f"{_s0.get('sharpe', float('nan')):.3f}"],
+                       ["MDD", f"{_s0.get('mdd', float('nan')):.1%}"]],
+                      headers=["X0 스몰캡 벤치마크 (U-1000 무선별 동일가중)", "값"],
+                      title="깔때기 비교 기준선 — KOSPI 대비 초과는 소형주 프리미엄일 수 있다")
+        except Exception as e:                                   # noqa
+            LOG.warn(f"X0 스몰캡 벤치마크 산출 실패({type(e).__name__}) — 비교 기준선 없이 "
+                     f"진행합니다. 깔때기 초과수익이 소형주 프리미엄인지 구분되지 않습니다.")
         for nm, kw, desc in abl:
             b = run_experiment(P, cal, fwd, best_v, label=nm, quiet=True, **kw)
             summarize_experiment(nm, b, b["panel"], best_v, fwd, desc)

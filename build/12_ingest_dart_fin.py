@@ -249,7 +249,9 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
 
 def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
-                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                          priority: Optional[Sequence[str]] = None,
+                          only_years: Optional[Dict[str, set]] = None,
+                          reprt_codes: Optional[Sequence[str]] = None) -> pd.DataFrame:
     """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
 
     priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
@@ -266,16 +268,22 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
-    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
-              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    reprts = list(reprt_codes) if reprt_codes else (
+        [REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
+        else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
     # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
     corp_sorted = sorted((str(c) for c in corp_codes),
                          key=lambda c: (order.get(c, 10 ** 9), c))
+    # ★ only_years 가 있으면 '그 회사가 실제로 후보였던 기간(+소급)'만 요청한다. 예전에는
+    #   (회사 전체) × (전 기간 연도)의 데카르트 곱이라 2,980사 × 15년 × 4보고서 = 178,800회,
+    #   회사별 API 로 9일짜리 작업이었다. 2018~2021 에만 하위권이던 회사의 2012년 재무는
+    #   어느 리밸런싱 시점에서도 읽히지 않는다.
     jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
-            if (c, int(y), str(r)) not in done]
+            if (c, int(y), str(r)) not in done
+            and (only_years is None or int(y) in only_years.get(str(c), ()))]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
