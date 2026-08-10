@@ -359,7 +359,9 @@ def build_panel_pass2(P: pd.DataFrame, ctx: dict, cal: pd.DataFrame) -> pd.DataF
                               exclude_irc=IRC_EXCLUDE, T=ctx.get("rtext"))
     P = P.merge(tpanel[["code", "rebal", "tone_q", "n_reports", "dTONE"]],
                 on=["code", "rebal"], how="left")
-    P = orthogonalize_tone(P)
+    P = orthogonalize_tone(P)                     # 종목단위 잔차 — TM 층이 A3 대조군으로 보존
+    # TONE-MEASURE v1.0 — §6.2 의 ΔTONE_resid '정의'를 대체한다(T2 자기참조 · 축 B 결합).
+    P = tm_panel(P, ctx, cal)
     P = build_exclusion_flags(P)
     P = apply_filter3a(P)
     return downcast_q(P)
@@ -497,6 +499,7 @@ def main() -> dict:
                 targets = ar[["corp_code", "bsns_year", "rcept_no", "rcept_dt"]].drop_duplicates("rcept_no")
         facts, pstats = fetch_annual_report_facts(targets)
         ctx["facts"] = facts
+        ctx["facts_targets"] = targets            # TONE-MEASURE B1/B2 섹션 텍스트도 같은 범위
         ctx["parse_rate"] = report_parse_rate(facts, pstats)
         # 3-A 의 '최대주주 지분율 < 15%' 는 하드 규칙인데 본문 표 레이아웃에 따라 추출 실패가
         # 잦다. 실패한 (회사, 연도) 에만 구조화 엔드포인트로 보강한다(전량 호출은 낭비).
@@ -537,6 +540,10 @@ def main() -> dict:
         verify_boilerplate_leak(T)
         lab = build_car_labels(T, ctx["px"])
         ctx["tone"] = build_tone_scores(T, lab)
+        # ── TONE-MEASURE 축 B 입력 — U-200 합집합 × 사업보고서만 (전 종목 수집 금지) ──────
+        ctx["sect"] = fetch_dart_section_texts(ctx.get("facts_targets", pd.DataFrame()))
+        ctx["b1"] = build_b1_change(ctx["sect"], ctx["sec"], P)
+        ctx["b2"] = build_b2_tone(ctx["sect"], ctx["sec"], ctx["px"])
 
     with PIPE.stage("L2.PANEL2", "[8]~[10] 하드팩트 · TONE · 배제 · 3-A", "L2", budget_s=1200):
         P = build_panel_pass2(P, ctx, cal)
@@ -663,6 +670,27 @@ def main() -> dict:
             abl_names.append(nm)
         report_experiment_table(abl_names, f"보조 어블레이션 (§8.2) — 최우수 변형 {best_v} 기준")
 
+    with PIPE.stage("L3.TMABL", "[12b] TONE-MEASURE 어블레이션 11종 (§6 고정)", "L3",
+                    budget_s=2400, critical=False):
+        # 명세 §6: 11개 버전으로 고정, 임의 추가 금지. 입력이 없는 버전(축 비활성)은 그
+        # 사실을 남기고 건너뛴다 — 조용히 사라지게 두지 않는다.
+        tm_names = []
+        for aid, desc, colname in TM_ABLATIONS:
+            if colname not in P.columns or int(P[colname].notna().sum()) == 0:
+                LOG.info(f"  TM-{aid}: 입력({colname}) 없음 — 건너뜀 (축 비활성/데이터 부재)")
+                continue
+            b = run_experiment(P, cal, fwd, best_v, label=f"TM-{aid}", quiet=True,
+                               score_col=colname,
+                               score_raw=(colname in ("score_f1", "score_f2")))
+            summarize_experiment(f"TM-{aid}", b, b["panel"], best_v, fwd, desc)
+            tm_names.append(f"TM-{aid}")
+        if tm_names:
+            report_experiment_table(tm_names, "TONE-MEASURE 어블레이션 (§6 — 11개 고정)")
+            # §2.3 — TM 버전들은 자체 검정 패밀리로 BH-FDR 보정 (개별 유의성 주장 금지)
+            report_bh_fdr(tm_names)
+            tm_required_comparisons()
+            tm_bottom_and_interact(P, fwd)
+
     with PIPE.stage("L5.FDR", "[13] BH-FDR 다중검정 보정", "L5", budget_s=120, critical=False):
         # §9-C2 는 'VQF 자신의 알파'가 아니라 'VQF − VQ 차이'의 유의성을 요구한다.
         # 차이검정을 같은 패밀리에 넣어야 다중검정 보정이 정직하다.
@@ -719,6 +747,9 @@ def main() -> dict:
 
     with PIPE.stage("L6.VERDICT", "[14] 수급 축 판정 · 사전등록 폐기조건", "L6", budget_s=120,
                     critical=False):
+        # TONE-MEASURE §5.3 인과 점검(|ρ|>0.5 중단보고) + §7 폐기조건 TM[1~8]
+        _tm_causal = tm_causal_check(P)
+        ctx["tm_kill"] = report_tm_kill(P, fwd, ctx.get("tm_gates", {}), _tm_causal)
         ctx["flow_verdict"] = report_flow_verdict(ctx.get("cmp", {}), fdr_pass=ctx.get("fdr"))
         report_cell_ladder()
         report_discretion_ledger()

@@ -253,6 +253,42 @@ L1.DART Tier-2 에서 멈춰 있었기 때문에 아직 노출되지 않았을 �
 
 ---
 
+## 5-b2. v1.2 — 사용자 FULL 크래시 수정 + TONE-MEASURE v1.0 구현
+
+### 크래시 원인 (사용자 실환경 · Windows py3.14 · L1.PANEL1 즉사)
+`MergeError: incompatible merge keys [0] dtype('O') and CategoricalDtype(...)`.
+트레이스백 12줄 절단이 `merge_asof` 프레임을 숨겼다 — 실체는 **캐시 parquet 의
+`krx_ohlcv_daily`(7,055,639행)가 `code` 를 category 로 저장**하고 있었고(과거 실행의 downcast
+잔재), `merge_asof(by="code")` 는 키 dtype 이 정확히 같아야 한다. 이 컨테이너의 캐시에는
+category 가 없어 여기선 통과하고 사용자 환경에서만 죽었다.
+**수정**: 캐시가 파이프라인에 들어오는 유일한 관문(`QVFVault.get_table`)에서
+`KEY_STR_COLS`(code·corp_code 등 12종)를 문자열로 강제(`_decat_keys`) + `build_cap_panel`
+방어 + 전수조사 `§TM키` 조항이 **바로 그 입력(category 일봉+스냅샷)으로 실행 재현**한다.
+
+### TONE-MEASURE v1.0 (`build/q27_tonemeasure.py` · QVF §6.2 ΔTONE_resid 정의 대체)
+- **축 A**: 게이트 A1~A6(실측·증권사별 분해) · 리포트 유형 규칙분류(24개월 INITIATION 규칙) ·
+  POS/NEG 분리(문장 마진투표 병렬계열) · **T2 broker 자기참조 차분**(400일 규칙·분기 단순평균·
+  n_b) · 직교화 확장(report_type 비중·n_b·log ADTV). A1/A2 실패→축 A 꺼짐, A4 실패→T3 폴백,
+  A6 미달→'검증 불가'(가중치 재조정 금지 — 그건 튜닝이다).
+- **축 B**: B1 정규화 6단계+섹션분해(S1/S2/S3)+유사도 4종+셀 z(부호 −) · B2 DART 전용
+  분류기(별도 학습·라벨 오염 명시)+자기이력 selfz(최소 4·`tm_selfz`)+펀더멘털 잔차
+  ABTONE(부호 −) · B3 = 기존 하드팩트/이상현상. **문서 수집은 U-200 합집합 × 사업보고서만**
+  (`fetch_dart_section_texts` — L1.FACTS 와 같은 targets).
+- **결합**: `dAXISB` = 부호정렬 합성(성분 2개 이상일 때만; dNONFIN 단독이면 원값 후퇴 = 기존
+  QVF 동작 비트 재현) · Score2 = 2·z(축B) + 1·z(ΔTONE_resid) − 배제(F2 형태가 실선정) ·
+  INTERACT 는 보고전용 가설(F1 어블레이션에서만 페널티 검정 — §5.2 승격 대기).
+- **어블레이션 11종 고정**(A1~A5·B1v·B2v·B3v·C1·F1·F2) + §6.1 필수비교 6종 + §6.2 BOTTOM
+  비대칭 + 자체 BH-FDR 패밀리(§2.3). **폐기조건 TM[1~8]** 보고(부호 역전 시 뒤집지 않고
+  해당 층 제외 — §7[7]).
+- 합성 산식(dAXISB 동일가중)·INTERACT 페널티 1.0z 는 명세가 침묵하는 임의 선택 — 원장 기재.
+
+전수조사 **32조항 · 272소검정**(TM 7조항 신규 — T2 차분 정답, B1 '숫자만 변경 → CHANGE<0.05
+vs 내용 변경 → >0.30', selfz 확장윈도우 정답, 부호 정렬 상관, 게이트 판정 로직).
+검증 4종(조립기·전수조사·SMOKE·원셀) 전부 통과. **B1/B2/게이트의 실데이터 검증은 미완** —
+FULL 재실행에서 섹션 텍스트 수집(U-200 × 연 1회 ≈ 수천 호출)이 처음 돈다.
+
+---
+
 ## 6. 다음 세션에서 할 일
 
 ### 1순위 — FULL 재실행 (명세 전수조사는 완료)

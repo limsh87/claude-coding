@@ -24,8 +24,8 @@ LISTING_SEASONING_DAYS = SEASONING_DAYS
 #    (실제로 계약 Q3 가 이 경로를 잡아냈다)
 #    merge/merge_asof 의 결합키가 한쪽만 category 인 경우에도 조용히 어긋날 수 있다.
 #    → 키·식별자 컬럼만 문자열로 되돌린다. 수치 컬럼의 다운캐스트 이득은 그대로 남는다.
-_NEVER_CAT = ("code", "corp_code", "rcept_no", "report_uid", "analyst_id", "stock_code",
-              "broker_id", "src_cap", "exit_kind", "flow_src", "parse_status")
+# 단일 원본: 캐시 관문(QVFVault.get_table)이 강제하는 목록과 같은 것을 쓴다 — 두 벌이면 갈라진다.
+_NEVER_CAT = QVFVault.KEY_STR_COLS
 
 
 def downcast_q(df: pd.DataFrame) -> pd.DataFrame:
@@ -458,10 +458,15 @@ def build_cap_panel(cal: pd.DataFrame, px_daily: pd.DataFrame, snaps: pd.DataFra
       ③만 쓰면 증자·감자가 반영되지 않아 시총이 조용히 틀어진다. 셋을 순서대로 쓴다.
     """
     px = px_daily[["code", "date", "close"]].copy()
+    # 캐시 관문(get_table)이 category 키를 str 로 되돌리지만, px 가 다른 경로로 들어와도
+    # 여기서 한 번 더 강제한다 — merge_asof(by="code") 는 dtype 불일치를 MergeError 로 던진다.
+    if str(px["code"].dtype) not in ("object", "str"):
+        px["code"] = px["code"].astype(str)
     px["date"] = as_ts_series(px["date"])
     px = px.dropna(subset=["code", "date", "close"]).sort_values(["date", "code"], kind="stable")
 
     sig = cal[["rebal", "signal_date"]].copy()
+    sig["signal_date"] = as_ts_series(sig["signal_date"])   # 결합키 단위 고정(as_ts 주석)
     # 신호일 종가 (그 날 거래가 없으면 직전 거래일 종가로 backward as-of)
     L = (sig.assign(_k=1).merge(pd.DataFrame({"code": sorted(px["code"].unique()), "_k": 1}),
                                 on="_k").drop(columns="_k"))
@@ -477,6 +482,8 @@ def build_cap_panel(cal: pd.DataFrame, px_daily: pd.DataFrame, snaps: pd.DataFra
     # ① KRX 스냅샷 — signal_date 이하의 가장 최근 스냅샷 (미래 스냅샷 사용 금지)
     if snaps is not None and len(snaps):
         S = snaps.copy()
+        if str(S["code"].dtype) not in ("object", "str"):   # category 캐시 방어(위 px 와 동일)
+            S["code"] = S["code"].astype(str)
         S["snap_date"] = as_ts_series(S["snap_date"])
         S = S.dropna(subset=["code", "snap_date"]).sort_values("snap_date", kind="stable")
         M = M.sort_values("signal_date", kind="stable")

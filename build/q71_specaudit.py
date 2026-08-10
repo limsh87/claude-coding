@@ -1133,13 +1133,276 @@ def _scstruct():
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
+#  TONE-MEASURE v1.0 조항 — 측정 형태가 명세와 '숫자로' 일치하는가
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§TM키", "캐시 병합키 — category dtype 캐시가 들어와도 병합이 죽지 않는다")
+def _sc_tmkey():
+    """실측 재현: 사용자 캐시의 krx_ohlcv_daily 가 code 를 category 로 저장하고 있었고,
+    merge_asof(by='code') 가 object vs category 로 MergeError 를 던져 L1.PANEL1 이 즉사했다.
+    관문(get_table)의 _decat_keys 와 build_cap_panel 의 방어를 '실행으로' 검정한다."""
+    k = SpecChk()
+    df = pd.DataFrame({"code": pd.Categorical(["000010", "000020"]),
+                       "corp_code": pd.Categorical(["C1", "C2"]), "x": [1.0, 2.0]})
+    out = QVFVault._decat_keys(df.copy())
+    # pandas 3 의 astype(str) 은 'str' dtype 을 준다 — object 와의 병합은 실측으로 안전하고
+    # (본 조항 하단에서 실행으로 확인), category 만이 merge_asof 를 죽인다.
+    k.add("_decat_keys: code category → 문자열", str(out["code"].dtype) in ("object", "str"),
+          f"실측 dtype {out['code'].dtype}")
+    k.add("_decat_keys: corp_code category → 문자열",
+          str(out["corp_code"].dtype) in ("object", "str"), f"실측 dtype {out['corp_code'].dtype}")
+    k.add("검정력 확인 — 입력은 실제로 category 였다",
+          str(df["code"].dtype) == "category", f"입력 dtype {df['code'].dtype}")
+
+    days = _sa_bdays("2020-01-02", 120)
+    cal = pd.DataFrame([{"rebal": pd.Timestamp("2020-06-01"),
+                         "signal_date": days[100], "exec_date": days[101]}])
+    px = _sa_prices(["000010", "000020"], days)
+    px_cat = px.copy()
+    px_cat["code"] = px_cat["code"].astype("category")     # 크래시를 재현하는 바로 그 입력
+    snaps = pd.DataFrame({"code": pd.Categorical(["000010", "000020"]),
+                          "snap_date": [days[90], days[90]],
+                          "mktcap": [1e10, 2e10], "shares": [1e6, 2e6]})
+    sec = pd.DataFrame({"code": ["000010", "000020"], "corp_code": [np.nan, np.nan]})
+    try:
+        cap = build_cap_panel(cal, px_cat, snaps, pd.DataFrame(), sec)
+        ok, ev = len(cap) == 2, f"산출 {len(cap)}행 (기대 2 · 시총 소스 {list(cap.get('src_cap', []))})"
+    except Exception as e:                                  # noqa
+        ok, ev = False, f"{type(e).__name__}: {e}"
+    k.add("category code 일봉+스냅샷으로 build_cap_panel 이 정상 동작(사용자 크래시 재현 입력)",
+          ok, ev)
+    return k
+
+
+@spec_clause("§TM3.3", "리포트 유형 — 규칙 분류 · 이력 기반 INITIATION · 24개월 판정불가")
+def _sc_tm33():
+    k = SpecChk()
+    dates = ([pd.Timestamp("2018-03-05") + pd.Timedelta(days=90 * i) for i in range(12)])
+    rep = pd.DataFrame({
+        "report_uid": [f"r{i}" for i in range(12)],
+        "stock_code": ["000010"] * 12,
+        "broker_id": ["B1"] * 12,
+        "pub_date": dates,
+        "title": ["4Q 실적 리뷰", "2019년 전망", "커버리지 개시", "기업 탐방 노트",
+                  "신규 수주 계약 체결", "아무 제목", "1Q 실적", "하반기 전망",
+                  "NDR 후기", "특허 승인", "그냥 노트", "3Q Re"],
+    })
+    rt = tm_report_type(rep)
+    k.eq("실적 리뷰 분류", rt.iloc[0], "UNKNOWN")     # 데이터 시작 24개월 내 첫 발간 → UNKNOWN
+    k.add("데이터 시작 24개월 내 첫 커버리지는 UNKNOWN(판정 불가)", rt.iloc[0] == "UNKNOWN",
+          f"실측 {rt.iloc[0]!r} — 24개월 규칙(§3.3)")
+    k.add("이후 제목 규칙이 동작 (실적/전망/탐방/이벤트)",
+          rt.iloc[6] == "EARNINGS_REVIEW" and rt.iloc[7] == "OUTLOOK"
+          and rt.iloc[8] == "VISIT_NOTE" and rt.iloc[9] == "EVENT",
+          f"[6..9] = {list(rt.iloc[6:10])}")
+    k.add("무규칙 제목은 OTHER", rt.iloc[10] == "OTHER", f"실측 {rt.iloc[10]!r}")
+    # 검정력: 25개월 공백 후 재개 → INITIATION (24개월 무이력 규칙)
+    rep2 = pd.DataFrame({"report_uid": ["a", "b"], "stock_code": ["000020"] * 2,
+                         "broker_id": ["B2"] * 2, "title": ["노트", "노트"],
+                         "pub_date": [pd.Timestamp("2018-06-01"), pd.Timestamp("2021-01-01")]})
+    rt2 = tm_report_type(pd.concat([rep, rep2], ignore_index=True))
+    k.add("25개월 공백 후 재개 리포트는 INITIATION", rt2.iloc[-1] == "INITIATION",
+          f"실측 {rt2.iloc[-1]!r} (공백 945일 > 730일)")
+    return k
+
+
+@spec_clause("§TM3.5", "T2 자기참조 차분 — 동일 broker 직전 대비 · 400일 규칙 · 분기 단순평균")
+def _sc_tm35():
+    k = SpecChk()
+    days = _sa_bdays("2019-01-02", 500)
+    px = _sa_prices(["000010"], days)
+    set_trading_days(px)
+    cal = pd.DataFrame([
+        {"rebal": pd.Timestamp("2020-03-01"), "signal_date": pd.Timestamp("2020-02-28"),
+         "exec_date": pd.Timestamp("2020-03-02")},
+        {"rebal": pd.Timestamp("2020-06-01"), "signal_date": pd.Timestamp("2020-05-29"),
+         "exec_date": pd.Timestamp("2020-06-01")}])
+    G0 = pd.DataFrame({"code": ["000010", "000010"],
+                       "rebal": [pd.Timestamp("2020-03-01"), pd.Timestamp("2020-06-01")],
+                       "signal_date": [pd.Timestamp("2020-02-28"), pd.Timestamp("2020-05-29")]})
+    S = pd.DataFrame({
+        "report_uid": ["r1", "r2", "r3", "r4", "r5"],
+        "stock_code": ["000010"] * 5,
+        "broker_id": ["B1", "B1", "B2", "B1", "B3"],
+        "pub_date": [pd.Timestamp("2020-01-10"), pd.Timestamp("2020-02-10"),   # B1: Δ=+0.2
+                     pd.Timestamp("2020-02-15"),                               # B2: 직전 없음→결측
+                     pd.Timestamp("2020-05-10"),                               # B1: Δ=+0.1
+                     pd.Timestamp("2020-05-15")],                              # B3: 직전 없음
+        "tone": [0.1, 0.3, 0.9, 0.4, 0.8],
+        "pos_frac": [0.2, 0.5, 0.9, 0.6, 0.9],
+        "neg_frac": [0.3, 0.1, 0.0, 0.1, 0.0]})
+    out = tm_t2_delta(S, G0, cal)
+    q1 = out[out["rebal"] == pd.Timestamp("2020-03-01")].iloc[0]
+    q2 = out[out["rebal"] == pd.Timestamp("2020-06-01")].iloc[0]
+    k.eq("1분기 ΔTONE(T2) = B1 의 0.3−0.1 만 (B2 는 직전 없음→결측)",
+         float(q1["dTONE_t2"]), 0.2, tol=1e-9)
+    k.eq("1분기 유효 broker 수 n_b = 1", float(q1["n_b"]), 1.0)
+    k.eq("2분기 ΔTONE(T2) = B1 의 0.4−0.3 만 (B3 는 직전 없음)",
+         float(q2["dTONE_t2"]), 0.1, tol=1e-6)
+    k.eq("ΔPOS 도 같은 규칙 (0.6−0.5)", float(q2["dPOS_t2"]), 0.1, tol=1e-6)
+    # 검정력 — T3(종목단위)라면 1분기 tone 평균에 B2 의 0.9 가 섞여 값이 완전히 다르다
+    t3_mean_q1 = float(np.mean([0.1, 0.3, 0.9]))
+    k.add("T2 가 T3 와 실제로 다른 값을 만든다(구성 변화 오염 제거)",
+          abs(float(q1["tone_abs_q"]) - t3_mean_q1) < 1e-9 and abs(0.2 - t3_mean_q1) > 0.1,
+          f"절대톤 평균 {t3_mean_q1:.3f} vs T2 Δ {0.2:.3f} — 절대톤에는 B2 문체가 섞인다")
+    # 400일 규칙
+    S2 = pd.DataFrame({"report_uid": ["a", "b"], "stock_code": ["000010"] * 2,
+                       "broker_id": ["B9"] * 2, "tone": [0.0, 0.5],
+                       "pos_frac": [0.1, 0.6], "neg_frac": [0.1, 0.0],
+                       "pub_date": [pd.Timestamp("2019-01-15"), pd.Timestamp("2020-05-20")]})
+    out2 = tm_t2_delta(S2, G0, cal)
+    v = out2.loc[out2["rebal"] == pd.Timestamp("2020-06-01"), "dTONE_t2"]
+    k.add("직전 리포트 간격 > 400일 → 결측 (커버리지 재개 ≠ 견해 변화)",
+          bool(pd.isna(v.iloc[0])), f"간격 491일 · 실측 {v.iloc[0]!r}")
+    return k
+
+
+@spec_clause("§TM4.2", "B1 정규화 6단계 — 숫자만 바뀐 문서는 '변화 없음'이어야 한다")
+def _sc_tm42():
+    k = SpecChk()
+    t = tm_normalize_text("매출액은 1,234억원(전년 대비 12.5% 증가)이고 2024년 3월 15일 "
+                          "이사회에서 대표이사 김철수 를 선임하였다. 주식회사 한빛전자 와 계약.")
+    k.add("[1] 숫자·비율 → <NUM>", "1,234" not in t and "12.5" not in t and "<NUM>" in t, f"'{t[:90]}…'")
+    k.add("[3] 임원 성명 → <NAME>", "김철수" not in t, f"NAME 마스킹: {'<NAME>' in t}")
+    k.add("[3] 회사명 → <ORG>", "한빛전자" not in t, f"ORG 마스킹: {'<ORG>' in t}")
+
+    base = ("당사는 반도체 검사장비를 제조 판매하고 있으며 주요 고객은 국내외 종합반도체 "
+            "회사이다. 매출액은 <YR>년 1,000억원이며 영업이익률은 10.0% 수준이다. "
+            "당사의 주력 제품은 웨이퍼 프로버이며 시장 점유율은 15.0% 이다. " * 8)
+    a = base.replace("<YR>", "2023")
+    b = (base.replace("<YR>", "2024").replace("1,000억원", "1,350억원")
+             .replace("10.0%", "12.3%").replace("15.0%", "17.2%"))
+    m_same = tm_similarity(tm_normalize_text(a), tm_normalize_text(b))
+    k.add("숫자·연도만 바뀐 전년 동기 문서 → CHANGE ≈ 0 (가짜 변화 억제)",
+          np.isfinite(m_same["change"]) and m_same["change"] < 0.05,
+          f"CHANGE {m_same['change']:.4f} (cos {m_same['cos']:.3f} · jac {m_same['jac']:.3f})")
+    c = ("당사는 기존 반도체 검사장비 사업을 중단하고 이차전지 소재 사업으로 전환하였다. "
+         "신규 공장을 착공하였으며 주요 고객은 배터리 제조사이다. 소송이 계류중이며 "
+         "우발부채가 존재한다. 유상증자를 결의하였다. " * 8)
+    m_diff = tm_similarity(tm_normalize_text(a), tm_normalize_text(c))
+    k.add("검정력 확인 — 내용이 실제로 바뀐 문서 → CHANGE 가 크다",
+          np.isfinite(m_diff["change"]) and m_diff["change"] > 0.30,
+          f"CHANGE {m_diff['change']:.4f} — 숫자만 바뀐 경우({m_same['change']:.4f})와 분리된다")
+    k.add("유사도 4종이 전부 산출된다",
+          all(np.isfinite(m_same[x]) for x in ("cos", "jac", "edit", "lenr")),
+          f"cos/jac/edit/lenr = {m_same['cos']:.3f}/{m_same['jac']:.3f}/"
+          f"{m_same['edit']:.3f}/{m_same['lenr']:.3f}")
+    return k
+
+
+@spec_clause("§TM4.3", "B2 자기이력 표준화 — 확장윈도우 · 최소 이력 4개 미달은 결측")
+def _sc_tm43():
+    k = SpecChk()
+    x = pd.Series([0.10, 0.20, 0.30, 0.40, 0.90, 0.35])
+    z = tm_selfz(x)
+    k.add("이력 1~4번째 관측은 결측 (최소 4개 요건)", bool(z.iloc[:4].isna().all()),
+          f"실측 {[None if pd.isna(v) else round(float(v),3) for v in z.iloc[:4]]}")
+    mu4, sd4 = float(np.mean([0.1, 0.2, 0.3, 0.4])), float(np.std([0.1, 0.2, 0.3, 0.4]))
+    k.eq("5번째 selfz = (0.9 − mean(앞4)) / sd(앞4)", float(z.iloc[4]), (0.9 - mu4) / sd4, tol=1e-9)
+    mu5 = float(np.mean([0.1, 0.2, 0.3, 0.4, 0.9]))
+    sd5 = float(np.std([0.1, 0.2, 0.3, 0.4, 0.9]))
+    k.eq("6번째는 확장윈도우(앞 5개) 기준 — 미래를 보지 않는다",
+         float(z.iloc[5]), (0.35 - mu5) / sd5, tol=1e-9)
+    k.add("검정력 확인 — 자기 자신을 이력에 넣으면 값이 달라야 한다",
+          abs(float(z.iloc[4]) - (0.9 - mu5) / max(sd5, 1e-9)) > 0.5,
+          f"올바른 값 {float(z.iloc[4]):+.3f} vs 자기포함 오류값 {(0.9-mu5)/sd5:+.3f}")
+    return k
+
+
+@spec_clause("§TM5", "결합 — 부호 정렬(B1↑·ABTONE↑=악재) · INTERACT 정의 · 후퇴 경로")
+def _sc_tm5():
+    k = SpecChk()
+    n = 40
+    # a(ΔTONE_resid)·abtone 를 같은 방향으로 두어 INTERACT 겹침이 실제로 생기게 한다(검정력).
+    P = _sa_cells(_sa_grid(n, ["2020-03-01"], sector="X",
+                           b1_change=[float(i) / n for i in range(n)],
+                           abtone=[float(i) / n for i in range(n)],
+                           dNONFIN=[float((i * 13) % n) for i in range(n)],
+                           dTONE_resid=[float(i) for i in range(n)]))
+    d = tm_combine(P)
+    b1z = pd.to_numeric(d["b1_change_z"], errors="coerce")
+    ax = pd.to_numeric(d["dAXISB"], errors="coerce")
+    c_b1 = float(b1z.corr(ax))
+    c_ab = float(pd.to_numeric(d["abtone_z"], errors="coerce").corr(ax))
+    c_nf = float(pd.to_numeric(d["dnonfin_z"], errors="coerce").corr(ax))
+    k.add("B1 변화량↑ → 축B 점수↓ (부호 −)", c_b1 < -0.3, f"corr(b1_z, AXISB) = {c_b1:+.3f}")
+    k.add("ABTONE↑ → 축B 점수↓ (부호 −)", c_ab < -0.3, f"corr(abtone_z, AXISB) = {c_ab:+.3f}")
+    k.add("하드팩트↑ → 축B 점수↑ (부호 +)", c_nf > 0.3, f"corr(dnonfin_z, AXISB) = {c_nf:+.3f}")
+    n_int = int(pd.to_numeric(d["INTERACT"], errors="coerce").sum())
+    a = pd.to_numeric(d["dTONE_resid"], errors="coerce")
+    b = pd.to_numeric(d["abtone"], errors="coerce")
+    manual = int(((a >= a.quantile(0.7)) & (b >= b.quantile(0.7))).sum())
+    k.eq("INTERACT = ΔTONE 상위30% ∧ ABTONE 상위30% (수동 재계산과 일치)", n_int, manual)
+    k.add("검정력 확인 — 겹침이 실제로 존재한다(0 이면 검정이 공회전)", n_int > 0,
+          f"INTERACT 발동 {n_int}행")
+    # 후퇴 경로: 성분이 dNONFIN 뿐이면 dAXISB == dNONFIN (기존 QVF 동작 보존)
+    P2 = _sa_cells(_sa_grid(n, ["2020-03-01"], sector="X",
+                            dNONFIN=[float(i % 5) for i in range(n)]))
+    d2 = tm_combine(P2)
+    same = bool(np.allclose(pd.to_numeric(d2["dAXISB"], errors="coerce"),
+                            pd.to_numeric(d2["dNONFIN"], errors="coerce"), equal_nan=True))
+    k.add("B1/B2 부재 시 dAXISB = dNONFIN (스모크·초기 실행 후퇴 경로)", same,
+          f"동일 여부 {same}")
+    # 어블레이션 컬럼: score_f2 = 2·z(dAXISB)+1·z(dTONE_resid) · f1 = f2 − INTERACT
+    d = tm_build_ablation_columns(d)
+    zB = zscore_observed_then_neutral(d, "dAXISB", col(d, "dAXISB").notna())
+    zT = zscore_observed_then_neutral(d, "dTONE_resid", col(d, "dTONE_resid").notna())
+    want = (SCORE2_W_NONFIN * zB + SCORE2_W_TONE * zT).astype(float)
+    err = float(np.nanmax(np.abs(pd.to_numeric(d["score_f2"], errors="coerce") - want)))
+    k.add("score_f2 = 2·z(축B) + 1·z(ΔTONE_resid)", err < 1e-5, f"최대 오차 {err:.2e}")
+    diff = (pd.to_numeric(d["score_f2"], errors="coerce")
+            - pd.to_numeric(d["score_f1"], errors="coerce"))
+    k.add("score_f1 = score_f2 − INTERACT 페널티 (INTERACT=1 행만 1.0 차이)",
+          bool(np.allclose(diff, pd.to_numeric(d["INTERACT"], errors="coerce"), atol=1e-6)),
+          f"차이 합 {float(diff.sum()):.1f} = INTERACT 합 {float(d['INTERACT'].sum()):.1f}")
+    k.eq("어블레이션은 11개로 고정 (§6 — 임의 추가 금지)", len(TM_ABLATIONS), 11)
+    return k
+
+
+@spec_clause("§TM3.1", "게이트 A1~A5 — 실측 판정 로직 (A1/A2 실패→축A 꺼짐 · A4 실패→T3)")
+def _sc_tm31():
+    k = SpecChk()
+    days = _sa_bdays("2020-01-02", 60)
+    px = _sa_prices(["000010"], days)
+    set_trading_days(px)
+    cal = pd.DataFrame([{"rebal": pd.Timestamp("2020-03-01"),
+                         "signal_date": pd.Timestamp("2020-02-28"),
+                         "exec_date": pd.Timestamp("2020-03-02")}])
+    P = _sa_grid(10, ["2020-03-01"], u200_V=True, sector="X")
+    # 10종목 중 4종목에 리포트(전부 broker 보유, 그중 2종목은 같은 broker 연속 2건)
+    rows = []
+    for i, c in enumerate(["000001", "000002", "000003", "000004"]):
+        rows.append({"report_uid": f"x{i}", "stock_code": c, "broker_id": "B1",
+                     "analyst_id": "a1", "pub_date": pd.Timestamp("2020-02-10"), "tone": 0.1})
+        if i < 2:
+            rows.append({"report_uid": f"y{i}", "stock_code": c, "broker_id": "B1",
+                         "analyst_id": "a1", "pub_date": pd.Timestamp("2020-02-20"), "tone": 0.2})
+    S = pd.DataFrame(rows)
+    _keep = dict(TM_STATE)
+    try:
+        g = tm_gates_axisA(S, P, cal)
+        k.eq("A1 = 리포트 보유 4/10 종목", g["A1"], 0.4, tol=1e-9)
+        k.eq("A2 = broker_id 100%", g["A2"], 1.0, tol=1e-9)
+        k.eq("A4 = 연속 2건 2/10 (종목,분기)", g["A4"], 0.2, tol=1e-9)
+        k.add("A1(40%)·A2(100%)·A4(20%) 전부 기준 이상 → 축A 활성 · tier=T2",
+              TM_STATE["axisA_on"] is True and TM_STATE["tier"] == "T2",
+              f"axisA_on={TM_STATE['axisA_on']} tier={TM_STATE['tier']}")
+        # 검정력: 리포트가 1종목뿐이면 A1=10% < 30% → 축 A 꺼짐
+        g2 = tm_gates_axisA(S[S["stock_code"] == "000001"], P, cal)
+        k.add("A1 미달(10%) → 축 A 전면 비활성 (§3.1 판정 로직)",
+              TM_STATE["axisA_on"] is False, f"A1={100*g2['A1']:.0f}% · axisA_on={TM_STATE['axisA_on']}")
+    finally:
+        TM_STATE.update(_keep)
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
 #  실행 — 전역 스냅샷/복원으로 파이프라인을 오염시키지 않는다
 # ════════════════════════════════════════════════════════════════════════════════════════════
 #  검정이 만지는 전역 목록. 여기 빠진 이름이 있으면 검증층이 본 실행의 입력을 바꾼다.
 _SPEC_GUARDED = ("U1000_N", "U1000_RANK_BEFORE_FILTER", "QVF_TRADING_DAYS",
                  "FLOW_NONZERO_RATIO", "FLOW_NONZERO_RATIO_PREREG", "FLOW_NONZERO_BY_WINDOW",
                  "PHASE0_FLOW_OK", "QVF_DELIST_MAP", "STOP_ON_KILL_CRITERIA",
-                 "QVF_REBAL_SHIFT_DAYS", "SCORE2_W_NONFIN", "SCORE2_W_TONE")
+                 "QVF_REBAL_SHIFT_DAYS", "SCORE2_W_NONFIN", "SCORE2_W_TONE", "TM_STATE")
 
 
 def _spec_snapshot() -> dict:

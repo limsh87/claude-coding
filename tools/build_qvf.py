@@ -36,8 +36,9 @@ ORDER = [
     "q24_dartfact.py",          # ΔNONFIN 하드팩트 · 배제플래그
     "q25_tone.py",              # TONE 분류기 · 직교화 · 인과순서
     "q26_filter2.py",           # 2차 필터 · 3-A 규칙판
-    "q40_backtest.py",          # 분기 백테스트 · 비용 모델
+    "q40_backtest.py",          # 분기 백테스트 · 비용 모델 (q27 이 rank_ic 등을 참조)
     "q50_robust.py",            # 실험 매트릭스 · BH-FDR · 강건성
+    "q27_tonemeasure.py",       # TONE-MEASURE v1.0 — 축A T2·게이트 / 축B B1·B2 / 결합·어블레이션
     "q60_report.py",            # Phase0 · §9 판정 · §10.4 · 산출물
     "q70_contracts.py",         # 계약 Q1~Q14 (원칙)
     "q71_specaudit.py",         # 명세 전수조사 §3.1~§10.4 (숫자)
