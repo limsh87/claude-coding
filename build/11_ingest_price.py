@@ -177,7 +177,10 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         #   같이 쓰고 있어서, pykrx 와 FDR 이 초당 2건을 '나눠' 먹었다. 종목 3,300개가 두
         #   경로를 다 타면 6,600슬롯 ÷ 2/s ≈ 55분 — 사용자가 본 그 숫자다. 버킷을 분리한다.
         limiter("fdr").wait()
-        d = fdr.DataReader(code, start, end)
+        # FDR 은 실패를 print() 로 뱉는다(로거가 아니다). 폐지 종목이 정상적으로 섞인
+        # 소형주 백테스트에서 수백~수천 줄이 되어 진짜 경고를 화면 밖으로 밀어낸다.
+        with capture_noise(f"fdr:{code}"):
+            d = fdr.DataReader(code, start, end)
     except Exception:
         return None
     if d is None or len(d) == 0:
@@ -412,8 +415,20 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 todo.append((c, start))
                 n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
-            n_fwd += 1
+            # ★★ 폐지 종목이 매 실행 여기로 떨어졌다 ★★
+            #   2018년에 폐지된 종목은 캐시 최대일이 영원히 2018년이므로, 요청 종료일(2026)과
+            #   비교하면 매 실행 '증분 수집 대상'이 된다. 그리고 폐지 종목은 어느 소스도 주지
+            #   않으므로 pykrx→fdr→네이버(2호스트×2회)→yfinance 를 전부 헛돌고, KRX 게이트가
+            #   2qps 로 직렬화되어 있어 종목당 0.5초를 통째로 잡아먹는다. 상장일을 볼 때
+            #   폐지일도 같이 봐야 했다 — 앞선 수정이 backfill 분기만 덮었다.
+            _D = CODE_DELISTED.get(c)
+            if _D is not None and pd.notna(_D) and mx >= as_ts(_D) - pd.Timedelta(days=7):
+                n_ipo += 1                      # 폐지일까지 받아둠 = 완결. 더 받을 것이 없다.
+            elif _recently_failed(c, mx):
+                n_skip += 1                     # 최근 실패 = 네거티브 캐시 적용(예전엔 미적용)
+            else:
+                todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+                n_fwd += 1
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
                  f"(요청 시작일 이전으로 물어본 적이 없는 종목만).")
@@ -463,8 +478,14 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             _all = pd.concat([_prev, pd.DataFrame(asked)], ignore_index=True) \
                 if _prev is not None else pd.DataFrame(asked)
             # 같은 종목은 '가장 이른 시작일로 물어본 기록'을 남긴다(그게 확정 근거다).
-            _all = (_all.sort_values(["code", "requested_from", "attempted_at"])
-                        .drop_duplicates("code", keep="first").reset_index(drop=True))
+            # ★ 예전엔 keep="first" 라 attempted_at 이 '최초 시도 시각'에 고정됐다. 그러면
+            #   _recently_failed 의 30일 타이머가 31일째부터 영원히 False 를 돌려주어
+            #   네거티브 캐시가 스스로 꺼진다. requested_from 은 가장 이른 값(어디까지
+            #   물어봤나), attempted_at 은 가장 최근 값(언제 물어봤나)이어야 맞다.
+            _all = (_all.groupby("code", as_index=False)
+                        .agg(requested_from=("requested_from", "min"),
+                             attempted_at=("attempted_at", "max"))
+                        .reset_index(drop=True))
             try:
                 VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
                                 source="fetch_prices:asked_ledger")

@@ -651,3 +651,38 @@ def bh_fdr(pvals: Sequence[float], q: float = 0.10) -> np.ndarray:
         out[order[:kmax + 1]] = True
     return out
 
+
+
+@contextmanager
+def capture_noise(tag: str = ""):
+    """블록 안의 stdout/stderr 를 가로채 LOG.debug 로 돌린다. 실패는 세지 되 화면은 지킨다.
+
+    ★ FDR·pykrx 는 logging 을 쓰지 않는다. 둘 다 builtin print() 로 직접 뱉는다:
+        FinanceDataReader/naver/data.py : '"000010" invalid symbol or has no data'
+        FinanceDataReader/krx/listing.py: print(r.text)  ← 로그인/에러 HTML 전문을 통째로
+        pykrx/website/comm/util.py      : 'Error occurred in {fn}: {e}'
+      그래서 logging.getLogger("FinanceDataReader").setLevel(CRITICAL) 은 아무 효과가 없다.
+    ★ pykrx 의 @dataframe_empty_handler 는 JSONDecodeError 를 삼키고 빈 DataFrame 을
+      돌려준다. 세션 만료로 JSON 대신 로그인 HTML 을 받은 '실패'가 호출부에는 '그 날짜에
+      상장 종목이 없음' 이라는 사실로 보인다 — 이 캡처가 그 구분을 되살린다.
+    yield 는 캡처된 텍스트를 담을 리스트다(블록 종료 후 확인).
+    """
+    buf, box = io.StringIO(), []
+    o, e = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = buf
+    try:
+        yield box
+    finally:
+        sys.stdout, sys.stderr = o, e
+        txt = buf.getvalue().strip()
+        if txt:
+            box.append(txt)
+            head = txt.splitlines()[0][:200]
+            LOG.debug(f"[{tag}] 라이브러리 출력 {len(txt.splitlines())}줄 (첫 줄: {head})")
+
+
+def noise_is_failure(box: List[str]) -> bool:
+    """캡처된 출력이 '조용한 실패'를 뜻하는가. pykrx 의 삼킨 예외를 되살리는 판정."""
+    t = " ".join(box)
+    return bool(re.search(r"Error occurred in|JSONDecodeError|Expecting value|"
+                          r"not found or invalid|no data or code", t))

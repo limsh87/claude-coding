@@ -419,7 +419,16 @@ class QVFVault(Vault):
     # ── 다중루트 읽기 -------------------------------------------------------------------
     def get_table(self, name: str, scope: str = "shared",
                   max_age_days: Optional[float] = None) -> Optional[pd.DataFrame]:
-        d = super().get_table(name, scope=scope, max_age_days=max_age_days)
+        # ★★ 인덱스에만 걸어두고 정작 '데이터 테이블'은 무방비였다 ★★
+        #   read_parquet_safe 는 못 읽은 파일을 .corrupt 로 개명하고 None 을 준다. 그런데
+        #   못 읽는 가장 흔한 원인 두 가지(드라이브 플레이스홀더 0바이트 · 동기화 중 부분
+        #   파일)는 '손상'이 아니라 정상적인 드라이브 동작이다. 그 개명 한 번에
+        #     · 일봉 캐시가 사라짐 → 후보 전량 콜드 재수집
+        #     · put_table 이 '기존 파일 없음'으로 보고 백업조차 없이 작은 새 파일로 교체
+        #     · 폐지 종목은 캐시가 유일한 사본이라 되받을 수 없음 → 생존자편향 제거(C2) 붕괴
+        #   가 한꺼번에 일어난다. 인덱스에 쓰던 보호를 데이터 테이블에도 그대로 씌운다.
+        with _suppress_corrupt_rename():
+            d = super().get_table(name, scope=scope, max_age_days=max_age_days)
         if d is not None:
             self.table_src[name] = self.root
             return d

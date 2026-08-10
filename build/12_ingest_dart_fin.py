@@ -85,14 +85,29 @@ class DartBudget:
 DBUDGET: Optional[DartBudget] = None
 
 
+# ★ dart_api 는 실패 종류를 전부 None 으로 뭉갠다. 그런데 호출부는 '이 회사는 그 해에
+#   제출한 것이 없다(013)' 와 '한도가 소진돼 물어보지도 못했다' 를 반드시 구분해야 한다.
+#   구분하지 않으면 예산 소진분이 '데이터 없음' 센티넬로 공용 캐시에 영구 기록되어
+#   다음 실행이 영영 재요청하지 않는다 — 캐시를 훼손하는 것과 같다(절대 1원칙 위반).
+DART_LAST_STATUS = threading.local()
+
+
+def dart_status() -> str:
+    """직전 dart_api 호출의 결과 코드. '013'=자료없음 · 'NOBUDGET'/'NET'/'AUTH' 등."""
+    return getattr(DART_LAST_STATUS, "v", "")
+
+
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
     호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
     → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
+    DART_LAST_STATUS.v = ""
     if not DART_API_KEY:
+        DART_LAST_STATUS.v = "NOKEY"
         return None
     if DBUDGET is not None and not DBUDGET.take(tries):
+        DART_LAST_STATUS.v = "NOBUDGET"
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
@@ -102,8 +117,10 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
     if DBUDGET is not None:
         DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
     if not isinstance(js, dict):
+        DART_LAST_STATUS.v = "NET"          # 네트워크/비JSON — 자료 없음이 아니다
         return None
     st = str(js.get("status", ""))
+    DART_LAST_STATUS.v = st or "000"
     if st and st != "000":
         if st in ("020", "021"):
             if DBUDGET is not None:
@@ -160,6 +177,14 @@ def _fs_one(job) -> Optional[pd.DataFrame]:
         with _FS_DIV_LK:
             _FS_DIV[corp] = used
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
+        # ★★ 센티넬은 '자료 없음'이 확인된 경우에만 쓴다 ★★
+        #   예산 소진·네트워크 실패·인증 오류로 못 물어본 것을 '없다'고 기록하면, 공용
+        #   캐시에 거짓 부재가 영구히 박히고 다음 실행이 영영 재요청하지 않는다.
+        #   실측 위험: 잔여 2만으로 잘라도 job 당 1~2 단위를 쓰므로 목록 중반부터 전부
+        #   예산 소진에 걸린다 — 매 실행 수천 건이 '제출 안 함'으로 굳는다.
+        _st = dart_status()
+        if _st not in ("013", "000"):
+            return None                      # 못 물어봤다 → 아무것도 기록하지 않는다
         # ★ '데이터 없음'도 결과다. 빈손을 캐시하지 않으면 done 집합에 영영 안 들어가서
         #   매 실행 같은 조합을 다시 묻는다 — "재실행하면 이 지점부터 이어받습니다"가
         #   거짓이 되는 지점이고, 하루치 한도가 통째로 '같은 부재를 재발견'하는 데 쓰였다.

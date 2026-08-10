@@ -925,6 +925,41 @@ def candidate_year_span(snaps: Optional[pd.DataFrame], sec: pd.DataFrame,
 
 
 # ── 시가총액 폴백: pykrx 없이도 PIT 시총을 만든다 ──────────────────────────────────────────
+def _normalize_shares_table(d: Optional[pd.DataFrame], name: str) -> Optional[pd.DataFrame]:
+    """다른 전략/이전 버전이 남긴 주식수 테이블을 이 코드가 쓰는 스키마로 맞춘다.
+
+    ★★ 공용 캐시는 전략 간에 공유된다 — 이름이 같아도 컬럼은 다를 수 있다 ★★
+      실측: D:/tcd_cache 의 naver_shares_snapshot(4,020행)에는 'shares_now' 가 없어서
+      dropna(subset=["code","shares_now"]) 가 KeyError 로 죽었다. 캐시를 '있다/없다'로만
+      보고 스키마를 확인하지 않은 것이 원인이다. 재사용하려면 관대하게 읽어야 한다.
+    ★ 맞출 수 없으면 None 을 돌려 신규 수집으로 넘긴다. 남의 캐시는 절대 건드리지 않는다.
+    """
+    if d is None or not len(d):
+        return None
+    d = d.copy()
+    low = {str(c).strip().lower(): c for c in d.columns}
+    c_code = next((low[k] for k in ("code", "종목코드", "ticker", "symbol", "티커") if k in low), None)
+    c_sh = next((low[k] for k in ("shares_now", "shares", "상장주식수", "listed_shares",
+                                  "shares_issued", "listed_stock_cnt", "발행주식수") if k in low), None)
+    if c_code is None or c_sh is None:
+        LOG.warn(f"{name} 캐시에 필요한 컬럼이 없어(가진 컬럼: {list(d.columns)[:8]}) "
+                 f"재사용하지 않고 새로 수집합니다. 기존 캐시는 그대로 둡니다.")
+        return None
+    out = pd.DataFrame({"code": d[c_code].map(to_code6),
+                        "shares_now": pd.to_numeric(d[c_sh], errors="coerce")})
+    if "market" in low:
+        out["market"] = d[low["market"]].astype(str)
+    out = out.dropna(subset=["code", "shares_now"])
+    out = out[out["shares_now"] > 0].drop_duplicates("code", keep="last").reset_index(drop=True)
+    if not len(out):
+        LOG.warn(f"{name} 캐시를 정규화했으나 유효행이 0 입니다 — 새로 수집합니다.")
+        return None
+    if c_sh != "shares_now" or c_code != "code":
+        LOG.info(f"{name} 캐시 스키마를 맞췄습니다: '{c_code}'→code · '{c_sh}'→shares_now "
+                 f"({len(out):,}행) — 다른 전략이 남긴 캐시를 그대로 재활용합니다.")
+    return out
+
+
 NAVER_SUM = "https://finance.naver.com/sise/sise_market_sum.naver"
 
 
@@ -939,9 +974,10 @@ def fetch_naver_shares() -> pd.DataFrame:
       (증자·분할이 있었으면 그만큼 오차). 그래서 cap_src 를 'naver_shares_x_close' 로
       남겨 §3 시총 소스 감사표에 그대로 드러나게 한다 — 숨기지 않는다.
     """
-    cached = VAULT.get_table("naver_shares_snapshot", scope="shared")
+    cached = _normalize_shares_table(VAULT.get_table("naver_shares_snapshot", scope="shared"),
+                                     "naver_shares_snapshot")
     if cached is not None and len(cached):
-        LOG.info(f"공용 캐시에서 네이버 상장주식수 {len(cached):,}종목 재사용")
+        LOG.info(f"공용 캐시에서 상장주식수 {len(cached):,}종목 재사용")
         return cached
     rows: List[dict] = []
     for sosok, mkt in ((0, "KOSPI"), (1, "KOSDAQ")):
@@ -993,9 +1029,11 @@ def cap_snapshots_from_prices(px: pd.DataFrame, shares: pd.DataFrame,
     P["code"] = P["code"].astype(str)
     P["date"] = as_ts_series(P["date"])
     P = P.dropna(subset=["code", "date", "close"]).sort_values("date", kind="stable")
-    sh = shares.copy()
+    sh = _normalize_shares_table(shares, "shares")
+    if sh is None or not len(sh):
+        LOG.warn("주식수 표를 이 코드가 쓰는 스키마로 맞추지 못해 시총 폴백을 건너뜁니다.")
+        return pd.DataFrame(columns=cols)
     sh["code"] = sh["code"].astype(str)
-    sh = sh.dropna(subset=["code", "shares_now"]).drop_duplicates("code")
     grid = (pd.DataFrame({"snap_date": sorted({as_ts(d) for d in signal_dates})})
             .merge(sh[["code"]], how="cross").sort_values("snap_date", kind="stable"))
     M = pd.merge_asof(grid, P.rename(columns={"date": "px_date"}),
