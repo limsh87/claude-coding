@@ -3637,9 +3637,12 @@ class KRXMarketplace:
                 for extra in ({}, {"skipDup": "Y"}):
                     body = {"mbrId": self.uid, pwf: self.pw, "mbrNm": "", "telNo": "",
                             "di": "", "certType": "", **extra}
+                    _tag = f"{url.rsplit('/', 1)[-1]}/{pwf}" + ("+skipDup" if extra else "")
                     txt = net_post(url, source="krx", data=body, referer=self.LOGIN_PAGE,
                                    headers={"X-Requested-With": "XMLHttpRequest"})
                     if txt is None:
+                        _st, _hd = NET_LAST.get("krx", ("—", ""))
+                        L.info(f"   KRX 후보 {_tag} — 응답 없음(HTTP {_st}) · {str(_hd)[:110]}")
                         continue
                     ec = em = ""
                     try:
@@ -3650,6 +3653,14 @@ class KRXMarketplace:
                         if re.search(r"CD011|중복\s*로그인", str(txt)):
                             ec = "CD011"
                         else:
+                            # ★조용히 넘어가지 않는다 — 사용자가 "ID/PW 는 맞다"고 할 때
+                            #   우리가 근거를 못 대면 진단이 거기서 멈춘다. 서버가 실제로
+                            #   무엇을 돌려줬는지(로그인 폼 HTML? 오류 페이지? 리다이렉트?)를
+                            #   그대로 보여 준다.
+                            _head = re.sub(r"\s+", " ", str(txt))[:220]
+                            _ttl = re.search(r"<title[^>]*>(.{0,80})", str(txt), re.I)
+                            L.info(f"   KRX 후보 {_tag} — JSON 아님(길이 {len(str(txt)):,}) "
+                                   f"title={_ttl.group(1).strip() if _ttl else '—'} · {_head}")
                             continue           # 이 후보는 JSON 을 안 준다 — 다음 후보로
                     if ec == "CD011":
                         L.warn("KRX 중복 로그인(CD011) — 브라우저/다른 노트북의 같은 계정 "
@@ -7463,29 +7474,50 @@ _TITLE_CODE = re.compile(r"\((\d{6}|\d{4}[0-9A-HJ-NP-TV-Z][0KLMN])\)")
 # ★한경 목록 파라미터 조합 후보. 실측에서 현행 조합이 ★HTTP 500(응답길이 0)을 받았다 —
 #   서버가 report_type 과 search_report_type 을 동시에 받으면 거부하는 것으로 보인다.
 #   검증된 구현들이 서로 다른 이름을 쓰므로 하나를 찍지 말고 실측으로 고른다.
+#   ★2026-08-10 정정 — 나는 "빈 문자열 파라미터가 500 의 원인"이라고 추론해 빈 값을
+#   걷어내려 했는데 ★정반대였다. 이 저장소의 ★실제로 성공했던 구현
+#   (build/13_ingest_research.py: hankyung_collect)은 빈 문자열을 ★전부 보내고 있었고,
+#   우리에게는 그중 ★두 개(search_value·business_code)가 아예 빠져 있었다.
+#   추론으로 파라미터를 지어내지 말고 ★작동한 코드를 그대로 옮긴다.
+#
+#   원본과 우리의 차이 4가지(전부 500 의 후보였다):
+#     ① search_value·business_code 누락   ② now_page·pagenum 이 str(원본은 int)
+#     ③ timeout 25(원본 30)               ④ ★축 — 원본은 ★연도 단위, 우리는 월 단위였다
+#        (원본 주석: "연도 단위로 쪼개서 수집. 한 번에 10년을 요청하면 페이지 상한에 걸린다")
 HK_PARAM_VARIANTS = [
+    # ★1순위 = build/13_ingest_research.py 가 실제로 성공한 조합 그대로
+    ("orig", {"skinType": "business", "report_type": "CO", "order_type": "",
+              "pagenum": 80, "search_text": "", "search_value": "", "business_code": ""}),
+    ("orig-noskin", {"report_type": "CO", "order_type": "", "pagenum": 80,
+                     "search_text": "", "search_value": "", "business_code": ""}),
     ("v25", {"skinType": "business", "report_type": "CO", "search_text": ""}),
     ("v4", {"skinType": "business", "search_report_type": "CO", "order_type": "",
             "pagenum": "80", "search_text": ""}),
     ("plain", {"report_type": "CO", "search_text": ""}),
-    ("full", {"skinType": "business", "report_type": "CO", "search_report_type": "CO",
-              "order_type": "", "pagenum": "80", "search_text": ""}),
 ]
+
+
+def _hk_clean(prm: dict) -> dict:
+    """★아무것도 걷어내지 않는다 — 빈 문자열까지 그대로 보내는 것이 성공 조합이다.
+    (한때 빈 값을 제거했다가 되돌렸다. 여기 손대기 전에 위 주석을 읽을 것.)"""
+    return dict(prm)
 
 
 def _hk_pick_variant(base: str, m0: pd.Timestamp, m1: pd.Timestamp) -> Optional[dict]:
     """쓰기 전에 한 달로 조합을 고른다 — 틀린 조합으로 120개월을 태우지 않기 위해서다."""
     for name, pv in HK_PARAM_VARIANTS:
         prm = dict(pv)
-        prm.update({"now_page": "1", "sdate": m0.strftime("%Y-%m-%d"),
+        prm.update({"now_page": 1, "sdate": m0.strftime("%Y-%m-%d"),
                     "edate": m1.strftime("%Y-%m-%d")})
-        got, why = _hk_rows(net_get(base, source="hankyung", params=prm,
-                                    referer="https://consensus.hankyung.com/"))
+        got, why = _hk_rows(net_get(base, source="hankyung", params=_hk_clean(prm),
+                                    referer="https://consensus.hankyung.com/",
+                                    timeout=30, tries=3))
         if got:
             L.ok(f"한경 파라미터 조합 '{name}' 채택 — {len(got)}건 확인({m0:%Y-%m}).")
             return dict(pv)
-        st, _ = NET_LAST.get("hankyung", ("—", ""))
-        L.info(f"한경 조합 '{name}' 미채택(HTTP {st} · 사유 {why}) — 다음 조합을 시도합니다.")
+        st, hd = NET_LAST.get("hankyung", ("—", ""))
+        L.info(f"한경 조합 '{name}' 미채택(HTTP {st} · 사유 {why}) · 보낸 파라미터 "
+               f"{sorted(_hk_clean(prm))} · 응답머리 {str(hd)[:90]} — 다음 조합을 시도합니다.")
     return None
 
 REPORT_COLS = ["rid", "source", "src_id", "pub_date", "stock_code", "stock_name", "title",
@@ -7525,10 +7557,10 @@ def harvest_hankyung(start: str, end: str,
         seen_id: set = set()             # ★그 달에 이미 본 보고서 id
         while page <= 200:
             _prm = dict(variant[0])
-            _prm.update({"now_page": str(page), "sdate": m0.strftime("%Y-%m-%d"),
+            _prm.update({"now_page": page, "sdate": m0.strftime("%Y-%m-%d"),
                          "edate": m1.strftime("%Y-%m-%d")})
-            html = net_get(base, source="hankyung", params=_prm,
-                           referer="https://consensus.hankyung.com/")
+            html = net_get(base, source="hankyung", params=_hk_clean(_prm),
+                           referer="https://consensus.hankyung.com/", timeout=30, tries=3)
             got, why = _hk_rows(html)
             if not got:
                 if why in ("layout", "nohtml") and not n_alarm[0]:
@@ -8107,19 +8139,28 @@ def _nps_preflight(names: Sequence[Tuple[str, str]]) -> bool:
 NPS_V1 = "https://apis.data.go.kr/B552015/NpsBplcInfoInqireService/getBassInfoSearch"
 NPS_PAGE_ROWS = 1000        # 1콜당 행수(공식 상한)
 NPS_MAX_PAGES = 900         # 월당 페이지 상한(전국 사업장 ≈ 60만 → 600p. 여유 포함)
-NPS_SEED_MONTHS = 14        # ★최신 이 개월수를 먼저 받는다 — 12개월 차분에 13개월이 필요하다
+NPS_SEED_MONTHS = 14        # ★1회 실행에서 우선 확보할 최신 개월수(12개월 차분에 13개월 필요)
+NPS_ALL_MONTHS = True       # ★True 면 최신 14개월을 먼저 채운 뒤 ★남은 전 구간(10년)까지
+#                             같은 실행에서 계속 내려간다. 월 원장이 있으므로 몇 번을 나눠
+#                             돌려도 정확히 이어받는다. False 면 시딩 14개월에서 멈춘다.
 NPS_MONTH_AXIS = True       # ★원전 축. False 로 두면 옛 종목축(신호 생성 불가)으로 돈다
 
 
-def _nps_month_call(ym: str, page: int) -> Tuple[str, List[dict]]:
-    """(상태, items) — V2 먼저, 빈손이면 V1. 두 스펙 사이에서 조용히 죽지 않게 한다."""
-    for url in (NPS_SEARCH, NPS_V1):
-        st, items = dg_call(url, {"dataCrtYm": ym, "pageNo": page,
-                                  "numOfRows": NPS_PAGE_ROWS},
-                            src=DG_SRC_NPS, json_param="dataType")
-        if items or st in (DG_LIMIT, DG_AUTH, DG_NET):
-            return st, items
-    return DG_EMPTY, []
+# ★서버가 받아 주는 (엔드포인트 × 페이지크기) 조합. 한 번 찾으면 원장에 남겨 재사용한다.
+#   왜 조합을 시도하는가(실측): 종목축 검색은 numOfRows=100 으로 ★성공하는데 월축은
+#   원전을 따라 1000 을 보내 `net`(HTTP 실패)로 떨어졌다. V2 의 페이지 상한이 100 이면
+#   1000 은 그대로 거부다. 어느 쪽이 맞는지는 ★서버에 물어야 안다 — 추측하지 않는다.
+NPS_MONTH_COMBOS = [("V2", 100), ("V1", 1000), ("V1", 100), ("V2", 1000)]
+_NPS_COMBO: Dict[str, Any] = {"url": None, "rows": 0}
+
+
+def _nps_month_call(ym: str, page: int, url: Optional[str] = None,
+                    rows: int = 0) -> Tuple[str, List[dict]]:
+    """(상태, items). url/rows 를 주면 그 조합만, 안 주면 확정된 조합을 쓴다."""
+    u = url or _NPS_COMBO["url"] or NPS_SEARCH
+    n = rows or _NPS_COMBO["rows"] or 100
+    return dg_call(u, {"dataCrtYm": ym, "pageNo": page, "numOfRows": n},
+                   src=DG_SRC_NPS, json_param="dataType")
 
 
 def _nps_month_probe() -> bool:
@@ -8132,11 +8173,28 @@ def _nps_month_probe() -> bool:
     """
     a_ym = (pd.Timestamp.today() - pd.DateOffset(months=3)).strftime("%Y%m")
     b_ym = (pd.Timestamp.today() - pd.DateOffset(months=9)).strftime("%Y%m")
-    sa, ia = _nps_month_call(a_ym, 1)
-    sb, ib = _nps_month_call(b_ym, 1)
+    # ★조합을 하나씩 물어본다. 실패하면 ★서버가 뭐라고 했는지를 그대로 남긴다 —
+    #   직전 실행은 "응답이 비었습니다(202605:net)" 만 찍어서 원인을 알 수 없었다.
+    ia = ib = None
+    for tag, n in NPS_MONTH_COMBOS:
+        url = NPS_SEARCH if tag == "V2" else NPS_V1
+        sa, ia = _nps_month_call(a_ym, 1, url=url, rows=n)
+        if ia:
+            _NPS_COMBO["url"], _NPS_COMBO["rows"] = url, n
+            L.ok(f"PACK-N 월축 조합 확정 — {tag} · numOfRows={n} · {a_ym} {len(ia)}행 수신.")
+            sb, ib = _nps_month_call(b_ym, 1, url=url, rows=n)
+            break
+        _st, _hd = NET_LAST.get(DG_SRC_NPS, ("—", ""))
+        L.info(f"   월축 조합 {tag}/numOfRows={n} 미채택 — 상태 {sa} · HTTP {_st} · "
+               f"응답머리 {str(_hd)[:120]}")
     if not ia or not ib:
-        L.warn(f"PACK-N 월축 프리플라이트 — 응답이 비었습니다({a_ym}:{sa} · {b_ym}:{sb}). "
-               f"종목축으로 내려갑니다.")
+        _st, _hd = NET_LAST.get(DG_SRC_NPS, ("—", ""))
+        L.warn(f"PACK-N 월축 불가 — {len(NPS_MONTH_COMBOS)}개 조합이 전부 실패했습니다. "
+               f"마지막 응답 HTTP {_st} · {str(_hd)[:200]}")
+        L.warn("   확인 사항: ① 이 서비스가 dataCrtYm 단독 조회를 허용하는지(활용가이드) "
+               "② 활용신청이 '국민연금 가입 사업장 내역'으로 승인됐는지 "
+               "③ DATA_GO_KR_KEY 가 ★Decoding 키인지. "
+               "종목축으로 내려가지만 그 축은 최신 1개월만 주므로 10년치가 불가능합니다.")
         return False
     ka = {str(x.get("seq") or x.get("wkplNm") or "") for x in ia[:200]}
     kb = {str(x.get("seq") or x.get("wkplNm") or "") for x in ib[:200]}
@@ -8172,13 +8230,18 @@ def harvest_nps_month(master: pd.DataFrame, months: pd.DatetimeIndex,
         pre[n[:2]].append((n, c))
     done_ym, led = led_read("nps_months_done", "ym", what="PACK-N 월축")
     want = [m.strftime("%Y%m") for m in months]
-    todo = [y for y in sorted(set(want), reverse=True) if y not in done_ym][:NPS_SEED_MONTHS]
+    # ★최신월부터 역순 — 12개월 차분에 13개월이 필요하므로 최근이 먼저 값을 만든다.
+    #   그 뒤 NPS_ALL_MONTHS 면 남은 전 구간(10년)까지 같은 순서로 계속 내려간다.
+    rest = [y for y in sorted(set(want), reverse=True) if y not in done_ym]
+    todo = rest if NPS_ALL_MONTHS else rest[:NPS_SEED_MONTHS]
     if not todo:
-        L.info("PACK-N 월축: 목표 개월이 전부 원장에 있습니다 — 신규 수집 없음.")
+        L.info(f"PACK-N 월축: 목표 {len(set(want))}개월이 전부 원장에 있습니다 — 신규 수집 없음.")
         return pd.DataFrame(columns=cols)
-    L.info(f"PACK-N ★월축 수집 — 최신 {len(todo)}개월({todo[-1]}~{todo[0]}) 우선. "
-           f"콜당 {NPS_PAGE_ROWS}행 · 월당 최대 {NPS_MAX_PAGES}p. "
-           f"잔여 {QUOTA.remaining(DG_SRC_NPS):,}콜.")
+    L.info(f"PACK-N ★월축 수집 — 전 구간 {len(set(want))}개월 중 남은 {len(todo)}개월 "
+           f"({todo[-1]}~{todo[0]}), 최신월부터. 콜당 {_NPS_COMBO['rows'] or NPS_PAGE_ROWS}행 · "
+           f"월당 최대 {NPS_MAX_PAGES}p · 잔여 {QUOTA.remaining(DG_SRC_NPS):,}콜. "
+           f"★한 실행에서 다 못 받아도 월 원장이 정확히 이어받습니다"
+           f"(이미 확보 {len(done_ym)}개월).")
     got: List[dict] = []
     new_led: List[dict] = []
     with stage_bar(len(todo), "국민연금 사업장(★월축)") as bar:
@@ -8192,6 +8255,7 @@ def harvest_nps_month(master: pd.DataFrame, months: pd.DatetimeIndex,
                     complete = False
                     break
                 st, items = _nps_month_call(ym, page)
+                _rows_cap = _NPS_COMBO["rows"] or NPS_PAGE_ROWS
                 if st in (DG_LIMIT, DG_AUTH, DG_NET, DG_BAD):
                     complete = False
                     break
@@ -8222,7 +8286,7 @@ def harvest_nps_month(master: pd.DataFrame, months: pd.DatetimeIndex,
                                  "_lost": _nps_num(it.get("lssJnngpCnt")),
                                  "_site": f"{w}|{it.get('ldongAddrMgplSgguCd') or ''}",
                                  "_conf": bs / 100.0})
-                if len(items) < NPS_PAGE_ROWS:
+                if len(items) < _rows_cap:
                     break
                 page += 1
             else:
