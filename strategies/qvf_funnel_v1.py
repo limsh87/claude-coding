@@ -274,7 +274,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.1258"
+BUILD_VERSION      = "qvf1.20260810.1322"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -12665,20 +12665,17 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
                                    skip_years=research_covered_years(cached, "naver"))
                 # 상세 보강은 U-1000 후보로만. 소비처(build_tp_revision)가 U-1000 패널에만
                 # 붙으므로 후보 밖 종목의 목표주가는 어디에도 쓰이지 않는다.
-                frames.append(naver_enrich_detail(nv, codes=ctx.get("candidates")))
+                # ★ 상세(목표주가) 보강은 여기서 하지 않는다 — 이 시점엔 U-200 이 없어서
+                #   U-1000 후보(2,652종목)로밖에 못 좁힌다. tp_revision 은 ΔTONE 직교화
+                #   설명변수이고 ΔTONE 은 U-200 에서만 계산되므로, 후보 전체를 받는 것은
+                #   실측 5,434건 중 대부분이 버려지는 낭비다. L1.TONE 으로 미룬다.
+                frames.append(nv)
         if cached is not None and len(cached):
             LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용")
             frames.append(cached)
         rep = build_report_master(frames, ctx["sec"])
+        # ★ PDF 도 같은 이유로 L1.TONE 으로 미룬다(아래 참조). 여기서는 목록 원장만 저장한다.
         if len(rep):
-            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH,
-                                codes=ctx.get("candidates"),
-                                train_per_year=RESEARCH_PDF_TRAIN_PER_YEAR)
-            if "pdf_target" in rep.columns:
-                fill = rep["target_price"].isna() & rep["pdf_target"].notna()
-                if fill.any():
-                    rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
-                    LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건 추가 확보")
             VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
                             source="hankyung+naver")
         A, L = build_analyst_ledger(rep)
@@ -12874,7 +12871,28 @@ def main() -> dict:
 
     with PIPE.stage("L1.TONE", "[7] 리포트 본문 · TONE 분류기 (확장윈도우)", "L1",
                     budget_s=5400, critical=False):
-        T = build_report_text_table(ctx.get("reports", pd.DataFrame()), ctx.get("need_codes"))
+        # ★★ 상세·PDF 는 '1·2차에서 걸러낸 종목'에만 필요하다 ★★
+        #   tp_revision(목표주가 수정률)과 리포트 본문은 ΔTONE 계산에만 쓰이고, ΔTONE 은
+        #   U-200 에서만 계산된다. 그런데 예전에는 L1.RESEARCH(=U-200 이 아직 없는 시점)에서
+        #   받아 U-1000 후보 2,652종목 전체를 대상으로 했다 — 실측 5,434건 상세 조회에
+        #   36분, PDF 는 시간 단위였고 대부분이 U-200 에 들지 못해 버려졌다.
+        #   need_codes(U-200 3변형 합집합)가 확정된 지금 받는다.
+        _rep = ctx.get("reports", pd.DataFrame())
+        _need = ctx.get("need_codes")
+        if len(_rep) and _need:
+            _rep = naver_enrich_detail(_rep, codes=_need)
+            _rep = download_pdfs(_rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH,
+                                 codes=_need, train_per_year=RESEARCH_PDF_TRAIN_PER_YEAR)
+            if "pdf_target" in _rep.columns:
+                _fill = _rep["target_price"].isna() & _rep["pdf_target"].notna()
+                if _fill.any():
+                    _rep.loc[_fill, "target_price"] = _rep.loc[_fill, "pdf_target"]
+                    LOG.ok(f"PDF 본문에서 목표주가 {int(_fill.sum()):,}건 추가 확보")
+            VAULT.put_table("research_report_master", _rep, scope="shared", domain="research",
+                            source="hankyung+naver+detail+pdf")
+            ctx["reports"] = _rep
+            ctx["analysts"], ctx["links"] = build_analyst_ledger(_rep)
+        T = build_report_text_table(_rep, _need)
         ctx["rtext"] = T
         verify_boilerplate_leak(T)
         lab = build_car_labels(T, ctx["px"])
