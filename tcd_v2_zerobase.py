@@ -249,6 +249,7 @@ RUNTIME_4H_LIMIT_ABOLISHED = True
 # ╚══════════════════════════════════════════════════════════════════════════════════════════╝
 import os, sys, io, re, gc, json, math, time, zlib, random, shutil, string, hashlib, zipfile
 import platform, tempfile, threading, traceback, subprocess, unicodedata, warnings
+import xml.etree.ElementTree as _ET
 import datetime as dtm
 from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -7558,25 +7559,80 @@ def linkage_audit(rep: pd.DataFrame, analysts: pd.DataFrame, links: pd.DataFrame
 # ║   PACK-D 공시원문(사업보고서) 텍스트 유사도                                                 ║
 # ╚══════════════════════════════════════════════════════════════════════════════════════════╝
 
-def datagokr_call(url: str, params: dict, src: str = "datagokr") -> Optional[dict]:
-    if not DATA_GO_KR_KEY or not QUOTA.allow(src):
-        return None
+# ── 공공데이터포털 호출 — ★XML 이 1급 시민이다 ──────────────────────────────────────────────
+#   옛 구현은 `_type=json` 을 넣었다. 그런데
+#     · 국민연금(B552015) 의 JSON 스위치는 ★`dataType` 이다. `_type` 은 조용히 무시되고
+#       기본값 XML 이 온다 → net_json 이 파싱 실패 → None → 프리플라이트 실패 → 팩 비활성.
+#     · 관세청(1220000) 은 ★JSON 자체를 지원하지 않는다. 무엇을 넣든 XML 만 온다.
+#   즉 두 팩이 "통신 100% 성공, 수확 0행"이던 직접 원인이 이 한 줄이었다.
+#   그래서 XML 을 먼저 읽고, 상태를 ★뭉개지 않고 그대로 올린다 — '한도초과'와 '진짜 없음'을
+#   구분하지 못하면 원장이 오염되어 다음 실행이 영구히 건너뛴다.
+DG_OK, DG_EMPTY, DG_LIMIT, DG_AUTH, DG_NET, DG_BAD = "ok", "empty", "limit", "auth", "net", "bad"
+
+
+def dg_call(url: str, params: dict, src: str = "datagokr",
+            json_param: Optional[str] = None, key: Optional[str] = None
+            ) -> Tuple[str, List[dict]]:
+    """(상태, items). json_param 은 그 서비스가 JSON 을 지원할 때만 준다."""
+    if not (key or DATA_GO_KR_KEY) or not QUOTA.allow(src):
+        return DG_NET, []
     p = dict(params)
-    p["serviceKey"] = DATA_GO_KR_KEY
-    p.setdefault("_type", "json")
-    js = net_json(url, source=src, params=p, tries=2,
+    p["serviceKey"] = key or DATA_GO_KR_KEY
+    if json_param:
+        p.setdefault(json_param, "json")
+    txt = net_get(url, source=src, params=p, tries=2,
                   count_cb=lambda: QUOTA.charge(src))
-    if js is None:
-        return None
-    blob = json.dumps(js)[:400]
-    if "LIMITED_NUMBER_OF_SERVICE_REQUESTS" in blob:
-        QUOTA.server_says_limit(src)
-        return None
-    if "SERVICE_KEY_IS_NOT_REGISTERED" in blob or "SERVICE ERROR" in blob:
-        L.warn("공공데이터포털 키 오류 — 활용신청 승인 여부와 Decoding 키 여부를 확인하세요.")
-        return None
-    QUOTA.ok(src)         # ★정상 응답 — 공식치를 넘겼을 때 '실측 상향'의 근거가 된다
-    return js
+    if not txt:
+        return DG_NET, []
+    t = str(txt).lstrip().replace("<script/>", "").replace("<script></script>", "")
+    if t[:1] in "{[":                                   # JSON 경로
+        try:
+            js = json.loads(t)
+        except Exception:
+            return DG_BAD, []
+        blob = json.dumps(js)[:400]
+        if "LIMITED_NUMBER_OF_SERVICE_REQUESTS" in blob:
+            QUOTA.server_says_limit(src)
+            return DG_LIMIT, []
+        if "SERVICE_KEY_IS_NOT_REGISTERED" in blob or "SERVICE ERROR" in blob:
+            L.warn("공공데이터포털 키 오류 — 활용신청 승인 여부와 ★Decoding 키 여부를 확인하세요.")
+            return DG_AUTH, []
+        items = _dg_items(js)
+        QUOTA.ok(src)
+        return (DG_OK if items else DG_EMPTY), items
+    # XML 경로 — 관세청은 이쪽뿐이다
+    try:
+        root = _ET.fromstring(t)
+    except Exception:
+        return DG_BAD, []
+    if root.tag.endswith("OpenAPI_ServiceResponse") or root.find(".//cmmMsgHeader") is not None:
+        rc = (root.findtext(".//returnReasonCode") or "").strip()
+        if rc == "22":
+            QUOTA.server_says_limit(src)
+            return DG_LIMIT, []
+        if rc in {"20", "21", "30", "31", "32", "33"}:
+            L.warn(f"공공데이터포털 인증/권한 오류(returnReasonCode={rc}) — 활용신청 승인과 "
+                   f"Decoding 키를 확인하세요.")
+            return DG_AUTH, []
+        return DG_BAD, []
+    rc = (root.findtext(".//header/resultCode") or root.findtext(".//resultCode") or "").strip()
+    if rc and rc not in ("00", "0"):
+        if rc in {"22", "20"}:
+            QUOTA.server_says_limit(src)
+            return DG_LIMIT, []
+        if rc in {"03", "13"}:
+            return DG_EMPTY, []
+        return DG_BAD, []
+    items = [{c.tag: (c.text or "").strip() for c in it}
+             for it in root.findall(".//items/item")]
+    QUOTA.ok(src)
+    return (DG_OK if items else DG_EMPTY), items
+
+
+def datagokr_call(url: str, params: dict, src: str = "datagokr") -> Optional[dict]:
+    """구 인터페이스 유지용 얇은 래퍼 — 새 코드는 dg_call 을 직접 쓴다."""
+    st, items = dg_call(url, params, src, json_param="dataType")
+    return {"response": {"body": {"items": {"item": items}}}} if st == DG_OK else None
 
 
 def _dg_items(js: Optional[dict]) -> List[dict]:
@@ -7612,6 +7668,9 @@ NPS_PERIOD = NPS_BASE + "/getPdAcctoSttusInfoSearchV2"  # seq → 월별 취득/
 NPS_CONTRIB_RATE = 0.09                                  # 국민연금 보험료율(시행 상수)
 NPS_SIM_MIN = 80                                         # 상호 유사도 하한
 NPS_MAX_SITES = 3                                        # 한 종목이 들고 갈 사업장 수 상한
+NPS_RULE_VER = 2      # ★검색 질의·정규화·필드 매핑 규칙 버전. 올리면 옛 원장이
+#                       자동 무효화되어, 구 규칙으로 무매칭 판정된 종목이 90일간
+#                       영구 스킵되는 사고를 막는다(v2 = dataType/상세필드 교정판).
 
 
 def _nps_num(x) -> float:
@@ -7619,19 +7678,28 @@ def _nps_num(x) -> float:
     return float(v) if pd.notna(v) else 0.0
 
 
-def _nps_sites(nm: str) -> Optional[List[dict]]:
-    """사업장명 검색 1회 — 반환은 (seq, 자료생성년월, 사업장명) 목록. None = 통신 실패."""
-    js = datagokr_call(NPS_SEARCH, {"wkplNm": str(nm)[:30], "numOfRows": 100, "pageNo": 1})
-    if js is None:
-        return None
-    return _dg_items(js)
+def _nps_sites(nm: str) -> Tuple[str, List[dict]]:
+    """사업장명 검색 — (상태, 항목). wkplNm 은 ★부분일치라 넓은 질의부터 던지면
+    '삼성전자'에 하청·현장까지 수천 건이 걸리고 본사가 첫 100건 밖으로 밀린다.
+    좁은 표기부터 시도해 정확일치를 먼저 잡고, 없을 때만 넓힌다."""
+    base = clean_txt(nm)[:28]
+    last = (DG_EMPTY, [])
+    for q in (f"(주){base}", f"{base}(주)", base):
+        st, items = dg_call(NPS_SEARCH, {"wkplNm": q, "numOfRows": 100, "pageNo": 1},
+                            json_param="dataType")
+        if st in (DG_NET, DG_BAD, DG_LIMIT, DG_AUTH):
+            return st, []
+        if items:
+            return st, items
+        last = (st, items)
+    return last
 
 
 def _nps_preflight(names: Sequence[Tuple[str, str]]) -> bool:
     """★쓰기 전에 재 본다. 옛 구현이 한 시간을 태운 뒤에야 '0행'을 알려줬기 때문이다.
     상위 몇 종목만 실제로 조회해 (a) 응답이 오는지 (b) seq 가 들어 있는지 확인한다."""
     for code, nm in list(names)[:4]:
-        it = _nps_sites(nm)
+        stt, it = _nps_sites(nm)
         if it and any(str(x.get("seq") or "").strip() for x in it):
             return True
     st, head = NET_LAST.get("datagokr", ("—", ""))
@@ -7668,6 +7736,11 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
     if led is not None and len(led):
         led = led.copy()
         led["tried_at"] = ds_(led["tried_at"])
+        # ★규칙 버전 — 검색 질의·정규화·필드 매핑이 바뀌면 옛 원장은 무효다. 안 그러면
+        #   구 규칙으로 '무매칭' 판정된 종목이 90일간 영구 스킵되어, 고쳐 놓고도 0행이 된다.
+        if "rule_ver" not in led.columns:
+            led["rule_ver"] = 0
+        led = led[pd.to_numeric(led["rule_ver"], errors="coerce").fillna(0) >= NPS_RULE_VER]
         fr = led[(today_ts - led["tried_at"]).dt.days < 90]
         done_codes = set(fr["code"].astype(str))
         L.info(f"PACK-N 원장: {len(done_codes):,}종목은 이미 처리(성공·무매칭 포함) — "
@@ -7689,7 +7762,9 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
         # ★잡 1건 ≠ 호출 1건. net_get(tries=2) 이라 실패 시 2회까지 계수되고, 잡마다
         #   검색 1 + 기간 1 + 상세 ≤NPS_MAX_SITES 를 쓴다. 잔여를 잡 수로 그대로 쓰면
         #   실제로는 몇 배를 쏜다(실측: 10,000잡 캡으로 20,000호출을 태웠다).
-        per_job = 2 + NPS_MAX_SITES
+        # ★실측식 — 검색 폴백 최대 3회 + 사업장당 상세 1회. 옛 `2 + NPS_MAX_SITES` 는
+        #   검색 폴백과 페이징을 안 세서 배정의 몇 배를 쐈다.
+        per_job = 3 + NPS_MAX_SITES
         # ★cap_of 규약 — None(무제한)일 때만 잔여 전량. 옛 `or 10**9` 는 배정 0 을
         #   무제한으로 뒤집어, 예산을 한 건도 못 받은 팩이 오히려 다 태우게 했다.
         _mc = cap_of(max_calls)
@@ -7710,65 +7785,84 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
         QUOTA.plan("datagokr", len(jobs) * (2 + NPS_MAX_SITES), "국민연금 사업장(종목축)")
 
     def one(job):
+        """★한 종목 = 검색 1~2회 + 상세 1회. 월별 시계열은 여기서 못 만든다 — 아래 참조."""
         code, nm = job
-        if not QUOTA.allow("datagokr"):        # ★배치 안에서도 발사 직전 확인
-            return None
-        items = _nps_sites(nm)
-        if items is None:
+        st_s, items = _nps_sites(nm)
+        if st_s == DG_NET or st_s == DG_BAD:
             return None                        # 통신 실패 — 원장에 아무것도 남기지 않는다
         tgt = clean_corp(nm)
-        best: Dict[str, Tuple[float, str]] = {}      # seq → (유사도, 사업장명)
+        # ★seq 는 사업장 식별자가 ★아니다 — (사업장 × 자료생성년월) 키다. 옛 코드는 상위 3개
+        #   seq 를 '사업장 3곳'으로 보고 합산해서, 같은 사업장의 서로 다른 3개 '월'을 더했다
+        #   (가입자수 3~4배 과대). 사업장은 (정규화명, 시군구코드)로 식별하고 월은 분리한다.
+        sites: Dict[Tuple[str, str], Dict[str, str]] = {}
+        conf = 0.0
         for it in items:
             sq = str(it.get("seq") or "").strip()
-            if not sq:
+            ym = str(it.get("dataCrtYm") or "").strip()
+            if not sq or len(ym) != 6:
                 continue
-            sim = float(name_sim(str(it.get("wkplNm", "")), tgt))
+            if str(it.get("wkplJnngStcd") or "1") != "1":     # 등록 상태인 사업장만
+                continue
+            wn = str(it.get("wkplNm", ""))
+            sim = float(name_sim(wn, tgt))
             if sim < NPS_SIM_MIN:
                 continue
-            if sq not in best or sim > best[sq][0]:
-                best[sq] = (sim, str(it.get("wkplNm", "")))
-        if not best:
-            return {"_none": code}             # ★서버가 '없다'고 답한 것은 반드시 기록한다
-        seqs = [s for s, _ in sorted(best.items(), key=lambda kv: -kv[1][0])][:NPS_MAX_SITES]
-        conf = max(v[0] for v in best.values()) / 100.0
-        agg: Dict[str, dict] = {}              # YYYYMM → 합산
-        for sq in seqs:
-            if not QUOTA.allow("datagokr"):
-                break
-            # 기간별 현황 — dataCrtYm 을 ★생략하면 그 사업장의 월별 시계열 전체가 온다
-            pj = datagokr_call(NPS_PERIOD, {"seq": sq, "numOfRows": 300, "pageNo": 1})
-            for it in _dg_items(pj):
-                ym = str(it.get("dataCrtYm") or "").strip()
-                if len(ym) != 6:
+            conf = max(conf, sim / 100.0)
+            sites.setdefault((clean_corp(wn), str(it.get("ldongAddrMgplSgguCd") or "")),
+                             {})[ym] = sq
+        if not sites:
+            # ★서버가 답은 했는데 매칭이 없다 = 진짜 없음. 통신 실패와 구분해 기록한다.
+            return {"_none": code} if st_s in (DG_OK, DG_EMPTY) else None
+        # 관측 월이 가장 많은 사업장 = 본사로 본다(지점·현장은 월 수가 적다)
+        top = sorted(sites.items(), key=lambda kv: -len(kv[1]))[:NPS_MAX_SITES]
+        rows = []
+        for _key, ym2seq in top:
+            ym = max(ym2seq)                   # ★최신 월 1개만 — 아래 비용 주석 참조
+            st_d, det = dg_call(NPS_DETAIL, {"seq": ym2seq[ym], "numOfRows": 10,
+                                             "pageNo": 1}, json_param="dataType")
+            if st_d != DG_OK:
+                continue
+            for it in det:
+                # ★가입자수·고지금액은 ★상세에만 있다. 옛 코드는 기간별 응답에서 찾았는데
+                #   거기엔 nwAcqzrCnt·lssJnngpCnt 뿐이라 members 가 항상 0 이었고,
+                #   마지막 게이트 `if m > 0` 에서 전건 탈락했다(수확 0행의 직접 원인).
+                m = _nps_num(it.get("jnngpCnt"))
+                if m <= 0:
                     continue
-                a = agg.setdefault(ym, {"m": 0.0, "amt": 0.0, "new": 0.0,
-                                        "lost": 0.0, "n": 0})
-                a["m"] += _nps_num(it.get("jnngpCnt"))
-                a["amt"] += _nps_num(it.get("crrmmNtcAmt"))
-                a["new"] += _nps_num(it.get("nwAcqzrCnt"))
-                a["lost"] += _nps_num(it.get("lssJnngpCnt"))
-                a["n"] += 1
-            if not agg and QUOTA.allow("datagokr"):
-                dj = datagokr_call(NPS_DETAIL, {"seq": sq, "numOfRows": 100, "pageNo": 1})
-                for it in _dg_items(dj):
-                    ym = str(it.get("dataCrtYm") or "").strip()
-                    if len(ym) != 6:
-                        continue
-                    a = agg.setdefault(ym, {"m": 0.0, "amt": 0.0, "new": 0.0,
-                                            "lost": 0.0, "n": 0})
-                    a["m"] += _nps_num(it.get("jnngpCnt"))
-                    a["amt"] += _nps_num(it.get("crrmmNtcAmt"))
-                    a["n"] += 1
-        rows = [{"code": code, "month": pd.Timestamp(f"{ym[:4]}-{ym[4:]}-01")
-                 + pd.offsets.MonthEnd(0), "nps_members": v["m"], "nps_amt": v["amt"],
-                 "nps_new": v["new"], "nps_lost": v["lost"], "n_sites": float(v["n"]),
-                 "match_conf": conf}
-                for ym, v in agg.items() if v["m"] > 0]
-        return {"_rows": rows, "_code": code} if rows else {"_none": code}
+                rows.append({"code": code,
+                             "month": pd.Timestamp(f"{ym[:4]}-{ym[4:]}-01")
+                                      + pd.offsets.MonthEnd(0),
+                             "nps_members": m,
+                             "nps_amt": _nps_num(it.get("crrmmNtcAmt")),
+                             "nps_new": _nps_num(it.get("nwAcqzrCnt")),
+                             "nps_lost": _nps_num(it.get("lssJnngpCnt")),
+                             "n_sites": 1.0, "match_conf": conf})
+        if not rows:
+            return {"_none": code}
+        agg = (pd.DataFrame(rows).groupby(["code", "month"], as_index=False)
+               .agg(nps_members=("nps_members", "sum"), nps_amt=("nps_amt", "sum"),
+                    nps_new=("nps_new", "sum"), nps_lost=("nps_lost", "sum"),
+                    n_sites=("n_sites", "sum"), match_conf=("match_conf", "max")))
+        return {"_rows": agg.to_dict("records"), "_code": code}
+
 
     if jobs:
-        L.info(f"PACK-N 수집 — ★종목축 {len(jobs):,}종목 (월은 응답에서 나옵니다. "
-               f"옛 구현은 월을 요청에 넣어 {len(jobs)*len(months):,}회를 헛돌았습니다).")
+        L.info(f"PACK-N 수집 — ★종목축 {len(jobs):,}종목 · 종목당 검색 1~3 + 상세 "
+               f"{NPS_MAX_SITES} 회.")
+        # ★★코드로 고칠 수 없는 한계를 먼저 말한다(공식 공지 2018-07-02).
+        #   이 API 는 ★제공시점 기준 1년치만 보관하고 매년 과거분을 삭제한다. 그런데
+        #   n1=dlog(가입자수,12) · n3=diff(상실률,12) · n4=diff(사업장수,12) 는 전부
+        #   ★13개월이 있어야 첫 값이 나온다. 즉 아무리 잘 받아도 첫 실행의 TP_N1~N4 는
+        #   전부 결측이고, V4 가 그걸 보고 팩을 무효화한다. 이건 수집 실패가 아니라
+        #   데이터의 성질이다 — 매월 실행해 원장에 쌓아야 13개월째부터 피처가 생긴다.
+        #   그리고 월별 가입자수는 (사업장 × 월)마다 상세 1콜이라, 전 종목 12개월을
+        #   한 번에 받으려면 약 19만 회가 필요하다(하루 몫의 35배). 그래서 이번 실행은
+        #   ★종목당 최신 1개월만 받아 시딩한다.
+        L.warn("PACK-N 은 ★시딩 단계입니다 — 이 API 는 1년치만 보관하는데 n1·n3·n4 는 "
+               "13개월이 있어야 첫 값이 나옵니다. 이번 실행은 종목당 ★최신 1개월만 받아 "
+               "드라이브에 쌓습니다(월별 전량은 종목당 24콜 = 전 종목 19만 회로 하루 몫의 "
+               "35배). 매월 실행하면 13개월째부터 TP_N1~N4 가 살아납니다. 그때까지 PACK-N 은 "
+               "θ_N 만 계산되고 V4 가 증거층에서 제외합니다 — 정상 동작입니다.")
         with stage_bar(len(jobs), "국민연금 사업장(종목축)") as bar:
             for batch in chunked(jobs, 200):
                 if CLOCK.over() or not QUOTA.allow("datagokr"):
@@ -7780,11 +7874,13 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                         continue                       # 통신 실패 — 원장 미기록(재시도 대상)
                     if "_none" in r:
                         new_led.append({"code": r["_none"], "n_rows": 0,
-                                        "tried_at": today_ts})
+                                        "tried_at": today_ts,
+                                        "rule_ver": NPS_RULE_VER})
                     else:
                         got += r["_rows"]
                         new_led.append({"code": r["_code"], "n_rows": len(r["_rows"]),
-                                        "tried_at": today_ts})
+                                        "tried_at": today_ts,
+                                        "rule_ver": NPS_RULE_VER})
                 bar.update(len(batch))
     if new_led:
         allf = pd.concat([led, pd.DataFrame(new_led)], ignore_index=True) \
@@ -7957,50 +8053,77 @@ def load_hs_map() -> pd.DataFrame:
     return validate_hs_map(VAULT.load_table("hs_corp_map", "shared"))
 
 
+_HS_SGN_OK = re.compile(r"^(\d{2}|\d{4}|\d{6}|\d{10})$")   # ★8자리는 서버가 거부한다
+CUSTOMS_ADV = {"US", "DE", "FR", "GB", "JP", "TW", "NL", "IT", "CA", "AU", "CH", "SE", "BE"}
+
+
 def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
                     max_calls: int = -1) -> pd.DataFrame:
-    """HS별 월 수출 중량/금액/국가군. 키·매핑 없으면 빈 결과(팩 비활성)."""
-    cols = ["ym", "hs", "grp", "exp_usd", "exp_kg"]
+    """HS별 ★국가별 월 수출 금액·중량.
+
+    ★2026-08 재작성 — 옛 구현은 세 가지 때문에 구조적으로 틀렸다:
+      ① `_type=json` — 이 API 는 ★JSON 을 지원하지 않는다. XML 만 온다. net_json 이 항상
+         None 을 돌려줘서, 매핑을 채워 넣어도 전 잡이 0행이었다.
+      ② 잡 축이 (월 × HS) — 이 API 는 조회기간을 최대 1년까지 받는다. ★(연도 × HS) 로
+         묶으면 호출이 정확히 1/12 이 된다(HS 900개 × 11년 = 9,900회).
+      ③ 응답의 ★'총계' 행을 그대로 담았다. 분모(N_usd)가 2배가 되어 전 weight 가 절반으로
+         눌리고, 국가 HHI 는 총계 버킷 때문에 폭발한다.
+      추가로 grp 에 국가코드를 붙여 놔서(`선진_US`) '선진_US'와 '선진_DE'가 다른 버킷이 됐다
+      — dest_hhi 가 국가 HHI 가 아니라 준-국가 HHI 였다. cc 를 분리한다.
+    """
+    cols = ["ym", "hs", "cc", "grp", "exp_usd", "exp_kg"]
     if not (CUSTOMS_API_KEY or DATA_GO_KR_KEY) or not hs_codes:
         return pd.DataFrame(columns=cols)
     key_src = "customs" if CUSTOMS_API_KEY else "datagokr"
     cached = VAULT.load_table("customs_hs_monthly", "shared")
-    have = set()
+    have: set = set()
     if cached is not None and len(cached):
-        have = set(zip(cached["ym"].astype(str), cached["hs"].astype(str)))
-        L.info(f"캐시 재사용: 관세 통관 {len(cached):,}행")
-    ADV = {"US": "선진", "DE": "선진", "FR": "선진", "GB": "선진", "JP": "선진", "TW": "선진",
-           "NL": "선진", "IT": "선진"}
-    jobs = [(m, h) for m in months for h in hs_codes
-            if (m.strftime("%Y%m"), str(h)) not in have]
+        if "cc" not in cached.columns:        # 구 스키마(grp 에 국가 혼합) — 재수집 대상
+            L.info("관세 캐시가 구 스키마입니다(국가코드 미분리) — 국가 HHI 를 위해 새로 받습니다.")
+            cached = None
+        else:
+            have = set(zip(cached["ym"].astype(str).str[:4], cached["hs"].astype(str)))
+            L.info(f"캐시 재사용: 관세 통관 {len(cached):,}행")
+    hs_ok = [str(h) for h in dict.fromkeys(str(x) for x in hs_codes)
+             if _HS_SGN_OK.match(str(x))]
+    if len(hs_ok) < len(set(map(str, hs_codes))):
+        L.info(f"관세 hsSgn 자릿수 필터 — {len(set(map(str, hs_codes)))-len(hs_ok)}개 제외"
+               f"(2·4·6·10자리만 허용, ★8자리는 서버가 거부).")
+    # 최근 2개월은 확정치가 아직 없다(익월 15일경 확정) — 애초에 묻지 않는다.
+    y_max = (pd.Timestamp.today() - pd.DateOffset(months=2)).year
+    years = sorted({int(m.year) for m in months if int(m.year) <= y_max})
+    jobs = [(y, h) for y in years for h in hs_ok if (str(y), h) not in have]
     if RUN_MODE == "CACHED":
         jobs = []
+    if jobs:
+        QUOTA.plan(key_src, len(jobs), f"관세 통관(★연도×HS축 {len(years)}년 × {len(hs_ok)}개)")
 
     def one(job):
-        m, h = job
-        if not QUOTA.allow(key_src):           # ★배치 내부에서도 잔여량 확인(한도 후 발사 방지)
+        y, h = job
+        st, items = dg_call(CUSTOMS_URL,
+                            {"strtYymm": f"{y}01", "endYymm": f"{y}12", "hsSgn": h,
+                             "numOfRows": 9900, "pageNo": 1},
+                            src=key_src, key=CUSTOMS_API_KEY or None)
+        if st != DG_OK:
             return []
-        key = CUSTOMS_API_KEY or DATA_GO_KR_KEY
-        js = net_json(CUSTOMS_URL, source=key_src,
-                      params={"serviceKey": key, "strtYymm": m.strftime("%Y%m"),
-                              "endYymm": m.strftime("%Y%m"), "hsSgn": str(h), "_type": "json"},
-                      count_cb=lambda: QUOTA.charge(key_src))
-        if js is not None and "LIMITED_NUMBER_OF_SERVICE_REQUESTS" in json.dumps(js)[:400]:
-            QUOTA.server_says_limit(key_src)   # ★서버 한도 신호 학습(다른 datagokr 경로와 동일)
-            return []
-        items = _dg_items(js)
         rows = []
         for it in items:
-            cc = str(it.get("statCd") or it.get("cntyCd") or "")
-            rows.append({"ym": m.strftime("%Y%m"), "hs": str(h),
-                         "grp": ADV.get(cc, "기타") + ("_" + cc if cc else ""),
+            yr = str(it.get("year") or "").strip()
+            cc = str(it.get("statCd") or it.get("cntyCd") or "").strip()
+            # ★총계행 제거 — 국가코드가 비었거나 year 가 'YYYY.MM' 형식이 아니면 합계다.
+            if not cc or cc == "-" or "." not in yr:
+                continue
+            rows.append({"ym": yr.replace(".", "").replace("-", ""), "hs": h, "cc": cc,
+                         "grp": "선진" if cc in CUSTOMS_ADV else "신흥",
                          "exp_usd": pd.to_numeric(it.get("expDlr"), errors="coerce"),
                          "exp_kg": pd.to_numeric(it.get("expWgt"), errors="coerce")})
+        if len(items) >= 9900:
+            L.warn(f"관세 {y}/{h}: {len(items):,}행 = numOfRows 상한 — 그 HS 는 반년으로 "
+                   f"쪼개 다시 받아야 누락이 없습니다.")
         return rows
 
     got: List[dict] = []
-    _sx0 = QUOTA.spent(key_src)
-    with stage_bar(len(jobs), "관세 통관(월×HS축)") as bar:
+    with stage_bar(len(jobs), "관세 통관(★연도×HS축)") as bar:
         for batch in budget_batches(jobs, 200, key_src, "관세 통관",
                                     cap=max_calls, unit="건"):
             for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
@@ -8010,11 +8133,17 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
     frames = ([cached] if cached is not None and len(cached) else []) + \
              ([pd.DataFrame(got)] if got else [])
     if not frames:
+        if jobs:
+            _st, _hd = NET_LAST.get(key_src, ("—", ""))
+            L.warn(f"관세 통관 0행 — 마지막 응답 {_st} · {str(_hd)[:150]}")
         return pd.DataFrame(columns=cols)
-    X = pd.concat(frames, ignore_index=True).drop_duplicates()
+    X = pd.concat(frames, ignore_index=True).drop_duplicates(["ym", "hs", "cc"])
     if got:
         VAULT.save_table("customs_hs_monthly", X, "shared", domain="customs",
-                         source="unipass/data.go.kr")
+                         source="data.go.kr:1220000/nitemtrade")
+        L.ok(f"관세 통관 {len(got):,}행 신규 · 누적 {len(X):,}행 · "
+             f"HS {X['hs'].nunique():,}개 · 국가 {X['cc'].nunique():,}개 "
+             f"(호출 {len(jobs):,}회 — 월축이었다면 {len(jobs)*12:,}회)")
     return X.reindex(columns=cols)
 
 
@@ -8658,8 +8787,12 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     C["w_kg"] = colx(C, "exp_kg") * colx(C, "weight").fillna(1.0)
     agg = C.groupby(["code", "month"], observed=True).agg(
         exp_usd=("w_usd", "sum"), exp_kg=("w_kg", "sum")).reset_index()
-    grp_share = (C.groupby(["code", "month", "grp"], observed=True)["w_usd"].sum()
-                  .reset_index())
+    # ★x3(목적지 다변화)의 축은 ★국가여야 한다. 옛 수집기는 grp 에 국가코드를 붙여
+    #   놔서('선진_US','선진_DE') 같은 그룹 안에서도 버킷이 갈렸고, HHI 가 국가 집중도가
+    #   아니라 준-국가 집중도를 재고 있었다. 이제 cc(국가코드)로 잰다.
+    _dest = "cc" if "cc" in C.columns else "grp"
+    grp_share = (C.groupby(["code", "month", _dest], observed=True)["w_usd"].sum()
+                  .reset_index().rename(columns={_dest: "grp"}))
     hhi_m = grp_share.groupby(["code", "month"], observed=True)["w_usd"] \
         .apply(lambda s: hhi(s.to_numpy())).rename("dest_hhi").reset_index()
     agg = agg.merge(hhi_m, on=["code", "month"], how="left")
