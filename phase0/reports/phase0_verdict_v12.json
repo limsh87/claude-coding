@@ -1,9 +1,9 @@
 {
   "run_mode": "LIVE",
   "version": "v1.2",
-  "generated_at": "2026-08-10T06:10:02",
+  "generated_at": "2026-08-10T06:18:47",
   "meta": {
-    "runtime_sec": 3.831648349761963,
+    "runtime_sec": 2.34294056892395,
     "counters": {
       "api_calls_by_date": {},
       "api_calls_total": 0,

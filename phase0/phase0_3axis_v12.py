@@ -51,6 +51,33 @@
 
 from __future__ import annotations
 
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  ▼▼▼  인 증 정 보  입 력 란  —  여기에 키를 붙여넣는다  ▼▼▼               ║
+# ║  비워두면 같은 이름의 환경변수에서 읽는다. 둘 다 없으면 해당 축은          ║
+# ║  BLOCKED_PREREQ(NO_KEY) 로 기록되고 나머지 축은 정상 진행한다.            ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+# [1] 축 A / A-Δ — OpenDART 인증키 (40자 16진 문자열)
+#     발급 https://opendart.fss.or.kr/  →  인증키 신청/관리 (이메일 인증 즉시, 무료)
+DART_API_KEY = ""
+
+# [2] 축 B — GCP 서비스계정. ★ 아래 두 칸의 역할이 다르다. 바꿔 넣으면 축 B가 통째로 죽는다.
+#     발급 https://console.cloud.google.com/iam-admin/serviceaccounts
+#          → 서비스 계정 만들기 → 키 → 새 키 만들기 → JSON → 다운로드
+#     최소 역할: BigQuery User + BigQuery Job User / 결제 계정 연결 필요(월 1TB 무료)
+GCP_SA_KEY_PATH = ""      # JSON 키 "파일의 절대경로"   예) /content/sa-key.json
+GCP_PROJECT_ID = ""       # "프로젝트 ID 문자열"        예) compelling-muse-311107
+
+# [3] 축 C — 공공데이터포털 **Decoding** 키 (코드가 인코딩하므로 Encoding 키를 넣지 말 것)
+#     발급 https://www.data.go.kr/ → 국민연금공단_국민연금 가입 사업장 내역 → 활용신청
+#     ★ 실행 전 마이페이지 > 데이터활용 > 활용신청 현황에서 '승인' 상태를 확인한다.
+#       '신청' 상태면 어떤 파라미터로도 실패한다.
+DATA_GO_KR_KEY = ""
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  ▲▲▲  여기까지가 입력란. 아래는 손대지 않는다.  ▲▲▲                       ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
 import bisect
 import csv
 import io
@@ -757,8 +784,45 @@ def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: Optional[List[
 #  사전점검(Preflight) — 원인을 구분해서 보고한다. 하나의 BLOCKED 로 뭉치지 않는다(§5.1).
 # =============================================================================
 
-DART_API_KEY = os.environ.get("DART_API_KEY", "").strip()
-DATA_GO_KR_KEY = os.environ.get("DATA_GO_KR_KEY", "").strip()
+def _resolve_key(pasted: str, env_name: str) -> Tuple[str, str]:
+    """입력란 우선, 없으면 환경변수. 반환: (키, 출처)"""
+    if (pasted or "").strip():
+        return pasted.strip(), "입력란"
+    env = os.environ.get(env_name, "").strip()
+    if env:
+        return env, f"환경변수 {env_name}"
+    return "", "없음"
+
+
+DART_API_KEY, _DART_KEY_SRC = _resolve_key(DART_API_KEY, "DART_API_KEY")
+DATA_GO_KR_KEY, _NPS_KEY_SRC = _resolve_key(DATA_GO_KR_KEY, "DATA_GO_KR_KEY")
+
+# 축 B는 google 라이브러리가 환경변수를 직접 읽으므로, 입력란 값을 환경변수로 승격한다.
+_GCP_PATH, _GCP_PATH_SRC = _resolve_key(GCP_SA_KEY_PATH, "GOOGLE_APPLICATION_CREDENTIALS")
+_GCP_PROJ, _GCP_PROJ_SRC = _resolve_key(GCP_PROJECT_ID, "GOOGLE_CLOUD_PROJECT")
+if _GCP_PATH:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _GCP_PATH
+if _GCP_PROJ:
+    os.environ["GOOGLE_CLOUD_PROJECT"] = _GCP_PROJ
+
+
+def _mask(key: str) -> str:
+    """키 자체는 로그·판정표 어디에도 남기지 않는다. 길이와 앞 4자만 보인다."""
+    if not key:
+        return "(없음)"
+    return f"{key[:4]}…{'*' * 6} (길이 {len(key)})"
+
+
+def log_key_status() -> None:
+    log("  키 입력 상태 (값은 마스킹된다)")
+    log(f"    [1] DART_API_KEY            {_mask(DART_API_KEY)}  ← {_DART_KEY_SRC}")
+    log(f"    [2] GCP_SA_KEY_PATH         "
+        f"{_GCP_PATH or '(없음)'}  ← {_GCP_PATH_SRC}")
+    log(f"        GCP_PROJECT_ID          {_GCP_PROJ or '(없음)'}  ← {_GCP_PROJ_SRC}")
+    log(f"    [3] DATA_GO_KR_KEY          {_mask(DATA_GO_KR_KEY)}  ← {_NPS_KEY_SRC}")
+    if _GCP_PATH and ("/" not in _GCP_PATH and "\\" not in _GCP_PATH):
+        log("    ⚠ GCP_SA_KEY_PATH 가 파일경로가 아니라 프로젝트 ID 처럼 보인다. "
+            "두 칸이 바뀌지 않았는지 확인할 것(§5.1).")
 
 DART_HOST = "opendart.fss.or.kr"
 KRX_HOST = "data.krx.co.kr"
@@ -2564,6 +2628,8 @@ def main() -> int:
     # --- 사전점검 요약 ---------------------------------------------------------
     log("")
     rule("사전점검 (Preflight) — 원인을 구분해 보고한다", "-")
+    log_key_status()
+    log("")
     pre_a = preflight_axis_a()
     pre_b, _bi = preflight_axis_b()
     pre_c = preflight_axis_c()

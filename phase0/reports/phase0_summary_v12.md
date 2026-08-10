@@ -3,10 +3,10 @@
 - 실행 모드: LIVE
 - 전 상장사 노드 수: 미측정 (PENDING)
 - 축 C 첫 응답 wkplNm 표본 3건: 미획득 (PENDING)
-- 생성 시각: 2026-08-10T06:10:02
+- 생성 시각: 2026-08-10T06:18:47
 - PROJECT_ROOT: `/home/user/claude-coding/phase0` (P0_RUNTIME_ROOT=PASS)
 - 총 API 호출: 0 / 중단선 15200 (80% 트립선 12160)
-- 총 실행시간: 3.8s
+- 총 실행시간: 2.3s
 
 ## 축별 판정
 

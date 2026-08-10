@@ -6,6 +6,7 @@
 |---|---|
 | `phase0_3axis_v12.py` | 실행체. §8.5 요구대로 **단일 코드 셀**. Colab 한 셀에 붙여넣거나 `python phase0_3axis_v12.py` |
 | `tests/test_logic_v12.py` | 순수 함수 로직 테스트. **측정값을 만들지 않으며 §9 산출물이 아니다** |
+| `../tools/gen_phase0_preview.py` | 브라우저에서 읽고 복사·다운로드하는 단일 HTML 미리보기 생성기 |
 
 ---
 
@@ -22,15 +23,35 @@ v1.1의 셀프테스트 36/36 PASS는 합성 데이터였으므로 측정값이 
 
 ## 2. 실행에 필요한 것
 
-### 2.1 환경변수
+### 2.1 키 입력란 — 파일 맨 위
 
-| 변수 | 값 | 축 |
+`phase0_3axis_v12.py` 상단(`from __future__` 바로 아래)에 입력란이 있다. 네 칸을 채우면 된다.
+
+```python
+DART_API_KEY    = ""      # OpenDART 인증키 40자
+GCP_SA_KEY_PATH = ""      # JSON 키 "파일의 절대경로"  예) /content/sa-key.json
+GCP_PROJECT_ID  = ""      # "프로젝트 ID 문자열"       예) compelling-muse-311107
+DATA_GO_KR_KEY  = ""      # 공공데이터포털 Decoding 키
+```
+
+비워두면 같은 이름의 환경변수에서 읽는다. 둘 다 없으면 해당 축만 `BLOCKED_PREREQ(NO_KEY)`로
+기록되고 나머지 축은 정상 진행한다.
+
+| 입력란 | 대응 환경변수 | 축 |
 |---|---|---|
-| `DART_API_KEY` | OpenDART 인증키 40자 | A, A-Δ |
-| `GOOGLE_APPLICATION_CREDENTIALS` | 서비스계정 JSON 키 **파일의 절대경로** | B |
-| `GOOGLE_CLOUD_PROJECT` | GCP **프로젝트 ID 문자열** | B |
-| `DATA_GO_KR_KEY` | 공공데이터포털 **Decoding** 키 | C |
-| `P0_PROJECT_ROOT` | (선택) 캐시·산출물 루트. 미지정 시 이 파일의 디렉터리 | 전체 |
+| `DART_API_KEY` | `DART_API_KEY` | A, A-Δ |
+| `GCP_SA_KEY_PATH` | `GOOGLE_APPLICATION_CREDENTIALS` | B |
+| `GCP_PROJECT_ID` | `GOOGLE_CLOUD_PROJECT` | B |
+| `DATA_GO_KR_KEY` | `DATA_GO_KR_KEY` | C |
+| — | `P0_PROJECT_ROOT` (선택) 캐시·산출물 루트 | 전체 |
+
+키는 로그·판정표 어디에도 남지 않는다. 실행 시작 시 **앞 4자와 길이만** 마스킹해 출처와 함께 찍는다.
+
+```
+키 입력 상태 (값은 마스킹된다)
+  [1] DART_API_KEY      abc1…****** (길이 40)  ← 입력란
+  [2] GCP_SA_KEY_PATH   /content/sa-key.json   ← 환경변수 GOOGLE_APPLICATION_CREDENTIALS
+```
 
 > **v1.1이 죽은 지점**: `GOOGLE_APPLICATION_CREDENTIALS`에 프로젝트 ID(`compelling-muse-311107`)를 넣었다.
 > 두 변수는 역할이 다르다. 위 표대로 넣어야 한다. 코드는 이 오설정을 감지하면
