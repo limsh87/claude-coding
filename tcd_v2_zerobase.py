@@ -6728,6 +6728,40 @@ def _disc_done() -> Tuple[set, set]:
     return mons, pairs
 
 
+def _sync_disc_month_ledger(specs: Sequence[dict]) -> int:
+    """(월×유형) 원장 → 월 원장 재동기화. 선택된 유형이 전부 끝난 달만 올린다.
+
+    ★수집을 한 건도 안 한 실행에서도 반드시 돌려야 한다. 이 표는 두 곳이 읽는다:
+      ① disc_plan 의 월 건너뛰기  ② filed_trusted_years 의 연도 신뢰 판정.
+    ②가 막히면 제출사실 소거가 통째로 죽어 직원현황·재무가 전수를 다시 태운다.
+    """
+    try:
+        st = VAULT.load_table("dart_disc_done_spec", "shared")
+        if st is None or not len(st) or not specs:
+            return 0
+        pairs = set(zip(st["ym"].astype(str), st["key"].astype(str)))
+        need = {s["key"] for s in specs}
+        full = sorted({ym for ym, _ in pairs if all((ym, k) in pairs for k in need)})
+        if not full:
+            return 0
+        mt = VAULT.load_table("dart_disclosures_done", "shared")
+        have = set(mt["ym"].astype(str)) if mt is not None and len(mt) else set()
+        add = [m for m in full if m not in have]
+        if not add:
+            return 0
+        am = pd.concat([mt, pd.DataFrame({"ym": add})], ignore_index=True) \
+            if mt is not None and len(mt) else pd.DataFrame({"ym": add})
+        VAULT.save_table("dart_disclosures_done", am.drop_duplicates("ym"), "shared",
+                         domain="dart", source="sweep_complete_months")
+        L.info(f"공시 완주 월 원장 재동기화 — {len(add)}개월을 새로 완주로 확정"
+               f"(누적 {len(have)+len(add)}개월). 이 표가 '제출사실 소거'의 신뢰 근거라,"
+               f" 갱신이 밀리면 소거가 통째로 꺼져 직원현황·재무가 전수를 다시 태웁니다.")
+        return len(add)
+    except Exception as e:                                            # noqa
+        L.warn(f"공시 완주 월 원장 재동기화 실패({type(e).__name__}: {e}) — 소거 없이 진행합니다.")
+        return 0
+
+
 def disc_plan(start: str, end: str, avail: Optional[int] = None) -> dict:
     """★스윕 전 프리플라이트 — 어떤 유형을 훑을지와 '진짜 필요 호출수'를 실측으로 정한다.
 
@@ -6936,6 +6970,9 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = -1,
                             "rcept_dt", "report_nm", "rm") if c in d.columns]
         frames.append(d[keep])
     if not frames:
+        # ★행이 하나도 없어도 원장 재동기화는 한다 — 이전 실행이 (월×유형)만 남긴 채
+        #   끝났으면 여기서 월 원장을 맞춰 줘야 다음 티어의 소거가 살아난다.
+        _sync_disc_month_ledger(specs)
         return empty
     D = pd.concat(frames, ignore_index=True).drop_duplicates("rcept_no", keep="last")
     D["rcept_dt"] = ds_(D["rcept_dt"])
@@ -6960,20 +6997,15 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = -1,
         _new = pd.DataFrame(done_new, columns=["ym", "key"])
         _all = pd.concat([_st, _new], ignore_index=True) \
             if _st is not None and len(_st) else _new
-        _all = _all.drop_duplicates(["ym", "key"])
-        VAULT.save_table("dart_disc_done_spec", _all, "shared",
+        VAULT.save_table("dart_disc_done_spec", _all.drop_duplicates(["ym", "key"]), "shared",
                          domain="dart", source="sweep_complete_month_type")
-        # 선택된 유형이 ★전부 끝난 달만 월 원장에 올린다(하류는 이 원장만 신뢰한다).
-        need_keys = {s["key"] for s in specs}
-        pairset = set(zip(_all["ym"].astype(str), _all["key"].astype(str)))
-        full = sorted({ym for ym, _ in pairset
-                       if all((ym, k) in pairset for k in need_keys)})
-        if full:
-            _mt = VAULT.load_table("dart_disclosures_done", "shared")
-            _am = pd.concat([_mt, pd.DataFrame({"ym": full})], ignore_index=True) \
-                if _mt is not None and len(_mt) else pd.DataFrame({"ym": full})
-            VAULT.save_table("dart_disclosures_done", _am.drop_duplicates("ym"), "shared",
-                             domain="dart", source="sweep_complete_months")
+    # ★★월 원장 재동기화는 ★새로 받은 게 없어도 한다.
+    #   옛 코드는 이 블록이 `if done_new:` 안에 있었다. 그래서 스윕이 이미 다 끝난 실행
+    #   (남은 (월×유형) 0건)에서는 한 번도 갱신되지 않았고, (월×유형) 원장에는 완주로
+    #   남아 있는 달이 월 원장에는 안 올라갔다. 그 결과 filed_trusted_years 가 그 연도를
+    #   신뢰하지 않아 ★소거 지도 134,279조합을 손에 쥐고도 '소거 적용 연도 0개'가 되고,
+    #   직원현황·재무가 전수를 다시 태웠다(실측: 그 상태로 12,046회가 배정됐다).
+    _sync_disc_month_ledger(specs)
     D = pit_mark(D, "rcept_dt", "rcept_dt", origin="dart_list")     # 접수일=공개일
     L.ok(f"공시목록 {len(D):,}건 — " +
          ", ".join(f"{k}={int((D['kind']==k).sum()):,}" for k in DISCLOSURE_KINDS
@@ -8078,6 +8110,36 @@ def pack_off(pid: str, why: str):
         SENSOR_PACKS[pid]["enabled"] = False
         SENSOR_PACKS[pid]["why_off"] = why
         L.warn(f"센서팩 '{pid}' 비활성화 — {why} (조용히 남겨두지 않고 명시적으로 끕니다)")
+
+
+@contextmanager
+def pack_state_guard(restore: bool = True):
+    """★센서팩 활성 상태를 스냅샷했다가 되돌린다.
+
+    pack_off() 는 전역 SENSOR_PACKS 를 끈다. 그래서 ★합성 스모크가 실데이터 실행을
+    오염시킬 수 있다 — 합성 패널에는 관세(X)·조달(P)의 원천이 애초에 없으므로 커버리지
+    0% 판정이 나고, 그 판정이 그대로 남아 실데이터에 그 팩이 아무리 많이 들어와도
+    packs_on() 이 영영 제외한다. 실측에서 매 실행 'X·P 비활성화'가 뜬 원인이 이것이고,
+    hs_corp_map 을 넣어도 조달을 다 받아도 죽는 상태였다. 수집은 하는데 피처가 안
+    만들어지므로 쿼터만 태우고 축은 사라지는, 가장 나쁜 형태의 결함이다.
+
+    스모크는 ★배관 검증이지 데이터 판정이 아니다. 판정은 실데이터로만 한다(§8.4).
+    """
+    snap = {k: (v["enabled"], v["why_off"]) for k, v in SENSOR_PACKS.items()}
+    try:
+        yield snap
+    finally:
+        if restore:
+            back = [k for k, v in SENSOR_PACKS.items()
+                    if not v["enabled"] and snap.get(k, (True, ""))[0]]
+            for k, (en, why) in snap.items():
+                if k in SENSOR_PACKS:
+                    SENSOR_PACKS[k]["enabled"] = en
+                    SENSOR_PACKS[k]["why_off"] = why
+            if back:
+                L.info(f"스모크가 끈 팩 {back} 을 되돌립니다 — 합성데이터엔 그 팩의 원천이 "
+                       f"애초에 없으므로 그건 데이터 판정이 아닙니다. 활성 여부는 실데이터 "
+                       f"커버리지로 다시 판정합니다(§8.4).")
 
 
 # ── 기본 패널 ───────────────────────────────────────────────────────────────────────────────
@@ -10541,8 +10603,17 @@ def main() -> dict:
         contract_selftests(strict=True)
 
     with RUN.step("C.SMOKE", "합성 스모크(계산경로 증명)", "L0"):
-        if not run_smoke(full_chain=(RUN_MODE == "SMOKE")):
-            raise RuntimeError("스모크 실패 — 실데이터 수집을 시작하지 않습니다.")
+        # ★★스모크의 팩 판정을 밖으로 새게 두면 안 된다.
+        #   합성 패널에는 관세(X)·조달(P) 데이터가 없다. 그대로 assemble_signal 을 태우면
+        #   커버리지 0% 판정이 나고 pack_off() 가 ★전역 SENSOR_PACKS 를 끈다. 그 뒤로는
+        #   실데이터에 그 팩이 아무리 많이 들어와도 packs_on() 이 영영 제외한다.
+        #   → 매 실행 'X·P 비활성화'가 뜬 진짜 이유가 이것이다. hs_corp_map 을 넣어도,
+        #     조달 데이터를 다 받아도 죽었다. 수집은 하는데 피처가 안 만들어지므로
+        #     쿼터만 태우고 축은 사라지는, 가장 나쁜 형태의 결함이었다.
+        #   스모크는 ★배관 검증이지 데이터 판정이 아니다. 판정은 실데이터로만 한다(§8.4).
+        with pack_state_guard(restore=(RUN_MODE != "SMOKE")):
+            if not run_smoke(full_chain=(RUN_MODE == "SMOKE")):
+                raise RuntimeError("스모크 실패 — 실데이터 수집을 시작하지 않습니다.")
 
     months = month_grid(BT_START, BT_END)
     if RUN_MODE == "SMOKE":
@@ -10588,6 +10659,79 @@ def main() -> dict:
     with RUN.step("G.FLOW", "기관·외국인 수급(★월축 전종목 일괄)", "L1", critical=False):
         ctx["flows"] = harvest_flows(master["code"].tolist(), BT_START, BT_END)
 
+    with RUN.step("J.PACKS", "센서팩 전용 수집(NPS·조달·관세)", "L1", critical=False):
+        # ★★순서 — 이 스테이지는 H.DART ★앞에 있다.
+        #   옛 배치는 DART(재무·직원·공시) 다음이었다. 그런데 DART 는 전 상장사 × 전 연도라
+        #   가장 무겁고, 시간·호출 예산을 거기서 소진하면 ★뒤에 있는 팩이 통째로 굶는다.
+        #   실제로 국민연금·관세가 여러 실행에서 0건으로 끝났다.
+        #   의존성을 보면 앞으로 옮기는 데 아무 제약이 없다:
+        #     · harvest_nps 는 master(회사명) + adv_rank 만 쓴다 — 둘 다 E.PX 까지면 확정된다
+        #     · harvest_procurement 는 months 만 쓴다
+        #     · harvest_customs 는 hs_map + months 만 쓴다
+        #     · 예산도 별개다(datagokr ↔ dart) — 앞으로 옮겨도 DART 몫이 줄지 않는다
+        #   DART 에 의존하는 것은 ★피처 단계의 θ 뿐이다(θ_N=가입자수/직원수, θ_X=수출/매출).
+        #   그건 L.PANEL 에서 계산하므로 수집 순서와 무관하다.
+        #   ※ PACK-D(공시원문)만은 ctx["disclosures"] 가 필요해 H.DART 뒤(J2.PACKD)에 남긴다.
+        dgb = CallBudget("datagokr", DATAGOKR_BUDGET_SHARE)
+
+        # ★수집기별 개별 격리 — 한 팩의 예외가 나머지 팩 수집까지 무산시키지 않게 한다
+        def _try(tag, fn):
+            try:
+                return fn()
+            except Exception as e:                        # noqa
+                L.warn(f"팩 수집 '{tag}' 실패({type(e).__name__}: {str(e)[:120]}) — "
+                       f"해당 팩만 결측으로 두고 계속 진행합니다.")
+                RUN.note(f"WARN: 팩 수집 {tag} 실패")
+                return None
+
+        ctx["_try_pack"] = _try
+        # ★DART 와 같은 2단계 배분(수요 선언 → 정산). 관세는 수요를 ★정확히 셀 수 있다 —
+        #   (월 × HS코드)이고, HS 매핑이 없으면 0 이다. 0 을 선언하면 그 몫이 회수되어
+        #   국민연금·조달로 흘러간다. 선언이 없으면 '수요 미상'으로 10%를 깔고 앉는다.
+        ctx["hs_map"] = _try("HS매핑", load_hs_map) if "X" in ACTIVE_PACKS else None
+        hs_list = (ctx["hs_map"]["hs"].astype(str).unique().tolist()
+                   if ctx.get("hs_map") is not None and len(ctx["hs_map"]) else [])
+        dgb.declare("customs", len(months) * len(hs_list))
+        dgb.declare("nps", None)          # 종목별 검색 1 + 기간 1 + 상세 ≤3 — 사전에 못 센다
+        dgb.declare("procure", None)      # 월당 페이지 수가 응답에서 나온다
+        dgb.settle()
+        dgb.table({"nps": "국민연금 사업장", "procure": "조달 낙찰", "customs": "관세 통관"})
+        _ar = ctx.get("adv_rank", pd.Series(dtype=float))
+        prio_codes = list(_ar.index) if len(_ar) else master["code"].tolist()
+        if "N" in ACTIVE_PACKS:
+            nps = _try("NPS", lambda: harvest_nps(master, months, priority=prio_codes,
+                                                  max_calls=dgb.take("nps")))
+            if nps is not None and len(nps):
+                _try("NPS등록", lambda: PITX.put(
+                    "nps_monthly",
+                    pit_mark(nps, "month", ds_(nps["month"]) + pd.offsets.MonthEnd(2),
+                             origin="nps"), keys=["code"]))
+        if "P" in ACTIVE_PACKS:
+            ctx["procurement"] = _try("조달",
+                                      lambda: harvest_procurement(months,
+                                                                  max_calls=dgb.take("procure")))
+        if "X" in ACTIVE_PACKS:
+            if hs_list:
+                ctx["customs"] = _try("관세",
+                                      lambda: harvest_customs(months, hs_list,
+                                                              max_calls=dgb.take("customs")))
+            else:
+                # ★이 팩이 꺼지는 이유는 '데이터를 못 받아서'가 아니라 ★매핑이 없어서다.
+                #   계약 §6.3 은 5단계(회사↔HS) 매핑을 자동구축 대상에서 제외한다 — 추정
+                #   매핑은 θ 를 위조하고 V4 부분거부권을 무력화하기 때문이다. 그래서 여기서
+                #   자동으로 만들지 않는다. 대신 ★무엇을 어디에 넣으면 켜지는지를 정확히 알린다.
+                pack_off("X", "HS↔기업 매핑 테이블 부재 — 관세청 통관자료는 'HS코드별 수출'이라 "
+                              "회사로 내리려면 매핑이 반드시 있어야 합니다. 계약 §6.3 이 5단계 "
+                              "매핑을 자동구축 대상에서 제외하므로(추정 매핑은 θ 를 위조하고 V4 "
+                              "부분거부권을 무력화합니다) 이 코드가 임의로 만들지 않습니다.")
+                L.warn("PACK-X 를 켜는 법 — 드라이브 공용 인덱스에 'hs_corp_map' 테이블을 "
+                       "넣으세요. 컬럼: code(6자리 종목코드) · hs(HS 6~10자리) · "
+                       "weight(그 HS 가 그 회사 수출에서 차지하는 비중 0~1) · "
+                       "valid_from · valid_to(매핑 유효구간 — C3 PIT 강제). "
+                       f"경로: {getattr(VAULT, 'ns', {}).get('shared', '(금고 미연결)')}"
+                       " · 파일명 hs_corp_map.parquet(또는 .csv). "
+                       "출처 예: 관세청 수출입무역통계 품목-기업 연계, 무역협회 K-stat, "
+                       "사업보고서 '사업의 내용'의 제품별 매출 비중 + 품목→HS 대응표.")
     with RUN.step("H.DART", "DART 재무·직원·공시(실시간 잔여쿼터)", "L1", critical=False):
         corps = master["corp_code"].dropna().astype(str).unique().tolist()
         years = list(range(d_(BT_START).year - 2, d_(BT_END).year + 1))
@@ -10727,77 +10871,19 @@ def main() -> dict:
                              source="entity_resolution")
         ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, Lk
 
-    with RUN.step("J.PACKS", "팩 전용 수집(NPS·조달·관세·공시원문)", "L1", critical=False):
-        # ★공공데이터포털 잔여도 DART 와 같은 배분기로 나눈다. 국민연금이 잔여를 다 먹으면
-        #   조달·관세가 매 실행 0건이 된다(실측: NPS 가 20,000회를 태우는 동안 나머지는 굶었다).
-        dgb = CallBudget("datagokr", DATAGOKR_BUDGET_SHARE)
-
-        # ★수집기별 개별 격리 — 한 팩의 예외가 나머지 팩 수집까지 무산시키지 않게 한다
-        def _try(tag, fn):
-            try:
-                return fn()
-            except Exception as e:                        # noqa
-                L.warn(f"팩 수집 '{tag}' 실패({type(e).__name__}: {str(e)[:120]}) — "
-                       f"해당 팩만 결측으로 두고 계속 진행합니다.")
-                RUN.note(f"WARN: 팩 수집 {tag} 실패")
-                return None
-
-        # ★DART 와 같은 2단계 배분(수요 선언 → 정산). 관세는 수요를 ★정확히 셀 수 있다 —
-        #   (월 × HS코드)이고, HS 매핑이 없으면 0 이다. 0 을 선언하면 그 몫이 회수되어
-        #   국민연금·조달로 흘러간다. 선언이 없으면 '수요 미상'으로 10%를 깔고 앉는다.
-        ctx["hs_map"] = _try("HS매핑", load_hs_map) if "X" in ACTIVE_PACKS else None
-        hs_list = (ctx["hs_map"]["hs"].astype(str).unique().tolist()
-                   if ctx.get("hs_map") is not None and len(ctx["hs_map"]) else [])
-        dgb.declare("customs", len(months) * len(hs_list))
-        dgb.declare("nps", None)          # 종목별 검색 1 + 기간 1 + 상세 ≤3 — 사전에 못 센다
-        dgb.declare("procure", None)      # 월당 페이지 수가 응답에서 나온다
-        dgb.settle()
-        dgb.table({"nps": "국민연금 사업장", "procure": "조달 낙찰", "customs": "관세 통관"})
-        _ar = ctx.get("adv_rank", pd.Series(dtype=float))
-        prio_codes = list(_ar.index) if len(_ar) else master["code"].tolist()
-        if "N" in ACTIVE_PACKS:
-            nps = _try("NPS", lambda: harvest_nps(master, months, priority=prio_codes,
-                                                  max_calls=dgb.take("nps")))
-            if nps is not None and len(nps):
-                _try("NPS등록", lambda: PITX.put(
-                    "nps_monthly",
-                    pit_mark(nps, "month", ds_(nps["month"]) + pd.offsets.MonthEnd(2),
-                             origin="nps"), keys=["code"]))
-        if "P" in ACTIVE_PACKS:
-            ctx["procurement"] = _try("조달",
-                                      lambda: harvest_procurement(months,
-                                                                  max_calls=dgb.take("procure")))
-        if "X" in ACTIVE_PACKS:
-            if hs_list:
-                ctx["customs"] = _try("관세",
-                                      lambda: harvest_customs(months, hs_list,
-                                                              max_calls=dgb.take("customs")))
-            else:
-                # ★이 팩이 꺼지는 이유는 '데이터를 못 받아서'가 아니라 ★매핑이 없어서다.
-                #   계약 §6.3 은 5단계(회사↔HS) 매핑을 자동구축 대상에서 제외한다 — 추정
-                #   매핑은 θ 를 위조하고 V4 부분거부권을 무력화하기 때문이다. 그래서 여기서
-                #   자동으로 만들지 않는다. 대신 ★무엇을 어디에 넣으면 켜지는지를 정확히 알린다.
-                pack_off("X", "HS↔기업 매핑 테이블 부재 — 관세청 통관자료는 'HS코드별 수출'이라 "
-                              "회사로 내리려면 매핑이 반드시 있어야 합니다. 계약 §6.3 이 5단계 "
-                              "매핑을 자동구축 대상에서 제외하므로(추정 매핑은 θ 를 위조하고 V4 "
-                              "부분거부권을 무력화합니다) 이 코드가 임의로 만들지 않습니다.")
-                L.warn("PACK-X 를 켜는 법 — 드라이브 공용 인덱스에 'hs_corp_map' 테이블을 "
-                       "넣으세요. 컬럼: code(6자리 종목코드) · hs(HS 6~10자리) · "
-                       "weight(그 HS 가 그 회사 수출에서 차지하는 비중 0~1) · "
-                       "valid_from · valid_to(매핑 유효구간 — C3 PIT 강제). "
-                       f"경로: {getattr(VAULT, 'ns', {}).get('shared', '(금고 미연결)')}"
-                       " · 파일명 hs_corp_map.parquet(또는 .csv). "
-                       "출처 예: 관세청 수출입무역통계 품목-기업 연계, 무역협회 K-stat, "
-                       "사업보고서 '사업의 내용'의 제품별 매출 비중 + 품목→HS 대응표.")
-        if "D" in ACTIVE_PACKS:
-            bows = _try("공시원문", lambda: harvest_doc_texts(
-                ctx.get("disclosures", pd.DataFrame()), master))
-            if bows is not None and len(bows):
-                tsim = _try("텍스트유사도", lambda: text_similarity(bows))
-                if tsim is not None and len(tsim):
-                    PITX.put("text_sim",
-                             pit_mark(tsim, "rcept_dt", "rcept_dt", origin="doctext"),
-                             keys=["corp_code"])
+    with RUN.step("J2.PACKD", "공시 원문·텍스트 유사도(PACK-D)", "L1", critical=False,
+                  skip="D" not in ACTIVE_PACKS, skip_why="PACK-D 비활성"):
+        # ★이 팩만 H.DART 뒤에 남는다 — ctx["disclosures"](공시목록)가 원천이기 때문이다.
+        #   나머지 팩(N·P·X)은 DART 와 무관하므로 앞으로 옮겼다(J.PACKS 주석 참조).
+        _try = ctx.get("_try_pack") or (lambda tag, fn: fn())
+        bows = _try("공시원문", lambda: harvest_doc_texts(
+            ctx.get("disclosures", pd.DataFrame()), master))
+        if bows is not None and len(bows):
+            tsim = _try("텍스트유사도", lambda: text_similarity(bows))
+            if tsim is not None and len(tsim):
+                PITX.put("text_sim",
+                         pit_mark(tsim, "rcept_dt", "rcept_dt", origin="doctext"),
+                         keys=["corp_code"])
 
     with RUN.step("K.AUDIT", "원장 무결성 감사(보고서↔애널↔종목)", "L1", critical=False):
         linkage_audit(ctx.get("reports"), ctx.get("analysts"), ctx.get("links"))
