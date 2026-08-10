@@ -211,9 +211,11 @@ def build_final_selection(P: pd.DataFrame, variant: str, n_final: int = FINAL_N,
     else:
         pool = col(d, f"f2_{variant}").fillna(0).astype(bool)
         rank_col = f"score2_{variant}"
+    # ★ X1 은 §8.2 정의상 "1차만 (2차·3차 없음)" 이다. 여기에 3-A 를 적용하면 X1 이 사실은
+    #   '1차 + 3차' 가 되고, §10.4 의 폐기조건 ②(깔때기 기여)와 ③(배제가 MDD 를 개선하는가)이
+    #   둘 다 잘못된 기준선과 비교하게 된다. 특히 ③은 X1 에 이미 배제가 들어가 있으므로
+    #   '배제의 기여가 없다'는 결론을 구조적으로 유도한다 — 2층 논리를 부당하게 반증한다.
     if use_rule3a and stage != "x1":
-        pool = pool & (col(d, "RULE3A_BLOCK").fillna(0) == 0)
-    elif use_rule3a and stage == "x1":
         pool = pool & (col(d, "RULE3A_BLOCK").fillna(0) == 0)
 
     sel = pd.Series(False, index=d.index)

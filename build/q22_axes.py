@@ -93,8 +93,13 @@ def z_lower_is_better(P: pd.DataFrame, raw: pd.Series, valid: pd.Series,
     n_forced = int(forced.sum())
     if n_forced:
         z_out = z_out.where(~forced, worst)
-        # 셀 전체가 부적격이라 worst 도 NaN 이면 -3 으로 바닥을 준다(z 스케일상 하위 0.1%).
-        z_out = z_out.where(~(forced & z_out.isna()), -3.0)
+        # 셀 전체가 부적격이라 worst 도 NaN 인 경우: 임의 상수(-3 등)를 쓰지 않고 '그 시점
+        # 횡단면의 실제 최소 z' 를 바닥으로 쓴다. 명세에 없는 숫자를 만들지 않기 위함이다.
+        if (forced & z_out.isna()).any():
+            floor = z.groupby(P["rebal"].to_numpy(), observed=True).transform("min")
+            z_out = z_out.where(~(forced & z_out.isna()), floor)
+            # 그 시점 전체가 부적격이면 그때만 최후의 바닥값을 쓴다(관측이 아예 없는 경우).
+            z_out = z_out.where(~(forced & z_out.isna()), -3.0)
     if name:
         LOG.debug(f"  {name}: 유효 {int(ok.sum()):,} · 분모부적격 강제최하위 {n_forced:,} · "
                   f"결측(모름) {int(r.isna().sum()):,}")
@@ -256,9 +261,13 @@ def axis_V(P: pd.DataFrame) -> pd.DataFrame:
     # EV = 시총 + 순차입금. 차입금 계정이 결측이면 부채총계로 폴백(과대추정 방향 — 보수적).
     ev = cap + debt.fillna(col(d, "liabilities")).fillna(0) - cash.fillna(0)
     ebit = col(d, "op_income_ttm")
-    # ★ 순현금이 시총보다 커서 EV<=0 인 경우는 '분모 오류'가 아니라 실제로 최우량이다.
-    #   EV 를 0 으로 클립해 비율 0(=최우량)으로 두되, EBIT 부호 규칙은 그대로 적용한다.
-    d["ev_ebit"] = safe_div(ev.clip(lower=0), ebit)
+    # ★ EV<=0(순현금이 시총보다 큼)은 '분모 오류'가 아니라 실제로 최우량이다. §5.2 의 부호
+    #   규칙은 분모(EBIT)에 대한 것이지 분자에 대한 것이 아니다.
+    #   ★ 예전엔 EV 를 0 으로 클립했는데, 그러면 순현금 기업이 전부 비율 0 에 동점으로 묶여
+    #     V축 최상위를 뭉텅이로 차지한다(하위 1000 구간에서 드물지 않다). 클립하지 않으면
+    #     비율이 음수로 이어져 '순현금이 많을수록 더 좋다'는 연속 순서가 그대로 보존된다.
+    #     EBIT>0 이므로 낮을수록 우수라는 단조성도 깨지지 않는다.
+    d["ev_ebit"] = safe_div(ev, ebit)
     d["_v_ok_ev"] = ebit.notna() & (ebit > 0)
 
     d["pbr"] = safe_div(cap, col(d, "equity"))

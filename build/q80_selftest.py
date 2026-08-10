@@ -281,6 +281,7 @@ def run_selftest(full_chain: bool = False) -> bool:
         report_phase0(0.95, 0.60, 0.85, 0.35, 120)
         report_flow_verdict(cmp_res, fdr_pass=fdr)
         report_preregistration_kill([f"{v}-full" for v in VARIANTS], "VQ-full", "X1")
+        report_discretion_ledger()
         report_final_holdings(P, "VQ", "_sel", S["sec"], top_n=12)
         LOG.ok("full_chain 예행연습 완료 — 백테스트·성과검증·강건성·판정표가 모두 정상 출력됩니다.")
         return True

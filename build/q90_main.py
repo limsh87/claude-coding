@@ -429,6 +429,7 @@ def main() -> dict:
                     critical=False):
         ctx["flow_verdict"] = report_flow_verdict(ctx.get("cmp", {}), fdr_pass=ctx.get("fdr"))
         ctx["kill"] = report_preregistration_kill(main_names, best, "X1")
+        report_discretion_ledger()
 
     with PIPE.stage("L6.REPORT", "[15] 최종 산출물", "L6", budget_s=300, critical=False):
         bench = qvf_benchmarks(cal, ctx["px"])
