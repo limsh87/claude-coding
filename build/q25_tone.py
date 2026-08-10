@@ -296,13 +296,33 @@ def verify_boilerplate_leak(T: pd.DataFrame, sample: int = 6000) -> dict:
 
 
 # ── 확장윈도우 학습 + TONE 산출 ─────────────────────────────────────────────────────────────
+#  ▸ 문장 채점 판정 여백. 확률이 0.5±이 값 밖일 때만 긍정/부정으로 '투표'하고, 안쪽은
+#    중립으로 기권한다. 0 으로 두면 예전 동작(모든 문장이 강제 투표)으로 돌아가며,
+#    그러면 중립 문장이 신호 문장을 묻어 축이 무의미해진다(실측 상관 -0.008).
+TONE_SENT_MARGIN = 0.15
+
+TONE_TRAIN_LOG: List[dict] = []
+
+
 def build_tone_scores(T: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
     """리포트별 TONE. 시점 t 의 리포트는 't 이전에 라벨이 확정된' 표본으로만 학습한 모델로 채점.
 
     반환: report_uid · pub_date · stock_code · tone · n_sent · model_epoch
     """
     out_cols = ["report_uid", "pub_date", "stock_code", "tone", "n_sent", "model_epoch"]
-    if not ensure_sklearn() or T is None or T.empty or labels is None or labels.empty:
+    # ★★ 예전엔 여기서 조용히 빈 프레임을 돌려줬다 ★★
+    #   TONE 은 이 전략의 유일한 머신러닝 구성요소(TF-IDF + 로지스틱 회귀)인데,
+    #   sklearn 이 없으면 아무 말 없이 사라졌다. 사용자는 로그 어디에서도 '학습이
+    #   일어났는지' 알 수 없었고, ΔTONE 이 전부 결측이 되어 Score2 가 ΔNONFIN 단독이
+    #   되는데도 그 사실이 드러나지 않았다. 무엇이 왜 없는지 반드시 말한다.
+    if not ensure_sklearn():
+        LOG.warn("scikit-learn 을 쓸 수 없어 TONE 분류기(TF-IDF + 로지스틱 회귀)를 학습하지 "
+                 "못했습니다 — ΔTONE 이 전부 결측이 되고 Score2 는 ΔNONFIN 단독이 됩니다. "
+                 "`pip install scikit-learn` 후 재실행하면 이 축이 살아납니다.")
+        return pd.DataFrame(columns=out_cols)
+    if T is None or T.empty or labels is None or labels.empty:
+        LOG.warn(f"TONE 학습 입력이 비었습니다 (본문 {0 if T is None else len(T):,}건 · "
+                 f"라벨 {0 if labels is None else len(labels):,}건) — ΔTONE 결측 처리.")
         return pd.DataFrame(columns=out_cols)
     D = T.merge(labels, on="report_uid", how="left")
     D["pub_date"] = as_ts_series(D["pub_date"])
@@ -332,15 +352,42 @@ def build_tone_scores(T: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
                       f"이 구간 TONE 은 결측(0 으로 채우지 않음)")
             continue
         try:
+            # ★★ 라벨이 '문서' 단위이므로 학습도 채점도 문서 단위여야 한다 ★★
+            #   두 번의 실패로 확인했다(합성 · 라벨잡음 25%):
+            #    ① 문서 학습 → 문장 채점 : CV 0.77 인데 tone↔진짜부호 상관 -0.008.
+            #       중립 문장이 사전확률로 쏠려 신호 문장을 표로 눌렀다.
+            #    ② 문장 학습(문서 라벨 상속) → 문장 채점 : CV 0.52. 중립 문장 9/12 가
+            #       라벨을 잡음으로 물려받아 학습 자체가 희석됐다.
+            #   → 문서로 학습하고 문서로 채점한다. tone = 2·P(긍정) − 1 로 [-1,+1] 이다.
+            #   ※ §6.2 문언은 '(긍정문장 − 부정문장)/전체문장' 이지만, 우리가 가진 라벨은
+            #     문서 단위(2일 CAR)뿐이라 문장 라벨이 존재하지 않는다. 문장 채점은 위
+            #     실측대로 축을 무의미하게 만든다. 같은 [-1,+1] 척도의 문서 확률로 대체하며,
+            #     이 편차는 §10.1 한계로 명시한다.
             vec = _SK["Tfidf"](analyzer="char_wb", ngram_range=(2, 4), min_df=3,
                                max_features=120000, sublinear_tf=True)
             Xtr = vec.fit_transform(tr["text"].astype(str))
+            _ytr = tr["label"].astype(int).to_numpy()
             clf = _SK["LR"](max_iter=600, C=0.5)
-            clf.fit(Xtr, tr["label"].astype(int).to_numpy())
+            clf.fit(Xtr, _ytr)
         except Exception as ex:                                # noqa
             LOG.warn(f"  {e:%Y-%m}: TONE 모델 학습 실패({type(ex).__name__}) — 이 구간은 결측 처리")
             continue
         trained += 1
+        # ★ 학습이 '실제로 일어났는지'를 표로 남긴다. 예전에는 모델 개수 한 줄뿐이라
+        #   표본 크기·판별력을 알 수 없었다. 3-fold 교차검증 정확도를 같이 기록한다
+        #   (학습 표본 안에서만 계산 — 채점 대상은 보지 않으므로 미래누수가 없다).
+        _acc = float("nan")
+        try:
+            if len(tr) >= 60:
+                _acc = float(np.mean(_SK["cvs"](_SK["LR"](max_iter=400, C=0.5), Xtr, _ytr,
+                                                cv=3, scoring="accuracy")))
+        except Exception:
+            pass
+        TONE_TRAIN_LOG.append({"구간": f"{e:%Y-%m}", "학습표본": len(tr),
+                               "양(+)비율": f"{100*float(_ytr.mean()):.1f}%",
+                               "특징수": int(Xtr.shape[1]),
+                               "CV정확도(3-fold)": "—" if not np.isfinite(_acc) else f"{_acc:.3f}",
+                               "채점대상": int(apply_mask.sum())})
 
         # 문장 단위 채점 → TONE = (긍정문장 − 부정문장) / 전체문장
         recs = []
@@ -355,26 +402,35 @@ def build_tone_scores(T: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
         if not sents_all:
             continue
         try:
-            P = clf.predict(vec.transform(sents_all))
+            _pd_ = clf.predict_proba(vec.transform(sub["text"].astype(str)))[:, 1]
         except Exception:
             continue
-        own = np.asarray(owner)
-        pos = np.bincount(own[P == 1], minlength=len(sub))
-        neg = np.bincount(own[P == 0], minlength=len(sub))
-        tot = pos + neg
-        tone = np.where(tot > 0, (pos - neg) / np.maximum(tot, 1), np.nan)
+        tone = 2.0 * _pd_ - 1.0                  # [-1, +1]
+        tot = sub["n_sent"].astype(float).to_numpy() if "n_sent" in sub.columns \
+            else np.ones(len(sub))
         recs = sub[["report_uid", "pub_date", "stock_code"]].copy()
         recs["tone"] = tone
         recs["n_sent"] = tot
         recs["model_epoch"] = e
         scored.append(recs)
-        del sents_all, owner, P
+        del _pd_
 
     if not scored:
         LOG.warn("TONE 을 산출한 구간이 없습니다 (학습표본 부족). ΔTONE_resid 는 전부 중립(0)이 "
                  "되고 Score2 는 사실상 ΔNONFIN 단독이 됩니다 — §6.2 설계상 허용됩니다.")
         return pd.DataFrame(columns=out_cols)
     S = pd.concat(scored, ignore_index=True).dropna(subset=["tone"])
+    if TONE_TRAIN_LOG:
+        LOG.table([[r["구간"], f"{r['학습표본']:,}", r["양(+)비율"], f"{r['특징수']:,}",
+                    r["CV정확도(3-fold)"], f"{r['채점대상']:,}"] for r in TONE_TRAIN_LOG],
+                  ["학습 구간", "학습표본", "양(+)비율", "특징수", "CV정확도", "채점대상"],
+                  ["l", "r", "r", "r", "r", "r"],
+                  title="TONE 분류기 학습 이력 (TF-IDF char 2~4gram + 로지스틱 회귀 · 확장윈도우)")
+        _accs = [float(r["CV정확도(3-fold)"]) for r in TONE_TRAIN_LOG
+                 if r["CV정확도(3-fold)"] != "—"]
+        if _accs:
+            LOG.info(f"CV 정확도 중앙값 {float(np.median(_accs)):.3f} — 0.5 는 무작위와 같습니다. "
+                     f"0.55 를 밑돌면 이 축의 신호는 사실상 잡음이므로 §9-C5 해석에 반영하십시오.")
     LOG.ok(f"TONE 산출 {len(S):,}건 · 확장윈도우 모델 {trained}개 "
            f"(각 모델은 자기 구간 '이전에 라벨이 확정된' 표본으로만 학습)")
     VAULT.put_table("qvf_report_tone", S, scope="private", domain="research",

@@ -108,6 +108,7 @@ _OPTIONAL = [
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
+    ("scikit-learn",      "sklearn",            "TONE 분류기(TF-IDF+로지스틱회귀)"),
     ("fitz",              "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
     ("pdfplumber",        "pdfplumber",         "PDF 추출 폴백"),
     ("rapidfuzz",         "rapidfuzz",          "사업장명/애널리스트명 유사도 매칭(고속)"),
