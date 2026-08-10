@@ -1911,6 +1911,45 @@ class VaultArchive:
                     return df
         return None
 
+    def explain_missing(self, name: str, scope: str = "shared"):
+        """★'분명히 수집했는데 캐시가 없다' 를 ★추측이 아니라 사실로 만든다.
+
+        load_table 은 두 가지 경우에 조용히 None 을 준다: ①파일이 없다
+        ②parquet 이 손상돼 read_parquet_soft 가 `.corrupt.<ts>` 로 격리했다.
+        ②는 저장 도중 중단(Ctrl-C·커널 재시작)이면 실제로 일어나고, 지금까지는
+        그 사실이 로그 어디에도 안 남아 사용자가 "왜 캐시를 안 쓰냐"고 물을 수밖에 없었다.
+        찾아본 경로와 ★거기 실제로 있는 파일을 전부 찍는다.
+        """
+        L.warn(f"'{name}' 을(를) 어느 경로에서도 읽지 못했습니다 — 찾아본 곳과 실제 내용:")
+        seen = set()
+        for root, sc, tag in ([(self.root, s, "GDRIVE")
+                               for s in (scope, "private" if scope == "shared" else "shared")]
+                              + [(h, scope, "LOCAL_HUNT") for h in self.hunt]):
+            d = os.path.dirname(self._table_path(root, sc, name))
+            if d in seen:
+                continue
+            seen.add(d)
+            if not os.path.isdir(d):
+                L.warn(f"   [{tag}] {d} — 폴더 없음")
+                continue
+            try:
+                fs = sorted(os.listdir(d))
+            except Exception as e:                                # noqa
+                L.warn(f"   [{tag}] {d} — 목록 실패({type(e).__name__})")
+                continue
+            hit = [f for f in fs if f.startswith(name)]
+            corrupt = [f for f in fs if name in f and ".corrupt" in f]
+            L.warn(f"   [{tag}] {d} — 파일 {len(fs)}개"
+                   + (f" · '{name}' 관련 {hit}" if hit else f" · '{name}' 관련 ★없음"))
+            if corrupt:
+                L.warn(f"      ★손상 격리본이 있습니다: {corrupt} — 저장 도중 중단되어 "
+                       f"parquet 이 깨졌다는 뜻입니다. 원본은 삭제하지 않고 보관돼 있으니, "
+                       f"이번 실행이 다시 모아 정상 파일로 대체합니다.")
+            elif fs and not hit:
+                L.warn(f"      같은 폴더의 다른 테이블: {fs[:8]}"
+                       + (" …" if len(fs) > 8 else "")
+                       + " — 폴더는 살아 있으니 이 테이블만 아직 저장된 적이 없습니다.")
+
     # 샤드 테이블(증분 append 전용) ---------------------------------------------------------
     def _shard_dir(self, root: str, scope: str, name: str) -> str:
         nsdir = SHARED_NAMESPACE if scope == "shared" else PRIVATE_NAMESPACE
@@ -2841,7 +2880,13 @@ class QuotaBook:
             return int(lc)
         base = int(self.HINT.get(src, 10 ** 8))
         sp = self.spent(src)
-        if sp >= base:
+        # ★부등호가 결정적이다: `>` 이지 `>=` 가 아니다.
+        #   · spent == HINT — 공식치에 ★막 도달했을 뿐, 그 너머를 받아준다는 근거는 없다.
+        #     여기서 넓히면 근거 없이 한도를 밀어 올리는 것이다. 멈춘다(옛 동작 유지).
+        #     같은 실행 안에서의 확장은 soft 승격 경로(PROBE_MIN_OK 회의 정상 응답)가 맡는다.
+        #   · spent >  HINT — 장부가 ★이미 그만큼 나갔고 서버가 거부하지 않았음을 증명한다.
+        #     그보다 낮은 상한은 사실과 다르다. 재시작해도 그 실측을 잊지 않는다.
+        if sp > base:
             return int(sp + max(1, round(base * self.PROBE_STEP)))
         return base
 
@@ -2856,12 +2901,22 @@ class QuotaBook:
     PROBE_MIN_OK = 40       # 상향하려면 그 구간에서 서버가 이만큼은 정상 응답해야 한다
 
     def ceiling(self, src: str) -> int:
-        """지금 이 순간의 실효 상한. 서버가 알려준 실측치 > 실측 상향치 > 공식치 순."""
+        """지금 이 순간의 ★실효 상한 — allow() 가 실제로 보는 값.
+
+        ★2026-08-10 사고: hint() 만 고치고 여기를 안 고쳐서 반쪽짜리가 됐다. 로그가
+          그 모순을 그대로 찍었다 —
+            "dg_nps: 오늘 이미 20,240건 사용 (잔여 추정 ★1,000건)"   ← hint() (표시용)
+            "[dg_nps] 공식치 10,000건에 도달했고 ... 정지합니다"      ← ceiling() (실제 관문)
+          soft 는 ★메모리 전용이라 재시작하면 비고, 그러면 HINT(10,000) 로 떨어져
+          spent(20,240) 에 막힌다. 그래서 월축 프로브가 ★한 줄도 못 찍고 죽었다.
+          표시와 관문이 다른 값을 보면 그건 버그다 — 같은 근거를 보게 한다.
+        """
         lc = self.learned(src)
         if lc is not None:
             return int(lc)
         key = f"{src}:{self._fp(src)}"
-        return int(self.soft.get(key) or self.HINT.get(src, 10 ** 8))
+        # hint() 가 '서버가 거부한 적 없으면 이미 쓴 만큼이 하한'이라는 근거를 갖고 있다.
+        return max(int(self.soft.get(key) or 0), int(self.hint(src)))
 
     def ok(self, src: str, n: int = 1):
         """서버가 정상 응답했다 — 실측 상향의 근거가 된다(호출 성공 카운터)."""
@@ -8235,9 +8290,10 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
     else:
         # ★비어 있어도 ★반드시 말한다. 조용히 넘어가면 사용자는 "호출은 태웠는데
         #   캐시가 왜 없냐"를 로그만으로 알 수 없다(실제로 그 질문을 받았다).
-        L.warn("국민연금 캐시가 비어 있습니다 — 이번 실행이 처음부터 모읍니다. "
-               "이전 실행에서 호출을 쓰고도 캐시가 없다면 그때 저장 전에 끊긴 것입니다"
-               "(이번 판부터는 ★배치마다 즉시 저장하므로 그 손실이 재발하지 않습니다).")
+        L.warn("국민연금 캐시가 비어 있습니다 — 아래가 그 이유입니다"
+               "(이번 판부터는 ★배치마다 즉시 저장하므로 같은 손실이 재발하지 않습니다).")
+        if VAULT is not None:
+            VAULT.explain_missing("nps_corp_monthly", "shared")
     # ★원장은 '종목 단위'다 — 한 번 조회하면 그 종목의 전 기간이 한꺼번에 들어오기 때문이다.
     today_ts = pd.Timestamp(dtm.date.today())
     done_codes, led = led_read("nps_codes_done", "code", ttl_days=90,
