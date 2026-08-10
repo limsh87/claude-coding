@@ -71,6 +71,10 @@ _DOC_PERIOD_RE = re.compile(r"제\s*\d{1,4}\s*(?:기|분기|반기|사업연도|
 # [2] 잔여 숫자 (반각/전각/콤마/소수/백분율/괄호음수)
 _DOC_NUM_RE = re.compile(r"[（(]?\s*[△▲▽▼\-−]?\s*[0-9０-９][0-9０-９,，.．]*\s*%?\s*[)）]?")
 
+# 마스크 토큰 보호용 자리표시자. 문서 본문에 등장할 수 없는 제어문자를 쓴다.
+_DOC_MASK_PH = {"<NUM>": "\x01N\x02", "<DATE>": "\x01D\x02",
+                "<PERIOD>": "\x01P\x02", "<COMPANY>": "\x01C\x02"}
+
 # [1] 표/이미지/스크립트
 _DOC_TABLE_RE = re.compile(r"<table\b.*?</table>", re.I | re.S)
 _DOC_DROP_TAG_RE = re.compile(r"<(script|style|img|object|embed)\b.*?(</\1>|/?>)", re.I | re.S)
@@ -241,8 +245,16 @@ def arc_normalize_text(raw_html: str, company_names: Sequence[str] = ()) -> str:
     # [5] 서식·법정 문구 제거 + 공백/특수문자 정규화 (표제어는 남긴다)
     t = _DOC_BOILERPLATE_RE.sub(" ", t)
     t = unicodedata.normalize("NFKC", t)
-    t = re.sub(r"[·ㆍ∙•▷▶□■◦○●◇◆＊*※#~^_=+|\\/\[\]{}<>]+(?![A-Z]+>)", " ", t)
-    t = re.sub(r"<\s*(NUM|DATE|PERIOD|COMPANY)\s*>", r"<\1>", t)
+    # ★ 특수문자 정리에서 마스크 토큰이 훼손되는 사고를 원천 차단한다.
+    #   이전 구현은 문자클래스에 <> 를 넣고 (?![A-Z]+>) 로만 보호했는데, 여는 '<' 는 살아도
+    #   닫는 '>' 는 뒤에 [A-Z]+> 가 없으므로 그대로 지워져 '<NUM>' 이 '<NUM ' 이 됐다.
+    #   결과적으로 마스크가 토큰화 단계에서 흩어지고 D1 전체가 무의미해진다(A5 가 잡은 버그).
+    #   → 마스크를 제어문자 자리표시자로 잠시 치환한 뒤 정리하고 되돌린다.
+    for k, ph in _DOC_MASK_PH.items():
+        t = t.replace(k, ph)
+    t = re.sub(r"[·ㆍ∙•▷▶□■◦○●◇◆＊*※#~^_=+|\\/\[\]{}<>]+", " ", t)
+    for k, ph in _DOC_MASK_PH.items():
+        t = t.replace(ph, k)
     t = re.sub(r"(?:<NUM>\s*){3,}", "<NUM> ", t)        # 표 잔재로 반복되는 마스크 압축
     t = re.sub(r"[ \t\r\f\v]+", " ", t)
     t = re.sub(r"\n{2,}", "\n", t)
@@ -517,7 +529,7 @@ def fetch_arc_documents(dis: pd.DataFrame, sec: pd.DataFrame,
     frames = have_frames + ([pd.DataFrame(got)] if got else [])
     if not frames:
         LOG.warn("정기보고서 토큰을 한 건도 확보하지 못했습니다 — D1 비활성화 대상입니다.")
-        _arc_doc_fail_report(0)
+        _arc_doc_fail_report(len(jobs))
         return pd.DataFrame(columns=ARC_DOC_COLS)
 
     T = pd.concat([f.reindex(columns=ARC_DOC_COLS) for f in frames], ignore_index=True)

@@ -337,23 +337,36 @@ def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N)
 
 # 우선주 코드 규칙: 구형 6자리는 끝자리가 5/7/9 (1우/2우B/3우 등),
 # 2024 영숫자 체계는 6번째 자리가 K/L/M/N.
-_PREF_RE = re.compile(r"^\d{5}[5-9]$|^\d{4}[0-9A-HJ-NP-TV-Z][KLMN]$")
+_PREF_NEW_RE = re.compile(r"^\d{4}[0-9A-HJ-NP-TV-Z][KLMN]$")     # 2024 영숫자 체계 우선주
 _SPAC_RE = re.compile(r"스팩|기업인수목적")
 _REIT_RE = re.compile(r"리츠|리 츠|REIT", re.I)
-_PREF_NAME_RE = re.compile(r"(\d?\s*우(?:B|C)?)$|우선주")
+_PREF_NAME_RE = re.compile(r"\d?\s*우(?:B|C)?$|우선주$")
 
 
-def is_preferred(code: str, name: str = "") -> bool:
-    """우선주 판정. 코드 규칙 + 종목명 접미 규칙을 함께 본다.
+def is_preferred(code: str, name: str = "", base_codes: Optional[set] = None) -> bool:
+    """우선주 판정.
 
-    ★ 코드 규칙만 쓰면 신형 티커에서 새고, 이름 규칙만 쓰면 '대우' 같은 정상 사명이 걸린다.
-      둘 중 하나라도 확실하면 우선주로 본다(보수적 제외 — 우선주가 남는 것보다 낫다).
+    ★ '끝자리가 5~9 면 우선주' 라는 흔한 휴리스틱은 과잉 제외를 낳는다. 보통주도 끝자리가
+      0 이 아닌 경우가 있고, 그런 종목을 통째로 버리면 유니버스가 조용히 줄어 선택편향이 된다.
+      그래서 세 근거 중 하나가 확실할 때만 우선주로 본다:
+        ① 2024 영숫자 체계에서 6번째 자리가 K/L/M/N
+        ② 끝자리가 0 이 아니면서 **같은 앞 5자리 + 0 인 보통주가 실제로 존재**
+           (우선주는 정의상 형제 보통주가 있다 — 이게 가장 결정적인 증거다)
+        ③ 종목명이 '…우' / '…우B' / '…우선주' 로 끝남 ('미래에셋대우' 같은 사명은 제외)
     """
     c = str(code or "")
-    if _PREF_RE.match(c):
+    if _PREF_NEW_RE.match(c):
         return True
     n = re.sub(r"\s+", "", str(name or ""))
-    return bool(n and _PREF_NAME_RE.search(n) and not n.endswith("대우"))
+    if n and _PREF_NAME_RE.search(n) and not re.search(r"(대우|한우|교우|동우|삼우)$", n):
+        return True
+    # ★ 끝자리가 0 이 아니라는 것만으로는 부족하다. 한국 우선주 코드는 5/7/9(구형 1·2·3우)
+    #   또는 6/8(신형우선주) 로 끝난다. 1~4 로 끝나는 종목까지 형제 규칙에 걸면 보통주가
+    #   대량 제외되어 유니버스가 조용히 붕괴한다(합성 검정에서 220종목 중 189종목이 제외됐다).
+    if base_codes and len(c) == 6 and c.isdigit() and c[-1] in "56789":
+        if (c[:5] + "0") in base_codes:
+            return True
+    return False
 
 
 def classify_excluded(sec: pd.DataFrame) -> pd.DataFrame:
@@ -373,11 +386,19 @@ def classify_excluded(sec: pd.DataFrame) -> pd.DataFrame:
     nm = S.get("name", pd.Series("", index=S.index)).astype(str)
     S["ex_spac"] = nm.str.contains(_SPAC_RE, na=False).astype("int8")
     S["ex_reit"] = nm.str.contains(_REIT_RE, na=False).astype("int8")
-    S["ex_pref"] = [1 if is_preferred(c, n) else 0 for c, n in zip(S["code"], nm)]
+    _base = set(S["code"].astype(str))
+    S["ex_pref"] = [1 if is_preferred(c, n, _base) else 0 for c, n in zip(S["code"], nm)]
     S["ex_static"] = ((S["ex_spac"] + S["ex_reit"] + S["ex_pref"]) > 0).astype("int8")
     n = int(S["ex_static"].sum())
     LOG.info(f"§3.3 상시 제외 {n:,}종목 — 스팩 {int(S['ex_spac'].sum()):,} · "
              f"우선주 {int(S['ex_pref'].sum()):,} · 리츠 {int(S['ex_reit'].sum()):,}")
+    # ★ 안전밸브: 상시 제외가 과도하면 규칙이 오작동하고 있다는 뜻이다. 조용히 넘기면
+    #   유니버스가 붕괴한 채로 백테스트가 끝까지 돌아가 '표본이 적은 좋은 성과'를 만든다.
+    if len(S) and n / len(S) > 0.15:
+        LOG.warn(f"상시 제외 비율이 {100*n/len(S):.1f}% 로 과도합니다(정상 범위 5~12%). "
+                 f"우선주 판정 규칙이 오작동해 보통주를 걸러내고 있을 가능성이 큽니다 — "
+                 f"유니버스 감쇠 감사표에서 종목수를 반드시 확인하세요.")
+        PIPE.note(f"WARN: 상시 제외 {100*n/len(S):.0f}%")
     return S[cols]
 
 
@@ -400,10 +421,23 @@ class ArcUniverse:
 
     def build(self, rebals: pd.DatetimeIndex, mc: pd.DataFrame, liq: pd.DataFrame) -> pd.DataFrame:
         """리밸일별 U-1000 멤버십을 만든다. 반환: code, asof, mktcap, adtv60, uni_rank."""
-        mcx = (mc.set_index(["code", "asof"])["mktcap"]
-               if mc is not None and len(mc) else pd.Series(dtype=float))
-        lqx = (liq.set_index(["code", "asof"])["adtv60"]
-               if liq is not None and len(liq) else pd.Series(dtype=float))
+        # ★ (code, asof) 가 중복이면 reindex 가 "non-unique multi-index" 로 죽는다.
+        #   실데이터에서는 소스 병합 과정에서 흔히 발생하므로 여기서 방어하고 건수를 남긴다.
+        def _uniq(df, val):
+            if df is None or len(df) == 0 or val not in df.columns:
+                return pd.Series(dtype=float)
+            d = df[["code", "asof", val]].copy()
+            d["code"] = d["code"].astype(str)
+            d["asof"] = as_ts_series(d["asof"])
+            n0 = len(d)
+            d = d.dropna(subset=["code", "asof"]).drop_duplicates(["code", "asof"], keep="last")
+            if n0 - len(d):
+                LOG.info(f"유니버스 입력 '{val}' 에서 중복 (code, asof) {n0-len(d):,}행을 "
+                         f"마지막 값으로 정리했습니다.")
+            return d.set_index(["code", "asof"])[val]
+
+        mcx = _uniq(mc, "mktcap")
+        lqx = _uniq(liq, "adtv60")
         out = []
         for t in rebals:
             t = as_ts(t)
@@ -413,7 +447,8 @@ class ArcUniverse:
             self.audit_row("상시제외후", t, cand)
             if not cand:
                 continue
-            idx = pd.MultiIndex.from_product([cand, [t]], names=["code", "asof"])
+            idx = pd.MultiIndex.from_product([[str(c) for c in cand], [pd.Timestamp(t)]],
+                                             names=["code", "asof"])
             m = mcx.reindex(idx).to_numpy(dtype="float64") if len(mcx) else np.full(len(cand), np.nan)
             a = lqx.reindex(idx).to_numpy(dtype="float64") if len(lqx) else np.full(len(cand), np.nan)
             df = pd.DataFrame({"code": cand, "asof": t, "mktcap": m, "adtv60": a})
