@@ -12,13 +12,34 @@ Colab / JupyterLab 한 셀에 통째로 붙여넣거나 `python phase0_altdata_3
 
 ## 1. 실행
 
+### 코랩 (셀 하나에 붙여넣기)
+
+파일 전체를 한 셀에 붙여넣고 실행하면 된다. 별도 설정 없이 그대로 돈다.
+
+- 작업 루트는 자동으로 **`/content/phase0`** 이 된다 (윈도우면 `C:\phase0`).
+- `/content` 는 세션이 끝나면 사라지므로 계약 `P0_RUNTIME_ROOT` 는 **PASS 가 아니라 `WAIVED`** 로 기록되고,
+  그 사실이 모든 판정표의 `known_limitations` 에 실린다.
+- 대신 **구글드라이브 콜드 백업**이 켜져 있어(`DRIVE_BACKUP=True`) 원본 API 응답을
+  `MyDrive/phase0_cache/` 에 아카이브로 보관한다. 세션이 죽어도 다음 실행에서 되살려서
+  **DART 일일 한도를 다시 태우지 않는다.** 첫 실행 때 드라이브 마운트 승인 창이 뜬다.
+
+바꾸고 싶으면 파일 상단 설정 블록만 고치면 된다:
+
+```python
+PROJECT_ROOT = ""            # 비우면 자동 (코랩 /content/phase0, 윈도우 C:\phase0)
+ALLOW_EPHEMERAL_ROOT = True  # False 로 두면 사라지는 경로에서 아예 중단한다(명세 §8.1 엄격)
+DRIVE_BACKUP = True          # 콜드 백업 사용
+AUTO_MOUNT_DRIVE = True      # 코랩에서 드라이브 자동 마운트 시도
+```
+
+### 커맨드라인
+
 ```bash
-# ① 로직 검증 — 네트워크·키 불필요. 30개 자가검정 + 계약 10건 검사. 약 20초.
-PHASE0_PROJECT_ROOT=/home/<사용자>/phase0 PHASE0_RUN_MODE=SELFTEST \
-    python3 phase0/phase0_altdata_3axis_v11.py
+# ① 로직 검증 — 네트워크·키 불필요. 36개 자가검정 + 계약 10건 검사. 약 20초.
+PHASE0_RUN_MODE=SELFTEST python3 phase0/phase0_altdata_3axis_v11.py
 
 # ② 실측
-export PHASE0_PROJECT_ROOT=/home/<사용자>/phase0   # ★ /content 는 계약 FAIL 로 중단된다
+export PHASE0_PROJECT_ROOT=C:/phase0               # 비우면 환경에 맞춰 자동
 export DART_API_KEY=...                            # 축 A / A-Δ
 export DATA_GO_KR_KEY=...                          # 축 C (일반 인증키 Decoding)
 export GOOGLE_APPLICATION_CREDENTIALS=...          # 축 B (또는 gcloud auth application-default login)
@@ -64,7 +85,7 @@ PHASE0_RUN_MODE=FULL python3 phase0/phase0_altdata_3axis_v11.py
 | 5 | 매핑 실패 86종목 | 6분류 자동 진단 + ⑥원인불명 20종목 초과 시 축 판정 보류 |
 | 6 | PIT 폐기 574건 | STOP 사유에서 제외. 접수년월 분포를 진단 산출물로 남김 |
 | 7 | 축 C HTTP 400 | STOP → UNVERIFIED 재분류 + 4단계 재프로브 |
-| 8 | `/content` 인데 계약 PASS | 런타임 경로를 실제로 검사. `/content` 감지 시 안내 후 중단 |
+| 8 | `/content` 인데 계약 PASS | 런타임 경로를 실제로 검사. 사라지는 경로는 `PASS` 가 될 수 없고 `FAIL` 또는 `WAIVED` 다 |
 | 9 | 캐시 히트율 1.0% | 키 = (corp_code, bsns_year, reprt_code). 재실행 히트율 1.000 검증 |
 | 10 | 호출 수가 누적으로 기록됨 | 버킷별 독립 카운터 + 총계 별도 필드 |
 
@@ -108,6 +129,34 @@ v1.0 이 실제로 11013 을 사용한 것과 일치한다.
 
 셀프테스트 T12c~T12e 가 이 경로를 검증한다.
 
+### 사라지는 작업 루트 (`P0_RUNTIME_ROOT`)
+
+명세 §8.1 이 `/content` 를 막는 이유는 단 하나다 — **세션이 끝나면 캐시가 사라져서
+재실행마다 DART 일일 한도를 새로 태우기 때문**이다. 코랩 외에 선택지가 없는 환경을 위해
+계약 상태를 4단계로 나눴다:
+
+| 상태 | 의미 | 실행 |
+|---|---|---|
+| `PASS` | 사라지지 않는 경로 | 계속 |
+| `WAIVED` | 사라지는 경로 + 운영자 명시 승인(`ALLOW_EPHEMERAL_ROOT=True`) | 계속 |
+| `SKIP` | 검사 자체를 하지 못함 | 계속 |
+| `FAIL` | 위반 | **중단** |
+
+**면제는 절대 `PASS` 로 기록되지 않는다**(셀프테스트 T08c 가 이걸 고정한다).
+그리고 면제 사실은 요약본 구석이 아니라 **모든 축 판정표의 `known_limitations` 맨 앞**에 실린다.
+
+피해 자체는 콜드 백업으로 막는다(§8.4). 원본 API 응답을 아카이브 한 덩어리로 묶어 드라이브에
+보관하고, 다음 실행에서 되살린다. 수집 단계마다 체크포인트를 남기므로 세션이 중간에 죽어도
+거기까지의 호출은 보존된다. 복원은 **skip-if-exists** 라 로컬 핫 캐시를 절대 덮어쓰지 않고,
+재저장 시 직전 세대를 `.prev` 로 남긴다 (T18/T18b/T18c 로 검증).
+
+### 노트북 셀 실행
+
+- `sys.exit()` 를 부르지 않는다. 셀 실행이면 종료코드만 찍는다
+  (IPython 이 `SystemExit` 를 트레이스백으로 도배하고, 그 과정에서 내부 예외까지 터진다).
+- 소스 파일이 없어도 **IPython 입력 히스토리에서 셀 원문을 읽어** 정적 검사를 실제로 수행한다.
+  1차 실행에서 `P0_NO_STRATEGY` 가 통째로 비었던 원인이 이것이다. 못 읽으면 `PASS` 가 아니라 `SKIP` 이다.
+
 ### 호출 예산
 
 가용 19,000콜 기준, **80%(15,200콜) 도달 시 스스로 중단**하고 보고한다.
@@ -128,10 +177,11 @@ v1.0 이 실제로 11013 을 사용한 것과 일치한다.
 `RUN_MODE=SELFTEST` 는 1,300개 합성 법인(겸직 인물 900명 중 600명 상주, 300명 분기마다 교체)으로
 파이프라인을 끝까지 돌리고, 그래프 계산을 **독립적으로 재구현한 naive 버전과 대조**한다.
 
-계약 10건 + 자가검정 30건, 전부 PASS 를 확인했다. 주요 항목:
+계약 10건 + 자가검정 36건, 전부 PASS 를 확인했다. 주요 항목:
 
 | 검사 | 확인 내용 |
 |---|---|
+| T08c~e | 면제는 PASS 로 기록되지 않음 / 셀 실행에서도 정적 검사 수행 / 못 읽으면 SKIP |
 | T09 | 카나리 전멸 시 벌크 미진입 → UNVERIFIED (소모 11콜) |
 | T10c | 유니버스 밖 상대와의 외부 링크 보존 |
 | T10d | 매핑 실패 6분류 정확도 |
@@ -142,6 +192,7 @@ v1.0 이 실제로 11013 을 사용한 것과 일치한다.
 | T14 | 재실행 캐시 히트율 1.000, 신규 호출 0회 |
 | T15 | 축 C 프로브 전멸 → UNVERIFIED (STOP 아님) |
 | T17 | 축 B 인증 없음 → BLOCKED_PREREQ, 우회 시도 없음 |
+| T18~c | 콜드 백업 저장 → 로컬 소거 → 복원 왕복 / 기존 캐시 미훼손 / 직전 세대 보존 |
 
 ---
 
