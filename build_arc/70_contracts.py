@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A20 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A21 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -602,12 +602,40 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A20", "게이트가 실제로 축을 끄는가", a20)
 
+    # ── A21  '정보 없음' 을 '중립 0' 으로 착각하지 않는가 ─────────────────────────────────
+    def a21():
+        P = _mk_panel()
+        P.loc[:29, ["dTONE", "dTONE_resid"]] = np.nan       # 축 A 결측 30개
+        P.loc[:14, ["D1_SCORE", "D2_SCORE", "D3_SCORE"]] = np.nan   # 그중 15개는 축 B 도 결측
+        # ① 축 A 단독 팔: 결측을 0 으로 채우면 전 종목 동점이 되어 코드 순서로 편입된다
+        Q1 = assemble_final(P, use_axes=("A",), use_excl=True)
+        if Q1.loc[:29, "FINAL_SCORE"].notna().any():
+            return False, ("★축 A 단독 팔에서 ΔTONE 결측 종목에 점수가 부여됐습니다. "
+                           "그 팔에는 DART_SCORE 가 없으므로 '중립 0' 은 곧 전 종목 동점이고, "
+                           "리포트가 없는 종목이 코드 순서로 편입됩니다 — A1 이 축 A 의 "
+                           "순기여가 아니라 동점 처리 규칙을 측정하게 됩니다.")
+        if not Q1.loc[30:, "FINAL_SCORE"].notna().any():
+            return False, "축 A 단독 팔에서 ΔTONE 이 있는 종목까지 탈락했습니다"
+        # ② 풀버전: 축 A 결측이라도 축 B 가 있으면 생존(§7.2)
+        Q2 = assemble_final(P, use_axes=("A", "D1", "D2", "D3"), use_excl=True)
+        if not Q2.loc[15:29, "FINAL_SCORE"].notna().all():
+            return False, "풀버전에서 축 A 결측·축 B 보유 종목이 탈락했습니다(§7.2 위반)"
+        # ③ 두 축 모두 결측이면 편입 불가 (근거 없는 종목이 중간 순위를 차지하면 안 된다)
+        if Q2.loc[:14, "FINAL_SCORE"].notna().any():
+            return False, ("★축 A·축 B 가 모두 결측인 종목에 점수가 부여됐습니다. "
+                           "아무 근거도 없는 종목이 중간 순위를 차지하고, 표본이 얇은 분기에는 "
+                           "실제로 편입됩니다.")
+        return True, ("단독 팔은 결측 유지 · 풀버전은 축 A 결측 생존(§7.2) · "
+                      "두 축 모두 결측이면 편입 불가 확인")
+
+    _ac("A21", "'정보 없음' vs '중립 0' 구분", a21)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A20 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A21 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

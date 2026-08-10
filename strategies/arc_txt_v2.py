@@ -247,7 +247,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0542"
+BUILD_VERSION = "v2.20260810.0545"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -9575,18 +9575,26 @@ AXIS_B_LAYERS = (("D1", "D1_SCORE", ARC_W_D1),
 SCORE_OUT_COLS = ["DART_SCORE", "AXIS_A_Z", "FINAL_SCORE", "FINAL_RANK", "n_axes_b"]
 
 
-def _score_axis_a(P: pd.DataFrame, use_raw: bool = False) -> pd.Series:
-    """축 A 표준화 점수. §7.2 — 결측은 0(중립)으로 둔다. 탈락시키지 않는다.
+def _score_axis_a(P: pd.DataFrame, use_raw: bool = False,
+                  neutral_fill: bool = True) -> Tuple[pd.Series, pd.Series]:
+    """축 A 표준화 점수와 '원래 결측이었는지' 마스크.
 
-    ★ 여기서만 결측을 0 으로 채운다. 다른 곳에서 0 채움은 금지다.
-      근거: 명세 §7.2 가 "ΔTONE_resid = 0 (중립)으로 두고 DART_SCORE 만으로 평가한다" 를
-      명시적으로 지시한다. 리포트가 없다는 사실 자체는 나쁜 신호가 아니기 때문이다.
+    §7.2 는 "축 A 결측 종목은 ΔTONE_resid = 0(중립)으로 두고 DART_SCORE 만으로 평가,
+    탈락시키지 말 것" 을 지시한다. 그래서 축 B 가 함께 있을 때만 0 으로 채운다.
+
+    ★ 축 A **단독** 팔(A1/A2 어블레이션)에서는 0 으로 채우면 안 된다. 그 팔에는
+      DART_SCORE 가 없으므로 '중립 0' 이 곧 '전 종목 동점'이 되고, 리포트가 없는 종목이
+      코드 순서로 편입된다. 그러면 A1 은 축 A 의 순기여가 아니라 '동점 처리 규칙'을
+      측정하게 된다. 단독 팔에서는 결측을 결측으로 남겨 편입 대상에서 빼야 한다.
     """
     src = "dTONE" if use_raw else "dTONE_resid"
     if src not in P.columns:
-        return pd.Series(0.0, index=P.index, dtype="float32")
+        empty = pd.Series(np.nan, index=P.index, dtype="float32")
+        return (empty.fillna(0.0) if neutral_fill else empty,
+                pd.Series(True, index=P.index))
     z = xsec_z_arc(P, src)
-    return z.fillna(0.0).astype("float32")
+    miss = z.isna()
+    return ((z.fillna(0.0) if neutral_fill else z).astype("float32"), miss)
 
 
 def _score_d1_variant(P: pd.DataFrame, d1_metric: Optional[str],
@@ -9658,16 +9666,24 @@ def assemble_final(P: pd.DataFrame,
 
     # ── 축 A ──────────────────────────────────────────────────────────────────────────────
     has_a = ("A" in axes) or ("A_RAW" in axes)
-    Q["AXIS_A_Z"] = _score_axis_a(Q, use_raw=("A_RAW" in axes)) if has_a else np.nan
+    has_b = bool(vals)
+    if has_a:
+        az, a_miss = _score_axis_a(Q, use_raw=("A_RAW" in axes), neutral_fill=has_b)
+        Q["AXIS_A_Z"] = az
+    else:
+        Q["AXIS_A_Z"] = np.nan
+        a_miss = pd.Series(True, index=Q.index)
 
     # ── 최종 합성 (§7.2) ──────────────────────────────────────────────────────────────────
-    has_b = bool(vals)
     if has_a and has_b:
-        fin = ARC_W_AXIS_A * Q["AXIS_A_Z"].astype("float64") + \
-              ARC_W_AXIS_B * pd.to_numeric(Q["DART_SCORE"], errors="coerce")
-        # 축 B 가 결측인 행은 축 A 단독으로 평가한다(가중치 재배분). 반대도 마찬가지.
         b = pd.to_numeric(Q["DART_SCORE"], errors="coerce")
+        fin = (ARC_W_AXIS_A * Q["AXIS_A_Z"].astype("float64") + ARC_W_AXIS_B * b)
+        # 축 B 가 결측인 행은 축 A 단독으로 평가한다(가중치 재배분). 반대도 마찬가지.
         fin = fin.where(b.notna(), Q["AXIS_A_Z"].astype("float64"))
+        # ★ 두 축이 모두 결측인 행은 '중립 0' 이 아니라 '정보 없음' 이다. 0 으로 두면
+        #   아무 근거도 없는 종목이 중간 순위를 차지하고, 표본이 얇은 분기에는 그 종목들이
+        #   실제로 편입된다. 명세 §7.2 의 '중립 0' 은 '축 B 가 있을 때' 의 규정이다.
+        fin = fin.where(~(a_miss & b.isna()))
     elif has_a:
         fin = Q["AXIS_A_Z"].astype("float64")
     elif has_b:
@@ -11180,7 +11196,7 @@ def report_dataflow_map() -> None:
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A20 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A21 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -11781,12 +11797,40 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A20", "게이트가 실제로 축을 끄는가", a20)
 
+    # ── A21  '정보 없음' 을 '중립 0' 으로 착각하지 않는가 ─────────────────────────────────
+    def a21():
+        P = _mk_panel()
+        P.loc[:29, ["dTONE", "dTONE_resid"]] = np.nan       # 축 A 결측 30개
+        P.loc[:14, ["D1_SCORE", "D2_SCORE", "D3_SCORE"]] = np.nan   # 그중 15개는 축 B 도 결측
+        # ① 축 A 단독 팔: 결측을 0 으로 채우면 전 종목 동점이 되어 코드 순서로 편입된다
+        Q1 = assemble_final(P, use_axes=("A",), use_excl=True)
+        if Q1.loc[:29, "FINAL_SCORE"].notna().any():
+            return False, ("★축 A 단독 팔에서 ΔTONE 결측 종목에 점수가 부여됐습니다. "
+                           "그 팔에는 DART_SCORE 가 없으므로 '중립 0' 은 곧 전 종목 동점이고, "
+                           "리포트가 없는 종목이 코드 순서로 편입됩니다 — A1 이 축 A 의 "
+                           "순기여가 아니라 동점 처리 규칙을 측정하게 됩니다.")
+        if not Q1.loc[30:, "FINAL_SCORE"].notna().any():
+            return False, "축 A 단독 팔에서 ΔTONE 이 있는 종목까지 탈락했습니다"
+        # ② 풀버전: 축 A 결측이라도 축 B 가 있으면 생존(§7.2)
+        Q2 = assemble_final(P, use_axes=("A", "D1", "D2", "D3"), use_excl=True)
+        if not Q2.loc[15:29, "FINAL_SCORE"].notna().all():
+            return False, "풀버전에서 축 A 결측·축 B 보유 종목이 탈락했습니다(§7.2 위반)"
+        # ③ 두 축 모두 결측이면 편입 불가 (근거 없는 종목이 중간 순위를 차지하면 안 된다)
+        if Q2.loc[:14, "FINAL_SCORE"].notna().any():
+            return False, ("★축 A·축 B 가 모두 결측인 종목에 점수가 부여됐습니다. "
+                           "아무 근거도 없는 종목이 중간 순위를 차지하고, 표본이 얇은 분기에는 "
+                           "실제로 편입됩니다.")
+        return True, ("단독 팔은 결측 유지 · 풀버전은 축 A 결측 생존(§7.2) · "
+                      "두 축 모두 결측이면 편입 불가 확인")
+
+    _ac("A21", "'정보 없음' vs '중립 0' 구분", a21)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A20 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A21 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))
@@ -13079,7 +13123,7 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A20", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A21", "L0", budget_s=300):
         run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
 
     with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",

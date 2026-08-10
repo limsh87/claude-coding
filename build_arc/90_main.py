@@ -289,7 +289,7 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A20", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A21", "L0", budget_s=300):
         run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
 
     with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",

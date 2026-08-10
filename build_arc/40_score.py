@@ -23,18 +23,26 @@ AXIS_B_LAYERS = (("D1", "D1_SCORE", ARC_W_D1),
 SCORE_OUT_COLS = ["DART_SCORE", "AXIS_A_Z", "FINAL_SCORE", "FINAL_RANK", "n_axes_b"]
 
 
-def _score_axis_a(P: pd.DataFrame, use_raw: bool = False) -> pd.Series:
-    """축 A 표준화 점수. §7.2 — 결측은 0(중립)으로 둔다. 탈락시키지 않는다.
+def _score_axis_a(P: pd.DataFrame, use_raw: bool = False,
+                  neutral_fill: bool = True) -> Tuple[pd.Series, pd.Series]:
+    """축 A 표준화 점수와 '원래 결측이었는지' 마스크.
 
-    ★ 여기서만 결측을 0 으로 채운다. 다른 곳에서 0 채움은 금지다.
-      근거: 명세 §7.2 가 "ΔTONE_resid = 0 (중립)으로 두고 DART_SCORE 만으로 평가한다" 를
-      명시적으로 지시한다. 리포트가 없다는 사실 자체는 나쁜 신호가 아니기 때문이다.
+    §7.2 는 "축 A 결측 종목은 ΔTONE_resid = 0(중립)으로 두고 DART_SCORE 만으로 평가,
+    탈락시키지 말 것" 을 지시한다. 그래서 축 B 가 함께 있을 때만 0 으로 채운다.
+
+    ★ 축 A **단독** 팔(A1/A2 어블레이션)에서는 0 으로 채우면 안 된다. 그 팔에는
+      DART_SCORE 가 없으므로 '중립 0' 이 곧 '전 종목 동점'이 되고, 리포트가 없는 종목이
+      코드 순서로 편입된다. 그러면 A1 은 축 A 의 순기여가 아니라 '동점 처리 규칙'을
+      측정하게 된다. 단독 팔에서는 결측을 결측으로 남겨 편입 대상에서 빼야 한다.
     """
     src = "dTONE" if use_raw else "dTONE_resid"
     if src not in P.columns:
-        return pd.Series(0.0, index=P.index, dtype="float32")
+        empty = pd.Series(np.nan, index=P.index, dtype="float32")
+        return (empty.fillna(0.0) if neutral_fill else empty,
+                pd.Series(True, index=P.index))
     z = xsec_z_arc(P, src)
-    return z.fillna(0.0).astype("float32")
+    miss = z.isna()
+    return ((z.fillna(0.0) if neutral_fill else z).astype("float32"), miss)
 
 
 def _score_d1_variant(P: pd.DataFrame, d1_metric: Optional[str],
@@ -106,16 +114,24 @@ def assemble_final(P: pd.DataFrame,
 
     # ── 축 A ──────────────────────────────────────────────────────────────────────────────
     has_a = ("A" in axes) or ("A_RAW" in axes)
-    Q["AXIS_A_Z"] = _score_axis_a(Q, use_raw=("A_RAW" in axes)) if has_a else np.nan
+    has_b = bool(vals)
+    if has_a:
+        az, a_miss = _score_axis_a(Q, use_raw=("A_RAW" in axes), neutral_fill=has_b)
+        Q["AXIS_A_Z"] = az
+    else:
+        Q["AXIS_A_Z"] = np.nan
+        a_miss = pd.Series(True, index=Q.index)
 
     # ── 최종 합성 (§7.2) ──────────────────────────────────────────────────────────────────
-    has_b = bool(vals)
     if has_a and has_b:
-        fin = ARC_W_AXIS_A * Q["AXIS_A_Z"].astype("float64") + \
-              ARC_W_AXIS_B * pd.to_numeric(Q["DART_SCORE"], errors="coerce")
-        # 축 B 가 결측인 행은 축 A 단독으로 평가한다(가중치 재배분). 반대도 마찬가지.
         b = pd.to_numeric(Q["DART_SCORE"], errors="coerce")
+        fin = (ARC_W_AXIS_A * Q["AXIS_A_Z"].astype("float64") + ARC_W_AXIS_B * b)
+        # 축 B 가 결측인 행은 축 A 단독으로 평가한다(가중치 재배분). 반대도 마찬가지.
         fin = fin.where(b.notna(), Q["AXIS_A_Z"].astype("float64"))
+        # ★ 두 축이 모두 결측인 행은 '중립 0' 이 아니라 '정보 없음' 이다. 0 으로 두면
+        #   아무 근거도 없는 종목이 중간 순위를 차지하고, 표본이 얇은 분기에는 그 종목들이
+        #   실제로 편입된다. 명세 §7.2 의 '중립 0' 은 '축 B 가 있을 때' 의 규정이다.
+        fin = fin.where(~(a_miss & b.isna()))
     elif has_a:
         fin = Q["AXIS_A_Z"].astype("float64")
     elif has_b:
