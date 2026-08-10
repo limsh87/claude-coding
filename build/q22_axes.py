@@ -128,8 +128,19 @@ def z_lower_is_better(P: pd.DataFrame, raw: pd.Series, valid: pd.Series,
       상위에 오를 수 있다. 즉 적자기업이 벌점 대신 면제를 받는다. 정반대의 결과다.
     """
     r = pd.to_numeric(raw, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    vb = valid.fillna(False).to_numpy(dtype=bool)
-    ok = vb & r.notna().to_numpy()
+    # ★★ '모름(<NA>)' 을 '부적격(False)' 과 같이 다루면 그 지표가 통째로 죽는다 ★★
+    #   valid 는 3상태다: True=적격 · False=관측했는데 부적격 · <NA>=분모 개념이 없거나 미상.
+    #   예전에는 `valid.fillna(False)` 로 뭉갠 뒤 그것을 z 표본 조건으로도 썼다. 그래서
+    #   '분모 부적격' 개념 자체가 없는 지표(ROIC 표준편차·발생액·주식수 증가율 — axis_Q 가
+    #   의도적으로 valid=<NA> 를 넘긴다)는 표본이 0 이 되어 z 가 전 행 NaN 이 됐다.
+    #   실측: 관측률 100% 인 합성 패널에서도 Q축 5개 지표 중 gp_a·부채비율 2개만 살아남고
+    #   §5.3 이 '반드시 포함' 으로 지정한 주식수 증가율을 포함한 3개가 산출되지 않았다
+    #   (스모크 로그의 "지표 5개 중 평균 2.00개 가용" 이 그 흔적이며, 코드는 이것을
+    #    '커버리지 부족' 으로 잘못 안내했다 — 원인은 수집이 아니라 이 한 줄이었다).
+    #   → z 표본은 '부적격이라고 확인된 것만' 뺀다. 벌점(forced)은 그대로 valid=False 에만.
+    vb_sample = valid.fillna(True).to_numpy(dtype=bool)    # 모름은 z 표본에 포함
+    vb = valid.fillna(False).to_numpy(dtype=bool)          # 적격이라고 '확인된' 것
+    ok = vb_sample & r.notna().to_numpy()
     sig = pd.Series(np.where(ok, -r.to_numpy(dtype="float64"), np.nan), index=P.index)
     z = _cell_ladder_z(P, sig)
 
@@ -311,6 +322,7 @@ def attach_fundamentals_q(G: pd.DataFrame, fq: pd.DataFrame, sec: pd.DataFrame) 
                  f"(행을 버리면 그대로 생존자편향).")
     L = base[m].copy()
     L["corp_code"] = L["corp_code"].astype(str)
+    L["signal_date"] = as_ts_series(L["signal_date"])           # 결합키 단위 고정(as_ts 주석)
     L = L.sort_values("signal_date", kind="stable")
     M = pd.merge_asof(L, R, left_on="signal_date", right_on="knowledge_date",
                       by="corp_code", direction="backward")

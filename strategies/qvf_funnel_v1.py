@@ -274,7 +274,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.1349"
+BUILD_VERSION      = "qvf1.20260810.1427"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -976,6 +976,20 @@ PIPE = Pipeline()
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 # ── 날짜 정규화 ─────────────────────────────────────────────────────────────────────────────
+# ── 시간 해상도 고정 ────────────────────────────────────────────────────────────────────────
+#  ★★ pandas 3.x 는 기본 해상도를 ns 에서 us 로 바꿨다 ★★
+#    · pd.Timestamp("2020-01-01").unit == "us",  pd.to_datetime(["2020-01-01"]) → datetime64[us]
+#    · 그런데 pd.to_datetime(datetime64[ns] 배열) 은 ns 를 그대로 유지한다.
+#    즉 같은 파이프라인 안에서 '문자열/Timestamp 에서 만든 열(us)' 과 '넘파이 ns 배열에서 만든
+#    열(ns)' 이 섞인다. merge_asof 는 결합키 dtype 이 다르면 MergeError 로 죽는다:
+#      "incompatible merge keys [1] dtype('<M8[us]') and dtype('<M8[ns]')"
+#    실제로 이것 하나로 build_nonfin_panel 이 죽어 스모크가 통과하지 못했다. 조용한 열화가
+#    아니라 즉사라서 그나마 낫지만, 원인이 날짜 '값'이 아니라 '단위'라 로그만 봐서는 안 잡힌다.
+#    → 날짜를 만드는 두 함수에서 해상도를 ns 로 못박는다. 이 프로젝트의 시간 범위(1970~2100)는
+#      ns 표현 범위(1677~2262) 안이므로 정보 손실이 없다.
+TS_UNIT = "ns"
+
+
 def as_ts(x) -> Optional[pd.Timestamp]:
     """무엇이 들어오든 tz-naive 로 정규화된 Timestamp. tz 혼재는 이 프로젝트 최빈 버그였다."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -991,7 +1005,11 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return None
     if getattr(t, "tzinfo", None) is not None:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
-    return t.normalize()
+    t = t.normalize()
+    try:
+        return t.as_unit(TS_UNIT)
+    except (AttributeError, ValueError):        # pandas < 2.0 은 항상 ns 라 할 일이 없다
+        return t
 
 
 def as_ts_series(s) -> pd.Series:
@@ -1001,7 +1019,14 @@ def as_ts_series(s) -> pd.Series:
             out = out.dt.tz_localize(None)
     except Exception:
         pass
-    return out.dt.normalize()
+    out = out.dt.normalize()
+    # 해상도 고정 — 여기서 통일하지 않으면 하류 merge_asof 가 dtype 불일치로 죽는다(위 주석).
+    if str(out.dtype).startswith("datetime64") and str(out.dtype) != f"datetime64[{TS_UNIT}]":
+        try:
+            out = out.astype(f"datetime64[{TS_UNIT}]")
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def month_end(x) -> Optional[pd.Timestamp]:
@@ -7179,7 +7204,11 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
     _seen = _amt.notna().cumsum() > 0
     _amt = _amt.where(~(_seen & _amt.isna()), 0.0)
     _adtv = _amt.rolling(int(window), min_periods=int(window)).mean()
-    _adtv = _adtv.stack(dropna=True).rename("adtv").reset_index()
+    # ★ stack(dropna=) 은 pandas 3.x 에서 ValueError 로 제거됐다(같은 저장소의 p_x_customs 가
+    #   이미 그 이유로 melt 를 쓴다). 여기만 남아 있어서 pandas 3 에서는 §3.2 유동성 게이트가
+    #   통째로 죽는다 — L1.PANEL1 이 시작도 못 한다. 버전 안정적인 melt 로 바꾼다(결과 동일).
+    _adtv = (_adtv.reset_index().melt(id_vars="date", var_name="code", value_name="adtv")
+                  .dropna(subset=["adtv"]))
     _adtv.columns = ["date", "code", "adtv"]
     _adtv["code"] = _adtv["code"].astype(str)
     px["code"] = px["code"].astype(str)
@@ -7218,7 +7247,9 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
         lambda s: s.rolling(INVVOL_WINDOW_DAYS, min_periods=max(20, INVVOL_WINDOW_DAYS // 3)).std())
 
     keep = px[["code", "date", "adtv", "cs_spread", "vol_d"]].dropna(subset=["date"])
-    sig = cal[["rebal", "signal_date"]].drop_duplicates().sort_values("signal_date", kind="stable")
+    sig = cal[["rebal", "signal_date"]].drop_duplicates().copy()
+    sig["signal_date"] = as_ts_series(sig["signal_date"])       # 결합키 단위 고정(as_ts 주석)
+    sig = sig.sort_values("signal_date", kind="stable")
     L = (sig.assign(_k=1).merge(pd.DataFrame({"code": sorted(keep["code"].unique()), "_k": 1}),
                                 on="_k").drop(columns="_k")).sort_values("signal_date", kind="stable")
     R = keep.rename(columns={"date": "px_date"}).sort_values("px_date", kind="stable")
@@ -7792,8 +7823,19 @@ def z_lower_is_better(P: pd.DataFrame, raw: pd.Series, valid: pd.Series,
       상위에 오를 수 있다. 즉 적자기업이 벌점 대신 면제를 받는다. 정반대의 결과다.
     """
     r = pd.to_numeric(raw, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    vb = valid.fillna(False).to_numpy(dtype=bool)
-    ok = vb & r.notna().to_numpy()
+    # ★★ '모름(<NA>)' 을 '부적격(False)' 과 같이 다루면 그 지표가 통째로 죽는다 ★★
+    #   valid 는 3상태다: True=적격 · False=관측했는데 부적격 · <NA>=분모 개념이 없거나 미상.
+    #   예전에는 `valid.fillna(False)` 로 뭉갠 뒤 그것을 z 표본 조건으로도 썼다. 그래서
+    #   '분모 부적격' 개념 자체가 없는 지표(ROIC 표준편차·발생액·주식수 증가율 — axis_Q 가
+    #   의도적으로 valid=<NA> 를 넘긴다)는 표본이 0 이 되어 z 가 전 행 NaN 이 됐다.
+    #   실측: 관측률 100% 인 합성 패널에서도 Q축 5개 지표 중 gp_a·부채비율 2개만 살아남고
+    #   §5.3 이 '반드시 포함' 으로 지정한 주식수 증가율을 포함한 3개가 산출되지 않았다
+    #   (스모크 로그의 "지표 5개 중 평균 2.00개 가용" 이 그 흔적이며, 코드는 이것을
+    #    '커버리지 부족' 으로 잘못 안내했다 — 원인은 수집이 아니라 이 한 줄이었다).
+    #   → z 표본은 '부적격이라고 확인된 것만' 뺀다. 벌점(forced)은 그대로 valid=False 에만.
+    vb_sample = valid.fillna(True).to_numpy(dtype=bool)    # 모름은 z 표본에 포함
+    vb = valid.fillna(False).to_numpy(dtype=bool)          # 적격이라고 '확인된' 것
+    ok = vb_sample & r.notna().to_numpy()
     sig = pd.Series(np.where(ok, -r.to_numpy(dtype="float64"), np.nan), index=P.index)
     z = _cell_ladder_z(P, sig)
 
@@ -7975,6 +8017,7 @@ def attach_fundamentals_q(G: pd.DataFrame, fq: pd.DataFrame, sec: pd.DataFrame) 
                  f"(행을 버리면 그대로 생존자편향).")
     L = base[m].copy()
     L["corp_code"] = L["corp_code"].astype(str)
+    L["signal_date"] = as_ts_series(L["signal_date"])           # 결합키 단위 고정(as_ts 주석)
     L = L.sort_values("signal_date", kind="stable")
     M = pd.merge_asof(L, R, left_on="signal_date", right_on="knowledge_date",
                       by="corp_code", direction="backward")
@@ -9224,6 +9267,7 @@ def _asof_attach(base: pd.DataFrame, R: pd.DataFrame, sec: pd.DataFrame,
         return d.drop(columns=["_ord"])
     L = d[m].copy()
     L["corp_code"] = L["corp_code"].astype(str)
+    L["signal_date"] = as_ts_series(L["signal_date"])           # 결합키 단위 고정(as_ts 주석)
     L = L.sort_values("signal_date", kind="stable")
     M = pd.merge_asof(L, RR, left_on="signal_date", right_on="knowledge_date",
                       by="corp_code", direction="backward", suffixes=("", "_r"))
@@ -10283,6 +10327,9 @@ def build_exec_prices(cal: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame
     codes = sorted(px["code"].unique())
     L = (cal[["rebal", "exec_date"]].assign(_k=1)
          .merge(pd.DataFrame({"code": codes, "_k": 1}), on="_k").drop(columns="_k"))
+    # ★ 결합키의 '단위'를 왼쪽에서도 못박는다. 오른쪽(px)은 as_ts_series 를 통과해 ns 인데
+    #   왼쪽 캘린더가 다른 경로로 만들어지면 pandas 3.x 가 MergeError 로 죽는다(as_ts 주석 참조).
+    L["exec_date"] = as_ts_series(L["exec_date"])
     L = L.sort_values("exec_date", kind="stable")
     R = px[["code", "date", "px_exec"]].rename(columns={"date": "px_date"})
     # ★ forward 방향이다. 체결일에 거래가 없으면 '그 이후 첫 거래일'에 체결된 것으로 본다.
@@ -10330,7 +10377,13 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
     E["px_next"] = g["px_exec"].shift(-1)
     E["r_next"] = g["_r"].shift(-1)
     adjacent = (E["r_next"] - E["_r"]) == 1
-    E["fwd_ret"] = (E["px_next"] / E["px_exec"] - 1.0).where(adjacent)
+    # ★★ float64 로 못박는다 ★★
+    #   px_exec 는 downcast_q 로 float32 다. 그대로 두면 fwd_ret 도 float32 가 되는데,
+    #   아래 상장폐지 처리에서 넣는 정리매매 수익률은 float64(종가 소스에 따라 달라짐)라
+    #   pandas 3.x 의 엄격한 setitem 이 `TypeError: Invalid value '[-0.9]' for dtype
+    #   'float32'` 로 죽는다. 하필 그 경로가 생존자편향 방어라 계약 Q3 가 통째로 실패하고
+    #   L0.CONTRACT 에서 실행이 멈춘다(pandas 2.x 에서는 조용히 캐스팅돼 드러나지 않았다).
+    E["fwd_ret"] = (E["px_next"] / E["px_exec"] - 1.0).where(adjacent).astype("float64")
     E["exit_kind"] = np.where(E["fwd_ret"].notna(), "normal", "missing")
 
     # 마지막 리밸런싱은 다음 시점이 없으므로 수익률이 없는 것이 정상이다.
@@ -10385,7 +10438,7 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
             reach = ld.notna() & (ld >= E.loc[resolve, "_dl"] - pd.Timedelta(days=7))
             liq_ret = lc / entry - 1.0
             captured = reach & liq_ret.notna() & (liq_ret < 0)
-            E.loc[resolve, "fwd_ret"] = liq_ret.where(captured, -1.0)
+            E.loc[resolve, "fwd_ret"] = liq_ret.where(captured, -1.0).astype("float64")
             kind = np.where(captured.to_numpy(), "liquidation", "delist_-100%")
             # 정지 후 창 밖 폐지는 별도 유형으로 남겨 감사표에서 바로 보이게 한다.
             kind = np.where(stuck[resolve].to_numpy() & ~captured.to_numpy(),
@@ -10488,7 +10541,11 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                 _known_spr[_c] = float(_v)
         _med_adv = float(np.median(list(_cur_adv.values()))) if _cur_adv else np.nan
         if not np.isfinite(_med_adv) or _med_adv <= 0:
-            _med_adv = float(ADTV_MIN_KRW)
+            # ★ 상수 이름이 틀려 있었다(ADTV_MIN_KRW 는 이 파일 어디에도 정의돼 있지 않다).
+            #   그 분기 ADTV 가 하나도 없으면 NameError 로 백테스트가 죽는다 — 함수 안이라
+            #   조립기의 '정의 전 참조' 검사(최상위만 본다)도 잡지 못했다. §3.2 의 유동성
+            #   하한이 의도한 값이다.
+            _med_adv = float(MIN_ADTV_KRW)
         sub = d[d["rebal"] == t].copy()
         if sub.empty:
             # ★ 3-A 통과 종목이 0 인 분기는 설계상 발생할 수 있는 정상 결과다(사전등록).
@@ -10815,9 +10872,17 @@ def paired_diff_test(a: str, b: str, label: Optional[str] = None) -> dict:
     d = d.dropna().to_numpy(dtype=float)
     if len(d) < 4:
         return {"name": nm, "t": np.nan, "p": np.nan, "n": int(len(d)), "mean": np.nan}
-    t, _se = hac_tstat(d)
+    # ★★ hac_tstat 는 (평균, t) 를 돌려준다 — 프로젝트의 다른 8개 호출부는 전부 그렇게 받는다.
+    #   여기만 `t, _se = ...` 로 받아 '평균'을 t 통계량으로 쓰고 있었다. 분기수익률 차이의
+    #   평균은 통상 0.001~0.05 라 p = 1 − t.cdf(0.05, 39) ≈ 0.48 이 되어:
+    #     · §9-C2 ('차이'가 BH-FDR 후에도 유의) 는 사실상 절대 통과하지 못하고,
+    #     · §10.4 ② ('깔때기 기여가 미미' = p ≥ 0.10) 는 사실상 항상 충족되어
+    #       STOP_ON_KILL_CRITERIA=True 인 기본 실행이 매번 폐기 판정으로 끝난다.
+    #   즉 전략이 성과가 아니라 언패킹 한 줄 때문에 폐기된다. 스모크(n<12 → nan → 폴백)
+    #   에서는 드러나지 않고 40분기 실행에서만 나타나므로 지금까지 잡히지 않았다.
+    mu, t = hac_tstat(d)
     return {"name": nm, "t": float(t), "p": _pval_from_t(float(t), len(d)),
-            "n": int(len(d)), "mean": float(np.mean(d))}
+            "n": int(len(d)), "mean": float(mu)}
 
 
 def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q,
@@ -11416,7 +11481,7 @@ QVF_PINNED_SRC = {
     'apply_filter2': 'def apply_filter2(P: pd.DataFrame, variant: str, n: int = SECOND_N,\n                  use_tone: bool = True, use_nonfin: bool = True,\n                  use_exclusion: bool = True) -> pd.DataFrame:\n    """U-200(변형별) → 상위 n 종목. 어블레이션(X2/X3)을 위해 구성요소를 켜고 끌 수 있다."""\n    d = P.copy()\n    inu = col(d, f"u200_{variant}").fillna(0).astype(bool) if f"u200_{variant}" in d.columns \\\n        else pd.Series(True, index=d.index)\n\n    zN = pd.Series(0.0, index=d.index, dtype="float32")\n    if use_nonfin:\n        zN = zscore_observed_then_neutral(d, "dNONFIN", inu & col(d, "dNONFIN").notna())\n    zT = pd.Series(0.0, index=d.index, dtype="float32")\n    if use_tone:\n        zT = zscore_observed_then_neutral(d, "dTONE_resid", inu & col(d, "dTONE_resid").notna())\n\n    d[f"score2_{variant}"] = (SCORE2_W_NONFIN * zN + SCORE2_W_TONE * zT).astype("float32")\n    excl = col(d, "EXCLUDED").fillna(0).astype(bool) if use_exclusion else \\\n        pd.Series(False, index=d.index)\n\n    sel = pd.Series(False, index=d.index)\n    for _t, g in d.groupby("rebal", observed=True):\n        gg = g[inu.loc[g.index] & ~excl.loc[g.index]]\n        if gg.empty:\n            continue\n        keys = [f"score2_{variant}", f"score1_{variant}", "code"]\n        keys = [k for k in keys if k in gg.columns]\n        asc = [False] * (len(keys) - 1) + [True]\n        idx = gg.sort_values(keys, ascending=asc, kind="mergesort").head(min(n, len(gg))).index\n        sel.loc[idx] = True\n    d[f"f2_{variant}"] = sel\n    return d',
     'build_final_selection': 'def build_final_selection(P: pd.DataFrame, variant: str, n_final: int = FINAL_N,\n                          use_rule3a: bool = True, stage: str = "full") -> pd.Series:\n    """최종 편입 종목 플래그.\n\n    stage: "full"(1→2→3A) | "x1"(1차만) | "x4"(1→2, 3A 없음)\n    """\n    d = P\n    if stage == "x1":\n        pool = col(d, f"u200_{variant}").fillna(0).astype(bool)\n        rank_col = f"score1_{variant}"\n    else:\n        pool = col(d, f"f2_{variant}").fillna(0).astype(bool)\n        rank_col = f"score2_{variant}"\n    # ★ X1 은 §8.2 정의상 "1차만 (2차·3차 없음)" 이다. 여기에 3-A 를 적용하면 X1 이 사실은\n    #   \'1차 + 3차\' 가 되고, §10.4 의 폐기조건 ②(깔때기 기여)와 ③(배제가 MDD 를 개선하는가)이\n    #   둘 다 잘못된 기준선과 비교하게 된다. 특히 ③은 X1 에 이미 배제가 들어가 있으므로\n    #   \'배제의 기여가 없다\'는 결론을 구조적으로 유도한다 — 2층 논리를 부당하게 반증한다.\n    if use_rule3a and stage != "x1":\n        pool = pool & (col(d, "RULE3A_BLOCK").fillna(0) == 0)\n\n    sel = pd.Series(False, index=d.index)\n    short_q: List[Tuple[Any, int]] = []\n    for _t, g in d.groupby("rebal", observed=True):\n        gg = g[pool.loc[g.index]]\n        if gg.empty:\n            short_q.append((_t, 0))\n            continue\n        keys = [c for c in (rank_col, f"score1_{variant}", "code") if c in gg.columns]\n        asc = [False] * (len(keys) - 1) + [True]\n        k = int(min(max(FINAL_N_MIN, min(n_final, FINAL_N_MAX)), len(gg)))\n        # ★ §7.4 는 보유 20~40 종목을 규정한다. 풀이 20 미만이면 그 분기는 규정 미달이며,\n        #   조용히 진행하면 \'집중 포트폴리오의 우연한 성과\'가 규정 준수로 보고된다.\n        #   여기서 종목을 억지로 채우면(제외 규칙을 되돌려서) 그게 더 큰 위반이므로,\n        #   미달 자체는 허용하되 분기와 종목수를 반드시 표면화한다.\n        if k < FINAL_N_MIN:\n            short_q.append((_t, k))\n        sel.loc[gg.sort_values(keys, ascending=asc, kind="mergesort").head(k).index] = True\n    if short_q:\n        LOG.warn(f"§7.4 보유 하한({FINAL_N_MIN}종목) 미달 분기 {len(short_q)}회 "\n                 f"[{stage}/{variant}] — " +\n                 ", ".join(f"{as_ts(t):%Y-%m}:{n}종목" for t, n in short_q[:8]) +\n                 (" …" if len(short_q) > 8 else "") +\n                 ". 규칙을 되돌려 억지로 채우지 않았습니다. 해당 분기의 성과는 "\n                 "\'규정 범위 밖의 집중 포트폴리오\' 로 해석해야 합니다.")\n    return sel',
     'run_experiment': 'def run_experiment(P: pd.DataFrame, cal: pd.DataFrame, fwd: pd.DataFrame, variant: str,\n                   u200_n: int = U200_N, final_n: int = FINAL_N, second_n: int = SECOND_N,\n                   use_tone: bool = True, use_nonfin: bool = True,\n                   use_exclusion: bool = True, use_rule3a: bool = True,\n                   stage: str = "full", scheme: str = "equal",\n                   label: str = "", quiet: bool = True) -> dict:\n    """한 실험(변형 × 구성)을 끝까지 돌린다. 패널 재계산 없이 선정 단계만 다시 돈다.\n\n    ★ 실험 7개 + 민감도 수십 개를 매번 데이터 수집부터 돌리면 4시간 예산(§0.5)을 넘긴다.\n      비싼 것(수집·피처)은 한 번만 하고, 싼 것(스코어·선정·체결)만 반복한다.\n    """\n    keep_level = LOG.min\n    if quiet:\n        LOG.min = LOG.LEVELS["WARN"]\n    try:\n        d = build_u200(P, variants=(variant,), n=u200_n)\n        if stage != "x1":\n            d = apply_filter2(d, variant, n=second_n, use_tone=use_tone,\n                              use_nonfin=use_nonfin, use_exclusion=use_exclusion)\n        d["_sel"] = build_final_selection(d, variant, n_final=final_n,\n                                          use_rule3a=use_rule3a, stage=stage)\n        bt = run_qbacktest(d, cal, "_sel", fwd, scheme=scheme, apply_costs=True,\n                           label=label or f"{variant}-{stage}")\n        bt["panel"] = d\n    finally:\n        LOG.min = keep_level\n    return bt',
-    'run_qbacktest': 'def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.DataFrame,\n                  scheme: str = "equal", apply_costs: bool = True,\n                  label: str = "QVF", delist: Optional[Dict[str, pd.Timestamp]] = None,\n                  cost_model: Optional[str] = None) -> dict:\n    """분기 리밸런싱 롱온리 백테스트. 비용 전/후를 동시에 산출한다.\n\n    cost_model: "spec"(기본, §8.1 문언 = 증권거래세 + 스프레드/2) | "extended"(+수수료+충격)\n    """\n    cost_model = str(cost_model or QVF_COST_MODEL).lower()\n    need = ["code", "rebal", sel_col]\n    d = P[[c for c in P.columns if c in set(need) | {"adtv", "cs_spread", "vol_d", "market",\n                                                     "mktcap", "score1_V", "score1_VQ",\n                                                     "score1_VQF"}]].copy()\n    # ★★ 유동성/스프레드 조회표는 \'선정 종목\'이 아니라 패널 전체에서 만들어야 한다 ★★\n    #   예전에는 선정 종목만 남긴 프레임에서 dict 를 만들었다. 그러면 이번 분기에 \'팔고\n    #   나가는\' 종목은 ADTV 조회가 100% 실패하고, 폴백 `part=1.0`(참여율 100%) 이 걸려\n    #   매도 레그 전체가 IMPACT_K = 1000bp 를 맞았다. 총비용의 9할이 이 한 줄이었고,\n    #   세 변형 전부를 비용 차감 후 음의 CAGR 로 밀어 §10.4 폐기조건 ①을 자동 발동시켰다.\n    _LQ = P[[c for c in ("code", "rebal", "adtv", "cs_spread") if c in P.columns]].copy()\n    _LQ["code"] = _LQ["code"].astype(str)\n    _LQ["rebal"] = as_ts_series(_LQ["rebal"])\n    _adv_by_t: Dict[Any, Dict[str, float]] = {}\n    _spr_by_t: Dict[Any, Dict[str, float]] = {}\n    for _t, _g in _LQ.groupby("rebal", observed=True):\n        _cd = _g["code"].to_numpy()\n        if "adtv" in _g.columns:\n            _adv_by_t[as_ts(_t)] = dict(zip(_cd, pd.to_numeric(_g["adtv"], errors="coerce")))\n        if "cs_spread" in _g.columns:\n            _spr_by_t[as_ts(_t)] = dict(zip(_cd, pd.to_numeric(_g["cs_spread"], errors="coerce")))\n    del _LQ\n    # 패널에서 아예 사라진 종목(유니버스 이탈)을 위한 \'마지막으로 알던 값\' 누적표.\n    _known_adv: Dict[str, float] = {}\n    _known_spr: Dict[str, float] = {}\n    n_adv_fallback = 0\n    d = d[d[sel_col].fillna(False).astype(bool)]\n    F = fwd.set_index(["code", "rebal"])["fwd_ret"] if len(fwd) else pd.Series(dtype="float64")\n\n    reb = sorted(pd.unique(as_ts_series(cal["rebal"])))\n    # ★ 보유구간은 [체결일, 다음 체결일) 이지 [명목일, 다음 명목일) 이 아니다.\n    #   3/1 은 삼일절이라 결코 거래일이 아니고 6/1·12/1 도 주말에 자주 걸린다. 두 구간의\n    #   차이(1~3일의 이음매)에서 폐지된 종목은 \'창 밖\'으로 판정되어 −100% 대신 0% 가 된다.\n    #   즉 분기마다 며칠씩 생존자편향이 새는 뒷문이 열려 있었다.\n    exec_of = {as_ts(r.rebal): as_ts(r.exec_date) for r in cal.itertuples(index=False)}\n    exec_next = {t: (exec_of.get(reb[i + 1]) if i + 1 < len(reb) else None)\n                 for i, t in enumerate(reb)}\n    dlmap = ({str(k): as_ts(v) for k, v in dict(delist).items()} if delist\n             else dict(QVF_DELIST_MAP))\n    prev_w: Dict[str, float] = {}\n    rows, holds = [], []\n    n_missing, n_forced_delist, n_empty_q = 0, 0, 0\n    for t in reb:\n        # 이번 분기 조회표를 갱신한다(패널에 있는 종목은 최신값, 없으면 마지막으로 알던 값).\n        _cur_adv = _adv_by_t.get(as_ts(t), {})\n        _cur_spr = _spr_by_t.get(as_ts(t), {})\n        for _c, _v in _cur_adv.items():\n            if _v is not None and np.isfinite(_v) and _v > 0:\n                _known_adv[_c] = float(_v)\n        for _c, _v in _cur_spr.items():\n            if _v is not None and np.isfinite(_v) and _v > 0:\n                _known_spr[_c] = float(_v)\n        _med_adv = float(np.median(list(_cur_adv.values()))) if _cur_adv else np.nan\n        if not np.isfinite(_med_adv) or _med_adv <= 0:\n            _med_adv = float(ADTV_MIN_KRW)\n        sub = d[d["rebal"] == t].copy()\n        if sub.empty:\n            # ★ 3-A 통과 종목이 0 인 분기는 설계상 발생할 수 있는 정상 결과다(사전등록).\n            #   그런데 예전 코드는 회전율만 기록하고 비용 0, 수익 0 으로 넘겼다 — 전량 청산을\n            #   공짜로 처리하고, 그 분기 보유분의 실제 수익을 통째로 증발시킨 것이다.\n            turn0 = float(sum(abs(v) for v in prev_w.values()))\n            g0 = 0.0\n            nx0 = exec_next.get(t)\n            te0 = exec_of.get(t, t)\n            for c, w in prev_w.items():\n                fr = F.get((c, t), np.nan) if len(F) else np.nan\n                fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan\n                if not np.isfinite(fr):\n                    dl = dlmap.get(str(c))\n                    # 창 안 폐지만 인정하면 \'정지 → 다음 분기 이후 폐지\'가 0% 로 샌다.\n                    # 체결 불가 + 이후 폐지 확인이면 규정대로 −100%(마지막 분기는 제외).\n                    fr = -1.0 if (dl is not None and nx0 is not None and as_ts(dl) > te0) else 0.0\n                g0 += w * fr\n            c0 = 0.0\n            if apply_costs and prev_w:\n                tax0 = qvf_sell_tax(te0)\n                _fee0 = (COMMISSION_BPS / 1e4) if cost_model == "extended" else 0.0\n                for c, w in prev_w.items():\n                    sp0 = _known_spr.get(str(c), np.nan)\n                    sp0 = (float(sp0) if sp0 is not None and np.isfinite(sp0)\n                           else SLIPPAGE_FLOOR_BPS / 1e4)\n                    sp0 = float(np.clip(sp0, SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))\n                    imp0 = 0.0\n                    if cost_model == "extended":\n                        adv0 = _cur_adv.get(str(c), _known_adv.get(str(c), np.nan))\n                        adv0 = float(adv0) if adv0 is not None and np.isfinite(adv0) and adv0 > 0 else _med_adv\n                        imp0 = IMPACT_K * math.sqrt(min(1.0, abs(w) * ACCOUNT_KRW / adv0))\n                    c0 += abs(w) * (_fee0 + sp0 / 2.0 + imp0 + tax0)\n            n_empty_q += 1\n            rows.append({"rebal": t, "ret": g0 - c0, "ret_gross": g0, "n": 0,\n                         "turnover": turn0, "cost": c0})\n            prev_w = {}\n            continue\n        sub["w"] = compute_weights(sub, scheme)\n        w_new = dict(zip(sub["code"].astype(str), sub["w"].astype(float)))\n\n        turn = sum(abs(w_new.get(c, 0.0) - prev_w.get(c, 0.0))\n                   for c in set(w_new) | set(prev_w))\n        cost = 0.0\n        if apply_costs:\n            # ★ 세율 구간 경계가 2019-06-03 인데 2019-06-01 은 토요일이라 그 분기 체결일이\n            #   정확히 2019-06-03 이다. 명목일로 조회하면 그 한 분기만 구세율(0.30%)이 적용돼\n            #   매도 레그 전체에 20bp 를 과다계상한다. 체결일 기준으로 조회한다.\n            tax = qvf_sell_tax(exec_of.get(t, t))\n            _fee = (COMMISSION_BPS / 1e4) if cost_model == "extended" else 0.0\n            for c in set(w_new) | set(prev_w):\n                dw = w_new.get(c, 0.0) - prev_w.get(c, 0.0)\n                if abs(dw) < 1e-9:\n                    continue\n                # 매수·매도 모두 패널 전체 조회표를 쓴다(매도 종목도 값을 갖는다).\n                sp = _cur_spr.get(c, _known_spr.get(c, np.nan))\n                sp = float(sp) if sp is not None and np.isfinite(sp) else SLIPPAGE_FLOOR_BPS / 1e4\n                sp = float(np.clip(sp, SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))\n                impact = 0.0\n                if cost_model == "extended":\n                    adv = _cur_adv.get(c, _known_adv.get(c, np.nan))\n                    if adv is None or not np.isfinite(adv) or adv <= 0:\n                        # 폴백은 \'참여율 100%\'(=충격 상수 1000bp) 가 아니라 그 분기 횡단면\n                        # 중앙 ADTV 다. 조회 실패를 최악의 유동성으로 등치시키면 안 된다.\n                        adv = _med_adv\n                        n_adv_fallback += 1\n                    part = min(1.0, (abs(dw) * ACCOUNT_KRW) / float(adv))\n                    impact = IMPACT_K * math.sqrt(part)\n                one_way = _fee + sp / 2.0 + impact\n                cost += abs(dw) * one_way + (abs(dw) * tax if dw < 0 else 0.0)\n\n        gross = 0.0\n        nx = exec_next.get(t)\n        t_exec = exec_of.get(t, t)\n        for c, w in w_new.items():\n            fr = F.get((c, t), np.nan) if len(F) else np.nan\n            fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan\n            if not np.isfinite(fr):\n                # ★ 체결가가 없어 수익률을 못 만든 종목을 일괄 0% 로 두면, 폐지 직전에\n                #   소스에서 사라지는 종목이 전부 \'무손실\'이 된다 — 생존자편향의 뒷문이다.\n                #   ★ 판정 기준은 "이번 보유창 안에서 폐지"가 아니라 "다시 체결 가능해지지\n                #     않았고(=fr 결측) 이후 폐지되었다"이다. 정지가 수개월 이어지다 폐지되는\n                #     한국 실질심사 경로가 예전 창 조건을 표준적으로 빠져나갔다.\n                dl = dlmap.get(str(c))\n                if dl is not None and nx is not None and as_ts(dl) > t_exec:\n                    fr = -1.0\n                    n_forced_delist += 1\n                else:\n                    fr = 0.0                  # 마지막 분기 등 — 임의 가정 금지\n                    n_missing += 1\n            gross += w * fr\n            holds.append({"rebal": t, "code": c, "weight": w, "ret": fr})\n        rows.append({"rebal": t, "ret": gross - cost, "ret_gross": gross, "n": len(w_new),\n                     "turnover": turn, "cost": cost})\n        prev_w = w_new\n\n    R = pd.DataFrame(rows)\n    if len(R):\n        R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()\n        R["equity_gross"] = (1.0 + R["ret_gross"].fillna(0)).cumprod()\n    if n_forced_delist or n_missing or n_empty_q:\n        LOG.info(f"[{label}] 체결가 결측 보정 — 보유구간 내 폐지 확인 {n_forced_delist:,}건은 "\n                 f"−100% · 그 외 {n_missing:,}건은 0%(마지막 분기 등) · "\n                 f"선정 0종목 분기 {n_empty_q:,}회(청산비용 부과·보유수익 반영)")\n        if n_missing > max(20, 0.02 * len(holds)):\n            LOG.warn(f"0% 로 처리된 보유가 {n_missing:,}건으로 많습니다. 폐지·거래정지가 "\n                     f"\'무손실\'로 새고 있을 수 있습니다 — 위 \'보유 종료 유형\' 표와 함께 보세요.")\n    if n_adv_fallback:\n        LOG.debug(f"[{label}] ADTV 조회 실패 {n_adv_fallback:,}건 — 그 분기 중앙 ADTV 로 대체")\n    return {"returns": R, "holdings": pd.DataFrame(holds), "label": label, "scheme": scheme,\n            "cost_model": cost_model,\n            "n_forced_delist": n_forced_delist, "n_missing": n_missing}',
+    'run_qbacktest': 'def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.DataFrame,\n                  scheme: str = "equal", apply_costs: bool = True,\n                  label: str = "QVF", delist: Optional[Dict[str, pd.Timestamp]] = None,\n                  cost_model: Optional[str] = None) -> dict:\n    """분기 리밸런싱 롱온리 백테스트. 비용 전/후를 동시에 산출한다.\n\n    cost_model: "spec"(기본, §8.1 문언 = 증권거래세 + 스프레드/2) | "extended"(+수수료+충격)\n    """\n    cost_model = str(cost_model or QVF_COST_MODEL).lower()\n    need = ["code", "rebal", sel_col]\n    d = P[[c for c in P.columns if c in set(need) | {"adtv", "cs_spread", "vol_d", "market",\n                                                     "mktcap", "score1_V", "score1_VQ",\n                                                     "score1_VQF"}]].copy()\n    # ★★ 유동성/스프레드 조회표는 \'선정 종목\'이 아니라 패널 전체에서 만들어야 한다 ★★\n    #   예전에는 선정 종목만 남긴 프레임에서 dict 를 만들었다. 그러면 이번 분기에 \'팔고\n    #   나가는\' 종목은 ADTV 조회가 100% 실패하고, 폴백 `part=1.0`(참여율 100%) 이 걸려\n    #   매도 레그 전체가 IMPACT_K = 1000bp 를 맞았다. 총비용의 9할이 이 한 줄이었고,\n    #   세 변형 전부를 비용 차감 후 음의 CAGR 로 밀어 §10.4 폐기조건 ①을 자동 발동시켰다.\n    _LQ = P[[c for c in ("code", "rebal", "adtv", "cs_spread") if c in P.columns]].copy()\n    _LQ["code"] = _LQ["code"].astype(str)\n    _LQ["rebal"] = as_ts_series(_LQ["rebal"])\n    _adv_by_t: Dict[Any, Dict[str, float]] = {}\n    _spr_by_t: Dict[Any, Dict[str, float]] = {}\n    for _t, _g in _LQ.groupby("rebal", observed=True):\n        _cd = _g["code"].to_numpy()\n        if "adtv" in _g.columns:\n            _adv_by_t[as_ts(_t)] = dict(zip(_cd, pd.to_numeric(_g["adtv"], errors="coerce")))\n        if "cs_spread" in _g.columns:\n            _spr_by_t[as_ts(_t)] = dict(zip(_cd, pd.to_numeric(_g["cs_spread"], errors="coerce")))\n    del _LQ\n    # 패널에서 아예 사라진 종목(유니버스 이탈)을 위한 \'마지막으로 알던 값\' 누적표.\n    _known_adv: Dict[str, float] = {}\n    _known_spr: Dict[str, float] = {}\n    n_adv_fallback = 0\n    d = d[d[sel_col].fillna(False).astype(bool)]\n    F = fwd.set_index(["code", "rebal"])["fwd_ret"] if len(fwd) else pd.Series(dtype="float64")\n\n    reb = sorted(pd.unique(as_ts_series(cal["rebal"])))\n    # ★ 보유구간은 [체결일, 다음 체결일) 이지 [명목일, 다음 명목일) 이 아니다.\n    #   3/1 은 삼일절이라 결코 거래일이 아니고 6/1·12/1 도 주말에 자주 걸린다. 두 구간의\n    #   차이(1~3일의 이음매)에서 폐지된 종목은 \'창 밖\'으로 판정되어 −100% 대신 0% 가 된다.\n    #   즉 분기마다 며칠씩 생존자편향이 새는 뒷문이 열려 있었다.\n    exec_of = {as_ts(r.rebal): as_ts(r.exec_date) for r in cal.itertuples(index=False)}\n    exec_next = {t: (exec_of.get(reb[i + 1]) if i + 1 < len(reb) else None)\n                 for i, t in enumerate(reb)}\n    dlmap = ({str(k): as_ts(v) for k, v in dict(delist).items()} if delist\n             else dict(QVF_DELIST_MAP))\n    prev_w: Dict[str, float] = {}\n    rows, holds = [], []\n    n_missing, n_forced_delist, n_empty_q = 0, 0, 0\n    for t in reb:\n        # 이번 분기 조회표를 갱신한다(패널에 있는 종목은 최신값, 없으면 마지막으로 알던 값).\n        _cur_adv = _adv_by_t.get(as_ts(t), {})\n        _cur_spr = _spr_by_t.get(as_ts(t), {})\n        for _c, _v in _cur_adv.items():\n            if _v is not None and np.isfinite(_v) and _v > 0:\n                _known_adv[_c] = float(_v)\n        for _c, _v in _cur_spr.items():\n            if _v is not None and np.isfinite(_v) and _v > 0:\n                _known_spr[_c] = float(_v)\n        _med_adv = float(np.median(list(_cur_adv.values()))) if _cur_adv else np.nan\n        if not np.isfinite(_med_adv) or _med_adv <= 0:\n            # ★ 상수 이름이 틀려 있었다(ADTV_MIN_KRW 는 이 파일 어디에도 정의돼 있지 않다).\n            #   그 분기 ADTV 가 하나도 없으면 NameError 로 백테스트가 죽는다 — 함수 안이라\n            #   조립기의 \'정의 전 참조\' 검사(최상위만 본다)도 잡지 못했다. §3.2 의 유동성\n            #   하한이 의도한 값이다.\n            _med_adv = float(MIN_ADTV_KRW)\n        sub = d[d["rebal"] == t].copy()\n        if sub.empty:\n            # ★ 3-A 통과 종목이 0 인 분기는 설계상 발생할 수 있는 정상 결과다(사전등록).\n            #   그런데 예전 코드는 회전율만 기록하고 비용 0, 수익 0 으로 넘겼다 — 전량 청산을\n            #   공짜로 처리하고, 그 분기 보유분의 실제 수익을 통째로 증발시킨 것이다.\n            turn0 = float(sum(abs(v) for v in prev_w.values()))\n            g0 = 0.0\n            nx0 = exec_next.get(t)\n            te0 = exec_of.get(t, t)\n            for c, w in prev_w.items():\n                fr = F.get((c, t), np.nan) if len(F) else np.nan\n                fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan\n                if not np.isfinite(fr):\n                    dl = dlmap.get(str(c))\n                    # 창 안 폐지만 인정하면 \'정지 → 다음 분기 이후 폐지\'가 0% 로 샌다.\n                    # 체결 불가 + 이후 폐지 확인이면 규정대로 −100%(마지막 분기는 제외).\n                    fr = -1.0 if (dl is not None and nx0 is not None and as_ts(dl) > te0) else 0.0\n                g0 += w * fr\n            c0 = 0.0\n            if apply_costs and prev_w:\n                tax0 = qvf_sell_tax(te0)\n                _fee0 = (COMMISSION_BPS / 1e4) if cost_model == "extended" else 0.0\n                for c, w in prev_w.items():\n                    sp0 = _known_spr.get(str(c), np.nan)\n                    sp0 = (float(sp0) if sp0 is not None and np.isfinite(sp0)\n                           else SLIPPAGE_FLOOR_BPS / 1e4)\n                    sp0 = float(np.clip(sp0, SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))\n                    imp0 = 0.0\n                    if cost_model == "extended":\n                        adv0 = _cur_adv.get(str(c), _known_adv.get(str(c), np.nan))\n                        adv0 = float(adv0) if adv0 is not None and np.isfinite(adv0) and adv0 > 0 else _med_adv\n                        imp0 = IMPACT_K * math.sqrt(min(1.0, abs(w) * ACCOUNT_KRW / adv0))\n                    c0 += abs(w) * (_fee0 + sp0 / 2.0 + imp0 + tax0)\n            n_empty_q += 1\n            rows.append({"rebal": t, "ret": g0 - c0, "ret_gross": g0, "n": 0,\n                         "turnover": turn0, "cost": c0})\n            prev_w = {}\n            continue\n        sub["w"] = compute_weights(sub, scheme)\n        w_new = dict(zip(sub["code"].astype(str), sub["w"].astype(float)))\n\n        turn = sum(abs(w_new.get(c, 0.0) - prev_w.get(c, 0.0))\n                   for c in set(w_new) | set(prev_w))\n        cost = 0.0\n        if apply_costs:\n            # ★ 세율 구간 경계가 2019-06-03 인데 2019-06-01 은 토요일이라 그 분기 체결일이\n            #   정확히 2019-06-03 이다. 명목일로 조회하면 그 한 분기만 구세율(0.30%)이 적용돼\n            #   매도 레그 전체에 20bp 를 과다계상한다. 체결일 기준으로 조회한다.\n            tax = qvf_sell_tax(exec_of.get(t, t))\n            _fee = (COMMISSION_BPS / 1e4) if cost_model == "extended" else 0.0\n            for c in set(w_new) | set(prev_w):\n                dw = w_new.get(c, 0.0) - prev_w.get(c, 0.0)\n                if abs(dw) < 1e-9:\n                    continue\n                # 매수·매도 모두 패널 전체 조회표를 쓴다(매도 종목도 값을 갖는다).\n                sp = _cur_spr.get(c, _known_spr.get(c, np.nan))\n                sp = float(sp) if sp is not None and np.isfinite(sp) else SLIPPAGE_FLOOR_BPS / 1e4\n                sp = float(np.clip(sp, SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))\n                impact = 0.0\n                if cost_model == "extended":\n                    adv = _cur_adv.get(c, _known_adv.get(c, np.nan))\n                    if adv is None or not np.isfinite(adv) or adv <= 0:\n                        # 폴백은 \'참여율 100%\'(=충격 상수 1000bp) 가 아니라 그 분기 횡단면\n                        # 중앙 ADTV 다. 조회 실패를 최악의 유동성으로 등치시키면 안 된다.\n                        adv = _med_adv\n                        n_adv_fallback += 1\n                    part = min(1.0, (abs(dw) * ACCOUNT_KRW) / float(adv))\n                    impact = IMPACT_K * math.sqrt(part)\n                one_way = _fee + sp / 2.0 + impact\n                cost += abs(dw) * one_way + (abs(dw) * tax if dw < 0 else 0.0)\n\n        gross = 0.0\n        nx = exec_next.get(t)\n        t_exec = exec_of.get(t, t)\n        for c, w in w_new.items():\n            fr = F.get((c, t), np.nan) if len(F) else np.nan\n            fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan\n            if not np.isfinite(fr):\n                # ★ 체결가가 없어 수익률을 못 만든 종목을 일괄 0% 로 두면, 폐지 직전에\n                #   소스에서 사라지는 종목이 전부 \'무손실\'이 된다 — 생존자편향의 뒷문이다.\n                #   ★ 판정 기준은 "이번 보유창 안에서 폐지"가 아니라 "다시 체결 가능해지지\n                #     않았고(=fr 결측) 이후 폐지되었다"이다. 정지가 수개월 이어지다 폐지되는\n                #     한국 실질심사 경로가 예전 창 조건을 표준적으로 빠져나갔다.\n                dl = dlmap.get(str(c))\n                if dl is not None and nx is not None and as_ts(dl) > t_exec:\n                    fr = -1.0\n                    n_forced_delist += 1\n                else:\n                    fr = 0.0                  # 마지막 분기 등 — 임의 가정 금지\n                    n_missing += 1\n            gross += w * fr\n            holds.append({"rebal": t, "code": c, "weight": w, "ret": fr})\n        rows.append({"rebal": t, "ret": gross - cost, "ret_gross": gross, "n": len(w_new),\n                     "turnover": turn, "cost": cost})\n        prev_w = w_new\n\n    R = pd.DataFrame(rows)\n    if len(R):\n        R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()\n        R["equity_gross"] = (1.0 + R["ret_gross"].fillna(0)).cumprod()\n    if n_forced_delist or n_missing or n_empty_q:\n        LOG.info(f"[{label}] 체결가 결측 보정 — 보유구간 내 폐지 확인 {n_forced_delist:,}건은 "\n                 f"−100% · 그 외 {n_missing:,}건은 0%(마지막 분기 등) · "\n                 f"선정 0종목 분기 {n_empty_q:,}회(청산비용 부과·보유수익 반영)")\n        if n_missing > max(20, 0.02 * len(holds)):\n            LOG.warn(f"0% 로 처리된 보유가 {n_missing:,}건으로 많습니다. 폐지·거래정지가 "\n                     f"\'무손실\'로 새고 있을 수 있습니다 — 위 \'보유 종료 유형\' 표와 함께 보세요.")\n    if n_adv_fallback:\n        LOG.debug(f"[{label}] ADTV 조회 실패 {n_adv_fallback:,}건 — 그 분기 중앙 ADTV 로 대체")\n    return {"returns": R, "holdings": pd.DataFrame(holds), "label": label, "scheme": scheme,\n            "cost_model": cost_model,\n            "n_forced_delist": n_forced_delist, "n_missing": n_missing}',
     'qvf_sell_tax': 'def qvf_sell_tax(dt) -> float:\n    t = as_ts(dt)\n    rate = QVF_TAX_SCHEDULE[0][1]\n    for d, r in QVF_TAX_SCHEDULE:\n        if t >= as_ts(d):\n            rate = r\n    return float(rate)',
     'Vault.put_table': '    def put_table(self, name: str, df: pd.DataFrame, scope: str = "shared",\n                  domain: str = "table", source: str = "", extra: Optional[dict] = None) -> Optional[str]:\n        """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다."""\n        if df is None:\n            return None\n        path = os.path.join(self.table_dir(scope), f"{name}.parquet")\n        if os.path.exists(path):\n            bak = os.path.join(self.ns[scope], "index", "_backup",\n                               f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")\n            try:\n                # ★ 대용량 테이블(일봉 패널·DART 원시계정 등)은 백업 전체복사가 드라이브에\n                #   파일 크기의 2배 I/O 를 만든다. 몇 행 추가하려고 수백 MB 를 두 번 쓴다.\n                #   atomic_write_parquet 이 이미 임시파일→교체라 \'쓰다 만 파일\'은 생기지\n                #   않으므로, 큰 파일은 복사를 건너뛰고 직전 1개만 보존한다.\n                _sz = os.path.getsize(path)\n                if _sz > VAULT_BACKUP_MAX_BYTES:\n                    _prev = os.path.join(self.ns[scope], "index", "_backup", f"{name}.prev.parquet")\n                    if not os.path.exists(_prev):\n                        shutil.copy2(path, _prev)           # 최초 1회만 안전본을 남긴다\n                    LOG.debug(f"{name}: {_sz/1e6:,.0f}MB — 회차별 백업 생략(원자적 교체로 보호). "\n                              f"직전 안전본은 _backup/{name}.prev.parquet")\n                else:\n                    shutil.copy2(path, bak)\n            except Exception as e:                          # noqa\n                LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "\n                         f"리비전 파일로 저장합니다: {name}")\n                path = os.path.join(self.table_dir(scope),\n                                    f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")\n        try:\n            atomic_write_parquet(df, path)\n        except Exception as e:                              # noqa\n            LOG.warn(f"테이블 저장 실패({type(e).__name__}): {name}")\n            return None\n        self._register(scope, {\n            "uid": sha1_str("table", scope, name), "domain": domain, "subtype": "table",\n            "key": name, "path": os.path.relpath(path, self.root), "abs_path": path,\n            "fmt": "parquet", "bytes": os.path.getsize(path), "sha1": "",\n            "source": source, "adopted": False,\n            "extra": json.dumps({**(extra or {}), "rows": int(len(df)),\n                                 "cols": list(map(str, df.columns))[:80]}, ensure_ascii=False),\n        })\n        return path',
     'Vault.put_blob': '    def put_blob(self, domain: str, subtype: str, key: str, data: bytes, fmt: str,\n                 source: str = "", event_date=None, knowledge_date=None,\n                 scope: str = "shared", extra: Optional[dict] = None,\n                 uid: Optional[str] = None) -> Optional[str]:\n        """원본 바이트를 내용해시 경로에 저장하고 인덱스에 등록. 같은 내용이면 재기록하지 않는다."""\n        if not data:\n            return None\n        h = sha1_bytes(data)\n        uid = uid or sha1_str(domain, subtype, key, h)\n        sub = os.path.join(self.blob_dir(scope), domain, subtype, h[:2], h[2:4])\n        fn = f"{h}.{fmt.lstrip(\'.\')}"\n        abspath = os.path.join(sub, fn)\n        rel = os.path.relpath(abspath, self.root)\n        if not os.path.exists(abspath):                    # 존재하면 절대 덮어쓰지 않는다\n            try:\n                atomic_write_bytes(abspath, data)\n            except Exception as e:                          # noqa\n                LOG.warn(f"blob 저장 실패({type(e).__name__}) — 인덱스에만 기록하지 않고 건너뜁니다: {key}")\n                return None\n        else:\n            self.stats["blob_dedup_hit"] += 1\n        self._register(scope, {\n            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),\n            "path": rel, "abs_path": abspath, "fmt": fmt, "bytes": len(data), "sha1": h,\n            "event_date": str(as_ts(event_date) or ""), "knowledge_date": str(as_ts(knowledge_date) or ""),\n            "source": source, "adopted": False,\n            "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),\n        })\n        return abspath',
@@ -13059,10 +13124,13 @@ def main() -> dict:
             #   패밀리에 섞으면 보정 대상 수만 부풀려 실제 가설들의 검정력을 깎는다.
             ctx["x0_smallcap"] = b0
             _s0 = qperf_stats(b0["returns"])
+            # ★ qperf_stats 의 키는 'CAGR'/'Sharpe'/'MDD' 다(한글 키와 섞여 있다).
+            #   소문자로 조회하면 전부 기본값 nan 이 찍혀 X0 벤치마크 표가 통째로 비었다 —
+            #   §10.2 귀속의 '비교 기준선'이 읽을 수 없는 상태로 출력되고 있었다.
             LOG.table([["분기 평균 종목수", f"{float(b0['returns']['n'].mean()):,.0f}"],
-                       ["CAGR (비용차감)", f"{_s0.get('cagr', float('nan')):+.2%}"],
-                       ["Sharpe", f"{_s0.get('sharpe', float('nan')):.3f}"],
-                       ["MDD", f"{_s0.get('mdd', float('nan')):.1%}"]],
+                       ["CAGR (비용차감)", f"{_s0.get('CAGR', float('nan')):+.2%}"],
+                       ["Sharpe", f"{_s0.get('Sharpe', float('nan')):.3f}"],
+                       ["MDD", f"{_s0.get('MDD', float('nan')):.1%}"]],
                       headers=["X0 스몰캡 벤치마크 (U-1000 무선별 동일가중)", "값"],
                       title="깔때기 비교 기준선 — KOSPI 대비 초과는 소형주 프리미엄일 수 있다")
         except Exception as e:                                   # noqa

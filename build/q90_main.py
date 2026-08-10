@@ -628,10 +628,13 @@ def main() -> dict:
             #   패밀리에 섞으면 보정 대상 수만 부풀려 실제 가설들의 검정력을 깎는다.
             ctx["x0_smallcap"] = b0
             _s0 = qperf_stats(b0["returns"])
+            # ★ qperf_stats 의 키는 'CAGR'/'Sharpe'/'MDD' 다(한글 키와 섞여 있다).
+            #   소문자로 조회하면 전부 기본값 nan 이 찍혀 X0 벤치마크 표가 통째로 비었다 —
+            #   §10.2 귀속의 '비교 기준선'이 읽을 수 없는 상태로 출력되고 있었다.
             LOG.table([["분기 평균 종목수", f"{float(b0['returns']['n'].mean()):,.0f}"],
-                       ["CAGR (비용차감)", f"{_s0.get('cagr', float('nan')):+.2%}"],
-                       ["Sharpe", f"{_s0.get('sharpe', float('nan')):.3f}"],
-                       ["MDD", f"{_s0.get('mdd', float('nan')):.1%}"]],
+                       ["CAGR (비용차감)", f"{_s0.get('CAGR', float('nan')):+.2%}"],
+                       ["Sharpe", f"{_s0.get('Sharpe', float('nan')):.3f}"],
+                       ["MDD", f"{_s0.get('MDD', float('nan')):.1%}"]],
                       headers=["X0 스몰캡 벤치마크 (U-1000 무선별 동일가중)", "값"],
                       title="깔때기 비교 기준선 — KOSPI 대비 초과는 소형주 프리미엄일 수 있다")
         except Exception as e:                                   # noqa

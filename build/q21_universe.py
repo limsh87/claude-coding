@@ -566,7 +566,11 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
     _seen = _amt.notna().cumsum() > 0
     _amt = _amt.where(~(_seen & _amt.isna()), 0.0)
     _adtv = _amt.rolling(int(window), min_periods=int(window)).mean()
-    _adtv = _adtv.stack(dropna=True).rename("adtv").reset_index()
+    # ★ stack(dropna=) 은 pandas 3.x 에서 ValueError 로 제거됐다(같은 저장소의 p_x_customs 가
+    #   이미 그 이유로 melt 를 쓴다). 여기만 남아 있어서 pandas 3 에서는 §3.2 유동성 게이트가
+    #   통째로 죽는다 — L1.PANEL1 이 시작도 못 한다. 버전 안정적인 melt 로 바꾼다(결과 동일).
+    _adtv = (_adtv.reset_index().melt(id_vars="date", var_name="code", value_name="adtv")
+                  .dropna(subset=["adtv"]))
     _adtv.columns = ["date", "code", "adtv"]
     _adtv["code"] = _adtv["code"].astype(str)
     px["code"] = px["code"].astype(str)
@@ -605,7 +609,9 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
         lambda s: s.rolling(INVVOL_WINDOW_DAYS, min_periods=max(20, INVVOL_WINDOW_DAYS // 3)).std())
 
     keep = px[["code", "date", "adtv", "cs_spread", "vol_d"]].dropna(subset=["date"])
-    sig = cal[["rebal", "signal_date"]].drop_duplicates().sort_values("signal_date", kind="stable")
+    sig = cal[["rebal", "signal_date"]].drop_duplicates().copy()
+    sig["signal_date"] = as_ts_series(sig["signal_date"])       # 결합키 단위 고정(as_ts 주석)
+    sig = sig.sort_values("signal_date", kind="stable")
     L = (sig.assign(_k=1).merge(pd.DataFrame({"code": sorted(keep["code"].unique()), "_k": 1}),
                                 on="_k").drop(columns="_k")).sort_values("signal_date", kind="stable")
     R = keep.rename(columns={"date": "px_date"}).sort_values("px_date", kind="stable")

@@ -55,6 +55,9 @@ def build_exec_prices(cal: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame
     codes = sorted(px["code"].unique())
     L = (cal[["rebal", "exec_date"]].assign(_k=1)
          .merge(pd.DataFrame({"code": codes, "_k": 1}), on="_k").drop(columns="_k"))
+    # ★ 결합키의 '단위'를 왼쪽에서도 못박는다. 오른쪽(px)은 as_ts_series 를 통과해 ns 인데
+    #   왼쪽 캘린더가 다른 경로로 만들어지면 pandas 3.x 가 MergeError 로 죽는다(as_ts 주석 참조).
+    L["exec_date"] = as_ts_series(L["exec_date"])
     L = L.sort_values("exec_date", kind="stable")
     R = px[["code", "date", "px_exec"]].rename(columns={"date": "px_date"})
     # ★ forward 방향이다. 체결일에 거래가 없으면 '그 이후 첫 거래일'에 체결된 것으로 본다.
@@ -102,7 +105,13 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
     E["px_next"] = g["px_exec"].shift(-1)
     E["r_next"] = g["_r"].shift(-1)
     adjacent = (E["r_next"] - E["_r"]) == 1
-    E["fwd_ret"] = (E["px_next"] / E["px_exec"] - 1.0).where(adjacent)
+    # ★★ float64 로 못박는다 ★★
+    #   px_exec 는 downcast_q 로 float32 다. 그대로 두면 fwd_ret 도 float32 가 되는데,
+    #   아래 상장폐지 처리에서 넣는 정리매매 수익률은 float64(종가 소스에 따라 달라짐)라
+    #   pandas 3.x 의 엄격한 setitem 이 `TypeError: Invalid value '[-0.9]' for dtype
+    #   'float32'` 로 죽는다. 하필 그 경로가 생존자편향 방어라 계약 Q3 가 통째로 실패하고
+    #   L0.CONTRACT 에서 실행이 멈춘다(pandas 2.x 에서는 조용히 캐스팅돼 드러나지 않았다).
+    E["fwd_ret"] = (E["px_next"] / E["px_exec"] - 1.0).where(adjacent).astype("float64")
     E["exit_kind"] = np.where(E["fwd_ret"].notna(), "normal", "missing")
 
     # 마지막 리밸런싱은 다음 시점이 없으므로 수익률이 없는 것이 정상이다.
@@ -157,7 +166,7 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
             reach = ld.notna() & (ld >= E.loc[resolve, "_dl"] - pd.Timedelta(days=7))
             liq_ret = lc / entry - 1.0
             captured = reach & liq_ret.notna() & (liq_ret < 0)
-            E.loc[resolve, "fwd_ret"] = liq_ret.where(captured, -1.0)
+            E.loc[resolve, "fwd_ret"] = liq_ret.where(captured, -1.0).astype("float64")
             kind = np.where(captured.to_numpy(), "liquidation", "delist_-100%")
             # 정지 후 창 밖 폐지는 별도 유형으로 남겨 감사표에서 바로 보이게 한다.
             kind = np.where(stuck[resolve].to_numpy() & ~captured.to_numpy(),
@@ -260,7 +269,11 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                 _known_spr[_c] = float(_v)
         _med_adv = float(np.median(list(_cur_adv.values()))) if _cur_adv else np.nan
         if not np.isfinite(_med_adv) or _med_adv <= 0:
-            _med_adv = float(ADTV_MIN_KRW)
+            # ★ 상수 이름이 틀려 있었다(ADTV_MIN_KRW 는 이 파일 어디에도 정의돼 있지 않다).
+            #   그 분기 ADTV 가 하나도 없으면 NameError 로 백테스트가 죽는다 — 함수 안이라
+            #   조립기의 '정의 전 참조' 검사(최상위만 본다)도 잡지 못했다. §3.2 의 유동성
+            #   하한이 의도한 값이다.
+            _med_adv = float(MIN_ADTV_KRW)
         sub = d[d["rebal"] == t].copy()
         if sub.empty:
             # ★ 3-A 통과 종목이 0 인 분기는 설계상 발생할 수 있는 정상 결과다(사전등록).

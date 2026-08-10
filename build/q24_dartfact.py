@@ -777,6 +777,7 @@ def _asof_attach(base: pd.DataFrame, R: pd.DataFrame, sec: pd.DataFrame,
         return d.drop(columns=["_ord"])
     L = d[m].copy()
     L["corp_code"] = L["corp_code"].astype(str)
+    L["signal_date"] = as_ts_series(L["signal_date"])           # 결합키 단위 고정(as_ts 주석)
     L = L.sort_values("signal_date", kind="stable")
     M = pd.merge_asof(L, RR, left_on="signal_date", right_on="knowledge_date",
                       by="corp_code", direction="backward", suffixes=("", "_r"))

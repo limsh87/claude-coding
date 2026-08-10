@@ -8,6 +8,20 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 # ── 날짜 정규화 ─────────────────────────────────────────────────────────────────────────────
+# ── 시간 해상도 고정 ────────────────────────────────────────────────────────────────────────
+#  ★★ pandas 3.x 는 기본 해상도를 ns 에서 us 로 바꿨다 ★★
+#    · pd.Timestamp("2020-01-01").unit == "us",  pd.to_datetime(["2020-01-01"]) → datetime64[us]
+#    · 그런데 pd.to_datetime(datetime64[ns] 배열) 은 ns 를 그대로 유지한다.
+#    즉 같은 파이프라인 안에서 '문자열/Timestamp 에서 만든 열(us)' 과 '넘파이 ns 배열에서 만든
+#    열(ns)' 이 섞인다. merge_asof 는 결합키 dtype 이 다르면 MergeError 로 죽는다:
+#      "incompatible merge keys [1] dtype('<M8[us]') and dtype('<M8[ns]')"
+#    실제로 이것 하나로 build_nonfin_panel 이 죽어 스모크가 통과하지 못했다. 조용한 열화가
+#    아니라 즉사라서 그나마 낫지만, 원인이 날짜 '값'이 아니라 '단위'라 로그만 봐서는 안 잡힌다.
+#    → 날짜를 만드는 두 함수에서 해상도를 ns 로 못박는다. 이 프로젝트의 시간 범위(1970~2100)는
+#      ns 표현 범위(1677~2262) 안이므로 정보 손실이 없다.
+TS_UNIT = "ns"
+
+
 def as_ts(x) -> Optional[pd.Timestamp]:
     """무엇이 들어오든 tz-naive 로 정규화된 Timestamp. tz 혼재는 이 프로젝트 최빈 버그였다."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -23,7 +37,11 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return None
     if getattr(t, "tzinfo", None) is not None:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
-    return t.normalize()
+    t = t.normalize()
+    try:
+        return t.as_unit(TS_UNIT)
+    except (AttributeError, ValueError):        # pandas < 2.0 은 항상 ns 라 할 일이 없다
+        return t
 
 
 def as_ts_series(s) -> pd.Series:
@@ -33,7 +51,14 @@ def as_ts_series(s) -> pd.Series:
             out = out.dt.tz_localize(None)
     except Exception:
         pass
-    return out.dt.normalize()
+    out = out.dt.normalize()
+    # 해상도 고정 — 여기서 통일하지 않으면 하류 merge_asof 가 dtype 불일치로 죽는다(위 주석).
+    if str(out.dtype).startswith("datetime64") and str(out.dtype) != f"datetime64[{TS_UNIT}]":
+        try:
+            out = out.astype(f"datetime64[{TS_UNIT}]")
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def month_end(x) -> Optional[pd.Timestamp]:
