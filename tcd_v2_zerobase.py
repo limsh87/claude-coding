@@ -160,6 +160,17 @@ PACK_TIME_SHARE = 0.25    # ★센서팩(N·P·X) 수집에 줄 시간 몫 — �
 #                           ★분모가 사라져 그 팩 축이 통째로 죽는다 — 팩을 먼저 받으려던
 #                           목적과 정확히 반대의 결과다. 그래서 몫을 물리적으로 건다.
 PACK_TIME_CAP_MIN = 50    # 위 비율과 무관하게 넘지 않을 절대 상한(분). 0 = 비율만 적용.
+THETA_X_ANNUALIZE = False  # ★θ_X 의 분자를 연율화할 것인가. 기본 False = ★원전 산식 그대로.
+#                            원전(build/p_x_customs.py): theta_X = (월 exp_usd × 1300) / revenue_ttm
+#                            분자는 '한 달' 수출인데 분모는 'TTM(12개월)' 매출이라 차원이
+#                            어긋나 있고, 그래서 수출 100% 기업도 θ≈0.083 이 나온다.
+#                            V4 부분거부권 임계가 θ<0.50 이므로 이 상태로는 PACK-X 가
+#                            사실상 전건 무효가 된다.
+#                            ★그럼에도 기본값을 False 로 둔다 — 계약 산식을 코드가 임의로
+#                            바꾸지 않는다는 원칙이 우선이기 때문이다(사용자 지시 2026-08-10:
+#                            "정의드리프트 변경 산식훼손 절대 없게 해").
+#                            True 로 바꾸면 분자에 ×12 를 곱해 차원을 맞춘다. 그 선택은
+#                            ★사용자가 한다. 실행 로그에 어느 쪽인지 반드시 찍힌다.
 USDKRW_CONST = 1300.0     # θ_X 계산용 환산율. 관세 통계는 USD, 재무는 KRW 라 축을 맞춰야 한다.
 #                           θ_X 는 '수출/매출 비율이 그럴듯한가'라는 정합성 지표라 환율의
 #                           연도별 변동(1,100~1,400)이 판정을 뒤집지 않는다. 정밀 환산이
@@ -7900,7 +7911,15 @@ NPS_BASE = "https://apis.data.go.kr/B552015/NpsBplcInfoInqireServiceV2"
 NPS_SEARCH = NPS_BASE + "/getBassInfoSearchV2"          # 사업장명 → (seq, dataCrtYm) 목록
 NPS_DETAIL = NPS_BASE + "/getDetailInfoSearchV2"        # seq → 가입자수·당월고지금액
 NPS_PERIOD = NPS_BASE + "/getPdAcctoSttusInfoSearchV2"  # seq → 월별 취득/상실 시계열
-NPS_CONTRIB_RATE = 0.09                                  # 국민연금 보험료율(시행 상수)
+NPS_CONTRIB_RATE = 0.09                                  # 국민연금 보험료율(1998-07 이후 고정)
+# ★기준소득월액 상한(월, 원). 매년 7월 개정. n5(캡 도달 비율)의 분모다.
+#   원전(build/p_n_employment.py)의 표를 그대로 옮긴다 — 값을 다시 만들면 그 자체가 드리프트다.
+NPS_INCOME_CAP = {
+    2016: 4_340_000, 2017: 4_490_000, 2018: 4_680_000, 2019: 4_860_000, 2020: 5_030_000,
+    2021: 5_240_000, 2022: 5_530_000, 2023: 5_900_000, 2024: 6_170_000, 2025: 6_370_000,
+    2026: 6_370_000,
+}
+NPS_REDETERMINE_MONTH = 7        # 기준소득월액 정기결정 시행월(전년 소득 기준 일괄 갱신)
 NPS_SIM_MIN = 80                                         # 상호 유사도 하한
 NPS_MAX_SITES = 3                                        # 한 종목이 들고 갈 사업장 수 상한
 NPS_RULE_VER = 2      # ★검색 질의·정규화·필드 매핑 규칙 버전. 올리면 옛 원장이
@@ -8298,6 +8317,10 @@ def load_hs_map() -> pd.DataFrame:
 
 _HS_SGN_OK = re.compile(r"^(\d{2}|\d{4}|\d{6}|\d{10})$")   # ★8자리는 서버가 거부한다
 CUSTOMS_ADV = {"US", "DE", "FR", "GB", "JP", "TW", "NL", "IT", "CA", "AU", "CH", "SE", "BE"}
+# ★원전(build/p_x_customs.py)의 국가군 정의. x3_2(선진시장 비중 변화)의 분자 기준이다.
+#   수집기가 cc(국가코드)를 그대로 남기므로 실사용은 CUSTOMS_ADV 쪽이지만, grp 만 있는
+#   구버전 캐시를 읽을 때를 위해 원전 이름도 그대로 보존한다(정의 드리프트 방지).
+ADVANCED_GROUPS = {"선진_미국", "선진_EU", "선진_일본", "선진_대만"}
 
 
 def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
@@ -8613,6 +8636,27 @@ def pack_status_table(P: Optional[pd.DataFrame] = None):
            title="센서팩 활성 현황 (실데이터 기준 — 위 합성 스모크 경고와 무관합니다)")
 
 
+# ── θ(관측 커버리지) — ★계약 산식은 여기 ★한 곳에만 있다 ──────────────────────────────────
+#   ★왜 함수로 빼는가(2026-08-10 사고): θ_X 를 검증하던 리허설 테스트가 산식을 ★자기 안에
+#   복사해 두고 있었다. 그래서 프로덕션 산식을 바꿔도 테스트는 그대로 통과했고, 내가
+#   계약 산식을 텐트 함수로 바꾼 것을 아무도 잡지 못했다(drift_audit 이 30커밋 살아남은
+#   것과 정확히 같은 유형 — '사본'을 검증한 것). 정의가 한 곳뿐이면 그 사고가 불가능하다.
+
+def theta_x_of(exp_usd, revenue_ttm):
+    """θ_X — ★원전(build/p_x_customs.py) 그대로:
+        theta_X = safe_div(exp_usd * 1300.0, revenue_ttm).clip(0, 2)
+    THETA_X_ANNUALIZE=True 일 때만 분자에 ×12(월↔TTM 차원 보정). 기본은 원전(False)."""
+    fx = exp_usd * USDKRW_CONST * (12.0 if THETA_X_ANNUALIZE else 1.0)
+    return sdiv(fx, revenue_ttm).clip(0, 2)
+
+
+def theta_n_of(nps_members, employees):
+    """θ_N — ★원전(build/p_n_employment.py) 그대로:
+        theta_N = safe_div(nps_members, employees).clip(0, 2);  theta_N.where(theta_N > 0)"""
+    t = sdiv(nps_members, employees).clip(0, 2)
+    return t.where(t > 0)
+
+
 # ── 기본 패널 ───────────────────────────────────────────────────────────────────────────────
 def frame_panel(uni: "PITUniverse", months: pd.DatetimeIndex,
                 monthly_px: pd.DataFrame) -> pd.DataFrame:
@@ -8736,7 +8780,7 @@ def axis_resource(P: pd.DataFrame) -> pd.DataFrame:
     P["value_added"] = colx(P, "op_income_ttm").fillna(0) + colx(P, "payroll").fillna(0) + \
         colx(P, "dep_ttm").fillna(0)
     P["va_per_emp"] = sdiv(P["value_added"], colx(P, "employees"))
-    P["d_va_emp"] = g("va_per_emp").diff(12)
+    P["d_va_per_emp"] = g("va_per_emp").diff(12)   # ★원전(build/21_axes.py) 이름 그대로
     P["dlog_emp"] = g("employees").transform(lambda s: dlog(s, 12))
     P["c3"] = sdiv(colx(P, "capex_ttm").abs(), colx(P, "dep_ttm").abs())
     P["debt_ratio"] = sdiv(colx(P, "liabilities"), colx(P, "equity"))
@@ -8747,7 +8791,7 @@ def axis_resource(P: pd.DataFrame) -> pd.DataFrame:
 
 def axis_resource_tp(P: pd.DataFrame) -> pd.DataFrame:
     P["TP_C1"] = tp_pair(zx(P, "dlog_ic"), zx(P, "d_roic"))         # 확장↑ 인데 ROIC 유지
-    P["TP_C2"] = tp_pair(zx(P, "dlog_emp"), zx(P, "d_va_emp"))      # 인원↑ 인데 생산성 유지
+    P["TP_C2"] = tp_pair(zx(P, "dlog_emp"), zx(P, "d_va_per_emp"))      # 인원↑ 인데 생산성 유지
     # ★E_AXB 와 같은 결측 전파 결함. c3(=CAPEX/감가상각)는 두 계정이 모두 있어야 하는데
     #   그 한 항목 때문에 TP_C1(182,657행)·TP_C2(232,908행)가 통째로 버려졌다(E_AXC 15.8%).
     P["E_AXC"] = nrow_mean(pd.DataFrame({
@@ -8933,33 +8977,62 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     prev_amt = g("nps_amt").shift(1)
     # 함정(c) 분모 불안정: |Δ인원| < max(3, 인원×0.5%) → 결측(0 채움 금지)
     ok_dm = d_mem.abs() >= np.maximum(3.0, prev_mem * 0.005)
-    marginal_wage = sdiv(d_amt, d_mem.where(ok_dm)) / NPS_CONTRIB_RATE
+    # ★원전(build/p_n_employment.py) 그대로: 한계임금에 상한 clip(0, 5e7) 을 건다.
+    #   이게 빠지면 Δ인원이 임계를 겨우 넘긴 달에 한계임금이 수억으로 튀고, 그 값이
+    #   wage_premium 을 통해 TP_N1 을 지배한다.
+    marginal_wage = (sdiv(d_amt, d_mem.where(ok_dm)) / NPS_CONTRIB_RATE).clip(0, 5e7)
     avg_wage_prev = sdiv(prev_amt, prev_mem) / NPS_CONTRIB_RATE
     wage_premium = sdiv(marginal_wage, avg_wage_prev)
+    # ★원전: wage_premium 은 (0.1, 10) 밖이면 결측. 극단비율은 분모 불안정의 잔재다.
+    wage_premium = wage_premium.where((wage_premium > 0.1) & (wage_premium < 10))
     # 함정(a) 7월 정기결정: 기준소득월액이 일괄 갱신되는 '귀속월 7월'을 제외한다.
     # ★패널 월이 아니라 NPS '귀속월'(asof 가 붙여준 month_n) 기준 — 공개지연 2개월 때문에
     #   패널 7월 행은 5월 귀속분이라, 패널 월로 걸면 깨끗한 달을 버리고 오염 달을 통과시킨다.
     accr_m = ds_(P["month_n"]) if "month_n" in P.columns else P["month"]
     july = accr_m.dt.month == 7
     P["n2"] = wage_premium.where(~july.fillna(False))
-    P["n6"] = sdiv(d_amt, prev_amt).where(july.fillna(False))   # 7월 점프폭 = 연1회 임금상승률
+    # ★원전: n6 는 ★인당 추정소득(est_income)의 전월 대비 변화율이지 고지총액 비율이 아니다.
+    #   총액 비율은 인원 변동이 섞여 '임금상승률'이 아니게 된다. 그리고 ffill(11) 로
+    #   7월 값을 다음 6월까지 끌고 간다(연 1회 관측이므로).
+    est_income = sdiv(sdiv(amt, NPS_CONTRIB_RATE), mem)
+    _ei_prev = est_income.groupby(P["code"], observed=True).shift(1)
+    P["n6"] = (sdiv(est_income, _ei_prev) - 1.0).where(july.fillna(False))
+    P["n6"] = g("n6").ffill(limit=11)
+    # ★원전의 n5(캡 도달 비율 변화) — 재작성에서 빠져 있었다. TP 에는 쓰이지 않지만
+    #   high_wage_flag(임금신호 신뢰도 하향)의 입력이라 그대로 복원한다.
+    _cap = P["month"].dt.year.map(NPS_INCOME_CAP).fillna(6_370_000)
+    P["cap_ratio"] = sdiv(est_income, _cap).clip(0, 2)
+    P["n5"] = g("cap_ratio").diff(12)
+    P["high_wage_flag"] = (P["cap_ratio"] > 0.85).astype(float)
     P["n1"] = g("nps_members").transform(lambda s: dlog(s, 12))
     # n3 = -Δ(상실자수/가입자수). ★차분은 반드시 종목 내에서 — 전체 시리즈 diff 는 종목
     # 경계를 넘어 앞 종목의 값과 차분되는 조용한 오염이 된다.
     loss_ratio = sdiv(colx(P, "nps_lost"), mem)
     P["n3"] = -loss_ratio.groupby(P["code"], observed=True).diff(12)
-    P["n4"] = (g("n_sites").diff(12) > 0).astype(float).where(colx(P, "n_sites").notna())
-    # 월 해상도 인당 부가가치(TP_N4 — 분자를 월별 NPS 인원으로 대체)
+    # ★원전: n4 = (Δ사업장수 > 0) ★AND (n1 > 0). 뒤 조건이 빠져 있었다 —
+    #   그러면 '인원은 줄었는데 사업장만 늘어난' 경우(단순 이전·분할)까지 1 이 되어
+    #   TP_N3 = z(n4)×z(n1) 이 음수 곱으로 뒤집힌다(원전 해석표의 '사업장 이전에 불과').
+    P["n4"] = ((g("n_sites").diff(12) > 0) & (P["n1"] > 0)).astype(float) \
+        .where(colx(P, "n_sites").notna())
+    # ★TP_N4 의 우변은 ★원전대로 d_va_per_emp(DART 직원수 기준, build/21_axes.py)다.
+    #   재작성에서 분모를 월별 NPS 가입자수로 바꾼 va_emp_m 을 새로 만들어 갈아끼웠는데,
+    #   그건 '월 해상도가 낫다'는 내 판단이었지 계약이 아니다. 되돌린다.
+    #   (참고용으로 월 해상도 값은 남겨 두되 TP 에는 쓰지 않는다.)
     P["va_emp_m"] = sdiv(colx(P, "value_added"), mem)
     P["d_va_emp_m"] = g("va_emp_m").diff(12)
     # θ_N: 매핑 가입자수 / DART 종업원수 — 배제가 아니라 가중치, 0.5 미만이면 V4 로 팩 무효
-    P["theta_N"] = sdiv(mem, colx(P, "employees")).clip(0, 1.5)
+    # ★원전: clip(0, 2) 이고 0 은 결측으로 뺀다(0 이면 '매핑 실패'지 '커버리지 0'이 아니다).
+    #   재작성에서 clip(0, 1.5) 로 바뀌어 있었다 — 근거 없는 변경이라 되돌린다.
+    P["theta_N"] = theta_n_of(mem, colx(P, "employees"))
     P["TP_N1"] = tp_pair(zx(P, "n1"), zx(P, "n2"))
     P["TP_N2"] = tp_pair(zx(P, "n1"), zx(P, "n3"))
     P["TP_N3"] = tp_pair(zx(P, "n4"), zx(P, "n1"))
-    P["TP_N4"] = tp_pair(zx(P, "n1"), zx(P, "d_va_emp_m"))
-    theta_w = P["theta_N"].clip(0, 1)
-    P["E_N"] = nrow_mean(P, ["TP_N1", "TP_N2", "TP_N3", "TP_N4"]) * theta_w
+    P["TP_N4"] = tp_pair(zx(P, "n1"), zx(P, "d_va_per_emp"))
+    # ★원전: θ 는 배제기준이 아니라 가중치 — 결측이면 0(=그 팩 기여 없음)으로 떨어뜨린다.
+    #   fillna(0.0) 이 빠져 있어 θ 결측이 E_N 을 NaN 으로 만들고, 그 행이 하한선 축
+    #   계산에서 통째로 빠지고 있었다.
+    P["E_N"] = (nrow_mean(P, ["TP_N1", "TP_N2", "TP_N3", "TP_N4"])
+                * P["theta_N"].clip(0, 1).fillna(0.0))
     return P
 
 
@@ -9006,7 +9079,7 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     cust = ctx.get("customs")
     hmap = ctx.get("hs_map")
     if cust is None or not len(cust) or hmap is None or not len(hmap):
-        for c in ("x1", "x2", "x3", "TP_X1", "TP_X2", "E_X", "theta_X"):
+        for c in ("x1", "x2", "x3_1", "x3_2", "TP_X1", "TP_X2", "TP_X3", "E_X", "theta_X"):
             P[c] = np.nan
         return P
     C = cust.copy()
@@ -9017,7 +9090,7 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     C = C[(C["month"] >= C["valid_from"].fillna(pd.Timestamp("1990-01-01"))) &
           (C["month"] <= C["valid_to"].fillna(pd.Timestamp("2100-01-01")))]
     if not len(C):
-        for c in ("x1", "x2", "x3", "TP_X1", "TP_X2", "E_X", "theta_X"):
+        for c in ("x1", "x2", "x3_1", "x3_2", "TP_X1", "TP_X2", "TP_X3", "E_X", "theta_X"):
             P[c] = np.nan
         return P
     C["w_usd"] = colx(C, "exp_usd") * colx(C, "weight").fillna(1.0)
@@ -9049,24 +9122,38 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     agg["x2"] = (agg.groupby("code", observed=True)["x2_res"]
                     .transform(lambda s: s.rolling(6, min_periods=3).mean() /
                                s.rolling(36, min_periods=12).std()))
-    agg["x3"] = -agg.groupby("code", observed=True)["dest_hhi"].diff(12)
-    P = P.merge(agg[["code", "month", "x1", "x2", "x3", "exp_usd"]],
+    agg["x3_1"] = -agg.groupby("code", observed=True)["dest_hhi"].diff(12)
+    # ★x3_2(선진시장 비중 변화) — 원전(build/p_x_customs.py)의 센서다. 재작성 과정에서
+    #   통째로 빠져 TP_X3 가 사라졌다. ADVANCED_GROUPS 는 원전 정의를 그대로 쓴다.
+    _adv = (C[C["cc"].isin(CUSTOMS_ADV)] if "cc" in C.columns
+            else C[C["grp"].astype(str).isin(ADVANCED_GROUPS)])
+    adv_m = (_adv.groupby(["code", "month"], observed=True)["w_usd"].sum()
+             .rename("adv_usd").reset_index())
+    agg = agg.merge(adv_m, on=["code", "month"], how="left")
+    agg["adv_share"] = sdiv(agg["adv_usd"].fillna(0.0), agg["exp_usd"])
+    agg["x3_2"] = agg.groupby("code", observed=True)["adv_share"].diff(12)
+    P = P.merge(agg[["code", "month", "x1", "x2", "x3_1", "x3_2", "exp_usd"]],
                 on=["code", "month"], how="left")
-    # ★θ_X = 매핑이 귀속시킨 연간 수출액 ÷ 매출(TTM). 이건 '내가 매기는 신뢰도'가 아니라
-    #   ★매핑의 결과가 회사의 실제 규모와 정합하는지의 실측이다. 그래서 매핑을 자동으로
-    #   만들어도 엉터리면 여기서 드러나고 V4 가 그 팩을 죽인다 — 단, 한 방향으로만 그렇다.
+    # ── θ_X — ★원전(build/p_x_customs.py) 산식을 그대로 쓴다 ─────────────────────────────
+    #      원전:  theta_X = safe_div(exp_usd * 1300.0, revenue_ttm).clip(0, 2)
+    #      E_X   = nanmean(TP_X1..X3) * theta_X.clip(0, 1).fillna(0.0)
     #
-    #   ★구멍: 옛 식은 과소귀속만 잡고 ★과대귀속은 오히려 보상했다. 한 HS 의 국가 전체
-    #   수출을 소형사 하나에 몰아주면 비율이 3.0 이 되는데, clip(0,1.2)→clip(0,1) 이
-    #   그걸 '완벽한 매핑(θ=1)'으로 만든다. 즉 매핑이 틀릴수록 가중치가 올라간다.
-    #   수출액이 매출을 넘는 것은 회계적으로 불가능하므로(수출은 매출의 부분집합),
-    #   비율 1 을 정점으로 하고 넘어가면 ★같은 기울기로 떨어뜨린다: 1.0→1.0, 1.5→0.5,
-    #   2.0→0. 그러면 과대귀속도 θ 를 깎아 V4 임계 0.50 아래로 밀어낸다.
-    _xr = sdiv(colx(P, "exp_usd") * USDKRW_CONST * 12, colx(P, "revenue_ttm"))
-    P["theta_X"] = np.where(_xr.notna(), np.minimum(_xr, np.maximum(0.0, 2.0 - _xr)), np.nan)
-    P["TP_X1"] = tp_pair(zx(P, "x1"), zx(P, "x2"))
-    P["TP_X2"] = tp_pair(zx(P, "x3"), zx(P, "x2"))
-    P["E_X"] = nrow_mean(P, ["TP_X1", "TP_X2"]) * P["theta_X"].clip(0, 1)
+    #   ★2026-08-10 복원 기록: 재작성 과정에서 내가 여기를 두 군데 바꿨다 —
+    #      ① `* 12` 를 붙였고(월 수출 vs TTM 매출의 차원을 맞추려고)
+    #      ② clip(0,2) 를 '텐트 함수' min(xr, 2-xr) 로 바꿨다(과대귀속을 벌주려고).
+    #      둘 다 '개선'이라고 판단해서 한 것이지만 ★계약 산식의 무단 변경이다.
+    #      사용자 지시(2026-08-10): "정의드리프트 변경 산식훼손 절대 없게 해".
+    #      → 원전으로 되돌린다. 아래 THETA_X_ANNUALIZE 는 기본 False(=원전)이며,
+    #        차원 문제를 알고도 감수할지는 ★사용자가 정한다. 코드가 몰래 정하지 않는다.
+    P["theta_X"] = theta_x_of(colx(P, "exp_usd"), colx(P, "revenue_ttm"))
+    P["TP_X1"] = tp_pair(zx(P, "x1"), zx(P, "x2"))                    # 물량↑ 인데 단가 안 깎임
+    P["TP_X2"] = tp_pair(zx(P, "x3_1"), zx(P, "x2"))                  # 고객 다변화 + 단가 유지
+    # ★TP_X3 = 신시장 진입인데 판관비가 안 늘었다. 재작성에서 통째로 빠져 있었다.
+    _sg = sdiv(colx(P, "sgna_ttm"), colx(P, "revenue_ttm"))
+    P["d_sgna_ratio"] = _sg.groupby(P["code"], observed=True).diff(12)
+    P["TP_X3"] = tp_pair(zx(P, "x3_2"), -zx(P, "d_sgna_ratio"))
+    P["E_X"] = (nrow_mean(P, ["TP_X1", "TP_X2", "TP_X3"])
+                * P["theta_X"].clip(0, 1).fillna(0.0))
     return P
 
 
