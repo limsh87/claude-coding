@@ -243,7 +243,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0807"
+BUILD_VERSION      = "qvf1.20260810.0818"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -469,6 +469,13 @@ if OPT.get("pykrx"):
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
+        # ★ yfinance 는 종목마다 "possibly delisted; no price data found" 를 ERROR 로 뱉는다.
+        #   폐지 종목이 정상적으로 섞여 있는 소형주 백테스트에서는 이게 수천 줄로 쏟아져
+        #   진짜 경고를 화면 밖으로 밀어낸다. 실패 건수는 우리가 수집 시도 원장으로 이미
+        #   집계하므로(원인·재시도 정책 포함) 라이브러리 자체 로그는 끈다 — 정보 손실이 없다.
+        for _n in ("yfinance", "yfinance.data", "yfinance.ticker", "peewee", "urllib3"):
+            logging.getLogger(_n).setLevel(logging.CRITICAL)
+            logging.getLogger(_n).propagate = False
     except Exception:
         yf = None
 if OPT.get("fitz"):
@@ -960,15 +967,6 @@ def sha1_bytes(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()
 
 
-def sha1_file(path: str, chunk: int = 1 << 20) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
 
 
 def norm_text(s: Any) -> str:
@@ -1014,15 +1012,6 @@ def to_code6(x: Any) -> Optional[str]:
     return None
 
 
-def similarity(a: str, b: str) -> float:
-    """0~100. rapidfuzz 있으면 그걸, 없으면 difflib."""
-    a, b = norm_corp_name(a), norm_corp_name(b)
-    if not a or not b:
-        return 0.0
-    if rapidfuzz_fuzz is not None:
-        return float(rapidfuzz_fuzz.token_set_ratio(a, b))
-    import difflib
-    return 100.0 * difflib.SequenceMatcher(None, a, b).ratio()
 
 
 # ── 원자적 파일 IO (드라이브 FUSE 에서 깨지지 않게) ──────────────────────────────────────────
@@ -1143,27 +1132,6 @@ def limiter(source: str) -> RateLimiter:
         return _LIMITERS[source]
 
 
-def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, quiet: bool = False):
-    def deco(fn):
-        def wrapped(*a, **kw):
-            last = None
-            for i in range(tries):
-                try:
-                    return fn(*a, **kw)
-                except exc as e:                       # noqa
-                    last = e
-                    if i == tries - 1:
-                        break
-                    slp = (base ** i) + random.random() * 0.4
-                    if not quiet:
-                        LOG.debug(f"재시도 {i+1}/{tries-1} ({type(e).__name__}) — {slp:.1f}s 대기")
-                    time.sleep(slp)
-            if on_fail is not None:
-                return on_fail(last)
-            raise last                                  # type: ignore
-        wrapped.__name__ = getattr(fn, "__name__", "wrapped")
-        return wrapped
-    return deco
 
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
@@ -1194,24 +1162,6 @@ def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
     return out
 
 
-def pmap_cpu(fn: Callable, items: Sequence, workers: Optional[int] = None, desc: str = "") -> List[Any]:
-    """연산 병렬. fork 가능하면 프로세스, 아니면 스레드로 자동 폴백(결과 동일, 속도만 차이)."""
-    items = list(items)
-    if not items:
-        return []
-    w = max(1, min(workers or N_CPU, len(items)))
-    if w == 1 or not CAN_FORK:
-        if not CAN_FORK:
-            LOG.debug("fork 불가 환경 — 연산 병렬을 스레드로 폴백합니다(결과 동일).")
-        return [fn(x) for x in tqdm(items, desc=desc or "연산", leave=False, ncols=88)]
-    try:
-        ctx = _mp.get_context("fork")
-        with ProcessPoolExecutor(max_workers=w, mp_context=ctx) as ex:
-            return list(tqdm(ex.map(fn, items), total=len(items), desc=desc or "연산",
-                             leave=False, ncols=88))
-    except Exception as e:                                # noqa
-        LOG.warn(f"프로세스 병렬 실패({type(e).__name__}) — 순차 실행으로 폴백합니다.")
-        return [fn(x) for x in items]
 
 
 # ── 메모리 ──────────────────────────────────────────────────────────────────────────────────
@@ -1235,11 +1185,6 @@ def downcast(df: pd.DataFrame, cat_thresh: float = 0.35) -> pd.DataFrame:
     return df
 
 
-def mem_mb(df: pd.DataFrame) -> float:
-    try:
-        return float(df.memory_usage(deep=True).sum()) / 1e6
-    except Exception:
-        return -1.0
 
 
 # ── PIT 프레임 강제 (C1) ────────────────────────────────────────────────────────────────────
@@ -1295,104 +1240,19 @@ WINSOR_SIGMA = 2.0
 CELL_MIN_N = 8
 
 
-def _winsor_np(a: np.ndarray, k: float = WINSOR_SIGMA) -> np.ndarray:
-    m = np.nanmean(a)
-    s = np.nanstd(a)
-    if not np.isfinite(s) or s == 0:
-        return a
-    return np.clip(a, m - k * s, m + k * s)
 
 
-def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N,
-           k: float = WINSOR_SIGMA) -> pd.Series:
-    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다.
-
-    구현 주의 두 가지:
-     ① ±inf 를 반드시 먼저 NaN 으로 바꾼다. np.nanmean 은 NaN 은 무시하지만 inf 는 무시하지
-        않으므로, 셀에 inf 가 단 하나만 있어도 평균이 inf·표준편차가 NaN 이 되어
-        **그 셀 전체의 z-score 가 0으로 뭉개진다.** 비율 지표(diff/log)에서 흔히 발생한다.
-     ② groupby.transform(파이썬 UDF) 대신 네이티브 집계로 벡터화한다.
-        실데이터 규모(30만 행 × 수천 셀)에서 UDF 경로는 호출당 10초 이상이고,
-        파이프라인은 이 함수를 수십 번 부른다.
-    """
-    v = pd.to_numeric(values, errors="coerce").astype("float64")
-    v = v.replace([np.inf, -np.inf], np.nan)
-    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
-
-    g = v.groupby(grp, observed=True, dropna=False)
-    cnt = g.transform("count")
-    mu0 = g.transform("mean")
-    sd0 = g.transform("std", ddof=0)
-    w = v.clip(lower=mu0 - k * sd0, upper=mu0 + k * sd0)          # ① winsorize
-
-    gw = w.groupby(grp, observed=True, dropna=False)
-    mu = gw.transform("mean")
-    sd = gw.transform("std", ddof=0)                               # ② z-score
-    z = (w - mu) / sd.where(sd > 0)
-    z = z.mask(sd.notna() & (sd <= 0) & w.notna(), 0.0)            # 셀 내 전원 동일값 → 0
-    return z.where(cnt >= min_n).astype("float32")
 
 
-def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
-    """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
-    v = pd.to_numeric(values, errors="coerce").astype("float64")
-    v = v.replace([np.inf, -np.inf], np.nan)
-    grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
-    g = v.groupby(grp, observed=True, dropna=False)
-    cnt = g.transform("count")
-    r = g.rank(pct=True, method="average")
-    return r.where(cnt >= min_n).astype("float32")
 
 
 CELL_LADDER = ("cell", "cell_l2", "cell_l3")
 
 
-def xsec_z_l(P: pd.DataFrame, name: str, min_n: int = CELL_MIN_N) -> pd.Series:
-    """셀 폴백 사다리를 적용한 z-score (C11).
-
-    ★ 왜 필요한가: 셀에 종목이 30개 있어도 '그 센서를 관측한' 종목은 5개뿐일 수 있다.
-      (관세·조달처럼 일부 종목만 커버하는 팩이 정확히 이 경우다)
-      셀 크기만 보고 폴백하면 z-score 는 표본부족으로 전부 NaN 이 되고,
-      그 팩은 아무 신호도 못 내면서 로그에는 아무것도 남지 않는다 — 최악의 조용한 실패다.
-      그래서 '그 센서의 유효 관측 수' 기준으로 산업 상위 → 전체 순으로 단계적 폴백한다.
-    """
-    v = col(P, name)
-    if v.notna().sum() == 0:
-        return pd.Series(np.nan, index=P.index, dtype="float32")
-    z = xsec_z(v, P["cell"], min_n) if "cell" in P.columns else \
-        pd.Series(np.nan, index=P.index, dtype="float32")
-    for lvl in CELL_LADDER[1:]:
-        if not z.isna().any():
-            break
-        if lvl in P.columns:
-            z = z.where(z.notna(), xsec_z(v, P[lvl], min_n))
-    return z
 
 
-def xsec_rank_pct_l(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.Series:
-    v = col(P, name_or_series) if isinstance(name_or_series, str) else \
-        pd.to_numeric(name_or_series, errors="coerce")
-    if v.notna().sum() == 0:
-        return pd.Series(np.nan, index=P.index, dtype="float32")
-    r = xsec_rank_pct(v, P["cell"], min_n) if "cell" in P.columns else \
-        pd.Series(np.nan, index=P.index, dtype="float32")
-    for lvl in CELL_LADDER[1:]:
-        if not r.isna().any():
-            break
-        if lvl in P.columns:
-            r = r.where(r.notna(), xsec_rank_pct(v, P[lvl], min_n))
-    return r
 
 
-def tp_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
-    """트레이드오프 쌍 = z(개선) × z(대가회피).  ★ 절대로 합으로 바꾸지 말 것 (§1.1).
-
-    합으로 바꾸면 평범한 퀄리티 팩터가 되고 이 전략의 존재 이유가 사라진다.
-    한쪽이 결측이면 결과도 결측 — 0으로 채우면 '대가를 안 치렀다'는 거짓 주장이 된다.
-    """
-    a = pd.to_numeric(z_improve, errors="coerce")
-    b = pd.to_numeric(z_nopay, errors="coerce")
-    return (a * b).astype("float32")
 
 
 def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
@@ -1409,18 +1269,6 @@ def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     return pd.Series(default, index=df.index, dtype="float64")
 
 
-def gby(df: pd.DataFrame, name: str, key: str = "code"):
-    """col() 의 groupby 판(版). 없는 컬럼도 NaN 으로 만든 뒤 그룹화한다.
-
-    ★ col() 이 막지 못하는 구멍이 정확히 여기였다. 피처 계산부는 결측 컬럼 산술을 col() 로
-      막아 두었지만, `P.groupby("code")[c]` 는 여전히 맨손이라 c 가 없으면 KeyError 로 죽는다.
-      DART 키가 없거나 재무 수집이 부분 실패하면 assets·contract_liab 같은 재무상태표 계정이
-      아예 생성되지 않는데, 이 경로는 critical 스테이지(L1.PANEL)라 그대로 실행 전체가 중단된다.
-      "키 없이도 실행은 된다"는 상단 안내와 정면으로 어긋나므로 groupby 도 안전 접근으로 통일한다.
-    """
-    if name not in df.columns:
-        df[name] = np.nan
-    return df.groupby(key, observed=True)[name]
 
 
 def safe_div(a, b, eps: float = 1e-12):
@@ -1430,89 +1278,13 @@ def safe_div(a, b, eps: float = 1e-12):
     return out.replace([np.inf, -np.inf], np.nan)
 
 
-def dlog(s: pd.Series, periods: int = 12) -> pd.Series:
-    """Δlog. 음수/0 은 결측 처리 (log 의 정의역 밖을 0으로 메우는 것이 최빈 버그)."""
-    v = pd.to_numeric(s, errors="coerce")
-    lv = np.log(v.where(v > 0))
-    return lv.diff(periods)
 
 
-def nanmean_cols(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
-    """가용 축만으로 평균. 결측을 0으로 채우지 않는다 (§7.3 지시)."""
-    use = [c for c in cols if c in df.columns]
-    if not use:
-        return pd.Series(np.nan, index=df.index)
-    return df[use].astype("float64").mean(axis=1, skipna=True)
 
 
 # ── 벡터화 롤링 OLS (칼만 대체, §3) ─────────────────────────────────────────────────────────
-def rolling_ols_resid(y: np.ndarray, X: np.ndarray, window: int,
-                      ridge: float = 1e-8, chunk: int = 256) -> np.ndarray:
-    """N개 엔티티 × T기간 패널에 대해 길이 W 롤링 OLS 를 배치로 풀고 창 마지막 시점 잔차를 반환.
-
-    y : (N, T)
-    X : (N, T, K)   — 절편은 호출자가 포함시킬 것
-    반환: (N, T) 잔차. 창이 안 차거나 결측 포함이면 NaN.
-
-    종목별 파이썬 루프로 짜면 15분짜리가 3시간이 된다(§3). 반드시 이 경로를 쓸 것.
-    """
-    y = np.asarray(y, dtype=np.float64)
-    X = np.asarray(X, dtype=np.float64)
-    N, T = y.shape
-    K = X.shape[2]
-    out = np.full((N, T), np.nan, dtype=np.float64)
-    if T < window or window < K + 2:
-        return out
-    try:
-        from numpy.lib.stride_tricks import sliding_window_view as _swv
-    except Exception:                                     # numpy<1.20 폴백
-        _swv = None
-
-    for s in range(0, N, chunk):
-        e = min(N, s + chunk)
-        yc, Xc = y[s:e], X[s:e]
-        n = e - s
-        if _swv is not None:
-            yw = _swv(yc, window, axis=1)                 # (n, T-W+1, W)
-            Xw = _swv(Xc, window, axis=1)                 # (n, T-W+1, K, W)
-            Xw = np.moveaxis(Xw, -1, 2)                   # (n, T-W+1, W, K)
-        else:
-            idx = np.arange(window)[None, :] + np.arange(T - window + 1)[:, None]
-            yw = yc[:, idx]
-            Xw = Xc[:, idx, :]
-        finite = np.isfinite(yw).all(axis=2) & np.isfinite(Xw).all(axis=(2, 3))   # (n, M)
-        yw = np.where(np.isfinite(yw), yw, 0.0)
-        Xw = np.where(np.isfinite(Xw), Xw, 0.0)
-        XtX = np.einsum("nmwk,nmwl->nmkl", Xw, Xw, optimize=True)
-        Xty = np.einsum("nmwk,nmw->nmk", Xw, yw, optimize=True)
-        XtX += ridge * np.eye(K)[None, None, :, :] * np.maximum(
-            1.0, np.abs(np.einsum("nmkk->nm", XtX))[..., None, None] / max(K, 1))
-        try:
-            beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]                   # (n, M, K)
-        except np.linalg.LinAlgError:
-            beta = np.einsum("nmkl,nml->nmk", np.linalg.pinv(XtX), Xty)
-        x_last = Xw[:, :, -1, :]                                                  # (n, M, K)
-        resid = yw[:, :, -1] - np.einsum("nmk,nmk->nm", x_last, beta)
-        resid = np.where(finite, resid, np.nan)
-        out[s:e, window - 1:] = resid
-        del yw, Xw, XtX, Xty, beta
-    return out
 
 
-def rolling_ols_beta_last(y: np.ndarray, X: np.ndarray, window: int, ridge: float = 1e-8) -> np.ndarray:
-    """위와 동일하되 마지막 창의 계수만 필요할 때 (R3 직교화 등)."""
-    N, T = y.shape
-    K = X.shape[2]
-    if T < window:
-        return np.full((N, K), np.nan)
-    yw, Xw = y[:, -window:], X[:, -window:, :]
-    ok = np.isfinite(yw).all(axis=1) & np.isfinite(Xw).all(axis=(1, 2))
-    yw = np.nan_to_num(yw); Xw = np.nan_to_num(Xw)
-    XtX = np.einsum("nwk,nwl->nkl", Xw, Xw) + ridge * np.eye(K)[None]
-    Xty = np.einsum("nwk,nw->nk", Xw, yw)
-    beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]
-    beta[~ok] = np.nan
-    return beta
 
 
 def hac_tstat(x: np.ndarray, lags: Optional[int] = None) -> Tuple[float, float]:
@@ -1583,26 +1355,6 @@ INDEX_COLUMNS = [
 ]
 
 
-def _mount_drive() -> Tuple[str, str]:
-    """(루트경로, 상태문자열). Colab이면 마운트 시도, 아니면 로컬 폴백. 어느 쪽이든 죽지 않는다."""
-    if ENV["colab"]:
-        try:
-            from google.colab import drive as _gdrive      # type: ignore
-            mp = "/content/drive"
-            if not os.path.isdir(os.path.join(mp, "MyDrive")):
-                _gdrive.mount(mp, force_remount=False)
-            if os.path.isdir(os.path.join(mp, "MyDrive")):
-                return GDRIVE_ROOT, "COLAB_DRIVE"
-            return LOCAL_CACHE_ROOT, "COLAB_DRIVE_FAILED→LOCAL"
-        except Exception as e:                             # noqa
-            LOG.warn(f"구글드라이브 마운트 실패({type(e).__name__}) — 로컬 캐시로 폴백합니다.")
-            return LOCAL_CACHE_ROOT, "COLAB_MOUNT_ERROR→LOCAL"
-    # JupyterLab / CLI: 드라이브가 이미 동기화되어 있으면 그 경로를 쓴다.
-    for cand in (GDRIVE_ROOT, os.path.expanduser("~/Google Drive/MyDrive/tcd_cache"),
-                 os.path.expanduser("~/GoogleDrive/MyDrive/tcd_cache")):
-        if cand and os.path.isdir(cand):
-            return cand, "LOCAL_SYNCED_DRIVE"
-    return LOCAL_CACHE_ROOT, "LOCAL"
 
 
 class Vault:
@@ -2152,13 +1904,6 @@ def _decode(content: bytes, resp_enc: Optional[str], url: str,
     return best if best is not None else content.decode("utf-8", "replace")
 
 
-def euckr_q(s: str) -> str:
-    """네이버/한경 레거시 경로의 한글 파라미터는 UTF-8이 아니라 EUC-KR 퍼센트인코딩이다.
-    이걸 틀리면 예외 없이 '검색 결과 0건'이 나온다 — 최악의 조용한 실패."""
-    try:
-        return quote(str(s), encoding="euc-kr")
-    except Exception:
-        return quote(str(s))
 
 
 def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
@@ -4544,98 +4289,8 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     return downcast(px)
 
 
-def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
-    """월말 기준 가격 패널 + 익월 시가 체결가 + 20일 평균거래대금(ADV).
-
-    체결은 '신호 산출일 다음 거래일 시가'(§10.1). 당일 종가 체결은 미래누수다.
-    """
-    px = px.sort_values(["code", "date"])
-    px["adv20"] = (px.groupby("code", observed=True)["amount"]
-                     .transform(lambda s: s.rolling(20, min_periods=10).mean()))
-    px["ret1d"] = px.groupby("code", observed=True)["close"].pct_change()
-
-    # 월말 스냅샷
-    px["ym"] = px["date"].values.astype("datetime64[M]")
-    last = px.groupby(["code", "ym"], observed=True).tail(1).copy()
-    last["month"] = as_ts_series(last["ym"]) + pd.offsets.MonthEnd(0)
-
-    # 다음 거래일 시가 = 체결가
-    nxt = px.copy()
-    nxt["next_open"] = nxt.groupby("code", observed=True)["open"].shift(-1)
-    nxt["next_date"] = nxt.groupby("code", observed=True)["date"].shift(-1)
-    keep = nxt[["code", "date", "next_open", "next_date"]]
-    last = last.merge(keep, on=["code", "date"], how="left")
-
-    monthly = last[["code", "month", "date", "close", "adv20", "next_open", "next_date"]].copy()
-    monthly = monthly.rename(columns={"date": "signal_date"})
-    monthly = monthly[monthly["month"].isin(months)]
-
-    # 월간 수익률(체결가→체결가). 상장폐지 처리는 backtest 엔진에서 -100% 로 강제한다.
-    monthly = monthly.sort_values(["code", "month"])
-    # 체결가 = 신호 산출일의 '다음 거래일 시가'. 그 다음 거래일이 너무 멀면(거래정지·상폐 직전)
-    # 그 가격으로 체결했다고 가정할 수 없으므로 종가로 폴백한다.
-    gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
-    monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
-    monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
-
-    # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
-    #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
-    nxt_px = monthly.groupby("code", observed=True)["exec_px"].shift(-1)
-    nxt_m = monthly.groupby("code", observed=True)["month"].shift(-1)
-    adjacent = (((nxt_m.dt.year - monthly["month"].dt.year) * 12 +
-                 (nxt_m.dt.month - monthly["month"].dt.month)) == 1)
-    monthly["fwd_ret"] = (nxt_px / monthly["exec_px"] - 1.0).where(adjacent)
-    n_gap = int((nxt_m.notna() & ~adjacent).sum())
-    if n_gap:
-        LOG.info(f"월 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
-                 f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
-                 f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
-    PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
-    return {"daily": px, "monthly": downcast(monthly)}
 
 
-def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """d3(기관+외국인 누적순매수) 입력. 없으면 D축은 가용 축 평균으로 자동 축소된다."""
-    cached = VAULT.get_table("krx_investor_flows", scope="shared")
-    if cached is not None and len(cached):
-        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용")
-        cached["date"] = as_ts_series(cached["date"])
-        return cached
-    if pykrx_stock is None or RUN_MODE == "CACHED":
-        LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "
-                 "U 는 가용 축 평균으로 계산됩니다. 0으로 채우지 않습니다.")
-        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
-
-    codes = sorted({c for c in map(to_code6, codes) if c})
-
-    def _one(code: str):
-        try:
-            limiter("krx").wait()
-            d = pykrx_stock.get_market_trading_value_by_date(
-                as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
-        except Exception:
-            return None
-        if d is None or len(d) == 0:
-            return None
-        d = d.reset_index()
-        d = d.rename(columns={d.columns[0]: "date"})
-        inst = next((c for c in d.columns if "기관" in str(c)), None)
-        forg = next((c for c in d.columns if "외국" in str(c)), None)
-        if inst is None and forg is None:
-            return None
-        return pd.DataFrame({"code": code, "date": as_ts_series(d["date"]),
-                             "inst_net": pd.to_numeric(d[inst], errors="coerce") if inst else np.nan,
-                             "foreign_net": pd.to_numeric(d[forg], errors="coerce") if forg else np.nan})
-
-    res = pmap_io(_one, codes, workers=min(N_WORKERS_IO, 8), desc="수급 수집")
-    got = [d for d in res if d is not None and len(d)]
-    if not got:
-        LOG.warn("수급 데이터를 받지 못했습니다 — d3 결측 처리.")
-        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
-    fl = pd.concat(got, ignore_index=True)
-    VAULT.put_table("krx_investor_flows", fl, scope="shared", domain="flow", source="pykrx")
-    PIPE.io("OUT", "DRIVE", "krx_investor_flows", fl, source="pykrx")
-    return downcast(fl)
 
 
 
@@ -5095,62 +4750,6 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── 직원현황 (θ_N, TP_C2) ───────────────────────────────────────────────────────────────────
-def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    if not DART_API_KEY:
-        return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
-    cached = VAULT.get_table("dart_employees", scope="shared")
-    done = set()
-    if cached is not None and len(cached):
-        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
-        LOG.info(f"공용 캐시에서 직원현황 {len(cached):,}행 재사용")
-    jobs = [(c, y) for c in corp_codes for y in years if (str(c), int(y)) not in done]
-    if RUN_MODE == "CACHED":
-        jobs = []
-
-    def _one(job):
-        corp, year = job
-        js = dart_api("empSttus.json", {"corp_code": corp, "bsns_year": str(year),
-                                        "reprt_code": REPRT_CODES["FY"]})
-        if not js or not isinstance(js.get("list"), list):
-            return None
-        d = pd.DataFrame(js["list"])
-        # ★ empSttus 행은 사업부문(fo_bbm) × 성별(sexdstn) 로 쪼개져 온다. 각 조합은 서로소이므로
-        #   합산이 맞지만, 일부 기업은 '합계/계' 소계 행을 함께 넣어 이중계상이 발생한다 → 제거.
-        #   또 jan_salary_am(1인 평균급여)은 절대 합산하면 안 되는 값이므로 아예 쓰지 않는다.
-        for col in ("fo_bbm", "sexdstn"):
-            if col in d.columns:
-                d = d[~d[col].astype(str).str.strip().isin(["합계", "계", "소계", "총계", "합 계"])]
-        if d.empty:
-            return None
-        num = lambda s: pd.to_numeric(pd.Series(s).astype(str).str.replace(r"[^\d.\-]", "", regex=True),
-                                      errors="coerce")
-        emp = num(d.get("sm", pd.Series(dtype=object))).sum(skipna=True) if "sm" in d.columns else np.nan
-        pay = num(d.get("fyer_salary_totamt", pd.Series(dtype=object))).sum(skipna=True) \
-            if "fyer_salary_totamt" in d.columns else np.nan
-        rn = str(d["rcept_no"].iloc[0]) if "rcept_no" in d.columns and len(d) else ""
-        return {"corp_code": corp, "bsns_year": int(year), "employees": float(emp),
-                "payroll": float(pay), "rcept_no": rn}
-
-    got = [r for r in pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 12),
-                              desc="DART 직원현황") if r] if jobs else []
-    frames = ([cached] if cached is not None and len(cached) else [])
-    if got:
-        frames.append(pd.DataFrame(got))
-    if not frames:
-        return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
-    E = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"], keep="last")
-    # ★ E.get("rcept_no", "") 는 컬럼이 없으면 '문자열'을 돌려주고, zip 이 그걸 글자 단위로
-    #   훑어 knowledge_date 가 전부 깨진다. 컬럼 존재를 먼저 보장한다.
-    if "rcept_no" not in E.columns:
-        E["rcept_no"] = ""
-    E["period_end"] = as_ts_series(E["bsns_year"].astype(int).astype(str) + "-12-31")
-    E["knowledge_date"] = [_knowledge_from_rcept(rn, REPRT_CODES["FY"], int(y))
-                           for rn, y in zip(E["rcept_no"], E["bsns_year"])]
-    if got:
-        VAULT.put_table("dart_employees", E, scope="shared", domain="dart", source="opendart empSttus")
-    E = pit_frame(E, "period_end", "knowledge_date", source="dart")
-    PIPE.io("OUT", "DRIVE", "dart_employees", E, source="opendart empSttus")
-    return E
 
 
 # ── 공시목록 스윕 (시장 전체를 날짜로 훑는다 — 회사별 호출보다 수십 배 싸다) ──────────────────
@@ -5167,76 +4766,6 @@ DISCLOSURE_PATTERNS = {
 }
 
 
-def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
-    """월 단위로 시장 전체 공시목록을 훑는다. PACK-C(자사주/배당)와 V3(희석성 조달)의 입력."""
-    if not DART_API_KEY:
-        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
-    cached = VAULT.get_table("dart_disclosures", scope="shared")
-    have_months = set()
-    if cached is not None and len(cached):
-        cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
-        have_months = set(cached["rcept_dt"].dt.to_period("M").astype(str))
-        LOG.info(f"공용 캐시에서 공시목록 {len(cached):,}행 재사용")
-
-    months = pd.period_range(as_ts(start), as_ts(end), freq="M")
-    todo = [m for m in months if str(m) not in have_months]
-    if RUN_MODE == "CACHED":
-        todo = []
-
-    # ★ 파이프라인이 실제로 소비하는 공시 유형을 전부 훑어야 한다.
-    #   B(주요사항보고)만 훑으면 PACK-C 의 자사주·증자는 잡히지만
-    #   PACK-D 가 필요로 하는 '사업보고서'는 A(정기공시)라 단 한 건도 안 잡힌다.
-    #   그러면 fetch_dart_documents 가 걸러낼 대상이 없어 팩 전체가 조용히 죽는다.
-    #   (실경로에서만 드러나는 유형 — 합성 스모크는 dis 를 직접 만들어 넣으므로 못 본다)
-    DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
-
-    def _one(m):
-        rows = []
-        for ty in DISCLOSURE_TYPES:
-            page = 1
-            while page <= 100:
-                js = dart_api("list.json", {
-                    "bgn_de": m.start_time.strftime("%Y%m%d"),
-                    "end_de": m.end_time.strftime("%Y%m%d"),
-                    "pblntf_ty": ty, "page_no": page, "page_count": 100,
-                    "last_reprt_at": "N"})
-                if not js or not isinstance(js.get("list"), list) or not js["list"]:
-                    break
-                rows.extend(js["list"])
-                if page >= int(js.get("total_page", 1) or 1):
-                    break
-                page += 1
-        return rows
-
-    new = []
-    if todo:
-        res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 8), desc="DART 공시목록")
-        for r in res:
-            if r:
-                new.extend(r)
-
-    frames = ([cached] if cached is not None and len(cached) else [])
-    if new:
-        d = pd.DataFrame(new)
-        keep = [c for c in ("corp_code", "corp_name", "stock_code", "rcept_no", "rcept_dt",
-                            "report_nm", "flr_nm", "corp_cls") if c in d.columns]
-        frames.append(d[keep])
-    if not frames:
-        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
-    D = pd.concat(frames, ignore_index=True).drop_duplicates("rcept_no", keep="last")
-    D["rcept_dt"] = as_ts_series(D["rcept_dt"])
-    D["report_nm"] = D["report_nm"].astype(str)
-    D["event"] = ""
-    for ev, pat in DISCLOSURE_PATTERNS.items():
-        hit = D["report_nm"].str.contains(pat, regex=True, na=False) & (D["event"] == "")
-        D.loc[hit, "event"] = ev
-    if new:
-        VAULT.put_table("dart_disclosures", D, scope="shared", domain="dart", source="opendart list.json")
-    D = pit_frame(D, "rcept_dt", "rcept_dt", source="dart")     # 접수일 = 공개일
-    LOG.ok(f"공시목록 {len(D):,}건 — 이벤트 분류: " +
-           ", ".join(f"{k}={int((D['event']==k).sum()):,}" for k in DISCLOSURE_PATTERNS if (D['event']==k).any()))
-    PIPE.io("OUT", "DRIVE", "dart_disclosures", D, source="opendart list.json")
-    return D
 
 
 
@@ -6254,55 +5783,6 @@ def audit_linkage(rep: pd.DataFrame, A: pd.DataFrame, L: pd.DataFrame):
                  f"(RESEARCH_DOWNLOAD_PDF=True 로 개선 가능).")
 
 
-def build_consensus_panel(L: pd.DataFrame, months: pd.DatetimeIndex,
-                          window_days: int = 90) -> pd.DataFrame:
-    """D축 d2(목표주가 상향 리비전) · d4(커버리지 변화) 산출.
-
-    ★ 리비전은 '같은 애널리스트가 같은 종목에 대해 이전에 제시한 목표주가' 와 비교해야 한다.
-      애널리스트 식별이 없으면 이 지표는 만들 수 없다 — 애널리스트 원장이 필요한 진짜 이유.
-    """
-    cols = ["code", "month", "n_analyst", "tp_median", "rev_up", "rev_dn", "d2_raw", "d4_raw"]
-    if L is None or L.empty:
-        LOG.warn("애널리스트 연결이 없어 컨센서스 패널을 만들 수 없습니다 — d2/d4 결측 처리. "
-                 "U 는 가용 축(d1, d3) 평균으로 계산됩니다(0으로 채우지 않음).")
-        return pd.DataFrame(columns=cols)
-    x = L.dropna(subset=["stock_code"]).copy()
-    x["pub_date"] = as_ts_series(x["pub_date"])
-    x = x.dropna(subset=["pub_date"])
-    if x.empty:
-        return pd.DataFrame(columns=cols)
-
-    x = x.sort_values(["stock_code", "analyst_id", "pub_date"])
-    x["prev_tp"] = x.groupby(["stock_code", "analyst_id"], observed=True)["target_price"].shift(1)
-    x["rev"] = np.where(x["target_price"].notna() & x["prev_tp"].notna(),
-                        np.sign(x["target_price"] - x["prev_tp"]), np.nan)
-
-    out = []
-    for m in months:
-        lo = m - pd.Timedelta(days=window_days)
-        w = x[(x["pub_date"] > lo) & (x["pub_date"] <= m)]
-        if w.empty:
-            continue
-        g = w.groupby("stock_code", observed=True)
-        agg = pd.DataFrame({
-            "n_analyst": g["analyst_id"].nunique(),
-            "tp_median": g["target_price"].median(),
-            "rev_up": g["rev"].apply(lambda s: float((s > 0).sum())),
-            "rev_dn": g["rev"].apply(lambda s: float((s < 0).sum())),
-        }).reset_index().rename(columns={"stock_code": "code"})
-        agg["month"] = m
-        out.append(agg)
-    if not out:
-        return pd.DataFrame(columns=cols)
-    P = pd.concat(out, ignore_index=True)
-    P = P.sort_values(["code", "month"])
-    # d2 = -(상향 리비전 수 / 커버리지)   d4 = -Δ(커버리지 애널리스트 수)
-    P["d2_raw"] = -(P["rev_up"] / P["n_analyst"].replace(0, np.nan))
-    P["d4_raw"] = -P.groupby("code", observed=True)["n_analyst"].diff()
-    LOG.ok(f"컨센서스 패널 {len(P):,}행 ({P['code'].nunique():,}종목 × {P['month'].nunique()}개월) — "
-           f"목표주가 리비전 관측 {int((P['rev_up']+P['rev_dn']).sum()):,}건")
-    PIPE.io("OUT", "MEM", "consensus_panel", P)
-    return downcast(P)
 
 
 
@@ -6581,50 +6061,8 @@ SIZE_BUCKETS = [(0, 50, "<50"), (50, 100, "50-99"), (100, 300, "100-299"),
                 (300, 1000, "300-999"), (1000, 10 ** 9, "1000+")]
 
 
-def size_bucket(n_emp: float) -> str:
-    if n_emp is None or not np.isfinite(n_emp) or n_emp <= 0:
-        return "미상"
-    for lo, hi, lab in SIZE_BUCKETS:
-        if lo <= n_emp < hi:
-            return lab
-    return "1000+"
 
 
-def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N) -> pd.DataFrame:
-    """cell_key = (date, industry, size_bucket). 규모를 넣는 이유는 §5.6-② 참조:
-    정부 지원제도 요건 대부분이 기업 규모에 연동되므로 정책효과가 셀 내 공통충격으로 흡수된다.
-    비용 0의 오염 제거."""
-    ind = sec.set_index("code")["industry"].astype(str).to_dict()
-    p = panel.copy()
-    p["industry"] = p["code"].map(ind).fillna("미분류").astype(str)
-    p["industry_l1"] = p["industry"].str.slice(0, 4)                 # 폴백용 상위 단위
-    p["size_bucket"] = p["employees"].map(size_bucket) if "employees" in p.columns else "미상"
-    ym = p["month"].dt.strftime("%Y%m")
-    p["cell"] = ym + "|" + p["industry"] + "|" + p["size_bucket"]
-    # 폴백 사다리를 컬럼으로 미리 만들어 둔다. 센서별로 유효 관측이 부족할 때
-    # xsec_z_l 이 이 사다리를 타고 내려간다(C11 "산업 상위 단위로 폴백").
-    p["cell_l2"] = ym + "|" + p["industry_l1"] + "|ALL"
-    p["cell_l3"] = ym + "|ALL|ALL"
-
-    cnt = p.groupby("cell", observed=True)["code"].transform("size")
-    small = cnt < min_n
-    n_small = int(small.sum())
-    still_n = 0
-    if n_small:
-        p.loc[small, "cell"] = p.loc[small, "cell_l2"]
-        cnt2 = p.groupby("cell", observed=True)["code"].transform("size")
-        still = cnt2 < min_n
-        still_n = int(still.sum())
-        if still.any():
-            p.loc[still, "cell"] = p.loc[still, "cell_l3"]
-        LOG.info(f"셀 폴백 발생: 1차 {n_small:,}행(산업 상위단위로) / 2차 {still_n:,}행(전체로). "
-                 f"C11 요구대로 폴백을 로깅합니다.")
-        PIPE.note(f"셀 폴백 {n_small:,}행")
-    for c in ("cell", "cell_l2", "cell_l3"):
-        p[c] = p[c].astype("category")
-    LOG.debug(f"셀 구성: 1단계 {p['cell'].nunique():,}개 · 2단계 {p['cell_l2'].nunique():,}개 · "
-              f"3단계 {p['cell_l3'].nunique():,}개")
-    return p
 
 
 

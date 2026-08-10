@@ -114,6 +114,77 @@ def _extract_sources(blob: str, names) -> dict:
     return out
 
 
+# ★ 공용 코어(01~05, 10~14, 20)는 TCD v2 와 같은 파일을 쓴다. 그래서 QVF 가 한 번도 부르지
+#   않는 수집기·유틸이 그대로 딸려 들어온다 — 사용자가 지적한 "다른 전략 코드가 그대로 있다"가
+#   바로 이것이다. 공용 조각을 지우면 TCD 빌드가 깨지므로, '조립 시점에' 도달 불가능한 최상위
+#   정의를 잘라낸다. 조각은 공유하되 산출물에는 안 쓰는 코드가 남지 않는다.
+PRUNE_KEEP = {
+    # 문자열/데코레이터로도 안 잡히는데 반드시 남겨야 하는 이름이 생기면 여기에 적는다.
+}
+
+
+def _names_used(node) -> set:
+    out = set()
+    for x in ast.walk(node):
+        if isinstance(x, ast.Name):
+            out.add(x.id)
+        elif isinstance(x, ast.Attribute):
+            out.add(x.attr)          # 메서드명 경유 참조까지 보수적으로 센다
+    return out
+
+
+def _strings_in(node) -> set:
+    return {x.value.strip() for x in ast.walk(node)
+            if isinstance(x, ast.Constant) and isinstance(x.value, str)}
+
+
+def prune_unreachable(blob: str, extra_roots=()) -> tuple:
+    """조립본에서 아무도 도달하지 못하는 최상위 함수/클래스를 제거한다(고정점까지 반복).
+
+    보수적으로 남긴다. 아래 중 하나라도 해당하면 루트로 본다:
+      · 모듈 최상위 실행문이 참조하는 이름
+      · 데코레이터가 붙은 정의(데코레이터가 레지스트리에 등록하는 부작용을 가진다 — 계약 _q* 가 그렇다)
+      · 이름이 문자열 리터럴로 등장하는 정의(globals()[...] · getattr 동적 호출 대비)
+    """
+    removed = []
+    while True:
+        tree = ast.parse(blob)
+        lines = blob.split("\n")
+        defs, roots, strs = {}, set(extra_roots) | set(PRUNE_KEEP), set()
+        for n in tree.body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defs[n.name] = n
+                if n.decorator_list:
+                    roots.add(n.name)
+                    for d in n.decorator_list:
+                        roots |= _names_used(d)
+            else:
+                roots |= _names_used(n)
+            strs |= _strings_in(n)
+        roots |= {s for s in strs if s in defs}
+        edges = {k: _names_used(v) for k, v in defs.items()}
+
+        seen, stack = set(), [r for r in roots if r in defs]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(x for x in edges.get(cur, ()) if x in defs and x not in seen)
+
+        dead = [n for n in defs if n not in seen]
+        if not dead:
+            return blob, removed
+
+        cut = set()
+        for name in dead:
+            node = defs[name]
+            lo = min([node.lineno] + [d.lineno for d in node.decorator_list])
+            removed.append((name, node.end_lineno - lo + 1))
+            cut.update(range(lo, node.end_lineno + 1))
+        blob = "\n".join(l for i, l in enumerate(lines, 1) if i not in cut)
+
+
 def build(version: str) -> str:
     parts = []
     for i, fn in enumerate(ORDER):
@@ -126,6 +197,15 @@ def build(version: str) -> str:
     left = sorted(set(re.findall(r"@@\w+@@", blob)))
     if left:
         raise SystemExit(f"치환되지 않은 플레이스홀더: {left}")
+
+    n0 = blob.count("\n") + 1
+    blob, pruned = prune_unreachable(blob, extra_roots={n.split(".")[0] for n in SRC_PIN})
+    if pruned:
+        tot = sum(ln for _, ln in pruned)
+        print(f"  · 미도달 최상위 정의 {len(pruned)}개 / {tot:,}줄 제거 "
+              f"({n0:,} → {blob.count(chr(10))+1:,}줄)")
+        for nm, ln in sorted(pruned, key=lambda x: -x[1]):
+            print(f"      - {nm:<32}{ln:>5}줄")
 
     # 소스 고정 블록을 계약 계층 '앞'에 끼워 넣는다(정의 순서 = 조립 순서).
     srcmap = _extract_sources(blob, SRC_PIN)

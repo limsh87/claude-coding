@@ -214,6 +214,13 @@ if OPT.get("pykrx"):
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
+        # ★ yfinance 는 종목마다 "possibly delisted; no price data found" 를 ERROR 로 뱉는다.
+        #   폐지 종목이 정상적으로 섞여 있는 소형주 백테스트에서는 이게 수천 줄로 쏟아져
+        #   진짜 경고를 화면 밖으로 밀어낸다. 실패 건수는 우리가 수집 시도 원장으로 이미
+        #   집계하므로(원인·재시도 정책 포함) 라이브러리 자체 로그는 끈다 — 정보 손실이 없다.
+        for _n in ("yfinance", "yfinance.data", "yfinance.ticker", "peewee", "urllib3"):
+            logging.getLogger(_n).setLevel(logging.CRITICAL)
+            logging.getLogger(_n).propagate = False
     except Exception:
         yf = None
 if OPT.get("fitz"):
