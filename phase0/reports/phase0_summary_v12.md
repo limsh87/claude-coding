@@ -3,10 +3,10 @@
 - 실행 모드: LIVE
 - 전 상장사 노드 수: 미측정 (PENDING)
 - 축 C 첫 응답 wkplNm 표본 3건: 미획득 (PENDING)
-- 생성 시각: 2026-08-10T06:18:47
+- 생성 시각: 2026-08-10T06:31:12
 - PROJECT_ROOT: `/home/user/claude-coding/phase0` (P0_RUNTIME_ROOT=PASS)
 - 총 API 호출: 0 / 중단선 15200 (80% 트립선 12160)
-- 총 실행시간: 2.3s
+- 총 실행시간: 2.1s
 
 ## 축별 판정
 
@@ -27,6 +27,7 @@
 - `NO_KEY` — OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)
 
 **known_limitations**
+- 사전점검 경고 [KRX_NO_LOGIN]: KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. 유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. 가입: https://www.krx.co.kr (무료)
 - 사전점검 단계에서 차단되어 어떤 게이트도 측정되지 않았다. STOP(측정 결과 미달)이 아니라 BLOCKED_PREREQ(측정 자체 불가)다(§11).
 
 ### 축 A — 2021-06-30 — BLOCKED_PREREQ
@@ -38,6 +39,7 @@
 - `NO_KEY` — OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)
 
 **known_limitations**
+- 사전점검 경고 [KRX_NO_LOGIN]: KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. 유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. 가입: https://www.krx.co.kr (무료)
 - 사전점검 단계에서 차단되어 어떤 게이트도 측정되지 않았다. STOP(측정 결과 미달)이 아니라 BLOCKED_PREREQ(측정 자체 불가)다(§11).
 
 ### 축 A-delta — 2026-03-31 — BLOCKED_PREREQ
@@ -49,6 +51,7 @@
 - `NO_KEY` — OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)
 
 **known_limitations**
+- 사전점검 경고 [KRX_NO_LOGIN]: KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. 유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. 가입: https://www.krx.co.kr (무료)
 - 사전점검 단계에서 차단되어 스냅샷을 하나도 구성하지 못했다. STOP 이 아니라 BLOCKED_PREREQ 다.
 
 ### 축 B — 2026-06-30 — BLOCKED_PREREQ

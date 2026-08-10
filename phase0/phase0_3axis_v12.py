@@ -61,6 +61,17 @@ from __future__ import annotations
 #     발급 https://opendart.fss.or.kr/  →  인증키 신청/관리 (이메일 인증 즉시, 무료)
 DART_API_KEY = ""
 
+# [1-b] 축 A / A-Δ — KRX 로그인 (data.krx.co.kr 계정)
+#     전 상장사 유니버스와 시가총액을 pykrx 로 받는데, pykrx 1.2.8 은 KRX_ID/KRX_PW 가
+#     있으면 로그인 세션으로, 없으면 **비로그인 세션으로 폴백**한다. 하드 차단은 아니지만
+#     KRX 가 로그인을 요구하는 엔드포인트에서는 빈 응답이 돌아온다.
+#     가입 https://www.krx.co.kr  →  회원가입 (무료). 데이터 이용 신청은 따로 필요 없다.
+#     ★ pykrx 는 import 시점에 이 값을 읽는다. 이 파일은 pykrx 를 늦게 import 하므로
+#       여기에 넣으면 되지만, 노트북에서 이미 pykrx 를 import 한 뒤라면 런타임을 재시작해야 한다.
+#       (코드가 그 상황을 감지해 경고한다)
+KRX_ID = ""
+KRX_PW = ""
+
 # [2] 축 B — GCP 서비스계정. ★ 아래 두 칸의 역할이 다르다. 바꿔 넣으면 축 B가 통째로 죽는다.
 #     발급 https://console.cloud.google.com/iam-admin/serviceaccounts
 #          → 서비스 계정 만들기 → 키 → 새 키 만들기 → JSON → 다운로드
@@ -797,6 +808,20 @@ def _resolve_key(pasted: str, env_name: str) -> Tuple[str, str]:
 DART_API_KEY, _DART_KEY_SRC = _resolve_key(DART_API_KEY, "DART_API_KEY")
 DATA_GO_KR_KEY, _NPS_KEY_SRC = _resolve_key(DATA_GO_KR_KEY, "DATA_GO_KR_KEY")
 
+# KRX 로그인 — pykrx 는 webio 모듈 로드 시점에 os.environ 을 읽는다(pykrx/website/comm/webio.py).
+# 따라서 환경변수 승격이 pykrx import 보다 **먼저** 일어나야 한다. 이 파일은 pykrx 를
+# 함수 안에서만 import 하므로 순서가 보장되지만, 이미 import 된 상태라면 손쓸 수 없다.
+_KRX_ID, _KRX_ID_SRC = _resolve_key(KRX_ID, "KRX_ID")
+_KRX_PW, _KRX_PW_SRC = _resolve_key(KRX_PW, "KRX_PW")
+if _KRX_ID:
+    os.environ["KRX_ID"] = _KRX_ID
+if _KRX_PW:
+    os.environ["KRX_PW"] = _KRX_PW
+
+_KRX_IMPORTED_TOO_EARLY = bool(_KRX_ID and _KRX_PW) and any(
+    m.startswith("pykrx") for m in sys.modules
+)
+
 # 축 B는 google 라이브러리가 환경변수를 직접 읽으므로, 입력란 값을 환경변수로 승격한다.
 _GCP_PATH, _GCP_PATH_SRC = _resolve_key(GCP_SA_KEY_PATH, "GOOGLE_APPLICATION_CREDENTIALS")
 _GCP_PROJ, _GCP_PROJ_SRC = _resolve_key(GCP_PROJECT_ID, "GOOGLE_CLOUD_PROJECT")
@@ -815,14 +840,21 @@ def _mask(key: str) -> str:
 
 def log_key_status() -> None:
     log("  키 입력 상태 (값은 마스킹된다)")
-    log(f"    [1] DART_API_KEY            {_mask(DART_API_KEY)}  ← {_DART_KEY_SRC}")
-    log(f"    [2] GCP_SA_KEY_PATH         "
-        f"{_GCP_PATH or '(없음)'}  ← {_GCP_PATH_SRC}")
-    log(f"        GCP_PROJECT_ID          {_GCP_PROJ or '(없음)'}  ← {_GCP_PROJ_SRC}")
-    log(f"    [3] DATA_GO_KR_KEY          {_mask(DATA_GO_KR_KEY)}  ← {_NPS_KEY_SRC}")
+    log(f"    [1]  DART_API_KEY           {_mask(DART_API_KEY)}  ← {_DART_KEY_SRC}")
+    log(f"    [1b] KRX_ID                 {_KRX_ID or '(없음)'}  ← {_KRX_ID_SRC}")
+    log(f"         KRX_PW                 {_mask(_KRX_PW)}  ← {_KRX_PW_SRC}")
+    log(f"    [2]  GCP_SA_KEY_PATH        {_GCP_PATH or '(없음)'}  ← {_GCP_PATH_SRC}")
+    log(f"         GCP_PROJECT_ID         {_GCP_PROJ or '(없음)'}  ← {_GCP_PROJ_SRC}")
+    log(f"    [3]  DATA_GO_KR_KEY         {_mask(DATA_GO_KR_KEY)}  ← {_NPS_KEY_SRC}")
     if _GCP_PATH and ("/" not in _GCP_PATH and "\\" not in _GCP_PATH):
         log("    ⚠ GCP_SA_KEY_PATH 가 파일경로가 아니라 프로젝트 ID 처럼 보인다. "
             "두 칸이 바뀌지 않았는지 확인할 것(§5.1).")
+    if _KRX_IMPORTED_TOO_EARLY:
+        log("    ⚠ pykrx 가 이 셀보다 먼저 import 되어 있다. pykrx 는 모듈 로드 시점에 "
+            "KRX_ID/KRX_PW 를 읽으므로 지금 설정한 값이 반영되지 않는다. "
+            "런타임을 재시작(Colab: 런타임 > 세션 다시 시작)하고 이 셀부터 실행할 것.")
+    if bool(_KRX_ID) != bool(_KRX_PW):
+        log("    ⚠ KRX_ID 와 KRX_PW 중 한쪽만 채워져 있다. 둘 다 있어야 로그인한다.")
 
 DART_HOST = "opendart.fss.or.kr"
 KRX_HOST = "data.krx.co.kr"
@@ -843,6 +875,8 @@ class PreflightResult:
     cause_class: str    # OK / NO_KEY / NET_BLOCKED / NET_DOWN / DEP_MISSING / AUTH_* / ...
     detail: str
     blockers: List[Tuple[str, str]] = field(default_factory=list)
+    # 차단은 아니지만 결과를 조용히 망가뜨릴 수 있는 것. 예: KRX 비로그인 폴백.
+    warnings: List[Tuple[str, str]] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.ok:
@@ -858,15 +892,19 @@ _CAUSE_PRIORITY = [
 ]
 
 
-def _combine(blockers: List[Tuple[str, str]], ok_detail: str) -> PreflightResult:
+def _combine(
+    blockers: List[Tuple[str, str]], ok_detail: str,
+    warnings: Optional[List[Tuple[str, str]]] = None,
+) -> PreflightResult:
+    warns = warnings or []
     if not blockers:
-        return PreflightResult(True, "OK", ok_detail, [])
+        return PreflightResult(True, "OK", ok_detail, [], warns)
     ranked = sorted(
         blockers,
         key=lambda b: _CAUSE_PRIORITY.index(b[0]) if b[0] in _CAUSE_PRIORITY else 99,
     )
     primary = ranked[0]
-    return PreflightResult(False, primary[0], primary[1], ranked)
+    return PreflightResult(False, primary[0], primary[1], ranked, warns)
 
 
 def probe_host(host: str, *, timeout: int = 20) -> PreflightResult:
@@ -909,6 +947,24 @@ def preflight_axis_a(force: bool = False) -> PreflightResult:
     if _PREFLIGHT_MEMO.a is not None and not force:
         return _PREFLIGHT_MEMO.a
     blockers: List[Tuple[str, str]] = []
+    warns: List[Tuple[str, str]] = []
+
+    # KRX 로그인은 하드 요건이 아니다 — pykrx 는 비로그인 세션으로 폴백한다.
+    # 다만 KRX 가 로그인을 요구하는 엔드포인트에서는 빈 응답이 돌아오고, 그러면
+    # '휴장일'로 오진하기 쉽다. 차단이 아니라 경고로 남겨 그 오진을 막는다.
+    if not (_KRX_ID and _KRX_PW):
+        warns.append((
+            "KRX_NO_LOGIN",
+            "KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. "
+            "유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. "
+            "가입: https://www.krx.co.kr (무료)",
+        ))
+    if _KRX_IMPORTED_TOO_EARLY:
+        warns.append((
+            "KRX_ENV_TOO_LATE",
+            "pykrx 가 이 스크립트보다 먼저 import 되어 KRX_ID/KRX_PW 가 반영되지 않았다. "
+            "런타임을 재시작하고 이 셀부터 실행할 것.",
+        ))
 
     if not _HAS_REQUESTS:
         blockers.append(("DEP_MISSING", "requests 미설치 — pip install requests"))
@@ -941,7 +997,7 @@ def preflight_axis_a(force: bool = False) -> PreflightResult:
         if not krx.ok:
             blockers.append((krx.cause_class, f"KRX({KRX_HOST}) 도달 불가 — {krx.detail}"))
 
-    res = _combine(blockers, "OpenDART + KRX 도달 가능, 키 형식 정상")
+    res = _combine(blockers, "OpenDART + KRX 도달 가능, 키 형식 정상", warns)
     _PREFLIGHT_MEMO.a = res
     return res
 
@@ -1078,6 +1134,16 @@ def preflight_axis_b(force: bool = False) -> Tuple[PreflightResult, Dict[str, An
 # =============================================================================
 
 
+def krx_session_state() -> str:
+    """pykrx 가 실제로 로그인 세션을 쥐고 있는지 확인한다. 추측하지 않고 물어본다."""
+    try:
+        from pykrx.website.comm.auth import get_auth_session
+
+        return "로그인됨" if get_auth_session() is not None else "비로그인(폴백)"
+    except Exception:
+        return "확인불가"
+
+
 @dataclass
 class Universe:
     as_of: date
@@ -1096,11 +1162,18 @@ def fetch_universe(as_of: date, breaker: CircuitBreaker) -> Universe:
     from pykrx import stock
 
     ds = as_of.strftime("%Y%m%d")
-    log(f"  KRX 시가총액 조회 (market=ALL, date={ds})")
+    log(f"  KRX 시가총액 조회 (market=ALL, date={ds}) — 세션 {krx_session_state()}")
     COUNTERS.aux_call("krx_market_cap")     # OpenDART 예산과 분리해 센다
     cap_df = stock.get_market_cap_by_ticker(ds, market="ALL")
     if cap_df is None or len(cap_df) == 0:
-        raise RuntimeError(f"KRX 시가총액 응답이 비었다 (date={ds}) — 휴장일이거나 응답 실패")
+        # 빈 응답을 '휴장일'로 단정하면 오진이다. 비로그인 폴백이 더 흔한 원인이다.
+        hint = (
+            " KRX_ID/KRX_PW 가 설정되지 않아 비로그인 세션으로 조회했다. "
+            "KRX 가 로그인을 요구하는 엔드포인트면 이것이 원인이다."
+            if not (_KRX_ID and _KRX_PW)
+            else " 로그인 세션은 있으나 응답이 비었다. 휴장일인지 확인할 것."
+        )
+        raise RuntimeError(f"KRX 시가총액 응답이 비었다 (date={ds}).{hint}")
 
     caps: Dict[str, int] = {}
     for tkr, row in cap_df.iterrows():
@@ -1490,6 +1563,7 @@ def run_axis_a(limitations: List[str]) -> Tuple[List[AxisVerdict], Optional[str]
                 blocked_reason=pre.summary(), blocked_cause_class=pre.cause_class,
             )
             v.extra["preflight_blockers"] = [{"cause_class": c, "detail": d} for c, d in pre.blockers]
+            v.known_limitations += [f"사전점검 경고 [{c}]: {d}" for c, d in pre.warnings]
             v.known_limitations.append(
                 "사전점검 단계에서 차단되어 어떤 게이트도 측정되지 않았다. "
                 "STOP(측정 결과 미달)이 아니라 BLOCKED_PREREQ(측정 자체 불가)다(§11)."
@@ -1668,7 +1742,10 @@ def run_axis_a(limitations: List[str]) -> Tuple[List[AxisVerdict], Optional[str]
                 "exec_records": g.n_records,
                 "birth_ym_missing": g.n_birth_missing,
             }
+            v.known_limitations += [f"사전점검 경고 [{c}]: {d}" for c, d in pre.warnings]
             v.known_limitations += [
+                f"KRX 세션 상태: {krx_session_state()}. 비로그인 폴백이면 유니버스가 "
+                "조용히 비거나 축소될 수 있다.",
                 "겸직 엣지는 (성명 + 출생년월) 동일성으로 판정한다. 출생년월 결측 레코드는 "
                 "동명이인 오결합을 피하기 위해 엣지 생성에서 제외했으며 그 수를 A-2 로 보고한다.",
                 "A-5 는 인물 다중 겸직을 합산하지 않고 '고유 종목쌍' 수로 센다(보수적 계수).",
@@ -1754,6 +1831,7 @@ def run_axis_a_delta(limitations: List[str]) -> Tuple[AxisVerdict, Optional[str]
         v.blocked_reason = pre.summary()
         v.blocked_cause_class = pre.cause_class
         v.extra["preflight_blockers"] = [{"cause_class": c, "detail": d} for c, d in pre.blockers]
+        v.known_limitations += [f"사전점검 경고 [{c}]: {d}" for c, d in pre.warnings]
         v.known_limitations.append(
             "사전점검 단계에서 차단되어 스냅샷을 하나도 구성하지 못했다. STOP 이 아니라 BLOCKED_PREREQ 다."
         )
@@ -2638,11 +2716,13 @@ def main() -> int:
                    ("축 C (공공데이터포털)", pre_c)):
         if pr.ok:
             log(f"  [OK   ] {nm}: {pr.detail}")
-            continue
-        log(f"  [BLOCK] {nm} — 차단 사유 {len(pr.blockers)}건 "
-            f"(우선 해결: {pr.cause_class})")
-        for c, d in pr.blockers:
-            log(f"           · [{c}] {d}")
+        else:
+            log(f"  [BLOCK] {nm} — 차단 사유 {len(pr.blockers)}건 "
+                f"(우선 해결: {pr.cause_class})")
+            for c, d in pr.blockers:
+                log(f"           · [{c}] {d}")
+        for c, d in pr.warnings:
+            log(f"  [WARN ] {nm} — [{c}] {d}")
 
     limitations: List[str] = []
     verdicts: List[AxisVerdict] = []
@@ -2716,6 +2796,7 @@ def main() -> int:
             key: {
                 "ok": pr.ok, "primary_cause_class": pr.cause_class, "detail": pr.detail,
                 "blockers": [{"cause_class": c, "detail": d} for c, d in pr.blockers],
+                "warnings": [{"cause_class": c, "detail": d} for c, d in pr.warnings],
             }
             for key, pr in (("axis_a", pre_a), ("axis_b", pre_b), ("axis_c", pre_c))
         },

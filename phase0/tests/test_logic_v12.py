@@ -435,6 +435,22 @@ check("차단 없으면 ok", P._combine([], "정상").ok is True)
 r2 = P._combine([("AUTH_BILLING", "결제 미설정"), ("DEP_MISSING", "미설치")], "ok")
 check("DEP_MISSING 이 최우선", r2.cause_class == "DEP_MISSING", r2.cause_class)
 
+# 경고는 차단이 아니다 — 통과시키되 기록은 남긴다
+rw = P._combine([], "정상", [("KRX_NO_LOGIN", "비로그인 폴백")])
+check("경고만 있으면 ok 는 유지", rw.ok is True)
+check("경고가 기록된다", len(rw.warnings) == 1, str(rw.warnings))
+check("경고는 blockers 에 섞이지 않는다", rw.blockers == [], str(rw.blockers))
+rwb = P._combine([("NO_KEY", "키 없음")], "ok", [("KRX_NO_LOGIN", "비로그인")])
+check("차단과 경고가 함께 있어도 각각 유지",
+      rwb.ok is False and len(rwb.blockers) == 1 and len(rwb.warnings) == 1)
+
+# KRX 자격증명은 축 A 의 하드 요건이 아니다 (pykrx 가 비로그인으로 폴백한다)
+check("KRX 미로그인은 차단 사유가 아니다",
+      "KRX_NO_LOGIN" not in P._CAUSE_PRIORITY)
+check("KRX 세션 상태를 추측하지 않고 조회한다",
+      P.krx_session_state() in {"로그인됨", "비로그인(폴백)", "확인불가"},
+      P.krx_session_state())
+
 # §5.1 — 각 원인이 별개 클래스로 유지되는가
 classes = {c for c, _ in P._combine(
     [("AUTH_PATH", "a"), ("AUTH_KEY_FORMAT", "b"), ("AUTH_PERMISSION", "c"),

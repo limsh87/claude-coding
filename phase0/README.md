@@ -29,6 +29,8 @@ v1.1의 셀프테스트 36/36 PASS는 합성 데이터였으므로 측정값이 
 
 ```python
 DART_API_KEY    = ""      # OpenDART 인증키 40자
+KRX_ID          = ""      # KRX 로그인 ID   (data.krx.co.kr 계정)
+KRX_PW          = ""      # KRX 로그인 PW
 GCP_SA_KEY_PATH = ""      # JSON 키 "파일의 절대경로"  예) /content/sa-key.json
 GCP_PROJECT_ID  = ""      # "프로젝트 ID 문자열"       예) compelling-muse-311107
 DATA_GO_KR_KEY  = ""      # 공공데이터포털 Decoding 키
@@ -37,20 +39,38 @@ DATA_GO_KR_KEY  = ""      # 공공데이터포털 Decoding 키
 비워두면 같은 이름의 환경변수에서 읽는다. 둘 다 없으면 해당 축만 `BLOCKED_PREREQ(NO_KEY)`로
 기록되고 나머지 축은 정상 진행한다.
 
-| 입력란 | 대응 환경변수 | 축 |
-|---|---|---|
-| `DART_API_KEY` | `DART_API_KEY` | A, A-Δ |
-| `GCP_SA_KEY_PATH` | `GOOGLE_APPLICATION_CREDENTIALS` | B |
-| `GCP_PROJECT_ID` | `GOOGLE_CLOUD_PROJECT` | B |
-| `DATA_GO_KR_KEY` | `DATA_GO_KR_KEY` | C |
-| — | `P0_PROJECT_ROOT` (선택) 캐시·산출물 루트 | 전체 |
+| 입력란 | 대응 환경변수 | 축 | 필수 |
+|---|---|---|---|
+| `DART_API_KEY` | `DART_API_KEY` | A, A-Δ | 필수 |
+| `KRX_ID` / `KRX_PW` | `KRX_ID` / `KRX_PW` | A, A-Δ | 권장 (아래 참조) |
+| `GCP_SA_KEY_PATH` | `GOOGLE_APPLICATION_CREDENTIALS` | B | 필수 |
+| `GCP_PROJECT_ID` | `GOOGLE_CLOUD_PROJECT` | B | 필수 |
+| `DATA_GO_KR_KEY` | `DATA_GO_KR_KEY` | C | 필수 |
+| — | `P0_PROJECT_ROOT` (선택) 캐시·산출물 루트 | 전체 | — |
+
+### KRX 로그인 (`KRX_ID` / `KRX_PW`)
+
+전 상장사 유니버스와 시가총액을 pykrx로 받는다. pykrx 1.2.8은 이 두 값이 있으면 로그인
+세션으로, 없으면 **비로그인 세션으로 폴백**한다(`pykrx/website/comm/webio.py`). 하드 요건은
+아니라서 차단(`BLOCKED_PREREQ`)이 아니라 **경고**(`KRX_NO_LOGIN`)로 기록하지만, KRX가 로그인을
+요구하는 엔드포인트에서는 빈 응답이 돌아온다. 그 빈 응답을 '휴장일'로 오진하지 않도록
+실패 메시지가 세션 상태를 함께 찍는다.
+
+가입은 https://www.krx.co.kr 회원가입(무료)이면 되고 별도 데이터 이용 신청은 필요 없다.
+
+> **주의 — pykrx는 import 시점에 이 두 값을 읽는다.** 이 파일은 pykrx를 함수 안에서만
+> import하므로 입력란에 넣으면 되지만, 노트북에서 이미 pykrx를 import한 뒤라면 값이 반영되지
+> 않는다. 코드가 그 상황을 감지해 경고하며, 런타임을 재시작(Colab: 런타임 > 세션 다시 시작)하고
+> 이 셀부터 실행해야 한다.
 
 키는 로그·판정표 어디에도 남지 않는다. 실행 시작 시 **앞 4자와 길이만** 마스킹해 출처와 함께 찍는다.
 
 ```
 키 입력 상태 (값은 마스킹된다)
-  [1] DART_API_KEY      abc1…****** (길이 40)  ← 입력란
-  [2] GCP_SA_KEY_PATH   /content/sa-key.json   ← 환경변수 GOOGLE_APPLICATION_CREDENTIALS
+  [1]  DART_API_KEY     abc1…****** (길이 40)  ← 입력란
+  [1b] KRX_ID           myaccount              ← 입력란
+       KRX_PW           s3cr…****** (길이 12)  ← 입력란
+  [2]  GCP_SA_KEY_PATH  /content/sa-key.json   ← 환경변수 GOOGLE_APPLICATION_CREDENTIALS
 ```
 
 > **v1.1이 죽은 지점**: `GOOGLE_APPLICATION_CREDENTIALS`에 프로젝트 ID(`compelling-muse-311107`)를 넣었다.

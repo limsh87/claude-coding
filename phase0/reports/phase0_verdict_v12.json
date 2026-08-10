@@ -1,9 +1,9 @@
 {
   "run_mode": "LIVE",
   "version": "v1.2",
-  "generated_at": "2026-08-10T06:18:47",
+  "generated_at": "2026-08-10T06:31:12",
   "meta": {
-    "runtime_sec": 2.34294056892395,
+    "runtime_sec": 2.1271002292633057,
     "counters": {
       "api_calls_by_date": {},
       "api_calls_total": 0,
@@ -52,6 +52,12 @@
             "cause_class": "NO_KEY",
             "detail": "OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)"
           }
+        ],
+        "warnings": [
+          {
+            "cause_class": "KRX_NO_LOGIN",
+            "detail": "KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. 유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. 가입: https://www.krx.co.kr (무료)"
+          }
         ]
       },
       "axis_b": {
@@ -63,7 +69,8 @@
             "cause_class": "NO_KEY",
             "detail": "GCP 자격증명이 없다. 다음 중 하나를 설정한다: (a) GOOGLE_APPLICATION_CREDENTIALS = 서비스계정 JSON 키 '파일의 절대경로' + GOOGLE_CLOUD_PROJECT = '프로젝트 ID', 또는 (b) gcloud auth application-default login. 최소 역할: BigQuery User + BigQuery Job User. 결제 계정 연결 필요(월 1TB 무료)."
           }
-        ]
+        ],
+        "warnings": []
       },
       "axis_c": {
         "ok": false,
@@ -78,7 +85,8 @@
             "cause_class": "NO_KEY",
             "detail": "공공데이터포털 키 없음. 환경변수 DATA_GO_KR_KEY(Decoding 키)를 설정한다. 발급: https://www.data.go.kr/ → 국민연금공단_국민연금 가입 사업장 내역 → 활용신청. 마이페이지 > 데이터활용 > 활용신청 현황에서 '승인' 상태를 먼저 확인할 것(§6.1)."
           }
-        ]
+        ],
+        "warnings": []
       }
     },
     "scope_reductions": [],
@@ -92,6 +100,7 @@
       "status": "BLOCKED_PREREQ",
       "gates": [],
       "known_limitations": [
+        "사전점검 경고 [KRX_NO_LOGIN]: KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. 유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. 가입: https://www.krx.co.kr (무료)",
         "사전점검 단계에서 차단되어 어떤 게이트도 측정되지 않았다. STOP(측정 결과 미달)이 아니라 BLOCKED_PREREQ(측정 자체 불가)다(§11)."
       ],
       "blocked_reason": "[NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)",
@@ -124,6 +133,7 @@
       "status": "BLOCKED_PREREQ",
       "gates": [],
       "known_limitations": [
+        "사전점검 경고 [KRX_NO_LOGIN]: KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. 유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. 가입: https://www.krx.co.kr (무료)",
         "사전점검 단계에서 차단되어 어떤 게이트도 측정되지 않았다. STOP(측정 결과 미달)이 아니라 BLOCKED_PREREQ(측정 자체 불가)다(§11)."
       ],
       "blocked_reason": "[NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)",
@@ -156,6 +166,7 @@
       "status": "BLOCKED_PREREQ",
       "gates": [],
       "known_limitations": [
+        "사전점검 경고 [KRX_NO_LOGIN]: KRX_ID/KRX_PW 미설정 — pykrx 가 비로그인 세션으로 폴백한다. 유니버스·시가총액 응답이 비면 휴장일이 아니라 이것이 원인일 수 있다. 가입: https://www.krx.co.kr (무료)",
         "사전점검 단계에서 차단되어 스냅샷을 하나도 구성하지 못했다. STOP 이 아니라 BLOCKED_PREREQ 다."
       ],
       "blocked_reason": "[NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)",

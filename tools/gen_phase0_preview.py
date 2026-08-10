@@ -297,6 +297,11 @@ footer {{ margin-top:64px; padding-top:24px; border-top:1px solid var(--rule);
 <tr><td><code>DART_API_KEY</code></td>
     <td>OpenDART 인증키 40자</td>
     <td>opendart.fss.or.kr → 인증키 신청/관리 (이메일 인증 즉시, 무료)</td></tr>
+<tr><td><code>KRX_ID</code><br><code>KRX_PW</code></td>
+    <td>KRX 로그인 계정<br>
+        <strong>권장</strong> — 없으면 pykrx가 비로그인 세션으로 폴백한다.
+        차단은 아니지만 KRX가 로그인을 요구하는 엔드포인트에서 빈 응답이 온다.</td>
+    <td>krx.co.kr → 회원가입 (무료, 데이터 이용 신청 불필요)</td></tr>
 <tr><td><code>GCP_SA_KEY_PATH</code></td>
     <td>서비스계정 JSON 키 <strong>파일의 절대경로</strong><br>
         예) <code>/content/sa-key.json</code></td>
@@ -317,6 +322,9 @@ footer {{ margin-top:64px; padding-top:24px; border-top:1px solid var(--rule);
 <p><strong>v1.1이 죽은 지점.</strong> 위 두 GCP 칸은 역할이 다르다. 프로젝트 ID를
 경로 자리에 넣으면 축 B가 통째로 죽는다. 코드가 이 오설정을 감지하면
 <code>AUTH_PATH</code>로 분류하고 "이 값은 프로젝트 ID처럼 보인다"고 짚어준다.</p>
+<p><strong>pykrx는 import 시점에 <code>KRX_ID</code>/<code>KRX_PW</code>를 읽는다.</strong>
+노트북에서 이미 pykrx를 import한 뒤라면 값이 반영되지 않는다. 코드가 그 상황을 감지해
+경고하며, 런타임을 재시작하고 이 셀부터 실행해야 한다.</p>
 <p>키는 로그·판정표 어디에도 남지 않는다. 실행 시작 시 앞 4자와 길이만 마스킹해 찍는다.</p>
 </div>
 
