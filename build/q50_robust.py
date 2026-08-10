@@ -120,9 +120,19 @@ def paired_diff_test(a: str, b: str, label: Optional[str] = None) -> dict:
     d = d.dropna().to_numpy(dtype=float)
     if len(d) < 4:
         return {"name": nm, "t": np.nan, "p": np.nan, "n": int(len(d)), "mean": np.nan}
-    t, _se = hac_tstat(d)
+    # ★★ hac_tstat 는 (평균, t통계량) 을 돌려준다 — (t, se) 가 아니다 ★★
+    #   예전엔 `t, _se = hac_tstat(d)` 라 '평균'을 t 통계량 자리에 받았다. 분기 평균차는
+    #   보통 0.0x 수준이므로 p 값이 항상 0.49 근처가 되고, 그 결과
+    #     · §10.4 폐기조건 ②(p ≥ 0.10)가 '매 실행' 발동 → FULL 실행이 L6.VERDICT 에서
+    #       KillCriteria 로 중단되고 최종 종목표가 나오지 않는다
+    #     · §9-C2 가 영원히 통과하지 못해 수급축 채택 판정이 데이터와 무관하게 고정된다
+    #     · §8.3 BH-FDR 패밀리에 가짜 p 가 섞여 진짜 가설들의 임계가 낮아진다
+    #   실측(분기 +3.0% 차이를 심고 40분기): 보고된 t 0.029 · p 0.4885 인데
+    #   실제 HAC t 는 20.49 · p < 1e-15 였다. 벗어나려면 분기 평균차가 +130% 를 넘어야 했다.
+    #   다른 호출부 두 곳은 올바르게 풀고 있었고 여기만 틀렸다.
+    _mu, t = hac_tstat(d)
     return {"name": nm, "t": float(t), "p": _pval_from_t(float(t), len(d)),
-            "n": int(len(d)), "mean": float(np.mean(d))}
+            "n": int(len(d)), "mean": float(_mu)}
 
 
 def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q,

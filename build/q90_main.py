@@ -629,9 +629,12 @@ def main() -> dict:
             ctx["x0_smallcap"] = b0
             _s0 = qperf_stats(b0["returns"])
             LOG.table([["분기 평균 종목수", f"{float(b0['returns']['n'].mean()):,.0f}"],
-                       ["CAGR (비용차감)", f"{_s0.get('cagr', float('nan')):+.2%}"],
-                       ["Sharpe", f"{_s0.get('sharpe', float('nan')):.3f}"],
-                       ["MDD", f"{_s0.get('mdd', float('nan')):.1%}"]],
+                       # ★ qperf_stats 는 'CAGR'/'Sharpe'/'MDD' (대문자)로 돌려준다. 소문자 키를 읽어
+                       #   X0 벤치마크 표가 전부 nan 으로 찍혔다 — §10.2 가 '소형주 프리미엄과
+                       #   깔때기 알파'를 구분하려고 만든 기준선인데 읽을 수가 없었다.
+                       ["CAGR (비용차감)", f"{_s0.get('CAGR', float('nan')):+.2%}"],
+                       ["Sharpe", f"{_s0.get('Sharpe', float('nan')):.3f}"],
+                       ["MDD", f"{_s0.get('MDD', float('nan')):.1%}"]],
                       headers=["X0 스몰캡 벤치마크 (U-1000 무선별 동일가중)", "값"],
                       title="깔때기 비교 기준선 — KOSPI 대비 초과는 소형주 프리미엄일 수 있다")
         except Exception as e:                                   # noqa
