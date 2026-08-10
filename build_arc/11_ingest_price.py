@@ -191,10 +191,25 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     d = d.dropna(subset=["close"])
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
+# 종목 → 시장(KOSPI/KOSDAQ) · 폐지여부. fetch_prices 가 주입한다.
+_PX_MKT: Dict[str, str] = {}
+_PX_DELISTED: set = set()
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if yf is None:
+    """yfinance 최종 폴백.
+
+    ★ 한국 **폐지종목은 야후에 데이터가 아예 없다.** 그런데도 .KS/.KQ 두 번씩 때려
+      404/YFTzMissingError 로그를 수천 줄 뿜으며 종목당 수 초를 태웠다(로그인 성공과 무관하게
+      옛 폐지 코드는 앞 소스 3개가 전부 빈손이라 여기까지 내려온다). 폐지 종목은 건너뛴다.
+    ★ 시장을 알면 접미사를 하나만 시도한다 — 호출이 절반이 된다.
+    """
+    if yf is None or code in _PX_DELISTED:
         return None
-    for suf in (".KS", ".KQ"):
+    mk = str(_PX_MKT.get(code, "")).upper()
+    sufs = (".KS",) if mk.startswith("KOSPI") else (".KQ",) if mk.startswith("KOSDAQ") \
+        else (".KS", ".KQ")
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
@@ -220,9 +235,24 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장.
+
+    sec 를 주면 시장·폐지 정보를 폴백 체인에 넘겨 헛발질(폐지종목 yfinance 조회 등)을 막는다.
+    """
     codes = sorted({c for c in map(to_code6, codes) if c})
+    if sec is not None and len(sec):
+        try:
+            S = sec.drop_duplicates("code")
+            _PX_MKT.clear()
+            _PX_MKT.update({str(k): str(v) for k, v in
+                            zip(S["code"], S.get("market", pd.Series("", index=S.index)))})
+            _PX_DELISTED.clear()
+            _dd = as_ts_series(S.get("delisting_date", pd.Series(pd.NaT, index=S.index)))
+            _PX_DELISTED.update(S.loc[_dd.notna(), "code"].astype(str).tolist())
+        except Exception:
+            pass
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
     have_min: Dict[str, pd.Timestamp] = {}
@@ -294,6 +324,8 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if todo:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
+        _chain_stat: Counter = Counter()
+
         def _one(job):
             code, st = job
             for nm, fn in PRICE_CHAIN:
@@ -304,7 +336,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 if d is not None and len(d):
                     d = d.dropna(subset=["date"])
                     if len(d):
+                        _chain_stat[f"성공:{nm}"] += 1
                         return d
+                _chain_stat[f"실패:{nm}"] += 1
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
@@ -366,6 +400,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if _n_full != len(px):
         LOG.info(f"공용 캐시에는 {_n_full:,}행 전량을 보존하고, 이번 실행에는 요청 구간 "
                  f"{len(px):,}행만 사용합니다(캐시 절단 없음).")
+    if todo and "_chain_stat" in dir():
+        _rows = [[nm, f"{_chain_stat.get('성공:'+nm, 0):,}", f"{_chain_stat.get('실패:'+nm, 0):,}"]
+                 for nm, _f in PRICE_CHAIN]
+        LOG.table(_rows, ["폴백 소스", "성공", "빈손"], ["l", "r", "r"],
+                  title="가격 폴백 체인 — '빈손'이 많은 소스는 그만큼 시간을 태운 것입니다")
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")

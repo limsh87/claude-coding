@@ -250,7 +250,7 @@ SELFTEST = True                       # 검증 하네스 실행 여부. 하네�
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0943"
+BUILD_VERSION = "v2.20260810.1001"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -1644,25 +1644,54 @@ INDEX_COLUMNS = [
 ]
 
 def _mount_drive() -> Tuple[str, str]:
-    """(루트경로, 상태문자열). Colab이면 마운트 시도, 아니면 로컬 폴백. 어느 쪽이든 죽지 않는다."""
+    """(루트경로, 상태문자열).
+
+    ★★ 마운트 실패를 조용히 로컬로 폴백하면 안 된다. 드라이브에 이미 모아둔 캐시가 통째로
+       안 보이게 되어 **전량 재수집**이 시작되고(일봉 5천 종목 = 수 시간), 새로 받은 것도
+       드라이브가 아닌 곳에 쌓인다(사용자의 절대 원칙 위반). 재시도하고, 그래도 안 되면
+       계속 진행할지 여부를 명시적으로 정하게 한다.
+    """
     if ENV["colab"]:
-        try:
-            from google.colab import drive as _gdrive      # type: ignore
-            mp = "/content/drive"
-            if not os.path.isdir(os.path.join(mp, "MyDrive")):
-                _gdrive.mount(mp, force_remount=False)
+        mp = "/content/drive"
+        last = ""
+        for attempt in range(3):
             if os.path.isdir(os.path.join(mp, "MyDrive")):
                 return GDRIVE_ROOT, "COLAB_DRIVE"
-            return LOCAL_CACHE_ROOT, "COLAB_DRIVE_FAILED→LOCAL"
-        except Exception as e:                             # noqa
-            LOG.warn(f"구글드라이브 마운트 실패({type(e).__name__}) — 로컬 캐시로 폴백합니다.")
-            return LOCAL_CACHE_ROOT, "COLAB_MOUNT_ERROR→LOCAL"
+            try:
+                from google.colab import drive as _gdrive  # type: ignore
+                _gdrive.mount(mp, force_remount=(attempt > 0))
+            except Exception as e:                         # noqa
+                last = f"{type(e).__name__}: {str(e)[:160]}"
+                LOG.warn(f"구글드라이브 마운트 실패 {attempt+1}/3 ({last})")
+                time.sleep(2.0 * (attempt + 1))
+        if os.path.isdir(os.path.join(mp, "MyDrive")):
+            return GDRIVE_ROOT, "COLAB_DRIVE"
+        LOG.error("구글드라이브를 마운트하지 못했습니다 (3회 시도). " + (last or ""))
+        LOG.error("★ 이대로 진행하면 ① 드라이브의 기존 캐시가 전혀 보이지 않아 일봉·DART·"
+                  "리포트를 **전량 재수집**하고 ② 새로 받은 데이터도 드라이브에 저장되지 "
+                  "않습니다. 노트북을 재시작하고 드라이브 인증 팝업을 승인한 뒤 다시 "
+                  "실행하세요. 그래도 진행하려면 코드 상단에 "
+                  "ALLOW_NO_DRIVE = True 를 넣으십시오.")
+        if not globals().get("ALLOW_NO_DRIVE", False):
+            raise RuntimeError("구글드라이브 마운트 실패 — 캐시 없이 시작하면 전량 재수집이 "
+                               "됩니다. ALLOW_NO_DRIVE=True 로 명시하지 않는 한 중단합니다.")
+        return os.path.abspath(LOCAL_CACHE_ROOT), "COLAB_MOUNT_ERROR→LOCAL(명시적 허용)"
+
     # JupyterLab / CLI: 드라이브가 이미 동기화되어 있으면 그 경로를 쓴다.
-    for cand in (GDRIVE_ROOT, os.path.expanduser("~/Google Drive/MyDrive/tcd_cache"),
-                 os.path.expanduser("~/GoogleDrive/MyDrive/tcd_cache")):
+    # ★ 후보를 CACHE_SEARCH_DIRS 에서 파생시킨다. 예전에는 다른 전략 폴더(tcd_cache)만
+    #   후보라, 로컬 동기화 환경에서 신규 수집분이 전부 CWD 상대경로에 쌓였다.
+    cands = [GDRIVE_ROOT]
+    for d in globals().get("CACHE_SEARCH_DIRS", []):
+        e = os.path.expanduser(str(d))
+        if re.search(r"(drive|드라이브)", e, re.I) and e not in cands:
+            cands.append(e)
+    for cand in cands:
         if cand and os.path.isdir(cand):
             return cand, "LOCAL_SYNCED_DRIVE"
-    return LOCAL_CACHE_ROOT, "LOCAL"
+    LOG.warn(f"구글드라이브 경로를 찾지 못해 로컬 캐시({LOCAL_CACHE_ROOT})를 씁니다. "
+             f"★ 이 실행의 신규 수집분은 드라이브에 저장되지 않습니다.")
+    return os.path.abspath(LOCAL_CACHE_ROOT), "LOCAL"
+
 
 class Vault:
     def __init__(self, root: str, mode: str):
@@ -1679,6 +1708,7 @@ class Vault:
         self._idx: Dict[str, pd.DataFrame] = {}
         self._uidset: Dict[str, set] = {}
         self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
+        self._sibs: Optional[List[str]] = None
         self._lk = threading.RLock()
         self.stats = Counter()
 
@@ -1798,9 +1828,13 @@ class Vault:
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
                                         "_legacy_file") if c in idx.columns]
-                idx.loc[miss, "uid"] = [
-                    sha1_str("legacy", i, *[str(idx.iloc[i].get(c, "")) for c in fill_src])
-                    for i in np.where(miss.to_numpy())[0]]
+                # ★ 행 '위치'를 해시에 넣으면 저널이 커질수록 같은 레거시 행의 uid 가
+                #   달라져 컴팩션마다 인덱스가 증식한다(5→10→15→20행). 내용만으로 해시한다.
+                _sub = idx.loc[miss, fill_src].astype(str) if fill_src else None
+                idx.loc[miss, "uid"] = (
+                    [sha1_str("legacy", *row) for row in _sub.to_numpy().tolist()]
+                    if _sub is not None else
+                    [sha1_str("legacy", str(k)) for k in np.where(miss.to_numpy())[0]])
                 LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 uid 를 부여했습니다 "
                          f"(uid 결측 행이 하나로 뭉개지는 것을 방지 — 기존 기록 보존).")
             idx["uid"] = idx["uid"].astype(str)
@@ -1992,6 +2026,36 @@ class Vault:
         except Exception:
             pass
 
+    def sibling_table_dirs(self) -> List[str]:
+        """다른 전략 볼트의 공용(_shared) 테이블 폴더들.
+
+        ★★ '공용 인덱스'는 전략 간 공유가 목적인데, 볼트 루트가 전략마다 다르면
+           (quant_cache vs tcd_cache) 서로의 _shared 를 전혀 못 본다. 그러면 다른 전략이
+           이미 받아둔 일봉·DART 원자료를 눈앞에 두고 **전량 재수집**한다.
+           읽기 전용으로만 훑는다 — 남의 볼트에 쓰지 않는다.
+        """
+        if getattr(self, "_sibs", None) is not None:
+            return self._sibs
+        out, seen = [], {os.path.realpath(self.table_dir("shared"))}
+        roots = [os.path.expanduser(str(d)) for d in globals().get("CACHE_SEARCH_DIRS", [])]
+        roots += [os.path.dirname(self.root)]                 # 형제 폴더 스캔용 상위
+        for r in roots:
+            if not r or not os.path.isdir(r):
+                continue
+            cands = [r] + [os.path.join(r, x) for x in (os.listdir(r)[:200]
+                                                        if os.path.isdir(r) else [])]
+            for c in cands:
+                td = os.path.join(c, GDRIVE_SHARED_NS, "table")
+                rp = os.path.realpath(td)
+                if os.path.isdir(td) and rp not in seen:
+                    seen.add(rp); out.append(td)
+        self._sibs = out
+        if out:
+            LOG.info(f"타 전략 공용 캐시 {len(out)}곳을 읽기 전용으로 함께 조회합니다: "
+                     + " · ".join(os.path.relpath(x, os.path.dirname(self.root))
+                                  for x in out[:4]))
+        return out
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
@@ -2007,6 +2071,16 @@ class Vault:
                     return read_parquet_safe(os.path.join(td, revs[-1]))
             except Exception:
                 pass
+            if scope == "shared":
+                for sd in self.sibling_table_dirs():
+                    sp = os.path.join(sd, f"{name}.parquet")
+                    if os.path.exists(sp):
+                        d = read_parquet_safe(sp)
+                        if d is not None and len(d):
+                            LOG.ok(f"타 전략 공용 캐시에서 '{name}' {len(d):,}행 재사용 "
+                                   f"({os.path.dirname(os.path.dirname(sd)).split(os.sep)[-1]})"
+                                   f" — 재수집하지 않습니다.")
+                            return d
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
@@ -3300,10 +3374,25 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     d = d.dropna(subset=["close"])
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
+# 종목 → 시장(KOSPI/KOSDAQ) · 폐지여부. fetch_prices 가 주입한다.
+_PX_MKT: Dict[str, str] = {}
+_PX_DELISTED: set = set()
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    if yf is None:
+    """yfinance 최종 폴백.
+
+    ★ 한국 **폐지종목은 야후에 데이터가 아예 없다.** 그런데도 .KS/.KQ 두 번씩 때려
+      404/YFTzMissingError 로그를 수천 줄 뿜으며 종목당 수 초를 태웠다(로그인 성공과 무관하게
+      옛 폐지 코드는 앞 소스 3개가 전부 빈손이라 여기까지 내려온다). 폐지 종목은 건너뛴다.
+    ★ 시장을 알면 접미사를 하나만 시도한다 — 호출이 절반이 된다.
+    """
+    if yf is None or code in _PX_DELISTED:
         return None
-    for suf in (".KS", ".KQ"):
+    mk = str(_PX_MKT.get(code, "")).upper()
+    sufs = (".KS",) if mk.startswith("KOSPI") else (".KQ",) if mk.startswith("KOSDAQ") \
+        else (".KS", ".KQ")
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
@@ -3329,9 +3418,24 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
-def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
+def fetch_prices(codes: Sequence[str], start: str, end: str,
+                 sec: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """폴백 체인으로 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장.
+
+    sec 를 주면 시장·폐지 정보를 폴백 체인에 넘겨 헛발질(폐지종목 yfinance 조회 등)을 막는다.
+    """
     codes = sorted({c for c in map(to_code6, codes) if c})
+    if sec is not None and len(sec):
+        try:
+            S = sec.drop_duplicates("code")
+            _PX_MKT.clear()
+            _PX_MKT.update({str(k): str(v) for k, v in
+                            zip(S["code"], S.get("market", pd.Series("", index=S.index)))})
+            _PX_DELISTED.clear()
+            _dd = as_ts_series(S.get("delisting_date", pd.Series(pd.NaT, index=S.index)))
+            _PX_DELISTED.update(S.loc[_dd.notna(), "code"].astype(str).tolist())
+        except Exception:
+            pass
     cached = VAULT.get_table("krx_ohlcv_daily", scope="shared")
     have_max: Dict[str, pd.Timestamp] = {}
     have_min: Dict[str, pd.Timestamp] = {}
@@ -3403,6 +3507,8 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if todo:
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
+        _chain_stat: Counter = Counter()
+
         def _one(job):
             code, st = job
             for nm, fn in PRICE_CHAIN:
@@ -3413,7 +3519,9 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 if d is not None and len(d):
                     d = d.dropna(subset=["date"])
                     if len(d):
+                        _chain_stat[f"성공:{nm}"] += 1
                         return d
+                _chain_stat[f"실패:{nm}"] += 1
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
@@ -3475,6 +3583,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if _n_full != len(px):
         LOG.info(f"공용 캐시에는 {_n_full:,}행 전량을 보존하고, 이번 실행에는 요청 구간 "
                  f"{len(px):,}행만 사용합니다(캐시 절단 없음).")
+    if todo and "_chain_stat" in dir():
+        _rows = [[nm, f"{_chain_stat.get('성공:'+nm, 0):,}", f"{_chain_stat.get('실패:'+nm, 0):,}"]
+                 for nm, _f in PRICE_CHAIN]
+        LOG.table(_rows, ["폴백 소스", "성공", "빈손"], ["l", "r", "r"],
+                  title="가격 폴백 체인 — '빈손'이 많은 소스는 그만큼 시간을 태운 것입니다")
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
@@ -6769,6 +6882,49 @@ def is_preferred(code: str, name: str = "", base_codes: Optional[set] = None) ->
         if (c[:5] + "0") in base_codes:
             return True
     return False
+
+def price_fetch_candidates(sec: pd.DataFrame, start, end) -> List[str]:
+    """일봉을 실제로 받아야 하는 종목만 추린다.
+
+    ★★ 예전에는 종목마스터 전체(5,398종목)의 10년치 일봉을 받았다. U-1000 은 KOSPI+KOSDAQ
+       보통주 중 시총 하위 1000 이므로, 아래 셋은 **어떤 리밸일에도 후보가 될 수 없다**:
+         ① §3.3 상시 제외 — 스팩·우선주·리츠·시장밖(KONEX/수익증권/투자회사/선박투자회사)
+         ② 백테 시작 전에 이미 폐지된 종목
+         ③ 백테 종료 후에 상장한 종목
+       그런데도 전부 받으려다 보니 000010·000085 같은 옛 폐지 코드에서 FDR→네이버→yfinance
+       까지 4단 폴백을 돌며 수십 분을 태웠다(yfinance 는 한국 폐지종목 데이터가 아예 없다).
+       ★ ②의 경계는 넉넉히 잡는다 — 모멘텀 12-1 과 ADTV60 이 리밸일 이전 데이터를 쓰므로
+         시작 18개월 전까지 살아 있던 종목은 남긴다. 생존자편향은 여기서 다시 들어오면 안 된다.
+    """
+    if sec is None or sec.empty:
+        return []
+    S = sec.drop_duplicates("code").copy()
+    S["code"] = S["code"].astype(str)
+    n0 = len(S)
+    ex = classify_excluded(S)
+    static_out = set(ex.loc[ex["ex_static"] == 1, "code"].astype(str)) if len(ex) else set()
+
+    ld = as_ts_series(S.get("listing_date", pd.Series(pd.NaT, index=S.index)))
+    dd = as_ts_series(S.get("delisting_date", pd.Series(pd.NaT, index=S.index)))
+    lo = as_ts(start) - pd.DateOffset(months=18)      # 모멘텀·ADTV 창까지 여유
+    hi = as_ts(end)
+    dead_before = dd.notna() & (dd < lo)
+    born_after = ld.notna() & (ld > hi)
+    drop_static = S["code"].isin(static_out)
+    keep = ~(dead_before | born_after | drop_static)
+
+    LOG.table([["종목 마스터 전체", f"{n0:,}", ""],
+               ["§3.3 상시 제외(스팩·우선주·리츠·시장밖)", f"-{int(drop_static.sum()):,}",
+                "U-1000 정의상 후보 불가"],
+               [f"백테 시작({lo:%Y-%m}) 이전 폐지", f"-{int((dead_before & ~drop_static).sum()):,}",
+                "해당 구간에 존재하지 않음"],
+               [f"백테 종료({hi:%Y-%m}) 이후 상장", f"-{int((born_after & ~drop_static).sum()):,}",
+                "해당 구간에 존재하지 않음"],
+               ["일봉 수집 대상", f"{int(keep.sum()):,}", "이 종목만 받는다"]],
+              ["단계", "종목수", "근거"], ["l", "r", "l"],
+              title="일봉 수집 대상 사전 선별 (받지 않아도 되는 종목을 먼저 뺀다)")
+    return S.loc[keep, "code"].astype(str).tolist()
+
 
 def classify_excluded(sec: pd.DataFrame) -> pd.DataFrame:
     """§3.3 종목 속성 기반 상시 제외 판정. 반환: code, ex_spac, ex_pref, ex_reit, ex_static.
@@ -11071,9 +11227,10 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("L1.PX", "가격 · 유동성 · PIT 시가총액", "L1", budget_s=2400):
         KRX.login()
-        px = fetch_prices(ctx["sec"]["code"].tolist(),
+        _px_codes = price_fetch_candidates(ctx["sec"], BACKTEST_START, BACKTEST_END)
+        px = fetch_prices(_px_codes,
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+                          BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
         ctx["liq"] = build_liquidity_panel(px, rebals)
         ctx["exec"] = build_exec_prices(px, rebals)

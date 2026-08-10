@@ -318,6 +318,49 @@ def is_preferred(code: str, name: str = "", base_codes: Optional[set] = None) ->
             return True
     return False
 
+def price_fetch_candidates(sec: pd.DataFrame, start, end) -> List[str]:
+    """일봉을 실제로 받아야 하는 종목만 추린다.
+
+    ★★ 예전에는 종목마스터 전체(5,398종목)의 10년치 일봉을 받았다. U-1000 은 KOSPI+KOSDAQ
+       보통주 중 시총 하위 1000 이므로, 아래 셋은 **어떤 리밸일에도 후보가 될 수 없다**:
+         ① §3.3 상시 제외 — 스팩·우선주·리츠·시장밖(KONEX/수익증권/투자회사/선박투자회사)
+         ② 백테 시작 전에 이미 폐지된 종목
+         ③ 백테 종료 후에 상장한 종목
+       그런데도 전부 받으려다 보니 000010·000085 같은 옛 폐지 코드에서 FDR→네이버→yfinance
+       까지 4단 폴백을 돌며 수십 분을 태웠다(yfinance 는 한국 폐지종목 데이터가 아예 없다).
+       ★ ②의 경계는 넉넉히 잡는다 — 모멘텀 12-1 과 ADTV60 이 리밸일 이전 데이터를 쓰므로
+         시작 18개월 전까지 살아 있던 종목은 남긴다. 생존자편향은 여기서 다시 들어오면 안 된다.
+    """
+    if sec is None or sec.empty:
+        return []
+    S = sec.drop_duplicates("code").copy()
+    S["code"] = S["code"].astype(str)
+    n0 = len(S)
+    ex = classify_excluded(S)
+    static_out = set(ex.loc[ex["ex_static"] == 1, "code"].astype(str)) if len(ex) else set()
+
+    ld = as_ts_series(S.get("listing_date", pd.Series(pd.NaT, index=S.index)))
+    dd = as_ts_series(S.get("delisting_date", pd.Series(pd.NaT, index=S.index)))
+    lo = as_ts(start) - pd.DateOffset(months=18)      # 모멘텀·ADTV 창까지 여유
+    hi = as_ts(end)
+    dead_before = dd.notna() & (dd < lo)
+    born_after = ld.notna() & (ld > hi)
+    drop_static = S["code"].isin(static_out)
+    keep = ~(dead_before | born_after | drop_static)
+
+    LOG.table([["종목 마스터 전체", f"{n0:,}", ""],
+               ["§3.3 상시 제외(스팩·우선주·리츠·시장밖)", f"-{int(drop_static.sum()):,}",
+                "U-1000 정의상 후보 불가"],
+               [f"백테 시작({lo:%Y-%m}) 이전 폐지", f"-{int((dead_before & ~drop_static).sum()):,}",
+                "해당 구간에 존재하지 않음"],
+               [f"백테 종료({hi:%Y-%m}) 이후 상장", f"-{int((born_after & ~drop_static).sum()):,}",
+                "해당 구간에 존재하지 않음"],
+               ["일봉 수집 대상", f"{int(keep.sum()):,}", "이 종목만 받는다"]],
+              ["단계", "종목수", "근거"], ["l", "r", "l"],
+              title="일봉 수집 대상 사전 선별 (받지 않아도 되는 종목을 먼저 뺀다)")
+    return S.loc[keep, "code"].astype(str).tolist()
+
+
 def classify_excluded(sec: pd.DataFrame) -> pd.DataFrame:
     """§3.3 종목 속성 기반 상시 제외 판정. 반환: code, ex_spac, ex_pref, ex_reit, ex_static.
 

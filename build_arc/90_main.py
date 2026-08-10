@@ -55,9 +55,10 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("L1.PX", "가격 · 유동성 · PIT 시가총액", "L1", budget_s=2400):
         KRX.login()
-        px = fetch_prices(ctx["sec"]["code"].tolist(),
+        _px_codes = price_fetch_candidates(ctx["sec"], BACKTEST_START, BACKTEST_END)
+        px = fetch_prices(_px_codes,
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
-                          BACKTEST_END)
+                          BACKTEST_END, sec=ctx["sec"])
         ctx["px"] = px
         ctx["liq"] = build_liquidity_panel(px, rebals)
         ctx["exec"] = build_exec_prices(px, rebals)

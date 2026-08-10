@@ -14,25 +14,54 @@ INDEX_COLUMNS = [
 ]
 
 def _mount_drive() -> Tuple[str, str]:
-    """(루트경로, 상태문자열). Colab이면 마운트 시도, 아니면 로컬 폴백. 어느 쪽이든 죽지 않는다."""
+    """(루트경로, 상태문자열).
+
+    ★★ 마운트 실패를 조용히 로컬로 폴백하면 안 된다. 드라이브에 이미 모아둔 캐시가 통째로
+       안 보이게 되어 **전량 재수집**이 시작되고(일봉 5천 종목 = 수 시간), 새로 받은 것도
+       드라이브가 아닌 곳에 쌓인다(사용자의 절대 원칙 위반). 재시도하고, 그래도 안 되면
+       계속 진행할지 여부를 명시적으로 정하게 한다.
+    """
     if ENV["colab"]:
-        try:
-            from google.colab import drive as _gdrive      # type: ignore
-            mp = "/content/drive"
-            if not os.path.isdir(os.path.join(mp, "MyDrive")):
-                _gdrive.mount(mp, force_remount=False)
+        mp = "/content/drive"
+        last = ""
+        for attempt in range(3):
             if os.path.isdir(os.path.join(mp, "MyDrive")):
                 return GDRIVE_ROOT, "COLAB_DRIVE"
-            return LOCAL_CACHE_ROOT, "COLAB_DRIVE_FAILED→LOCAL"
-        except Exception as e:                             # noqa
-            LOG.warn(f"구글드라이브 마운트 실패({type(e).__name__}) — 로컬 캐시로 폴백합니다.")
-            return LOCAL_CACHE_ROOT, "COLAB_MOUNT_ERROR→LOCAL"
+            try:
+                from google.colab import drive as _gdrive  # type: ignore
+                _gdrive.mount(mp, force_remount=(attempt > 0))
+            except Exception as e:                         # noqa
+                last = f"{type(e).__name__}: {str(e)[:160]}"
+                LOG.warn(f"구글드라이브 마운트 실패 {attempt+1}/3 ({last})")
+                time.sleep(2.0 * (attempt + 1))
+        if os.path.isdir(os.path.join(mp, "MyDrive")):
+            return GDRIVE_ROOT, "COLAB_DRIVE"
+        LOG.error("구글드라이브를 마운트하지 못했습니다 (3회 시도). " + (last or ""))
+        LOG.error("★ 이대로 진행하면 ① 드라이브의 기존 캐시가 전혀 보이지 않아 일봉·DART·"
+                  "리포트를 **전량 재수집**하고 ② 새로 받은 데이터도 드라이브에 저장되지 "
+                  "않습니다. 노트북을 재시작하고 드라이브 인증 팝업을 승인한 뒤 다시 "
+                  "실행하세요. 그래도 진행하려면 코드 상단에 "
+                  "ALLOW_NO_DRIVE = True 를 넣으십시오.")
+        if not globals().get("ALLOW_NO_DRIVE", False):
+            raise RuntimeError("구글드라이브 마운트 실패 — 캐시 없이 시작하면 전량 재수집이 "
+                               "됩니다. ALLOW_NO_DRIVE=True 로 명시하지 않는 한 중단합니다.")
+        return os.path.abspath(LOCAL_CACHE_ROOT), "COLAB_MOUNT_ERROR→LOCAL(명시적 허용)"
+
     # JupyterLab / CLI: 드라이브가 이미 동기화되어 있으면 그 경로를 쓴다.
-    for cand in (GDRIVE_ROOT, os.path.expanduser("~/Google Drive/MyDrive/tcd_cache"),
-                 os.path.expanduser("~/GoogleDrive/MyDrive/tcd_cache")):
+    # ★ 후보를 CACHE_SEARCH_DIRS 에서 파생시킨다. 예전에는 다른 전략 폴더(tcd_cache)만
+    #   후보라, 로컬 동기화 환경에서 신규 수집분이 전부 CWD 상대경로에 쌓였다.
+    cands = [GDRIVE_ROOT]
+    for d in globals().get("CACHE_SEARCH_DIRS", []):
+        e = os.path.expanduser(str(d))
+        if re.search(r"(drive|드라이브)", e, re.I) and e not in cands:
+            cands.append(e)
+    for cand in cands:
         if cand and os.path.isdir(cand):
             return cand, "LOCAL_SYNCED_DRIVE"
-    return LOCAL_CACHE_ROOT, "LOCAL"
+    LOG.warn(f"구글드라이브 경로를 찾지 못해 로컬 캐시({LOCAL_CACHE_ROOT})를 씁니다. "
+             f"★ 이 실행의 신규 수집분은 드라이브에 저장되지 않습니다.")
+    return os.path.abspath(LOCAL_CACHE_ROOT), "LOCAL"
+
 
 class Vault:
     def __init__(self, root: str, mode: str):
@@ -49,6 +78,7 @@ class Vault:
         self._idx: Dict[str, pd.DataFrame] = {}
         self._uidset: Dict[str, set] = {}
         self._pending: Dict[str, List[dict]] = {"shared": [], "private": []}
+        self._sibs: Optional[List[str]] = None
         self._lk = threading.RLock()
         self.stats = Counter()
 
@@ -168,9 +198,13 @@ class Vault:
             if miss.any():
                 fill_src = [c for c in ("path", "abs_path", "key", "sha1", "domain", "subtype",
                                         "_legacy_file") if c in idx.columns]
-                idx.loc[miss, "uid"] = [
-                    sha1_str("legacy", i, *[str(idx.iloc[i].get(c, "")) for c in fill_src])
-                    for i in np.where(miss.to_numpy())[0]]
+                # ★ 행 '위치'를 해시에 넣으면 저널이 커질수록 같은 레거시 행의 uid 가
+                #   달라져 컴팩션마다 인덱스가 증식한다(5→10→15→20행). 내용만으로 해시한다.
+                _sub = idx.loc[miss, fill_src].astype(str) if fill_src else None
+                idx.loc[miss, "uid"] = (
+                    [sha1_str("legacy", *row) for row in _sub.to_numpy().tolist()]
+                    if _sub is not None else
+                    [sha1_str("legacy", str(k)) for k in np.where(miss.to_numpy())[0]])
                 LOG.info(f"레거시 인덱스 {int(miss.sum()):,}행에 uid 를 부여했습니다 "
                          f"(uid 결측 행이 하나로 뭉개지는 것을 방지 — 기존 기록 보존).")
             idx["uid"] = idx["uid"].astype(str)
@@ -362,6 +396,36 @@ class Vault:
         except Exception:
             pass
 
+    def sibling_table_dirs(self) -> List[str]:
+        """다른 전략 볼트의 공용(_shared) 테이블 폴더들.
+
+        ★★ '공용 인덱스'는 전략 간 공유가 목적인데, 볼트 루트가 전략마다 다르면
+           (quant_cache vs tcd_cache) 서로의 _shared 를 전혀 못 본다. 그러면 다른 전략이
+           이미 받아둔 일봉·DART 원자료를 눈앞에 두고 **전량 재수집**한다.
+           읽기 전용으로만 훑는다 — 남의 볼트에 쓰지 않는다.
+        """
+        if getattr(self, "_sibs", None) is not None:
+            return self._sibs
+        out, seen = [], {os.path.realpath(self.table_dir("shared"))}
+        roots = [os.path.expanduser(str(d)) for d in globals().get("CACHE_SEARCH_DIRS", [])]
+        roots += [os.path.dirname(self.root)]                 # 형제 폴더 스캔용 상위
+        for r in roots:
+            if not r or not os.path.isdir(r):
+                continue
+            cands = [r] + [os.path.join(r, x) for x in (os.listdir(r)[:200]
+                                                        if os.path.isdir(r) else [])]
+            for c in cands:
+                td = os.path.join(c, GDRIVE_SHARED_NS, "table")
+                rp = os.path.realpath(td)
+                if os.path.isdir(td) and rp not in seen:
+                    seen.add(rp); out.append(td)
+        self._sibs = out
+        if out:
+            LOG.info(f"타 전략 공용 캐시 {len(out)}곳을 읽기 전용으로 함께 조회합니다: "
+                     + " · ".join(os.path.relpath(x, os.path.dirname(self.root))
+                                  for x in out[:4]))
+        return out
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
@@ -377,6 +441,16 @@ class Vault:
                     return read_parquet_safe(os.path.join(td, revs[-1]))
             except Exception:
                 pass
+            if scope == "shared":
+                for sd in self.sibling_table_dirs():
+                    sp = os.path.join(sd, f"{name}.parquet")
+                    if os.path.exists(sp):
+                        d = read_parquet_safe(sp)
+                        if d is not None and len(d):
+                            LOG.ok(f"타 전략 공용 캐시에서 '{name}' {len(d):,}행 재사용 "
+                                   f"({os.path.dirname(os.path.dirname(sd)).split(os.sep)[-1]})"
+                                   f" — 재수집하지 않습니다.")
+                            return d
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
