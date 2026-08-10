@@ -1,16 +1,11 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-B  가격 · 거래대금 · 수급                                                              ║
-# ║                                                                                          ║
-# ║  KRX 인증(2025-12 변경) → pykrx → FinanceDataReader → 네이버 → yfinance → 캐시            ║
-# ║  어느 경로가 실제로 쓰였는지 종목 단위로 기록하고 표로 출력한다.                            ║
-# ║  ▶ 폴백해도 백테스트는 정상 동작한다. 단, 거래대금(Amount)은 소스에 따라 근사가 되므로      ║
-# ║    유동성 필터(V6)의 엄밀성이 달라진다 — 이 점을 감사표에 명시한다.                        ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-B  가격 · 거래대금 · 수급
+#  KRX 인증(2025-12 변경) → pykrx → FinanceDataReader → 네이버 → yfinance → 캐시
+#  어느 경로가 실제로 쓰였는지 종목 단위로 기록하고 표로 출력한다.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 PRICE_COLS = ["code", "date", "open", "high", "low", "close", "volume", "amount", "src"]
-
 
 class KRXAuth:
     """KRX 데이터 마켓플레이스 인증(2025-12 변경 대응). 실패해도 절대 죽지 않고 폴백으로 넘긴다.
@@ -111,7 +106,6 @@ class KRXAuth:
 
 KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 
-
 # ── 개별 소스 ───────────────────────────────────────────────────────────────────────────────
 def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if pykrx_stock is None:
@@ -132,7 +126,6 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     d["code"], d["src"] = code, "pykrx"
     return d.reindex(columns=PRICE_COLS)
 
-
 def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if fdr is None:
         return None
@@ -152,7 +145,6 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
             pd.to_numeric(d.get("volume"), errors="coerce")      # 근사 — 감사표에 명시된다
     d["code"], d["src"] = code, "fdr"
     return d.reindex(columns=PRICE_COLS)
-
 
 def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """네이버 차트 API. 폴백 중에서는 가장 안정적이지만 거래대금이 없다."""
@@ -184,10 +176,7 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         return None
     d = pd.DataFrame(rows, columns=hdr)
     # ★ 이 rename 이 오랫동안 아무 일도 하지 않고 있었다.
-    #   {**ren, **{c: c for c in d.columns}} 는 두 번째 dict 가 첫 번째를 덮어써서
-    #   '날짜'→'날짜' 가 '날짜'→'date' 를 이긴다. 결과적으로 컬럼명이 한글로 남고
-    #   d.get("close") 가 None 이 되어 None*None TypeError 로 죽는다.
-    #   (pykrx/FDR 이 둘 다 없는 환경에서만 드러나므로 오래 숨어 있었다)
+    #   (상세 근거는 커밋 로그 참조)
     ren = {"날짜": "date", "시가": "open", "고가": "high", "저가": "low",
            "종가": "close", "거래량": "volume", "외국인소진율": "foreign_ratio"}
     d = d.rename(columns=ren)
@@ -201,7 +190,6 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     d["code"], d["src"] = code, "naver"
     d = d.dropna(subset=["close"])
     return d.reindex(columns=PRICE_COLS) if len(d) else None
-
 
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if yf is None:
@@ -232,7 +220,6 @@ def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 PRICE_CHAIN = [("pykrx", _px_pykrx), ("fdr", _px_fdr), ("naver", _px_naver), ("yfinance", _px_yf)]
 
-
 def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     """폴백 체인으로 전 종목 일봉 수집. 캐시 증분 갱신. 공용 인덱스에 저장."""
     codes = sorted({c for c in map(to_code6, codes) if c})
@@ -250,12 +237,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
 
     # ── 시도 원장 (음성 캐시) ─────────────────────────────────────────────────────────────
     #  ★ 폐지 종목과 '어느 소스에도 없는 종목'은 매 실행마다 전 소스 체인을 헛돌게 만든다.
-    #    성공한 종목만 캐시에 남으므로 실패는 영원히 기억되지 않고, 그 수는 백테스트 기간이
-    #    길어질수록 단조 증가한다. 실측상 완전 캐시 상태의 실행에서도 13~15분을 여기서 쓴다.
-    #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
-    #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
+    #   (상세 근거는 커밋 로그 참조)
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    #   (상세 근거는 커밋 로그 참조)
+    _today = as_ts(_dt.date.today())
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):
@@ -368,11 +353,19 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     px = (px.sort_values(["code", "date"])
             .drop_duplicates(["code", "date"], keep="last")
             .reset_index(drop=True))
-    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
-
+    # ★★ 절대 원칙: 저장용 프레임과 소비용 프레임을 분리한다.
+    #    예전에는 [캐시 + 신규] 를 합친 뒤 요청 구간으로 **잘라서** 공용 테이블에 되썼다.
+    #   (상세 근거는 커밋 로그 참조)
     if new_frames:
         VAULT.put_table("krx_ohlcv_daily", px, scope="shared", domain="price",
                         source="chain:" + ",".join(f"{k}×{v}" for k, v in src_used.most_common()))
+        _n_full = len(px)
+    else:
+        _n_full = len(px)
+    px = px[(px["date"] >= as_ts(start) - pd.Timedelta(days=400)) & (px["date"] <= end_ts)]
+    if _n_full != len(px):
+        LOG.info(f"공용 캐시에는 {_n_full:,}행 전량을 보존하고, 이번 실행에는 요청 구간 "
+                 f"{len(px):,}행만 사용합니다(캐시 절단 없음).")
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
@@ -382,117 +375,13 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     PIPE.io("OUT", "DRIVE", "krx_ohlcv_daily", px, source="price chain")
     return downcast(px)
 
-
-def build_price_panel(px: pd.DataFrame, months: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
-    """월말 기준 가격 패널 + 익월 시가 체결가 + 20일 평균거래대금(ADV).
-
-    체결은 '신호 산출일 다음 거래일 시가'(§10.1). 당일 종가 체결은 미래누수다.
-    """
-    px = px.sort_values(["code", "date"])
-    px["adv20"] = (px.groupby("code", observed=True)["amount"]
-                     .transform(lambda s: s.rolling(20, min_periods=10).mean()))
-    px["ret1d"] = px.groupby("code", observed=True)["close"].pct_change()
-
-    # 월말 스냅샷
-    px["ym"] = px["date"].values.astype("datetime64[M]")
-    last = px.groupby(["code", "ym"], observed=True).tail(1).copy()
-    last["month"] = as_ts_series(last["ym"]) + pd.offsets.MonthEnd(0)
-
-    # 다음 거래일 시가 = 체결가
-    nxt = px.copy()
-    nxt["next_open"] = nxt.groupby("code", observed=True)["open"].shift(-1)
-    nxt["next_date"] = nxt.groupby("code", observed=True)["date"].shift(-1)
-    keep = nxt[["code", "date", "next_open", "next_date"]]
-    last = last.merge(keep, on=["code", "date"], how="left")
-
-    monthly = last[["code", "month", "date", "close", "adv20", "next_open", "next_date"]].copy()
-    monthly = monthly.rename(columns={"date": "signal_date"})
-    monthly = monthly[monthly["month"].isin(months)]
-
-    # 월간 수익률(체결가→체결가). 상장폐지 처리는 backtest 엔진에서 -100% 로 강제한다.
-    monthly = monthly.sort_values(["code", "month"])
-    # 체결가 = 신호 산출일의 '다음 거래일 시가'. 그 다음 거래일이 너무 멀면(거래정지·상폐 직전)
-    # 그 가격으로 체결했다고 가정할 수 없으므로 종가로 폴백한다.
-    gap = (monthly["next_date"] - monthly["signal_date"]).dt.days
-    monthly["exec_px"] = monthly["next_open"].where(gap.notna() & (gap <= 10))
-    monthly["exec_px"] = monthly["exec_px"].fillna(monthly["close"])
-
-    # ★ fwd_ret 은 '바로 다음 달'과만 짝지어야 한다. 거래가 끊겨 중간 달이 패널에서 빠지면
-    #   shift(-1) 이 몇 달 뒤 가격을 끌어와 한 달 수익으로 둔갑시킨다(수익 과대계상).
-    nxt_px = monthly.groupby("code", observed=True)["exec_px"].shift(-1)
-    nxt_m = monthly.groupby("code", observed=True)["month"].shift(-1)
-    adjacent = (((nxt_m.dt.year - monthly["month"].dt.year) * 12 +
-                 (nxt_m.dt.month - monthly["month"].dt.month)) == 1)
-    monthly["fwd_ret"] = (nxt_px / monthly["exec_px"] - 1.0).where(adjacent)
-    n_gap = int((nxt_m.notna() & ~adjacent).sum())
-    if n_gap:
-        LOG.info(f"월 연속성이 끊긴 {n_gap:,}건의 fwd_ret 을 결측 처리했습니다 "
-                 f"(건너뛴 달의 수익을 한 달 수익으로 계상하지 않기 위함). "
-                 f"상장폐지 구간은 백테스트 엔진이 -100% 로 별도 처리합니다.")
-    PIPE.io("OUT", "MEM", "price_panel_monthly", monthly)
-    return {"daily": px, "monthly": downcast(monthly)}
-
-
-def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
-    """d3(기관+외국인 누적순매수) 입력. 없으면 D축은 가용 축 평균으로 자동 축소된다."""
-    cached = VAULT.get_table("krx_investor_flows", scope="shared")
-    if cached is not None and len(cached):
-        LOG.info(f"공용 캐시에서 수급 {len(cached):,}행 재사용")
-        cached["date"] = as_ts_series(cached["date"])
-        return cached
-    if pykrx_stock is None or RUN_MODE == "CACHED":
-        LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "
-                 "U 는 가용 축 평균으로 계산됩니다. 0으로 채우지 않습니다.")
-        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
-
-    codes = sorted({c for c in map(to_code6, codes) if c})
-
-    def _one(code: str):
-        try:
-            limiter("krx").wait()
-            d = pykrx_stock.get_market_trading_value_by_date(
-                as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
-        except Exception:
-            return None
-        if d is None or len(d) == 0:
-            return None
-        d = d.reset_index()
-        d = d.rename(columns={d.columns[0]: "date"})
-        inst = next((c for c in d.columns if "기관" in str(c)), None)
-        forg = next((c for c in d.columns if "외국" in str(c)), None)
-        if inst is None and forg is None:
-            return None
-        return pd.DataFrame({"code": code, "date": as_ts_series(d["date"]),
-                             "inst_net": pd.to_numeric(d[inst], errors="coerce") if inst else np.nan,
-                             "foreign_net": pd.to_numeric(d[forg], errors="coerce") if forg else np.nan})
-
-    res = pmap_io(_one, codes, workers=min(N_WORKERS_IO, 8), desc="수급 수집")
-    got = [d for d in res if d is not None and len(d)]
-    if not got:
-        LOG.warn("수급 데이터를 받지 못했습니다 — d3 결측 처리.")
-        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
-    fl = pd.concat(got, ignore_index=True)
-    VAULT.put_table("krx_investor_flows", fl, scope="shared", domain="flow", source="pykrx")
-    PIPE.io("OUT", "DRIVE", "krx_investor_flows", fl, source="pykrx")
-    return downcast(fl)
-
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-B+  PIT 시가총액 — U-1000 유니버스의 유일한 근거                                       ║
-# ║                                                                                          ║
-# ║  ★ 이 함수가 이 전략에서 가장 위험한 지점이다.                                             ║
-# ║    "현재 시점 시총 랭크를 과거에 적용" 하는 순간 유니버스 전체가 미래정보로 오염된다.        ║
-# ║    (지금 소형주인 종목은 '과거 10년간 주가가 하락한' 종목이므로, 그걸 2016년 유니버스로     ║
-# ║     쓰면 하락할 종목만 골라 담은 셈이 된다 — 알파가 아니라 마이너스 알파가 나온다)          ║
-# ║    그래서 시총은 반드시 '그 시점에 관측된 값'이어야 하고, 아래 3중 경로로 확보한다:          ║
-# ║      ① pykrx 시점별 시가총액 스냅샷 (가장 정확. KRX 세션 필요)                              ║
-# ║      ② 일봉 종가 × PIT 상장주식수(DART stockTotqySttus as-of)                              ║
-# ║      ③ 일봉 종가 × 스냅샷에서 관측된 최근 상장주식수 (선형 보간 금지 — 계단 유지)           ║
-# ║    ②③ 은 근사이므로 어느 경로가 몇 % 를 채웠는지 반드시 표로 보고한다.                      ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-B+  PIT 시가총액 — U-1000 유니버스의 유일한 근거
+#  ★ 이 함수가 이 전략에서 가장 위험한 지점이다.
+#  "현재 시점 시총 랭크를 과거에 적용" 하는 순간 유니버스 전체가 미래정보로 오염된다.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 MKTCAP_COLS = ["date", "code", "mktcap", "shares_listed", "close_mc", "mc_src"]
-
 
 def fetch_market_cap_snapshots(rebals: pd.DatetimeIndex) -> pd.DataFrame:
     """리밸런싱 시점별 시가총액 스냅샷 (pykrx). 캐시 증분.
@@ -528,13 +417,7 @@ def fetch_market_cap_snapshots(rebals: pd.DatetimeIndex) -> pd.DataFrame:
         LOG.info(f"PIT 시가총액 스냅샷 {len(todo)}개 시점 수집 (직렬)")
         bad_streak = 0
         for d in tqdm(todo, desc="PIT 시가총액", ncols=88, leave=False):
-            # ★ 당일 누수 차단. pykrx 의 get_nearest_business_day_in_a_week(prev=True) 는
-            #   [d-7, d] 구간 지수 OHLCV 의 마지막 인덱스를 돌려주므로, **d 가 거래일이면
-            #   d 를 그대로 반환**한다. 그러면 mktcap 은 리밸일 '당일 종가' 기준인데
-            #   체결은 같은 날 '시가'다 → 그날 급락한 종목이 시총이 줄어 하위 1000 안으로
-            #   들어오고, 우리는 급락 직전 시가에 그 종목을 살 수 있게 된다.
-            #   조회 기준일을 하루 앞으로 밀어 t-1 영업일 종가를 쓰게 만든다.
-            #   (build_liquidity_panel 이 allow_exact_matches=False 로 강제하는 것과 동일 규약)
+            #   (상세 근거는 커밋 로그 참조)
             _q = (as_ts(d) - pd.Timedelta(days=1)).strftime("%Y%m%d")
             bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
                            _q, prev=True) or _q
@@ -592,7 +475,6 @@ def fetch_market_cap_snapshots(rebals: pd.DatetimeIndex) -> pd.DataFrame:
     PIPE.io("OUT", "DRIVE", "krx_marketcap_pit", M, source="pykrx")
     return downcast(M)
 
-
 def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                        snap_mc: pd.DataFrame, shares: pd.DataFrame,
                        sec: pd.DataFrame) -> pd.DataFrame:
@@ -618,15 +500,7 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
     if not base_rows:
         return pd.DataFrame(columns=["code", "asof", "mktcap", "shares_listed", "mc_src"])
     B = pd.concat(base_rows, ignore_index=True)
-    # ★★ code 를 반드시 문자열로 고정한다. fetch_prices 는 downcast() 를 거치는데, 일봉은
-    #    3,500종목 × 875만행이라 nunique/len ≈ 0.0004 < cat_thresh 라서 **code 가 category
-    #    dtype 으로 바뀐다.** 그 dtype 이 여기까지 전파되면 아래 폴백 경로 ②③ 의
-    #    merge_asof(by=...) 가 "incompatible merge keys ... must be the same type" 로 죽는다.
-    #    경로 ① 만 astype(str) 을 했었기 때문에, KRX 로그인이 없어 경로 ①이 열리지 않는
-    #    실행에서는 DART 주식총수와 월말 종가가 둘 다 멀쩡한데도 시총이 100% 결측이 되고,
-    #    U-1000 이 0행 → build_arc_panel 이 RuntimeError → 실행 전체가 중단됐다.
-    #    경로 ② 의 예외 문구는 "대개 정렬/타입 문제" 수준이라 원인이 사용자 설정(KRX 로그인)
-    #    으로 오인됐고, 경로 ③ 은 except: pass 로 로그가 한 줄도 없었다.
+    #   (상세 근거는 커밋 로그 참조)
     B["code"] = B["code"].astype(str)
     B["mktcap"] = np.nan
     B["shares_listed"] = np.nan

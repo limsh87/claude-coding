@@ -1,27 +1,10 @@
 
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-G  DART 정기보고서 원문 수집 + §6.1.3 텍스트 정규화
+#  ★ 명세 §6.1.3 의 단계 순서에 함정이 하나 있어 구현에서 바로잡았다:
+#  ★ 섹션 분해 순서도 바로잡았다. 명세 [5]는 '표준 목차 헤더 제거'를 지시하는데, 섹션 분해는
+# ────────────────────────────────────────────────────────────────────────────────────────
 
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-G  DART 정기보고서 원문 수집 + §6.1.3 텍스트 정규화                                    ║
-# ║                                                                                          ║
-# ║  D1(Lazy Prices)의 성패는 전적으로 이 파일의 정규화 품질에 달려 있다.                       ║
-# ║  정규화가 부실하면 "금액이 매년 바뀐다" 는 자명한 사실이 100% 변경으로 집계되어             ║
-# ║  전 종목이 '변경 기업'이 되고 신호가 통째로 소멸한다.                                       ║
-# ║                                                                                          ║
-# ║  ★ 명세 §6.1.3 의 단계 순서에 함정이 하나 있어 구현에서 바로잡았다:                         ║
-# ║    명세는 [2] 숫자 마스킹 → [3] 날짜 마스킹 순서다. 그런데 [2]를 먼저 하면 모든 숫자가       ║
-# ║    <NUM> 이 되어 [3]의 날짜 정규식이 매칭할 대상이 사라진다(무동작). 즉 '2023년'과          ║
-# ║    '2024년'이 둘 다 '<NUM>년' 이 되어 우연히 같아지긴 하지만, '제27기'→'제<NUM>기' 처럼     ║
-# ║    기수/날짜/일반수치가 전부 한 토큰으로 뭉개져 서로 다른 성격의 변화를 구분할 수 없다.      ║
-# ║    → 구현 순서: 날짜/기수 마스킹 → 그 다음 잔여 숫자 마스킹. 결과는 명세의 의도와 동일하며   ║
-# ║      오히려 더 정밀하다. 이 결정을 A5 계약검정이 실제 문서로 검증한다.                      ║
-# ║                                                                                          ║
-# ║  ★ 섹션 분해 순서도 바로잡았다. 명세 [5]는 '표준 목차 헤더 제거'를 지시하는데, 섹션 분해는   ║
-# ║    바로 그 헤더를 기준으로 한다. 헤더를 먼저 지우면 분해가 불가능하다.                      ║
-# ║    → [5]에서는 '자동생성 목차 블록 / 페이지번호 / 법정 고지문' 만 제거하고 본문 표제어는     ║
-# ║      보존한다. 표제어는 섹션 분해가 끝난 뒤 각 섹션 앞머리에서만 잘라낸다.                   ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
-
-ARC_DOC_TYPES = {"FY": "사업보고서", "H1": "반기보고서", "Q1": "분기보고서", "Q3": "분기보고서"}
 ARC_SECTIONS = ["S_MDA", "S_LEGAL", "S_EXEC", "S_BIZ", "S_RISK", "S_GOV", "S_ALL"]
 
 # 섹션 표제 정규식. 로마숫자/아라비아 목차 번호는 선택적으로만 매칭하고(서식 개정 때 번호가
@@ -88,7 +71,6 @@ _DOC_STOPWORDS = set("""
 것으로 것을 것이 하나 여부 정도 수준 상태 경우에는 위해 대해 대해서 그것 이것
 """.split())
 
-
 # ── 토큰화 폴백 사다리 ──────────────────────────────────────────────────────────────────────
 _DOC_TAGGER = {"kind": None, "obj": None, "warned": False}
 
@@ -103,7 +85,6 @@ _KO_SUFFIX = sorted([
     "은", "는", "이", "가", "을", "를", "에", "의", "와", "과", "도", "만", "로", "라",
 ], key=len, reverse=True)
 _KO_TOKEN_RE = re.compile(r"[가-힣]{2,}|[A-Za-z]{3,}|<[A-Z]+>")
-
 
 def _doc_load_tagger():
     """konlpy → soynlp → 규칙기반. konlpy 는 JVM 을 띄우다 프로세스를 죽일 수 있어 지연 로딩."""
@@ -144,7 +125,6 @@ def _doc_load_tagger():
                      "결과 해석 시 감안하고, 가능하면 `pip install soynlp` 를 권합니다.")
     return _DOC_TAGGER
 
-
 def _doc_rule_stem(tok: str) -> str:
     """규칙기반 어간 추출. 긴 조사/어미부터 잘라내고 2자 미만은 버린다."""
     if tok.startswith("<") and tok.endswith(">"):
@@ -155,7 +135,6 @@ def _doc_rule_stem(tok: str) -> str:
             t = t[: -len(suf)]
             break
     return t if len(t) >= 2 else ""
-
 
 def arc_tokenize(norm_text: str) -> List[str]:
     """§6.1.3 [6]. 명사·동사·형용사 어간만 유지, 조사·어미 제거, 불용어 적용."""
@@ -188,7 +167,6 @@ def arc_tokenize(norm_text: str) -> List[str]:
     # 마스킹 토큰은 대소문자 그대로 보존되어야 한다(<NUM> 등)
     return [t for t in toks if t not in _DOC_STOPWORDS]
 
-
 # ── 정규화 본체 ─────────────────────────────────────────────────────────────────────────────
 def _doc_company_variants(names: Sequence[str]) -> List[str]:
     """사명 변형 전개. '㈜대한전선' / '주식회사 대한전선' / '대한전선(주)' / 'Daehan' 을 모두 잡는다.
@@ -204,7 +182,6 @@ def _doc_company_variants(names: Sequence[str]) -> List[str]:
             out.add(re.escape(s))
             out.add(re.escape(s[:2]) + r"[가-힣A-Za-z]{0,6}" + r"(?:주식회사|㈜|\(주\))")
     return sorted(out, key=len, reverse=True)[:24]      # 정규식 폭발 방지
-
 
 def arc_normalize_text(raw_html: str, company_names: Sequence[str] = ()) -> str:
     """§6.1.3 [1]~[5]. 섹션 표제어는 **보존**한다(분해에 필요하므로).
@@ -246,10 +223,7 @@ def arc_normalize_text(raw_html: str, company_names: Sequence[str] = ()) -> str:
     t = _DOC_BOILERPLATE_RE.sub(" ", t)
     t = unicodedata.normalize("NFKC", t)
     # ★ 특수문자 정리에서 마스크 토큰이 훼손되는 사고를 원천 차단한다.
-    #   이전 구현은 문자클래스에 <> 를 넣고 (?![A-Z]+>) 로만 보호했는데, 여는 '<' 는 살아도
-    #   닫는 '>' 는 뒤에 [A-Z]+> 가 없으므로 그대로 지워져 '<NUM>' 이 '<NUM ' 이 됐다.
-    #   결과적으로 마스크가 토큰화 단계에서 흩어지고 D1 전체가 무의미해진다(A5 가 잡은 버그).
-    #   → 마스크를 제어문자 자리표시자로 잠시 치환한 뒤 정리하고 되돌린다.
+    #   (상세 근거는 커밋 로그 참조)
     for k, ph in _DOC_MASK_PH.items():
         t = t.replace(k, ph)
     t = re.sub(r"[·ㆍ∙•▷▶□■◦○●◇◆＊*※#~^_=+|\\/\[\]{}<>]+", " ", t)
@@ -259,7 +233,6 @@ def arc_normalize_text(raw_html: str, company_names: Sequence[str] = ()) -> str:
     t = re.sub(r"[ \t\r\f\v]+", " ", t)
     t = re.sub(r"\n{2,}", "\n", t)
     return t.strip()
-
 
 def arc_split_sections(norm_text: str) -> Dict[str, str]:
     """정규화 텍스트 → {섹션ID: 본문}. S_ALL 은 항상 포함. 실패 섹션은 키 자체를 넣지 않는다.
@@ -293,11 +266,9 @@ def arc_split_sections(norm_text: str) -> Dict[str, str]:
             out[sid] = seg[:400_000]
     return out
 
-
 # ── 문서 유형/연도 해석 ─────────────────────────────────────────────────────────────────────
 _DOC_PERIOD_IN_NM = re.compile(r"\((\d{4})[.\-/](\d{1,2})\)")
 _DOC_AMEND_RE = re.compile(r"\[?\s*(기재정정|첨부정정|첨부추가|정정)\s*\]?")
-
 
 def _doc_classify(report_nm: str, rcept_dt) -> Optional[Tuple[str, int, bool]]:
     """report_nm → (doc_type, bsns_year, is_amend). 정기보고서가 아니면 None."""
@@ -334,7 +305,6 @@ def _doc_classify(report_nm: str, rcept_dt) -> Optional[Tuple[str, int, bool]]:
         return None
     return (dt, int(year), is_amend)
 
-
 # ── 수집 ────────────────────────────────────────────────────────────────────────────────────
 ARC_DOC_COLS = ["corp_code", "rcept_no", "rcept_dt", "doc_type", "bsns_year", "section",
                 "n_tokens", "tf", "bigram", "tok_len", "is_amend"]
@@ -342,7 +312,6 @@ ARC_DOC_TF_TOP = 350          # 섹션당 저장 토큰 수. 코사인/자카드
 ARC_DOC_BG_TOP = 120
 
 _ARC_DOC_FAIL: "Counter" = Counter()
-
 
 def _doc_unzip_text(raw: bytes) -> str:
     """DART 원문 zip → 평문. 모든 xml/html 엔트리를 읽는다.
@@ -371,7 +340,6 @@ def _doc_unzip_text(raw: bytes) -> str:
     except Exception:
         chunks = [_decode(raw, None, "dart_doc")]
     return "\n".join(chunks)
-
 
 def fetch_arc_documents(dis: pd.DataFrame, sec: pd.DataFrame,
                         max_docs: int = None) -> pd.DataFrame:
@@ -556,7 +524,6 @@ def fetch_arc_documents(dis: pd.DataFrame, sec: pd.DataFrame,
     PIPE.io("OUT", "DRIVE", "dart_doc_norm", T, source="opendart document.xml")
     return T
 
-
 def _arc_doc_fail_report(n_try: int):
     """§0.4 — 기계판독 실패율을 반드시 측정·보고한다(구형 공시는 PDF 스캔본 비중이 높다)."""
     if not _ARC_DOC_FAIL:
@@ -574,23 +541,14 @@ def _arc_doc_fail_report(n_try: int):
                  f"구형 공시의 PDF 스캔본 비중이 높은 구간이면 정상이며, D1 은 그 구간에서 "
                  f"결측 처리됩니다(0으로 채우지 않습니다).")
 
-
 # ── 페어링 (§6.1.1) ─────────────────────────────────────────────────────────────────────────
 ARC_PAIR_COLS = ["corp_code", "doc_type", "bsns_year", "section", "rcept_no", "prev_rcept_no",
                  "rcept_dt", "prev_rcept_dt", "tf", "prev_tf", "bigram", "prev_bigram",
                  "tok_len", "prev_tok_len", "is_amend"]
 
-
 def arc_doc_pairs(T: pd.DataFrame) -> pd.DataFrame:
     """§6.1.1 '동일 유형 × 전년 동기' 페어링. 직전 분기 비교는 절대 하지 않는다.
-
     ★ 왜 직전 분기와 비교하면 안 되는가: 사업보고서(연간)와 분기보고서는 분량·구성이
-      구조적으로 다르다. 섞어서 비교하면 전 종목에서 가짜 변화가 대량 발생해 신호가 죽는다.
-
-    ★ 정정공시 처리(§4.1): 같은 (corp, type, year) 에 여러 접수가 있으면 **가장 늦은 접수본**을
-      그 기수의 대표로 삼되, 비교 시점은 그 접수일이다. 즉 '그 시점에 관측 가능했던 최신 버전'
-      규약과 일치한다(미래 정정본을 과거 시점에 소급 적용하지 않는다 — 과거 시점의 유사도는
-      그 시점 이전 접수본만으로 계산되기 때문).
     """
     if T is None or T.empty:
         return pd.DataFrame(columns=ARC_PAIR_COLS)
@@ -601,11 +559,7 @@ def arc_doc_pairs(T: pd.DataFrame) -> pd.DataFrame:
     d = d.dropna(subset=["bsns_year"])
     d["bsns_year"] = d["bsns_year"].astype(int)
     # ★ 계약 §4.1: 정정공시(is_amend)는 플래그만 기록하고 신호에는 쓰지 않는다.
-    #   예전에는 keep="last" 만 걸려 있어 **정정본이 원본을 프레임에서 삭제**했다. 그러면
-    #   ① 원본이 실제로 공개됐던 시점의 D1 이 통째로 사라지고(D1_MISSING),
-    #   ② 다음 해의 비교 기준이 '당시 공개돼 있던 텍스트'가 아니라 '나중에 정정된 텍스트'가
-    #      된다 — 그 시점에 읽을 수 없었던 문서를 비교 대상으로 쓰는 미래 참조다.
-    #   정정공시를 내는 기업은 부실기업 쪽으로 치우쳐 있어, 이 손실은 무작위가 아니다.
+    #   (상세 근거는 커밋 로그 참조)
     if "is_amend" in d.columns:
         am = d["is_amend"].astype(bool)
         n_am = int(am.sum())
@@ -648,7 +602,6 @@ def arc_doc_pairs(T: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("OUT", "MEM", "dart_doc_pairs", M)
     return M
 
-
 def arc_norm_sample_report(T: pd.DataFrame, n: int = 5) -> None:
     """§10-[4] 육안 검증. 정규화가 가짜 변화를 실제로 제거했는지 사람이 확인하는 관문.
 
@@ -670,11 +623,7 @@ def arc_norm_sample_report(T: pd.DataFrame, n: int = 5) -> None:
             toks = list(json.loads(r.tf).items())[:22]
         except Exception:
             toks = []
-        # ★ int(r.tok_len) 을 try 밖에 두면 안 된다. 공용 캐시에는 tok_len 이 없던 스키마의
-        #   샤드가 남아 있을 수 있고(Vault 는 과거 버전 재사용을 설계 목표로 삼는다),
-        #   그러면 여기서 ValueError 가 나면서 L1.DOC 스테이지가 WARN 으로 접혀
-        #   ctx["doc_pairs"] 가 설정되지 않는다 → GATE_4/5 판정불가 → **원문을 전부 받아
-        #   놓고도 D1 축이 비활성화된 채** 백테스트가 끝까지 정상 완주한다.
+        #   (상세 근거는 커밋 로그 참조)
         _tl = pd.to_numeric(getattr(r, "tok_len", np.nan), errors="coerce")
         rows.append([str(r.corp_code), str(r.doc_type), str(r.bsns_year),
                      (f"{int(_tl):,}" if np.isfinite(_tl) else "—"),
@@ -700,7 +649,6 @@ def arc_norm_sample_report(T: pd.DataFrame, n: int = 5) -> None:
     except Exception:
         pass
 
-
 def arc_doc_years(T: Optional[pd.DataFrame] = None) -> List[int]:
     """수집된 정기보고서의 사업연도 목록. 매니페스트가 있으면 그걸, 없으면 캐시 샤드를 본다."""
     if T is not None and len(T) and "bsns_year" in T.columns:
@@ -712,7 +660,6 @@ def arc_doc_years(T: Optional[pd.DataFrame] = None) -> List[int]:
         if os.path.exists(pth):
             out.append(y)
     return out
-
 
 def arc_doc_load_years(years: Sequence[int]) -> pd.DataFrame:
     """지정 연도의 토큰 샤드만 메모리에 올린다.

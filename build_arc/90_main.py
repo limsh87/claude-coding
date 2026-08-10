@@ -1,5 +1,4 @@
 
-
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  오케스트레이터 — §10 실행 순서                                                            ║
 # ║   [1] Phase 0 게이트 → [2] U-1000 PIT → [3] DART 수집 → [4] 정규화 → [5] D1                ║
@@ -43,7 +42,6 @@ def offer_download(paths: Sequence[str]):
     except Exception:
         for p in paths:
             _safe_print(f"⬇  산출물 경로: {p}")
-
 
 def arc_collect(rebals: pd.DatetimeIndex) -> dict:
     """L1 수집 — 각 단계는 실패해도 파이프라인을 죽이지 않고 '무엇이 없는지'를 남긴다."""
@@ -159,7 +157,6 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
           ctx["report_text"] = build_report_text_store(rep) if len(rep) else pd.DataFrame()
     return ctx
 
-
 def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
     """L2 — 유니버스 → 패널 → 축 B(D1·D2·D3·배제) → 축 A(TONE·직교화) → FINAL."""
     with PIPE.stage("L2.UNI", "U-1000 PIT 유니버스 + 분기 패널", "L2", budget_s=900):
@@ -255,6 +252,35 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
                         scope="private", domain="scores", source="L2")
     return Q, uni
 
+def load_verify_harness() -> bool:
+    """검증 하네스 파일을 찾아 현재 전역에 로드한다. 없으면 조용히 False.
+
+    본체와 같은 폴더 · 현재 작업 디렉터리 · 구글드라이브 캐시 루트 순으로 찾는다.
+    exec 로 이 모듈의 globals() 에 직접 넣으므로 하네스는 본체의 모든 이름을 그대로 쓴다.
+    """
+    if not SELFTEST:
+        return False
+    if "run_contract_tests" in globals():
+        return True
+    here = os.path.dirname(os.path.abspath(globals().get("__file__", "") or "."))
+    cands = [os.path.join(here, VERIFY_FILE), os.path.join(os.getcwd(), VERIFY_FILE)]
+    try:
+        cands.append(os.path.join(VAULT.root, VERIFY_FILE))
+    except Exception:
+        pass
+    for c in cands:
+        try:
+            if c and os.path.exists(c):
+                exec(compile(open(c, encoding="utf-8").read(), c, "exec"), globals())
+                LOG.ok(f"검증 하네스 로드: {c}")
+                return True
+        except Exception as e:                                      # noqa
+            LOG.warn(f"검증 하네스 로드 실패({type(e).__name__}: {str(e)[:120]}) — "
+                     f"검증을 건너뛰고 본체만 실행합니다.")
+            return False
+    LOG.info(f"검증 하네스({VERIFY_FILE})가 없어 계약검정·리허설·스모크를 건너뜁니다. "
+             f"본체 실행에는 영향이 없습니다. 검증까지 돌리려면 같은 폴더에 두세요.")
+    return False
 
 def main() -> dict:
     t_all = time.time()
@@ -290,16 +316,18 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A21", "L0", budget_s=300):
-        run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
-
-    with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",
-                    budget_s=(3600 if RUN_MODE == "SMOKE" else 600)):
-        if not run_selftest(full_chain=(RUN_MODE == "SMOKE")):
-            raise RuntimeError("스모크 실패 — 실데이터 수집을 시작하지 않습니다.")
-
-    with PIPE.stage("L0.REHEARSAL", "실경로 리허설", "L0", budget_s=900):
-        run_rehearsal(strict=True)
+    # ── 검증 하네스(선택) ─────────────────────────────────────────────────────────────────
+    #   계약검정 A1~A39 · 실경로 리허설 · 합성 스모크는 별도 파일(arc_txt_v2_verify.py)에 있다.
+    #   같은 폴더에 있으면 자동으로 실행하고, 없으면 건너뛴다 — 본체는 그것 없이도 완전히 돈다.
+    if load_verify_harness() and "run_contract_tests" in globals():
+        with PIPE.stage("L0.CONTRACT", "계약 자동검정", "L0", budget_s=300):
+            run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
+        with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",
+                        budget_s=(3600 if RUN_MODE == "SMOKE" else 600)):
+            if not run_selftest(full_chain=(RUN_MODE == "SMOKE")):
+                raise RuntimeError("스모크 실패 — 실데이터 수집을 시작하지 않습니다.")
+        with PIPE.stage("L0.REHEARSAL", "실경로 리허설", "L0", budget_s=900):
+            run_rehearsal(strict=True)
 
     rebals = rebal_dates(BACKTEST_START, BACKTEST_END)
     LOG.info(f"리밸런싱 시점 {len(rebals)}개 ({rebals[0]:%Y-%m-%d} ~ {rebals[-1]:%Y-%m-%d})")

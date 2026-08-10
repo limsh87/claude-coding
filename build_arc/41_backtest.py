@@ -1,16 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L3  백테스트 엔진 (분기 리밸런싱) + 비용 모델 (§7.2 / §8.1)                                ║
-# ║                                                                                          ║
-# ║  · 분기 1회 리밸런싱(3/1, 6/1, 9/1, 12/1). 체결 = 리밸일 이후 첫 거래일 시가.               ║
-# ║  · 상장폐지: 정리매매 최종가 반영, 없으면 −100%. 누락 처리 금지(= 생존자편향).               ║
-# ║  · 롱온리. §7.3 부정 신호(BOTTOM)는 별도 검증만 하고 자동으로 숏을 만들지 않는다.            ║
-# ║  · 비용: 증권거래세 이력 + 수수료 + 실측 스프레드 기반 슬리피지. 비용 전/후 병기 필수.       ║
-# ║                                                                                          ║
-# ║  ★ 연율화 계수는 4 다(분기). 12 로 쓰면 성과가 통째로 3배로 부풀려진다.                     ║
-# ║    A17 계약검정이 이걸 실제 수치로 검사한다.                                                ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L3  백테스트 엔진 (분기 리밸런싱) + 비용 모델 (§7.2 / §8.1)
+#  ★ 연율화 계수는 4 다(분기). 12 로 쓰면 성과가 통째로 3배로 부풀려진다.
+#  · 분기 1회 리밸런싱(3/1, 6/1, 9/1, 12/1). 체결 = 리밸일 이후 첫 거래일 시가.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 PERIODS_PER_YEAR = 4          # 분기 리밸런싱
 
@@ -20,7 +13,6 @@ ARC_TAX_SCHEDULE = [
     ("2023-01-01", 0.0020), ("2024-01-01", 0.0018), ("2025-01-01", 0.0015),
 ]
 
-
 def arc_sell_tax(dt) -> float:
     t = as_ts(dt)
     rate = ARC_TAX_SCHEDULE[0][1]
@@ -28,7 +20,6 @@ def arc_sell_tax(dt) -> float:
         if t is not None and t >= as_ts(d):
             rate = r
     return rate
-
 
 def arc_slippage(trade_krw: float, adv_krw: float) -> float:
     """제곱근 시장충격 + 초소형주 최소 스프레드 하한.
@@ -42,7 +33,6 @@ def arc_slippage(trade_krw: float, adv_krw: float) -> float:
         return max(floor, 0.02)
     part = min(1.0, abs(trade_krw) / adv_krw)
     return float(max(floor, ARC_SLIPPAGE_K * math.sqrt(part)))
-
 
 def _bt_weights(sub: pd.DataFrame, weighting: str) -> np.ndarray:
     """동일가중(기준) 또는 역변동성 가중(병행 산출). 유동성 상한을 water-filling 으로 강제."""
@@ -79,7 +69,6 @@ def _bt_weights(sub: pd.DataFrame, weighting: str) -> np.ndarray:
         w = w / w.sum()
     return w
 
-
 def _bt_pick(elig: pd.DataFrame, k: int, signal_col: str) -> pd.DataFrame:
     """상위 k 선정. 동점은 명시적 키로 깬다 — 행 순서로 깨지 않는다.
 
@@ -92,7 +81,6 @@ def _bt_pick(elig: pd.DataFrame, k: int, signal_col: str) -> pd.DataFrame:
                            if c in elig.columns and c != signal_col]
     asc = [False] + [False if c == "FINAL_SCORE" else True for c in keys[1:]]
     return elig.sort_values(keys, ascending=asc, kind="mergesort").head(int(k))
-
 
 def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFrame,
                  signal_col: str = "FINAL_RANK", apply_costs: bool = True,
@@ -134,12 +122,7 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
                          "measurable": False})
             prev_w = {}
             continue
-        # ★ 편입 자격은 '오늘 신호가 있는가' 만으로 판정한다. 예전에는 여기에
-        #   `& sub["fwd_ret_1q"].notna()` 가 붙어 있었는데, 그러면 **t 시점의 편입 가능
-        #   여부가 t+1 시점의 정보(다음 분기에 유니버스에 남아 있는가 / 가격이 있는가)로
-        #   결정된다.** 방향성 있는 편향이다 — 시총이 커져 U-1000 을 이탈하는 종목(=크게
-        #   오른 종목)과 유동성이 말라 이탈하는 종목(=붕괴 중인 종목)이 둘 다 후보에서
-        #   지워졌다. 측정 불가는 아래에서 '유니버스 중앙값으로 대치 + 건수 보고'로 다룬다.
+        #   (상세 근거는 커밋 로그 참조)
         elig = sub[sub[signal_col].notna()]
         n_elig = len(elig)
         if uni is not None:
@@ -166,11 +149,7 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
 
         cost = 0.0
         if apply_costs:
-            # ★ advmap 은 그 분기 패널 전체(sub)에서 만든다. 예전에는 pick('새로 담을 종목')
-            #   으로만 만들었는데, 비용 루프는 set(w_new) | set(prev_w) 를 돌기 때문에
-            #   **전량 매도되는 종목은 adv=0 으로 조회되어 arc_slippage 의 '데이터 없음'
-            #   폴백(일괄 2%)** 을 탔다. 매도 슬리피지가 매수의 2.4배로 매겨져 연 3~4%p
-            #   유령 비용이 붙고, 회전율이 다른 어블레이션 팔끼리의 비용후 비교가 왜곡된다.
+            #   (상세 근거는 커밋 로그 참조)
             advmap = dict(zip(sub["code"].astype(str),
                               pd.to_numeric(sub.get("adtv60", pd.Series(np.nan, index=sub.index)),
                                             errors="coerce").fillna(0.0)))
@@ -241,7 +220,6 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
     return {"returns": R, "holdings": H, "label": label,
             "eligible": R[["asof", "n_elig"]] if len(R) else pd.DataFrame()}
 
-
 # ── 성과 지표 (분기 기준) ───────────────────────────────────────────────────────────────────
 def perf_stats(R: pd.DataFrame, rf: float = 0.0, gross: bool = False) -> dict:
     """분기 수익률 시계열 → 성과 지표. ★ 연율화 계수는 4 (분기 4개 = 1년)."""
@@ -299,13 +277,11 @@ def perf_stats(R: pd.DataFrame, rf: float = 0.0, gross: bool = False) -> dict:
         "평균편입가능": float(Rm["n_elig"].mean()) if "n_elig" in Rm.columns else np.nan,
     }
 
-
 def bt_ic(P: pd.DataFrame, signal_col: str = "FINAL_RANK") -> Tuple[float, float, int]:
     """신호의 기간별 Spearman IC / IC-IR."""
     if P is None or P.empty or signal_col not in P.columns or "fwd_ret_1q" not in P.columns:
         return (np.nan, np.nan, 0)
     return info_coef(P[signal_col], P["fwd_ret_1q"], P["asof"].astype(str))
-
 
 def attach_volatility(P: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame:
     """역변동성 가중용 분기 변동성(직전 60거래일 일간수익률 표준편차, 연율화)."""
@@ -341,7 +317,6 @@ def attach_volatility(P: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame:
         P["vol_q"] = np.nan
     return P
 
-
 def benchmark_returns(rebals: pd.DatetimeIndex) -> Dict[str, pd.Series]:
     """벤치마크 분기 수익률. FDR 이 없으면 빈 dict — 그 사실을 로그로 남긴다."""
     out: Dict[str, pd.Series] = {}
@@ -374,7 +349,6 @@ def benchmark_returns(rebals: pd.DatetimeIndex) -> Dict[str, pd.Series]:
     if out:
         LOG.ok(f"벤치마크 확보: {', '.join(out)} (분기 수익률)")
     return out
-
 
 def equal_weight_universe_return(P: pd.DataFrame) -> pd.Series:
     """U-1000 동일가중 수익률 — 초과수익 계산의 1순위 벤치마크.

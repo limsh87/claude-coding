@@ -1,20 +1,11 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-G  실경로 리허설 — 수집 함수를 '진짜로' 실행해 본다                                    ║
-# ║                                                                                          ║
-# ║  합성 스모크(80)는 완성된 패널을 주입한다. 즉 build_security_master · fetch_prices ·        ║
-# ║  fetch_arc_documents · hankyung_collect 같은 실제 수집·정제 함수는 한 줄도 실행되지 않는다. ║
-# ║  실제로 계약 검정 + 스모크를 전부 통과한 빌드가 실행 2분 만에 수집부 한 줄 때문에 죽은      ║
-# ║  전례가 있어 이 계층이 생겼다.                                                              ║
-# ║                                                                                          ║
-# ║  여기서는 네트워크 계층만 가짜로 바꾸고(HTTP·pykrx·FDR), 그 위 수집·정제 로직은 실물 실행.   ║
-# ║  각 함수에 네 가지를 먹인다: ① 정상 ② 빈 응답 ③ 깨진 응답 ④ 기대 컬럼 누락                  ║
-# ║  전부 '예외 없이' 통과해야 하고, 정상 응답에서는 실제로 값이 나와야 한다.                    ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L0-G  실경로 리허설 — 수집 함수를 '진짜로' 실행해 본다
+#  합성 스모크(80)는 완성된 패널을 주입한다. 즉 build_security_master · fetch_prices ·
+#  fetch_arc_documents · hankyung_collect 같은 실제 수집·정제 함수는 한 줄도 실행되지 않는다.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 REHEARSAL_RESULTS: List[dict] = []
-
 
 def _arh(name: str, fn: Callable, expect_rows: bool = True, note: str = ""):
     t0 = time.time()
@@ -33,7 +24,6 @@ def _arh(name: str, fn: Callable, expect_rows: bool = True, note: str = ""):
             "tb": traceback.format_exc()})
         return None
 
-
 # ── 픽스처 ──────────────────────────────────────────────────────────────────────────────────
 def _afx_fdr_listing(n: int = 40) -> bytes:
     rows = ["Code,ISU_CD,Name,Market,Dept,Close,ChagesRatio,Marcap,Stocks,MarketId"]
@@ -43,14 +33,12 @@ def _afx_fdr_listing(n: int = 40) -> bytes:
                     f"10000,0.5,1000000000,100000,{'STK' if i%2 else 'KSQ'}")
     return ("﻿" + "\n".join(rows)).encode("utf-8")
 
-
 def _afx_fdr_delisting(n: int = 30) -> bytes:
     rows = ["Symbol,Name,Market,SecuGroup,Kind,DelistingDate,ToSymbol,ToName,Reason"]
     for i in range(n):
         code = f"{900000+i:06d}" if i < 20 else f"KR{i:08d}"
         rows.append(f"{code},폐지{i+1:03d},KOSPI,주권,보통주,{2017+(i%8)}-0{1+(i%9)}-15,,,상장폐지")
     return ("﻿" + "\n".join(rows)).encode("utf-8")
-
 
 def _afx_kind(n: int = 30) -> bytes:
     head = ("<table><tr><th>회사명</th><th>종목코드</th><th>업종</th><th>주요제품</th>"
@@ -59,7 +47,6 @@ def _afx_kind(n: int = 30) -> bytes:
                    f"<td>2010-03-15</td><td>12월</td><td>홍길동</td><td>http://x</td>"
                    f"<td>서울</td></tr>" for i in range(n))
     return (head + body + "</table>").encode("euc-kr")
-
 
 def _afx_corpcode(n: int = 40) -> bytes:
     buf = io.BytesIO()
@@ -70,7 +57,6 @@ def _afx_corpcode(n: int = 40) -> bytes:
     with zipfile.ZipFile(buf, "w") as z:
         z.writestr("CORPCODE.xml", xml.encode("utf-8"))
     return buf.getvalue()
-
 
 def _afx_fnltt(corp: str, year: int) -> dict:
     def row(sj, aid, anm, amt):
@@ -98,7 +84,6 @@ def _afx_fnltt(corp: str, year: int) -> dict:
             "-60,000,000,000"),
     ]}
 
-
 def _afx_emp(corp: str, year: int) -> dict:
     def r(bbm, sex, sm, tot):
         return {"rcept_no": f"{year+1}0331000001", "corp_code": corp, "fo_bbm": bbm,
@@ -107,7 +92,6 @@ def _afx_emp(corp: str, year: int) -> dict:
     return {"status": "000", "list": [
         r("반도체", "남", "1,200", "96,000,000,000"), r("반도체", "여", "300", "21,000,000,000"),
         r("합계", "합계", "1,500", "117,000,000,000")]}
-
 
 def _afx_shares(corp: str, year: int) -> dict:
     return {"status": "000", "list": [
@@ -121,14 +105,12 @@ def _afx_shares(corp: str, year: int) -> dict:
          "isu_stock_totqy": "11,000,000", "now_to_isu_stock_totqy": "11,000,000",
          "tesstk_co": "100,000", "istc_totqy": "11,000,000"}]}
 
-
 def _afx_audit(corp: str, year: int) -> dict:
     emph = "계속기업으로서의 존속능력에 대한 불확실성" if int(year) % 3 == 0 else ""
     return {"status": "000", "list": [
         {"rcept_no": f"{year+1}0331000001", "corp_code": corp, "bsns_year": str(year),
          "adtor": "합성회계법인", "adt_opinion": "적정", "emphs_matter": emph,
          "core_adt_matter": "수익인식"}]}
-
 
 def _afx_dart_list(bgn: str, ty: str) -> dict:
     y = int(bgn[:4])
@@ -151,7 +133,6 @@ def _afx_dart_list(bgn: str, ty: str) -> dict:
                       "report_nm": "단일판매ㆍ공급계약체결", "flr_nm": "합성002",
                       "corp_cls": "Y"})
     return {"status": "000" if items else "013", "page_no": 1, "total_page": 1, "list": items}
-
 
 # ★ 실제 사업보고서는 섹션당 수천~수만 자다. 픽스처가 너무 짧으면 fetch_arc_documents 의
 #   '본문 최소 길이' 와 섹션 최소 길이 필터에 걸려 0행이 되고, 리허설이 실제 경로를 검증하지
@@ -198,7 +179,6 @@ _AFX_SECTIONS = [
      "투자위험요소: 전방 산업 경기 변동에 따라 실적이 영향을 받을 수 있습니다. "),
 ]
 
-
 def _afx_doc_body(y: int, newer: bool) -> str:
     fmt = dict(
         year=y, gi=y - 1990, mm=(y % 12) + 1,
@@ -217,7 +197,6 @@ def _afx_doc_body(y: int, newer: bool) -> str:
     out.append("</DOCUMENT>")
     return "\n".join(out)
 
-
 def _afx_document(rcept_no: str) -> bytes:
     """전년/당년 두 해치. 당년본은 (a) 숫자·날짜만 바뀐 섹션과 (b) 서술이 바뀐 섹션을 나눈다."""
     y = int(str(rcept_no)[:4]) if str(rcept_no)[:4].isdigit() else 2020
@@ -233,7 +212,6 @@ def _afx_document(rcept_no: str) -> bytes:
                                  "<table><tr><td>자산</td><td>1,000</td></tr></table>"
                                  "</DOC>").encode("euc-kr"))
     return buf.getvalue()
-
 
 def _afx_hankyung(n: int = 12) -> str:
     hdr = ("<tr>" + "".join(f"<th>{h}</th>" for h in
@@ -254,7 +232,6 @@ def _afx_hankyung(n: int = 12) -> str:
     return (f"<div id='contents'><div class='table_style01'><table>{hdr}"
             f"{''.join(rows)}</table></div></div>")
 
-
 def _afx_naver_research(n: int = 12) -> str:
     hdr = ("<tr><th>종목명</th><th>제목</th><th>증권사</th><th>첨부</th>"
            "<th>작성일</th><th>조회수</th></tr>")
@@ -274,10 +251,8 @@ def _afx_naver_research(n: int = 12) -> str:
     return (f"<div id='contentarea_left'><div class='box_type_m'>"
             f"<table class='type_1'>{hdr}{''.join(rows)}</table></div></div>{nav}")
 
-
 def _afx_pdf() -> bytes:
     return b"%PDF-1.4\n% synthetic fixture\n%%EOF\n"
-
 
 class _ArcFixtureNet:
     """URL 로 픽스처를 골라주는 가짜 네트워크. mode 로 정상/빈/깨짐/컬럼누락 전환."""
@@ -370,7 +345,6 @@ class _ArcFixtureNet:
             return []                     # JSON API 미가용 → HTML 폴백 경로를 타게 한다
         self.hits["other_json"] += 1
         return None
-
 
 def run_rehearsal(strict: bool = True) -> bool:
     LOG.banner("② 실경로 리허설 (REHEARSAL)",

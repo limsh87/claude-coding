@@ -1,23 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-D  캐시 저장소 (VAULT) — 구글드라이브 공용/전용 인덱스                                 ║
-# ║                                                                                          ║
-# ║  ★★★ 절대 1원칙: 기존 캐시·인덱스를 훼손하지 않는다. ★★★                                  ║
-# ║                                                                                          ║
-# ║  훼손 불가능성을 "약속"이 아니라 "구조"로 보장한다:                                        ║
-# ║   1) 인덱스의 진실은 append-only JSONL 저널이다. 기존 줄을 다시 쓰지 않으므로              ║
-# ║      코드가 어떻게 잘못돼도 과거 기록이 사라질 수 없다.                                    ║
-# ║   2) index.parquet 은 저널의 파생물(캐시)일 뿐이다. 재생성 전 항상 타임스탬프 백업.        ║
-# ║   3) 컬럼은 합집합으로만 확장한다. 스키마가 달라도 기존 컬럼을 떨어뜨리지 않는다.          ║
-# ║   4) 원본 blob 은 내용해시 기반 경로에 쓰므로 같은 내용은 재기록조차 하지 않는다.          ║
-# ║      내용이 다르면 새 리비전으로 쓰고, 기존 파일은 건드리지 않는다.                        ║
-# ║   5) 이미 드라이브에 있던 리포트는 "옮기지 않고 경로만 등록"한다(adopt-by-reference).      ║
-# ║   6) 삭제 API 자체가 없다. 손상 파일조차 지우지 않고 .corrupt 로 격리만 한다.              ║
-# ║                                                                                          ║
-# ║  공용 인덱스(_shared) : 다른 전략에서도 그대로 재활용 가능한 원본/정제본                   ║
-# ║  전용 인덱스(tcd_v2)  : 이 전략 고유의 피처·스코어·리포트                                  ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L0-D  캐시 저장소 (VAULT) — 구글드라이브 공용/전용 인덱스
+#  ★★★ 절대 1원칙: 기존 캐시·인덱스를 훼손하지 않는다. ★★★
+#  훼손 불가능성을 "약속"이 아니라 "구조"로 보장한다:
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 VAULT_SCHEMA_VER = "2.0"
 
@@ -26,7 +12,6 @@ INDEX_COLUMNS = [
     "bytes", "sha1", "event_date", "knowledge_date", "source", "collected_at",
     "strategy", "adopted", "schema_ver", "extra",
 ]
-
 
 def _mount_drive() -> Tuple[str, str]:
     """(루트경로, 상태문자열). Colab이면 마운트 시도, 아니면 로컬 폴백. 어느 쪽이든 죽지 않는다."""
@@ -48,7 +33,6 @@ def _mount_drive() -> Tuple[str, str]:
         if cand and os.path.isdir(cand):
             return cand, "LOCAL_SYNCED_DRIVE"
     return LOCAL_CACHE_ROOT, "LOCAL"
-
 
 class Vault:
     def __init__(self, root: str, mode: str):
@@ -298,12 +282,37 @@ class Vault:
                     continue
         return None
 
+    # 공용 테이블이 이 비율 아래로 줄면 '수집 실패' 로 보고 교체하지 않는다.
+    SHRINK_GUARD = 0.5
+
     def put_table(self, name: str, df: pd.DataFrame, scope: str = "shared",
-                  domain: str = "table", source: str = "", extra: Optional[dict] = None) -> Optional[str]:
+                  domain: str = "table", source: str = "", extra: Optional[dict] = None,
+                  allow_shrink: bool = False) -> Optional[str]:
         """정제 테이블(parquet). 기존 파일은 백업 후 교체 — 백업 없이는 절대 교체하지 않는다."""
         if df is None:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+
+        #   (상세 근거는 커밋 로그 참조)
+        if (scope == "shared" and not allow_shrink and os.path.exists(path)):
+            try:
+                n_old = int(pq_num_rows(path))
+            except Exception:
+                n_old = -1
+            n_new = int(len(df))
+            if n_old > 0 and n_new < max(1, int(n_old * self.SHRINK_GUARD)):
+                rev = os.path.join(self.table_dir(scope),
+                                   f"{name}.rev{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
+                try:
+                    atomic_write_parquet(df, rev)
+                except Exception:
+                    rev = "(저장 실패)"
+                LOG.warn(f"공용 테이블 '{name}' 이 {n_old:,}행 → {n_new:,}행으로 급감해 "
+                         f"교체하지 않았습니다(수집 실패로 판단). 기존 캐시는 그대로 두고 "
+                         f"새 결과는 리비전 파일로만 남깁니다: {os.path.basename(str(rev))}. "
+                         f"의도한 축소라면 allow_shrink=True 로 호출하세요.")
+                return None
+
         if os.path.exists(path):
             bak = os.path.join(self.ns[scope], "index", "_backup",
                                f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
@@ -490,13 +499,11 @@ class Vault:
         LOG.info("무결성 원칙: 저널은 append-only(기존 줄 재기록 없음) · index.parquet 은 백업 후 교체 · "
                  "blob 은 내용해시 경로라 덮어쓰기 자체가 발생하지 않음 · 삭제 API 없음.")
 
-
 def _safe_size(p: str) -> int:
     try:
         return os.path.getsize(p)
     except Exception:
         return -1
-
 
 def free_gb(path: str) -> float:
     try:

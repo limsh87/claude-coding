@@ -1,5 +1,4 @@
 
-
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L5-B  강건성 (§8.4) + 인과 순서 점검 (§7.1) + 부정 신호 검증 (§7.3)                       ║
 # ║                                                                                          ║
@@ -10,7 +9,6 @@
 
 ROBUST_RESULTS: "OrderedDict[str, dict]" = OrderedDict()
 
-
 def _rrec(rid: str, name: str, passed: Optional[bool], detail: str,
           metrics: Optional[dict] = None):
     # ★ numpy bool 주의: np.False_ is False → False. `is False` 분기가 조용히 빗나간다.
@@ -20,18 +18,15 @@ def _rrec(rid: str, name: str, passed: Optional[bool], detail: str,
     (LOG.ok if passed is True else (LOG.error if passed is False else LOG.warn))(
         f"[{rid}] {name} → " + {True: "✔", False: "✘", None: "—"}[passed] + f" {detail}")
 
-
 def _rsharpe(bt) -> float:
     s = perf_stats(bt["returns"]) if bt else {}
     return float(s.get("Sharpe", np.nan)) if s else np.nan
-
 
 def _rsafe(fn, rid: str, name: str):
     try:
         fn()
     except Exception as e:                                        # noqa
         _rrec(rid, name, None, f"실행 실패 — {type(e).__name__}: {str(e)[:140]}")
-
 
 # ── R1. 서브기간 (전반부 / 후반부) ──────────────────────────────────────────────────────────
 def R_subperiod(bt: dict) -> None:
@@ -68,7 +63,6 @@ def R_subperiod(bt: dict) -> None:
            "한 구간이 음(−)입니다 — 특정 레짐에 의존할 가능성을 배제할 수 없습니다."),
           {"mu_first": mus[0], "mu_second": mus[1]})
 
-
 # ── R2. 시총 사분위별 분해 ──────────────────────────────────────────────────────────────────
 def R_size_quartile(P: pd.DataFrame, bt: dict) -> None:
     H = bt.get("holdings")
@@ -94,7 +88,6 @@ def R_size_quartile(P: pd.DataFrame, bt: dict) -> None:
     LOG.table(rows, ["시총 사분위", "보유건수", "평균 분기수익", "승률", "누적 기여"],
               ["l", "r", "r", "r", "r"], title="R2 시총 사분위별 성과 분해")
     _rrec("R2", "시총 사분위 분해", True, f"{len(rows)}개 분위로 분해 완료")
-
 
 # ── R3. 섹터별 분해 (§8.4 필수) ─────────────────────────────────────────────────────────────
 def R_sector(P: pd.DataFrame, bt: dict, sec: pd.DataFrame) -> None:
@@ -131,7 +124,6 @@ def R_sector(P: pd.DataFrame, bt: dict, sec: pd.DataFrame) -> None:
            "★ 한 섹터에 20%p 이상 초과 배분되었습니다 — v1.0 의 섹터 편향이 남아 있을 "
            "가능성이 있습니다. D3 섹터 발화율 표와 함께 해석하세요."),
           {"max_over_sector": worst[0], "max_over": worst[1]})
-
 
 # ── R4. 리밸런싱 ±5거래일 이동 ──────────────────────────────────────────────────────────────
 def R_rebal_shift(P: pd.DataFrame, rebals, run_fn, px_daily: Optional[pd.DataFrame] = None) -> None:
@@ -170,7 +162,6 @@ def R_rebal_shift(P: pd.DataFrame, rebals, run_fn, px_daily: Optional[pd.DataFra
              "엄밀한 ±5거래일 검정은 체결가를 그 날짜로 다시 만들어야 하며, "
              "그 경우 신호 산출 시점도 함께 바뀌어야 합니다.")
 
-
 # ── R5. 보유종목수 20 / 30 / 40 ─────────────────────────────────────────────────────────────
 def R_holdings(P: pd.DataFrame, run_fn) -> None:
     Q = assemble_final(P, use_axes=("A", "D1", "D2", "D3"), use_excl=True)
@@ -191,7 +182,6 @@ def R_holdings(P: pd.DataFrame, run_fn) -> None:
     _rrec("R5", "보유종목수 민감도", stable,
           f"Sharpe 범위 {min(fin):.3f}~{max(fin):.3f}" if fin else "산출 불가",
           {"sharpes": fin})
-
 
 # ── R6. STRUCT_FLAG 포함 / 제외 ─────────────────────────────────────────────────────────────
 def R_struct(P: pd.DataFrame, run_fn) -> None:
@@ -215,7 +205,6 @@ def R_struct(P: pd.DataFrame, run_fn) -> None:
     _rrec("R6", "STRUCT_FLAG 민감도", bool(np.isfinite(s1) and np.isfinite(s2) and
                                           abs(s1 - s2) < 0.5),
           f"Sharpe {s1:.3f} → {s2:.3f} (Δ {s2-s1:+.3f})", {"s_base": s1, "s_drop": s2})
-
 
 # ── R7. 한국IR협의회 기업의뢰 리포트 포함 / 제외 ────────────────────────────────────────────
 def R_ircouncil(P: pd.DataFrame, rep: Optional[pd.DataFrame], run_fn) -> None:
@@ -262,7 +251,6 @@ def R_ircouncil(P: pd.DataFrame, rep: Optional[pd.DataFrame], run_fn) -> None:
     LOG.info("[방법론적 우려] TONE 재집계 대신 '기업의뢰 전용 종목-분기의 축 A 결측 처리'로 "
              "근사했습니다. 혼합 커버 종목의 편향은 제거되지 않습니다.")
 
-
 # ── R8. D1 유사도 지표 4종 단독 ─────────────────────────────────────────────────────────────
 def R_d1_metrics(P: pd.DataFrame, run_fn) -> None:
     rows, sh = [], {}
@@ -287,7 +275,6 @@ def R_d1_metrics(P: pd.DataFrame, run_fn) -> None:
                             "있을 수 있습니다(사전등록 구성이므로 자동 변경하지 않고 보고만)."),
           {"base": base, **sh})
 
-
 # ── R9. D1 섹션 가중치 균등배분 ─────────────────────────────────────────────────────────────
 def R_d1_weights(P: pd.DataFrame, run_fn) -> None:
     if "D1_SCORE_equalw" not in P.columns:
@@ -309,7 +296,6 @@ def R_d1_weights(P: pd.DataFrame, run_fn) -> None:
            and abs(a - b) < 0.4 else
            "★ 가중치 선택이 성과를 크게 바꿉니다 — 사전등록 값의 임의성이 결과에 반영됩니다."),
           {"preset": a, "equal": b})
-
 
 # ── R10. §7.3 부정 신호 (BOTTOM 그룹) ───────────────────────────────────────────────────────
 def R_bottom_group(P: pd.DataFrame) -> None:
@@ -360,7 +346,6 @@ def R_bottom_group(P: pd.DataFrame) -> None:
                      "숏 슬리브 도입 여부는 **자동 결정하지 않고** 보고 후 지시를 기다립니다.")
     else:
         _rrec("R10", "부정 신호 검증", None, "표본 부족으로 비대칭 판정 불가")
-
 
 # ── R11. §7.1 인과 순서 점검 ────────────────────────────────────────────────────────────────
 def R_causal_order(P: pd.DataFrame, rep: Optional[pd.DataFrame],
@@ -442,7 +427,6 @@ def R_causal_order(P: pd.DataFrame, rep: Optional[pd.DataFrame],
     _rrec("R11", "인과 순서 점검", None if not detail else True,
           " · ".join(detail) or "판정불가", metrics)
 
-
 def report_robustness() -> None:
     LOG.banner("[산출물 10] 강건성 검사 요약 (§9.2-10)",
                "실패는 그대로 보고한다. 파라미터를 조정해 통과시키지 않는다")
@@ -462,7 +446,6 @@ def report_robustness() -> None:
                  " — 파라미터를 조정하지 않고 그대로 보고합니다(§9.1).")
     else:
         LOG.ok("강건성 검사에서 실패 항목이 없습니다.")
-
 
 def run_robustness_suite(P, bt, rebals, uni, sec, run_fn,
                          rep=None, doc=None, px_daily=None) -> None:

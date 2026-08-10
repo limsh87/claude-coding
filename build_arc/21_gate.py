@@ -1,14 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-H  Phase 0 — 데이터 실현가능성 게이트 (§2)                                             ║
-# ║                                                                                          ║
-# ║  이 게이트의 목적은 '전략을 통과시키는 것'이 아니라 **어느 축이 성립 가능한지 먼저          ║
-# ║  확정하는 것**이다. 실패해도 전략을 폐기하지 않고 해당 축만 비활성화한다(§2.3).             ║
-# ║  v1.0 과 달리 축 B 가 독립 작동 가능하므로, 축 A 가 죽어도 DART-ONLY 폴백으로 진행한다.     ║
-# ║                                                                                          ║
-# ║  ★ 어떤 경우에도 예외를 던지지 않는다. 판정만 하고 돌려준다.                                ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-H  Phase 0 — 데이터 실현가능성 게이트 (§2)
+#  ★ 어떤 경우에도 예외를 던지지 않는다. 판정만 하고 돌려준다.
+#  이 게이트의 목적은 '전략을 통과시키는 것'이 아니라 **어느 축이 성립 가능한지 먼저
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 ARC_GATES = [
     ("GATE_1", "median(pair_count(q)) ≥ 150", "축 A 최소 표본 (분기 중앙값)"),
@@ -22,10 +17,8 @@ GATE_THRESHOLDS = {"GATE_1": 150.0, "GATE_2": 80.0, "GATE_3": 0.70,
                    "GATE_4": 0.85, "GATE_5": 0.80, "GATE_6": 0.90}
 GATE_RESULTS: "OrderedDict[str, dict]" = OrderedDict()
 
-
 def _grec(gid: str, value, passed: Optional[bool], detail: str):
     GATE_RESULTS[gid] = {"id": gid, "value": value, "pass": passed, "detail": detail}
-
 
 def _gate_pair_counts(rep: pd.DataFrame, uni_codes: Optional[set] = None) -> pd.Series:
     """분기 q 와 q−1 '양쪽 모두' 리포트 ≥1건인 종목 수 (§2.1 pair_count).
@@ -53,7 +46,6 @@ def _gate_pair_counts(rep: pd.DataFrame, uni_codes: Optional[set] = None) -> pd.
         out[cur] = len(have[cur] & have[prev])
     return pd.Series(out, dtype=int).sort_index()
 
-
 def _gate_fs_cov(fin: pd.DataFrame, shares: Optional[pd.DataFrame]) -> Tuple[float, dict]:
     """D2 6개 지표 산출에 필요한 재무항목의 (법인×분기) 가용률."""
     need = ["net_income_ttm", "cfo_ttm", "assets", "liabilities", "cash",
@@ -74,7 +66,6 @@ def _gate_fs_cov(fin: pd.DataFrame, shares: Optional[pd.DataFrame]) -> Tuple[flo
     for c in need:
         ok &= col(fin, c).notna()
     return (float(ok.mean()) if len(fin) else 0.0, det)
-
 
 def run_phase0_gates(ctx: dict, rebals: pd.DatetimeIndex) -> dict:
     """§2 게이트 6종 실측 + 판정. 예외를 던지지 않는다."""
@@ -256,7 +247,6 @@ def run_phase0_gates(ctx: dict, rebals: pd.DatetimeIndex) -> dict:
     return {"axis_a": bool(axis_a), "d1": bool(d1), "d2": bool(d2),
             "mode": mode, "metrics": metrics}
 
-
 def _gate_d1_failure_breakdown(T, pairs, ctx):
     """GATE_4/5 실패 사유 분해 — PDF 스캔본 / 서식변경 / 전년동기 부재 / 기타."""
     rows = []
@@ -284,7 +274,6 @@ def _gate_d1_failure_breakdown(T, pairs, ctx):
     LOG.info("조치 우선순위: ① DART 예산 소진이면 내일 재실행(이어받기) "
              "② 섹션0개가 많으면 ARC_SECTION_PAT 표제어 정규식 점검 "
              "③ 스캔본이 많으면 그 구간은 구조적으로 D1 결측 — 정상입니다.")
-
 
 def report_gate_table() -> None:
     """§9.2-(1) 최종 산출물용 재출력."""

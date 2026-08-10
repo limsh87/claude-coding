@@ -1,15 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L5-A  어블레이션 11종 (§8.2) + BH-FDR 다중검정 보정 (§8.3)                                ║
-# ║                                                                                          ║
-# ║  ★ 모든 팔은 assemble_final() 하나를 통과한다. 기준선과 절제팔이 서로 다른 계산경로를       ║
-# ║    타면 Δ가 '무엇을 뺐는가'가 아니라 '계산 방식이 달라졌는가'를 재게 된다.                   ║
-# ║    널-절제(아무것도 빼지 않은 팔)의 Δ가 정확히 0 인지 매 실행 검증한다.                      ║
-# ║                                                                                          ║
-# ║  ★ 비용 차감 전/후를 반드시 병기한다(§8.1). 비용 전만 보고하는 것은 금지다.                 ║
-# ║  ★ F4(v1.0 재현)는 반드시 실행한다 — 수치 없이 "v2.0 이 개선됐다"고 말하지 않기 위함이다.   ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L5-A  어블레이션 11종 (§8.2) + BH-FDR 다중검정 보정 (§8.3)
+#  ★ 모든 팔은 assemble_final() 하나를 통과한다. 기준선과 절제팔이 서로 다른 계산경로를
+#  ★ 비용 차감 전/후를 반드시 병기한다(§8.1). 비용 전만 보고하는 것은 금지다.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 ABLATIONS = [
     ("A1", "ΔTONE_resid 단독", "축 A 순기여",
@@ -37,10 +31,6 @@ ABLATIONS = [
 ]
 
 ABLATION_RESULTS: "OrderedDict[str, dict]" = OrderedDict()
-
-_ABL_METRIC_ORDER = ["CAGR", "MDD", "Sharpe", "Sortino", "IC", "IC-IR", "t(IC)", "회전율",
-                     "평균종목수", "승률", "평균편입가능"]
-
 
 def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
              purpose: str, kw: dict) -> dict:
@@ -77,7 +67,6 @@ def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
         LOG.warn(f"어블레이션 {aid} 실패 — {rec['err']} (나머지 실험은 계속 진행합니다)")
     return rec
 
-
 def run_ablations(P: pd.DataFrame, rebals, uni, sec, run_fn) -> pd.DataFrame:
     """§8.2 어블레이션 11종 전부 실행."""
     ABLATION_RESULTS.clear()
@@ -108,7 +97,6 @@ def run_ablations(P: pd.DataFrame, rebals, uni, sec, run_fn) -> pd.DataFrame:
 
     LOG.ok(f"어블레이션 11종 완료 — 소요 {time.time()-t0:.1f}초")
     return report_ablation_table()
-
 
 def report_ablation_table() -> pd.DataFrame:
     """§9.2-(6) 어블레이션 성과표 (비용 전/후 병기)."""
@@ -171,7 +159,6 @@ def report_ablation_table() -> pd.DataFrame:
                         for k, v in ABLATION_RESULTS.items()])
     return out
 
-
 def report_f4_vs_f1() -> None:
     """§9.2-(7) v1.0(F4) 대비 v2.0(F1) 개선폭 정량 비교."""
     LOG.banner("[산출물 7] F4(v1.0 재현) 대비 F1(v2.0) 개선폭 (§9.2-7)",
@@ -210,7 +197,6 @@ def report_f4_vs_f1() -> None:
         else:
             LOG.error(f"★ 이 백테스트에서 v2.0(F1) 이 v1.0(F4) 를 이기지 못했습니다 "
                       f"(Sharpe {s1-s4:+.3f}). 개선 주장을 철회하고 그대로 보고합니다(§9.1).")
-
 
 def apply_bh_fdr(q: Optional[float] = None) -> pd.DataFrame:
     """§8.3 — 11개 실험을 하나의 검정 패밀리로 묶어 BH-FDR 보정."""

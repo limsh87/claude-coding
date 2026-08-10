@@ -1,18 +1,11 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-B  커널 — 로깅 / 스테이지 / 데이터흐름 원장 / 에러 국소화 / 런타임 계측(C10)          ║
-# ║                                                                                          ║
-# ║  이 블록의 목적은 단 하나:  "어디서 터졌고, 무슨 데이터가 어디로 흘렀는가"를               ║
-# ║  스크롤 없이 한 화면에서 보이게 만드는 것.                                                ║
-# ║                                                                                          ║
-# ║  · 모든 연산은 STAGE 컨텍스트 안에서만 수행한다.                                          ║
-# ║  · 모든 데이터 입출력은 FLOW 원장에 기록한다. (행수·바이트·소스·PIT컬럼 유무)              ║
-# ║  · 예외는 잡아서 "스테이지ID + 입출력 스냅샷 + 한글 진단 힌트"와 함께 재출력한다.          ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L0-B  커널 — 로깅 / 스테이지 / 데이터흐름 원장 / 에러 국소화 / 런타임 계측(C10)
+#  이 블록의 목적은 단 하나:  "어디서 터졌고, 무슨 데이터가 어디로 흘렀는가"를
+#  스크롤 없이 한 화면에서 보이게 만드는 것.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 _T0_PROCESS = time.time()
-
 
 def _dw(s: str) -> int:
     """한글/한자 폭 2칸을 반영한 표시 너비. 표 정렬이 깨지지 않게 하는 유일한 방법."""
@@ -20,7 +13,6 @@ def _dw(s: str) -> int:
     for ch in str(s):
         w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
     return w
-
 
 def _pad(s: str, n: int, align: str = "l") -> str:
     s = str(s)
@@ -30,7 +22,6 @@ def _pad(s: str, n: int, align: str = "l") -> str:
     if align == "c":
         return " " * (gap // 2) + s + " " * (gap - gap // 2)
     return s + " " * gap
-
 
 def _trunc(s: str, n: int) -> str:
     s = str(s).replace("\n", " ")
@@ -42,7 +33,6 @@ def _trunc(s: str, n: int) -> str:
             return out + "…"
         out += ch
     return out
-
 
 class _Log:
     LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
@@ -106,7 +96,6 @@ class _Log:
 
 LOG = _Log("DEBUG" if VERBOSE else "INFO")
 
-
 # ── 데이터 흐름 원장 ────────────────────────────────────────────────────────────────────────
 @dataclass
 class IOEvent:
@@ -121,7 +110,6 @@ class IOEvent:
     ok: bool = True
     note: str = ""
     pit_cols: str = ""      # knowledge_date 계열 컬럼 존재 여부 — C1 감사에 쓰인다
-
 
 @dataclass
 class StageRecord:
@@ -144,14 +132,11 @@ class StageRecord:
     def dur(self) -> float:
         return (self.t_end or time.time()) - self.t_start
 
-
 class KillCriteria(Exception):
     """§15 킬 기준 위반. 우회하지 말고 사용자에게 보고하고 멈춘다."""
 
-
 class StageFailure(Exception):
     pass
-
 
 # ── 예외 → 한글 진단 힌트 ───────────────────────────────────────────────────────────────────
 _DIAG_RULES: List[Tuple[str, str]] = [
@@ -219,7 +204,6 @@ _DIAG_RULES: List[Tuple[str, str]] = [
      "새로 추가한 소스가 tz-aware 를 반환했을 가능성이 큽니다."),
 ]
 
-
 def diagnose(exc: BaseException, extra: str = "") -> str:
     blob = f"{type(exc).__name__}: {exc}\n{extra}\n{traceback.format_exc()}"
     for pat, hint in _DIAG_RULES:
@@ -227,7 +211,6 @@ def diagnose(exc: BaseException, extra: str = "") -> str:
             return hint
     return ("알려진 패턴에 해당하지 않는 오류입니다. 아래 트레이스백의 마지막 프레임과 "
             "그 직전 FLOW 원장 행을 함께 보면 원인 구간이 좁혀집니다.")
-
 
 # ── 파이프라인 ──────────────────────────────────────────────────────────────────────────────
 class Pipeline:
@@ -278,16 +261,7 @@ class Pipeline:
     def stage(self, sid: str, name: str, layer: str = "L?",
               budget_s: Optional[float] = None, critical: bool = True,
               skip_if: bool = False, skip_reason: str = ""):
-        """★★ skip_if 는 '스테이지를 SKIP 으로 표시' 할 뿐 **본문 실행을 막지 않는다**.
-
-        파이썬 컨텍스트 매니저는 구조적으로 with 블록의 본문을 건너뛸 수 없다(yield 이후
-        제어가 본문으로 넘어간 뒤 돌아온다). 그래서 `with PIPE.stage(..., skip_if=True):`
-        안의 코드는 그대로 실행된다 — 이 사실을 모르고 쓰면 '축을 껐다'고 로그에는 찍히는데
-        실제로는 계산이 다 돌아가고 값까지 반영되는 조용한 사고가 난다.
-
-        → 호출부는 반드시 본문 안에서 명시적으로 `if <조건>:` 로 분기해야 한다.
-          stage_skipped(rec) 로 레코드에서 스킵 여부를 확인할 수도 있다.
-        """
+        """★★ skip_if 는 '스테이지를 SKIP 으로 표시' 할 뿐 **본문 실행을 막지 않는다**."""
         rec = StageRecord(sid=sid, name=name, layer=layer, budget_s=budget_s)
         self.stages[sid] = rec
         prev, self.current = self.current, rec
@@ -416,11 +390,6 @@ class Pipeline:
                      "✔ 예산 내" if sum(agg.values()) <= 4 * 3600 else "❗ 초과 — 아키텍처 수정 필요"])
         LOG.table(rows, ["계층", "실측(초)", "실측(분)", "계약예산", "판정"], ["c", "r", "r", "r", "l"])
         LOG.info("계층 정의 — L0:부트/캐시  L1:수집·피처패널  L2:스코어  L3:백테스트  L5:강건성  L6:리포트")
-
-
-def stage_skipped(rec: "StageRecord") -> bool:
-    """스테이지가 SKIP 으로 표시되었는가. with 본문 안에서 분기할 때 쓴다."""
-    return getattr(rec, "status", "") == "SKIP"
 
 
 PIPE = Pipeline()

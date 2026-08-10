@@ -1,15 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L6  리포팅 — §9.2 최종 산출물 11종                                                        ║
-# ║                                                                                          ║
-# ║  §9.1 증거 등급 (엄격 준수):                                                               ║
-# ║   · 실증적 주장은 이 백테스트에서 산출된 수치로만 뒷받침한다.                                ║
-# ║   · 방법론적 우려는 "[방법론적 우려]" 라벨을 붙여 명시한다.                                  ║
-# ║   · 메커니즘 그럴듯함을 증거로 제시하지 않는다.                                              ║
-# ║   · 인접 문헌(미국 10-K)을 한국 데이터 현상의 증거로 대체하지 않는다.                        ║
-# ║   · 근거를 못 찾았으면 "근거 없음" 이라 명시한다. 이 기준은 낙관적 주장에도 동일 적용한다.    ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L6  리포팅 — §9.2 최종 산출물 11종
+#  §9.1 증거 등급 (엄격 준수):
+#  · 실증적 주장은 이 백테스트에서 산출된 수치로만 뒷받침한다.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 def report_performance(bt: dict, bench: Dict[str, pd.Series], label: str = "",
                        uni_bench: Optional[pd.Series] = None) -> None:
@@ -85,7 +79,6 @@ def report_performance(bt: dict, bench: Dict[str, pd.Series], label: str = "",
             LOG.warn("상위 5% 종목을 제외하면 총기여가 0 이하가 됩니다. 성과가 소수 종목에 "
                      "전적으로 의존합니다 — 실전에서 그 종목을 놓치면 전략 전체가 실패합니다.")
 
-
 def report_correlation_matrix(P: pd.DataFrame) -> None:
     """§6.6 / §9.2-(3) D1·D2·D3 상호 상관행렬 (기간별)."""
     LOG.banner("[산출물 3] D1/D2/D3 상호 상관행렬 (§6.6)",
@@ -128,12 +121,6 @@ def report_correlation_matrix(P: pd.DataFrame) -> None:
         LOG.ok("모든 층 쌍의 |상관| 이 0.6 이하 — 세 층이 서로 다른 정보를 담고 있다는 "
                "이 백테스트의 실증 근거입니다.")
 
-
-def report_universe_attrition(uni) -> None:
-    if uni is not None and hasattr(uni, "report_attrition"):
-        uni.report_attrition()
-
-
 def report_interpretation(P: pd.DataFrame) -> None:
     """해석 참조표 + §9.1 증거 등급 상기 블록."""
     LOG.banner("해석 참조표", "각 신호가 높을 때 / 낮을 때 무엇을 뜻하는가")
@@ -172,7 +159,6 @@ def report_interpretation(P: pd.DataFrame) -> None:
                          f"{float(v.quantile(0.9)):+.3f}" if n else "—"])
         LOG.table(rows, ["신호", "관측", "커버리지", "10분위", "중앙값", "90분위"],
                   ["l", "r", "r", "r", "r", "r"], title="신호 분포")
-
 
 def diagnostic_card(P: pd.DataFrame, bt: dict, sec: pd.DataFrame, top_n: int = 5) -> None:
     """최근 시점 상위 종목이 '왜' 뽑혔는지 한 장으로."""
@@ -231,7 +217,6 @@ def diagnostic_card(P: pd.DataFrame, bt: dict, sec: pd.DataFrame, top_n: int = 5
         _safe_print("  " + "  ".join(flags))
     _safe_print("─" * 104)
     _safe_print("  범례: ✔ 통과 · ✘ 발동(제외) · — 미관측(결측)")
-
 
 def report_kill_criteria(ctx: dict) -> dict:
     """§9.2-(11) / §9.3 사전등록 폐기 조건 5개를 실측으로 판정."""
@@ -318,7 +303,6 @@ def report_kill_criteria(ctx: dict) -> dict:
         LOG.ok("사전등록 폐기 조건에 해당하는 항목이 없습니다.")
     return res
 
-
 def report_final_deliverables(ctx: dict) -> None:
     """§9.2 산출물 11종의 목차 — 무엇이 어디에 나왔고 판정이 무엇인지 한 표로."""
     LOG.banner("최종 산출물 점검표 (§9.2)", "11개 항목이 전부 출력되었는지 확인한다")
@@ -370,7 +354,6 @@ def report_final_deliverables(ctx: dict) -> None:
     if miss:
         LOG.warn(f"미출력 산출물: {', '.join(miss)} — 해당 축이 비활성화되었거나 "
                  f"상위 단계에서 표본이 부족했기 때문입니다. 위 로그에서 사유를 확인하세요.")
-
 
 def report_dataflow_map() -> None:
     LOG.banner("데이터 흐름 지도 (거시)", "에러가 나면 어느 상자인지 먼저 보세요")

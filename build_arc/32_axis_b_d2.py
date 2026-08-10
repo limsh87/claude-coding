@@ -1,16 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L2-B2  D2 — 재무제표 이상현상 (§6.2)                                                      ║
-# ║                                                                                          ║
-# ║  발생액·순영업자산·재고/매출채권 괴리는 이미 문헌 검증된 이상현상이며, 섹터 무관하게        ║
-# ║  100% 커버된다. D1 이 텍스트 파싱 실패로 결측일 때 축 B 를 지탱하는 것이 이 층이다.         ║
-# ║                                                                                          ║
-# ║  ★ 반드시 '분기 프레임' 에서 계산한다. 패널(asof)에서 diff 를 하면 같은 분기값이 여러       ║
-# ║    리밸일에 반복되어 증가율이 0 또는 폭발한다. 이건 조용한 실패라 더 위험하다.               ║
-# ║  ★ 주식수 증가율을 포함하는 이유(§6.2): 소형주는 지속적 증자·CB 발행으로 실적이 개선돼도    ║
-# ║    주당지표가 개선되지 않거나 악화된다. 이 항목 없이는 D2 가 소형주 구간에서 오작동한다.    ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L2-B2  D2 — 재무제표 이상현상 (§6.2)
+#  ★ 반드시 '분기 프레임' 에서 계산한다. 패널(asof)에서 diff 를 하면 같은 분기값이 여러
+#  ★ 주식수 증가율을 포함하는 이유(§6.2): 소형주는 지속적 증자·CB 발행으로 실적이 개선돼도
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 # (컬럼, 방향) — 방향 +1 = 높을수록 우수, -1 = 낮을수록 우수
 D2_ITEMS = [("ACCRUAL", -1), ("NOA", -1), ("AR_DIVERGE", -1),
@@ -20,7 +13,6 @@ D2_PANEL_COLS = ["corp_code", "event_date", "knowledge_date", "bsns_year", "repr
                 D2_COLS + ["D2_FORCED_LOW"]
 
 _D2_QORD = {"11013": 1, "11012": 2, "11014": 3, "11011": 4}
-
 
 def build_d2_panel(fin: pd.DataFrame, shares: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """분기 프레임에서 6개 지표를 만든다. 반환은 PIT frame (corp_code 키)."""
@@ -80,12 +72,7 @@ def build_d2_panel(fin: pd.DataFrame, shares: Optional[pd.DataFrame] = None) -> 
     if not has_debt:
         LOG.info("총차입금 계정이 없어 NOA 를 (자산−현금) − 부채 로 근사합니다 "
                  "[방법론적 한계 — 차입 의존도가 높은 기업에서 NOA 가 과소평가됩니다].")
-    # ★ cash 결측을 0 으로 채우면 §0.5(결측을 0 으로 채우지 않는다) 위반이고, 실제로
-    #   "현금 라인만 못 읽은 법인" 이 조용히 불리해진다(실측: 자산 1000·부채 400 동일 회사가
-    #   cash=200 → NOA 0.40, cash=NaN → NOA 0.60. NOA 는 방향 −1 이라 페널티다).
-    #   fillna(0) 은 NaN 을 없애므로 결측률 표에는 흔적조차 남지 않고 커버리지 100% 로 보고된다.
-    #   debt 는 데이터셋에 아예 없는 계정이라 0 대체가 불가피하지만, cash 는 있어야 하는데
-    #   빠진 값이므로 대우가 달라야 한다 → NOA 를 결측으로 두고 §6.5 재배분에 맡긴다.
+    #   (상세 근거는 커밋 로그 참조)
     _n_cash_na = int(cash.isna().sum())
     if _n_cash_na:
         LOG.info(f"현금성자산 결측 {_n_cash_na:,}행 — 해당 행의 NOA 를 결측 처리합니다 "
@@ -162,7 +149,6 @@ def build_d2_panel(fin: pd.DataFrame, shares: Optional[pd.DataFrame] = None) -> 
     PIPE.io("OUT", "MEM", "d2_panel", out)
     return downcast(out[D2_PANEL_COLS])
 
-
 def attach_d2(P: pd.DataFrame, d2: Optional[pd.DataFrame]) -> pd.DataFrame:
     """as-of 결합 후 §6.2 합성: 섹터 중립 z → 상하위 1% 윈저 → 동일가중 평균."""
     P = P.copy()
@@ -184,13 +170,7 @@ def attach_d2(P: pd.DataFrame, d2: Optional[pd.DataFrame]) -> pd.DataFrame:
         v = (pd.to_numeric(col(P, c), errors="coerce")
                .groupby(_qkey, observed=True)
                .transform(lambda s: winsor_series(s, ARC_D2_WINSOR_P))) * float(sgn)
-        # ★ §6.2 는 '해당 지표 **최하위 순위**로 강제 배정' 이다. '최하위 값'을 넣고 나서
-        #   z 를 돌리면, 대입값의 범위(분기 전체)와 표준화 범위(분기×섹터 셀)가 어긋나
-        #   분산이 좁은 셀에 극단값이 꽂힌다 — 실측에서 바닥분모 종목 1개 때문에 같은 셀
-        #   39종목 전원의 z 표준편차가 1.01 → 0.36 으로 압축됐다. 그 셀 종목들은 다른 셀과
-        #   경쟁할 때 꼬리에 도달하지 못해 상위 N 에서 구조적으로 밀린다. 지표마다 압축률이
-        #   달라 '동일가중 평균'도 더 이상 동일가중이 아니게 된다.
-        #   → 강제 배정은 값이 아니라 **z 계산 후 셀 내 최하위 z** 로 한다.
+        #   (상세 근거는 커밋 로그 참조)
         z = xsec_z_arc(P.assign(**{f"_v_{c}": v.mask(forced)}), f"_v_{c}")
         if forced.any() and z.notna().any():
             zmin = z.groupby(_cellkey, observed=True).transform("min")
@@ -207,7 +187,6 @@ def attach_d2(P: pd.DataFrame, d2: Optional[pd.DataFrame]) -> pd.DataFrame:
                  f"미완이거나 corp_code 매칭률이 낮다는 뜻입니다. "
                  f"D2 는 D1 보다 대체 불가하므로(§2.3) 심각 이슈로 취급하세요.")
     return P
-
 
 def report_d2_coverage(P: pd.DataFrame) -> dict:
     """지표별 결측률 — GATE_6 의 근거이자 '어느 지표가 D2 를 지탱하는가' 의 답."""

@@ -1,5 +1,4 @@
 
-
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L0-E  HTTP 계층 — 스레드로컬 세션 / 소스별 스로틀 / 인코딩 자동판별 / 차단 회피          ║
 # ║                                                                                          ║
@@ -20,7 +19,6 @@ UA_POOL = [
 _TLS = threading.local()
 HTTP_STATS: Counter = Counter()
 _HTTP_LK = threading.Lock()
-
 
 def _session() -> "requests.Session":
     s = getattr(_TLS, "sess", None)
@@ -57,7 +55,6 @@ def _session() -> "requests.Session":
 _HANGUL = re.compile(r"[가-힣]")
 _MOJI = re.compile(r"[¿½¶ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß]")
 
-
 def _korean_score(t: str) -> float:
     """한글 가독성 점수. 네이버 금융은 body 가 EUC-KR 인데 meta 는 utf-8 이라고 '거짓말'한다.
     meta 를 믿으면 조용히 깨진 글자를 얻는다(예외가 안 난다) — 그래서 점수로 고른다."""
@@ -68,7 +65,6 @@ def _korean_score(t: str) -> float:
     moji = len(_MOJI.findall(s))
     repl = s.count("�")
     return han - 3.0 * moji - 5.0 * repl
-
 
 def _decode(content: bytes, resp_enc: Optional[str], url: str,
             force_enc: Optional[str] = None) -> str:
@@ -105,16 +101,6 @@ def _decode(content: bytes, resp_enc: Optional[str], url: str,
         if sc > 30:                     # 충분히 한글다우면 더 볼 필요 없음
             return t
     return best if best is not None else content.decode("utf-8", "replace")
-
-
-def euckr_q(s: str) -> str:
-    """네이버/한경 레거시 경로의 한글 파라미터는 UTF-8이 아니라 EUC-KR 퍼센트인코딩이다.
-    이걸 틀리면 예외 없이 '검색 결과 0건'이 나온다 — 최악의 조용한 실패."""
-    try:
-        return quote(str(s), encoding="euc-kr")
-    except Exception:
-        return quote(str(s))
-
 
 def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
              headers: Optional[dict] = None, timeout: int = 25, tries: int = 4,
@@ -163,7 +149,6 @@ def http_get(url: str, source: str = "generic", params: Optional[dict] = None,
         HTTP_STATS[f"{source}:FAIL"] += 1
     return None
 
-
 def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
               json_body: Optional[dict] = None, headers: Optional[dict] = None,
               timeout: int = 30, tries: int = 3, as_bytes: bool = False,
@@ -189,7 +174,6 @@ def http_post(url: str, source: str = "generic", data: Optional[dict] = None,
         HTTP_STATS[f"{source}:POSTFAIL"] += 1
     return None
 
-
 def soup_of(html: Optional[str]) -> Optional[BeautifulSoup]:
     if not html:
         return None
@@ -199,7 +183,6 @@ def soup_of(html: Optional[str]) -> Optional[BeautifulSoup]:
         except Exception:
             continue
     return None
-
 
 def http_json(url: str, source: str = "generic", **kw) -> Optional[Any]:
     t = http_get(url, source=source, **kw)
@@ -215,7 +198,6 @@ def http_json(url: str, source: str = "generic", **kw) -> Optional[Any]:
             except Exception:
                 return None
         return None
-
 
 def report_http():
     if not HTTP_STATS:

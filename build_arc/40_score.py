@@ -1,39 +1,18 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L2-C  스코어 조립 — DART_SCORE (§6.5) / FINAL_SCORE (§7.2)                                ║
-# ║                                                                                          ║
-# ║  DART_SCORE = 0.40·D1 + 0.40·D2 + 0.20·D3      (사전등록 가중치. 튜닝 금지)                ║
-# ║  FINAL_SCORE = 0.5·z(ΔTONE_resid) + 0.5·z(DART_SCORE)                                     ║
-# ║                                                                                          ║
-# ║  ★ 두 가지 '탈락시키지 않기' 규칙이 이 파일의 핵심이다:                                     ║
-# ║    ① 축 A 결측(리포트 없음) → ΔTONE_resid = 0(중립)으로 두고 DART_SCORE 만으로 평가.        ║
-# ║       탈락시키지 않는다. 이것이 v2.0 에서 축 B 를 강화한 이유다(§7.2).                       ║
-# ║    ② D1 결측 → D1 가중치를 D2·D3 에 '비례 재배분'. 종목을 탈락시키지 않는다(§6.5).           ║
-# ║    A10 / A11 계약검정이 이 두 규칙을 실제 데이터로 검사한다.                                 ║
-# ║                                                                                          ║
-# ║  ★ 어블레이션은 전부 이 함수 하나를 통과한다. 기준선과 절제팔이 서로 다른 계산경로를 타면    ║
-# ║    Δ가 '무엇을 뺐는가'가 아니라 '계산 방식이 달라졌는가'를 재게 된다(이전 프로젝트의 사고).  ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L2-C  스코어 조립 — DART_SCORE (§6.5) / FINAL_SCORE (§7.2)
+#  ★ 두 가지 '탈락시키지 않기' 규칙이 이 파일의 핵심이다:
+#  ★ 어블레이션은 전부 이 함수 하나를 통과한다. 기준선과 절제팔이 서로 다른 계산경로를 타면
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 AXIS_B_LAYERS = (("D1", "D1_SCORE", ARC_W_D1),
                  ("D2", "D2_SCORE", ARC_W_D2),
                  ("D3", "D3_SCORE", ARC_W_D3))
 
-SCORE_OUT_COLS = ["DART_SCORE", "AXIS_A_Z", "FINAL_SCORE", "FINAL_RANK", "n_axes_b"]
-
-
 def _score_axis_a(P: pd.DataFrame, use_raw: bool = False,
                   neutral_fill: bool = True) -> Tuple[pd.Series, pd.Series]:
     """축 A 표준화 점수와 '원래 결측이었는지' 마스크.
-
-    §7.2 는 "축 A 결측 종목은 ΔTONE_resid = 0(중립)으로 두고 DART_SCORE 만으로 평가,
-    탈락시키지 말 것" 을 지시한다. 그래서 축 B 가 함께 있을 때만 0 으로 채운다.
-
     ★ 축 A **단독** 팔(A1/A2 어블레이션)에서는 0 으로 채우면 안 된다. 그 팔에는
-      DART_SCORE 가 없으므로 '중립 0' 이 곧 '전 종목 동점'이 되고, 리포트가 없는 종목이
-      코드 순서로 편입된다. 그러면 A1 은 축 A 의 순기여가 아니라 '동점 처리 규칙'을
-      측정하게 된다. 단독 팔에서는 결측을 결측으로 남겨 편입 대상에서 빼야 한다.
     """
     src = "dTONE" if use_raw else "dTONE_resid"
     if src not in P.columns:
@@ -46,7 +25,6 @@ def _score_axis_a(P: pd.DataFrame, use_raw: bool = False,
 
 
 _REGROUP_MIN_N = 20
-
 
 def _regroup_z(P: pd.DataFrame, v: pd.Series, gcol: str) -> pd.Series:
     """(기간 × 가용성그룹) 안에서 재표준화. 그룹이 작으면 원값을 그대로 둔다.
@@ -64,7 +42,6 @@ def _regroup_z(P: pd.DataFrame, v: pd.Series, gcol: str) -> pd.Series:
     ok = (n >= _REGROUP_MIN_N) & (sd > 0) & sd.notna()
     return x.where(~ok, (x - mu) / sd.where(sd > 0, 1.0))
 
-
 def _score_d1_variant(P: pd.DataFrame, d1_metric: Optional[str],
                       d1_equal_weights: bool) -> pd.Series:
     """D1 점수 선택 — 기본 합성 / 지표 단독 / 섹션 균등가중 (§8.4 강건성용)."""
@@ -77,7 +54,6 @@ def _score_d1_variant(P: pd.DataFrame, d1_metric: Optional[str],
         return pd.to_numeric(P["D1_SCORE_equalw"], errors="coerce")
     return pd.to_numeric(col(P, "D1_SCORE"), errors="coerce")
 
-
 def assemble_final(P: pd.DataFrame,
                    use_axes: Sequence[str] = ("A", "D1", "D2", "D3"),
                    use_excl: bool = True,
@@ -85,17 +61,7 @@ def assemble_final(P: pd.DataFrame,
                    d1_metric: Optional[str] = None,
                    d1_equal_weights: bool = False,
                    include_struct: bool = False) -> pd.DataFrame:
-    """지정된 축만으로 DART_SCORE / FINAL_SCORE / FINAL_RANK 를 재조립한다.
-
-    원본 P 를 변형하지 않는다(copy). 어블레이션·강건성은 전부 이 함수를 통과한다.
-
-    use_axes 원소:
-      "A"     ΔTONE_resid (직교화 후)
-      "A_RAW" ΔTONE (직교화 전) — A2 어블레이션 전용
-      "D1" / "D2" / "D3"
-    v1_hardgate=True 면 ΔNONFIN>0 을 편입 조건으로 강제한다 (F4: v1.0 재현 전용).
-    include_struct=True 면 STRUCT_FLAG 종목의 D1 을 되살린다 (§8.4 민감도).
-    """
+    """지정된 축만으로 DART_SCORE / FINAL_SCORE / FINAL_RANK 를 재조립한다."""
     Q = P.copy()
     axes = set(use_axes or ())
 
@@ -148,12 +114,7 @@ def assemble_final(P: pd.DataFrame,
         az64 = Q["AXIS_A_Z"].astype("float64")
         fin = (ARC_W_AXIS_A * az64 + ARC_W_AXIS_B * b)
         # ★ 가중치 재배분은 **양방향 대칭**이어야 한다.
-        #   예전에는 '축 B 결측 → 축 A 에 100% 재배분'만 있고 반대가 없었다. 축 A 결측 행은
-        #   AXIS_A_Z 를 0 으로 채운 채 축 B 가중치가 0.5 로 남아, FINAL 의 **분산이 절반으로
-        #   줄었다**(0.5·B vs 0.5·A+0.5·B). 상위 N 선정은 꼬리에서 일어나므로 분산이 좁은
-        #   쪽은 NaN 이 아닌데도 구조적으로 밀린다 — 커버리지 50% 에서는 리포트 없는 종목이
-        #   상위 30 에 사실상 한 종목도 들어가지 못했다. §7.2 '탈락시키지 말 것'의 실질 위반.
-        #   A10 은 점수가 NaN 이 아닌지만 봐서 이 붕괴를 잡지 못했다.
+        #   (상세 근거는 커밋 로그 참조)
         fin = fin.where(b.notna(), az64)                 # 축 B 결측 → 축 A 단독
         fin = fin.where(~a_miss, b)                      # 축 A 결측 → 축 B 단독 (대칭)
         # ★ 두 축이 모두 결측인 행은 '중립 0' 이 아니라 '정보 없음' 이다. 0 으로 두면
@@ -188,7 +149,6 @@ def assemble_final(P: pd.DataFrame,
     Q["FINAL_RANK"] = (Q.groupby("asof", observed=True)["FINAL_SCORE"]
                         .rank(pct=True, method="average").astype("float32"))
     return Q
-
 
 def report_score_summary(P: pd.DataFrame) -> None:
     """스코어 구성 요약 — 각 축이 실제로 몇 %의 종목에 값을 주고 있는가."""

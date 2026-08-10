@@ -1,16 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L2-B3  D3 하드팩트(가점) + 배제 플래그(하드 제외)  §6.3 / §6.4                            ║
-# ║                                                                                          ║
-# ║  D3 — 완료형 사실만 추출한다. 전망·계획·의지·기대·예정은 전부 제외.                         ║
-# ║       ★★ ΔNONFIN > 0 을 편입 조건으로 쓰지 않는다. v1.0 에서 폐기된 규칙이다.               ║
-# ║          ΔNONFIN = 0 인 종목도 다른 축 점수가 높으면 편입 가능해야 한다(A9 계약검정).       ║
-# ║          섹터 편향(기술·제조 쏠림)이 있으므로 가점으로만 쓴다.                              ║
-# ║                                                                                          ║
-# ║  배제 — 특수관계자·우발부채·소송은 경영진이 감추려 하는 정보다. 그럼에도 공시됐다는 것은     ║
-# ║        신호의 신뢰도가 높다는 뜻이므로 **여기만 하드 제외를 유지**한다(§6.4).                ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L2-B3  D3 하드팩트(가점) + 배제 플래그(하드 제외)  §6.3 / §6.4
+#  ★★ ΔNONFIN > 0 을 편입 조건으로 쓰지 않는다. v1.0 에서 폐기된 규칙이다.
+#  D3 — 완료형 사실만 추출한다. 전망·계획·의지·기대·예정은 전부 제외.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 D3_EVENTS = [
     ("NF_RND_EMP",   "연구개발 인력 순증",              "기술·제조"),
@@ -63,7 +56,6 @@ _D3_KEY_RE = {k: re.compile(v) for k, v in _D3_KEY.items()}
 
 _D3_SENT_SPLIT = re.compile(r"(?<=[다\.])\s+|\n+")
 
-
 def _d3_count_facts(text: str, pat: "re.Pattern") -> int:
     """완료형 동사 + 날짜 + 숫자가 모두 있는 문장만 센다. 정성적 판단은 하지 않는다."""
     if not text:
@@ -81,23 +73,9 @@ def _d3_count_facts(text: str, pat: "re.Pattern") -> int:
         n += 1
     return n
 
-
 def _d3_text_by_doc(T: pd.DataFrame) -> pd.DataFrame:
     """정규화 토큰 테이블 → 문서 단위 **토큰 집합**.
-
     ★ 예전에는 tf(JSON dict 문자열)들을 이어붙인 문자열에 정규식을 그대로 걸었다. 두 가지가
-      동시에 깨졌다:
-        ① 두 단어 패턴(`해외\s*법인`, `지분\s*취득`, `정부\s*과제`, `신규\s*사업` …)은
-           JSON 덤프에서 **원리상 매칭될 수 없다** — 두 토큰 사이에 항상 `": 3, "` 가 낀다.
-           해당 이벤트는 어떤 데이터를 넣어도 영구 0 이었다(NF_GOVRND·NF_NEWBIZ·
-           NF_SUBSID·NF_OVERSEAS 실측 전부 0건).
-        ② 단일 토큰 패턴(`특허`, `자회사`, `출자` …)은 '이 단어가 보고서 어딘가에 나오는가'
-           가 되어 이벤트가 아니라 상수가 됐다(NF_PATENT 실측 67% 발화).
-      → 토큰 집합으로 바꾸고, 다단어 패턴은 **모든 구성 토큰이 집합에 있는지**로 판정한다.
-
-    ★ 그리고 §6.3 의 핵심인 '완료형만' 필터(_d3_count_facts)는 exact=True 경로에서만
-      돌아가는데 그 경로에 도달하는 코드가 없었다 — 규정 전체가 죽은 코드였다.
-      원문이 공용 인덱스에 남아 있으면 그걸 읽어 exact 경로를 실제로 태운다.
     """
     cols = ["corp_code", "rcept_no", "rcept_dt", "blob", "tokens", "exact"]
     if T is None or T.empty:
@@ -120,9 +98,7 @@ def _d3_text_by_doc(T: pd.DataFrame) -> pd.DataFrame:
     # ── 원문 재조회 → §6.3 완료형 판정(정확 경로)을 **실제로** 태운다 ──────────────────
     #   원문 zip 은 15 모듈이 공용 인덱스에 ("dart_doc","raw", rcept_no) 로 저장해 둔다.
     #   put_blob 의 uid 는 내용해시를 포함해 재구성할 수 없으므로 get_blob_by_key 로 찾는다.
-    #   ★ 전 문서를 다시 여는 건 비싸다 → **약한 규칙이 하나라도 걸린 후보 문서만** 연다.
-    #     완료형 필터는 같은 키워드 정규식에 '완료형 동사 + 날짜 + 숫자' 를 더한 것이므로
-    #     약한 판정을 통과하지 못한 문서는 정확 판정도 통과할 수 없다(안전한 사전 선별).
+    #   (상세 근거는 커밋 로그 참조)
     _keys = list(_D3_KEY_RE.keys())
     cand = g["tokens"].map(lambda ts: any(_d3_tokens_hit(ts, k) for k in _keys) or
                                       any(_d3_tokens_hit(ts, k) for k in _D3_WEAK_CONSTANT))
@@ -163,7 +139,6 @@ def _d3_text_by_doc(T: pd.DataFrame) -> pd.DataFrame:
                  + ". 원문이 없는 후보는 토큰 집합 기반 약한 판정으로 남습니다.")
     return g[cols]
 
-
 # 다단어 판정용 — 패턴을 '있어야 할 토큰들의 선택지 집합' 으로 표현한다.
 #   값: [[대안1토큰들], [대안2토큰들], ...]  (한 대안의 토큰이 전부 있으면 발화)
 _D3_TOKEN_RULES: Dict[str, List[List[str]]] = {
@@ -180,13 +155,11 @@ _D3_TOKEN_RULES: Dict[str, List[List[str]]] = {
 # 원문(exact) 경로가 없을 때는 이 태그들을 0 이 아니라 **NaN(미판정)** 으로 둔다.
 _D3_WEAK_CONSTANT = {"NF_PATENT", "NF_SUBSID"}
 
-
 def _d3_tokens_hit(tokens: set, key: str) -> bool:
     for alt in _D3_TOKEN_RULES.get(key, []):
         if all(t in tokens for t in alt):
             return True
     return False
-
 
 def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
                       dis: pd.DataFrame, notes: Optional[pd.DataFrame] = None) -> pd.DataFrame:
@@ -318,10 +291,7 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
     H = _event_state_table(H, D3_COLS, D3_VALID_DAYS)
     # ★ sum(skipna=True) 는 NaN 을 0 으로 취급하고 전부 NaN 인 행도 0.0 을 돌려준다.
     #   _event_state_table 이 방금 보존한 '모름 ≠ 미발화' 불변식이 두 줄 뒤에서 깨진다.
-    #   D3 태그는 재무·직원·수시공시·문서텍스트 네 소스에서 오는데, 문서 파싱이 실패한
-    #   법인은 5개 태그가 통째로 '모름'이 된다. 그대로 합산하면 D3_SCORE 가 '사실 건수'가
-    #   아니라 '데이터 커버리지'의 함수가 되고, 그 값이 최종 점수의 10%(0.20×0.50)를 쥔다.
-    #   → 관측된 태그 수를 함께 남기고, 관측이 0 인 행은 NaN 으로 둔다.
+    #   (상세 근거는 커밋 로그 참조)
     H["D3_N_OBS"] = H[D3_COLS].notna().sum(axis=1).astype("int16")
     H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True).where(H["D3_N_OBS"] > 0)
     H = pit_frame(H, "event_date", "knowledge_date", source="dart_d3")
@@ -349,7 +319,6 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
     PIPE.io("OUT", "MEM", "d3_hardfacts", H)
     return H[cols]
 
-
 # ── 배제 플래그 (§6.4) ──────────────────────────────────────────────────────────────────────
 _EX_OWNER_PAT = r"최대주주\s*변경|최대주주변경"
 _EX_CBBW_PAT = r"전환사채|신주인수권부사채|교환사채"
@@ -361,24 +330,11 @@ EXCL_VALID_DAYS = {"EX_RELATED": 400, "EX_CONTINGENT": 400, "EX_LITIGATION": 400
                    "EX_LOSS4Q": 400, "EX_IMPAIR": 400}
 D3_VALID_DAYS = 370          # 하드팩트 이벤트는 직전 1년치를 센다
 
-
 def _event_state_table(X: pd.DataFrame, cols: Sequence[str],
                        valid_days, key: str = "corp_code",
                        tcol: str = "knowledge_date") -> pd.DataFrame:
     """소스별로 흩어진 '이벤트' 행들을 시점마다 완결된 '상태' 행으로 바꾼다.
-
     ★ 이 함수가 없으면 §6.4 하드 제외가 사실상 작동하지 않는다. 왜인지 남긴다:
-      build_exclusion_flags 는 재무·공시목록·감사의견을 **각각 다른 접수일**로 행을 만들고,
-      그 행에는 다른 소스의 플래그가 NaN 으로 남는다. 병합 키가 (corp_code, knowledge_date)
-      이므로 접수일이 다르면 병합되지 않는다. 그런데 소비 측(attach_d3)은 asof 결합이라
-      corp_code 당 **가장 최근 1행만** 붙이고, 그 행에 없는 플래그는 NaN → fillna(0) →
-      **제외 해제**가 된다. 재무 행은 매 분기 무조건 생성되므로, 연 1회짜리 EX_AUDIT
-      ('의견거절' 등)은 다음 분기보고서가 접수되는 순간 영구히 덮인다. 리밸일이 3/6/9/12월
-      1일이므로 EX_AUDIT 이 살아 있는 리밸일은 사실상 존재하지 않았다.
-
-    해법: 발화 이벤트마다 유효기간을 부여하고 **만료 시점에 'off' 행을 명시적으로 생성**해,
-    어느 시점을 집어도 그 한 행 안에서 모든 플래그의 상태가 완결되게 만든다.
-    관측 자체가 없는 플래그는 0 이 아니라 NaN 으로 남긴다('미발화'와 '모름'은 다르다).
     """
     if X is None or len(X) == 0:
         return X
@@ -433,7 +389,6 @@ def _event_state_table(X: pd.DataFrame, cols: Sequence[str],
     else:
         TL["event_date"] = TL[tcol]
     return TL
-
 
 def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
                           audit: Optional[pd.DataFrame] = None,
@@ -516,10 +471,7 @@ def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
 
     # ── 특수관계자 / 우발부채 / 소송 ──────────────────────────────────────────────────────
     #   ★ 이 셋은 '금액' 판정이 필요한데, 15 모듈의 정규화는 숫자를 <NUM> 으로 치환한다.
-    #     정규화 이전 원문에서 금액을 뽑아야 정확하다. 원문 blob 이 공용 인덱스에 있으므로
-    #     읽을 수는 있으나, 10년치 전 종목 원문 재파싱은 콜드빌드급 비용이다.
-    #     거짓 제외보다 결측이 낫다는 원칙(§6.4 정신)에 따라 결측으로 두되,
-    #     결측률을 반드시 표로 드러낸다. 조용히 0 으로 채우지 않는다.
+    #   (상세 근거는 커밋 로그 참조)
     miss_note.append("EX_RELATED / EX_CONTINGENT / EX_LITIGATION 은 금액 판정이 필요해 "
                      "정규화 이전 원문 재파싱이 선행되어야 합니다 — 현재 결측 처리")
 
@@ -553,7 +505,6 @@ def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
     PIPE.io("OUT", "MEM", "exclusion_flags", X)
     return X[cols]
 
-
 def attach_d3(P: pd.DataFrame, d3: Optional[pd.DataFrame],
               excl: Optional[pd.DataFrame]) -> pd.DataFrame:
     """D3_SCORE(가점) + EXCLUDE(하드 제외) 결합."""
@@ -586,7 +537,6 @@ def attach_d3(P: pd.DataFrame, d3: Optional[pd.DataFrame],
              f"★ v1.0 과 달리 이들도 편입 가능합니다(하드게이트 폐기, §6.3).")
     return P
 
-
 def report_d3_sector(P: pd.DataFrame) -> None:
     """§9.2-(9) 근거 — 섹터별 D3 발화율. v1.0 의 기술·제조 편향이 완화됐는지 직접 본다."""
     LOG.banner("D3 섹터 편향 점검 (§6.3 v2.0 개선 확인)",
@@ -611,7 +561,6 @@ def report_d3_sector(P: pd.DataFrame) -> None:
               ["l", "r", "r", "r", "r"])
     LOG.info("v2.0 추가항목(신규사업·종속기업·해외거점·직원증가)의 발화율이 비기술 섹터에서 "
              "v1.0 항목보다 높다면, 섹터 편향 완화가 실제로 작동한 것입니다.")
-
 
 def report_exclusion(P: pd.DataFrame) -> None:
     """배제 플래그별 발동 건수·비율·연도별 추이."""

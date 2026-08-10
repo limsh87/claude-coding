@@ -1,19 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L2-B1  D1 — 텍스트 변화량 (Lazy Prices 방식) §6.1                                         ║
-# ║                                                                                          ║
-# ║  근거: Cohen·Malloy·Nguyen, "Lazy Prices", Journal of Finance 2020.                       ║
-# ║  기업은 정기보고서를 기본적으로 전기 문서 복붙으로 작성한다. 따라서 '문서를 능동적으로       ║
-# ║  고쳤다는 사실 자체'가 신호다.                                                             ║
-# ║                                                                                          ║
-# ║  ⚠ [방법론적 우려 — 반드시 유지]                                                           ║
-# ║    이는 미국 10-K 결과다. 한국 사업보고서에 대한 직접 재현 증거는 확인된 바 없다.            ║
-# ║    이 파일은 그것을 '검증해야 할 가설'로 취급하며, 성립을 전제하지 않는다.                   ║
-# ║    부호 검증(report_d1_sign_check)이 그 판정을 담당하고, 역전이면 그대로 보고한다.           ║
-# ║                                                                                          ║
-# ║  ★ 부호를 사후에 뒤집어 성과를 맞추는 코드는 이 파일에 존재하지 않는다(§9.3-5).             ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L2-B1  D1 — 텍스트 변화량 (Lazy Prices 방식) §6.1
+#  ★ 부호를 사후에 뒤집어 성과를 맞추는 코드는 이 파일에 존재하지 않는다(§9.3-5).
+#  근거: Cohen·Malloy·Nguyen, "Lazy Prices", Journal of Finance 2020.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 D1_SECTION_WEIGHTS = dict(ARC_D1_WEIGHTS)       # 사전등록. 튜닝 금지(A13 계약검정이 감시).
 D1_METRICS = tuple(ARC_D1_METRICS)
@@ -28,11 +18,9 @@ D1_OUT_COLS = (["corp_code", "event_date", "knowledge_date"] +
                ["CHANGE_composite", "D1_SCORE", "STRUCT_FLAG", "n_sections"] +
                D1_VARIANT_COLS)
 
-
 # ── 구조적 변화 (§6.1.6) ────────────────────────────────────────────────────────────────────
 _STRUCT_PAT = (r"합병|분할|영업양수|영업양도|자산양수|자산양도|지주회사\s*(전환|설립)|"
                r"주식교환|주식이전|포괄적\s*교환|회사분할")
-
 
 def build_struct_flags(dis: pd.DataFrame) -> pd.DataFrame:
     """§6.1.6 합병·분할·영업양수도·지주전환 → STRUCT_FLAG.
@@ -57,7 +45,6 @@ def build_struct_flags(dis: pd.DataFrame) -> pd.DataFrame:
            f"(해당 종목-기간의 D1 은 결측 처리됩니다 — §6.1.6)")
     return S[[c for c in cols if c in S.columns]]
 
-
 # ── 유사도 4종 (§6.1.4) ─────────────────────────────────────────────────────────────────────
 def _d1_load(js: Any) -> Dict[str, float]:
     if not js or (isinstance(js, float) and not np.isfinite(js)):
@@ -69,7 +56,6 @@ def _d1_load(js: Any) -> Dict[str, float]:
         return {str(k): float(v) for k, v in d.items()} if isinstance(d, dict) else {}
     except Exception:
         return {}
-
 
 def _d1_pair_metrics(cur: Dict[str, float], prev: Dict[str, float],
                      cur_bg: Dict[str, float], prev_bg: Dict[str, float],
@@ -112,7 +98,6 @@ def _d1_pair_metrics(cur: Dict[str, float], prev: Dict[str, float],
     lc, lp = float(tok_len_c or 0), float(tok_len_p or 0)
     lr = float(min(lc, lp) / max(lc, lp)) if max(lc, lp) > 0 else np.nan
     return (cos, jac, simple, lr)
-
 
 def d1_similarity(pairs: pd.DataFrame,
                   df_state: Optional[dict] = None) -> pd.DataFrame:
@@ -188,7 +173,6 @@ def d1_similarity(pairs: pd.DataFrame,
     PIPE.io("OUT", "MEM", "d1_similarity", S)
     return S
 
-
 # ── 합성 (§6.1.5 공통충격 제거 → §6.1.7 섹션 가중) ──────────────────────────────────────────
 def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """기간×섹션 횡단면 z → 지표 동일가중 → 섹션 가중합성 → D1_SCORE.
@@ -225,10 +209,7 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
 
     # 섹션 → 문서 단위 피벗. 합성 지표와 4개 개별 지표를 모두 만든다
     # (개별 지표는 §8.4 '유사도 4종 각각 단독 사용 시 성과' 강건성 검사에 필요하다).
-    # ★ 최종 z 의 셀 키(사업연도|보고서종류)를 만들려면 pivot index 에 두 컬럼이 있어야 한다.
-    #   예전에는 index 가 (corp_code, rcept_dt) 뿐이라 아래 `if "bsns_year" in W.columns`
-    #   가드가 **항상 빗나가고** 셀이 조용히 달력연도 단독으로 폴백했다(문자열 연결이
-    #   정상 동작해 "2019|" 라는 그럴듯한 키가 만들어져 예외도 나지 않았다).
+    #   (상세 근거는 커밋 로그 참조)
     _PIV_IDX = ["corp_code", "rcept_dt"] + [c for c in ("bsns_year", "doc_type")
                                             if c in d.columns]
     if len(_PIV_IDX) < 4:
@@ -283,10 +264,7 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
 
     # D1_SCORE = −z(CHANGE_composite). 변화가 클수록 낮은 점수(§6.1.7).
     # ★ 셀은 '달력연도'가 아니라 **동시 제출 코호트(사업연도|보고서종류)** 여야 한다.
-    #   달력연도로 잡으면 3월 접수분(사업보고서)의 평균·표준편차·윈저 경계가 같은 해
-    #   11월 접수분(3분기보고서)으로부터 계산된다 — 3월 문서의 점수가 11월 데이터로
-    #   정해지는 명백한 미래 참조다. 코호트별 섹션 수·파싱 성공률이 실제로 다르므로
-    #   코호트 간 상대 스케일이 바뀌고, 결산월이 섞인 한 리밸일의 횡단면 순위가 달라진다.
+    #   (상세 근거는 커밋 로그 참조)
     W["_yr"] = W["bsns_year"].astype(str) + "|" + W["doc_type"].astype(str)
     W["D1_SCORE"] = -xsec_z(W["CHANGE_composite"], W["_yr"], min_n=CELL_MIN_N)
     W["D1_SCORE_equalw"] = -xsec_z(W["CHANGE_equalw"], W["_yr"], min_n=CELL_MIN_N)
@@ -306,12 +284,7 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
             flags = []
             for cc, rd in zip(W["corp_code"].astype(str), as_ts_series(W["rcept_dt"])):
                 ds = key.get(cc)
-                # ★ 단방향이어야 한다. 예전에는 abs(...) 라 **문서 접수 이후** 최대 1년의
-                #   공시까지 매칭했다. 그러면 "앞으로 12개월 안에 합병·분할·지주전환을
-                #   공시할 기업" 이라는 미래 정보로 그 문서의 D1 이 지워지고, §6.5 에 따라
-                #   D1 가중치 0.40 이 D2·D3 로 재배분된다. 합병 대상 종목은 전방수익률이
-                #   체계적으로 다르므로 방향성 있는 편향이다. struct 는 PIT.register 를
-                #   거치지 않고 파이썬 리스트로 직접 조회되므로 as-of 강제도 없었다.
+                #   (상세 근거는 커밋 로그 참조)
                 hit = bool(ds) and any(0 <= (rd - d0).days <= 365
                                        for d0 in ds if pd.notna(d0))
                 flags.append(1.0 if hit else 0.0)
@@ -334,7 +307,6 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
            f"D1_SCORE 유효 {int(W['D1_SCORE'].notna().sum()):,})")
     PIPE.io("OUT", "MEM", "d1_composite", W)
     return W[D1_OUT_COLS]
-
 
 def attach_d1(P: pd.DataFrame, d1: Optional[pd.DataFrame]) -> pd.DataFrame:
     """패널에 D1 결합 + D1_MISSING 판정 (§3.3 상장 24개월 미만 / §6.1.6 / 파싱 실패)."""
@@ -361,7 +333,6 @@ def attach_d1(P: pd.DataFrame, d1: Optional[pd.DataFrame]) -> pd.DataFrame:
     LOG.ok(f"D1 결합 완료 — 결측률 {100*rate:.1f}% "
            f"(결측분은 §6.5 에 따라 D2·D3 로 가중치가 비례 재배분되며 종목은 탈락하지 않습니다)")
     return P
-
 
 def report_d1_sign_check(P: pd.DataFrame) -> dict:
     """§9.2-(4) D1 부호 검증 — 한국 데이터에서 '변화 = 악재' 가 성립하는가.
@@ -414,7 +385,6 @@ def report_d1_sign_check(P: pd.DataFrame) -> dict:
                               "처리하며, D1 제외 버전(F2)을 주 결과로 삼는 것을 권고합니다.")
             LOG.error(out["verdict"])
     return out
-
 
 def build_d1_streaming(struct: Optional[pd.DataFrame] = None,
                        years: Optional[Sequence[int]] = None,

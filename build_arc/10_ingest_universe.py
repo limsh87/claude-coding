@@ -1,20 +1,9 @@
 
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-A  종목 마스터 & PIT 유니버스 (C2 생존자편향 제거)                                     ║
-# ║                                                                                          ║
-# ║  다중 소스 교차 구축 — 우선순위와 역할이 각각 다르다:                                      ║
-# ║    ① FDR GitHub 캐시  listing/krx        상장 종목 + 상장일        ← 로그인 불필요, 1순위  ║
-# ║    ② FDR GitHub 캐시  listing/delisting  상장폐지 + 폐지일         ← ★생존자편향 제거 입력 ║
-# ║    ③ KIND 상장법인목록                   상장일·업종 보강                                  ║
-# ║    ④ pykrx 월/분기말 스냅샷              "그 날 실제 상장" 검증     ← 인증 필요, 보조      ║
-# ║    ⑤ DART corpCode.xml                   corp_code ↔ 종목코드                              ║
-# ║    ⑥ 네이버 금융                         ①~⑤ 어디에도 이름이 없는 잔여 코드 보강          ║
-# ║                                                                                          ║
-# ║  ★ 설계 원칙: 유니버스의 정확성은 ①②③⑤(상장일·폐지일)만으로 성립해야 한다.                ║
-# ║    ④ 스냅샷은 '검증·보강'이지 '의존'이 아니다. KRX 인증이 실패해도 백테스트는 정상이어야   ║
-# ║    한다. 실제로 KRX 는 부분 응답을 자주 내는데, 그걸 진실로 믿으면 그 달 유니버스가        ║
-# ║    조용히 쪼그라들어 곧바로 선택편향이 된다.                                               ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-A  종목 마스터 & PIT 유니버스 (C2 생존자편향 제거)
+#  ★ 설계 원칙: 유니버스의 정확성은 ①②③⑤(상장일·폐지일)만으로 성립해야 한다.
+#  다중 소스 교차 구축 — 우선순위와 역할이 각각 다르다:
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "listing_date_src",
                    "delisting_date", "corp_code", "industry", "sector_src", "src",
@@ -24,7 +13,6 @@ SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "listing_date_src",
 #   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
 #   상장/폐지일이 이미 있으므로 분기 격자(40 × 2 = 80 호출)로도 검증 목적은 충분하다.
 UNIVERSE_SNAPSHOT_FREQ = "Q"
-
 
 # ── 중복 컬럼 방어 (이번 크래시의 직접 원인 유형) ────────────────────────────────────────────
 def assert_no_dup_cols(df: pd.DataFrame, where: str) -> pd.DataFrame:
@@ -40,22 +28,10 @@ def assert_no_dup_cols(df: pd.DataFrame, where: str) -> pd.DataFrame:
                            f"pandas 연산의 의미가 바뀌므로 여기서 중단합니다.")
     return df
 
-
 # ── KRX 세션 게이트 ─────────────────────────────────────────────────────────────────────────
 class KRXGate:
     """pykrx 호출을 단일 게이트로 통과시킨다.
-
     ★ 왜 필요한가 (pykrx 1.2.8 소스 확인 결과):
-      get_auth_session() 은 모듈 전역 _auth_session 에 대해 락 없이 검사-후-생성을 한다.
-      스레드 6개가 동시에 None 을 보면 6개가 각자 로그인하고, KRX 는 중복 로그인(CD011)을
-      skipDup 로 처리하며 앞선 세션을 강제 종료시킨다. 살아남는 건 마지막 하나뿐이고
-      나머지 스레드는 죽은 쿠키로 요청해 JSON 대신 로그인 HTML 을 받는다.
-      → 실제 운영 로그의 'Error occurred in ...: Expecting value: line 13 column 1' 이 이것이다.
-      또 세션은 3600초(버퍼 300초 → 실효 55분) 만료라 긴 수집은 반드시 만료를 넘긴다.
-      만료 갱신도 같은 무락 경로를 타므로 장시간 실행에서 같은 폭풍이 재현된다.
-
-    대응: ① 메인 스레드에서 단 한 번 워밍업 ② 모든 pykrx 호출을 락으로 직렬화
-          ③ 만료 전에 선제 갱신 ④ 실패해도 예외 대신 None 을 돌려 상위가 폴백하게 한다.
     """
 
     def __init__(self):
@@ -127,14 +103,12 @@ class KRXGate:
 
 KRXG = KRXGate()
 
-
 # ── 로그인 불필요 경로 ★1순위 ──────────────────────────────────────────────────────────────
 #   FinanceDataReader 가 실제로 읽는 GitHub 캐시. KRX 인증 변경의 영향을 받지 않는다.
 #   FDR 라이브러리 자체는 최신 영업일을 알아내려고 data.krx.co.kr 을 한 번 찌르는데,
 #   그게 로그인 벽에 막히면 CSV 는 멀쩡한데도 ValueError 로 죽는다 → 우리는 CSV 를 직접 읽는다.
 FDR_CACHE = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
              "refs/heads/master/data/{kind}/{date}.csv")
-
 
 def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
     """영업일 CSV 만 존재하므로 최근 날짜부터 거꾸로 훑는다."""
@@ -167,10 +141,8 @@ def _fdr_cache_csv(kind: str, back_days: int = 14) -> Optional[pd.DataFrame]:
             continue
     return None
 
-
 def _lower_map(d: pd.DataFrame) -> Dict[str, str]:
     return {str(c).strip().lower(): c for c in d.columns}
-
 
 def fetch_fdr_listing() -> pd.DataFrame:
     d = _fdr_cache_csv("listing/krx")
@@ -224,7 +196,6 @@ def fetch_fdr_listing() -> pd.DataFrame:
         "delisting_date": pd.NaT, "corp_code": np.nan,
         "sector_src": "fdr", "src": "fdr:KRX"})
     return t.dropna(subset=["code"]).drop_duplicates("code")
-
 
 def fetch_fdr_delisting() -> pd.DataFrame:
     """★ 생존자편향 제거의 핵심 입력. KRX Open API 에는 상장폐지 엔드포인트가 아예 없어서
@@ -308,7 +279,6 @@ def fetch_fdr_delisting() -> pd.DataFrame:
                      f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
     return t
 
-
 def fetch_kind_listing() -> pd.DataFrame:
     """KIND 상장법인목록 — 상장일·업종 보강.
     ★ 종목코드가 정수로 와서 앞자리 0 이 날아간다(5930 ← 005930). to_code6 이 복구한다."""
@@ -346,7 +316,6 @@ def fetch_kind_listing() -> pd.DataFrame:
             return t
     LOG.warn("KIND 상장법인목록을 받지 못했습니다 — 상장일은 FDR/스냅샷으로만 채웁니다.")
     return pd.DataFrame(columns=SEC_MASTER_COLS)
-
 
 def fetch_dart_corpcode() -> pd.DataFrame:
     """corp_code ↔ 종목코드. DART 의 모든 재무·공시 조회는 corp_code 로만 된다."""
@@ -391,7 +360,6 @@ def fetch_dart_corpcode() -> pd.DataFrame:
     LOG.ok(f"DART corpCode {len(d):,}건 (상장 매칭 {int(d['code'].notna().sum()):,}건)")
     return d
 
-
 # ── pykrx 스냅샷 (보조·검증) ────────────────────────────────────────────────────────────────
 def _snapshot_grid(months: pd.DatetimeIndex) -> List[pd.Timestamp]:
     f = str(UNIVERSE_SNAPSHOT_FREQ).upper()
@@ -402,7 +370,6 @@ def _snapshot_grid(months: pd.DatetimeIndex) -> List[pd.Timestamp]:
     if f == "A":
         return [m for m in months if m.month == 12] or list(months[::12])
     return [m for m in months if m.month in (3, 6, 9, 12)] or list(months[::3])   # 기본 Q
-
 
 def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
     """분기말 상장종목 스냅샷. C2 의 '검증' 입력이다(의존 대상이 아님).
@@ -482,7 +449,6 @@ def fetch_pykrx_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
     PIPE.io("OUT", "DRIVE", "krx_listing_snapshots", snap, source="pykrx")
     return snap
 
-
 def fetch_naver_names(codes: Sequence[str], limit: int = 400) -> Dict[str, str]:
     """①~⑤ 어디에도 이름이 없는 잔여 코드를 네이버로 보강한다.
     이름이 비면 국민연금·조달 상호 매칭이 통째로 실패하므로 커버리지에 직접 영향이 있다."""
@@ -506,7 +472,6 @@ def fetch_naver_names(codes: Sequence[str], limit: int = 400) -> Dict[str, str]:
     if out:
         LOG.ok(f"네이버로 종목명 {len(out):,}건 보강")
     return out
-
 
 # ── 종목 마스터 ─────────────────────────────────────────────────────────────────────────────
 def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
@@ -595,12 +560,7 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         g = snapshots.groupby("code")["snap_date"]
         agg = agg.merge(g.min().rename("snap_first"), left_on="code", right_index=True, how="left")
         agg = agg.merge(g.max().rename("snap_last"), left_on="code", right_index=True, how="left")
-        # ★ 스냅샷 백필은 '관측 시작일'이지 상장일이 아니다. 백테 시작월 이전에 상장된
-        #   종목은 전부 백테 시작월이 상장일로 찍히고, 그 위에 250거래일 시즈닝 +
-        #   ARC_MIN_LISTING_M 이 걸려 **그 종목만** 초기 구간에서 사라진다.
-        #   폐지 종목은 스냅샷 커버리지가 짧아 이 경로에 훨씬 많이 걸리므로, 생존군과
-        #   폐지군에 서로 다른 규칙이 적용되는 비대칭이 생긴다. 출처를 기록해 시즈닝
-        #   앵커에서 제외한다(=추정 상장일로는 종목을 탈락시키지 않는다).
+        #   (상세 근거는 커밋 로그 참조)
         need = agg["listing_date"].isna() & agg["snap_first"].notna()
         agg["listing_date_src"] = np.where(agg["listing_date"].notna(), "source", "")
         agg.loc[need, "listing_date"] = agg.loc[need, "snap_first"]

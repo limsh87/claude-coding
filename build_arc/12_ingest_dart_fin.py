@@ -1,17 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-C  DART — 재무제표 / 직원현황 / 공시목록                                               ║
-# ║                                                                                          ║
-# ║  ★ PIT 핵심: knowledge_date = 접수일자(rcept_dt). 결산기준일이 아니다.                     ║
-# ║    fnltt* 응답의 rcept_no 앞 8자리가 곧 접수일자다 → 여기서 knowledge_date 를 얻는다.       ║
-# ║    rcept_no 가 없으면 법정 제출기한(분기 45일 / 사업보고서 90일)으로 보수적 추정한다.       ║
-# ║    ※ 보수적 추정은 '늦게 알았다'는 방향이므로 미래누수를 만들지 않는다.                     ║
-# ║                                                                                          ║
-# ║  ★ 호출 예산: DART 는 일 20,000건 제한. 10년 분기 전체 재무제표는 그 몇 배다.               ║
-# ║    → 콜드빌드는 며칠에 걸쳐 '이어받기'로 완성된다(§3: 콜드빌드는 4시간 예산 밖).            ║
-# ║    → 남은 호출량을 실시간으로 표시하고, 한도에 닿으면 깨끗하게 멈춘 뒤 진행률을 알려준다.   ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-C  DART — 재무제표 / 직원현황 / 공시목록
+#  ★ PIT 핵심: knowledge_date = 접수일자(rcept_dt). 결산기준일이 아니다.
+#  ★ 호출 예산: DART 는 일 20,000건 제한. 10년 분기 전체 재무제표는 그 몇 배다.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 DART_BASE = "https://opendart.fss.or.kr/api/"
 DART_STATEMENT_FREQ = "quarterly"         # "quarterly" | "annual"
@@ -27,21 +19,9 @@ DART_STATUS_MSG = {
     "900": "정의되지 않은 오류", "901": "사용자 계정 폐쇄",
 }
 
-
 class DartBudget:
     """DART 일일 호출 예산 — **상한을 하드코딩하지 않고 실시간으로 추적·학습한다.**
-
     ★ 왜 19,000 같은 상수를 박으면 안 되는가:
-      ① 계정 등급·정책 변경으로 실제 한도가 달라진다(20,000 이 아닐 수 있다).
-      ② 같은 키를 다른 노트북/스크립트가 함께 쓰면 우리가 센 숫자와 서버의 숫자가 어긋난다.
-      ③ 여유분을 크게 잡으면 매일 수천 건을 그냥 버리게 되고, 콜드빌드가 며칠 더 걸린다.
-      → 그래서 (a) 오늘 이미 쓴 양을 드라이브 원장에서 읽고,
-              (b) 서버가 status=020(한도초과)을 준 지점을 '실측 상한'으로 학습해 기록하며,
-              (c) 다음 실행부터 그 학습값을 쓴다.
-        상한을 모르는 첫날에는 힌트값(ARC_DART_LIMIT_HINT)에서 출발하되, 그건 '추정'이라고
-        로그에 명시한다.
-
-    원장은 전용 인덱스에 남는다(다른 전략의 예산과 섞이면 안 되므로 private).
     """
 
     def __init__(self):
@@ -67,11 +47,27 @@ class DartBudget:
     def _path(self) -> str:
         return os.path.join(VAULT.ns["private"], "index", "dart_budget.json")
 
+    LEARN_TTL_DAYS = 30          # 학습값 만료 — 한 번의 020 이 1년 뒤 실행까지 묶으면 안 된다
+
     def _load(self):
         try:
             j = json.loads(open(self._path()).read())
             self.learned_limit = (int(j["learned_limit"])
                                   if j.get("learned_limit") else None)
+            self.learned_at = j.get("learned_at") or ""
+            # ★ 학습값에 만료를 준다. 예전에는 날짜 무관하게 무조건 읽어, 한 번의 020(또는
+            #   021 오분류)으로 박힌 낮은 상한이 **1년 뒤에도 그대로** 적용됐다.
+            if self.learned_limit and self.learned_at:
+                try:
+                    age = (_dt.date.today() -
+                           _dt.date.fromisoformat(str(self.learned_at))).days
+                    if age > self.LEARN_TTL_DAYS:
+                        LOG.info(f"DART 상한 학습값({self.learned_limit:,})이 {age}일 전 값이라 "
+                                 f"만료 처리하고 힌트값으로 되돌립니다 "
+                                 f"(TTL {self.LEARN_TTL_DAYS}일).")
+                        self.learned_limit, self.learned_at = None, ""
+                except Exception:
+                    pass
             if j.get("date") == self.today:
                 self.n = int(j.get("n", 0))
         except Exception:
@@ -85,6 +81,7 @@ class DartBudget:
             atomic_write_text(self._path(), json.dumps(
                 {"date": self.today, "n": self.n,
                  "learned_limit": self.learned_limit,
+                 "learned_at": getattr(self, "learned_at", "") or "",
                  "updated": _dt.datetime.now().isoformat(timespec="seconds")}))
         except Exception:
             pass
@@ -112,13 +109,28 @@ class DartBudget:
                 self._save()
             return True
 
+    # 학습 하한 — 힌트값의 이 비율 아래로는 내려가지 않는다. 020 은 '같은 키를 다른
+    # 노트북이 쓰는 중' 이거나 'UTC/KST 리셋 어긋남' 으로도 발생하는데, 그때 학습한
+    # 낮은 값이 영구 고정되면 이후 모든 실행이 그 상한에 갇힌다.
+    LEARN_FLOOR_RATIO = 0.5
+
     def note_rate_limited(self):
         """서버가 status=020 을 준 순간 = 실제 상한에 닿았다. 그 지점을 학습해 영속화한다."""
         with self._lk:
             self.exhausted = True
             self.hit_020_at = self.n
             prev = self.learned_limit
-            self.learned_limit = int(self.n)
+            hint = int(globals().get("ARC_DART_LIMIT_HINT", 20_000))
+            floor = int(hint * self.LEARN_FLOOR_RATIO)
+            learned = int(self.n)
+            if learned < floor:
+                LOG.warn(f"020 시점 사용량 {learned:,}건이 힌트값 {hint:,}의 "
+                         f"{self.LEARN_FLOOR_RATIO:.0%}({floor:,}) 미만입니다. 같은 키를 다른 "
+                         f"실행이 쓰고 있거나 UTC/KST 리셋이 어긋난 상황일 수 있으므로, "
+                         f"이 값을 영구 상한으로 학습하지 않고 하한 {floor:,}로 기록합니다.")
+                learned = floor
+            self.learned_limit = learned
+            self.learned_at = str(_dt.date.today())
             self._save()
         if prev != self.learned_limit:
             LOG.warn(f"DART 서버가 한도 초과(020)를 반환했습니다. 실제 상한을 {self.n:,}건으로 "
@@ -140,7 +152,6 @@ class DartBudget:
 
 DBUDGET: Optional[DartBudget] = None
 
-
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
@@ -161,13 +172,18 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
         return None
     st = str(js.get("status", ""))
     if st and st != "000":
-        if st in ("020", "021"):
+        if st == "020":
             # ★ 여기가 '실측 상한'을 배우는 유일한 지점이다. 상수를 믿지 않고 서버가 거부한
             #   순간의 사용량을 기록해 다음 실행의 예산 계산에 쓴다.
             if DBUDGET is not None:
                 DBUDGET.note_rate_limited()
-            LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
+            LOG.warn(f"DART status=020 ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
                      f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+        elif st == "021":
+            #   (상세 근거는 커밋 로그 참조)
+            LOG.warn(f"DART status=021 ({DART_STATUS_MSG.get(st, '?')}) — 요청의 회사 수가 "
+                     f"많습니다. 일일 한도와 무관하므로 예산을 소진 처리하지 않고 배치 크기를 "
+                     f"줄여 진행하세요(ARC 는 DART_MULTI_BATCH 로 조절).")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -175,7 +191,6 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
             LOG.debug(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) ep={endpoint}")
         return None
     return js
-
 
 def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Timestamp:
     """rcept_no 앞 8자리 = 접수일자(YYYYMMDD). 없으면 법정기한으로 보수적 추정."""
@@ -187,11 +202,9 @@ def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Times
     mm, dd = REPRT_PERIOD_END.get(reprt_code, (12, 31))
     return as_ts(f"{year}-{mm:02d}-{dd:02d}") + pd.Timedelta(days=REPRT_DEADLINE_DAYS.get(reprt_code, 90))
 
-
 # ── 전체 재무제표 ───────────────────────────────────────────────────────────────────────────
 _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
             "account_id", "account_nm", "thstrm_amount", "rcept_no"]
-
 
 def _fs_one(job) -> Optional[pd.DataFrame]:
     corp, year, reprt = job
@@ -211,20 +224,10 @@ def _fs_one(job) -> Optional[pd.DataFrame]:
     d["reprt_code"] = reprt
     return d[_FS_KEEP]
 
-
 # ── Tier-1: 다중회사 주요계정 (배치) ────────────────────────────────────────────────────────
 #   fnlttMultiAcnt 는 corp_code 를 콤마로 최대 100개까지 받는다.
-#   2,500사 × 10년 × 4분기를 단건으로 받으면 100,000 호출(일 20,000 한도로 5일)이지만
-#   배치로는 1,000 호출(1시간 이내)이면 끝난다. ★100배 차이다.
-#   다만 '주요계정'만 오므로 B/C축이 필요로 하는 재고·매출채권·영업CF 는 없다.
-#   → 헤드라인은 배치로 싹 깔고, 전체 재무제표는 우선순위대로 단건 수집해 덮어쓴다(2단 구성).
+#   (상세 근거는 커밋 로그 참조)
 DART_MULTI_BATCH = 100
-_MULTI_ACCOUNT_MAP = {
-    "매출액": "revenue", "영업이익": "op_income", "당기순이익": "net_income",
-    "자산총계": "assets", "부채총계": "liabilities", "자본총계": "equity",
-}
-
-
 def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
     """주요계정 배치 수집. 전체 재무제표의 '바닥'을 싸게 깔아둔다."""
     if not DART_API_KEY:
@@ -281,7 +284,6 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
            f"(호출 {len(jobs):,}회로 확보)")
     PIPE.io("OUT", "DRIVE", "dart_multi_raw", M, source="opendart fnlttMultiAcnt")
     return M
-
 
 def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                           priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
@@ -345,7 +347,6 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
     PIPE.io("OUT", "DRIVE", "dart_fnltt_raw", fs, source="opendart fnlttSinglAcntAll")
     return fs
 
-
 def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFrame:
     """Tier-2(전체 재무제표)를 우선하고, 없는 (회사, 기간)만 Tier-1(주요계정)로 메운다.
 
@@ -366,7 +367,6 @@ def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFra
         LOG.info(f"주요계정으로 보완한 (회사×기간) {fill.groupby(['corp_code','bsns_year','reprt_code']).ngroups:,}건 "
                  f"— 전체 재무제표 콜드빌드가 끝나면 자동으로 대체됩니다.")
     return pd.concat([full, fill], ignore_index=True)
-
 
 # ── 계정 매핑 (한국 XBRL 계정명은 회사마다 다르다 → 정규식 다중 매칭) ────────────────────────
 ACCOUNT_PATTERNS: Dict[str, Tuple[str, List[str]]] = {
@@ -405,15 +405,6 @@ _SJ_MAP = {"BS": ("BS",), "IS": ("IS", "CIS"), "CF": ("CF",)}
 FLOW_ITEMS = ["revenue", "cogs", "gross_profit", "sgna", "rnd", "op_income", "net_income",
               "cfo", "capex", "dep", "dividend_paid", "treasury_buy", "debt_raise",
               "tax_expense", "pretax_income", "other_income"]
-
-# 재무 결합 후 패널이 반드시 보유해야 하는 컬럼 전체 목록.
-# attach_fundamentals 가 이 목록으로 스키마를 계약적으로 보장한다 — 수집이 얼마나 실패하든
-# 패널의 컬럼 집합은 항상 같아야 한다. 그래야 "어떤 실행에선 있고 어떤 실행엔 없는" 축이
-# 사라지고, 결측은 결측대로 조용히가 아니라 표로 드러난다.
-FUNDAMENTAL_COLS = (list(ACCOUNT_PATTERNS)
-                    + [f"{c}{s}" for c in FLOW_ITEMS for s in ("_q", "_ttm")]
-                    + ["employees", "payroll", "v2_bad_3q"])
-
 
 def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     """원시 계정 → (corp_code, period, 항목) 와이드 테이블. knowledge_date 를 여기서 확정한다."""
@@ -486,11 +477,7 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
         if _k not in W.columns:
             W[_k] = np.nan
     # ── V2 거부권용 '이익-현금 괴리 3분기 연속' 플래그 ─────────────────────────────────────
-    #   ★ 여기서 만드는 이유: 연속성은 분기 관측을 세야 하는데, 월 패널에서 세면
-    #     같은 분기값이 1~4개월 반복되므로 어떤 고정 개월수도 정답이 아니다. 분기 프레임은
-    #     관측당 정확히 한 행이고 이미 (corp_code, bsns_year, q) 로 정렬돼 있다.
-    #     as-of 결합이 이 플래그를 C1 게이트웨이 그대로 실어 나른다.
-    #   min_periods=3 — 제출분이 3개 미만이면 NaN(=거부하지 않음). 근거 없는 제외 금지.
+    #   (상세 근거는 커밋 로그 참조)
     _bad_q = ((col(W, "net_income_ttm") > 0) &
               (col(W, "cfo_ttm") < 0.5 * col(W, "net_income_ttm"))).astype(float)
     W["v2_bad_3q"] = (_bad_q.groupby(W["corp_code"], observed=True)
@@ -512,7 +499,6 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
            f"(knowledge_date = 접수일자 기준, 누적→분기 차분 완료)")
     PIPE.io("OUT", "MEM", "dart_financials_tidy", W)
     return downcast(W)
-
 
 # ── 직원현황 (θ_N, TP_C2) ───────────────────────────────────────────────────────────────────
 def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
@@ -572,7 +558,6 @@ def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.
     PIPE.io("OUT", "DRIVE", "dart_employees", E, source="opendart empSttus")
     return E
 
-
 # ── 공시목록 스윕 (시장 전체를 날짜로 훑는다 — 회사별 호출보다 수십 배 싸다) ──────────────────
 DISCLOSURE_PATTERNS = {
     "treasury_acq":  r"자기주식\s*취득",
@@ -585,7 +570,6 @@ DISCLOSURE_PATTERNS = {
     "capital_reduce": r"감자",
     "audit_opinion": r"감사보고서",
 }
-
 
 def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     """월 단위로 시장 전체 공시목록을 훑는다. PACK-C(자사주/배당)와 V3(희석성 조달)의 입력."""
@@ -604,10 +588,7 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
         todo = []
 
     # ★ 파이프라인이 실제로 소비하는 공시 유형을 전부 훑어야 한다.
-    #   B(주요사항보고)만 훑으면 PACK-C 의 자사주·증자는 잡히지만
-    #   PACK-D 가 필요로 하는 '사업보고서'는 A(정기공시)라 단 한 건도 안 잡힌다.
-    #   그러면 fetch_dart_documents 가 걸러낼 대상이 없어 팩 전체가 조용히 죽는다.
-    #   (실경로에서만 드러나는 유형 — 합성 스모크는 dis 를 직접 만들어 넣으므로 못 본다)
+    #   (상세 근거는 커밋 로그 참조)
     DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
 
     def _one(m):
@@ -658,7 +639,6 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     PIPE.io("OUT", "DRIVE", "dart_disclosures", D, source="opendart list.json")
     return D
 
-
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L1-C+  ARC 추가 수집 — 주식총수(D2 SHARE_GROWTH) / 감사의견(배제 EX_AUDIT)               ║
 # ║                                                                                          ║
@@ -669,18 +649,6 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
 
 _SHARE_COLS = ["corp_code", "bsns_year", "reprt_code", "shares_common", "shares_total",
                "treasury_shares", "period_end", "knowledge_date", "rcept_no"]
-
-
-def _num_kr(x) -> float:
-    """'1,234,567' / '1,234,567 주' / '-' → float. 콤마·단위·전각 부호를 전부 처리한다."""
-    s = re.sub(r"[^\d.\-]", "", str(x or "").replace("−", "-").replace("△", "-"))
-    if s in ("", "-", ".", "-."):
-        return float("nan")
-    try:
-        return float(s)
-    except Exception:
-        return float("nan")
-
 
 def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
     """주식의 총수 현황(stockTotqySttus). D2 의 SHARE_GROWTH 입력.
@@ -767,7 +735,6 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Dat
     PIPE.io("OUT", "DRIVE", "dart_shares", S, source="opendart stockTotqySttus")
     return downcast(S)
 
-
 def _num_kr_series(s) -> pd.Series:
     return pd.to_numeric(
         pd.Series(s).astype(str)
@@ -778,7 +745,6 @@ def _num_kr_series(s) -> pd.Series:
 
 _AUDIT_COLS = ["corp_code", "bsns_year", "audit_opinion", "emphasis", "key_matter",
                "auditor", "period_end", "knowledge_date"]
-
 
 def fetch_dart_audit(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
     """감사의견 + 특기사항/강조사항 (accnutAdtorNmNdAdtOpinion). 배제 플래그 EX_AUDIT 입력.

@@ -1,5 +1,4 @@
 
-
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L0-C  유틸 — 해시 / 원자적 IO / 재시도 / 레이트리미터 / 병렬 / 벡터화 통계               ║
 # ║                                                                                          ║
@@ -25,7 +24,6 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
     return t.normalize()
 
-
 def as_ts_series(s) -> pd.Series:
     out = pd.to_datetime(pd.Series(s), errors="coerce")
     try:
@@ -35,15 +33,12 @@ def as_ts_series(s) -> pd.Series:
         pass
     return out.dt.normalize()
 
-
 def month_end(x) -> Optional[pd.Timestamp]:
     t = as_ts(x)
     return None if t is None else (t + pd.offsets.MonthEnd(0)).normalize()
 
-
 def month_range(start, end) -> pd.DatetimeIndex:
     return pd.date_range(month_end(start), month_end(end), freq="ME")
-
 
 # ── 해시 / 식별자 ───────────────────────────────────────────────────────────────────────────
 def sha1_str(*parts) -> str:
@@ -53,21 +48,8 @@ def sha1_str(*parts) -> str:
         h.update(b"\x1f")
     return h.hexdigest()
 
-
 def sha1_bytes(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()
-
-
-def sha1_file(path: str, chunk: int = 1 << 20) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
-
 
 def norm_text(s: Any) -> str:
     """상호/애널리스트명/제목 정규화. 매칭 정확도의 8할이 여기서 결정된다."""
@@ -79,7 +61,6 @@ def norm_text(s: Any) -> str:
     s = re.sub(r"[^\w가-힣A-Za-z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
-
 def norm_corp_name(s: Any) -> str:
     """법인격 접미어 제거 — 사업장명↔법인명 매칭용."""
     t = norm_text(s)
@@ -88,12 +69,10 @@ def norm_corp_name(s: Any) -> str:
     t = re.sub(r"(주식회사|유한회사)", " ", t)
     return re.sub(r"\s+", "", t).strip()
 
-
 # 2024-01-01 종목코드 개편으로 영숫자 코드가 도입되었다.
 # 형식: 앞 4자리 숫자 + 5번째(0-9,A-Z 중 I/O/U 제외) + 6번째(0,K,L,M,N)
 # ★ 단순히 \D 를 제거하면 신형 티커가 조용히 망가진다(예: '09701K' → '009701').
 _TICKER_RE = re.compile(r"^(?:\d{6}|\d{4}[0-9A-HJ-NP-TV-Z][0-9KLMN])$")
-
 
 def to_code6(x: Any) -> Optional[str]:
     """'005930', 5930, 'A005930', '005930.KS', '09701K' → 정규화 코드.
@@ -111,24 +90,11 @@ def to_code6(x: Any) -> Optional[str]:
         return cand if _TICKER_RE.match(cand) else None
     return None
 
-
-def similarity(a: str, b: str) -> float:
-    """0~100. rapidfuzz 있으면 그걸, 없으면 difflib."""
-    a, b = norm_corp_name(a), norm_corp_name(b)
-    if not a or not b:
-        return 0.0
-    if rapidfuzz_fuzz is not None:
-        return float(rapidfuzz_fuzz.token_set_ratio(a, b))
-    import difflib
-    return 100.0 * difflib.SequenceMatcher(None, a, b).ratio()
-
-
 # ── 원자적 파일 IO (드라이브 FUSE 에서 깨지지 않게) ──────────────────────────────────────────
 def _ensure_dir(path: str):
     d = os.path.dirname(os.path.abspath(path))
     if d:
         os.makedirs(d, exist_ok=True)
-
 
 def atomic_write_bytes(path: str, data: bytes) -> str:
     """임시파일 → flush/fsync → os.replace. 드라이브 마운트에서 중단돼도 원본이 반쪽 나지 않는다."""
@@ -144,10 +110,8 @@ def atomic_write_bytes(path: str, data: bytes) -> str:
     os.replace(tmp, path)
     return path
 
-
 def atomic_write_text(path: str, text: str) -> str:
     return atomic_write_bytes(path, text.encode("utf-8"))
-
 
 def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd") -> str:
     _ensure_dir(path)
@@ -166,6 +130,20 @@ def atomic_write_parquet(df: pd.DataFrame, path: str, compression: str = "zstd")
     os.replace(tmp, path)
     return path
 
+def pq_num_rows(path: str) -> int:
+    """parquet 행 수를 **메타데이터만 읽어** 반환한다. 캐시 축소 감지용이라 전량 로드 금지."""
+    try:
+        import pyarrow.parquet as _pq                        # type: ignore
+        return int(_pq.ParquetFile(path).metadata.num_rows)
+    except Exception:
+        pass
+    try:
+        return int(len(pd.read_parquet(path, columns=[])))
+    except Exception:
+        try:
+            return int(len(pd.read_parquet(path)))
+        except Exception:
+            return -1
 
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
     if not os.path.exists(path):
@@ -179,7 +157,6 @@ def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
         except Exception:
             pass
         return None
-
 
 def read_jsonl(path: str) -> List[dict]:
     if not os.path.exists(path):
@@ -196,7 +173,6 @@ def read_jsonl(path: str) -> List[dict]:
                 continue                        # 반쪽 줄은 건너뛴다 (append-only 저널의 정상 동작)
     return out
 
-
 def append_jsonl(path: str, rows: Iterable[dict]):
     _ensure_dir(path)
     with open(path, "a", encoding="utf-8") as f:
@@ -207,7 +183,6 @@ def append_jsonl(path: str, rows: Iterable[dict]):
             os.fsync(f.fileno())
         except Exception:
             pass
-
 
 # ── 레이트리미터 / 재시도 ───────────────────────────────────────────────────────────────────
 class RateLimiter:
@@ -233,36 +208,11 @@ class RateLimiter:
 _LIMITERS: Dict[str, RateLimiter] = {}
 _LIMITER_LOCK = threading.Lock()
 
-
 def limiter(source: str) -> RateLimiter:
     with _LIMITER_LOCK:
         if source not in _LIMITERS:
             _LIMITERS[source] = RateLimiter(RATE_LIMIT_QPS.get(source, RATE_LIMIT_QPS.get("generic", 3.0)))
         return _LIMITERS[source]
-
-
-def retry(tries: int = 4, base: float = 1.6, exc=(Exception,), on_fail=None, quiet: bool = False):
-    def deco(fn):
-        def wrapped(*a, **kw):
-            last = None
-            for i in range(tries):
-                try:
-                    return fn(*a, **kw)
-                except exc as e:                       # noqa
-                    last = e
-                    if i == tries - 1:
-                        break
-                    slp = (base ** i) + random.random() * 0.4
-                    if not quiet:
-                        LOG.debug(f"재시도 {i+1}/{tries-1} ({type(e).__name__}) — {slp:.1f}s 대기")
-                    time.sleep(slp)
-            if on_fail is not None:
-                return on_fail(last)
-            raise last                                  # type: ignore
-        wrapped.__name__ = getattr(fn, "__name__", "wrapped")
-        return wrapped
-    return deco
-
 
 # ── 병렬 ────────────────────────────────────────────────────────────────────────────────────
 def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
@@ -291,27 +241,6 @@ def pmap_io(fn: Callable, items: Sequence, workers: Optional[int] = None,
                  ", ".join(f"{k}×{v}" for k, v in errs.most_common(4)))
     return out
 
-
-def pmap_cpu(fn: Callable, items: Sequence, workers: Optional[int] = None, desc: str = "") -> List[Any]:
-    """연산 병렬. fork 가능하면 프로세스, 아니면 스레드로 자동 폴백(결과 동일, 속도만 차이)."""
-    items = list(items)
-    if not items:
-        return []
-    w = max(1, min(workers or N_CPU, len(items)))
-    if w == 1 or not CAN_FORK:
-        if not CAN_FORK:
-            LOG.debug("fork 불가 환경 — 연산 병렬을 스레드로 폴백합니다(결과 동일).")
-        return [fn(x) for x in tqdm(items, desc=desc or "연산", leave=False, ncols=88)]
-    try:
-        ctx = _mp.get_context("fork")
-        with ProcessPoolExecutor(max_workers=w, mp_context=ctx) as ex:
-            return list(tqdm(ex.map(fn, items), total=len(items), desc=desc or "연산",
-                             leave=False, ncols=88))
-    except Exception as e:                                # noqa
-        LOG.warn(f"프로세스 병렬 실패({type(e).__name__}) — 순차 실행으로 폴백합니다.")
-        return [fn(x) for x in items]
-
-
 # ── 메모리 ──────────────────────────────────────────────────────────────────────────────────
 def downcast(df: pd.DataFrame, cat_thresh: float = 0.35) -> pd.DataFrame:
     """float64→float32, 저카디널리티 object→category. 10년 패널 RAM을 3~5배 줄인다."""
@@ -332,17 +261,14 @@ def downcast(df: pd.DataFrame, cat_thresh: float = 0.35) -> pd.DataFrame:
                 pass
     return df
 
-
 def mem_mb(df: pd.DataFrame) -> float:
     try:
         return float(df.memory_usage(deep=True).sum()) / 1e6
     except Exception:
         return -1.0
 
-
 # ── PIT 프레임 강제 (C1) ────────────────────────────────────────────────────────────────────
 PIT_COLS = ("event_date", "knowledge_date")
-
 
 def _resolve_dates(df: pd.DataFrame, arg) -> pd.Series:
     """날짜 인자 해석 규칙 — 딱 세 가지만 허용한다(모호함이 곧 버그다):
@@ -361,7 +287,6 @@ def _resolve_dates(df: pd.DataFrame, arg) -> pd.Series:
             raise ValueError(f"날짜 배열 길이 불일치: {len(arg)} vs {len(df)}")
         return as_ts_series(pd.Series(list(arg))).set_axis(df.index)
     return as_ts_series(pd.Series([arg] * len(df))).set_axis(df.index)
-
 
 def pit_frame(df: pd.DataFrame, event_date, knowledge_date, source: str = "") -> pd.DataFrame:
     """모든 수집 결과는 이 함수를 통과해야 한다. 통과하지 않은 테이블은 PIT store 가 거부한다."""
@@ -387,32 +312,13 @@ def pit_frame(df: pd.DataFrame, event_date, knowledge_date, source: str = "") ->
         out["_src"] = source
     return out
 
-
 # ── 벡터화 횡단면 통계 (C5 순서 고정) ───────────────────────────────────────────────────────
 WINSOR_SIGMA = 2.0
 CELL_MIN_N = 8
 
-
-def _winsor_np(a: np.ndarray, k: float = WINSOR_SIGMA) -> np.ndarray:
-    m = np.nanmean(a)
-    s = np.nanstd(a)
-    if not np.isfinite(s) or s == 0:
-        return a
-    return np.clip(a, m - k * s, m + k * s)
-
-
 def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N,
            k: float = WINSOR_SIGMA) -> pd.Series:
-    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다.
-
-    구현 주의 두 가지:
-     ① ±inf 를 반드시 먼저 NaN 으로 바꾼다. np.nanmean 은 NaN 은 무시하지만 inf 는 무시하지
-        않으므로, 셀에 inf 가 단 하나만 있어도 평균이 inf·표준편차가 NaN 이 되어
-        **그 셀 전체의 z-score 가 0으로 뭉개진다.** 비율 지표(diff/log)에서 흔히 발생한다.
-     ② groupby.transform(파이썬 UDF) 대신 네이티브 집계로 벡터화한다.
-        실데이터 규모(30만 행 × 수천 셀)에서 UDF 경로는 호출당 10초 이상이고,
-        파이프라인은 이 함수를 수십 번 부른다.
-    """
+    """C5: winsorize(±2σ) → 셀 내 z-score.  순서는 여기서만 정의되고 파라미터화하지 않는다."""
     v = pd.to_numeric(values, errors="coerce").astype("float64")
     v = v.replace([np.inf, -np.inf], np.nan)
     grp = pd.Series(cells).astype(object).fillna("__NA__").to_numpy()
@@ -430,7 +336,6 @@ def xsec_z(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N,
     z = z.mask(sd.notna() & (sd <= 0) & w.notna(), 0.0)            # 셀 내 전원 동일값 → 0
     return z.where(cnt >= min_n).astype("float32")
 
-
 def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
     """셀 내 백분위 랭크 [0,1]. 표본 부족 셀은 NaN (0으로 채우지 않는다)."""
     v = pd.to_numeric(values, errors="coerce").astype("float64")
@@ -443,55 +348,6 @@ def xsec_rank_pct(values: pd.Series, cells: pd.Series, min_n: int = CELL_MIN_N) 
 
 
 CELL_LADDER = ("cell", "cell_l2", "cell_l3")
-
-
-def xsec_z_l(P: pd.DataFrame, name: str, min_n: int = CELL_MIN_N) -> pd.Series:
-    """셀 폴백 사다리를 적용한 z-score (C11).
-
-    ★ 왜 필요한가: 셀에 종목이 30개 있어도 '그 센서를 관측한' 종목은 5개뿐일 수 있다.
-      (관세·조달처럼 일부 종목만 커버하는 팩이 정확히 이 경우다)
-      셀 크기만 보고 폴백하면 z-score 는 표본부족으로 전부 NaN 이 되고,
-      그 팩은 아무 신호도 못 내면서 로그에는 아무것도 남지 않는다 — 최악의 조용한 실패다.
-      그래서 '그 센서의 유효 관측 수' 기준으로 산업 상위 → 전체 순으로 단계적 폴백한다.
-    """
-    v = col(P, name)
-    if v.notna().sum() == 0:
-        return pd.Series(np.nan, index=P.index, dtype="float32")
-    z = xsec_z(v, P["cell"], min_n) if "cell" in P.columns else \
-        pd.Series(np.nan, index=P.index, dtype="float32")
-    for lvl in CELL_LADDER[1:]:
-        if not z.isna().any():
-            break
-        if lvl in P.columns:
-            z = z.where(z.notna(), xsec_z(v, P[lvl], min_n))
-    return z
-
-
-def xsec_rank_pct_l(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.Series:
-    v = col(P, name_or_series) if isinstance(name_or_series, str) else \
-        pd.to_numeric(name_or_series, errors="coerce")
-    if v.notna().sum() == 0:
-        return pd.Series(np.nan, index=P.index, dtype="float32")
-    r = xsec_rank_pct(v, P["cell"], min_n) if "cell" in P.columns else \
-        pd.Series(np.nan, index=P.index, dtype="float32")
-    for lvl in CELL_LADDER[1:]:
-        if not r.isna().any():
-            break
-        if lvl in P.columns:
-            r = r.where(r.notna(), xsec_rank_pct(v, P[lvl], min_n))
-    return r
-
-
-def tp_product(z_improve: pd.Series, z_nopay: pd.Series) -> pd.Series:
-    """트레이드오프 쌍 = z(개선) × z(대가회피).  ★ 절대로 합으로 바꾸지 말 것 (§1.1).
-
-    합으로 바꾸면 평범한 퀄리티 팩터가 되고 이 전략의 존재 이유가 사라진다.
-    한쪽이 결측이면 결과도 결측 — 0으로 채우면 '대가를 안 치렀다'는 거짓 주장이 된다.
-    """
-    a = pd.to_numeric(z_improve, errors="coerce")
-    b = pd.to_numeric(z_nopay, errors="coerce")
-    return (a * b).astype("float32")
-
 
 def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     """없는 컬럼도 NaN Series 로 돌려주는 안전 접근자.
@@ -506,34 +362,11 @@ def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
         return pd.to_numeric(df[name], errors="coerce")
     return pd.Series(default, index=df.index, dtype="float64")
 
-
-def gby(df: pd.DataFrame, name: str, key: str = "code"):
-    """col() 의 groupby 판(版). 없는 컬럼도 NaN 으로 만든 뒤 그룹화한다.
-
-    ★ col() 이 막지 못하는 구멍이 정확히 여기였다. 피처 계산부는 결측 컬럼 산술을 col() 로
-      막아 두었지만, `P.groupby("code")[c]` 는 여전히 맨손이라 c 가 없으면 KeyError 로 죽는다.
-      DART 키가 없거나 재무 수집이 부분 실패하면 assets·contract_liab 같은 재무상태표 계정이
-      아예 생성되지 않는데, 이 경로는 critical 스테이지(L1.PANEL)라 그대로 실행 전체가 중단된다.
-      "키 없이도 실행은 된다"는 상단 안내와 정면으로 어긋나므로 groupby 도 안전 접근으로 통일한다.
-    """
-    if name not in df.columns:
-        df[name] = np.nan
-    return df.groupby(key, observed=True)[name]
-
-
 def safe_div(a, b, eps: float = 1e-12):
     a = pd.to_numeric(a, errors="coerce")
     b = pd.to_numeric(b, errors="coerce")
     out = a / b.where(b.abs() > eps)
     return out.replace([np.inf, -np.inf], np.nan)
-
-
-def dlog(s: pd.Series, periods: int = 12) -> pd.Series:
-    """Δlog. 음수/0 은 결측 처리 (log 의 정의역 밖을 0으로 메우는 것이 최빈 버그)."""
-    v = pd.to_numeric(s, errors="coerce")
-    lv = np.log(v.where(v > 0))
-    return lv.diff(periods)
-
 
 def nanmean_cols(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
     """가용 축만으로 평균. 결측을 0으로 채우지 않는다 (§7.3 지시)."""
@@ -541,77 +374,6 @@ def nanmean_cols(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
     if not use:
         return pd.Series(np.nan, index=df.index)
     return df[use].astype("float64").mean(axis=1, skipna=True)
-
-
-# ── 벡터화 롤링 OLS (칼만 대체, §3) ─────────────────────────────────────────────────────────
-def rolling_ols_resid(y: np.ndarray, X: np.ndarray, window: int,
-                      ridge: float = 1e-8, chunk: int = 256) -> np.ndarray:
-    """N개 엔티티 × T기간 패널에 대해 길이 W 롤링 OLS 를 배치로 풀고 창 마지막 시점 잔차를 반환.
-
-    y : (N, T)
-    X : (N, T, K)   — 절편은 호출자가 포함시킬 것
-    반환: (N, T) 잔차. 창이 안 차거나 결측 포함이면 NaN.
-
-    종목별 파이썬 루프로 짜면 15분짜리가 3시간이 된다(§3). 반드시 이 경로를 쓸 것.
-    """
-    y = np.asarray(y, dtype=np.float64)
-    X = np.asarray(X, dtype=np.float64)
-    N, T = y.shape
-    K = X.shape[2]
-    out = np.full((N, T), np.nan, dtype=np.float64)
-    if T < window or window < K + 2:
-        return out
-    try:
-        from numpy.lib.stride_tricks import sliding_window_view as _swv
-    except Exception:                                     # numpy<1.20 폴백
-        _swv = None
-
-    for s in range(0, N, chunk):
-        e = min(N, s + chunk)
-        yc, Xc = y[s:e], X[s:e]
-        n = e - s
-        if _swv is not None:
-            yw = _swv(yc, window, axis=1)                 # (n, T-W+1, W)
-            Xw = _swv(Xc, window, axis=1)                 # (n, T-W+1, K, W)
-            Xw = np.moveaxis(Xw, -1, 2)                   # (n, T-W+1, W, K)
-        else:
-            idx = np.arange(window)[None, :] + np.arange(T - window + 1)[:, None]
-            yw = yc[:, idx]
-            Xw = Xc[:, idx, :]
-        finite = np.isfinite(yw).all(axis=2) & np.isfinite(Xw).all(axis=(2, 3))   # (n, M)
-        yw = np.where(np.isfinite(yw), yw, 0.0)
-        Xw = np.where(np.isfinite(Xw), Xw, 0.0)
-        XtX = np.einsum("nmwk,nmwl->nmkl", Xw, Xw, optimize=True)
-        Xty = np.einsum("nmwk,nmw->nmk", Xw, yw, optimize=True)
-        XtX += ridge * np.eye(K)[None, None, :, :] * np.maximum(
-            1.0, np.abs(np.einsum("nmkk->nm", XtX))[..., None, None] / max(K, 1))
-        try:
-            beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]                   # (n, M, K)
-        except np.linalg.LinAlgError:
-            beta = np.einsum("nmkl,nml->nmk", np.linalg.pinv(XtX), Xty)
-        x_last = Xw[:, :, -1, :]                                                  # (n, M, K)
-        resid = yw[:, :, -1] - np.einsum("nmk,nmk->nm", x_last, beta)
-        resid = np.where(finite, resid, np.nan)
-        out[s:e, window - 1:] = resid
-        del yw, Xw, XtX, Xty, beta
-    return out
-
-
-def rolling_ols_beta_last(y: np.ndarray, X: np.ndarray, window: int, ridge: float = 1e-8) -> np.ndarray:
-    """위와 동일하되 마지막 창의 계수만 필요할 때 (R3 직교화 등)."""
-    N, T = y.shape
-    K = X.shape[2]
-    if T < window:
-        return np.full((N, K), np.nan)
-    yw, Xw = y[:, -window:], X[:, -window:, :]
-    ok = np.isfinite(yw).all(axis=1) & np.isfinite(Xw).all(axis=(1, 2))
-    yw = np.nan_to_num(yw); Xw = np.nan_to_num(Xw)
-    XtX = np.einsum("nwk,nwl->nkl", Xw, Xw) + ridge * np.eye(K)[None]
-    Xty = np.einsum("nwk,nw->nk", Xw, yw)
-    beta = np.linalg.solve(XtX, Xty[..., None])[..., 0]
-    beta[~ok] = np.nan
-    return beta
-
 
 def hac_tstat(x: np.ndarray, lags: Optional[int] = None) -> Tuple[float, float]:
     """Newey-West HAC 평균 t통계량. 월간 초과수익 시계열의 유의성에 쓴다(R2/R3)."""
@@ -633,7 +395,6 @@ def hac_tstat(x: np.ndarray, lags: Optional[int] = None) -> Tuple[float, float]:
     se = math.sqrt(var / n)
     return (float(mu), float(mu / se))
 
-
 def bh_fdr(pvals: Sequence[float], q: float = 0.10) -> np.ndarray:
     """Benjamini-Hochberg. 강건성 검정을 여러 번 돌리면 다중검정 보정이 필요하다."""
     p = np.asarray(pvals, dtype=float)
@@ -650,7 +411,6 @@ def bh_fdr(pvals: Sequence[float], q: float = 0.10) -> np.ndarray:
         kmax = np.max(np.where(passed)[0])
         out[order[:kmax + 1]] = True
     return out
-
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L0-C+  ARC 전용 헬퍼 — 분기 시간축 / 횡단면 직교화 / IC                                  ║
@@ -678,14 +438,12 @@ def rebal_dates(start, end) -> pd.DatetimeIndex:
                 out.append(t)
     return pd.DatetimeIndex(sorted(out))
 
-
 def qlabel(ts) -> str:
     """Timestamp → 'YYYYQn'. 분기 라벨은 문자열로만 다룬다(정수 인코딩은 연말 경계에서 깨진다)."""
     t = as_ts(ts)
     if t is None:
         return ""
     return f"{t.year}Q{(t.month - 1) // 3 + 1}"
-
 
 def qshift(qs: str, k: int) -> str:
     """'2019Q3', -1 → '2019Q2' / '2019Q3', -4 → '2018Q3'."""
@@ -695,16 +453,6 @@ def qshift(qs: str, k: int) -> str:
     y, q = int(m.group(1)), int(m.group(2))
     n = y * 4 + (q - 1) + k
     return f"{n // 4}Q{n % 4 + 1}"
-
-
-def qend(qs: str) -> Optional[pd.Timestamp]:
-    """'2019Q3' → 2019-09-30 (분기 결산기준일)."""
-    m = re.match(r"^(\d{4})Q([1-4])$", str(qs or ""))
-    if not m:
-        return None
-    y, q = int(m.group(1)), int(m.group(2))
-    return as_ts(f"{y}-{q*3:02d}-01") + pd.offsets.MonthEnd(0)
-
 
 def prev_quarter_of(asof) -> str:
     """리밸일 시점에 '이미 종료된' 직전 분기 라벨.
@@ -716,10 +464,6 @@ def prev_quarter_of(asof) -> str:
     if t is None:
         return ""
     return qlabel(t - pd.offsets.QuarterEnd(1)) if t.day <= 15 else qlabel(t)
-
-
-ARC_CELL_LADDER = ("cell", "cell_all")
-
 
 def xsec_z_arc(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.Series:
     """ARC 셀 사다리(cell → cell_all)를 적용한 횡단면 z-score.
@@ -739,20 +483,6 @@ def xsec_z_arc(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.S
         z = z.where(z.notna(), xsec_z(v, P["cell_all"], min_n))
     return z.astype("float32")
 
-
-def xsec_rank_arc(P: pd.DataFrame, name_or_series, min_n: int = CELL_MIN_N) -> pd.Series:
-    v = col(P, name_or_series) if isinstance(name_or_series, str) else \
-        pd.to_numeric(pd.Series(name_or_series), errors="coerce")
-    v = pd.Series(np.asarray(v, dtype="float64"), index=P.index)
-    if v.notna().sum() == 0:
-        return pd.Series(np.nan, index=P.index, dtype="float32")
-    r = xsec_rank_pct(v, P["cell"], min_n) if "cell" in P.columns else \
-        pd.Series(np.nan, index=P.index, dtype="float32")
-    if "cell_all" in P.columns and r.isna().any():
-        r = r.where(r.notna(), xsec_rank_pct(v, P["cell_all"], min_n))
-    return r.astype("float32")
-
-
 def winsor_series(s, p: float = 0.01) -> pd.Series:
     """백분위 기준 상하위 p 윈저라이즈. ±inf 를 먼저 NaN 으로 바꾼다(§C5 와 동일한 이유)."""
     v = pd.to_numeric(pd.Series(s), errors="coerce").replace([np.inf, -np.inf], np.nan)
@@ -763,7 +493,6 @@ def winsor_series(s, p: float = 0.01) -> pd.Series:
 
 
 OLS_MIN_OBS_PER_PARAM = 5      # 횡단면 회귀 자유도 하한 (관측수 / 파라미터수)
-
 
 def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
     """단일 횡단면 OLS 잔차. 절편은 호출자가 넣지 않아도 여기서 붙인다.
@@ -782,12 +511,7 @@ def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarra
     A = np.column_stack([np.ones(n), X])
     ok = np.isfinite(y) & np.isfinite(A).all(axis=1)
     out = np.full(n, np.nan)
-    # ★ 자유도 가드를 파라미터 수의 '비율'로 잡는다. p+3 은 너무 헐거웠다 —
-    #   통제변수 6개 + 섹터더미 7개 + 절편 = 14 파라미터인데 관측 17개면 통과했고,
-    #   그때 잔차와 원신호의 상관은 0.42 에 불과했다(나머지 58%가 적합오차). 그러면
-    #   '직교화된 톤'이 실제로는 규모·모멘텀·섹터의 결정적 함수, 즉 위장된 사이즈 베팅이
-    #   되고 그 값이 FINAL_SCORE 의 50% 를 차지한다. 실측 상관: n=17 0.42 · n=30 0.74 ·
-    #   n=60 0.88 · n=120 0.94. 5p 를 최소선으로 둔다.
+    #   (상세 근거는 커밋 로그 참조)
     if ok.sum() < max(A.shape[1] + 3, OLS_MIN_OBS_PER_PARAM * A.shape[1]):
         return out
     Ao, yo = A[ok], y[ok]
@@ -802,7 +526,6 @@ def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarra
 
 
 XSEC_RESID_DOF: List[dict] = []      # 직교화 자유도 진단(셀별 관측수/파라미터수)
-
 
 def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
     """셀(=기간)별 횡단면 OLS 잔차. §5.3 직교화의 실행부.
@@ -837,7 +560,6 @@ def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
                  f"최소 비율 {min(d['ratio'] for d in _thin):.1f} · 파라미터 {n_par}개")
     return out.astype("float32")
 
-
 def measurable_ret(R: pd.DataFrame, key: str = "ret") -> pd.Series:
     """성과·유의성 계산에 쓸 수익률 시계열. **측정 불가 분기를 일관되게 제외한다.**
 
@@ -853,7 +575,6 @@ def measurable_ret(R: pd.DataFrame, key: str = "ret") -> pd.Series:
         Rm = R
     return Rm.set_index("asof")[key]
 
-
 def newey_west_p(x, lags: Optional[int] = None) -> float:
     """HAC t → 양측 p-value. scipy 가 없으면 정규근사로 폴백한다."""
     a = np.asarray(x, dtype=float)
@@ -868,7 +589,6 @@ def newey_west_p(x, lags: Optional[int] = None) -> float:
         return float(2.0 * (1.0 - _st.t.cdf(abs(t), df=max(1, len(a) - 1))))
     except Exception:
         return float(math.erfc(abs(t) / math.sqrt(2.0)))
-
 
 def info_coef(sig, fwd, groups) -> Tuple[float, float, int]:
     """기간별 Spearman IC 의 (평균, IC-IR, 기간수).
@@ -904,32 +624,11 @@ def info_coef(sig, fwd, groups) -> Tuple[float, float, int]:
     #   뒤집힌다. 소비 측은 info_coef_full() 로 IR 과 t 를 분리해 받는다.
     return (mu, (mu / sd * math.sqrt(len(arr))) if sd > 0 else float("nan"), len(arr))
 
-
 def info_coef_full(sig, fwd, groups) -> Tuple[float, float, float, int]:
     """(평균 IC, IC-IR = mean/std, t통계량 = IR×√n, 기간수). 표에 쓸 때는 이쪽을 쓴다."""
     mu, tstat, n = info_coef(sig, fwd, groups)
     ir = (tstat / math.sqrt(n)) if (n > 0 and np.isfinite(tstat)) else float("nan")
     return (mu, ir, tstat, n)
-
-
-def next_trading_on_or_after(trading_days: np.ndarray, t) -> Optional[pd.Timestamp]:
-    """t 이상인 첫 거래일. 없으면 None. (달력 리밸일 → 실제 체결일 변환)"""
-    tt = as_ts(t)
-    if tt is None or trading_days is None or len(trading_days) == 0:
-        return None
-    i = int(np.searchsorted(trading_days, np.datetime64(tt), side="left"))
-    return as_ts(trading_days[i]) if i < len(trading_days) else None
-
-
-def shift_trading_days(trading_days: np.ndarray, t, k: int) -> Optional[pd.Timestamp]:
-    """t 를 기준으로 k 거래일 이동(±). 강건성 검사 '리밸런싱 ±5거래일'에 쓴다."""
-    tt = as_ts(t)
-    if tt is None or trading_days is None or len(trading_days) == 0:
-        return None
-    i = int(np.searchsorted(trading_days, np.datetime64(tt), side="left")) + int(k)
-    i = max(0, min(len(trading_days) - 1, i))
-    return as_ts(trading_days[i])
-
 
 def assert_no_dup_cols_arc(df: pd.DataFrame, where: str) -> pd.DataFrame:
     """중복 컬럼은 pandas 에서 예외 없이 의미가 바뀐다(df[c] 가 DataFrame 이 된다).
@@ -942,7 +641,6 @@ def assert_no_dup_cols_arc(df: pd.DataFrame, where: str) -> pd.DataFrame:
                            f"pandas 연산의 의미가 바뀌므로 여기서 중단합니다.")
     return df
 
-
 def ensure_cols(df: pd.DataFrame, cols: Sequence[str], fill=np.nan) -> pd.DataFrame:
     """계약 컬럼 보장. 수집이 얼마나 실패하든 패널의 컬럼 집합은 항상 같아야 한다.
 
@@ -954,16 +652,9 @@ def ensure_cols(df: pd.DataFrame, cols: Sequence[str], fill=np.nan) -> pd.DataFr
             df[c] = fill
     return df
 
-
 def arc_kd_lag(df: pd.DataFrame, days: int = None) -> pd.DataFrame:
     """§4 시점 규약 — DART 파생 테이블의 knowledge_date 에 T+거래일 지연을 적용한다.
-
     ★ 왜 필요한가: `_knowledge_from_rcept` 는 접수일자(rcept_dt) 를 그대로 knowledge_date 로
-      쓴다. 그러면 '접수 당일'에 그 재무제표를 쓸 수 있게 되는데, 명세 §4 는
-      "rcept_dt(접수일자) + 1거래일부터 사용 가능" 을 규정한다. 접수는 장중에도 일어나므로
-      당일 사용은 실행 불가능한 정보 접근이다 — 작지만 명백한 미래누수다.
-      D1(31 모듈)은 이미 명시적으로 +1 을 더하고 있어, 여기서 재무·직원·주식수·감사의견
-      계열도 같은 규약으로 맞춘다. A19 계약검정이 이를 강제한다.
     """
     d = int(days if days is not None else globals().get("ARC_DART_LAG_DAYS", 1))
     if df is None or len(df) == 0 or "knowledge_date" not in getattr(df, "columns", []):

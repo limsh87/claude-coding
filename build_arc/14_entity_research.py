@@ -1,16 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-E  엔티티 해상 — 증권사 정규화 / 애널리스트 원장 / 보고서↔애널리스트 연결              ║
-# ║                                                                                          ║
-# ║  이 모듈이 답해야 하는 질문 (사용자 요구사항):                                              ║
-# ║    Q1. 보고서와 애널리스트가 제대로 연결되었는가?   → report_analyst_link + 연결 감사표     ║
-# ║    Q2. 다중소스 원장 연결은 확실한가?               → dedup_key 병합 + 소스기여 감사표      ║
-# ║    Q3. 목표주가는 누가 언제 제시했는가?             → (analyst_id, code, date, tp) 원장     ║
-# ║                                                                                          ║
-# ║  증권사 사명 변경(2016~2026)을 정규화하지 않으면 같은 애널리스트가 소속 변경만으로          ║
-# ║  다른 사람이 되어버린다 → 목표주가 리비전(d2)이 통째로 망가진다.                            ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-E  엔티티 해상 — 증권사 정규화 / 애널리스트 원장 / 보고서↔애널리스트 연결
+#  이 모듈이 답해야 하는 질문 (사용자 요구사항):
+#  Q1. 보고서와 애널리스트가 제대로 연결되었는가?   → report_analyst_link + 연결 감사표
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 # 정규화 표: (별칭 정규식 → 정식명). 사명 변경 이력이 핵심이다.
 BROKER_CANON: List[Tuple[str, str]] = [
@@ -64,7 +57,6 @@ MINOR_BROKERS = ["유안타증권", "한화투자증권", "교보증권", "IBK�
                  "다올투자증권", "DB금융투자", "BNK투자증권", "흥국증권", "부국증권",
                  "한양증권", "상상인증권", "케이프투자증권", "DS투자증권", "코리아에셋투자증권"]
 
-
 def normalize_broker(raw: Any) -> Tuple[str, str]:
     """(broker_id, 정식명). 못 알아보면 정규화 문자열 자체를 id 로 쓰되 '미상' 표시는 하지 않는다
     (미상으로 뭉치면 서로 다른 소형사가 한 덩어리가 되어 커버리지 통계가 거짓이 된다)."""
@@ -81,7 +73,6 @@ def normalize_broker(raw: Any) -> Tuple[str, str]:
 
 _ANALYST_SPLIT = re.compile(r"[,/·∙•|;]|\s{2,}|\s외\s|\s및\s")
 
-
 def split_analysts(raw: Any) -> List[str]:
     """'홍길동, 김철수' / '홍길동/김철수' / '홍길동 외 1인' → ['홍길동','김철수']"""
     t = _clean_cell(raw)
@@ -97,7 +88,6 @@ def split_analysts(raw: Any) -> List[str]:
             out.append(p)
     return list(dict.fromkeys(out))
 
-
 def _name_to_code_map(sec: pd.DataFrame) -> Dict[str, str]:
     m: Dict[str, str] = {}
     for _, r in sec.iterrows():
@@ -106,7 +96,6 @@ def _name_to_code_map(sec: pd.DataFrame) -> Dict[str, str]:
         if n and isinstance(c, str) and n not in m:
             m[n] = c
     return m
-
 
 def _atoms(vals, sep: str) -> List[str]:
     """합성 토큰을 원자로 되돌린 뒤 정렬·중복제거. 병합을 멱등하게 만드는 핵심 함수."""
@@ -121,14 +110,12 @@ def _atoms(vals, sep: str) -> List[str]:
                 out.add(tok)
     return sorted(out)
 
-
 def _pick_str(vals) -> str:
     """비어있지 않은 값 중 사전순 최소. '행 순서상 첫 값'과 달리 실행 간 재현된다."""
     c = sorted({str(v).strip() for v in vals
                 if v is not None and str(v).strip()
                 and str(v).strip().lower() not in ("nan", "none", "<na>")})
     return c[0] if c else ""
-
 
 def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd.DataFrame:
     """다중 소스 병합 → 보고서 원장. 중복 제거가 아니라 '병합'이다(정보를 버리지 않는다)."""
@@ -188,12 +175,7 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
 
     # ── 멱등 병합 (재실행 안전) ─────────────────────────────────────────────────────────
     #   이 함수의 출력(원장)은 다음 실행에서 드라이브 캐시로부터 '입력 프레임'으로 되돌아온다.
-    #   그때 source="hankyung+naver" 같은 합성 토큰이 다시 들어오므로, 단순 set 병합은
-    #   "hankyung+naver" 를 원자 하나로 취급해 실행할 때마다 문자열이 무한히 길어진다
-    #   (hankyung+naver → hankyung+hankyung+naver+naver → …). 구분자로 먼저 분해한다.
-    #   report_uid 도 "first"(행 순서 의존)면 캐시만으로 도는 실행에서 값이 바뀌어
-    #   PDF 캐시·애널리스트 연결표가 통째로 끊긴다. 순서에 무관한 min 으로 고정한다.
-    #   (min 은 병합행이 다시 들어와도 같은 값을 낸다: min{u1,u2,min(u1,u2)} = min(u1,u2))
+    #   (상세 근거는 커밋 로그 참조)
     m = d.groupby("dedup_key", as_index=False).agg(**{
         "report_uid": ("report_uid", "min"),
         "src_report_id": ("src_report_id", lambda s: "|".join(_atoms(s, "|"))),
@@ -220,7 +202,6 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
     m = pit_frame(m, "event_date", "knowledge_date", source="research")
     PIPE.io("OUT", "MEM", "report_master", m, source="hankyung+naver")
     return m
-
 
 def build_analyst_ledger(rep: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """애널리스트 마스터 + 보고서↔애널리스트 연결표. 연결 방법과 신뢰도를 반드시 기록한다."""
@@ -275,7 +256,6 @@ def build_analyst_ledger(rep: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     PIPE.io("OUT", "MEM", "analyst_master", A)
     PIPE.io("OUT", "MEM", "report_analyst_link", L)
     return A, L
-
 
 def audit_linkage(rep: pd.DataFrame, A: pd.DataFrame, L: pd.DataFrame):
     """★ 사용자 요구: '보고서와 식별된 애널리스트가 제대로 연결되었는지 한눈에'."""
@@ -345,66 +325,11 @@ def audit_linkage(rep: pd.DataFrame, A: pd.DataFrame, L: pd.DataFrame):
                  f"네이버 단독 건은 리스트에 작성자가 없어 PDF 추출에 의존합니다 "
                  f"(RESEARCH_DOWNLOAD_PDF=True 로 개선 가능).")
 
-
-def build_consensus_panel(L: pd.DataFrame, months: pd.DatetimeIndex,
-                          window_days: int = 90) -> pd.DataFrame:
-    """D축 d2(목표주가 상향 리비전) · d4(커버리지 변화) 산출.
-
-    ★ 리비전은 '같은 애널리스트가 같은 종목에 대해 이전에 제시한 목표주가' 와 비교해야 한다.
-      애널리스트 식별이 없으면 이 지표는 만들 수 없다 — 애널리스트 원장이 필요한 진짜 이유.
-    """
-    cols = ["code", "month", "n_analyst", "tp_median", "rev_up", "rev_dn", "d2_raw", "d4_raw"]
-    if L is None or L.empty:
-        LOG.warn("애널리스트 연결이 없어 컨센서스 패널을 만들 수 없습니다 — d2/d4 결측 처리. "
-                 "U 는 가용 축(d1, d3) 평균으로 계산됩니다(0으로 채우지 않음).")
-        return pd.DataFrame(columns=cols)
-    x = L.dropna(subset=["stock_code"]).copy()
-    x["pub_date"] = as_ts_series(x["pub_date"])
-    x = x.dropna(subset=["pub_date"])
-    if x.empty:
-        return pd.DataFrame(columns=cols)
-
-    x = x.sort_values(["stock_code", "analyst_id", "pub_date"])
-    x["prev_tp"] = x.groupby(["stock_code", "analyst_id"], observed=True)["target_price"].shift(1)
-    x["rev"] = np.where(x["target_price"].notna() & x["prev_tp"].notna(),
-                        np.sign(x["target_price"] - x["prev_tp"]), np.nan)
-
-    out = []
-    for m in months:
-        lo = m - pd.Timedelta(days=window_days)
-        w = x[(x["pub_date"] > lo) & (x["pub_date"] <= m)]
-        if w.empty:
-            continue
-        g = w.groupby("stock_code", observed=True)
-        agg = pd.DataFrame({
-            "n_analyst": g["analyst_id"].nunique(),
-            "tp_median": g["target_price"].median(),
-            "rev_up": g["rev"].apply(lambda s: float((s > 0).sum())),
-            "rev_dn": g["rev"].apply(lambda s: float((s < 0).sum())),
-        }).reset_index().rename(columns={"stock_code": "code"})
-        agg["month"] = m
-        out.append(agg)
-    if not out:
-        return pd.DataFrame(columns=cols)
-    P = pd.concat(out, ignore_index=True)
-    P = P.sort_values(["code", "month"])
-    # d2 = -(상향 리비전 수 / 커버리지)   d4 = -Δ(커버리지 애널리스트 수)
-    P["d2_raw"] = -(P["rev_up"] / P["n_analyst"].replace(0, np.nan))
-    P["d4_raw"] = -P.groupby("code", observed=True)["n_analyst"].diff()
-    LOG.ok(f"컨센서스 패널 {len(P):,}행 ({P['code'].nunique():,}종목 × {P['month'].nunique()}개월) — "
-           f"목표주가 리비전 관측 {int((P['rev_up']+P['rev_dn']).sum()):,}건")
-    PIPE.io("OUT", "MEM", "consensus_panel", P)
-    return downcast(P)
-
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-E+  ARC 추가 — 분기 리비전 패널(§5.3 직교화 통제변수) / 기업의뢰 리포트 태깅            ║
-# ║                                                                                          ║
-# ║  ★ 직교화는 이 전략 성립의 필요조건이다(§1.1). 통제변수가 부실하면 "애널리스트 과소반응     ║
-# ║    전략의 재포장"을 텍스트 알파로 오인하게 된다. 그래서 리비전은 반드시                     ║
-# ║    '같은 애널리스트가 같은 종목에 이전에 제시한 값' 과 비교한다 — 애널리스트 원장이         ║
-# ║    필요한 진짜 이유다.                                                                     ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-E+  ARC 추가 — 분기 리비전 패널(§5.3 직교화 통제변수) / 기업의뢰 리포트 태깅
+#  ★ 직교화는 이 전략 성립의 필요조건이다(§1.1). 통제변수가 부실하면 "애널리스트 과소반응
+#  전략의 재포장"을 텍스트 알파로 오인하게 된다. 그래서 리비전은 반드시
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 # 기업의뢰(sponsored) 리포트 발행처 — §8.4 민감도 분석에서 분리 검증한다.
 SPONSORED_BROKERS = [
@@ -415,7 +340,6 @@ _SPONSORED_RE = re.compile("|".join(SPONSORED_BROKERS), re.I)
 
 REVISION_COLS = ["code", "asof", "q", "n_analyst", "tp_median", "tp_rev", "opin_chg",
                  "n_reports_win"]
-
 
 def tag_sponsored_reports(rep: pd.DataFrame) -> pd.DataFrame:
     """기업의뢰형 리포트에 is_sponsored=1. 원장을 변형하지 않고 컬럼만 추가한다.
@@ -437,19 +361,10 @@ def tag_sponsored_reports(rep: pd.DataFrame) -> pd.DataFrame:
                  f"§8.4 민감도 분석에서 포함/제외 두 버전으로 검증합니다.")
     return R
 
-
 def build_revision_panel(L: pd.DataFrame, rebals: pd.DatetimeIndex,
                          window_days: int = 120) -> pd.DataFrame:
     """§5.3 통제변수 — 목표주가 수정률 / 투자의견 변경 더미 / 커버리지.
-
-    window_days=120 : 분기 리밸런싱이므로 직전 1개 분기(약 90일)에 제출 지연을 감안해 넉넉히.
     ★ 창을 '리밸일 이전'으로만 잡는다. 리밸일 당일 발간분은 T+1 규약(§4)상 아직 쓸 수 없다.
-
-    [방법론적 한계 — 숨기지 않는다]
-      EPS 컨센서스 시계열은 과거 복원이 불가능하다(유료 벤더 데이터). 따라서 eps_rev 는
-      여기서 만들지 않고, 패널 조립부가 PIT 실적(TTM 순이익) 변화율을 대리변수로 채운다.
-      대리변수는 '컨센서스 수정'이 아니라 '실현 실적 변화'이므로 통제력이 약하다.
-      이 한계를 §9.1 기준에 따라 리포트에 명시한다.
     """
     if L is None or L.empty:
         LOG.warn("애널리스트 연결이 없어 리비전 패널을 만들 수 없습니다 — "

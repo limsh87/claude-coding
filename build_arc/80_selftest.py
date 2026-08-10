@@ -1,22 +1,13 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L0-F  합성데이터 엔드투엔드 스모크                                                        ║
-# ║                                                                                          ║
-# ║  실데이터를 한 바이트도 받기 전에 계산경로 전체를 합성데이터로 통과시킨다.                   ║
-# ║  목적은 성과 측정이 아니라 **배관 검증**이다. 실수집은 수 시간~수 일이 걸리는데              ║
-# ║  그걸 다 받은 뒤 조립부에서 터지면 그 시간이 통째로 날아간다.                                ║
-# ║                                                                                          ║
-# ║  ★ 합성데이터에 '진짜 알파'를 심는다. quality[i] 가 높으면 ① ΔTONE↑ ② 문서변화↓            ║
-# ║    ③ D2 지표 우수 ④ ΔNONFIN↑ ⑤ 미래수익↑. 그래야 하네스가 신호에 반응하는지 검증된다.       ║
-# ║  ★ 엣지 케이스를 반드시 섞는다: 기간 중 상장/폐지, 축 A 결측 20%, D1 결측 15%,              ║
-# ║    배제 발동 10%. 각각이 회귀 방지 장치다.                                                  ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L0-F  합성데이터 엔드투엔드 스모크
+#  ★ 합성데이터에 '진짜 알파'를 심는다. quality[i] 가 높으면 ① ΔTONE↑ ② 문서변화↓
+#  ★ 엣지 케이스를 반드시 섞는다: 기간 중 상장/폐지, 축 A 결측 20%, D1 결측 15%,
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 _SYN_VOCAB = [f"어휘{i:03d}" for i in range(400)] + \
              ["매출", "영업이익", "제조", "판매", "고객", "설비", "연구개발", "특허", "수출",
               "계약", "소송", "우발", "지배구조", "임원", "직원", "위험", "환율", "경쟁"]
-
 
 def make_arc_synthetic(n_codes: int = 220, n_years: int = 8, seed: int = SEED) -> dict:
     rng = np.random.default_rng(seed)
@@ -34,11 +25,7 @@ def make_arc_synthetic(n_codes: int = 220, n_years: int = 8, seed: int = SEED) -
     inds = rng.choice(["반도체", "제약", "화학", "기계", "음식료", "은행"], n_codes)
 
     quality = rng.normal(size=n_codes)
-    # ★ 축 A 는 '수준' 이 아니라 '변화(ΔTONE)' 를 신호로 쓴다. 합성에서 톤을 quality 의
-    #   상수배로만 만들면 ΔTONE 은 정의상 순수 잡음이 되어, 축 A 경로가 신호를 잡을 수
-    #   있는지 자체를 검증하지 못한다(초기 빌드에서 A1 의 IC 가 0 으로 나온 이유).
-    #   → 시간가변 잠재변수 mood[i, t] 를 랜덤워크로 만들고, 톤과 '다음 분기 수익' 을
-    #     모두 Δmood 에 연동한다. 그래야 '톤 변화가 수익에 선행' 하는 구조가 심긴다.
+    #   (상세 근거는 커밋 로그 참조)
     n_reb = len(rebals)
     mood = np.cumsum(rng.normal(0, 0.55, size=(n_codes, n_reb)), axis=1)
     dmood = np.diff(mood, axis=1, prepend=mood[:, :1])
@@ -253,7 +240,6 @@ def make_arc_synthetic(n_codes: int = 220, n_years: int = 8, seed: int = SEED) -
             "doc_tokens": doc_tokens, "snap_mc": snap_mc, "rebals": rebals,
             "quality": quality}
 
-
 def _syn_build_panel(S: dict) -> Tuple[pd.DataFrame, Any, dict]:
     """합성데이터로 실제 파이프라인 함수를 그대로 통과시킨다(모의 구현 금지)."""
     rebals = S["rebals"]
@@ -294,7 +280,6 @@ def _syn_build_panel(S: dict) -> Tuple[pd.DataFrame, Any, dict]:
     P = attach_axis_a(P, tone_q, rev)
     P = attach_volatility(P, px)
     return P, uni, {"pairs": pairs, "d1": d1, "tone_q": tone_q, "rev": rev}
-
 
 def run_selftest(full_chain: bool = False) -> bool:
     """full_chain=True 면 성과·어블레이션·BH-FDR·강건성·해석표까지 전부 합성으로 예행연습."""

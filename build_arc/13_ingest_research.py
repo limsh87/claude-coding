@@ -1,22 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-D  애널리스트 리포트 수집 — 한경컨센서스 + 네이버금융리서치                            ║
-# ║                                                                                          ║
-# ║  두 소스의 역할이 다르다. 합쳐야 원장이 완성된다:                                          ║
-# ║    · 한경컨센서스(skinType=business) : 작성자(애널리스트)·적정가격·투자의견을 리스트에서    ║
-# ║      바로 준다. 1요청에 최대 수백 행 → 애널리스트 원장의 1순위 소스.                       ║
-# ║      단, 종목코드가 컬럼에 없다. 제목의 "종목명(005930)" 에서 뽑아야 한다.                 ║
-# ║    · 네이버금융리서치 : 종목코드를 td[0] a.stock_item href 에 확실히 준다.                 ║
-# ║      애널리스트명은 리스트에 없다(PDF/상세에 있음). 커버리지 폭이 넓다.                    ║
-# ║                                                                                          ║
-# ║  ⚠ 두 사이트 모두 robots.txt 가 Disallow: / 다. 사용자가 명시적으로 수집을 지시했으므로     ║
-# ║    수행하되, 초당 요청을 보수적으로 제한하고(RATE_LIMIT_QPS) 이 사실을 로그에 명시한다.     ║
-# ║  ⚠ PDF 원문은 증권사 저작물이다. 로컬 캐시/분석 용도로만 쓰고 재배포하지 말 것.             ║
-# ║                                                                                          ║
-# ║  파싱 전략: 컬럼 인덱스를 믿지 않는다. <th> 헤더 텍스트로 매핑하고, 헤더가 없을 때만        ║
-# ║  내용 기반 휴리스틱으로 폴백한다. (공개 스크래퍼들의 컬럼 인덱스가 서로 모순되기 때문)      ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-D  애널리스트 리포트 수집 — 한경컨센서스 + 네이버금융리서치
+#  두 소스의 역할이 다르다. 합쳐야 원장이 완성된다:
+#  · 한경컨센서스(skinType=business) : 작성자(애널리스트)·적정가격·투자의견을 리스트에서
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 HK_BASE = "https://consensus.hankyung.com"
 HK_LIST = HK_BASE + "/analysis/list"
@@ -41,10 +28,8 @@ _OPINION_MAP = {
 }
 _NULL_TOKENS = {"", "-", "--", "0", "n/a", "na", "없음", "투자의견없음", "nr", "not rated", "제시안함"}
 
-
 def _clean_cell(x: Any) -> str:
     return re.sub(r"\s+", " ", str(x or "")).strip()
-
 
 def _dedup_repeat(s: str) -> str:
     """한경 제목이 'ABCABCABC' 처럼 2~3회 반복되어 나오는 알려진 버그를 되돌린다."""
@@ -58,7 +43,6 @@ def _dedup_repeat(s: str) -> str:
             if unit * k == s:
                 return unit
     return s
-
 
 def parse_target_price(x: Any) -> Optional[float]:
     """'123,000'→123000.  '0'/'-'/'없음' → None.
@@ -74,7 +58,6 @@ def parse_target_price(x: Any) -> Optional[float]:
         return None
     return v
 
-
 def parse_opinion(x: Any) -> Optional[str]:
     t = _clean_cell(x)
     if t.lower() in _NULL_TOKENS:
@@ -87,7 +70,6 @@ def parse_opinion(x: Any) -> Optional[str]:
 
 
 _YYMMDD = re.compile(r"^\s*(\d{2})[.\-/](\d{2})[.\-/](\d{2})\s*$")
-
 
 def parse_kr_date(s: Any) -> Optional[str]:
     """★ 네이버 리스트의 'YY.MM.DD' 를 반드시 명시 포맷으로 파싱한다.
@@ -116,17 +98,14 @@ def parse_kr_date(s: Any) -> Optional[str]:
 
 _CODE_IN_TITLE = re.compile(r"[（(]\s*([0-9]{6})\s*[)）]")
 
-
 def code_from_title(title: str) -> Optional[str]:
     m = _CODE_IN_TITLE.search(str(title or ""))
     return m.group(1) if m else None
-
 
 def name_from_title(title: str) -> str:
     t = _clean_cell(title)
     m = _CODE_IN_TITLE.search(t)
     return _clean_cell(t[: m.start()]) if m else ""
-
 
 # ── 헤더 기반 테이블 파서 (컬럼 인덱스 불신 원칙) ────────────────────────────────────────────
 def _table_headers(table) -> List[str]:
@@ -138,12 +117,10 @@ def _table_headers(table) -> List[str]:
             break
     return hdr
 
-
 def _row_map(headers: List[str], tds: List) -> Dict[str, Any]:
     if headers and len(headers) == len(tds):
         return {headers[i]: tds[i] for i in range(len(tds))}
     return {}
-
 
 def _pick(rowmap: Dict[str, Any], *names) -> Optional[Any]:
     for n in names:
@@ -152,10 +129,8 @@ def _pick(rowmap: Dict[str, Any], *names) -> Optional[Any]:
                 return v
     return None
 
-
 # ── 한경컨센서스 ────────────────────────────────────────────────────────────────────────────
 _HK_LAYOUT_LOGGED = set()
-
 
 def _hk_parse(html: str, category: str) -> List[dict]:
     soup = soup_of(html)
@@ -238,7 +213,6 @@ def _hk_parse(html: str, category: str) -> List[dict]:
         })
     return out
 
-
 def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
                      page_size: int = 80, max_pages: int = 400) -> pd.DataFrame:
     """연도 단위로 쪼개서 수집. 한 번에 10년을 요청하면 서버 페이지 상한에 걸린다."""
@@ -303,7 +277,6 @@ def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
     PIPE.io("IN", "HTTP", "hankyung:analysis/list", d, source=HK_LIST)
     return d
 
-
 # ── 네이버 금융 리서치 ──────────────────────────────────────────────────────────────────────
 NV_CATS = {
     "company": ("company_list.naver", "company_read.naver"),
@@ -313,9 +286,6 @@ NV_CATS = {
     "economy": ("economy_list.naver", "economy_read.naver"),
     "debenture": ("debenture_list.naver", "debenture_read.naver"),
 }
-_NV_PDF_RE = re.compile(r"/stock-research/(\w+)/(\d+)/(\d{8})_(\w+)_(\d+)\.pdf")
-
-
 def _nv_parse_list(html: str, cat: str) -> List[dict]:
     soup = soup_of(html)
     if soup is None:
@@ -380,7 +350,6 @@ def _nv_parse_list(html: str, cat: str) -> List[dict]:
         })
     return out
 
-
 def _nv_last_page(html: str) -> int:
     soup = soup_of(html)
     if soup is None:
@@ -391,7 +360,6 @@ def _nv_last_page(html: str) -> int:
         if m:
             mx = max(mx, int(m.group(1)))
     return mx
-
 
 def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
                        hard_cap: int = 60000) -> pd.DataFrame:
@@ -434,7 +402,6 @@ def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
     if len(d):
         d = d[d["src_report_id"].astype(str).str.len() > 0]
     return d
-
 
 def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "industry"),
                   max_pages: int = 1500) -> pd.DataFrame:
@@ -481,7 +448,6 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     LOG.ok(f"네이버 리서치 {len(d):,}건 (종목코드 보유 {int(d['stock_code'].notna().sum()):,})")
     PIPE.io("IN", "HTTP", "naver:research", d, source=NV_BASE)
     return d
-
 
 def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다."""
@@ -536,7 +502,6 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
     LOG.ok(f"네이버 상세 보강 — 목표주가 {int(got['target_price'].notna().sum()):,}건 추가 확보")
     return df
 
-
 # ── PDF 원문 ────────────────────────────────────────────────────────────────────────────────
 _ANALYST_LINE = re.compile(
     r"([가-힣]{2,4})\s*(?:연구원|애널리스트|수석|책임|선임)?\s*"
@@ -545,7 +510,6 @@ _ANALYST_LINE = re.compile(
 _EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _TP_PAT = re.compile(r"(?:목표\s*주가|목표주가|적정\s*주가|적정주가|TP)\s*[:：(]?\s*"
                      r"(?:원\)?\s*)?([0-9][0-9,]{2,9})")
-
 
 def pdf_text(data: bytes, max_pages: int = 3) -> str:
     """1페이지 헤더/푸터에 애널리스트명·이메일·목표주가가 몰려 있다. 앞 3장이면 충분하다."""
@@ -565,7 +529,6 @@ def pdf_text(data: bytes, max_pages: int = 3) -> str:
             pass
     return ""
 
-
 def pdf_extract_fields(text: str) -> dict:
     out = {"pdf_analysts": "", "pdf_emails": "", "pdf_target": None}
     if not text:
@@ -582,7 +545,6 @@ def pdf_extract_fields(text: str) -> dict:
     if m:
         out["pdf_target"] = parse_target_price(m.group(1))
     return out
-
 
 def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     """PDF 를 공용 인덱스에 저장(내용해시 경로 → 중복 저장 없음)하고 본문 필드를 추출한다."""
@@ -626,11 +588,7 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
 
     jobs = list(zip(work["report_uid"].astype(str), work["pdf_url"].astype(str)))
 
-    # ★ 청크로 끊어 받는다. pmap_io 는 결과 리스트를 통째로 들고 있으므로, 한 번에 던지면
-    #   내려받은 PDF 본문 전부가 동시에 RAM 에 남는다. 목표치인 연 3만건 × 10년 = 30만건에
-    #   평균 300KB 를 곱하면 90GB 다. 캐시가 차 있어도 마찬가지다 — 캐시 경로도 blob 바이트를
-    #   그대로 반환하기 때문에 오히려 더 빨리 쌓인다. 청크 단위로 소비하고 버리면 상주량이
-    #   작업 수와 무관하게 평평해진다(약 600MB). 청크마다 flush 하므로 중간에 끊겨도 이어받는다.
+    #   (상세 근거는 커밋 로그 참조)
     PDF_CHUNK = 2000
     rows = []
     ok = 0
@@ -666,21 +624,14 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     PIPE.io("OUT", "DRIVE", "research:pdf", ext, source="hankyung/naver pdf")
     return df
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-D+  ARC 추가 — 리포트 '본문 전문' 저장소 (축 A TONE 의 유일한 입력)                    ║
-# ║                                                                                          ║
-# ║  기존 pdf_text() 는 앞 3장만 읽는다. 애널리스트명·목표주가를 뽑기엔 충분하지만              ║
-# ║  톤 분류는 문장이 필요하다 — 3장으론 표와 헤더뿐이라 문장이 거의 안 나온다.                 ║
-# ║                                                                                          ║
-# ║  ★ 본문을 매 실행마다 PDF 에서 다시 뽑으면 30만 건 × 수백 ms = 며칠이 걸린다.               ║
-# ║    그래서 추출 결과를 '연도 샤드 parquet' 으로 공용 인덱스에 저장한다.                      ║
-# ║    (단일 거대 parquet 금지 — 30만 건 × 20KB = 6GB 라 메모리에 못 올린다)                    ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-D+  ARC 추가 — 리포트 '본문 전문' 저장소 (축 A TONE 의 유일한 입력)
+#  ★ 본문을 매 실행마다 PDF 에서 다시 뽑으면 30만 건 × 수백 ms = 며칠이 걸린다.
+#  기존 pdf_text() 는 앞 3장만 읽는다. 애널리스트명·목표주가를 뽑기엔 충분하지만
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 RESEARCH_TEXT_MAXLEN = 12000        # 리포트당 저장 상한(문자). 톤 분류엔 이걸로 충분하다.
 RESEARCH_TEXT_SHARD = "research_report_text_{year}"
-
 
 def pdf_full_text(data: bytes, max_pages: Optional[int] = None) -> str:
     """리포트 본문 전문 추출. pdf_text() 의 확장판(페이지 수 상향 + 레이아웃 정리).
@@ -715,7 +666,6 @@ def pdf_full_text(data: bytes, max_pages: Optional[int] = None) -> str:
         except Exception:
             pass
     return ""
-
 
 def build_report_text_store(rep: pd.DataFrame, chunk: int = 1500) -> pd.DataFrame:
     """보고서 원장 → 본문 텍스트 저장소. 연도 샤드로 공용 인덱스에 영속화하고 증분 갱신.

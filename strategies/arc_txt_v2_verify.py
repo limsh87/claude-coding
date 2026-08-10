@@ -1,3 +1,8 @@
+"""ARC-TXT v2 검증 하네스 — 계약검정 A1~A39 / 실경로 리허설 / 합성 스모크.
+
+본체(arc_txt_v2.py)와 같은 폴더에 두면 SELFTEST=True 일 때 자동으로 실행된다.
+단독 실행은 불가하다(본체의 전역 이름을 쓴다). 없어도 본체는 완전히 동작한다.
+"""
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  계약 자동검정 A1~A39 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
@@ -1159,4 +1164,951 @@ def run_contract_tests(strict: bool = True) -> bool:
         return False
     LOG.ok(f"계약 {len([r for r in CONTRACT_RESULTS if r['pass'] is True])}건 전부 통과 "
            f"(건너뜀 {len([r for r in CONTRACT_RESULTS if r['pass'] is None])}건).")
+    return True
+
+
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L0-G  실경로 리허설 — 수집 함수를 '진짜로' 실행해 본다
+#  합성 스모크(80)는 완성된 패널을 주입한다. 즉 build_security_master · fetch_prices ·
+#  fetch_arc_documents · hankyung_collect 같은 실제 수집·정제 함수는 한 줄도 실행되지 않는다.
+# ────────────────────────────────────────────────────────────────────────────────────────
+
+REHEARSAL_RESULTS: List[dict] = []
+
+def _arh(name: str, fn: Callable, expect_rows: bool = True, note: str = ""):
+    t0 = time.time()
+    try:
+        out = fn()
+        n = len(out) if hasattr(out, "__len__") else (1 if out is not None else 0)
+        ok = (not expect_rows) or n > 0
+        REHEARSAL_RESULTS.append({
+            "name": name, "ok": ok, "rows": n, "sec": time.time() - t0,
+            "err": "" if ok else "정상 응답인데 결과가 0행입니다(파싱 실패 가능성)", "note": note})
+        return out
+    except Exception as e:                                        # noqa
+        REHEARSAL_RESULTS.append({
+            "name": name, "ok": False, "rows": -1, "sec": time.time() - t0,
+            "err": f"{type(e).__name__}: {str(e)[:200]}", "note": note,
+            "tb": traceback.format_exc()})
+        return None
+
+# ── 픽스처 ──────────────────────────────────────────────────────────────────────────────────
+def _afx_fdr_listing(n: int = 40) -> bytes:
+    rows = ["Code,ISU_CD,Name,Market,Dept,Close,ChagesRatio,Marcap,Stocks,MarketId"]
+    for i in range(n):
+        code = f"{(i+1)*10:06d}"          # 실제 보통주처럼 끝자리 0
+        rows.append(f"{code},KR7{code}003,합성{i+1:03d},{'KOSPI' if i%2 else 'KOSDAQ'},,"
+                    f"10000,0.5,1000000000,100000,{'STK' if i%2 else 'KSQ'}")
+    return ("﻿" + "\n".join(rows)).encode("utf-8")
+
+def _afx_fdr_delisting(n: int = 30) -> bytes:
+    rows = ["Symbol,Name,Market,SecuGroup,Kind,DelistingDate,ToSymbol,ToName,Reason"]
+    for i in range(n):
+        code = f"{900000+i:06d}" if i < 20 else f"KR{i:08d}"
+        rows.append(f"{code},폐지{i+1:03d},KOSPI,주권,보통주,{2017+(i%8)}-0{1+(i%9)}-15,,,상장폐지")
+    return ("﻿" + "\n".join(rows)).encode("utf-8")
+
+def _afx_kind(n: int = 30) -> bytes:
+    head = ("<table><tr><th>회사명</th><th>종목코드</th><th>업종</th><th>주요제품</th>"
+            "<th>상장일</th><th>결산월</th><th>대표자명</th><th>홈페이지</th><th>지역</th></tr>")
+    body = "".join(f"<tr><td>합성{i+1:03d}</td><td>{i+1}</td><td>화학</td><td>제품</td>"
+                   f"<td>2010-03-15</td><td>12월</td><td>홍길동</td><td>http://x</td>"
+                   f"<td>서울</td></tr>" for i in range(n))
+    return (head + body + "</table>").encode("euc-kr")
+
+def _afx_corpcode(n: int = 40) -> bytes:
+    buf = io.BytesIO()
+    xml = "<result>" + "".join(
+        f"<list><corp_code>C{i+1:07d}</corp_code><corp_name>합성{i+1:03d}</corp_name>"
+        f"<stock_code>{(i+1)*10:06d}</stock_code><modify_date>20240101</modify_date></list>"
+        for i in range(n)) + "</result>"
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("CORPCODE.xml", xml.encode("utf-8"))
+    return buf.getvalue()
+
+def _afx_fnltt(corp: str, year: int) -> dict:
+    def row(sj, aid, anm, amt):
+        return {"rcept_no": f"{year+1}0331000001", "reprt_code": "11011",
+                "bsns_year": str(year), "corp_code": corp, "sj_div": sj, "sj_nm": sj,
+                "account_id": aid, "account_nm": anm, "thstrm_amount": amt,
+                "frmtrm_amount": amt, "ord": "1"}
+    return {"status": "000", "message": "정상", "list": [
+        row("IS", "ifrs-full_Revenue", "매출액", "1,234,567,000,000"),
+        row("IS", "ifrs-full_CostOfSales", "매출원가", "900,000,000,000"),
+        row("IS", "dart_OperatingIncomeLoss", "영업이익", "120,000,000,000"),
+        row("IS", "ifrs-full_ProfitLoss", "당기순이익", "90,000,000,000"),
+        row("IS", "-표준계정코드 미사용-", "경상연구개발비", "30,000,000,000"),
+        row("BS", "ifrs-full_Inventories", "재고자산", "150,000,000,000"),
+        row("BS", "ifrs-full_TradeAndOtherCurrentReceivables", "매출채권및기타채권",
+            "180,000,000,000"),
+        row("BS", "ifrs-full_Assets", "자산총계", "3,000,000,000,000"),
+        row("BS", "ifrs-full_Liabilities", "부채총계", "1,200,000,000,000"),
+        row("BS", "ifrs-full_Equity", "자본총계", "1,800,000,000,000"),
+        row("BS", "ifrs-full_CashAndCashEquivalents", "현금및현금성자산", "300,000,000,000"),
+        row("BS", "ifrs-full_PropertyPlantAndEquipment", "유형자산", "800,000,000,000"),
+        row("CF", "ifrs-full_CashFlowsFromUsedInOperatingActivities", "영업활동현금흐름",
+            "140,000,000,000"),
+        row("CF", "ifrs-full_PurchaseOfPropertyPlantAndEquipment", "유형자산의 취득",
+            "-60,000,000,000"),
+    ]}
+
+def _afx_emp(corp: str, year: int) -> dict:
+    def r(bbm, sex, sm, tot):
+        return {"rcept_no": f"{year+1}0331000001", "corp_code": corp, "fo_bbm": bbm,
+                "sexdstn": sex, "sm": sm, "fyer_salary_totamt": tot,
+                "jan_salary_am": "70,000,000"}
+    return {"status": "000", "list": [
+        r("반도체", "남", "1,200", "96,000,000,000"), r("반도체", "여", "300", "21,000,000,000"),
+        r("합계", "합계", "1,500", "117,000,000,000")]}
+
+def _afx_shares(corp: str, year: int) -> dict:
+    return {"status": "000", "list": [
+        {"rcept_no": f"{year+1}0331000001", "corp_code": corp, "se": "보통주",
+         "isu_stock_totqy": "10,000,000", "now_to_isu_stock_totqy": "10,000,000",
+         "tesstk_co": "100,000", "istc_totqy": "10,000,000"},
+        {"rcept_no": f"{year+1}0331000001", "corp_code": corp, "se": "우선주",
+         "isu_stock_totqy": "1,000,000", "now_to_isu_stock_totqy": "1,000,000",
+         "tesstk_co": "0", "istc_totqy": "1,000,000"},
+        {"rcept_no": f"{year+1}0331000001", "corp_code": corp, "se": "합계",
+         "isu_stock_totqy": "11,000,000", "now_to_isu_stock_totqy": "11,000,000",
+         "tesstk_co": "100,000", "istc_totqy": "11,000,000"}]}
+
+def _afx_audit(corp: str, year: int) -> dict:
+    emph = "계속기업으로서의 존속능력에 대한 불확실성" if int(year) % 3 == 0 else ""
+    return {"status": "000", "list": [
+        {"rcept_no": f"{year+1}0331000001", "corp_code": corp, "bsns_year": str(year),
+         "adtor": "합성회계법인", "adt_opinion": "적정", "emphs_matter": emph,
+         "core_adt_matter": "수익인식"}]}
+
+def _afx_dart_list(bgn: str, ty: str) -> dict:
+    y = int(bgn[:4])
+    m = int(bgn[4:6])
+    items = []
+    if ty == "A" and m == 3:
+        for i in range(1, 4):
+            items.append({"corp_code": f"C{i:07d}", "corp_name": f"합성{i:03d}",
+                          "stock_code": f"{i:06d}", "rcept_no": f"{y}0320{i:06d}",
+                          "rcept_dt": f"{y}0320",
+                          "report_nm": f"사업보고서 ({y-1}.12)", "flr_nm": f"합성{i:03d}",
+                          "corp_cls": "Y"})
+    if ty == "B" and m == 7:
+        items.append({"corp_code": "C0000001", "corp_name": "합성001", "stock_code": "000001",
+                      "rcept_no": f"{y}0710000001", "rcept_dt": f"{y}0710",
+                      "report_nm": "주요사항보고서(전환사채발행결정)", "flr_nm": "합성001",
+                      "corp_cls": "Y"})
+        items.append({"corp_code": "C0000002", "corp_name": "합성002", "stock_code": "000002",
+                      "rcept_no": f"{y}0711000002", "rcept_dt": f"{y}0711",
+                      "report_nm": "단일판매ㆍ공급계약체결", "flr_nm": "합성002",
+                      "corp_cls": "Y"})
+    return {"status": "000" if items else "013", "page_no": 1, "total_page": 1, "list": items}
+
+# ★ 실제 사업보고서는 섹션당 수천~수만 자다. 픽스처가 너무 짧으면 fetch_arc_documents 의
+#   '본문 최소 길이' 와 섹션 최소 길이 필터에 걸려 0행이 되고, 리허설이 실제 경로를 검증하지
+#   못한다(초기 빌드에서 실제로 이 함정에 걸렸다). 문단을 반복해 현실적인 분량을 만든다.
+_AFX_SECTIONS = [
+    ("I. 회사의 개요",
+     "당사는 {year}년 12월 31일 현재 제{gi}기 사업연도를 마감하였습니다. "
+     "합성전자 주식회사는 {year}년 3월 20일에 본 보고서를 제출하였습니다. "
+     "자본금은 {a} 백만원이며 발행주식총수는 {b} 주입니다. "
+     "본점 소재지는 충청북도 청주시이며 지점은 {f} 개를 운영하고 있습니다. "),
+    ("II. 사업의 내용",
+     "당사는 반도체 소재를 제조하여 국내외에 판매하고 있습니다. {biz} "
+     "주요 원재료 매입액은 {c} 백만원이며 생산능력은 연간 {d} 톤입니다. "
+     "당사는 {year}년 중 유형자산 {e} 백만원을 취득하였습니다. "
+     "{year}년 {mm}월 특허 {f} 건을 등록하였습니다. "
+     "주요 매출처는 국내 대형 반도체 제조사이며 수출 비중은 {f} 퍼센트입니다. "
+     "생산 공정은 정제, 배합, 포장의 세 단계로 구성되어 있습니다. "),
+    ("III. 재무에 관한 사항",
+     "당기 매출액은 {c} 백만원이며 영업이익은 {a} 백만원입니다. "
+     "<table><tr><td>매출액</td><td>{c}</td></tr><tr><td>영업이익</td><td>{a}</td></tr></table> "
+     "부채비율은 안정적인 수준을 유지하고 있습니다. "),
+    ("VII. 이사의 경영진단 및 분석의견",
+     "{mda} 당기 매출은 {c} 백만원으로 전기 대비 증가하였습니다. "
+     "원가율은 전기 대비 소폭 상승하였으며 판매관리비는 통제 범위 내에서 관리되고 있습니다. "
+     "향후 자금 조달 계획과 유동성 관리 방안을 지속적으로 점검하고 있습니다. "
+     "부문별 실적은 소재 부문이 전체 매출의 대부분을 차지하고 있습니다. "),
+    ("VIII. 임원 및 직원 등에 관한 사항",
+     "직원 수는 {g} 명이며 연간 급여총액은 {a} 백만원입니다. "
+     "{year}년 중 연구개발 인력 {f} 명을 신규 채용하였습니다. "
+     "임원은 사내이사 {f} 명과 사외이사 {f} 명으로 구성되어 있습니다. "
+     "평균 근속연수는 {f} 년이며 이직률은 안정적으로 관리되고 있습니다. "),
+    ("IX. 계열회사 등에 관한 사항",
+     "당사의 계열회사는 총 {f} 개사입니다. 지배구조는 안정적으로 유지되고 있습니다. "
+     "{year}년 중 종속기업 지분을 {d} 백만원에 취득하였습니다. "
+     "최대주주 및 특수관계인의 지분율은 {f} 퍼센트입니다. "),
+    ("X. 대주주 등과의 거래내용",
+     "특수관계자와의 매출 거래는 {d} 백만원이며 매입 거래는 {e} 백만원입니다. "
+     "거래 조건은 제3자와의 거래와 동일한 기준을 적용하고 있습니다. "),
+    ("XI. 그 밖에 투자자 보호를 위하여 필요한 사항",
+     "제재현황: 해당사항 없습니다. "
+     "우발부채 등: 계류 중인 소송사건은 {f} 건이며 소송가액은 {d} 백만원입니다. "
+     "지급보증 잔액은 {e} 백만원입니다. "
+     "사업위험: 환율 변동과 원자재 가격 상승 위험이 존재합니다. {risk} "
+     "투자위험요소: 전방 산업 경기 변동에 따라 실적이 영향을 받을 수 있습니다. "),
+]
+
+def _afx_doc_body(y: int, newer: bool) -> str:
+    fmt = dict(
+        year=y, gi=y - 1990, mm=(y % 12) + 1,
+        a=f"{1000+y:,}", b=f"{10_000_000+y*13:,}", c=f"{1_234_567+y*31:,}",
+        d=f"{98_765+y*7:,}", e=f"{45_678+y*11:,}", f=(y % 9) + 1, g=f"{450+y%50:,}",
+        biz=("이차전지 부품 사업을 신규로 개시하였으며 관련 매출이 발생하였습니다."
+             if newer else "주력 제품은 실리콘 웨이퍼용 소재입니다."),
+        mda=("영업환경 악화로 수익성이 하락하였으며 원가 절감 계획을 시행하고 있습니다."
+             if newer else "안정적인 수요를 바탕으로 견조한 실적을 유지하였습니다."),
+        risk=("경쟁사 진입으로 가격 경쟁이 심화되고 있습니다." if newer else
+              "주요 고객사와의 장기 공급 계약으로 위험을 완화하고 있습니다."))
+    out = ["<?xml version='1.0' encoding='euc-kr'?><DOCUMENT><TITLE>사업보고서</TITLE>"]
+    for head, para in _AFX_SECTIONS:
+        out.append(head)
+        out.append((para.format(**fmt) + "\n") * 6)      # 섹션당 현실적 분량 확보
+    out.append("</DOCUMENT>")
+    return "\n".join(out)
+
+def _afx_document(rcept_no: str) -> bytes:
+    """전년/당년 두 해치. 당년본은 (a) 숫자·날짜만 바뀐 섹션과 (b) 서술이 바뀐 섹션을 나눈다."""
+    y = int(str(rcept_no)[:4]) if str(rcept_no)[:4].isdigit() else 2020
+    newer = (y % 2 == 0)
+    body = _afx_doc_body(y, newer)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        # ★ 본보고서 + 감사보고서 + 첨부 3개 엔트리. 첫 엔트리만 읽으면 내용이 소실되는 회귀를 잡는다.
+        z.writestr("00_main.xml", body.encode("euc-kr"))
+        z.writestr("01_audit.xml", ("<?xml version='1.0' encoding='euc-kr'?><DOC>"
+                                    "감사의견 적정. 강조사항 없음.</DOC>").encode("euc-kr"))
+        z.writestr("02_fs.xml", ("<?xml version='1.0' encoding='euc-kr'?><DOC>"
+                                 "<table><tr><td>자산</td><td>1,000</td></tr></table>"
+                                 "</DOC>").encode("euc-kr"))
+    return buf.getvalue()
+
+def _afx_hankyung(n: int = 12) -> str:
+    hdr = ("<tr>" + "".join(f"<th>{h}</th>" for h in
+           ["작성일", "제목", "적정가격", "투자의견", "작성자", "제공출처",
+            "기업정보", "차트", "첨부"]) + "</tr>")
+    rows = []
+    for i in range(n):
+        idx = 500000 + i
+        rows.append(
+            "<tr>"
+            f"<td>2024-0{1+(i%9)}-15</td>"
+            f"<td class='text_l'><a href='/analysis/downpdf?report_idx={idx}'>"
+            f"합성{i+1:03d}({i+1:06d}) 실적 개선 전망</a></td>"
+            f"<td class='text_r'>{(i+5)*10000:,}</td><td>Buy</td>"
+            f"<td>애널{i%7:02d}</td><td>{'미래에셋대우' if i%2 else '하나금융투자'}</td>"
+            f"<td>-</td><td>-</td>"
+            f"<td><a href='/analysis/downpdf?report_idx={idx}'>PDF</a></td></tr>")
+    return (f"<div id='contents'><div class='table_style01'><table>{hdr}"
+            f"{''.join(rows)}</table></div></div>")
+
+def _afx_naver_research(n: int = 12) -> str:
+    hdr = ("<tr><th>종목명</th><th>제목</th><th>증권사</th><th>첨부</th>"
+           "<th>작성일</th><th>조회수</th></tr>")
+    rows = []
+    for i in range(n):
+        rows.append(
+            "<tr>"
+            f"<td><a class='stock_item' href='/item/main.naver?code={i+1:06d}' "
+            f"title='합성{i+1:03d}'>합성{i+1:03d}</a></td>"
+            f"<td><a href='company_read.naver?nid={90000+i}&amp;page=1'>실적 개선 전망</a></td>"
+            f"<td>{'KB증권' if i%2 else '신한금융투자'}</td>"
+            f"<td class='file'><a href='https://stock.pstatic.net/stock-research/company/16/"
+            f"2024011{i%9}_company_{800000+i}.pdf'><img alt='pdf'/></a></td>"
+            f"<td class='date'>24.0{1+(i%9)}.1{i%9}</td><td class='date'>1,234</td></tr>")
+    nav = ("<table class='Nnavi'><tr><td class='pgRR'>"
+           "<a href='/research/company_list.naver?&amp;page=2'>맨뒤</a></td></tr></table>")
+    return (f"<div id='contentarea_left'><div class='box_type_m'>"
+            f"<table class='type_1'>{hdr}{''.join(rows)}</table></div></div>{nav}")
+
+def _afx_pdf() -> bytes:
+    return b"%PDF-1.4\n% synthetic fixture\n%%EOF\n"
+
+class _ArcFixtureNet:
+    """URL 로 픽스처를 골라주는 가짜 네트워크. mode 로 정상/빈/깨짐/컬럼누락 전환."""
+
+    def __init__(self, mode: str = "ok"):
+        self.mode = mode
+        self.hits: Counter = Counter()
+
+    def get(self, url, source="generic", params=None, as_bytes=False, **kw):
+        u, p = str(url), (params or {})
+        if self.mode == "empty":
+            return b"" if as_bytes else ""
+        if self.mode == "broken":
+            return b"\x00\x01garbage" if as_bytes else "<html><body>오류</body></html>"
+        if "fdr_krx_data_cache" in u:
+            if "/delisting/" in u:
+                self.hits["fdr_delisting"] += 1
+                return _afx_fdr_delisting()
+            self.hits["fdr_listing"] += 1
+            if self.mode == "missingcol":
+                return b"\xef\xbb\xbf,Foo,Bar\n0,1,2\n"
+            return _afx_fdr_listing()
+        if "kind.krx.co.kr" in u:
+            self.hits["kind"] += 1
+            return _afx_kind()
+        if "corpCode.xml" in u:
+            self.hits["corpcode"] += 1
+            return _afx_corpcode()
+        if "document.xml" in u:
+            self.hits["document"] += 1
+            return _afx_document(str(p.get("rcept_no", "20200320000001")))
+        if "consensus.hankyung.com" in u:
+            if "downpdf" in u:
+                self.hits["hk_pdf"] += 1
+                return _afx_pdf()
+            self.hits["hankyung"] += 1
+            return (_afx_hankyung() if int(p.get("now_page", 1) or 1) == 1
+                    else "<td class='no_data'>데이터가 없습니다</td>")
+        if "finance.naver.com/research" in u:
+            self.hits["naver_research"] += 1
+            return (_afx_naver_research() if int(p.get("page", 1) or 1) <= 1
+                    else "<div id='contentarea_left'><table class='type_1'></table></div>")
+        if "finance.naver.com/item/main" in u:
+            self.hits["naver_item"] += 1
+            return '<div class="wrap_company"><h2><a href="#">합성종목</a></h2></div>'
+        if "stock.pstatic.net" in u:
+            self.hits["naver_pdf"] += 1
+            return _afx_pdf()
+        if "siseJson" in u:
+            self.hits["naver_chart"] += 1
+            rows = ["['날짜','시가','고가','저가','종가','거래량','외국인소진율']"]
+            d0 = as_ts("2016-05-02")
+            for i in range(0, 2600, 1):
+                d2 = d0 + pd.Timedelta(days=i)
+                if d2.weekday() >= 5:
+                    continue
+                rows.append(f"['{d2:%Y%m%d}',10000,10100,9900,10050,120000,5.0]")
+            return "[" + ",".join(rows) + "]"
+        self.hits["other"] += 1
+        return b"" if as_bytes else ""
+
+    def json(self, url, source="generic", params=None, **kw):
+        u, p = str(url), (params or {})
+        if self.mode == "empty":
+            return None
+        if self.mode == "broken":
+            return {"nonsense": True}
+        if "fnlttSinglAcntAll" in u:
+            self.hits["fnltt"] += 1
+            if self.mode == "missingcol":
+                return {"status": "000", "list": [{"corp_code": p.get("corp_code")}]}
+            return _afx_fnltt(p.get("corp_code", "C0000001"), int(p.get("bsns_year", 2020)))
+        if "fnlttMultiAcnt" in u:
+            self.hits["multi"] += 1
+            return {"status": "013"}
+        if "empSttus" in u:
+            self.hits["emp"] += 1
+            return _afx_emp(p.get("corp_code", "C0000001"), int(p.get("bsns_year", 2020)))
+        if "stockTotqySttus" in u:
+            self.hits["shares"] += 1
+            return _afx_shares(p.get("corp_code", "C0000001"), int(p.get("bsns_year", 2020)))
+        if "accnutAdtorNmNdAdtOpinion" in u:
+            self.hits["audit"] += 1
+            return _afx_audit(p.get("corp_code", "C0000001"), int(p.get("bsns_year", 2020)))
+        if "list.json" in u:
+            self.hits["dart_list"] += 1
+            return _afx_dart_list(str(p.get("bgn_de", "20200301")), str(p.get("pblntf_ty", "A")))
+        if "stockSecurity/researches" in u:
+            self.hits["naver_api"] += 1
+            return []                     # JSON API 미가용 → HTML 폴백 경로를 타게 한다
+        self.hits["other_json"] += 1
+        return None
+
+def run_rehearsal(strict: bool = True) -> bool:
+    LOG.banner("② 실경로 리허설 (REHEARSAL)",
+               "네트워크만 가짜로 바꾸고 수집·정제 로직은 실물 그대로 실행한다")
+    REHEARSAL_RESULTS.clear()
+    G = globals()
+    saved = {k: G.get(k) for k in ("http_get", "http_json", "http_post", "fdr", "pykrx_stock",
+                                   "yf", "DART_API_KEY", "RUN_MODE", "RESEARCH_DOWNLOAD_PDF",
+                                   "ARC_DOC_MAX")}
+    saved_vault, saved_budget = G.get("VAULT"), G.get("DBUDGET")
+    tmp = tempfile.mkdtemp(prefix="arc_rehearsal_")
+    rebals = rebal_dates("2019-03-01", "2021-12-01")
+
+    try:
+        net = _ArcFixtureNet("ok")
+        G["http_get"], G["http_json"] = net.get, net.json
+        G["http_post"] = lambda *a, **k: ""
+        G["fdr"] = None
+        G["pykrx_stock"] = None                # 스냅샷 부재 시 폴백 경로 검증
+        G["yf"] = None
+        G["DART_API_KEY"] = "REHEARSAL"
+        G["RUN_MODE"] = "FULL"
+        G["RESEARCH_DOWNLOAD_PDF"] = True
+        G["ARC_DOC_MAX"] = 40
+        G["VAULT"] = Vault(tmp, "REHEARSAL")
+        G["DBUDGET"] = DartBudget()
+
+        # ── ① 유니버스 ────────────────────────────────────────────────────────────────────
+        snaps = _arh("fetch_pykrx_snapshots (pykrx 없음 → 폴백)",
+                     lambda: fetch_pykrx_snapshots(month_range("2019-01-01", "2021-12-31")),
+                     expect_rows=False, note="pykrx 미설치에서 죽지 않고 빈 결과여야 한다")
+        _arh("fetch_fdr_listing", fetch_fdr_listing)
+        _arh("fetch_fdr_delisting", fetch_fdr_delisting)
+        _arh("fetch_kind_listing", fetch_kind_listing)
+        _arh("fetch_dart_corpcode", fetch_dart_corpcode)
+        sec = _arh("build_security_master",
+                   lambda: build_security_master(
+                       snaps if snaps is not None else
+                       pd.DataFrame(columns=["snap_date", "code", "market"])),
+                   note="중복 컬럼 → groupby.agg 폭발이 과거 이 지점에서 났다")
+        if sec is None or not len(sec):
+            sec = pd.DataFrame({"code": [f"{i+1:06d}" for i in range(20)],
+                                "name": [f"합성{i+1:03d}" for i in range(20)],
+                                "market": "KOSPI", "industry": "화학",
+                                "corp_code": [f"C{i+1:07d}" for i in range(20)],
+                                "listing_date": as_ts("2010-01-01"),
+                                "delisting_date": pd.NaT})
+        _arh("classify_excluded", lambda: classify_excluded(sec), expect_rows=False)
+
+        # ── ② 가격 · 시총 ─────────────────────────────────────────────────────────────────
+        codes = sec["code"].dropna().astype(str).tolist()[:8]
+        px = _arh("fetch_prices (네이버 차트 폴백)",
+                  lambda: fetch_prices(codes, "2018-06-01", "2021-12-31"),
+                  note="FDR/pykrx 없이 네이버 경로만으로 동작해야 한다")
+        if px is not None and len(px):
+            _arh("build_liquidity_panel", lambda: build_liquidity_panel(px, rebals))
+            _arh("build_exec_prices", lambda: build_exec_prices(px, rebals))
+            _arh("attach_volatility", lambda: attach_volatility(
+                pd.DataFrame({"code": codes[:3], "asof": rebals[0]}), px), expect_rows=False)
+        _arh("fetch_market_cap_snapshots (pykrx 없음)",
+             lambda: fetch_market_cap_snapshots(rebals), expect_rows=False)
+
+        # ── ③ DART ────────────────────────────────────────────────────────────────────────
+        corps = sec["corp_code"].dropna().astype(str).tolist()[:4]
+        years = [2019, 2020]
+        fs = _arh("fetch_dart_financials", lambda: fetch_dart_financials(corps, years))
+        fin = None
+        if fs is not None and len(fs):
+            fin = _arh("tidy_financials", lambda: tidy_financials(fs))
+        _arh("fetch_dart_employees", lambda: fetch_dart_employees(corps, years),
+             note="사업부문×성별 분해 + '합계' 소계행 이중계상 방지")
+        shares = _arh("fetch_dart_shares", lambda: fetch_dart_shares(corps, years),
+                      note="보통주/우선주/합계 행 분해 — 합계 행 우선")
+        audit = _arh("fetch_dart_audit", lambda: fetch_dart_audit(corps, years))
+        dis = _arh("fetch_dart_disclosures",
+                   lambda: fetch_dart_disclosures("2020-01-01", "2020-12-31"),
+                   note="A(정기공시) + B(주요사항) 두 유형을 모두 훑어야 한다")
+
+        # ── ④ 정기보고서 원문 → 정규화 → 페어링 → 유사도 ─────────────────────────────────
+        T = None
+        if dis is not None and len(dis):
+            T = _arh("fetch_arc_documents (원문+정규화)",
+                     lambda: fetch_arc_documents(dis, sec, max_docs=20),
+                     note="zip 다중 엔트리 · EUC-KR · 6단계 정규화")
+        if T is not None and len(T):
+            _arh("arc_norm_sample_report", lambda: (arc_norm_sample_report(T, 2) or [1]),
+                 expect_rows=False)
+            pairs = _arh("arc_doc_pairs", lambda: arc_doc_pairs(T), expect_rows=False)
+            if pairs is not None and len(pairs):
+                S = _arh("d1_similarity", lambda: d1_similarity(pairs))
+                if S is not None and len(S):
+                    _arh("d1_composite",
+                         lambda: d1_composite(S, build_struct_flags(dis)), expect_rows=False)
+            _arh("arc_doc_load_years", lambda: arc_doc_load_years(arc_doc_years(T)),
+                 expect_rows=False)
+            _arh("build_d1_streaming (연도 스트리밍)",
+                 lambda: build_d1_streaming(build_struct_flags(dis), T_manifest=T),
+                 expect_rows=False,
+                 note="연도 2개씩만 올려 상주량을 평평하게 유지하는 경로")
+        _arh("build_struct_flags", lambda: build_struct_flags(dis), expect_rows=False)
+
+        # ── ⑤ D2 / D3 / 배제 ──────────────────────────────────────────────────────────────
+        if fin is not None and len(fin):
+            _arh("build_d2_panel", lambda: build_d2_panel(fin, shares), expect_rows=False)
+            _arh("build_exclusion_flags",
+                 lambda: build_exclusion_flags(fin, dis, audit, T), expect_rows=False)
+        _arh("extract_hardfacts",
+             lambda: extract_hardfacts(T, fin, None, dis), expect_rows=False)
+
+        # ── ⑥ 리서치 원장 → 본문 → TONE ───────────────────────────────────────────────────
+        hk = _arh("hankyung_collect", lambda: hankyung_collect("2024-01-01", "2024-12-31"))
+        nv = _arh("naver_collect",
+                  lambda: naver_collect("2024-01-01", "2024-12-31", cats=("company",)))
+        frames = [x for x in (hk, nv) if x is not None and len(x)]
+        rep = _arh("build_report_master", lambda: build_report_master(frames, sec)) \
+            if frames else None
+        if rep is not None and len(rep):
+            rep = _arh("tag_sponsored_reports", lambda: tag_sponsored_reports(rep))
+            rep2 = _arh("download_pdfs", lambda: download_pdfs(rep, cap_per_month=3),
+                        expect_rows=False)
+            AL = _arh("build_analyst_ledger",
+                      lambda: build_analyst_ledger(rep2 if rep2 is not None else rep),
+                      expect_rows=False)
+            if AL is not None:
+                A, L = AL
+                _arh("audit_linkage", lambda: (audit_linkage(rep, A, L) or [1]),
+                     expect_rows=False)
+                _arh("build_revision_panel", lambda: build_revision_panel(L, rebals),
+                     expect_rows=False)
+            rt = _arh("build_report_text_store",
+                      lambda: build_report_text_store(rep2 if rep2 is not None else rep),
+                      expect_rows=False,
+                      note="PDF 픽스처에 텍스트 레이어가 없어 0행이 정상이다")
+            _arh("build_tone_training",
+                 lambda: build_tone_training(rt if rt is not None else
+                                             pd.DataFrame(columns=["report_uid", "code",
+                                                                   "pub_date", "text"]),
+                                             px if px is not None else pd.DataFrame(), sec),
+                 expect_rows=False)
+
+        # ── ⑦ 게이트 ──────────────────────────────────────────────────────────────────────
+        _arh("run_phase0_gates",
+             lambda: (run_phase0_gates({"reports": rep, "report_text": None,
+                                        "doc_tokens": T, "doc_pairs": None, "fin": fin,
+                                        "shares": shares, "links": None,
+                                        "panel_base": None}, rebals) or {"x": 1}),
+             expect_rows=False)
+
+        # ── ⑧ 이상 응답 내성 (빈 / 깨짐 / 컬럼누락) ───────────────────────────────────────
+        for mode, label in (("empty", "빈 응답"), ("broken", "깨진 응답"),
+                            ("missingcol", "기대 컬럼 누락")):
+            bad = _ArcFixtureNet(mode)
+            G["http_get"], G["http_json"] = bad.get, bad.json
+            G["VAULT"] = Vault(tempfile.mkdtemp(prefix=f"arc_rh_{mode}_"), "REHEARSAL")
+            G["DBUDGET"] = DartBudget()
+            for fname, fn in (("fetch_fdr_listing", fetch_fdr_listing),
+                              ("fetch_fdr_delisting", fetch_fdr_delisting),
+                              ("fetch_kind_listing", fetch_kind_listing),
+                              ("fetch_dart_corpcode", fetch_dart_corpcode)):
+                _arh(f"[{label}] {fname}", fn, expect_rows=False,
+                     note="예외 없이 빈 결과를 돌려줘야 한다")
+            _arh(f"[{label}] fetch_dart_financials",
+                 lambda: fetch_dart_financials(corps, [2020]), expect_rows=False)
+            _arh(f"[{label}] fetch_dart_shares",
+                 lambda: fetch_dart_shares(corps, [2020]), expect_rows=False)
+            _arh(f"[{label}] fetch_dart_audit",
+                 lambda: fetch_dart_audit(corps, [2020]), expect_rows=False)
+            _arh(f"[{label}] fetch_arc_documents",
+                 lambda: fetch_arc_documents(dis, sec, max_docs=5), expect_rows=False)
+            _arh(f"[{label}] hankyung_collect",
+                 lambda: hankyung_collect("2024-01-01", "2024-03-31"), expect_rows=False)
+            _arh(f"[{label}] build_report_master(빈 입력)",
+                 lambda: build_report_master([], sec), expect_rows=False)
+            _arh(f"[{label}] arc_doc_pairs(빈 입력)",
+                 lambda: arc_doc_pairs(pd.DataFrame(columns=ARC_DOC_COLS)), expect_rows=False)
+            _arh(f"[{label}] d1_similarity(빈 입력)",
+                 lambda: d1_similarity(pd.DataFrame(columns=ARC_PAIR_COLS)), expect_rows=False)
+            _arh(f"[{label}] build_d2_panel(빈 입력)",
+                 lambda: build_d2_panel(pd.DataFrame(), None), expect_rows=False)
+
+    finally:
+        for k, v in saved.items():
+            G[k] = v
+        G["VAULT"], G["DBUDGET"] = saved_vault, saved_budget
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    ok_n = sum(1 for r in REHEARSAL_RESULTS if r["ok"])
+    LOG.table([[_trunc(r["name"], 42), "✔" if r["ok"] else "✘",
+                f"{r['rows']:,}" if r["rows"] >= 0 else "예외",
+                f"{r['sec']:.2f}s", _trunc(r["err"] or r["note"], 56)]
+               for r in REHEARSAL_RESULTS],
+              ["실경로 함수", "판정", "결과", "소요", "비고"],
+              ["l", "c", "r", "r", "l"], maxw=58)
+    fails = [r for r in REHEARSAL_RESULTS if not r["ok"]]
+    if fails:
+        LOG.error(f"실경로 리허설 {len(fails)}/{len(REHEARSAL_RESULTS)}건 실패")
+        for r in fails[:5]:
+            LOG.banner(f"✘ 리허설 실패: {_trunc(r['name'], 60)}", _trunc(r["err"], 92))
+            for ln in str(r.get("tb", "")).rstrip().split("\n")[-10:]:
+                _safe_print("   " + ln)
+        if strict:
+            raise RuntimeError(
+                f"실경로 리허설 실패 {len(fails)}건 — 실데이터 수집을 시작하지 않습니다. "
+                f"여기서 막는 것이 몇 시간 뒤 L1 에서 죽는 것보다 훨씬 쌉니다.")
+        return False
+    LOG.ok(f"실경로 리허설 {ok_n}/{len(REHEARSAL_RESULTS)}건 통과 — "
+           f"수집·정제 함수가 실제 데이터 모양에서 정상 동작합니다.")
+    return True
+
+
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L0-F  합성데이터 엔드투엔드 스모크
+#  ★ 합성데이터에 '진짜 알파'를 심는다. quality[i] 가 높으면 ① ΔTONE↑ ② 문서변화↓
+#  ★ 엣지 케이스를 반드시 섞는다: 기간 중 상장/폐지, 축 A 결측 20%, D1 결측 15%,
+# ────────────────────────────────────────────────────────────────────────────────────────
+
+_SYN_VOCAB = [f"어휘{i:03d}" for i in range(400)] + \
+             ["매출", "영업이익", "제조", "판매", "고객", "설비", "연구개발", "특허", "수출",
+              "계약", "소송", "우발", "지배구조", "임원", "직원", "위험", "환율", "경쟁"]
+
+def make_arc_synthetic(n_codes: int = 220, n_years: int = 8, seed: int = SEED) -> dict:
+    rng = np.random.default_rng(seed)
+    end = as_ts(BACKTEST_END)
+    start = end - pd.DateOffset(years=n_years)
+    rebals = rebal_dates(start.strftime("%Y-%m-%d"), BACKTEST_END)
+    # ★ 실제 한국 보통주 코드는 대부분 끝자리가 0 이다. 합성에서 000001,000002… 처럼
+    #   촘촘한 연번을 쓰면 '형제 보통주' 우선주 규칙이 대량 오발화해 유니버스가 붕괴한다.
+    #   현실과 같은 간격(10)으로 만들고, 진짜 우선주 쌍을 소수만 섞는다.
+    codes = [f"{(i + 1) * 10:06d}" for i in range(n_codes)]
+    for j in range(3, n_codes, 40):                 # 형제 보통주가 실재하는 우선주를 섞는다
+        codes[j] = f"{j * 10 + 5:06d}"              # codes[j-1] = j*10 이 형제 보통주
+    corps = [f"C{i+1:07d}" for i in range(n_codes)]
+    sectors = ["IT/전자", "헬스케어", "소재", "산업재", "소비재", "금융"]
+    inds = rng.choice(["반도체", "제약", "화학", "기계", "음식료", "은행"], n_codes)
+
+    quality = rng.normal(size=n_codes)
+    #   (상세 근거는 커밋 로그 참조)
+    n_reb = len(rebals)
+    mood = np.cumsum(rng.normal(0, 0.55, size=(n_codes, n_reb)), axis=1)
+    dmood = np.diff(mood, axis=1, prepend=mood[:, :1])
+    reb_pos = {pd.Timestamp(t): j for j, t in enumerate(rebals)}
+
+    # ── 상장/폐지 (생존자편향 검증) ───────────────────────────────────────────────────────
+    listing = [start - pd.DateOffset(years=int(rng.integers(3, 15))) for _ in codes]
+    for i in rng.choice(n_codes, size=max(1, n_codes // 12), replace=False):
+        listing[i] = rebals[int(rng.integers(2, max(3, len(rebals) - 6)))]
+    delist = [pd.NaT] * n_codes
+    for i in rng.choice(n_codes, size=max(1, n_codes // 10), replace=False):
+        delist[i] = rebals[int(rng.integers(4, max(5, len(rebals) - 2)))]
+
+    sec = pd.DataFrame({"code": codes, "name": [f"합성{i+1:03d}" for i in range(n_codes)],
+                        "market": rng.choice(["KOSPI", "KOSDAQ"], n_codes),
+                        "listing_date": listing, "delisting_date": delist,
+                        "industry": inds, "corp_code": corps, "src": "synthetic"})
+
+    # ── 일봉 ──────────────────────────────────────────────────────────────────────────────
+    days = pd.bdate_range(start - pd.DateOffset(months=18), end + pd.Timedelta(days=5))
+    _day_arr = np.asarray(days.values, dtype="datetime64[ns]")
+    _reb_arr = np.asarray(pd.DatetimeIndex(rebals).values, dtype="datetime64[ns]")
+    px_rows = []
+    for i, c in enumerate(codes):
+        # 각 거래일이 속한 리밸 구간의 '직전 Δmood' 를 drift 에 더한다 → 톤 변화 선행 구조
+        seg = np.clip(np.searchsorted(_reb_arr, _day_arr, side="right") - 1, 0, n_reb - 1)
+        lead = dmood[i][np.clip(seg, 0, n_reb - 1)]
+        drift = 0.0004 + 0.0008 * quality[i] + 0.0016 * lead
+        r = rng.normal(drift, 0.024, len(days))
+        p = float(rng.lognormal(8.5, 0.7)) * np.exp(np.cumsum(r))
+        vol = rng.lognormal(10.8, 0.9, len(days))
+        px_rows.append(pd.DataFrame({
+            "code": c, "date": days, "open": p * (1 + rng.normal(0, 0.004, len(days))),
+            "high": p * 1.012, "low": p * 0.988, "close": p,
+            "volume": vol, "amount": p * vol, "src": "synthetic"}))
+    px = pd.concat(px_rows, ignore_index=True)
+    for i, c in enumerate(codes):
+        if pd.notna(delist[i]):
+            px = px[~((px["code"] == c) & (px["date"] > delist[i]))]
+        px = px[~((px["code"] == c) & (px["date"] < listing[i]))]
+
+    # ── PIT 시가총액 ──────────────────────────────────────────────────────────────────────
+    mc_rows = []
+    shares_out = {c: float(rng.lognormal(16.0, 0.8)) for c in codes}
+    for t in rebals:
+        prev = px[px["date"] < as_ts(t)]
+        if prev.empty:
+            continue
+        last = prev.groupby("code", observed=True).tail(1)
+        for cc, cl in zip(last["code"], last["close"]):
+            mc_rows.append({"date": as_ts(t), "code": cc,
+                            "mktcap": float(cl) * shares_out[cc],
+                            "shares_listed": shares_out[cc], "close_mc": float(cl),
+                            "mc_src": "synthetic"})
+    snap_mc = pd.DataFrame(mc_rows)
+
+    # ── 재무 (분기) ───────────────────────────────────────────────────────────────────────
+    rc = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}
+    fin_rows, emp_rows, sh_rows, aud_rows = [], [], [], []
+    years = list(range(start.year - 1, end.year + 1))
+    for i, c in enumerate(codes):
+        base_rev = float(rng.lognormal(24, 1.0))
+        sh = shares_out[c]
+        for y in years:
+            for q in (1, 2, 3, 4):
+                gr = 1 + 0.015 * quality[i] + rng.normal(0, 0.05)
+                base_rev *= gr
+                rev = base_rev
+                ni = rev * (0.05 + 0.015 * quality[i] + rng.normal(0, 0.01))
+                cfo = ni * (1.0 + 0.35 * quality[i] + rng.normal(0, 0.15))
+                pe = as_ts(f"{y}-{q*3:02d}-01") + pd.offsets.MonthEnd(0)
+                kd = pe + pd.Timedelta(days=45 if q < 4 else 90)
+                fin_rows.append({
+                    "corp_code": corps[i], "bsns_year": y, "reprt_code": rc[q],
+                    "period_end": pe, "knowledge_date": kd,
+                    "revenue_ttm": rev * 4, "net_income_ttm": ni * 4, "cfo_ttm": cfo * 4,
+                    "op_income_q": rev * (0.06 + 0.02 * quality[i] + rng.normal(0, 0.03)),
+                    "assets": rev * 5.5, "liabilities": rev * 2.4, "equity": rev * 3.1,
+                    "cash": rev * 0.6, "capital_stock": rev * 0.5,
+                    "inventory": rev * (0.8 - 0.05 * quality[i]) * (1 + rng.normal(0, 0.05)),
+                    "receivable": rev * (0.9 - 0.05 * quality[i]) * (1 + rng.normal(0, 0.05)),
+                    "ppe": rev * 2.0 * (1 + 0.02 * max(quality[i], 0)),
+                    "rnd_ttm": rev * (0.02 + 0.012 * max(quality[i], 0)) * 4,
+                })
+                sh *= (1 + max(0.0, 0.006 - 0.004 * quality[i]) + abs(rng.normal(0, 0.002)))
+                sh_rows.append({"corp_code": corps[i], "bsns_year": y, "reprt_code": rc[q],
+                                "shares_common": sh, "shares_total": sh,
+                                "treasury_shares": 0.0, "period_end": pe,
+                                "knowledge_date": kd})
+            emp_rows.append({"corp_code": corps[i], "bsns_year": y,
+                             "period_end": as_ts(f"{y}-12-31"),
+                             "knowledge_date": as_ts(f"{y}-12-31") + pd.Timedelta(days=90),
+                             "employees": float(max(15, rng.lognormal(4.8, 0.9) *
+                                                    (1 + 0.05 * quality[i]))),
+                             "payroll": float(rng.lognormal(21, 0.8))})
+            # 배제 발동 10% — 감사 강조사항
+            aud_rows.append({"corp_code": corps[i], "bsns_year": y,
+                             "audit_opinion": "적정",
+                             "emphasis": ("계속기업 불확실성" if rng.random() < 0.03 else ""),
+                             "key_matter": "", "auditor": "합성회계법인",
+                             "period_end": as_ts(f"{y}-12-31"),
+                             "knowledge_date": as_ts(f"{y}-12-31") + pd.Timedelta(days=90)})
+    fin = pit_frame(pd.DataFrame(fin_rows), "period_end", "knowledge_date", source="synthetic")
+    emp = pit_frame(pd.DataFrame(emp_rows), "period_end", "knowledge_date", source="synthetic")
+    shares = pit_frame(pd.DataFrame(sh_rows), "period_end", "knowledge_date", source="synthetic")
+    audit = pit_frame(pd.DataFrame(aud_rows), "period_end", "knowledge_date", source="synthetic")
+
+    # ── 공시목록 ──────────────────────────────────────────────────────────────────────────
+    dis_rows = []
+    for i, c in enumerate(codes):
+        for y in years:
+            dis_rows.append({"corp_code": corps[i], "corp_name": f"합성{i+1:03d}",
+                             "stock_code": c, "rcept_no": sha1_str(c, y, "FY")[:14],
+                             "rcept_dt": as_ts(f"{y+1}-03-20"),
+                             "report_nm": f"사업보고서 ({y}.12)", "event": ""})
+            if rng.random() < 0.06:
+                dis_rows.append({"corp_code": corps[i], "corp_name": f"합성{i+1:03d}",
+                                 "stock_code": c, "rcept_no": sha1_str(c, y, "cb")[:14],
+                                 "rcept_dt": as_ts(f"{y}-07-10"),
+                                 "report_nm": "주요사항보고서(전환사채발행결정)", "event": "cb_issue"})
+            if rng.random() < 0.03:
+                dis_rows.append({"corp_code": corps[i], "corp_name": f"합성{i+1:03d}",
+                                 "stock_code": c, "rcept_no": sha1_str(c, y, "mg")[:14],
+                                 "rcept_dt": as_ts(f"{y}-05-10"),
+                                 "report_nm": "주요사항보고서(회사합병결정)", "event": ""})
+            if rng.random() < 0.12 + 0.10 * max(quality[i], 0):
+                dis_rows.append({"corp_code": corps[i], "corp_name": f"합성{i+1:03d}",
+                                 "stock_code": c, "rcept_no": sha1_str(c, y, "sc")[:14],
+                                 "rcept_dt": as_ts(f"{y}-09-05"),
+                                 "report_nm": "단일판매ㆍ공급계약체결", "event": ""})
+    dis = pit_frame(pd.DataFrame(dis_rows), "rcept_dt", "rcept_dt", source="synthetic")
+
+    # ── 정기보고서 토큰 (D1 입력) — D1 결측 15% 포함 ──────────────────────────────────────
+    doc_rows = []
+    no_d1 = set(rng.choice(n_codes, size=max(1, int(n_codes * 0.15)), replace=False).tolist())
+    for i, c in enumerate(codes):
+        if i in no_d1:
+            continue
+        prev_tf: Dict[str, Dict[str, int]] = {}
+        for y in years:
+            # quality 가 높을수록 문서를 '덜' 고친다 (Lazy Prices 방향)
+            churn = float(np.clip(0.25 - 0.10 * quality[i] + rng.normal(0, 0.05), 0.02, 0.6))
+            for sname in ARC_SECTIONS:
+                base = prev_tf.get(sname)
+                if base is None:
+                    idx = rng.choice(len(_SYN_VOCAB), size=90, replace=False)
+                    tf = {_SYN_VOCAB[j]: int(rng.integers(1, 9)) for j in idx}
+                else:
+                    tf = dict(base)
+                    k = max(1, int(len(tf) * churn))
+                    drop = list(rng.choice(list(tf), size=min(k, len(tf)), replace=False))
+                    for d0 in drop:
+                        tf.pop(d0, None)
+                    add = rng.choice(len(_SYN_VOCAB), size=k, replace=False)
+                    for j in add:
+                        tf[_SYN_VOCAB[j]] = int(rng.integers(1, 9))
+                prev_tf[sname] = tf
+                toks = list(tf)
+                bg = {f"{toks[j]}_{toks[j+1]}": 1 for j in range(min(len(toks) - 1, 40))}
+                doc_rows.append({
+                    "corp_code": corps[i], "rcept_no": sha1_str(c, y, sname)[:16],
+                    "rcept_dt": as_ts(f"{y+1}-03-20"), "doc_type": "FY", "bsns_year": y,
+                    "section": sname, "n_tokens": len(tf),
+                    "tf": json.dumps(tf, ensure_ascii=False),
+                    "bigram": json.dumps(bg, ensure_ascii=False),
+                    "tok_len": int(sum(tf.values())), "is_amend": False})
+    doc_tokens = pd.DataFrame(doc_rows)
+
+    # ── 리포트 원장 + 애널리스트 링크 — 축 A 결측 20% 포함 ────────────────────────────────
+    no_rep = set(rng.choice(n_codes, size=max(1, int(n_codes * 0.20)), replace=False).tolist())
+    brokers = MAJOR_BROKERS[:8] + MINOR_BROKERS[:8] + ["한국IR협의회"]
+    analysts = [(b, f"애널{j:02d}") for b in brokers for j in range(3)]
+    rep_rows, link_rows, tone_rows = [], [], []
+    for t in rebals:
+        for i in range(n_codes):
+            if i in no_rep or rng.random() > 0.55:
+                continue
+            for _ in range(int(rng.integers(1, 3))):
+                b, nm = analysts[int(rng.integers(0, len(analysts)))]
+                bid, bname = normalize_broker(b)
+                d = as_ts(t) - pd.Timedelta(days=int(rng.integers(3, 88)))
+                uid = sha1_str("syn", codes[i], d, nm, rng.integers(1e9))
+                tp = float(np.exp(rng.normal(9.4, 0.5)) * (1 + 0.12 * quality[i]))
+                rep_rows.append({
+                    "report_uid": uid, "source": "synthetic", "src_report_id": uid[:10],
+                    "pub_date": d, "category": "company",
+                    "title": f"합성{i+1:03d}({codes[i]}) 리포트", "stock_code": codes[i],
+                    "stock_name": f"합성{i+1:03d}", "broker_raw": b, "broker_id": bid,
+                    "broker_name": bname, "analyst_raw": nm, "target_price": tp,
+                    "opinion": "BUY", "pdf_url": None, "detail_url": None,
+                    "event_date": d, "knowledge_date": d})
+                link_rows.append({
+                    "report_uid": uid, "name": nm, "broker_id": bid, "broker_name": bname,
+                    "role": "lead", "link_method": "list_field", "link_conf": 0.98,
+                    "pub_date": d, "stock_code": codes[i], "target_price": tp,
+                    "opinion": "BUY", "name_norm": nm,
+                    "analyst_id": sha1_str("analyst", bid, nm)[:14]})
+                _j = reb_pos.get(pd.Timestamp(t), 0)
+                tone_rows.append({
+                    "report_uid": uid, "code": codes[i], "pub_date": d,
+                    "TONE_report": float(np.clip(0.10 * quality[i] + 0.45 * mood[i, _j] /
+                                                 max(1.0, abs(mood[i, _j]) ** 0.5 + 1e-9)
+                                                 + rng.normal(0, 0.22), -1, 1)),
+                    "n_sent": int(rng.integers(10, 40)),
+                    "event_date": d, "knowledge_date": d + pd.Timedelta(days=1)})
+    reports = tag_sponsored_reports(pd.DataFrame(rep_rows))
+    links = pd.DataFrame(link_rows)
+    tone_rep = pd.DataFrame(tone_rows)
+
+    return {"sec": sec, "px": px, "fin": fin, "shares": shares, "emp": emp, "dis": dis,
+            "audit": audit, "reports": reports, "links": links, "tone_rep": tone_rep,
+            "doc_tokens": doc_tokens, "snap_mc": snap_mc, "rebals": rebals,
+            "quality": quality}
+
+def _syn_build_panel(S: dict) -> Tuple[pd.DataFrame, Any, dict]:
+    """합성데이터로 실제 파이프라인 함수를 그대로 통과시킨다(모의 구현 금지)."""
+    rebals = S["rebals"]
+    sec, px = S["sec"], S["px"]
+
+    liq = build_liquidity_panel(px, rebals)
+    execp = build_exec_prices(px, rebals)
+    mc = build_mktcap_panel(rebals,
+                            px.assign(month=as_ts_series(px["date"]) + pd.offsets.MonthEnd(0))
+                              .groupby(["code", "month"], observed=True)
+                              .tail(1)[["code", "month", "close"]],
+                            S["snap_mc"], S["shares"], sec)
+    base = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+    exd = classify_excluded(sec)
+    uni = ArcUniverse(base, sec, exd)
+    U = uni.build(rebals, mc, liq[["code", "asof", "adtv60"]] if len(liq) else liq)
+    P = build_arc_panel(uni, rebals, U, liq, execp, sec, px_daily=px)
+
+    # 축 B
+    pairs = arc_doc_pairs(S["doc_tokens"])
+    struct = build_struct_flags(S["dis"])
+    d1 = d1_composite(d1_similarity(pairs), struct)
+    P = attach_d1(P, d1)
+    P = attach_d2(P, build_d2_panel(S["fin"], S["shares"]))
+    hard = extract_hardfacts(S["doc_tokens"], S["fin"], S["emp"], S["dis"])
+    excl = build_exclusion_flags(S["fin"], S["dis"], S["audit"], S["doc_tokens"])
+    P = attach_d3(P, hard, excl)
+
+    # 재무를 패널에 붙여 eps_rev 대리변수를 만들 수 있게 한다
+    if len(S["fin"]):
+        PIT.register("syn_fin", arc_kd_lag(S["fin"]), key_cols=["corp_code"])
+        P = PIT.asof_join(P, "syn_fin", by="corp_code", left_time="asof",
+                          cols=["corp_code", "knowledge_date", "net_income_ttm", "assets"],
+                          suffix="_fin")
+    # 축 A
+    tone_q = aggregate_tone(S["tone_rep"], rebals)
+    rev = build_revision_panel(S["links"], rebals)
+    P = attach_axis_a(P, tone_q, rev)
+    P = attach_volatility(P, px)
+    return P, uni, {"pairs": pairs, "d1": d1, "tone_q": tone_q, "rev": rev}
+
+def run_selftest(full_chain: bool = False) -> bool:
+    """full_chain=True 면 성과·어블레이션·BH-FDR·강건성·해석표까지 전부 합성으로 예행연습."""
+    LOG.banner("① 합성데이터 엔드투엔드 스모크",
+               "실데이터 수집 전에 계산경로 전체를 증명한다 (수십 초)" +
+               (" · full_chain: 어블레이션·강건성까지 전부 실행" if full_chain else ""))
+    t0 = time.time()
+    try:
+        S = make_arc_synthetic()
+    except Exception as e:                                        # noqa
+        LOG.error(f"합성데이터 생성 실패 — {type(e).__name__}: {e}")
+        return False
+    LOG.info(f"합성: 종목 {len(S['sec'])} · 리밸 {len(S['rebals'])} · 일봉 {len(S['px']):,} · "
+             f"재무 {len(S['fin']):,} · 문서토큰 {len(S['doc_tokens']):,} · "
+             f"리포트 {len(S['reports']):,}")
+
+    P, uni, aux = _syn_build_panel(S)
+    Q = assemble_final(P, use_axes=("A", "D1", "D2", "D3"), use_excl=True)
+
+    def _run(pp, label="smoke", apply_costs=True, top_n=None, weighting=None, bottom=False):
+        return run_backtest(pp, S["rebals"], uni, S["sec"], apply_costs=apply_costs,
+                            label=label, top_n=top_n, weighting=weighting, bottom=bottom)
+
+    bt = _run(Q, label="SMOKE")
+    st = perf_stats(bt["returns"])
+    dur = time.time() - t0
+
+    # ── 배관 검증 판정 ────────────────────────────────────────────────────────────────────
+    checks = []
+    checks.append(("패널 생성", len(P) > 0, f"{len(P):,}행"))
+    checks.append(("백테스트 기간 일치", len(bt["returns"]) == len(S["rebals"]),
+                   f"{len(bt['returns'])}/{len(S['rebals'])}"))
+    checks.append(("성과 산출", bool(st) and np.isfinite(st.get("CAGR", np.nan)),
+                   f"CAGR {st.get('CAGR', float('nan'))*100:+.2f}%"))
+    n_a_miss = int((pd.to_numeric(col(P, "has_axis_a"), errors="coerce").fillna(0) == 0).sum())
+    surv = int(Q.loc[pd.to_numeric(col(Q, "has_axis_a"), errors="coerce").fillna(0) == 0,
+                     "FINAL_SCORE"].notna().sum())
+    checks.append(("축 A 결측 종목 생존 (§7.2)", n_a_miss == 0 or surv > 0,
+                   f"결측 {n_a_miss:,}행 중 {surv:,}행 생존"))
+    n_d1_miss = int(pd.to_numeric(col(P, "D1_MISSING"), errors="coerce").fillna(0).sum())
+    surv2 = int(Q.loc[pd.to_numeric(col(Q, "D1_MISSING"), errors="coerce").fillna(0) > 0,
+                      "FINAL_SCORE"].notna().sum())
+    checks.append(("D1 결측 가중치 재배분 (§6.5)", n_d1_miss == 0 or surv2 > 0,
+                   f"결측 {n_d1_miss:,}행 중 {surv2:,}행 생존"))
+    n_ex = int(pd.to_numeric(col(P, "EXCLUDE"), errors="coerce").fillna(0).sum())
+    leak = int(Q.loc[pd.to_numeric(col(Q, "EXCLUDE"), errors="coerce").fillna(0) > 0,
+                     "FINAL_SCORE"].notna().sum())
+    checks.append(("배제 하드 제외 (§6.4)", leak == 0, f"발동 {n_ex:,}행 · 누수 {leak}행"))
+    ic, icir, n_ic = bt_ic(Q, "FINAL_RANK")
+    checks.append(("신호→수익 반응 (하네스 민감도)", np.isfinite(ic),
+                   f"IC {ic:+.4f} (IC-IR {icir:+.2f}, {n_ic}기간)"))
+
+    LOG.table([[k, "✔" if ok else "✘", v] for k, ok, v in checks],
+              ["배관 검증 항목", "판정", "실측"], ["l", "c", "l"],
+              title=f"스모크 결과 (소요 {dur:.1f}초 — 성과 수치는 의미 없음, 배관 검증용)")
+    ok_all = all(ok for _k, ok, _v in checks)
+    if not ok_all:
+        LOG.error("스모크 실패 — 실데이터 수집 전에 계산경로를 먼저 고쳐야 합니다.")
+        return False
+    LOG.ok(f"스모크 통과 ({dur:.1f}초) — 수집→패널→신호→백테스트 경로가 정상 동작합니다.")
+
+    if not full_chain:
+        return True
+
+    # ── full_chain: 최종 출력물 전체 예행연습 ─────────────────────────────────────────────
+    LOG.banner("⚠ 아래 수치는 전부 합성 난수 기반입니다",
+               "전략의 실제 성과가 아니라 '출력물이 제대로 나오는지' 예행연습입니다. 해석 금지")
+    ctx = {"panel_base": P, "reports": S["reports"], "report_text": S["reports"],
+           "doc_tokens": S["doc_tokens"], "doc_pairs": aux["pairs"], "fin": S["fin"],
+           "shares": S["shares"], "links": S["links"], "doc_attempted": len(S["doc_tokens"])}
+    with PIPE.stage("SMOKE.GATE", "[합성] Phase 0 게이트", "L1", budget_s=120, critical=False):
+        run_phase0_gates(ctx, S["rebals"])
+    with PIPE.stage("SMOKE.PERF", "[합성] 성과 검증", "L6", budget_s=120, critical=False):
+        report_performance(bt, {}, label="ARC-TXT v2 (합성 예행연습)",
+                           uni_bench=equal_weight_universe_return(Q))
+        uni.report_attrition()
+        report_score_summary(Q)
+    with PIPE.stage("SMOKE.DIAG", "[합성] 층 상관 · D1 부호 · D2 커버리지", "L6",
+                    budget_s=120, critical=False):
+        report_correlation_matrix(Q)
+        ctx["d1_sign"] = report_d1_sign_check(Q)
+        report_d2_coverage(Q)
+        report_d3_sector(Q)
+        report_exclusion(Q)
+        ctx["axis_a_ic"] = report_axis_a_ic(Q)
+    with PIPE.stage("SMOKE.ABL", "[합성] 어블레이션 11종 + BH-FDR", "L5",
+                    budget_s=1800, critical=False):
+        run_ablations(Q, S["rebals"], uni, S["sec"], _run)
+        report_f4_vs_f1()
+        ctx["fdr"] = apply_bh_fdr()
+    with PIPE.stage("SMOKE.ROBUST", "[합성] 강건성 R1~R11", "L5", budget_s=1800, critical=False):
+        run_robustness_suite(Q, bt, S["rebals"], uni, S["sec"], _run,
+                             rep=S["reports"], doc=S["doc_tokens"], px_daily=S["px"])
+    with PIPE.stage("SMOKE.REPORT", "[합성] 해석표 · 진단카드 · 폐기판정", "L6",
+                    budget_s=180, critical=False):
+        report_interpretation(Q)
+        diagnostic_card(Q, bt, S["sec"])
+        ctx["kill"] = report_kill_criteria(ctx)
+        report_final_deliverables(ctx)
+
+    LOG.ok("full_chain 예행연습 완료 — 게이트·성과·어블레이션·BH-FDR·강건성·해석표·진단카드·"
+           "폐기판정이 모두 정상 출력되었습니다. RUN_MODE='FULL' 로 바꾸면 동일한 출력이 "
+           "실데이터로 나옵니다.")
+    # ★ 합성 결과가 실데이터 결과와 섞이면 안 된다. 전부 비운다.
+    ABLATION_RESULTS.clear()
+    ROBUST_RESULTS.clear()
+    GATE_RESULTS.clear()
     return True

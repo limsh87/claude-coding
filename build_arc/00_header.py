@@ -79,13 +79,6 @@ KRX_MARKETPLACE_PW = ""
 #    ⚠ 엔드포인트별 '이용신청'이 따로 필요하고 승인에 하루 정도 걸립니다. 키만으론 즉시 안 됩니다.
 KRX_OPENAPI_KEY = ""
 
-# ── ③ 공공데이터포털 (선택 — D3 정부 R&D 과제 대조용) ───────────────────────────────────────
-#    발급: https://www.data.go.kr → 로그인 → API 상세페이지 → [활용신청]
-#          → 마이페이지 > 데이터활용 > Open API > 인증키
-#    ★ 반드시 "일반 인증키(Decoding)" 를 넣으세요. Encoding 키(%2B, %3D 포함)를 넣으면
-#      이중 인코딩으로 항상 401/SERVICE_KEY_IS_NOT_REGISTERED 가 납니다.
-DATA_GO_KR_KEY = ""
-
 # ── ④ 캐시 경로 ─────────────────────────────────────────────────────────────────────────────
 #
 #    ★★★ 절대 1원칙 ★★★
@@ -142,6 +135,7 @@ BACKTEST_END   = "2026-07-31"
 #              게이트·백테스트·어블레이션·강건성·해석표가 전부 나옵니다. 처음엔 이걸로 한 번.
 #    "FULL"  : 스모크 → 리허설 → 실데이터 수집 → 전체 (권장)
 #    "CACHED": 스모크 → 리허설 → 캐시만 사용(신규 수집 안 함) → 전체. 오프라인 재현용.
+VERIFY_FILE = "arc_txt_v2_verify.py"   # 검증 하네스(선택) — 같은 폴더에 있으면 자동 실행
 RUN_MODE = "FULL"
 
 # ── ⑦ 성능 / 자원 ───────────────────────────────────────────────────────────────────────────
@@ -177,7 +171,6 @@ ARC_REPORT_LAG_DAYS   = 1             # 리포트 발간일 + 1거래일부터 �
 
 # ── §5 축 A: 애널리스트 텍스트톤 ────────────────────────────────────────────────────────────
 ARC_TONE_MODEL        = "logreg"      # "nb" | "logreg" | "lgbm"  (LLM 금지)
-ARC_TONE_CAR_DAYS     = 2             # 라벨: 발간일 기준 2일 CAR(시장수익률 차감)의 부호
 ARC_TONE_HALFLIFE_D   = 30.0          # §5.2 최신성 가중 반감기 30일
 ARC_TONE_MIN_SENT     = 3             # 리포트당 최소 문장 수 (미만이면 TONE 결측)
 ARC_TONE_MIN_TRAIN    = 2000          # 확장윈도우 학습 최소 문장 수 (미만이면 그 시점 스킵)
@@ -245,11 +238,8 @@ ARC_DART_SAFETY       = 200           # 마지막 여유분 — 다음 실행의
 SEED = 20260810                       # 결정성: 모든 난수는 이 시드에서 파생
 VERBOSE = True
 STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False 로 끄지 마세요)
+SELFTEST = True                       # 검증 하네스 실행 여부. 하네스 파일이 없으면 자동 생략
 
 STRATEGY_ID   = "@@STRATEGY_ID@@"
 STRATEGY_NAME = "@@STRATEGY_NAME@@"
 BUILD_VERSION = "@@BUILD_VERSION@@"
-
-# 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
-CUSTOMS_API_KEY = ""
-GDRIVE_ADOPT_DIRS = CACHE_SEARCH_DIRS

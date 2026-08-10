@@ -1,13 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-F  PIT 저장소 / 유니버스 / 셀  (계약 C1·C2·C3·C4·C11)                                 ║
-# ║                                                                                          ║
-# ║  C1: 모든 데이터 접근은 PIT.get(table, as_of) 한 곳만 통과한다.                            ║
-# ║      DataFrame 직접 슬라이싱 금지. 우회 파라미터를 만들지 않는다.                          ║
-# ║  C2: 유니버스는 상장폐지 종목을 포함한다. 정리매매가 없으면 -100%.                          ║
-# ║  C11: 셀 = (date, industry, size_bucket). 다른 그룹키 금지.                                ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-F  PIT 저장소 / 유니버스 / 셀  (계약 C1·C2·C3·C4·C11)
+#  C1: 모든 데이터 접근은 PIT.get(table, as_of) 한 곳만 통과한다.
+#  DataFrame 직접 슬라이싱 금지. 우회 파라미터를 만들지 않는다.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 class PITStore:
     """유일한 데이터 게이트웨이. 등록된 테이블은 knowledge_date 로 정렬되어 보관되고,
@@ -135,10 +131,8 @@ class PITStore:
 
 PIT = PITStore()
 
-
 # ── 유니버스 (C2) ───────────────────────────────────────────────────────────────────────────
 LISTING_SEASONING_DAYS = 250          # 상장일 + 250거래일 ≈ 1년
-
 
 class Universe:
     def __init__(self, sec: pd.DataFrame, snapshots: pd.DataFrame, px_daily: pd.DataFrame,
@@ -178,15 +172,7 @@ class Universe:
         self._delist = {c: d for c, d in zip(self._codes_arr, self.sec["delisting_date"])
                         if pd.notna(d)}
 
-        # 상장 후 250거래일 시즈닝 — 거래일 배열에 대한 searchsorted 를 한 번에 벡터화
-        #
-        # ★ 앵커 주의 (조용한 유니버스 붕괴의 원인) ─────────────────────────────────────
-        #   searchsorted 는 '가격패널 시작일 이전에 상장한' 종목을 전부 index 0 으로 보낸다.
-        #   거기에 +250 을 더하면 1990년 상장 종목조차 "패널 시작 후 250거래일"에야 시즈닝이
-        #   끝난 것으로 계산된다. 2016-08 시작 패널이면 2017년 중반까지 삼성전자를 포함한
-        #   기존 상장사 전부가 유니버스에서 빠진다. 에러 없이, 로그도 없이.
-        #   → 시즈닝의 앵커는 '패널 시작일'이 아니라 '상장일'이다. 패널 시작 전 상장분은
-        #     이미 오래전에 시즈닝이 끝난 것으로 확정한다.
+        #   (상세 근거는 커밋 로그 참조)
         self._seasoned: Dict[str, Any] = {}
         _FAR = pd.Timestamp("2100-01-01")     # 패널 안에서 시즈닝이 끝나지 않는 신규 상장
         if len(self._trading_days):
@@ -279,11 +265,9 @@ class Universe:
             LOG.warn("최종 선정 종목이 월평균 5개 미만입니다. 통계적 판단이 불가능한 수준이므로 "
                      "임계값을 낮추기 전에 어느 게이트가 원인인지 위 표에서 먼저 확인하세요.")
 
-
 # ── 셀 (C11) ────────────────────────────────────────────────────────────────────────────────
 SIZE_BUCKETS = [(0, 50, "<50"), (50, 100, "50-99"), (100, 300, "100-299"),
                 (300, 1000, "300-999"), (1000, 10 ** 9, "1000+")]
-
 
 def size_bucket(n_emp: float) -> str:
     if n_emp is None or not np.isfinite(n_emp) or n_emp <= 0:
@@ -293,57 +277,11 @@ def size_bucket(n_emp: float) -> str:
             return lab
     return "1000+"
 
-
-def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N) -> pd.DataFrame:
-    """cell_key = (date, industry, size_bucket). 규모를 넣는 이유는 §5.6-② 참조:
-    정부 지원제도 요건 대부분이 기업 규모에 연동되므로 정책효과가 셀 내 공통충격으로 흡수된다.
-    비용 0의 오염 제거."""
-    ind = sec.set_index("code")["industry"].astype(str).to_dict()
-    p = panel.copy()
-    p["industry"] = p["code"].map(ind).fillna("미분류").astype(str)
-    p["industry_l1"] = p["industry"].str.slice(0, 4)                 # 폴백용 상위 단위
-    p["size_bucket"] = p["employees"].map(size_bucket) if "employees" in p.columns else "미상"
-    ym = p["month"].dt.strftime("%Y%m")
-    p["cell"] = ym + "|" + p["industry"] + "|" + p["size_bucket"]
-    # 폴백 사다리를 컬럼으로 미리 만들어 둔다. 센서별로 유효 관측이 부족할 때
-    # xsec_z_l 이 이 사다리를 타고 내려간다(C11 "산업 상위 단위로 폴백").
-    p["cell_l2"] = ym + "|" + p["industry_l1"] + "|ALL"
-    p["cell_l3"] = ym + "|ALL|ALL"
-
-    cnt = p.groupby("cell", observed=True)["code"].transform("size")
-    small = cnt < min_n
-    n_small = int(small.sum())
-    still_n = 0
-    if n_small:
-        p.loc[small, "cell"] = p.loc[small, "cell_l2"]
-        cnt2 = p.groupby("cell", observed=True)["code"].transform("size")
-        still = cnt2 < min_n
-        still_n = int(still.sum())
-        if still.any():
-            p.loc[still, "cell"] = p.loc[still, "cell_l3"]
-        LOG.info(f"셀 폴백 발생: 1차 {n_small:,}행(산업 상위단위로) / 2차 {still_n:,}행(전체로). "
-                 f"C11 요구대로 폴백을 로깅합니다.")
-        PIPE.note(f"셀 폴백 {n_small:,}행")
-    for c in ("cell", "cell_l2", "cell_l3"):
-        p[c] = p[c].astype("category")
-    LOG.debug(f"셀 구성: 1단계 {p['cell'].nunique():,}개 · 2단계 {p['cell_l2'].nunique():,}개 · "
-              f"3단계 {p['cell_l3'].nunique():,}개")
-    return p
-
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L1-F+  ARC — U-1000 유니버스 (§3) + 분기 패널 조립                                        ║
-# ║                                                                                          ║
-# ║  §3.1  PIT 시가총액 랭크 '하위 1000종목' (KOSPI+KOSDAQ). 매 리밸일 스냅샷으로 재구성.       ║
-# ║  §3.2  직전 60거래일 ADTV ≥ 1억원                                                          ║
-# ║  §3.3  관리종목·환기·거래정지·스팩·우선주·리츠·완전자본잠식·상장12개월미만 제외             ║
-# ║  §3.4  ★상장폐지 종목을 PIT 스냅샷에 반드시 포함. 정리매매 없으면 -100%.                    ║
-# ║                                                                                          ║
-# ║  ★ 이 전략에서 가장 치명적인 편향 지점은 "현재 시총 랭크를 과거에 적용" 이다.                ║
-# ║    지금 소형주인 종목은 정의상 '지난 10년간 주가가 하락한' 종목이므로, 그 명단으로            ║
-# ║    2016년 유니버스를 만들면 하락할 종목만 골라 담은 셈이 된다. 그래서 랭크는 반드시           ║
-# ║    그 시점에 관측된 시총(mc_panel)으로만 매긴다. A3 계약검정이 이걸 실제로 검사한다.          ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L1-F+  ARC — U-1000 유니버스 (§3) + 분기 패널 조립
+#  ★ 이 전략에서 가장 치명적인 편향 지점은 "현재 시총 랭크를 과거에 적용" 이다.
+#  §3.1  PIT 시가총액 랭크 '하위 1000종목' (KOSPI+KOSDAQ). 매 리밸일 스냅샷으로 재구성.
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 # 우선주 코드 규칙: 구형 6자리는 끝자리가 5/7/9 (1우/2우B/3우 등),
 # 2024 영숫자 체계는 6번째 자리가 K/L/M/N.
@@ -362,17 +300,9 @@ _NONEQUITY_SECUGROUP_RE = re.compile(
     r"수익증권|투자회사|선박투자회사|신주인수권|출자증권|외국주권예탁증서|ETN|ETF", re.I)
 _PREF_NAME_RE = re.compile(r"\d?\s*우(?:B|C)?$|우선주$")
 
-
 def is_preferred(code: str, name: str = "", base_codes: Optional[set] = None) -> bool:
     """우선주 판정.
-
     ★ '끝자리가 5~9 면 우선주' 라는 흔한 휴리스틱은 과잉 제외를 낳는다. 보통주도 끝자리가
-      0 이 아닌 경우가 있고, 그런 종목을 통째로 버리면 유니버스가 조용히 줄어 선택편향이 된다.
-      그래서 세 근거 중 하나가 확실할 때만 우선주로 본다:
-        ① 2024 영숫자 체계에서 6번째 자리가 K/L/M/N
-        ② 끝자리가 0 이 아니면서 **같은 앞 5자리 + 0 인 보통주가 실제로 존재**
-           (우선주는 정의상 형제 보통주가 있다 — 이게 가장 결정적인 증거다)
-        ③ 종목명이 '…우' / '…우B' / '…우선주' 로 끝남 ('미래에셋대우' 같은 사명은 제외)
     """
     c = str(code or "")
     if _PREF_NEW_RE.match(c):
@@ -387,7 +317,6 @@ def is_preferred(code: str, name: str = "", base_codes: Optional[set] = None) ->
         if (c[:5] + "0") in base_codes:
             return True
     return False
-
 
 def classify_excluded(sec: pd.DataFrame) -> pd.DataFrame:
     """§3.3 종목 속성 기반 상시 제외 판정. 반환: code, ex_spac, ex_pref, ex_reit, ex_static.
@@ -445,7 +374,6 @@ def classify_excluded(sec: pd.DataFrame) -> pd.DataFrame:
                  f"유니버스 감쇠 감사표에서 종목수를 반드시 확인하세요.")
         PIPE.note(f"WARN: 상시 제외 {100*n/len(S):.0f}%")
     return S[cols]
-
 
 class ArcUniverse:
     """U-1000 PIT 유니버스. 기존 Universe(상장/폐지 근거)를 감싸 랭크·유동성·제외를 얹는다."""
@@ -544,7 +472,6 @@ class ArcUniverse:
             LOG.warn(f"최종 단계 종목이 목표 보유수({ARC_TOP_N_MIN}~{ARC_TOP_N_MAX})보다 적습니다. "
                      f"임계값을 낮추기 전에 위 표에서 어느 게이트가 원인인지 먼저 확인하세요.")
 
-
 # ── 셀 (횡단면 표준화 단위) ─────────────────────────────────────────────────────────────────
 _SECTOR_MAP = [
     (r"반도체|전자|디스플레이|IT|정보기술|통신장비|컴퓨터|소프트|인터넷|게임|미디어|콘텐츠",
@@ -560,7 +487,6 @@ _SECTOR_MAP = [
 ]
 _SECTOR_RE = [(re.compile(p), s) for p, s in _SECTOR_MAP]
 
-
 def to_sector(industry: Any) -> str:
     """세부 업종 문자열 → 8개 상위 섹터. 횡단면 셀이 너무 잘게 쪼개지는 것을 막는다.
 
@@ -572,7 +498,6 @@ def to_sector(industry: Any) -> str:
         if rx.search(s):
             return lab
     return "기타"
-
 
 def build_arc_cells(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N) -> pd.DataFrame:
     """cell = (분기, 섹터). 폴백 = (분기, ALL).
@@ -600,13 +525,11 @@ def build_arc_cells(P: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N)
     LOG.debug(f"셀 구성: 섹터셀 {p['cell'].nunique():,}개 · 전체셀 {p['cell_all'].nunique():,}개")
     return p
 
-
 # ── 분기 패널 조립 ──────────────────────────────────────────────────────────────────────────
 ARC_PANEL_BASE_COLS = ["code", "asof", "q", "corp_code", "market", "industry", "sector",
                        "mktcap", "adtv60", "uni_rank", "close", "exec_px",
                        "fwd_ret_1q", "fwd_ret_2q", "fwd_ret_4q", "listing_months",
                        "mom_12_1", "log_mktcap", "log_adtv", "cell", "cell_all"]
-
 
 def build_liquidity_panel(px_daily: pd.DataFrame, rebals: pd.DatetimeIndex) -> pd.DataFrame:
     """리밸일 시점의 (직전 60거래일 ADTV, 직전 종가, 12-1 모멘텀). 전부 t 이전 관측만 쓴다.
@@ -653,7 +576,6 @@ def build_liquidity_panel(px_daily: pd.DataFrame, rebals: pd.DatetimeIndex) -> p
     PIPE.io("OUT", "MEM", "liquidity_panel", L)
     return downcast(L)
 
-
 def build_exec_prices(px_daily: pd.DataFrame, rebals: pd.DatetimeIndex) -> pd.DataFrame:
     """체결가 = 리밸일 '이후 첫 거래일의 시가'. §4 룩어헤드 금지의 실행부.
 
@@ -698,7 +620,6 @@ def build_exec_prices(px_daily: pd.DataFrame, rebals: pd.DatetimeIndex) -> pd.Da
                  f"{100*n_fb/max(len(E),1):.2f}%")
     return downcast(E)
 
-
 def _last_close_before(px_daily: Optional[pd.DataFrame],
                        codes: Sequence[str], cutoffs: pd.Series) -> pd.Series:
     """각 (code, cutoff) 에 대해 cutoff 이하 마지막 종가. 상장폐지 청산가 산출용."""
@@ -728,24 +649,11 @@ def _last_close_before(px_daily: Optional[pd.DataFrame],
     out.loc[M["_i"].to_numpy()] = M["close"].to_numpy(dtype="float64")
     return out
 
-
 def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFrame,
                     liq: pd.DataFrame, execp: pd.DataFrame, sec: pd.DataFrame,
                     px_daily: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """U-1000 멤버십 + 유동성 + 체결가 + 전방수익률 → 기본 패널 P.
-
     ★ 전방수익률은 패널(=U-1000 멤버십) 내부 shift 로 만들면 안 된다. 세 가지가 동시에 깨진다:
-      ① 다음 리밸일에 U-1000 밖으로 나간 종목(시총이 커진 '큰 승자', 유동성이 마른 '붕괴
-         종목')은 전방수익률이 NaN 이 되고, run_backtest 의 elig 필터가 그 종목을 **오늘의
-         편입 후보에서** 지운다 → 오늘의 편입 자격이 내일의 유니버스 잔류 여부로 결정된다.
-      ② 거래정지가 한 분기 이상 이어지면 시총 격자에서 먼저 사라지므로, 폐지일이 왔을 때
-         -100% 를 계상할 행 자체가 없다. 한국의 감사의견거절·자본잠식 폐지는 대부분
-         '수개월 거래정지 → 폐지' 경로라, 이 손실이 통째로 사라진다.
-      ③ 합병·완전자회사화 같은 정상 폐지에까지 -100% 가 붙는다(실제로는 합병비율·공개매수가로
-         원금 수준이 회수된다).
-      → 전방수익률은 execp(전 종목 × 전 리밸일 체결가 격자)에서 (code, asof+3k월) 로 직접
-        만들고, 폐지는 delisting_map() 전수 기준으로 판정하며 청산가는 폐지일 이전 마지막
-        종가를 쓴다. 마지막 종가조차 없을 때만 -100%.
     """
     if U is None or U.empty:
         raise RuntimeError(
@@ -838,14 +746,7 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
         died = dl.notna() & (dl > P["asof"]) & (dl <= tgt)
         # ★ '거래정지 → 유니버스 소실 → 폐지' 경로. 보유 중에 팔 수 없었고 결국 폐지됐으므로
         #   청산 결과를 이 분기에 계상한다. 결측으로 두면 손실만 선택적으로 사라진다.
-        #
-        #   ★★ 단, '정지 후 **재개**' 와 반드시 구별해야 한다. 예전 구현은 "전방가격 없음 +
-        #      언젠가 폐지됨" 만 보고 곧바로 폐지일 직전 종가를 썼는데, 그러면 3년 뒤 합병
-        #      폐지 종목의 **다년 수익률이 1분기 수익률 자리**에 들어간다(실측 fwd_ret_1q
-        #      +400% 인데 같은 행 fwd_ret_2q 는 +20%). elig 가 더 이상 fwd_ret 를 보지
-        #      않으므로 그 행은 실제로 편입되어 포트폴리오 수익에 곧바로 들어간다.
-        #      → 정지가 풀려 다시 거래된 리밸일이 폐지 전에 존재하면 **거기서 청산**한다.
-        #        진입 체결가가 없는 행(base 결측)은 애초에 보유가 성립하지 않으므로 제외.
+        #   (상세 근거는 커밋 로그 참조)
         can_hold = base.notna() & (base > 0)
         stuck = r.isna() & can_hold & dl.notna() & (dl > P["asof"]) & ~died
         resolve = (died | stuck) & can_hold

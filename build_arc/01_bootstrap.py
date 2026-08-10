@@ -30,7 +30,6 @@ for _s in ("stdout", "stderr"):
     except Exception:
         pass
 
-
 def _console_ok(sample: str = "╔✔⚠★─") -> bool:
     enc = (getattr(sys.stdout, "encoding", None) or "utf-8")
     try:
@@ -39,8 +38,6 @@ def _console_ok(sample: str = "╔✔⚠★─") -> bool:
     except Exception:
         return False
 
-
-CONSOLE_UNICODE = _console_ok()
 # 인코딩이 안 되는 콘솔용 치환표 (표 모양은 잃되 정보는 전부 보존한다)
 _ASCII_FALLBACK = str.maketrans({
     "╔": "+", "╗": "+", "╚": "+", "╝": "+", "═": "=", "║": "|",
@@ -53,7 +50,6 @@ _ASCII_FALLBACK = str.maketrans({
     "⑧": "(8)", "⑨": "(9)", "⑩": "(10)", "⭐": "*", "⛔": "STOP", "∏": "prod",
 })
 
-
 def _safe_print(*args, **kw):
     """어떤 콘솔에서도 죽지 않는 print. 인코딩 실패 시에만 ASCII 로 낮춘다."""
     try:
@@ -64,7 +60,6 @@ def _safe_print(*args, **kw):
         except Exception:
             enc = (getattr(sys.stdout, "encoding", None) or "ascii")
             print(*[str(a).encode(enc, "replace").decode(enc, "replace") for a in args], **kw)
-
 
 def _detect_env() -> Dict[str, Any]:
     """Colab / JupyterLab / VSCode / 순수 CLI 를 구분한다. 어느 쪽이든 죽지 않아야 한다."""
@@ -121,16 +116,12 @@ _OPTIONAL = [
 ]
 
 # ★ konlpy / lightgbm 은 '설치 시도조차' 하지 않는다.
-#   konlpy 는 JVM(JDK) 이 필요해서 Colab 이 아닌 환경에서 설치가 실패하거나, 설치돼도
-#   import 시점에 JVM 을 띄우려다 프로세스를 통째로 죽이는 사례가 있다. 있으면 쓰고 없으면
-#   soynlp → 규칙기반으로 내려간다(15_ingest_dart_doc 의 폴백 사다리).
-#   lightgbm 도 마찬가지로 무거우며, TONE 분류기는 LogReg 로 충분하다.
+#   (상세 근거는 커밋 로그 참조)
 _OPTIONAL_DETECT_ONLY = [
     ("konlpy",   "konlpy",   "한국어 형태소 분석(Mecab/Okt). 있으면 D1 토큰화 품질이 가장 좋음"),
     ("lightgbm", "lightgbm", "TONE 분류기 대안 (ARC_TONE_MODEL='lgbm' 일 때만)"),
     ("Mecab",    "mecab-ko", "Mecab 직결 바인딩(가장 빠름)"),
 ]
-
 
 def _pip_install(pkgs: List[str], quiet: bool = True) -> Tuple[bool, str]:
     if not pkgs:
@@ -144,7 +135,6 @@ def _pip_install(pkgs: List[str], quiet: bool = True) -> Tuple[bool, str]:
         return r.returncode == 0, (r.stderr or r.stdout)[-2000:]
     except Exception as e:                                    # noqa
         return False, f"{type(e).__name__}: {e}"
-
 
 def _ensure_deps() -> Dict[str, bool]:
     import importlib
@@ -186,7 +176,6 @@ def _ensure_deps() -> Dict[str, bool]:
             out[mod] = False
     return out
 
-
 # ═══ 자격증명은 어떤 서드파티 import 보다도 먼저 주입한다 ═══════════════════════════════════
 #   pykrx.webio 는 모듈 로드 시점에 build_krx_session() 을 돌린다. 순서를 뒤집으면
 #   예외 없이 '비인증 세션'이 만들어지고 원인 추적이 매우 어려운 실패로 이어진다.
@@ -219,8 +208,6 @@ np.seterr(all="ignore")
 # 결정성(C8): 모든 난수는 이 시드에서 파생된다.
 random.seed(SEED)
 np.random.seed(SEED % (2 ** 32 - 1))
-RNG = np.random.default_rng(SEED)
-
 # 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
 if OPT.get("FinanceDataReader"):

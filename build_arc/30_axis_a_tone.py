@@ -1,19 +1,9 @@
 
-
-# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  L2-A  축 A — 애널리스트 텍스트톤 (§5)                                                     ║
-# ║                                                                                          ║
-# ║  경제적 근거: 애널리스트는 정성적 판단을 서술문에 먼저 반영하고 목표주가·투자의견은          ║
-# ║  지연 갱신한다(비동기적 업데이트). 저커버리지 소형주일수록 이 텍스트를 읽는 투자자가 적다.   ║
-# ║                                                                                          ║
-# ║  ★★ 이 축의 성립 조건은 '텍스트 톤이 컨센서스 수정과 독립적인 정보' 라는 것이다.            ║
-# ║     아니면 이 전략은 '애널리스트 과소반응 전략'의 재포장에 불과하다.                        ║
-# ║     그래서 직교화(§5.3)는 선택이 아니라 전략 성립의 필요조건이며, 여기서 강제된다.           ║
-# ║                                                                                          ║
-# ║  ★★ LLM API 호출 금지(§5.1). 토큰 비용 문제이자, 사전학습 코퍼스로 인한 룩어헤드 오염       ║
-# ║     위험 때문이다. 2016년 리포트를 2024년까지 학습한 모델로 채점하면 그 자체가 미래정보다.   ║
-# ║     이 파일은 TF-IDF + (NB | LogReg) 만 쓰며, A18 계약검정이 소스에서 이를 검사한다.        ║
-# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+# ────────────────────────────────────────────────────────────────────────────────────────
+#  L2-A  축 A — 애널리스트 텍스트톤 (§5)
+#  ★★ 이 축의 성립 조건은 '텍스트 톤이 컨센서스 수정과 독립적인 정보' 라는 것이다.
+#  ★★ LLM API 호출 금지(§5.1). 토큰 비용 문제이자, 사전학습 코퍼스로 인한 룩어헤드 오염
+# ────────────────────────────────────────────────────────────────────────────────────────
 
 # ── 정형 텍스트 제거 사전 (§5.1) ────────────────────────────────────────────────────────────
 #   ★ 왜 이게 필수인가: 면책조항·컴플라이언스 문구는 증권사마다 고정 문구다. 제거하지 않으면
@@ -52,7 +42,6 @@ TONE_Q_COLS = ["code", "asof", "q", "TONE", "n_reports_q"]
 
 _TONE_STATE: Dict[str, Any] = {"fits": 0, "backend": "", "warned": False}
 
-
 def tone_clean_report_text(txt: str) -> str:
     """정형 텍스트 제거 + 표 잔재 제거. 제거하지 않으면 증권사 식별자로 누출된다."""
     if not txt:
@@ -73,7 +62,6 @@ def tone_clean_report_text(txt: str) -> str:
         keep.append(s)
     return "\n".join(keep)
 
-
 def tone_sentences(txt: str) -> List[str]:
     """한국어 문장 분리. 8~400자만 채택."""
     if not txt:
@@ -84,7 +72,6 @@ def tone_sentences(txt: str) -> List[str]:
         if 8 <= len(s) <= 400 and re.search(r"[가-힣]{2,}", s):
             out.append(s)
     return out
-
 
 # ── 라벨: 발간일 기준 2일 CAR (시장수익률 차감) 의 부호 ─────────────────────────────────────
 def _tone_market_excess(px_daily: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
@@ -112,7 +99,6 @@ def _tone_market_excess(px_daily: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFra
     d["car2"] = g.shift(-1).fillna(0) + g.shift(-2).fillna(0)
     d["car2"] = d["car2"].where(g.shift(-2).notna())
     return d[["code", "date", "car2"]]
-
 
 def build_tone_training(rep_text: pd.DataFrame, px_daily: pd.DataFrame,
                         sec: pd.DataFrame, max_sent_per_report: int = 22,
@@ -187,7 +173,6 @@ def build_tone_training(rep_text: pd.DataFrame, px_daily: pd.DataFrame,
     PIPE.io("OUT", "MEM", "tone_training", T)
     return T
 
-
 # ── 순수 numpy Multinomial NB (sklearn 부재 시 폴백) ────────────────────────────────────────
 class _ToneNaiveBayes:
     """해시 기반 bag-of-words + Multinomial NB. sklearn 이 없어도 축 A 가 죽지 않게 한다.
@@ -250,7 +235,6 @@ class _ToneNaiveBayes:
             out[k] = int(sc[1] > sc[0])
         return out
 
-
 def fit_tone_expanding(train: pd.DataFrame, cut) -> Optional[Tuple[Any, Any]]:
     """cut '이전' 데이터로만 학습한 (vectorizer, model). 표본 부족이면 None.
 
@@ -297,7 +281,6 @@ def fit_tone_expanding(train: pd.DataFrame, cut) -> Optional[Tuple[Any, Any]]:
                  "이 사실을 결과 해석에 반드시 반영하세요.")
     return (None, mdl)
 
-
 def _tone_predict(fit: Tuple[Any, Any], sents: Sequence[str]) -> np.ndarray:
     vec, mdl = fit
     if vec is not None:
@@ -307,17 +290,10 @@ def _tone_predict(fit: Tuple[Any, Any], sents: Sequence[str]) -> np.ndarray:
             return np.ones(len(sents), dtype=int)
     return np.asarray(mdl.predict(list(sents))).astype(int)
 
-
 def score_tone_reports(rep_text: pd.DataFrame, train: pd.DataFrame,
                        rebals: pd.DatetimeIndex) -> pd.DataFrame:
     """§5.1 확장윈도우 재학습 + §5.2 리포트 단위 TONE.
-
-    TONE(report) = (긍정문장 수 − 부정문장 수) / 전체문장 수  ∈ [-1, +1]
-
     ★ 성능: 리밸일마다 매번 재학습하면 40회 × 수십 초다. 학습표본이 직전 학습 대비
-      15% 이상 늘었을 때만 재학습하고 그 외에는 직전 모델을 재사용한다.
-      재사용해도 '그 시점 이전 데이터로만 학습된 모델' 이라는 성질은 그대로 유지된다
-      (더 오래된 모델을 쓰는 것이므로 오히려 보수적이다).
     """
     if rep_text is None or rep_text.empty or train is None or train.empty:
         return pd.DataFrame(columns=TONE_REPORT_COLS)
@@ -374,7 +350,6 @@ def score_tone_reports(rep_text: pd.DataFrame, train: pd.DataFrame,
     PIPE.io("OUT", "MEM", "tone_reports", T)
     return T
 
-
 def aggregate_tone(tone_rep: pd.DataFrame, rebals: pd.DatetimeIndex,
                    half_life_days: Optional[float] = None) -> pd.DataFrame:
     """§5.2 분기 집계 — 최신성 가중평균. 가중치 = exp(−λ·경과일수), 반감기 30일 고정.
@@ -411,10 +386,8 @@ def aggregate_tone(tone_rep: pd.DataFrame, rebals: pd.DatetimeIndex,
            f"· 반감기 {hl:.0f}일 최신성 가중")
     return downcast(Q)
 
-
 # ── §5.3 ΔTONE + 직교화 ─────────────────────────────────────────────────────────────────────
 AXIS_A_COLS = ["TONE", "TONE_prev", "dTONE", "dTONE_resid", "n_reports_q", "has_axis_a"]
-
 
 def attach_axis_a(P: pd.DataFrame, tone_q: pd.DataFrame,
                   rev: Optional[pd.DataFrame] = None) -> pd.DataFrame:
@@ -488,11 +461,7 @@ def attach_axis_a(P: pd.DataFrame, tone_q: pd.DataFrame,
     # ── 직교화 사다리 (§5.3) ──────────────────────────────────────────────────────────────
     # ★ 자유도 하한(관측수 ≥ 5 × 파라미터수)을 걸면, 리포트 커버리지가 얇은 초기 분기는
     #   파라미터 14개(통제 6 + 섹터더미 7 + 절편)를 감당하지 못해 축 A 가 통째로 사라진다.
-    #   그렇다고 하한을 풀면 잔차의 절반 이상이 규모·모멘텀·섹터의 적합오차가 되어
-    #   '직교화된 톤'이 위장된 사이즈 베팅이 된다(실측: n=17 에서 corr 0.42).
-    #   → 파라미터를 줄이며 내려가는 사다리를 쓴다. §5.3 이 요구하는 핵심은 **명시된 통제
-    #     변수와의 직교화**이고 섹터 중립은 그 위의 추가 조치이므로, 먼저 섹터더미를 버린다.
-    #     모든 단계가 실패하면 그 분기는 결측이다 — 직교화 없는 원신호를 쓰지는 않는다.
+    #   (상세 근거는 커밋 로그 참조)
     _LADDER = [("통제 + 섹터더미", X_full),
                ("통제만(섹터더미 제외)", X),
                ("축소통제(규모·모멘텀·수정률)",
@@ -533,7 +502,6 @@ def attach_axis_a(P: pd.DataFrame, tone_q: pd.DataFrame,
                  f"결측입니다(§7.2 에 따라 종목은 축 B 로 평가되고 탈락하지 않습니다).")
     P = ensure_cols(P, AXIS_A_COLS)
     return P
-
 
 def report_axis_a_ic(P: pd.DataFrame) -> dict:
     """§5.3 중간 검증 — 직교화 전/후 IC 를 나란히 보고한다. 이게 축 A 존속의 판정 근거다."""

@@ -18,6 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "build_arc")
 OUT = os.path.join(ROOT, "strategies")
 
+# 본체 — 사용자가 실제로 돌리는 산출물(수집·정제·백테스트·성과·어블레이션·강건성·해석표)
 ORDER = [
     "00_header.py", "01_bootstrap.py", "02_kernel.py", "03_util.py", "04_vault.py",
     "05_http.py",
@@ -26,9 +27,13 @@ ORDER = [
     "20_pit.py", "21_gate.py",
     "30_axis_a_tone.py", "31_axis_b_d1.py", "32_axis_b_d2.py", "33_axis_b_d3.py",
     "40_score.py", "41_backtest.py",
-    "50_ablation.py", "51_robust.py", "60_report.py",
-    "70_contracts.py", "75_rehearsal.py", "80_selftest.py", "90_main.py",
+    "50_ablation.py", "51_robust.py", "60_report.py", "90_main.py",
 ]
+
+# 검증 하네스 — 별도 파일. 본체는 이게 없어도 완전히 동작한다.
+#   같은 폴더에 두면 SELFTEST=True 일 때 본체가 자동으로 읽어 실행한다.
+VERIFY_ORDER = ["70_contracts.py", "75_rehearsal.py", "80_selftest.py"]
+VERIFY_FNAME = "arc_txt_v2_verify.py"
 
 SPEC = dict(
     sid="ARC_TXT_V2",
@@ -74,10 +79,19 @@ def build(version: str) -> str:
     return blob
 
 
+def build_verify() -> str:
+    """검증 하네스 조각을 하나로 묶는다. 본체가 exec 로 읽어 들이므로 import 는 없다."""
+    head = ('"""ARC-TXT v2 검증 하네스 — 계약검정 A1~A39 / 실경로 리허설 / 합성 스모크.\n\n'
+            "본체(arc_txt_v2.py)와 같은 폴더에 두면 SELFTEST=True 일 때 자동으로 실행된다.\n"
+            "단독 실행은 불가하다(본체의 전역 이름을 쓴다). 없어도 본체는 완전히 동작한다.\n"
+            '"""\n')
+    return head + "\n".join(strip_head(read(fn), keep=False) for fn in VERIFY_ORDER)
+
+
 def check_pieces() -> None:
     """조각 안의 최상위 import 를 잡는다 — concat 파일에서 순서 사고의 원인이 된다."""
     bad = []
-    for fn in ORDER:
+    for fn in ORDER + VERIFY_ORDER:
         if fn in ("00_header.py", "01_bootstrap.py"):
             continue                                  # 부트스트랩만 임포트를 허용
         src = read(fn)
@@ -116,7 +130,15 @@ def main():
         f.write(blob)
     check_built(path)
     n = blob.count("\n") + 1
-    print(f"  ✔ {SPEC['fname']:<24} {n:>7,}줄  {len(blob)/1024:>8.1f}KB")
+    print(f"  ✔ {SPEC['fname']:<24} {n:>7,}줄  {len(blob)/1024:>8.1f}KB   [본체]")
+
+    vblob = build_verify()
+    vpath = os.path.join(OUT, VERIFY_FNAME)
+    with open(vpath, "w", encoding="utf-8") as f:
+        f.write(vblob)
+    ast.parse(vblob, filename=vpath)
+    vn = vblob.count("\n") + 1
+    print(f"  ✔ {VERIFY_FNAME:<24} {vn:>7,}줄  {len(vblob)/1024:>8.1f}KB   [검증 하네스·선택]")
     print(f"\n빌드 {version} → {path}")
     return path
 
