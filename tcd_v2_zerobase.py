@@ -1202,7 +1202,8 @@ class CallBudget:
 
 
 def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
-             label: str = "", quiet: bool = False) -> List[Any]:
+             label: str = "", quiet: bool = False,
+             on_done: Optional[Callable] = None) -> List[Any]:
     """네트워크 병렬(스레드). 예외는 None 으로 흡수하되 유형별 건수를 로그로 남긴다.
 
     quiet=True — 호출자가 '전체 진행'을 재는 바깥 진행바를 이미 들고 있을 때 쓴다.
@@ -1224,7 +1225,17 @@ def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
         #   shutdown(wait=True) 가 또 블록해서 바깥 배치 루프의 CLOCK.over() 체크에 영영
         #   도달하지 못한다(시간예산 무력화). 공시·주요계정·심층재무·직원현황 네 스테이지가
         #   전부 이 경로를 쓴다.
-        it = as_completed(futs, timeout=NET_TASK_TIMEOUT_S * max(1, len(items) // max(w, 1)))
+        # ★배치 전체 상한 — 옛 공식은 `300 × (len//w)` 라 200건/6워커에서 9,900초(2.75시간)가
+        #   나왔다. 상한이라기보다 방치에 가깝다. 15분으로 못 박고, 남은 시간예산도 넘지 않게 한다.
+        #   하한은 NET_TASK_TIMEOUT_S 자체다 — 상수 60 을 바닥에 깔면 작은 배치가
+        #   1건짜리 상한보다 오래 붙잡힌다(작업 1건 상한이 1초여도 60초를 기다린다).
+        _cap_s = max(float(NET_TASK_TIMEOUT_S),
+                     min(NET_TASK_TIMEOUT_S * math.ceil(len(items) / w), 900.0))
+        try:
+            _cap_s = min(_cap_s, max(30.0, CLOCK.remaining()))
+        except Exception:
+            pass
+        it = as_completed(futs, timeout=_cap_s)
         if not quiet:
             it = tqdm(it, total=len(futs), desc=label or "수집", leave=False, ncols=86)
         try:
@@ -1234,6 +1245,15 @@ def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
                     out[i] = fu.result(timeout=NET_TASK_TIMEOUT_S)
                 except Exception as e:                            # noqa
                     errs[type(e).__name__] += 1
+                # ★한 건 끝날 때마다 바깥 진행바를 민다. 이게 없으면 배치가 다 끝나야
+                #   바가 움직이고, 배치 하나가 몇 분~수십 분이면 화면은 `0/N` 에 고정된다 —
+                #   사용자에게 '정체'와 '진행 중'이 완전히 같아 보인다. ZIP 에서 이미 한 번
+                #   겪고 그 한 곳만 고쳤는데, 같은 모양이 9곳 남아 있었다.
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception:
+                        pass
         except Exception as e:                                    # noqa
             n_left = sum(1 for f in futs if not f.done())
             errs[type(e).__name__] += max(1, n_left)
@@ -4810,13 +4830,13 @@ def _sweep_per_stock(codes: Sequence[str], start: str, end: str,
         if CLOCK.over():
             CLOCK.cut(f"종목 스윕: {n_done:,}/{len(todo):,}종목에서 중단(이어받음)")
             break
-        for item in pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True):
+        for item in pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True,
+                             on_done=lambda: bar.update(1)):
             if not item:
                 continue
             c, d = item
             (got.append(d) if d is not None else bad.append({"code": c, "tried_at": today_ts}))
         n_done += len(batch)
-        bar.update(len(batch))
         if got:                       # ★배치마다 즉시 저장 — 도중에 끊겨도 남는다
             add = _px_norm(pd.concat([g.reindex(columns=PX_BULK_COLS) for g in got],
                                      ignore_index=True))
@@ -4973,8 +4993,8 @@ def harvest_prices(master: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
                           f"(받은 {bar.n:,}일은 저장 완료 — 재실행 시 이어받음)")
                 stop = True
                 break
-            res = pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True)
-            bar.update(len(batch))
+            res = pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True,
+                           on_done=lambda: bar.update(1))
             for item in res:
                 if not item:
                     continue
@@ -5993,8 +6013,8 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
     _cap = cap_of(max_calls)
     with stage_bar(len(jobs), "DART 주요계정(회사 100개/호출)") as bar:
         for batch in budget_batches(jobs, 200, "dart", "DART 주요계정 벌크", cap=max_calls, unit="회"):
-            res = pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True)
-            bar.update(len(batch))
+            res = pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True,
+                           on_done=lambda: bar.update(1))
             got += [t[0] for t in res if t and t[0] is not None and len(t[0])]
         # ★응답에 안 나온 회사도 '조회는 했다'로 남긴다 — 안 그러면 미제출 회사·연도 조합을
         #   매 실행 다시 묶어 보내며 하루 한도의 5% 를 영구히 태운다.
@@ -6165,8 +6185,8 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
         _cap = cap_of(max_calls)
         with stage_bar(len(jobs), "DART 전체재무제표(심층)") as bar:
           for batch in budget_batches(jobs, 400, "dart", "DART 재무", cap=max_calls, unit="건"):
-            res = pmap_net(one, batch, workers=min(IO_THREADS, 10), quiet=True)
-            bar.update(len(batch))
+            res = pmap_net(one, batch, workers=min(IO_THREADS, 10), quiet=True,
+                           on_done=lambda: bar.update(1))
             for d in res:
                 if isinstance(d, tuple) and d and d[0] == "EMPTY":
                     new_empty.append({"corp_code": d[1], "bsns_year": d[2],
@@ -6505,13 +6525,13 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
                           f"(하루 한도 {cap_d:,}건 기준). "
                           f"그 사이에도 시가총액 폴백이 있어 셀 배정은 정상 동작합니다.")
                 break
-            for r in pmap_net(one, batch, workers=min(IO_THREADS, 10), quiet=True):
+            for r in pmap_net(one, batch, workers=min(IO_THREADS, 10), quiet=True,
+                              on_done=lambda: bar.update(1)):
                 if isinstance(r, tuple) and r and r[0] == "EMPTY":
                     new_empty.append({"corp_code": r[1], "bsns_year": r[2],
                                       "tried_at": today_ts})
                 elif r:
                     got.append(r)
-            bar.update(len(batch))
     if new_empty:
         alle = pd.concat([negE, pd.DataFrame(new_empty)], ignore_index=True) \
             if negE is not None and len(negE) else pd.DataFrame(new_empty)
@@ -6986,7 +7006,8 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = -1,
     _n_ok = 0
     with stage_bar(len(jobs), "DART 공시목록(월×유형 스윕)") as bar:
         for batch in budget_batches(jobs, 48, "dart", "공시목록", cap=max_calls, unit="건"):
-            for item in pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True):
+            for item in pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True,
+                                 on_done=lambda: bar.update(1)):
                 if not item:
                     continue
                 r, ok = item
@@ -6995,10 +7016,10 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = -1,
                 if ok:
                     done_new.append(ok)
                     _n_ok += 1
-            # ★진행바는 '성공한 것'만 센다. 제출한 수를 세면 QUOTA 가 막힌 뒤 마지막 배치가
-            #   전속력으로 바를 채우고 0행을 수집해, 사용자에겐 '다 됐는데 왜 또 하지?'가 된다.
-            bar.n = _n_ok
-            bar.refresh()
+            # ★바는 on_done 이 '끝난 건'마다 밀고(정체와 진행을 구별하려면 이게 필수),
+            #   실제 성공 수는 후미에 붙여 보여 준다. QUOTA 가 막힌 뒤 마지막 배치가
+            #   전속력으로 지나가면 진척과 성공이 벌어지는 게 그대로 보인다.
+            bar.set_postfix_str(f"완주 {_n_ok:,}")
     frames = ([cached] if cached is not None and len(cached) else [])
     if fresh:
         d = pd.DataFrame(fresh)
@@ -7864,12 +7885,13 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                "35배). 매월 실행하면 13개월째부터 TP_N1~N4 가 살아납니다. 그때까지 PACK-N 은 "
                "θ_N 만 계산되고 V4 가 증거층에서 제외합니다 — 정상 동작입니다.")
         with stage_bar(len(jobs), "국민연금 사업장(종목축)") as bar:
-            for batch in chunked(jobs, 200):
-                if CLOCK.over() or not QUOTA.allow("datagokr"):
-                    CLOCK.cut(f"국민연금: {len(jobs)-bar.n:,}종목 남기고 중단 "
-                              f"({len(got):,}행 수집 · 재실행 시 이어받음)")
-                    break
-                for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+            # ★배치는 작게. 종목당 검색1~3+상세N 이라 200개면 첫 갱신까지 몇 분이 걸린다
+            #   — on_done 이 건별로 밀어도 배치 경계의 CLOCK/QUOTA 확인이 늦으면 시간 몫을
+            #   넘겨서야 멈춘다.
+            for batch in budget_batches(jobs, 24, "datagokr", "국민연금",
+                                        cap=max_calls, unit="종목"):
+                for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+                                  on_done=lambda: bar.update(1)):
                     if not r:
                         continue                       # 통신 실패 — 원장 미기록(재시도 대상)
                     if "_none" in r:
@@ -7881,7 +7903,6 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                         new_led.append({"code": r["_code"], "n_rows": len(r["_rows"]),
                                         "tried_at": today_ts,
                                         "rule_ver": NPS_RULE_VER})
-                bar.update(len(batch))
     if new_led:
         allf = pd.concat([led, pd.DataFrame(new_led)], ignore_index=True) \
             if led is not None and len(led) else pd.DataFrame(new_led)
@@ -7967,7 +7988,8 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
     with stage_bar(len(todo), "조달 낙찰(월축)") as bar:
         for batch in budget_batches(todo, 6, "datagokr", "조달 낙찰",
                                     cap=max_calls, unit="개월"):
-            for item in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+            for item in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+                                 on_done=lambda: bar.update(1)):
                 if not item:
                     continue
                 r, ok_ym = item
@@ -7975,7 +7997,6 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
                     got += r
                 if ok_ym:
                     done_new.append(ok_ym)
-            bar.update(len(batch))
     if done_new:
         base = done_tbl if done_tbl is not None and len(done_tbl) else None
         alld = pd.concat([base, pd.DataFrame({"ym": done_new})], ignore_index=True) \
@@ -8126,10 +8147,10 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
     with stage_bar(len(jobs), "관세 통관(★연도×HS축)") as bar:
         for batch in budget_batches(jobs, 200, key_src, "관세 통관",
                                     cap=max_calls, unit="건"):
-            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+                              on_done=lambda: bar.update(1)):
                 if r:
                     got += r
-            bar.update(len(batch))
     frames = ([cached] if cached is not None and len(cached) else []) + \
              ([pd.DataFrame(got)] if got else [])
     if not frames:
@@ -8203,10 +8224,10 @@ def harvest_doc_texts(disc: pd.DataFrame, master: pd.DataFrame,
             if CLOCK.over() or not QUOTA.allow("dart"):
                 CLOCK.cut(f"공시원문: {len(got)//3:,}건 수집 후 중단")
                 break
-            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
+            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+                              on_done=lambda: bar.update(1)):
                 if r:
                     got += r
-            bar.update(len(batch))
     frames = ([cached] if cached is not None and len(cached) else []) + \
              ([pd.DataFrame(got)] if got else [])
     if not frames:
