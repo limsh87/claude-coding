@@ -268,7 +268,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.1037"
+BUILD_VERSION      = "qvf1.20260810.1045"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -7302,6 +7302,94 @@ def candidate_year_span(snaps: Optional[pd.DataFrame], sec: pd.DataFrame,
     return out
 
 
+# ── 시가총액 폴백: pykrx 없이도 PIT 시총을 만든다 ──────────────────────────────────────────
+NAVER_SUM = "https://finance.naver.com/sise/sise_market_sum.naver"
+
+
+def fetch_naver_shares() -> pd.DataFrame:
+    """네이버 시가총액 페이지에서 전 종목 '상장주식수'를 받는다. 반환: code · shares_now
+
+    ★ 왜 필요한가: 시총을 pykrx 단일 경로에 묶어 둔 것이 설계 오류였다. pykrx import 가
+      깨지자(윈도우 인코딩) U-1000 자체를 만들 수 없어 실행이 통째로 멈췄다. 유니버스는
+      여러 소스로 서야 한다.
+    ★ 비용: 시장 2개 × 약 33페이지 = 약 66요청. 전 종목 주식수를 이 값으로 확보한다.
+    ★ 한계: '현재' 주식수다. 과거 시총은 이 주식수를 과거로 이월해 종가와 곱해 근사한다
+      (증자·분할이 있었으면 그만큼 오차). 그래서 cap_src 를 'naver_shares_x_close' 로
+      남겨 §3 시총 소스 감사표에 그대로 드러나게 한다 — 숨기지 않는다.
+    """
+    cached = VAULT.get_table("naver_shares_snapshot", scope="shared")
+    if cached is not None and len(cached):
+        LOG.info(f"공용 캐시에서 네이버 상장주식수 {len(cached):,}종목 재사용")
+        return cached
+    rows: List[dict] = []
+    for sosok, mkt in ((0, "KOSPI"), (1, "KOSDAQ")):
+        for page in range(1, 45):
+            html = http_get(NAVER_SUM, source="naver", force_enc="euc-kr", tries=2,
+                            params={"sosok": sosok, "page": page,
+                                    "fieldIds": "listed_stock_cnt", "menu": "market_sum"})
+            if not html:
+                break
+            s = soup_of(html)
+            if s is None:
+                break
+            n0 = len(rows)
+            for tr in s.select("table.type_2 tr"):
+                a = tr.select_one("a.tltle") or tr.select_one("td a[href*='code=']")
+                if a is None:
+                    continue
+                m = re.search(r"code=(\d{6})", a.get("href", ""))
+                if not m:
+                    continue
+                tds = [td.get_text(strip=True).replace(",", "") for td in tr.select("td")]
+                sh = next((v for v in reversed(tds) if v.isdigit() and len(v) >= 5), None)
+                if sh:
+                    rows.append({"code": m.group(1), "shares_now": float(sh), "market": mkt})
+            if len(rows) == n0:                 # 더 이상 종목이 없다 = 마지막 페이지
+                break
+    if not rows:
+        LOG.warn("네이버 상장주식수를 받지 못했습니다 (차단 또는 페이지 구조 변경).")
+        return pd.DataFrame(columns=["code", "shares_now", "market"])
+    S = pd.DataFrame(rows).drop_duplicates("code", keep="first").reset_index(drop=True)
+    VAULT.put_table("naver_shares_snapshot", S, scope="shared", domain="universe",
+                    source="naver:sise_market_sum")
+    PIPE.io("OUT", "DRIVE", "naver_shares_snapshot", S, source="naver")
+    LOG.ok(f"네이버 상장주식수 {len(S):,}종목 확보 (요청 약 {len(S)//50 + 2}회) — "
+           f"pykrx 없이도 시총 랭크를 만들 수 있습니다.")
+    return S
+
+
+def cap_snapshots_from_prices(px: pd.DataFrame, shares: pd.DataFrame,
+                              signal_dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
+    """주식수 × 신호일 직전 종가 = PIT 근사 시가총액. pykrx·KRX 로그인이 모두 죽어도 선다.
+
+    종가는 이미 캐시에 있는 일봉을 그대로 쓰므로 신규 호출이 0 이다.
+    """
+    cols = ["code", "snap_date", "mktcap", "shares"]
+    if px is None or not len(px) or shares is None or not len(shares):
+        return pd.DataFrame(columns=cols)
+    P = px[["code", "date", "close"]].copy()
+    P["code"] = P["code"].astype(str)
+    P["date"] = as_ts_series(P["date"])
+    P = P.dropna(subset=["code", "date", "close"]).sort_values("date", kind="stable")
+    sh = shares.copy()
+    sh["code"] = sh["code"].astype(str)
+    sh = sh.dropna(subset=["code", "shares_now"]).drop_duplicates("code")
+    grid = (pd.DataFrame({"snap_date": sorted({as_ts(d) for d in signal_dates})})
+            .merge(sh[["code"]], how="cross").sort_values("snap_date", kind="stable"))
+    M = pd.merge_asof(grid, P.rename(columns={"date": "px_date"}),
+                      left_on="snap_date", right_on="px_date", by="code",
+                      direction="backward", tolerance=pd.Timedelta(days=15))
+    M = M.dropna(subset=["close"]).merge(sh[["code", "shares_now"]], on="code", how="left")
+    M["mktcap"] = pd.to_numeric(M["close"], errors="coerce") * M["shares_now"]
+    M["shares"] = M["shares_now"]
+    M = M.dropna(subset=["mktcap"])
+    LOG.ok(f"시총 폴백 산출 {len(M):,}행 ({M['code'].nunique():,}종목 × "
+           f"{M['snap_date'].nunique()}시점) — 주식수 × 종가. 신규 네트워크 호출 0회.")
+    LOG.warn("이 경로의 주식수는 '현재' 값을 과거로 이월한 근사입니다 — 증자·분할이 있었던 "
+             "종목은 과거 시총이 과대추정됩니다. §3 시총 소스 감사표에서 비중을 확인하세요.")
+    return M[cols].reset_index(drop=True)
+
+
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L1-Q2  가치(V) · 퀄리티(Q) · 수급(F) 축 (§5.2 ~ §5.4)                                     ║
@@ -12105,7 +12193,29 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
     with PIPE.stage("L1.CAP", "PIT 시가총액 스냅샷 (전 종목 · 날짜당 1~2호출)", "L1",
                     budget_s=900, critical=False):
         KRX.login()
-        ctx["snaps_cap"] = fetch_krx_cap_snapshots(list(as_ts_series(ctx["cal"]["signal_date"])))
+        _sd = list(as_ts_series(ctx["cal"]["signal_date"]))
+        ctx["snaps_cap"] = fetch_krx_cap_snapshots(_sd)
+        # ★★ 시총을 pykrx 단일 경로에 묶어 둔 것이 설계 오류였다 ★★
+        #   pykrx import 하나가 깨지자(윈도우 인코딩) U-1000 을 만들 수 없어 실행이 통째로
+        #   멈췄다. 유니버스는 여러 소스로 서야 한다는 요구사항을 시총에는 적용하지 않았다.
+        #   폴백: 네이버 시가총액 페이지에서 상장주식수(약 66요청) × '이미 캐시에 있는' 종가.
+        #   신규 일봉 호출은 0 이다.
+        if ctx["snaps_cap"] is None or not len(ctx["snaps_cap"]):
+            LOG.warn("KRX/pykrx 경로로 시총을 못 받았습니다 — 네이버 주식수 × 캐시 종가로 "
+                     "폴백합니다(신규 일봉 호출 없음).")
+            _pxc = VAULT.get_table("krx_ohlcv_daily", scope="shared")
+            _sh = fetch_naver_shares()
+            if _pxc is not None and len(_pxc) and len(_sh):
+                ctx["snaps_cap"] = cap_snapshots_from_prices(_pxc, _sh, _sd)
+                if len(ctx["snaps_cap"]):
+                    VAULT.put_table("krx_marketcap_snapshots_approx", ctx["snaps_cap"],
+                                    scope="shared", domain="universe",
+                                    source="naver_shares_x_cached_close")
+            elif not len(_sh):
+                LOG.warn("네이버 주식수도 받지 못했습니다.")
+            else:
+                LOG.warn(f"일봉 캐시가 비어 있어 종가를 곱할 수 없습니다 "
+                         f"(캐시 {0 if _pxc is None else len(_pxc):,}행).")
 
     with PIPE.stage("L1.PX", "가격 · 거래대금 (U-1000 후보만)", "L1", budget_s=2400):
         cand, cinfo = select_universe_candidates(ctx.get("snaps_cap"),
@@ -12140,8 +12250,13 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
                 f"  사유: {' · '.join(_why) or '시총 스냅샷 0건'}\n"
                 "  전 종목 일봉을 대신 받는 것은 해결이 아닙니다 — 시총 없이는 어차피 "
                 "유니버스가 구성되지 않고, 수집만 수 배로 늘어납니다.\n"
-                "  조치: ① pykrx 를 쓸 수 있게 하거나(대개 파이썬 버전 호환), "
-                "② 시총 스냅샷이 든 캐시(krx_marketcap_snapshots)를 미러 경로에 두거나, "
+                "  네이버 주식수 × 캐시 종가 폴백도 시도했으나 실패했습니다(주식수 또는 "
+                "일봉 캐시 없음).\n"
+                "  조치: ① 윈도우에서 pykrx import 가 JSONDecodeError 로 깨지면 인코딩 "
+                "문제입니다 — 환경변수 PYTHONUTF8=1 을 설정하고 커널을 재시작하거나 "
+                "`pip install -U pykrx` 하십시오. "
+                "② 일봉 캐시가 있는 폴더를 CACHE_MIRROR_ROOTS 에 추가하면 네이버 주식수만으로 "
+                "시총을 만들 수 있습니다. "
                 "③ KRX 마켓플레이스 로그인을 성공시키십시오. "
                 "이미 받아둔 일봉 캐시는 그대로 보존되며 재실행 시 이어받습니다.")
         set_code_market(ctx["sec"])

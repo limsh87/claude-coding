@@ -922,3 +922,91 @@ def candidate_year_span(snaps: Optional[pd.DataFrame], sec: pd.DataFrame,
     for cc, (y0, y1) in span.items():
         out[cc] = set(range(y0 - int(lookback_years), y1 + 1))
     return out
+
+
+# ── 시가총액 폴백: pykrx 없이도 PIT 시총을 만든다 ──────────────────────────────────────────
+NAVER_SUM = "https://finance.naver.com/sise/sise_market_sum.naver"
+
+
+def fetch_naver_shares() -> pd.DataFrame:
+    """네이버 시가총액 페이지에서 전 종목 '상장주식수'를 받는다. 반환: code · shares_now
+
+    ★ 왜 필요한가: 시총을 pykrx 단일 경로에 묶어 둔 것이 설계 오류였다. pykrx import 가
+      깨지자(윈도우 인코딩) U-1000 자체를 만들 수 없어 실행이 통째로 멈췄다. 유니버스는
+      여러 소스로 서야 한다.
+    ★ 비용: 시장 2개 × 약 33페이지 = 약 66요청. 전 종목 주식수를 이 값으로 확보한다.
+    ★ 한계: '현재' 주식수다. 과거 시총은 이 주식수를 과거로 이월해 종가와 곱해 근사한다
+      (증자·분할이 있었으면 그만큼 오차). 그래서 cap_src 를 'naver_shares_x_close' 로
+      남겨 §3 시총 소스 감사표에 그대로 드러나게 한다 — 숨기지 않는다.
+    """
+    cached = VAULT.get_table("naver_shares_snapshot", scope="shared")
+    if cached is not None and len(cached):
+        LOG.info(f"공용 캐시에서 네이버 상장주식수 {len(cached):,}종목 재사용")
+        return cached
+    rows: List[dict] = []
+    for sosok, mkt in ((0, "KOSPI"), (1, "KOSDAQ")):
+        for page in range(1, 45):
+            html = http_get(NAVER_SUM, source="naver", force_enc="euc-kr", tries=2,
+                            params={"sosok": sosok, "page": page,
+                                    "fieldIds": "listed_stock_cnt", "menu": "market_sum"})
+            if not html:
+                break
+            s = soup_of(html)
+            if s is None:
+                break
+            n0 = len(rows)
+            for tr in s.select("table.type_2 tr"):
+                a = tr.select_one("a.tltle") or tr.select_one("td a[href*='code=']")
+                if a is None:
+                    continue
+                m = re.search(r"code=(\d{6})", a.get("href", ""))
+                if not m:
+                    continue
+                tds = [td.get_text(strip=True).replace(",", "") for td in tr.select("td")]
+                sh = next((v for v in reversed(tds) if v.isdigit() and len(v) >= 5), None)
+                if sh:
+                    rows.append({"code": m.group(1), "shares_now": float(sh), "market": mkt})
+            if len(rows) == n0:                 # 더 이상 종목이 없다 = 마지막 페이지
+                break
+    if not rows:
+        LOG.warn("네이버 상장주식수를 받지 못했습니다 (차단 또는 페이지 구조 변경).")
+        return pd.DataFrame(columns=["code", "shares_now", "market"])
+    S = pd.DataFrame(rows).drop_duplicates("code", keep="first").reset_index(drop=True)
+    VAULT.put_table("naver_shares_snapshot", S, scope="shared", domain="universe",
+                    source="naver:sise_market_sum")
+    PIPE.io("OUT", "DRIVE", "naver_shares_snapshot", S, source="naver")
+    LOG.ok(f"네이버 상장주식수 {len(S):,}종목 확보 (요청 약 {len(S)//50 + 2}회) — "
+           f"pykrx 없이도 시총 랭크를 만들 수 있습니다.")
+    return S
+
+
+def cap_snapshots_from_prices(px: pd.DataFrame, shares: pd.DataFrame,
+                              signal_dates: Sequence[pd.Timestamp]) -> pd.DataFrame:
+    """주식수 × 신호일 직전 종가 = PIT 근사 시가총액. pykrx·KRX 로그인이 모두 죽어도 선다.
+
+    종가는 이미 캐시에 있는 일봉을 그대로 쓰므로 신규 호출이 0 이다.
+    """
+    cols = ["code", "snap_date", "mktcap", "shares"]
+    if px is None or not len(px) or shares is None or not len(shares):
+        return pd.DataFrame(columns=cols)
+    P = px[["code", "date", "close"]].copy()
+    P["code"] = P["code"].astype(str)
+    P["date"] = as_ts_series(P["date"])
+    P = P.dropna(subset=["code", "date", "close"]).sort_values("date", kind="stable")
+    sh = shares.copy()
+    sh["code"] = sh["code"].astype(str)
+    sh = sh.dropna(subset=["code", "shares_now"]).drop_duplicates("code")
+    grid = (pd.DataFrame({"snap_date": sorted({as_ts(d) for d in signal_dates})})
+            .merge(sh[["code"]], how="cross").sort_values("snap_date", kind="stable"))
+    M = pd.merge_asof(grid, P.rename(columns={"date": "px_date"}),
+                      left_on="snap_date", right_on="px_date", by="code",
+                      direction="backward", tolerance=pd.Timedelta(days=15))
+    M = M.dropna(subset=["close"]).merge(sh[["code", "shares_now"]], on="code", how="left")
+    M["mktcap"] = pd.to_numeric(M["close"], errors="coerce") * M["shares_now"]
+    M["shares"] = M["shares_now"]
+    M = M.dropna(subset=["mktcap"])
+    LOG.ok(f"시총 폴백 산출 {len(M):,}행 ({M['code'].nunique():,}종목 × "
+           f"{M['snap_date'].nunique()}시점) — 주식수 × 종가. 신규 네트워크 호출 0회.")
+    LOG.warn("이 경로의 주식수는 '현재' 값을 과거로 이월한 근사입니다 — 증자·분할이 있었던 "
+             "종목은 과거 시총이 과대추정됩니다. §3 시총 소스 감사표에서 비중을 확인하세요.")
+    return M[cols].reset_index(drop=True)

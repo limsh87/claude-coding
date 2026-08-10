@@ -91,7 +91,29 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
     with PIPE.stage("L1.CAP", "PIT 시가총액 스냅샷 (전 종목 · 날짜당 1~2호출)", "L1",
                     budget_s=900, critical=False):
         KRX.login()
-        ctx["snaps_cap"] = fetch_krx_cap_snapshots(list(as_ts_series(ctx["cal"]["signal_date"])))
+        _sd = list(as_ts_series(ctx["cal"]["signal_date"]))
+        ctx["snaps_cap"] = fetch_krx_cap_snapshots(_sd)
+        # ★★ 시총을 pykrx 단일 경로에 묶어 둔 것이 설계 오류였다 ★★
+        #   pykrx import 하나가 깨지자(윈도우 인코딩) U-1000 을 만들 수 없어 실행이 통째로
+        #   멈췄다. 유니버스는 여러 소스로 서야 한다는 요구사항을 시총에는 적용하지 않았다.
+        #   폴백: 네이버 시가총액 페이지에서 상장주식수(약 66요청) × '이미 캐시에 있는' 종가.
+        #   신규 일봉 호출은 0 이다.
+        if ctx["snaps_cap"] is None or not len(ctx["snaps_cap"]):
+            LOG.warn("KRX/pykrx 경로로 시총을 못 받았습니다 — 네이버 주식수 × 캐시 종가로 "
+                     "폴백합니다(신규 일봉 호출 없음).")
+            _pxc = VAULT.get_table("krx_ohlcv_daily", scope="shared")
+            _sh = fetch_naver_shares()
+            if _pxc is not None and len(_pxc) and len(_sh):
+                ctx["snaps_cap"] = cap_snapshots_from_prices(_pxc, _sh, _sd)
+                if len(ctx["snaps_cap"]):
+                    VAULT.put_table("krx_marketcap_snapshots_approx", ctx["snaps_cap"],
+                                    scope="shared", domain="universe",
+                                    source="naver_shares_x_cached_close")
+            elif not len(_sh):
+                LOG.warn("네이버 주식수도 받지 못했습니다.")
+            else:
+                LOG.warn(f"일봉 캐시가 비어 있어 종가를 곱할 수 없습니다 "
+                         f"(캐시 {0 if _pxc is None else len(_pxc):,}행).")
 
     with PIPE.stage("L1.PX", "가격 · 거래대금 (U-1000 후보만)", "L1", budget_s=2400):
         cand, cinfo = select_universe_candidates(ctx.get("snaps_cap"),
@@ -126,8 +148,13 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
                 f"  사유: {' · '.join(_why) or '시총 스냅샷 0건'}\n"
                 "  전 종목 일봉을 대신 받는 것은 해결이 아닙니다 — 시총 없이는 어차피 "
                 "유니버스가 구성되지 않고, 수집만 수 배로 늘어납니다.\n"
-                "  조치: ① pykrx 를 쓸 수 있게 하거나(대개 파이썬 버전 호환), "
-                "② 시총 스냅샷이 든 캐시(krx_marketcap_snapshots)를 미러 경로에 두거나, "
+                "  네이버 주식수 × 캐시 종가 폴백도 시도했으나 실패했습니다(주식수 또는 "
+                "일봉 캐시 없음).\n"
+                "  조치: ① 윈도우에서 pykrx import 가 JSONDecodeError 로 깨지면 인코딩 "
+                "문제입니다 — 환경변수 PYTHONUTF8=1 을 설정하고 커널을 재시작하거나 "
+                "`pip install -U pykrx` 하십시오. "
+                "② 일봉 캐시가 있는 폴더를 CACHE_MIRROR_ROOTS 에 추가하면 네이버 주식수만으로 "
+                "시총을 만들 수 있습니다. "
                 "③ KRX 마켓플레이스 로그인을 성공시키십시오. "
                 "이미 받아둔 일봉 캐시는 그대로 보존되며 재실행 시 이어받습니다.")
         set_code_market(ctx["sec"])
