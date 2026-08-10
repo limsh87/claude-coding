@@ -206,7 +206,8 @@ RATE_LIMIT_QPS = {      # 소스별 초당 요청 상한 — 차단 방지용. �
     "dart":      8.0,
     "hankyung":  2.0,
     "naver":     2.5,
-    "krx":       2.0,
+    "krx":       2.0,   # KRX 웹세션 — 올리면 차단 위험. KRXGate 가 추가로 직렬화한다.
+    "fdr":       6.0,   # FinanceDataReader 자체/깃허브 캐시 경로. KRX 버킷과 분리(병목 해소).
     "datagokr":  5.0,
     "customs":   3.0,
     "kind":      2.0,

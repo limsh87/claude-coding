@@ -135,15 +135,38 @@ _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
             "account_id", "account_nm", "thstrm_amount", "rcept_no"]
 
 
+_FS_DIV: Dict[str, str] = {}          # corp_code → 그 회사에서 실제로 먹히는 fs_div
+_FS_DIV_LK = threading.Lock()
+
+
 def _fs_one(job) -> Optional[pd.DataFrame]:
     corp, year, reprt = job
-    js = dart_api("fnlttSinglAcntAll.json",
-                  {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
-    if not js or "list" not in js:
+    # ★ 예전엔 (회사, 연도, 보고서)마다 OFS 를 먼저 치고 비면 CFS 를 또 쳤다. 소형주는
+    #   연결재무제표만 내는 곳이 많고 폐지사는 대부분 연도에 제출 자체가 없어서, 빈 조합마다
+    #   호출이 2배가 됐다 — 작업 15만건이 실호출 21만~25만건이 되는 경로다.
+    #   fs_div 는 회사 속성이지 연도 속성이 아니므로 회사당 한 번만 알아내고 재사용한다.
+    with _FS_DIV_LK:
+        known = _FS_DIV.get(corp)
+    order = (known,) if known else ("OFS", "CFS")
+    js, used = None, None
+    for div in order:
         js = dart_api("fnlttSinglAcntAll.json",
-                      {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
+                      {"corp_code": corp, "bsns_year": str(year),
+                       "reprt_code": reprt, "fs_div": div})
+        if js and isinstance(js.get("list"), list) and js["list"]:
+            used = div
+            break
+    if used and not known:
+        with _FS_DIV_LK:
+            _FS_DIV[corp] = used
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
-        return None
+        # ★ '데이터 없음'도 결과다. 빈손을 캐시하지 않으면 done 집합에 영영 안 들어가서
+        #   매 실행 같은 조합을 다시 묻는다 — "재실행하면 이 지점부터 이어받습니다"가
+        #   거짓이 되는 지점이고, 하루치 한도가 통째로 '같은 부재를 재발견'하는 데 쓰였다.
+        #   센티넬 1행을 남겨 다음 실행이 건너뛰게 한다(값은 전부 결측이라 집계에 무해).
+        return pd.DataFrame([{**{c: None for c in _FS_KEEP}, "corp_code": corp,
+                              "bsns_year": int(year), "reprt_code": reprt,
+                              "fs_div": "NONE", "account_id": "_EMPTY_"}])[_FS_KEEP]
     d = pd.DataFrame(js["list"])
     for c in _FS_KEEP:
         if c not in d.columns:
@@ -306,6 +329,10 @@ def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFra
 
     콜드빌드가 며칠 걸리는 동안에도 매출·영업이익·순이익·자산·부채·자본은 전 종목이
     확보되어 있어 유니버스 구성과 규모 버킷(C11), R3 팩터가 즉시 동작한다."""
+    # ★ '데이터 없음' 센티넬(_fs_one)은 재요청을 막으려고 캐시에만 남기는 행이다. 여기서
+    #   걸러내지 않으면 '전체 재무제표가 있다'고 오인해 Tier-1(주요계정) 폴백을 막아버린다.
+    if full is not None and len(full) and "account_id" in full.columns:
+        full = full[full["account_id"].astype(str) != "_EMPTY_"]
     if multi is None or multi.empty:
         return full if full is not None else pd.DataFrame(columns=_FS_KEEP)
     if full is None or full.empty:

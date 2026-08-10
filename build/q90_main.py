@@ -140,8 +140,25 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
             LOG.warn(f"U-1000 후보를 못 만들어 전 상장사 {len(corps):,}개로 DART 를 받습니다 — "
                      f"호출량이 수만 회로 늘어납니다. 시총 스냅샷 단계를 먼저 확인하세요.")
         years = list(range(as_ts(BACKTEST_START).year - 4, as_ts(BACKTEST_END).year + 1))
+        # ★★ priority 를 한 번도 넘기지 않고 있었다 ★★
+        #   fetch_dart_financials 는 "끊겼을 때 남아 있는 것이 투자 가능한 종목의 최근
+        #   데이터가 되도록" priority 순으로 받게 설계돼 있는데(12_ingest:248), 호출부가
+        #   인자를 안 줘서 order={} → 정렬이 corp_code 알파벳순으로 붕괴했다. 그래서
+        #   14,117 호출을 태우고도 확보된 회사가 시총 하위와 무관해 fin_cov 가 바닥이었고,
+        #   §2.2 게이트가 매일 KillCriteria 로 죽였다. 호출 절감은 0이지만 '쓸모없는
+        #   부분빌드'를 '쓸모있는 부분빌드'로 바꾸는 가장 값싼 한 줄이다.
+        _prio = corps
+        _sn = ctx.get("snaps_cap")
+        if _sn is not None and len(_sn):
+            _mc = (_sn.groupby("code", observed=True)["mktcap"].mean()
+                     .rename("mc").reset_index())
+            _mc["code"] = _mc["code"].astype(str)
+            _pm = _m.merge(_mc, on="code", how="left").sort_values("mc", kind="stable")
+            _prio = _pm["corp_code"].dropna().astype(str).drop_duplicates().tolist()
+            LOG.info(f"DART 수집 우선순위: 시총 낮은 순 {len(_prio):,}사 — 한도로 끊겨도 "
+                     f"U-1000 편입 가능성이 높은 종목부터 완성됩니다.")
         multi = fetch_dart_multi_accounts(corps, years)
-        fs = fetch_dart_financials(corps, years)
+        fs = fetch_dart_financials(corps, years, priority=_prio)
         fin = tidy_financials(merge_financial_tiers(fs, multi))
         ctx["fin"] = apply_t_plus_1(fin, "재무제표")
         # ★ 주식총수는 DART 로 받지 않는다. (corp × year) 마다 1호출이라 후보 2,000사 × 11년
@@ -465,12 +482,18 @@ def main() -> dict:
 
         def _rebuild_shift(sh: int, variant: str):
             cal2 = qvf_rebal_calendar(ctx["px"], BACKTEST_START, BACKTEST_END, shift_days=sh)
-            fl2 = fetch_flow_netbuy(cal2, ctx["px"], window=FLOW_WINDOW_DAYS)
-            P2, uni2 = build_panel_pass1(ctx, cal2, fl2)
-            P2 = build_panel_pass2(P2, ctx, cal2)
-            ep2 = build_exec_prices(cal2, ctx["px"])
-            fwd2 = build_forward_returns(ep2, cal2, uni2.delisting_map(), ctx["px"])
-            b = run_experiment(P2, cal2, fwd2, variant, label=f"shift{sh}", quiet=True)
+            # 수급 캐시가 '옮긴 신호일'로 다시 계산되도록 시프트를 알린다. 이게 없으면
+            # 캐시 키가 같아 옮기지 않은 값을 재사용하고 F축 강건성 검정이 무효가 된다.
+            globals()["QVF_REBAL_SHIFT_DAYS"] = int(sh)
+            try:
+                fl2 = fetch_flow_netbuy(cal2, ctx["px"], window=FLOW_WINDOW_DAYS)
+                P2, uni2 = build_panel_pass1(ctx, cal2, fl2)
+                P2 = build_panel_pass2(P2, ctx, cal2)
+                ep2 = build_exec_prices(cal2, ctx["px"])
+                fwd2 = build_forward_returns(ep2, cal2, uni2.delisting_map(), ctx["px"])
+                b = run_experiment(P2, cal2, fwd2, variant, label=f"shift{sh}", quiet=True)
+            finally:
+                globals()["QVF_REBAL_SHIFT_DAYS"] = 0
             return qperf_stats(b["returns"])
         R_rebal_shift(_rebuild_shift, best_v)
 

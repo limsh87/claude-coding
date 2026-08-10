@@ -418,7 +418,11 @@ def fetch_flow_netbuy(cal: pd.DataFrame, px_daily: pd.DataFrame,
       그 시점에 실제 거래된 종목만 담고 있어 결측과 0 이 구분된다.
     """
     cols = ["code", "rebal", "foreign_net", "inst_net", "flow_src"]
-    key = f"qvf_flow_netbuy_w{int(window)}"
+    # ★ 캐시 키에 shift_days 가 빠져 있었다. R_rebal_shift(±5거래일) 재구축은 signal_date 만
+    #   옮기고 rebal 이름은 그대로 두므로, have 집합이 전부 적중해 '옮기지 않은 신호일로 계산한
+    #   수급'을 그대로 재사용했다 — F축에서 강건성 검정이 통째로 무효였다(VQF 가 대표 변형인데도).
+    _sh = int(globals().get("QVF_REBAL_SHIFT_DAYS", 0) or 0)
+    key = f"qvf_flow_netbuy_w{int(window)}" + (f"_s{_sh:+d}" if _sh else "")
     cached = VAULT.get_table(key, scope="shared")
     have: set = set()
     if cached is not None and len(cached):

@@ -206,7 +206,8 @@ RATE_LIMIT_QPS = {      # 소스별 초당 요청 상한 — 차단 방지용. �
     "dart":      8.0,
     "hankyung":  2.0,
     "naver":     2.5,
-    "krx":       2.0,
+    "krx":       2.0,   # KRX 웹세션 — 올리면 차단 위험. KRXGate 가 추가로 직렬화한다.
+    "fdr":       6.0,   # FinanceDataReader 자체/깃허브 캐시 경로. KRX 버킷과 분리(병목 해소).
     "datagokr":  5.0,
     "customs":   3.0,
     "kind":      2.0,
@@ -243,7 +244,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0917"
+BUILD_VERSION      = "qvf1.20260810.0925"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -3996,8 +3997,15 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if pykrx_stock is None:
         return None
     try:
-        limiter("krx").wait()
-        d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
+        # ★ 예전엔 pykrx 를 12스레드에서 '직접' 불렀다. KRXGate 가 존재하는 이유가 정확히
+        #   이것을 막기 위해서다(10_ingest_universe:46-54): 동시 호출이 각자 재로그인을 하고
+        #   KRX 가 skipDup 으로 앞 세션을 죽여, 진 쪽은 JSON 대신 로그인 HTML 을 받는다.
+        #   그러면 이 종목은 실패로 떨어져 fdr → naver(×4) → yfinance 까지 전부 타므로
+        #   종목당 요청이 4~8배가 된다. 55분의 상당 부분이 이 되먹임이었다.
+        #   KRXG.call 은 락으로 직렬화하고 세션을 미리 갱신한다(자체 스로틀 포함이라
+        #   limiter("krx") 는 이중 대기가 되어 뺀다).
+        d = KRXG.call(pykrx_stock.get_market_ohlcv,
+                      start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
         return None
     if d is None or len(d) == 0:
@@ -4016,7 +4024,10 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if fdr is None:
         return None
     try:
-        limiter("krx").wait()
+        # ★ FDR 은 KRX 웹세션이 아니라 자체 엔드포인트/깃허브 캐시를 쓴다. 그런데 "krx" 버킷을
+        #   같이 쓰고 있어서, pykrx 와 FDR 이 초당 2건을 '나눠' 먹었다. 종목 3,300개가 두
+        #   경로를 다 타면 6,600슬롯 ÷ 2/s ≈ 55분 — 사용자가 본 그 숫자다. 버킷을 분리한다.
+        limiter("fdr").wait()
         d = fdr.DataReader(code, start, end)
     except Exception:
         return None
@@ -4160,7 +4171,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
     #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    # ★ 예전엔 _today = as_ts(end) 였다 — end 는 BACKTEST_END(설정 상수)지 '오늘'이 아니다.
+    #   그래서 attempted_at 이 항상 같은 값이라 (_today - at).days 가 늘 0 이었고,
+    #   "30일 뒤 자동 재시도합니다"는 영원히 오지 않았다. 일시적 네트워크 장애 한 번으로
+    #   종목이 유니버스에서 영구 제외되는데 INFO 한 줄로만 흘렀다.
+    _today = pd.Timestamp.today().normalize()
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):
@@ -4451,15 +4466,38 @@ _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
             "account_id", "account_nm", "thstrm_amount", "rcept_no"]
 
 
+_FS_DIV: Dict[str, str] = {}          # corp_code → 그 회사에서 실제로 먹히는 fs_div
+_FS_DIV_LK = threading.Lock()
+
+
 def _fs_one(job) -> Optional[pd.DataFrame]:
     corp, year, reprt = job
-    js = dart_api("fnlttSinglAcntAll.json",
-                  {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
-    if not js or "list" not in js:
+    # ★ 예전엔 (회사, 연도, 보고서)마다 OFS 를 먼저 치고 비면 CFS 를 또 쳤다. 소형주는
+    #   연결재무제표만 내는 곳이 많고 폐지사는 대부분 연도에 제출 자체가 없어서, 빈 조합마다
+    #   호출이 2배가 됐다 — 작업 15만건이 실호출 21만~25만건이 되는 경로다.
+    #   fs_div 는 회사 속성이지 연도 속성이 아니므로 회사당 한 번만 알아내고 재사용한다.
+    with _FS_DIV_LK:
+        known = _FS_DIV.get(corp)
+    order = (known,) if known else ("OFS", "CFS")
+    js, used = None, None
+    for div in order:
         js = dart_api("fnlttSinglAcntAll.json",
-                      {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
+                      {"corp_code": corp, "bsns_year": str(year),
+                       "reprt_code": reprt, "fs_div": div})
+        if js and isinstance(js.get("list"), list) and js["list"]:
+            used = div
+            break
+    if used and not known:
+        with _FS_DIV_LK:
+            _FS_DIV[corp] = used
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
-        return None
+        # ★ '데이터 없음'도 결과다. 빈손을 캐시하지 않으면 done 집합에 영영 안 들어가서
+        #   매 실행 같은 조합을 다시 묻는다 — "재실행하면 이 지점부터 이어받습니다"가
+        #   거짓이 되는 지점이고, 하루치 한도가 통째로 '같은 부재를 재발견'하는 데 쓰였다.
+        #   센티넬 1행을 남겨 다음 실행이 건너뛰게 한다(값은 전부 결측이라 집계에 무해).
+        return pd.DataFrame([{**{c: None for c in _FS_KEEP}, "corp_code": corp,
+                              "bsns_year": int(year), "reprt_code": reprt,
+                              "fs_div": "NONE", "account_id": "_EMPTY_"}])[_FS_KEEP]
     d = pd.DataFrame(js["list"])
     for c in _FS_KEEP:
         if c not in d.columns:
@@ -4622,6 +4660,10 @@ def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFra
 
     콜드빌드가 며칠 걸리는 동안에도 매출·영업이익·순이익·자산·부채·자본은 전 종목이
     확보되어 있어 유니버스 구성과 규모 버킷(C11), R3 팩터가 즉시 동작한다."""
+    # ★ '데이터 없음' 센티넬(_fs_one)은 재요청을 막으려고 캐시에만 남기는 행이다. 여기서
+    #   걸러내지 않으면 '전체 재무제표가 있다'고 오인해 Tier-1(주요계정) 폴백을 막아버린다.
+    if full is not None and len(full) and "account_id" in full.columns:
+        full = full[full["account_id"].astype(str) != "_EMPTY_"]
     if multi is None or multi.empty:
         return full if full is not None else pd.DataFrame(columns=_FS_KEEP)
     if full is None or full.empty:
@@ -5684,6 +5726,15 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
+        # ★★ 이 4개가 빠져 있어서 PDF 캐시가 '쓰고도 못 읽는' 상태였다 ★★
+        #   download_pdfs 는 pdf_uid/pdf_analysts/pdf_emails/pdf_target 를 돌려주고
+        #   원장에 저장까지 된다. 그런데 다음 실행에서 원장을 다시 읽어 이 agg 를 통과시키면
+        #   여기 없는 컬럼은 통째로 사라진다 → download_pdfs 가 pdf_uid 를 못 봐서
+        #   전 코퍼스(최대 30만건)를 매번 다시 내려받고 다시 파싱했다. blob 캐시가 HTTP 는
+        #   막아줬지만 드라이브 blob 읽기 + pdf_text() 파싱 30만회는 그대로 났다.
+        **({k: (k, _pick_str) for k in ("pdf_uid", "pdf_analysts", "pdf_emails")
+            if k in d.columns}),
+        **({"pdf_target": ("pdf_target", "max")} if "pdf_target" in d.columns else {}),
     })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")
@@ -7393,7 +7444,11 @@ def fetch_flow_netbuy(cal: pd.DataFrame, px_daily: pd.DataFrame,
       그 시점에 실제 거래된 종목만 담고 있어 결측과 0 이 구분된다.
     """
     cols = ["code", "rebal", "foreign_net", "inst_net", "flow_src"]
-    key = f"qvf_flow_netbuy_w{int(window)}"
+    # ★ 캐시 키에 shift_days 가 빠져 있었다. R_rebal_shift(±5거래일) 재구축은 signal_date 만
+    #   옮기고 rebal 이름은 그대로 두므로, have 집합이 전부 적중해 '옮기지 않은 신호일로 계산한
+    #   수급'을 그대로 재사용했다 — F축에서 강건성 검정이 통째로 무효였다(VQF 가 대표 변형인데도).
+    _sh = int(globals().get("QVF_REBAL_SHIFT_DAYS", 0) or 0)
+    key = f"qvf_flow_netbuy_w{int(window)}" + (f"_s{_sh:+d}" if _sh else "")
     cached = VAULT.get_table(key, scope="shared")
     have: set = set()
     if cached is not None and len(cached):
@@ -10748,70 +10803,88 @@ def _q1():
 
 @_contract("Q2", "시점 규약 — 신호일 < 체결일, 공시는 접수일+1거래일")
 def _q2():
-    days = pd.bdate_range("2020-01-01", "2020-06-30")
-    px = pd.DataFrame({"code": "000660", "date": days, "open": 1.0, "high": 1.0,
-                       "low": 1.0, "close": 1.0, "volume": 1.0, "amount": 1.0})
-    set_trading_days(px)
-    cal = qvf_rebal_calendar(px, "2020-01-01", "2020-06-30")
-    if not (cal["signal_date"] < cal["exec_date"]).all():
-        raise ContractViolation("signal_date >= exec_date 인 리밸런싱이 있습니다.")
-    d0 = as_ts("2020-03-10")
-    d1 = next_trading_day(d0)
-    if not (d1 > d0):
-        raise ContractViolation("next_trading_day 가 날짜를 미래로 밀지 않습니다 (§4 위반).")
-    s = next_trading_day_series(pd.Series([d0, as_ts("2020-03-13")]))
-    if not (as_ts_series(s) > pd.Series([d0, as_ts("2020-03-13")])).all():
-        raise ContractViolation("next_trading_day_series 가 §4 규약을 만족하지 않습니다.")
-    return f"리밸 {len(cal)}시점 · 접수일+1거래일 이동 확인"
+    # ★ set_trading_days 는 전역 QVF_TRADING_DAYS 를 덮어쓴다(q21:48). 계약이 끝나도 합성
+    #   2020년 영업일 격자가 남으므로, 뒤에 오는 스테이지가 그 격자로 next_trading_day 를
+    #   계산하면 2020-01-01 이전 날짜가 전부 2020-01-01 로 접힌다 — DART knowledge_date 가
+    #   통째로 조작되는 셈이다. 지금은 L1.CAL 이 나중에 덮어써서 우연히 무해할 뿐이다.
+    #   계약은 자기가 만진 전역을 반드시 원복해야 한다.
+    _SAVED_TD = globals().get("QVF_TRADING_DAYS")
+    try:
+        days = pd.bdate_range("2020-01-01", "2020-06-30")
+        px = pd.DataFrame({"code": "000660", "date": days, "open": 1.0, "high": 1.0,
+                           "low": 1.0, "close": 1.0, "volume": 1.0, "amount": 1.0})
+        set_trading_days(px)
+        cal = qvf_rebal_calendar(px, "2020-01-01", "2020-06-30")
+        if not (cal["signal_date"] < cal["exec_date"]).all():
+            raise ContractViolation("signal_date >= exec_date 인 리밸런싱이 있습니다.")
+        d0 = as_ts("2020-03-10")
+        d1 = next_trading_day(d0)
+        if not (d1 > d0):
+            raise ContractViolation("next_trading_day 가 날짜를 미래로 밀지 않습니다 (§4 위반).")
+        s = next_trading_day_series(pd.Series([d0, as_ts("2020-03-13")]))
+        if not (as_ts_series(s) > pd.Series([d0, as_ts("2020-03-13")])).all():
+            raise ContractViolation("next_trading_day_series 가 §4 규약을 만족하지 않습니다.")
+        return f"리밸 {len(cal)}시점 · 접수일+1거래일 이동 확인"
+    finally:
+        globals()["QVF_TRADING_DAYS"] = _SAVED_TD
 
 
 @_contract("Q3", "생존자편향 — 폐지 종목이 유니버스에 있고 −100% 가 적용된다")
 def _q3():
-    days = pd.bdate_range("2020-01-01", "2021-06-30")
-    rows = []
-    for c, stop in (("000001", None), ("000002", as_ts("2020-08-15"))):
-        dd = days if stop is None else days[days <= stop]
-        rows.append(pd.DataFrame({"code": c, "date": dd, "open": 100.0, "high": 101.0,
-                                  "low": 99.0, "close": 100.0, "volume": 1e5, "amount": 1e7}))
-    px = pd.concat(rows, ignore_index=True)
-    set_trading_days(px)
-    cal = qvf_rebal_calendar(px, "2020-01-01", "2021-06-30")
-    sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["A", "B"],
-                        "market": ["KOSPI", "KOSDAQ"],
-                        "listing_date": [as_ts("2010-01-01")] * 2,
-                        "delisting_date": [pd.NaT, as_ts("2020-08-20")],
-                        "industry": ["기계", "기계"], "corp_code": ["C1", "C2"], "src": "t"})
-    uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
-    at = uni.at(as_ts("2020-06-01"))
-    if "000002" not in at:
-        raise ContractViolation("폐지 예정 종목이 폐지 전 시점의 유니버스에서 빠졌습니다 — 생존자편향.")
-    if "000002" in uni.at(as_ts("2020-12-01")):
-        raise ContractViolation("폐지 이후 시점에 폐지 종목이 유니버스에 남아 있습니다.")
-    ep = build_exec_prices(cal, px)
-    fwd = build_forward_returns(ep, cal, {"000002": as_ts("2020-08-20")}, px)
-    row = fwd[(fwd["code"] == "000002") & (fwd["rebal"] == as_ts("2020-06-01"))]
-    if row.empty or not np.isclose(float(row["fwd_ret"].iloc[0]), -1.0, atol=1e-9):
-        raise ContractViolation(
-            "보유 중 상장폐지에 −100% 가 적용되지 않았습니다 (§3.4 위반). "
-            "가격 시계열이 폐지 직전에 끊겼을 때 마지막 정상가를 청산가로 쓰면 "
-            "'상장폐지 = 무손실'이 되어 생존자편향이 그대로 재유입됩니다.")
-    # 정리매매가 실제로 관측된 경우에는 그 가격을 써야 한다(무조건 −100% 도 틀렸다).
-    px2 = px.copy()
-    tail = px2["code"] == "000002"
-    px2.loc[tail & (px2["date"] >= as_ts("2020-08-10")), ["close", "open"]] = 12.0
-    extra = pd.DataFrame({"code": "000002",
-                          "date": pd.bdate_range("2020-08-17", "2020-08-19"),
-                          "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
-                          "volume": 1e4, "amount": 1e5})
-    px2 = pd.concat([px2, extra], ignore_index=True)
-    fwd2 = build_forward_returns(build_exec_prices(cal, px2), cal,
-                                 {"000002": as_ts("2020-08-20")}, px2)
-    r2 = fwd2[(fwd2["code"] == "000002") & (fwd2["rebal"] == as_ts("2020-06-01"))]
-    if r2.empty or float(r2["fwd_ret"].iloc[0]) <= -0.999:
-        raise ContractViolation("정리매매 체결가가 관측되었는데도 −100% 로 처리했습니다 "
-                                "(§3.4 는 '실제 체결가 반영'을 먼저 요구합니다).")
-    return (f"폐지 전 포함 · 폐지 후 제외 · 데이터 끊김 → −100% · "
-            f"정리매매 관측 → 실가 반영({float(r2['fwd_ret'].iloc[0]):+.1%})")
+    # ★ set_trading_days 는 전역 QVF_TRADING_DAYS 를 덮어쓴다(q21:48). 계약이 끝나도 합성
+    #   2020년 영업일 격자가 남으므로, 뒤에 오는 스테이지가 그 격자로 next_trading_day 를
+    #   계산하면 2020-01-01 이전 날짜가 전부 2020-01-01 로 접힌다 — DART knowledge_date 가
+    #   통째로 조작되는 셈이다. 지금은 L1.CAL 이 나중에 덮어써서 우연히 무해할 뿐이다.
+    #   계약은 자기가 만진 전역을 반드시 원복해야 한다.
+    _SAVED_TD = globals().get("QVF_TRADING_DAYS")
+    try:
+        days = pd.bdate_range("2020-01-01", "2021-06-30")
+        rows = []
+        for c, stop in (("000001", None), ("000002", as_ts("2020-08-15"))):
+            dd = days if stop is None else days[days <= stop]
+            rows.append(pd.DataFrame({"code": c, "date": dd, "open": 100.0, "high": 101.0,
+                                      "low": 99.0, "close": 100.0, "volume": 1e5, "amount": 1e7}))
+        px = pd.concat(rows, ignore_index=True)
+        set_trading_days(px)
+        cal = qvf_rebal_calendar(px, "2020-01-01", "2021-06-30")
+        sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["A", "B"],
+                            "market": ["KOSPI", "KOSDAQ"],
+                            "listing_date": [as_ts("2010-01-01")] * 2,
+                            "delisting_date": [pd.NaT, as_ts("2020-08-20")],
+                            "industry": ["기계", "기계"], "corp_code": ["C1", "C2"], "src": "t"})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+        at = uni.at(as_ts("2020-06-01"))
+        if "000002" not in at:
+            raise ContractViolation("폐지 예정 종목이 폐지 전 시점의 유니버스에서 빠졌습니다 — 생존자편향.")
+        if "000002" in uni.at(as_ts("2020-12-01")):
+            raise ContractViolation("폐지 이후 시점에 폐지 종목이 유니버스에 남아 있습니다.")
+        ep = build_exec_prices(cal, px)
+        fwd = build_forward_returns(ep, cal, {"000002": as_ts("2020-08-20")}, px)
+        row = fwd[(fwd["code"] == "000002") & (fwd["rebal"] == as_ts("2020-06-01"))]
+        if row.empty or not np.isclose(float(row["fwd_ret"].iloc[0]), -1.0, atol=1e-9):
+            raise ContractViolation(
+                "보유 중 상장폐지에 −100% 가 적용되지 않았습니다 (§3.4 위반). "
+                "가격 시계열이 폐지 직전에 끊겼을 때 마지막 정상가를 청산가로 쓰면 "
+                "'상장폐지 = 무손실'이 되어 생존자편향이 그대로 재유입됩니다.")
+        # 정리매매가 실제로 관측된 경우에는 그 가격을 써야 한다(무조건 −100% 도 틀렸다).
+        px2 = px.copy()
+        tail = px2["code"] == "000002"
+        px2.loc[tail & (px2["date"] >= as_ts("2020-08-10")), ["close", "open"]] = 12.0
+        extra = pd.DataFrame({"code": "000002",
+                              "date": pd.bdate_range("2020-08-17", "2020-08-19"),
+                              "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
+                              "volume": 1e4, "amount": 1e5})
+        px2 = pd.concat([px2, extra], ignore_index=True)
+        fwd2 = build_forward_returns(build_exec_prices(cal, px2), cal,
+                                     {"000002": as_ts("2020-08-20")}, px2)
+        r2 = fwd2[(fwd2["code"] == "000002") & (fwd2["rebal"] == as_ts("2020-06-01"))]
+        if r2.empty or float(r2["fwd_ret"].iloc[0]) <= -0.999:
+            raise ContractViolation("정리매매 체결가가 관측되었는데도 −100% 로 처리했습니다 "
+                                    "(§3.4 는 '실제 체결가 반영'을 먼저 요구합니다).")
+        return (f"폐지 전 포함 · 폐지 후 제외 · 데이터 끊김 → −100% · "
+                f"정리매매 관측 → 실가 반영({float(r2['fwd_ret'].iloc[0]):+.1%})")
+    finally:
+        globals()["QVF_TRADING_DAYS"] = _SAVED_TD
 
 
 @_contract("Q4", "부호 처리 — 음수 분모가 최우량이 아니라 최하위로 배정된다")
@@ -10868,8 +10941,15 @@ def _q5():
 
 @_contract("Q6", "사전등록 가중치 — 코드 어디에도 가중치 최적화 루틴이 없다")
 def _q6():
-    if abs(sum(VARIANT_W["VQF"]) - 1.0) > 1e-9 or VARIANT_W["V"] != (1.0, 0.0, 0.0):
-        raise ContractViolation("VARIANT_W 가 §5.5 사전등록 값과 다릅니다.")
+    # ★ 예전엔 VQF 의 '합이 1'과 V 만 봤다. VQ 는 아예 검사하지 않았고, VQF 도 (0.1,0.1,0.8)
+    #   처럼 완전히 다른 값이 합만 맞으면 통과했다 — 계약 이름이 '사전등록 가중치'인데
+    #   정작 사전등록 값을 검정하지 않았다. 세 변형 전부를 리터럴로 못박는다.
+    _PRE = {"V": (1.0, 0.0, 0.0), "VQ": (0.5, 0.5, 0.0), "VQF": (0.4, 0.4, 0.2)}
+    for _k, _w in _PRE.items():
+        _got = tuple(float(x) for x in VARIANT_W.get(_k, ()))
+        if len(_got) != 3 or max(abs(a - b) for a, b in zip(_got, _w)) > 1e-9:
+            raise ContractViolation(
+                f"VARIANT_W['{_k}'] 이 §5.5 사전등록 값과 다릅니다: {_got} ≠ {_w}")
     if (SCORE2_W_NONFIN, SCORE2_W_TONE) != (2.0, 1.0):
         raise ContractViolation("Score2 가중치가 §6.3 사전등록 값(2:1)과 다릅니다.")
     src = ""
@@ -10990,6 +11070,16 @@ def _q11():
     z = xsec_z_pct(v, cells, min_n=3)
     if z.isna().sum() < 3:
         raise ContractViolation("±inf 와 NaN 이 결측으로 유지되지 않았습니다.")
+    # ★ 위 검정은 '한쪽 방향'이라 z 를 전부 NaN 으로 만드는 회귀도 통과한다(결측이 3개 이상이면
+    #   되니까). 그러면 z-score 무결성을 지킨다는 계약이 정작 축이 통째로 죽은 상태를 승인한다.
+    #   유효값이 실제로 살아 있고 표준화가 됐는지도 같이 본다.
+    _ok = z[v.notna() & np.isfinite(v)]
+    if _ok.isna().any():
+        raise ContractViolation("정상 관측치의 z 까지 NaN 이 되었습니다 — 표준화가 죽었습니다.")
+    if abs(float(_ok.mean())) > 1e-6 or abs(float(_ok.std(ddof=0)) - 1.0) > 1e-6:
+        raise ContractViolation(
+            f"관측치 z 가 표준화되지 않았습니다(평균 {float(_ok.mean()):+.3g} · "
+            f"표준편차 {float(_ok.std(ddof=0)):.3g}).")
     z2 = xsec_z_pct(pd.Series([1.0, 2.0]), pd.Series(["A", "A"]), min_n=8)
     if not z2.isna().all():
         raise ContractViolation("표본 부족 셀의 z 가 NaN 이 아닙니다 — 0 으로 채우면 그 종목이 "
@@ -11691,8 +11781,25 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
             LOG.warn(f"U-1000 후보를 못 만들어 전 상장사 {len(corps):,}개로 DART 를 받습니다 — "
                      f"호출량이 수만 회로 늘어납니다. 시총 스냅샷 단계를 먼저 확인하세요.")
         years = list(range(as_ts(BACKTEST_START).year - 4, as_ts(BACKTEST_END).year + 1))
+        # ★★ priority 를 한 번도 넘기지 않고 있었다 ★★
+        #   fetch_dart_financials 는 "끊겼을 때 남아 있는 것이 투자 가능한 종목의 최근
+        #   데이터가 되도록" priority 순으로 받게 설계돼 있는데(12_ingest:248), 호출부가
+        #   인자를 안 줘서 order={} → 정렬이 corp_code 알파벳순으로 붕괴했다. 그래서
+        #   14,117 호출을 태우고도 확보된 회사가 시총 하위와 무관해 fin_cov 가 바닥이었고,
+        #   §2.2 게이트가 매일 KillCriteria 로 죽였다. 호출 절감은 0이지만 '쓸모없는
+        #   부분빌드'를 '쓸모있는 부분빌드'로 바꾸는 가장 값싼 한 줄이다.
+        _prio = corps
+        _sn = ctx.get("snaps_cap")
+        if _sn is not None and len(_sn):
+            _mc = (_sn.groupby("code", observed=True)["mktcap"].mean()
+                     .rename("mc").reset_index())
+            _mc["code"] = _mc["code"].astype(str)
+            _pm = _m.merge(_mc, on="code", how="left").sort_values("mc", kind="stable")
+            _prio = _pm["corp_code"].dropna().astype(str).drop_duplicates().tolist()
+            LOG.info(f"DART 수집 우선순위: 시총 낮은 순 {len(_prio):,}사 — 한도로 끊겨도 "
+                     f"U-1000 편입 가능성이 높은 종목부터 완성됩니다.")
         multi = fetch_dart_multi_accounts(corps, years)
-        fs = fetch_dart_financials(corps, years)
+        fs = fetch_dart_financials(corps, years, priority=_prio)
         fin = tidy_financials(merge_financial_tiers(fs, multi))
         ctx["fin"] = apply_t_plus_1(fin, "재무제표")
         # ★ 주식총수는 DART 로 받지 않는다. (corp × year) 마다 1호출이라 후보 2,000사 × 11년
@@ -12016,12 +12123,18 @@ def main() -> dict:
 
         def _rebuild_shift(sh: int, variant: str):
             cal2 = qvf_rebal_calendar(ctx["px"], BACKTEST_START, BACKTEST_END, shift_days=sh)
-            fl2 = fetch_flow_netbuy(cal2, ctx["px"], window=FLOW_WINDOW_DAYS)
-            P2, uni2 = build_panel_pass1(ctx, cal2, fl2)
-            P2 = build_panel_pass2(P2, ctx, cal2)
-            ep2 = build_exec_prices(cal2, ctx["px"])
-            fwd2 = build_forward_returns(ep2, cal2, uni2.delisting_map(), ctx["px"])
-            b = run_experiment(P2, cal2, fwd2, variant, label=f"shift{sh}", quiet=True)
+            # 수급 캐시가 '옮긴 신호일'로 다시 계산되도록 시프트를 알린다. 이게 없으면
+            # 캐시 키가 같아 옮기지 않은 값을 재사용하고 F축 강건성 검정이 무효가 된다.
+            globals()["QVF_REBAL_SHIFT_DAYS"] = int(sh)
+            try:
+                fl2 = fetch_flow_netbuy(cal2, ctx["px"], window=FLOW_WINDOW_DAYS)
+                P2, uni2 = build_panel_pass1(ctx, cal2, fl2)
+                P2 = build_panel_pass2(P2, ctx, cal2)
+                ep2 = build_exec_prices(cal2, ctx["px"])
+                fwd2 = build_forward_returns(ep2, cal2, uni2.delisting_map(), ctx["px"])
+                b = run_experiment(P2, cal2, fwd2, variant, label=f"shift{sh}", quiet=True)
+            finally:
+                globals()["QVF_REBAL_SHIFT_DAYS"] = 0
             return qperf_stats(b["returns"])
         R_rebal_shift(_rebuild_shift, best_v)
 

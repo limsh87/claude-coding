@@ -71,70 +71,88 @@ def _q1():
 
 @_contract("Q2", "시점 규약 — 신호일 < 체결일, 공시는 접수일+1거래일")
 def _q2():
-    days = pd.bdate_range("2020-01-01", "2020-06-30")
-    px = pd.DataFrame({"code": "000660", "date": days, "open": 1.0, "high": 1.0,
-                       "low": 1.0, "close": 1.0, "volume": 1.0, "amount": 1.0})
-    set_trading_days(px)
-    cal = qvf_rebal_calendar(px, "2020-01-01", "2020-06-30")
-    if not (cal["signal_date"] < cal["exec_date"]).all():
-        raise ContractViolation("signal_date >= exec_date 인 리밸런싱이 있습니다.")
-    d0 = as_ts("2020-03-10")
-    d1 = next_trading_day(d0)
-    if not (d1 > d0):
-        raise ContractViolation("next_trading_day 가 날짜를 미래로 밀지 않습니다 (§4 위반).")
-    s = next_trading_day_series(pd.Series([d0, as_ts("2020-03-13")]))
-    if not (as_ts_series(s) > pd.Series([d0, as_ts("2020-03-13")])).all():
-        raise ContractViolation("next_trading_day_series 가 §4 규약을 만족하지 않습니다.")
-    return f"리밸 {len(cal)}시점 · 접수일+1거래일 이동 확인"
+    # ★ set_trading_days 는 전역 QVF_TRADING_DAYS 를 덮어쓴다(q21:48). 계약이 끝나도 합성
+    #   2020년 영업일 격자가 남으므로, 뒤에 오는 스테이지가 그 격자로 next_trading_day 를
+    #   계산하면 2020-01-01 이전 날짜가 전부 2020-01-01 로 접힌다 — DART knowledge_date 가
+    #   통째로 조작되는 셈이다. 지금은 L1.CAL 이 나중에 덮어써서 우연히 무해할 뿐이다.
+    #   계약은 자기가 만진 전역을 반드시 원복해야 한다.
+    _SAVED_TD = globals().get("QVF_TRADING_DAYS")
+    try:
+        days = pd.bdate_range("2020-01-01", "2020-06-30")
+        px = pd.DataFrame({"code": "000660", "date": days, "open": 1.0, "high": 1.0,
+                           "low": 1.0, "close": 1.0, "volume": 1.0, "amount": 1.0})
+        set_trading_days(px)
+        cal = qvf_rebal_calendar(px, "2020-01-01", "2020-06-30")
+        if not (cal["signal_date"] < cal["exec_date"]).all():
+            raise ContractViolation("signal_date >= exec_date 인 리밸런싱이 있습니다.")
+        d0 = as_ts("2020-03-10")
+        d1 = next_trading_day(d0)
+        if not (d1 > d0):
+            raise ContractViolation("next_trading_day 가 날짜를 미래로 밀지 않습니다 (§4 위반).")
+        s = next_trading_day_series(pd.Series([d0, as_ts("2020-03-13")]))
+        if not (as_ts_series(s) > pd.Series([d0, as_ts("2020-03-13")])).all():
+            raise ContractViolation("next_trading_day_series 가 §4 규약을 만족하지 않습니다.")
+        return f"리밸 {len(cal)}시점 · 접수일+1거래일 이동 확인"
+    finally:
+        globals()["QVF_TRADING_DAYS"] = _SAVED_TD
 
 
 @_contract("Q3", "생존자편향 — 폐지 종목이 유니버스에 있고 −100% 가 적용된다")
 def _q3():
-    days = pd.bdate_range("2020-01-01", "2021-06-30")
-    rows = []
-    for c, stop in (("000001", None), ("000002", as_ts("2020-08-15"))):
-        dd = days if stop is None else days[days <= stop]
-        rows.append(pd.DataFrame({"code": c, "date": dd, "open": 100.0, "high": 101.0,
-                                  "low": 99.0, "close": 100.0, "volume": 1e5, "amount": 1e7}))
-    px = pd.concat(rows, ignore_index=True)
-    set_trading_days(px)
-    cal = qvf_rebal_calendar(px, "2020-01-01", "2021-06-30")
-    sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["A", "B"],
-                        "market": ["KOSPI", "KOSDAQ"],
-                        "listing_date": [as_ts("2010-01-01")] * 2,
-                        "delisting_date": [pd.NaT, as_ts("2020-08-20")],
-                        "industry": ["기계", "기계"], "corp_code": ["C1", "C2"], "src": "t"})
-    uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
-    at = uni.at(as_ts("2020-06-01"))
-    if "000002" not in at:
-        raise ContractViolation("폐지 예정 종목이 폐지 전 시점의 유니버스에서 빠졌습니다 — 생존자편향.")
-    if "000002" in uni.at(as_ts("2020-12-01")):
-        raise ContractViolation("폐지 이후 시점에 폐지 종목이 유니버스에 남아 있습니다.")
-    ep = build_exec_prices(cal, px)
-    fwd = build_forward_returns(ep, cal, {"000002": as_ts("2020-08-20")}, px)
-    row = fwd[(fwd["code"] == "000002") & (fwd["rebal"] == as_ts("2020-06-01"))]
-    if row.empty or not np.isclose(float(row["fwd_ret"].iloc[0]), -1.0, atol=1e-9):
-        raise ContractViolation(
-            "보유 중 상장폐지에 −100% 가 적용되지 않았습니다 (§3.4 위반). "
-            "가격 시계열이 폐지 직전에 끊겼을 때 마지막 정상가를 청산가로 쓰면 "
-            "'상장폐지 = 무손실'이 되어 생존자편향이 그대로 재유입됩니다.")
-    # 정리매매가 실제로 관측된 경우에는 그 가격을 써야 한다(무조건 −100% 도 틀렸다).
-    px2 = px.copy()
-    tail = px2["code"] == "000002"
-    px2.loc[tail & (px2["date"] >= as_ts("2020-08-10")), ["close", "open"]] = 12.0
-    extra = pd.DataFrame({"code": "000002",
-                          "date": pd.bdate_range("2020-08-17", "2020-08-19"),
-                          "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
-                          "volume": 1e4, "amount": 1e5})
-    px2 = pd.concat([px2, extra], ignore_index=True)
-    fwd2 = build_forward_returns(build_exec_prices(cal, px2), cal,
-                                 {"000002": as_ts("2020-08-20")}, px2)
-    r2 = fwd2[(fwd2["code"] == "000002") & (fwd2["rebal"] == as_ts("2020-06-01"))]
-    if r2.empty or float(r2["fwd_ret"].iloc[0]) <= -0.999:
-        raise ContractViolation("정리매매 체결가가 관측되었는데도 −100% 로 처리했습니다 "
-                                "(§3.4 는 '실제 체결가 반영'을 먼저 요구합니다).")
-    return (f"폐지 전 포함 · 폐지 후 제외 · 데이터 끊김 → −100% · "
-            f"정리매매 관측 → 실가 반영({float(r2['fwd_ret'].iloc[0]):+.1%})")
+    # ★ set_trading_days 는 전역 QVF_TRADING_DAYS 를 덮어쓴다(q21:48). 계약이 끝나도 합성
+    #   2020년 영업일 격자가 남으므로, 뒤에 오는 스테이지가 그 격자로 next_trading_day 를
+    #   계산하면 2020-01-01 이전 날짜가 전부 2020-01-01 로 접힌다 — DART knowledge_date 가
+    #   통째로 조작되는 셈이다. 지금은 L1.CAL 이 나중에 덮어써서 우연히 무해할 뿐이다.
+    #   계약은 자기가 만진 전역을 반드시 원복해야 한다.
+    _SAVED_TD = globals().get("QVF_TRADING_DAYS")
+    try:
+        days = pd.bdate_range("2020-01-01", "2021-06-30")
+        rows = []
+        for c, stop in (("000001", None), ("000002", as_ts("2020-08-15"))):
+            dd = days if stop is None else days[days <= stop]
+            rows.append(pd.DataFrame({"code": c, "date": dd, "open": 100.0, "high": 101.0,
+                                      "low": 99.0, "close": 100.0, "volume": 1e5, "amount": 1e7}))
+        px = pd.concat(rows, ignore_index=True)
+        set_trading_days(px)
+        cal = qvf_rebal_calendar(px, "2020-01-01", "2021-06-30")
+        sec = pd.DataFrame({"code": ["000001", "000002"], "name": ["A", "B"],
+                            "market": ["KOSPI", "KOSDAQ"],
+                            "listing_date": [as_ts("2010-01-01")] * 2,
+                            "delisting_date": [pd.NaT, as_ts("2020-08-20")],
+                            "industry": ["기계", "기계"], "corp_code": ["C1", "C2"], "src": "t"})
+        uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+        at = uni.at(as_ts("2020-06-01"))
+        if "000002" not in at:
+            raise ContractViolation("폐지 예정 종목이 폐지 전 시점의 유니버스에서 빠졌습니다 — 생존자편향.")
+        if "000002" in uni.at(as_ts("2020-12-01")):
+            raise ContractViolation("폐지 이후 시점에 폐지 종목이 유니버스에 남아 있습니다.")
+        ep = build_exec_prices(cal, px)
+        fwd = build_forward_returns(ep, cal, {"000002": as_ts("2020-08-20")}, px)
+        row = fwd[(fwd["code"] == "000002") & (fwd["rebal"] == as_ts("2020-06-01"))]
+        if row.empty or not np.isclose(float(row["fwd_ret"].iloc[0]), -1.0, atol=1e-9):
+            raise ContractViolation(
+                "보유 중 상장폐지에 −100% 가 적용되지 않았습니다 (§3.4 위반). "
+                "가격 시계열이 폐지 직전에 끊겼을 때 마지막 정상가를 청산가로 쓰면 "
+                "'상장폐지 = 무손실'이 되어 생존자편향이 그대로 재유입됩니다.")
+        # 정리매매가 실제로 관측된 경우에는 그 가격을 써야 한다(무조건 −100% 도 틀렸다).
+        px2 = px.copy()
+        tail = px2["code"] == "000002"
+        px2.loc[tail & (px2["date"] >= as_ts("2020-08-10")), ["close", "open"]] = 12.0
+        extra = pd.DataFrame({"code": "000002",
+                              "date": pd.bdate_range("2020-08-17", "2020-08-19"),
+                              "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
+                              "volume": 1e4, "amount": 1e5})
+        px2 = pd.concat([px2, extra], ignore_index=True)
+        fwd2 = build_forward_returns(build_exec_prices(cal, px2), cal,
+                                     {"000002": as_ts("2020-08-20")}, px2)
+        r2 = fwd2[(fwd2["code"] == "000002") & (fwd2["rebal"] == as_ts("2020-06-01"))]
+        if r2.empty or float(r2["fwd_ret"].iloc[0]) <= -0.999:
+            raise ContractViolation("정리매매 체결가가 관측되었는데도 −100% 로 처리했습니다 "
+                                    "(§3.4 는 '실제 체결가 반영'을 먼저 요구합니다).")
+        return (f"폐지 전 포함 · 폐지 후 제외 · 데이터 끊김 → −100% · "
+                f"정리매매 관측 → 실가 반영({float(r2['fwd_ret'].iloc[0]):+.1%})")
+    finally:
+        globals()["QVF_TRADING_DAYS"] = _SAVED_TD
 
 
 @_contract("Q4", "부호 처리 — 음수 분모가 최우량이 아니라 최하위로 배정된다")
@@ -191,8 +209,15 @@ def _q5():
 
 @_contract("Q6", "사전등록 가중치 — 코드 어디에도 가중치 최적화 루틴이 없다")
 def _q6():
-    if abs(sum(VARIANT_W["VQF"]) - 1.0) > 1e-9 or VARIANT_W["V"] != (1.0, 0.0, 0.0):
-        raise ContractViolation("VARIANT_W 가 §5.5 사전등록 값과 다릅니다.")
+    # ★ 예전엔 VQF 의 '합이 1'과 V 만 봤다. VQ 는 아예 검사하지 않았고, VQF 도 (0.1,0.1,0.8)
+    #   처럼 완전히 다른 값이 합만 맞으면 통과했다 — 계약 이름이 '사전등록 가중치'인데
+    #   정작 사전등록 값을 검정하지 않았다. 세 변형 전부를 리터럴로 못박는다.
+    _PRE = {"V": (1.0, 0.0, 0.0), "VQ": (0.5, 0.5, 0.0), "VQF": (0.4, 0.4, 0.2)}
+    for _k, _w in _PRE.items():
+        _got = tuple(float(x) for x in VARIANT_W.get(_k, ()))
+        if len(_got) != 3 or max(abs(a - b) for a, b in zip(_got, _w)) > 1e-9:
+            raise ContractViolation(
+                f"VARIANT_W['{_k}'] 이 §5.5 사전등록 값과 다릅니다: {_got} ≠ {_w}")
     if (SCORE2_W_NONFIN, SCORE2_W_TONE) != (2.0, 1.0):
         raise ContractViolation("Score2 가중치가 §6.3 사전등록 값(2:1)과 다릅니다.")
     src = ""
@@ -313,6 +338,16 @@ def _q11():
     z = xsec_z_pct(v, cells, min_n=3)
     if z.isna().sum() < 3:
         raise ContractViolation("±inf 와 NaN 이 결측으로 유지되지 않았습니다.")
+    # ★ 위 검정은 '한쪽 방향'이라 z 를 전부 NaN 으로 만드는 회귀도 통과한다(결측이 3개 이상이면
+    #   되니까). 그러면 z-score 무결성을 지킨다는 계약이 정작 축이 통째로 죽은 상태를 승인한다.
+    #   유효값이 실제로 살아 있고 표준화가 됐는지도 같이 본다.
+    _ok = z[v.notna() & np.isfinite(v)]
+    if _ok.isna().any():
+        raise ContractViolation("정상 관측치의 z 까지 NaN 이 되었습니다 — 표준화가 죽었습니다.")
+    if abs(float(_ok.mean())) > 1e-6 or abs(float(_ok.std(ddof=0)) - 1.0) > 1e-6:
+        raise ContractViolation(
+            f"관측치 z 가 표준화되지 않았습니다(평균 {float(_ok.mean()):+.3g} · "
+            f"표준편차 {float(_ok.std(ddof=0)):.3g}).")
     z2 = xsec_z_pct(pd.Series([1.0, 2.0]), pd.Series(["A", "A"]), min_n=8)
     if not z2.isna().all():
         raise ContractViolation("표본 부족 셀의 z 가 NaN 이 아닙니다 — 0 으로 채우면 그 종목이 "

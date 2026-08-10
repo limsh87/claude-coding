@@ -146,8 +146,15 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if pykrx_stock is None:
         return None
     try:
-        limiter("krx").wait()
-        d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
+        # ★ 예전엔 pykrx 를 12스레드에서 '직접' 불렀다. KRXGate 가 존재하는 이유가 정확히
+        #   이것을 막기 위해서다(10_ingest_universe:46-54): 동시 호출이 각자 재로그인을 하고
+        #   KRX 가 skipDup 으로 앞 세션을 죽여, 진 쪽은 JSON 대신 로그인 HTML 을 받는다.
+        #   그러면 이 종목은 실패로 떨어져 fdr → naver(×4) → yfinance 까지 전부 타므로
+        #   종목당 요청이 4~8배가 된다. 55분의 상당 부분이 이 되먹임이었다.
+        #   KRXG.call 은 락으로 직렬화하고 세션을 미리 갱신한다(자체 스로틀 포함이라
+        #   limiter("krx") 는 이중 대기가 되어 뺀다).
+        d = KRXG.call(pykrx_stock.get_market_ohlcv,
+                      start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
         return None
     if d is None or len(d) == 0:
@@ -166,7 +173,10 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if fdr is None:
         return None
     try:
-        limiter("krx").wait()
+        # ★ FDR 은 KRX 웹세션이 아니라 자체 엔드포인트/깃허브 캐시를 쓴다. 그런데 "krx" 버킷을
+        #   같이 쓰고 있어서, pykrx 와 FDR 이 초당 2건을 '나눠' 먹었다. 종목 3,300개가 두
+        #   경로를 다 타면 6,600슬롯 ÷ 2/s ≈ 55분 — 사용자가 본 그 숫자다. 버킷을 분리한다.
+        limiter("fdr").wait()
         d = fdr.DataReader(code, start, end)
     except Exception:
         return None
@@ -310,7 +320,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
     #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    # ★ 예전엔 _today = as_ts(end) 였다 — end 는 BACKTEST_END(설정 상수)지 '오늘'이 아니다.
+    #   그래서 attempted_at 이 항상 같은 값이라 (_today - at).days 가 늘 0 이었고,
+    #   "30일 뒤 자동 재시도합니다"는 영원히 오지 않았다. 일시적 네트워크 장애 한 번으로
+    #   종목이 유니버스에서 영구 제외되는데 INFO 한 줄로만 흘렀다.
+    _today = pd.Timestamp.today().normalize()
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):

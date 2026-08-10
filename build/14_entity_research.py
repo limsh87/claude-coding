@@ -211,6 +211,15 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
+        # ★★ 이 4개가 빠져 있어서 PDF 캐시가 '쓰고도 못 읽는' 상태였다 ★★
+        #   download_pdfs 는 pdf_uid/pdf_analysts/pdf_emails/pdf_target 를 돌려주고
+        #   원장에 저장까지 된다. 그런데 다음 실행에서 원장을 다시 읽어 이 agg 를 통과시키면
+        #   여기 없는 컬럼은 통째로 사라진다 → download_pdfs 가 pdf_uid 를 못 봐서
+        #   전 코퍼스(최대 30만건)를 매번 다시 내려받고 다시 파싱했다. blob 캐시가 HTTP 는
+        #   막아줬지만 드라이브 blob 읽기 + pdf_text() 파싱 30만회는 그대로 났다.
+        **({k: (k, _pick_str) for k in ("pdf_uid", "pdf_analysts", "pdf_emails")
+            if k in d.columns}),
+        **({"pdf_target": ("pdf_target", "max")} if "pdf_target" in d.columns else {}),
     })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")
