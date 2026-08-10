@@ -1057,7 +1057,7 @@ class DartQuota:
         if self.observed_limit:
             LOG.warn(f"오늘({self.today}) 이 키의 실측 한도 {self.observed_limit:,}건에 이미 "
                      f"도달한 기록이 있습니다. DART 신규 수집은 건너뛰고 캐시로 진행합니다. "
-                     f"내일 재실행하면 정확히 이 지점부터 이어받습니다.")
+                     f"★ 지금 재실행해도 캐시분은 그대로 쓰입니다. 한도는 KST 자정에 리셋됩니다.")
         elif self.hist_limit:
             LOG.info(f"과거 실측된 일일 한도 {self.hist_limit:,}건을 '계획용 추정치'로만 씁니다. "
                      f"실제 소비는 서버가 020(한도초과)을 줄 때까지 계속합니다 — "
@@ -1129,7 +1129,7 @@ class DartQuota:
         self._append({"event": "limit_observed", "limit": int(self.observed_limit)})
         globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)
         LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 확인했습니다. "
-                 f"여기까지 받은 데이터는 캐시에 저장되어 있으며, 내일 재실행하면 정확히 "
+                 f"여기까지 받은 데이터는 캐시에 저장되어 있습니다. ★ 지금 재실행해도 "
                  f"이 지점부터 이어받습니다. (한도값을 코드에 고정하지 않고 실측한 값입니다)")
 
     def _confirm_exhaustion(self) -> bool:

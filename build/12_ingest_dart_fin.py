@@ -126,7 +126,9 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
             LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+                     f"받은 만큼 저장합니다. ★ 지금 바로 재실행해도 됩니다 — 이미 받은 분은 "
+                     f"캐시에서 그대로 쓰이고 재요청하지 않습니다. 남은 분만 한도 리셋"
+                     f"(KST 자정) 이후에 채워집니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -321,7 +323,8 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         if _left is not None and _left <= 0:
             LOG.warn(f"DART 잔여 호출이 0 입니다 — Tier-2(전체 재무제표) 신규 수집을 건너뜁니다. "
                      f"Tier-1(주요계정)만으로 V축·자본잠식 판정은 동작합니다. "
-                     f"내일 재실행하면 정확히 이 지점부터 이어받습니다.")
+                     f"★ 지금 재실행해도 여기까지는 캐시로 그대로 진행됩니다. 남은 분만 "
+                     f"한도 리셋(KST 자정) 이후에 채워집니다.")
             jobs = []
         elif _left is not None and total_needed > _left:
             LOG.warn(f"필요 호출({total_needed:,})이 오늘 잔여({_left:,})를 넘습니다 — "

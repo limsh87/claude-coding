@@ -508,6 +508,34 @@ def main() -> dict:
 
     with PIPE.stage("L2.PANEL2", "[8]~[10] 하드팩트 · TONE · 배제 · 3-A", "L2", budget_s=1200):
         P = build_panel_pass2(P, ctx, cal)
+        # ★★ 2차 필터가 '아무것도 안 하면서 이름만 유지'하는 것을 막는다 ★★
+        #   DART 호출량이 0 이면 facts·dis 가 비어 오고, dNONFIN·dTONE_resid 가 전부 NaN 이
+        #   된다. zscore_observed_then_neutral 은 NaN 을 0(중립)으로 채우므로 score2 가 전
+        #   행 동일해지고, 선정은 tie-break 인 score1 으로 떨어진다 — 즉 U-200 을 1차 점수로
+        #   자른 것과 같다. 그런데 실험표에는 여전히 '1차→2차(DART+TONE)→3-A' 라고 찍힌다.
+        #   §10.2 귀속(1차=알파 / 2차·3-A=좌측꼬리)이 통째로 거짓이 되는 지점이다.
+        #   느린 게 아니라 틀린 결과이므로, 조용히 넘어가지 않고 이름과 판정에 반영한다.
+        _obs = {k: int(pd.to_numeric(P[k], errors="coerce").abs().gt(0).sum())
+                for k in ("dNONFIN", "dTONE_resid") if k in P.columns}
+        _dead = [k for k, v in _obs.items() if v == 0]
+        globals()["QVF_FILTER2_DEGRADED"] = list(_dead)
+        if _dead:
+            LOG.table([[k, f"{_obs.get(k, 0):,}행",
+                        "✘ 전부 결측 — 이 축은 선정에 기여하지 않음" if k in _dead else "✔"]
+                       for k in ("dNONFIN", "dTONE_resid") if k in _obs],
+                      ["2차 필터 입력", "관측", "판정"], ["l", "r", "l"],
+                      title="⚠ 2차 필터가 실질적으로 동작하지 않았습니다")
+            LOG.warn(
+                f"{'·'.join(_dead)} 이(가) 전부 결측입니다 — 결측은 0(중립)으로 채워지므로 "
+                f"Score2 가 전 행 동일해지고 선정이 1차 점수로 떨어집니다. 즉 이번 실행의 "
+                f"'full' 실험은 사실상 X1(1차만)과 같습니다.\n"
+                f"  원인은 대개 DART 호출량 소진 또는 공시·본문 수집 실패입니다 "
+                f"(L1.DART / L1.DIS / L1.FACTS 스테이지 상태를 보세요).\n"
+                f"  ★ 이 상태로도 백테스트는 끝까지 돌지만, §10.2 귀속(1차=알파 / 2차·3-A="
+                f"좌측꼬리)은 성립하지 않습니다. 실험 이름에 '(2차축 결측)' 을 붙여 표시합니다.\n"
+                f"  한도가 리셋(KST 자정)된 뒤 재실행하면 캐시분은 그대로 두고 남은 분만 "
+                f"채워집니다 — 그때 비로소 2차 필터가 있는 결과가 나옵니다.")
+            PIPE.note("WARN: 2차 필터 입력 결측 — full 실험이 X1 과 동등")
         VAULT.put_table(f"l1_panel_{STRATEGY_ID}", P, scope="private", domain="features",
                         source="QVF panel")
 
