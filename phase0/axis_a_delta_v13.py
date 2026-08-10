@@ -49,24 +49,28 @@
 #
 DART_API_KEY = ""
 
-#  KRX_ID / KRX_PW ─ KRX 정보데이터시스템 마켓플레이스 계정 (pykrx 인증 경로용). 선택.
+#  KRX_ID / KRX_PW ─ KRX 마켓플레이스 계정. ★비워 두는 것을 권장한다★
 #     발급: http://data.krx.co.kr/  →  우측 상단 [로그인] → [회원가입]
-#           이메일 인증 후 즉시 사용. 무료.
-#     비워도 된다 — 시총 조회는 비인증 pykrx 경로 또는 KRX Open API로도 동작한다.
-#     ★ 값을 넣든 안 넣든, pykrx 는 이 값들이 os.environ 에 들어간 '뒤에' import 된다(§4).
-#     ★ pykrx 1.2.8 은 import 시점에 실제로 로그인을 시도하고 실패를 흡수하지 않는 결함이
-#       있다 — 이 스크립트는 그 실패를 붙잡아 무자격 재시도 후에도 안 되면 폴백 경로로
-#       넘어간다. KRX_ID/PW 가 틀렸다고 스크립트 전체가 죽지 않는다.
+#     ★ 왜 권장하지 않는가: 최근 pykrx 는 import 시점에 이 값으로 KRX 로그인을 시도하는데,
+#       그 로그인이 실패하면 응답이 JSON 이 아니어서 import 자체가 JSONDecodeError 로
+#       터진다(pykrx 쪽 결함이며 실제로 이 스크립트 사용 중 발생했다). 이 스크립트는 그
+#       실패를 흡수해 계속 진행하지만, 애초에 비워 두면 그 경로를 아예 타지 않는다.
+#     ★ 비워도 측정에 아무 지장이 없다 — 시가총액은 아래 provider 체인이 담당하며
+#       그 중 어느 것도 이 계정을 필요로 하지 않는다.
 #
 KRX_ID = ""
 KRX_PW = ""
 
-#  KRX_OPENAPI_KEY ─ KRX 정보데이터시스템 Open API 인증키. 선택이지만 강력 추천.
-#     발급: https://data.krx.co.kr/  →  [Open API] 메뉴 → 키 발급
-#     ★ 함정: 키 발급만으로 바로 쓸 수 없다. '주식 일별매매정보'(sto/stk_bydd_trd) 같은
-#       엔드포인트별로 별도 이용신청이 필요하고 승인에 하루 정도 걸린다. 이 스크립트는
-#       시작 시 1회 프로브를 날려 실제 사용 가능 여부를 판정하고, 안 되면 조용히 pykrx로만
-#       진행한다(둘 다 있으면 이 소스가 1순위 — pykrx 의 스크래핑보다 공식 API 라 더 안정적).
+#  KRX_OPENAPI_KEY ─ KRX Open API 인증키. ★2025년 스냅샷(S1~S3)을 쓰려면 사실상 필수★
+#     발급: https://data.krx.co.kr/  →  [Open API] → 회원가입 후 인증키 발급
+#     ★★ 반드시 알아야 할 함정: 키를 받는 것만으로는 호출이 안 된다.
+#        [Open API] → [이용신청] 에서 **'주식 일별매매정보'(sto/stk_bydd_trd)** 를
+#        따로 신청해 승인받아야 한다. 승인에 하루 정도 걸린다.
+#        이 스크립트는 시작 시 1회 실호출로 '키가 있다'와 '실제로 쓸 수 있다'를 구분해
+#        판정하고, 거부되면 거부 사유를 그대로 로그에 찍는다.
+#     ★ 왜 사실상 필수인가: 인증이 필요 없는 FDR 캐시는 최근 약 5개월치만 보관한다(롤링).
+#        2026-03-31(S4)은 커버되지만 2025-06-30 / 09-30 / 12-30(S1~S3)은 404 다.
+#        과거 날짜의 전종목 시가총액을 주는 무료 공개 경로는 사실상 KRX 뿐이다.
 #
 KRX_OPENAPI_KEY = ""
 
@@ -163,6 +167,7 @@ import json
 import time
 import errno
 import random
+import contextlib
 import hashlib
 import zipfile
 import datetime as _dt
@@ -217,7 +222,7 @@ def resolve_project_root(raw: str) -> Path:
 # 아래 전역은 _bootstrap() 이 채운다. 모듈 import 만으로는 아무 부작용도 일어나지 않게 해서,
 # 순수 로직(PIT 필터·인물키·엣지·전이)을 네트워크와 자격증명 없이 따로 검증할 수 있게 한다.
 # JupyterLab 셀에 붙여넣으면 __name__ == "__main__" 이므로 평소처럼 전부 실행된다.
-ROOT = DIR_CACHE_RAW = DIR_CACHE_META = DIR_STATE = DIR_REPORTS = None
+ROOT = DIR_CACHE_RAW = DIR_CACHE_META = DIR_STATE = DIR_REPORTS = DIR_CACHE_MARKET = None
 pd = requests = stock = fdr = None
 PYKRX_AVAILABLE = False
 PYKRX_DIAGNOSTIC = ""
@@ -481,15 +486,16 @@ def _bootstrap():
     pykrx·FDR 은 둘 다 실패해도 여기서 죽지 않는다. 죽는 건 PROJECT_ROOT 검사와
     DART_API_KEY 부재뿐이다 — 이 둘은 이 실행의 존재 이유(로컬 캐시, LIVE 데이터)와 직결된다.
     """
-    global ROOT, DIR_CACHE_RAW, DIR_CACHE_META, DIR_STATE, DIR_REPORTS
-    global pd, requests, stock, fdr, _LOG_FH
+    global ROOT, DIR_CACHE_RAW, DIR_CACHE_META, DIR_STATE, DIR_REPORTS, DIR_CACHE_MARKET
+    global pd, requests, stock, fdr, _LOG_FH, KRX_MDC
 
     ROOT = resolve_project_root(PROJECT_ROOT)          # P0_LOCAL_ROOT_ONLY — 여기서 터진다
     DIR_CACHE_RAW = ROOT / "cache" / "raw" / "dart_exctv"
     DIR_CACHE_META = ROOT / "cache" / "meta"
     DIR_STATE = ROOT / "cache" / "state"
     DIR_REPORTS = ROOT / "reports"
-    for d in (DIR_CACHE_RAW, DIR_CACHE_META, DIR_STATE, DIR_REPORTS):
+    DIR_CACHE_MARKET = ROOT / "cache" / "market"       # 날짜별 전종목 시총 스냅샷
+    for d in (DIR_CACHE_RAW, DIR_CACHE_META, DIR_STATE, DIR_REPORTS, DIR_CACHE_MARKET):
         d.mkdir(parents=True, exist_ok=True)
     _LOG_FH = open(DIR_REPORTS / "run_log.txt", "a", encoding="utf-8")
 
@@ -500,6 +506,7 @@ def _bootstrap():
 
     stock = _import_pykrx_after_env()                  # ← 자격증명 주입 '이후'의 유일한 지점. 안 죽는다.
     fdr = _try_import_fdr()
+    KRX_MDC = KrxMdcClient()                           # pykrx 를 거치지 않는 자체 KRX 클라이언트
 
     if stock is not None and hasattr(stock, _DEAD_CALL_NAME):
         # NO_KNOWN_DEAD_CALL: '쓰지 않는다'로 끝내지 않고, 호출되면 터지게 만든다.
@@ -510,62 +517,491 @@ def _bootstrap():
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
-#  ▣ 7. KRX Open API — 시가총액 1순위 소스 (pykrx 가 죽어도 살아 있다)
+#  ▣ 7. 시장 스냅샷 provider 체인 — "날짜당 요청 1회로 그 날 전종목 (코드·시총·시장구분)"
 # ══════════════════════════════════════════════════════════════════════════════════════════
+#  이 계층이 이번 개정의 핵심이다. 이전 판은 pykrx 하나에 매달렸고, pykrx 세션이 죽자
+#  11일 역행 × 4 시그니처 × 4 스냅샷 = 176회를 헛돌며 40초를 버리고 전부 실패했다.
+#
+#  설계 원칙 4가지:
+#   (1) 종목별 개별 요청 금지. 어떤 provider든 "날짜 1개 → 전종목 1회 요청"이어야 한다.
+#       (2,700종목을 하나씩 도는 순간 그게 병목이고 차단 사유다)
+#   (2) 죽은 provider 는 즉시 사망 판정하고 그 실행 내내 다시 부르지 않는다.
+#       — 176회 헛수고의 재발 방지책이 바로 이것이다.
+#   (3) 한 번 해결된 날짜 스냅샷은 로컬 + 드라이브 공용 인덱스에 영구 캐시한다.
+#       재실행은 네트워크 0회. 다른 전략도 같은 파일을 그대로 쓴다.
+#   (4) 어느 provider 가 실제로 데이터를 줬는지 판정표에 남긴다(mcap_source).
+#
+#  provider 우선순위와 검증 상태(정직하게 표기 — 확인 못 한 걸 확인했다고 하지 않는다):
+#   1. FDR GitHub 캐시  ★이번에 직접 검증함★  인증 불필요, 최근 약 5개월만 커버
+#        컬럼: Code, Market, MarketId(STK/KSQ/KNX), Close, Marcap, Stocks
+#        2026-03-31 실측 2,881종목 전부 Marcap>0 / KONEX 제외 2,772종목
+#        ※ Market 은 "KOSDAQ GLOBAL" 을 별도 라벨로 쪼개므로 반드시 MarketId 를 쓴다.
+#   2. KRX MDC getJsonData  (자체 구현. pykrx 를 거치지 않는다)  인증 불필요, 전 기간
+#        pykrx 가 로그인을 도입하기 전부터 쓰던 공개 경로. 워밍업 GET 으로 세션 쿠키만
+#        얻으면 로그인 없이 조회된다. ※ 개발 컨테이너의 프록시가 data.krx.co.kr 을 403 으로
+#        막아 여기서는 검증하지 못했다. 사용자 PC 에서는 KRX 에 도달하므로 런타임에 판정된다.
+#   3. KRX Open API  전 기간이지만 '엔드포인트별 이용신청 승인'이 따로 필요하다
+#   4. pykrx  세션 건강검진을 통과했을 때만. 실패하면 즉시 사망 판정.
+# ══════════════════════════════════════════════════════════════════════════════════════════
+FDR_KRX_LISTING_URL = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+                       "refs/heads/master/data/listing/krx/{d}.csv")
 KRX_OPENAPI_URL = "https://data-dbg.krx.co.kr/svc/apis/sto/stk_bydd_trd"
+KRX_MDC_JSON_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+KRX_MDC_WARMUP_URL = "https://data.krx.co.kr/contents/MDC/MDI/mainPage/index.cmd"
+KRX_MDC_REFERER = "https://data.krx.co.kr/contents/MDC/MDI/mainPage/index.cmd"
+KRX_MDC_BLD_ALL_QUOTES = "dbms/MDC/STAT/standard/MDCSTAT01501"     # 전종목 시세(시가총액 포함)
+
+# 시장구분 정규화 — 소스마다 표기가 다르다. STK=유가증권, KSQ=코스닥, KNX=코넥스.
+# "KOSDAQ GLOBAL" 은 코스닥의 세부 소속이므로 KSQ 로 접는다(별도 시장이 아니다).
+_MKT_NORM = {
+    "STK": "STK", "KSQ": "KSQ", "KNX": "KNX",
+    "KOSPI": "STK", "KOSDAQ": "KSQ", "KOSDAQ GLOBAL": "KSQ", "KONEX": "KNX",
+    "유가증권": "STK", "코스닥": "KSQ", "코스닥글로벌": "KSQ", "코넥스": "KNX",
+    "유가증권시장": "STK", "코스닥시장": "KSQ", "코넥스시장": "KNX",
+}
 
 
+def _norm_market(v) -> str:
+    s = re.sub(r"\s+", " ", str(v or "")).strip().upper()
+    if s in _MKT_NORM:
+        return _MKT_NORM[s]
+    s2 = s.replace(" ", "")
+    for k, val in _MKT_NORM.items():
+        if k.replace(" ", "").upper() == s2:
+            return val
+    if "KOSDAQ" in s or "코스닥" in s:
+        return "KSQ"
+    if "KONEX" in s or "코넥스" in s:
+        return "KNX"
+    if "KOSPI" in s or "유가증권" in s:
+        return "STK"
+    return ""
+
+
+def _num(series):
+    """'1,234' · '1234' · 1234 → 숫자. 실패는 NaN(추정하지 않는다)."""
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+
+
+def _mk_snapshot(codes, caps, mkts):
+    """provider 공통 산출물: index=종목코드, columns=[cap, mkt]. 유효행이 없으면 None."""
+    df = pd.DataFrame({"cap": list(caps), "mkt": [_norm_market(m) for m in mkts]},
+                      index=[to_code6(c) for c in codes])
+    df = df[df.index != ""]
+    df = df[~df.index.duplicated(keep="first")]
+    df["cap"] = pd.to_numeric(df["cap"], errors="coerce").fillna(0)
+    df = df[df["cap"] > 0]
+    return df if len(df) >= EMPTY_UNIVERSE_MIN else None
+
+
+# ── provider 생사 판정 ─────────────────────────────────────────────────────────────────────
+#   "unknown" → 아직 안 써봄 / "alive" → 데이터를 준 적 있음 / "dead" → 이번 실행에선 포기
+#   dead 판정 후에는 절대 다시 부르지 않는다. 이게 176회 헛수고를 막는 장치다.
+PROVIDER_STATE: dict = {}
+_PROVIDER_FAILS: dict = defaultdict(int)
+PROVIDER_DEAD_AFTER = 2          # 연속 2회 실패하면 이번 실행에서는 사망 처리
+_PROVIDER_LK = threading.Lock()
+
+
+def _provider_alive(name: str) -> bool:
+    with _PROVIDER_LK:
+        return PROVIDER_STATE.get(name, "unknown") != "dead"
+
+
+def _provider_ok(name: str):
+    with _PROVIDER_LK:
+        PROVIDER_STATE[name] = "alive"
+        _PROVIDER_FAILS[name] = 0
+
+
+def _provider_fail(name: str, why: str = ""):
+    with _PROVIDER_LK:
+        _PROVIDER_FAILS[name] += 1
+        n = _PROVIDER_FAILS[name]
+        if n >= PROVIDER_DEAD_AFTER and PROVIDER_STATE.get(name) != "alive":
+            PROVIDER_STATE[name] = "dead"
+            dead_now = True
+        else:
+            PROVIDER_STATE.setdefault(name, "unknown")
+            dead_now = False
+    if dead_now:
+        WARN(f"    [{name}] 연속 {n}회 실패 — 이번 실행에서는 이 소스를 더 부르지 않는다"
+             + (f" ({why})" if why else ""))
+
+
+# ── provider 1: FDR GitHub 캐시 (검증 완료) ────────────────────────────────────────────────
+def snap_fdr_cache(date_iso: str):
+    """반환 (df|None, note). 404 는 '휴장일'이거나 '롤링 윈도우 밖'이다 — 구분은 호출측에서."""
+    name = "fdr_cache"
+    if requests is None or not _provider_alive(name):
+        return None, "skip"
+    try:
+        r = requests.get(FDR_KRX_LISTING_URL.format(d=date_iso), timeout=30,
+                         headers={"User-Agent": "Mozilla/5.0"})
+    except Exception as e:                                   # noqa: BLE001
+        _provider_fail(name, type(e).__name__)
+        return None, f"네트워크실패({type(e).__name__})"
+    if r.status_code == 404:
+        _provider_ok(name)          # 404 는 소스가 살아있다는 뜻이다(그 날짜가 없을 뿐)
+        return None, "404(휴장일 또는 커버리지밖)"
+    if r.status_code != 200 or len(r.content) < 500:
+        _provider_fail(name, f"http{r.status_code}")
+        return None, f"http{r.status_code}"
+    try:
+        df = pd.read_csv(io.BytesIO(r.content), encoding="utf-8-sig",
+                         dtype={"Code": str, "ISU_CD": str})
+    except Exception as e:                                   # noqa: BLE001
+        _provider_fail(name, type(e).__name__)
+        return None, f"파싱실패({type(e).__name__})"
+    if len(df.columns) and str(df.columns[0]).strip().lower() in ("", "unnamed: 0", "unnamed:0"):
+        df = df.drop(columns=[df.columns[0]])
+    if not {"Code", "Marcap"} <= set(df.columns):
+        _provider_fail(name, "스키마변경")
+        return None, f"스키마 불일치({list(df.columns)[:6]})"
+    mk = df["MarketId"] if "MarketId" in df.columns else df.get("Market", "")
+    snap = _mk_snapshot(df["Code"], _num(df["Marcap"]), mk)
+    if snap is None:
+        _provider_fail(name, "유효행부족")
+        return None, "유효행 부족"
+    _provider_ok(name)
+    return snap, f"{len(snap):,}종목"
+
+
+# ── provider 2: KRX MDC (자체 구현 — pykrx 를 거치지 않는다) ───────────────────────────────
+class KrxMdcClient:
+    """워밍업 GET 으로 세션 쿠키만 확보한 뒤 getJsonData 를 POST 한다. 로그인하지 않는다.
+
+    pykrx 는 최근 버전에서 로그인을 강제하게 바뀌었고 그 로그인이 실패하면 모든 조회가
+    죽는다. 이 클라이언트는 그 경로를 통째로 우회한다 — 우리가 필요한 건 공개 통계 화면
+    하나뿐이고, 그건 원래 로그인 없이 조회된다.
+    """
+
+    def __init__(self):
+        self.s = None
+        self.lk = threading.Lock()
+
+    def _session(self):
+        if self.s is not None:
+            return self.s
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": KRX_MDC_REFERER,
+            "Origin": "https://data.krx.co.kr",
+        })
+        try:
+            s.get(KRX_MDC_WARMUP_URL, timeout=25)            # 세션 쿠키 확보. 실패해도 계속.
+        except Exception:                                     # noqa: BLE001
+            pass
+        self.s = s
+        return s
+
+    def all_quotes(self, date_c: str):
+        with self.lk:
+            s = self._session()
+        body = {"bld": KRX_MDC_BLD_ALL_QUOTES, "locale": "ko_KR", "mktId": "ALL",
+                "trdDd": date_c, "share": "1", "money": "1", "csvxls_isNo": "false"}
+        r = s.post(KRX_MDC_JSON_URL, data=body, timeout=40)
+        if r.status_code != 200:
+            raise RuntimeError(f"http{r.status_code}")
+        txt = r.text.lstrip()
+        if not txt[:1] in ("{", "["):
+            # 로그인 HTML 이 오면 여기서 잡힌다 — JSONDecodeError 를 엉뚱한 곳에서 만나지 않게.
+            raise RuntimeError("JSON 이 아닌 응답(로그인/차단 페이지 추정)")
+        js = r.json()
+        for k, v in js.items():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v
+        raise RuntimeError(f"행 배열 없음(keys={list(js)[:5]})")
+
+
+KRX_MDC = None       # _bootstrap 이후에 만든다(requests 필요)
+
+_MDC_CODE_KEYS = ("ISU_SRT_CD", "ISU_CD", "종목코드")
+_MDC_CAP_KEYS = ("MKTCAP", "시가총액")
+_MDC_MKT_KEYS = ("MKT_NM", "MKT_TP_NM", "시장구분")
+
+
+def snap_krx_mdc(date_iso: str):
+    name = "krx_mdc"
+    if requests is None or KRX_MDC is None or not _provider_alive(name):
+        return None, "skip"
+    date_c = compact(date_iso)
+    try:
+        rows = KRX_MDC.all_quotes(date_c)
+    except Exception as e:                                   # noqa: BLE001
+        _provider_fail(name, f"{type(e).__name__}: {e}")
+        return None, f"{type(e).__name__}: {str(e)[:60]}"
+    df = pd.DataFrame(rows)
+    code_c = next((c for c in _MDC_CODE_KEYS if c in df.columns), None)
+    cap_c = next((c for c in _MDC_CAP_KEYS if c in df.columns), None)
+    mkt_c = next((c for c in _MDC_MKT_KEYS if c in df.columns), None)
+    if not code_c or not cap_c:
+        _provider_fail(name, "스키마변경")
+        return None, f"스키마 불일치({list(df.columns)[:8]})"
+    snap = _mk_snapshot(df[code_c], _num(df[cap_c]),
+                        df[mkt_c] if mkt_c else [""] * len(df))
+    if snap is None:
+        # 휴장일이면 행이 0이거나 시총이 전부 0으로 온다 — 소스는 살아있다.
+        _provider_ok(name)
+        return None, "행 없음/시총0 (휴장일 추정)"
+    _provider_ok(name)
+    return snap, f"{len(snap):,}종목"
+
+
+# ── provider 3: KRX Open API (엔드포인트 이용신청 승인 필요) ───────────────────────────────
 def probe_krx_openapi() -> bool:
-    """실제 호출로 사용 가능 여부를 1회 확인한다. 엔드포인트별 이용신청이 안 돼 있으면
-    키가 유효해도 거부된다 — 그래서 '키가 있다'와 '쓸 수 있다'를 코드로 직접 구분해야 한다."""
+    """'키가 있다'와 '실제로 쓸 수 있다'는 다르다 — 엔드포인트별 이용신청 승인이 따로 필요하다.
+    최근 평일 1회 호출로 실사용 가능 여부를 판정하고, 거부 사유를 그대로 로그에 남긴다."""
     global KRX_OPENAPI_OK, KRX_OPENAPI_MODE
     if not str(KRX_OPENAPI_KEY or "").strip() or requests is None:
         return False
     d = _dt.date.today() - _dt.timedelta(days=7)
     while d.weekday() >= 5:
         d -= _dt.timedelta(days=1)
+    last = ""
     for mode in ("query", "header"):
+        kw = ({"params": {"AUTH_KEY": KRX_OPENAPI_KEY, "basDd": d.strftime("%Y%m%d")}}
+              if mode == "query" else
+              {"params": {"basDd": d.strftime("%Y%m%d")}, "headers": {"AUTH_KEY": KRX_OPENAPI_KEY}})
         try:
-            if mode == "query":
-                r = requests.get(KRX_OPENAPI_URL, timeout=15,
-                                 params={"AUTH_KEY": KRX_OPENAPI_KEY, "basDd": d.strftime("%Y%m%d")})
-            else:
-                r = requests.get(KRX_OPENAPI_URL, timeout=15,
-                                 params={"basDd": d.strftime("%Y%m%d")},
-                                 headers={"AUTH_KEY": KRX_OPENAPI_KEY})
+            r = requests.get(KRX_OPENAPI_URL, timeout=20, **kw)
             js = r.json()
-        except Exception:                                # noqa: BLE001
+        except Exception as e:                               # noqa: BLE001
+            last = f"{type(e).__name__}"
             continue
         if isinstance(js, dict) and (js.get("OutBlock_1") or js.get("output")):
             KRX_OPENAPI_OK, KRX_OPENAPI_MODE = True, mode
             return True
+        if isinstance(js, dict):
+            last = str(js.get("message") or js.get("msg") or list(js)[:3])[:120]
     KRX_OPENAPI_OK = False
+    if last:
+        LOG(f"    KRX Open API 거부 사유: {last}")
     return False
 
 
-def _mcap_frame_openapi(date_c: str):
-    """KRX Open API 벌크 조회(그 날짜 전종목 1콜). 실패하면 None — 예외를 던지지 않는다."""
-    if not KRX_OPENAPI_OK or requests is None:
-        return None
-    kw = ({"params": {"AUTH_KEY": KRX_OPENAPI_KEY, "basDd": date_c}} if KRX_OPENAPI_MODE == "query"
-          else {"params": {"basDd": date_c}, "headers": {"AUTH_KEY": KRX_OPENAPI_KEY}})
+def snap_krx_openapi(date_iso: str):
+    name = "krx_openapi"
+    if not KRX_OPENAPI_OK or requests is None or not _provider_alive(name):
+        return None, "skip"
+    date_c = compact(date_iso)
+    kw = ({"params": {"AUTH_KEY": KRX_OPENAPI_KEY, "basDd": date_c}}
+          if KRX_OPENAPI_MODE == "query" else
+          {"params": {"basDd": date_c}, "headers": {"AUTH_KEY": KRX_OPENAPI_KEY}})
     try:
-        r = requests.get(KRX_OPENAPI_URL, timeout=20, **kw)
+        r = requests.get(KRX_OPENAPI_URL, timeout=30, **kw)
         js = r.json()
-    except Exception:                                    # noqa: BLE001
-        return None
+    except Exception as e:                                   # noqa: BLE001
+        _provider_fail(name, type(e).__name__)
+        return None, f"{type(e).__name__}"
     rows = js.get("OutBlock_1") or js.get("output") or []
     if not rows:
-        return None
+        _provider_ok(name)
+        return None, "행 없음(휴장일 추정)"
     df = pd.DataFrame(rows)
     code_c = next((c for c in ("ISU_SRT_CD", "ISU_CD", "srtnCd") if c in df.columns), None)
     cap_c = next((c for c in ("MKTCAP", "mktCap") if c in df.columns), None)
+    mkt_c = next((c for c in ("MKT_NM", "mktNm") if c in df.columns), None)
     if not code_c or not cap_c:
+        _provider_fail(name, "스키마변경")
+        return None, f"스키마 불일치({list(df.columns)[:8]})"
+    snap = _mk_snapshot(df[code_c], _num(df[cap_c]), df[mkt_c] if mkt_c else [""] * len(df))
+    if snap is None:
+        _provider_ok(name)
+        return None, "유효행 부족(휴장일 추정)"
+    _provider_ok(name)
+    return snap, f"{len(snap):,}종목"
+
+
+# ── provider 4: pykrx (건강검진 통과 시에만) ──────────────────────────────────────────────
+def _pykrx_quiet(fn_name: str, *a, **kw):
+    """pykrx 는 내부 예외를 삼키면서 'Error occurred in ...' 를 stdout 에 직접 print 한다.
+    그 스팸이 로그를 덮어버리므로 표준출력을 잠시 가로챈다(반환값은 그대로)."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            return pykrx_call(fn_name, *a, **kw)
+    finally:
+        pass
+
+
+def snap_pykrx(date_iso: str):
+    name = "pykrx"
+    if not PYKRX_AVAILABLE or stock is None or not _provider_alive(name):
+        return None, "skip"
+    date_c = compact(date_iso)
+    df = None
+    for fn, kw in (("get_market_cap_by_ticker", {"market": "ALL", "alternative": False}),
+                   ("get_market_cap_by_ticker", {"market": "ALL"})):
+        df = _pykrx_quiet(fn, date_c, **kw)
+        if isinstance(df, pd.DataFrame) and len(df) and "시가총액" in df.columns:
+            break
+        df = None
+    if df is None:
+        _provider_fail(name, "빈 응답/세션 없음")
+        return None, "빈 응답(세션 미인증 추정)"
+    mkts = []
+    try:
+        lab = {}
+        for mk, tag in (("KOSPI", "STK"), ("KOSDAQ", "KSQ"), ("KONEX", "KNX")):
+            for t in (_pykrx_quiet("get_market_ticker_list", date_c, market=mk) or []):
+                lab[to_code6(t)] = tag
+        mkts = [lab.get(to_code6(i), "") for i in df.index]
+    except Exception:                                        # noqa: BLE001
+        mkts = [""] * len(df)
+    snap = _mk_snapshot(df.index, _num(df["시가총액"]), mkts)
+    if snap is None:
+        _provider_ok(name)
+        return None, "시총>0 부족 (휴장일 추정)"
+    _provider_ok(name)
+    return snap, f"{len(snap):,}종목"
+
+
+# ── 스냅샷 캐시 (로컬 → 드라이브 공용 인덱스) + provider 체인 ─────────────────────────────
+_SNAP_MEM: dict = {}          # date_iso -> (df|None, source)
+_SNAP_LK = threading.Lock()
+
+MARKET_PROVIDERS = [
+    ("fdr_cache", snap_fdr_cache),
+    ("krx_mdc", snap_krx_mdc),
+    ("krx_openapi", snap_krx_openapi),
+    ("pykrx", snap_pykrx),
+]
+
+
+def _snap_local_path(date_iso: str) -> Path:
+    return DIR_CACHE_MARKET / f"krx_market_{compact(date_iso)}.csv"
+
+
+def _snap_shared_path(date_iso: str):
+    return drive_shared("table", f"krx_market_{compact(date_iso)}.csv")
+
+
+def _snap_read_csv(p: Path):
+    try:
+        df = pd.read_csv(p, dtype={"code": str})
+    except Exception:                                        # noqa: BLE001
         return None
-    out = pd.DataFrame({"시가총액": pd.to_numeric(
-        df[cap_c].astype(str).str.replace(",", "", regex=False), errors="coerce")})
-    out.index = [to_code6(x) for x in df[code_c]]
-    return out if len(out) and (out["시가총액"] > 0).sum() > 0 else None
+    if not {"code", "cap"} <= set(df.columns):
+        return None
+    # ★ .to_numpy() 가 반드시 있어야 한다. Series 를 그대로 넘기면서 index= 를 함께 주면
+    #   pandas 는 '값 정렬'이 아니라 '라벨 재색인'을 한다 — Series 의 라벨은 0,1,2… 인데
+    #   새 index 는 종목코드라 하나도 안 맞아서 전 값이 NaN 이 된다. 그러면 cap>0 필터에
+    #   전부 걸려 캐시가 항상 비어 보이고, 매 실행이 조용히 네트워크를 다시 탄다.
+    out = pd.DataFrame(
+        {"cap": pd.to_numeric(df["cap"], errors="coerce").fillna(0).to_numpy(),
+         "mkt": (df["mkt"].fillna("").astype(str).to_numpy()
+                 if "mkt" in df.columns else [""] * len(df))},
+        index=[to_code6(c) for c in df["code"]])
+    out = out[(out.index != "") & (out["cap"] > 0)]
+    out = out[~out.index.duplicated(keep="first")]
+    return out if len(out) >= EMPTY_UNIVERSE_MIN else None
+
+
+def _snap_write_csv(df, p: Path):
+    body = pd.DataFrame({"code": df.index, "cap": df["cap"].astype("int64"), "mkt": df["mkt"]})
+    write_text(p, body.to_csv(index=False))
+
+
+def get_market_snapshot(date_iso: str):
+    """그 날짜의 전종목 (코드·시총·시장구분). 반환 (df|None, source, trail).
+
+    탐색 순서: 실행내 메모 → 로컬 캐시 → 드라이브 공용 인덱스 → provider 체인.
+    성공하면 로컬과 드라이브 양쪽에 캐시하므로, 한 번 푼 날짜는 두 번 다시 네트워크를 타지 않는다.
+    """
+    with _SNAP_LK:
+        if date_iso in _SNAP_MEM:
+            df, src = _SNAP_MEM[date_iso]
+            return df, src, ["memo"]
+
+    trail = []
+    lp = _snap_local_path(date_iso)
+    if lp.exists():
+        df = _snap_read_csv(lp)
+        if df is not None:
+            with _SNAP_LK:
+                _SNAP_MEM[date_iso] = (df, "local_cache")
+            return df, "local_cache", ["로컬캐시"]
+        trail.append("로컬캐시 손상")
+
+    sp = _snap_shared_path(date_iso)
+    if sp is not None and sp.exists():
+        try:
+            df = _snap_read_csv(sp)
+        except Exception:                                    # noqa: BLE001
+            df = None
+        if df is not None:
+            try:
+                _snap_write_csv(df, lp)          # 드라이브에서 받은 것을 로컬에도 심어 둔다
+            except DiskFull:
+                raise
+            except OSError:
+                pass                              # 로컬 기록 실패해도 측정은 계속한다
+            with _SNAP_LK:
+                _SNAP_MEM[date_iso] = (df, "drive_shared")
+            return df, "drive_shared", ["드라이브 공용 인덱스"]
+        trail.append("드라이브 캐시 손상")
+
+    for name, fn in MARKET_PROVIDERS:
+        if not _provider_alive(name):
+            trail.append(f"{name}=사망(생략)")
+            continue
+        try:
+            df, note = fn(date_iso)
+        except Exception as e:                               # noqa: BLE001
+            _provider_fail(name, type(e).__name__)
+            trail.append(f"{name}={type(e).__name__}")
+            continue
+        trail.append(f"{name}={note}")
+        if df is not None:
+            try:
+                _snap_write_csv(df, lp)
+                if sp is not None:
+                    _snap_write_csv(df, sp)
+            except DiskFull:
+                raise
+            except OSError:
+                pass
+            with _SNAP_LK:
+                _SNAP_MEM[date_iso] = (df, name)
+            return df, name, trail
+
+    with _SNAP_LK:
+        _SNAP_MEM[date_iso] = (None, "")
+    return None, "", trail
+
+
+def probe_market_providers() -> dict:
+    """시작 시 1회. 최근 거래일로 각 provider 의 실사용 가능 여부를 실측한다.
+
+    여기서 죽은 provider 를 미리 걸러 두면, 스냅샷 4개를 도는 동안 죽은 소스를 반복
+    호출하는 낭비(이전 판의 176회)가 원천적으로 발생하지 않는다.
+    """
+    out = {}
+    d = _dt.date.today() - _dt.timedelta(days=1)
+    probed = None
+    for _ in range(12):
+        if d.weekday() < 5:
+            probed = d.isoformat()
+            break
+        d -= _dt.timedelta(days=1)
+    if probed is None:
+        return out
+    for name, fn in MARKET_PROVIDERS:
+        try:
+            df, note = fn(probed)
+        except Exception as e:                               # noqa: BLE001
+            df, note = None, f"{type(e).__name__}"
+            _provider_fail(name, type(e).__name__)
+        out[name] = {"date": probed, "rows": (0 if df is None else int(len(df))), "note": note,
+                     "state": PROVIDER_STATE.get(name, "unknown")}
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -1232,61 +1668,9 @@ def _sha256_thresholds() -> str:
 # ══════════════════════════════════════════════════════════════════════════════════════════
 #  ▣ 14. 유니버스 — 거래일 스냅 + 빈 유니버스 가드 + 시총/티커 다중소스 폴백
 # ══════════════════════════════════════════════════════════════════════════════════════════
-_MCAP_CACHE: dict = {}          # date_c -> (df|None, source) — 실행 내 메모이제이션, 재조회 제거
-
-
-def _mcap_frame_pykrx(date_c: str):
-    for fn, kw in (("get_market_cap_by_ticker", {"market": "ALL", "alternative": False}),
-                   ("get_market_cap_by_ticker", {"market": "ALL"}),
-                   ("get_market_cap_by_ticker", {}),
-                   ("get_market_cap", {"market": "ALL"})):
-        df = pykrx_call(fn, date_c, **kw)
-        if isinstance(df, pd.DataFrame) and len(df) and "시가총액" in df.columns:
-            return df
-    return None
-
-
-def _mcap_frame(date_c: str):
-    """시총 조회 1콜 = 그 날 전종목. KRX Open API(공식) 1순위, pykrx(스크래핑) 2순위.
-    같은 날짜는 실행 중 한 번만 실제로 조회한다(메모이제이션) — v1.2/재시도로 인한
-    중복 시총조회를 원천 제거한다."""
-    if date_c in _MCAP_CACHE:
-        return _MCAP_CACHE[date_c][0]
-    df, src = None, ""
-    if KRX_OPENAPI_OK:
-        df = _mcap_frame_openapi(date_c)
-        if df is not None:
-            src = "krx_openapi"
-    if df is None and PYKRX_AVAILABLE:
-        df = _mcap_frame_pykrx(date_c)
-        if df is not None:
-            src = "pykrx"
-    _MCAP_CACHE[date_c] = (df, src)
-    return df
-
-
-def _mcap_source(date_c: str) -> str:
-    return _MCAP_CACHE.get(date_c, (None, ""))[1]
-
-
-def resolve_trading_day(nominal_iso: str):
-    """분기말이 휴장일이면 직전 거래일로 이동. '시총>0 종목수'로 거래일을 실측한다."""
-    d0 = _dt.date.fromisoformat(nominal_iso)
-    trail = []
-    for back in range(TRADING_DAY_LOOKBACK + 1):
-        d = d0 - _dt.timedelta(days=back)
-        date_c = compact(d.isoformat())
-        df = _mcap_frame(date_c)
-        if df is None:
-            trail.append((d.isoformat(), "조회실패(전 소스)"))
-            continue
-        n_pos = int((pd.to_numeric(df["시가총액"], errors="coerce").fillna(0) > 0).sum())
-        trail.append((d.isoformat(), f"행 {len(df):,} / 시총>0 {n_pos:,} [{_mcap_source(date_c)}]"))
-        if n_pos >= EMPTY_UNIVERSE_MIN:
-            return d.isoformat(), df, trail
-    return None, None, trail
-
-
+#  스냅샷 하나를 확정하는 데 필요한 네트워크 요청은 "거래일 1개당 1회"가 상한이다.
+#  휴장일이면 직전 거래일로 역행하는데, 그때도 provider 체인은 살아있는 소스만 탄다.
+#  이미 사망 판정된 소스는 호출조차 하지 않으므로 이전 판의 176회 헛수고가 재발할 수 없다.
 _SECURITY_MASTER_CACHE = None
 
 
@@ -1297,84 +1681,78 @@ def _security_master_lazy():
     return _SECURITY_MASTER_CACHE
 
 
-def _resolve_listed_set(date_c: str, snap_date_iso: str):
-    """티커 목록 1순위=pykrx(그 날짜 정확), 실패 시 다중소스 상장/폐지 병합의 point-in-time 필터.
-    반환: (listed_by_market: {market: set(code)}, source: str)"""
-    by_mkt, any_ok = {}, False
-    for mk in ("KOSPI", "KOSDAQ", "KONEX"):
-        ts = pykrx_call("get_market_ticker_list", date_c, market=mk)
-        if ts:
-            by_mkt[mk] = {to_code6(t) for t in ts}
-            any_ok = True
-    if any_ok:
-        return by_mkt, "pykrx"
+def resolve_market_day(nominal_iso: str):
+    """분기말이 휴장일이면 직전 거래일로 역행하며 '그 날 전종목 스냅샷'을 확보한다.
 
-    WARN("    pykrx 티커목록 사용 불가 — 다중소스 상장유니버스 폴백(FDR+KIND+DART)으로 대체")
-    master = _security_master_lazy()
-    codes = point_in_time_listed(master, snap_date_iso)
-    if not codes:
-        return {}, "none"
-    # 폴백에는 시장 라벨이 부실하므로(KIND/FDR 캐시가 시장을 늘 주지 않는다) 전부 하나의
-    # 가상 마켓으로 묶는다 — INCLUDE_KONEX 필터는 이 경로에서는 걸 수 없다는 뜻이고,
-    # 그 사실을 로그로 명시한다.
-    LOG(f"    폴백 유니버스 {len(codes):,}종목 — 시장 라벨(KOSPI/KOSDAQ/KONEX) 구분 불가 "
-        f"(KONEX 필터 미적용, methodology 에 기록됨)")
-    return {"_FALLBACK_ALL": codes}, "fallback_multi_source"
+    반환 (eff_date|None, snapshot_df|None, source, trail).
+    거래일 판정은 달력이 아니라 '그 날 시총>0 종목이 실제로 존재하는가'로 한다 —
+    분기말 휴장(2025-12-31 등)을 달력 없이 정확히 잡아내는 유일한 방법이다.
+    """
+    d0 = _dt.date.fromisoformat(nominal_iso)
+    trail = []
+    for back in range(TRADING_DAY_LOOKBACK + 1):
+        d = (d0 - _dt.timedelta(days=back)).isoformat()
+        snap, src, why = get_market_snapshot(d)
+        if snap is not None:
+            trail.append((d, f"{len(snap):,}종목 [{src}]"))
+            return d, snap, src, trail
+        trail.append((d, " · ".join(why) if why else "없음"))
+    return None, None, "", trail
 
 
 def build_universe(sid: str, nominal_iso: str):
-    """반환: dict(효과일자, 시총표, 측정대상 코드집합, 전상장 코드집합, 상태, 소스 진단)."""
-    eff, df, trail = resolve_trading_day(nominal_iso)
+    """반환: dict(효과일자, 시총표, 측정대상 코드집합, 전상장 코드집합, 상태, 소스 진단).
+
+    시가총액과 시장구분을 한 소스에서 동시에 받으므로, 예전처럼 티커목록을 따로 조회해
+    교집합을 내는 단계가 사라졌다(스냅샷당 3회 추가 호출 제거).
+    """
+    eff, snap, src, trail = resolve_market_day(nominal_iso)
     for day, note in trail:
         mark = "←사용" if day == eff else ""
         LOG(f"    거래일 탐색 {day}: {note} {mark}")
     if eff is None:
+        alive = [n for n, _ in MARKET_PROVIDERS if _provider_alive(n)]
         WARN(f"  {sid} 빈 유니버스 — {nominal_iso} 부터 {TRADING_DAY_LOOKBACK}일 역행했으나 "
-             f"시총>0 종목이 {EMPTY_UNIVERSE_MIN} 미만(KRX Open API·pykrx 모두 실패 포함). "
+             f"어느 소스에서도 시총>0 종목 {EMPTY_UNIVERSE_MIN}개 이상을 얻지 못했다. "
+             f"(생존 소스: {', '.join(alive) or '없음'}) "
              f"P0_EMPTY_UNIVERSE_GUARD 발동: 임원현황 수집에 진입하지 않는다.")
         return {"snapshot": sid, "date_nominal": nominal_iso, "date": "", "status": "UNVERIFIED",
                 "status_reason": "EMPTY_UNIVERSE", "listed": set(), "measure": set(),
-                "mcap": None, "n_listed_all": 0, "n_konex": 0, "mcap_source": "", "universe_source": ""}
+                "mcap": None, "n_listed_all": 0, "n_konex": 0,
+                "mcap_source": "", "universe_source": ""}
     if eff != nominal_iso:
         WARN(f"  {sid} 휴장일 스냅: {nominal_iso} → {eff} (직전 거래일)")
 
-    date_c = compact(eff)
-    mcap_src = _mcap_source(date_c)
-    cap = pd.to_numeric(df["시가총액"], errors="coerce").fillna(0)
-    df = df.assign(_cap=cap.values)
-    df.index = [to_code6(i) for i in df.index]
-    df = df[~df.index.duplicated(keep="first")]     # .loc 이 행을 불려 내는 사고 방지
-    all_pos = df[df["_cap"] > 0]
-
-    by_mkt, universe_src = _resolve_listed_set(date_c, eff)
-    konex = by_mkt.get("KONEX", set())
-    if "_FALLBACK_ALL" in by_mkt:
-        sel = by_mkt["_FALLBACK_ALL"]
+    konex = set(snap.index[snap["mkt"] == "KNX"])
+    n_unlabeled = int((snap["mkt"] == "").sum())
+    if INCLUDE_KONEX or n_unlabeled == len(snap):
+        # 시장 라벨이 통째로 없는 소스라면 KONEX 필터를 걸 수 없다 — 걸린 척하지 않는다.
+        listed = set(snap.index)
+        if n_unlabeled == len(snap) and not INCLUDE_KONEX:
+            WARN(f"  {sid} 시장구분 라벨이 전혀 없는 소스({src}) — KONEX 필터를 적용하지 못했다. "
+                 f"측정 대상(시총 하위 {MEASURE_N})에 KONEX 가 섞일 수 있다(판정표에 기록).")
     else:
-        keep_markets = ["KOSPI", "KOSDAQ"] + (["KONEX"] if INCLUDE_KONEX else [])
-        sel = set().union(*(by_mkt.get(mk, set()) for mk in keep_markets)) if by_mkt else set()
+        listed = set(snap.index[snap["mkt"] != "KNX"])
 
-    listed = set(all_pos.index) & sel if sel else set(all_pos.index)
-    if not sel:
-        WARN(f"  {sid} 시장/유니버스 라벨 전부 결측 — 시총>0 전체를 유니버스로 사용")
     if len(listed) < EMPTY_UNIVERSE_MIN:
         WARN(f"  {sid} 시장 필터 후 {len(listed)}종목 — P0_EMPTY_UNIVERSE_GUARD 발동")
         return {"snapshot": sid, "date_nominal": nominal_iso, "date": eff, "status": "UNVERIFIED",
                 "status_reason": "EMPTY_UNIVERSE_AFTER_MARKET_FILTER", "listed": set(),
-                "measure": set(), "mcap": None, "n_listed_all": len(all_pos), "n_konex": len(konex),
-                "mcap_source": mcap_src, "universe_source": universe_src}
+                "measure": set(), "mcap": None, "n_listed_all": len(snap), "n_konex": len(konex),
+                "mcap_source": src, "universe_source": src}
 
-    sub = all_pos.loc[sorted(listed)].sort_values("_cap", ascending=True)
+    sub = snap.loc[sorted(listed)].sort_values("cap", ascending=True)
     measure = set(sub.index[:MEASURE_N])
+    lo = sub["cap"].iloc[0] / 1e8
+    hi = sub["cap"].iloc[min(len(measure), len(sub)) - 1] / 1e8
     LOG(f"    전 상장사(시총>0, {'KONEX 포함' if INCLUDE_KONEX else 'KONEX 제외'}) "
-        f"{len(listed):,}종목  |  ALL 기준 {len(all_pos):,} (KONEX {len(konex):,})  "
-        f"|  시총소스={mcap_src}  유니버스소스={universe_src}")
-    LOG(f"    측정대상 = 시총 하위 {len(measure):,}종목  "
-        f"(최소 {sub['_cap'].iloc[0] / 1e8:,.0f}억 ~ 최대 {sub['_cap'].iloc[len(measure) - 1] / 1e8:,.0f}억)")
+        f"{len(listed):,}종목  |  소스 전체 {len(snap):,} (KONEX {len(konex):,} / "
+        f"시장라벨없음 {n_unlabeled:,})  |  소스={src}")
+    LOG(f"    측정대상 = 시총 하위 {len(measure):,}종목  (최소 {lo:,.0f}억 ~ 최대 {hi:,.0f}억)")
     return {"snapshot": sid, "date_nominal": nominal_iso, "date": eff, "status": "OK",
             "status_reason": "", "listed": listed, "measure": measure, "mcap": sub,
-            "n_listed_all": len(all_pos), "n_konex": len(konex),
-            "mcap_source": mcap_src, "universe_source": universe_src}
+            "n_listed_all": len(snap), "n_konex": len(konex), "n_unlabeled_market": n_unlabeled,
+            "mcap_source": src, "universe_source": src}
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -1767,14 +2145,32 @@ def main():
     LOG("")
     LOG("데이터소스 가용성")
     LOG(f"  DART_API_KEY      : 설정됨 (끝 4자리 …{DART_API_KEY.strip()[-4:]})")
-    LOG(f"  pykrx             : {'사용가능' if PYKRX_AVAILABLE else f'사용불가 — {PYKRX_DIAGNOSTIC}'}")
+    LOG(f"  pykrx             : {'import 성공' if PYKRX_AVAILABLE else f'사용불가 — {PYKRX_DIAGNOSTIC}'}")
     LOG(f"  KRX Open API      : {'사용가능(mode=' + KRX_OPENAPI_MODE + ')' if krx_oa else ('키 있으나 엔드포인트 미승인/오류' if KRX_OPENAPI_KEY else '키 미설정')}")
-    LOG(f"  FinanceDataReader : {'사용가능' if FDR_AVAILABLE else '미설치(선택 의존성 — 상장목록 폴백 일부 축소)'}")
-    LOG(f"  KRX ID/PW(마켓플레이스) : {'설정됨' if (KRX_ID and KRX_PW) else '미설정 — pykrx 비인증 경로로 진행'}")
-    if not PYKRX_AVAILABLE and not krx_oa:
-        WARN("  pykrx 와 KRX Open API 가 둘 다 사용 불가하다 — 이 실행은 시가총액을 전혀 "
-             "얻을 수 없으므로 모든 스냅샷이 UNVERIFIED 로 끝날 가능성이 높다. "
-             "KRX_OPENAPI_KEY 발급을 강력 권장한다(§0).")
+    LOG(f"  FinanceDataReader : {'사용가능' if FDR_AVAILABLE else '미설치(선택 의존성)'}")
+    LOG(f"  KRX ID/PW(마켓플레이스) : {'설정됨' if (KRX_ID and KRX_PW) else '미설정'}")
+
+    # ── 시장 스냅샷 provider 실사용 건강검진 (최근 평일 1회) ────────────────────────────
+    #   여기서 죽은 소스를 미리 걸러 두는 게 이번 개정의 핵심 성능 장치다. 이 검진이 없으면
+    #   죽은 소스를 스냅샷 4개 × 역행 11일 동안 반복 호출하며 수십 초를 버린다(이전 판의 실패).
+    LOG("")
+    LOG("시장 스냅샷 provider 건강검진 (최근 평일 1회 실호출)")
+    probe = probe_market_providers()
+    for name, info in probe.items():
+        mark = "✓" if info["rows"] else "✗"
+        LOG(f"  {mark} {name:<13} {info['date']} → {info['rows']:,}종목  ({info['note']})")
+    alive_providers = [n for n, _ in MARKET_PROVIDERS if _provider_alive(n)]
+    if not any(i["rows"] for i in probe.values()):
+        WARN("  어떤 provider 도 시장 스냅샷을 주지 못했다. 이 상태로는 시가총액을 얻을 수 "
+             "없어 모든 스냅샷이 UNVERIFIED 로 끝난다. 조치 우선순위:")
+        WARN("   1) 네트워크에서 raw.githubusercontent.com 과 data.krx.co.kr 접근 가능한지 확인")
+        WARN("   2) KRX Open API 를 쓰려면 키 발급만으로는 부족하고 '주식 일별매매정보"
+             "(stk_bydd_trd)' 엔드포인트 이용신청 승인이 따로 필요하다 (승인 하루 정도)")
+        WARN("   3) 사내망/방화벽/프록시가 KRX 를 막고 있는지 확인")
+    else:
+        OK(f"  생존 provider: {', '.join(alive_providers)}")
+        LOG("  ※ FDR 캐시는 최근 약 5개월만 커버한다(롤링). 2025년 스냅샷(S1~S3)은 "
+            "KRX MDC / KRX Open API 가 담당한다.")
 
     # ── 2. 캐시 인벤토리 (P0_CACHE_FIRST) ────────────────────────────────────────────
     RULE("2. 캐시 인벤토리 (로컬 → 드라이브 공용 인덱스 순으로 탐색)")
@@ -1917,7 +2313,13 @@ def main():
                "cache_hit": 0, "api_new": int(u.get("api_new", 0)),
                "records_no_birth": 0, "status": u["status"],
                "status_reason": u.get("status_reason", ""),
-               "mcap_source": u.get("mcap_source", ""), "universe_source": u.get("universe_source", "")}
+               "mcap_source": u.get("mcap_source", ""),
+               "universe_source": u.get("universe_source", ""),
+               # 유니버스 구성 근거를 판정표에 남긴다 — 노드 수가 예상과 다를 때
+               # 'KONEX 를 뺐기 때문인지 소스가 부실했기 때문인지'를 사후에 구분할 수 있어야 한다.
+               "n_listed_all": int(u.get("n_listed_all", 0)),
+               "n_konex": int(u.get("n_konex", 0)),
+               "n_unlabeled_market": int(u.get("n_unlabeled_market", 0))}
         if u["status"] != "OK":
             WARN(f"  {sid}: {u.get('status_reason')} — 그래프 구성 생략")
             snap_out.append(rec)

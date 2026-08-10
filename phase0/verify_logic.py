@@ -367,14 +367,74 @@ ad3 = M.AdaptiveDelay(lo=0.1, hi=0.6, start=0.5, backoff_factor=3.0)
 ad3.on_failure()
 check("상한(hi) 위로 안 올라감", ad3.cur, 0.6)
 
-print("\n[17] KRX Open API — 키 미설정/네트워크 없음 시 조용히 생략")
+print("\n[17] 시장 스냅샷 provider — 정규화·사망판정·체인")
 _real_requests = M.requests
+
+# ── 시장구분 정규화: 실제 FDR 데이터에 'KOSDAQ GLOBAL' 이라는 별도 라벨이 존재한다 ──
+check("MarketId STK", M._norm_market("STK"), "STK")
+check("MarketId KSQ", M._norm_market("KSQ"), "KSQ")
+check("MarketId KNX", M._norm_market("KNX"), "KNX")
+check("KOSPI → STK", M._norm_market("KOSPI"), "STK")
+check("KOSDAQ → KSQ", M._norm_market("KOSDAQ"), "KSQ")
+check("'KOSDAQ GLOBAL' 을 별도 시장으로 보지 않고 KSQ 로 접는다(실측 52종목)",
+      M._norm_market("KOSDAQ GLOBAL"), "KSQ")
+check("소문자/공백 변형도 KSQ", M._norm_market(" kosdaq  global "), "KSQ")
+check("한글 코스닥", M._norm_market("코스닥"), "KSQ")
+check("한글 유가증권", M._norm_market("유가증권시장"), "STK")
+check("한글 코넥스", M._norm_market("코넥스"), "KNX")
+check("빈 값은 빈 라벨(추정 금지)", M._norm_market(""), "")
+check("모르는 값은 빈 라벨", M._norm_market("XYZ"), "")
+
+# ── provider 사망 판정: 죽은 소스를 반복 호출하지 않는 장치 ──
+M.PROVIDER_STATE.clear()
+M._PROVIDER_FAILS.clear()
+check("초기 상태는 생존 취급", M._provider_alive("t1"), True)
+M._provider_fail("t1", "테스트")
+check("1회 실패로는 사망 아님", M._provider_alive("t1"), True)
+M._provider_fail("t1", "테스트")
+check(f"연속 {M.PROVIDER_DEAD_AFTER}회 실패 → 사망(이후 호출 안 함)", M._provider_alive("t1"), False)
+M.PROVIDER_STATE.clear(); M._PROVIDER_FAILS.clear()
+M._provider_ok("t2")
+for _ in range(5):
+    M._provider_fail("t2", "테스트")
+check("한 번이라도 데이터를 준 소스는 실패가 쌓여도 사망시키지 않는다(일시적 휴장/네트워크 구분)",
+      M._provider_alive("t2"), True)
+M.PROVIDER_STATE.clear(); M._PROVIDER_FAILS.clear()
+
+# ── _mk_snapshot: provider 공통 산출물 규격 ──
+import pandas as _pd_t
+M.pd = _pd_t                      # [13] 에서 None 으로 비워 뒀으므로 되돌린다
+
+_PAD = [f"{i:06d}" for i in range(100, 100 + M.EMPTY_UNIVERSE_MIN)]   # 최소치 충족용 패딩
+snap = M._mk_snapshot(["005930", "000660", "09701K"] + _PAD,
+                      [100, 200, 300] + [1] * len(_PAD),
+                      ["KOSPI", "KOSDAQ", "KONEX"] + ["KOSPI"] * len(_PAD))
+check("스냅샷 생성", len(snap), 3 + len(_PAD))
+check("신형 영숫자 티커 보존", "09701K" in snap.index, True)
+check("시장 라벨 정규화", sorted(set(snap["mkt"].tolist())), ["KNX", "KSQ", "STK"])
+zero = M._mk_snapshot(["A1", "B1"] + _PAD, [0, -1] + [1] * len(_PAD), [""] * (2 + len(_PAD)))
+check("시총 0 이하는 제외", len(zero), len(_PAD))
+check("EMPTY_UNIVERSE_MIN 미만이면 None(부분응답을 진실로 믿지 않는다)",
+      M._mk_snapshot(["005930"], [100], ["KOSPI"]), None)
+dup = M._mk_snapshot(["005930", "005930"] + _PAD, [100, 999] + [1] * len(_PAD),
+                     ["KOSPI", "KOSPI"] + ["KOSPI"] * len(_PAD))
+check("중복 종목코드는 첫 행만(.loc 이 행을 불려내는 사고 방지)", len(dup), 1 + len(_PAD))
+check("중복 시 첫 행의 값이 남는다", int(dup.loc["005930", "cap"]), 100)
+
+# ── 숫자 파싱: KRX 응답은 '1,234,567' 처럼 콤마가 박혀 온다 ──
+check("콤마 포함 숫자 파싱", int(M._num(_pd_t.Series(["1,350,490,358,448,000"])).iloc[0]),
+      1350490358448000)
+check("파싱 불가는 NaN(0으로 추정하지 않는다)",
+      bool(M._num(_pd_t.Series(["-"])).isna().iloc[0]), True)
+
+# ── KRX Open API: 키 없으면 조용히 생략 ──
 M.requests = None
 M.KRX_OPENAPI_KEY = ""
 M.KRX_OPENAPI_OK = False
 check("키 없으면 probe False", M.probe_krx_openapi(), False)
-check("키 없으면 mcap fetch None", M._mcap_frame_openapi("20250630"), None)
+check("키 없으면 snapshot None", M.snap_krx_openapi("2025-06-30")[0], None)
 check("probe 후에도 OK 플래그 False", M.KRX_OPENAPI_OK, False)
+check("requests 없으면 FDR provider 도 None", M.snap_fdr_cache("2025-06-30")[0], None)
 M.requests = _real_requests
 
 print("\n[18] pykrx_call 래퍼 — 예외를 절대 밖으로 흘리지 않는다 (P0_DEFENSIVE_PYKRX)")
@@ -516,61 +576,135 @@ check("빈 유니버스 임계 100", M.EMPTY_UNIVERSE_MIN, 100)
 check("워커 ≤ 8 (I/O바운드라 멀티프로세싱 대신 스레드 — 상한만 확인)", M.N_WORKERS <= 8, True)
 check("전이 3개", M.TRANSITIONS, [("S1", "S2"), ("S2", "S3"), ("S3", "S4")])
 
-print("\n[21] 거래일 스냅 / 빈 유니버스 가드 (pykrx 대역)")
+print("\n[21] 거래일 스냅 / 빈 유니버스 가드 / 스냅샷 캐시")
+import pandas as _pdx
+M.pd = _pdx
+M.DIR_CACHE_MARKET = tmp / "cache" / "market"
+M.DIR_CACHE_MARKET.mkdir(parents=True, exist_ok=True)
+M.GDRIVE_ROOT = ""
 
 
-class _FakePd:
-    """resolve_trading_day 가 쓰는 pandas 표면만 흉내낸다."""
-    @staticmethod
-    def to_numeric(s, errors=None):
-        return s
-
-    class DataFrame:
-        pass
+def _mkframe(caps_nonzero):
+    """caps_nonzero=False 면 휴장일(시총 전부 0) 형태를 만든다."""
+    n = 2903
+    caps = [1e9] * n if caps_nonzero else [0] * n
+    return _pdx.DataFrame({"cap": caps, "mkt": ["STK"] * n},
+                          index=[f"{i:06d}" for i in range(1, n + 1)])
 
 
-class _Series(list):
-    def fillna(self, v):
-        return self
-
-    def __gt__(self, v):
-        return _Series([x > v for x in self])
-
-    def sum(self):
-        return sum(1 for x in self if x is True)
+CAL = {"2025-12-30", "2025-06-30"}          # 이 날짜만 거래일
+_calls = []
 
 
-class _Frame:
-    """휴장일이면 시총이 전부 0 — 실제 결함 재현 형태."""
-    columns = ["시가총액"]
-
-    def __init__(self, caps):
-        self.caps = caps
-
-    def __len__(self):
-        return len(self.caps)
-
-    def __getitem__(self, k):
-        return _Series(self.caps)
+def _fake_provider(date_iso):
+    _calls.append(date_iso)
+    if date_iso in CAL:
+        return _mkframe(True), f"{2903:,}종목"
+    return None, "휴장일"
 
 
-_real_pd, _real_frame = M.pd, M._mcap_frame
-M.pd = _FakePd
-_FakePd.DataFrame = _Frame
-CAL = {"20251231": [0] * 2903, "20251230": [1e9] * 2903,
-       "20250630": [1e9] * 2900, "20260101": [0] * 10}
-M._mcap_frame = lambda d: (_Frame(CAL[d]) if d in CAL else None)
-eff, df, trail = M.resolve_trading_day("2025-12-31")
+_real_providers = M.MARKET_PROVIDERS
+M.MARKET_PROVIDERS = [("fake", _fake_provider)]
+M._SNAP_MEM.clear(); M.PROVIDER_STATE.clear(); M._PROVIDER_FAILS.clear()
+
+eff, snap, src, trail = M.resolve_market_day("2025-12-31")
 check("휴장일 12-31 → 직전 거래일 12-30", eff, "2025-12-30")
 check("12-31 을 먼저 시도한 기록이 남는다", trail[0][0], "2025-12-31")
-check("시총>0 0종목이 로그에 남는다", "시총>0 0" in trail[0][1], True)
-eff2, _, _ = M.resolve_trading_day("2025-06-30")
+check("소스명이 기록된다", src, "fake")
+check("스냅샷 2,903종목", len(snap), 2903)
+
+# 캐시 동작: 같은 날짜 재요청은 provider 를 다시 부르지 않는다
+_n_before = len(_calls)
+M.resolve_market_day("2025-12-31")
+check("동일 날짜 재요청은 provider 재호출 0회(메모+캐시)", len(_calls), _n_before)
+
+# 로컬 캐시 파일이 실제로 생성되고, 메모를 비워도 파일에서 복구된다
+cache_file = M._snap_local_path("2025-12-30")
+check("해결된 스냅샷이 로컬 캐시 파일로 저장됨", cache_file.exists(), True)
+M._SNAP_MEM.clear()
+_n2 = len(_calls)
+snap2, src2, _ = M.get_market_snapshot("2025-12-30")
+check("메모를 비워도 로컬 캐시에서 복구(네트워크 0회)", len(_calls), _n2)
+check("복구 소스 표기", src2, "local_cache")
+check("복구된 종목수 일치", len(snap2), 2903)
+check("복구 후에도 신형 티커/시총 보존", int(snap2["cap"].iloc[0]), 1000000000)
+
+eff2, _, _, _ = M.resolve_market_day("2025-06-30")
 check("거래일이면 이동 없음", eff2, "2025-06-30")
-M._mcap_frame = lambda d: _Frame([0] * 2903)
-eff3, df3, trail3 = M.resolve_trading_day("2025-12-31")
+
+# 전부 휴장이면 수집 진입 금지
+M._SNAP_MEM.clear(); M.PROVIDER_STATE.clear(); M._PROVIDER_FAILS.clear()
+CAL.clear()
+eff3, snap3, _, trail3 = M.resolve_market_day("2024-12-31")
 check("전부 휴장이면 None (수집 진입 금지)", eff3, None)
 check("역행 11일치 시도 기록", len(trail3), M.TRADING_DAY_LOOKBACK + 1)
-M.pd, M._mcap_frame = _real_pd, _real_frame
+
+# 죽은 provider 는 역행 중에 반복 호출되지 않는다 (176회 헛수고 재발 방지)
+M._SNAP_MEM.clear(); M.PROVIDER_STATE.clear(); M._PROVIDER_FAILS.clear()
+_calls.clear()
+
+
+def _dead_provider(date_iso):
+    _calls.append(date_iso)
+    raise ConnectionError("소스 사망")
+
+
+M.MARKET_PROVIDERS = [("deadsrc", _dead_provider)]
+M.resolve_market_day("2024-12-31")
+check(f"죽은 소스는 {M.PROVIDER_DEAD_AFTER}회만 호출되고 나머지 역행에서는 생략됨 "
+      f"(이전 판은 11일×4시그니처를 전부 헛돌았다)", len(_calls), M.PROVIDER_DEAD_AFTER)
+check("사망 판정 기록됨", M.PROVIDER_STATE.get("deadsrc"), "dead")
+
+M.MARKET_PROVIDERS = _real_providers
+M._SNAP_MEM.clear(); M.PROVIDER_STATE.clear(); M._PROVIDER_FAILS.clear()
+
+print("\n[22] build_universe — 시장구분 필터 / KONEX 제외 / 측정대상 선정")
+
+
+def _reset_market_state():
+    """서브테스트 격리. 캐시 파일까지 지워야 한다 — 안 그러면 (정상 동작하는) 로컬 캐시가
+    앞 서브테스트의 데이터를 그대로 돌려줘서 뒤 서브테스트가 stub 을 못 탄다."""
+    M._SNAP_MEM.clear(); M.PROVIDER_STATE.clear(); M._PROVIDER_FAILS.clear()
+    for f in M.DIR_CACHE_MARKET.glob("krx_market_*.csv"):
+        f.unlink()
+
+
+M.INCLUDE_KONEX = False
+n_stk, n_ksq, n_knx = 900, 1800, 100
+codes = [f"{i:06d}" for i in range(1, n_stk + n_ksq + n_knx + 1)]
+mkts = ["STK"] * n_stk + ["KSQ"] * n_ksq + ["KNX"] * n_knx
+caps = [(i + 1) * 1e8 for i in range(len(codes))]      # KONEX 가 시총 상위가 되도록 뒤에 배치
+uni_snap = _pdx.DataFrame({"cap": caps, "mkt": mkts}, index=codes)
+M.MARKET_PROVIDERS = [("uni", lambda d: (uni_snap, "stub"))]
+_reset_market_state()
+u = M.build_universe("SX", "2026-03-31")
+check("상태 OK", u["status"], "OK")
+check("KONEX 제외 후 전상장", len(u["listed"]), n_stk + n_ksq)
+check("KONEX 집계", u["n_konex"], n_knx)
+check("KONEX 가 유니버스에서 실제로 빠짐",
+      any(c in u["listed"] for c in codes[-n_knx:]), False)
+check("측정대상 = 시총 하위 1,000", len(u["measure"]), 1000)
+check("측정대상이 최저시총부터", min(u["measure"]), "000001")
+check("소스 기록", u["mcap_source"], "uni")
+
+# 시장 라벨이 통째로 없는 소스면 KONEX 필터를 건 척하지 않는다
+nolabel = _pdx.DataFrame({"cap": caps, "mkt": [""] * len(codes)}, index=codes)
+M.MARKET_PROVIDERS = [("nolabel", lambda d: (nolabel, "stub"))]
+_reset_market_state()
+u2 = M.build_universe("SY", "2026-03-31")
+check("라벨 없으면 전체를 유니버스로(필터 건 척하지 않음)", len(u2["listed"]), len(codes))
+check("라벨없음 건수를 기록", u2["n_unlabeled_market"], len(codes))
+
+# 종목수가 최소치 미만이면 UNVERIFIED
+tiny = _pdx.DataFrame({"cap": [1e8] * 50, "mkt": ["STK"] * 50},
+                      index=[f"{i:06d}" for i in range(1, 51)])
+M.MARKET_PROVIDERS = [("tiny", lambda d: (M._mk_snapshot(tiny.index, tiny["cap"], tiny["mkt"]), "stub"))]
+_reset_market_state()
+u3 = M.build_universe("SZ", "2026-03-31")
+check("50종목뿐이면 UNVERIFIED (부분응답을 진실로 믿지 않는다)", u3["status"], "UNVERIFIED")
+check("사유 EMPTY_UNIVERSE", u3["status_reason"], "EMPTY_UNIVERSE")
+M.MARKET_PROVIDERS = _real_providers
+_reset_market_state()
 
 print("\n" + "=" * 70)
 if FAIL:
