@@ -77,13 +77,24 @@ def collect_all(months: pd.DatetimeIndex) -> dict:
             prio = [c2c[c] for c in adv.index if c in c2c]
         except Exception:
             prio = []
+        # ★ 호출 순서 = 예산 배분이다. DartBudget.take 는 엔드포인트를 구분하지 않는 단일
+        #   하드 게이트라서, 여기서 먼저 부르는 함수가 일일 19,000건을 통째로 가져간다.
+        #   전체 재무제표(2,500사×13년×4보고서 ≈ 130,000건, 약 7일)를 먼저 돌리면
+        #   직원현황·공시목록은 콜드빌드 내내 정확히 0건을 받는다 — PACK-N·PACK-C·PACK-D 가
+        #   일주일 동안 조용히 죽는데, 하류는 이걸 "데이터 부재"로 보고해 원인을 오도한다.
+        #   → 호출당 가치가 높은 '싸고 유한한' 스윕을 먼저 끝내고, 열린 스윕(전체 재무제표)이
+        #     나머지를 먹게 한다. 다음 날부터는 앞 스윕들이 캐시로 job 0 이 되어, 전체
+        #     재무제표가 한도를 다시 전부 가져간다 — 정상 상태에서는 순서가 무해해진다.
         # Tier-1: 주요계정 배치 (100사/호출) → 전 종목 헤드라인을 싸게 확보
         multi = fetch_dart_multi_accounts(corps, years)
-        # Tier-2: 전체 재무제표 (우선순위·최근연도부터) → B/C축이 필요로 하는 상세 계정
+        # 시장 전체 날짜 스윕 (~수천 호출, 하루면 끝남). PACK-C·PACK-D·V3 의 유일한 입력.
+        dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
+        # 직원현황 (~32,500 호출, 약 2일). PACK-N·TP_C2 의 유일한 입력.
+        emp = fetch_dart_employees(corps, years)
+        # Tier-2: 전체 재무제표 (우선순위·최근연도부터) → B/C축이 필요로 하는 상세 계정.
+        #   헤드라인은 이미 Tier-1 이 깔아뒀으므로 이게 며칠 늦어도 유니버스·규모버킷은 산다.
         fs = fetch_dart_financials(corps, years, priority=prio)
         fin = tidy_financials(merge_financial_tiers(fs, multi))
-        emp = fetch_dart_employees(corps, years)
-        dis = fetch_dart_disclosures(BACKTEST_START, BACKTEST_END)
         ctx["fin"], ctx["emp"], ctx["disclosures"] = fin, emp, dis
         if len(fin):
             PIT.register("dart_financials", fin, key_cols=["corp_code"])

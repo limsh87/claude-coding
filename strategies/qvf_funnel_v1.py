@@ -234,9 +234,11 @@ N_WORKERS_CPU  = 0      # 연산 병렬(프로세스). 0 = CPU 코어수 자동(
 RATE_LIMIT_QPS = {      # 소스별 초당 요청 상한 — 차단 방지용. 낮출수록 안전/느림.
     "dart":      8.0,
     "hankyung":  2.0,
+    # ★ pykrx(get_market_ohlcv, adjusted=True)와 FinanceDataReader(6자리 코드)는 둘 다
+    #   fchart.stock.naver.com 을 친다. 한 호스트는 한 버킷으로 센다 — 경로별로 버킷을 나누면
+    #   그 호스트가 상한들의 '합'을 맞게 되어, 계량표는 지키는데 실제 서버는 초과당한다.
     "naver":     2.5,
-    "krx":       2.0,   # KRX 웹세션 — 올리면 차단 위험. KRXGate 가 추가로 직렬화한다.
-    "fdr":       6.0,   # FinanceDataReader 자체/깃허브 캐시 경로. KRX 버킷과 분리(병목 해소).
+    "krx":       2.0,   # data.krx.co.kr 웹세션 — 올리면 차단 위험. KRXGate 가 추가로 직렬화한다.
     "datagokr":  5.0,
     "customs":   3.0,
     "kind":      2.0,
@@ -274,7 +276,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.1.20260810.1951"
+BUILD_VERSION      = "qvf1.1.20260810.2023"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -552,6 +554,46 @@ def _import_pykrx():
 
 fdr = _opt_import("FinanceDataReader", _import_fdr)
 pykrx_stock = _opt_import("pykrx", _import_pykrx)
+
+# ★ pykrx 1.2.8 의 get_auth_session() 은 모듈 전역 _auth_session 에 대해 '락 없는 검사-후-생성'
+#   이다. 스레드 N 개가 동시에 None(또는 만료)을 보면 N 번 로그인하고, KRX 는 중복 로그인을
+#   skipDup 으로 처리하며 앞선 세션을 강제 종료한다. 살아남는 건 1개, 나머지는 죽은 쿠키로
+#   요청해 JSON 대신 로그인 HTML 을 받는다("Expecting value: line 13 column 1"). 만료(3600-300초
+#   =55분) 갱신도 같은 무락 경로라, 공유 세션 하나에 대해 여러 스레드가 동시에 refresh() 를
+#   돌리면 서로가 쓰고 있는 소켓을 close() 한다.
+#   KRXGate(10_ingest_universe.py)는 자기 자신을 통해 들어오는 호출만 직렬화한다. 가격·수급
+#   수집처럼 별도 스레드풀에서 pykrx 를 직접 부르는 호출까지 다 막으려면, 게이트가 아니라
+#   라이브러리 경계에서 막아야 한다 — 호출 지점을 하나라도 놓치면 폭풍이 되살아나기 때문이다.
+#   webio 는 함수를 '이름으로' import 했으므로(from ... import get_auth_session) auth 모듈만
+#   패치하면 효과가 없다 — 두 바인딩을 모두 교체한다. 데이터 호출 자체는 계속 병렬로 둔다.
+if pykrx_stock is not None:
+    try:
+        import pykrx.website.comm.auth as _kauth
+        import pykrx.website.comm.webio as _kwebio
+
+        _KRX_AUTH_LK = threading.RLock()
+        _KRX_AUTH_FAIL = [0.0]          # 음성 캐시 — 틀린 자격증명 재시도 폭주 억제 (10분)
+        _kx_orig_get_auth = _kauth.get_auth_session
+
+        def _kx_get_auth_locked():
+            with _KRX_AUTH_LK:
+                if _KRX_AUTH_FAIL[0] and (time.time() - _KRX_AUTH_FAIL[0]) < 600:
+                    return None
+                try:
+                    s = _kx_orig_get_auth()
+                except Exception:
+                    s = None
+                if s is None and os.environ.get("KRX_ID") and os.environ.get("KRX_PW"):
+                    _KRX_AUTH_FAIL[0] = time.time()
+                else:
+                    _KRX_AUTH_FAIL[0] = 0.0
+                return s
+
+        _kauth.get_auth_session = _kx_get_auth_locked
+        _kwebio.get_auth_session = _kx_get_auth_locked
+    except Exception:
+        pass
+
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
@@ -795,7 +837,9 @@ _DIAG_RULES: List[Tuple[str, str]] = [
     (r"Expecting value: line \d+ column 1|JSONDecodeError|Error occurred in get_market",
      "JSON 대신 HTML(대개 로그인/에러 페이지)을 받았습니다. KRX 계열이면 세션이 끊긴 것입니다. "
      "pykrx 는 스레드마다 재로그인하며 KRX 는 중복 로그인 시 이전 세션을 끊습니다 — "
-     "모든 pykrx 호출은 KRXG.call() 게이트로 직렬화해야 합니다. "
+     "로그인 자체는 01_bootstrap 이 pykrx auth/webio 경계에 락을 걸어 직렬화하므로 "
+     "이 오류가 계속 보이면 그 패치가 적용되지 않은 것입니다(pykrx 버전 확인). "
+     "data.krx.co.kr 을 직접 치는 호출은 그와 별개로 KRXG.call() 을 거쳐야 합니다. "
      "KRX ID/PW 를 다른 브라우저 탭에서 동시에 쓰고 있지 않은지도 확인하세요."),
     (r"UnicodeEncodeError|cp949|charmap",
      "콘솔 인코딩 문제입니다(윈도우 기본 cp949 는 罫線문자 ╔═║ 와 ✔✘ 를 못 씁니다). "
@@ -1039,8 +1083,39 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return t
 
 
-def as_ts_series(s) -> pd.Series:
-    out = pd.to_datetime(pd.Series(s), errors="coerce")
+_DATE_FMTS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d")
+_DATE_NULLS = ("", "nan", "nat", "none", "null", "-", "--")
+
+
+def as_ts_series(s, where: str = "") -> pd.Series:
+    """★ pandas 2.x 는 첫 비결측 원소 하나로 날짜 포맷을 추론하고, 그 포맷에 맞지 않는 값은
+    errors="coerce" 때문에 예외도 경고도 없이 전부 NaT 가 된다 — 다수/소수 무관, 행 0 이 이긴다.
+    폐지일처럼 소스가 섞일 수 있는 컬럼(FDR GitHub 캐시는 ISO, KRX 라이브 응답은 슬래시)에서
+    이건 곧 생존자편향이다. 빠른 경로가 값을 죽였을 때만 포맷별로 재파싱하고, 복구/실패
+    건수를 반드시 로그로 남긴다 — 01_bootstrap 의 warnings.filterwarnings("ignore") 때문에
+    pandas 자체 경고도 안 뜨므로 여기서 못 잡으면 아무도 못 잡는다."""
+    raw = pd.Series(s)
+    out = pd.to_datetime(raw, errors="coerce")
+    if len(raw) and raw.dtype == object and out.isna().any():
+        txt = raw.astype(str).str.strip()
+        miss = out.isna() & ~txt.str.lower().isin(_DATE_NULLS)
+        n0 = int(miss.sum())
+        if n0:
+            out = out.copy()
+            for f in ("mixed",) + _DATE_FMTS:
+                # to_numpy() — 라벨 정렬을 쓰면 중복 인덱스에서 어긋난다
+                out.loc[miss] = pd.to_datetime(raw[miss], errors="coerce", format=f).to_numpy()
+                miss = miss & out.isna()
+                if not miss.any():
+                    break
+            n1 = int(miss.sum())
+            if n0 - n1:
+                LOG.warn(f"[{where or 'as_ts_series'}] 날짜 {n0 - n1:,}/{len(raw):,}건이 첫 행과 "
+                         f"형식이 달라 기본 추론에서 NaT 가 될 뻔했습니다 — 형식별 재파싱으로 "
+                         f"복구했습니다. 소스의 날짜 형식이 섞여 있습니다.")
+            if n1:
+                LOG.warn(f"[{where or 'as_ts_series'}] 날짜 파싱 실패 {n1:,}/{len(raw):,}건 — "
+                         f"예: {txt[miss].head(5).tolist()}")
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
@@ -1118,13 +1193,28 @@ def to_code6(x: Any) -> Optional[str]:
         return s
     # ★★ 0 채우기는 '순수 숫자' 입력에만 적용한다 ★★
     #   이 함수의 약속은 "조용히 0으로 채워 잘못된 종목을 만들지 않는다" 인데, 문자가 섞인
-    #   코드에서 숫자만 뽑아 zfill 하면 정확히 그 약속을 깬다:
-    #     '00341A'(쌍용양회4우B, 2014 폐지) → '000341'(쌍용양회 보통주)
-    #   FDR 폐지목록 실측(2026-08-10 · 4,173행)에서 원본≠매핑이 285건, 그중 주권이 13건이다.
-    #   전부 구형 우선주 코드이고, 그 폐지일이 보통주에 붙으면 상장 중인 종목이 유니버스에서
-    #   사라지고 보유분이 −100% 로 청산된다. 못 읽는 코드는 '만들지 말고' 실패해야 한다
-    #   (그 13건은 §3.3 이 어차피 제외하는 우선주라 잃는 것도 없다).
-    #   숫자 입력(5930 → '005930')과 엑셀에서 앞자리 0 이 날아간 경우는 그대로 지원된다.
+    #   코드에서 숫자만 뽑아 zfill 하면 정확히 그 약속을 깬다. 두 세션이 독립적으로
+    #   **서로 다른 실사례**를 통해 같은 결함에 도달했다 — 같은 버그의 두 얼굴이다:
+    #
+    #   (a) 우선주가 보통주로 둔갑    '00341A'(쌍용양회4우B, 2014 폐지) → '000341'(보통주)
+    #       FDR 폐지목록 실측(2026-08-10 · 4,173행): 원본≠매핑 285건, 그중 주권 13건.
+    #       폐지일이 보통주에 붙으면 상장 중인 종목이 유니버스에서 사라지고 보유분이
+    #       −100% 로 청산된다(그 13건은 §3.3 이 어차피 제외하는 우선주라 잃는 것은 없다).
+    #
+    #   (b) 신주인수권증권이 살아있는 회사로 둔갑
+    #       '008465W' → '008465', '00846W' → '000846', 'J00123' → '000123'.
+    #       상장폐지 피드(MDCSTAT23801)는 SecuGroup 필터가 없어 신주인수권증권/증서·
+    #       수익증권이 대량으로 섞여 들어온다. 그 **권리행사기간 만료일**이 멀쩡히
+    #       상장돼 있는 회사의 delisting_date 로 집계되고(build_security_master 의 agg 가
+    #       delisting_date="max") 그 회사가 유니버스에서 영구 제외된다.
+    #
+    #   두 경우 모두 절단된 코드가 '유효해 보이므로' 어떤 카운터에도 안 걸린다 — 오히려
+    #   겹치면 n_dupe 를 늘려 "중복"으로 오귀속된다. 못 읽는 코드는 '만들지 말고' 실패해야
+    #   한다. 복구는 '앞자리 0 이 날아간 순수 정수 코드'에만 허용한다(KIND 의 5930,
+    #   엑셀에서 앞자리 0 이 날아간 경우). 문자가 하나라도 섞이면 절단 대상이지
+    #   zero-padding 대상이 아니다.
+    #   (상한 6 은 위 _TICKER_RE 가 순수 6자리를 이미 반환하므로 실질적으로 len<6 과
+    #    동치다. 앞의 검사가 바뀌어도 의도가 남도록 경계를 명시해 둔다.)
     if s.isdigit() and 1 <= len(s) <= 6:
         cand = s.zfill(6)
         return cand if _TICKER_RE.match(cand) else None
@@ -3810,6 +3900,15 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
     dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
                                   "listingdate") if k in col), None)
+    # ★ 폐지파일에는 ListingDate 도 같이 들어 있다(KrxDelistingCache: LIST_DD→ListingDate).
+    #   이걸 안 읽으면 폐지종목은 상장일이 영영 결측이 된다 — 폐지종목은 정의상 상장목록·
+    #   KIND 스냅샷 어디에도 없어서 다른 보강 경로가 없기 때문이다. 그 결과 build_security_master
+    #   가 상장일을 NaT 로 못박고(§ d2["listing_date"]=NaT), Universe 는 그 종목을 250거래일
+    #   시즈닝 없이 백테스트 첫 달부터 넣어버린다(상장 전인데도 멤버가 되는 경우까지 있다).
+    #   dl_c 가 listingdate 로 폴백된 경우엔 같은 컬럼을 두 번 쓰지 않도록 비운다.
+    ld_c = next((col[k] for k in ("listingdate", "listing_date", "list_dd") if k in col), None)
+    if ld_c is not None and ld_c == dl_c:
+        ld_c = None
     name_c = col.get("name") or col.get("isu_nm") or code_c
 
     n_raw = len(d)
@@ -3820,6 +3919,7 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        "listing_date": as_ts_series(d[ld_c]) if ld_c else pd.NaT,
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
         "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
@@ -3828,7 +3928,11 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
-    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    # ★ na_position="first" 가 반드시 필요하다. 기본값은 "last" 라서 NaT 가 실제 폐지일보다
+    #   뒤로 정렬되고, keep="last" 가 그 NaT 를 채택해 '아는 폐지일'을 버려버린다. 그러면
+    #   listing_date 도 NaT 인 이 행은 두 날짜가 모두 NaT 가 되어 유니버스에서 통째로
+    #   사라진다(상장~폐지 전 구간이 조용히 증발 — C2 위반).
+    t = t.sort_values("delisting_date", na_position="first").drop_duplicates("code", keep="last")
     n_nodate = int(t["delisting_date"].isna().sum())
 
     LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
@@ -4094,8 +4198,12 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        # ★ 여기서 listing_date 를 무조건 NaT 로 지우면 안 된다. fetch_fdr_delisting 이 이제
+        #   ListingDate 를 함께 읽어 오므로(위 패치), 그 값을 살려야 폐지종목도 250거래일
+        #   시즈닝을 정상적으로 거친다 — 안 그러면 상장 직후 종목이 시즈닝 없이 유니버스에
+        #   들어오거나(있으면 안 되는 조기 편입), agg 의 listing_date="min" 이 채울 근거가
+        #   아예 없어 폐지종목 전체가 '근거 없는 종목'으로 유니버스에서 통째로 빠진다.
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "listing_date", "market"]).copy()
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
@@ -4142,11 +4250,39 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         name=("name", _first_str),
         market=("market", _first_str),
         listing_date=("listing_date", "min"),
+        listing_date_late=("listing_date", "max"),
         delisting_date=("delisting_date", "max"),
         industry=("industry", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
     )
     assert_no_dup_cols(agg, "security_master:agg")
+
+    # ★ 상장일 충돌을 min() 으로 조용히 덮지 않는다.
+    #   FDR ListingDate 와 KIND 상장일은 이전상장(KONEX→KOSDAQ→KOSPI)·재상장·지주회사
+    #   전환·물적분할에서 서로 다른 값을 준다. min() 은 언제나 '이른 쪽'을 채택하므로,
+    #   값이 틀린 종목은 상장 후 시즈닝 기준점이 통째로 앞당겨져 실제 상장 첫 달부터
+    #   유니버스에 편입된다(에러도 로그도 없이 — 시즈닝 게이트가 통째로 우회된다).
+    #   멤버십 채택 규칙은 min 을 유지한다 — max 로 바꾸면 이전상장 종목이 원상장~이전
+    #   구간(카카오형이면 18년) 통째로 유니버스에서 빠져 반대 방향 선택편향이 된다.
+    #   대신 보수적 기준일(늦은 쪽)을 listing_date_late 로 보존하고 충돌을 전부 로깅한다.
+    _ld_lo = as_ts_series(agg["listing_date"])
+    _ld_hi = as_ts_series(agg["listing_date_late"])
+    _gap = (_ld_hi - _ld_lo).dt.days.fillna(0)
+    _conf = agg.loc[_gap > 5].assign(gap=_gap[_gap > 5])
+    if len(_conf):
+        _conf = _conf.sort_values("gap", ascending=False)
+        LOG.warn(f"상장일이 소스마다 다른 종목 {len(_conf):,}건 — 채택 규칙은 무조건 "
+                 f"'이른 날짜'입니다. 이 {len(_conf):,}건은 실제보다 이른 시점부터 "
+                 f"유니버스에 편입되고 상장 후 시즈닝이 사실상 면제됩니다. "
+                 f"보수적 기준일은 listing_date_late 컬럼에 보존했습니다.")
+        LOG.table([[r["code"], str(r["name"])[:14],
+                    str(pd.Timestamp(r["listing_date"]).date()),
+                    str(pd.Timestamp(r["listing_date_late"]).date()),
+                    f"{int(r['gap']):,}일", str(r["src"])[:30]]
+                   for r in _conf.head(15).to_dict("records")],
+                  ["코드", "종목명", "채택(이른쪽)", "다른 소스", "차이", "소스"],
+                  ["l", "l", "l", "l", "r", "l"],
+                  title="상장일 소스 충돌 (차이 상위 15건)")
 
     # 스냅샷으로 상장/폐지일 보정 — 소스 날짜가 없을 때만 관측으로 채운다
     if snapshots is not None and len(snapshots):
@@ -4156,12 +4292,35 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         need = agg["listing_date"].isna() & agg["snap_first"].notna()
         agg.loc[need, "listing_date"] = agg.loc[need, "snap_first"]
         last_snap = snapshots["snap_date"].max()
-        gone = (agg["delisting_date"].isna() & agg["snap_last"].notna() &
-                (agg["snap_last"] < last_snap - pd.Timedelta(days=200)))
+        _lag = pd.Timedelta(days=200)
+        # ★ 스냅샷의 '결손'은 폐지의 증거가 아니다. KRX 세션이 한쪽 시장만 죽거나
+        #   티커 목록이 꼬리에서 잘리면(§8.0% 임계 가드는 '전체 종목수 급감'만 본다 —
+        #   KOSDAQ 전체가 죽고 KOSPI 는 멀쩡하면 중앙값 자체가 낮아져 가드를 통과한다)
+        #   살아있는 종목이 통째로 관측에서 사라지는데, 그걸 폐지일로 쓰면 그 종목이
+        #   유니버스에서 영구히 빠진다 — 반대 방향 선택편향이다. 그것도 이 캐시가
+        #   VAULT 에 저장되므로 다음 실행의 KRX 가 멀쩡해도 스스로 못 고친다.
+        #   두 가지가 동시에 성립할 때만 폐지로 인정한다:
+        #     ① 그 종목이 마지막으로 관측된 '그 시장'의 스냅샷이 끝까지 이어졌을 것
+        #        (그 시장 자체가 도중에 끊겼다면 결손은 종목이 아니라 시장의 문제다)
+        #     ② FDR 상장목록(=지금 상장중이라는 권위 있는 진술)에 없을 것
+        smk = (snapshots.sort_values("snap_date").drop_duplicates("code", keep="last")
+                        .set_index("code")["market"])
+        covered = {mk for mk, d in snapshots.groupby("market")["snap_date"].max().items()
+                   if pd.notna(d) and d >= last_snap - _lag}
+        still_listed = set(lst["code"].dropna()) if len(lst) else set()
+        miss = (agg["delisting_date"].isna() & agg["snap_last"].notna() &
+                (agg["snap_last"] < last_snap - _lag))
+        gone = miss & agg["code"].map(smk).isin(covered) & (~agg["code"].isin(still_listed))
         agg.loc[gone, "delisting_date"] = agg.loc[gone, "snap_last"] + pd.offsets.MonthEnd(1)
         if int(gone.sum()):
             LOG.info(f"스냅샷에서 사라진 {int(gone.sum()):,}종목을 폐지로 추정 "
                      f"(폐지명단 누락 보완 — 생존자편향 2차 방어)")
+        _veto = int(miss.sum()) - int(gone.sum())
+        if _veto:
+            LOG.warn(f"스냅샷에서 사라졌지만 상장목록에 살아있거나 해당 시장 스냅샷이 "
+                     f"중간에 끊긴 {_veto:,}종목은 폐지로 찍지 않았습니다. 이 숫자가 크면 "
+                     f"폐지가 많은 게 아니라 KRX 스냅샷 세션이 그만큼 망가진 것입니다 "
+                     f"(스냅샷은 검증용이지 의존 대상이 아닙니다).")
         agg = agg.drop(columns=[c for c in ("snap_first", "snap_last") if c in agg.columns])
 
     cc = fetch_dart_corpcode()
@@ -4361,16 +4520,22 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if pykrx_stock is None:
         return None
+    # ★ get_market_ohlcv(from, to, code) 는 adjusted=True 가 기본이라 내부적으로
+    #   get_market_ohlcv_by_date → pykrx.website.naver 를 거쳐 fchart.stock.naver.com 을 친다.
+    #   data.krx.co.kr 을 전혀 두드리지 않는다 — 즉 KRX 세션 유무와 무관하게 동작하고(그래서
+    #   자격증명 없는 기본 모드에서도 이 경로가 동작하는 것이다), 계량은 naver 버킷이어야 한다.
+    #   krx 버킷으로 세면 KRX 를 쓰지도 않는 요청이 2.0qps 상한을 다 잡아먹어, 실제로
+    #   두들겨지는 네이버 호스트는 상한 밖에서 무제한으로 맞는다.
     try:
-        # ★ 예전엔 pykrx 를 12스레드에서 '직접' 불렀다. KRXGate 가 존재하는 이유가 정확히
-        #   이것을 막기 위해서다(10_ingest_universe:46-54): 동시 호출이 각자 재로그인을 하고
-        #   KRX 가 skipDup 으로 앞 세션을 죽여, 진 쪽은 JSON 대신 로그인 HTML 을 받는다.
-        #   그러면 이 종목은 실패로 떨어져 fdr → naver(×4) → yfinance 까지 전부 타므로
-        #   종목당 요청이 4~8배가 된다. 55분의 상당 부분이 이 되먹임이었다.
-        #   KRXG.call 은 락으로 직렬화하고 세션을 미리 갱신한다(자체 스로틀 포함이라
-        #   limiter("krx") 는 이중 대기가 되어 뺀다).
-        d = KRXG.call(pykrx_stock.get_market_ohlcv,
-                      start.replace("-", ""), end.replace("-", ""), code)
+        # ★ 한때 이 호출을 KRXG.call 로 감쌌다 — 12스레드 직접 호출이 각자 재로그인하고 KRX 가
+        #   skipDup 으로 앞 세션을 죽여, 진 쪽이 로그인 HTML 을 받아 폴백 체인을 전부 타던
+        #   되먹임을 막기 위해서였다. 그 진단은 맞았지만 처방이 틀렸다: 게이트는 '자기를 통해
+        #   들어오는' 호출만 직렬화하므로 다른 스레드풀의 직접 호출은 그대로 새고, 반대로 이
+        #   경로는 KRX 를 두드리지도 않는데 KRX 락에 줄을 서 병렬성만 잃는다.
+        #   로그인 폭풍은 01_bootstrap 이 pykrx auth/webio 경계에서 락으로 막는다 —
+        #   호출 지점을 하나도 놓치지 않는 유일한 지점이다. 여기서는 계량만 맞추면 된다.
+        limiter("naver").wait()
+        d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
         return None
     if d is None or len(d) == 0:
@@ -4381,18 +4546,31 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     d = d.rename(columns={k: v for k, v in ren.items() if k in d.columns})
     if "date" not in d.columns:
         d = d.rename(columns={d.columns[0]: "date"})
-    d["code"], d["src"] = code, "pykrx"
+    # ★ 네이버 경로는 거래대금(거래대금)을 주지 않는다 — 시가/고가/저가/종가/거래량/등락률뿐.
+    #   폴백이 없으면 reindex 가 amount 를 전 행 NaN 으로 만들고, 그 결과 adv20 이 전 행 NaN,
+    #   V6 유동성 거부권이 100% 발동해 유니버스가 통째로 비어 백테스트 자체가 사라진다.
+    #   _px_fdr/_px_naver 와 동일한 근사를 쓰고, 근사임을 소스명(pykrx(naver))으로 감사표에 남긴다.
+    if "amount" not in d.columns or pd.to_numeric(d["amount"], errors="coerce").notna().sum() == 0:
+        d["amount"] = pd.to_numeric(d.get("close"), errors="coerce") * \
+            pd.to_numeric(d.get("volume"), errors="coerce")      # 근사 — 감사표에 명시된다
+        d["src"] = "pykrx(naver)"
+    else:
+        d["src"] = "pykrx"
+    d["code"] = code
     return d.reindex(columns=PRICE_COLS)
 
 
 def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if fdr is None:
         return None
+    # ★ 6자리 코드에 대한 FDR 기본 리더는 NaverDailyReader(fchart.stock.naver.com) 다.
+    #   KRX 를 두드리지 않으므로 위 _px_pykrx 와 같은 이유로 naver 버킷을 쓴다.
     try:
-        # ★ FDR 은 KRX 웹세션이 아니라 자체 엔드포인트/깃허브 캐시를 쓴다. 그런데 "krx" 버킷을
-        #   같이 쓰고 있어서, pykrx 와 FDR 이 초당 2건을 '나눠' 먹었다. 종목 3,300개가 두
-        #   경로를 다 타면 6,600슬롯 ÷ 2/s ≈ 55분 — 사용자가 본 그 숫자다. 버킷을 분리한다.
-        limiter("fdr").wait()
+        # ★ 한때 이 경로를 전용 "fdr" 버킷으로 분리했다. 병목은 실제로 풀렸지만 방식이
+        #   틀렸다 — 두 경로가 같은 호스트(fchart.stock.naver.com)를 치는데 버킷을 나누면
+        #   그 호스트가 두 상한의 '합'을 맞는다. 상한 밖에서 무제한으로 맞는다는, 원래
+        #   지적했던 결함과 방향만 반대인 같은 결함이다. 한 호스트는 한 버킷으로 센다.
+        limiter("naver").wait()
         # FDR 은 실패를 print() 로 뱉는다(로거가 아니다). 폐지 종목이 정상적으로 섞인
         # 소형주 백테스트에서 수백~수천 줄이 되어 진짜 경고를 화면 밖으로 밀어낸다.
         with capture_noise(f"fdr:{code}"):
@@ -4750,9 +4928,13 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
-        if src_used.get("naver", 0) or src_used.get("yfinance", 0):
-            LOG.warn("네이버/yfinance 경로로 받은 종목은 거래대금이 종가×거래량 근사입니다. "
-                     "V6 유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향).")
+        # ★ "pykrx" 라는 이름만 보고 거래대금이 진짜라고 믿으면 안 된다. pykrx 는 KRX 세션이
+        #   없으면(기본 모드) 내부적으로 네이버 경로를 타는데, 그 경로는 거래대금을 안 주므로
+        #   _px_pykrx 가 종가×거래량 근사를 채우고 소스명을 "pykrx(naver)"로 남겨 둔다.
+        _approx = sum(v for k, v in src_used.items() if k in ("naver", "yfinance") or "(naver)" in k)
+        if _approx:
+            LOG.warn(f"거래대금이 종가×거래량 근사인 종목 {_approx:,}개 (naver/yfinance/pykrx(naver) "
+                     f"경로). V6 유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향).")
     PIPE.io("OUT", "DRIVE", "krx_ohlcv_daily", px, source="price chain")
     return downcast(px)
 
@@ -5775,6 +5957,11 @@ def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
         if len(items) < page_size:
             break
         index += len(items)
+    else:
+        # ★ while 이 hard_cap 소진으로(=고갈이 아니라 상한으로) 끝났다는 뜻이다. 조용히 두면
+        #   하류는 "시장이 그만큼만 발간했다"로 읽는다 — 구분이 안 된다.
+        LOG.warn(f"CAPHIT cat={cat} {start}~{end} hard_cap={hard_cap:,} rows={len(rows):,} — "
+                 f"상한에 걸려 잘렸습니다(고갈 아님). 창을 더 잘게 쪼개야 합니다.")
     d = pd.DataFrame(rows)
     if len(d):
         d = d[d["src_report_id"].astype(str).str.len() > 0]
@@ -5799,8 +5986,22 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     frames = []
     for cat in cats:
         # ① JSON API 우선
+        #   ★ 10년 창을 한 번에 요청하면 hard_cap(60,000)에 걸려 조용히 잘린다. 잘린 지점이
+        #     날짜 경계라 특정 연도들이 통째로 0건이 되는데, 하류에서는 '시장이 그만큼만
+        #     발간했다'로 보여 구분이 안 된다. 한경(hankyung_collect)이 연 단위로 쪼개는 것과
+        #     같은 이유 — 여기서는 분기 단위로 쪼갠다(카테고리당 60,000 상한을 안전하게 벗어남).
         try:
-            dj = naver_collect_json(cat, start, end)
+            _qs = pd.period_range(as_ts(start), as_ts(end), freq="Q")
+            _jobs = [(cat,
+                      max(q.start_time, as_ts(start)).strftime("%Y-%m-%d"),
+                      min(q.end_time.normalize(), as_ts(end)).strftime("%Y-%m-%d"))
+                     for q in _qs]
+            _res = pmap_io(lambda j: naver_collect_json(*j), _jobs,
+                           workers=min(4, N_WORKERS_IO), desc=f"네이버 JSON {cat}")
+            _ok = [r for r in _res if r is not None and len(r)]
+            dj = pd.concat(_ok, ignore_index=True) if _ok else pd.DataFrame()
+            if len(dj):
+                dj = dj.drop_duplicates(subset=["src_report_id"], ignore_index=True)
         except Exception:
             dj = pd.DataFrame()
         if len(dj) > 50:
@@ -6092,7 +6293,24 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0,
                 df[c] = None
         return df
     ext = pd.DataFrame(rows)
-    df = df.merge(ext, on="report_uid", how="left")
+    # ★ 단순 merge 는 안 된다. df 가 이미 (캐시에서 물려받은) pdf_uid/pdf_analysts/pdf_emails/
+    #   pdf_target 을 갖고 있으면 pandas 가 ext 쪽에 _x/_y 접미사를 붙여 두 컬럼 다 못 쓰게 된다.
+    #   그리고 이번 실행에서 URL 이 죽어 스킵된 행(ext 에 없음)의 값을 그냥 NaN 으로 덮으면
+    #   전에 성공적으로 뽑아둔 값을 잃는다. → 이번 회차 추출값을 우선하되(신선도), 없으면
+    #   기존 값으로 떨어진다(가용성). combine_first 방향(새 값 우선)을 명시적으로 구현한다.
+    pdf_ext_cols = [c for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target")
+                   if c in ext.columns]
+    ext2 = ext.rename(columns={c: f"__new_{c}" for c in pdf_ext_cols})
+    df = df.merge(ext2, on="report_uid", how="left")
+    for c in pdf_ext_cols:
+        nc = f"__new_{c}"
+        fresh = df[nc]
+        has_fresh = fresh.notna() & (fresh.astype(str).str.strip() != "")
+        if c in df.columns:
+            df[c] = fresh.where(has_fresh, df[c])
+        else:
+            df[c] = fresh
+        df = df.drop(columns=[nc])
     PIPE.io("OUT", "DRIVE", "research:pdf", ext, source="hankyung/naver pdf")
     return df
 
@@ -6309,14 +6527,19 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
-        # ★★ 이 4개가 빠져 있어서 PDF 캐시가 '쓰고도 못 읽는' 상태였다 ★★
+        # ★★ 이 5개가 빠져 있어서 PDF 캐시가 '쓰고도 못 읽는' 상태였다 ★★
         #   download_pdfs 는 pdf_uid/pdf_analysts/pdf_emails/pdf_target 를 돌려주고
         #   원장에 저장까지 된다. 그런데 다음 실행에서 원장을 다시 읽어 이 agg 를 통과시키면
-        #   여기 없는 컬럼은 통째로 사라진다 → download_pdfs 가 pdf_uid 를 못 봐서
-        #   전 코퍼스(최대 30만건)를 매번 다시 내려받고 다시 파싱했다. blob 캐시가 HTTP 는
-        #   막아줬지만 드라이브 blob 읽기 + pdf_text() 파싱 30만회는 그대로 났다.
+        #   named aggregation 은 열거하지 않은 컬럼을 통째로 버린다 → download_pdfs 가
+        #   pdf_uid 를 못 봐서 전 코퍼스(최대 30만건)를 매번 다시 내려받고 다시 파싱했다.
+        #   blob 캐시가 HTTP 는 막아줬지만 드라이브 blob 읽기 + pdf_text() 파싱 30만회는
+        #   그대로 났다. 게다가 그 손실이 공용 볼트에 그대로 덮어써지므로 다른 전략까지
+        #   같이 잃는다 — build_analyst_ledger 의 pdf_header 폴백이 빈손이 되어 애널리스트
+        #   연결이 통째로 끊긴다.
         **({k: (k, _pick_str) for k in ("pdf_uid", "pdf_analysts", "pdf_emails")
             if k in d.columns}),
+        # pdf_target 은 수치다 — 네이티브 max 로 NaN 을 무시한다(위 target_price 와 같은 이유:
+        # 파이썬 람다는 30만건에서 50초, 게다가 '첫 비결측'은 그룹 내 행 순서에 의존한다).
         **({"pdf_target": ("pdf_target", "max")} if "pdf_target" in d.columns else {}),
         # 상세페이지 조회 여부도 같은 이유로 반드시 살아남아야 한다 — 떨어지면 목표주가를
         # 못 찾은 건을 매 실행 다시 연다(네이버 상세 2시간의 원인).
@@ -8687,8 +8910,21 @@ def fetch_disclosures_qvf(start: str, end: str) -> pd.DataFrame:
     if cached is not None and len(cached):
         cached = cached.copy()
         cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
-        have = set(cached["rcept_dt"].dropna().dt.to_period("M").astype(str))
-        LOG.info(f"캐시에서 QVF 공시목록 {len(cached):,}행 · {len(have)}개월 재사용")
+        # ★ 스킵 기준은 '그 달을 받았다'가 아니라 '그 달을 지금 필요한 유형 전부로 받았다'다.
+        #   위 docstring 은 코어 테이블을 분리한 이유를 적어 뒀지만, 분리만으로는 절반이다 —
+        #   QVF_DISCLOSURE_TYPES 를 나중에 넓히면(예: E 지분공시 추가) 이전 스윕이 만든
+        #   자기 캐시가 그 달을 덮고 있어 넓힌 스윕이 단 한 번도 실행되지 않는다. 코드는
+        #   고쳐졌는데 결과는 그대로 굶고, 로그는 '재사용'이라 말한다. 유형 태그로 판정한다.
+        if "pblntf_ty" not in cached.columns:
+            cached["pblntf_ty"] = ""         # 유형 태그가 없던 구버전 캐시 = 커버리지 미상
+        cached["pblntf_ty"] = cached["pblntf_ty"].astype(str)
+        _cov = (cached.groupby(cached["rcept_dt"].dt.to_period("M").astype(str),
+                               observed=True)["pblntf_ty"].agg(set))
+        _need = set(QVF_DISCLOSURE_TYPES)
+        have = {mo for mo, tys in _cov.items() if _need <= tys}
+        LOG.info(f"캐시에서 QVF 공시목록 {len(cached):,}행 재사용 — 유형 "
+                 f"{'/'.join(QVF_DISCLOSURE_TYPES)} 가 모두 채워진 {len(have)}개월 건너뜀 "
+                 f"(나머지 {len(_cov) - len(have):,}개월은 재수집)")
 
     months = pd.period_range(as_ts(start) - pd.DateOffset(months=6), as_ts(end), freq="M")
     todo = [m for m in months if str(m) not in have]

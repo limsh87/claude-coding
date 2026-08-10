@@ -44,8 +44,39 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return t
 
 
-def as_ts_series(s) -> pd.Series:
-    out = pd.to_datetime(pd.Series(s), errors="coerce")
+_DATE_FMTS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d")
+_DATE_NULLS = ("", "nan", "nat", "none", "null", "-", "--")
+
+
+def as_ts_series(s, where: str = "") -> pd.Series:
+    """★ pandas 2.x 는 첫 비결측 원소 하나로 날짜 포맷을 추론하고, 그 포맷에 맞지 않는 값은
+    errors="coerce" 때문에 예외도 경고도 없이 전부 NaT 가 된다 — 다수/소수 무관, 행 0 이 이긴다.
+    폐지일처럼 소스가 섞일 수 있는 컬럼(FDR GitHub 캐시는 ISO, KRX 라이브 응답은 슬래시)에서
+    이건 곧 생존자편향이다. 빠른 경로가 값을 죽였을 때만 포맷별로 재파싱하고, 복구/실패
+    건수를 반드시 로그로 남긴다 — 01_bootstrap 의 warnings.filterwarnings("ignore") 때문에
+    pandas 자체 경고도 안 뜨므로 여기서 못 잡으면 아무도 못 잡는다."""
+    raw = pd.Series(s)
+    out = pd.to_datetime(raw, errors="coerce")
+    if len(raw) and raw.dtype == object and out.isna().any():
+        txt = raw.astype(str).str.strip()
+        miss = out.isna() & ~txt.str.lower().isin(_DATE_NULLS)
+        n0 = int(miss.sum())
+        if n0:
+            out = out.copy()
+            for f in ("mixed",) + _DATE_FMTS:
+                # to_numpy() — 라벨 정렬을 쓰면 중복 인덱스에서 어긋난다
+                out.loc[miss] = pd.to_datetime(raw[miss], errors="coerce", format=f).to_numpy()
+                miss = miss & out.isna()
+                if not miss.any():
+                    break
+            n1 = int(miss.sum())
+            if n0 - n1:
+                LOG.warn(f"[{where or 'as_ts_series'}] 날짜 {n0 - n1:,}/{len(raw):,}건이 첫 행과 "
+                         f"형식이 달라 기본 추론에서 NaT 가 될 뻔했습니다 — 형식별 재파싱으로 "
+                         f"복구했습니다. 소스의 날짜 형식이 섞여 있습니다.")
+            if n1:
+                LOG.warn(f"[{where or 'as_ts_series'}] 날짜 파싱 실패 {n1:,}/{len(raw):,}건 — "
+                         f"예: {txt[miss].head(5).tolist()}")
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
@@ -132,13 +163,28 @@ def to_code6(x: Any) -> Optional[str]:
         return s
     # ★★ 0 채우기는 '순수 숫자' 입력에만 적용한다 ★★
     #   이 함수의 약속은 "조용히 0으로 채워 잘못된 종목을 만들지 않는다" 인데, 문자가 섞인
-    #   코드에서 숫자만 뽑아 zfill 하면 정확히 그 약속을 깬다:
-    #     '00341A'(쌍용양회4우B, 2014 폐지) → '000341'(쌍용양회 보통주)
-    #   FDR 폐지목록 실측(2026-08-10 · 4,173행)에서 원본≠매핑이 285건, 그중 주권이 13건이다.
-    #   전부 구형 우선주 코드이고, 그 폐지일이 보통주에 붙으면 상장 중인 종목이 유니버스에서
-    #   사라지고 보유분이 −100% 로 청산된다. 못 읽는 코드는 '만들지 말고' 실패해야 한다
-    #   (그 13건은 §3.3 이 어차피 제외하는 우선주라 잃는 것도 없다).
-    #   숫자 입력(5930 → '005930')과 엑셀에서 앞자리 0 이 날아간 경우는 그대로 지원된다.
+    #   코드에서 숫자만 뽑아 zfill 하면 정확히 그 약속을 깬다. 두 세션이 독립적으로
+    #   **서로 다른 실사례**를 통해 같은 결함에 도달했다 — 같은 버그의 두 얼굴이다:
+    #
+    #   (a) 우선주가 보통주로 둔갑    '00341A'(쌍용양회4우B, 2014 폐지) → '000341'(보통주)
+    #       FDR 폐지목록 실측(2026-08-10 · 4,173행): 원본≠매핑 285건, 그중 주권 13건.
+    #       폐지일이 보통주에 붙으면 상장 중인 종목이 유니버스에서 사라지고 보유분이
+    #       −100% 로 청산된다(그 13건은 §3.3 이 어차피 제외하는 우선주라 잃는 것은 없다).
+    #
+    #   (b) 신주인수권증권이 살아있는 회사로 둔갑
+    #       '008465W' → '008465', '00846W' → '000846', 'J00123' → '000123'.
+    #       상장폐지 피드(MDCSTAT23801)는 SecuGroup 필터가 없어 신주인수권증권/증서·
+    #       수익증권이 대량으로 섞여 들어온다. 그 **권리행사기간 만료일**이 멀쩡히
+    #       상장돼 있는 회사의 delisting_date 로 집계되고(build_security_master 의 agg 가
+    #       delisting_date="max") 그 회사가 유니버스에서 영구 제외된다.
+    #
+    #   두 경우 모두 절단된 코드가 '유효해 보이므로' 어떤 카운터에도 안 걸린다 — 오히려
+    #   겹치면 n_dupe 를 늘려 "중복"으로 오귀속된다. 못 읽는 코드는 '만들지 말고' 실패해야
+    #   한다. 복구는 '앞자리 0 이 날아간 순수 정수 코드'에만 허용한다(KIND 의 5930,
+    #   엑셀에서 앞자리 0 이 날아간 경우). 문자가 하나라도 섞이면 절단 대상이지
+    #   zero-padding 대상이 아니다.
+    #   (상한 6 은 위 _TICKER_RE 가 순수 6자리를 이미 반환하므로 실질적으로 len<6 과
+    #    동치다. 앞의 검사가 바뀌어도 의도가 남도록 경계를 명시해 둔다.)
     if s.isdigit() and 1 <= len(s) <= 6:
         cand = s.zfill(6)
         return cand if _TICKER_RE.match(cand) else None
