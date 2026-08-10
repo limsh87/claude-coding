@@ -7942,17 +7942,60 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
 CUSTOMS_URL = "https://apis.data.go.kr/1220000/nitemtrade/getNitemtradeList"
 
 
-def load_hs_map() -> pd.DataFrame:
-    """HS↔기업 매핑(시간구간 테이블, C3). 5단계 자동구축 대상이 아니므로 캐시에서만 읽는다.
-    (드라이브 공용 인덱스의 hs_corp_map 테이블 — 없으면 PACK-X 자동 비활성)"""
-    m = VAULT.load_table("hs_corp_map", "shared")
+HS_MAP_COLS = ["code", "hs", "weight", "valid_from", "valid_to"]
+
+
+def validate_hs_map(m: pd.DataFrame, tag: str = "hs_corp_map") -> pd.DataFrame:
+    """★HS↔기업 매핑의 불변식 검사 — 자동 구축의 가장 큰 함정을 여기서 잡는다.
+
+    weight 의 의미는 ★'그 HS 의 국가 전체 수출 중 이 회사가 차지하는 몫'이다.
+    소비부가 `exp_usd(국가 전체) × weight` 로 곱하기 때문이다. 그런데 자동 구축을 하면
+    손에 먼저 잡히는 것은 ★'그 회사 매출 중 그 제품이 차지하는 비중'이다 — 방향이 정반대다.
+    그걸 그대로 넣으면 한 HS 에 걸린 회사들의 weight 합이 1 을 크게 넘고, 국가 수출이
+    회사 수만큼 복제되어 귀속된다. θ_X 가 과대귀속을 잡아 주긴 하지만, 그건 마지막
+    방어선이지 첫 방어선이 아니다 — 여기서 잡아야 원인이 로그에 남는다.
+
+    검사: ①필수 컬럼 ②weight 범위 [0,1] ③★HS 별 weight 합 ≤ 1 ④유효구간 정합성.
+    위반은 버리지 않고 ★잘라서 통과시키되(수집분을 버리지 않는다) 규모를 로그에 남긴다.
+    """
     if m is None or not len(m):
-        return pd.DataFrame(columns=["code", "hs", "weight", "valid_from", "valid_to"])
-    m = m.copy()
+        return pd.DataFrame(columns=HS_MAP_COLS)
+    d = m.copy()
+    for c in HS_MAP_COLS:
+        if c not in d.columns:
+            d[c] = np.nan
+    d["code"] = d["code"].astype(str).map(code6)
+    d["hs"] = d["hs"].astype(str).str.replace(r"\D", "", regex=True)
+    d["weight"] = pd.to_numeric(d["weight"], errors="coerce")
     for c in ("valid_from", "valid_to"):
-        if c in m.columns:
-            m[c] = ds_(m[c])
-    return m
+        d[c] = ds_(d[c])
+    n0 = len(d)
+    d = d[d["code"].notna() & (d["hs"].str.len() >= 4)]
+    bad_w = int((d["weight"] < 0).sum() + (d["weight"] > 1).sum())
+    d["weight"] = d["weight"].clip(0.0, 1.0).fillna(0.0)
+    # ★핵심 불변식 — 한 HS 에 걸린 회사들의 몫 합은 1 을 넘을 수 없다.
+    #   넘으면 의미가 뒤집혔거나(제품비중을 그대로 넣음) 중복 귀속이다. 비례 축소한다.
+    g = d.groupby("hs", observed=True)["weight"].transform("sum")
+    over = g > 1.0 + 1e-9
+    n_over_hs = int(d.loc[over, "hs"].nunique())
+    if over.any():
+        d.loc[over, "weight"] = d.loc[over, "weight"] / g[over]
+    bad_iv = int((d["valid_to"].notna() & d["valid_from"].notna() &
+                  (d["valid_to"] < d["valid_from"])).sum())
+    d = d[~(d["valid_to"].notna() & d["valid_from"].notna() &
+            (d["valid_to"] < d["valid_from"]))]
+    if n0 != len(d) or bad_w or n_over_hs or bad_iv:
+        L.warn(f"{tag} 정합성 교정 — 입력 {n0:,}행 → {len(d):,}행 · "
+               f"weight 범위이탈 {bad_w:,} · ★HS별 합>1 인 HS {n_over_hs:,}개(비례 축소) · "
+               f"유효구간 역전 {bad_iv:,}. 합>1 이 많으면 weight 의미가 뒤집힌 것입니다 — "
+               f"weight 는 '회사 제품 매출비중'이 아니라 ★'그 HS 국가수출 중 이 회사 몫'입니다.")
+    return d.reindex(columns=HS_MAP_COLS)
+
+
+def load_hs_map() -> pd.DataFrame:
+    """HS↔기업 매핑(시간구간 테이블, C3) — 드라이브 공용 인덱스의 hs_corp_map.
+    읽은 뒤 반드시 불변식 검사를 통과시킨다(자동 구축분·수기 투입분 모두)."""
+    return validate_hs_map(VAULT.load_table("hs_corp_map", "shared"))
 
 
 def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
