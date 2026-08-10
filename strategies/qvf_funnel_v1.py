@@ -234,7 +234,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0622"
+BUILD_VERSION      = "qvf1.20260810.0625"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -7192,7 +7192,19 @@ def select_u1000(G: pd.DataFrame) -> pd.DataFrame:
             "자본잠식제외": int(g["erosion"].sum()),
             "적격": int(g["elig"].sum()),
             "U1000": int(g["in_u1000"].sum()),
-            "대안해석": int(alt["elig"].sum()) if len(alt) else 0})
+            "대안해석": int(alt["elig"].sum()) if len(alt) else 0,
+            # §3.1 문언이 두 가지로 읽히는 지점이라 두 모집단의 규모·성격 차이를 남긴다.
+            "채택_시총중앙": float(g.loc[g["in_u1000"], "mktcap"].median())
+                              if int(g["in_u1000"].sum()) else np.nan,
+            "채택_시총상한": float(g.loc[g["in_u1000"], "mktcap"].max())
+                              if int(g["in_u1000"].sum()) else np.nan,
+            "대안_시총중앙": float(alt.loc[alt["elig"], "mktcap"].median())
+                              if len(alt) and int(alt["elig"].sum()) else np.nan,
+            "대안_시총상한": float(alt.loc[alt["elig"], "mktcap"].max())
+                              if len(alt) and int(alt["elig"].sum()) else np.nan,
+            "겹침": (len(set(g.loc[g["in_u1000"], "code"]) &
+                         set(alt.loc[alt["elig"], "code"])) /
+                     max(1, int(g["in_u1000"].sum()))) if len(alt) else np.nan})
 
     U = d[d["in_u1000"]].drop(columns=[c for c in ("_prerank",) if c in d.columns]).copy()
     if U.empty:
@@ -7206,8 +7218,35 @@ def select_u1000(G: pd.DataFrame) -> pd.DataFrame:
               ["l", "r", "r", "r", "r", "r", "r", "r"],
               title="U-1000 감쇠 감사 (최근 12분기) — 어느 게이트에서 표본이 줄어드는지")
     LOG.info(f"U-1000 평균 {Aud['U1000'].mean():,.0f}종목 "
-             f"(적격 평균 {Aud['적격'].mean():,.0f} / 전체상장 평균 {Aud['전체상장'].mean():,.0f}) · "
-             f"랭크순서 해석 대안값 평균 {Aud['대안해석'].mean():,.0f}종목")
+             f"(적격 평균 {Aud['적격'].mean():,.0f} / 전체상장 평균 {Aud['전체상장'].mean():,.0f})")
+    # ★★ §3.1 '하위 1000종목' 은 문언상 두 가지로 읽힌다 ★★
+    #   (A) 채택: §3.2/§3.3 게이트를 통과한 종목 안에서 하위 1000
+    #   (B) 대안: 전 종목에서 하위 1000 을 먼저 뽑고 그 안에서 게이트
+    #   둘은 모집단 자체가 다르다 — (A)가 더 크고 유동성 좋은 종목을 포함하므로 비용이
+    #   낮아지고, 1차필터 선택률이 낮아져 Score1 의 분산·알파가 기계적으로 커진다.
+    #   즉 §10.2 의 "1차필터 기여 = 알파 창출" 주장이 이 해석 하나에 직접 의존한다.
+    #   개수 한 줄만 찍고 넘어가면 안 되므로 규모·성격 차이를 표로 남긴다.
+    _fmt_eok = lambda v: "—" if not np.isfinite(v) else f"{v/1e8:,.0f}억"
+    LOG.table([
+        ["종목수", f"{Aud['U1000'].mean():,.0f}", f"{Aud['대안해석'].mean():,.0f}"],
+        ["시총 중앙값", _fmt_eok(Aud['채택_시총중앙'].mean()), _fmt_eok(Aud['대안_시총중앙'].mean())],
+        ["시총 상한", _fmt_eok(Aud['채택_시총상한'].mean()), _fmt_eok(Aud['대안_시총상한'].mean())],
+        ["채택 대비 겹침률", "100.0%", f"{100*Aud['겹침'].mean():.1f}%"],
+    ], ["항목", "채택: 게이트 → 하위1000", "대안: 하위1000 → 게이트"], ["l", "r", "r"],
+        title="§3.1 '하위 1000' 해석 비교 (전 분기 평균) — 명세 문언이 두 갈래로 읽히는 지점")
+    globals()["U1000_INTERP_AUDIT"] = {
+        "n_adopted": float(Aud["U1000"].mean()), "n_alt": float(Aud["대안해석"].mean()),
+        "cap_med_adopted": float(Aud["채택_시총중앙"].mean()),
+        "cap_med_alt": float(Aud["대안_시총중앙"].mean()),
+        "cap_max_adopted": float(Aud["채택_시총상한"].mean()),
+        "cap_max_alt": float(Aud["대안_시총상한"].mean()),
+        "overlap": float(Aud["겹침"].mean())}
+    if np.isfinite(Aud["겹침"].mean()) and Aud["겹침"].mean() < 0.90:
+        LOG.warn(f"두 해석의 겹침률이 {100*Aud['겹침'].mean():.1f}% 입니다 — 사실상 다른 "
+                 f"모집단입니다. 결과를 '하위 1000 전략'이라고 부를 때 어느 해석인지 반드시 "
+                 f"명시하고, 전체 재실행으로 비교하려면 U1000_RANK_BEFORE_FILTER=True 로 "
+                 f"두고 한 번 더 돌리십시오(§8.4 축으로 자동 병행하지는 않습니다 — 유니버스가 "
+                 f"바뀌면 패널 전체를 다시 만들어야 해서 실행시간이 두 배가 됩니다).")
     if Aud["U1000"].mean() < U1000_N * 0.5:
         LOG.warn(f"U-1000 이 목표 {U1000_N} 의 절반에 못 미칩니다. 위 감쇠 감사표에서 어느 게이트가 "
                  f"원인인지 먼저 확인하세요(대개 시총 결측 또는 유동성 하한).")
