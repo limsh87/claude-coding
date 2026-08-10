@@ -247,7 +247,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0623"
+BUILD_VERSION = "v2.20260810.0630"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -3957,6 +3957,16 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
     if not base_rows:
         return pd.DataFrame(columns=["code", "asof", "mktcap", "shares_listed", "mc_src"])
     B = pd.concat(base_rows, ignore_index=True)
+    # ★★ code 를 반드시 문자열로 고정한다. fetch_prices 는 downcast() 를 거치는데, 일봉은
+    #    3,500종목 × 875만행이라 nunique/len ≈ 0.0004 < cat_thresh 라서 **code 가 category
+    #    dtype 으로 바뀐다.** 그 dtype 이 여기까지 전파되면 아래 폴백 경로 ②③ 의
+    #    merge_asof(by=...) 가 "incompatible merge keys ... must be the same type" 로 죽는다.
+    #    경로 ① 만 astype(str) 을 했었기 때문에, KRX 로그인이 없어 경로 ①이 열리지 않는
+    #    실행에서는 DART 주식총수와 월말 종가가 둘 다 멀쩡한데도 시총이 100% 결측이 되고,
+    #    U-1000 이 0행 → build_arc_panel 이 RuntimeError → 실행 전체가 중단됐다.
+    #    경로 ② 의 예외 문구는 "대개 정렬/타입 문제" 수준이라 원인이 사용자 설정(KRX 로그인)
+    #    으로 오인됐고, 경로 ③ 은 except: pass 로 로그가 한 줄도 없었다.
+    B["code"] = B["code"].astype(str)
     B["mktcap"] = np.nan
     B["shares_listed"] = np.nan
     B["mc_src"] = ""
@@ -3998,7 +4008,8 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                 .sort_values("knowledge_date"))
         Sh["corp_code"] = Sh["corp_code"].astype(str)
         L = B.loc[need, ["code", "asof", "close"]].copy()
-        L["corp_code"] = L["code"].map(c2c)
+        L["code"] = L["code"].astype(str)
+        L["corp_code"] = L["code"].map(c2c).astype(object)
         L = L.dropna(subset=["corp_code"]).sort_values("asof")
         if len(L):
             try:
@@ -4017,7 +4028,9 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                 B.loc[m, "shares_listed"] = fill_sh[m]
                 B.loc[m, "mc_src"] = "close×DART주식수"
             except Exception as e:                                   # noqa
-                LOG.warn(f"종가×DART주식수 결합 실패({type(e).__name__}) — 해당 경로를 건너뜁니다.")
+                LOG.warn(f"종가×DART주식수 결합 실패({type(e).__name__}: {str(e)[:120]}) — "
+                         f"해당 경로를 건너뜁니다. 이 경로가 죽으면 KRX 로그인이 없는 실행에서 "
+                         f"시총이 통째로 결측이 되고 U-1000 이 비어 실행 전체가 중단됩니다.")
 
     # ── 경로 ③ 종가 × 종목별 마지막 관측 상장주식수(스냅샷) ────────────────────────────────
     need = B["mktcap"].isna()
@@ -4027,6 +4040,7 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
         S = S.dropna(subset=["date", "code", "shares_listed"]).sort_values("date")
         S["code"] = S["code"].astype(str)
         L = B.loc[need, ["code", "asof", "close"]].copy().sort_values("asof")
+        L["code"] = L["code"].astype(str)
         if len(L) and len(S):
             try:
                 M3 = pd.merge_asof(L, S[["date", "code", "shares_listed"]],
@@ -4043,8 +4057,11 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                 B.loc[m, "mktcap"] = fill_mc[m]
                 B.loc[m, "shares_listed"] = fill_sh[m]
                 B.loc[m, "mc_src"] = "close×최근관측주식수"
-            except Exception:
-                pass
+            except Exception as e:                                   # noqa
+                # ★ 예전에는 `except Exception: pass` 라 로그가 한 줄도 없었다. 이 경로가
+                #   조용히 죽으면 시총이 결측이 되고 그 종목이 유니버스에서 통째로 빠진다.
+                LOG.warn(f"종가×최근관측주식수 결합 실패({type(e).__name__}: "
+                         f"{str(e)[:120]}) — 해당 경로를 건너뜁니다.")
 
     B["mc_src"] = B["mc_src"].replace("", "결측")
     cov = B.groupby("mc_src").size().sort_values(ascending=False)
@@ -6957,8 +6974,14 @@ def arc_norm_sample_report(T: pd.DataFrame, n: int = 5) -> None:
             toks = list(json.loads(r.tf).items())[:22]
         except Exception:
             toks = []
+        # ★ int(r.tok_len) 을 try 밖에 두면 안 된다. 공용 캐시에는 tok_len 이 없던 스키마의
+        #   샤드가 남아 있을 수 있고(Vault 는 과거 버전 재사용을 설계 목표로 삼는다),
+        #   그러면 여기서 ValueError 가 나면서 L1.DOC 스테이지가 WARN 으로 접혀
+        #   ctx["doc_pairs"] 가 설정되지 않는다 → GATE_4/5 판정불가 → **원문을 전부 받아
+        #   놓고도 D1 축이 비활성화된 채** 백테스트가 끝까지 정상 완주한다.
+        _tl = pd.to_numeric(getattr(r, "tok_len", np.nan), errors="coerce")
         rows.append([str(r.corp_code), str(r.doc_type), str(r.bsns_year),
-                     f"{int(r.tok_len):,}",
+                     (f"{int(_tl):,}" if np.isfinite(_tl) else "—"),
                      _trunc(" ".join(f"{k}×{v}" for k, v in toks), 92)])
     LOG.table(rows, ["법인코드", "유형", "사업연도", "토큰수", "상위 토큰 (정규화 후)"],
               ["l", "c", "c", "r", "l"], maxw=96)
@@ -7817,7 +7840,26 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
     else:
         EG = pd.DataFrame(columns=["code", "asof", "exec_px"])
 
+    # ★ '다음에 실제로 거래된 리밸일' — 거래정지가 언제 풀렸는지를 알려주는 유일한 정보.
+    #   이게 없으면 '정지 후 재개' 와 '정지 후 폐지' 를 구별할 수 없다.
+    if len(EG):
+        _EGs = EG.sort_values("asof", kind="stable").rename(
+            columns={"asof": "resume_asof", "exec_px": "resume_px"})
+        _L = P[["code", "asof"]].copy()
+        _L["code"] = _L["code"].astype(str)
+        _L["_ord"] = np.arange(len(_L))
+        _L = _L.sort_values("asof", kind="stable")
+        _M = pd.merge_asof(_L, _EGs, left_on="asof", right_on="resume_asof", by="code",
+                           direction="forward", allow_exact_matches=False)
+        _M = _M.sort_values("_ord")
+        resume_asof = pd.Series(_M["resume_asof"].to_numpy(), index=P.index)
+        resume_px = pd.Series(_M["resume_px"].to_numpy(dtype="float64"), index=P.index)
+    else:
+        resume_asof = pd.Series(pd.NaT, index=P.index)
+        resume_px = pd.Series(np.nan, index=P.index, dtype="float64")
+
     src_counts: Dict[str, int] = {}
+    hold_q_all: List[float] = []
     for k, lab in ((1, "fwd_ret_1q"), (2, "fwd_ret_2q"), (4, "fwd_ret_4q")):
         tgt = P["asof"] + pd.DateOffset(months=3 * k)
         if len(EG):
@@ -7832,24 +7874,42 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
 
         # ★ 폐지는 전방가격 유무와 무관하게 폐지 처리가 이긴다(정상 청산도 폐지가 최종 사건).
         died = dl.notna() & (dl > P["asof"]) & (dl <= tgt)
-        # ★ '거래정지 → 유니버스 소실 → 몇 분기 뒤 폐지' 경로. 보유 중에 팔 수 없었고 결국
-        #   폐지됐으므로, 청산 결과를 이 분기에 계상한다. 결측으로 두면 손실만 사라진다.
-        stuck = r.isna() & dl.notna() & (dl > P["asof"]) & ~died
-        resolve = died | stuck
+        # ★ '거래정지 → 유니버스 소실 → 폐지' 경로. 보유 중에 팔 수 없었고 결국 폐지됐으므로
+        #   청산 결과를 이 분기에 계상한다. 결측으로 두면 손실만 선택적으로 사라진다.
+        #
+        #   ★★ 단, '정지 후 **재개**' 와 반드시 구별해야 한다. 예전 구현은 "전방가격 없음 +
+        #      언젠가 폐지됨" 만 보고 곧바로 폐지일 직전 종가를 썼는데, 그러면 3년 뒤 합병
+        #      폐지 종목의 **다년 수익률이 1분기 수익률 자리**에 들어간다(실측 fwd_ret_1q
+        #      +400% 인데 같은 행 fwd_ret_2q 는 +20%). elig 가 더 이상 fwd_ret 를 보지
+        #      않으므로 그 행은 실제로 편입되어 포트폴리오 수익에 곧바로 들어간다.
+        #      → 정지가 풀려 다시 거래된 리밸일이 폐지 전에 존재하면 **거기서 청산**한다.
+        #        진입 체결가가 없는 행(base 결측)은 애초에 보유가 성립하지 않으므로 제외.
+        can_hold = base.notna() & (base > 0)
+        stuck = r.isna() & can_hold & dl.notna() & (dl > P["asof"]) & ~died
+        resolve = (died | stuck) & can_hold
         if resolve.any():
+            # ① 폐지 전에 거래가 재개된 리밸일이 있으면 그 체결가로 청산
+            resumed = stuck & resume_asof.notna() & (as_ts_series(resume_asof) <= dl)
+            r_res = resume_px / base - 1.0
+            # ② 없으면 폐지일 직전 종가 (정상 폐지의 합병비율·공개매수가 수준을 반영)
             lc = _last_close_before(px_daily, P["code"].astype(str).tolist(),
-                                    dl.where(resolve))
+                                    dl.where(resolve & ~resumed))
             lc.index = P.index
             r_die = pd.to_numeric(lc, errors="coerce") / base - 1.0
             # 폐지일이 진입 체결일보다 앞서면 애초에 보유할 수 없다 → 청산가로 쓰지 않는다.
             too_early = as_ts_series(P.get("exec_date", P["asof"])) > dl
             r_die = r_die.mask(too_early)
-            r = r.mask(resolve, r_die.fillna(-1.0))
+            r_out = r_die.fillna(-1.0).where(~resumed, r_res)
+            r = r.mask(resolve, r_out)
             if k == 1:
+                exit_dt = as_ts_series(resume_asof).where(resumed, dl)
+                hq = ((exit_dt - P["asof"]).dt.days / 91.31).where(resolve)
+                hold_q_all = [float(x) for x in hq.dropna().to_numpy()]
                 src_counts = {
-                    "폐지_최종종가청산": int((resolve & r_die.notna()).sum()),
-                    "폐지_종가없음_-100%": int((resolve & r_die.isna()).sum()),
-                    "거래정지후폐지_복원": int(stuck.sum())}
+                    "폐지_최종종가청산": int((resolve & ~resumed & r_die.notna()).sum()),
+                    "폐지_종가없음_-100%": int((resolve & ~resumed & r_die.isna()).sum()),
+                    "거래정지후재개_청산": int((resumed & r_res.notna()).sum()),
+                    "거래정지후폐지_복원": int((stuck & ~resumed).sum())}
         P[lab] = r.astype("float32")
 
     # 폐지 계상 누락 감시 — 패널 행이 있는 종목만 세면 '거래정지 후 폐지' 경로가 통째로 빠진다.
@@ -7865,8 +7925,15 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
     LOG.info(f"보유 구간 내 상장폐지: 패널 계상 {n_died_panel:,}건 "
              f"(청산가 반영 {src_counts.get('폐지_최종종가청산', 0):,} · "
              f"-100% {src_counts.get('폐지_종가없음_-100%', 0):,}) · "
+             f"거래정지 후 재개 청산 {src_counts.get('거래정지후재개_청산', 0):,}건 · "
              f"거래정지 후 폐지 복원 {src_counts.get('거래정지후폐지_복원', 0):,}건 · "
              f"폐지목록 전수 기준 {n_died_all:,}건 (§3.4)")
+    if hold_q_all:
+        _long = [h for h in hold_q_all if h > 1.5]
+        LOG.info(f"  청산 지평 — 중앙값 {float(np.median(hold_q_all)):.1f}분기 · "
+                 f"최대 {max(hold_q_all):.1f}분기 · 1분기 초과 {len(_long):,}건. "
+                 f"1분기를 넘는 건은 '보유 중 매도 불가(거래정지)' 구간이며, 실현 손익 전액을 "
+                 f"진입 분기에 계상합니다 — 총액은 정확하나 그 분기 수익률은 과대/과소됩니다.")
     if n_died_all and (n_died_panel + src_counts.get("거래정지후폐지_복원", 0)) == 0:
         LOG.warn(f"폐지목록에는 보유 구간 내 폐지가 {n_died_all:,}건 있는데 패널에서 계상된 "
                  f"것이 0건입니다. 폐지 종목이 폐지 전에 유니버스에서 사라졌다는 뜻이므로 "
@@ -11766,7 +11833,7 @@ def report_dataflow_map() -> None:
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A31 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A34 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -12708,12 +12775,124 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A31", "직교화 자유도 하한", a31)
 
+    # ── A32  category dtype 이 시총 폴백 경로를 죽이지 않는가 ─────────────────────────────
+    def a32():
+        # fetch_prices 는 downcast() 를 거치고, 일봉은 nunique/len 이 극히 작아 code 가
+        # category 로 바뀐다. 그 dtype 이 merge_asof(by=...) 를 MergeError 로 죽인다.
+        rb = pd.to_datetime(["2019-03-01", "2019-06-01"])
+        codes = [f"{i*10:06d}" for i in range(1, 6)]
+        days = pd.bdate_range("2018-11-01", "2019-06-10")
+        px = pd.DataFrame({"code": np.repeat(codes, len(days)),
+                           "date": np.tile(days.values, len(codes))})
+        px["close"] = 1000.0
+        px["open"] = px["high"] = px["low"] = 1000.0
+        px["volume"] = 1000.0
+        px["amount"] = 1e9
+        px["src"] = "t"
+        px = downcast(px)
+        if str(px["code"].dtype) != "category":
+            px["code"] = px["code"].astype("category")     # 조건 강제(회귀 검정의 요지)
+        shares = pd.DataFrame({
+            "corp_code": [f"C{i}" for i in range(1, 6)],
+            "event_date": [pd.Timestamp("2018-12-31")] * 5,
+            "knowledge_date": [pd.Timestamp("2019-02-01")] * 5,
+            "shares_total": [1e7] * 5})
+        sec = pd.DataFrame({"code": codes, "corp_code": [f"C{i}" for i in range(1, 6)]})
+        px_monthly = (px.assign(month=as_ts_series(px["date"]) + pd.offsets.MonthEnd(0))
+                        .groupby(["code", "month"], observed=True)
+                        .tail(1)[["code", "month", "close"]])
+        # snap_mc 를 비워 경로 ①을 닫는다 = KRX 로그인이 없는 실행과 동일한 상태
+        M = build_mktcap_panel(rb, px_monthly, pd.DataFrame(), shares, sec)
+        got = int(pd.to_numeric(M.get("mktcap", pd.Series(dtype=float)),
+                                errors="coerce").notna().sum()) if len(M) else 0
+        if got == 0:
+            return False, ("★KRX 스냅샷이 없는 실행에서 시총이 0건 확보됐습니다. DART 주식총수와 "
+                           "월말 종가가 둘 다 정상인데도 code 가 category dtype 이라 폴백 "
+                           "경로 ②③ 의 merge_asof 가 MergeError 로 죽습니다 → U-1000 0행 → "
+                           "build_arc_panel RuntimeError → 실행 전체 중단.")
+        return True, f"category dtype 에서도 폴백 경로가 시총 {got:,}행 확보"
+
+    _ac("A32", "시총 폴백 경로 dtype 내성", a32)
+
+    # ── A33  '정지 후 재개' 를 '정지 후 폐지' 로 오인하지 않는가 ──────────────────────────
+    def a33():
+        rb = pd.to_datetime(["2017-03-01", "2017-06-01", "2017-09-01", "2017-12-01"])
+        U = pd.DataFrame({"code": ["X"], "asof": [rb[0]], "mktcap": [1e10],
+                          "uni_rank": [1], "adtv60": [5e8]})
+        # 2017-06-01 은 거래정지라 체결가 격자에 없다. 2017-09-01 에 재개. 폐지는 3년 뒤 합병.
+        execp = pd.DataFrame({"code": ["X", "X", "X"],
+                              "asof": [rb[0], rb[2], rb[3]],
+                              "exec_px": [1000.0, 1100.0, 1150.0],
+                              "exec_date": [rb[0], rb[2], rb[3]]})
+        px = pd.DataFrame({"code": ["X", "X"],
+                           "date": pd.to_datetime(["2017-03-02", "2020-12-18"]),
+                           "open": [1000.0, 5000.0], "close": [1000.0, 5000.0]})
+        sec = pd.DataFrame({"code": ["X"], "name": ["정지후재개"], "market": ["KOSDAQ"],
+                            "industry": ["기타"], "corp_code": ["CX"],
+                            "listing_date": [pd.NaT]})
+
+        class _U:
+            def delisting_map(self): return {"X": pd.Timestamp("2020-12-20")}
+        P = build_arc_panel(_U(), rb, U, pd.DataFrame(), execp, sec, px_daily=px)
+        row = P[P["asof"] == rb[0]]
+        if row.empty:
+            return None, "패널이 비어 검정을 건너뜁니다"
+        r1 = float(row["fwd_ret_1q"].iloc[0])
+        r2 = float(row["fwd_ret_2q"].iloc[0])
+        if np.isfinite(r1) and r1 > 1.0:
+            return False, (f"★1분기 전방수익률이 {r1:+.1%} 입니다. 거래정지가 풀려 재개된 "
+                           f"종목인데도 '정지 후 폐지'로 오인해 **3년 9개월 뒤 폐지일 직전 "
+                           f"종가**를 1분기 수익률 자리에 넣었습니다. elig 가 더 이상 "
+                           f"fwd_ret 를 보지 않으므로 이 행은 실제로 편입되어 포트폴리오 "
+                           f"수익에 곧바로 들어갑니다(같은 행 fwd_ret_2q={r2:+.1%}).")
+        if np.isfinite(r1) and np.isfinite(r2) and r1 > r2 + 1.0:
+            return False, f"1분기({r1:+.1%})가 2분기({r2:+.1%})를 크게 웃돕니다 — 지평 혼선"
+        # 진입 체결가가 없는 행은 보유가 성립하지 않으므로 -100% 가 찍히면 안 된다
+        U2 = pd.DataFrame({"code": ["Y"], "asof": [rb[0]], "mktcap": [1e10],
+                           "uni_rank": [1], "adtv60": [5e8]})
+        sec2 = pd.DataFrame({"code": ["Y"], "name": ["진입불가"], "market": ["KOSDAQ"],
+                             "industry": ["기타"], "corp_code": ["CY"],
+                             "listing_date": [pd.NaT]})
+
+        class _U2:
+            def delisting_map(self): return {"Y": pd.Timestamp("2020-07-01")}
+        P2 = build_arc_panel(_U2(), rb, U2, pd.DataFrame(),
+                             pd.DataFrame(columns=["code", "asof", "exec_px", "exec_date"]),
+                             sec2, px_daily=px)
+        if len(P2) and float(pd.to_numeric(P2["fwd_ret_1q"], errors="coerce")
+                             .fillna(0).min()) <= -0.99:
+            return False, ("★진입 체결가가 없어 애초에 살 수 없었던 종목에 -100% 가 "
+                           "계상됐습니다(없는 손실을 만들어 냅니다).")
+        return True, (f"정지 후 재개는 재개 체결가로 청산 ({r1:+.2%}, 2Q {r2:+.2%}) · "
+                      f"진입 불가 종목에 -100% 미계상")
+
+    _ac("A33", "거래정지 후 재개 vs 폐지 구별", a33)
+
+    # ── A34  tok_len 결측이 D1 축을 통째로 끄지 않는가 ────────────────────────────────────
+    def a34():
+        # 공용 캐시에 tok_len 이 없던 스키마의 샤드가 섞이면 그 열이 전부 NaN 이 된다.
+        T = pd.DataFrame({
+            "corp_code": ["C1"], "rcept_no": ["R1"], "rcept_dt": [pd.Timestamp("2019-03-25")],
+            "doc_type": ["FY"], "bsns_year": [2018], "section": ["S_MDA"],
+            "n_tokens": [100], "tf": ['{"매출": 3, "영업이익": 2}'], "bigram": ["{}"],
+            "tok_len": [np.nan], "is_amend": [False]})
+        try:
+            arc_norm_sample_report(T)
+        except Exception as e:                                # noqa
+            return False, (f"★{type(e).__name__} — 육안 검증용 표 함수가 데이터 파이프라인을 "
+                           f"끊습니다. 이 함수는 L1.DOC 안에서 ctx['doc_pairs'] 설정 **앞에** "
+                           f"호출되므로, 여기서 죽으면 GATE_4/5 가 판정불가가 되어 원문을 전부 "
+                           f"받아 놓고도 D1 축이 비활성화된 채 백테스트가 완주합니다: {e}")
+        return True, "tok_len 전부 결측인 샤드에서도 예외 없이 표를 출력"
+
+    _ac("A34", "캐시 스키마 변화 내성 (tok_len)", a34)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A31 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A34 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

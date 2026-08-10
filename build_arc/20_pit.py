@@ -802,7 +802,26 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
     else:
         EG = pd.DataFrame(columns=["code", "asof", "exec_px"])
 
+    # ★ '다음에 실제로 거래된 리밸일' — 거래정지가 언제 풀렸는지를 알려주는 유일한 정보.
+    #   이게 없으면 '정지 후 재개' 와 '정지 후 폐지' 를 구별할 수 없다.
+    if len(EG):
+        _EGs = EG.sort_values("asof", kind="stable").rename(
+            columns={"asof": "resume_asof", "exec_px": "resume_px"})
+        _L = P[["code", "asof"]].copy()
+        _L["code"] = _L["code"].astype(str)
+        _L["_ord"] = np.arange(len(_L))
+        _L = _L.sort_values("asof", kind="stable")
+        _M = pd.merge_asof(_L, _EGs, left_on="asof", right_on="resume_asof", by="code",
+                           direction="forward", allow_exact_matches=False)
+        _M = _M.sort_values("_ord")
+        resume_asof = pd.Series(_M["resume_asof"].to_numpy(), index=P.index)
+        resume_px = pd.Series(_M["resume_px"].to_numpy(dtype="float64"), index=P.index)
+    else:
+        resume_asof = pd.Series(pd.NaT, index=P.index)
+        resume_px = pd.Series(np.nan, index=P.index, dtype="float64")
+
     src_counts: Dict[str, int] = {}
+    hold_q_all: List[float] = []
     for k, lab in ((1, "fwd_ret_1q"), (2, "fwd_ret_2q"), (4, "fwd_ret_4q")):
         tgt = P["asof"] + pd.DateOffset(months=3 * k)
         if len(EG):
@@ -817,24 +836,42 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
 
         # ★ 폐지는 전방가격 유무와 무관하게 폐지 처리가 이긴다(정상 청산도 폐지가 최종 사건).
         died = dl.notna() & (dl > P["asof"]) & (dl <= tgt)
-        # ★ '거래정지 → 유니버스 소실 → 몇 분기 뒤 폐지' 경로. 보유 중에 팔 수 없었고 결국
-        #   폐지됐으므로, 청산 결과를 이 분기에 계상한다. 결측으로 두면 손실만 사라진다.
-        stuck = r.isna() & dl.notna() & (dl > P["asof"]) & ~died
-        resolve = died | stuck
+        # ★ '거래정지 → 유니버스 소실 → 폐지' 경로. 보유 중에 팔 수 없었고 결국 폐지됐으므로
+        #   청산 결과를 이 분기에 계상한다. 결측으로 두면 손실만 선택적으로 사라진다.
+        #
+        #   ★★ 단, '정지 후 **재개**' 와 반드시 구별해야 한다. 예전 구현은 "전방가격 없음 +
+        #      언젠가 폐지됨" 만 보고 곧바로 폐지일 직전 종가를 썼는데, 그러면 3년 뒤 합병
+        #      폐지 종목의 **다년 수익률이 1분기 수익률 자리**에 들어간다(실측 fwd_ret_1q
+        #      +400% 인데 같은 행 fwd_ret_2q 는 +20%). elig 가 더 이상 fwd_ret 를 보지
+        #      않으므로 그 행은 실제로 편입되어 포트폴리오 수익에 곧바로 들어간다.
+        #      → 정지가 풀려 다시 거래된 리밸일이 폐지 전에 존재하면 **거기서 청산**한다.
+        #        진입 체결가가 없는 행(base 결측)은 애초에 보유가 성립하지 않으므로 제외.
+        can_hold = base.notna() & (base > 0)
+        stuck = r.isna() & can_hold & dl.notna() & (dl > P["asof"]) & ~died
+        resolve = (died | stuck) & can_hold
         if resolve.any():
+            # ① 폐지 전에 거래가 재개된 리밸일이 있으면 그 체결가로 청산
+            resumed = stuck & resume_asof.notna() & (as_ts_series(resume_asof) <= dl)
+            r_res = resume_px / base - 1.0
+            # ② 없으면 폐지일 직전 종가 (정상 폐지의 합병비율·공개매수가 수준을 반영)
             lc = _last_close_before(px_daily, P["code"].astype(str).tolist(),
-                                    dl.where(resolve))
+                                    dl.where(resolve & ~resumed))
             lc.index = P.index
             r_die = pd.to_numeric(lc, errors="coerce") / base - 1.0
             # 폐지일이 진입 체결일보다 앞서면 애초에 보유할 수 없다 → 청산가로 쓰지 않는다.
             too_early = as_ts_series(P.get("exec_date", P["asof"])) > dl
             r_die = r_die.mask(too_early)
-            r = r.mask(resolve, r_die.fillna(-1.0))
+            r_out = r_die.fillna(-1.0).where(~resumed, r_res)
+            r = r.mask(resolve, r_out)
             if k == 1:
+                exit_dt = as_ts_series(resume_asof).where(resumed, dl)
+                hq = ((exit_dt - P["asof"]).dt.days / 91.31).where(resolve)
+                hold_q_all = [float(x) for x in hq.dropna().to_numpy()]
                 src_counts = {
-                    "폐지_최종종가청산": int((resolve & r_die.notna()).sum()),
-                    "폐지_종가없음_-100%": int((resolve & r_die.isna()).sum()),
-                    "거래정지후폐지_복원": int(stuck.sum())}
+                    "폐지_최종종가청산": int((resolve & ~resumed & r_die.notna()).sum()),
+                    "폐지_종가없음_-100%": int((resolve & ~resumed & r_die.isna()).sum()),
+                    "거래정지후재개_청산": int((resumed & r_res.notna()).sum()),
+                    "거래정지후폐지_복원": int((stuck & ~resumed).sum())}
         P[lab] = r.astype("float32")
 
     # 폐지 계상 누락 감시 — 패널 행이 있는 종목만 세면 '거래정지 후 폐지' 경로가 통째로 빠진다.
@@ -850,8 +887,15 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
     LOG.info(f"보유 구간 내 상장폐지: 패널 계상 {n_died_panel:,}건 "
              f"(청산가 반영 {src_counts.get('폐지_최종종가청산', 0):,} · "
              f"-100% {src_counts.get('폐지_종가없음_-100%', 0):,}) · "
+             f"거래정지 후 재개 청산 {src_counts.get('거래정지후재개_청산', 0):,}건 · "
              f"거래정지 후 폐지 복원 {src_counts.get('거래정지후폐지_복원', 0):,}건 · "
              f"폐지목록 전수 기준 {n_died_all:,}건 (§3.4)")
+    if hold_q_all:
+        _long = [h for h in hold_q_all if h > 1.5]
+        LOG.info(f"  청산 지평 — 중앙값 {float(np.median(hold_q_all)):.1f}분기 · "
+                 f"최대 {max(hold_q_all):.1f}분기 · 1분기 초과 {len(_long):,}건. "
+                 f"1분기를 넘는 건은 '보유 중 매도 불가(거래정지)' 구간이며, 실현 손익 전액을 "
+                 f"진입 분기에 계상합니다 — 총액은 정확하나 그 분기 수익률은 과대/과소됩니다.")
     if n_died_all and (n_died_panel + src_counts.get("거래정지후폐지_복원", 0)) == 0:
         LOG.warn(f"폐지목록에는 보유 구간 내 폐지가 {n_died_all:,}건 있는데 패널에서 계상된 "
                  f"것이 0건입니다. 폐지 종목이 폐지 전에 유니버스에서 사라졌다는 뜻이므로 "

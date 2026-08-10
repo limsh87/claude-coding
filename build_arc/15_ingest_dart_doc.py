@@ -670,8 +670,14 @@ def arc_norm_sample_report(T: pd.DataFrame, n: int = 5) -> None:
             toks = list(json.loads(r.tf).items())[:22]
         except Exception:
             toks = []
+        # ★ int(r.tok_len) 을 try 밖에 두면 안 된다. 공용 캐시에는 tok_len 이 없던 스키마의
+        #   샤드가 남아 있을 수 있고(Vault 는 과거 버전 재사용을 설계 목표로 삼는다),
+        #   그러면 여기서 ValueError 가 나면서 L1.DOC 스테이지가 WARN 으로 접혀
+        #   ctx["doc_pairs"] 가 설정되지 않는다 → GATE_4/5 판정불가 → **원문을 전부 받아
+        #   놓고도 D1 축이 비활성화된 채** 백테스트가 끝까지 정상 완주한다.
+        _tl = pd.to_numeric(getattr(r, "tok_len", np.nan), errors="coerce")
         rows.append([str(r.corp_code), str(r.doc_type), str(r.bsns_year),
-                     f"{int(r.tok_len):,}",
+                     (f"{int(_tl):,}" if np.isfinite(_tl) else "—"),
                      _trunc(" ".join(f"{k}×{v}" for k, v in toks), 92)])
     LOG.table(rows, ["법인코드", "유형", "사업연도", "토큰수", "상위 토큰 (정규화 후)"],
               ["l", "c", "c", "r", "l"], maxw=96)

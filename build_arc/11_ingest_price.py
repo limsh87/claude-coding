@@ -618,6 +618,16 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
     if not base_rows:
         return pd.DataFrame(columns=["code", "asof", "mktcap", "shares_listed", "mc_src"])
     B = pd.concat(base_rows, ignore_index=True)
+    # ★★ code 를 반드시 문자열로 고정한다. fetch_prices 는 downcast() 를 거치는데, 일봉은
+    #    3,500종목 × 875만행이라 nunique/len ≈ 0.0004 < cat_thresh 라서 **code 가 category
+    #    dtype 으로 바뀐다.** 그 dtype 이 여기까지 전파되면 아래 폴백 경로 ②③ 의
+    #    merge_asof(by=...) 가 "incompatible merge keys ... must be the same type" 로 죽는다.
+    #    경로 ① 만 astype(str) 을 했었기 때문에, KRX 로그인이 없어 경로 ①이 열리지 않는
+    #    실행에서는 DART 주식총수와 월말 종가가 둘 다 멀쩡한데도 시총이 100% 결측이 되고,
+    #    U-1000 이 0행 → build_arc_panel 이 RuntimeError → 실행 전체가 중단됐다.
+    #    경로 ② 의 예외 문구는 "대개 정렬/타입 문제" 수준이라 원인이 사용자 설정(KRX 로그인)
+    #    으로 오인됐고, 경로 ③ 은 except: pass 로 로그가 한 줄도 없었다.
+    B["code"] = B["code"].astype(str)
     B["mktcap"] = np.nan
     B["shares_listed"] = np.nan
     B["mc_src"] = ""
@@ -659,7 +669,8 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                 .sort_values("knowledge_date"))
         Sh["corp_code"] = Sh["corp_code"].astype(str)
         L = B.loc[need, ["code", "asof", "close"]].copy()
-        L["corp_code"] = L["code"].map(c2c)
+        L["code"] = L["code"].astype(str)
+        L["corp_code"] = L["code"].map(c2c).astype(object)
         L = L.dropna(subset=["corp_code"]).sort_values("asof")
         if len(L):
             try:
@@ -678,7 +689,9 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                 B.loc[m, "shares_listed"] = fill_sh[m]
                 B.loc[m, "mc_src"] = "close×DART주식수"
             except Exception as e:                                   # noqa
-                LOG.warn(f"종가×DART주식수 결합 실패({type(e).__name__}) — 해당 경로를 건너뜁니다.")
+                LOG.warn(f"종가×DART주식수 결합 실패({type(e).__name__}: {str(e)[:120]}) — "
+                         f"해당 경로를 건너뜁니다. 이 경로가 죽으면 KRX 로그인이 없는 실행에서 "
+                         f"시총이 통째로 결측이 되고 U-1000 이 비어 실행 전체가 중단됩니다.")
 
     # ── 경로 ③ 종가 × 종목별 마지막 관측 상장주식수(스냅샷) ────────────────────────────────
     need = B["mktcap"].isna()
@@ -688,6 +701,7 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
         S = S.dropna(subset=["date", "code", "shares_listed"]).sort_values("date")
         S["code"] = S["code"].astype(str)
         L = B.loc[need, ["code", "asof", "close"]].copy().sort_values("asof")
+        L["code"] = L["code"].astype(str)
         if len(L) and len(S):
             try:
                 M3 = pd.merge_asof(L, S[["date", "code", "shares_listed"]],
@@ -704,8 +718,11 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
                 B.loc[m, "mktcap"] = fill_mc[m]
                 B.loc[m, "shares_listed"] = fill_sh[m]
                 B.loc[m, "mc_src"] = "close×최근관측주식수"
-            except Exception:
-                pass
+            except Exception as e:                                   # noqa
+                # ★ 예전에는 `except Exception: pass` 라 로그가 한 줄도 없었다. 이 경로가
+                #   조용히 죽으면 시총이 결측이 되고 그 종목이 유니버스에서 통째로 빠진다.
+                LOG.warn(f"종가×최근관측주식수 결합 실패({type(e).__name__}: "
+                         f"{str(e)[:120]}) — 해당 경로를 건너뜁니다.")
 
     B["mc_src"] = B["mc_src"].replace("", "결측")
     cov = B.groupby("mc_src").size().sort_values(ascending=False)
