@@ -85,14 +85,29 @@ class DartBudget:
 DBUDGET: Optional[DartBudget] = None
 
 
+# ★ dart_api 는 실패 종류를 전부 None 으로 뭉갠다. 그런데 호출부는 '이 회사는 그 해에
+#   제출한 것이 없다(013)' 와 '한도가 소진돼 물어보지도 못했다' 를 반드시 구분해야 한다.
+#   구분하지 않으면 예산 소진분이 '데이터 없음' 센티넬로 공용 캐시에 영구 기록되어
+#   다음 실행이 영영 재요청하지 않는다 — 캐시를 훼손하는 것과 같다(절대 1원칙 위반).
+DART_LAST_STATUS = threading.local()
+
+
+def dart_status() -> str:
+    """직전 dart_api 호출의 결과 코드. '013'=자료없음 · 'NOBUDGET'/'NET'/'AUTH' 등."""
+    return getattr(DART_LAST_STATUS, "v", "")
+
+
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
     호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
     → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
+    DART_LAST_STATUS.v = ""
     if not DART_API_KEY:
+        DART_LAST_STATUS.v = "NOKEY"
         return None
     if DBUDGET is not None and not DBUDGET.take(tries):
+        DART_LAST_STATUS.v = "NOBUDGET"
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
@@ -102,14 +117,18 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
     if DBUDGET is not None:
         DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
     if not isinstance(js, dict):
+        DART_LAST_STATUS.v = "NET"          # 네트워크/비JSON — 자료 없음이 아니다
         return None
     st = str(js.get("status", ""))
+    DART_LAST_STATUS.v = st or "000"
     if st and st != "000":
         if st in ("020", "021"):
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
             LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+                     f"받은 만큼 저장합니다. ★ 지금 바로 재실행해도 됩니다 — 이미 받은 분은 "
+                     f"캐시에서 그대로 쓰이고 재요청하지 않습니다. 남은 분만 한도 리셋"
+                     f"(KST 자정) 이후에 채워집니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -135,15 +154,46 @@ _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
             "account_id", "account_nm", "thstrm_amount", "rcept_no"]
 
 
+_FS_DIV: Dict[str, str] = {}          # corp_code → 그 회사에서 실제로 먹히는 fs_div
+_FS_DIV_LK = threading.Lock()
+
+
 def _fs_one(job) -> Optional[pd.DataFrame]:
     corp, year, reprt = job
-    js = dart_api("fnlttSinglAcntAll.json",
-                  {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
-    if not js or "list" not in js:
+    # ★ 예전엔 (회사, 연도, 보고서)마다 OFS 를 먼저 치고 비면 CFS 를 또 쳤다. 소형주는
+    #   연결재무제표만 내는 곳이 많고 폐지사는 대부분 연도에 제출 자체가 없어서, 빈 조합마다
+    #   호출이 2배가 됐다 — 작업 15만건이 실호출 21만~25만건이 되는 경로다.
+    #   fs_div 는 회사 속성이지 연도 속성이 아니므로 회사당 한 번만 알아내고 재사용한다.
+    with _FS_DIV_LK:
+        known = _FS_DIV.get(corp)
+    order = (known,) if known else ("OFS", "CFS")
+    js, used = None, None
+    for div in order:
         js = dart_api("fnlttSinglAcntAll.json",
-                      {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
+                      {"corp_code": corp, "bsns_year": str(year),
+                       "reprt_code": reprt, "fs_div": div})
+        if js and isinstance(js.get("list"), list) and js["list"]:
+            used = div
+            break
+    if used and not known:
+        with _FS_DIV_LK:
+            _FS_DIV[corp] = used
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
-        return None
+        # ★★ 센티넬은 '자료 없음'이 확인된 경우에만 쓴다 ★★
+        #   예산 소진·네트워크 실패·인증 오류로 못 물어본 것을 '없다'고 기록하면, 공용
+        #   캐시에 거짓 부재가 영구히 박히고 다음 실행이 영영 재요청하지 않는다.
+        #   실측 위험: 잔여 2만으로 잘라도 job 당 1~2 단위를 쓰므로 목록 중반부터 전부
+        #   예산 소진에 걸린다 — 매 실행 수천 건이 '제출 안 함'으로 굳는다.
+        _st = dart_status()
+        if _st not in ("013", "000"):
+            return None                      # 못 물어봤다 → 아무것도 기록하지 않는다
+        # ★ '데이터 없음'도 결과다. 빈손을 캐시하지 않으면 done 집합에 영영 안 들어가서
+        #   매 실행 같은 조합을 다시 묻는다 — "재실행하면 이 지점부터 이어받습니다"가
+        #   거짓이 되는 지점이고, 하루치 한도가 통째로 '같은 부재를 재발견'하는 데 쓰였다.
+        #   센티넬 1행을 남겨 다음 실행이 건너뛰게 한다(값은 전부 결측이라 집계에 무해).
+        return pd.DataFrame([{**{c: None for c in _FS_KEEP}, "corp_code": corp,
+                              "bsns_year": int(year), "reprt_code": reprt,
+                              "fs_div": "NONE", "account_id": "_EMPTY_"}])[_FS_KEEP]
     d = pd.DataFrame(js["list"])
     for c in _FS_KEEP:
         if c not in d.columns:
@@ -226,7 +276,9 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
 
 def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
-                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                          priority: Optional[Sequence[str]] = None,
+                          only_years: Optional[Dict[str, set]] = None,
+                          reprt_codes: Optional[Sequence[str]] = None) -> pd.DataFrame:
     """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
 
     priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
@@ -243,27 +295,48 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
-    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
-              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    reprts = list(reprt_codes) if reprt_codes else (
+        [REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
+        else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
     # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
     corp_sorted = sorted((str(c) for c in corp_codes),
                          key=lambda c: (order.get(c, 10 ** 9), c))
+    # ★ only_years 가 있으면 '그 회사가 실제로 후보였던 기간(+소급)'만 요청한다. 예전에는
+    #   (회사 전체) × (전 기간 연도)의 데카르트 곱이라 2,980사 × 15년 × 4보고서 = 178,800회,
+    #   회사별 API 로 9일짜리 작업이었다. 2018~2021 에만 하위권이던 회사의 2012년 재무는
+    #   어느 리밸런싱 시점에서도 읽히지 않는다.
     jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
-            if (c, int(y), str(r)) not in done]
+            if (c, int(y), str(r)) not in done
+            and (only_years is None or int(y) in only_years.get(str(c), ()))]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
         total_needed = len(jobs)
-        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
-                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
-        if total_needed > DART_DAILY_LIMIT:
-            LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
-                     f"오늘 받을 수 있는 만큼 받고 저장합니다. "
-                     f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
-                     f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
+        # ★★ 예전에는 jobs 전체를 그대로 pmap_io 에 넘기고 '한도에 걸리면 예외가 나겠지'에
+        #    맡겼다. 그 결과 하루치 호출을 통째로 태우고도 아무 회사도 완성되지 않았다
+        #    (실측: 사용자 키가 14,117회 소진). 요구사항은 "남은 호출량을 실시간으로 체크해서
+        #    그만큼만 쓰라"이므로, 던지기 전에 살아 있는 잔여 예산으로 잘라낸다.
+        _left = DBUDGET.remaining_calls() if DBUDGET is not None else None
+        if _left is not None and _left <= 0:
+            LOG.warn(f"DART 잔여 호출이 0 입니다 — Tier-2(전체 재무제표) 신규 수집을 건너뜁니다. "
+                     f"Tier-1(주요계정)만으로 V축·자본잠식 판정은 동작합니다. "
+                     f"★ 지금 재실행해도 여기까지는 캐시로 그대로 진행됩니다. 남은 분만 "
+                     f"한도 리셋(KST 자정) 이후에 채워집니다.")
+            jobs = []
+        elif _left is not None and total_needed > _left:
+            LOG.warn(f"필요 호출({total_needed:,})이 오늘 잔여({_left:,})를 넘습니다 — "
+                     f"잔여만큼인 {_left:,}건만 받고 나머지는 다음 실행으로 넘깁니다. "
+                     f"약 {math.ceil(total_needed / max(_left, 1))}일에 걸쳐 콜드빌드가 완성됩니다. "
+                     f"(우선순위 정렬이 되어 있어 '투자 가능한 종목의 최근 데이터'부터 채워집니다)")
+            jobs = jobs[:_left]
+        else:
+            LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 (오늘 잔여 "
+                     f"{_left if _left is not None else '미상':,}건 이내)"
+                     if _left is not None else f"DART 재무 신규 수집 대상 {total_needed:,}건")
+    if jobs:
         res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
         got = [d for d in res if d is not None and len(d)]
     else:
@@ -292,6 +365,10 @@ def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFra
 
     콜드빌드가 며칠 걸리는 동안에도 매출·영업이익·순이익·자산·부채·자본은 전 종목이
     확보되어 있어 유니버스 구성과 규모 버킷(C11), R3 팩터가 즉시 동작한다."""
+    # ★ '데이터 없음' 센티넬(_fs_one)은 재요청을 막으려고 캐시에만 남기는 행이다. 여기서
+    #   걸러내지 않으면 '전체 재무제표가 있다'고 오인해 Tier-1(주요계정) 폴백을 막아버린다.
+    if full is not None and len(full) and "account_id" in full.columns:
+        full = full[full["account_id"].astype(str) != "_EMPTY_"]
     if multi is None or multi.empty:
         return full if full is not None else pd.DataFrame(columns=_FS_KEEP)
     if full is None or full.empty:

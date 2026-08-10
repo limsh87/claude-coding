@@ -111,8 +111,22 @@ class KRXGate:
             self._refresh_if_stale()
             limiter("krx").wait()
             self.calls += 1
+            # ★ pykrx 는 @dataframe_empty_handler 로 JSONDecodeError 등을 삼키고 빈
+            #   DataFrame 을 돌려주며, 예외 문구는 print() 로 stdout 에 뱉는다. 그래서
+            #   아래 except 는 '세션 만료 → JSON 대신 로그인 HTML' 이라는 가장 흔한 실패를
+            #   한 번도 잡지 못했다 — self.fails 가 0 인데 전 호출이 실패하는 상태가 되고,
+            #   호출부는 빈 결과를 '그 날짜에 상장 종목이 없음' 이라는 사실로 오해한다.
+            #   삼켜진 출력을 가로채 실패로 되살린다.
             try:
-                return fn(*a, **kw)
+                with capture_noise(f"pykrx:{getattr(fn, '__name__', '?')}") as box:
+                    out = fn(*a, **kw)
+                if noise_is_failure(box):
+                    self.fails += 1
+                    if self.fails <= 3 or self.fails % 50 == 0:
+                        LOG.warn(f"pykrx 내부 실패(삼켜진 예외) {self.fails}건 — "
+                                 f"{box[0].splitlines()[0][:120]}")
+                    return None
+                return out
             except Exception as e:                                     # noqa
                 self.fails += 1
                 LOG.debug(f"pykrx 호출 실패 {getattr(fn, '__name__', '?')}: {type(e).__name__}")

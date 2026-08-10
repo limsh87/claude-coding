@@ -162,7 +162,7 @@ STOP_ON_KILL_CRITERIA = True   # §15 킬 기준 위반 시 즉시 중단하고 
 STRATEGY_ID        = "PACK_P"
 STRATEGY_NAME      = "PACK-P 조달청 낙찰"
 ACTIVE_PACKS       = ["P"]
-BUILD_VERSION      = "v2.20260810.1914"
+BUILD_VERSION      = "v2.20260810.1929"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -274,6 +274,7 @@ _OPTIONAL = [
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
+    ("scikit-learn",      "sklearn",            "TONE 분류기(TF-IDF+로지스틱회귀)"),
     ("fitz",              "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
     ("pdfplumber",        "pdfplumber",         "PDF 추출 폴백"),
     ("rapidfuzz",         "rapidfuzz",          "사업장명/애널리스트명 유사도 매칭(고속)"),
@@ -367,16 +368,43 @@ RNG = np.random.default_rng(SEED)
 
 # 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
-if OPT.get("FinanceDataReader"):
+
+# ★★ import 실패를 조용히 삼키면 안 된다 ★★
+#   예전에는 `except Exception: pykrx_stock = None` 이었다. 그러면 '설치는 됐지만 import 가
+#   깨진' 상태(파이썬 3.14 + 윈도우에서 실제로 발생)가 '패키지 없음'과 구별되지 않는다.
+#   상단 표에는 "pykrx 설치됨"으로 뜨는데 실제로는 None 이라, 시총 스냅샷이 0건이 되고
+#   → 후보를 못 좁혀 전 종목 5,398개 일봉을 받는 폭주로 이어졌다. 사용자는 원인을 볼 수
+#   없었다. 실패 사유를 반드시 남기고, 능력 표가 '실물 import 결과'를 말하게 한다.
+IMPORT_FAILURES: Dict[str, str] = {}
+
+
+def _opt_import(pkg: str, fn):
+    if not OPT.get(pkg):
+        return None
     try:
-        import FinanceDataReader as fdr           # type: ignore
-    except Exception:
-        fdr = None
-if OPT.get("pykrx"):
-    try:
-        from pykrx import stock as pykrx_stock    # type: ignore
-    except Exception:
-        pykrx_stock = None
+        return fn()
+    except BaseException as e:                    # noqa — SystemExit/ImportError 모두 잡는다
+        IMPORT_FAILURES[pkg] = f"{type(e).__name__}: {e}"
+        return None
+
+
+def _import_fdr():
+    import FinanceDataReader as _m                # type: ignore
+    # FDR 은 종목마다 '"000010" invalid symbol or has no data' 를 직접 출력한다.
+    # 폐지 종목이 정상적으로 섞인 소형주 백테스트에서 수천 줄이 되어 진짜 경고를 밀어낸다.
+    for _n in ("FinanceDataReader", "financedatareader", "requests", "urllib3"):
+        logging.getLogger(_n).setLevel(logging.CRITICAL)
+        logging.getLogger(_n).propagate = False
+    return _m
+
+
+def _import_pykrx():
+    from pykrx import stock as _m                 # type: ignore
+    return _m
+
+
+fdr = _opt_import("FinanceDataReader", _import_fdr)
+pykrx_stock = _opt_import("pykrx", _import_pykrx)
 
 # ★ pykrx 1.2.8 의 get_auth_session() 은 모듈 전역 _auth_session 에 대해 '락 없는 검사-후-생성'
 #   이다. 스레드 N 개가 동시에 None(또는 만료)을 보면 N 번 로그인하고, KRX 는 중복 로그인을
@@ -420,6 +448,13 @@ if pykrx_stock is not None:
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
+        # ★ yfinance 는 종목마다 "possibly delisted; no price data found" 를 ERROR 로 뱉는다.
+        #   폐지 종목이 정상적으로 섞여 있는 소형주 백테스트에서는 이게 수천 줄로 쏟아져
+        #   진짜 경고를 화면 밖으로 밀어낸다. 실패 건수는 우리가 수집 시도 원장으로 이미
+        #   집계하므로(원인·재시도 정책 포함) 라이브러리 자체 로그는 끈다 — 정보 손실이 없다.
+        for _n in ("yfinance", "yfinance.data", "yfinance.ticker", "peewee", "urllib3"):
+            logging.getLogger(_n).setLevel(logging.CRITICAL)
+            logging.getLogger(_n).propagate = False
     except Exception:
         yf = None
 if OPT.get("fitz"):
@@ -653,7 +688,9 @@ _DIAG_RULES: List[Tuple[str, str]] = [
     (r"Expecting value: line \d+ column 1|JSONDecodeError|Error occurred in get_market",
      "JSON 대신 HTML(대개 로그인/에러 페이지)을 받았습니다. KRX 계열이면 세션이 끊긴 것입니다. "
      "pykrx 는 스레드마다 재로그인하며 KRX 는 중복 로그인 시 이전 세션을 끊습니다 — "
-     "모든 pykrx 호출은 KRXG.call() 게이트로 직렬화해야 합니다. "
+     "로그인 자체는 01_bootstrap 이 pykrx auth/webio 경계에 락을 걸어 직렬화하므로 "
+     "이 오류가 계속 보이면 그 패치가 적용되지 않은 것입니다(pykrx 버전 확인). "
+     "data.krx.co.kr 을 직접 치는 호출은 그와 별개로 KRXG.call() 을 거쳐야 합니다. "
      "KRX ID/PW 를 다른 브라우저 탭에서 동시에 쓰고 있지 않은지도 확인하세요."),
     (r"UnicodeEncodeError|cp949|charmap",
      "콘솔 인코딩 문제입니다(윈도우 기본 cp949 는 罫線문자 ╔═║ 와 ✔✘ 를 못 씁니다). "
@@ -1546,6 +1583,117 @@ def bh_fdr(pvals: Sequence[float], q: float = 0.10) -> np.ndarray:
 
 
 
+class _ThreadTee:
+    """스레드별로 출력을 갈라 보내는 stdout/stderr 대역.
+
+    ★★ 왜 이게 필요한가 — 전역 교체는 멀티스레드에서 반드시 깨진다 ★★
+      sys.stdout 은 프로세스 전역이다. 워커 스레드 12개가 각자
+        o = sys.stdout; sys.stdout = buf ... sys.stdout = o
+      를 하면, 스레드 B 가 스레드 A 의 buf 를 '원본'으로 저장했다가 복구하는 순간
+      stdout 이 죽은 StringIO 로 영구 고정된다. 그때부터 tqdm 진행바도 LOG 도
+      화면에 한 글자도 나오지 않는다 — 실행은 도는데 멈춘 것처럼 보인다.
+      실측으로 사용자의 일봉 수집이 0% 에서 얼어붙은 것처럼 보인 원인이 정확히 이것이다.
+    → 대역을 '한 번만' 설치하고, 캡처는 스레드로컬 버퍼의 유무로만 결정한다.
+      캡처 중인 스레드의 출력만 버퍼로 가고 나머지는 그대로 화면에 나간다.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+
+    def _buf(self):
+        return getattr(self._local, "buf", None)
+
+    def _push(self):
+        b = io.StringIO()
+        self._local.buf = b
+        return b
+
+    def _pop(self):
+        b = getattr(self._local, "buf", None)
+        self._local.buf = None
+        return b.getvalue() if b is not None else ""
+
+    def write(self, s):
+        b = self._buf()
+        if b is not None:
+            return b.write(s)
+        return self._real.write(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._real.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, k):
+        return getattr(self._real, k)
+
+
+def _install_tee():
+    """대역을 딱 한 번 설치한다(재실행·중복 import 대비)."""
+    out = sys.stdout
+    if not isinstance(out, _ThreadTee):
+        sys.stdout = _ThreadTee(out)
+    err = sys.stderr
+    if not isinstance(err, _ThreadTee):
+        sys.stderr = _ThreadTee(err)
+    return sys.stdout, sys.stderr
+
+
+_TEE_OUT, _TEE_ERR = _install_tee()
+NOISE_COUNT: Dict[str, int] = {}
+
+
+@contextmanager
+def capture_noise(tag: str = ""):
+    """이 블록 '안의 이 스레드' 출력만 가로채 LOG.debug 로 돌린다.
+
+    ★ FDR·pykrx 는 logging 을 쓰지 않는다. 둘 다 builtin print() 로 직접 뱉는다:
+        FinanceDataReader/naver/data.py : '"000010" invalid symbol or has no data'
+        FinanceDataReader/krx/listing.py: print(r.text)  ← 로그인/에러 HTML 전문을 통째로
+        pykrx/website/comm/util.py      : 'Error occurred in {fn}: {e}'
+      그래서 logging.getLogger("FinanceDataReader").setLevel(CRITICAL) 은 아무 효과가 없다.
+    ★ pykrx 의 @dataframe_empty_handler 는 JSONDecodeError 를 삼키고 빈 DataFrame 을
+      돌려준다. 세션 만료로 JSON 대신 로그인 HTML 을 받은 '실패'가 호출부에는 '그 날짜에
+      상장 종목이 없음' 이라는 사실로 보인다 — 이 캡처가 그 구분을 되살린다.
+    ★ 다른 스레드(tqdm 진행바·LOG)는 영향을 받지 않는다. 전역 교체가 아니다.
+    yield 는 캡처된 텍스트를 담을 리스트다(블록 종료 후 확인).
+    """
+    box: List[str] = []
+    _TEE_OUT._push()
+    _TEE_ERR._push()
+    try:
+        yield box
+    finally:
+        txt = (_TEE_OUT._pop() + "\n" + _TEE_ERR._pop()).strip()
+        if txt:
+            box.append(txt)
+            # ★ 종목마다 한 줄이면 1,500줄이 된다 — 억제한 소음을 다른 형태로 되살리는 꼴이다.
+            #   접두어별로 앞 3건만 남기고 나머지는 세기만 한다(끝에 합계를 보고한다).
+            k = str(tag).split(":", 1)[0]
+            n = NOISE_COUNT[k] = NOISE_COUNT.get(k, 0) + 1
+            if n <= 3:
+                LOG.debug(f"[{tag}] 라이브러리 출력 {len(txt.splitlines())}줄 "
+                          f"(첫 줄: {txt.splitlines()[0][:160]})")
+            elif n == 4:
+                LOG.debug(f"[{k}] 이후 같은 종류의 라이브러리 출력은 세기만 합니다.")
+
+
+def noise_is_failure(box: List[str]) -> bool:
+    """캡처된 출력이 '조용한 실패'를 뜻하는가. pykrx 의 삼킨 예외를 되살리는 판정."""
+    t = " ".join(box)
+    return bool(re.search(r"Error occurred in|JSONDecodeError|Expecting value|"
+                          r"not found or invalid|no data or code", t))
+
+
+
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L0-D  캐시 저장소 (VAULT) — 구글드라이브 공용/전용 인덱스                                 ║
 # ║                                                                                          ║
@@ -1834,7 +1982,19 @@ class Vault:
             bak = os.path.join(self.ns[scope], "index", "_backup",
                                f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
             try:
-                shutil.copy2(path, bak)
+                # ★ 대용량 테이블(일봉 패널·DART 원시계정 등)은 백업 전체복사가 드라이브에
+                #   파일 크기의 2배 I/O 를 만든다. 몇 행 추가하려고 수백 MB 를 두 번 쓴다.
+                #   atomic_write_parquet 이 이미 임시파일→교체라 '쓰다 만 파일'은 생기지
+                #   않으므로, 큰 파일은 복사를 건너뛰고 직전 1개만 보존한다.
+                _sz = os.path.getsize(path)
+                if _sz > VAULT_BACKUP_MAX_BYTES:
+                    _prev = os.path.join(self.ns[scope], "index", "_backup", f"{name}.prev.parquet")
+                    if not os.path.exists(_prev):
+                        shutil.copy2(path, _prev)           # 최초 1회만 안전본을 남긴다
+                    LOG.debug(f"{name}: {_sz/1e6:,.0f}MB — 회차별 백업 생략(원자적 교체로 보호). "
+                              f"직전 안전본은 _backup/{name}.prev.parquet")
+                else:
+                    shutil.copy2(path, bak)
             except Exception as e:                          # noqa
                 LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
                          f"리비전 파일로 저장합니다: {name}")
@@ -2384,8 +2544,22 @@ class KRXGate:
             self._refresh_if_stale()
             limiter("krx").wait()
             self.calls += 1
+            # ★ pykrx 는 @dataframe_empty_handler 로 JSONDecodeError 등을 삼키고 빈
+            #   DataFrame 을 돌려주며, 예외 문구는 print() 로 stdout 에 뱉는다. 그래서
+            #   아래 except 는 '세션 만료 → JSON 대신 로그인 HTML' 이라는 가장 흔한 실패를
+            #   한 번도 잡지 못했다 — self.fails 가 0 인데 전 호출이 실패하는 상태가 되고,
+            #   호출부는 빈 결과를 '그 날짜에 상장 종목이 없음' 이라는 사실로 오해한다.
+            #   삼켜진 출력을 가로채 실패로 되살린다.
             try:
-                return fn(*a, **kw)
+                with capture_noise(f"pykrx:{getattr(fn, '__name__', '?')}") as box:
+                    out = fn(*a, **kw)
+                if noise_is_failure(box):
+                    self.fails += 1
+                    if self.fails <= 3 or self.fails % 50 == 0:
+                        LOG.warn(f"pykrx 내부 실패(삼켜진 예외) {self.fails}건 — "
+                                 f"{box[0].splitlines()[0][:120]}")
+                    return None
+                return out
             except Exception as e:                                     # noqa
                 self.fails += 1
                 LOG.debug(f"pykrx 호출 실패 {getattr(fn, '__name__', '?')}: {type(e).__name__}")
@@ -2982,6 +3156,13 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
 PRICE_COLS = ["code", "date", "open", "high", "low", "close", "volume", "amount", "src"]
 
 
+def _krx_recent_bizday() -> str:
+    d = _dt.date.today() - _dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= _dt.timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
 class KRXAuth:
     """KRX 데이터 마켓플레이스 인증(2025-12 변경 대응). 실패해도 절대 죽지 않고 폴백으로 넘긴다.
 
@@ -3023,26 +3204,48 @@ class KRXAuth:
         # 워밍업 없이 바로 POST 하면 세션 쿠키가 없어 항상 실패한다
         http_get(self.LOGIN_WARM1, source="krx", tries=1)
         http_get(self.LOGIN_WARM2, source="krx", tries=1, referer=self.LOGIN_WARM1)
+        # ★★ 로그인 성공을 '실패 단어가 없더라' 로 판정하면 안 된다 ★★
+        #   예전 판정은 응답 앞 600자에 (실패|오류|error|fail) 가 없으면 성공으로 봤다.
+        #   그러면 (a) 엔드포인트가 바뀌어 엉뚱한 200 응답이 와도 '성공', (b) 네트워크
+        #   실패·차단·캡차로 txt=None 이면 전부 'ID/PW 를 확인하세요' 가 된다.
+        #   사용자가 자격증명을 정확히 넣고도 틀렸다는 말을 듣는 이유가 정확히 (b) 다.
+        #   → 성공은 '실제 인증이 필요한 호출이 되는가' 로만 증명하고, 실패는 사유를 나눈다.
+        reasons = []
         for extra in ({}, {"skipDup": "Y"}):
             body = {"mbrNm": "", "telNo": "", "di": "", "certType": "",
                     "mbrId": self.user, "pw": self.pw, **extra}
             txt = http_post(self.LOGIN_POST, source="krx", data=body, referer=self.LOGIN_WARM1,
                             headers={"X-Requested-With": "XMLHttpRequest"})
             if txt is None:
+                reasons.append("네트워크/차단: 로그인 엔드포인트가 응답하지 않음")
                 continue
-            if re.search(r"CD011|중복\s*로그인", str(txt)):
-                LOG.warn("KRX 중복 로그인(CD011) 감지 — 같은 계정이 브라우저나 다른 노트북에서 "
-                         "이미 로그인되어 있습니다. skipDup 으로 재시도하면 기존 세션이 강제 종료됩니다. "
-                         "두 노트북을 동시에 돌리면 서로를 계속 밀어냅니다.")
+            body_s = str(txt)
+            if re.search(r"CD011|중복\s*로그인", body_s):
+                reasons.append("중복 로그인(CD011): 같은 계정이 다른 곳에 로그인되어 있음")
+                LOG.warn("KRX 중복 로그인(CD011) — 같은 계정이 브라우저나 다른 노트북에서 이미 "
+                         "로그인되어 있습니다. 두 곳을 동시에 돌리면 서로를 계속 밀어냅니다.")
                 continue
-            if not re.search(r"(실패|불일치|오류|error|fail|로그인이\s*필요)", str(txt)[:600], re.I):
-                self.session_ok = True
+            if re.search(r"(비밀번호|아이디).{0,20}(불일치|틀|확인)|존재하지\s*않는\s*(회원|아이디)",
+                         body_s[:1500]):
+                reasons.append("자격증명 불일치: KRX 가 ID/PW 오류로 응답함")
+                continue
+            # 여기까지 왔으면 '아마 성공' 이다. 말이 아니라 기능으로 확인한다.
+            self.session_ok = True
+            probe = self.json_data("dbms/MDC/STAT/standard/MDCSTAT01501",
+                                   mktId="ALL", trdDd=_krx_recent_bizday())
+            if isinstance(probe, dict) and probe.get("OutBlock_1"):
                 self.status = "LOGIN_OK"
-                LOG.ok("KRX 마켓플레이스 로그인 성공.")
+                LOG.ok("KRX 마켓플레이스 로그인 성공 (인증 호출로 확인).")
                 return True
+            self.session_ok = False
+            reasons.append("로그인 응답은 정상이나 인증 호출이 데이터를 주지 않음 "
+                           "(세션 미형성 또는 bld 변경)")
         self.status = "LOGIN_FAILED"
-        LOG.warn("KRX 마켓플레이스 로그인 실패. ID/PW 를 확인하세요. "
-                 "로그인 불필요 경로로 폴백하며 백테스트는 정상 진행됩니다.")
+        LOG.warn("KRX 마켓플레이스를 사용하지 못했습니다 — 사유: "
+                 + " / ".join(dict.fromkeys(reasons)) + "\n"
+                 "  ※ 이 단계는 '검증·보강' 이며 백테스트에 필수가 아닙니다. 상장/폐지 목록과 "
+                 "시총은 로그인 불필요 경로(FDR·KIND·pykrx)로 이미 확보됩니다.\n"
+                 "  ※ 자격증명이 맞는데도 위 사유가 '네트워크/차단' 이면 ID/PW 문제가 아닙니다.")
         return self.openapi_ok
 
     def _probe_openapi(self) -> bool:
@@ -3093,6 +3296,13 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     #   krx 버킷으로 세면 KRX 를 쓰지도 않는 요청이 2.0qps 상한을 다 잡아먹어, 실제로
     #   두들겨지는 네이버 호스트는 상한 밖에서 무제한으로 맞는다.
     try:
+        # ★ 한때 이 호출을 KRXG.call 로 감쌌다 — 12스레드 직접 호출이 각자 재로그인하고 KRX 가
+        #   skipDup 으로 앞 세션을 죽여, 진 쪽이 로그인 HTML 을 받아 폴백 체인을 전부 타던
+        #   되먹임을 막기 위해서였다. 그 진단은 맞았지만 처방이 틀렸다: 게이트는 '자기를 통해
+        #   들어오는' 호출만 직렬화하므로 다른 스레드풀의 직접 호출은 그대로 새고, 반대로 이
+        #   경로는 KRX 를 두드리지도 않는데 KRX 락에 줄을 서 병렬성만 잃는다.
+        #   로그인 폭풍은 01_bootstrap 이 pykrx auth/webio 경계에서 락으로 막는다 —
+        #   호출 지점을 하나도 놓치지 않는 유일한 지점이다. 여기서는 계량만 맞추면 된다.
         limiter("naver").wait()
         d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
@@ -3125,8 +3335,15 @@ def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     # ★ 6자리 코드에 대한 FDR 기본 리더는 NaverDailyReader(fchart.stock.naver.com) 다.
     #   KRX 를 두드리지 않으므로 위 _px_pykrx 와 같은 이유로 naver 버킷을 쓴다.
     try:
+        # ★ 한때 이 경로를 전용 "fdr" 버킷으로 분리했다. 병목은 실제로 풀렸지만 방식이
+        #   틀렸다 — 두 경로가 같은 호스트(fchart.stock.naver.com)를 치는데 버킷을 나누면
+        #   그 호스트가 두 상한의 '합'을 맞는다. 상한 밖에서 무제한으로 맞는다는, 원래
+        #   지적했던 결함과 방향만 반대인 같은 결함이다. 한 호스트는 한 버킷으로 센다.
         limiter("naver").wait()
-        d = fdr.DataReader(code, start, end)
+        # FDR 은 실패를 print() 로 뱉는다(로거가 아니다). 폐지 종목이 정상적으로 섞인
+        # 소형주 백테스트에서 수백~수천 줄이 되어 진짜 경고를 화면 밖으로 밀어낸다.
+        with capture_noise(f"fdr:{code}"):
+            d = fdr.DataReader(code, start, end)
     except Exception:
         return None
     if d is None or len(d) == 0:
@@ -3191,10 +3408,64 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+# 종목 → 시장(KOSPI/KOSDAQ). 종목 마스터에서 채운다. 비어 있으면 예전처럼 둘 다 시도한다.
+CODE_MARKET: Dict[str, str] = {}
+CODE_LISTED: Dict[str, pd.Timestamp] = {}     # 종목 → 상장일
+CODE_DELISTED: Dict[str, pd.Timestamp] = {}   # 종목 → 폐지일
+
+
+def set_code_dates(sec: pd.DataFrame):
+    """상장일·폐지일 표. '캐시가 완결인가'를 판정하는 1순위 증거다.
+
+    ★ 왜 필요한가: 캐시 최소일이 요청 시작일보다 늦을 때, 그것이 '결손'인지 '그 종목의
+      실제 최초 거래일'인지 구분해야 한다. 예전에는 별도 원장(price_fetch_attempts)에만
+      의존했는데, 그 원장은 구버전에서 실패만 기록했고 다른 PC/전략의 캐시를 물려받으면
+      아예 비어 있다. 실측: 캐시 696만행·3,497종목이 있는데 원장에 없다는 이유로 3,492종목을
+      '처음부터 다시' 받았다. 상장일은 이미 종목 마스터에 있다 — 그걸 쓰는 게 맞다.
+    """
+    lo, ld = CODE_LISTED, CODE_DELISTED
+    lo.clear(); ld.clear()
+    cols = {c.lower(): c for c in sec.columns}
+    c_list = cols.get("listing_date") or cols.get("listed_date") or cols.get("list_date")
+    c_del = cols.get("delisting_date") or cols.get("delist_date")
+    codes = sec["code"].astype(str)
+    if c_list:
+        for c, v in zip(codes, as_ts_series(sec[c_list])):
+            if pd.notna(v):
+                lo[c] = v
+    if c_del:
+        for c, v in zip(codes, as_ts_series(sec[c_del])):
+            if pd.notna(v):
+                ld[c] = v
+    LOG.debug(f"상장일 {len(lo):,}종목 · 폐지일 {len(ld):,}종목 확보 — 캐시 완결성 판정에 사용")
+
+
+def set_code_market(sec: pd.DataFrame):
+    """yfinance 접미사를 '추측'하지 않기 위한 시장 구분표.
+
+    ★ 예전에는 모든 종목에 .KS 와 .KQ 를 둘 다 시도했다. 시장 구분은 종목 마스터에 이미
+      있는데도 그랬다. 그 결과 (a) 호출이 정확히 2배가 되고 (b) 실패하는 쪽이 항상 하나씩
+      생겨 로그가 'possibly delisted' 로 도배되어 진짜 오류가 묻힌다.
+    """
+    if sec is None or not len(sec) or "market" not in sec.columns:
+        return
+    m = {}
+    for c, mk in zip(sec["code"].astype(str), sec["market"].astype(str)):
+        u = mk.upper()
+        if "KOSDAQ" in u:
+            m[c] = ".KQ"
+        elif "KOSPI" in u or "STK" in u:
+            m[c] = ".KS"
+    CODE_MARKET.update(m)
+    LOG.debug(f"yfinance 접미사 확정 {len(m):,}종목 (추측 대신 시장 구분 사용)")
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if yf is None:
         return None
-    for suf in (".KS", ".KQ"):
+    known = CODE_MARKET.get(str(code))
+    sufs = (known,) if known else (".KS", ".KQ")
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
@@ -3243,7 +3514,11 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     #    → '언제 무엇을 시도했는지'를 남겨 30일간 재시도하지 않는다. 소스가 복구되면
     #      30일 뒤 자동으로 다시 시도하므로 영구 포기가 아니다.
     RETRY_AFTER_DAYS = 30
-    _today = as_ts(end)
+    # ★ 예전엔 _today = as_ts(end) 였다 — end 는 BACKTEST_END(설정 상수)지 '오늘'이 아니다.
+    #   그래서 attempted_at 이 항상 같은 값이라 (_today - at).days 가 늘 0 이었고,
+    #   "30일 뒤 자동 재시도합니다"는 영원히 오지 않았다. 일시적 네트워크 장애 한 번으로
+    #   종목이 유니버스에서 영구 제외되는데 INFO 한 줄로만 흘렀다.
+    _today = pd.Timestamp.today().normalize()
     attempts: Dict[str, dict] = {}
     _att = VAULT.get_table("price_fetch_attempts", scope="shared")
     if _att is not None and len(_att):
@@ -3262,7 +3537,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_ipo = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
@@ -3271,19 +3546,63 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 continue
             todo.append((c, start))
             continue
-        # ★ 과거 방향 백필을 반드시 함께 본다.
-        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
-        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
-        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
+        # ★ 과거 방향 백필을 함께 본다. 앞선 실행이 최근 구간만 캐시했다면
+        #   max 만 보고 판단하면 앞 구간을 영원히 못 받는다.
         if mn is not None and mn > start_ts + pd.Timedelta(days=10):
-            todo.append((c, start))
-            n_back += 1
+            # ★★ 여기서 무조건 재수집하면 '무한 재수집 루프'가 된다 ★★
+            #   2019년 상장 종목의 캐시 최소일은 당연히 2019년이다. 그건 '결손'이 아니라
+            #   그 종목의 실제 최초 거래일이다. 그런데 요청 시작일(2015)과만 비교하면
+            #   매 실행 전 구간을 다시 받고, 상장 전 데이터는 존재하지 않으므로 캐시
+            #   최소일이 움직이지 않아, 다음 실행도 똑같이 다시 받는다 — 영원히.
+            #   실측: 이 조건 하나로 1,974종목이 매 실행 재수집되어 55분을 썼다.
+            #   → 이미 이 시작일(또는 그 이전)로 요청해 본 적이 있으면 mn 이 곧 그 종목의
+            #     확정된 최초 거래일이다. 다시 물어도 답은 같다.
+            #   ★ 증거는 세 가지다. 강한 순서대로 본다.
+            #     ① 상장일: 캐시 최소일이 상장일 근처면 그건 결손이 아니라 완결이다. 가장 강하다.
+            #     ② 폐지일: 요청 시작일 이전에 이미 폐지된 종목은 받을 데이터 자체가 없다.
+            #     ③ 시도 원장: 위 둘을 모르는 종목의 마지막 수단.
+            #   예전에는 ③만 봤다. 그런데 원장은 구버전에서 실패만 기록했고 다른 PC/전략의
+            #   캐시를 물려받으면 비어 있다 — 실측으로 캐시 3,497종목 중 3,492종목이
+            #   '원장에 없다'는 이유만으로 전량 재수집됐다. 상장일은 이미 손에 있었다.
+            _L = CODE_LISTED.get(c)
+            _D = CODE_DELISTED.get(c)
+            _p = attempts.get(c)
+            _asked = _p.get("frm") if _p else None
+            if _L is not None and pd.notna(_L) and mn <= as_ts(_L) + pd.Timedelta(days=10):
+                n_ipo += 1                      # ① 상장일 = 캐시 최소일 → 완결
+            elif _D is not None and pd.notna(_D) and as_ts(_D) <= start_ts:
+                n_ipo += 1                      # ② 요청 구간 전에 폐지 → 받을 것이 없음
+            elif _asked is not None and pd.notna(_asked) and _asked <= start_ts + pd.Timedelta(days=10):
+                n_ipo += 1                      # ③ 같은 시작일로 이미 물어봤다
+            else:
+                todo.append((c, start))
+                n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
-            n_fwd += 1
+            # ★★ 폐지 종목이 매 실행 여기로 떨어졌다 ★★
+            #   2018년에 폐지된 종목은 캐시 최대일이 영원히 2018년이므로, 요청 종료일(2026)과
+            #   비교하면 매 실행 '증분 수집 대상'이 된다. 그리고 폐지 종목은 어느 소스도 주지
+            #   않으므로 pykrx→fdr→네이버(2호스트×2회)→yfinance 를 전부 헛돌고, KRX 게이트가
+            #   2qps 로 직렬화되어 있어 종목당 0.5초를 통째로 잡아먹는다. 상장일을 볼 때
+            #   폐지일도 같이 봐야 했다 — 앞선 수정이 backfill 분기만 덮었다.
+            _D = CODE_DELISTED.get(c)
+            if _D is not None and pd.notna(_D) and mx >= as_ts(_D) - pd.Timedelta(days=7):
+                n_ipo += 1                      # 폐지일까지 받아둠 = 완결. 더 받을 것이 없다.
+            elif _recently_failed(c, mx):
+                n_skip += 1                     # 최근 실패 = 네거티브 캐시 적용(예전엔 미적용)
+            else:
+                todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+                n_fwd += 1
+    if NOISE_COUNT:
+        LOG.info("수집 중 라이브러리 자체 출력 — "
+                 + " · ".join(f"{k} {v:,}건" for k, v in sorted(NOISE_COUNT.items()))
+                 + " (대부분 폐지·비상장 종목의 정상적인 '데이터 없음' 입니다)")
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+                 f"(요청 시작일 이전으로 물어본 적이 없는 종목만).")
+    if n_ipo:
+        LOG.info(f"캐시 최소일이 요청 시작일보다 늦지만 이미 확인된 {n_ipo:,}종목은 재수집하지 "
+                 f"않습니다 (상장이 그 이후 = 결손이 아님). 이 판정이 없으면 매 실행 전 구간을 "
+                 f"다시 받고도 캐시가 그대로라 영원히 반복합니다.")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -3311,26 +3630,40 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
-        failed = []
+        failed, asked = [], []
         for (c, st), d in zip(todo, res):
+            # ★ 성공/실패와 무관하게 '무엇을 언제 어느 시작일로 물어봤는지'를 남긴다.
+            #   성공분을 안 남기면 위의 무한 재수집 판정이 근거를 잃는다.
+            asked.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if asked:
+            _prev = _att if _att is not None and len(_att) else None
+            _all = pd.concat([_prev, pd.DataFrame(asked)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(asked)
+            # 같은 종목은 '가장 이른 시작일로 물어본 기록'을 남긴다(그게 확정 근거다).
+            # ★ 예전엔 keep="first" 라 attempted_at 이 '최초 시도 시각'에 고정됐다. 그러면
+            #   _recently_failed 의 30일 타이머가 31일째부터 영원히 False 를 돌려주어
+            #   네거티브 캐시가 스스로 꺼진다. requested_from 은 가장 이른 값(어디까지
+            #   물어봤나), attempted_at 은 가장 최근 값(언제 물어봤나)이어야 맞다.
+            _all = (_all.groupby("code", as_index=False)
+                        .agg(requested_from=("requested_from", "min"),
+                             attempted_at=("attempted_at", "max"))
+                        .reset_index(drop=True))
+            try:
+                VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
+                                source="fetch_prices:asked_ledger")
+            except Exception as e:                                   # noqa
+                LOG.warn(f"수집 시도 원장 저장 실패({type(e).__name__}) — 다음 실행이 같은 "
+                         f"구간을 다시 받을 수 있습니다.")
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
-            # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
-            #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
-            _prev = _att if _att is not None and len(_att) else None
-            _new = pd.DataFrame(failed)
-            _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
-            _all = (_all.sort_values("attempted_at")
-                        .drop_duplicates("code", keep="last").reset_index(drop=True))
-            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
-                            source="fetch_prices:negative_cache")
+            # 실패분은 위 asked 원장에 이미 포함되어 있다(중복 저장하지 않는다).
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
@@ -3565,14 +3898,29 @@ class DartBudget:
 DBUDGET: Optional[DartBudget] = None
 
 
+# ★ dart_api 는 실패 종류를 전부 None 으로 뭉갠다. 그런데 호출부는 '이 회사는 그 해에
+#   제출한 것이 없다(013)' 와 '한도가 소진돼 물어보지도 못했다' 를 반드시 구분해야 한다.
+#   구분하지 않으면 예산 소진분이 '데이터 없음' 센티넬로 공용 캐시에 영구 기록되어
+#   다음 실행이 영영 재요청하지 않는다 — 캐시를 훼손하는 것과 같다(절대 1원칙 위반).
+DART_LAST_STATUS = threading.local()
+
+
+def dart_status() -> str:
+    """직전 dart_api 호출의 결과 코드. '013'=자료없음 · 'NOBUDGET'/'NET'/'AUTH' 등."""
+    return getattr(DART_LAST_STATUS, "v", "")
+
+
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
     호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
     → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
+    DART_LAST_STATUS.v = ""
     if not DART_API_KEY:
+        DART_LAST_STATUS.v = "NOKEY"
         return None
     if DBUDGET is not None and not DBUDGET.take(tries):
+        DART_LAST_STATUS.v = "NOBUDGET"
         return None
     p = dict(params)
     p["crtfc_key"] = DART_API_KEY
@@ -3582,14 +3930,18 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
     if DBUDGET is not None:
         DBUDGET.refund(max(0, tries - max(1, attempts["n"])))
     if not isinstance(js, dict):
+        DART_LAST_STATUS.v = "NET"          # 네트워크/비JSON — 자료 없음이 아니다
         return None
     st = str(js.get("status", ""))
+    DART_LAST_STATUS.v = st or "000"
     if st and st != "000":
         if st in ("020", "021"):
             if DBUDGET is not None:
                 DBUDGET.exhausted = True
             LOG.warn(f"DART status={st} ({DART_STATUS_MSG.get(st, '?')}) — 수집을 중단하고 "
-                     f"받은 만큼 저장합니다. 내일 재실행하면 이어받습니다.")
+                     f"받은 만큼 저장합니다. ★ 지금 바로 재실행해도 됩니다 — 이미 받은 분은 "
+                     f"캐시에서 그대로 쓰이고 재요청하지 않습니다. 남은 분만 한도 리셋"
+                     f"(KST 자정) 이후에 채워집니다.")
         elif st in ("010", "011", "012", "901"):
             LOG.error(f"DART 인증 오류 status={st} ({DART_STATUS_MSG.get(st, '?')}). "
                       f"DART_API_KEY 를 확인하세요.")
@@ -3615,15 +3967,46 @@ _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
             "account_id", "account_nm", "thstrm_amount", "rcept_no"]
 
 
+_FS_DIV: Dict[str, str] = {}          # corp_code → 그 회사에서 실제로 먹히는 fs_div
+_FS_DIV_LK = threading.Lock()
+
+
 def _fs_one(job) -> Optional[pd.DataFrame]:
     corp, year, reprt = job
-    js = dart_api("fnlttSinglAcntAll.json",
-                  {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
-    if not js or "list" not in js:
+    # ★ 예전엔 (회사, 연도, 보고서)마다 OFS 를 먼저 치고 비면 CFS 를 또 쳤다. 소형주는
+    #   연결재무제표만 내는 곳이 많고 폐지사는 대부분 연도에 제출 자체가 없어서, 빈 조합마다
+    #   호출이 2배가 됐다 — 작업 15만건이 실호출 21만~25만건이 되는 경로다.
+    #   fs_div 는 회사 속성이지 연도 속성이 아니므로 회사당 한 번만 알아내고 재사용한다.
+    with _FS_DIV_LK:
+        known = _FS_DIV.get(corp)
+    order = (known,) if known else ("OFS", "CFS")
+    js, used = None, None
+    for div in order:
         js = dart_api("fnlttSinglAcntAll.json",
-                      {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
+                      {"corp_code": corp, "bsns_year": str(year),
+                       "reprt_code": reprt, "fs_div": div})
+        if js and isinstance(js.get("list"), list) and js["list"]:
+            used = div
+            break
+    if used and not known:
+        with _FS_DIV_LK:
+            _FS_DIV[corp] = used
     if not js or not isinstance(js.get("list"), list) or not js["list"]:
-        return None
+        # ★★ 센티넬은 '자료 없음'이 확인된 경우에만 쓴다 ★★
+        #   예산 소진·네트워크 실패·인증 오류로 못 물어본 것을 '없다'고 기록하면, 공용
+        #   캐시에 거짓 부재가 영구히 박히고 다음 실행이 영영 재요청하지 않는다.
+        #   실측 위험: 잔여 2만으로 잘라도 job 당 1~2 단위를 쓰므로 목록 중반부터 전부
+        #   예산 소진에 걸린다 — 매 실행 수천 건이 '제출 안 함'으로 굳는다.
+        _st = dart_status()
+        if _st not in ("013", "000"):
+            return None                      # 못 물어봤다 → 아무것도 기록하지 않는다
+        # ★ '데이터 없음'도 결과다. 빈손을 캐시하지 않으면 done 집합에 영영 안 들어가서
+        #   매 실행 같은 조합을 다시 묻는다 — "재실행하면 이 지점부터 이어받습니다"가
+        #   거짓이 되는 지점이고, 하루치 한도가 통째로 '같은 부재를 재발견'하는 데 쓰였다.
+        #   센티넬 1행을 남겨 다음 실행이 건너뛰게 한다(값은 전부 결측이라 집계에 무해).
+        return pd.DataFrame([{**{c: None for c in _FS_KEEP}, "corp_code": corp,
+                              "bsns_year": int(year), "reprt_code": reprt,
+                              "fs_div": "NONE", "account_id": "_EMPTY_"}])[_FS_KEEP]
     d = pd.DataFrame(js["list"])
     for c in _FS_KEEP:
         if c not in d.columns:
@@ -3706,7 +4089,9 @@ def fetch_dart_multi_accounts(corp_codes: Sequence[str], years: Sequence[int]) -
 
 
 def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
-                          priority: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                          priority: Optional[Sequence[str]] = None,
+                          only_years: Optional[Dict[str, set]] = None,
+                          reprt_codes: Optional[Sequence[str]] = None) -> pd.DataFrame:
     """전체 재무제표 원시 계정. 캐시 증분 — 이미 받은 (corp, year, reprt) 는 건너뛴다.
 
     priority 를 주면 그 순서(대개 유동성/시총 상위)대로 먼저 받는다.
@@ -3723,27 +4108,48 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
-    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
-              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    reprts = list(reprt_codes) if reprt_codes else (
+        [REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
+        else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
     # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
     corp_sorted = sorted((str(c) for c in corp_codes),
                          key=lambda c: (order.get(c, 10 ** 9), c))
+    # ★ only_years 가 있으면 '그 회사가 실제로 후보였던 기간(+소급)'만 요청한다. 예전에는
+    #   (회사 전체) × (전 기간 연도)의 데카르트 곱이라 2,980사 × 15년 × 4보고서 = 178,800회,
+    #   회사별 API 로 9일짜리 작업이었다. 2018~2021 에만 하위권이던 회사의 2012년 재무는
+    #   어느 리밸런싱 시점에서도 읽히지 않는다.
     jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
-            if (c, int(y), str(r)) not in done]
+            if (c, int(y), str(r)) not in done
+            and (only_years is None or int(y) in only_years.get(str(c), ()))]
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
         total_needed = len(jobs)
-        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
-                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
-        if total_needed > DART_DAILY_LIMIT:
-            LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
-                     f"오늘 받을 수 있는 만큼 받고 저장합니다. "
-                     f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
-                     f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
+        # ★★ 예전에는 jobs 전체를 그대로 pmap_io 에 넘기고 '한도에 걸리면 예외가 나겠지'에
+        #    맡겼다. 그 결과 하루치 호출을 통째로 태우고도 아무 회사도 완성되지 않았다
+        #    (실측: 사용자 키가 14,117회 소진). 요구사항은 "남은 호출량을 실시간으로 체크해서
+        #    그만큼만 쓰라"이므로, 던지기 전에 살아 있는 잔여 예산으로 잘라낸다.
+        _left = DBUDGET.remaining_calls() if DBUDGET is not None else None
+        if _left is not None and _left <= 0:
+            LOG.warn(f"DART 잔여 호출이 0 입니다 — Tier-2(전체 재무제표) 신규 수집을 건너뜁니다. "
+                     f"Tier-1(주요계정)만으로 V축·자본잠식 판정은 동작합니다. "
+                     f"★ 지금 재실행해도 여기까지는 캐시로 그대로 진행됩니다. 남은 분만 "
+                     f"한도 리셋(KST 자정) 이후에 채워집니다.")
+            jobs = []
+        elif _left is not None and total_needed > _left:
+            LOG.warn(f"필요 호출({total_needed:,})이 오늘 잔여({_left:,})를 넘습니다 — "
+                     f"잔여만큼인 {_left:,}건만 받고 나머지는 다음 실행으로 넘깁니다. "
+                     f"약 {math.ceil(total_needed / max(_left, 1))}일에 걸쳐 콜드빌드가 완성됩니다. "
+                     f"(우선순위 정렬이 되어 있어 '투자 가능한 종목의 최근 데이터'부터 채워집니다)")
+            jobs = jobs[:_left]
+        else:
+            LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 (오늘 잔여 "
+                     f"{_left if _left is not None else '미상':,}건 이내)"
+                     if _left is not None else f"DART 재무 신규 수집 대상 {total_needed:,}건")
+    if jobs:
         res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
         got = [d for d in res if d is not None and len(d)]
     else:
@@ -3772,6 +4178,10 @@ def merge_financial_tiers(full: pd.DataFrame, multi: pd.DataFrame) -> pd.DataFra
 
     콜드빌드가 며칠 걸리는 동안에도 매출·영업이익·순이익·자산·부채·자본은 전 종목이
     확보되어 있어 유니버스 구성과 규모 버킷(C11), R3 팩터가 즉시 동작한다."""
+    # ★ '데이터 없음' 센티넬(_fs_one)은 재요청을 막으려고 캐시에만 남기는 행이다. 여기서
+    #   걸러내지 않으면 '전체 재무제표가 있다'고 오인해 Tier-1(주요계정) 폴백을 막아버린다.
+    if full is not None and len(full) and "account_id" in full.columns:
+        full = full[full["account_id"].astype(str) != "_EMPTY_"]
     if multi is None or multi.empty:
         return full if full is not None else pd.DataFrame(columns=_FS_KEEP)
     if full is None or full.empty:
@@ -4337,11 +4747,42 @@ def _hk_parse(html: str, category: str) -> List[dict]:
     return out
 
 
+def research_covered_years(cached: Optional[pd.DataFrame], source: str) -> set:
+    """캐시에 이미 충분히 담긴 '지난 연도'들. 그 해는 다시 훑지 않는다.
+
+    ★ 예전에는 두 수집기 모두 캐시를 아예 보지 않고 매 실행 10년 전체를 다시 훑었다.
+      한경만 연 375페이지 × 11년 ÷ 2.0qps ≈ 34분, 네이버 상세보강까지 합치면 약 3시간이
+      '이미 가진 것을 다시 받는 데' 쓰였다.
+    ★ 올해는 항상 다시 훑는다 — 새 리포트가 계속 올라오기 때문이다. 지난 연도는 확정이다.
+    """
+    if cached is None or not len(cached) or "pub_date" not in cached.columns:
+        return set()
+    d = cached
+    if "source" in d.columns:
+        d = d[d["source"].astype(str).str.contains(source, na=False)]
+    if not len(d):
+        return set()
+    y = as_ts_series(d["pub_date"]).dt.year.dropna()
+    if not len(y):
+        return set()
+    this_year = pd.Timestamp.today().year
+    cnt = y.value_counts()
+    # 그 해에 리포트가 극소수면 수집이 중간에 끊긴 것으로 보고 다시 훑는다.
+    return {int(k) for k, v in cnt.items() if int(k) < this_year and int(v) >= 100}
+
+
 def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
-                     page_size: int = 80, max_pages: int = 400) -> pd.DataFrame:
+                     page_size: int = 80, max_pages: int = 400,
+                     skip_years: Optional[set] = None) -> pd.DataFrame:
     """연도 단위로 쪼개서 수집. 한 번에 10년을 요청하면 서버 페이지 상한에 걸린다."""
     rows: List[dict] = []
-    years = list(range(as_ts(start).year, as_ts(end).year + 1))
+    years = [y for y in range(as_ts(start).year, as_ts(end).year + 1)
+             if not (skip_years and y in skip_years)]
+    if skip_years:
+        LOG.info(f"한경: 캐시에 확정된 {len(skip_years)}개 연도는 건너뜁니다 "
+                 f"(재수집 {len(years)}개 연도만 — 연도당 약 375페이지).")
+    if not years:
+        return pd.DataFrame()
     jobs = []
     for skin in skins:
         for y in years:
@@ -4540,7 +4981,20 @@ def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
 
 
 def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "industry"),
-                  max_pages: int = 1500) -> pd.DataFrame:
+                  max_pages: int = 1500, skip_years: Optional[set] = None) -> pd.DataFrame:
+    # ★ 네이버는 날짜 구간 하나로 훑으므로 '연도 건너뛰기' 대신 시작일을 앞으로 당긴다.
+    #   캐시가 확정한 연도가 start 부터 연속으로 이어지는 만큼만 잘라낸다(중간 구멍은 다시 받는다).
+    if skip_years:
+        y0, y1 = as_ts(start).year, as_ts(end).year
+        y = y0
+        while y <= y1 and y in skip_years:
+            y += 1
+        if y > y0:
+            start = max(as_ts(start), as_ts(f"{y}-01-01")).strftime("%Y-%m-%d")
+            LOG.info(f"네이버: 캐시 확정 구간을 건너뛰고 {start} 부터 수집합니다 "
+                     f"({y - y0}개 연도 절약).")
+            if as_ts(start) > as_ts(end):
+                return pd.DataFrame()
     frames = []
     for cat in cats:
         # ① JSON API 우선
@@ -4600,12 +5054,31 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     return d
 
 
-def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
-    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다."""
+def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000,
+                        codes: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다.
+
+    ★ 이 함수 하나가 매 실행 2시간 13분을 썼다(20,000건 ÷ 2.5qps). 원인 두 가지:
+      ① 상세를 열어봤는데 목표주가가 없던 건은 다음 실행에도 target_price 가 결측이라
+         '아직 안 해봤다'와 구분되지 않아 영원히 다시 열었다 → detail_tried 로 표시한다.
+      ② 소비처는 build_tp_revision 뿐이고 그건 U-1000 패널에만 붙는다. 후보 밖 종목의
+         목표주가는 어디에도 쓰이지 않는데 다 받고 있었다 → codes 로 좁힌다.
+    """
     if df.empty:
         return df
+    if "detail_tried" not in df.columns:
+        df = df.assign(detail_tried=False)
+    df["detail_tried"] = df["detail_tried"].fillna(False).astype(bool)
     need = df[(df["source"] == "naver") & (df["category"] == "company") &
-              (df["target_price"].isna()) & (df["detail_url"].notna())].copy()
+              (df["target_price"].isna()) & (df["detail_url"].notna()) &
+              (~df["detail_tried"])].copy()
+    if codes is not None and "stock_code" in need.columns:
+        _cs = {str(c) for c in codes}
+        n0 = len(need)
+        need = need[need["stock_code"].astype(str).isin(_cs)]
+        if n0:
+            LOG.info(f"네이버 상세 보강 대상을 U-1000 후보로 축소: {n0:,} → {len(need):,}건 "
+                     f"(후보 밖 종목의 목표주가는 어느 패널에도 붙지 않습니다)")
     if need.empty:
         return df
     if len(need) > limit:
@@ -4634,6 +5107,9 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
 
     res = pmap_io(_one, need["detail_url"].tolist(), workers=min(8, N_WORKERS_IO),
                   desc="네이버 상세(목표주가)")
+    # ★ 시도했다는 사실 자체를 남긴다. 목표주가를 못 찾은 건도 '해봤다'로 표시해야
+    #   다음 실행이 같은 URL 을 다시 열지 않는다(이게 2시간의 절반이었다).
+    df.loc[df["detail_url"].isin(need["detail_url"]), "detail_tried"] = True
     got = pd.DataFrame([r for r in res if r])
     if got.empty:
         return df
@@ -4701,7 +5177,9 @@ def pdf_extract_fields(text: str) -> dict:
     return out
 
 
-def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
+def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0,
+                  codes: Optional[Sequence[str]] = None,
+                  train_per_year: int = 0) -> pd.DataFrame:
     """PDF 를 공용 인덱스에 저장(내용해시 경로 → 중복 저장 없음)하고 본문 필드를 추출한다."""
     if df.empty or not RESEARCH_DOWNLOAD_PDF:
         for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target"):
@@ -4711,7 +5189,42 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     if fitz is None and pdfplumber is None:
         LOG.warn("PDF 파서(pymupdf/pdfplumber)가 없어 원문 추출을 건너뜁니다. "
                  "한경 리스트의 작성자/목표주가만으로도 애널리스트 연결은 동작합니다.")
-    work = df[df["pdf_url"].notna()].copy()
+    # ★ 이미 받아서 blob 에 넣고 원장에 pdf_uid 를 남긴 건은 다시 열지 않는다. blob 캐시가
+    #   HTTP 는 막아줬지만 예전에는 pdf_uid 가 병합에서 증발해(14_entity:agg 누락) 매 실행
+    #   전 코퍼스를 드라이브에서 다시 읽고 pdf_text() 로 다시 파싱했다 — 최대 30만회.
+    _done_pdf = (df["pdf_uid"].astype(str).str.len() > 0) if "pdf_uid" in df.columns \
+        else pd.Series(False, index=df.index)
+    work = df[df["pdf_url"].notna() & ~_done_pdf].copy()
+    # ★★ 여기서 범위를 좁히지 않으면 전 코퍼스를 받는다 ★★
+    #   실측: 대상 198,128건 × 1.6건/초 = 34시간. 그런데 이 PDF 의 소비처는
+    #   build_report_text_table 하나뿐이고, 그것이 실제로 쓰는 것은
+    #     ① U-200 종목의 리포트(ΔTONE 계산 대상)  ② 톤 분류기 학습표본(연 상한)
+    #   둘뿐이다. 시총 하위 1000 전략이므로 후보 밖 종목의 리포트는 어느 패널에도
+    #   붙지 않는다 — 대형주 리포트가 코퍼스의 대부분인데 전부 받고 있었다.
+    if codes is not None and "stock_code" in work.columns:
+        _cs = {str(c) for c in codes}
+        n0 = len(work)
+        keep = work["stock_code"].astype(str).isin(_cs)
+        # 학습표본: 후보 밖 리포트도 연 상한만큼은 남긴다(분류기 일반화용).
+        if train_per_year > 0 and "pub_date" in work.columns:
+            _y = as_ts_series(work["pub_date"]).dt.year
+            extra = (work[~keep].assign(_y=_y[~keep])
+                     .sort_values("pub_date", kind="stable")
+                     .groupby("_y", observed=True).head(int(train_per_year)).index)
+            keep = keep | work.index.isin(extra)
+        work = work[keep]
+        LOG.table([["전체 PDF 대상", f"{n0:,}"],
+                   ["U-1000 후보 종목 리포트", f"{int(work['stock_code'].astype(str).isin(_cs).sum()):,}"],
+                   [f"학습표본(후보 밖 · 연 {train_per_year:,}건)",
+                    f"{len(work) - int(work['stock_code'].astype(str).isin(_cs).sum()):,}"],
+                   ["실제 수집 대상", f"{len(work):,}"],
+                   ["절감", f"{100*(1-len(work)/max(1,n0)):.0f}%"],
+                   ["예상 소요", f"약 {len(work)/max(RATE_LIMIT_QPS.get('hankyung',2.0),0.1)/3600:.1f}시간"]],
+                  ["항목", "건수"], ["l", "r"],
+                  title="PDF 수집 범위 — 소비처(ΔTONE)가 실제로 쓰는 것만 받는다")
+    if int(_done_pdf.sum()):
+        LOG.info(f"PDF {int(_done_pdf.sum()):,}건은 이미 원장에 pdf_uid 가 있어 건너뜁니다 "
+                 f"(신규 대상 {len(work):,}건).")
     if cap_per_month and len(work):
         work["_m"] = as_ts_series(work["pub_date"]).dt.to_period("M")
         work = work.groupby("_m", observed=True).head(cap_per_month).drop(columns=["_m"])
@@ -4725,7 +5238,20 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
                   (idx["subtype"].astype(str) == "report_pdf")]
         # iterrows 는 30만 행에서 13초를 쓴다. zip 은 같은 결과를 0.2초에 만든다.
         known = dict(zip(sub["key"].astype(str), sub["uid"].astype(str)))
-    LOG.info(f"PDF 대상 {len(work):,}건 (드라이브 캐시 보유 {sum(1 for k in work['report_uid'] if k in known):,}건)")
+    # ★ 캐시 보유분을 앞으로 보낸다. _one 은 캐시면 http_get 을 타지 않으므로(네트워크 0)
+    #   앞 청크가 즉시 끝나고, 중간에 끊겨도 '이미 가진 것'이 먼저 원장에 기록된다.
+    #   그리고 예상 시간은 '신규 다운로드분'으로만 계산해야 정직하다 — 예전 로그는 캐시분까지
+    #   포함해 34시간처럼 보이게 했다.
+    _hit = work["report_uid"].astype(str).isin(known.keys())
+    work = pd.concat([work[_hit], work[~_hit]], ignore_index=False)
+    _n_new = int((~_hit).sum())
+    _qps = max(float(RATE_LIMIT_QPS.get("hankyung", 2.0)), 0.1)
+    LOG.table([["PDF 대상", f"{len(work):,}"],
+               ["드라이브 캐시 보유 (네트워크 0)", f"{int(_hit.sum()):,}"],
+               ["신규 다운로드", f"{_n_new:,}"],
+               ["예상 소요 (신규분만)", f"약 {_n_new/_qps/3600:.1f}시간"]],
+              ["항목", "건수"], ["l", "r"],
+              title="PDF 수집 — 캐시 보유분 먼저 처리하고, 시간은 신규분으로만 추정한다")
 
     def _one(rec):
         uid, url = rec
@@ -5013,14 +5539,23 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
-        # ★ download_pdfs 가 붙이는 PDF 추출 컬럼은 '캐시된 원장'에만 존재한다. named
-        #   aggregation 은 열거하지 않은 컬럼을 통째로 버리므로, 여기서 명시하지 않으면
-        #   재실행마다 pdf_uid/pdf_analysts/pdf_emails/pdf_target 가 사라지고 그 손실이
-        #   그대로 공용 볼트에 덮어써진다 — build_analyst_ledger 의 pdf_header 폴백이
-        #   그때부터 빈손이 되어 애널리스트 연결이 통째로 끊긴다.
-        **{c: (c, lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), None))
-           for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target")
-           if c in d.columns},
+        # ★★ 이 5개가 빠져 있어서 PDF 캐시가 '쓰고도 못 읽는' 상태였다 ★★
+        #   download_pdfs 는 pdf_uid/pdf_analysts/pdf_emails/pdf_target 를 돌려주고
+        #   원장에 저장까지 된다. 그런데 다음 실행에서 원장을 다시 읽어 이 agg 를 통과시키면
+        #   named aggregation 은 열거하지 않은 컬럼을 통째로 버린다 → download_pdfs 가
+        #   pdf_uid 를 못 봐서 전 코퍼스(최대 30만건)를 매번 다시 내려받고 다시 파싱했다.
+        #   blob 캐시가 HTTP 는 막아줬지만 드라이브 blob 읽기 + pdf_text() 파싱 30만회는
+        #   그대로 났다. 게다가 그 손실이 공용 볼트에 그대로 덮어써지므로 다른 전략까지
+        #   같이 잃는다 — build_analyst_ledger 의 pdf_header 폴백이 빈손이 되어 애널리스트
+        #   연결이 통째로 끊긴다.
+        **({k: (k, _pick_str) for k in ("pdf_uid", "pdf_analysts", "pdf_emails")
+            if k in d.columns}),
+        # pdf_target 은 수치다 — 네이티브 max 로 NaN 을 무시한다(위 target_price 와 같은 이유:
+        # 파이썬 람다는 30만건에서 50초, 게다가 '첫 비결측'은 그룹 내 행 순서에 의존한다).
+        **({"pdf_target": ("pdf_target", "max")} if "pdf_target" in d.columns else {}),
+        # 상세페이지 조회 여부도 같은 이유로 반드시 살아남아야 한다 — 떨어지면 목표주가를
+        # 못 찾은 건을 매 실행 다시 연다(네이버 상세 2시간의 원인).
+        **({"detail_tried": ("detail_tried", "max")} if "detail_tried" in d.columns else {}),
     })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")

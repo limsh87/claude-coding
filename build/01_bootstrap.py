@@ -108,6 +108,7 @@ _OPTIONAL = [
     ("FinanceDataReader", "finance-datareader", "가격/상장목록 1순위 폴백"),
     ("pykrx",             "pykrx",              "PIT 상장목록(특정일 상장종목) — 생존자편향 제거의 핵심"),
     ("yfinance",          "yfinance",           "가격 최종 폴백"),
+    ("scikit-learn",      "sklearn",            "TONE 분류기(TF-IDF+로지스틱회귀)"),
     ("fitz",              "pymupdf",            "리포트 PDF 텍스트 추출(가장 빠름)"),
     ("pdfplumber",        "pdfplumber",         "PDF 추출 폴백"),
     ("rapidfuzz",         "rapidfuzz",          "사업장명/애널리스트명 유사도 매칭(고속)"),
@@ -201,16 +202,43 @@ RNG = np.random.default_rng(SEED)
 
 # 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
-if OPT.get("FinanceDataReader"):
+
+# ★★ import 실패를 조용히 삼키면 안 된다 ★★
+#   예전에는 `except Exception: pykrx_stock = None` 이었다. 그러면 '설치는 됐지만 import 가
+#   깨진' 상태(파이썬 3.14 + 윈도우에서 실제로 발생)가 '패키지 없음'과 구별되지 않는다.
+#   상단 표에는 "pykrx 설치됨"으로 뜨는데 실제로는 None 이라, 시총 스냅샷이 0건이 되고
+#   → 후보를 못 좁혀 전 종목 5,398개 일봉을 받는 폭주로 이어졌다. 사용자는 원인을 볼 수
+#   없었다. 실패 사유를 반드시 남기고, 능력 표가 '실물 import 결과'를 말하게 한다.
+IMPORT_FAILURES: Dict[str, str] = {}
+
+
+def _opt_import(pkg: str, fn):
+    if not OPT.get(pkg):
+        return None
     try:
-        import FinanceDataReader as fdr           # type: ignore
-    except Exception:
-        fdr = None
-if OPT.get("pykrx"):
-    try:
-        from pykrx import stock as pykrx_stock    # type: ignore
-    except Exception:
-        pykrx_stock = None
+        return fn()
+    except BaseException as e:                    # noqa — SystemExit/ImportError 모두 잡는다
+        IMPORT_FAILURES[pkg] = f"{type(e).__name__}: {e}"
+        return None
+
+
+def _import_fdr():
+    import FinanceDataReader as _m                # type: ignore
+    # FDR 은 종목마다 '"000010" invalid symbol or has no data' 를 직접 출력한다.
+    # 폐지 종목이 정상적으로 섞인 소형주 백테스트에서 수천 줄이 되어 진짜 경고를 밀어낸다.
+    for _n in ("FinanceDataReader", "financedatareader", "requests", "urllib3"):
+        logging.getLogger(_n).setLevel(logging.CRITICAL)
+        logging.getLogger(_n).propagate = False
+    return _m
+
+
+def _import_pykrx():
+    from pykrx import stock as _m                 # type: ignore
+    return _m
+
+
+fdr = _opt_import("FinanceDataReader", _import_fdr)
+pykrx_stock = _opt_import("pykrx", _import_pykrx)
 
 # ★ pykrx 1.2.8 의 get_auth_session() 은 모듈 전역 _auth_session 에 대해 '락 없는 검사-후-생성'
 #   이다. 스레드 N 개가 동시에 None(또는 만료)을 보면 N 번 로그인하고, KRX 는 중복 로그인을
@@ -254,6 +282,13 @@ if pykrx_stock is not None:
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
+        # ★ yfinance 는 종목마다 "possibly delisted; no price data found" 를 ERROR 로 뱉는다.
+        #   폐지 종목이 정상적으로 섞여 있는 소형주 백테스트에서는 이게 수천 줄로 쏟아져
+        #   진짜 경고를 화면 밖으로 밀어낸다. 실패 건수는 우리가 수집 시도 원장으로 이미
+        #   집계하므로(원인·재시도 정책 포함) 라이브러리 자체 로그는 끈다 — 정보 손실이 없다.
+        for _n in ("yfinance", "yfinance.data", "yfinance.ticker", "peewee", "urllib3"):
+            logging.getLogger(_n).setLevel(logging.CRITICAL)
+            logging.getLogger(_n).propagate = False
     except Exception:
         yf = None
 if OPT.get("fitz"):
