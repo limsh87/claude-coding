@@ -210,11 +210,33 @@ def _xml_to_text(raw: bytes) -> Tuple[str, str]:
     return txt, "ok"
 
 
-def _section(text: str, key: str, span: int = 6000) -> str:
-    m = _SECTION_RE[key].search(text)
-    if not m:
+def _section(text: str, key: str, span: int = 6000,
+             probe: Optional[Sequence[str]] = None, max_tries: int = 10) -> str:
+    """앵커 섹션을 잘라낸다. ★ '문서 전체의 첫 매치'를 쓰면 안 된다.
+
+    ★★ 이 함수가 조용히 실패하면 §6.1 배제플래그 6종 중 4종과 §7.2 3-A 6개 중 4개가
+       '한 번도 발동하지 않는다' ★★
+      DART 사업보고서는 맨 앞에 목차가 있고, 앵커 정규식(`감사의견`, `주주에 관한 사항`,
+      `특수관계자…거래` 등)은 목차 항목에 그대로 걸린다. 그러면 창 6,000자가 목차와
+      회사의 개요를 덮고 실제 섹션에는 닿지 못한다. 파이프라인은 정상 종료하고 진단표에는
+      "섹션 발견율 100%" 가 찍히는데, 값은 전부 None 이다. 그리고 '근거 결측이면 배제하지
+      않는다' 규칙과 결합해 필터층이 통째로 무력화된다. 더 나쁜 것은 어블레이션이
+      "3-A 는 기여가 없다"로 읽히지 "3-A 가 실행되지 않았다"로 읽히지 않는다는 점이다.
+    → 앵커의 모든 매치를 돌면서 '목표 숫자·문구가 실제로 잡히는 창'을 채택한다.
+    """
+    hits = [m.start() for m in _SECTION_RE[key].finditer(text)]
+    if not hits:
         return ""
-    return text[m.start(): m.start() + span]
+    hits = hits[:max_tries]
+    if probe:
+        for st in hits:
+            w = text[st: st + span]
+            if any(re.search(p, w) for p in probe):
+                return w
+    # 목표를 못 찾았거나 probe 가 없으면: 목차로 추정되는 선두 매치를 피해 마지막 매치를 쓴다.
+    #  (목차는 문서 앞부분에 몰려 있고, 실제 본문 섹션은 뒤에 온다)
+    st = hits[-1] if len(hits) > 1 else hits[0]
+    return text[st: st + span]
 
 
 def _count_patents(sect: str) -> Optional[float]:
@@ -246,14 +268,27 @@ def _rnd_headcount(sect: str) -> Optional[float]:
 
 
 def _ratio_pct(sect: str, pats: Sequence[str]) -> Optional[float]:
+    """'%' 로 적힌 비율을 소수로 돌려준다.
+
+    ★★ 예전 코드는 `v / 100.0 if v > 1.5 else v` 였다 ★★
+      즉 "0.8 %" 를 0.8(=80%)로, "1.5 %" 를 1.5(=150%)로 읽었다. 실무에서 특수관계자
+      매출 비중이 1.5% 이하인 종목은 드물지 않다(로그정규 중앙값 4% 가정 시 약 22%).
+      그 종목들이 전부 100배로 부풀려져 §7.2 `r_related(>30%)` 에 무조건 걸렸고,
+      §6.1 `x_related_up` 의 '상승폭 상위 20%' 임계는 5배 이동해 올바른 플래그 집합과의
+      일치율이 5% 수준이었다 — 이 플래그는 특수관계자 위험이 아니라 '비중이 1.5% 미만인가'
+      를 세고 있었다. 1.5 라는 컷 자체가 명세에 없는 임의값이다.
+    → 패턴이 '%' 기호를 실제로 소비했으면 무조건 /100 한다. 여기 오는 패턴은 전부 그렇다.
+    """
     for p in pats:
         m = re.search(p, sect)
         if m:
             try:
                 v = float(m.group(1).replace(",", ""))
-                return v / 100.0 if v > 1.5 else v
             except Exception:
                 continue
+            if not np.isfinite(v) or v < 0 or v > 100.0:
+                continue                      # 표에서 엉뚱한 숫자를 물었다 — 다음 패턴으로
+            return v / 100.0
     return None
 
 
@@ -279,11 +314,13 @@ def _amount_krw(sect: str, pats: Sequence[str]) -> Optional[float]:
 def extract_report_facts(text: str) -> dict:
     """사업보고서 본문 → 하드팩트 수치. 판단하지 않고 숫자만 뽑는다."""
     out: Dict[str, Any] = {}
-    ip = _section(text, "ip")
+    ip = _section(text, "ip", probe=[r"특허\D{0,12}?[\d,]{1,6}\s*건",
+                                     r"특허\s*(?:권|등록|제?\s*\d{2,})"])
     out["patents"] = _count_patents(ip)
     out["sect_ip"] = bool(ip)
 
-    rnd = _section(text, "rnd")
+    rnd = _section(text, "rnd", probe=[r"연구\s*(?:개발)?\s*인력\D{0,12}?[\d,]{1,6}\s*명",
+                                       r"(?:연구원|연구개발\s*인원)\D{0,10}?[\d,]{1,6}\s*명"])
     out["rnd_headcount"] = _rnd_headcount(rnd)
     out["sect_rnd"] = bool(rnd)
     # 정부 R&D 과제: 완료형 사실 문장만 인정
@@ -293,35 +330,45 @@ def extract_report_facts(text: str) -> dict:
             gov += 1
     out["gov_rnd_facts"] = float(gov)
 
-    rel = _section(text, "related")
+    _rel_pats = [r"매출\D{0,20}?([\d,.]+)\s*%", r"비중\D{0,10}?([\d,.]+)\s*%"]
+    _relp_pats = [r"매입\D{0,20}?([\d,.]+)\s*%"]
+    rel = _section(text, "related", probe=_rel_pats + _relp_pats)
     out["sect_related"] = bool(rel)
-    out["related_sales_ratio"] = _ratio_pct(
-        rel, [r"매출\D{0,20}?([\d,.]+)\s*%", r"비중\D{0,10}?([\d,.]+)\s*%"])
-    out["related_purchase_ratio"] = _ratio_pct(
-        rel, [r"매입\D{0,20}?([\d,.]+)\s*%"])
+    out["related_sales_ratio"] = _ratio_pct(rel, _rel_pats)
+    out["related_purchase_ratio"] = _ratio_pct(rel, _relp_pats)
 
-    cg = _section(text, "contingent")
+    _cg_pats = [r"지급보증\D{0,24}?([\d,]{3,})", r"우발부채\D{0,24}?([\d,]{3,})"]
+    cg = _section(text, "contingent", probe=_cg_pats)
     out["sect_contingent"] = bool(cg)
-    out["contingent_amt"] = _amount_krw(
-        cg, [r"지급보증\D{0,24}?([\d,]{3,})", r"우발부채\D{0,24}?([\d,]{3,})"])
+    out["contingent_amt"] = _amount_krw(cg, _cg_pats)
 
-    ls = _section(text, "lawsuit")
+    _ls_pats = [r"소송\s*가?액\D{0,24}?([\d,]{3,})", r"청구\s*금액\D{0,24}?([\d,]{3,})"]
+    ls = _section(text, "lawsuit", probe=_ls_pats + [r"소송.{0,20}제기"])
     out["sect_lawsuit"] = bool(ls)
-    out["lawsuit_amt"] = _amount_krw(
-        ls, [r"소송\s*가?액\D{0,24}?([\d,]{3,})", r"청구\s*금액\D{0,24}?([\d,]{3,})"])
+    out["lawsuit_amt"] = _amount_krw(ls, _ls_pats)
     out["lawsuit_new"] = float(sum(1 for s in _SENT_SPLIT.split(ls)[:300]
                                    if re.search(r"소송.{0,20}제기", s) and is_completed_fact(s)))
 
-    au = _section(text, "audit")
+    # ★ 핵심감사사항(KAM)은 2018년 이후 상장사 감사보고서의 '필수 기재사항'이지 강조사항이
+    #   아니다. 탐지어에 넣으면 정상 기업이 전부 발동한다. §6.1/§7.2 가 요구하는 것은
+    #   '강조사항·특기사항'과 '계속기업 불확실성' 이다.
+    _au_pats = [r"강조\s*사항", r"특기\s*사항", r"계속기업.{0,20}(불확실|의문|중요한)"]
+    au = _section(text, "audit", probe=_au_pats)
     out["sect_audit"] = bool(au)
-    out["audit_emphasis"] = float(bool(
-        re.search(r"(강조사항|특기사항|계속기업|핵심감사사항)", au) and
-        not re.search(r"해당사항\s*없|없습니다", au[:400])))
+    _au_hit = next((m for m in (re.search(p, au) for p in _au_pats) if m), None)
+    if _au_hit is None:
+        out["audit_emphasis"] = 0.0
+    else:
+        # 부정 판정은 '그 문구 주변'에서 본다. 앵커 기준 고정 400자 창은 문서 레이아웃의
+        # 우연에 판정이 좌우된다(목차 유무만으로 결과가 뒤집혔다).
+        _near = au[max(0, _au_hit.start() - 120): _au_hit.start() + 300]
+        out["audit_emphasis"] = float(not re.search(r"해당\s*사항\s*(?:이)?\s*없|"
+                                                    r"기재할\s*사항\s*없|없습니다", _near))
 
-    hd = _section(text, "holder")
+    _hd_pats = [r"최대주주\D{0,40}?([\d,.]+)\s*%", r"소유\s*비율\D{0,10}?([\d,.]+)\s*%"]
+    hd = _section(text, "holder", probe=_hd_pats)
     out["sect_holder"] = bool(hd)
-    out["major_holder_pct"] = _ratio_pct(
-        hd, [r"최대주주\D{0,40}?([\d,.]+)\s*%", r"소유\s*비율\D{0,10}?([\d,.]+)\s*%"])
+    out["major_holder_pct"] = _ratio_pct(hd, _hd_pats)
     return out
 
 
@@ -456,11 +503,36 @@ def report_parse_rate(F: pd.DataFrame, stats: dict) -> float:
                                              "sect_audit", "sect_holder")]
         okF = F[F["parse_status"].astype(str) == "ok"]
         if len(okF):
-            LOG.table([[c.replace("sect_", ""),
-                        f"{100*pd.to_numeric(okF[c], errors='coerce').fillna(0).mean():.1f}%"]
-                       for c, _ in sect],
-                      ["섹션", "정상판독 문서 내 발견율"], ["l", "r"],
-                      title="섹션별 발견율 — '판독 실패'와 '해당 섹션 없음'은 다른 사건이다")
+            # ★★ '섹션 발견율' 만 보면 안 된다 ★★
+            #   그 표는 "단어가 문서 어딘가에 있었다"를 재는 것이지 "그 섹션을 읽었다"를
+            #   재는 것이 아니다. 앵커가 목차에 걸리면 발견율은 100% 인데 값은 전부 None 이고,
+            #   그 상태로 §6.1 배제플래그 4종과 §7.2 3-A 4개가 한 번도 발동하지 않는다.
+            #   → 필드별 '값 추출 성공률' 을 나란히 싣는다. 이 값이 0 에 가까우면 파서가
+            #     죽은 것이지 데이터가 없는 것이 아니다.
+            _valcol = {"ip": "patents", "rnd": "rnd_headcount", "related": "related_sales_ratio",
+                       "contingent": "contingent_amt", "lawsuit": "lawsuit_amt",
+                       "audit": "audit_emphasis", "holder": "major_holder_pct"}
+            rows, worst = [], []
+            for c, _ in sect:
+                nm = c.replace("sect_", "")
+                s_rate = 100 * pd.to_numeric(okF[c], errors="coerce").fillna(0).mean()
+                vc = _valcol.get(nm)
+                if vc and vc in okF.columns:
+                    v_rate = 100 * okF[vc].notna().mean()
+                    vtxt = f"{v_rate:.1f}%"
+                    if s_rate >= 50.0 and v_rate < 5.0:
+                        worst.append(nm)
+                else:
+                    vtxt = "—"
+                rows.append([nm, f"{s_rate:.1f}%", vtxt])
+            LOG.table(rows, ["섹션", "앵커 발견율", "값 추출 성공률"], ["l", "r", "r"],
+                      title="섹션별 발견율 vs 값 추출률 — 앵커만 잡히고 값이 안 나오면 "
+                            "목차에 걸린 것이다(필터층이 통째로 무력화된다)")
+            if worst:
+                LOG.warn(f"앵커는 잡히는데 값이 거의 안 나오는 섹션: {', '.join(worst)}. "
+                         f"이 섹션에 의존하는 §6.1 배제플래그·§7.2 3-A 는 사실상 발동하지 "
+                         f"않습니다 — 어블레이션의 '기여 없음'을 '규칙이 무의미하다'로 읽지 "
+                         f"마십시오. 파서가 실행되지 않은 것입니다.")
     if rate < 0.80:
         LOG.warn(f"dart_parse_rate {100*rate:.1f}% < 80% (§2.1 게이트 미달). "
                  f"주된 사유는 위 표에 분해되어 있습니다. 스캔본 비중이 높다면 정규식을 고쳐도 "
@@ -733,7 +805,13 @@ def _attach_disclosure_events(d: pd.DataFrame, dis: pd.DataFrame,
     sig_by_rebal = (d.groupby("rebal", observed=True)["signal_date"].first().to_dict())
     prev_by_rebal: Dict[Any, pd.Timestamp] = {}
     for i, t in enumerate(reb):
-        prev_by_rebal[t] = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        # ★ 왼쪽 끝은 '직전 분기의 signal_date'. 명목 리밸일로 잡으면
+        #   (signal_{i-1}, rebal_{i-1}] 구간이 어느 창에도 속하지 않아, 명목일이 거래일인
+        #   분기마다 정확히 1거래일의 공시가 사라진다.
+        _p = as_ts(sig_by_rebal.get(reb[i - 1])) if i > 0 else None
+        if _p is None:
+            _p = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        prev_by_rebal[t] = _p
 
     idx = {(c, as_ts(t)): None for c, t in zip(d["code"], d["rebal"])}
     for t in reb:

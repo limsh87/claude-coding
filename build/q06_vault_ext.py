@@ -41,6 +41,36 @@ def ro_read_parquet(path: str) -> Tuple[Optional[pd.DataFrame], str]:
         return None, type(e).__name__
 
 
+@contextmanager
+def _suppress_corrupt_rename():
+    """이 블록 안에서는 read_parquet_safe 가 파일을 개명하지 않는다.
+
+    ★ 쓰기루트도 결국 같은 구글드라이브다. 위 독스트링이 진단한 파괴 조건(placeholder /
+      동기화 중 부분 파일)은 미러만의 문제가 아니라 쓰기루트에서도 똑같이 성립한다.
+      그런데 코어 load_index 는 index.parquet 을 read_parquet_safe 로 읽으므로,
+      동기화가 느린 환경에서는 실행마다 index.parquet 을 `.corrupt.<ts>` 로 개명한다.
+      저널이 진실의 원천이라 데이터 유실은 없지만 (a) "삭제 없음 / 기존 캐시 훼손 금지"가
+      자기 쓰기루트에서 깨지고, (b) .corrupt 파일이 무한히 쌓이며, (c) 멀쩡한 컴팩션
+      결과를 매번 버려 저널 전량 재파싱을 하게 된다.
+    """
+    g = globals()
+    orig = g.get("read_parquet_safe")
+
+    def _ro(path, *a, **kw):
+        d, st = ro_read_parquet(path)
+        if d is None and st not in ("ok", "FileNotFoundError"):
+            LOG.info(f"인덱스 parquet 을 아직 읽을 수 없습니다({st}) — 파일은 그대로 두고 "
+                     f"저널로 진행합니다: {path}")
+        return d
+
+    g["read_parquet_safe"] = _ro
+    try:
+        yield
+    finally:
+        if orig is not None:
+            g["read_parquet_safe"] = orig
+
+
 def _expand(p: str) -> str:
     try:
         return os.path.abspath(os.path.expanduser(os.path.expandvars(str(p))))
@@ -222,6 +252,9 @@ class QVFVault(Vault):
         self._own_only = False                       # compact 중 미러 행을 배제하기 위한 스위치
         self._merged: Dict[str, pd.DataFrame] = {}   # 미러 병합 결과 캐시(더티 시 무효화)
         self._uidpath: Dict[str, Dict[str, Tuple[str, str, str]]] = {}   # uid → 경로
+        # 이번 실행에서 등록한 행. 코어가 self._idx 를 갱신하지 않으므로 조회 때 얹어준다.
+        self._new_rows: Dict[str, List[dict]] = {}
+        self._idxlk = threading.RLock()              # read_parquet_safe 치환 구간 보호용
 
     # ── 쓰기 경로 구조적 봉인 ----------------------------------------------------------
     def _wpath(self, path: str) -> str:
@@ -301,9 +334,59 @@ class QVFVault(Vault):
         self._mirror_idx[key] = out
         return out
 
+    # ★★ 같은 실행에서 저장한 것을 같은 실행에서 반드시 되찾을 수 있어야 한다 ★★
+    #   코어 Vault._register 는 _pending 과 _uidset 만 갱신하고 self._idx 는 손대지 않는다.
+    #   그리고 코어 load_index 는 force 가 아니면 self._idx 의 캐시본을 그대로 돌려준다.
+    #   그래서 "put_blob → flush → get_blob" 이 같은 실행 안에서 None 을 돌려주는 구멍이
+    #   있었다. 콜드런 1회차에 방금 내려받은 PDF 가 TONE 입력에서 통째로 빠지고, 2회차부터
+    #   갑자기 정상이 되는 형태로 나타난다 — '본문이 짧아 제외'와 구분되지 않는다.
+    #   저장↔재호출 연결은 이 전략의 절대 1원칙이므로, 등록분을 인덱스에 반드시 얹는다.
+    def _pending_frame(self, scope: str) -> Optional[pd.DataFrame]:
+        with self._lk:
+            rows = list(self._new_rows.get(scope, ()))
+        if not rows:
+            return None
+        f = pd.DataFrame(rows)
+        if "uid" in f.columns:
+            f["uid"] = f["uid"].astype(str)
+        f["_root"] = self.root
+        return f
+
+    def _with_new_rows(self, scope: str, own: pd.DataFrame) -> pd.DataFrame:
+        f = self._pending_frame(scope)
+        if f is None:
+            return own
+        o = own.copy()
+        if "_root" not in o.columns:
+            o["_root"] = self.root
+        allc: List[str] = []
+        for g in (o, f):
+            for c in g.columns:
+                if c not in allc:
+                    allc.append(c)
+        out = pd.concat([o.reindex(columns=allc), f.reindex(columns=allc)], ignore_index=True)
+        if "uid" in out.columns:
+            out["uid"] = out["uid"].astype(str)
+            # 저널을 이미 다시 읽었다면 같은 uid 가 양쪽에 있다 — 먼저 온 쪽(저널)을 남긴다.
+            out = out.drop_duplicates(subset=["uid"], keep="first").reset_index(drop=True)
+        return out
+
     def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:
-        own = super().load_index(scope, force=force)
+        if force:
+            # ★ force=True 가 오히려 복구를 막던 버그: 파생 캐시를 같이 비우지 않으면
+            #   스테일 인덱스로 만들어진 빈 uid→경로 사전이 그대로 남아 get_blob 이
+            #   영구히 None 을 돌려준다.
+            with self._lk:
+                self._merged.pop(scope, None)
+                self._uidpath.pop(scope, None)
+                self._mirror_idx.pop(scope, None)
+        with self._idxlk:
+            with _suppress_corrupt_rename():
+                own = super().load_index(scope, force=force)
+        own = self._with_new_rows(scope, own)
         if self._own_only:
+            with self._lk:
+                self._uidset[scope] = set(own["uid"].astype(str).tolist()) if len(own) else set()
             return own
         if not force:
             cached = self._merged.get(scope)
@@ -358,8 +441,17 @@ class QVFVault(Vault):
                 self.stats[f"mirror_table_hit:{name}"] += 1
                 LOG.info(f"로컬/미러 캐시 적중: {name} ({len(dd):,}행) ← {mr}")
                 PIPE.io("IN", "MIRROR", f"table:{name}", dd, source=mr)
-                if self.promote_tables:
-                    # 드라이브에 '없을 때만' 승격한다 → 최신본을 과거본으로 덮을 수 없다.
+                if sc != scope:
+                    LOG.warn(f"  ※ 요청 스코프는 '{scope}' 인데 '{sc}' 스코프의 동명 테이블을 "
+                             f"채택했습니다: {name} — 이름이 겹치는 전략이 있는지 확인하세요.")
+                    self.table_src[name] = f"{mr}#{sc}"
+                # ★★ 승격은 '드라이브에 파일이 실재하지 않을 때만' ★★
+                #   super().get_table 은 파일이 있어도 max_age_days 를 넘기면 None 을 준다.
+                #   그 None 을 '드라이브에 없음'으로 읽으면, 로컬 미러(복사·동기화로 mtime 만
+                #   최신이고 내용은 과거)가 드라이브의 최신본을 덮어쓴다. dart_corpcode 처럼
+                #   전 파이프라인의 종목 연결 축이 3분의 1로 줄어드는 사고가 실제로 난다.
+                _own_p = os.path.join(self.table_dir(scope), f"{name}.parquet")
+                if self.promote_tables and not os.path.exists(_own_p):
                     try:
                         self.put_table(name, dd, scope=scope, domain="table",
                                        source=f"promoted_from_mirror:{os.path.basename(mr)}")
@@ -397,8 +489,60 @@ class QVFVault(Vault):
     #      ③ get_blob   : 전 인덱스 불리언 마스크 → uid→경로 사전
     def _register(self, scope: str, rec: dict):
         super()._register(scope, rec)
+        with self._lk:
+            self._new_rows.setdefault(scope, []).append(dict(rec))
         self._merged.pop(scope, None)
         self._uidpath.pop(scope, None)
+
+    def flush(self, scope: Optional[str] = None):
+        """코어와 달리 append 가 성공한 뒤에 pending 을 비운다.
+
+        ★ 코어는 `rows, self._pending[sc] = self._pending[sc], []` 로 먼저 비우고 append 한다.
+          드라이브 용량 초과·네트워크 끊김으로 append 가 던지면 그 행들은 영구 소실되고,
+          blob 파일은 이미 쓰여 있으므로 '인덱스 없는 고아 blob' 이 남는다. 삭제 API 가
+          없으므로 영구히 남고, 그 세션 내내 has() 는 True 라 재수집도 되지 않는다.
+        """
+        scopes = [scope] if scope else ["shared", "private"]
+        for sc in scopes:
+            with self._lk:
+                rows = list(self._pending.get(sc, ()))
+            if not rows:
+                continue
+            with self.lock(f"journal_{sc}"):
+                append_jsonl(self.journal(sc), rows)     # 실패하면 여기서 예외 — pending 은 그대로
+            with self._lk:
+                del self._pending[sc][:len(rows)]
+            self.stats[f"journal_append:{sc}"] += len(rows)
+            LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")
+
+    def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
+              source: str = "", event_date=None, knowledge_date=None,
+              scope: str = "shared", extra: Optional[dict] = None,
+              size: Optional[int] = None) -> Optional[str]:
+        """size 를 알고 있으면 getsize() 를 생략한다 — 드라이브 FUSE 왕복 1회/파일 절감.
+
+        ★ uid 는 코어와 동일한 sha1_str("adopt", domain, subtype, abspath, size) 여야 한다.
+          계약 Q7 이 '코어 경로와 size 지정 경로의 uid 가 같은가'를 회귀로 고정한다.
+        """
+        if size is None:
+            return super().adopt(abs_path, domain, subtype, key, source=source,
+                                 event_date=event_date, knowledge_date=knowledge_date,
+                                 scope=scope, extra=extra)
+        sz = int(size)
+        uid = sha1_str("adopt", domain, subtype, os.path.abspath(abs_path), sz)
+        if self.has(scope, uid):
+            return uid
+        self._register(scope, {
+            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),
+            "path": abs_path, "abs_path": abs_path,
+            "fmt": os.path.splitext(abs_path)[1].lstrip("."),
+            "bytes": sz, "sha1": "", "source": source or "adopted",
+            "event_date": str(as_ts(event_date) or ""),
+            "knowledge_date": str(as_ts(knowledge_date) or ""),
+            "adopted": True, "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),
+        })
+        self.stats["adopted"] += 1
+        return uid
 
     def has(self, scope: str, uid: str) -> bool:
         if scope not in self._uidset:
@@ -443,9 +587,30 @@ class QVFVault(Vault):
         return None
 
     # ── 기존 리포트 폴더 흡수 (드라이브 FUSE 안전판) --------------------------------------
-    _MANAGED_DIRNAMES = {"blob", "table", "index", "_backup", "_locks", "reports"}
+    # ★★ 이름으로 프루닝하면 사용자의 폴더를 먹는다 ★★
+    #   예전에는 {"blob","table","index","_backup","_locks","reports"} 를 '이름'으로 잘랐다.
+    #   그러면 트리 어디에 있든 그 이름이면 하위 전체가 사라진다 — GDRIVE_ADOPT_DIRS 기본값에
+    #   `reports` 가 있는데 `research/reports/`, `archive/reports/` 는 리포트를 모아둔
+    #   폴더에서 극히 흔한 이름이다. 실측으로 8개 중 7개가 통째로 누락됐고, 누락 사실은
+    #   어디에도 남지 않았다. 그래서 '이름'이 아니라 '구조'로 판정한다.
+    _HEX2_RE = re.compile(r"^[0-9a-f]{2}$")
+    _HASH_FANOUT_MIN = 32          # 2자리 16진수 하위폴더가 이만큼이면 내용해시 샤드 트리
+    _MANAGED_NS_CHILD = {"index", "blob", "table", "_backup", "_locks"}
     _SKIP_DIRNAMES = {".git", "__pycache__", ".ipynb_checkpoints", "node_modules",
                       ".cache", ".Trash", "$RECYCLE.BIN", "System Volume Information"}
+
+    def _is_cache_ns(self, path: str) -> bool:
+        """`<X>/_shared/blob` 처럼 '캐시 네임스페이스 바로 아래의 관리 폴더'인가.
+
+        이름만 보는 것이 아니라 부모가 캐시 네임스페이스인지까지 본다. 사용자의
+        `research/reports`, `archive/table` 은 여기에 걸리지 않는다.
+        """
+        parts = [p for p in os.path.normpath(str(path)).replace("\\", "/").split("/") if p]
+        for i in range(len(parts) - 1):
+            if parts[i] in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS) and \
+                    parts[i + 1] in self._MANAGED_NS_CHILD:
+                return True
+        return False
 
     def _managed_keys(self) -> set:
         """쓰기루트·미러의 관리 트리. 여기는 이미 인덱스에 있으므로 절대 걷지 않는다."""
@@ -510,22 +675,38 @@ class QVFVault(Vault):
             LOG.info("스캔할 외부 리포트 폴더가 없습니다. (기존 인덱스는 그대로 사용됩니다)")
             return pd.DataFrame(columns=["abs_path", "kind", "name"])
 
-        # 디렉터리 mtime 체크포인트 — 바뀌지 않은 폴더는 다시 걷지 않는다
-        ckpt: Dict[str, float] = {}
+        # ── 디렉터리 체크포인트 ──────────────────────────────────────────────────────────
+        #  ★ 예전 체크포인트는 mtime 만 저장하고, 무변경이어도 scandir 는 그대로 했다.
+        #    아끼는 것이 파일 stat 뿐이라 '디렉터리 열거 절감률 0.0%' 였고, FUSE 왕복이
+        #    비용의 전부인 드라이브에서는 이어받기가 회차당 +332 → +47 → +7 로 감쇠해
+        #    사실상 수렴하지 않았다. 이제 '완주한 디렉터리의 하위폴더 목록'까지 저장해서,
+        #    mtime 이 같으면 scandir 자체를 생략하고 저장된 하위폴더로 바로 내려간다.
+        #  ★ 그리고 상한으로 중도 탈출한 디렉터리는 체크포인트에 넣지 않는다. 예전에는
+        #    scandir '전에' 기록해서, 상한에 걸려 10건만 읽은 디렉터리의 나머지 40건이
+        #    (트리가 바뀌지 않는 한) 영구히 등록되지 않았다.
+        ckpt: Dict[str, Tuple[float, List[str]]] = {}
         cdf = self.get_table("qvf_adopt_scan_state", scope="private")
         if cdf is not None and len(cdf):
             try:
-                ckpt = dict(zip(cdf["dirpath"].astype(str),
-                                pd.to_numeric(cdf["mtime"], errors="coerce").fillna(-1.0)))
+                _mt = pd.to_numeric(cdf["mtime"], errors="coerce").fillna(-1.0)
+                _sd = (cdf["subdirs"].astype(str) if "subdirs" in cdf.columns
+                       else pd.Series(["[]"] * len(cdf)))
+                for _p, _m, _s in zip(cdf["dirpath"].astype(str), _mt, _sd):
+                    try:
+                        kids = json.loads(_s) if _s and _s != "nan" else []
+                    except Exception:
+                        kids = []
+                    ckpt[_p] = (float(_m), list(kids) if isinstance(kids, list) else [])
             except Exception:
                 ckpt = {}
             LOG.info(f"이전 스캔 체크포인트 {len(ckpt):,}개 디렉터리 — 변경되지 않은 폴더는 "
-                     f"다시 걷지 않습니다.")
+                     f"열거(scandir) 자체를 생략하고 저장된 하위폴더로 바로 내려갑니다.")
 
         t0 = time.time()
         found: List[dict] = []
-        new_ckpt: Dict[str, float] = dict(ckpt)
-        n_files = n_dirs = n_skipped_dirs = 0
+        new_ckpt: Dict[str, Tuple[float, List[str]]] = dict(ckpt)
+        n_files = n_dirs = n_skipped_dirs = n_ckpt_hit = 0
+        skipped_samples: List[str] = []
         stopped = ""
 
         for root in roots:
@@ -549,25 +730,50 @@ class QVFVault(Vault):
                 if n_dirs % 200 == 0:
                     LOG.info(f"  … 디렉터리 {n_dirs:,} · 파일 {n_files:,} · "
                              f"{time.time()-t0:.0f}초 경과")
-                unchanged = (abs(ckpt.get(cur, -1.0) - st_m) < 1e-6)
-                new_ckpt[cur] = st_m
+                prev = ckpt.get(cur)
+                if prev is not None and abs(prev[0] - st_m) < 1e-6:
+                    # 무변경 + 이전에 '완주' 한 디렉터리 → 열거를 통째로 생략한다.
+                    n_ckpt_hit += 1
+                    stack.extend(prev[1])
+                    continue
+                completed = True
+                subdirs: List[str] = []
+                hex2 = 0
                 try:
                     with os.scandir(cur) as it:
                         for ent in it:
                             try:
                                 if ent.is_dir(follow_symlinks=False):
                                     nm = ent.name
-                                    if (nm.startswith(".") or nm in self._MANAGED_DIRNAMES
-                                            or nm in self._SKIP_DIRNAMES):
+                                    if nm.startswith(".") or nm in self._SKIP_DIRNAMES:
                                         n_skipped_dirs += 1
                                         continue
+                                    if self._is_cache_ns(ent.path):
+                                        n_skipped_dirs += 1
+                                        if len(skipped_samples) < 6:
+                                            skipped_samples.append(ent.path)
+                                        continue
+                                    if self._HEX2_RE.match(nm):
+                                        hex2 += 1
+                                        if hex2 >= self._HASH_FANOUT_MIN:
+                                            # 내용해시 샤드 트리(최대 65,536 디렉터리). 여기는
+                                            # 남의 캐시 blob 이지 사용자의 리포트가 아니다.
+                                            n_skipped_dirs += 1
+                                            if len(skipped_samples) < 6:
+                                                skipped_samples.append(ent.path)
+                                            continue
                                     if _same_place_key(ent.path) in managed:
                                         n_skipped_dirs += 1
                                         continue
+                                    subdirs.append(ent.path)
                                     stack.append(ent.path)
                                     continue
-                                if unchanged:
-                                    continue          # 내용이 안 바뀐 폴더의 파일은 건너뛴다
+                                # ★ 예산 검사가 디렉터리 경계에만 있으면 예산이 상한이 아니다.
+                                #   파일 1만 개짜리 디렉터리 하나가 예산을 통째로 넘긴다.
+                                if (n_files & 0x3FF) == 0 and time.time() - t0 > max_seconds:
+                                    completed = False
+                                    stopped = f"시간 예산 {max_seconds:.0f}초 초과"
+                                    break
                                 low = ent.name.lower()
                                 if low.endswith(".pdf"):
                                     kind = "report_pdf"
@@ -587,12 +793,17 @@ class QVFVault(Vault):
                                               "name": ent.name, "dir": cur, "bytes": sz})
                                 n_files += 1
                                 if n_files >= max_files:
+                                    completed = False
                                     break
                             except Exception:
                                 continue
                 except Exception as e:                              # noqa
-                    LOG.debug(f"  디렉터리 열람 실패({type(e).__name__}): {cur}")
-                    continue
+                    completed = False
+                    LOG.warn(f"  디렉터리 열람 실패({type(e).__name__}) — 이 하위 트리는 "
+                             f"이번 실행에서 등록되지 않습니다: {cur}")
+                if completed:
+                    # 완주한 디렉터리만 체크포인트에 남긴다(중도 탈출분은 다음 실행에서 재시도).
+                    new_ckpt[cur] = (st_m, subdirs)
 
         dur = time.time() - t0
         if not found:
@@ -604,23 +815,39 @@ class QVFVault(Vault):
             for r in df.itertuples(index=False):
                 m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)
                 ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+                # scandir 에서 이미 크기를 알고 있다 — getsize() 를 또 부르면 드라이브 FUSE
+                # 왕복이 파일마다 한 번씩 더 붙는다(리포트 3만 건이면 2.6~6.4분).
                 self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",
                            subtype=r.kind, key=r.name, source="preexisting_drive_cache",
                            event_date=ed, knowledge_date=ed, scope="shared",
-                           extra={"dir": r.dir})
+                           extra={"dir": r.dir},
+                           size=(int(r.bytes) if int(r.bytes) >= 0 else None))
             self.flush("shared")
             LOG.ok(f"기존 리포트 {len(df):,}건을 공용 인덱스에 '참조 등록'했습니다 "
                    f"(파일은 원위치 그대로, 이동·삭제 없음) — "
                    f"디렉터리 {n_dirs:,}개 · {dur:.1f}초")
 
+        # ★ 프루닝은 '조용히' 하면 안 된다. 사용자가 자기 리포트가 왜 안 잡혔는지 알 수 있어야
+        #   한다. 예전에는 n_skipped_dirs 를 증가만 시키고 출력하는 곳이 한 군데도 없었다.
+        LOG.table([["걸은 디렉터리", f"{n_dirs:,}"],
+                   ["체크포인트 적중(열거 생략)", f"{n_ckpt_hit:,}"],
+                   ["프루닝한 하위폴더", f"{n_skipped_dirs:,}"],
+                   ["프루닝 예시", _trunc(" / ".join(skipped_samples), 90) if skipped_samples else "—"],
+                   ["새로 찾은 파일", f"{len(found):,}"],
+                   ["소요", f"{dur:.1f}초"],
+                   ["중단 사유", stopped or "—"]],
+                  ["항목", "값"], ["l", "l"],
+                  title="기존 리포트 폴더 스캔 요약 — 프루닝 건수를 숨기면 누락을 알 수 없다")
         if stopped:
-            LOG.warn(f"스캔을 중단했습니다: {stopped}. 여기까지의 체크포인트를 저장했으므로 "
-                     f"다음 실행에서 걷지 않은 폴더부터 이어받습니다. 상한을 늘리려면 "
-                     f"ADOPT_SCAN_MAX_FILES / ADOPT_SCAN_MAX_SECONDS 를 조정하세요.")
+            LOG.warn(f"스캔을 중단했습니다: {stopped}. 완주한 디렉터리만 체크포인트에 저장했으므로 "
+                     f"다음 실행에서 남은 폴더부터 이어받습니다(중도 탈출한 폴더는 다시 읽습니다). "
+                     f"상한을 늘리려면 ADOPT_SCAN_MAX_FILES / ADOPT_SCAN_MAX_SECONDS 를 조정하세요.")
         try:
             self.put_table("qvf_adopt_scan_state",
                            pd.DataFrame({"dirpath": list(new_ckpt.keys()),
-                                         "mtime": list(new_ckpt.values())}),
+                                         "mtime": [v[0] for v in new_ckpt.values()],
+                                         "subdirs": [json.dumps(v[1], ensure_ascii=False)
+                                                     for v in new_ckpt.values()]}),
                            scope="private", domain="index", source="adopt_scan checkpoint")
         except Exception as e:                                      # noqa
             LOG.debug(f"스캔 체크포인트 저장 실패({type(e).__name__}) — 기능에 영향 없음")
@@ -741,6 +968,32 @@ class DartQuota:
         rows: List[dict] = []
         for p in [self._path()] + self._mirror_paths():
             rows.extend(read_jsonl(p))
+        # ★★ 미러의 저널 사본을 중복 합산하면 안 된다 ★★
+        #   로컬 미러가 드라이브 캐시의 복사본이면(= CACHE_MIRROR_ROOTS 의 정상 용도) 같은
+        #   소비 이벤트가 '미러 수 + 1' 배로 세어진다. 실측으로 500건 사용이 1,000~1,500건
+        #   으로 잡혔고, take() 의 안전정지가 실제 사용량의 절반 지점에서 걸려 DART 수집이
+        #   조기 중단됐다. 그런데 그 스테이지는 critical=False 라 실패로 잡히지도 않는다.
+        #   → evt_id 로 dedup 한다. 미러를 '읽는' 것 자체는 타당하다(다른 기기의 소비를
+        #     봐야 하므로). 중복만 걷어낸다.
+        seen_evt = set()
+        uniq: List[dict] = []
+        for r in rows:
+            eid = r.get("evt_id")
+            if eid:
+                if eid in seen_evt:
+                    continue
+                seen_evt.add(eid)
+            else:
+                # 구버전 저널(evt_id 없음)은 자연키로 대체한다.
+                nk = (r.get("date"), r.get("key_fp"), r.get("host"), r.get("pid"),
+                      r.get("ts"), r.get("event"), r.get("n"), r.get("limit"))
+                if nk in seen_evt:
+                    continue
+                seen_evt.add(nk)
+            uniq.append(r)
+        if len(uniq) != len(rows):
+            LOG.debug(f"DART 쿼터 저널 중복 {len(rows) - len(uniq):,}행 제거(미러 사본)")
+        rows = uniq
         mine_pid = os.getpid()
         for r in rows:
             if str(r.get("key_fp")) != self.key_fp:
@@ -781,8 +1034,12 @@ class DartQuota:
                      "기록합니다(다음 실행부터 계획에 반영됩니다).")
 
     def _append(self, rec: dict):
+        self._seq = getattr(self, "_seq", 0) + 1
+        _ts = _dt.datetime.now().isoformat(timespec="microseconds")
         rec = {"date": self.today, "key_fp": self.key_fp, "pid": os.getpid(),
-               "host": platform.node(), "ts": _dt.datetime.now().isoformat(timespec="seconds"),
+               "host": platform.node(), "ts": _ts,
+               # 미러 사본 중복 합산을 막는 고유 id. 없으면 dedup 자체가 불가능하다.
+               "evt_id": sha1_str("dartquota", platform.node(), os.getpid(), _ts, self._seq),
                **rec}
         try:
             with self.vault.lock("dart_quota", timeout=15.0):

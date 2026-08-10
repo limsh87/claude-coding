@@ -413,7 +413,13 @@ def build_tone_panel(S: pd.DataFrame, G: pd.DataFrame, cal: pd.DataFrame,
     parts = []
     for i, t in enumerate(reb):
         hi = sig.get(as_ts(t))
-        lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        # ★ 왼쪽 끝은 '직전 분기의 signal_date' 여야 한다. 명목 리밸일(reb[i-1])로 잡으면
+        #   signal_date_{i-1} < rebal_{i-1} 이므로 (signal_{i-1}, rebal_{i-1}] 구간이
+        #   어느 창에도 속하지 않는다 — 명목일이 거래일인 분기마다 정확히 1거래일의
+        #   공시·리포트·목표주가 수정이 조용히 사라진다.
+        lo = sig.get(as_ts(reb[i - 1])) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        if lo is None:
+            lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
         w = R[(R["usable"] > lo) & (R["usable"] <= hi)]
         if w.empty:
             continue
@@ -523,7 +529,13 @@ def build_tp_revision(links: pd.DataFrame, G: pd.DataFrame, cal: pd.DataFrame) -
     parts = []
     for i, t in enumerate(reb):
         hi = sig.get(as_ts(t))
-        lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        # ★ 왼쪽 끝은 '직전 분기의 signal_date' 여야 한다. 명목 리밸일(reb[i-1])로 잡으면
+        #   signal_date_{i-1} < rebal_{i-1} 이므로 (signal_{i-1}, rebal_{i-1}] 구간이
+        #   어느 창에도 속하지 않는다 — 명목일이 거래일인 분기마다 정확히 1거래일의
+        #   공시·리포트·목표주가 수정이 조용히 사라진다.
+        lo = sig.get(as_ts(reb[i - 1])) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        if lo is None:
+            lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
         w = L[(L["usable"] > lo) & (L["usable"] <= hi)]
         if w.empty:
             continue

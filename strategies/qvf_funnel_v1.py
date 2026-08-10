@@ -166,11 +166,22 @@ INVVOL_WINDOW_DAYS = 120
 ACCOUNT_KRW   = 100_000_000         # 슬리피지 참여율 계산용 가정 계좌 규모
 
 # ── ⑪ 비용 모델 (§8.1) ──────────────────────────────────────────────────────────────────────
-COMMISSION_BPS = 1.5                # 편도 위탁수수료(개인 온라인 가정), bp
+#  ★ §8.1 의 문언은 "비용 = 증권거래세 + 실측 호가스프레드 기반 슬리피지" 다. 수수료와
+#    제곱근 시장충격은 명세에 없다. 명세를 넘는 비용을 기본값으로 두면 §10.4 폐기조건 ①
+#    ("비용 차감 후 성과")이 사전등록되지 않은 비용 때문에 발동한다 — 하락 드리프트다.
+#    그래서 기본(사전등록) 모형은 "spec" 이고, 확장 모형은 §8.4 강건성 축으로만 병기한다.
+QVF_COST_MODEL = "spec"             # "spec" = 세금 + 스프레드/2 (§8.1 문언)
+#                                     "extended" = spec + 수수료 + 제곱근 충격 (명세 초과)
+COMMISSION_BPS = 1.5                # 편도 위탁수수료(개인 온라인 가정), bp — extended 전용
 SLIPPAGE_MODE  = "corwin_schultz"   # "corwin_schultz" | "amihud" | "fixed"
 SLIPPAGE_FLOOR_BPS = 15.0           # 초소형주 최소 스프레드 가정 하한
 SLIPPAGE_CAP_BPS   = 400.0          # 추정 스프레드 상한 (추정치 폭주 방지)
-IMPACT_K       = 0.10               # 제곱근 시장충격 계수
+IMPACT_K       = 0.10               # 제곱근 시장충격 계수 — extended 전용
+# 체결일에 거래가 없을 때 '그 이후 첫 거래일'까지 기다리는 최대 일수.
+#  ★ 예전 15일은 정지 종목이 −60% 로 재개장한 가격을 진입가로 쓰게 만들었다(정지 복권의
+#    유리한 쪽만 취하는 비대칭). 짧게 잡아 '리밸런싱 시점에 거래되지 않는 종목은 못 산다'는
+#    현실을 그대로 반영하고, 탈락 건수를 감사표에 남긴다.
+EXEC_FILL_MAX_LAG_DAYS = 5
 
 # ── ⑫ 강건성 (§8.3 / §8.4) ──────────────────────────────────────────────────────────────────
 BH_FDR_Q          = 0.10
@@ -223,7 +234,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0521"
+BUILD_VERSION      = "qvf1.20260810.0622"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -2303,6 +2314,36 @@ def ro_read_parquet(path: str) -> Tuple[Optional[pd.DataFrame], str]:
         return None, type(e).__name__
 
 
+@contextmanager
+def _suppress_corrupt_rename():
+    """이 블록 안에서는 read_parquet_safe 가 파일을 개명하지 않는다.
+
+    ★ 쓰기루트도 결국 같은 구글드라이브다. 위 독스트링이 진단한 파괴 조건(placeholder /
+      동기화 중 부분 파일)은 미러만의 문제가 아니라 쓰기루트에서도 똑같이 성립한다.
+      그런데 코어 load_index 는 index.parquet 을 read_parquet_safe 로 읽으므로,
+      동기화가 느린 환경에서는 실행마다 index.parquet 을 `.corrupt.<ts>` 로 개명한다.
+      저널이 진실의 원천이라 데이터 유실은 없지만 (a) "삭제 없음 / 기존 캐시 훼손 금지"가
+      자기 쓰기루트에서 깨지고, (b) .corrupt 파일이 무한히 쌓이며, (c) 멀쩡한 컴팩션
+      결과를 매번 버려 저널 전량 재파싱을 하게 된다.
+    """
+    g = globals()
+    orig = g.get("read_parquet_safe")
+
+    def _ro(path, *a, **kw):
+        d, st = ro_read_parquet(path)
+        if d is None and st not in ("ok", "FileNotFoundError"):
+            LOG.info(f"인덱스 parquet 을 아직 읽을 수 없습니다({st}) — 파일은 그대로 두고 "
+                     f"저널로 진행합니다: {path}")
+        return d
+
+    g["read_parquet_safe"] = _ro
+    try:
+        yield
+    finally:
+        if orig is not None:
+            g["read_parquet_safe"] = orig
+
+
 def _expand(p: str) -> str:
     try:
         return os.path.abspath(os.path.expanduser(os.path.expandvars(str(p))))
@@ -2484,6 +2525,9 @@ class QVFVault(Vault):
         self._own_only = False                       # compact 중 미러 행을 배제하기 위한 스위치
         self._merged: Dict[str, pd.DataFrame] = {}   # 미러 병합 결과 캐시(더티 시 무효화)
         self._uidpath: Dict[str, Dict[str, Tuple[str, str, str]]] = {}   # uid → 경로
+        # 이번 실행에서 등록한 행. 코어가 self._idx 를 갱신하지 않으므로 조회 때 얹어준다.
+        self._new_rows: Dict[str, List[dict]] = {}
+        self._idxlk = threading.RLock()              # read_parquet_safe 치환 구간 보호용
 
     # ── 쓰기 경로 구조적 봉인 ----------------------------------------------------------
     def _wpath(self, path: str) -> str:
@@ -2563,9 +2607,59 @@ class QVFVault(Vault):
         self._mirror_idx[key] = out
         return out
 
+    # ★★ 같은 실행에서 저장한 것을 같은 실행에서 반드시 되찾을 수 있어야 한다 ★★
+    #   코어 Vault._register 는 _pending 과 _uidset 만 갱신하고 self._idx 는 손대지 않는다.
+    #   그리고 코어 load_index 는 force 가 아니면 self._idx 의 캐시본을 그대로 돌려준다.
+    #   그래서 "put_blob → flush → get_blob" 이 같은 실행 안에서 None 을 돌려주는 구멍이
+    #   있었다. 콜드런 1회차에 방금 내려받은 PDF 가 TONE 입력에서 통째로 빠지고, 2회차부터
+    #   갑자기 정상이 되는 형태로 나타난다 — '본문이 짧아 제외'와 구분되지 않는다.
+    #   저장↔재호출 연결은 이 전략의 절대 1원칙이므로, 등록분을 인덱스에 반드시 얹는다.
+    def _pending_frame(self, scope: str) -> Optional[pd.DataFrame]:
+        with self._lk:
+            rows = list(self._new_rows.get(scope, ()))
+        if not rows:
+            return None
+        f = pd.DataFrame(rows)
+        if "uid" in f.columns:
+            f["uid"] = f["uid"].astype(str)
+        f["_root"] = self.root
+        return f
+
+    def _with_new_rows(self, scope: str, own: pd.DataFrame) -> pd.DataFrame:
+        f = self._pending_frame(scope)
+        if f is None:
+            return own
+        o = own.copy()
+        if "_root" not in o.columns:
+            o["_root"] = self.root
+        allc: List[str] = []
+        for g in (o, f):
+            for c in g.columns:
+                if c not in allc:
+                    allc.append(c)
+        out = pd.concat([o.reindex(columns=allc), f.reindex(columns=allc)], ignore_index=True)
+        if "uid" in out.columns:
+            out["uid"] = out["uid"].astype(str)
+            # 저널을 이미 다시 읽었다면 같은 uid 가 양쪽에 있다 — 먼저 온 쪽(저널)을 남긴다.
+            out = out.drop_duplicates(subset=["uid"], keep="first").reset_index(drop=True)
+        return out
+
     def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:
-        own = super().load_index(scope, force=force)
+        if force:
+            # ★ force=True 가 오히려 복구를 막던 버그: 파생 캐시를 같이 비우지 않으면
+            #   스테일 인덱스로 만들어진 빈 uid→경로 사전이 그대로 남아 get_blob 이
+            #   영구히 None 을 돌려준다.
+            with self._lk:
+                self._merged.pop(scope, None)
+                self._uidpath.pop(scope, None)
+                self._mirror_idx.pop(scope, None)
+        with self._idxlk:
+            with _suppress_corrupt_rename():
+                own = super().load_index(scope, force=force)
+        own = self._with_new_rows(scope, own)
         if self._own_only:
+            with self._lk:
+                self._uidset[scope] = set(own["uid"].astype(str).tolist()) if len(own) else set()
             return own
         if not force:
             cached = self._merged.get(scope)
@@ -2620,8 +2714,17 @@ class QVFVault(Vault):
                 self.stats[f"mirror_table_hit:{name}"] += 1
                 LOG.info(f"로컬/미러 캐시 적중: {name} ({len(dd):,}행) ← {mr}")
                 PIPE.io("IN", "MIRROR", f"table:{name}", dd, source=mr)
-                if self.promote_tables:
-                    # 드라이브에 '없을 때만' 승격한다 → 최신본을 과거본으로 덮을 수 없다.
+                if sc != scope:
+                    LOG.warn(f"  ※ 요청 스코프는 '{scope}' 인데 '{sc}' 스코프의 동명 테이블을 "
+                             f"채택했습니다: {name} — 이름이 겹치는 전략이 있는지 확인하세요.")
+                    self.table_src[name] = f"{mr}#{sc}"
+                # ★★ 승격은 '드라이브에 파일이 실재하지 않을 때만' ★★
+                #   super().get_table 은 파일이 있어도 max_age_days 를 넘기면 None 을 준다.
+                #   그 None 을 '드라이브에 없음'으로 읽으면, 로컬 미러(복사·동기화로 mtime 만
+                #   최신이고 내용은 과거)가 드라이브의 최신본을 덮어쓴다. dart_corpcode 처럼
+                #   전 파이프라인의 종목 연결 축이 3분의 1로 줄어드는 사고가 실제로 난다.
+                _own_p = os.path.join(self.table_dir(scope), f"{name}.parquet")
+                if self.promote_tables and not os.path.exists(_own_p):
                     try:
                         self.put_table(name, dd, scope=scope, domain="table",
                                        source=f"promoted_from_mirror:{os.path.basename(mr)}")
@@ -2659,8 +2762,60 @@ class QVFVault(Vault):
     #      ③ get_blob   : 전 인덱스 불리언 마스크 → uid→경로 사전
     def _register(self, scope: str, rec: dict):
         super()._register(scope, rec)
+        with self._lk:
+            self._new_rows.setdefault(scope, []).append(dict(rec))
         self._merged.pop(scope, None)
         self._uidpath.pop(scope, None)
+
+    def flush(self, scope: Optional[str] = None):
+        """코어와 달리 append 가 성공한 뒤에 pending 을 비운다.
+
+        ★ 코어는 `rows, self._pending[sc] = self._pending[sc], []` 로 먼저 비우고 append 한다.
+          드라이브 용량 초과·네트워크 끊김으로 append 가 던지면 그 행들은 영구 소실되고,
+          blob 파일은 이미 쓰여 있으므로 '인덱스 없는 고아 blob' 이 남는다. 삭제 API 가
+          없으므로 영구히 남고, 그 세션 내내 has() 는 True 라 재수집도 되지 않는다.
+        """
+        scopes = [scope] if scope else ["shared", "private"]
+        for sc in scopes:
+            with self._lk:
+                rows = list(self._pending.get(sc, ()))
+            if not rows:
+                continue
+            with self.lock(f"journal_{sc}"):
+                append_jsonl(self.journal(sc), rows)     # 실패하면 여기서 예외 — pending 은 그대로
+            with self._lk:
+                del self._pending[sc][:len(rows)]
+            self.stats[f"journal_append:{sc}"] += len(rows)
+            LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")
+
+    def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
+              source: str = "", event_date=None, knowledge_date=None,
+              scope: str = "shared", extra: Optional[dict] = None,
+              size: Optional[int] = None) -> Optional[str]:
+        """size 를 알고 있으면 getsize() 를 생략한다 — 드라이브 FUSE 왕복 1회/파일 절감.
+
+        ★ uid 는 코어와 동일한 sha1_str("adopt", domain, subtype, abspath, size) 여야 한다.
+          계약 Q7 이 '코어 경로와 size 지정 경로의 uid 가 같은가'를 회귀로 고정한다.
+        """
+        if size is None:
+            return super().adopt(abs_path, domain, subtype, key, source=source,
+                                 event_date=event_date, knowledge_date=knowledge_date,
+                                 scope=scope, extra=extra)
+        sz = int(size)
+        uid = sha1_str("adopt", domain, subtype, os.path.abspath(abs_path), sz)
+        if self.has(scope, uid):
+            return uid
+        self._register(scope, {
+            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),
+            "path": abs_path, "abs_path": abs_path,
+            "fmt": os.path.splitext(abs_path)[1].lstrip("."),
+            "bytes": sz, "sha1": "", "source": source or "adopted",
+            "event_date": str(as_ts(event_date) or ""),
+            "knowledge_date": str(as_ts(knowledge_date) or ""),
+            "adopted": True, "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),
+        })
+        self.stats["adopted"] += 1
+        return uid
 
     def has(self, scope: str, uid: str) -> bool:
         if scope not in self._uidset:
@@ -2705,9 +2860,30 @@ class QVFVault(Vault):
         return None
 
     # ── 기존 리포트 폴더 흡수 (드라이브 FUSE 안전판) --------------------------------------
-    _MANAGED_DIRNAMES = {"blob", "table", "index", "_backup", "_locks", "reports"}
+    # ★★ 이름으로 프루닝하면 사용자의 폴더를 먹는다 ★★
+    #   예전에는 {"blob","table","index","_backup","_locks","reports"} 를 '이름'으로 잘랐다.
+    #   그러면 트리 어디에 있든 그 이름이면 하위 전체가 사라진다 — GDRIVE_ADOPT_DIRS 기본값에
+    #   `reports` 가 있는데 `research/reports/`, `archive/reports/` 는 리포트를 모아둔
+    #   폴더에서 극히 흔한 이름이다. 실측으로 8개 중 7개가 통째로 누락됐고, 누락 사실은
+    #   어디에도 남지 않았다. 그래서 '이름'이 아니라 '구조'로 판정한다.
+    _HEX2_RE = re.compile(r"^[0-9a-f]{2}$")
+    _HASH_FANOUT_MIN = 32          # 2자리 16진수 하위폴더가 이만큼이면 내용해시 샤드 트리
+    _MANAGED_NS_CHILD = {"index", "blob", "table", "_backup", "_locks"}
     _SKIP_DIRNAMES = {".git", "__pycache__", ".ipynb_checkpoints", "node_modules",
                       ".cache", ".Trash", "$RECYCLE.BIN", "System Volume Information"}
+
+    def _is_cache_ns(self, path: str) -> bool:
+        """`<X>/_shared/blob` 처럼 '캐시 네임스페이스 바로 아래의 관리 폴더'인가.
+
+        이름만 보는 것이 아니라 부모가 캐시 네임스페이스인지까지 본다. 사용자의
+        `research/reports`, `archive/table` 은 여기에 걸리지 않는다.
+        """
+        parts = [p for p in os.path.normpath(str(path)).replace("\\", "/").split("/") if p]
+        for i in range(len(parts) - 1):
+            if parts[i] in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS) and \
+                    parts[i + 1] in self._MANAGED_NS_CHILD:
+                return True
+        return False
 
     def _managed_keys(self) -> set:
         """쓰기루트·미러의 관리 트리. 여기는 이미 인덱스에 있으므로 절대 걷지 않는다."""
@@ -2772,22 +2948,38 @@ class QVFVault(Vault):
             LOG.info("스캔할 외부 리포트 폴더가 없습니다. (기존 인덱스는 그대로 사용됩니다)")
             return pd.DataFrame(columns=["abs_path", "kind", "name"])
 
-        # 디렉터리 mtime 체크포인트 — 바뀌지 않은 폴더는 다시 걷지 않는다
-        ckpt: Dict[str, float] = {}
+        # ── 디렉터리 체크포인트 ──────────────────────────────────────────────────────────
+        #  ★ 예전 체크포인트는 mtime 만 저장하고, 무변경이어도 scandir 는 그대로 했다.
+        #    아끼는 것이 파일 stat 뿐이라 '디렉터리 열거 절감률 0.0%' 였고, FUSE 왕복이
+        #    비용의 전부인 드라이브에서는 이어받기가 회차당 +332 → +47 → +7 로 감쇠해
+        #    사실상 수렴하지 않았다. 이제 '완주한 디렉터리의 하위폴더 목록'까지 저장해서,
+        #    mtime 이 같으면 scandir 자체를 생략하고 저장된 하위폴더로 바로 내려간다.
+        #  ★ 그리고 상한으로 중도 탈출한 디렉터리는 체크포인트에 넣지 않는다. 예전에는
+        #    scandir '전에' 기록해서, 상한에 걸려 10건만 읽은 디렉터리의 나머지 40건이
+        #    (트리가 바뀌지 않는 한) 영구히 등록되지 않았다.
+        ckpt: Dict[str, Tuple[float, List[str]]] = {}
         cdf = self.get_table("qvf_adopt_scan_state", scope="private")
         if cdf is not None and len(cdf):
             try:
-                ckpt = dict(zip(cdf["dirpath"].astype(str),
-                                pd.to_numeric(cdf["mtime"], errors="coerce").fillna(-1.0)))
+                _mt = pd.to_numeric(cdf["mtime"], errors="coerce").fillna(-1.0)
+                _sd = (cdf["subdirs"].astype(str) if "subdirs" in cdf.columns
+                       else pd.Series(["[]"] * len(cdf)))
+                for _p, _m, _s in zip(cdf["dirpath"].astype(str), _mt, _sd):
+                    try:
+                        kids = json.loads(_s) if _s and _s != "nan" else []
+                    except Exception:
+                        kids = []
+                    ckpt[_p] = (float(_m), list(kids) if isinstance(kids, list) else [])
             except Exception:
                 ckpt = {}
             LOG.info(f"이전 스캔 체크포인트 {len(ckpt):,}개 디렉터리 — 변경되지 않은 폴더는 "
-                     f"다시 걷지 않습니다.")
+                     f"열거(scandir) 자체를 생략하고 저장된 하위폴더로 바로 내려갑니다.")
 
         t0 = time.time()
         found: List[dict] = []
-        new_ckpt: Dict[str, float] = dict(ckpt)
-        n_files = n_dirs = n_skipped_dirs = 0
+        new_ckpt: Dict[str, Tuple[float, List[str]]] = dict(ckpt)
+        n_files = n_dirs = n_skipped_dirs = n_ckpt_hit = 0
+        skipped_samples: List[str] = []
         stopped = ""
 
         for root in roots:
@@ -2811,25 +3003,50 @@ class QVFVault(Vault):
                 if n_dirs % 200 == 0:
                     LOG.info(f"  … 디렉터리 {n_dirs:,} · 파일 {n_files:,} · "
                              f"{time.time()-t0:.0f}초 경과")
-                unchanged = (abs(ckpt.get(cur, -1.0) - st_m) < 1e-6)
-                new_ckpt[cur] = st_m
+                prev = ckpt.get(cur)
+                if prev is not None and abs(prev[0] - st_m) < 1e-6:
+                    # 무변경 + 이전에 '완주' 한 디렉터리 → 열거를 통째로 생략한다.
+                    n_ckpt_hit += 1
+                    stack.extend(prev[1])
+                    continue
+                completed = True
+                subdirs: List[str] = []
+                hex2 = 0
                 try:
                     with os.scandir(cur) as it:
                         for ent in it:
                             try:
                                 if ent.is_dir(follow_symlinks=False):
                                     nm = ent.name
-                                    if (nm.startswith(".") or nm in self._MANAGED_DIRNAMES
-                                            or nm in self._SKIP_DIRNAMES):
+                                    if nm.startswith(".") or nm in self._SKIP_DIRNAMES:
                                         n_skipped_dirs += 1
                                         continue
+                                    if self._is_cache_ns(ent.path):
+                                        n_skipped_dirs += 1
+                                        if len(skipped_samples) < 6:
+                                            skipped_samples.append(ent.path)
+                                        continue
+                                    if self._HEX2_RE.match(nm):
+                                        hex2 += 1
+                                        if hex2 >= self._HASH_FANOUT_MIN:
+                                            # 내용해시 샤드 트리(최대 65,536 디렉터리). 여기는
+                                            # 남의 캐시 blob 이지 사용자의 리포트가 아니다.
+                                            n_skipped_dirs += 1
+                                            if len(skipped_samples) < 6:
+                                                skipped_samples.append(ent.path)
+                                            continue
                                     if _same_place_key(ent.path) in managed:
                                         n_skipped_dirs += 1
                                         continue
+                                    subdirs.append(ent.path)
                                     stack.append(ent.path)
                                     continue
-                                if unchanged:
-                                    continue          # 내용이 안 바뀐 폴더의 파일은 건너뛴다
+                                # ★ 예산 검사가 디렉터리 경계에만 있으면 예산이 상한이 아니다.
+                                #   파일 1만 개짜리 디렉터리 하나가 예산을 통째로 넘긴다.
+                                if (n_files & 0x3FF) == 0 and time.time() - t0 > max_seconds:
+                                    completed = False
+                                    stopped = f"시간 예산 {max_seconds:.0f}초 초과"
+                                    break
                                 low = ent.name.lower()
                                 if low.endswith(".pdf"):
                                     kind = "report_pdf"
@@ -2849,12 +3066,17 @@ class QVFVault(Vault):
                                               "name": ent.name, "dir": cur, "bytes": sz})
                                 n_files += 1
                                 if n_files >= max_files:
+                                    completed = False
                                     break
                             except Exception:
                                 continue
                 except Exception as e:                              # noqa
-                    LOG.debug(f"  디렉터리 열람 실패({type(e).__name__}): {cur}")
-                    continue
+                    completed = False
+                    LOG.warn(f"  디렉터리 열람 실패({type(e).__name__}) — 이 하위 트리는 "
+                             f"이번 실행에서 등록되지 않습니다: {cur}")
+                if completed:
+                    # 완주한 디렉터리만 체크포인트에 남긴다(중도 탈출분은 다음 실행에서 재시도).
+                    new_ckpt[cur] = (st_m, subdirs)
 
         dur = time.time() - t0
         if not found:
@@ -2866,23 +3088,39 @@ class QVFVault(Vault):
             for r in df.itertuples(index=False):
                 m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)
                 ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+                # scandir 에서 이미 크기를 알고 있다 — getsize() 를 또 부르면 드라이브 FUSE
+                # 왕복이 파일마다 한 번씩 더 붙는다(리포트 3만 건이면 2.6~6.4분).
                 self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",
                            subtype=r.kind, key=r.name, source="preexisting_drive_cache",
                            event_date=ed, knowledge_date=ed, scope="shared",
-                           extra={"dir": r.dir})
+                           extra={"dir": r.dir},
+                           size=(int(r.bytes) if int(r.bytes) >= 0 else None))
             self.flush("shared")
             LOG.ok(f"기존 리포트 {len(df):,}건을 공용 인덱스에 '참조 등록'했습니다 "
                    f"(파일은 원위치 그대로, 이동·삭제 없음) — "
                    f"디렉터리 {n_dirs:,}개 · {dur:.1f}초")
 
+        # ★ 프루닝은 '조용히' 하면 안 된다. 사용자가 자기 리포트가 왜 안 잡혔는지 알 수 있어야
+        #   한다. 예전에는 n_skipped_dirs 를 증가만 시키고 출력하는 곳이 한 군데도 없었다.
+        LOG.table([["걸은 디렉터리", f"{n_dirs:,}"],
+                   ["체크포인트 적중(열거 생략)", f"{n_ckpt_hit:,}"],
+                   ["프루닝한 하위폴더", f"{n_skipped_dirs:,}"],
+                   ["프루닝 예시", _trunc(" / ".join(skipped_samples), 90) if skipped_samples else "—"],
+                   ["새로 찾은 파일", f"{len(found):,}"],
+                   ["소요", f"{dur:.1f}초"],
+                   ["중단 사유", stopped or "—"]],
+                  ["항목", "값"], ["l", "l"],
+                  title="기존 리포트 폴더 스캔 요약 — 프루닝 건수를 숨기면 누락을 알 수 없다")
         if stopped:
-            LOG.warn(f"스캔을 중단했습니다: {stopped}. 여기까지의 체크포인트를 저장했으므로 "
-                     f"다음 실행에서 걷지 않은 폴더부터 이어받습니다. 상한을 늘리려면 "
-                     f"ADOPT_SCAN_MAX_FILES / ADOPT_SCAN_MAX_SECONDS 를 조정하세요.")
+            LOG.warn(f"스캔을 중단했습니다: {stopped}. 완주한 디렉터리만 체크포인트에 저장했으므로 "
+                     f"다음 실행에서 남은 폴더부터 이어받습니다(중도 탈출한 폴더는 다시 읽습니다). "
+                     f"상한을 늘리려면 ADOPT_SCAN_MAX_FILES / ADOPT_SCAN_MAX_SECONDS 를 조정하세요.")
         try:
             self.put_table("qvf_adopt_scan_state",
                            pd.DataFrame({"dirpath": list(new_ckpt.keys()),
-                                         "mtime": list(new_ckpt.values())}),
+                                         "mtime": [v[0] for v in new_ckpt.values()],
+                                         "subdirs": [json.dumps(v[1], ensure_ascii=False)
+                                                     for v in new_ckpt.values()]}),
                            scope="private", domain="index", source="adopt_scan checkpoint")
         except Exception as e:                                      # noqa
             LOG.debug(f"스캔 체크포인트 저장 실패({type(e).__name__}) — 기능에 영향 없음")
@@ -3003,6 +3241,32 @@ class DartQuota:
         rows: List[dict] = []
         for p in [self._path()] + self._mirror_paths():
             rows.extend(read_jsonl(p))
+        # ★★ 미러의 저널 사본을 중복 합산하면 안 된다 ★★
+        #   로컬 미러가 드라이브 캐시의 복사본이면(= CACHE_MIRROR_ROOTS 의 정상 용도) 같은
+        #   소비 이벤트가 '미러 수 + 1' 배로 세어진다. 실측으로 500건 사용이 1,000~1,500건
+        #   으로 잡혔고, take() 의 안전정지가 실제 사용량의 절반 지점에서 걸려 DART 수집이
+        #   조기 중단됐다. 그런데 그 스테이지는 critical=False 라 실패로 잡히지도 않는다.
+        #   → evt_id 로 dedup 한다. 미러를 '읽는' 것 자체는 타당하다(다른 기기의 소비를
+        #     봐야 하므로). 중복만 걷어낸다.
+        seen_evt = set()
+        uniq: List[dict] = []
+        for r in rows:
+            eid = r.get("evt_id")
+            if eid:
+                if eid in seen_evt:
+                    continue
+                seen_evt.add(eid)
+            else:
+                # 구버전 저널(evt_id 없음)은 자연키로 대체한다.
+                nk = (r.get("date"), r.get("key_fp"), r.get("host"), r.get("pid"),
+                      r.get("ts"), r.get("event"), r.get("n"), r.get("limit"))
+                if nk in seen_evt:
+                    continue
+                seen_evt.add(nk)
+            uniq.append(r)
+        if len(uniq) != len(rows):
+            LOG.debug(f"DART 쿼터 저널 중복 {len(rows) - len(uniq):,}행 제거(미러 사본)")
+        rows = uniq
         mine_pid = os.getpid()
         for r in rows:
             if str(r.get("key_fp")) != self.key_fp:
@@ -3043,8 +3307,12 @@ class DartQuota:
                      "기록합니다(다음 실행부터 계획에 반영됩니다).")
 
     def _append(self, rec: dict):
+        self._seq = getattr(self, "_seq", 0) + 1
+        _ts = _dt.datetime.now().isoformat(timespec="microseconds")
         rec = {"date": self.today, "key_fp": self.key_fp, "pid": os.getpid(),
-               "host": platform.node(), "ts": _dt.datetime.now().isoformat(timespec="seconds"),
+               "host": platform.node(), "ts": _ts,
+               # 미러 사본 중복 합산을 막는 고유 id. 없으면 dedup 자체가 불가능하다.
+               "evt_id": sha1_str("dartquota", platform.node(), os.getpid(), _ts, self._seq),
                **rec}
         try:
             with self.vault.lock("dart_quota", timeout=15.0):
@@ -6379,12 +6647,23 @@ def apply_t_plus_1(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
 #  ★ 종목코드 6번째 자리 규칙: 보통주는 '0'. 구형 우선주는 5/7/9, 2024 개편 신형은 K/L/M/N.
 #    이름만으로 거르면 '삼성전자우' 는 잡아도 '현대차2우B' 같은 변형에서 새고,
 #    코드만으로 거르면 6자리 영숫자 신형에서 샌다. 둘을 OR 로 묶는다.
-_PREF_NAME_RE = re.compile(r"우(?:B|C)?$|\d+우(?:B|C)?$|우선주")
+# ★★ 이름 규칙은 실존 소형주를 영구 삭제할 수 있다 — 경계를 반드시 붙인다 ★★
+#   예전 `우(?:B|C)?$` 는 '연우'·'미래에셋대우' 처럼 '…우' 로 끝나는 보통주를 전부 우선주로
+#   판정했고, `파워|마이다스|FOCUS|TREX` 는 접미 경계가 없어 '파워로직스'·'파워넷' 을
+#   ETF 로 판정했다. 셋 다 정확히 §3.1 이 겨냥하는 하위 1000 구간 종목이다. 시점불변
+#   삭제라 전 리밸런싱·전 실험에서 동일하게 빠지는 재현 가능한 편향이 된다.
+#   → 우선주 이름 규칙은 '숫자+우' / '우B' / '우선주' 처럼 우선주에서만 나타나는 형태로
+#     좁히고, 단독 '…우' 는 코드 6번째 자리 규칙에만 맡긴다(그쪽이 정확하다).
+_PREF_NAME_RE = re.compile(r"\d+우(?:B|C)?$|[가-힣A-Za-z]우(?:B|C)$|우선주")
 _SPAC_RE = re.compile(r"스팩|기업인수목적")
 _REIT_RE = re.compile(r"리츠|위탁관리부동산투자|기업구조조정부동산투자|부동산투자회사")
-_FUND_RE = re.compile(r"^(KODEX|TIGER|KBSTAR|ARIRANG|KINDEX|HANARO|SOL |ACE |PLUS |RISE |"
-                      r"KOSEF|TREX|FOCUS|마이다스|파워|미래에셋TIGER)|ETN$|ETF$|"
-                      r"레버리지$|인버스$|선물\s*ETN")
+# ETF/ETN 브랜드 접두는 뒤에 공백/숫자/영문 경계를 요구한다. '파워'·'마이다스'·'FOCUS'·
+# 'TREX' 는 실존 사업회사 이름의 접두이기도 하므로 목록에서 뺀다(§3.3 에 없는 확장이기도 하다).
+_FUND_RE = re.compile(r"^(KODEX|TIGER|KBSTAR|ARIRANG|KINDEX|HANARO|KOSEF|SOL|ACE|PLUS|RISE|"
+                      r"미래에셋TIGER)(?=[\s\d]|$)|ETN$|ETF$|레버리지$|인버스$|선물\s*ETN")
+
+# 구조적 제외로 걸러진 종목을 사후 검증할 수 있도록 명단을 남긴다(개수만 찍으면 확인 불가).
+EXCLUSION_AUDIT: Dict[str, str] = {}
 
 
 def is_preferred(code: str, name: str = "") -> bool:
@@ -6392,21 +6671,28 @@ def is_preferred(code: str, name: str = "") -> bool:
     if len(c) == 6 and c[5] not in ("0",):
         # 신형 영숫자 코드는 6번째가 0/K/L/M/N 이고 0 만 보통주다. 구형은 0 이 보통주.
         return True
+    # ★ 코드가 보통주(6번째='0')로 확정된 종목은 이름 규칙을 적용하지 않는다.
+    #   코드 규칙이 이름 규칙보다 정확하며, 이름 규칙의 오탐은 전부 이 경로에서 나왔다.
+    if len(c) == 6 and c[5] == "0":
+        return bool(re.search(r"우선주$", str(name or "")))
     return bool(_PREF_NAME_RE.search(str(name or "")))
 
 
 def classify_exclusion(code: str, name: str) -> str:
     """이름·코드만으로 판별 가능한 구조적 제외 사유. 없으면 빈 문자열."""
     nm = str(name or "").strip()
+    why = ""
     if is_preferred(code, nm):
-        return "우선주"
-    if _SPAC_RE.search(nm):
-        return "스팩"
-    if _REIT_RE.search(nm):
-        return "리츠"
-    if _FUND_RE.search(nm):
-        return "ETF/ETN"
-    return ""
+        why = "우선주"
+    elif _SPAC_RE.search(nm):
+        why = "스팩"
+    elif _REIT_RE.search(nm):
+        why = "리츠"
+    elif _FUND_RE.search(nm):
+        why = "ETF/ETN"
+    if why:
+        EXCLUSION_AUDIT[f"{code} {nm}"] = why
+    return why
 
 
 # ── 거래일 캘린더 / 리밸런싱 격자 ────────────────────────────────────────────────────────────
@@ -6731,7 +7017,32 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
     px["date"] = as_ts_series(px["date"])
     px = px.dropna(subset=["code", "date"]).sort_values(["code", "date"], kind="stable")
     g = px.groupby("code", observed=True)
-    px["adtv"] = g["amount"].transform(lambda s: s.rolling(window, min_periods=max(10, window // 3)).mean())
+
+    # ★★ rolling(60) 은 '시장 60거래일'이 아니라 '그 종목이 가진 60개 행' 이다 ★★
+    #   거래정지·소스 누락으로 행이 빠지면 창이 조용히 늘어나고, 분모에서 무거래일이 빠져
+    #   유동성이 과대평가된다. 과대 배수는 정확히 60/실거래일수다 — 20일만 거래된 종목은
+    #   ADTV 가 3배로 잡혀 §3.2 의 1억 게이트를 통과한다. 즉 §3.3 이 빼라는 바로 그
+    #   거래정지·초박형 종목이 U-1000 에 들어오고, 백테스트는 실제로 살 수 없는 종목을 산다.
+    #   pykrx 는 정지일을 amount=0 행으로 주지만 naver/yfinance 폴백은 행 자체를 생략하므로
+    #   §3.2 의 의미가 소스별로 달라진다.
+    #   → 시장 거래일 격자에 reindex 하고 무거래일 거래대금을 0 으로 채운 뒤 rolling 한다.
+    _tds = pd.DatetimeIndex(sorted(pd.unique(px["date"])), name="date")
+    _amt = (px.pivot_table(index="date", columns="code", values="amount", aggfunc="last")
+              .reindex(_tds))
+    _amt.columns.name = "code"
+    # 첫 상장 전 구간까지 0 으로 채우면 신규 상장주의 ADTV 가 부당하게 낮아진다.
+    # 각 종목의 '최초 관측일 이후'만 0 으로 채운다(그 이전은 결측 유지).
+    _seen = _amt.notna().cumsum() > 0
+    _amt = _amt.where(~(_seen & _amt.isna()), 0.0)
+    _adtv = _amt.rolling(int(window), min_periods=int(window)).mean()
+    _adtv = _adtv.stack(dropna=True).rename("adtv").reset_index()
+    _adtv.columns = ["date", "code", "adtv"]
+    _adtv["code"] = _adtv["code"].astype(str)
+    px["code"] = px["code"].astype(str)
+    px = px.merge(_adtv, on=["date", "code"], how="left")
+    _n_tight = int(px["adtv"].isna().sum())
+    LOG.debug(f"ADTV: 시장 거래일 격자 {len(_tds):,}일 · min_periods={window} "
+              f"(자기 행이 아니라 시장 거래일 기준) · 창 미충족 결측 {_n_tight:,}행")
 
     # ── 실측 호가스프레드 추정: Corwin-Schultz(2012) 고가/저가 추정량 ─────────────────────
     #  §8.1 은 '실측 호가스프레드 기반 슬리피지'를 요구한다. 과거 호가(bid/ask) 시계열은
@@ -6800,6 +7111,15 @@ def build_universe_grid(uni: "Universe", cal: pd.DataFrame, cap: pd.DataFrame,
         by = Counter(v for v in struct.values() if v)
         LOG.info(f"구조적 제외 종목 {n_struct:,}건 (시점 불변) — " +
                  ", ".join(f"{k} {v:,}" for k, v in by.most_common()))
+        # ★ 개수만 찍으면 사후 검증이 불가능하다. 이름 규칙의 오탐(실존 소형주가 ETF/우선주로
+        #   판정되는 사고)은 명단을 봐야만 잡힌다. 사유별 표본을 반드시 남긴다.
+        _samp = defaultdict(list)
+        for k, v in struct.items():
+            if v and len(_samp[v]) < 12:
+                _samp[v].append(f"{k} {names.get(k, '')}".strip())
+        LOG.table([[k, f"{by[k]:,}", _trunc(", ".join(_samp[k]), 78)] for k in by],
+                  ["제외 사유", "건수", "표본(최대 12)"], ["l", "r", "l"], maxw=80,
+                  title="구조적 제외 명단 (§3.3) — 이름 규칙의 오탐은 명단을 봐야만 잡힌다")
 
     parts = []
     for r in cal.itertuples(index=False):
@@ -6999,6 +7319,18 @@ def _cell_ladder_z(P: pd.DataFrame, v: pd.Series, min_n: int = CELL_MIN_N) -> pd
     return z
 
 
+def _denom_ok(x: pd.Series) -> pd.Series:
+    """분모의 3상태 적격 판정. True=적격 · False=관측했는데 부적격 · <NA>=분모 자체를 모름.
+
+    ★ 2상태(bool)로 두면 '모름'과 '부적격'이 같은 False 가 되어, 재무를 확보하지 못한 종목
+      전체가 §5.2 의 최하위 벌점을 맞는다. 반대로 '분모가 정확히 0' 인 관측치는 safe_div 가
+      NaN 을 주는 바람에 벌점을 통째로 빠져나갔다(완전자본잠식 기업이 Z_V 상위 7% 에 앉음).
+      두 사고가 같은 뿌리에서 나오므로 판정 자체를 3상태로 만든다.
+    """
+    v = pd.to_numeric(x, errors="coerce")
+    return (v > 0).astype("boolean").where(v.notna())
+
+
 def z_lower_is_better(P: pd.DataFrame, raw: pd.Series, valid: pd.Series,
                       name: str = "") -> pd.Series:
     """'낮을수록 우수' 지표를 z-score(높을수록 우수)로 바꾸되, 분모 부적격(valid=False)
@@ -7009,28 +7341,45 @@ def z_lower_is_better(P: pd.DataFrame, raw: pd.Series, valid: pd.Series,
       상위에 오를 수 있다. 즉 적자기업이 벌점 대신 면제를 받는다. 정반대의 결과다.
     """
     r = pd.to_numeric(raw, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    ok = valid.fillna(False).to_numpy(dtype=bool) & r.notna().to_numpy()
+    vb = valid.fillna(False).to_numpy(dtype=bool)
+    ok = vb & r.notna().to_numpy()
     sig = pd.Series(np.where(ok, -r.to_numpy(dtype="float64"), np.nan), index=P.index)
     z = _cell_ladder_z(P, sig)
-    # 셀별 최하위 z (윈저라이징 이후 값이므로 이상치로 폭주하지 않는다)
-    worst = z.groupby(P["cell"].astype(object).fillna("__NA__").to_numpy(),
-                      observed=True).transform("min")
-    forced = (~pd.Series(ok, index=P.index)) & r.notna().reindex(P.index).fillna(False)
-    # raw 자체가 결측(재무 미보유)인 경우는 '부적격'이 아니라 '모름' 이므로 강제하지 않는다.
+
+    # ★★ '최하위 강제'는 반드시 '횡단면 최하위' 여야 한다 ★★
+    #   예전에는 셀(cell) 내 최소 z 를 벌점으로 줬다. 두 가지가 겹치면 벌점이 상점이 된다:
+    #     ① z 는 표본 부족 시 cell_l2 / cell_l3(전 시장) 스케일로 계산되는데, 셀 최소는
+    #        그 사실을 모른 채 원래의 작은 셀에서만 min 을 잡는다.
+    #     ② 그 작은 셀의 유효 종목이 우연히 전부 '싼' 종목이면 셀 최소가 양수다.
+    #   실측으로 적자 8종목이 z=+1.165 를 받아 312종목 중 6위(상위 2%)에 앉았다. 이 파일
+    #   헤더가 스스로 경고한 실패("적자기업이 자동으로 최우량이 된다")가 방어 코드 안에서
+    #   재현된 것이다. 더구나 U-200 선정은 groupby("rebal") 즉 전 종목 횡단면에서 이뤄지므로,
+    #   벌점도 같은 횡단면에서 매겨야 규모가 일관된다(셀 크기에 따라 −2.3 ~ −4.4 로 2배
+    #   차이 나던 문제도 함께 사라진다).
+    _reb = P["rebal"].to_numpy()
+    worst = z.groupby(_reb, observed=True).transform("min")
+
+    # ★★ 분모가 '정확히 0' 인 관측치도 부적격이다 ★★
+    #   safe_div 는 |분모| ≤ 1e-12 이면 NaN 을 준다. 예전 조건 `forced = ~ok & r.notna()` 는
+    #   r 이 NaN 이라 강제를 건너뛰고 '모름'으로 분류했다. 그 결과 자기자본이 정확히 0 인
+    #   기업(=§3.3 이 제외를 요구하는 완전자본잠식)이 Z_V 상위 7% 에 앉았다.
+    #   valid=False 는 '분모를 봤고 부적격이더라' 이므로, r 의 결측 여부와 무관하게 강제한다.
+    #   반대로 valid 자체가 결측(재무 미보유)인 경우만 '모름'으로 남긴다.
+    known = valid.notna().to_numpy()
+    forced = pd.Series(known & (~vb), index=P.index)
     z_out = z.copy()
     n_forced = int(forced.sum())
     if n_forced:
         z_out = z_out.where(~forced, worst)
-        # 셀 전체가 부적격이라 worst 도 NaN 인 경우: 임의 상수(-3 등)를 쓰지 않고 '그 시점
-        # 횡단면의 실제 최소 z' 를 바닥으로 쓴다. 명세에 없는 숫자를 만들지 않기 위함이다.
-        if (forced & z_out.isna()).any():
-            floor = z.groupby(P["rebal"].to_numpy(), observed=True).transform("min")
-            z_out = z_out.where(~(forced & z_out.isna()), floor)
-            # 그 시점 전체가 부적격이면 그때만 최후의 바닥값을 쓴다(관측이 아예 없는 경우).
-            z_out = z_out.where(~(forced & z_out.isna()), -3.0)
+        # 그 시점 횡단면에 유효 관측이 아예 없으면 벌점을 만들 근거가 없다 — 결측으로 둔다
+        # (임의 상수를 찍지 않는다. 축 평균에서 빠지되, 그 사실은 아래 로그로 남는다).
+        n_nofloor = int((forced & z_out.isna()).sum())
+    else:
+        n_nofloor = 0
     if name:
-        LOG.debug(f"  {name}: 유효 {int(ok.sum()):,} · 분모부적격 강제최하위 {n_forced:,} · "
-                  f"결측(모름) {int(r.isna().sum()):,}")
+        LOG.debug(f"  {name}: 유효 {int(ok.sum()):,} · 분모부적격 강제최하위 {n_forced:,}"
+                  f"(그중 횡단면 유효관측 부재로 벌점 불가 {n_nofloor:,}) · "
+                  f"분모 자체 미상(모름) {int((~known).sum()):,}")
     return z_out.astype("float32")
 
 
@@ -7083,13 +7432,20 @@ def build_quarterly_fundamentals(fin: pd.DataFrame, shares: pd.DataFrame) -> pd.
         S = (S.dropna(subset=["corp_code", "knowledge_date", "shares_issued"])
               .sort_values(["corp_code", "knowledge_date"], kind="stable")
               .drop_duplicates(["corp_code", "knowledge_date"], keep="last"))
-        S["_n"] = S.groupby("corp_code", observed=True).cumcount()
+        # ★★ cumcount 로 인접성을 재면 안 된다 ★★
+        #   _n 이 cumcount 이므로 `_n − shift(_n, 12)` 는 정의상 항상 정확히 12 다. 즉 예전
+        #   가드는 항진명제였고 아무것도 막지 못했다 — 결측 분기를 건너뛴 채 12행 전을 집으면
+        #   5년 전 주식수를 '3년 증가율' 이라 부르게 된다. 실제 달력 간격으로 재야 한다.
         prev = S.groupby("corp_code", observed=True)["shares_issued"].shift(12)
-        prev_n = S.groupby("corp_code", observed=True)["_n"].shift(12)
-        # ★ 12행 전이 '정확히 12분기 전'일 때만 3년 증가율로 인정한다. 결측 분기를 건너뛴 채
-        #   shift(12) 를 믿으면 5년 전 주식수를 3년 증가율이라 부르게 된다.
-        contiguous = (S["_n"] - prev_n) == 12
+        prev_kd = S.groupby("corp_code", observed=True)["knowledge_date"].shift(12)
+        gap_d = (as_ts_series(S["knowledge_date"]) - as_ts_series(prev_kd)).dt.days
+        # 3년 = 1,095일. 제출 지연·분기 이동을 감안해 ±6개월(±183일)까지만 인정한다.
+        contiguous = gap_d.between(1095 - 183, 1095 + 183)
         S["share_growth3y"] = (safe_div(S["shares_issued"], prev) - 1.0).where(contiguous)
+        _n_drop = int((prev.notna() & ~contiguous.fillna(False)).sum())
+        if _n_drop:
+            LOG.debug(f"  주식수 3년 증가율: 12행 전이 실제로 3년 전이 아닌 {_n_drop:,}건 제외 "
+                      f"(중간 분기 결측 — 5년 전 값을 '3년 증가율'로 부르지 않는다)")
         S = S[["corp_code", "knowledge_date", "shares_issued", "shares_treasury",
                "share_growth3y"]].sort_values("knowledge_date", kind="stable")
         # ★★ outer merge 를 쓰면 안 된다 (적대적 감사가 잡은 조용한 실패) ★★
@@ -7196,15 +7552,15 @@ def axis_V(P: pd.DataFrame) -> pd.DataFrame:
     #     비율이 음수로 이어져 '순현금이 많을수록 더 좋다'는 연속 순서가 그대로 보존된다.
     #     EBIT>0 이므로 낮을수록 우수라는 단조성도 깨지지 않는다.
     d["ev_ebit"] = safe_div(ev, ebit)
-    d["_v_ok_ev"] = ebit.notna() & (ebit > 0)
+    d["_v_ok_ev"] = _denom_ok(ebit)
 
     d["pbr"] = safe_div(cap, col(d, "equity"))
-    d["_v_ok_pbr"] = col(d, "equity").notna() & (col(d, "equity") > 0)
+    d["_v_ok_pbr"] = _denom_ok(col(d, "equity"))
 
     d["pcr"] = safe_div(cap, col(d, "cfo_ttm"))
-    d["_v_ok_pcr"] = col(d, "cfo_ttm").notna() & (col(d, "cfo_ttm") > 0)
+    d["_v_ok_pcr"] = _denom_ok(col(d, "cfo_ttm"))
 
-    LOG.info("V축 부호 처리 (§5.2) — 분모 ≤ 0 관측치는 해당 지표에서 셀 최하위로 강제 배정:")
+    LOG.info("V축 부호 처리 (§5.2) — 분모 ≤ 0 관측치는 해당 지표에서 횡단면 최하위로 강제 배정:")
     d["zV_ev_ebit"] = z_lower_is_better(d, d["ev_ebit"], d["_v_ok_ev"], "EV/EBIT")
     d["zV_pbr"] = z_lower_is_better(d, d["pbr"], d["_v_ok_pbr"], "PBR")
     d["zV_pcr"] = z_lower_is_better(d, d["pcr"], d["_v_ok_pcr"], "PCR")
@@ -7229,15 +7585,19 @@ def axis_Q(P: pd.DataFrame) -> pd.DataFrame:
 
     # 높을수록 우수 → 그대로 z
     d["zQ_gp_a"] = _cell_ladder_z(d, d["gp_a"])
-    # 낮을수록 우수 → 부호 반전 후 z. 분모 부적격 개념이 없는 지표는 valid=notna.
-    d["zQ_roic_std3y"] = z_lower_is_better(d, col(d, "roic_std3y"),
-                                           col(d, "roic_std3y").notna(), "ROIC 3년 표준편차")
-    d["zQ_accruals"] = z_lower_is_better(d, d["accruals"], d["accruals"].notna(), "발생액")
+    # 낮을수록 우수 → 부호 반전 후 z.
+    #  ★ '분모 부적격' 개념이 없는 지표(ROIC 표준편차·발생액·주식수 증가율)는 valid 를 전부
+    #    <NA> 로 준다. 예전처럼 notna() 를 주면 '관측이 없다'가 '부적격'으로 읽혀 재무를
+    #    확보하지 못한 종목 전체가 최하위 벌점을 맞는다 — 그건 §5.2 가 말하는 부호 처리가
+    #    아니라 커버리지에 대한 처벌이다.
+    _na = pd.Series(pd.NA, index=d.index, dtype="boolean")
+    d["zQ_roic_std3y"] = z_lower_is_better(d, col(d, "roic_std3y"), _na, "ROIC 3년 표준편차")
+    d["zQ_accruals"] = z_lower_is_better(d, d["accruals"], _na, "발생액")
     # 부채비율은 자기자본이 0 이하면 의미가 뒤집힌다(음수 부채비율=최우량). 부적격 처리.
-    d["zQ_debt_ratio"] = z_lower_is_better(
-        d, d["debt_ratio"], col(d, "equity").notna() & (col(d, "equity") > 0), "부채비율")
-    d["zQ_share_growth3y"] = z_lower_is_better(
-        d, col(d, "share_growth3y"), col(d, "share_growth3y").notna(), "주식수 3년 증가율")
+    d["zQ_debt_ratio"] = z_lower_is_better(d, d["debt_ratio"], _denom_ok(col(d, "equity")),
+                                           "부채비율")
+    d["zQ_share_growth3y"] = z_lower_is_better(d, col(d, "share_growth3y"), _na,
+                                               "주식수 3년 증가율")
 
     zc = [f"zQ_{m}" for m in _Q_METRICS]
     n_ax = d[zc].notna().sum(axis=1)
@@ -7380,7 +7740,13 @@ def fetch_flow_netbuy(cal: pd.DataFrame, px_daily: pd.DataFrame,
         VAULT.put_table(key, out, scope="shared", domain="flow",
                         source=f"pykrx net purchases {window}d")
     PIPE.io("OUT", "DRIVE", key, F, source="krx flow")
-    return downcast_q(F.reindex(columns=cols))
+    out = downcast_q(F.reindex(columns=cols))
+    # 어느 창으로 만든 프레임인지 남긴다 — §9-C4 는 사전등록 창(60일)의 값만 읽어야 한다.
+    try:
+        out.attrs["flow_window"] = int(window)
+    except Exception:
+        pass
+    return out
 
 
 def axis_F(P: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
@@ -7417,6 +7783,14 @@ def axis_F(P: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
     nz = ((col(d, "flow_f").fillna(0).abs() > 0) | (col(d, "flow_i").fillna(0).abs() > 0))
     nonzero_ratio = float(nz[obs].mean()) if int(obs.sum()) else float("nan")
     globals()["FLOW_NONZERO_RATIO"] = nonzero_ratio
+    # ★ axis_F 는 §8.4 강건성(수급창 20/60/120일 민감도)에서도 재호출된다. 전역 하나만 두면
+    #   §9-C4 가 '사전등록된 60일 창'이 아니라 '강건성 마지막 실행(120일)'의 값을 읽는다.
+    #   창별로 따로 보관하고, 사전등록 창의 값을 C4 전용으로 고정한다.
+    _win = int((getattr(flows, "attrs", {}) or {}).get("flow_window", FLOW_WINDOW_DAYS))
+    globals().setdefault("FLOW_NONZERO_BY_WINDOW", {})
+    FLOW_NONZERO_BY_WINDOW[_win] = nonzero_ratio
+    if _win == int(FLOW_WINDOW_DAYS):
+        globals()["FLOW_NONZERO_RATIO_PREREG"] = nonzero_ratio
 
     d["zF_foreign"] = _cell_ladder_z(d, d["flow_f"])
     d["zF_inst"] = _cell_ladder_z(d, d["flow_i"])
@@ -7442,6 +7816,8 @@ def axis_F(P: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
 
 
 FLOW_NONZERO_RATIO: float = float("nan")
+FLOW_NONZERO_RATIO_PREREG: float = float("nan")   # §9-C4 전용 — 사전등록 창(60일)의 값
+FLOW_NONZERO_BY_WINDOW: Dict[int, float] = {}
 
 
 
@@ -7826,11 +8202,33 @@ def _xml_to_text(raw: bytes) -> Tuple[str, str]:
     return txt, "ok"
 
 
-def _section(text: str, key: str, span: int = 6000) -> str:
-    m = _SECTION_RE[key].search(text)
-    if not m:
+def _section(text: str, key: str, span: int = 6000,
+             probe: Optional[Sequence[str]] = None, max_tries: int = 10) -> str:
+    """앵커 섹션을 잘라낸다. ★ '문서 전체의 첫 매치'를 쓰면 안 된다.
+
+    ★★ 이 함수가 조용히 실패하면 §6.1 배제플래그 6종 중 4종과 §7.2 3-A 6개 중 4개가
+       '한 번도 발동하지 않는다' ★★
+      DART 사업보고서는 맨 앞에 목차가 있고, 앵커 정규식(`감사의견`, `주주에 관한 사항`,
+      `특수관계자…거래` 등)은 목차 항목에 그대로 걸린다. 그러면 창 6,000자가 목차와
+      회사의 개요를 덮고 실제 섹션에는 닿지 못한다. 파이프라인은 정상 종료하고 진단표에는
+      "섹션 발견율 100%" 가 찍히는데, 값은 전부 None 이다. 그리고 '근거 결측이면 배제하지
+      않는다' 규칙과 결합해 필터층이 통째로 무력화된다. 더 나쁜 것은 어블레이션이
+      "3-A 는 기여가 없다"로 읽히지 "3-A 가 실행되지 않았다"로 읽히지 않는다는 점이다.
+    → 앵커의 모든 매치를 돌면서 '목표 숫자·문구가 실제로 잡히는 창'을 채택한다.
+    """
+    hits = [m.start() for m in _SECTION_RE[key].finditer(text)]
+    if not hits:
         return ""
-    return text[m.start(): m.start() + span]
+    hits = hits[:max_tries]
+    if probe:
+        for st in hits:
+            w = text[st: st + span]
+            if any(re.search(p, w) for p in probe):
+                return w
+    # 목표를 못 찾았거나 probe 가 없으면: 목차로 추정되는 선두 매치를 피해 마지막 매치를 쓴다.
+    #  (목차는 문서 앞부분에 몰려 있고, 실제 본문 섹션은 뒤에 온다)
+    st = hits[-1] if len(hits) > 1 else hits[0]
+    return text[st: st + span]
 
 
 def _count_patents(sect: str) -> Optional[float]:
@@ -7862,14 +8260,27 @@ def _rnd_headcount(sect: str) -> Optional[float]:
 
 
 def _ratio_pct(sect: str, pats: Sequence[str]) -> Optional[float]:
+    """'%' 로 적힌 비율을 소수로 돌려준다.
+
+    ★★ 예전 코드는 `v / 100.0 if v > 1.5 else v` 였다 ★★
+      즉 "0.8 %" 를 0.8(=80%)로, "1.5 %" 를 1.5(=150%)로 읽었다. 실무에서 특수관계자
+      매출 비중이 1.5% 이하인 종목은 드물지 않다(로그정규 중앙값 4% 가정 시 약 22%).
+      그 종목들이 전부 100배로 부풀려져 §7.2 `r_related(>30%)` 에 무조건 걸렸고,
+      §6.1 `x_related_up` 의 '상승폭 상위 20%' 임계는 5배 이동해 올바른 플래그 집합과의
+      일치율이 5% 수준이었다 — 이 플래그는 특수관계자 위험이 아니라 '비중이 1.5% 미만인가'
+      를 세고 있었다. 1.5 라는 컷 자체가 명세에 없는 임의값이다.
+    → 패턴이 '%' 기호를 실제로 소비했으면 무조건 /100 한다. 여기 오는 패턴은 전부 그렇다.
+    """
     for p in pats:
         m = re.search(p, sect)
         if m:
             try:
                 v = float(m.group(1).replace(",", ""))
-                return v / 100.0 if v > 1.5 else v
             except Exception:
                 continue
+            if not np.isfinite(v) or v < 0 or v > 100.0:
+                continue                      # 표에서 엉뚱한 숫자를 물었다 — 다음 패턴으로
+            return v / 100.0
     return None
 
 
@@ -7895,11 +8306,13 @@ def _amount_krw(sect: str, pats: Sequence[str]) -> Optional[float]:
 def extract_report_facts(text: str) -> dict:
     """사업보고서 본문 → 하드팩트 수치. 판단하지 않고 숫자만 뽑는다."""
     out: Dict[str, Any] = {}
-    ip = _section(text, "ip")
+    ip = _section(text, "ip", probe=[r"특허\D{0,12}?[\d,]{1,6}\s*건",
+                                     r"특허\s*(?:권|등록|제?\s*\d{2,})"])
     out["patents"] = _count_patents(ip)
     out["sect_ip"] = bool(ip)
 
-    rnd = _section(text, "rnd")
+    rnd = _section(text, "rnd", probe=[r"연구\s*(?:개발)?\s*인력\D{0,12}?[\d,]{1,6}\s*명",
+                                       r"(?:연구원|연구개발\s*인원)\D{0,10}?[\d,]{1,6}\s*명"])
     out["rnd_headcount"] = _rnd_headcount(rnd)
     out["sect_rnd"] = bool(rnd)
     # 정부 R&D 과제: 완료형 사실 문장만 인정
@@ -7909,35 +8322,45 @@ def extract_report_facts(text: str) -> dict:
             gov += 1
     out["gov_rnd_facts"] = float(gov)
 
-    rel = _section(text, "related")
+    _rel_pats = [r"매출\D{0,20}?([\d,.]+)\s*%", r"비중\D{0,10}?([\d,.]+)\s*%"]
+    _relp_pats = [r"매입\D{0,20}?([\d,.]+)\s*%"]
+    rel = _section(text, "related", probe=_rel_pats + _relp_pats)
     out["sect_related"] = bool(rel)
-    out["related_sales_ratio"] = _ratio_pct(
-        rel, [r"매출\D{0,20}?([\d,.]+)\s*%", r"비중\D{0,10}?([\d,.]+)\s*%"])
-    out["related_purchase_ratio"] = _ratio_pct(
-        rel, [r"매입\D{0,20}?([\d,.]+)\s*%"])
+    out["related_sales_ratio"] = _ratio_pct(rel, _rel_pats)
+    out["related_purchase_ratio"] = _ratio_pct(rel, _relp_pats)
 
-    cg = _section(text, "contingent")
+    _cg_pats = [r"지급보증\D{0,24}?([\d,]{3,})", r"우발부채\D{0,24}?([\d,]{3,})"]
+    cg = _section(text, "contingent", probe=_cg_pats)
     out["sect_contingent"] = bool(cg)
-    out["contingent_amt"] = _amount_krw(
-        cg, [r"지급보증\D{0,24}?([\d,]{3,})", r"우발부채\D{0,24}?([\d,]{3,})"])
+    out["contingent_amt"] = _amount_krw(cg, _cg_pats)
 
-    ls = _section(text, "lawsuit")
+    _ls_pats = [r"소송\s*가?액\D{0,24}?([\d,]{3,})", r"청구\s*금액\D{0,24}?([\d,]{3,})"]
+    ls = _section(text, "lawsuit", probe=_ls_pats + [r"소송.{0,20}제기"])
     out["sect_lawsuit"] = bool(ls)
-    out["lawsuit_amt"] = _amount_krw(
-        ls, [r"소송\s*가?액\D{0,24}?([\d,]{3,})", r"청구\s*금액\D{0,24}?([\d,]{3,})"])
+    out["lawsuit_amt"] = _amount_krw(ls, _ls_pats)
     out["lawsuit_new"] = float(sum(1 for s in _SENT_SPLIT.split(ls)[:300]
                                    if re.search(r"소송.{0,20}제기", s) and is_completed_fact(s)))
 
-    au = _section(text, "audit")
+    # ★ 핵심감사사항(KAM)은 2018년 이후 상장사 감사보고서의 '필수 기재사항'이지 강조사항이
+    #   아니다. 탐지어에 넣으면 정상 기업이 전부 발동한다. §6.1/§7.2 가 요구하는 것은
+    #   '강조사항·특기사항'과 '계속기업 불확실성' 이다.
+    _au_pats = [r"강조\s*사항", r"특기\s*사항", r"계속기업.{0,20}(불확실|의문|중요한)"]
+    au = _section(text, "audit", probe=_au_pats)
     out["sect_audit"] = bool(au)
-    out["audit_emphasis"] = float(bool(
-        re.search(r"(강조사항|특기사항|계속기업|핵심감사사항)", au) and
-        not re.search(r"해당사항\s*없|없습니다", au[:400])))
+    _au_hit = next((m for m in (re.search(p, au) for p in _au_pats) if m), None)
+    if _au_hit is None:
+        out["audit_emphasis"] = 0.0
+    else:
+        # 부정 판정은 '그 문구 주변'에서 본다. 앵커 기준 고정 400자 창은 문서 레이아웃의
+        # 우연에 판정이 좌우된다(목차 유무만으로 결과가 뒤집혔다).
+        _near = au[max(0, _au_hit.start() - 120): _au_hit.start() + 300]
+        out["audit_emphasis"] = float(not re.search(r"해당\s*사항\s*(?:이)?\s*없|"
+                                                    r"기재할\s*사항\s*없|없습니다", _near))
 
-    hd = _section(text, "holder")
+    _hd_pats = [r"최대주주\D{0,40}?([\d,.]+)\s*%", r"소유\s*비율\D{0,10}?([\d,.]+)\s*%"]
+    hd = _section(text, "holder", probe=_hd_pats)
     out["sect_holder"] = bool(hd)
-    out["major_holder_pct"] = _ratio_pct(
-        hd, [r"최대주주\D{0,40}?([\d,.]+)\s*%", r"소유\s*비율\D{0,10}?([\d,.]+)\s*%"])
+    out["major_holder_pct"] = _ratio_pct(hd, _hd_pats)
     return out
 
 
@@ -8072,11 +8495,36 @@ def report_parse_rate(F: pd.DataFrame, stats: dict) -> float:
                                              "sect_audit", "sect_holder")]
         okF = F[F["parse_status"].astype(str) == "ok"]
         if len(okF):
-            LOG.table([[c.replace("sect_", ""),
-                        f"{100*pd.to_numeric(okF[c], errors='coerce').fillna(0).mean():.1f}%"]
-                       for c, _ in sect],
-                      ["섹션", "정상판독 문서 내 발견율"], ["l", "r"],
-                      title="섹션별 발견율 — '판독 실패'와 '해당 섹션 없음'은 다른 사건이다")
+            # ★★ '섹션 발견율' 만 보면 안 된다 ★★
+            #   그 표는 "단어가 문서 어딘가에 있었다"를 재는 것이지 "그 섹션을 읽었다"를
+            #   재는 것이 아니다. 앵커가 목차에 걸리면 발견율은 100% 인데 값은 전부 None 이고,
+            #   그 상태로 §6.1 배제플래그 4종과 §7.2 3-A 4개가 한 번도 발동하지 않는다.
+            #   → 필드별 '값 추출 성공률' 을 나란히 싣는다. 이 값이 0 에 가까우면 파서가
+            #     죽은 것이지 데이터가 없는 것이 아니다.
+            _valcol = {"ip": "patents", "rnd": "rnd_headcount", "related": "related_sales_ratio",
+                       "contingent": "contingent_amt", "lawsuit": "lawsuit_amt",
+                       "audit": "audit_emphasis", "holder": "major_holder_pct"}
+            rows, worst = [], []
+            for c, _ in sect:
+                nm = c.replace("sect_", "")
+                s_rate = 100 * pd.to_numeric(okF[c], errors="coerce").fillna(0).mean()
+                vc = _valcol.get(nm)
+                if vc and vc in okF.columns:
+                    v_rate = 100 * okF[vc].notna().mean()
+                    vtxt = f"{v_rate:.1f}%"
+                    if s_rate >= 50.0 and v_rate < 5.0:
+                        worst.append(nm)
+                else:
+                    vtxt = "—"
+                rows.append([nm, f"{s_rate:.1f}%", vtxt])
+            LOG.table(rows, ["섹션", "앵커 발견율", "값 추출 성공률"], ["l", "r", "r"],
+                      title="섹션별 발견율 vs 값 추출률 — 앵커만 잡히고 값이 안 나오면 "
+                            "목차에 걸린 것이다(필터층이 통째로 무력화된다)")
+            if worst:
+                LOG.warn(f"앵커는 잡히는데 값이 거의 안 나오는 섹션: {', '.join(worst)}. "
+                         f"이 섹션에 의존하는 §6.1 배제플래그·§7.2 3-A 는 사실상 발동하지 "
+                         f"않습니다 — 어블레이션의 '기여 없음'을 '규칙이 무의미하다'로 읽지 "
+                         f"마십시오. 파서가 실행되지 않은 것입니다.")
     if rate < 0.80:
         LOG.warn(f"dart_parse_rate {100*rate:.1f}% < 80% (§2.1 게이트 미달). "
                  f"주된 사유는 위 표에 분해되어 있습니다. 스캔본 비중이 높다면 정규식을 고쳐도 "
@@ -8349,7 +8797,13 @@ def _attach_disclosure_events(d: pd.DataFrame, dis: pd.DataFrame,
     sig_by_rebal = (d.groupby("rebal", observed=True)["signal_date"].first().to_dict())
     prev_by_rebal: Dict[Any, pd.Timestamp] = {}
     for i, t in enumerate(reb):
-        prev_by_rebal[t] = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        # ★ 왼쪽 끝은 '직전 분기의 signal_date'. 명목 리밸일로 잡으면
+        #   (signal_{i-1}, rebal_{i-1}] 구간이 어느 창에도 속하지 않아, 명목일이 거래일인
+        #   분기마다 정확히 1거래일의 공시가 사라진다.
+        _p = as_ts(sig_by_rebal.get(reb[i - 1])) if i > 0 else None
+        if _p is None:
+            _p = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        prev_by_rebal[t] = _p
 
     idx = {(c, as_ts(t)): None for c, t in zip(d["code"], d["rebal"])}
     for t in reb:
@@ -8784,7 +9238,13 @@ def build_tone_panel(S: pd.DataFrame, G: pd.DataFrame, cal: pd.DataFrame,
     parts = []
     for i, t in enumerate(reb):
         hi = sig.get(as_ts(t))
-        lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        # ★ 왼쪽 끝은 '직전 분기의 signal_date' 여야 한다. 명목 리밸일(reb[i-1])로 잡으면
+        #   signal_date_{i-1} < rebal_{i-1} 이므로 (signal_{i-1}, rebal_{i-1}] 구간이
+        #   어느 창에도 속하지 않는다 — 명목일이 거래일인 분기마다 정확히 1거래일의
+        #   공시·리포트·목표주가 수정이 조용히 사라진다.
+        lo = sig.get(as_ts(reb[i - 1])) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        if lo is None:
+            lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
         w = R[(R["usable"] > lo) & (R["usable"] <= hi)]
         if w.empty:
             continue
@@ -8894,7 +9354,13 @@ def build_tp_revision(links: pd.DataFrame, G: pd.DataFrame, cal: pd.DataFrame) -
     parts = []
     for i, t in enumerate(reb):
         hi = sig.get(as_ts(t))
-        lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        # ★ 왼쪽 끝은 '직전 분기의 signal_date' 여야 한다. 명목 리밸일(reb[i-1])로 잡으면
+        #   signal_date_{i-1} < rebal_{i-1} 이므로 (signal_{i-1}, rebal_{i-1}] 구간이
+        #   어느 창에도 속하지 않는다 — 명목일이 거래일인 분기마다 정확히 1거래일의
+        #   공시·리포트·목표주가 수정이 조용히 사라진다.
+        lo = sig.get(as_ts(reb[i - 1])) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
+        if lo is None:
+            lo = as_ts(reb[i - 1]) if i > 0 else (as_ts(t) - pd.DateOffset(months=3))
         w = L[(L["usable"] > lo) & (L["usable"] <= hi)]
         if w.empty:
             continue
@@ -9192,14 +9658,29 @@ def build_final_selection(P: pd.DataFrame, variant: str, n_final: int = FINAL_N,
         pool = pool & (col(d, "RULE3A_BLOCK").fillna(0) == 0)
 
     sel = pd.Series(False, index=d.index)
+    short_q: List[Tuple[Any, int]] = []
     for _t, g in d.groupby("rebal", observed=True):
         gg = g[pool.loc[g.index]]
         if gg.empty:
+            short_q.append((_t, 0))
             continue
         keys = [c for c in (rank_col, f"score1_{variant}", "code") if c in gg.columns]
         asc = [False] * (len(keys) - 1) + [True]
         k = int(min(max(FINAL_N_MIN, min(n_final, FINAL_N_MAX)), len(gg)))
+        # ★ §7.4 는 보유 20~40 종목을 규정한다. 풀이 20 미만이면 그 분기는 규정 미달이며,
+        #   조용히 진행하면 '집중 포트폴리오의 우연한 성과'가 규정 준수로 보고된다.
+        #   여기서 종목을 억지로 채우면(제외 규칙을 되돌려서) 그게 더 큰 위반이므로,
+        #   미달 자체는 허용하되 분기와 종목수를 반드시 표면화한다.
+        if k < FINAL_N_MIN:
+            short_q.append((_t, k))
         sel.loc[gg.sort_values(keys, ascending=asc, kind="mergesort").head(k).index] = True
+    if short_q:
+        LOG.warn(f"§7.4 보유 하한({FINAL_N_MIN}종목) 미달 분기 {len(short_q)}회 "
+                 f"[{stage}/{variant}] — " +
+                 ", ".join(f"{as_ts(t):%Y-%m}:{n}종목" for t, n in short_q[:8]) +
+                 (" …" if len(short_q) > 8 else "") +
+                 ". 규칙을 되돌려 억지로 채우지 않았습니다. 해당 분기의 성과는 "
+                 "'규정 범위 밖의 집중 포트폴리오' 로 해석해야 합니다.")
     return sel
 
 
@@ -9264,9 +9745,21 @@ def build_exec_prices(cal: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame
     # ★ forward 방향이다. 체결일에 거래가 없으면 '그 이후 첫 거래일'에 체결된 것으로 본다.
     #   backward 로 붙이면 체결일 이전 가격으로 사게 되어 미래를 모르고도 유리해진다.
     M = pd.merge_asof(L, R, left_on="exec_date", right_on="px_date", by="code",
-                      direction="forward", tolerance=pd.Timedelta(days=15))
+                      direction="forward",
+                      tolerance=pd.Timedelta(days=int(EXEC_FILL_MAX_LAG_DAYS)))
     out = M.dropna(subset=["px_exec"])[["code", "rebal", "exec_date", "px_date", "px_exec"]]
     out = out.rename(columns={"px_date": "fill_date"})
+    # ★ 체결 지연 분포를 감사표로 남긴다. tolerance 를 길게 잡으면 '정지 후 재개장 가격'을
+    #   진입가로 쓰게 되는데(정지 복권의 유리한 쪽만 취함), 그 건수를 숨기면 안 된다.
+    lag = (as_ts_series(out["fill_date"]) - as_ts_series(out["exec_date"])).dt.days
+    LOG.table([["당일 체결(lag=0)", f"{int((lag == 0).sum()):,}"],
+               ["1~2일 지연", f"{int(lag.between(1, 2).sum()):,}"],
+               [f"3~{int(EXEC_FILL_MAX_LAG_DAYS)}일 지연", f"{int(lag.between(3, int(EXEC_FILL_MAX_LAG_DAYS)).sum()):,}"],
+               [f"체결 불가(>{int(EXEC_FILL_MAX_LAG_DAYS)}일 · 매수 후보에서 탈락)",
+                f"{int(len(M) - len(out)):,}"]],
+              ["체결 지연", "건수"], ["l", "r"],
+              title=f"체결가 확보 상황 (허용 지연 {int(EXEC_FILL_MAX_LAG_DAYS)}일) — "
+                    f"지연 체결은 정지 해제가를 진입가로 쓰게 되므로 짧게 제한한다")
     PIPE.io("OUT", "MEM", "exec_prices", out)
     return downcast_q(out)
 
@@ -9314,16 +9807,28 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
     nxt_rebal = {t: (_exec_of.get(reb[i + 1]) if i + 1 < len(reb) else None)
                  for i, t in enumerate(reb)}
 
-    n_liq = n_zero = 0
+    n_liq = n_zero = n_halt = 0
     if delist:
         dl = {str(k): as_ts(v) for k, v in dict(delist).items()}
         E["_dl"] = as_ts_series(E["code"].map(dl))
         E["_nxt"] = as_ts_series(E["rebal"].map(nxt_rebal))
         in_window = (E["_dl"].notna() & E["_nxt"].notna() &
                      (E["_dl"] > E["exec_date"]) & (E["_dl"] <= E["_nxt"]))
-        if in_window.any():
-            ld = as_ts_series(E.loc[in_window, "code"].map(last_px["last_date"]))
-            lc = pd.to_numeric(E.loc[in_window, "code"].map(last_px["last_close"]),
+        # ★★ 창 밖 폐지의 뒷문 ★★
+        #   종목이 분기 중간에 거래정지되면 (a) 다음 신호일에 종가가 없어 U-1000 에서
+        #   탈락하고, (b) 다음 체결일에도 체결가가 없어 fwd_ret 이 결측("missing")이 되며,
+        #   (c) 실제 폐지일은 대개 몇 달 뒤라 위 in_window 를 벗어난다. 세 조건이 겹치면
+        #   그 포지션은 어느 분기에서도 −100% 를 받지 못하고 '정확히 0%'로 청산된다.
+        #   한국 실질심사 정지가 통상 수개월인 이상 이건 예외가 아니라 표준 경로다.
+        #   판정 기준을 "창 안에서 폐지됐는가"가 아니라 "이 포지션이 다시 체결 가능해지지
+        #   않았고 결국 폐지되었는가"로 바꾼다.
+        stuck = (E["_dl"].notna() & (E["_dl"] > E["exec_date"]) &
+                 (E["exit_kind"] == "missing") & (~in_window))
+        n_halt = int(stuck.sum())
+        resolve = in_window | stuck
+        if resolve.any():
+            ld = as_ts_series(E.loc[resolve, "code"].map(last_px["last_date"]))
+            lc = pd.to_numeric(E.loc[resolve, "code"].map(last_px["last_close"]),
                                errors="coerce")
             # ── 정리매매가로 인정하는 조건 (§3.4) ──────────────────────────────────────
             #  ① 가격 시계열이 폐지 시점까지 실제로 닿아 있을 것 (닿지 않으면 그냥 데이터가
@@ -9333,13 +9838,16 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
             #    청산가로 둔갑해 '상장폐지 = 0% 손실'이 된다. 그게 정확히 생존자편향의
             #    재유입이며, 계약 Q3 가 이 경로를 잡아낸다. 애매하면 규정대로 −100% 로
             #    보수적으로 처리한다(성과를 과소평가하는 방향 = 편향 통제상 옳은 방향).
-            entry = E.loc[in_window, "px_exec"]
-            reach = ld.notna() & (ld >= E.loc[in_window, "_dl"] - pd.Timedelta(days=7))
+            entry = E.loc[resolve, "px_exec"]
+            reach = ld.notna() & (ld >= E.loc[resolve, "_dl"] - pd.Timedelta(days=7))
             liq_ret = lc / entry - 1.0
             captured = reach & liq_ret.notna() & (liq_ret < 0)
-            E.loc[in_window, "fwd_ret"] = liq_ret.where(captured, -1.0)
-            E.loc[in_window, "exit_kind"] = np.where(captured.to_numpy(),
-                                                     "liquidation", "delist_-100%")
+            E.loc[resolve, "fwd_ret"] = liq_ret.where(captured, -1.0)
+            kind = np.where(captured.to_numpy(), "liquidation", "delist_-100%")
+            # 정지 후 창 밖 폐지는 별도 유형으로 남겨 감사표에서 바로 보이게 한다.
+            kind = np.where(stuck[resolve].to_numpy() & ~captured.to_numpy(),
+                            "halt_then_delist", kind)
+            E.loc[resolve, "exit_kind"] = kind
             n_liq = int(captured.sum())
             n_zero = int((~captured).sum())
         E = E.drop(columns=[c for c in ("_dl", "_nxt") if c in E.columns])
@@ -9351,6 +9859,9 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
     if n_liq or n_zero:
         LOG.info(f"보유 중 상장폐지 {n_liq + n_zero:,}건 — 정리매매가 반영 {n_liq:,}건 / "
                  f"가격 부재로 −100% 처리 {n_zero:,}건 (§3.4 규정대로 누락 처리하지 않음)")
+    if n_halt:
+        LOG.info(f"  그중 {n_halt:,}건은 '거래정지 → 다음 분기 이후 폐지'라 예전 규칙(같은 분기 "
+                 f"창 안 폐지만 인정)에서는 0% 로 새던 건이다 — halt_then_delist 로 계상했다.")
     return E[["code", "rebal", "exec_date", "px_exec", "fwd_ret", "exit_kind"]]
 
 
@@ -9374,12 +9885,38 @@ def compute_weights(sub: pd.DataFrame, scheme: str = "equal") -> pd.Series:
 
 def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.DataFrame,
                   scheme: str = "equal", apply_costs: bool = True,
-                  label: str = "QVF", delist: Optional[Dict[str, pd.Timestamp]] = None) -> dict:
-    """분기 리밸런싱 롱온리 백테스트. 비용 전/후를 동시에 산출한다."""
+                  label: str = "QVF", delist: Optional[Dict[str, pd.Timestamp]] = None,
+                  cost_model: Optional[str] = None) -> dict:
+    """분기 리밸런싱 롱온리 백테스트. 비용 전/후를 동시에 산출한다.
+
+    cost_model: "spec"(기본, §8.1 문언 = 증권거래세 + 스프레드/2) | "extended"(+수수료+충격)
+    """
+    cost_model = str(cost_model or QVF_COST_MODEL).lower()
     need = ["code", "rebal", sel_col]
     d = P[[c for c in P.columns if c in set(need) | {"adtv", "cs_spread", "vol_d", "market",
                                                      "mktcap", "score1_V", "score1_VQ",
                                                      "score1_VQF"}]].copy()
+    # ★★ 유동성/스프레드 조회표는 '선정 종목'이 아니라 패널 전체에서 만들어야 한다 ★★
+    #   예전에는 선정 종목만 남긴 프레임에서 dict 를 만들었다. 그러면 이번 분기에 '팔고
+    #   나가는' 종목은 ADTV 조회가 100% 실패하고, 폴백 `part=1.0`(참여율 100%) 이 걸려
+    #   매도 레그 전체가 IMPACT_K = 1000bp 를 맞았다. 총비용의 9할이 이 한 줄이었고,
+    #   세 변형 전부를 비용 차감 후 음의 CAGR 로 밀어 §10.4 폐기조건 ①을 자동 발동시켰다.
+    _LQ = P[[c for c in ("code", "rebal", "adtv", "cs_spread") if c in P.columns]].copy()
+    _LQ["code"] = _LQ["code"].astype(str)
+    _LQ["rebal"] = as_ts_series(_LQ["rebal"])
+    _adv_by_t: Dict[Any, Dict[str, float]] = {}
+    _spr_by_t: Dict[Any, Dict[str, float]] = {}
+    for _t, _g in _LQ.groupby("rebal", observed=True):
+        _cd = _g["code"].to_numpy()
+        if "adtv" in _g.columns:
+            _adv_by_t[as_ts(_t)] = dict(zip(_cd, pd.to_numeric(_g["adtv"], errors="coerce")))
+        if "cs_spread" in _g.columns:
+            _spr_by_t[as_ts(_t)] = dict(zip(_cd, pd.to_numeric(_g["cs_spread"], errors="coerce")))
+    del _LQ
+    # 패널에서 아예 사라진 종목(유니버스 이탈)을 위한 '마지막으로 알던 값' 누적표.
+    _known_adv: Dict[str, float] = {}
+    _known_spr: Dict[str, float] = {}
+    n_adv_fallback = 0
     d = d[d[sel_col].fillna(False).astype(bool)]
     F = fwd.set_index(["code", "rebal"])["fwd_ret"] if len(fwd) else pd.Series(dtype="float64")
 
@@ -9397,6 +9934,18 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
     rows, holds = [], []
     n_missing, n_forced_delist, n_empty_q = 0, 0, 0
     for t in reb:
+        # 이번 분기 조회표를 갱신한다(패널에 있는 종목은 최신값, 없으면 마지막으로 알던 값).
+        _cur_adv = _adv_by_t.get(as_ts(t), {})
+        _cur_spr = _spr_by_t.get(as_ts(t), {})
+        for _c, _v in _cur_adv.items():
+            if _v is not None and np.isfinite(_v) and _v > 0:
+                _known_adv[_c] = float(_v)
+        for _c, _v in _cur_spr.items():
+            if _v is not None and np.isfinite(_v) and _v > 0:
+                _known_spr[_c] = float(_v)
+        _med_adv = float(np.median(list(_cur_adv.values()))) if _cur_adv else np.nan
+        if not np.isfinite(_med_adv) or _med_adv <= 0:
+            _med_adv = float(ADTV_MIN_KRW)
         sub = d[d["rebal"] == t].copy()
         if sub.empty:
             # ★ 3-A 통과 종목이 0 인 분기는 설계상 발생할 수 있는 정상 결과다(사전등록).
@@ -9411,15 +9960,25 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                 fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan
                 if not np.isfinite(fr):
                     dl = dlmap.get(str(c))
-                    fr = -1.0 if (dl is not None and nx0 is not None and te0 < dl <= as_ts(nx0)) else 0.0
+                    # 창 안 폐지만 인정하면 '정지 → 다음 분기 이후 폐지'가 0% 로 샌다.
+                    # 체결 불가 + 이후 폐지 확인이면 규정대로 −100%(마지막 분기는 제외).
+                    fr = -1.0 if (dl is not None and nx0 is not None and as_ts(dl) > te0) else 0.0
                 g0 += w * fr
             c0 = 0.0
             if apply_costs and prev_w:
                 tax0 = qvf_sell_tax(te0)
-                sp0 = float(np.clip(SLIPPAGE_FLOOR_BPS / 1e4,
-                                    SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))
-                for w in prev_w.values():
-                    c0 += abs(w) * (COMMISSION_BPS / 1e4 + sp0 / 2.0 + tax0)
+                _fee0 = (COMMISSION_BPS / 1e4) if cost_model == "extended" else 0.0
+                for c, w in prev_w.items():
+                    sp0 = _known_spr.get(str(c), np.nan)
+                    sp0 = (float(sp0) if sp0 is not None and np.isfinite(sp0)
+                           else SLIPPAGE_FLOOR_BPS / 1e4)
+                    sp0 = float(np.clip(sp0, SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))
+                    imp0 = 0.0
+                    if cost_model == "extended":
+                        adv0 = _cur_adv.get(str(c), _known_adv.get(str(c), np.nan))
+                        adv0 = float(adv0) if adv0 is not None and np.isfinite(adv0) and adv0 > 0 else _med_adv
+                        imp0 = IMPACT_K * math.sqrt(min(1.0, abs(w) * ACCOUNT_KRW / adv0))
+                    c0 += abs(w) * (_fee0 + sp0 / 2.0 + imp0 + tax0)
             n_empty_q += 1
             rows.append({"rebal": t, "ret": g0 - c0, "ret_gross": g0, "n": 0,
                          "turnover": turn0, "cost": c0})
@@ -9432,29 +9991,30 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                    for c in set(w_new) | set(prev_w))
         cost = 0.0
         if apply_costs:
-            # ★ sub.get(없는컬럼) 은 None 을 돌려주고 pd.to_numeric(None) 은 스칼라 nan 이라
-            #   zip 이 "float is not iterable" 로 죽는다. 축소된 강건성 실행에서 실제로 도달한다.
-            spread = dict(zip(sub["code"].astype(str),
-                              pd.to_numeric(col(sub, "cs_spread"), errors="coerce")))
-            advm = dict(zip(sub["code"].astype(str),
-                            pd.to_numeric(col(sub, "adtv"), errors="coerce")))
             # ★ 세율 구간 경계가 2019-06-03 인데 2019-06-01 은 토요일이라 그 분기 체결일이
             #   정확히 2019-06-03 이다. 명목일로 조회하면 그 한 분기만 구세율(0.30%)이 적용돼
             #   매도 레그 전체에 20bp 를 과다계상한다. 체결일 기준으로 조회한다.
             tax = qvf_sell_tax(exec_of.get(t, t))
+            _fee = (COMMISSION_BPS / 1e4) if cost_model == "extended" else 0.0
             for c in set(w_new) | set(prev_w):
                 dw = w_new.get(c, 0.0) - prev_w.get(c, 0.0)
                 if abs(dw) < 1e-9:
                     continue
-                sp = spread.get(c, np.nan)
+                # 매수·매도 모두 패널 전체 조회표를 쓴다(매도 종목도 값을 갖는다).
+                sp = _cur_spr.get(c, _known_spr.get(c, np.nan))
                 sp = float(sp) if sp is not None and np.isfinite(sp) else SLIPPAGE_FLOOR_BPS / 1e4
                 sp = float(np.clip(sp, SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))
-                adv = advm.get(c, np.nan)
-                adv = float(adv) if adv is not None and np.isfinite(adv) and adv > 0 else 0.0
-                notional = abs(dw) * ACCOUNT_KRW
-                part = min(1.0, notional / adv) if adv > 0 else 1.0
-                impact = IMPACT_K * math.sqrt(part)
-                one_way = COMMISSION_BPS / 1e4 + sp / 2.0 + impact
+                impact = 0.0
+                if cost_model == "extended":
+                    adv = _cur_adv.get(c, _known_adv.get(c, np.nan))
+                    if adv is None or not np.isfinite(adv) or adv <= 0:
+                        # 폴백은 '참여율 100%'(=충격 상수 1000bp) 가 아니라 그 분기 횡단면
+                        # 중앙 ADTV 다. 조회 실패를 최악의 유동성으로 등치시키면 안 된다.
+                        adv = _med_adv
+                        n_adv_fallback += 1
+                    part = min(1.0, (abs(dw) * ACCOUNT_KRW) / float(adv))
+                    impact = IMPACT_K * math.sqrt(part)
+                one_way = _fee + sp / 2.0 + impact
                 cost += abs(dw) * one_way + (abs(dw) * tax if dw < 0 else 0.0)
 
         gross = 0.0
@@ -9466,9 +10026,11 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
             if not np.isfinite(fr):
                 # ★ 체결가가 없어 수익률을 못 만든 종목을 일괄 0% 로 두면, 폐지 직전에
                 #   소스에서 사라지는 종목이 전부 '무손실'이 된다 — 생존자편향의 뒷문이다.
-                #   보유구간 안에서 폐지가 확인되면 §3.4 규정대로 −100% 를 적용한다.
+                #   ★ 판정 기준은 "이번 보유창 안에서 폐지"가 아니라 "다시 체결 가능해지지
+                #     않았고(=fr 결측) 이후 폐지되었다"이다. 정지가 수개월 이어지다 폐지되는
+                #     한국 실질심사 경로가 예전 창 조건을 표준적으로 빠져나갔다.
                 dl = dlmap.get(str(c))
-                if dl is not None and nx is not None and t_exec < dl <= as_ts(nx):
+                if dl is not None and nx is not None and as_ts(dl) > t_exec:
                     fr = -1.0
                     n_forced_delist += 1
                 else:
@@ -9491,7 +10053,10 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
         if n_missing > max(20, 0.02 * len(holds)):
             LOG.warn(f"0% 로 처리된 보유가 {n_missing:,}건으로 많습니다. 폐지·거래정지가 "
                      f"'무손실'로 새고 있을 수 있습니다 — 위 '보유 종료 유형' 표와 함께 보세요.")
+    if n_adv_fallback:
+        LOG.debug(f"[{label}] ADTV 조회 실패 {n_adv_fallback:,}건 — 그 분기 중앙 ADTV 로 대체")
     return {"returns": R, "holdings": pd.DataFrame(holds), "label": label, "scheme": scheme,
+            "cost_model": cost_model,
             "n_forced_delist": n_forced_delist, "n_missing": n_missing}
 
 
@@ -9657,6 +10222,9 @@ def summarize_experiment(name: str, bt: dict, P: Optional[pd.DataFrame] = None,
         ic, icir, n_ic = rank_ic(P, sc, fwd, pool_col=pool)
     rec = {"name": name, "desc": desc, "net": net, "gross": gro,
            "IC": ic, "ICIR": icir, "n_ic": n_ic,
+           # ★ §9-C2 는 '차이의 유의성'을 요구한다. 차이를 검정하려면 두 실험의 분기수익률
+           #   시계열이 필요하므로 여기서 보관한다(요약 통계만으로는 만들 수 없다).
+           "R": (R[["rebal", "ret"]].copy() if R is not None and len(R) else None),
            "t": net.get("t통계량(HAC)", np.nan), "n": net.get("분기수", 0)}
     rec["p"] = _pval_from_t(rec["t"], int(rec["n"] or 0))
     EXPERIMENTS[name] = rec
@@ -9686,8 +10254,43 @@ def report_experiment_table(names: Sequence[str], title: str):
              "잠식할 수 있으므로 판단 기준은 언제나 '비용 차감 후' 입니다.")
 
 
-def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q) -> dict:
-    """§8.3 — 주 실험 3개 + 어블레이션 4개를 하나의 패밀리로 묶어 BH-FDR 보정."""
+def paired_diff_test(a: str, b: str, label: Optional[str] = None) -> dict:
+    """실험 a − b 의 분기수익률 차이에 대한 HAC t 검정. §9-C2 가 요구하는 '차이의 유의성'.
+
+    ★ 예전에는 C2 가 fdr_pass["VQF-full"] 즉 'VQF 자신의 알파가 0보다 큰가'를 읽었다.
+      VQF 와 VQ 는 U-200 중복률이 높아(C3 가 0.85 미만을 요구할 정도) 수익률이 강하게
+      상관된다 — 두 시계열의 차이는 각각의 수준보다 훨씬 작은 신호다. 자기 유의성으로
+      대체하면 C2 통과가 극적으로 쉬워지고, 수급 축 채택 쪽으로 기운다(상향 드리프트).
+    """
+    nm = label or f"{a}−{b}(차이)"
+    ra = (EXPERIMENTS.get(a) or {}).get("R")
+    rb = (EXPERIMENTS.get(b) or {}).get("R")
+    if ra is None or rb is None or not len(ra) or not len(rb):
+        return {"name": nm, "t": np.nan, "p": np.nan, "n": 0, "mean": np.nan}
+    m = ra.merge(rb, on="rebal", how="inner", suffixes=("_a", "_b"))
+    d = pd.to_numeric(m["ret_a"], errors="coerce") - pd.to_numeric(m["ret_b"], errors="coerce")
+    d = d.dropna().to_numpy(dtype=float)
+    if len(d) < 4:
+        return {"name": nm, "t": np.nan, "p": np.nan, "n": int(len(d)), "mean": np.nan}
+    t, _se = hac_tstat(d)
+    return {"name": nm, "t": float(t), "p": _pval_from_t(float(t), len(d)),
+            "n": int(len(d)), "mean": float(np.mean(d))}
+
+
+def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q,
+                  extra_tests: Optional[Sequence[dict]] = None) -> dict:
+    """§8.3 — 주 실험 3개 + 어블레이션 4개를 하나의 패밀리로 묶어 BH-FDR 보정.
+
+    extra_tests: {"name","t","p","n"} 형태의 추가 검정(예: §9-C2 의 VQF−VQ 차이).
+                 같은 패밀리에 넣어야 보정이 정직하다.
+    """
+    for _e in (extra_tests or ()):
+        if _e and np.isfinite(_e.get("p", np.nan)):
+            EXPERIMENTS[_e["name"]] = {"name": _e["name"], "desc": "§9-C2 차이검정",
+                                       "net": {}, "gross": {}, "R": None,
+                                       "t": _e["t"], "p": _e["p"], "n": _e["n"]}
+    names = list(names) + [e["name"] for e in (extra_tests or ())
+                           if e and np.isfinite(e.get("p", np.nan))]
     fam = [n for n in names if n in EXPERIMENTS and np.isfinite(EXPERIMENTS[n].get("p", np.nan))]
     if not fam:
         LOG.warn("유효한 p값이 없어 BH-FDR 보정을 수행할 수 없습니다.")
@@ -9943,14 +10546,19 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
         c1_d = (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f}"
                 if np.isfinite(s_vq) and np.isfinite(s_vqf) else "산출 불가")
 
-    # C2: 그 차이가 BH-FDR 보정 후에도 유의
+    # C2: 그 '차이'가 BH-FDR 보정 후에도 유의 — VQF 자신의 유의성이 아니다.
+    _dkey = f"{exp_vqf}−{exp_vq}(차이)"
     if _flow_ok is False:
         c2, c2_d = None, "flow_cov 게이트 미달 — 판정 불가"
     elif fdr_pass is None:
         c2, c2_d = None, "BH-FDR 결과 없음"
+    elif _dkey not in fdr_pass:
+        c2, c2_d = None, f"차이검정({_dkey})이 패밀리에 없음 — 판정 불가"
     else:
-        c2 = bool(fdr_pass.get(exp_vqf, False)) and c1
-        c2_d = (f"VQF-full BH-FDR {'통과' if fdr_pass.get(exp_vqf) else '기각'}"
+        _dt_rec = EXPERIMENTS.get(_dkey, {})
+        c2 = bool(fdr_pass.get(_dkey, False)) and bool(c1)
+        c2_d = (f"차이 HAC t {_dt_rec.get('t', float('nan')):+.2f} · "
+                f"BH-FDR {'통과' if fdr_pass.get(_dkey) else '기각'}"
                 + ("" if c1 else " · C1 미충족이라 차이 자체가 없음"))
 
     # C3: U-200 중복률 < 0.85
@@ -9960,10 +10568,17 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
     c3 = bool(np.isfinite(o) and o < 0.85)
     c3_d = f"VQ∩VQF 중복률 {o:.3f}" if np.isfinite(o) else "산출 불가"
 
-    # C4: 수급 비영 관측 비율 ≥ 30%
-    nz = globals().get("FLOW_NONZERO_RATIO", float("nan"))
+    # C4: 수급 비영 관측 비율 ≥ 30% — 반드시 '사전등록 창(60일)' 의 값이어야 한다.
+    #     axis_F 는 §8.4 민감도(20/60/120일)에서도 재호출되며 전역을 덮어쓴다. 그대로 읽으면
+    #     C4 가 마지막 실행(120일)의 값을 보게 되고, 창이 길수록 비영 비율이 높아지므로
+    #     사전등록 기준보다 통과하기 쉬워진다(상향 드리프트).
+    nz = globals().get("FLOW_NONZERO_RATIO_PREREG", float("nan"))
+    _nz_src = f"사전등록 {int(FLOW_WINDOW_DAYS)}일 창"
+    if not np.isfinite(nz):
+        nz = globals().get("FLOW_NONZERO_RATIO", float("nan"))
+        _nz_src = "창 미상(폴백)"
     c4 = bool(np.isfinite(nz) and nz >= 0.30)
-    c4_d = f"비영 관측 {100*nz:.1f}%" if np.isfinite(nz) else "산출 불가"
+    c4_d = f"비영 관측 {100*nz:.1f}% ({_nz_src})" if np.isfinite(nz) else "산출 불가"
 
     # C5: 리포트 커버리지가 VQ 대비 크게 높지 않음
     cov = (cmp_res or {}).get("coverage", {})
@@ -10016,9 +10631,22 @@ def report_preregistration_kill(main_names: Sequence[str], best: str,
     out["all_alpha_dead"] = k1
 
     # ② X1(1차만)과 최우수 full 의 차이가 미미 → 깔때기 구조 무가치
+    #   ★ 명세는 "미미"라고만 하고 수치를 주지 않는다. 예전 코드의 0.05 는 순수 임의값이었고,
+    #     40분기 표본에서 두 Sharpe 차이의 표준오차(≈0.50)의 0.1배에 불과하다 — 참 기여가
+    #     0 이어도 절반의 확률로 통과하는, 사실상 판별력 없는 기준이다.
+    #     그래서 '차이의 신뢰구간이 0 을 포함하면 미미'라는 통계적 정의로 대체한다.
+    #     비교 가능한 검정을 못 만들면 0.05 를 폴백으로 쓰되 그 사실을 근거란에 적는다.
     s_full = (EXPERIMENTS.get(best, {}).get("net") or {}).get("Sharpe", np.nan)
     s_x1 = (EXPERIMENTS.get(x1_name, {}).get("net") or {}).get("Sharpe", np.nan)
-    k2 = bool(np.isfinite(s_full) and np.isfinite(s_x1) and (s_full - s_x1) < 0.05)
+    _dt2 = paired_diff_test(best, x1_name, label=f"{best}−{x1_name}(깔때기기여)")
+    if np.isfinite(_dt2.get("t", np.nan)):
+        # 단측(우측) t 가 임계 미만 = 차이가 0 과 구분되지 않음 = 깔때기 기여 미미
+        k2 = bool(_dt2["p"] >= 0.10)
+        k2_basis = (f"분기수익률 차이 HAC t {_dt2['t']:+.2f} · p {_dt2['p']:.3f} "
+                    f"(n={_dt2['n']}) — p ≥ 0.10 이면 '미미'")
+    else:
+        k2 = bool(np.isfinite(s_full) and np.isfinite(s_x1) and (s_full - s_x1) < 0.05)
+        k2_basis = "차이검정 불가 → Sharpe 차 < 0.05 폴백(임의 임계값임을 명시)"
     out["funnel_worthless"] = k2
 
     # ③ 배제플래그가 MDD 개선에 기여하지 못함 → 2층 논리 반증
@@ -10031,8 +10659,7 @@ def report_preregistration_kill(main_names: Sequence[str], best: str,
         ["① 세 변형 모두 비용 차감 후 알파 소멸",
          ", ".join(f"{n} {100*cagrs[n]:+.1f}%" for n in main_names if np.isfinite(cagrs.get(n, np.nan))) or "산출 불가",
          "❗ 충족(폐기)" if k1 else "✔ 미충족"],
-        ["② X1(1차만) 과 최우수 full 의 차이가 미미",
-         f"Sharpe {s_full:.3f} vs X1 {s_x1:.3f}" if np.isfinite(s_full) and np.isfinite(s_x1) else "산출 불가",
+        ["② X1(1차만) 과 최우수 full 의 차이가 미미", k2_basis,
          "❗ 충족(폐기)" if k2 else "✔ 미충족"],
         ["③ 배제 컴포넌트가 MDD 개선에 기여 못함",
          f"MDD {100*m_full:+.1f}% vs X1 {100*m_x1:+.1f}%" if np.isfinite(m_full) and np.isfinite(m_x1) else "산출 불가",
@@ -10042,6 +10669,17 @@ def report_preregistration_kill(main_names: Sequence[str], best: str,
     if any(out.values()):
         LOG.warn("§10.4 폐기 조건이 충족되었습니다. 이 결과를 파라미터 조정으로 되살리려 하지 "
                  "마십시오. 위 수치를 그대로 보고하고 중단하는 것이 사전등록의 이행입니다.")
+        # ★ '미달 시 행동'을 표에 적어 놓고 아무것도 하지 않으면 그 표는 거짓말이 된다.
+        #   예전에는 폐기 판정을 낸 직후 그 폐기된 전략의 실전 편입 종목표를 그대로 출력했다.
+        out["_halted"] = bool(STOP_ON_KILL_CRITERIA)
+        if STOP_ON_KILL_CRITERIA:
+            _hit = [k for k, v in out.items() if v is True and not k.startswith("_")]
+            raise KillCriteria(
+                "§10.4 사전등록 폐기 조건 충족: " + ", ".join(_hit) + "\n"
+                "  사전등록의 이행은 '여기서 멈추는 것' 입니다. 최종 편입 종목표는 출력하지 "
+                "않습니다.\n"
+                "  수치만 확인하고 계속 보고 싶다면 STOP_ON_KILL_CRITERIA = False 로 두십시오 "
+                "— 단, 그 실행 결과를 '전략이 통과했다'고 읽으면 안 됩니다.")
     else:
         LOG.ok("§10.4 폐기 조건에 해당하지 않습니다.")
     LOG.info("§10.2 성격 구분 — 1차필터(가치·퀄리티)의 기여는 알파 창출로, 2차 배제플래그와 "
@@ -10102,8 +10740,13 @@ def report_discretion_ledger():
          "차입금 계정이 전부 결측이면 부채총계로 폴백 → EV 과대추정(=밸류 매력 과소평가)"],
         ["EV<0 을 클립하지 않음", "명세 침묵", "중립",
          "순현금>시총 기업이 연속 순서를 유지. 클립하면 최상위에 동점 덩어리가 생겼다"],
-        ["분모 부적격의 강제 바닥 = 그 시점 최소 z", "명세는 '최하위 순위'만 지정", "중립",
-         "임의 상수(-3 등)를 쓰지 않는다. 횡단면 전체가 부적격일 때만 -3 사용"],
+        ["분모 부적격의 강제 바닥 = 그 리밸일 횡단면 최소 z", "§5.2 '최하위 순위로 강제'", "중립",
+         "셀 최소를 쓰면 폴백 사다리와 어긋나 벌점이 양수(=상점)가 되고 셀 크기에 따라 "
+         "벌점이 2배 차이 났다. 선정이 횡단면 단위이므로 벌점도 횡단면 단위로 맞췄다. "
+         "임의 상수(-3 등)는 쓰지 않는다"],
+        ["분모 = 0 도 '부적격'(3상태 판정)", "§5.2 '음수 EBIT/분모'", "하향(보수적)",
+         "safe_div 가 NaN 을 주는 탓에 분모가 정확히 0 인 기업(완전자본잠식 등)이 벌점을 "
+         "빠져나가 Z_V 상위에 앉았다. '모름(재무 미보유)'과는 구분해 벌점을 주지 않는다"],
         ["ROIC 유효세율 결측 시 22% 가정", "명세 침묵", "중립",
          "ROIC 는 3년 표준편차로만 쓰이고 전 기업 동일 가정이라 횡단면 효과는 작다"],
         ["Score1 축 결측 시 가중치 재정규화", "§5.5 는 고정 가중치", "중립~보수",
@@ -10120,8 +10763,17 @@ def report_discretion_ledger():
          "과거 시계열 복원 불가. 목표주가 수정률로 일부 대체 — 잔차에 컨센서스 성분이 남을 수 있음"],
         ["Sharpe = (CAGR − rf) / 연변동성", "명세는 Sharpe 만 지정", "하향(보수적)",
          "기하평균(CAGR)을 쓰므로 산술평균 기준 Sharpe 보다 낮게 나온다"],
-        [f"제곱근 시장충격 K={IMPACT_K} 추가", "§8.1 은 거래세+스프레드만 지정", "하향(보수적)",
-         "명세에 없는 '추가 비용'이다. 성과를 낮추는 방향이므로 남겨두되 명시한다"],
+        [f"기본 비용모형 = '{QVF_COST_MODEL}' (거래세 + 스프레드/2)", "§8.1 문언 그대로", "중립",
+         f"수수료 {COMMISSION_BPS}bp 와 제곱근 충격 K={IMPACT_K} 는 명세에 없으므로 기본에서 "
+         f"뺐다. 사전등록 판정(§9·§10.4)은 명세 문언 기준이어야 한다. 확장 모형은 §8.4 "
+         f"민감도로 병기한다"],
+        ["ADTV 조회 실패 시 그 분기 중앙 ADTV 로 대체", "명세 침묵", "혼합",
+         "예전엔 조회 실패를 '참여율 100%'(=충격 1000bp)로 등치시켜 매도 레그 전체가 "
+         "18배 과다 비용을 맞았다. 중앙값 대체는 과소·과대 어느 쪽으로도 치우치지 않는다"],
+        [f"체결 허용 지연 {EXEC_FILL_MAX_LAG_DAYS}일 초과 시 매수 후보 탈락", "명세 침묵", "혼합",
+         "길게 잡으면 정지 종목의 '재개장 −60% 가격'을 진입가로 쓰게 된다(상향). 짧게 잡으면 "
+         "리밸일에 정지된 종목이 빠진다(상향). 후자는 현실 제약이고 전자는 공짜 복권이라 "
+         "짧은 쪽을 골랐다. 체결 지연 분포는 감사표로 출력한다"],
         [f"스프레드 하한 {SLIPPAGE_FLOOR_BPS:.0f}bp / 상한 {SLIPPAGE_CAP_BPS:.0f}bp",
          "명세 침묵", "혼합",
          "하한은 비용↑(보수적), 상한은 최악 종목의 비용↓(상향). CS 추정치 폭주 방지용"],
@@ -10131,15 +10783,25 @@ def report_discretion_ledger():
          "중립", "각각 명세 범위(200 / 60~80 / 20~40)의 값. 민감도는 §8.4 에서 별도 검정"],
         ["PIT 관리종목 이력 미적용", "§3.3 은 제외 요구", "⚠ 상향",
          "소급 조회 불가. 현재 명단을 과거에 적용하면 그게 미래누수라 적용하지 않았다. "
-         "재무기준(자본잠식·연속적자·감사의견)으로 근사하지만 동일하지 않다"],
+         "재무기준(자본잠식·연속적자·감사의견)으로 근사하지만 동일하지 않다. "
+         "★ 그 근사는 3-A 안에 있으므로 어블레이션 X1~X3 에는 §3.3 3종 제외가 없다"],
+        ["§10.4 ② '미미' = 차이의 단측 p ≥ 0.10", "명세는 '미미'라고만 함", "중립",
+         "예전 임계 0.05(Sharpe 차)는 40분기 표본에서 차이 표준오차의 0.1배라 판별력이 "
+         "사실상 없었다(참 기여가 0 이어도 절반만 발동). 통계적 정의로 바꿨다"],
+        ["U-1000 = 게이트 통과 종목 안에서의 하위 1000", "§3.1 '하위 1000종목'", "⚠ 상향",
+         "문언적 해석(전 종목 하위 1000 → 게이트)이면 종목수가 크게 줄고 시총 상한도 낮아진다. "
+         "게이트를 먼저 통과시키면 1차필터 선택률이 낮아져 Score1 의 분산이 커진다. "
+         "U1000_RANK_BEFORE_FILTER=True 로 대안 해석을 실행해 비교할 수 있다"],
     ]
     LOG.table(rows, ["임의 선택", "명세 조항", "드리프트", "영향 / 근거"],
               ["l", "l", "c", "l"], maxw=54)
     up = [r[0] for r in rows if "상향" in r[2]]
     LOG.warn(f"성과를 좋게 보이게 하는 방향의 선택 {len(up)}건: {', '.join(up)}. "
-             f"이 셋은 모두 '근거가 없는 종목을 배제하지 않는다'는 같은 원칙에서 나온다 — "
+             f"앞의 셋은 모두 '근거가 없는 종목을 배제하지 않는다'는 같은 원칙에서 나온다 — "
              f"반대로 하면 재무·공시 결측이 많은 초소형주가 통째로 사라져 선택편향이 되므로 "
-             f"교환관계이며, 어느 쪽도 공짜가 아니다. 근거 보유율 표와 함께 해석하십시오.")
+             f"교환관계이며, 어느 쪽도 공짜가 아니다. 마지막 U-1000 해석은 성격이 다르다: "
+             f"명세 문언이 두 가지로 읽히는 지점이며, 대안 해석을 실행해 비교하는 것이 "
+             f"유일한 정직한 처리다. 근거 보유율 표와 함께 해석하십시오.")
     LOG.info("§10.2 — 1차필터(가치·퀄리티)의 기여는 알파 창출로, 2차 배제플래그와 3-A 의 "
              "기여는 좌측꼬리 제거(MDD·Sortino)로 해석합니다. 배제 컴포넌트가 CAGR 을 크게 "
              "올렸다면 그것이 우연인지 별도 검증이 필요합니다.")
@@ -10507,8 +11169,105 @@ def _q12():
     return f"실측 기반 · 공용 저널 합산 · 020/021 구분 · 실효 한도 {DART_DAILY_LIMIT:,}"
 
 
+@_contract("Q13", "§10.4 폐기조건 — 충족 시 실제로 멈춘다(보고만 하고 지나가지 않는다)")
+def _q13():
+    """'미달 시 행동'을 표에 적어 놓고 아무것도 하지 않으면 그 표는 거짓말이 된다.
+
+    예전에는 폐기 판정을 낸 직후 그 폐기된 전략의 실전 편입 종목표를 그대로 출력했다.
+    여기서는 폐기가 확실히 성립하는 가짜 EXPERIMENTS 를 심고 KillCriteria 가 실제로
+    올라오는지, 그리고 STOP_ON_KILL_CRITERIA=False 면 올라오지 않는지 둘 다 본다.
+    """
+    keep_exp = dict(EXPERIMENTS)
+    keep_stop = STOP_ON_KILL_CRITERIA
+    try:
+        EXPERIMENTS.clear()
+        # 세 변형 전부 비용 차감 후 CAGR < 0 → 조건 ① 확실히 충족
+        for nm in ("V-full", "VQ-full", "VQF-full", "X1"):
+            EXPERIMENTS[nm] = {"name": nm, "desc": "", "R": None, "t": 0.0, "p": 0.9, "n": 8,
+                               "net": {"CAGR": -0.05, "Sharpe": 0.10, "MDD": -0.30},
+                               "gross": {}}
+        keep_level = LOG.min
+        LOG.min = 99                                   # 계약 표에 잡음을 남기지 않는다
+        try:
+            globals()["STOP_ON_KILL_CRITERIA"] = True
+            raised = False
+            try:
+                report_preregistration_kill(["V-full", "VQ-full", "VQF-full"], "VQ-full", "X1")
+            except KillCriteria:
+                raised = True
+            if not raised:
+                raise ContractViolation(
+                    "§10.4 폐기 조건이 충족됐는데 KillCriteria 가 올라오지 않았습니다 — "
+                    "폐기 판정 후에도 최종 편입 종목표가 출력됩니다.")
+            globals()["STOP_ON_KILL_CRITERIA"] = False
+            out = report_preregistration_kill(["V-full", "VQ-full", "VQF-full"], "VQ-full", "X1")
+            if not out.get("all_alpha_dead"):
+                raise ContractViolation("폐기 조건 ①(전 변형 알파 소멸)이 감지되지 않았습니다.")
+        finally:
+            LOG.min = keep_level
+    finally:
+        globals()["STOP_ON_KILL_CRITERIA"] = keep_stop
+        EXPERIMENTS.clear()
+        EXPERIMENTS.update(keep_exp)
+    return "충족 시 중단 · STOP 끄면 보고만"
+
+
+@_contract("Q14", "adopt(size=) 가 코어 경로와 같은 uid 를 만든다 — 캐시 중복등록 방지")
+def _q14():
+    """scandir 이 이미 알고 있는 크기를 넘겨 FUSE 왕복을 아끼되, uid 는 반드시 동일해야 한다.
+
+    uid 가 달라지면 같은 파일이 인덱스에 두 번 들어가고, 재실행마다 계속 늘어난다.
+    """
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        fp = os.path.join(td, "sample_report_2020-01-02.pdf")
+        with open(fp, "wb") as f:
+            f.write(b"x" * 1234)
+        sz = os.path.getsize(fp)
+        u_core = sha1_str("adopt", "research", "report_pdf", os.path.abspath(fp), sz)
+        v = QVFVault(os.path.join(td, "cache"), mode="local", mirrors=[])
+        u_fast = v.adopt(fp, domain="research", subtype="report_pdf", key="sample",
+                         scope="shared", size=sz)
+        if u_fast != u_core:
+            raise ContractViolation(
+                f"size 지정 경로의 uid 가 코어와 다릅니다: {u_fast} vs {u_core} — "
+                f"같은 파일이 인덱스에 중복 등록됩니다.")
+        if not v.has("shared", u_core):
+            raise ContractViolation("adopt 직후 has() 가 False 입니다 — 중복 수집이 발생합니다.")
+        # ★★ 같은 실행에서 저장한 것을 같은 실행에서 되찾을 수 있어야 한다(절대 1원칙) ★★
+        #   put_blob 은 uid 가 아니라 '파일 경로'를 돌려주므로 인덱스에서 uid 를 찾는다.
+        #   저널 flush 이전(=등록만 된 상태)과 이후 둘 다 성립해야 한다. 예전에는 코어가
+        #   self._idx 캐시를 갱신하지 않아 둘 다 None 이었고, 콜드런 1회차에 방금 받은
+        #   PDF 가 TONE 입력에서 통째로 빠졌다 — '본문이 짧아 제외'와 구분되지 않는 형태로.
+        for k, payload, flush_first in (("k_preflush", b"before-flush", False),
+                                        ("k_postflush", b"after-flush", True)):
+            v.put_blob("test", "unit", k, payload, "bin", scope="shared", source="contract")
+            if flush_first:
+                v.flush("shared")
+            idx = v.load_index("shared")
+            hit = idx[idx["key"].astype(str) == k]
+            if hit.empty:
+                raise ContractViolation(
+                    f"put_blob 직후 인덱스에서 '{k}' 를 찾을 수 없습니다 — 인덱스 캐시가 "
+                    f"등록분을 반영하지 않고 있습니다(절대 1원칙 위반).")
+            got = v.get_blob(str(hit["uid"].iloc[0]), "shared")
+            if got != payload:
+                raise ContractViolation(
+                    f"같은 실행에서 저장한 blob('{k}')을 get_blob 이 되찾지 못했습니다 "
+                    f"(flush {'후' if flush_first else '전'}). 콜드런 1회차에 방금 받은 "
+                    f"자료가 통째로 빠지는 경로입니다.")
+        # force=True 가 오히려 파생 캐시를 굳혀 복구를 막던 경로도 함께 고정한다.
+        idx = v.load_index("shared", force=True)
+        hit = idx[idx["key"].astype(str) == "k_postflush"]
+        if hit.empty or v.get_blob(str(hit["uid"].iloc[0]), "shared") != b"after-flush":
+            raise ContractViolation(
+                "load_index(force=True) 이후 get_blob 이 실패합니다 — force 가 _uidpath 를 "
+                "무효화하지 않아 스테일 사전이 영구히 남는 경로입니다.")
+    return "uid 동일 · 저장↔재호출 (flush 전/후/force) 전부 성립"
+
+
 def run_contract_tests(strict: bool = True) -> bool:
-    LOG.banner("계약 자동검정 Q1~Q12", "협상 불가 규칙 — 실패하면 실데이터 수집을 시작하지 않습니다")
+    LOG.banner("계약 자동검정 Q1~Q14", "협상 불가 규칙 — 실패하면 실데이터 수집을 시작하지 않습니다")
     rows, ok_all = [], True
     for c in CONTRACTS:
         t0 = time.time()
@@ -10529,7 +11288,7 @@ def run_contract_tests(strict: bool = True) -> bool:
             raise ContractViolation(msg)
         LOG.error(msg)
     else:
-        LOG.ok("계약 Q1~Q12 전부 통과 — PIT·생존자편향·부호처리·결측허용·비용·캐시 무결성 확인")
+        LOG.ok("계약 Q1~Q14 전부 통과 — PIT·생존자편향·부호처리·결측허용·비용·폐기조건·캐시 무결성 확인")
     return ok_all
 
 
@@ -10814,8 +11573,20 @@ def run_selftest(full_chain: bool = False) -> bool:
         report_robustness()
         report_phase0(0.95, 0.60, 0.85, 0.35, 120)
         report_flow_verdict(cmp_res, fdr_pass=fdr)
-        report_preregistration_kill([f"{v}-full" for v in VARIANTS], "VQ-full", "X1")
         report_discretion_ledger()
+        # ★ 스모크의 목적은 '배관이 끝까지 흐르는가' 이지 '전략이 통과하는가' 가 아니다.
+        #   합성 난수에는 알파가 없으므로 §10.4 는 발동하는 것이 정상이며, 그 발동으로
+        #   스모크가 죽으면 이후 표를 검증하지 못한다. 여기서만 중단을 끈다.
+        #   ★ '발동 시 실제로 멈추는가' 는 계약 Q13 이 별도로 검정한다 — 여기서 끄는 것이
+        #     §10.4 의 이행을 무력화하지 않는다는 점을 그 계약이 보증한다.
+        _keep_stop = STOP_ON_KILL_CRITERIA
+        globals()["STOP_ON_KILL_CRITERIA"] = False
+        try:
+            _kill = report_preregistration_kill([f"{v}-full" for v in VARIANTS], "VQ-full", "X1")
+        finally:
+            globals()["STOP_ON_KILL_CRITERIA"] = _keep_stop
+        LOG.info(f"스모크 §10.4 판정(중단은 끈 상태): "
+                 f"{ {k: v for k, v in _kill.items() if not k.startswith('_')} }")
         report_final_holdings(P, "VQ", "_sel", S["sec"], top_n=12)
         LOG.ok("full_chain 예행연습 완료 — 백테스트·성과검증·강건성·판정표가 모두 정상 출력됩니다.")
         return True
@@ -11159,7 +11930,7 @@ def main() -> dict:
         globals()["DBUDGET"] = DQUOTA       # 공용 코어(dart_api)가 참조하는 이름에 주입
         DQUOTA.report()
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 Q1~Q12", "L0", budget_s=180):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 Q1~Q14", "L0", budget_s=180):
         run_contract_tests(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0",
@@ -11283,9 +12054,15 @@ def main() -> dict:
            f"(Sharpe {EXPERIMENTS[best]['net'].get('Sharpe', float('nan')):.3f})")
 
     with PIPE.stage("L3.ABL", "[12] 보조 어블레이션 X1~X4", "L3", budget_s=1800, critical=False):
-        abl = [("X1", dict(stage="x1"), "1차만 — 깔때기 자체의 기여"),
-               ("X2", dict(use_tone=False, use_nonfin=False), "1차+배제플래그만 — 위험배제 효과"),
-               ("X3", dict(use_tone=False), "1차+ΔNONFIN만 — 애널리스트 축 기여"),
+        # ★ §8.2 문언대로. X1~X3 에 3-A 가 섞이면 §10.2 의 귀속("1차=알파 / 배제·3-A=좌측꼬리")
+        #   분해가 성립하지 않고, §8.3 BH-FDR 패밀리에 이질적 선정이 섞인다.
+        #   X3 = "1차 + ΔNONFIN만" 이므로 배제플래그도 꺼야 한다.
+        abl = [("X1", dict(stage="x1", use_rule3a=False),
+                "1차만 — 깔때기 자체의 기여"),
+               ("X2", dict(use_tone=False, use_nonfin=False, use_rule3a=False),
+                "1차+배제플래그만 — 위험배제 효과"),
+               ("X3", dict(use_tone=False, use_exclusion=False, use_rule3a=False),
+                "1차+ΔNONFIN만 — 애널리스트 축 기여"),
                ("X4", dict(use_rule3a=False), "1차+2차, 3-A 없음 — 3-A 기여")]
         abl_names = []
         for nm, kw, desc in abl:
@@ -11295,7 +12072,11 @@ def main() -> dict:
         report_experiment_table(abl_names, f"보조 어블레이션 (§8.2) — 최우수 변형 {best_v} 기준")
 
     with PIPE.stage("L5.FDR", "[13] BH-FDR 다중검정 보정", "L5", budget_s=120, critical=False):
-        ctx["fdr"] = report_bh_fdr(main_names + abl_names)
+        # §9-C2 는 'VQF 자신의 알파'가 아니라 'VQF − VQ 차이'의 유의성을 요구한다.
+        # 차이검정을 같은 패밀리에 넣어야 다중검정 보정이 정직하다.
+        _c2 = paired_diff_test("VQF-full", "VQ-full")
+        ctx["c2_diff"] = _c2
+        ctx["fdr"] = report_bh_fdr(main_names + abl_names, extra_tests=[_c2])
 
     with PIPE.stage("L5.ROBUST", "[13] 강건성 검사 (§8.4)", "L5", budget_s=4 * 3600, critical=False):
         bt_best = ctx.get(f"bt_{best_v}")
@@ -11341,8 +12122,10 @@ def main() -> dict:
     with PIPE.stage("L6.VERDICT", "[14] 수급 축 판정 · 사전등록 폐기조건", "L6", budget_s=120,
                     critical=False):
         ctx["flow_verdict"] = report_flow_verdict(ctx.get("cmp", {}), fdr_pass=ctx.get("fdr"))
-        ctx["kill"] = report_preregistration_kill(main_names, best, "X1")
         report_discretion_ledger()
+        # ★ 폐기 판정은 마지막에 둔다. STOP_ON_KILL_CRITERIA=True 면 여기서 KillCriteria 를
+        #   던져 '폐기된 전략의 최종 편입 종목표'가 출력되는 것을 막는다(§10.4 의 이행).
+        ctx["kill"] = report_preregistration_kill(main_names, best, "X1")
 
     with PIPE.stage("L6.REPORT", "[15] 최종 산출물", "L6", budget_s=300, critical=False):
         bench = qvf_benchmarks(cal, ctx["px"])

@@ -219,12 +219,27 @@ def build_final_selection(P: pd.DataFrame, variant: str, n_final: int = FINAL_N,
         pool = pool & (col(d, "RULE3A_BLOCK").fillna(0) == 0)
 
     sel = pd.Series(False, index=d.index)
+    short_q: List[Tuple[Any, int]] = []
     for _t, g in d.groupby("rebal", observed=True):
         gg = g[pool.loc[g.index]]
         if gg.empty:
+            short_q.append((_t, 0))
             continue
         keys = [c for c in (rank_col, f"score1_{variant}", "code") if c in gg.columns]
         asc = [False] * (len(keys) - 1) + [True]
         k = int(min(max(FINAL_N_MIN, min(n_final, FINAL_N_MAX)), len(gg)))
+        # ★ §7.4 는 보유 20~40 종목을 규정한다. 풀이 20 미만이면 그 분기는 규정 미달이며,
+        #   조용히 진행하면 '집중 포트폴리오의 우연한 성과'가 규정 준수로 보고된다.
+        #   여기서 종목을 억지로 채우면(제외 규칙을 되돌려서) 그게 더 큰 위반이므로,
+        #   미달 자체는 허용하되 분기와 종목수를 반드시 표면화한다.
+        if k < FINAL_N_MIN:
+            short_q.append((_t, k))
         sel.loc[gg.sort_values(keys, ascending=asc, kind="mergesort").head(k).index] = True
+    if short_q:
+        LOG.warn(f"§7.4 보유 하한({FINAL_N_MIN}종목) 미달 분기 {len(short_q)}회 "
+                 f"[{stage}/{variant}] — " +
+                 ", ".join(f"{as_ts(t):%Y-%m}:{n}종목" for t, n in short_q[:8]) +
+                 (" …" if len(short_q) > 8 else "") +
+                 ". 규칙을 되돌려 억지로 채우지 않았습니다. 해당 분기의 성과는 "
+                 "'규정 범위 밖의 집중 포트폴리오' 로 해석해야 합니다.")
     return sel

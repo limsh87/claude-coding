@@ -75,14 +75,19 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
         c1_d = (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f}"
                 if np.isfinite(s_vq) and np.isfinite(s_vqf) else "산출 불가")
 
-    # C2: 그 차이가 BH-FDR 보정 후에도 유의
+    # C2: 그 '차이'가 BH-FDR 보정 후에도 유의 — VQF 자신의 유의성이 아니다.
+    _dkey = f"{exp_vqf}−{exp_vq}(차이)"
     if _flow_ok is False:
         c2, c2_d = None, "flow_cov 게이트 미달 — 판정 불가"
     elif fdr_pass is None:
         c2, c2_d = None, "BH-FDR 결과 없음"
+    elif _dkey not in fdr_pass:
+        c2, c2_d = None, f"차이검정({_dkey})이 패밀리에 없음 — 판정 불가"
     else:
-        c2 = bool(fdr_pass.get(exp_vqf, False)) and c1
-        c2_d = (f"VQF-full BH-FDR {'통과' if fdr_pass.get(exp_vqf) else '기각'}"
+        _dt_rec = EXPERIMENTS.get(_dkey, {})
+        c2 = bool(fdr_pass.get(_dkey, False)) and bool(c1)
+        c2_d = (f"차이 HAC t {_dt_rec.get('t', float('nan')):+.2f} · "
+                f"BH-FDR {'통과' if fdr_pass.get(_dkey) else '기각'}"
                 + ("" if c1 else " · C1 미충족이라 차이 자체가 없음"))
 
     # C3: U-200 중복률 < 0.85
@@ -92,10 +97,17 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
     c3 = bool(np.isfinite(o) and o < 0.85)
     c3_d = f"VQ∩VQF 중복률 {o:.3f}" if np.isfinite(o) else "산출 불가"
 
-    # C4: 수급 비영 관측 비율 ≥ 30%
-    nz = globals().get("FLOW_NONZERO_RATIO", float("nan"))
+    # C4: 수급 비영 관측 비율 ≥ 30% — 반드시 '사전등록 창(60일)' 의 값이어야 한다.
+    #     axis_F 는 §8.4 민감도(20/60/120일)에서도 재호출되며 전역을 덮어쓴다. 그대로 읽으면
+    #     C4 가 마지막 실행(120일)의 값을 보게 되고, 창이 길수록 비영 비율이 높아지므로
+    #     사전등록 기준보다 통과하기 쉬워진다(상향 드리프트).
+    nz = globals().get("FLOW_NONZERO_RATIO_PREREG", float("nan"))
+    _nz_src = f"사전등록 {int(FLOW_WINDOW_DAYS)}일 창"
+    if not np.isfinite(nz):
+        nz = globals().get("FLOW_NONZERO_RATIO", float("nan"))
+        _nz_src = "창 미상(폴백)"
     c4 = bool(np.isfinite(nz) and nz >= 0.30)
-    c4_d = f"비영 관측 {100*nz:.1f}%" if np.isfinite(nz) else "산출 불가"
+    c4_d = f"비영 관측 {100*nz:.1f}% ({_nz_src})" if np.isfinite(nz) else "산출 불가"
 
     # C5: 리포트 커버리지가 VQ 대비 크게 높지 않음
     cov = (cmp_res or {}).get("coverage", {})
@@ -148,9 +160,22 @@ def report_preregistration_kill(main_names: Sequence[str], best: str,
     out["all_alpha_dead"] = k1
 
     # ② X1(1차만)과 최우수 full 의 차이가 미미 → 깔때기 구조 무가치
+    #   ★ 명세는 "미미"라고만 하고 수치를 주지 않는다. 예전 코드의 0.05 는 순수 임의값이었고,
+    #     40분기 표본에서 두 Sharpe 차이의 표준오차(≈0.50)의 0.1배에 불과하다 — 참 기여가
+    #     0 이어도 절반의 확률로 통과하는, 사실상 판별력 없는 기준이다.
+    #     그래서 '차이의 신뢰구간이 0 을 포함하면 미미'라는 통계적 정의로 대체한다.
+    #     비교 가능한 검정을 못 만들면 0.05 를 폴백으로 쓰되 그 사실을 근거란에 적는다.
     s_full = (EXPERIMENTS.get(best, {}).get("net") or {}).get("Sharpe", np.nan)
     s_x1 = (EXPERIMENTS.get(x1_name, {}).get("net") or {}).get("Sharpe", np.nan)
-    k2 = bool(np.isfinite(s_full) and np.isfinite(s_x1) and (s_full - s_x1) < 0.05)
+    _dt2 = paired_diff_test(best, x1_name, label=f"{best}−{x1_name}(깔때기기여)")
+    if np.isfinite(_dt2.get("t", np.nan)):
+        # 단측(우측) t 가 임계 미만 = 차이가 0 과 구분되지 않음 = 깔때기 기여 미미
+        k2 = bool(_dt2["p"] >= 0.10)
+        k2_basis = (f"분기수익률 차이 HAC t {_dt2['t']:+.2f} · p {_dt2['p']:.3f} "
+                    f"(n={_dt2['n']}) — p ≥ 0.10 이면 '미미'")
+    else:
+        k2 = bool(np.isfinite(s_full) and np.isfinite(s_x1) and (s_full - s_x1) < 0.05)
+        k2_basis = "차이검정 불가 → Sharpe 차 < 0.05 폴백(임의 임계값임을 명시)"
     out["funnel_worthless"] = k2
 
     # ③ 배제플래그가 MDD 개선에 기여하지 못함 → 2층 논리 반증
@@ -163,8 +188,7 @@ def report_preregistration_kill(main_names: Sequence[str], best: str,
         ["① 세 변형 모두 비용 차감 후 알파 소멸",
          ", ".join(f"{n} {100*cagrs[n]:+.1f}%" for n in main_names if np.isfinite(cagrs.get(n, np.nan))) or "산출 불가",
          "❗ 충족(폐기)" if k1 else "✔ 미충족"],
-        ["② X1(1차만) 과 최우수 full 의 차이가 미미",
-         f"Sharpe {s_full:.3f} vs X1 {s_x1:.3f}" if np.isfinite(s_full) and np.isfinite(s_x1) else "산출 불가",
+        ["② X1(1차만) 과 최우수 full 의 차이가 미미", k2_basis,
          "❗ 충족(폐기)" if k2 else "✔ 미충족"],
         ["③ 배제 컴포넌트가 MDD 개선에 기여 못함",
          f"MDD {100*m_full:+.1f}% vs X1 {100*m_x1:+.1f}%" if np.isfinite(m_full) and np.isfinite(m_x1) else "산출 불가",
@@ -174,6 +198,17 @@ def report_preregistration_kill(main_names: Sequence[str], best: str,
     if any(out.values()):
         LOG.warn("§10.4 폐기 조건이 충족되었습니다. 이 결과를 파라미터 조정으로 되살리려 하지 "
                  "마십시오. 위 수치를 그대로 보고하고 중단하는 것이 사전등록의 이행입니다.")
+        # ★ '미달 시 행동'을 표에 적어 놓고 아무것도 하지 않으면 그 표는 거짓말이 된다.
+        #   예전에는 폐기 판정을 낸 직후 그 폐기된 전략의 실전 편입 종목표를 그대로 출력했다.
+        out["_halted"] = bool(STOP_ON_KILL_CRITERIA)
+        if STOP_ON_KILL_CRITERIA:
+            _hit = [k for k, v in out.items() if v is True and not k.startswith("_")]
+            raise KillCriteria(
+                "§10.4 사전등록 폐기 조건 충족: " + ", ".join(_hit) + "\n"
+                "  사전등록의 이행은 '여기서 멈추는 것' 입니다. 최종 편입 종목표는 출력하지 "
+                "않습니다.\n"
+                "  수치만 확인하고 계속 보고 싶다면 STOP_ON_KILL_CRITERIA = False 로 두십시오 "
+                "— 단, 그 실행 결과를 '전략이 통과했다'고 읽으면 안 됩니다.")
     else:
         LOG.ok("§10.4 폐기 조건에 해당하지 않습니다.")
     LOG.info("§10.2 성격 구분 — 1차필터(가치·퀄리티)의 기여는 알파 창출로, 2차 배제플래그와 "
@@ -234,8 +269,13 @@ def report_discretion_ledger():
          "차입금 계정이 전부 결측이면 부채총계로 폴백 → EV 과대추정(=밸류 매력 과소평가)"],
         ["EV<0 을 클립하지 않음", "명세 침묵", "중립",
          "순현금>시총 기업이 연속 순서를 유지. 클립하면 최상위에 동점 덩어리가 생겼다"],
-        ["분모 부적격의 강제 바닥 = 그 시점 최소 z", "명세는 '최하위 순위'만 지정", "중립",
-         "임의 상수(-3 등)를 쓰지 않는다. 횡단면 전체가 부적격일 때만 -3 사용"],
+        ["분모 부적격의 강제 바닥 = 그 리밸일 횡단면 최소 z", "§5.2 '최하위 순위로 강제'", "중립",
+         "셀 최소를 쓰면 폴백 사다리와 어긋나 벌점이 양수(=상점)가 되고 셀 크기에 따라 "
+         "벌점이 2배 차이 났다. 선정이 횡단면 단위이므로 벌점도 횡단면 단위로 맞췄다. "
+         "임의 상수(-3 등)는 쓰지 않는다"],
+        ["분모 = 0 도 '부적격'(3상태 판정)", "§5.2 '음수 EBIT/분모'", "하향(보수적)",
+         "safe_div 가 NaN 을 주는 탓에 분모가 정확히 0 인 기업(완전자본잠식 등)이 벌점을 "
+         "빠져나가 Z_V 상위에 앉았다. '모름(재무 미보유)'과는 구분해 벌점을 주지 않는다"],
         ["ROIC 유효세율 결측 시 22% 가정", "명세 침묵", "중립",
          "ROIC 는 3년 표준편차로만 쓰이고 전 기업 동일 가정이라 횡단면 효과는 작다"],
         ["Score1 축 결측 시 가중치 재정규화", "§5.5 는 고정 가중치", "중립~보수",
@@ -252,8 +292,17 @@ def report_discretion_ledger():
          "과거 시계열 복원 불가. 목표주가 수정률로 일부 대체 — 잔차에 컨센서스 성분이 남을 수 있음"],
         ["Sharpe = (CAGR − rf) / 연변동성", "명세는 Sharpe 만 지정", "하향(보수적)",
          "기하평균(CAGR)을 쓰므로 산술평균 기준 Sharpe 보다 낮게 나온다"],
-        [f"제곱근 시장충격 K={IMPACT_K} 추가", "§8.1 은 거래세+스프레드만 지정", "하향(보수적)",
-         "명세에 없는 '추가 비용'이다. 성과를 낮추는 방향이므로 남겨두되 명시한다"],
+        [f"기본 비용모형 = '{QVF_COST_MODEL}' (거래세 + 스프레드/2)", "§8.1 문언 그대로", "중립",
+         f"수수료 {COMMISSION_BPS}bp 와 제곱근 충격 K={IMPACT_K} 는 명세에 없으므로 기본에서 "
+         f"뺐다. 사전등록 판정(§9·§10.4)은 명세 문언 기준이어야 한다. 확장 모형은 §8.4 "
+         f"민감도로 병기한다"],
+        ["ADTV 조회 실패 시 그 분기 중앙 ADTV 로 대체", "명세 침묵", "혼합",
+         "예전엔 조회 실패를 '참여율 100%'(=충격 1000bp)로 등치시켜 매도 레그 전체가 "
+         "18배 과다 비용을 맞았다. 중앙값 대체는 과소·과대 어느 쪽으로도 치우치지 않는다"],
+        [f"체결 허용 지연 {EXEC_FILL_MAX_LAG_DAYS}일 초과 시 매수 후보 탈락", "명세 침묵", "혼합",
+         "길게 잡으면 정지 종목의 '재개장 −60% 가격'을 진입가로 쓰게 된다(상향). 짧게 잡으면 "
+         "리밸일에 정지된 종목이 빠진다(상향). 후자는 현실 제약이고 전자는 공짜 복권이라 "
+         "짧은 쪽을 골랐다. 체결 지연 분포는 감사표로 출력한다"],
         [f"스프레드 하한 {SLIPPAGE_FLOOR_BPS:.0f}bp / 상한 {SLIPPAGE_CAP_BPS:.0f}bp",
          "명세 침묵", "혼합",
          "하한은 비용↑(보수적), 상한은 최악 종목의 비용↓(상향). CS 추정치 폭주 방지용"],
@@ -263,15 +312,25 @@ def report_discretion_ledger():
          "중립", "각각 명세 범위(200 / 60~80 / 20~40)의 값. 민감도는 §8.4 에서 별도 검정"],
         ["PIT 관리종목 이력 미적용", "§3.3 은 제외 요구", "⚠ 상향",
          "소급 조회 불가. 현재 명단을 과거에 적용하면 그게 미래누수라 적용하지 않았다. "
-         "재무기준(자본잠식·연속적자·감사의견)으로 근사하지만 동일하지 않다"],
+         "재무기준(자본잠식·연속적자·감사의견)으로 근사하지만 동일하지 않다. "
+         "★ 그 근사는 3-A 안에 있으므로 어블레이션 X1~X3 에는 §3.3 3종 제외가 없다"],
+        ["§10.4 ② '미미' = 차이의 단측 p ≥ 0.10", "명세는 '미미'라고만 함", "중립",
+         "예전 임계 0.05(Sharpe 차)는 40분기 표본에서 차이 표준오차의 0.1배라 판별력이 "
+         "사실상 없었다(참 기여가 0 이어도 절반만 발동). 통계적 정의로 바꿨다"],
+        ["U-1000 = 게이트 통과 종목 안에서의 하위 1000", "§3.1 '하위 1000종목'", "⚠ 상향",
+         "문언적 해석(전 종목 하위 1000 → 게이트)이면 종목수가 크게 줄고 시총 상한도 낮아진다. "
+         "게이트를 먼저 통과시키면 1차필터 선택률이 낮아져 Score1 의 분산이 커진다. "
+         "U1000_RANK_BEFORE_FILTER=True 로 대안 해석을 실행해 비교할 수 있다"],
     ]
     LOG.table(rows, ["임의 선택", "명세 조항", "드리프트", "영향 / 근거"],
               ["l", "l", "c", "l"], maxw=54)
     up = [r[0] for r in rows if "상향" in r[2]]
     LOG.warn(f"성과를 좋게 보이게 하는 방향의 선택 {len(up)}건: {', '.join(up)}. "
-             f"이 셋은 모두 '근거가 없는 종목을 배제하지 않는다'는 같은 원칙에서 나온다 — "
+             f"앞의 셋은 모두 '근거가 없는 종목을 배제하지 않는다'는 같은 원칙에서 나온다 — "
              f"반대로 하면 재무·공시 결측이 많은 초소형주가 통째로 사라져 선택편향이 되므로 "
-             f"교환관계이며, 어느 쪽도 공짜가 아니다. 근거 보유율 표와 함께 해석하십시오.")
+             f"교환관계이며, 어느 쪽도 공짜가 아니다. 마지막 U-1000 해석은 성격이 다르다: "
+             f"명세 문언이 두 가지로 읽히는 지점이며, 대안 해석을 실행해 비교하는 것이 "
+             f"유일한 정직한 처리다. 근거 보유율 표와 함께 해석하십시오.")
     LOG.info("§10.2 — 1차필터(가치·퀄리티)의 기여는 알파 창출로, 2차 배제플래그와 3-A 의 "
              "기여는 좌측꼬리 제거(MDD·Sortino)로 해석합니다. 배제 컴포넌트가 CAGR 을 크게 "
              "올렸다면 그것이 우연인지 별도 검증이 필요합니다.")

@@ -71,6 +71,18 @@ def _cell_ladder_z(P: pd.DataFrame, v: pd.Series, min_n: int = CELL_MIN_N) -> pd
     return z
 
 
+def _denom_ok(x: pd.Series) -> pd.Series:
+    """분모의 3상태 적격 판정. True=적격 · False=관측했는데 부적격 · <NA>=분모 자체를 모름.
+
+    ★ 2상태(bool)로 두면 '모름'과 '부적격'이 같은 False 가 되어, 재무를 확보하지 못한 종목
+      전체가 §5.2 의 최하위 벌점을 맞는다. 반대로 '분모가 정확히 0' 인 관측치는 safe_div 가
+      NaN 을 주는 바람에 벌점을 통째로 빠져나갔다(완전자본잠식 기업이 Z_V 상위 7% 에 앉음).
+      두 사고가 같은 뿌리에서 나오므로 판정 자체를 3상태로 만든다.
+    """
+    v = pd.to_numeric(x, errors="coerce")
+    return (v > 0).astype("boolean").where(v.notna())
+
+
 def z_lower_is_better(P: pd.DataFrame, raw: pd.Series, valid: pd.Series,
                       name: str = "") -> pd.Series:
     """'낮을수록 우수' 지표를 z-score(높을수록 우수)로 바꾸되, 분모 부적격(valid=False)
@@ -81,28 +93,45 @@ def z_lower_is_better(P: pd.DataFrame, raw: pd.Series, valid: pd.Series,
       상위에 오를 수 있다. 즉 적자기업이 벌점 대신 면제를 받는다. 정반대의 결과다.
     """
     r = pd.to_numeric(raw, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    ok = valid.fillna(False).to_numpy(dtype=bool) & r.notna().to_numpy()
+    vb = valid.fillna(False).to_numpy(dtype=bool)
+    ok = vb & r.notna().to_numpy()
     sig = pd.Series(np.where(ok, -r.to_numpy(dtype="float64"), np.nan), index=P.index)
     z = _cell_ladder_z(P, sig)
-    # 셀별 최하위 z (윈저라이징 이후 값이므로 이상치로 폭주하지 않는다)
-    worst = z.groupby(P["cell"].astype(object).fillna("__NA__").to_numpy(),
-                      observed=True).transform("min")
-    forced = (~pd.Series(ok, index=P.index)) & r.notna().reindex(P.index).fillna(False)
-    # raw 자체가 결측(재무 미보유)인 경우는 '부적격'이 아니라 '모름' 이므로 강제하지 않는다.
+
+    # ★★ '최하위 강제'는 반드시 '횡단면 최하위' 여야 한다 ★★
+    #   예전에는 셀(cell) 내 최소 z 를 벌점으로 줬다. 두 가지가 겹치면 벌점이 상점이 된다:
+    #     ① z 는 표본 부족 시 cell_l2 / cell_l3(전 시장) 스케일로 계산되는데, 셀 최소는
+    #        그 사실을 모른 채 원래의 작은 셀에서만 min 을 잡는다.
+    #     ② 그 작은 셀의 유효 종목이 우연히 전부 '싼' 종목이면 셀 최소가 양수다.
+    #   실측으로 적자 8종목이 z=+1.165 를 받아 312종목 중 6위(상위 2%)에 앉았다. 이 파일
+    #   헤더가 스스로 경고한 실패("적자기업이 자동으로 최우량이 된다")가 방어 코드 안에서
+    #   재현된 것이다. 더구나 U-200 선정은 groupby("rebal") 즉 전 종목 횡단면에서 이뤄지므로,
+    #   벌점도 같은 횡단면에서 매겨야 규모가 일관된다(셀 크기에 따라 −2.3 ~ −4.4 로 2배
+    #   차이 나던 문제도 함께 사라진다).
+    _reb = P["rebal"].to_numpy()
+    worst = z.groupby(_reb, observed=True).transform("min")
+
+    # ★★ 분모가 '정확히 0' 인 관측치도 부적격이다 ★★
+    #   safe_div 는 |분모| ≤ 1e-12 이면 NaN 을 준다. 예전 조건 `forced = ~ok & r.notna()` 는
+    #   r 이 NaN 이라 강제를 건너뛰고 '모름'으로 분류했다. 그 결과 자기자본이 정확히 0 인
+    #   기업(=§3.3 이 제외를 요구하는 완전자본잠식)이 Z_V 상위 7% 에 앉았다.
+    #   valid=False 는 '분모를 봤고 부적격이더라' 이므로, r 의 결측 여부와 무관하게 강제한다.
+    #   반대로 valid 자체가 결측(재무 미보유)인 경우만 '모름'으로 남긴다.
+    known = valid.notna().to_numpy()
+    forced = pd.Series(known & (~vb), index=P.index)
     z_out = z.copy()
     n_forced = int(forced.sum())
     if n_forced:
         z_out = z_out.where(~forced, worst)
-        # 셀 전체가 부적격이라 worst 도 NaN 인 경우: 임의 상수(-3 등)를 쓰지 않고 '그 시점
-        # 횡단면의 실제 최소 z' 를 바닥으로 쓴다. 명세에 없는 숫자를 만들지 않기 위함이다.
-        if (forced & z_out.isna()).any():
-            floor = z.groupby(P["rebal"].to_numpy(), observed=True).transform("min")
-            z_out = z_out.where(~(forced & z_out.isna()), floor)
-            # 그 시점 전체가 부적격이면 그때만 최후의 바닥값을 쓴다(관측이 아예 없는 경우).
-            z_out = z_out.where(~(forced & z_out.isna()), -3.0)
+        # 그 시점 횡단면에 유효 관측이 아예 없으면 벌점을 만들 근거가 없다 — 결측으로 둔다
+        # (임의 상수를 찍지 않는다. 축 평균에서 빠지되, 그 사실은 아래 로그로 남는다).
+        n_nofloor = int((forced & z_out.isna()).sum())
+    else:
+        n_nofloor = 0
     if name:
-        LOG.debug(f"  {name}: 유효 {int(ok.sum()):,} · 분모부적격 강제최하위 {n_forced:,} · "
-                  f"결측(모름) {int(r.isna().sum()):,}")
+        LOG.debug(f"  {name}: 유효 {int(ok.sum()):,} · 분모부적격 강제최하위 {n_forced:,}"
+                  f"(그중 횡단면 유효관측 부재로 벌점 불가 {n_nofloor:,}) · "
+                  f"분모 자체 미상(모름) {int((~known).sum()):,}")
     return z_out.astype("float32")
 
 
@@ -155,13 +184,20 @@ def build_quarterly_fundamentals(fin: pd.DataFrame, shares: pd.DataFrame) -> pd.
         S = (S.dropna(subset=["corp_code", "knowledge_date", "shares_issued"])
               .sort_values(["corp_code", "knowledge_date"], kind="stable")
               .drop_duplicates(["corp_code", "knowledge_date"], keep="last"))
-        S["_n"] = S.groupby("corp_code", observed=True).cumcount()
+        # ★★ cumcount 로 인접성을 재면 안 된다 ★★
+        #   _n 이 cumcount 이므로 `_n − shift(_n, 12)` 는 정의상 항상 정확히 12 다. 즉 예전
+        #   가드는 항진명제였고 아무것도 막지 못했다 — 결측 분기를 건너뛴 채 12행 전을 집으면
+        #   5년 전 주식수를 '3년 증가율' 이라 부르게 된다. 실제 달력 간격으로 재야 한다.
         prev = S.groupby("corp_code", observed=True)["shares_issued"].shift(12)
-        prev_n = S.groupby("corp_code", observed=True)["_n"].shift(12)
-        # ★ 12행 전이 '정확히 12분기 전'일 때만 3년 증가율로 인정한다. 결측 분기를 건너뛴 채
-        #   shift(12) 를 믿으면 5년 전 주식수를 3년 증가율이라 부르게 된다.
-        contiguous = (S["_n"] - prev_n) == 12
+        prev_kd = S.groupby("corp_code", observed=True)["knowledge_date"].shift(12)
+        gap_d = (as_ts_series(S["knowledge_date"]) - as_ts_series(prev_kd)).dt.days
+        # 3년 = 1,095일. 제출 지연·분기 이동을 감안해 ±6개월(±183일)까지만 인정한다.
+        contiguous = gap_d.between(1095 - 183, 1095 + 183)
         S["share_growth3y"] = (safe_div(S["shares_issued"], prev) - 1.0).where(contiguous)
+        _n_drop = int((prev.notna() & ~contiguous.fillna(False)).sum())
+        if _n_drop:
+            LOG.debug(f"  주식수 3년 증가율: 12행 전이 실제로 3년 전이 아닌 {_n_drop:,}건 제외 "
+                      f"(중간 분기 결측 — 5년 전 값을 '3년 증가율'로 부르지 않는다)")
         S = S[["corp_code", "knowledge_date", "shares_issued", "shares_treasury",
                "share_growth3y"]].sort_values("knowledge_date", kind="stable")
         # ★★ outer merge 를 쓰면 안 된다 (적대적 감사가 잡은 조용한 실패) ★★
@@ -268,15 +304,15 @@ def axis_V(P: pd.DataFrame) -> pd.DataFrame:
     #     비율이 음수로 이어져 '순현금이 많을수록 더 좋다'는 연속 순서가 그대로 보존된다.
     #     EBIT>0 이므로 낮을수록 우수라는 단조성도 깨지지 않는다.
     d["ev_ebit"] = safe_div(ev, ebit)
-    d["_v_ok_ev"] = ebit.notna() & (ebit > 0)
+    d["_v_ok_ev"] = _denom_ok(ebit)
 
     d["pbr"] = safe_div(cap, col(d, "equity"))
-    d["_v_ok_pbr"] = col(d, "equity").notna() & (col(d, "equity") > 0)
+    d["_v_ok_pbr"] = _denom_ok(col(d, "equity"))
 
     d["pcr"] = safe_div(cap, col(d, "cfo_ttm"))
-    d["_v_ok_pcr"] = col(d, "cfo_ttm").notna() & (col(d, "cfo_ttm") > 0)
+    d["_v_ok_pcr"] = _denom_ok(col(d, "cfo_ttm"))
 
-    LOG.info("V축 부호 처리 (§5.2) — 분모 ≤ 0 관측치는 해당 지표에서 셀 최하위로 강제 배정:")
+    LOG.info("V축 부호 처리 (§5.2) — 분모 ≤ 0 관측치는 해당 지표에서 횡단면 최하위로 강제 배정:")
     d["zV_ev_ebit"] = z_lower_is_better(d, d["ev_ebit"], d["_v_ok_ev"], "EV/EBIT")
     d["zV_pbr"] = z_lower_is_better(d, d["pbr"], d["_v_ok_pbr"], "PBR")
     d["zV_pcr"] = z_lower_is_better(d, d["pcr"], d["_v_ok_pcr"], "PCR")
@@ -301,15 +337,19 @@ def axis_Q(P: pd.DataFrame) -> pd.DataFrame:
 
     # 높을수록 우수 → 그대로 z
     d["zQ_gp_a"] = _cell_ladder_z(d, d["gp_a"])
-    # 낮을수록 우수 → 부호 반전 후 z. 분모 부적격 개념이 없는 지표는 valid=notna.
-    d["zQ_roic_std3y"] = z_lower_is_better(d, col(d, "roic_std3y"),
-                                           col(d, "roic_std3y").notna(), "ROIC 3년 표준편차")
-    d["zQ_accruals"] = z_lower_is_better(d, d["accruals"], d["accruals"].notna(), "발생액")
+    # 낮을수록 우수 → 부호 반전 후 z.
+    #  ★ '분모 부적격' 개념이 없는 지표(ROIC 표준편차·발생액·주식수 증가율)는 valid 를 전부
+    #    <NA> 로 준다. 예전처럼 notna() 를 주면 '관측이 없다'가 '부적격'으로 읽혀 재무를
+    #    확보하지 못한 종목 전체가 최하위 벌점을 맞는다 — 그건 §5.2 가 말하는 부호 처리가
+    #    아니라 커버리지에 대한 처벌이다.
+    _na = pd.Series(pd.NA, index=d.index, dtype="boolean")
+    d["zQ_roic_std3y"] = z_lower_is_better(d, col(d, "roic_std3y"), _na, "ROIC 3년 표준편차")
+    d["zQ_accruals"] = z_lower_is_better(d, d["accruals"], _na, "발생액")
     # 부채비율은 자기자본이 0 이하면 의미가 뒤집힌다(음수 부채비율=최우량). 부적격 처리.
-    d["zQ_debt_ratio"] = z_lower_is_better(
-        d, d["debt_ratio"], col(d, "equity").notna() & (col(d, "equity") > 0), "부채비율")
-    d["zQ_share_growth3y"] = z_lower_is_better(
-        d, col(d, "share_growth3y"), col(d, "share_growth3y").notna(), "주식수 3년 증가율")
+    d["zQ_debt_ratio"] = z_lower_is_better(d, d["debt_ratio"], _denom_ok(col(d, "equity")),
+                                           "부채비율")
+    d["zQ_share_growth3y"] = z_lower_is_better(d, col(d, "share_growth3y"), _na,
+                                               "주식수 3년 증가율")
 
     zc = [f"zQ_{m}" for m in _Q_METRICS]
     n_ax = d[zc].notna().sum(axis=1)
@@ -452,7 +492,13 @@ def fetch_flow_netbuy(cal: pd.DataFrame, px_daily: pd.DataFrame,
         VAULT.put_table(key, out, scope="shared", domain="flow",
                         source=f"pykrx net purchases {window}d")
     PIPE.io("OUT", "DRIVE", key, F, source="krx flow")
-    return downcast_q(F.reindex(columns=cols))
+    out = downcast_q(F.reindex(columns=cols))
+    # 어느 창으로 만든 프레임인지 남긴다 — §9-C4 는 사전등록 창(60일)의 값만 읽어야 한다.
+    try:
+        out.attrs["flow_window"] = int(window)
+    except Exception:
+        pass
+    return out
 
 
 def axis_F(P: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
@@ -489,6 +535,14 @@ def axis_F(P: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
     nz = ((col(d, "flow_f").fillna(0).abs() > 0) | (col(d, "flow_i").fillna(0).abs() > 0))
     nonzero_ratio = float(nz[obs].mean()) if int(obs.sum()) else float("nan")
     globals()["FLOW_NONZERO_RATIO"] = nonzero_ratio
+    # ★ axis_F 는 §8.4 강건성(수급창 20/60/120일 민감도)에서도 재호출된다. 전역 하나만 두면
+    #   §9-C4 가 '사전등록된 60일 창'이 아니라 '강건성 마지막 실행(120일)'의 값을 읽는다.
+    #   창별로 따로 보관하고, 사전등록 창의 값을 C4 전용으로 고정한다.
+    _win = int((getattr(flows, "attrs", {}) or {}).get("flow_window", FLOW_WINDOW_DAYS))
+    globals().setdefault("FLOW_NONZERO_BY_WINDOW", {})
+    FLOW_NONZERO_BY_WINDOW[_win] = nonzero_ratio
+    if _win == int(FLOW_WINDOW_DAYS):
+        globals()["FLOW_NONZERO_RATIO_PREREG"] = nonzero_ratio
 
     d["zF_foreign"] = _cell_ladder_z(d, d["flow_f"])
     d["zF_inst"] = _cell_ladder_z(d, d["flow_i"])
@@ -514,3 +568,5 @@ def axis_F(P: pd.DataFrame, flows: pd.DataFrame) -> pd.DataFrame:
 
 
 FLOW_NONZERO_RATIO: float = float("nan")
+FLOW_NONZERO_RATIO_PREREG: float = float("nan")   # §9-C4 전용 — 사전등록 창(60일)의 값
+FLOW_NONZERO_BY_WINDOW: Dict[int, float] = {}

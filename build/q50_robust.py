@@ -70,6 +70,9 @@ def summarize_experiment(name: str, bt: dict, P: Optional[pd.DataFrame] = None,
         ic, icir, n_ic = rank_ic(P, sc, fwd, pool_col=pool)
     rec = {"name": name, "desc": desc, "net": net, "gross": gro,
            "IC": ic, "ICIR": icir, "n_ic": n_ic,
+           # ★ §9-C2 는 '차이의 유의성'을 요구한다. 차이를 검정하려면 두 실험의 분기수익률
+           #   시계열이 필요하므로 여기서 보관한다(요약 통계만으로는 만들 수 없다).
+           "R": (R[["rebal", "ret"]].copy() if R is not None and len(R) else None),
            "t": net.get("t통계량(HAC)", np.nan), "n": net.get("분기수", 0)}
     rec["p"] = _pval_from_t(rec["t"], int(rec["n"] or 0))
     EXPERIMENTS[name] = rec
@@ -99,8 +102,43 @@ def report_experiment_table(names: Sequence[str], title: str):
              "잠식할 수 있으므로 판단 기준은 언제나 '비용 차감 후' 입니다.")
 
 
-def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q) -> dict:
-    """§8.3 — 주 실험 3개 + 어블레이션 4개를 하나의 패밀리로 묶어 BH-FDR 보정."""
+def paired_diff_test(a: str, b: str, label: Optional[str] = None) -> dict:
+    """실험 a − b 의 분기수익률 차이에 대한 HAC t 검정. §9-C2 가 요구하는 '차이의 유의성'.
+
+    ★ 예전에는 C2 가 fdr_pass["VQF-full"] 즉 'VQF 자신의 알파가 0보다 큰가'를 읽었다.
+      VQF 와 VQ 는 U-200 중복률이 높아(C3 가 0.85 미만을 요구할 정도) 수익률이 강하게
+      상관된다 — 두 시계열의 차이는 각각의 수준보다 훨씬 작은 신호다. 자기 유의성으로
+      대체하면 C2 통과가 극적으로 쉬워지고, 수급 축 채택 쪽으로 기운다(상향 드리프트).
+    """
+    nm = label or f"{a}−{b}(차이)"
+    ra = (EXPERIMENTS.get(a) or {}).get("R")
+    rb = (EXPERIMENTS.get(b) or {}).get("R")
+    if ra is None or rb is None or not len(ra) or not len(rb):
+        return {"name": nm, "t": np.nan, "p": np.nan, "n": 0, "mean": np.nan}
+    m = ra.merge(rb, on="rebal", how="inner", suffixes=("_a", "_b"))
+    d = pd.to_numeric(m["ret_a"], errors="coerce") - pd.to_numeric(m["ret_b"], errors="coerce")
+    d = d.dropna().to_numpy(dtype=float)
+    if len(d) < 4:
+        return {"name": nm, "t": np.nan, "p": np.nan, "n": int(len(d)), "mean": np.nan}
+    t, _se = hac_tstat(d)
+    return {"name": nm, "t": float(t), "p": _pval_from_t(float(t), len(d)),
+            "n": int(len(d)), "mean": float(np.mean(d))}
+
+
+def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q,
+                  extra_tests: Optional[Sequence[dict]] = None) -> dict:
+    """§8.3 — 주 실험 3개 + 어블레이션 4개를 하나의 패밀리로 묶어 BH-FDR 보정.
+
+    extra_tests: {"name","t","p","n"} 형태의 추가 검정(예: §9-C2 의 VQF−VQ 차이).
+                 같은 패밀리에 넣어야 보정이 정직하다.
+    """
+    for _e in (extra_tests or ()):
+        if _e and np.isfinite(_e.get("p", np.nan)):
+            EXPERIMENTS[_e["name"]] = {"name": _e["name"], "desc": "§9-C2 차이검정",
+                                       "net": {}, "gross": {}, "R": None,
+                                       "t": _e["t"], "p": _e["p"], "n": _e["n"]}
+    names = list(names) + [e["name"] for e in (extra_tests or ())
+                           if e and np.isfinite(e.get("p", np.nan))]
     fam = [n for n in names if n in EXPERIMENTS and np.isfinite(EXPERIMENTS[n].get("p", np.nan))]
     if not fam:
         LOG.warn("유효한 p값이 없어 BH-FDR 보정을 수행할 수 없습니다.")

@@ -106,12 +106,23 @@ def apply_t_plus_1(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
 #  ★ 종목코드 6번째 자리 규칙: 보통주는 '0'. 구형 우선주는 5/7/9, 2024 개편 신형은 K/L/M/N.
 #    이름만으로 거르면 '삼성전자우' 는 잡아도 '현대차2우B' 같은 변형에서 새고,
 #    코드만으로 거르면 6자리 영숫자 신형에서 샌다. 둘을 OR 로 묶는다.
-_PREF_NAME_RE = re.compile(r"우(?:B|C)?$|\d+우(?:B|C)?$|우선주")
+# ★★ 이름 규칙은 실존 소형주를 영구 삭제할 수 있다 — 경계를 반드시 붙인다 ★★
+#   예전 `우(?:B|C)?$` 는 '연우'·'미래에셋대우' 처럼 '…우' 로 끝나는 보통주를 전부 우선주로
+#   판정했고, `파워|마이다스|FOCUS|TREX` 는 접미 경계가 없어 '파워로직스'·'파워넷' 을
+#   ETF 로 판정했다. 셋 다 정확히 §3.1 이 겨냥하는 하위 1000 구간 종목이다. 시점불변
+#   삭제라 전 리밸런싱·전 실험에서 동일하게 빠지는 재현 가능한 편향이 된다.
+#   → 우선주 이름 규칙은 '숫자+우' / '우B' / '우선주' 처럼 우선주에서만 나타나는 형태로
+#     좁히고, 단독 '…우' 는 코드 6번째 자리 규칙에만 맡긴다(그쪽이 정확하다).
+_PREF_NAME_RE = re.compile(r"\d+우(?:B|C)?$|[가-힣A-Za-z]우(?:B|C)$|우선주")
 _SPAC_RE = re.compile(r"스팩|기업인수목적")
 _REIT_RE = re.compile(r"리츠|위탁관리부동산투자|기업구조조정부동산투자|부동산투자회사")
-_FUND_RE = re.compile(r"^(KODEX|TIGER|KBSTAR|ARIRANG|KINDEX|HANARO|SOL |ACE |PLUS |RISE |"
-                      r"KOSEF|TREX|FOCUS|마이다스|파워|미래에셋TIGER)|ETN$|ETF$|"
-                      r"레버리지$|인버스$|선물\s*ETN")
+# ETF/ETN 브랜드 접두는 뒤에 공백/숫자/영문 경계를 요구한다. '파워'·'마이다스'·'FOCUS'·
+# 'TREX' 는 실존 사업회사 이름의 접두이기도 하므로 목록에서 뺀다(§3.3 에 없는 확장이기도 하다).
+_FUND_RE = re.compile(r"^(KODEX|TIGER|KBSTAR|ARIRANG|KINDEX|HANARO|KOSEF|SOL|ACE|PLUS|RISE|"
+                      r"미래에셋TIGER)(?=[\s\d]|$)|ETN$|ETF$|레버리지$|인버스$|선물\s*ETN")
+
+# 구조적 제외로 걸러진 종목을 사후 검증할 수 있도록 명단을 남긴다(개수만 찍으면 확인 불가).
+EXCLUSION_AUDIT: Dict[str, str] = {}
 
 
 def is_preferred(code: str, name: str = "") -> bool:
@@ -119,21 +130,28 @@ def is_preferred(code: str, name: str = "") -> bool:
     if len(c) == 6 and c[5] not in ("0",):
         # 신형 영숫자 코드는 6번째가 0/K/L/M/N 이고 0 만 보통주다. 구형은 0 이 보통주.
         return True
+    # ★ 코드가 보통주(6번째='0')로 확정된 종목은 이름 규칙을 적용하지 않는다.
+    #   코드 규칙이 이름 규칙보다 정확하며, 이름 규칙의 오탐은 전부 이 경로에서 나왔다.
+    if len(c) == 6 and c[5] == "0":
+        return bool(re.search(r"우선주$", str(name or "")))
     return bool(_PREF_NAME_RE.search(str(name or "")))
 
 
 def classify_exclusion(code: str, name: str) -> str:
     """이름·코드만으로 판별 가능한 구조적 제외 사유. 없으면 빈 문자열."""
     nm = str(name or "").strip()
+    why = ""
     if is_preferred(code, nm):
-        return "우선주"
-    if _SPAC_RE.search(nm):
-        return "스팩"
-    if _REIT_RE.search(nm):
-        return "리츠"
-    if _FUND_RE.search(nm):
-        return "ETF/ETN"
-    return ""
+        why = "우선주"
+    elif _SPAC_RE.search(nm):
+        why = "스팩"
+    elif _REIT_RE.search(nm):
+        why = "리츠"
+    elif _FUND_RE.search(nm):
+        why = "ETF/ETN"
+    if why:
+        EXCLUSION_AUDIT[f"{code} {nm}"] = why
+    return why
 
 
 # ── 거래일 캘린더 / 리밸런싱 격자 ────────────────────────────────────────────────────────────
@@ -458,7 +476,32 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
     px["date"] = as_ts_series(px["date"])
     px = px.dropna(subset=["code", "date"]).sort_values(["code", "date"], kind="stable")
     g = px.groupby("code", observed=True)
-    px["adtv"] = g["amount"].transform(lambda s: s.rolling(window, min_periods=max(10, window // 3)).mean())
+
+    # ★★ rolling(60) 은 '시장 60거래일'이 아니라 '그 종목이 가진 60개 행' 이다 ★★
+    #   거래정지·소스 누락으로 행이 빠지면 창이 조용히 늘어나고, 분모에서 무거래일이 빠져
+    #   유동성이 과대평가된다. 과대 배수는 정확히 60/실거래일수다 — 20일만 거래된 종목은
+    #   ADTV 가 3배로 잡혀 §3.2 의 1억 게이트를 통과한다. 즉 §3.3 이 빼라는 바로 그
+    #   거래정지·초박형 종목이 U-1000 에 들어오고, 백테스트는 실제로 살 수 없는 종목을 산다.
+    #   pykrx 는 정지일을 amount=0 행으로 주지만 naver/yfinance 폴백은 행 자체를 생략하므로
+    #   §3.2 의 의미가 소스별로 달라진다.
+    #   → 시장 거래일 격자에 reindex 하고 무거래일 거래대금을 0 으로 채운 뒤 rolling 한다.
+    _tds = pd.DatetimeIndex(sorted(pd.unique(px["date"])), name="date")
+    _amt = (px.pivot_table(index="date", columns="code", values="amount", aggfunc="last")
+              .reindex(_tds))
+    _amt.columns.name = "code"
+    # 첫 상장 전 구간까지 0 으로 채우면 신규 상장주의 ADTV 가 부당하게 낮아진다.
+    # 각 종목의 '최초 관측일 이후'만 0 으로 채운다(그 이전은 결측 유지).
+    _seen = _amt.notna().cumsum() > 0
+    _amt = _amt.where(~(_seen & _amt.isna()), 0.0)
+    _adtv = _amt.rolling(int(window), min_periods=int(window)).mean()
+    _adtv = _adtv.stack(dropna=True).rename("adtv").reset_index()
+    _adtv.columns = ["date", "code", "adtv"]
+    _adtv["code"] = _adtv["code"].astype(str)
+    px["code"] = px["code"].astype(str)
+    px = px.merge(_adtv, on=["date", "code"], how="left")
+    _n_tight = int(px["adtv"].isna().sum())
+    LOG.debug(f"ADTV: 시장 거래일 격자 {len(_tds):,}일 · min_periods={window} "
+              f"(자기 행이 아니라 시장 거래일 기준) · 창 미충족 결측 {_n_tight:,}행")
 
     # ── 실측 호가스프레드 추정: Corwin-Schultz(2012) 고가/저가 추정량 ─────────────────────
     #  §8.1 은 '실측 호가스프레드 기반 슬리피지'를 요구한다. 과거 호가(bid/ask) 시계열은
@@ -527,6 +570,15 @@ def build_universe_grid(uni: "Universe", cal: pd.DataFrame, cap: pd.DataFrame,
         by = Counter(v for v in struct.values() if v)
         LOG.info(f"구조적 제외 종목 {n_struct:,}건 (시점 불변) — " +
                  ", ".join(f"{k} {v:,}" for k, v in by.most_common()))
+        # ★ 개수만 찍으면 사후 검증이 불가능하다. 이름 규칙의 오탐(실존 소형주가 ETF/우선주로
+        #   판정되는 사고)은 명단을 봐야만 잡힌다. 사유별 표본을 반드시 남긴다.
+        _samp = defaultdict(list)
+        for k, v in struct.items():
+            if v and len(_samp[v]) < 12:
+                _samp[v].append(f"{k} {names.get(k, '')}".strip())
+        LOG.table([[k, f"{by[k]:,}", _trunc(", ".join(_samp[k]), 78)] for k in by],
+                  ["제외 사유", "건수", "표본(최대 12)"], ["l", "r", "l"], maxw=80,
+                  title="구조적 제외 명단 (§3.3) — 이름 규칙의 오탐은 명단을 봐야만 잡힌다")
 
     parts = []
     for r in cal.itertuples(index=False):

@@ -246,7 +246,7 @@ def main() -> dict:
         globals()["DBUDGET"] = DQUOTA       # 공용 코어(dart_api)가 참조하는 이름에 주입
         DQUOTA.report()
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 Q1~Q12", "L0", budget_s=180):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 Q1~Q14", "L0", budget_s=180):
         run_contract_tests(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0",
@@ -370,9 +370,15 @@ def main() -> dict:
            f"(Sharpe {EXPERIMENTS[best]['net'].get('Sharpe', float('nan')):.3f})")
 
     with PIPE.stage("L3.ABL", "[12] 보조 어블레이션 X1~X4", "L3", budget_s=1800, critical=False):
-        abl = [("X1", dict(stage="x1"), "1차만 — 깔때기 자체의 기여"),
-               ("X2", dict(use_tone=False, use_nonfin=False), "1차+배제플래그만 — 위험배제 효과"),
-               ("X3", dict(use_tone=False), "1차+ΔNONFIN만 — 애널리스트 축 기여"),
+        # ★ §8.2 문언대로. X1~X3 에 3-A 가 섞이면 §10.2 의 귀속("1차=알파 / 배제·3-A=좌측꼬리")
+        #   분해가 성립하지 않고, §8.3 BH-FDR 패밀리에 이질적 선정이 섞인다.
+        #   X3 = "1차 + ΔNONFIN만" 이므로 배제플래그도 꺼야 한다.
+        abl = [("X1", dict(stage="x1", use_rule3a=False),
+                "1차만 — 깔때기 자체의 기여"),
+               ("X2", dict(use_tone=False, use_nonfin=False, use_rule3a=False),
+                "1차+배제플래그만 — 위험배제 효과"),
+               ("X3", dict(use_tone=False, use_exclusion=False, use_rule3a=False),
+                "1차+ΔNONFIN만 — 애널리스트 축 기여"),
                ("X4", dict(use_rule3a=False), "1차+2차, 3-A 없음 — 3-A 기여")]
         abl_names = []
         for nm, kw, desc in abl:
@@ -382,7 +388,11 @@ def main() -> dict:
         report_experiment_table(abl_names, f"보조 어블레이션 (§8.2) — 최우수 변형 {best_v} 기준")
 
     with PIPE.stage("L5.FDR", "[13] BH-FDR 다중검정 보정", "L5", budget_s=120, critical=False):
-        ctx["fdr"] = report_bh_fdr(main_names + abl_names)
+        # §9-C2 는 'VQF 자신의 알파'가 아니라 'VQF − VQ 차이'의 유의성을 요구한다.
+        # 차이검정을 같은 패밀리에 넣어야 다중검정 보정이 정직하다.
+        _c2 = paired_diff_test("VQF-full", "VQ-full")
+        ctx["c2_diff"] = _c2
+        ctx["fdr"] = report_bh_fdr(main_names + abl_names, extra_tests=[_c2])
 
     with PIPE.stage("L5.ROBUST", "[13] 강건성 검사 (§8.4)", "L5", budget_s=4 * 3600, critical=False):
         bt_best = ctx.get(f"bt_{best_v}")
@@ -428,8 +438,10 @@ def main() -> dict:
     with PIPE.stage("L6.VERDICT", "[14] 수급 축 판정 · 사전등록 폐기조건", "L6", budget_s=120,
                     critical=False):
         ctx["flow_verdict"] = report_flow_verdict(ctx.get("cmp", {}), fdr_pass=ctx.get("fdr"))
-        ctx["kill"] = report_preregistration_kill(main_names, best, "X1")
         report_discretion_ledger()
+        # ★ 폐기 판정은 마지막에 둔다. STOP_ON_KILL_CRITERIA=True 면 여기서 KillCriteria 를
+        #   던져 '폐기된 전략의 최종 편입 종목표'가 출력되는 것을 막는다(§10.4 의 이행).
+        ctx["kill"] = report_preregistration_kill(main_names, best, "X1")
 
     with PIPE.stage("L6.REPORT", "[15] 최종 산출물", "L6", budget_s=300, critical=False):
         bench = qvf_benchmarks(cal, ctx["px"])

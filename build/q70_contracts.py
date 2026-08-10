@@ -320,8 +320,105 @@ def _q12():
     return f"실측 기반 · 공용 저널 합산 · 020/021 구분 · 실효 한도 {DART_DAILY_LIMIT:,}"
 
 
+@_contract("Q13", "§10.4 폐기조건 — 충족 시 실제로 멈춘다(보고만 하고 지나가지 않는다)")
+def _q13():
+    """'미달 시 행동'을 표에 적어 놓고 아무것도 하지 않으면 그 표는 거짓말이 된다.
+
+    예전에는 폐기 판정을 낸 직후 그 폐기된 전략의 실전 편입 종목표를 그대로 출력했다.
+    여기서는 폐기가 확실히 성립하는 가짜 EXPERIMENTS 를 심고 KillCriteria 가 실제로
+    올라오는지, 그리고 STOP_ON_KILL_CRITERIA=False 면 올라오지 않는지 둘 다 본다.
+    """
+    keep_exp = dict(EXPERIMENTS)
+    keep_stop = STOP_ON_KILL_CRITERIA
+    try:
+        EXPERIMENTS.clear()
+        # 세 변형 전부 비용 차감 후 CAGR < 0 → 조건 ① 확실히 충족
+        for nm in ("V-full", "VQ-full", "VQF-full", "X1"):
+            EXPERIMENTS[nm] = {"name": nm, "desc": "", "R": None, "t": 0.0, "p": 0.9, "n": 8,
+                               "net": {"CAGR": -0.05, "Sharpe": 0.10, "MDD": -0.30},
+                               "gross": {}}
+        keep_level = LOG.min
+        LOG.min = 99                                   # 계약 표에 잡음을 남기지 않는다
+        try:
+            globals()["STOP_ON_KILL_CRITERIA"] = True
+            raised = False
+            try:
+                report_preregistration_kill(["V-full", "VQ-full", "VQF-full"], "VQ-full", "X1")
+            except KillCriteria:
+                raised = True
+            if not raised:
+                raise ContractViolation(
+                    "§10.4 폐기 조건이 충족됐는데 KillCriteria 가 올라오지 않았습니다 — "
+                    "폐기 판정 후에도 최종 편입 종목표가 출력됩니다.")
+            globals()["STOP_ON_KILL_CRITERIA"] = False
+            out = report_preregistration_kill(["V-full", "VQ-full", "VQF-full"], "VQ-full", "X1")
+            if not out.get("all_alpha_dead"):
+                raise ContractViolation("폐기 조건 ①(전 변형 알파 소멸)이 감지되지 않았습니다.")
+        finally:
+            LOG.min = keep_level
+    finally:
+        globals()["STOP_ON_KILL_CRITERIA"] = keep_stop
+        EXPERIMENTS.clear()
+        EXPERIMENTS.update(keep_exp)
+    return "충족 시 중단 · STOP 끄면 보고만"
+
+
+@_contract("Q14", "adopt(size=) 가 코어 경로와 같은 uid 를 만든다 — 캐시 중복등록 방지")
+def _q14():
+    """scandir 이 이미 알고 있는 크기를 넘겨 FUSE 왕복을 아끼되, uid 는 반드시 동일해야 한다.
+
+    uid 가 달라지면 같은 파일이 인덱스에 두 번 들어가고, 재실행마다 계속 늘어난다.
+    """
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        fp = os.path.join(td, "sample_report_2020-01-02.pdf")
+        with open(fp, "wb") as f:
+            f.write(b"x" * 1234)
+        sz = os.path.getsize(fp)
+        u_core = sha1_str("adopt", "research", "report_pdf", os.path.abspath(fp), sz)
+        v = QVFVault(os.path.join(td, "cache"), mode="local", mirrors=[])
+        u_fast = v.adopt(fp, domain="research", subtype="report_pdf", key="sample",
+                         scope="shared", size=sz)
+        if u_fast != u_core:
+            raise ContractViolation(
+                f"size 지정 경로의 uid 가 코어와 다릅니다: {u_fast} vs {u_core} — "
+                f"같은 파일이 인덱스에 중복 등록됩니다.")
+        if not v.has("shared", u_core):
+            raise ContractViolation("adopt 직후 has() 가 False 입니다 — 중복 수집이 발생합니다.")
+        # ★★ 같은 실행에서 저장한 것을 같은 실행에서 되찾을 수 있어야 한다(절대 1원칙) ★★
+        #   put_blob 은 uid 가 아니라 '파일 경로'를 돌려주므로 인덱스에서 uid 를 찾는다.
+        #   저널 flush 이전(=등록만 된 상태)과 이후 둘 다 성립해야 한다. 예전에는 코어가
+        #   self._idx 캐시를 갱신하지 않아 둘 다 None 이었고, 콜드런 1회차에 방금 받은
+        #   PDF 가 TONE 입력에서 통째로 빠졌다 — '본문이 짧아 제외'와 구분되지 않는 형태로.
+        for k, payload, flush_first in (("k_preflush", b"before-flush", False),
+                                        ("k_postflush", b"after-flush", True)):
+            v.put_blob("test", "unit", k, payload, "bin", scope="shared", source="contract")
+            if flush_first:
+                v.flush("shared")
+            idx = v.load_index("shared")
+            hit = idx[idx["key"].astype(str) == k]
+            if hit.empty:
+                raise ContractViolation(
+                    f"put_blob 직후 인덱스에서 '{k}' 를 찾을 수 없습니다 — 인덱스 캐시가 "
+                    f"등록분을 반영하지 않고 있습니다(절대 1원칙 위반).")
+            got = v.get_blob(str(hit["uid"].iloc[0]), "shared")
+            if got != payload:
+                raise ContractViolation(
+                    f"같은 실행에서 저장한 blob('{k}')을 get_blob 이 되찾지 못했습니다 "
+                    f"(flush {'후' if flush_first else '전'}). 콜드런 1회차에 방금 받은 "
+                    f"자료가 통째로 빠지는 경로입니다.")
+        # force=True 가 오히려 파생 캐시를 굳혀 복구를 막던 경로도 함께 고정한다.
+        idx = v.load_index("shared", force=True)
+        hit = idx[idx["key"].astype(str) == "k_postflush"]
+        if hit.empty or v.get_blob(str(hit["uid"].iloc[0]), "shared") != b"after-flush":
+            raise ContractViolation(
+                "load_index(force=True) 이후 get_blob 이 실패합니다 — force 가 _uidpath 를 "
+                "무효화하지 않아 스테일 사전이 영구히 남는 경로입니다.")
+    return "uid 동일 · 저장↔재호출 (flush 전/후/force) 전부 성립"
+
+
 def run_contract_tests(strict: bool = True) -> bool:
-    LOG.banner("계약 자동검정 Q1~Q12", "협상 불가 규칙 — 실패하면 실데이터 수집을 시작하지 않습니다")
+    LOG.banner("계약 자동검정 Q1~Q14", "협상 불가 규칙 — 실패하면 실데이터 수집을 시작하지 않습니다")
     rows, ok_all = [], True
     for c in CONTRACTS:
         t0 = time.time()
@@ -342,5 +439,5 @@ def run_contract_tests(strict: bool = True) -> bool:
             raise ContractViolation(msg)
         LOG.error(msg)
     else:
-        LOG.ok("계약 Q1~Q12 전부 통과 — PIT·생존자편향·부호처리·결측허용·비용·캐시 무결성 확인")
+        LOG.ok("계약 Q1~Q14 전부 통과 — PIT·생존자편향·부호처리·결측허용·비용·폐기조건·캐시 무결성 확인")
     return ok_all

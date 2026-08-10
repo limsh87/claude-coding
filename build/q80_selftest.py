@@ -280,8 +280,20 @@ def run_selftest(full_chain: bool = False) -> bool:
         report_robustness()
         report_phase0(0.95, 0.60, 0.85, 0.35, 120)
         report_flow_verdict(cmp_res, fdr_pass=fdr)
-        report_preregistration_kill([f"{v}-full" for v in VARIANTS], "VQ-full", "X1")
         report_discretion_ledger()
+        # ★ 스모크의 목적은 '배관이 끝까지 흐르는가' 이지 '전략이 통과하는가' 가 아니다.
+        #   합성 난수에는 알파가 없으므로 §10.4 는 발동하는 것이 정상이며, 그 발동으로
+        #   스모크가 죽으면 이후 표를 검증하지 못한다. 여기서만 중단을 끈다.
+        #   ★ '발동 시 실제로 멈추는가' 는 계약 Q13 이 별도로 검정한다 — 여기서 끄는 것이
+        #     §10.4 의 이행을 무력화하지 않는다는 점을 그 계약이 보증한다.
+        _keep_stop = STOP_ON_KILL_CRITERIA
+        globals()["STOP_ON_KILL_CRITERIA"] = False
+        try:
+            _kill = report_preregistration_kill([f"{v}-full" for v in VARIANTS], "VQ-full", "X1")
+        finally:
+            globals()["STOP_ON_KILL_CRITERIA"] = _keep_stop
+        LOG.info(f"스모크 §10.4 판정(중단은 끈 상태): "
+                 f"{ {k: v for k, v in _kill.items() if not k.startswith('_')} }")
         report_final_holdings(P, "VQ", "_sel", S["sec"], top_n=12)
         LOG.ok("full_chain 예행연습 완료 — 백테스트·성과검증·강건성·판정표가 모두 정상 출력됩니다.")
         return True
