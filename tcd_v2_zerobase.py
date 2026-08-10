@@ -164,12 +164,21 @@ USDKRW_CONST = 1300.0     # θ_X 계산용 환산율. 관세 통계는 USD, 재�
 #                           θ_X 는 '수출/매출 비율이 그럴듯한가'라는 정합성 지표라 환율의
 #                           연도별 변동(1,100~1,400)이 판정을 뒤집지 않는다. 정밀 환산이
 #                           필요해지면 여기를 월별 환율 시계열로 바꾸세요.
-DART_ZIP_WORKERS = 4      # ★일괄 ZIP 동시 다운로드 수(정부 사이트라 4 이상은 이득 없이 위험).
+DART_ZIP_WORKERS = 2      # ★일괄 ZIP 동시 다운로드 수. 4 → 2 로 낮춘다(실측 근거 아래).
 #                           파일은 개당 2~8MB · 129개 총 0.5~0.9GB 로 작다 — 진짜 비용은
 #                           압축 해제 후 40~55MB 짜리 TSV 를 pandas 로 읽는 CPU 쪽이다.
-#                           그래서 다운로드는 4병렬로 겹쳐 두고 파싱은 순차로 흘린다.
-#                           직렬이었을 때는 129개에 몇 시간이 걸렸고, 진행바가 파일 단위로만
-#                           움직여 '멈춤'과 구별이 안 됐다(실측: 0/129 에서 정체로 오인).
+#                           ★4병렬 실측: 672초에 4개 완주 · 누적 40MB = 스트림당 약 14KB/s.
+#                           파일이 작은데 이 속도가 나온다는 것은 대역폭이 아니라 ★동시
+#                           스트림 수에 서버가 반응했다는 뜻이다(정부 사이트의 전형적 반응).
+#                           2 로 낮추면 스트림당 속도가 올라 총 시간은 오히려 줄어든다.
+#                           ★이 값은 이제 상한일 뿐이다 — 아래 ZIP 스테이지가 실측 처리량을
+#                           재서 남은 시간에 몇 개가 들어가는지 계산하고, 못 들어가는 몫은
+#                           원장에 남겨 다음 실행이 이어받는다(정체 대신 정직한 부분 완주).
+ZIP_TIME_SHARE  = 0.30    # ★일괄 ZIP 에 줄 시간 몫 — 진입 시 '잔여 시간'의 비율.
+#                           이 몫이 없으면 129개가 남은 예산 전부(실측 ETA 2h20m)를 먹고
+#                           직원현황·공시가 굶는다. 재무는 다음 실행이 원장에서 이어받지만
+#                           직원현황(θ_N 분모)은 대체 경로가 없다 — 굶으면 팩 축이 죽는다.
+ZIP_TIME_CAP_MIN = 40     # 위 비율과 무관하게 넘지 않을 절대 상한(분). 0 = 비율만 적용.
 DART_BULK_MULTI  = True   # 다중회사 주요계정(fnlttMultiAcnt): 회사 100개를 한 번에 조회.
 #                           전 시장 12년을 약 1,600회로 덮는다(단건이면 16만회).
 DART_MULTI_BATCH = 100    # 한 요청에 넣을 회사 수(공식 상한 100). status 021 이 나면 낮추세요.
@@ -177,6 +186,15 @@ NPS_MAX_CALLS    = 0      # PACK-N 종목 상한(0 = 실시간 잔여가 허용�
 #                           ★2026-08 재설계로 (종목 × 월) 교차곱이 사라졌다 — 월은 요청이 아니라
 #                           응답에서 나온다. 종목당 검색 1 + 기간 1 + 상세 ≤3 회이므로 전 종목이
 #                           약 2만 회에 끝난다(옛 구현은 647,760회 = 65일이었고 그나마 0행이었다).
+DATAGOKR_WORKERS = 20     # ★공공데이터포털 동시 요청 스레드. 6 → 20 (차단 위험 증가 없음).
+#                           ★근거: 서버로 나가는 초당 요청 수는 스레드 수가 아니라
+#                           QPS_CAP['datagokr']=5.0 이 정한다(_Pace 는 소스별 ★전역 락으로
+#                           호출 간격을 강제한다). 스레드는 '응답을 기다리는 자리'일 뿐이다.
+#                           실측: 6스레드 · 왕복 3~4초 → 실효 1.5~2.0 req/s 로 상한 5.0 의
+#                           1/3 밖에 못 썼고, 국민연금이 50분 몫을 전부 쓰고도 993종목 중
+#                           912종목에서 끊겼다. 20스레드면 5.0 req/s 가 실제 상한이 되어
+#                           같은 일이 약 15분에 끝난다 — ★서버가 받는 초당 요청은 그대로다.
+#                           (403/429 가 보이면 이 값이 아니라 QPS_CAP 을 낮추세요.)
 DATAGOKR_BUDGET_SHARE = {  # ★공공데이터포털 하루치를 팩별로 나눈다. 하나가 다 먹으면 나머지가
     "nps":     0.55,       #   매 실행 0건이 된다(DART 에서 세 번 겪은 사고와 같은 구조).
     "procure": 0.35,       #   PACK-P 조달 — 월축이라 수요가 작지만 완주 원장이 있어 잘 이어받는다
@@ -2262,6 +2280,11 @@ def net_get(url: str, source: str = "generic", params: Optional[dict] = None,
         hdr["Referer"] = referer
     last = None
     for k in range(tries):
+        # ★재시도는 시계를 본다 — 시간 몫이 끝난 뒤에도 재시도가 붙으면, 스테이지는
+        #   '멈추기로 결정'했는데 진행 중인 수천 건이 각자 최대 150초씩(3회 × 25초 +
+        #   백오프) 더 태운다. 첫 시도는 막지 않는다(이미 시작된 일은 끝내야 한다).
+        if k and _dl_aborted():
+            break
         pace(source).wait()
         try:
             if k:
@@ -2316,6 +2339,8 @@ def net_post(url: str, source: str = "generic", data: Optional[dict] = None,
     if referer:
         hdr["Referer"] = referer
     for k in range(tries):
+        if k and _dl_aborted():          # ★net_get 과 같은 규약 — 재시도는 시계를 본다
+            break
         pace(source).wait()
         try:
             r = _sess().post(url, data=data, headers=hdr, timeout=timeout)
@@ -2332,9 +2357,26 @@ def net_post(url: str, source: str = "generic", data: Optional[dict] = None,
     return None
 
 
-DL_TOTAL_S   = 900      # 큰 파일 1개에 허용하는 총시간(초) — 넘으면 포기하고 다음 파일로
+DL_TOTAL_S   = 900      # ★파일 1개에 허용하는 총시간(초) — ★재시도를 전부 포함한 마감선
 DL_STALL_S   = 75       # 무진전 상한(초) — 이만큼 단 1바이트도 안 들어오면 끊는다
-DL_CHUNK     = 1 << 20  # 1MB 청크
+DL_CHUNK     = 1 << 18  # 256KB 청크 — 1MB 였을 때 무진전 감지가 사실상 죽어 있었다(아래)
+DL_MIN_BPS   = 24 << 10  # 처리량 바닥(24KB/s). 이 밑이면 '느린 게 아니라 막힌 것'으로 본다
+DL_GRACE_S   = 30       # 처리량을 재기 시작하는 시점 — TLS·서버 준비 시간은 봐준다
+DL_CLOCK_CHK_S = 2.0    # 스트림 도중 시계를 다시 보는 간격(초)
+
+# ★시계 갈고리 — CLOCK 은 이 파일보다 뒤에 정의되므로 직접 참조할 수 없다. p05b 가
+#   `DL_ABORT_HOOKS.append(lambda: CLOCK.over())` 로 꽂아 넣는다. 비어 있으면 무시된다.
+DL_ABORT_HOOKS: List[Callable[[], bool]] = []
+
+
+def _dl_aborted() -> bool:
+    for h in DL_ABORT_HOOKS:
+        try:
+            if h():
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def net_download(url: str, source: str = "generic", params: Optional[dict] = None,
@@ -2352,12 +2394,30 @@ def net_download(url: str, source: str = "generic", params: Optional[dict] = Non
       않아 진행바가 `0/129 [00:00<?, ?it/s]` 에 고정된 채 멈췄다. tqdm 은 update() 가
       불릴 때만 다시 그리므로 ★사용자에게는 '정체'와 '진행 중'이 완전히 동일하게 보인다.
 
-    그래서 세 가지를 동시에 건다:
-      ① 총시간 상한(total_s)  — 아무리 느려도 이 시간이면 포기하고 다음 파일로 넘어간다.
-      ② 무진전 상한(stall_s)  — 마지막 바이트 이후 이만큼 조용하면 죽은 연결로 보고 끊는다.
-                                (느리지만 살아 있는 연결은 죽이지 않는다 — 총시간이 맡는다)
-      ③ 진행 콜백(on_progress) — 받은 바이트를 밖으로 알린다. 진행바가 파일 단위로만
-                                움직이면 20분짜리 파일 하나에서 화면이 죽는다.
+    ★2026-08 재교정 — 위 장치를 달고도 같은 정체가 재현됐다. 로그가 정확히 말해 준다:
+      `DART 재무 일괄 ZIP: 4/129 [11:12<2:20:59, 67.68s/it, 40MB 수신]`
+      672초에 4개 완주(워커 4개) = 파일당 672초. total_s 는 240 이었는데 왜 672 인가?
+      ★240(1차 만료) + 2(백오프) + 240(2차 만료) + 3(백오프) + 187 = 672. 정확히 맞는다.
+      total_s 가 ★재시도 루프 ★안에 있어서 '한 번 시도의 상한'이었던 것이다. 즉 실효
+      상한은 tries × total_s = 720초였고, 129개 ÷ 4워커 × 720초 = ★6.5시간이다.
+      docstring 은 '아무리 느려도 이 시간이면 포기'라고 약속했는데 코드는 3배를 썼다.
+
+      그리고 무진전 상한은 ★죽어 있었다. `iter_content(chunk_size=1MB)` 는 1MB 가 찰
+      때까지 블록하는데, 청크를 받은 ★직후에 last_rx=now 로 갱신하고 나서 비교하므로
+      `now - last_rx` 는 항상 0 이다. 즉 stall 검사는 빈 청크에서만 발동하고, requests
+      는 본문에서 빈 청크를 거의 내지 않는다. 40초 만에 잡았어야 할 트리클을 240초
+      동안 방치한 이유가 이것이다.
+
+    그래서 네 가지를 건다:
+      ① 마감선(total_s)     — ★재시도·백오프를 전부 포함한 호출 1회의 절대 상한.
+      ② 처리량 바닥(MIN_BPS) — 유예(GRACE) 뒤에도 이 속도 미만이면 '느린 것'이 아니라
+                              '막힌 것'으로 보고 즉시 끊는다. 트리클을 30초에 잡는다.
+      ③ 시계 갈고리          — 스테이지 시간 몫이 끝나면 열려 있는 스트림도 즉시 접는다.
+      ④ 진행 콜백            — 받은 바이트를 밖으로 알린다(진행바가 파일 단위면 화면이 죽는다).
+
+    ★재시도 정책: 마감선·처리량·시계로 끊긴 것은 ★재시도하지 않는다. 같은 회선으로
+      처음부터 다시 받아도 더 빠를 이유가 없고, 비용만 정확히 tries 배가 된다.
+      재시도는 접속 실패·HTTP 오류처럼 '다시 하면 될 수도 있는' 경우에만 한다.
 
     반환: 파일 내용(bytes). spool_over 를 넘으면 임시파일 경로(str)를 돌려준다 —
     Colab RAM(≈12GB)에서 수백 MB 를 통째로 들고 zipfile 에 넘기면 파싱 피크에서 터진다.
@@ -2366,12 +2426,16 @@ def net_download(url: str, source: str = "generic", params: Optional[dict] = Non
     hdr = dict(headers or {})
     if referer:
         hdr["Referer"] = referer
+    deadline = time.monotonic() + float(total_s)      # ★호출 1회의 절대 마감선
     for k in range(max(1, tries)):
+        if time.monotonic() >= deadline or _dl_aborted():
+            break
         pace(source).wait()
         t0 = time.monotonic()
         buf: Optional[io.BytesIO] = io.BytesIO()
         tmpf = None
         got = 0
+        fatal = False              # 재시도해도 소용없는 중단(마감선·처리량·시계)
         try:
             r = _sess().get(url, params=params, headers=hdr, stream=True,
                             timeout=(15, 60))
@@ -2385,11 +2449,11 @@ def net_download(url: str, source: str = "generic", params: Optional[dict] = Non
                 continue
             total = int(r.headers.get("Content-Length") or 0)
             last_rx = time.monotonic()
+            last_chk = last_rx
             for chunk in r.iter_content(chunk_size=DL_CHUNK):
                 now = time.monotonic()
                 if chunk:
                     got += len(chunk)
-                    last_rx = now
                     if tmpf is None and buf is not None and got > spool_over:
                         # 임계치 초과 → 디스크로 흘린다(메모리 피크 차단)
                         tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".part")
@@ -2401,10 +2465,26 @@ def net_download(url: str, source: str = "generic", params: Optional[dict] = Non
                             on_progress(len(chunk), total)
                         except Exception:
                             pass
+                # ★검사 순서가 결정적이다 — last_rx 갱신은 검사 ★뒤에 한다. 앞에서 갱신하면
+                #   `now - last_rx` 가 늘 0 이라 무진전 검사가 통째로 죽는다(옛 버그).
                 if now - last_rx > stall_s:
+                    fatal = True
                     raise TimeoutError(f"stalled {stall_s:.0f}s at {got:,}B")
-                if now - t0 > total_s:
-                    raise TimeoutError(f"exceeded {total_s:.0f}s at {got:,}B")
+                el = now - t0
+                if el > DL_GRACE_S and got / el < DL_MIN_BPS:
+                    fatal = True
+                    raise TimeoutError(f"too slow {got/el/1024:.1f}KB/s < "
+                                       f"{DL_MIN_BPS/1024:.0f}KB/s at {got:,}B")
+                if now >= deadline:
+                    fatal = True
+                    raise TimeoutError(f"deadline {total_s:.0f}s at {got:,}B")
+                if now - last_chk > DL_CLOCK_CHK_S:
+                    last_chk = now
+                    if _dl_aborted():
+                        fatal = True
+                        raise TimeoutError(f"clock stop at {got:,}B")
+                if chunk:
+                    last_rx = now
             r.close()
             if total and got < total * 0.98:            # 잘린 응답을 성공으로 넘기지 않는다
                 raise IOError(f"truncated {got:,}/{total:,}B")
@@ -2422,7 +2502,14 @@ def net_download(url: str, source: str = "generic", params: Optional[dict] = Non
                     os.unlink(tmpf.name)
             except Exception:
                 pass
-            time.sleep(min(8.0, 1.8 ** k) + random.random())
+            # ★마감선·처리량·시계로 끊긴 것은 재시도하지 않는다 — 같은 회선으로 처음부터
+            #   다시 받아도 빨라질 이유가 없고, 비용만 정확히 tries 배가 된다(옛 3배 사고).
+            if fatal:
+                break
+            nap = min(8.0, 1.8 ** k) + random.random()
+            if time.monotonic() + nap >= deadline:
+                break
+            time.sleep(nap)
     with _NET_LK:
         NET_STATS[f"{source}:DFAIL"] += 1
     return None
@@ -2776,9 +2863,9 @@ class HarvestClock:
             return
         self._soft = time.time() + give
         self._soft_what, self._soft_give, self._soft_hit = what, give, False
-        L.info(f"⏱ '{what}' 시간 몫 {give/60:.0f}분 배정(잔여 {rem/60:.0f}분의 "
-               f"{share*100:.0f}%) — 이 몫을 넘기면 여기서 멈추고 다음 스테이지로 넘깁니다. "
-               f"뒤에 오는 DART 가 굶으면 θ 분모가 사라져 이 팩의 축도 같이 죽습니다.")
+        L.info(f"⏱ '{what}' 시간 몫 {give/60:.0f}분 배정(가용 {rem/60:.0f}분의 "
+               f"{share*100:.0f}%) — 이 몫을 넘기면 여기서 멈추고 다음으로 넘깁니다. "
+               f"남은 일은 원장에 남아 다음 실행이 정확히 이어받습니다.")
         try:
             yield give
         finally:
@@ -2795,8 +2882,20 @@ class HarvestClock:
     def elapsed(self) -> float:
         return time.time() - self.t0
 
-    def remaining(self) -> float:
-        return max(0.0, self.budget_s - self.elapsed())
+    def remaining(self, soft: bool = True) -> float:
+        """★기본이 '지금 유효한' 잔여다 — 서브예산 안에서는 그 마감선까지가 잔여다.
+
+        여기가 soft 를 안 보면 lease 가 ★중첩되지 않는다. 자식 lease 가
+        `remaining() × share` 로 자기 몫을 계산하는데 그 remaining 이 전역이면,
+        부모가 50분을 받았어도 자식이 200분을 받아 부모 마감선을 넘어 버린다.
+        그러면 '스테이지 안에서 수집기끼리 시간을 나눈다'는 설계가 성립하지 않는다.
+        전역 잔여가 필요한 곳(사용자에게 '전체 예산은 얼마 남았다'를 알릴 때)만
+        soft=False 로 명시한다.
+        """
+        g = max(0.0, self.budget_s - self.elapsed())
+        if soft and self._soft is not None:
+            return max(0.0, min(g, self._soft - time.time()))
+        return g
 
     def over(self) -> bool:
         # ★서브예산이 먼저다 — 전체 예산이 남아 있어도 이 스테이지의 몫은 끝났을 수 있다.
@@ -2805,9 +2904,9 @@ class HarvestClock:
             if not self._soft_hit:
                 self._soft_hit = True
                 L.warn(f"⏱ '{self._soft_what}' 시간 몫 {self._soft_give/60:.0f}분 소진 — "
-                       f"여기서 멈추고 다음 스테이지로 넘깁니다(전체 예산은 "
-                       f"{self.remaining()/60:.0f}분 남았습니다). 남은 일은 다음 실행이 "
-                       f"원장에서 정확히 이어받습니다.")
+                       f"여기서 멈추고 다음으로 넘깁니다(전체 예산은 "
+                       f"{self.remaining(soft=False)/60:.0f}분 남았습니다). 남은 일은 다음 "
+                       f"실행이 원장에서 정확히 이어받습니다.")
             return True
         if self.elapsed() >= self.budget_s:
             if not self.tripped:
@@ -2834,6 +2933,36 @@ class HarvestClock:
              f"아래 항목은 부분 수집 상태이며 재실행 시 이어받습니다")
         L.grid([[i + 1, c] for i, c in enumerate(self.cuts)] or [[1, "(상세 기록 없음)"]],
                ["#", "예산 도달로 잘린 수집"], ["r", "l"])
+
+
+class TimeSplit:
+    """★한 lease 안에서 여러 수집기가 시간을 나눠 갖게 한다 — CallBudget 이 '호출량'에
+    대해 하는 일을 그대로 '시간'에 대해 한다.
+
+    ★왜 필요한가(실측 사고): 센서팩 스테이지가 50분 몫을 받았는데 그 안에서 국민연금이
+      50분을 전부 쓰고, 조달은 `0/120 [00:00<?]` 에서 첫 배치도 못 돌고 잘렸다. 몫을
+      스테이지에만 걸면 ★스테이지 안의 첫 수집기가 다 먹는다 — DART 호출 예산에서 이미
+      세 번 겪은 것과 정확히 같은 구조이고, 그래서 해법도 같다: 들어가기 직전에 실잔여를
+      다시 재서, ★아직 안 받은 소비자들 사이의 상대 가중치로 나눈다.
+
+    앞의 수집기가 몫을 남기면(캐시 적중·조기 완주) 그 잔여는 자동으로 뒤로 흘러간다 —
+    take() 가 배분을 미리 못 박지 않고 자기 차례에 부모의 실잔여를 다시 재기 때문이다.
+    """
+
+    def __init__(self, weights: Dict[str, float]):
+        self.left: Dict[str, float] = {k: max(0.0, float(v)) for k, v in weights.items()}
+
+    def drop(self, key: str):
+        """할 일이 없는 소비자를 뺀다 — 남은 소비자들의 몫이 그만큼 커진다."""
+        self.left.pop(key, None)
+
+    @contextmanager
+    def take(self, key: str, what: str):
+        w = self.left.pop(key, 0.0)
+        rest = sum(self.left.values())
+        share = (w / (w + rest)) if (w + rest) > 0 else 1.0
+        with CLOCK.lease(share, what) as s:
+            yield s
 
 
 def chunked(seq: Sequence, size: int) -> Iterable[list]:
@@ -2869,6 +2998,11 @@ def budget_batches(jobs: Sequence, size: int, src: str, what: str,
 
 
 CLOCK = HarvestClock(HARVEST_TIME_BUDGET_H)
+
+# ★스트리밍 다운로드가 시계를 볼 수 있게 하는 갈고리 — net_download 는 CLOCK 보다 먼저
+#   정의되므로 직접 참조할 수 없다. 이게 없으면 시간 몫이 끝나도 이미 열린 스트림은
+#   자기 마감선까지 계속 받는다(4워커 × 240초 = 스테이지가 16분 늦게 멈춘다).
+DL_ABORT_HOOKS.append(lambda: CLOCK.over())
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════════════════╗
@@ -5812,7 +5946,7 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
         new_done = []
 
     kept: List[pd.DataFrame] = []
-    prog = {"b": 0, "t": 0.0}
+    prog = {"b": 0, "t": 0.0, "t0": time.monotonic(), "n": 0}
     plk = threading.Lock()
 
     def _fetch(r: dict):
@@ -5824,19 +5958,46 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
                     return
                 prog["t"] = now
                 mb = prog["b"] / 1048576.0
+                kbs = prog["b"] / max(1.0, now - prog["t0"]) / 1024.0
             try:      # ★긴 파일 하나에서 화면이 죽지 않도록 바이트 진행을 직접 그린다
-                bar.set_postfix_str(f"{mb:,.0f}MB 수신", refresh=True)
+                # ★속도를 같이 그린다 — 지난 라운드에 'MB 수신'만 보여서, 느린 것인지
+                #   막힌 것인지 사용자가 로그만으로 구별할 수 없었다. KB/s 가 보이면
+                #   회선 문제인지 서버 반응인지 한눈에 판정된다.
+                bar.set_postfix_str(f"{mb:,.0f}MB · {kbs:,.0f}KB/s", refresh=True)
             except Exception:
                 pass
-        # ★상한을 파일 실측에 맞춘다 — 일괄 ZIP 은 개당 2~8MB 다(실측). 240초를 넘긴다는
-        #   것은 30KB/s 미만이라는 뜻이고, 그건 느린 게 아니라 죽은 회선이다. 넉넉하게
-        #   잡아 두면 파일 하나가 스테이지 전체를 몇 시간 붙잡는다(이번 정체가 그것이다).
+        # ★상한은 '호출 1회'의 절대 마감선이다(net_download 가 재시도를 포함해 지킨다).
+        #   옛 코드는 이 값이 ★시도 1회의 상한이라 실효 상한이 3배(720초)였고, 129개를
+        #   4워커로 돌리면 6.5시간이었다 — 이번 정체의 정확한 산식이 그것이다.
         return r, net_download(DART_BULK_DL, source="dart_zip",
                                params={"fl_nm": r["file"]}, referer=DART_BULK_LIST,
-                               total_s=240, stall_s=40, on_progress=_on)
+                               total_s=180, stall_s=30, on_progress=_on)
 
-    with stage_bar(len(todo), "DART 재무 일괄 ZIP") as bar:
-        with ThreadPoolExecutor(max_workers=DART_ZIP_WORKERS,
+    def _eta_guard() -> bool:
+        """★실측 처리량으로 '이 몫 안에 몇 개가 들어가는가'를 계산해 정직하게 자른다.
+
+        진행바의 ETA(2:20:59)는 사용자에게 '기다리면 끝난다'로 읽히지만, 시간 몫이
+        40분이면 그 ETA 는 애초에 도달 불가능한 숫자다. 그럴 땐 기다리게 두지 말고
+        ★지금 몇 개까지 가능한지를 말하고 나머지는 원장에 남긴다(다음 실행이 이어받는다).
+        """
+        done, el = prog["n"], time.monotonic() - prog["t0"]
+        if done < 3 or el < 60:
+            return False
+        per = el / done
+        room = CLOCK.remaining()                       # ★이 스테이지 몫의 잔여
+        fits = int(room // per)
+        if fits >= len(todo) - done:
+            return False
+        L.warn(f"일괄 ZIP 실측 {per:.0f}초/파일 · 시간 몫 잔여 {room/60:.0f}분 → 이번 실행은 "
+               f"{done + max(0, fits):,}/{len(todo):,}개까지가 한계입니다. 남은 "
+               f"{len(todo)-done-max(0, fits):,}개는 원장에 남겨 다음 실행이 정확히 "
+               f"이어받습니다(호출한도를 쓰지 않는 경로라 재실행 비용은 시간뿐입니다).")
+        return False                                   # 판정만 알리고 중단은 시계가 한다
+
+    with CLOCK.lease(ZIP_TIME_SHARE, "DART 재무 일괄 ZIP",
+                     cap_s=ZIP_TIME_CAP_MIN * 60.0), \
+            stage_bar(len(todo), "DART 재무 일괄 ZIP") as bar:
+        with ThreadPoolExecutor(max_workers=max(1, int(DART_ZIP_WORKERS)),
                                 thread_name_prefix="zip") as ex:
             futs = {ex.submit(_fetch, r): r for r in todo}
             try:
@@ -5853,6 +6014,9 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
                         bar.update(1)
                         continue
                     bar.update(1)
+                    prog["n"] += 1
+                    if prog["n"] in (3, 8, 20, 50):
+                        _eta_guard()
                     if not raw:
                         continue
                     tmp = raw if isinstance(raw, str) else None
@@ -5897,8 +6061,10 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
     _flush(force=True)
     if kept:
         _tot = sum(len(x) for x in kept)
-        L.ok(f"재무 일괄 ZIP {_tot:,}행 확보 · 누적 수신 {prog['b']/1048576:,.0f}MB — "
-             f"호출한도 소비 0" + (f" · 멤버 스킵 {n_skip_mem}건" if n_skip_mem else ""))
+        _el = max(1.0, time.monotonic() - prog["t0"])
+        L.ok(f"재무 일괄 ZIP {_tot:,}행 확보 · {prog['n']}/{len(todo)}개 · 누적 수신 "
+             f"{prog['b']/1048576:,.0f}MB({prog['b']/_el/1024:,.0f}KB/s) — 호출한도 소비 0"
+             + (f" · 멤버 스킵 {n_skip_mem}건" if n_skip_mem else ""))
     got = kept
     frames = [x for x in (cached, pd.concat(got, ignore_index=True) if got else None)
               if x is not None and len(x)]
@@ -7885,12 +8051,13 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                "35배). 매월 실행하면 13개월째부터 TP_N1~N4 가 살아납니다. 그때까지 PACK-N 은 "
                "θ_N 만 계산되고 V4 가 증거층에서 제외합니다 — 정상 동작입니다.")
         with stage_bar(len(jobs), "국민연금 사업장(종목축)") as bar:
-            # ★배치는 작게. 종목당 검색1~3+상세N 이라 200개면 첫 갱신까지 몇 분이 걸린다
-            #   — on_done 이 건별로 밀어도 배치 경계의 CLOCK/QUOTA 확인이 늦으면 시간 몫을
-            #   넘겨서야 멈춘다.
-            for batch in budget_batches(jobs, 24, "datagokr", "국민연금",
+            # ★배치는 '워커를 다 채우되 시계 확인이 늦지 않을 만큼'이다. 배치 끝에는
+            #   장벽(pmap_net 이 전원 완료를 기다린다)이 있어서, 너무 작으면 꼬리 지연을
+            #   매 배치마다 물고(워커가 놀고) 너무 크면 CLOCK/QUOTA 확인이 늦어 시간 몫을
+            #   넘겨서야 멈춘다. 워커의 3배면 배치당 약 3파(=왕복 12초)라 둘 다 만족한다.
+            for batch in budget_batches(jobs, DATAGOKR_WORKERS * 3, "datagokr", "국민연금",
                                         cap=max_calls, unit="종목"):
-                for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+                for r in pmap_net(one, batch, workers=DATAGOKR_WORKERS, quiet=True,
                                   on_done=lambda: bar.update(1)):
                     if not r:
                         continue                       # 통신 실패 — 원장 미기록(재시도 대상)
@@ -7986,9 +8153,9 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
     done_new: List[str] = []
     _sp0 = QUOTA.spent("datagokr")
     with stage_bar(len(todo), "조달 낙찰(월축)") as bar:
-        for batch in budget_batches(todo, 6, "datagokr", "조달 낙찰",
+        for batch in budget_batches(todo, DATAGOKR_WORKERS, "datagokr", "조달 낙찰",
                                     cap=max_calls, unit="개월"):
-            for item in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+            for item in pmap_net(one, batch, workers=DATAGOKR_WORKERS, quiet=True,
                                  on_done=lambda: bar.update(1)):
                 if not item:
                     continue
@@ -8065,7 +8232,42 @@ def validate_hs_map(m: pd.DataFrame, tag: str = "hs_corp_map") -> pd.DataFrame:
                f"weight 범위이탈 {bad_w:,} · ★HS별 합>1 인 HS {n_over_hs:,}개(비례 축소) · "
                f"유효구간 역전 {bad_iv:,}. 합>1 이 많으면 weight 의미가 뒤집힌 것입니다 — "
                f"weight 는 '회사 제품 매출비중'이 아니라 ★'그 HS 국가수출 중 이 회사 몫'입니다.")
+    hs_map_null_check(d, tag)
     return d.reindex(columns=HS_MAP_COLS)
+
+
+def hs_map_null_check(d: pd.DataFrame, tag: str = "hs_corp_map") -> bool:
+    """★'켜졌지만 아무 정보도 못 싣는 매핑'을 잡는다 — 이 팩의 가장 비싼 실패 유형이다.
+
+    ★왜 이 검사가 반드시 필요한가(설계 중 발견):
+      회사↔HS 매핑을 자동으로 만들려 할 때 손에 제일 먼저 잡히는 방법은 '산업분류로 HS
+      챕터를 잇고, 그 챕터 안에서 매출 규모에 비례해 나눠 준다'이다. 값이 다 채워지고
+      Σweight=1 도 만족하니 검증을 통과하고, 로그에는 'PACK-X 활성'이 뜬다.
+      그런데 그렇게 만들면 회사 c 의 귀속 수출이
+          exp_c(t) = EXP_chapter(t) × (매출_c / Σ매출_chapter)
+      이므로 ★증가율 dlog(exp_c) 가 챕터 안에서 전원 동일하다. 계약 C5 는 셀
+      (월 × ★산업 × 규모) 안에서 z 를 매기고, 산업이 곧 챕터라 ★z 가 전원 0 이 된다.
+      즉 TP_X 는 수학적으로 항상 0 이고, E_pack = mean(TP…) × θ 를 ★희석만 한다.
+      '꺼진 팩'보다 나쁘다 — 꺼진 팩은 로그가 사실대로 말해 주기라도 한다.
+
+    그래서 매핑이 ★HS 안에서 회사별로 실제로 다른 시간 변화를 만들 수 있는지를 본다.
+    판정 기준은 단순하다: 한 회사가 여러 HS 에 서로 다른 비중으로 걸려 있어야 한다.
+    전 회사가 정확히 1개 HS 에만 걸려 있으면, 그 회사의 수출 시계열은 그 HS 시계열의
+    상수배라 셀 안에서 정보가 0 이다.
+    """
+    if d is None or not len(d):
+        return False
+    per_code = d.groupby("code", observed=True)["hs"].nunique()
+    multi = float((per_code > 1).mean()) if len(per_code) else 0.0
+    if multi < 0.05:
+        L.warn(f"★{tag} 무정보 경고 — 회사의 {multi*100:.1f}% 만이 2개 이상의 HS 에 걸려 "
+               f"있습니다. 이 매핑으로 만든 회사별 수출은 HS 시계열의 상수배가 되고, "
+               f"계약 C5 가 셀(월×★산업×규모) 안에서 z 를 매기므로 TP_X 가 ★전원 0 이 "
+               f"됩니다. 팩이 '켜졌다'고 표시되면서 신호는 0 인 상태가 되니, 산업분류로 "
+               f"HS 를 이어 붙인 매핑이라면 쓰지 마세요. 필요한 것은 ★회사 고유의 "
+               f"품목 구성입니다(사업보고서 '주요 제품 등의 현황'의 품목별 수출액 등).")
+        return False
+    return True
 
 
 def load_hs_map() -> pd.DataFrame:
@@ -8147,7 +8349,7 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
     with stage_bar(len(jobs), "관세 통관(★연도×HS축)") as bar:
         for batch in budget_batches(jobs, 200, key_src, "관세 통관",
                                     cap=max_calls, unit="건"):
-            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+            for r in pmap_net(one, batch, workers=DATAGOKR_WORKERS, quiet=True,
                               on_done=lambda: bar.update(1)):
                 if r:
                     got += r
@@ -8224,7 +8426,7 @@ def harvest_doc_texts(disc: pd.DataFrame, master: pd.DataFrame,
             if CLOCK.over() or not QUOTA.allow("dart"):
                 CLOCK.cut(f"공시원문: {len(got)//3:,}건 수집 후 중단")
                 break
-            for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True,
+            for r in pmap_net(one, batch, workers=DATAGOKR_WORKERS, quiet=True,
                               on_done=lambda: bar.update(1)):
                 if r:
                     got += r
@@ -10980,23 +11182,38 @@ def main() -> dict:
         #   사라져 이 팩들의 축이 통째로 죽는다 — 팩을 먼저 받으려던 목적과 정확히 반대다.
         with CLOCK.lease(PACK_TIME_SHARE, "센서팩(N·P·X) 수집",
                          cap_s=PACK_TIME_CAP_MIN * 60.0):
+            # ★스테이지 몫을 다시 수집기별로 쪼갠다 — 몫을 스테이지에만 걸면 ★그 안의
+            #   첫 수집기가 다 먹는다. 실측: 국민연금이 50분을 전부 쓰고 조달은
+            #   `0/120 [00:00<?]` 에서 첫 배치도 못 돌았다. 가중치는 DATAGOKR_BUDGET_SHARE
+            #   와 같은 순위(호출 예산과 시간 예산이 서로 다른 우선순위를 갖게 두면,
+            #   호출은 남았는데 시간이 없거나 그 반대인 상태가 반복된다).
+            tsp = TimeSplit({k: v for k, v in DATAGOKR_BUDGET_SHARE.items()})
+            for _k, _p in (("nps", "N"), ("procure", "P"), ("customs", "X")):
+                if _p not in ACTIVE_PACKS:
+                    tsp.drop(_k)          # 안 도는 수집기의 몫은 도는 쪽으로 흘려보낸다
+            if not hs_list:
+                tsp.drop("customs")
             if "N" in ACTIVE_PACKS:
-                nps = _try("NPS", lambda: harvest_nps(master, months, priority=prio_codes,
-                                                      max_calls=dgb.take("nps")))
+                with tsp.take("nps", "PACK-N 국민연금 사업장"):
+                    nps = _try("NPS", lambda: harvest_nps(master, months,
+                                                          priority=prio_codes,
+                                                          max_calls=dgb.take("nps")))
                 if nps is not None and len(nps):
                     _try("NPS등록", lambda: PITX.put(
                         "nps_monthly",
                         pit_mark(nps, "month", ds_(nps["month"]) + pd.offsets.MonthEnd(2),
                                  origin="nps"), keys=["code"]))
             if "P" in ACTIVE_PACKS:
-                ctx["procurement"] = _try("조달",
-                                          lambda: harvest_procurement(months,
-                                                                      max_calls=dgb.take("procure")))
+                with tsp.take("procure", "PACK-P 조달 낙찰"):
+                    ctx["procurement"] = _try(
+                        "조달", lambda: harvest_procurement(months,
+                                                           max_calls=dgb.take("procure")))
             if "X" in ACTIVE_PACKS:
                 if hs_list:
-                    ctx["customs"] = _try("관세",
-                                          lambda: harvest_customs(months, hs_list,
-                                                                  max_calls=dgb.take("customs")))
+                    with tsp.take("customs", "PACK-X 관세 통관"):
+                        ctx["customs"] = _try("관세",
+                                              lambda: harvest_customs(months, hs_list,
+                                                                      max_calls=dgb.take("customs")))
                 else:
                     # ★이 팩이 꺼지는 이유는 '데이터를 못 받아서'가 아니라 ★매핑이 없어서다.
                     #   계약 §6.3 은 5단계(회사↔HS) 매핑을 자동구축 대상에서 제외한다 — 추정
