@@ -1,0 +1,47 @@
+{
+  "reason": "미완료 축 존재",
+  "generated_at": "2026-08-10T06:10:02",
+  "counters": {
+    "api_calls_by_date": {},
+    "api_calls_total": 0,
+    "aux_calls": {},
+    "cache_hit_by_axis": {},
+    "cache_miss_by_axis": {},
+    "hard_stop": 15200,
+    "trip_at": 12160,
+    "tripped": false
+  },
+  "remaining": [
+    {
+      "axis": "A",
+      "as_of": "2026-06-30",
+      "status": "BLOCKED_PREREQ",
+      "blocked_reason": "[NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)"
+    },
+    {
+      "axis": "A",
+      "as_of": "2021-06-30",
+      "status": "BLOCKED_PREREQ",
+      "blocked_reason": "[NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)"
+    },
+    {
+      "axis": "A-delta",
+      "as_of": "2026-03-31",
+      "status": "BLOCKED_PREREQ",
+      "blocked_reason": "[NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)"
+    },
+    {
+      "axis": "B",
+      "as_of": "2026-06-30",
+      "status": "BLOCKED_PREREQ",
+      "blocked_reason": "[NO_KEY] GCP 자격증명이 없다. 다음 중 하나를 설정한다: (a) GOOGLE_APPLICATION_CREDENTIALS = 서비스계정 JSON 키 '파일의 절대경로' + GOOGLE_CLOUD_PROJECT = '프로젝트 ID', 또는 (b) gcloud auth application-default login. 최소 역할: BigQuery User + BigQuery Job User. 결제 계정 연결 필요(월 1TB 무료)."
+    },
+    {
+      "axis": "C",
+      "as_of": "2026-06-30",
+      "status": "BLOCKED_PREREQ",
+      "blocked_reason": "[NET_BLOCKED] 공공데이터포털(apis.data.go.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=apis.data.go.kr. 원문: ProxyError: HTTPSConnectionPool(host='apis.data.go.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))) || [NO_KEY] 공공데이터포털 키 없음. 환경변수 DATA_GO_KR_KEY(Decoding 키)를 설정한다. 발급: https://www.data.go.kr/ → 국민연금공단_국민연금 가입 사업장 내역 → 활용신청. 마이페이지 > 데이터활용 > 활용신청 현황에서 '승인' 상태를 먼저 확인할 것(§6.1)."
+    }
+  ],
+  "note": "캐시는 (corp_code, bsns_year, reprt_code) 키로 보존된다. 다음 실행은 캐시 히트로 0콜에서 이어받는다(§8.2)."
+}

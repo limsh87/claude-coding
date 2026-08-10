@@ -1,0 +1,78 @@
+[    0.1s] ==============================================================================
+[    0.1s] PHASE 0 — 대체데이터 3축 수집 가능성 검증 v1.2
+[    0.1s] ==============================================================================
+[    0.1s] 실행 모드: LIVE
+[    0.1s] PROJECT_ROOT: /home/user/claude-coding/phase0
+[    0.1s] Python 3.11.15 on Linux 6.18.5-fc-v20
+[    0.1s] 실행일: 2026-08-10   T_NOW=2026-06-30   T_PAST=2021-06-30
+
+[    0.1s] 이 단계는 수집 가능성만 측정한다. 팩터·시그널·수익률 연산은 전면 금지다(P0_NO_STRATEGY).
+
+[    0.1s] ------------------------------------------------------------------------------
+[    0.1s] 사전점검 (Preflight) — 원인을 구분해 보고한다
+[    0.1s] ------------------------------------------------------------------------------
+[    3.8s]   [BLOCK] 축 A / A-Δ (OpenDART + KRX) — 차단 사유 3건 (우선 해결: NET_BLOCKED)
+[    3.8s]            · [NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]            · [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]            · [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)
+[    3.8s]   [BLOCK] 축 B (BigQuery) — 차단 사유 1건 (우선 해결: NO_KEY)
+[    3.8s]            · [NO_KEY] GCP 자격증명이 없다. 다음 중 하나를 설정한다: (a) GOOGLE_APPLICATION_CREDENTIALS = 서비스계정 JSON 키 '파일의 절대경로' + GOOGLE_CLOUD_PROJECT = '프로젝트 ID', 또는 (b) gcloud auth application-default login. 최소 역할: BigQuery User + BigQuery Job User. 결제 계정 연결 필요(월 1TB 무료).
+[    3.8s]   [BLOCK] 축 C (공공데이터포털) — 차단 사유 2건 (우선 해결: NET_BLOCKED)
+[    3.8s]            · [NET_BLOCKED] 공공데이터포털(apis.data.go.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=apis.data.go.kr. 원문: ProxyError: HTTPSConnectionPool(host='apis.data.go.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]            · [NO_KEY] 공공데이터포털 키 없음. 환경변수 DATA_GO_KR_KEY(Decoding 키)를 설정한다. 발급: https://www.data.go.kr/ → 국민연금공단_국민연금 가입 사업장 내역 → 활용신청. 마이페이지 > 데이터활용 > 활용신청 현황에서 '승인' 상태를 먼저 확인할 것(§6.1).
+
+[    3.8s] ==============================================================================
+[    3.8s] 축 A — 겸직 그래프 밀도 (§3)
+[    3.8s] ==============================================================================
+[    3.8s]   축 A BLOCKED_PREREQ [NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]   축 A BLOCKED_PREREQ [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]   축 A BLOCKED_PREREQ [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)
+
+[    3.8s] ==============================================================================
+[    3.8s] 축 A-Δ — 분기별 엣지 생성/소멸 밀도 (§4)
+[    3.8s] ==============================================================================
+[    3.8s]   축 A-Δ BLOCKED_PREREQ [NET_BLOCKED] OpenDART(opendart.fss.or.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=opendart.fss.or.kr. 원문: ProxyError: HTTPSConnectionPool(host='opendart.fss.or.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]   축 A-Δ BLOCKED_PREREQ [NET_BLOCKED] KRX(data.krx.co.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=data.krx.co.kr. 원문: ProxyError: HTTPSConnectionPool(host='data.krx.co.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]   축 A-Δ BLOCKED_PREREQ [NO_KEY] OpenDART API 키 없음. 환경변수 DART_API_KEY 를 설정한다. 발급: https://opendart.fss.or.kr/ → 인증키 신청/관리 (이메일 인증 즉시 발급, 무료)
+
+[    3.8s] ==============================================================================
+[    3.8s] 축 B — Google Patents / BigQuery (§5)
+[    3.8s] ==============================================================================
+[    3.8s]   축 B BLOCKED_PREREQ [NO_KEY] GCP 자격증명이 없다. 다음 중 하나를 설정한다: (a) GOOGLE_APPLICATION_CREDENTIALS = 서비스계정 JSON 키 '파일의 절대경로' + GOOGLE_CLOUD_PROJECT = '프로젝트 ID', 또는 (b) gcloud auth application-default login. 최소 역할: BigQuery User + BigQuery Job User. 결제 계정 연결 필요(월 1TB 무료).
+
+[    3.8s] ==============================================================================
+[    3.8s] 축 C — 국민연금 사업장 (§6)
+[    3.8s] ==============================================================================
+
+[    3.8s]   ── 축 C 승인 상태 확인 안내 (§6.1) ────────────────────────────────
+[    3.8s]      공공데이터포털 마이페이지 > 데이터활용 > 활용신청 현황
+[    3.8s]      → '승인' 여부와 일일 트래픽 잔량을 확인한다.
+[    3.8s]      → 상태가 '신청' 이면 어떤 파라미터 조합으로도 실패한다.
+[    3.8s]   ────────────────────────────────────────────────────────────────
+[    3.8s]   축 C BLOCKED_PREREQ [NET_BLOCKED] 공공데이터포털(apis.data.go.kr) 도달 불가 — 프록시가 CONNECT 를 거부했다(조직 이그레스 정책). host=apis.data.go.kr. 원문: ProxyError: HTTPSConnectionPool(host='apis.data.go.kr', port=443): Max retries exceeded with url: / (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))
+[    3.8s]   축 C BLOCKED_PREREQ [NO_KEY] 공공데이터포털 키 없음. 환경변수 DATA_GO_KR_KEY(Decoding 키)를 설정한다. 발급: https://www.data.go.kr/ → 국민연금공단_국민연금 가입 사업장 내역 → 활용신청. 마이페이지 > 데이터활용 > 활용신청 현황에서 '승인' 상태를 먼저 확인할 것(§6.1).
+
+[    3.8s] ------------------------------------------------------------------------------
+[    3.8s] §1.3 자가진단
+[    3.8s] ------------------------------------------------------------------------------
+[    3.8s] 실행 모드: LIVE
+[    3.8s] 전 상장사 노드 수: 미측정(축 A 차단)   → PENDING
+[    3.8s] 축 C 첫 응답 wkplNm 표본 3건: 미획득(축 C 차단)   → PENDING
+
+[    3.8s] ==============================================================================
+[    3.8s] 최종 판정
+[    3.8s] ==============================================================================
+[    3.8s]   축 A        2026-06-30  →  BLOCKED_PREREQ  [NET_BLOCKED]
+[    3.8s]   축 A        2021-06-30  →  BLOCKED_PREREQ  [NET_BLOCKED]
+[    3.8s]   축 A-delta  2026-03-31  →  BLOCKED_PREREQ  [NET_BLOCKED]
+[    3.8s]   축 B        2026-06-30  →  BLOCKED_PREREQ  [NO_KEY]
+[    3.8s]   축 C        2026-06-30  →  BLOCKED_PREREQ  [NET_BLOCKED]
+
+[    3.8s] 산출물: /home/user/claude-coding/phase0/reports
+[    3.8s]   - diag_C_probes.csv  (3,362 bytes)
+[    3.8s]   - phase0_summary_v12.md  (7,672 bytes)
+[    3.8s]   - phase0_verdict_v12.csv  (4,253 bytes)
+[    3.8s]   - phase0_verdict_v12.json  (22,043 bytes)
+[    3.8s]   - resume_todo.json  (4,858 bytes)
+
+[    3.8s] 총 실행시간 3.8s / 총 API 호출 0
