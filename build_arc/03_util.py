@@ -900,3 +900,21 @@ def ensure_cols(df: pd.DataFrame, cols: Sequence[str], fill=np.nan) -> pd.DataFr
         if c not in df.columns:
             df[c] = fill
     return df
+
+
+def arc_kd_lag(df: pd.DataFrame, days: int = None) -> pd.DataFrame:
+    """§4 시점 규약 — DART 파생 테이블의 knowledge_date 에 T+거래일 지연을 적용한다.
+
+    ★ 왜 필요한가: `_knowledge_from_rcept` 는 접수일자(rcept_dt) 를 그대로 knowledge_date 로
+      쓴다. 그러면 '접수 당일'에 그 재무제표를 쓸 수 있게 되는데, 명세 §4 는
+      "rcept_dt(접수일자) + 1거래일부터 사용 가능" 을 규정한다. 접수는 장중에도 일어나므로
+      당일 사용은 실행 불가능한 정보 접근이다 — 작지만 명백한 미래누수다.
+      D1(31 모듈)은 이미 명시적으로 +1 을 더하고 있어, 여기서 재무·직원·주식수·감사의견
+      계열도 같은 규약으로 맞춘다. A19 계약검정이 이를 강제한다.
+    """
+    d = int(days if days is not None else globals().get("ARC_DART_LAG_DAYS", 1))
+    if df is None or len(df) == 0 or "knowledge_date" not in getattr(df, "columns", []):
+        return df
+    out = df.copy()
+    out["knowledge_date"] = as_ts_series(out["knowledge_date"]) + pd.Timedelta(days=d)
+    return out

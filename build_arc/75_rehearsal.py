@@ -464,6 +464,12 @@ def run_rehearsal(strict: bool = True) -> bool:
                 if S is not None and len(S):
                     _arh("d1_composite",
                          lambda: d1_composite(S, build_struct_flags(dis)), expect_rows=False)
+            _arh("arc_doc_load_years", lambda: arc_doc_load_years(arc_doc_years(T)),
+                 expect_rows=False)
+            _arh("build_d1_streaming (연도 스트리밍)",
+                 lambda: build_d1_streaming(build_struct_flags(dis), T_manifest=T),
+                 expect_rows=False,
+                 note="연도 2개씩만 올려 상주량을 평평하게 유지하는 경로")
         _arh("build_struct_flags", lambda: build_struct_flags(dis), expect_rows=False)
 
         # ── ⑤ D2 / D3 / 배제 ──────────────────────────────────────────────────────────────

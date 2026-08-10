@@ -678,7 +678,7 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
 # ║    (단일 거대 parquet 금지 — 30만 건 × 20KB = 6GB 라 메모리에 못 올린다)                    ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
-RESEARCH_TEXT_MAXLEN = 20000        # 리포트당 저장 상한(문자). 톤 분류엔 이걸로 충분하다.
+RESEARCH_TEXT_MAXLEN = 12000        # 리포트당 저장 상한(문자). 톤 분류엔 이걸로 충분하다.
 RESEARCH_TEXT_SHARD = "research_report_text_{year}"
 
 
@@ -834,6 +834,24 @@ def build_report_text_store(rep: pd.DataFrame, chunk: int = 1500) -> pd.DataFram
                             extra={"note": "리포트 본문 — 전 전략 공용(톤/토픽 분석 재사용)"})
         VAULT.flush("shared")
 
+    # ★ 메모리 예산 가드: 30만 건 × 12KB = 3.6GB 라 전 구간을 한 번에 들면 노트북이 죽는다.
+    #   예산을 넘으면 '최근 것부터' 유지하고, 무엇을 몇 건 떨어뜨렸는지 반드시 로그로 남긴다
+    #   (조용한 절단은 '전 구간을 다 썼다'는 착각을 만든다).
+    try:
+        budget_bytes = float(globals().get("MEM_BUDGET_GB", 6.0)) * 0.35 * 1e9
+        est = float(pd.to_numeric(T["n_chars"], errors="coerce").fillna(0).sum()) * 2.0
+        if est > budget_bytes and len(T) > 1000:
+            T = T.sort_values("pub_date", kind="stable")
+            keep = T["n_chars"].fillna(0).astype(float).mul(2.0)[::-1].cumsum()[::-1] <= budget_bytes
+            n_drop = int((~keep).sum())
+            T = T[keep]
+            LOG.warn(f"리포트 본문이 메모리 예산({budget_bytes/1e9:.1f}GB)을 초과해 "
+                     f"오래된 {n_drop:,}건을 이번 실행의 학습표본에서 제외했습니다 "
+                     f"(드라이브 캐시에는 그대로 보존됩니다). MEM_BUDGET_GB 를 올리면 "
+                     f"전 구간을 씁니다. ★ 초기 구간 TONE 모델이 그만큼 얇아집니다.")
+            PIPE.note(f"WARN: 본문 {n_drop:,}건 메모리 예산으로 제외")
+    except Exception:
+        pass
     rate = len(T) / max(len(R), 1)
     LOG.ok(f"리포트 본문 {len(T):,}건 확보 (원장 {len(R):,}건 대비 추출률 {100*rate:.1f}%)")
     if rate < 0.70:

@@ -130,8 +130,10 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
         A = pd.DataFrame({
             "corp_code": F["corp_code"],
             "event_date": as_ts_series(F["period_end"]) if "period_end" in F.columns else pd.NaT,
-            "knowledge_date": as_ts_series(F["knowledge_date"]) if "knowledge_date" in F.columns
-            else pd.NaT,
+            # §4 접수일 + 1거래일 (재무제표는 접수 당일 사용 불가)
+            "knowledge_date": (as_ts_series(F["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in F.columns else pd.NaT,
             # 완료형 정량 사실: 전년 동기 대비 실제 증가 (계획이 아니라 재무제표에 찍힌 값)
             "NF_RND_RATIO": (rnd_ratio > _lag4(rnd_ratio)).astype(float)
                             .where(rnd_ratio.notna() & _lag4(rnd_ratio).notna()),
@@ -152,8 +154,9 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
         B = pd.DataFrame({
             "corp_code": E["corp_code"],
             "event_date": as_ts_series(E["period_end"]) if "period_end" in E.columns else pd.NaT,
-            "knowledge_date": as_ts_series(E["knowledge_date"]) if "knowledge_date" in E.columns
-            else pd.NaT,
+            "knowledge_date": (as_ts_series(E["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in E.columns else pd.NaT,
             "NF_EMP": (pd.to_numeric(E["employees"], errors="coerce") > prev).astype(float)
                       .where(prev.notna()),
         })
@@ -273,8 +276,9 @@ def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
         parts.append(pd.DataFrame({
             "corp_code": F["corp_code"],
             "event_date": as_ts_series(F["period_end"]) if "period_end" in F.columns else pd.NaT,
-            "knowledge_date": as_ts_series(F["knowledge_date"]) if "knowledge_date" in F.columns
-            else pd.NaT,
+            "knowledge_date": (as_ts_series(F["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in F.columns else pd.NaT,
             "EX_LOSS4Q": streak.fillna(0.0),
             "EX_IMPAIR": ex_imp,
         }))
@@ -307,8 +311,9 @@ def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
         parts.append(pd.DataFrame({
             "corp_code": A["corp_code"],
             "event_date": as_ts_series(A["period_end"]) if "period_end" in A.columns else pd.NaT,
-            "knowledge_date": as_ts_series(A["knowledge_date"]) if "knowledge_date" in A.columns
-            else pd.NaT,
+            "knowledge_date": (as_ts_series(A["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in A.columns else pd.NaT,
             "EX_AUDIT": (bad_opinion | has_emph).astype(float),
         }))
     else:

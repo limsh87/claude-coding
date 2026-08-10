@@ -96,9 +96,20 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
         except Exception:
             pass
         ctx["doc_attempted"] = n_before
-        ctx["doc_tokens"] = fetch_arc_documents(ctx.get("dis"), ctx["sec"])
-        arc_norm_sample_report(ctx["doc_tokens"], n=5)      # §10-[4] 육안 검증
-        ctx["doc_pairs"] = arc_doc_pairs(ctx["doc_tokens"])
+        _T = fetch_arc_documents(ctx.get("dis"), ctx["sec"])
+        arc_norm_sample_report(_T, n=5)                     # §10-[4] 육안 검증
+        ctx["doc_pairs"] = arc_doc_pairs(_T)
+        # ★ 게이트·D3 는 매니페스트(토큰 제외)만 있으면 된다. tf/bigram 을 통째로 들고
+        #   다니면 문서 수에 비례해 상주량이 폭발하므로 여기서 떨어뜨린다.
+        #   D1 은 build_d1_streaming 이 연도 샤드에서 다시 읽는다.
+        _keep = [c for c in ARC_DOC_COLS if c not in ("tf", "bigram")]
+        ctx["doc_tokens_full"] = _T if len(_T) < 60_000 else None
+        ctx["doc_tokens"] = _T[_keep].copy() if len(_T) else _T
+        _mb = mem_mb(_T)
+        del _T
+        gc.collect()
+        LOG.info(f"문서 토큰 원본 {_mb:.0f}MB → 매니페스트만 보관 "
+                 f"({mem_mb(ctx['doc_tokens']):.0f}MB). D1 은 연도 샤드에서 스트리밍합니다.")
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 · 본문", "L1",
                     budget_s=5400, critical=False,
@@ -164,7 +175,8 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
                     skip_if=(not gate.get("d1", True)),
                     skip_reason="Phase 0 GATE_4/5 실패 — D1 비활성화"):
         struct = build_struct_flags(ctx.get("dis"))
-        d1 = d1_composite(d1_similarity(ctx.get("doc_pairs")), struct)
+        # ★ 연도 2개씩만 올리는 스트리밍 경로. 전 구간 토큰을 한 번에 들면 수 GB 가 된다.
+        d1 = build_d1_streaming(struct, T_manifest=ctx.get("doc_tokens"))
         P = attach_d1(P, d1)
     if not gate.get("d1", True):
         P = attach_d1(P, None)
@@ -175,10 +187,13 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
         report_d2_coverage(P)
 
     with PIPE.stage("L2.D3", "D3 하드팩트 + 배제 플래그", "L2", budget_s=900, critical=False):
-        hard = extract_hardfacts(ctx.get("doc_tokens"), ctx.get("fin"), ctx.get("emp"),
-                                 ctx.get("dis"))
-        excl = build_exclusion_flags(ctx.get("fin"), ctx.get("dis"), ctx.get("audit"),
-                                     ctx.get("doc_tokens"))
+        _Td = ctx.get("doc_tokens_full")     # tf 가 있어야 텍스트 기반 이벤트를 볼 수 있다
+        hard = extract_hardfacts(_Td, ctx.get("fin"), ctx.get("emp"), ctx.get("dis"))
+        excl = build_exclusion_flags(ctx.get("fin"), ctx.get("dis"), ctx.get("audit"), _Td)
+        if _Td is None:
+            LOG.warn("문서 수가 많아 토큰 원본을 메모리에 유지하지 않았습니다 — D3 의 "
+                     "텍스트 기반 이벤트(특허·정부과제·종속기업·해외거점·신규사업)는 이번 "
+                     "실행에서 결측입니다. 재무·직원·수시공시 기반 이벤트는 정상 산출됩니다.")
         P = attach_d3(P, hard, excl)
         report_d3_sector(P)
         report_exclusion(P)
@@ -186,7 +201,7 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
     with PIPE.stage("L2.FIN", "재무 결합 (직교화 통제변수용)", "L2", budget_s=300,
                     critical=False):
         if ctx.get("fin") is not None and len(ctx["fin"]):
-            PIT.register("arc_fin", ctx["fin"], key_cols=["corp_code"])
+            PIT.register("arc_fin", arc_kd_lag(ctx["fin"]), key_cols=["corp_code"])
             P = PIT.asof_join(P, "arc_fin", by="corp_code", left_time="asof",
                               cols=["corp_code", "knowledge_date", "net_income_ttm", "assets"],
                               suffix="_fin")
@@ -260,7 +275,7 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A18", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A19", "L0", budget_s=300):
         run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
 
     with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",

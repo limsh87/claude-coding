@@ -338,8 +338,8 @@ def _doc_classify(report_nm: str, rcept_dt) -> Optional[Tuple[str, int, bool]]:
 # ── 수집 ────────────────────────────────────────────────────────────────────────────────────
 ARC_DOC_COLS = ["corp_code", "rcept_no", "rcept_dt", "doc_type", "bsns_year", "section",
                 "n_tokens", "tf", "bigram", "tok_len", "is_amend"]
-ARC_DOC_TF_TOP = 700          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
-ARC_DOC_BG_TOP = 300
+ARC_DOC_TF_TOP = 450          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
+ARC_DOC_BG_TOP = 150
 
 _ARC_DOC_FAIL: "Counter" = Counter()
 
@@ -673,3 +673,35 @@ def arc_norm_sample_report(T: pd.DataFrame, n: int = 5) -> None:
                      f"패턴이 있다는 뜻이며, 그만큼 가짜 변화가 신호에 섞입니다.")
     except Exception:
         pass
+
+
+def arc_doc_years(T: Optional[pd.DataFrame] = None) -> List[int]:
+    """수집된 정기보고서의 사업연도 목록. 매니페스트가 있으면 그걸, 없으면 캐시 샤드를 본다."""
+    if T is not None and len(T) and "bsns_year" in T.columns:
+        return sorted(int(y) for y in pd.to_numeric(T["bsns_year"], errors="coerce")
+                      .dropna().unique())
+    out = []
+    for y in range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1):
+        pth = os.path.join(VAULT.table_dir("shared"), f"dart_doc_norm_{y}.parquet")
+        if os.path.exists(pth):
+            out.append(y)
+    return out
+
+
+def arc_doc_load_years(years: Sequence[int]) -> pd.DataFrame:
+    """지정 연도의 토큰 샤드만 메모리에 올린다.
+
+    ★ 왜 필요한가: 전 구간 토큰을 한 번에 들면 (2,500사 × 10년 × 4유형 × 7섹션) × 수 KB
+      = 수 GB 가 되어 노트북이 죽는다. D1 은 '전년 동기' 만 필요하므로 2개 연도씩만
+      올리면 상주량이 문서 수와 무관하게 평평해진다.
+    """
+    frames = []
+    for y in sorted({int(x) for x in years}):
+        d = VAULT.get_table(f"dart_doc_norm_{y}", scope="shared")
+        if d is not None and len(d):
+            frames.append(d.reindex(columns=ARC_DOC_COLS))
+    if not frames:
+        return pd.DataFrame(columns=ARC_DOC_COLS)
+    T = pd.concat(frames, ignore_index=True)
+    T["rcept_dt"] = as_ts_series(T["rcept_dt"])
+    return T.dropna(subset=["rcept_no", "section", "rcept_dt"])

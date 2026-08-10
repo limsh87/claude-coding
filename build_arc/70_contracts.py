@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A18 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A19 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -527,12 +527,58 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A18", "LLM API 호출 금지", a18)
 
+    # ── A19  DART 파생 테이블의 T+1 규약 ──────────────────────────────────────────────────
+    def a19():
+        """§4 'rcept_dt(접수일자) + 1거래일부터 사용 가능' 이 재무 계열에도 적용되는가.
+
+        ★ 초기 빌드에서 D1 만 +1 을 적용하고 재무·직원·주식수·감사의견은 접수 당일부터
+          쓸 수 있었다. 작지만 명백한 미래누수이며, 접수는 장중에도 일어나므로 실행 불가능한
+          정보 접근이다. 여기서 실제 프레임을 만들어 검사한다.
+        """
+        rc = REPRT_CODES["FY"]
+        fin = pit_frame(pd.DataFrame({
+            "corp_code": ["C1", "C1"], "bsns_year": [2019, 2020], "reprt_code": [rc, rc],
+            "period_end": pd.to_datetime(["2019-12-31", "2020-12-31"]),
+            "knowledge_date": pd.to_datetime(["2020-03-20", "2021-03-20"]),
+            "assets": [1000.0, 1100.0], "liabilities": [400.0, 430.0],
+            "equity": [600.0, 670.0], "cash": [100.0, 120.0],
+            "net_income_ttm": [50.0, 60.0], "cfo_ttm": [55.0, 70.0],
+            "revenue_ttm": [900.0, 990.0], "inventory": [80.0, 85.0],
+            "receivable": [90.0, 95.0], "op_income_q": [12.0, 14.0],
+        }), "period_end", "knowledge_date")
+        d2 = build_d2_panel(fin, None)
+        if d2 is None or d2.empty:
+            return False, "D2 패널이 비어 T+1 검사를 할 수 없습니다"
+        kd = as_ts_series(d2["knowledge_date"]).min()
+        if kd <= as_ts("2020-03-20"):
+            return False, (f"★T+1 위반: 접수일 2020-03-20 인 재무제표의 knowledge_date 가 "
+                           f"{str(kd)[:10]} 입니다. 접수 당일부터 쓸 수 있으면 미래누수입니다"
+                           f"(§4).")
+        # as-of 결합에서도 실제로 차단되는지
+        st = PITStore()
+        st.register("t_d2", d2, key_cols=["corp_code"])
+        panel = pd.DataFrame({"code": ["A"], "corp_code": ["C1"],
+                              "asof": [as_ts("2020-03-20")]})
+        got = st.asof_join(panel, "t_d2", by="corp_code", left_time="asof")
+        if "ACCRUAL" in got.columns and got["ACCRUAL"].notna().any():
+            return False, ("★접수 당일(2020-03-20) 리밸런싱에서 그 날 접수된 재무가 "
+                           "결합되었습니다. T+1 이 as-of 결합에서 무력화되고 있습니다.")
+        got2 = st.asof_join(pd.DataFrame({"code": ["A"], "corp_code": ["C1"],
+                                          "asof": [as_ts("2020-03-21")]}),
+                            "t_d2", by="corp_code", left_time="asof")
+        if "ACCRUAL" not in got2.columns or not got2["ACCRUAL"].notna().any():
+            return False, "T+1 다음 날에도 결합되지 않습니다 — 지연이 과도합니다"
+        return True, (f"재무 knowledge_date = 접수일 + {ARC_DART_LAG_DAYS}일 · "
+                      f"접수 당일 결합 차단 · 익일 결합 정상 확인")
+
+    _ac("A19", "DART T+1 규약 (재무 계열)", a19)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A18 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A19 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

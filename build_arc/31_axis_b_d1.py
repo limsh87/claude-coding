@@ -114,7 +114,8 @@ def _d1_pair_metrics(cur: Dict[str, float], prev: Dict[str, float],
     return (cos, jac, simple, lr)
 
 
-def d1_similarity(pairs: pd.DataFrame) -> pd.DataFrame:
+def d1_similarity(pairs: pd.DataFrame,
+                  df_state: Optional[dict] = None) -> pd.DataFrame:
     """§6.1.4 4종 유사도 산출.
 
     ★ IDF 누수 방지: 전체 기간 문서로 IDF 를 만들면 '미래에 흔해질 단어'의 가중치가
@@ -131,8 +132,12 @@ def d1_similarity(pairs: pd.DataFrame) -> pd.DataFrame:
     P = P.dropna(subset=["rcept_dt", "corp_code", "section"]).sort_values(
         ["rcept_dt", "corp_code", "section"], kind="stable").reset_index(drop=True)
 
-    df_cnt: "Counter" = Counter()      # 확장 문서빈도
-    n_docs = 0
+    # ★ 확장 IDF 상태. 연도별 스트리밍 호출에서도 '그때까지 관측된 문서' 만 반영되도록
+    #   호출자가 상태를 넘겨 이어갈 수 있게 한다(넘기지 않으면 호출 내에서만 누적).
+    if df_state is None:
+        df_state = {"df": Counter(), "n": 0}
+    df_cnt: "Counter" = df_state.setdefault("df", Counter())
+    n_docs = int(df_state.get("n", 0))
     out_rows: List[dict] = []
     t0 = time.time()
 
@@ -166,6 +171,7 @@ def d1_similarity(pairs: pd.DataFrame) -> pd.DataFrame:
                 add["#" + k] += 1
             n_docs += 1
         df_cnt.update(add)
+        df_state["n"] = n_docs
 
     if not out_rows:
         LOG.warn("유사도를 한 건도 계산하지 못했습니다 (토큰이 비었을 가능성).")
@@ -384,3 +390,42 @@ def report_d1_sign_check(P: pd.DataFrame) -> dict:
                               "처리하며, D1 제외 버전(F2)을 주 결과로 삼는 것을 권고합니다.")
             LOG.error(out["verdict"])
     return out
+
+
+def build_d1_streaming(struct: Optional[pd.DataFrame] = None,
+                       years: Optional[Sequence[int]] = None,
+                       T_manifest: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """연도 2개씩만 메모리에 올려 D1 을 만든다. 상주량이 문서 수와 무관하게 평평해진다.
+
+    ★ 확장 IDF 상태(df_state)를 연도 간에 이어받으므로, 한 번에 다 올려 계산한 것과
+      동일한 '그 시점까지 관측된 문서로만' 성질을 유지한다(미래누수 없음).
+    """
+    ys = list(years) if years else arc_doc_years(T_manifest)
+    if not ys:
+        LOG.warn("정기보고서 토큰 샤드가 없어 D1 을 만들 수 없습니다.")
+        return pd.DataFrame(columns=D1_OUT_COLS)
+    df_state = {"df": Counter(), "n": 0}
+    sims: List[pd.DataFrame] = []
+    for y in sorted(ys):
+        if (y - 1) not in ys:
+            continue                       # 전년 문서가 없으면 페어가 만들어지지 않는다
+        T2 = arc_doc_load_years([y - 1, y])
+        if T2.empty:
+            continue
+        pr = arc_doc_pairs(T2)
+        del T2
+        if pr is None or pr.empty:
+            continue
+        s1 = d1_similarity(pr, df_state=df_state)
+        del pr
+        if s1 is not None and len(s1):
+            sims.append(s1)
+        gc.collect()
+    if not sims:
+        LOG.warn("연도 스트리밍 D1 에서 유사도를 한 건도 만들지 못했습니다.")
+        return pd.DataFrame(columns=D1_OUT_COLS)
+    S = pd.concat(sims, ignore_index=True)
+    del sims
+    LOG.ok(f"D1 연도 스트리밍 완료 — 유사도 {len(S):,}행 (연도 {len(ys)}개, "
+           f"상주 연도 2개씩 유지)")
+    return d1_composite(S, struct)

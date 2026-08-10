@@ -144,6 +144,7 @@ def build_d2_panel(fin: pd.DataFrame, shares: Optional[pd.DataFrame] = None) -> 
     out["knowledge_date"] = (as_ts_series(kd["knowledge_date"]) if kd is not None
                              else as_ts_series(out["period_end"]) + pd.Timedelta(days=45))
     out = out.drop(columns=["_seq"])
+    out = arc_kd_lag(out)                    # §4 접수일 + 1거래일부터 사용 가능
     out = pit_frame(out, "period_end", "knowledge_date", source="dart_d2")
     out = ensure_cols(out, D2_PANEL_COLS)
     LOG.ok(f"D2 분기 패널 {len(out):,}행 · {out['corp_code'].nunique():,}사 — " +

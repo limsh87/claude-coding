@@ -247,7 +247,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0527"
+BUILD_VERSION = "v2.20260810.0534"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -1853,6 +1853,24 @@ def ensure_cols(df: pd.DataFrame, cols: Sequence[str], fill=np.nan) -> pd.DataFr
         if c not in df.columns:
             df[c] = fill
     return df
+
+
+def arc_kd_lag(df: pd.DataFrame, days: int = None) -> pd.DataFrame:
+    """§4 시점 규약 — DART 파생 테이블의 knowledge_date 에 T+거래일 지연을 적용한다.
+
+    ★ 왜 필요한가: `_knowledge_from_rcept` 는 접수일자(rcept_dt) 를 그대로 knowledge_date 로
+      쓴다. 그러면 '접수 당일'에 그 재무제표를 쓸 수 있게 되는데, 명세 §4 는
+      "rcept_dt(접수일자) + 1거래일부터 사용 가능" 을 규정한다. 접수는 장중에도 일어나므로
+      당일 사용은 실행 불가능한 정보 접근이다 — 작지만 명백한 미래누수다.
+      D1(31 모듈)은 이미 명시적으로 +1 을 더하고 있어, 여기서 재무·직원·주식수·감사의견
+      계열도 같은 규약으로 맞춘다. A19 계약검정이 이를 강제한다.
+    """
+    d = int(days if days is not None else globals().get("ARC_DART_LAG_DAYS", 1))
+    if df is None or len(df) == 0 or "knowledge_date" not in getattr(df, "columns", []):
+        return df
+    out = df.copy()
+    out["knowledge_date"] = as_ts_series(out["knowledge_date"]) + pd.Timedelta(days=d)
+    return out
 
 
 
@@ -5453,7 +5471,7 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
 # ║    (단일 거대 parquet 금지 — 30만 건 × 20KB = 6GB 라 메모리에 못 올린다)                    ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
-RESEARCH_TEXT_MAXLEN = 20000        # 리포트당 저장 상한(문자). 톤 분류엔 이걸로 충분하다.
+RESEARCH_TEXT_MAXLEN = 12000        # 리포트당 저장 상한(문자). 톤 분류엔 이걸로 충분하다.
 RESEARCH_TEXT_SHARD = "research_report_text_{year}"
 
 
@@ -5609,6 +5627,24 @@ def build_report_text_store(rep: pd.DataFrame, chunk: int = 1500) -> pd.DataFram
                             extra={"note": "리포트 본문 — 전 전략 공용(톤/토픽 분석 재사용)"})
         VAULT.flush("shared")
 
+    # ★ 메모리 예산 가드: 30만 건 × 12KB = 3.6GB 라 전 구간을 한 번에 들면 노트북이 죽는다.
+    #   예산을 넘으면 '최근 것부터' 유지하고, 무엇을 몇 건 떨어뜨렸는지 반드시 로그로 남긴다
+    #   (조용한 절단은 '전 구간을 다 썼다'는 착각을 만든다).
+    try:
+        budget_bytes = float(globals().get("MEM_BUDGET_GB", 6.0)) * 0.35 * 1e9
+        est = float(pd.to_numeric(T["n_chars"], errors="coerce").fillna(0).sum()) * 2.0
+        if est > budget_bytes and len(T) > 1000:
+            T = T.sort_values("pub_date", kind="stable")
+            keep = T["n_chars"].fillna(0).astype(float).mul(2.0)[::-1].cumsum()[::-1] <= budget_bytes
+            n_drop = int((~keep).sum())
+            T = T[keep]
+            LOG.warn(f"리포트 본문이 메모리 예산({budget_bytes/1e9:.1f}GB)을 초과해 "
+                     f"오래된 {n_drop:,}건을 이번 실행의 학습표본에서 제외했습니다 "
+                     f"(드라이브 캐시에는 그대로 보존됩니다). MEM_BUDGET_GB 를 올리면 "
+                     f"전 구간을 씁니다. ★ 초기 구간 TONE 모델이 그만큼 얇아집니다.")
+            PIPE.note(f"WARN: 본문 {n_drop:,}건 메모리 예산으로 제외")
+    except Exception:
+        pass
     rate = len(T) / max(len(R), 1)
     LOG.ok(f"리포트 본문 {len(T):,}건 확보 (원장 {len(R):,}건 대비 추출률 {100*rate:.1f}%)")
     if rate < 0.70:
@@ -6464,8 +6500,8 @@ def _doc_classify(report_nm: str, rcept_dt) -> Optional[Tuple[str, int, bool]]:
 # ── 수집 ────────────────────────────────────────────────────────────────────────────────────
 ARC_DOC_COLS = ["corp_code", "rcept_no", "rcept_dt", "doc_type", "bsns_year", "section",
                 "n_tokens", "tf", "bigram", "tok_len", "is_amend"]
-ARC_DOC_TF_TOP = 700          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
-ARC_DOC_BG_TOP = 300
+ARC_DOC_TF_TOP = 450          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
+ARC_DOC_BG_TOP = 150
 
 _ARC_DOC_FAIL: "Counter" = Counter()
 
@@ -6799,6 +6835,38 @@ def arc_norm_sample_report(T: pd.DataFrame, n: int = 5) -> None:
                      f"패턴이 있다는 뜻이며, 그만큼 가짜 변화가 신호에 섞입니다.")
     except Exception:
         pass
+
+
+def arc_doc_years(T: Optional[pd.DataFrame] = None) -> List[int]:
+    """수집된 정기보고서의 사업연도 목록. 매니페스트가 있으면 그걸, 없으면 캐시 샤드를 본다."""
+    if T is not None and len(T) and "bsns_year" in T.columns:
+        return sorted(int(y) for y in pd.to_numeric(T["bsns_year"], errors="coerce")
+                      .dropna().unique())
+    out = []
+    for y in range(as_ts(BACKTEST_START).year - 2, as_ts(BACKTEST_END).year + 1):
+        pth = os.path.join(VAULT.table_dir("shared"), f"dart_doc_norm_{y}.parquet")
+        if os.path.exists(pth):
+            out.append(y)
+    return out
+
+
+def arc_doc_load_years(years: Sequence[int]) -> pd.DataFrame:
+    """지정 연도의 토큰 샤드만 메모리에 올린다.
+
+    ★ 왜 필요한가: 전 구간 토큰을 한 번에 들면 (2,500사 × 10년 × 4유형 × 7섹션) × 수 KB
+      = 수 GB 가 되어 노트북이 죽는다. D1 은 '전년 동기' 만 필요하므로 2개 연도씩만
+      올리면 상주량이 문서 수와 무관하게 평평해진다.
+    """
+    frames = []
+    for y in sorted({int(x) for x in years}):
+        d = VAULT.get_table(f"dart_doc_norm_{y}", scope="shared")
+        if d is not None and len(d):
+            frames.append(d.reindex(columns=ARC_DOC_COLS))
+    if not frames:
+        return pd.DataFrame(columns=ARC_DOC_COLS)
+    T = pd.concat(frames, ignore_index=True)
+    T["rcept_dt"] = as_ts_series(T["rcept_dt"])
+    return T.dropna(subset=["rcept_no", "section", "rcept_dt"])
 
 
 
@@ -8475,7 +8543,8 @@ def _d1_pair_metrics(cur: Dict[str, float], prev: Dict[str, float],
     return (cos, jac, simple, lr)
 
 
-def d1_similarity(pairs: pd.DataFrame) -> pd.DataFrame:
+def d1_similarity(pairs: pd.DataFrame,
+                  df_state: Optional[dict] = None) -> pd.DataFrame:
     """§6.1.4 4종 유사도 산출.
 
     ★ IDF 누수 방지: 전체 기간 문서로 IDF 를 만들면 '미래에 흔해질 단어'의 가중치가
@@ -8492,8 +8561,12 @@ def d1_similarity(pairs: pd.DataFrame) -> pd.DataFrame:
     P = P.dropna(subset=["rcept_dt", "corp_code", "section"]).sort_values(
         ["rcept_dt", "corp_code", "section"], kind="stable").reset_index(drop=True)
 
-    df_cnt: "Counter" = Counter()      # 확장 문서빈도
-    n_docs = 0
+    # ★ 확장 IDF 상태. 연도별 스트리밍 호출에서도 '그때까지 관측된 문서' 만 반영되도록
+    #   호출자가 상태를 넘겨 이어갈 수 있게 한다(넘기지 않으면 호출 내에서만 누적).
+    if df_state is None:
+        df_state = {"df": Counter(), "n": 0}
+    df_cnt: "Counter" = df_state.setdefault("df", Counter())
+    n_docs = int(df_state.get("n", 0))
     out_rows: List[dict] = []
     t0 = time.time()
 
@@ -8527,6 +8600,7 @@ def d1_similarity(pairs: pd.DataFrame) -> pd.DataFrame:
                 add["#" + k] += 1
             n_docs += 1
         df_cnt.update(add)
+        df_state["n"] = n_docs
 
     if not out_rows:
         LOG.warn("유사도를 한 건도 계산하지 못했습니다 (토큰이 비었을 가능성).")
@@ -8747,6 +8821,45 @@ def report_d1_sign_check(P: pd.DataFrame) -> dict:
     return out
 
 
+def build_d1_streaming(struct: Optional[pd.DataFrame] = None,
+                       years: Optional[Sequence[int]] = None,
+                       T_manifest: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """연도 2개씩만 메모리에 올려 D1 을 만든다. 상주량이 문서 수와 무관하게 평평해진다.
+
+    ★ 확장 IDF 상태(df_state)를 연도 간에 이어받으므로, 한 번에 다 올려 계산한 것과
+      동일한 '그 시점까지 관측된 문서로만' 성질을 유지한다(미래누수 없음).
+    """
+    ys = list(years) if years else arc_doc_years(T_manifest)
+    if not ys:
+        LOG.warn("정기보고서 토큰 샤드가 없어 D1 을 만들 수 없습니다.")
+        return pd.DataFrame(columns=D1_OUT_COLS)
+    df_state = {"df": Counter(), "n": 0}
+    sims: List[pd.DataFrame] = []
+    for y in sorted(ys):
+        if (y - 1) not in ys:
+            continue                       # 전년 문서가 없으면 페어가 만들어지지 않는다
+        T2 = arc_doc_load_years([y - 1, y])
+        if T2.empty:
+            continue
+        pr = arc_doc_pairs(T2)
+        del T2
+        if pr is None or pr.empty:
+            continue
+        s1 = d1_similarity(pr, df_state=df_state)
+        del pr
+        if s1 is not None and len(s1):
+            sims.append(s1)
+        gc.collect()
+    if not sims:
+        LOG.warn("연도 스트리밍 D1 에서 유사도를 한 건도 만들지 못했습니다.")
+        return pd.DataFrame(columns=D1_OUT_COLS)
+    S = pd.concat(sims, ignore_index=True)
+    del sims
+    LOG.ok(f"D1 연도 스트리밍 완료 — 유사도 {len(S):,}행 (연도 {len(ys)}개, "
+           f"상주 연도 2개씩 유지)")
+    return d1_composite(S, struct)
+
+
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  L2-B2  D2 — 재무제표 이상현상 (§6.2)                                                      ║
@@ -8892,6 +9005,7 @@ def build_d2_panel(fin: pd.DataFrame, shares: Optional[pd.DataFrame] = None) -> 
     out["knowledge_date"] = (as_ts_series(kd["knowledge_date"]) if kd is not None
                              else as_ts_series(out["period_end"]) + pd.Timedelta(days=45))
     out = out.drop(columns=["_seq"])
+    out = arc_kd_lag(out)                    # §4 접수일 + 1거래일부터 사용 가능
     out = pit_frame(out, "period_end", "knowledge_date", source="dart_d2")
     out = ensure_cols(out, D2_PANEL_COLS)
     LOG.ok(f"D2 분기 패널 {len(out):,}행 · {out['corp_code'].nunique():,}사 — " +
@@ -9095,8 +9209,10 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
         A = pd.DataFrame({
             "corp_code": F["corp_code"],
             "event_date": as_ts_series(F["period_end"]) if "period_end" in F.columns else pd.NaT,
-            "knowledge_date": as_ts_series(F["knowledge_date"]) if "knowledge_date" in F.columns
-            else pd.NaT,
+            # §4 접수일 + 1거래일 (재무제표는 접수 당일 사용 불가)
+            "knowledge_date": (as_ts_series(F["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in F.columns else pd.NaT,
             # 완료형 정량 사실: 전년 동기 대비 실제 증가 (계획이 아니라 재무제표에 찍힌 값)
             "NF_RND_RATIO": (rnd_ratio > _lag4(rnd_ratio)).astype(float)
                             .where(rnd_ratio.notna() & _lag4(rnd_ratio).notna()),
@@ -9117,8 +9233,9 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
         B = pd.DataFrame({
             "corp_code": E["corp_code"],
             "event_date": as_ts_series(E["period_end"]) if "period_end" in E.columns else pd.NaT,
-            "knowledge_date": as_ts_series(E["knowledge_date"]) if "knowledge_date" in E.columns
-            else pd.NaT,
+            "knowledge_date": (as_ts_series(E["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in E.columns else pd.NaT,
             "NF_EMP": (pd.to_numeric(E["employees"], errors="coerce") > prev).astype(float)
                       .where(prev.notna()),
         })
@@ -9238,8 +9355,9 @@ def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
         parts.append(pd.DataFrame({
             "corp_code": F["corp_code"],
             "event_date": as_ts_series(F["period_end"]) if "period_end" in F.columns else pd.NaT,
-            "knowledge_date": as_ts_series(F["knowledge_date"]) if "knowledge_date" in F.columns
-            else pd.NaT,
+            "knowledge_date": (as_ts_series(F["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in F.columns else pd.NaT,
             "EX_LOSS4Q": streak.fillna(0.0),
             "EX_IMPAIR": ex_imp,
         }))
@@ -9272,8 +9390,9 @@ def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
         parts.append(pd.DataFrame({
             "corp_code": A["corp_code"],
             "event_date": as_ts_series(A["period_end"]) if "period_end" in A.columns else pd.NaT,
-            "knowledge_date": as_ts_series(A["knowledge_date"]) if "knowledge_date" in A.columns
-            else pd.NaT,
+            "knowledge_date": (as_ts_series(A["knowledge_date"]) +
+                               pd.Timedelta(days=ARC_DART_LAG_DAYS))
+            if "knowledge_date" in A.columns else pd.NaT,
             "EX_AUDIT": (bad_opinion | has_emph).astype(float),
         }))
     else:
@@ -11021,7 +11140,7 @@ def report_dataflow_map() -> None:
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A18 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A19 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -11547,12 +11666,58 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A18", "LLM API 호출 금지", a18)
 
+    # ── A19  DART 파생 테이블의 T+1 규약 ──────────────────────────────────────────────────
+    def a19():
+        """§4 'rcept_dt(접수일자) + 1거래일부터 사용 가능' 이 재무 계열에도 적용되는가.
+
+        ★ 초기 빌드에서 D1 만 +1 을 적용하고 재무·직원·주식수·감사의견은 접수 당일부터
+          쓸 수 있었다. 작지만 명백한 미래누수이며, 접수는 장중에도 일어나므로 실행 불가능한
+          정보 접근이다. 여기서 실제 프레임을 만들어 검사한다.
+        """
+        rc = REPRT_CODES["FY"]
+        fin = pit_frame(pd.DataFrame({
+            "corp_code": ["C1", "C1"], "bsns_year": [2019, 2020], "reprt_code": [rc, rc],
+            "period_end": pd.to_datetime(["2019-12-31", "2020-12-31"]),
+            "knowledge_date": pd.to_datetime(["2020-03-20", "2021-03-20"]),
+            "assets": [1000.0, 1100.0], "liabilities": [400.0, 430.0],
+            "equity": [600.0, 670.0], "cash": [100.0, 120.0],
+            "net_income_ttm": [50.0, 60.0], "cfo_ttm": [55.0, 70.0],
+            "revenue_ttm": [900.0, 990.0], "inventory": [80.0, 85.0],
+            "receivable": [90.0, 95.0], "op_income_q": [12.0, 14.0],
+        }), "period_end", "knowledge_date")
+        d2 = build_d2_panel(fin, None)
+        if d2 is None or d2.empty:
+            return False, "D2 패널이 비어 T+1 검사를 할 수 없습니다"
+        kd = as_ts_series(d2["knowledge_date"]).min()
+        if kd <= as_ts("2020-03-20"):
+            return False, (f"★T+1 위반: 접수일 2020-03-20 인 재무제표의 knowledge_date 가 "
+                           f"{str(kd)[:10]} 입니다. 접수 당일부터 쓸 수 있으면 미래누수입니다"
+                           f"(§4).")
+        # as-of 결합에서도 실제로 차단되는지
+        st = PITStore()
+        st.register("t_d2", d2, key_cols=["corp_code"])
+        panel = pd.DataFrame({"code": ["A"], "corp_code": ["C1"],
+                              "asof": [as_ts("2020-03-20")]})
+        got = st.asof_join(panel, "t_d2", by="corp_code", left_time="asof")
+        if "ACCRUAL" in got.columns and got["ACCRUAL"].notna().any():
+            return False, ("★접수 당일(2020-03-20) 리밸런싱에서 그 날 접수된 재무가 "
+                           "결합되었습니다. T+1 이 as-of 결합에서 무력화되고 있습니다.")
+        got2 = st.asof_join(pd.DataFrame({"code": ["A"], "corp_code": ["C1"],
+                                          "asof": [as_ts("2020-03-21")]}),
+                            "t_d2", by="corp_code", left_time="asof")
+        if "ACCRUAL" not in got2.columns or not got2["ACCRUAL"].notna().any():
+            return False, "T+1 다음 날에도 결합되지 않습니다 — 지연이 과도합니다"
+        return True, (f"재무 knowledge_date = 접수일 + {ARC_DART_LAG_DAYS}일 · "
+                      f"접수 당일 결합 차단 · 익일 결합 정상 확인")
+
+    _ac("A19", "DART T+1 규약 (재무 계열)", a19)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A18 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A19 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))
@@ -12032,6 +12197,12 @@ def run_rehearsal(strict: bool = True) -> bool:
                 if S is not None and len(S):
                     _arh("d1_composite",
                          lambda: d1_composite(S, build_struct_flags(dis)), expect_rows=False)
+            _arh("arc_doc_load_years", lambda: arc_doc_load_years(arc_doc_years(T)),
+                 expect_rows=False)
+            _arh("build_d1_streaming (연도 스트리밍)",
+                 lambda: build_d1_streaming(build_struct_flags(dis), T_manifest=T),
+                 expect_rows=False,
+                 note="연도 2개씩만 올려 상주량을 평평하게 유지하는 경로")
         _arh("build_struct_flags", lambda: build_struct_flags(dis), expect_rows=False)
 
         # ── ⑤ D2 / D3 / 배제 ──────────────────────────────────────────────────────────────
@@ -12428,7 +12599,7 @@ def _syn_build_panel(S: dict) -> Tuple[pd.DataFrame, Any, dict]:
 
     # 재무를 패널에 붙여 eps_rev 대리변수를 만들 수 있게 한다
     if len(S["fin"]):
-        PIT.register("syn_fin", S["fin"], key_cols=["corp_code"])
+        PIT.register("syn_fin", arc_kd_lag(S["fin"]), key_cols=["corp_code"])
         P = PIT.asof_join(P, "syn_fin", by="corp_code", left_time="asof",
                           cols=["corp_code", "knowledge_date", "net_income_ttm", "assets"],
                           suffix="_fin")
@@ -12646,9 +12817,20 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
         except Exception:
             pass
         ctx["doc_attempted"] = n_before
-        ctx["doc_tokens"] = fetch_arc_documents(ctx.get("dis"), ctx["sec"])
-        arc_norm_sample_report(ctx["doc_tokens"], n=5)      # §10-[4] 육안 검증
-        ctx["doc_pairs"] = arc_doc_pairs(ctx["doc_tokens"])
+        _T = fetch_arc_documents(ctx.get("dis"), ctx["sec"])
+        arc_norm_sample_report(_T, n=5)                     # §10-[4] 육안 검증
+        ctx["doc_pairs"] = arc_doc_pairs(_T)
+        # ★ 게이트·D3 는 매니페스트(토큰 제외)만 있으면 된다. tf/bigram 을 통째로 들고
+        #   다니면 문서 수에 비례해 상주량이 폭발하므로 여기서 떨어뜨린다.
+        #   D1 은 build_d1_streaming 이 연도 샤드에서 다시 읽는다.
+        _keep = [c for c in ARC_DOC_COLS if c not in ("tf", "bigram")]
+        ctx["doc_tokens_full"] = _T if len(_T) < 60_000 else None
+        ctx["doc_tokens"] = _T[_keep].copy() if len(_T) else _T
+        _mb = mem_mb(_T)
+        del _T
+        gc.collect()
+        LOG.info(f"문서 토큰 원본 {_mb:.0f}MB → 매니페스트만 보관 "
+                 f"({mem_mb(ctx['doc_tokens']):.0f}MB). D1 은 연도 샤드에서 스트리밍합니다.")
 
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 · 본문", "L1",
                     budget_s=5400, critical=False,
@@ -12714,7 +12896,8 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
                     skip_if=(not gate.get("d1", True)),
                     skip_reason="Phase 0 GATE_4/5 실패 — D1 비활성화"):
         struct = build_struct_flags(ctx.get("dis"))
-        d1 = d1_composite(d1_similarity(ctx.get("doc_pairs")), struct)
+        # ★ 연도 2개씩만 올리는 스트리밍 경로. 전 구간 토큰을 한 번에 들면 수 GB 가 된다.
+        d1 = build_d1_streaming(struct, T_manifest=ctx.get("doc_tokens"))
         P = attach_d1(P, d1)
     if not gate.get("d1", True):
         P = attach_d1(P, None)
@@ -12725,10 +12908,13 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
         report_d2_coverage(P)
 
     with PIPE.stage("L2.D3", "D3 하드팩트 + 배제 플래그", "L2", budget_s=900, critical=False):
-        hard = extract_hardfacts(ctx.get("doc_tokens"), ctx.get("fin"), ctx.get("emp"),
-                                 ctx.get("dis"))
-        excl = build_exclusion_flags(ctx.get("fin"), ctx.get("dis"), ctx.get("audit"),
-                                     ctx.get("doc_tokens"))
+        _Td = ctx.get("doc_tokens_full")     # tf 가 있어야 텍스트 기반 이벤트를 볼 수 있다
+        hard = extract_hardfacts(_Td, ctx.get("fin"), ctx.get("emp"), ctx.get("dis"))
+        excl = build_exclusion_flags(ctx.get("fin"), ctx.get("dis"), ctx.get("audit"), _Td)
+        if _Td is None:
+            LOG.warn("문서 수가 많아 토큰 원본을 메모리에 유지하지 않았습니다 — D3 의 "
+                     "텍스트 기반 이벤트(특허·정부과제·종속기업·해외거점·신규사업)는 이번 "
+                     "실행에서 결측입니다. 재무·직원·수시공시 기반 이벤트는 정상 산출됩니다.")
         P = attach_d3(P, hard, excl)
         report_d3_sector(P)
         report_exclusion(P)
@@ -12736,7 +12922,7 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
     with PIPE.stage("L2.FIN", "재무 결합 (직교화 통제변수용)", "L2", budget_s=300,
                     critical=False):
         if ctx.get("fin") is not None and len(ctx["fin"]):
-            PIT.register("arc_fin", ctx["fin"], key_cols=["corp_code"])
+            PIT.register("arc_fin", arc_kd_lag(ctx["fin"]), key_cols=["corp_code"])
             P = PIT.asof_join(P, "arc_fin", by="corp_code", left_time="asof",
                               cols=["corp_code", "knowledge_date", "net_income_ttm", "assets"],
                               suffix="_fin")
@@ -12810,7 +12996,7 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A18", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A19", "L0", budget_s=300):
         run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
 
     with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",

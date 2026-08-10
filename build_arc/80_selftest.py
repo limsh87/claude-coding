@@ -284,7 +284,7 @@ def _syn_build_panel(S: dict) -> Tuple[pd.DataFrame, Any, dict]:
 
     # 재무를 패널에 붙여 eps_rev 대리변수를 만들 수 있게 한다
     if len(S["fin"]):
-        PIT.register("syn_fin", S["fin"], key_cols=["corp_code"])
+        PIT.register("syn_fin", arc_kd_lag(S["fin"]), key_cols=["corp_code"])
         P = PIT.asof_join(P, "syn_fin", by="corp_code", left_time="asof",
                           cols=["corp_code", "knowledge_date", "net_income_ttm", "assets"],
                           suffix="_fin")
