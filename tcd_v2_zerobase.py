@@ -10352,8 +10352,18 @@ def run_comparison(P: pd.DataFrame, ctx: dict, months: pd.DatetimeIndex, uni: "P
 #   "성과가 나빴다"는 두 갈래다: ①전략이 나쁘다 ②측정이 아래로 치우쳤다.
 #   구분하지 않으면 멀쩡한 전략을 죽이거나(하향 과다), 없는 알파를 믿는다(상향 과다).
 #   그래서 방향별로 요인을 세우고, 환산 가능한 것은 수익률 영향(bp/월)으로 크기를 비교한다.
-def drift_audit(P: pd.DataFrame, bt: Optional[pd.DataFrame] = None,
+def drift_audit(P: pd.DataFrame, bt: Optional[Union[pd.DataFrame, dict]] = None,
                 master: Optional[pd.DataFrame] = None) -> dict:
+    """★bt 는 run_engine() 의 결과(dict) 또는 그 안의 returns 프레임 ★둘 다 받는다.
+
+    ★실측 사고(2026-08-10 FULL): main() 은 run_engine 의 dict 를 그대로 넘기는데 이
+      함수는 bt.columns 를 썼다 → O2.DRIFT 에서 AttributeError. 30커밋을 살아남은 이유는
+      ①rehearse 가 이 함수를 DataFrame 으로 ★직접 호출했고 ②SMOKE 는 main() 의 D.UNI
+      이후를 아예 실행하지 않았기 때문이다(main() 이 C.SMOKE 직후 return 한다).
+      ★호출부만 고치면 다음 호출부에서 같은 실수가 재발한다 — 받는 쪽에서 정규화한다.
+      (배선 자체는 smoke/wiring_v2.py 가 main() 을 통째로 완주시켜 잠근다.)
+    """
+    bt = bt.get("returns") if isinstance(bt, dict) else bt
     up: List[list] = []      # 상향 드리프트(성과를 좋게 만드는 쪽)
     dn: List[list] = []      # 하향 드리프트(성과를 나쁘게 만드는 쪽)
     h = dict(getattr(P, "attrs", {}).get("input_health") or {})
