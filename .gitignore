@@ -4,3 +4,5 @@ build/.smoke_*.log
 tcd_cache/
 .ipynb_checkpoints/
 .audit/
+outputs/
+scg_cache/

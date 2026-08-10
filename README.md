@@ -1,3 +1,7 @@
+> 이 저장소에는 두 개의 독립적인 퀀트 시스템이 있습니다.
+> **TCD v2**(아래) 와 **[SCG_ORIGINAL_REPRO_V1](README_SCG.md)** (스마트 컨센서스 갭 /
+> IBK 서프라이즈 포트폴리오 재현 — `smart_consensus_gap/`, `run_smart_consensus_gap.py`).
+
 # TCD v2 — 트레이드오프 붕괴 탐지 (Trade-off Collapse Detection)
 
 한국 상장사 「질적 전환」 탐지 퀀트 시스템. 명세서 v2 (2026-08-07) 구현체.
