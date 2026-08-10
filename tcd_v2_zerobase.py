@@ -7992,10 +7992,16 @@ NPS_INCOME_CAP = {
 }
 NPS_REDETERMINE_MONTH = 7        # 기준소득월액 정기결정 시행월(전년 소득 기준 일괄 갱신)
 NPS_SIM_MIN = 80                                         # 상호 유사도 하한
+NPS_THETA_MAX = 1.30    # ★θ_N 상한 — 넘으면 '대단한 회사'가 아니라 매칭이 과하게 붙은 것.
+#                         clip(0,1) 만 두면 과다결합이 오히려 최대 신뢰(θ=1)를 받는다.
 NPS_MAX_SITES = 3                                        # 한 종목이 들고 갈 사업장 수 상한
 NPS_RULE_VER = 2      # ★검색 질의·정규화·필드 매핑 규칙 버전. 올리면 옛 원장이
 #                       자동 무효화되어, 구 규칙으로 무매칭 판정된 종목이 90일간
 #                       영구 스킵되는 사고를 막는다(v2 = dataType/상세필드 교정판).
+
+
+def today_iso() -> str:
+    return dtm.date.today().isoformat()
 
 
 def _nps_num(x) -> float:
@@ -8035,6 +8041,168 @@ def _nps_preflight(names: Sequence[Tuple[str, str]]) -> bool:
     return False
 
 
+# ── ★월축 수집 — 원전(build/p_n_employment.py) 복원 ────────────────────────────────────────
+#   원전은 `dataCrtYm=YYYYMM` + numOfRows=1000 + 페이징으로 ★그 달의 전 사업장을 통째로
+#   받는다. 나는 이걸 "dataCrtYm 은 요청변수가 아니다"라고 판단해 종목축(사업장명 검색)으로
+#   갈아엎었는데, 그것이 두 가지를 동시에 망가뜨렸다:
+#     ① 종목축 응답은 ★최신 1개월만 준다 → n1·n3·n4 는 12개월 차분이라 ★영원히 결측.
+#        (공단은 1년치만 보관하므로 '매월 쌓으면 13개월째부터'라는 계획도 성립하지 않는다.)
+#     ② 종목당 6콜에 1행 — 실측 6,000콜/50분에 634행. 쿼터만 태우고 신호는 0.
+#   월축은 콜당 1,000행이고, 신규취득/상실/사업장수가 ★같은 응답에 들어 있다.
+NPS_V1 = "https://apis.data.go.kr/B552015/NpsBplcInfoInqireService/getBassInfoSearch"
+NPS_PAGE_ROWS = 1000        # 1콜당 행수(공식 상한)
+NPS_MAX_PAGES = 900         # 월당 페이지 상한(전국 사업장 ≈ 60만 → 600p. 여유 포함)
+NPS_SEED_MONTHS = 14        # ★최신 이 개월수를 먼저 받는다 — 12개월 차분에 13개월이 필요하다
+NPS_MONTH_AXIS = True       # ★원전 축. False 로 두면 옛 종목축(신호 생성 불가)으로 돈다
+
+
+def _nps_month_call(ym: str, page: int) -> Tuple[str, List[dict]]:
+    """(상태, items) — V2 먼저, 빈손이면 V1. 두 스펙 사이에서 조용히 죽지 않게 한다."""
+    for url in (NPS_SEARCH, NPS_V1):
+        st, items = dg_call(url, {"dataCrtYm": ym, "pageNo": page,
+                                  "numOfRows": NPS_PAGE_ROWS},
+                            src=DG_SRC_NPS, json_param="dataType")
+        if items or st in (DG_LIMIT, DG_AUTH, DG_NET):
+            return st, items
+    return DG_EMPTY, []
+
+
+def _nps_month_probe() -> bool:
+    """★dataCrtYm 이 ★실제로 필터로 작동하는지 서버에 물어 확인한다(2콜).
+
+    내가 종목축으로 갈아엎은 근거가 "dataCrtYm 은 요청변수가 아니다"였다. 그 판단이
+    맞는지 틀리는지는 ★추측이 아니라 서로 다른 두 달을 요청해 응답이 다른지 보면 끝난다.
+    같으면 서버가 그 인자를 무시하는 것이므로 월축은 성립하지 않는다 — 그때만 종목축으로
+    내려간다. 이 2콜이 6,000콜의 헛수고를 막는다.
+    """
+    a_ym = (pd.Timestamp.today() - pd.DateOffset(months=3)).strftime("%Y%m")
+    b_ym = (pd.Timestamp.today() - pd.DateOffset(months=9)).strftime("%Y%m")
+    sa, ia = _nps_month_call(a_ym, 1)
+    sb, ib = _nps_month_call(b_ym, 1)
+    if not ia or not ib:
+        L.warn(f"PACK-N 월축 프리플라이트 — 응답이 비었습니다({a_ym}:{sa} · {b_ym}:{sb}). "
+               f"종목축으로 내려갑니다.")
+        return False
+    ka = {str(x.get("seq") or x.get("wkplNm") or "") for x in ia[:200]}
+    kb = {str(x.get("seq") or x.get("wkplNm") or "") for x in ib[:200]}
+    ya = {str(x.get("dataCrtYm") or "") for x in ia[:50]}
+    if ka == kb and len(ka) > 5:
+        L.warn(f"PACK-N 월축 불가 — {a_ym} 과 {b_ym} 의 응답이 동일합니다. 서버가 "
+               f"dataCrtYm 을 무시합니다(응답 dataCrtYm={sorted(ya)[:3]}). 종목축으로 "
+               f"내려갑니다 — 다만 그 축은 최신 1개월만 주므로 n1·n3·n4 는 결측입니다.")
+        return False
+    L.ok(f"PACK-N ★월축 확인 — dataCrtYm 이 필터로 작동합니다({a_ym} ≠ {b_ym}). "
+         f"콜당 {NPS_PAGE_ROWS}행 · 신규취득/상실/사업장수가 같은 응답에 들어옵니다.")
+    return True
+
+
+def harvest_nps_month(master: pd.DataFrame, months: pd.DatetimeIndex,
+                      max_calls: int = -1) -> pd.DataFrame:
+    """★월축 국민연금 수집(원전 복원). 그 달 전 사업장 → 상장사만 남겨 패널로.
+
+    최신 NPS_SEED_MONTHS 개월을 ★먼저 받는다 — 12개월 차분에 13개월이 있어야 첫 값이
+    나오므로, 과거로 넓히는 것보다 최근 13개월을 완비하는 것이 신호 생성에 직결된다.
+    """
+    cols = ["code", "month", "nps_members", "nps_amt", "nps_new", "nps_lost",
+            "n_sites", "match_conf"]
+    # 상장사 정규화명 색인 — 콜당 1,000행을 메모리에서 즉시 걸러낸다
+    nm = master.dropna(subset=["code"]).copy()
+    nm["_n"] = nm["name"].astype(str).map(clean_corp)
+    nm = nm[nm["_n"].str.len() >= 2]
+    idx: Dict[str, str] = {}
+    for r in nm.itertuples(index=False):
+        idx.setdefault(r._n, r.code)
+    pre = defaultdict(list)
+    for n, c in idx.items():
+        pre[n[:2]].append((n, c))
+    done_ym, led = led_read("nps_months_done", "ym", what="PACK-N 월축")
+    want = [m.strftime("%Y%m") for m in months]
+    todo = [y for y in sorted(set(want), reverse=True) if y not in done_ym][:NPS_SEED_MONTHS]
+    if not todo:
+        L.info("PACK-N 월축: 목표 개월이 전부 원장에 있습니다 — 신규 수집 없음.")
+        return pd.DataFrame(columns=cols)
+    L.info(f"PACK-N ★월축 수집 — 최신 {len(todo)}개월({todo[-1]}~{todo[0]}) 우선. "
+           f"콜당 {NPS_PAGE_ROWS}행 · 월당 최대 {NPS_MAX_PAGES}p. "
+           f"잔여 {QUOTA.remaining(DG_SRC_NPS):,}콜.")
+    got: List[dict] = []
+    new_led: List[dict] = []
+    with stage_bar(len(todo), "국민연금 사업장(★월축)") as bar:
+        for ym in todo:
+            if CLOCK.over() or not QUOTA.allow(DG_SRC_NPS):
+                CLOCK.cut(f"국민연금 월축: {len(todo) - bar.n}개월 남기고 중단")
+                break
+            rows, page, complete = [], 1, True
+            while page <= NPS_MAX_PAGES:
+                if CLOCK.over() or not QUOTA.allow(DG_SRC_NPS):
+                    complete = False
+                    break
+                st, items = _nps_month_call(ym, page)
+                if st in (DG_LIMIT, DG_AUTH, DG_NET, DG_BAD):
+                    complete = False
+                    break
+                if not items:
+                    break
+                for it in items:
+                    if str(it.get("wkplJnngStcd") or "1") != "1":
+                        continue                       # 등록 상태 사업장만
+                    w = clean_corp(it.get("wkplNm", ""))
+                    if len(w) < 2:
+                        continue
+                    best, bs = None, 0.0
+                    for cand, code in pre.get(w[:2], ()):
+                        if w == cand or w.startswith(cand):
+                            best, bs = code, 100.0
+                            break
+                        s = float(name_sim(w, cand))
+                        if s > bs:
+                            best, bs = code, s
+                    if best is None or bs < NPS_SIM_MIN:
+                        continue
+                    rows.append({"code": best,
+                                 "month": pd.Timestamp(f"{ym[:4]}-{ym[4:]}-01")
+                                          + pd.offsets.MonthEnd(0),
+                                 "_mem": _nps_num(it.get("jnngpCnt")),
+                                 "_amt": _nps_num(it.get("crrmmNtcAmt")),
+                                 "_new": _nps_num(it.get("nwAcqzrCnt")),
+                                 "_lost": _nps_num(it.get("lssJnngpCnt")),
+                                 "_site": f"{w}|{it.get('ldongAddrMgplSgguCd') or ''}",
+                                 "_conf": bs / 100.0})
+                if len(items) < NPS_PAGE_ROWS:
+                    break
+                page += 1
+            else:
+                complete = False
+            bar.update(1)
+            if rows:
+                D = pd.DataFrame(rows)
+                agg = (D.groupby(["code", "month"], as_index=False)
+                       .agg(nps_members=("_mem", "sum"), nps_amt=("_amt", "sum"),
+                            nps_new=("_new", "sum"), nps_lost=("_lost", "sum"),
+                            n_sites=("_site", "nunique"), match_conf=("_conf", "max")))
+                got += agg.to_dict("records")
+                bar.set_postfix_str(f"{ym} {len(agg):,}종목 · {page}p", refresh=False)
+            if complete:
+                new_led.append({"ym": ym, "n_rows": len(rows), "tried_at": today_iso()})
+            # ★월이 끝날 때마다 적재 — 다음 달에서 끊겨도 여기까지는 남는다(절대1원칙)
+            if got:
+                _n = flush_rows("nps_corp_monthly", got, cols, ["code", "month"],
+                                domain="nps", source="data.go.kr NPS(월축 dataCrtYm)",
+                                note="월축 수집분 — 월 단위 즉시 적재")
+                if _n:
+                    got = []
+                    led_write("nps_months_done", led, new_led, "ym", domain="nps",
+                              source="month_ledger")
+                    new_led = []
+    out = VAULT.load_table("nps_corp_monthly", "shared") if VAULT is not None else None
+    if out is None or not len(out):
+        return pd.DataFrame(columns=cols)
+    out = out.copy()
+    out["month"] = ds_(out["month"])
+    L.ok(f"국민연금 월축 누적 {len(out):,}행 · {out['code'].nunique():,}종목 · "
+         f"{out['month'].nunique():,}개월 — 13개월이 모이면 TP_N1·N3·N4 가 살아납니다.")
+    return out.reindex(columns=cols)
+
+
 def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                 priority: Sequence[str] = (), max_calls: int = -1) -> pd.DataFrame:
     """상장사명 → 사업장 seq → 월별 가입자·고지금액 패널.
@@ -8048,6 +8216,16 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
     if not DATA_GO_KR_KEY:
         L.info("PACK-N: DATA_GO_KR_KEY 미입력 — 국민연금 팩 자동 비활성(§8.4).")
         return pd.DataFrame(columns=cols)
+    # ★월축 우선 — 원전의 축이고, 종목축은 최신 1개월만 주므로 n1·n3·n4 가 영원히 결측이다.
+    #   dataCrtYm 이 실제로 필터인지는 ★2콜 프리플라이트가 서버에 물어 확정한다.
+    if NPS_MONTH_AXIS and RUN_MODE != "CACHED" and QUOTA.allow(DG_SRC_NPS):
+        try:
+            if _nps_month_probe():
+                return harvest_nps_month(master, months, max_calls=max_calls)
+            L.warn("PACK-N: 월축이 불가해 종목축으로 내려갑니다 — 이 축은 최신 1개월만 주므로 "
+                   "TP_N1·N3·N4 는 이번 실행에서 결측입니다(θ_N 만 계산됩니다).")
+        except Exception as e:                                # noqa
+            L.warn(f"PACK-N 월축 시도 실패({type(e).__name__}: {str(e)[:100]}) — 종목축 폴백.")
     cached = VAULT.load_table("nps_corp_monthly", "shared")
     if cached is not None and len(cached):
         cached = cached.copy()
@@ -9500,6 +9678,22 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     # ★원전: θ 는 배제기준이 아니라 가중치 — 결측이면 0(=그 팩 기여 없음)으로 떨어뜨린다.
     #   fillna(0.0) 이 빠져 있어 θ 결측이 E_N 을 NaN 으로 만들고, 그 행이 하한선 축
     #   계산에서 통째로 빠지고 있었다.
+    # ★과다결합 게이트 — 원전 산식의 구멍을 ★대칭으로 막는다(계약 산식은 건드리지 않는다).
+    #   θ_N = 가입자수/직원수 이고 E_N 은 θ.clip(0,1) 을 곱한다. 그런데 사업장 매칭이
+    #   과하게 붙어 ★남의 회사 인원까지 합산되면 θ_N > 1 이 되고, clip 이 그걸 1.0
+    #   (= 최대 신뢰)으로 만든다. 즉 ★과소결합은 벌주고 과다결합은 보상한다.
+    #   V4 도 θ<0.50 인 행만 죽이므로 이쪽은 통과시킨다. 그래서 상한을 따로 건다.
+    #   (사업자번호 앞 6자리는 유일키가 아니라 전국 단위 충돌이 흔하다 — 실제 도달 경로다.)
+    _over = P["theta_N"] > NPS_THETA_MAX
+    if _over.any():
+        n_over = int(_over.sum())
+        for _c in ("n1", "n2", "n3", "n4", "TP_N1", "TP_N2", "TP_N3", "TP_N4"):
+            if _c in P.columns:
+                P[_c] = P[_c].mask(_over)        # ★0 이 아니라 NaN — 0 은 '중립'이라는 정보다
+        L.warn(f"PACK-N 과다결합 {n_over:,}행 무효화(θ_N > {NPS_THETA_MAX}) — 가입자수가 "
+               f"DART 직원수의 {NPS_THETA_MAX}배를 넘는 것은 그 회사가 특별한 게 아니라 "
+               f"★사업장 매칭이 남의 회사를 끌어온 것입니다. clip(0,1) 만 두면 이런 행이 "
+               f"오히려 최대 신뢰(θ=1)를 받습니다.")
     P["E_N"] = (nrow_mean(P, ["TP_N1", "TP_N2", "TP_N3", "TP_N4"])
                 * P["theta_N"].clip(0, 1).fillna(0.0))
     return P
