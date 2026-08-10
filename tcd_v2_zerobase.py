@@ -2139,6 +2139,120 @@ class VaultArchive:
 VAULT: Optional[VaultArchive] = None
 
 
+# ── 원장 규약 — 22개 수집기가 각자 복사하던 '무엇을 이미 했는가' 관리 ────────────────────────
+#   ★이 세 함수의 존재 이유: 지금까지 잡은 버그가 전부 '같은 형태의 복사본이 서로 갈라진'
+#   것이었다. max_calls=0 이 무제한으로 뒤집힌 7곳, 원장을 데이터보다 먼저 쓴 2곳, 중단
+#   사유를 잘못 적은 4곳, 진행바를 배치 단위로 민 9곳, 상한을 재시도 루프 안에 둔 1곳.
+#   전부 '한 곳을 고치고 나머지 N-1 곳을 못 고친' 사고다. 그래서 형태를 한 곳으로 모은다.
+
+def k1(v: Any) -> str:
+    """스칼라 → keyset() 과 ★똑같은 키 문자열. 2020 · 2020.0 · np.int64(2020) → "2020".
+
+    ★문자열은 절대 숫자로 해석하지 않는다 — corp_code "00126380" 이나 종목코드 "005930"
+    을 float 로 돌리면 앞의 0 이 날아가 다른 회사가 된다. 그래서 str 은 그대로 통과시킨다.
+    """
+    if isinstance(v, str):
+        return v
+    try:
+        f = float(v)
+        if f == int(f):
+            return str(int(f))
+    except Exception:
+        pass
+    return str(v)
+
+
+def keyset(df: Optional[pd.DataFrame], cols: Union[str, Sequence[str]]) -> set:
+    """프레임 → 키 집합. ★원장·캐시·잡 목록이 ★같은 규약으로 키를 만들게 하는 단 하나의 함수.
+
+    규약: 키는 언제나 문자열이다. 정수 컬럼은 "2020"(부동소수 "2020.0" 이 아니다).
+    ★왜 못 박는가: 같은 원장이 parquet 왕복에서 int64/float64/object 로 갈리고,
+    한쪽은 `("00126380", 2020, "11011")`, 다른 쪽은 `("00126380", "2020", "11011")`
+    로 물으면 교집합이 0 이 된다. 그러면 캐시가 있어도 전량 재수집하고, 음성 캐시는
+    매 실행 8,000회를 같은 빈 키에 태운다 — ★로그에는 아무 흔적도 남지 않는다.
+    """
+    if df is None or not len(df):
+        return set()
+    ks = [cols] if isinstance(cols, str) else list(cols)
+    if not all(k in df.columns for k in ks):
+        return set()
+
+    def _c(k):
+        c = df[k]
+        return (c.astype("Int64").astype(str) if pd.api.types.is_numeric_dtype(c)
+                else c.astype(str))
+
+    return set(_c(ks[0])) if len(ks) == 1 else set(zip(*[_c(k) for k in ks]))
+
+
+def led_read(name: str, key: Union[str, Sequence[str]], *, ttl_days: int = 0,
+             rule_ver: int = 0, scope: str = "shared",
+             what: str = "") -> Tuple[set, Optional[pd.DataFrame]]:
+    """원장 → (완주 키 집합, 원본 프레임).
+
+    ttl_days  — tried_at 이 이보다 오래된 기록은 '다시 해 볼 것'으로 본다(0=영구).
+    rule_ver  — 질의·정규화 규칙이 바뀌면 옛 기록은 무효다. 이게 없으면 구 규칙으로
+                '무매칭' 판정된 잡이 TTL 동안 영구 스킵되어, 고쳐 놓고도 0행이 된다.
+    """
+    t = VAULT.load_table(name, scope) if VAULT is not None else None
+    if t is None or not len(t):
+        return set(), None
+    t = t.copy()
+    if rule_ver:
+        if "rule_ver" not in t.columns:
+            t["rule_ver"] = 0
+        t = t[pd.to_numeric(t["rule_ver"], errors="coerce").fillna(0) >= rule_ver]
+    fr = t
+    if ttl_days and "tried_at" in t.columns:
+        fr = t[(pd.Timestamp(dtm.date.today()) - ds_(t["tried_at"])).dt.days < ttl_days]
+    ks = [key] if isinstance(key, str) else list(key)
+    if not all(k in fr.columns for k in ks):
+        return set(), t
+    done = keyset(fr, ks)                      # ★키 규약은 keyset() 하나만 안다
+    if done and what:
+        L.info(f"{what} 원장: {len(done):,}건은 이미 처리(성공·빈손 포함)"
+               + (f" — {ttl_days}일간 재조회하지 않습니다." if ttl_days else " — 건너뜁니다."))
+    return done, t
+
+
+def led_write(name: str, base: Optional[pd.DataFrame], rows: Sequence[dict],
+              key: Union[str, Sequence[str]], *, scope: str = "shared",
+              domain: str = "", source: str = "", note: str = "") -> bool:
+    """원장 쓰기. ★반드시 데이터 저장이 성공한 뒤에 부른다.
+
+    순서가 결정적이다: 원장을 먼저 쓰면, 그 뒤 데이터 저장이 실패했을 때(디스크 풀·
+    MemoryError) '원장에는 완주, 데이터는 0행'이 남고 그 잡은 ★영구히 재시도되지 않는다.
+    """
+    if not rows:
+        return False
+    ks = [key] if isinstance(key, str) else list(key)
+    add = pd.DataFrame(list(rows))
+    allf = (pd.concat([base, add], ignore_index=True)
+            if base is not None and len(base) else add)
+    if "tried_at" in allf.columns:
+        allf = allf.sort_values("tried_at")
+    ok = VAULT.save_table(name, allf.drop_duplicates(ks, keep="last"), scope,
+                          domain=domain, source=source, note=note)
+    return ok is not None
+
+
+def merge_keep(cached: Optional[pd.DataFrame], got: Sequence,
+               cols: Sequence[str], keys: Sequence[str]) -> pd.DataFrame:
+    """캐시 + 이번 수확 → concat·중복제거·스키마 정렬. 9곳이 각자 복사하던 꼬리.
+
+    got 은 DataFrame 목록이거나 dict 목록이다(수집기마다 달라서 둘 다 받는다).
+    """
+    fr: List[pd.DataFrame] = [cached] if cached is not None and len(cached) else []
+    if len(got):
+        fr.append(got if isinstance(got, pd.DataFrame)
+                  else (pd.concat(list(got), ignore_index=True)
+                        if isinstance(got[0], pd.DataFrame) else pd.DataFrame(list(got))))
+    if not fr:
+        return pd.DataFrame(columns=list(cols))
+    M = pd.concat([f.reindex(columns=list(cols)) for f in fr], ignore_index=True)
+    return M.drop_duplicates(list(keys), keep="last").reindex(columns=list(cols))
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════════════════╗
 # ║ [5] HTTP 계층 + 쿼터 미터                                                                  ║
 # ║   · 한국 사이트 수집 실패의 9할: UA/Referer 없음(403) · EUC-KR 오판(글자깨짐) · 과속(429)  ║
@@ -3841,13 +3955,10 @@ def harvest_snapshots(months: pd.DatetimeIndex) -> pd.DataFrame:
                 L.warn("스냅샷 연속 4회 공백 — 세션 끊김/차단으로 판단, 스냅샷 수집을 중단합니다"
                        "(유니버스는 상장·폐지일 경로로 정상).")
                 break
-    frames = ([cached] if cached is not None and len(cached) else []) + \
-             ([pd.DataFrame(new_rows)] if new_rows else [])
-    if not frames:
-        return pd.DataFrame(columns=["snap_date", "code", "market"])
-    snap = pd.concat(frames, ignore_index=True)
+    snap = merge_keep(cached, new_rows, ["snap_date", "code", "market"],
+                      ["snap_date", "code"])
     snap["snap_date"] = ds_(snap["snap_date"])
-    snap = snap.dropna(subset=["snap_date", "code"]).drop_duplicates(["snap_date", "code"])
+    snap = snap.dropna(subset=["snap_date", "code"])
     # 부분응답 방어 — 이웃 대비 급감 스냅샷은 '진실'이 아니라 '사고'다(그대로 믿으면 선택편향)
     size = snap.groupby("snap_date")["code"].size()
     med = float(size.median()) if len(size) else 0
@@ -3968,13 +4079,12 @@ def harvest_mktcap(months: pd.DatetimeIndex, px: Optional[pd.DataFrame] = None) 
             got["cap_src"] = got_src                      # ★월별 실제 소스로 기록(감사 정확성)
             src_used[got_src] += 1
             rows.extend(got.to_dict("records"))
-    frames = ([cached] if cached is not None and len(cached) else []) + \
-             ([pd.DataFrame(rows)] if rows else [])
-    if not frames:
+    _mc = ["code", "month", "mktcap", "shares", "cap_src"]
+    cap = merge_keep(cached, rows, _mc, _mc)
+    if not len(cap):
         L.info("시가총액 정식 스냅샷 없음 — 비교전략은 주식수 역산/거래대금 보정 프록시를 씁니다"
                "(감사표에 명시).")
-        return pd.DataFrame(columns=["code", "month", "mktcap", "shares", "cap_src"])
-    cap = pd.concat(frames, ignore_index=True)
+        return cap
     cap["month"] = ds_(cap["month"])
     cap = (cap.dropna(subset=["code", "month"])
               .drop_duplicates(["code", "month"], keep="last").reset_index(drop=True))
@@ -4408,16 +4518,17 @@ def harvest_marcap(years: Sequence[int]) -> Optional[pd.DataFrame]:
                              domain="price", source="FinanceData/marcap",
                              note="연도축 전 시장 일봉 — 전 전략 공용",
                              ver=MARCAP_SHARD_VER)
-            base = VAULT.load_table("marcap_years_done", "shared")
-            row = pd.DataFrame({"year": [y], "ver": [MARCAP_SHARD_VER]})
-            allf = pd.concat([base, row], ignore_index=True) \
-                if base is not None and len(base) else row
-            if "ver" not in allf.columns:
-                allf["ver"] = 0
-            allf["ver"] = pd.to_numeric(allf["ver"], errors="coerce").fillna(0).astype(int)
-            VAULT.save_table("marcap_years_done",
-                             allf.sort_values("ver").drop_duplicates("year", keep="last"),
-                             "shared", domain="price", source="year_ledger")
+            _, _yb = led_read("marcap_years_done", "year")
+            if _yb is not None:      # ★구버전 원장에는 ver 이 없다 — 0 으로 채워야 최신본이 이긴다
+                #  DataFrame.get("ver") 는 컬럼이 없으면 None 을 주고, pd.to_numeric(None)
+                #  은 Series 가 아니라 ★스칼라 nan 이다. 존재를 먼저 확인해야 한다.
+                _v = _yb["ver"] if "ver" in _yb.columns else 0
+                _yb["ver"] = pd.to_numeric(_v, errors="coerce").fillna(0).astype(int) \
+                    if "ver" in _yb.columns else 0
+                _yb = _yb.sort_values("ver")
+            led_write("marcap_years_done", _yb,
+                      [{"year": y, "ver": MARCAP_SHARD_VER}], "year",
+                      domain="price", source="year_ledger")
     if not got:
         L.warn("marcap 연도축 수집 실패 — 날짜축/종목축 경로로 진행합니다.")
         return None
@@ -4929,16 +5040,8 @@ def _sweep_per_stock(codes: Sequence[str], start: str, end: str,
         rank = {str(k): i for i, k in enumerate(order_hint.index)}
         codes.sort(key=lambda c: rank.get(c, 10 ** 9))
     today_ts = pd.Timestamp(dtm.date.today())
-    neg = VAULT.load_table("price_fail_log", "shared")
-    skip: Dict[str, pd.Timestamp] = {}
-    if neg is not None and len(neg):
-        neg = neg.copy()
-        neg["tried_at"] = ds_(neg["tried_at"])
-        neg = neg.sort_values("tried_at").drop_duplicates("code", keep="last")
-        skip = {str(r.code): r.tried_at for r in neg.itertuples(index=False)}
-    todo = [c for c in codes
-            if not (c in skip and pd.notna(skip[c])
-                    and (today_ts - skip[c]).days < RETRY_FAILED_AFTER_D)]
+    skip, _ = led_read("price_fail_log", "code", ttl_days=RETRY_FAILED_AFTER_D)
+    todo = [c for c in codes if c not in skip]
     if not todo:
         return None
     L.warn(f"벌크(날짜축) 소스가 하나도 살아 있지 않아 ★종목당 1회 스윕★ 으로 전환합니다 — "
@@ -4979,12 +5082,9 @@ def _sweep_per_stock(codes: Sequence[str], start: str, end: str,
                              scope="shared", domain="price", source="per_stock_sweep")
             got = []
         if bad:
-            base = VAULT.load_table("price_fail_log", "shared")
-            allf = pd.concat([base, pd.DataFrame(bad)], ignore_index=True) \
-                if base is not None and len(base) else pd.DataFrame(bad)
-            VAULT.save_table("price_fail_log",
-                             allf.sort_values("tried_at").drop_duplicates("code", keep="last"),
-                             "shared", domain="price", source="negative_cache")
+            _, _fb = led_read("price_fail_log", "code")
+            led_write("price_fail_log", _fb, bad, "code", domain="price",
+                      source="negative_cache")
             bad = []
     bar.close()
     fresh = VAULT.load_frame("krx_ohlcv_daily", "shared")
@@ -5243,13 +5343,9 @@ def _flush_px_shard(shard: List[pd.DataFrame], days: List[pd.Timestamp], led_row
             L.warn(f"샤드 저장 실패 — {len(days):,}거래일을 완료로 기록하지 않습니다"
                    f"(다음 실행에서 다시 받습니다).")
             return
-    if led_rows:
-        base = VAULT.load_table("price_dates_done", "shared")
-        allf = pd.concat([base, pd.DataFrame(led_rows)], ignore_index=True) \
-            if base is not None and len(base) else pd.DataFrame(led_rows)
-        VAULT.save_table("price_dates_done", allf.drop_duplicates("date", keep="last"),
-                         "shared", domain="price", source="date_ledger",
-                         note="수집 완료 거래일 — 재조회 방지 원장")
+    _, _db = led_read("price_dates_done", "date")
+    led_write("price_dates_done", _db, led_rows, "date", domain="price",
+              source="date_ledger", note="수집 완료 거래일 — 재조회 방지 원장")
 
 
 def _residual_fill(px: pd.DataFrame, want: Sequence[str], s_ts, e_ts,
@@ -5265,16 +5361,8 @@ def _residual_fill(px: pd.DataFrame, want: Sequence[str], s_ts, e_ts,
     if not miss:
         return px
     today_ts = pd.Timestamp(dtm.date.today())
-    neg = VAULT.load_table("price_fail_log", "shared")
-    fails: Dict[str, pd.Timestamp] = {}
-    if neg is not None and len(neg):
-        neg = neg.copy()
-        neg["tried_at"] = ds_(neg["tried_at"])
-        neg = neg.sort_values("tried_at").drop_duplicates("code", keep="last")
-        fails = {str(r.code): r.tried_at for r in neg.itertuples(index=False)}
-    fresh = [c for c in miss
-             if not (c in fails and pd.notna(fails[c])
-                     and (today_ts - fails[c]).days < RETRY_FAILED_AFTER_D)]
+    fails, _ = led_read("price_fail_log", "code", ttl_days=RETRY_FAILED_AFTER_D)
+    fresh = [c for c in miss if c not in fails]
     n_skip = len(miss) - len(fresh)
     if n_skip:
         L.info(f"최근 {RETRY_FAILED_AFTER_D}일 내 전 소스 실패 {n_skip:,}종목은 건너뜁니다"
@@ -5315,12 +5403,9 @@ def _residual_fill(px: pd.DataFrame, want: Sequence[str], s_ts, e_ts,
             else:
                 bad.append({"code": c, "tried_at": today_ts})
         if bad:                                    # ★배치마다 즉시 기록 — 도중에 끊겨도 남는다
-            base = VAULT.load_table("price_fail_log", "shared")
-            allf = pd.concat([base, pd.DataFrame(bad)], ignore_index=True) \
-                if base is not None and len(base) else pd.DataFrame(bad)
-            VAULT.save_table("price_fail_log",
-                             allf.sort_values("tried_at").drop_duplicates("code", keep="last"),
-                             "shared", domain="price", source="negative_cache")
+            _, _fb = led_read("price_fail_log", "code")
+            led_write("price_fail_log", _fb, bad, "code", domain="price",
+                      source="negative_cache")
             bad = []
     if got:
         add = _px_norm(pd.concat([g.reindex(columns=PX_BULK_COLS) for g in got],
@@ -5808,11 +5893,8 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
                "또는 쿼터 소진). 지금 받으면 전 파일이 0행으로 '완주' 기록되어 다시는 "
                "받지 않게 됩니다. corpCode 를 먼저 확보한 뒤 재실행하세요.")
         return cached if cached is not None else empty
-    done: set = set()
-    led = VAULT.load_table("dart_bulkzip_done", "shared")
-    if led is not None and len(led):
-        done = set(zip(led["year"].astype(int), led["report"].astype(str),
-                       led["stmt"].astype(str)))
+    done, _ = led_read("dart_bulkzip_done", ["year", "report", "stmt"])
+    if done:
         L.info(f"캐시 재사용: 재무 일괄 ZIP {len(done):,}개 파일 · "
                f"{0 if cached is None else len(cached):,}행")
     txt = net_post(DART_BULK_LIST, source="dart",
@@ -5827,7 +5909,7 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
         return cached if cached is not None else empty
     yrs = {int(y) for y in years}
     todo = [r for r in rows if int(r["year"]) in yrs and r["stmt"] in _BULK_SJ
-            and (int(r["year"]), r["report"], r["stmt"]) not in done]
+            and (k1(r["year"]), r["report"], r["stmt"]) not in done]
     todo.sort(key=lambda r: (-int(r["year"]), r["report"], r["stmt"]))
     if not todo:
         return cached if cached is not None else empty
@@ -5937,12 +6019,9 @@ def harvest_dart_bulk_zip(code2corp: Dict[str, str], years: Sequence[int]) -> pd
                 return
             kept.append(add)
             got = []
-        base = VAULT.load_table("dart_bulkzip_done", "shared")
-        allf = pd.concat([base, pd.DataFrame(new_done)], ignore_index=True) \
-            if base is not None and len(base) else pd.DataFrame(new_done)
-        VAULT.save_table("dart_bulkzip_done",
-                         allf.drop_duplicates(["year", "report", "stmt"]), "shared",
-                         domain="dart", source="bulkzip_ledger")
+        _, _base = led_read("dart_bulkzip_done", ["year", "report", "stmt"])
+        led_write("dart_bulkzip_done", _base, new_done, ["year", "report", "stmt"],
+                  domain="dart", source="bulkzip_ledger")
         new_done = []
 
     kept: List[pd.DataFrame] = []
@@ -6095,8 +6174,7 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
     cached = VAULT.load_frame("dart_fnltt_major", "shared")
     done: set = set()
     if cached is not None and len(cached):
-        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
-                       cached["reprt_code"].astype(str)))
+        done = keyset(cached, ["corp_code", "bsns_year", "reprt_code"])
         L.info(f"캐시 재사용: DART 주요계정(벌크) {len(cached):,}행 · {len(done):,}조합")
     corps = [str(c) for c in dict.fromkeys(str(c) for c in corps if c)]
     yrs = sorted({int(y) for y in years}, reverse=True)
@@ -6110,8 +6188,9 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
         for r in RQ.values():
             trust_y = bool(filed) and y in (trusted or set())
             _ex = exempt or set()
-            todo = [c for c in corps if (c, y, r) not in done and (c, y, r) not in skip
-                    and (not trust_y or c in _ex or (c, y, r) in filed)]
+            ys = k1(y)
+            todo = [c for c in corps if (c, ys, r) not in done and (c, ys, r) not in skip
+                    and (not trust_y or c in _ex or (c, ys, r) in filed)]
             n_raw += len(todo)
             for grp in chunked(todo, bs):
                 jobs.append((y, r, list(grp)))
@@ -6246,8 +6325,7 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
         if "tier" not in cached.columns:
             cached = cached.copy()
             cached["tier"] = 0                       # 구버전 캐시는 전부 심층 티어였다
-        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int),
-                       cached["reprt_code"].astype(str)))
+        done = keyset(cached, ["corp_code", "bsns_year", "reprt_code"])
         if "fs_kind" in cached.columns:      # ★회사별 재무 기준(별도/연결) 고정 — 혼합 방지
             ck = cached[cached["fs_kind"].astype(str).isin(("OFS", "CFS"))]
             fs_kind_pref = (ck.groupby(ck["corp_code"].astype(str))["fs_kind"]
@@ -6255,19 +6333,9 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
                             .dropna().to_dict())
         L.info(f"캐시 재사용: DART 재무(심층) {len(cached):,}행 · {len(done):,}조합")
     # 음성 캐시 — '데이터 없음' 조합을 90일간 재호출하지 않는다(쿼터 절약)
-    empty_seen = set()
-    neg = VAULT.load_table("dart_empty_log", "shared")
     today_ts = pd.Timestamp(dtm.date.today())
-    if neg is not None and len(neg):
-        neg = neg.copy()
-        neg["tried_at"] = ds_(neg["tried_at"])
-        fresh_neg = neg[(today_ts - neg["tried_at"]).dt.days < EMPTY_RETRY_AFTER_D]
-        empty_seen = set(zip(fresh_neg["corp_code"].astype(str),
-                             fresh_neg["bsns_year"].astype(int),
-                             fresh_neg["reprt_code"].astype(str)))
-        if empty_seen:
-            L.info(f"음성 캐시: '데이터 없음' {len(empty_seen):,}조합은 "
-                   f"{EMPTY_RETRY_AFTER_D}일간 재호출하지 않습니다.")
+    empty_seen, neg = led_read("dart_empty_log", ["corp_code", "bsns_year", "reprt_code"],
+                               ttl_days=EMPTY_RETRY_AFTER_D, what="음성 캐시(재무)")
     rank = {str(c): i for i, c in enumerate(priority)}
     corp_sorted = sorted((str(c) for c in corps), key=lambda c: (rank.get(c, 10 ** 9), c))
     n_all = len(corp_sorted)
@@ -6281,8 +6349,8 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
     have_zip = already or set()
     jobs = [(c, int(y), r) for y in sorted(set(int(v) for v in years), reverse=True)
             for c in corp_sorted for r in RQ.values()
-            if (c, int(y), r) not in done and (c, int(y), r) not in empty_seen
-            and (c, int(y), r) not in have_zip]
+            if (c, k1(y), r) not in done and (c, k1(y), r) not in empty_seen
+            and (c, k1(y), r) not in have_zip]
     if have_zip:
         L.info(f"일괄 ZIP 이 덮은 {len(have_zip):,}조합은 단건 API 대상에서 제외 — "
                f"남은 단건 수집 {len(jobs):,}건")
@@ -6359,20 +6427,14 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
                                       "reprt_code": d[3], "tried_at": today_ts})
                 elif d is not None and len(d):
                     got.append(d)
-    if new_empty:
-        base = neg if neg is not None and len(neg) else None
-        alle = pd.concat([base, pd.DataFrame(new_empty)], ignore_index=True) \
-            if base is not None else pd.DataFrame(new_empty)
-        alle = (alle.sort_values("tried_at")
-                    .drop_duplicates(["corp_code", "bsns_year", "reprt_code"], keep="last"))
-        VAULT.save_table("dart_empty_log", alle, "shared", domain="dart",
-                         source="negative_cache")
-    frames = ([cached] if cached is not None and len(cached) else []) + got
-    if not frames:
+    led_write("dart_empty_log", neg, new_empty,
+              ["corp_code", "bsns_year", "reprt_code"], domain="dart",
+              source="negative_cache")
+    fs = fs_compact(merge_keep(cached, got, _FS_KEEP,
+                               ["corp_code", "bsns_year", "reprt_code", "sj_div",
+                                "account_id", "account_nm"]))
+    if not len(fs):
         return pd.DataFrame(columns=_FS_KEEP)
-    fs = pd.concat([f.reindex(columns=_FS_KEEP) for f in frames], ignore_index=True)
-    fs = fs_compact(fs.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div",
-                                        "account_id", "account_nm"], keep="last"))
     if got:
         # ★샤드 append — 수십만행 테이블을 매 실행마다 통째로 다시 쓰지 않는다
         VAULT.save_shard("dart_fnltt_raw", pd.concat(got, ignore_index=True),
@@ -6573,21 +6635,13 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
     cached = VAULT.load_table("dart_employees", "shared")
     done = set()
     if cached is not None and len(cached):
-        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
+        done = keyset(cached, ["corp_code", "bsns_year"])
         L.info(f"캐시 재사용: 직원현황 {len(cached):,}행")
     # 음성 캐시 — empSttus 는 '사업보고서에만' 있어 진행 중인 연도·비제출 회사는 영구히 빈다.
     # 이걸 기록하지 않으면 매 실행 8,000회를 같은 빈 키에 태운다(하루 한도의 40%).
-    empty_seen: set = set()
-    negE = VAULT.load_table("dart_emp_empty_log", "shared")
     today_ts = pd.Timestamp(dtm.date.today())
-    if negE is not None and len(negE):
-        negE = negE.copy()
-        negE["tried_at"] = ds_(negE["tried_at"])
-        fr = negE[(today_ts - negE["tried_at"]).dt.days < EMPTY_RETRY_AFTER_D]
-        empty_seen = set(zip(fr["corp_code"].astype(str), fr["bsns_year"].astype(int)))
-        if empty_seen:
-            L.info(f"음성 캐시: 직원현황 '데이터 없음' {len(empty_seen):,}조합은 "
-                   f"{EMPTY_RETRY_AFTER_D}일간 재호출하지 않습니다.")
+    empty_seen, negE = led_read("dart_emp_empty_log", ["corp_code", "bsns_year"],
+                                ttl_days=EMPTY_RETRY_AFTER_D, what="음성 캐시(직원현황)")
     rank = {str(c): i for i, c in enumerate(priority)}
     clist = sorted((str(c) for c in corps), key=lambda c: (rank.get(c, 10 ** 9), c))
     ylist = sorted({int(v) for v in years}, reverse=True)
@@ -6625,7 +6679,7 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
             L.warn("공시목록에서 사업보고서 제출 사실을 찾지 못해 사전 소거를 건너뜁니다.")
     # ★사실 기반 소거 ②: 이미 받은 것 + 서버가 '없다'고 답한 것
     jobs = [(c, y) for (c, y) in universe
-            if (c, y) not in done and (c, y) not in empty_seen]
+            if (c, k1(y)) not in done and (c, k1(y)) not in empty_seen]
     n_target = len(universe)
     n_have = n_target - len(jobs)
     if RUN_MODE == "CACHED":
@@ -6698,21 +6752,15 @@ def harvest_dart_employees(corps: Sequence[str], years: Sequence[int],
                                       "tried_at": today_ts})
                 elif r:
                     got.append(r)
-    if new_empty:
-        alle = pd.concat([negE, pd.DataFrame(new_empty)], ignore_index=True) \
-            if negE is not None and len(negE) else pd.DataFrame(new_empty)
-        VAULT.save_table("dart_emp_empty_log",
-                         alle.sort_values("tried_at")
-                             .drop_duplicates(["corp_code", "bsns_year"], keep="last"),
-                         "shared", domain="dart", source="negative_cache")
-    frames = ([cached] if cached is not None and len(cached) else []) + \
-             ([pd.DataFrame(got)] if got else [])
-    if not frames:
+    led_write("dart_emp_empty_log", negE, new_empty, ["corp_code", "bsns_year"],
+              domain="dart", source="negative_cache")
+    # ★rcept_no 를 스키마에 넣어야 한다 — 반환 스키마에는 없지만 아래 knowledge_date
+    #   계산의 유일한 입력이다. 빼면 merge_keep 의 reindex 가 조용히 떨어뜨리고,
+    #   전 행의 공표일이 '법정기한 추정'으로 밀린다(PIT 가 통째로 보수화된다).
+    E = merge_keep(cached, got, list(empty.columns) + ["rcept_no"],
+                   ["corp_code", "bsns_year"])
+    if not len(E):
         return empty
-    E = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"],
-                                                             keep="last")
-    if "rcept_no" not in E.columns:
-        E["rcept_no"] = ""
     E["period_end"] = ds_(E["bsns_year"].astype(int).astype(str) + "-12-31")
     E["knowledge_date"] = [_kd_from_rcept(rn, RQ["FY"], int(y))
                            for rn, y in zip(E["rcept_no"], E["bsns_year"])]
@@ -6801,7 +6849,7 @@ def _filed_scan(disc: Optional[pd.DataFrame]) -> Tuple[set, set]:
         if r is None:
             exempt.add(c)
             continue
-        filed.add((c, int(y), r))
+        filed.add((c, k1(y), r))
     return filed, exempt
 
 
@@ -6851,8 +6899,11 @@ def _apply_filed(jobs: Sequence, filed: Optional[set], trusted: Optional[set],
         return list(jobs)
     tr = trusted if trusted is not None else set()
     ex = exempt if exempt is not None else set()
+    # ★jobs 는 정수 연도를 유지한다(그대로 API 파라미터가 된다). 집합 조회 시점에만
+    #   keyset() 규약(전부 문자열)으로 맞춘다 — 규약이 하나여야 조용한 불일치가 없다.
     return [j for j in jobs
-            if int(j[yi]) not in tr or str(j[0]) in ex or tuple(j) in filed]
+            if int(j[yi]) not in tr or str(j[0]) in ex
+            or tuple(k1(x) for x in j) in filed]
 
 
 # ★★보고서명 실측(2015~2026 · 141만행)으로 교정한 분류 규칙.
@@ -7214,13 +7265,10 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = -1,
             L.warn(f"공시목록 저장 실패 — 완주 원장을 쓰지 않고 다음 실행이 재시도합니다: "
                    f"{type(e).__name__}: {e}")
             done_new = []
-    if done_new:
-        _st = VAULT.load_table("dart_disc_done_spec", "shared")
-        _new = pd.DataFrame(done_new, columns=["ym", "key"])
-        _all = pd.concat([_st, _new], ignore_index=True) \
-            if _st is not None and len(_st) else _new
-        VAULT.save_table("dart_disc_done_spec", _all.drop_duplicates(["ym", "key"]), "shared",
-                         domain="dart", source="sweep_complete_month_type")
+    _, _stb = led_read("dart_disc_done_spec", ["ym", "key"])
+    led_write("dart_disc_done_spec", _stb,
+              [{"ym": a, "key": b} for a, b in done_new], ["ym", "key"],
+              domain="dart", source="sweep_complete_month_type")
     # ★월 원장에 새로 승격하지 않는다 — 유형 선택이 줄어든 실행에서 미완주 월이 완주로
     #   박히면 그 달의 거래소공시가 영구히 사라진다(disc_filed_months 주석 참조).
     #   제출사실 신뢰는 disc_filed_months() 가 A 유형 완주로 직접 계산한다.
@@ -7917,21 +7965,9 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
         L.info(f"캐시 재사용: 국민연금 패널 {len(cached):,}행 · "
                f"{cached['code'].nunique():,}종목")
     # ★원장은 '종목 단위'다 — 한 번 조회하면 그 종목의 전 기간이 한꺼번에 들어오기 때문이다.
-    done_codes: set = set()
-    led = VAULT.load_table("nps_codes_done", "shared")
     today_ts = pd.Timestamp(dtm.date.today())
-    if led is not None and len(led):
-        led = led.copy()
-        led["tried_at"] = ds_(led["tried_at"])
-        # ★규칙 버전 — 검색 질의·정규화·필드 매핑이 바뀌면 옛 원장은 무효다. 안 그러면
-        #   구 규칙으로 '무매칭' 판정된 종목이 90일간 영구 스킵되어, 고쳐 놓고도 0행이 된다.
-        if "rule_ver" not in led.columns:
-            led["rule_ver"] = 0
-        led = led[pd.to_numeric(led["rule_ver"], errors="coerce").fillna(0) >= NPS_RULE_VER]
-        fr = led[(today_ts - led["tried_at"]).dt.days < 90]
-        done_codes = set(fr["code"].astype(str))
-        L.info(f"PACK-N 원장: {len(done_codes):,}종목은 이미 처리(성공·무매칭 포함) — "
-               f"90일간 재조회하지 않습니다.")
+    done_codes, led = led_read("nps_codes_done", "code", ttl_days=90,
+                               rule_ver=NPS_RULE_VER, what="PACK-N")
     names = master.dropna(subset=["code"])
     names = names[names["name"].astype(str).str.strip() != ""]
     rank = {c: i for i, c in enumerate(priority)}
@@ -8070,25 +8106,17 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                         new_led.append({"code": r["_code"], "n_rows": len(r["_rows"]),
                                         "tried_at": today_ts,
                                         "rule_ver": NPS_RULE_VER})
-    if new_led:
-        allf = pd.concat([led, pd.DataFrame(new_led)], ignore_index=True) \
-            if led is not None and len(led) else pd.DataFrame(new_led)
-        VAULT.save_table("nps_codes_done",
-                         allf.sort_values("tried_at").drop_duplicates("code", keep="last"),
-                         "shared", domain="nps", source="code_ledger",
-                         note="처리 완료 종목 — 성공·무매칭 모두 기록(재조회 방지)")
-    frames = ([cached] if cached is not None and len(cached) else []) + \
-             ([pd.DataFrame(got)] if got else [])
-    if not frames:
-        return pd.DataFrame(columns=cols)
-    N = pd.concat(frames, ignore_index=True)
+    N = merge_keep(cached, got, cols, ["code", "month"])
     N["month"] = ds_(N["month"])
-    N = N.dropna(subset=["code", "month"]).drop_duplicates(["code", "month"], keep="last")
+    N = N.dropna(subset=["code", "month"])
     if got:
         VAULT.save_table("nps_corp_monthly", N, "shared", domain="nps",
                          source="data.go.kr NpsBplcInfoInqireServiceV2")
         L.ok(f"국민연금 {len(got):,}행 신규 · 누적 {len(N):,}행 · {N['code'].nunique():,}종목")
-    return N.reindex(columns=cols)
+    # ★원장은 데이터 저장 뒤에 쓴다 — 먼저 쓰면 저장 실패 시 그 종목은 영구 스킵된다.
+    led_write("nps_codes_done", led, new_led, "code", domain="nps", source="code_ledger",
+              note="처리 완료 종목 — 성공·무매칭 모두 기록(재조회 방지)")
+    return N
 
 
 # ── PACK-P: 조달청 낙찰 ─────────────────────────────────────────────────────────────────────
@@ -8106,9 +8134,9 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
     if cached is not None and len(cached):
         L.info(f"캐시 재사용: 조달 낙찰 {len(cached):,}행")
     # ★완주 월 원장 — 페이지 도중 한도 소진으로 반쪽만 받은 월을 완료로 오인하지 않는다
-    done_tbl = VAULT.load_table("g2b_done_months", "shared")
-    have = set(done_tbl["ym"].astype(str)) if done_tbl is not None and len(done_tbl) else \
-        (set(cached["ym"].astype(str)) if cached is not None and len(cached) else set())
+    have, done_tbl = led_read("g2b_done_months", "ym", what="PACK-P 조달")
+    if not have and cached is not None and len(cached):
+        have = set(cached["ym"].astype(str))
     todo = [m for m in months if m.strftime("%Y%m") not in have]
     if RUN_MODE == "CACHED":
         todo = []
@@ -8164,21 +8192,13 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
                     got += r
                 if ok_ym:
                     done_new.append(ok_ym)
-    if done_new:
-        base = done_tbl if done_tbl is not None and len(done_tbl) else None
-        alld = pd.concat([base, pd.DataFrame({"ym": done_new})], ignore_index=True) \
-            if base is not None else pd.DataFrame({"ym": done_new})
-        VAULT.save_table("g2b_done_months", alld.drop_duplicates("ym"), "shared",
-                         domain="procure", source="sweep_complete_months")
-    frames = ([cached] if cached is not None and len(cached) else []) + \
-             ([pd.DataFrame(got)] if got else [])
-    if not frames:
-        return pd.DataFrame(columns=cols)
-    G = pd.concat(frames, ignore_index=True).drop_duplicates()
+    G = merge_keep(cached, got, cols, cols)
     if got:
         VAULT.save_table("g2b_awards_monthly", G, "shared", domain="procure",
                          source="data.go.kr ScsbidInfoService")
-    return G.reindex(columns=cols)
+    led_write("g2b_done_months", done_tbl, [{"ym": y} for y in done_new], "ym",
+              domain="procure", source="sweep_complete_months")
+    return G
 
 
 # ── PACK-X: 관세청 수출 (HS 매핑 테이블이 있어야 활성) ──────────────────────────────────────
@@ -8353,21 +8373,19 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
                               on_done=lambda: bar.update(1)):
                 if r:
                     got += r
-    frames = ([cached] if cached is not None and len(cached) else []) + \
-             ([pd.DataFrame(got)] if got else [])
-    if not frames:
+    X = merge_keep(cached, got, cols, ["ym", "hs", "cc"])
+    if not len(X):
         if jobs:
             _st, _hd = NET_LAST.get(key_src, ("—", ""))
             L.warn(f"관세 통관 0행 — 마지막 응답 {_st} · {str(_hd)[:150]}")
-        return pd.DataFrame(columns=cols)
-    X = pd.concat(frames, ignore_index=True).drop_duplicates(["ym", "hs", "cc"])
+        return X
     if got:
         VAULT.save_table("customs_hs_monthly", X, "shared", domain="customs",
                          source="data.go.kr:1220000/nitemtrade")
         L.ok(f"관세 통관 {len(got):,}행 신규 · 누적 {len(X):,}행 · "
              f"HS {X['hs'].nunique():,}개 · 국가 {X['cc'].nunique():,}개 "
              f"(호출 {len(jobs):,}회 — 월축이었다면 {len(jobs)*12:,}회)")
-    return X.reindex(columns=cols)
+    return X
 
 
 # ── PACK-D: 공시 원문 텍스트 (Lazy Prices) ──────────────────────────────────────────────────
@@ -8430,11 +8448,7 @@ def harvest_doc_texts(disc: pd.DataFrame, master: pd.DataFrame,
                               on_done=lambda: bar.update(1)):
                 if r:
                     got += r
-    frames = ([cached] if cached is not None and len(cached) else []) + \
-             ([pd.DataFrame(got)] if got else [])
-    if not frames:
-        return pd.DataFrame(columns=cols)
-    T = pd.concat(frames, ignore_index=True).drop_duplicates(["rcept_no", "sec"], keep="last")
+    T = merge_keep(cached, got, cols, ["rcept_no", "sec"])
     if got:
         VAULT.save_table("doc_bow_sections", T, "shared", domain="doctext", source="opendart")
     return T
@@ -11299,9 +11313,7 @@ def main() -> dict:
         fs_zip = harvest_dart_bulk_zip(code2corp_all, years)
         zip_have = set()
         if fs_zip is not None and len(fs_zip):
-            zip_have = set(zip(fs_zip["corp_code"].astype(str),
-                               fs_zip["bsns_year"].astype(int),
-                               fs_zip["reprt_code"].astype(str)))
+            zip_have = keyset(fs_zip, ["corp_code", "bsns_year", "reprt_code"])
         # ★직원현황을 재무 단건보다 먼저 — 재무는 일괄 ZIP 이라는 무한도 대체재가 있지만
         #   직원현황은 대체재가 없다(오직 이 API 뿐). '대체 불가'가 예산의 우선권을 갖는다.
         #   size_bucket 이 전부 '규모미상'이 되면 C11 셀이 (월,산업)으로 붕괴해 규모 통제가
