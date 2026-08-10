@@ -234,10 +234,12 @@ def main() -> dict:
                 LOG.warn("여유 공간이 3GB 미만입니다. RESEARCH_DOWNLOAD_PDF=False 를 권합니다.")
         VAULT.load_index("shared")
         VAULT.load_index("private")
-        adopt_dirs = []
-        for d in GDRIVE_ADOPT_DIRS:
-            adopt_dirs.append(d if os.path.isabs(d) else os.path.join(os.path.dirname(VAULT.root), d))
-        adopt_dirs += [VAULT.root] + list(VAULT.mirrors)
+        # ★ 캐시 루트·미러를 스캔 대상에 넣지 않는다. 그 안의 파일은 이미 인덱스에 있고,
+        #   blob 은 내용해시 2단이라 드라이브 FUSE 에서 열거만 수 시간이다(실제로 여기서 멈췄다).
+        #   외부에 모아둔 리포트 폴더만 스캔한다. 상대경로는 드라이브 루트 기준으로 푼다.
+        _base = os.path.dirname(VAULT.root)
+        adopt_dirs = [d if os.path.isabs(d) else os.path.join(_base, d)
+                      for d in GDRIVE_ADOPT_DIRS]
         VAULT.adopt_scan(adopt_dirs)
         DQUOTA = DartQuota(VAULT)
         globals()["DQUOTA"] = DQUOTA

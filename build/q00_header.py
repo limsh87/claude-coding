@@ -92,7 +92,8 @@ GDRIVE_SHARED_NS   = "_shared"     # → {ROOT}/_shared   (공용 — 전략 간
 GDRIVE_PRIVATE_NS  = "qvf_v1"      # → {ROOT}/qvf_v1    (전용 — 이 전략)
 
 #  ▸ 읽기 전용 미러. 로컬 D: 드라이브나 예전 캐시 폴더를 여기에 넣으면 탐색 대상에 포함됩니다.
-#    (존재하지 않는 경로는 조용히 무시됩니다. OS 가 달라도 안전합니다)
+#    ★ 없는 경로는 자동으로 건너뜁니다. D: 가 없는 PC나 Colab 에서는 구글드라이브만 탐색하며,
+#      "로컬 미러 없음 — 드라이브만 탐색" 이라고 로그에 명시합니다. 설정을 지울 필요 없습니다.
 CACHE_MIRROR_ROOTS = [
     "D:/quant_cache", "D:/tcd_cache", "D:/qvf_cache", "D:/cache",
     "E:/quant_cache",
@@ -100,11 +101,20 @@ CACHE_MIRROR_ROOTS = [
     # "/내가/쓰던/캐시/폴더",
 ]
 
-#  ▸ 이미 리포트를 모아둔 폴더가 있으면 여기에 추가하세요. 재귀 스캔해서 '등록만' 합니다.
+#  ▸ 이미 리포트를 모아둔 '외부' 폴더가 있으면 여기에 추가하세요. 재귀 스캔해서 '등록만' 합니다.
 #    (파일을 옮기거나 지우지 않습니다. 경로/해시만 인덱스에 기록 — adopt-by-reference)
+#    ★ 캐시 루트 자신(_shared/blob 등)은 넣지 마세요 — 이미 인덱스에 있고, 내용해시 2단 디렉터리라
+#      드라이브 FUSE 에서 최대 65,536개 폴더를 열거하게 되어 몇 시간씩 멈춘 것처럼 보입니다.
+#      코드가 관리 트리는 자동으로 제외하지만, 애초에 넣지 않는 것이 가장 안전합니다.
 GDRIVE_ADOPT_DIRS = [
     "research", "reports", "consensus", "hankyung", "naver_research",
 ]
+
+#  ▸ 기존 리포트 폴더 스캔 제어. 드라이브는 파일당 왕복 지연이 커서 상한이 반드시 필요합니다.
+#    한 번 스캔한 디렉터리는 mtime 체크포인트로 기억해 다음 실행에서 건너뜁니다(이어받기).
+ADOPT_SCAN_ENABLED     = True
+ADOPT_SCAN_MAX_FILES   = 120_000    # 이 개수를 넘으면 중단하고 다음 실행에서 이어받습니다
+ADOPT_SCAN_MAX_SECONDS = 240        # 시간 예산. 초과 시 깨끗하게 중단하고 진행률을 보고합니다
 
 #  ▸ 드라이브를 못 찾았을 때의 로컬 폴백(그때만 쓰기 대상이 됩니다).
 LOCAL_CACHE_ROOT  = "./qvf_cache"

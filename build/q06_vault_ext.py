@@ -48,6 +48,24 @@ def _expand(p: str) -> str:
         return str(p)
 
 
+def _same_place_key(p: str):
+    """경로의 '실체' 식별자. 문자열 비교로는 같은 폴더를 두 번 걷는 것을 못 막는다.
+
+    ★ Colab 은 /content/drive/MyDrive 와 /content/drive/My Drive 를 '둘 다' 만든다.
+      realpath 가 서로 다르게 나오므로 문자열 dedup 이 실패하고, 같은 트리를 두 번 스캔한다.
+      드라이브 FUSE 에서 그건 그대로 2배의 시간이다. (st_dev, st_ino) 가 있으면 그걸 쓰고,
+      없으면 'My Drive' → 'MyDrive' 정규화한 realpath 로 떨어진다.
+    """
+    try:
+        st = os.stat(p)
+        if st.st_ino:
+            return ("ino", st.st_dev, st.st_ino)
+    except Exception:
+        pass
+    rp = os.path.realpath(p).replace("/My Drive/", "/MyDrive/").replace("\\My Drive\\", "\\MyDrive\\")
+    return ("path", os.path.normcase(rp))
+
+
 def _drive_mount_points() -> List[Tuple[str, str]]:
     """(마운트경로, 라벨) 후보. Colab / Windows / macOS / Linux 전부를 커버한다.
     존재하지 않는 경로는 호출자가 걸러낸다."""
@@ -164,11 +182,11 @@ def qvf_resolve_roots() -> Tuple[str, str, List[str]]:
     if os.path.isdir(lf) and os.path.realpath(lf) != os.path.realpath(write_root):
         mirrors.append(lf)
 
-    seen, uniq = set(), []
+    seen, uniq = {_same_place_key(write_root)}, []
     for m in mirrors:
-        rp = os.path.realpath(m)
-        if rp not in seen:
-            seen.add(rp)
+        k = _same_place_key(m)
+        if k not in seen:
+            seen.add(k)
             uniq.append(m)
     return write_root, mode, uniq
 
@@ -179,11 +197,31 @@ class QVFVault(Vault):
     def __init__(self, root: str, mode: str, mirrors: Optional[Sequence[str]] = None,
                  promote_tables: bool = True):
         super().__init__(root, mode)
-        self.mirrors: List[str] = [m for m in (mirrors or []) if os.path.isdir(m)]
+        # ★ 미러 중복제거는 생성자에서도 한 번 더 한다. qvf_resolve_roots 만 믿으면, 다른 경로로
+        #   생성자를 부르는 순간(테스트·재구성) 같은 트리를 두 번 읽고 인덱스가 두 배가 된다.
+        #   Colab 의 MyDrive / "My Drive" 처럼 문자열은 다른데 실체가 같은 경우가 실제로 있다.
+        _seen = {_same_place_key(self.root)}
+        _keep: List[str] = []
+        _dupes: List[str] = []
+        for m in (mirrors or []):
+            if not m or not os.path.isdir(m):
+                continue
+            k = _same_place_key(m)
+            if k in _seen:
+                _dupes.append(m)
+                continue
+            _seen.add(k)
+            _keep.append(m)
+        if _dupes:
+            LOG.info(f"쓰기루트와 같은 실체를 가리키는 미러 {len(_dupes)}개를 제외했습니다 "
+                     f"(같은 트리를 두 번 읽지 않습니다): {_trunc(', '.join(_dupes[:3]), 60)}")
+        self.mirrors: List[str] = _keep
         self.promote_tables = bool(promote_tables)
         self._mirror_idx: Dict[str, pd.DataFrame] = {}
         self.table_src: Dict[str, str] = {}          # 어느 루트가 이 테이블을 줬는가(감사용)
         self._own_only = False                       # compact 중 미러 행을 배제하기 위한 스위치
+        self._merged: Dict[str, pd.DataFrame] = {}   # 미러 병합 결과 캐시(더티 시 무효화)
+        self._uidpath: Dict[str, Dict[str, Tuple[str, str, str]]] = {}   # uid → 경로
 
     # ── 쓰기 경로 구조적 봉인 ----------------------------------------------------------
     def _wpath(self, path: str) -> str:
@@ -267,8 +305,13 @@ class QVFVault(Vault):
         own = super().load_index(scope, force=force)
         if self._own_only:
             return own
+        if not force:
+            cached = self._merged.get(scope)
+            if cached is not None:
+                return cached
         mir = self._load_mirror_index(scope)
         if mir.empty:
+            self._merged[scope] = own
             return own
         o = own.copy()
         if "_root" not in o.columns:
@@ -287,6 +330,7 @@ class QVFVault(Vault):
         with self._lk:
             self._idx[scope] = merged
             self._uidset[scope] = set(merged["uid"].astype(str).tolist())
+            self._merged[scope] = merged
         return merged
 
     # ── 다중루트 읽기 -------------------------------------------------------------------
@@ -345,6 +389,243 @@ class QVFVault(Vault):
                     continue
         return None
 
+    # ── O(1) 인덱스 계층 -----------------------------------------------------------------
+    #  ★ 공용 Vault 는 규모를 가정하지 않고 짜여 있다. 30만 행 인덱스 + 수만 건 blob 조회에서는
+    #    그 가정이 그대로 병목이 된다. 세 곳을 상수시간으로 내린다(코어는 손대지 않는다):
+    #      ① has()      : _pending 리스트 선형탐색 → uid 집합 조회. 신규 uid n 건이면 O(n²)→O(n)
+    #      ② load_index : 호출마다 미러 재병합 → 더티 플래그 캐시
+    #      ③ get_blob   : 전 인덱스 불리언 마스크 → uid→경로 사전
+    def _register(self, scope: str, rec: dict):
+        super()._register(scope, rec)
+        self._merged.pop(scope, None)
+        self._uidpath.pop(scope, None)
+
+    def has(self, scope: str, uid: str) -> bool:
+        if scope not in self._uidset:
+            self.load_index(scope)
+        with self._lk:
+            # _register 가 이미 _uidset 에 넣으므로 pending 을 따로 훑을 필요가 없다.
+            return str(uid) in self._uidset.get(scope, set())
+
+    def _uid_path_map(self, scope: str) -> Dict[str, Tuple[str, str, str]]:
+        m = self._uidpath.get(scope)
+        if m is not None:
+            return m
+        idx = self.load_index(scope)
+        m = {}
+        if len(idx):
+            root_col = (idx["_root"].astype(str) if "_root" in idx.columns
+                        else pd.Series([self.root] * len(idx), index=idx.index))
+            for u, ap, rel, rt in zip(idx["uid"].astype(str),
+                                      idx.get("abs_path", pd.Series([""] * len(idx))).astype(str),
+                                      idx.get("path", pd.Series([""] * len(idx))).astype(str),
+                                      root_col):
+                m[u] = (ap, rel, rt if rt and rt != "nan" else self.root)
+        self._uidpath[scope] = m
+        return m
+
+    def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:
+        ent = self._uid_path_map(scope).get(str(uid))
+        if ent is None:
+            return None
+        ap, rel, base = ent
+        cands = [ap]
+        if rel and rel not in ("", "nan"):
+            cands.append(os.path.join(base, rel))
+            if base != self.root:
+                cands.append(os.path.join(self.root, rel))
+        for c in cands:
+            try:
+                if c and c not in ("", "nan") and os.path.exists(c):
+                    return open(c, "rb").read()
+            except Exception:
+                continue
+        return None
+
+    # ── 기존 리포트 폴더 흡수 (드라이브 FUSE 안전판) --------------------------------------
+    _MANAGED_DIRNAMES = {"blob", "table", "index", "_backup", "_locks", "reports"}
+    _SKIP_DIRNAMES = {".git", "__pycache__", ".ipynb_checkpoints", "node_modules",
+                      ".cache", ".Trash", "$RECYCLE.BIN", "System Volume Information"}
+
+    def _managed_keys(self) -> set:
+        """쓰기루트·미러의 관리 트리. 여기는 이미 인덱스에 있으므로 절대 걷지 않는다."""
+        out = set()
+        for r in [self.root] + list(self.mirrors):
+            out.add(_same_place_key(r))
+            for ns in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS):
+                p = os.path.join(r, ns)
+                if os.path.isdir(p):
+                    out.add(_same_place_key(p))
+        return out
+
+    def adopt_scan(self, dirs: Sequence[str], max_files: int = None,
+                   max_seconds: float = None) -> pd.DataFrame:
+        """기존에 모아둔 리포트를 '등록만' 한다. 이동·개명·삭제 없음.
+
+        ★ 사용자의 실제 Colab 실행이 여기서 멈췄다. 원인은 하나가 아니라 넷이 겹친 것이었다:
+          ① 캐시 루트 자신을 스캔했다 → blob 은 내용해시 2단이라 최대 65,536개 디렉터리이고
+             드라이브 FUSE 에서 listdir 한 번이 50~200ms 다. 열거만 1~2시간인데,
+             그 파일들은 '이미 인덱스에 있는 것'이라 전부 무의미한 작업이다.
+          ② /content/drive/MyDrive 와 /content/drive/My Drive 를 중복 스캔했다.
+          ③ 파일마다 getsize() 로 FUSE 왕복이 한 번 더 붙었다.
+          ④ 코어의 max_files 상한은 안쪽 for 만 끊고 os.walk 는 계속 돌았다.
+        → 관리 트리 프루닝 + 실체 기준 중복제거 + scandir 1회 stat + '진짜' 상한 +
+          디렉터리 mtime 체크포인트(재실행 시 이어받기) + 진행률 출력.
+        """
+        max_files = int(ADOPT_SCAN_MAX_FILES if max_files is None else max_files)
+        max_seconds = float(ADOPT_SCAN_MAX_SECONDS if max_seconds is None else max_seconds)
+        if not ADOPT_SCAN_ENABLED:
+            LOG.info("ADOPT_SCAN_ENABLED=False — 기존 리포트 폴더 스캔을 건너뜁니다 "
+                     "(인덱스에 이미 등록된 자료는 그대로 사용됩니다).")
+            return pd.DataFrame(columns=["abs_path", "kind", "name"])
+
+        managed = self._managed_keys()
+        roots, skipped_missing, skipped_managed = [], [], []
+        seen_keys = set()
+        for d in dirs:
+            if not d:
+                continue
+            e = _expand(d)
+            if not os.path.isdir(e):
+                skipped_missing.append(d)
+                continue
+            k = _same_place_key(e)
+            if k in managed:
+                skipped_managed.append(e)
+                continue
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            roots.append(e)
+
+        if skipped_missing:
+            LOG.info(f"존재하지 않는 스캔 경로 {len(skipped_missing)}개는 건너뜁니다"
+                     f"(로컬 D: 가 없는 환경에서는 정상): "
+                     f"{_trunc(', '.join(skipped_missing[:4]), 70)}")
+        if skipped_managed:
+            LOG.info(f"캐시 관리 트리 {len(skipped_managed)}개는 스캔 대상에서 제외합니다 — "
+                     f"이미 인덱스에 있고, blob 은 내용해시 2단 구조라 드라이브에서 열거만 "
+                     f"수 시간이 걸립니다.")
+        if not roots:
+            LOG.info("스캔할 외부 리포트 폴더가 없습니다. (기존 인덱스는 그대로 사용됩니다)")
+            return pd.DataFrame(columns=["abs_path", "kind", "name"])
+
+        # 디렉터리 mtime 체크포인트 — 바뀌지 않은 폴더는 다시 걷지 않는다
+        ckpt: Dict[str, float] = {}
+        cdf = self.get_table("qvf_adopt_scan_state", scope="private")
+        if cdf is not None and len(cdf):
+            try:
+                ckpt = dict(zip(cdf["dirpath"].astype(str),
+                                pd.to_numeric(cdf["mtime"], errors="coerce").fillna(-1.0)))
+            except Exception:
+                ckpt = {}
+            LOG.info(f"이전 스캔 체크포인트 {len(ckpt):,}개 디렉터리 — 변경되지 않은 폴더는 "
+                     f"다시 걷지 않습니다.")
+
+        t0 = time.time()
+        found: List[dict] = []
+        new_ckpt: Dict[str, float] = dict(ckpt)
+        n_files = n_dirs = n_skipped_dirs = 0
+        stopped = ""
+
+        for root in roots:
+            if stopped:
+                break
+            LOG.info(f"기존 리포트 폴더 스캔: {root}")
+            stack = [root]
+            while stack:
+                if time.time() - t0 > max_seconds:
+                    stopped = f"시간 예산 {max_seconds:.0f}초 초과"
+                    break
+                if n_files >= max_files:
+                    stopped = f"파일 상한 {max_files:,}건 도달"
+                    break
+                cur = stack.pop()
+                try:
+                    st_m = os.stat(cur).st_mtime
+                except Exception:
+                    continue
+                n_dirs += 1
+                if n_dirs % 200 == 0:
+                    LOG.info(f"  … 디렉터리 {n_dirs:,} · 파일 {n_files:,} · "
+                             f"{time.time()-t0:.0f}초 경과")
+                unchanged = (abs(ckpt.get(cur, -1.0) - st_m) < 1e-6)
+                new_ckpt[cur] = st_m
+                try:
+                    with os.scandir(cur) as it:
+                        for ent in it:
+                            try:
+                                if ent.is_dir(follow_symlinks=False):
+                                    nm = ent.name
+                                    if (nm.startswith(".") or nm in self._MANAGED_DIRNAMES
+                                            or nm in self._SKIP_DIRNAMES):
+                                        n_skipped_dirs += 1
+                                        continue
+                                    if _same_place_key(ent.path) in managed:
+                                        n_skipped_dirs += 1
+                                        continue
+                                    stack.append(ent.path)
+                                    continue
+                                if unchanged:
+                                    continue          # 내용이 안 바뀐 폴더의 파일은 건너뛴다
+                                low = ent.name.lower()
+                                if low.endswith(".pdf"):
+                                    kind = "report_pdf"
+                                elif low.endswith((".parquet", ".jsonl", ".json", ".csv")) and \
+                                        any(t in low for t in
+                                            ("report", "consensus", "research", "analyst",
+                                             "hankyung", "naver", "dart", "krx", "price",
+                                             "ohlcv", "universe", "fnltt")):
+                                    kind = "table_like"
+                                else:
+                                    continue
+                                try:
+                                    sz = ent.stat(follow_symlinks=False).st_size
+                                except Exception:
+                                    sz = -1
+                                found.append({"abs_path": ent.path, "kind": kind,
+                                              "name": ent.name, "dir": cur, "bytes": sz})
+                                n_files += 1
+                                if n_files >= max_files:
+                                    break
+                            except Exception:
+                                continue
+                except Exception as e:                              # noqa
+                    LOG.debug(f"  디렉터리 열람 실패({type(e).__name__}): {cur}")
+                    continue
+
+        dur = time.time() - t0
+        if not found:
+            LOG.info(f"새로 등록할 리포트 파일이 없습니다 (디렉터리 {n_dirs:,}개 · {dur:.1f}초"
+                     + (f" · {stopped}" if stopped else "") + "). "
+                     f"이미 인덱스에 있는 자료는 그대로 사용됩니다.")
+        else:
+            df = pd.DataFrame(found)
+            for r in df.itertuples(index=False):
+                m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)
+                ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+                self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",
+                           subtype=r.kind, key=r.name, source="preexisting_drive_cache",
+                           event_date=ed, knowledge_date=ed, scope="shared",
+                           extra={"dir": r.dir})
+            self.flush("shared")
+            LOG.ok(f"기존 리포트 {len(df):,}건을 공용 인덱스에 '참조 등록'했습니다 "
+                   f"(파일은 원위치 그대로, 이동·삭제 없음) — "
+                   f"디렉터리 {n_dirs:,}개 · {dur:.1f}초")
+
+        if stopped:
+            LOG.warn(f"스캔을 중단했습니다: {stopped}. 여기까지의 체크포인트를 저장했으므로 "
+                     f"다음 실행에서 걷지 않은 폴더부터 이어받습니다. 상한을 늘리려면 "
+                     f"ADOPT_SCAN_MAX_FILES / ADOPT_SCAN_MAX_SECONDS 를 조정하세요.")
+        try:
+            self.put_table("qvf_adopt_scan_state",
+                           pd.DataFrame({"dirpath": list(new_ckpt.keys()),
+                                         "mtime": list(new_ckpt.values())}),
+                           scope="private", domain="index", source="adopt_scan checkpoint")
+        except Exception as e:                                      # noqa
+            LOG.debug(f"스캔 체크포인트 저장 실패({type(e).__name__}) — 기능에 영향 없음")
+        return pd.DataFrame(found) if found else pd.DataFrame(columns=["abs_path", "kind", "name"])
+
     def compact(self, scope: str):
         """★ 미러 행을 드라이브 인덱스에 쓰면 안 된다.
 
@@ -361,16 +642,24 @@ class QVFVault(Vault):
             self._own_only = keep
             self._idx.pop(scope, None)      # 합쳐진 조회용 뷰를 다음 조회에서 재구성
             self._uidset.pop(scope, None)
+            self._merged.pop(scope, None)
+            self._uidpath.pop(scope, None)
 
     def report_roots(self):
         rows = [["쓰기 루트 (신규 수집분 저장)", self.root, self.mode]]
         for m in self.mirrors:
             rows.append(["읽기 전용 미러", m, "탐색만 — 절대 쓰지 않음"])
+        missing = [m for m in CACHE_MIRROR_ROOTS if not os.path.isdir(_expand(m))]
+        if missing:
+            rows.append(["(없음 — 건너뜀)", _trunc(", ".join(missing), 44),
+                         "이 환경에 없는 경로. 정상입니다"])
         LOG.table(rows, ["역할", "경로", "비고"], ["l", "l", "l"],
                   title="캐시 루트 구성 (로컬·드라이브 양쪽 탐색 → 신규는 드라이브에만 기록)")
         if not self.mirrors:
-            LOG.info("읽기 전용 미러가 없습니다. 로컬 D: 등에 기존 캐시가 있다면 "
-                     "CACHE_MIRROR_ROOTS 에 경로를 추가하세요(탐색만 하고 절대 쓰지 않습니다).")
+            LOG.info("읽기 전용 미러가 없습니다 — 구글드라이브만 탐색합니다. "
+                     "로컬 D: 가 없는 PC나 Colab 에서는 정상이며, 기능에 영향이 없습니다. "
+                     "다른 PC의 로컬 캐시를 함께 쓰려면 CACHE_MIRROR_ROOTS 에 경로를 "
+                     "추가하세요(탐색만 하고 절대 쓰지 않습니다).")
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
