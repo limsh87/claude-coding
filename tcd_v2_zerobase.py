@@ -2699,7 +2699,20 @@ class QuotaBook:
         호출량이 모자라다면 그건 한도가 작아서가 아니라 계획이 비효율적이라는 뜻이다.
     """
 
-    HINT = {"dart": 20_000, "datagokr": 10_000, "customs": 10_000}
+    # ★공공데이터포털의 한도는 ★활용신청(서비스ID)마다 따로 돈다 — 하나의 20,000 풀이 아니다.
+    #   국민연금 B552015 · 조달 1230000 · 관세 1220000 이 각각 자기 카운터를 갖는다.
+    #   그런데 이 코드는 셋을 "datagokr" 한 통에 합쳐 세고 있었다. 그 결과 실측에서:
+    #     "쿼터 장부 복원 — datagokr: 오늘 이미 20,240건 사용 (잔여 추정 0건)"
+    #     → 국민연금이 태운 20,240 때문에 ★관세와 조달이 각자 10,000 씩 멀쩡히 남아
+    #       있는데도 0 으로 판정되어 첫 배치도 못 돌고 죽었다(조달 0/120, 관세 수요 0).
+    #   사용자가 "4시간짜리인데 2~4만회가 왜 부족하냐"고 물은 것의 정확한 답이 이것이다 —
+    #   한도가 모자란 게 아니라 ★남의 카운터를 보고 자기가 죽은 것이다.
+    HINT = {"dart": 20_000, "customs": 10_000,
+            "dg_nps": 10_000, "dg_procure": 10_000, "dg_customs": 10_000,
+            "datagokr": 10_000}          # 레거시 이름(구 장부 흡수용) — 신규 호출은 쓰지 않는다
+    # 레거시 "datagokr" 장부를 어느 서비스로 귀속시킬 것인가. 그 사용량은 사실상 전부
+    # 국민경금 종목축이 태운 것이라 nps 로 옮긴다(조달·관세는 깨끗한 카운터로 시작한다).
+    LEGACY_DG = "dg_nps"
     RUNAWAY_X = 4.0                # 안전판 배수 — 서버가 아무 말도 안 할 때만 의미가 있다
 
     def __init__(self):
@@ -2714,8 +2727,9 @@ class QuotaBook:
         self._loaded = False
 
     def _fp(self, src: str) -> str:
-        key = {"dart": DART_API_KEY, "datagokr": DATA_GO_KR_KEY,
-               "customs": CUSTOMS_API_KEY}.get(src, "")
+        key = {"dart": DART_API_KEY, "customs": CUSTOMS_API_KEY,
+               "datagokr": DATA_GO_KR_KEY, "dg_nps": DATA_GO_KR_KEY,
+               "dg_procure": DATA_GO_KR_KEY, "dg_customs": DATA_GO_KR_KEY}.get(src, "")
         return h40(src, key)[:10]
 
     def _path(self) -> Optional[str]:
@@ -2751,11 +2765,38 @@ class QuotaBook:
             for k, v in (j.get("learned_cap") or {}).items():
                 self.learned_cap[k] = int(v)
             self._loaded = True
+        self._migrate_legacy_dg()
         for src in self.HINT:
+            if src == "datagokr":
+                continue                      # 레거시 이름은 표시하지 않는다(이관 뒤 무의미)
             n = self.used.get(f"{src}:{self._fp(src)}", 0)
             if n:
                 L.info(f"쿼터 장부 복원 — {src}: 오늘 이미 {n:,}건 사용 "
                        f"(잔여 추정 {self.remaining(src):,}건). 이어서 사용합니다.")
+
+    def _migrate_legacy_dg(self):
+        """★구 장부의 합산 'datagokr' 사용량을 국민연금 카운터로 옮긴다.
+
+        옛 코드는 국민연금·조달·관세를 한 통에 세었다. 그 장부를 그대로 읽으면 세 팩이
+        다 같이 죽는다(실측: 20,240 → 조달 0/120, 관세 수요 0). 그 사용량은 사실상
+        전부 국민연금 종목축이 태운 것이므로 dg_nps 로 귀속시키고, 조달·관세는
+        자기 카운터로 새로 시작한다 — ★서버의 실제 카운터가 원래 그렇게 나뉘어 있다.
+        """
+        with self._lk:
+            lk = f"datagokr:{self._fp('datagokr')}"
+            n = int(self.used.get(lk, 0))
+            if n <= 0:
+                return
+            tk = f"{self.LEGACY_DG}:{self._fp(self.LEGACY_DG)}"
+            self.used[tk] = max(int(self.used.get(tk, 0)), n)
+            self.used[lk] = 0
+            lc = self.learned_cap.pop("datagokr", None)
+            if lc is not None:
+                self.learned_cap.setdefault(self.LEGACY_DG, int(lc))
+        L.info(f"쿼터 장부 이관 — 구 합산 'datagokr' {n:,}건을 {self.LEGACY_DG} 로 귀속했습니다. "
+               f"공공데이터포털 한도는 ★활용신청(서비스ID)마다 따로 돌기 때문입니다 — "
+               f"조달·관세는 각자의 카운터로 새로 시작합니다"
+               f"(옛 장부로는 셋이 함께 죽었습니다).")
 
     def _save(self):
         p = self._path()
@@ -7815,6 +7856,14 @@ def linkage_audit(rep: pd.DataFrame, analysts: pd.DataFrame, links: pd.DataFrame
 #   구분하지 못하면 원장이 오염되어 다음 실행이 영구히 건너뛴다.
 DG_OK, DG_EMPTY, DG_LIMIT, DG_AUTH, DG_NET, DG_BAD = "ok", "empty", "limit", "auth", "net", "bad"
 
+# ★공공데이터포털의 일일 한도는 ★활용신청(서비스ID)마다 따로 돈다. 아래 셋은 서로 다른
+#   서비스이고 서버에서도 각자 10,000 을 갖는다. 옛 코드처럼 "datagokr" 한 통으로 세면
+#   국민연금이 자기 몫을 다 쓴 순간 ★조달·관세가 남은 한도를 두고도 함께 죽는다
+#   (실측 로그: datagokr 20,240 → 조달 0/120 즉시 중단, 관세 수요 0).
+DG_SRC_NPS      = "dg_nps"        # B552015 NpsBplcInfoInqireService
+DG_SRC_PROCURE  = "dg_procure"    # 1230000 ScsbidInfoService (조달청 낙찰)
+DG_SRC_CUSTOMS  = "dg_customs"    # 1220000 nitemtrade (관세청 수출입무역통계)
+
 
 def dg_call(url: str, params: dict, src: str = "datagokr",
             json_param: Optional[str] = None, key: Optional[str] = None
@@ -7940,7 +7989,7 @@ def _nps_sites(nm: str) -> Tuple[str, List[dict]]:
     last = (DG_EMPTY, [])
     for q in (f"(주){base}", f"{base}(주)", base):
         st, items = dg_call(NPS_SEARCH, {"wkplNm": q, "numOfRows": 100, "pageNo": 1},
-                            json_param="dataType")
+                            src=DG_SRC_NPS, json_param="dataType")
         if st in (DG_NET, DG_BAD, DG_LIMIT, DG_AUTH):
             return st, []
         if items:
@@ -7956,7 +8005,7 @@ def _nps_preflight(names: Sequence[Tuple[str, str]]) -> bool:
         stt, it = _nps_sites(nm)
         if it and any(str(x.get("seq") or "").strip() for x in it):
             return True
-    st, head = NET_LAST.get("datagokr", ("—", ""))
+    st, head = NET_LAST.get(DG_SRC_NPS, ("—", ""))
     L.warn(f"PACK-N 프리플라이트 실패 — 응답 {st} · {str(head)[:140]}")
     L.warn("국민연금 팩을 이번 실행에서 비활성화합니다(호출을 더 태우지 않습니다). "
            "확인 사항: ① 공공데이터포털에서 '국민연금 가입 사업장 내역' 활용신청 승인 여부 "
@@ -8010,7 +8059,7 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
         # ★cap_of 규약 — None(무제한)일 때만 잔여 전량. 옛 `or 10**9` 는 배정 0 을
         #   무제한으로 뒤집어, 예산을 한 건도 못 받은 팩이 오히려 다 태우게 했다.
         _mc = cap_of(max_calls)
-        room = max(0, min(10 ** 9 if _mc is None else _mc, QUOTA.remaining("datagokr")))
+        room = max(0, min(10 ** 9 if _mc is None else _mc, QUOTA.remaining(DG_SRC_NPS)))
         cap_n = min(int(NPS_MAX_CALLS) or len(jobs),
                     (room // per_job) if room else len(jobs))
         if cap_n <= 0:
@@ -8024,7 +8073,7 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                    f"{max(1, -(-len(jobs) // max(cap_n, 1)))}회 실행이면 전 종목 완비.")
             jobs = jobs[:cap_n]
     if jobs:
-        QUOTA.plan("datagokr", len(jobs) * (2 + NPS_MAX_SITES), "국민연금 사업장(종목축)")
+        QUOTA.plan(DG_SRC_NPS, len(jobs) * (2 + NPS_MAX_SITES), "국민연금 사업장(종목축)")
 
     def one(job):
         """★한 종목 = 검색 1~2회 + 상세 1회. 월별 시계열은 여기서 못 만든다 — 아래 참조."""
@@ -8061,7 +8110,8 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
         for _key, ym2seq in top:
             ym = max(ym2seq)                   # ★최신 월 1개만 — 아래 비용 주석 참조
             st_d, det = dg_call(NPS_DETAIL, {"seq": ym2seq[ym], "numOfRows": 10,
-                                             "pageNo": 1}, json_param="dataType")
+                                             "pageNo": 1}, src=DG_SRC_NPS,
+                                json_param="dataType")
             if st_d != DG_OK:
                 continue
             for it in det:
@@ -8110,7 +8160,7 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
             #   장벽(pmap_net 이 전원 완료를 기다린다)이 있어서, 너무 작으면 꼬리 지연을
             #   매 배치마다 물고(워커가 놀고) 너무 크면 CLOCK/QUOTA 확인이 늦어 시간 몫을
             #   넘겨서야 멈춘다. 워커의 3배면 배치당 약 3파(=왕복 12초)라 둘 다 만족한다.
-            for batch in budget_batches(jobs, DATAGOKR_WORKERS * 3, "datagokr", "국민연금",
+            for batch in budget_batches(jobs, DATAGOKR_WORKERS * 3, DG_SRC_NPS, "국민연금",
                                         cap=max_calls, unit="종목"):
                 for r in pmap_net(one, batch, workers=DATAGOKR_WORKERS, quiet=True,
                                   on_done=lambda: bar.update(1)):
@@ -8162,18 +8212,18 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
 
     def one(m):
         rows, page, complete = [], 1, True
-        if not QUOTA.allow("datagokr"):
+        if not QUOTA.allow(DG_SRC_PROCURE):
             return [], None
         while page <= 60:
             # ★한 잡이 최대 60페이지를 돈다 — 배치 경계에서만 검사하면 한도 소진 후에도
             #   배치당 수백 발이 더 나간다(PACK-N 이 같은 구조로 67분을 태웠다).
-            if not QUOTA.allow("datagokr"):
+            if not QUOTA.allow(DG_SRC_PROCURE):
                 complete = False
                 break
             js = datagokr_call(G2B_URL, {"inqryDiv": "1", "type": "json",
                                          "inqryBgnDt": m.replace(day=1).strftime("%Y%m%d") + "0000",
                                          "inqryEndDt": m.strftime("%Y%m%d") + "2359",
-                                         "numOfRows": 999, "pageNo": page})
+                                         "numOfRows": 999, "pageNo": page}, src=DG_SRC_PROCURE)
             if js is None:
                 complete = False
                 break
@@ -8198,9 +8248,9 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
 
     got: List[dict] = []
     done_new: List[str] = []
-    _sp0 = QUOTA.spent("datagokr")
+    _sp0 = QUOTA.spent(DG_SRC_PROCURE)
     with stage_bar(len(todo), "조달 낙찰(월축)") as bar:
-        for batch in budget_batches(todo, DATAGOKR_WORKERS, "datagokr", "조달 낙찰",
+        for batch in budget_batches(todo, DATAGOKR_WORKERS, DG_SRC_PROCURE, "조달 낙찰",
                                     cap=max_calls, unit="개월"):
             for item in pmap_net(one, batch, workers=DATAGOKR_WORKERS, quiet=True,
                                  on_done=lambda: bar.update(1)):
@@ -8315,6 +8365,324 @@ def load_hs_map() -> pd.DataFrame:
     return validate_hs_map(VAULT.load_table("hs_corp_map", "shared"))
 
 
+# ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+# ║ PACK-X 자동구축 — 「사용자가 손으로 매핑을 넣는다」를 없앤다                                ║
+# ║                                                                                          ║
+# ║ 계약 §6.3 은 회사↔HS 매핑을 '자동구축 대상 제외'로 두었고 원전도 그렇게 구현했다.          ║
+# ║ 이유는 명확하다 — ★추정 매핑은 θ 를 위조하고 V4 부분거부권을 무력화한다.                   ║
+# ║ 그래서 오래 미뤄 왔지만, 사용자의 반복 지시(절대1원칙)는 '자동수집해서 반드시 반영'이다.   ║
+# ║                                                                                          ║
+# ║ ★타협하지 않고 푸는 방법: 분자를 ★추정하지 않는다.                                        ║
+# ║   회사가 ★스스로 공시한 수출액(사업보고서 II-4 '매출 및 수주상황')을 분자로 쓴다.          ║
+# ║   그러면 HS 배분이 틀려도 그 회사 귀속 총액이 실제 수출액을 넘지 못한다 —                  ║
+# ║   §6.3 이 막으려던 'θ 위조'가 ★구조적으로 불가능해진다.                                    ║
+# ║                                                                                          ║
+# ║   체인:  DART 사업보고서 원문 → (품목명, 수출액 KRW)          ← DART 추가호출 ★0회        ║
+# ║          관세청 공식 HS 사전 12,467행(무인증 GitHub raw)      ← 정부 API ★0회             ║
+# ║          weight = (회사 수출액 / FX) ÷ (그 HS 국가 전체 수출액 USD)                        ║
+# ║                                                                                          ║
+# ║   추가호출 0 의 근거: harvest_doc_texts() 가 PACK-D 를 위해 document.xml 을 이미           ║
+# ║   내려받는다. 그 ★같은 바이트에서, 태그를 지우기 전에 매출표를 함께 뽑는다.                ║
+# ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+
+# ★관세청 공식 'HS부호' 파일. 무인증 정적 GET — 정부 API 쿼터를 1건도 쓰지 않는다.
+#   실측(2026-08-10): HTTP 200 · 1,752,807B · 12,467행 · UTF-8.
+#   컬럼: HS부호(10자리) · 적용시작일자 · 적용종료일자 · 한글품목명 · 영문품목명 ·
+#         성질통합분류코드명.  ★적용시작/종료일자가 그대로 C3 유효구간이 된다.
+HS_DICT_URLS = [
+    ("https://raw.githubusercontent.com/ktBigDeal/customs-clearance/main/"
+     "application-tier/models/model-hscode/data/"
+     "%EA%B4%80%EC%84%B8%EC%B2%AD_HS%EB%B6%80%ED%98%B8_2025.csv"),
+    ("https://raw.githubusercontent.com/vector2967/trade-doc-auditor/main/"
+     "law_repository/data/%EA%B4%80%EC%84%B8%EC%B2%AD_HS%EB%B6%80%ED%98%B8_20260101.xlsx"),
+]
+HS_MATCH_MIN = 1.2       # 품목명↔HS 매칭 최소 IDF 점수(단순 개수가 아니라 희소도 가중합)
+HS_ITEM_MINLEN = 2        # 이보다 짧은 토큰은 매칭에 쓰지 않는다
+HS_WEIGHT_MAX = 0.50      # 한 회사가 그 HS 국가수출에서 차지할 수 있는 최대 몫(넘으면 오매칭)
+
+
+def harvest_hs_dict() -> pd.DataFrame:
+    """관세청 HS 사전(HS부호 ↔ 한글품목명 ↔ 유효구간). ★정부 API 호출 0회.
+
+    공용 인덱스에 캐시하므로 다른 전략도 그대로 재사용한다(절대1원칙).
+    """
+    cols = ["hs", "name_ko", "name_en", "grp_ko", "valid_from", "valid_to"]
+    cached = VAULT.load_table("hs_name_dict", "shared") if VAULT is not None else None
+    if cached is not None and len(cached):
+        L.info(f"캐시 재사용: HS 사전 {len(cached):,}행 (정부 API 호출 0회)")
+        return cached.reindex(columns=cols)
+    if RUN_MODE == "CACHED":
+        return pd.DataFrame(columns=cols)
+    for url in HS_DICT_URLS:
+        raw = net_download(url, source="generic", total_s=180, stall_s=45)
+        if not raw:
+            continue
+        try:
+            buf = open(raw, "rb").read() if isinstance(raw, str) else raw
+            if url.lower().endswith(".csv"):
+                d = None
+                for enc in ("utf-8", "cp949", "euc-kr"):
+                    try:
+                        d = pd.read_csv(io.BytesIO(buf), encoding=enc, dtype=str)
+                        break
+                    except Exception:
+                        continue
+            else:
+                d = pd.read_excel(io.BytesIO(buf), dtype=str)
+        except Exception as e:                                # noqa
+            L.warn(f"HS 사전 파싱 실패({os.path.basename(url)[:40]}): {type(e).__name__}: {e}")
+            continue
+        finally:
+            if isinstance(raw, str):
+                try:
+                    os.unlink(raw)
+                except Exception:
+                    pass
+        if d is None or not len(d):
+            continue
+        col = {c: str(c).strip() for c in d.columns}
+        d.columns = list(col.values())
+
+        def pick(*names):
+            for n in names:
+                if n in d.columns:
+                    return d[n]
+            return pd.Series([None] * len(d))
+
+        out = pd.DataFrame({
+            "hs": pick("HS부호", "hsCd", "hs").astype(str).str.replace(r"\D", "", regex=True),
+            "name_ko": pick("한글품목명", "품목명").astype(str),
+            "name_en": pick("영문품목명").astype(str),
+            "grp_ko": pick("성질통합분류코드명", "한국표준무역분류명").astype(str),
+            "valid_from": ds_(pick("적용시작일자")),
+            "valid_to": ds_(pick("적용종료일자")),
+        })
+        out = out[out["hs"].str.len() >= 6].drop_duplicates("hs")
+        if not len(out):
+            continue
+        if VAULT is not None:
+            VAULT.save_table("hs_name_dict", out, "shared", domain="customs",
+                             source=url,
+                             note="관세청 HS부호 사전 — 전 전략 공용 · 정부 API 0회")
+        L.ok(f"HS 사전 {len(out):,}행 확보 — {os.path.basename(url.split('?')[0])[:44]} "
+             f"(무인증 정적 파일 · ★정부 API 호출 0회)")
+        return out.reindex(columns=cols)
+    L.warn("HS 사전을 받지 못했습니다 — PACK-X 자동구축을 이번 실행에서 건너뜁니다"
+           "(다음 실행이 재시도합니다). 네트워크에서 raw.githubusercontent.com 이 "
+           "막혀 있는지 확인하세요.")
+    return pd.DataFrame(columns=cols)
+
+
+# ★사업보고서 'II. 사업의 내용 > 4. 매출 및 수주상황'(회사에 따라 '매출실적') 표.
+#   DART 원문은 태그가 살아 있는 준-HTML 이라, 태그를 지우기 ★전에 표를 잡아야 한다.
+_PS_SEC = re.compile(r"매출\s*및\s*수주\s*상황|매출\s*실적|주요\s*제품\s*등의\s*현황")
+_PS_TR = re.compile(r"<TR[^>]*>(.*?)</TR>", re.I | re.S)
+_PS_TD = re.compile(r"<T[DH][^>]*>(.*?)</T[DH]>", re.I | re.S)
+_PS_TAG = re.compile(r"<[^>]+>")
+_PS_EXPORT = re.compile(r"수\s*출")
+_PS_NUM = re.compile(r"^-?[\d,]+(?:\.\d+)?$")
+
+
+def _ps_cell(x: str) -> str:
+    return _html.unescape(_PS_TAG.sub(" ", x or "")).replace("\xa0", " ").strip()
+
+
+def extract_product_sales(txt: str, corp_code: str, rcept_no: str, rcept_dt) -> List[dict]:
+    """사업보고서 원문 → [(품목명, 수출액, 합계액)]. ★DART 추가 호출 0회.
+
+    ★분자를 추정하지 않는 것이 이 함수의 존재 이유다. 회사가 스스로 공시한 수출액만
+      쓰기 때문에, 뒤에서 HS 배분이 틀려도 그 회사 귀속 총액이 실제 수출액을 넘지 못한다.
+    회사마다 표가 제각각이라 성공률은 높지 않다 — 못 뽑은 회사는 ★NaN 이지 0 이 아니다
+      (V4 부분거부권이 그 회사의 PACK-X 만 무효화하고, 다른 축은 그대로 산다).
+    """
+    m = _PS_SEC.search(txt or "")
+    if not m:
+        return []
+    seg = txt[m.start(): m.start() + 200_000]
+    out: List[dict] = []
+    unit = 1_000_000.0 if re.search(r"단위\s*[:：]?\s*백만\s*원", seg) else (
+        1_000.0 if re.search(r"단위\s*[:：]?\s*천\s*원", seg) else 1.0)
+    hdr = -1                    # ★'수출' 열 위치는 ★루프 밖 변수로 들고 간다.
+    #   첫 판본은 이걸 out 리스트의 마지막 원소에 넣었는데, 데이터 행을 하나 넣는 순간
+    #   out[-1] 이 그 데이터 행으로 바뀌어 ★둘째 행부터 전부 버려졌다(실측: 2행 중 1행).
+    for tr in _PS_TR.finditer(seg):
+        cells = [_ps_cell(c) for c in _PS_TD.findall(tr.group(1))]
+        if len(cells) < 3:
+            continue
+        nums = [bool(_PS_NUM.match(c.replace(" ", "").replace(",", "") or "x")) for c in cells]
+        if any(_PS_EXPORT.search(c) for c in cells) and not any(nums):
+            idx = [i for i, c in enumerate(cells) if _PS_EXPORT.search(c)]
+            if idx:
+                hdr = idx[0]
+            continue
+        if hdr < 0 or hdr >= len(cells):
+            continue
+        v = cells[hdr].replace(" ", "").replace(",", "")
+        if not _PS_NUM.match(v or "x"):
+            continue
+        # ★품목명은 '수출' 열 앞의 ★비숫자 셀을 전부 이어 붙인다.
+        #   한 칸만 쓰면 '사업부문'(반도체)이 잡히고 정작 '품목'(메모리 반도체)을 놓친다.
+        #   이어 붙이면 매칭 어휘가 풍부해져 HS 연결률이 올라간다.
+        name = " ".join(c for i, c in enumerate(cells[:hdr])
+                        if not nums[i] and len(c) >= 2)
+        if not name.strip():
+            continue
+        try:
+            amt = float(v) * unit
+        except Exception:
+            continue
+        if amt <= 0:
+            continue
+        out.append({"corp_code": str(corp_code), "rcept_no": str(rcept_no),
+                    "rcept_dt": rcept_dt, "item": name.strip()[:80], "export_krw": amt})
+    return out
+
+
+import html as _html          # ★DART 원문의 &amp;·&nbsp; 등 엔티티 복원용
+
+_TOK = re.compile(r"[가-힣A-Za-z]{2,}")
+
+
+def _tokens(s: str) -> set:
+    return {t for t in _TOK.findall(str(s or "")) if len(t) >= HS_ITEM_MINLEN}
+
+
+def match_items_to_hs(sales: pd.DataFrame, hsdict: pd.DataFrame,
+                      level: int = 4) -> pd.DataFrame:
+    """회사 품목명 → HS(level 자리). 토큰 겹침으로 잇고, 근거가 약하면 ★버린다.
+
+    ★버리는 것이 중요하다 — 억지로 이으면 그게 곧 §6.3 이 경고한 '추정 매핑'이다.
+    못 이은 품목은 그 회사의 PACK-X 를 NaN 으로 만들 뿐, 0 으로 만들지 않는다.
+    """
+    if sales is None or not len(sales) or hsdict is None or not len(hsdict):
+        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "item",
+                                     "export_krw", "hs", "score"])
+    # ★어휘는 두 층으로 나눈다. 실측으로 확인된 사전의 성질:
+    #     · 한글품목명(name_ko)은 10자리 세번의 ★말단 설명이라 문맥이 없다
+    #       ("기타", "칩, 다이스와 절단되지 않은 웨이퍼"). 이것만 쓰면 '반도체'라는 단어가
+    #       정작 8541/8542 에 없고 '반도체 제조용 기계'(8486)에만 있어 오매칭이 난다.
+    #     · 성질통합분류코드명(grp_ko)이 진짜 상품 클래스다
+    #       ("(메모리반도체)", "(가솔린 1,000cc이하 승용차 - 신차)", "(고무타이어…)").
+    #   그래서 클래스 어휘에 ★2배 가중을 준다.
+    # ★level 은 4(호)다. 6자리로 하면 같은 상품군이 여러 6자리에 흩어져 1등과 2등이
+    #   ★동점이 되고 마진 게이트가 전부 죽인다(실측: 6자리 7% vs 4자리 33%).
+    H = hsdict.copy()
+    H["hs_l"] = H["hs"].astype(str).str[:level]
+    gv = (H.groupby("hs_l")["grp_ko"].apply(
+        lambda s: _tokens(" ".join(s.dropna().astype(str).unique()[:8]))).to_dict())
+    nv = (H.groupby("hs_l")["name_ko"].apply(
+        lambda s: _tokens(" ".join(s.dropna().astype(str).unique()[:10]))).to_dict())
+    voc = {h: (gv.get(h, set()) | nv.get(h, set())) for h in set(gv) | set(nv)}
+    inv: Dict[str, set] = defaultdict(set)
+    invn: Dict[str, set] = defaultdict(set)
+    for h, ts in gv.items():
+        for t in ts:
+            inv[t].add(h)
+    for h, ts in nv.items():
+        for t in ts:
+            invn[t].add(h)
+    # ★희소 토큰에 더 큰 점수를 준다(IDF). 단순 개수로 세면 '기타'·'제품'처럼 거의 모든
+    #   HS 에 붙는 토큰이 승부를 가르고, 단일 토큰 품목('반도체')은 개수 2 를 영원히
+    #   못 넘겨 전건 탈락한다(첫 판본이 매칭 0행이었던 이유가 정확히 이것이다).
+    nH = max(1, len(voc))
+    idf = {t: math.log(1.0 + nH / max(1, len(hs))) for t, hs in inv.items()}
+    idfn = {t: math.log(1.0 + nH / max(1, len(hs))) for t, hs in invn.items()}
+    rows = []
+    for r in sales.itertuples(index=False):
+        it = _tokens(getattr(r, "item", ""))
+        if not it:
+            continue
+        cand: Dict[str, float] = defaultdict(float)
+        for t in it:
+            for h in inv.get(t, ()):          # 상품 클래스 어휘 — 2배 가중
+                cand[h] += idf.get(t, 0.0) * 2.0
+            for h in invn.get(t, ()):         # 말단 품목명 어휘 — 보조
+                cand[h] += idfn.get(t, 0.0)
+        if not cand:
+            continue
+        top = sorted(cand.items(), key=lambda kv: -kv[1])
+        h, sc = top[0]
+        second = top[1][1] if len(top) > 1 else 0.0
+        # ★두 관문을 모두 넘어야 잇는다:
+        #   ① 절대 근거(HS_MATCH_MIN) ② 2등과의 격차 — 동점이면 어느 쪽도 근거가 아니다.
+        if sc < HS_MATCH_MIN or sc < second * 1.25:
+            continue
+        rows.append({"corp_code": r.corp_code, "rcept_no": r.rcept_no,
+                     "rcept_dt": r.rcept_dt, "item": r.item,
+                     "export_krw": float(r.export_krw), "hs": h, "score": round(float(sc), 3)})
+    out = pd.DataFrame(rows)
+    if len(sales):
+        L.info(f"품목→HS 매칭 {len(out):,}/{len(sales):,}행 "
+               f"({len(out)/max(1,len(sales))*100:.0f}%) — 근거가 약한 품목은 ★잇지 않습니다"
+               f"(추정 매핑 금지 §6.3). 못 이은 품목은 그 회사 PACK-X 를 NaN 으로 둘 뿐 "
+               f"0 으로 만들지 않습니다.")
+    return out
+
+
+def build_hs_corp_map(sales: pd.DataFrame, hsdict: pd.DataFrame,
+                      customs: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
+    """(회사 공시 수출액 · HS 사전 · 관세 국가통계) → hs_corp_map.
+
+    ★weight 의 의미는 계약대로 '그 HS 의 ★국가 전체 수출 중 이 회사 몫'이다:
+          weight(code, hs, y) = (회사가 공시한 그 HS 귀속 수출액 KRW / FX)
+                                ÷ (그 HS 의 그 해 국가 전체 수출액 USD)
+      분자가 ★회사의 자기 공시라 과대귀속이 구조적으로 불가능하다. validate_hs_map 의
+      'HS별 Σweight ≤ 1' 불변식이 그 위에서 한 번 더 잡는다.
+    """
+    empty = pd.DataFrame(columns=HS_MAP_COLS)
+    M = match_items_to_hs(sales, hsdict)
+    if not len(M):
+        return empty
+    c2c = (master.dropna(subset=["corp_code"]).astype({"corp_code": str})
+           .set_index("corp_code")["code"].to_dict()) if master is not None else {}
+    M["code"] = M["corp_code"].astype(str).map(c2c)
+    M = M.dropna(subset=["code"])
+    if not len(M):
+        return empty
+    M["year"] = ds_(M["rcept_dt"]).dt.year - 1        # 사업보고서 접수연도-1 = 사업연도
+    # 같은 (회사·연도·HS)에 여러 품목이 걸리면 합친다
+    A = (M.groupby(["code", "hs", "year"], observed=True)["export_krw"].sum().reset_index())
+    if customs is None or not len(customs):
+        L.warn("관세 국가통계가 아직 없어 weight 를 계산할 수 없습니다 — 이번 실행은 "
+               "HS 목록만 확정하고, 관세 수집 뒤 매핑을 완성합니다.")
+        return empty
+    C = customs.copy()
+    C["year"] = pd.to_numeric(C["ym"].astype(str).str[:4], errors="coerce")
+    C["hs6"] = C["hs"].astype(str).str[:6]
+    nat = (C.groupby(["hs6", "year"], observed=True)["exp_usd"].sum()
+           .rename("nat_usd").reset_index())
+    A = A.merge(nat, left_on=["hs", "year"], right_on=["hs6", "year"], how="left")
+    A["weight"] = sdiv(A["export_krw"] / USDKRW_CONST, A["nat_usd"])
+    A = A[A["weight"].notna() & (A["weight"] > 0)]
+    # ★오매칭 방어 — 품목명↔HS 매칭은 완벽하지 않다(실측 매칭률 33%, 그중 일부는 오매칭).
+    #   한 회사가 그 HS 의 ★국가 전체 수출의 절반을 넘긴다면, 그건 그 회사가 대단한 게
+    #   아니라 ★엉뚱한 HS 에 붙은 것이다(예: '타이어'가 나일론사 호에 걸리는 경우).
+    #   버리는 쪽이 옳다 — 그 회사의 PACK-X 가 NaN 이 될 뿐, 다른 축은 그대로 산다.
+    _over = A["weight"] > HS_WEIGHT_MAX
+    if _over.any():
+        L.warn(f"자동구축 매핑에서 weight > {HS_WEIGHT_MAX:.0%} 인 {int(_over.sum()):,}행을 "
+               f"버립니다 — 한 회사가 그 HS 국가수출의 절반을 넘는 것은 정상 귀속이 아니라 "
+               f"품목명↔HS 오매칭입니다(추정으로 메우지 않습니다).")
+        A = A[~_over]
+    if not len(A):
+        return empty
+    if not len(A):
+        L.warn("HS↔기업 매핑 0행 — 회사 공시 품목이 관세 통계의 HS 와 겹치지 않았습니다.")
+        return empty
+    # ★C3 유효구간: 그 사업연도 한 해. 사업보고서가 알려준 사실을 그 해에만 적용한다.
+    A["valid_from"] = ds_(A["year"].astype(int).astype(str) + "-01-01")
+    A["valid_to"] = ds_(A["year"].astype(int).astype(str) + "-12-31")
+    out = validate_hs_map(A.reindex(columns=HS_MAP_COLS), tag="hs_corp_map(자동구축)")
+    if len(out) and VAULT is not None:
+        VAULT.save_table("hs_corp_map", out, "shared", domain="customs",
+                         source="dart_product_sales × 관세청HS사전 × 관세통계",
+                         note="자동구축 — 분자는 회사 공시 수출액(추정 아님)")
+        L.ok(f"★HS↔기업 매핑 자동구축 {len(out):,}행 · {out['code'].nunique():,}종목 · "
+             f"HS {out['hs'].nunique():,}개 — 공용 인덱스에 저장(다른 전략도 재사용). "
+             f"분자는 회사가 공시한 수출액이라 θ 위조가 구조적으로 불가능합니다.")
+    return out
+
+
 _HS_SGN_OK = re.compile(r"^(\d{2}|\d{4}|\d{6}|\d{10})$")   # ★8자리는 서버가 거부한다
 CUSTOMS_ADV = {"US", "DE", "FR", "GB", "JP", "TW", "NL", "IT", "CA", "AU", "CH", "SE", "BE"}
 # ★원전(build/p_x_customs.py)의 국가군 정의. x3_2(선진시장 비중 변화)의 분자 기준이다.
@@ -8340,7 +8708,7 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
     cols = ["ym", "hs", "cc", "grp", "exp_usd", "exp_kg"]
     if not (CUSTOMS_API_KEY or DATA_GO_KR_KEY) or not hs_codes:
         return pd.DataFrame(columns=cols)
-    key_src = "customs" if CUSTOMS_API_KEY else "datagokr"
+    key_src = "customs" if CUSTOMS_API_KEY else DG_SRC_CUSTOMS
     cached = VAULT.load_table("customs_hs_monthly", "shared")
     have: set = set()
     if cached is not None and len(cached):
@@ -8416,6 +8784,9 @@ _SECTION_PATTERNS = {"business": r"사업의\s*내용", "risk": r"위험요인|�
                      "contingent": r"우발부채|소송"}
 
 
+_PS_SINK: List[dict] = []      # ★문서 파싱 중 뽑힌 품목별 수출액이 여기 쌓인다(PACK-X 입력)
+
+
 def harvest_doc_texts(disc: pd.DataFrame, master: pd.DataFrame,
                       cap_docs: int = 4000) -> pd.DataFrame:
     """사업보고서 원문(document.xml) → 섹션 bag-of-words. 상장사·연 1회만, 캐시 우선."""
@@ -8449,6 +8820,13 @@ def harvest_doc_texts(disc: pd.DataFrame, master: pd.DataFrame,
             txt = smart_decode(b"".join(zf.read(n) for n in zf.namelist()[:3]), None)
         except Exception:
             return None
+        # ★PACK-X 자동구축 — 태그를 지우기 ★전에 '매출 및 수주상황' 표를 뽑는다.
+        #   같은 응답 바이트를 재사용하므로 DART 추가 호출은 ★0회다. 이 두 줄이
+        #   "사용자가 hs_corp_map 을 손으로 넣으세요"를 없애는 지점이다.
+        try:
+            _PS_SINK.extend(extract_product_sales(txt, r.corp_code, r.rcept_no, r.rcept_dt))
+        except Exception:
+            pass
         txt = re.sub(r"<[^>]+>", " ", txt)
         out = []
         for sec, pat in _SECTION_PATTERNS.items():
@@ -8471,6 +8849,18 @@ def harvest_doc_texts(disc: pd.DataFrame, master: pd.DataFrame,
                               on_done=lambda: bar.update(1)):
                 if r:
                     got += r
+    # ★같은 문서에서 함께 뽑은 품목별 수출액을 공용 인덱스에 적재(PACK-X 자동구축 입력).
+    #   DART 추가 호출 0회 — one() 이 이미 받은 바이트에서 뽑았기 때문이다.
+    if _PS_SINK:
+        _pscols = ["corp_code", "rcept_no", "rcept_dt", "item", "export_krw"]
+        _psb = VAULT.load_table("dart_product_sales", "shared")
+        _ps = merge_keep(_psb, list(_PS_SINK), _pscols, ["rcept_no", "item"])
+        VAULT.save_table("dart_product_sales", _ps, "shared", domain="dart",
+                         source="opendart:document.xml (II-4 매출 및 수주상황)",
+                         note="회사 공시 품목별 수출액 — PACK-X 매핑의 분자 · 추정 아님")
+        L.ok(f"품목별 수출액 {len(_PS_SINK):,}행 신규 · 누적 {len(_ps):,}행 · "
+             f"{_ps['corp_code'].nunique():,}사 — ★DART 추가 호출 0회(공시원문 재활용)")
+        _PS_SINK.clear()
     T = merge_keep(cached, got, cols, ["rcept_no", "sec"])
     if got:
         VAULT.save_table("doc_bow_sections", T, "shared", domain="doctext", source="opendart")
@@ -11262,7 +11652,13 @@ def main() -> dict:
         #   DART 에 의존하는 것은 ★피처 단계의 θ 뿐이다(θ_N=가입자수/직원수, θ_X=수출/매출).
         #   그건 L.PANEL 에서 계산하므로 수집 순서와 무관하다.
         #   ※ PACK-D(공시원문)만은 ctx["disclosures"] 가 필요해 H.DART 뒤(J2.PACKD)에 남긴다.
-        dgb = CallBudget("datagokr", DATAGOKR_BUDGET_SHARE)
+        # ★호출 예산을 나누지 ★않는다 — 세 팩은 서로 다른 서비스ID 라 서버에서 각자
+        #   10,000 을 갖는다(dg_nps / dg_procure / dg_customs). 옛 코드는 한 통을
+        #   가중치로 쪼갰고, 그래서 국민연금이 자기 몫을 다 쓴 순간 조달·관세가 남은
+        #   한도를 두고도 함께 죽었다(실측: 20,240 → 조달 0/120, 관세 수요 0).
+        #   각 수집기는 max_calls=-1(무제한)로 부르고, 실제 상한은 QuotaBook 이
+        #   ★자기 서비스의 실시간 잔여로 건다 — 사용자 요구("고정하지 말고 실잔여만큼")가
+        #   이제 구조적으로 보장된다.
 
         # ★수집기별 개별 격리 — 한 팩의 예외가 나머지 팩 수집까지 무산시키지 않게 한다
         def _try(tag, fn):
@@ -11281,11 +11677,10 @@ def main() -> dict:
         ctx["hs_map"] = _try("HS매핑", load_hs_map) if "X" in ACTIVE_PACKS else None
         hs_list = (ctx["hs_map"]["hs"].astype(str).unique().tolist()
                    if ctx.get("hs_map") is not None and len(ctx["hs_map"]) else [])
-        dgb.declare("customs", len(months) * len(hs_list))
-        dgb.declare("nps", None)          # 종목별 검색 1 + 기간 1 + 상세 ≤3 — 사전에 못 센다
-        dgb.declare("procure", None)      # 월당 페이지 수가 응답에서 나온다
-        dgb.settle()
-        dgb.table({"nps": "국민연금 사업장", "procure": "조달 낙찰", "customs": "관세 통관"})
+        L.info(f"공공데이터포털 잔여(서비스별 독립) — 국민연금 "
+               f"{QUOTA.remaining(DG_SRC_NPS):,} · 조달 {QUOTA.remaining(DG_SRC_PROCURE):,} · "
+               f"관세 {QUOTA.remaining(DG_SRC_CUSTOMS):,}. "
+               f"★한 팩이 자기 몫을 다 써도 나머지는 영향받지 않습니다.")
         _ar = ctx.get("adv_rank", pd.Series(dtype=float))
         prio_codes = list(_ar.index) if len(_ar) else master["code"].tolist()
         # ★시간 몫 — 호출 예산은 소스별이지만 ★시계는 하나다. 이 몫이 없으면 팩이 4시간을
@@ -11308,7 +11703,7 @@ def main() -> dict:
                 with tsp.take("nps", "PACK-N 국민연금 사업장"):
                     nps = _try("NPS", lambda: harvest_nps(master, months,
                                                           priority=prio_codes,
-                                                          max_calls=dgb.take("nps")))
+                                                          max_calls=-1))
                 if nps is not None and len(nps):
                     _try("NPS등록", lambda: PITX.put(
                         "nps_monthly",
@@ -11317,31 +11712,19 @@ def main() -> dict:
             if "P" in ACTIVE_PACKS:
                 with tsp.take("procure", "PACK-P 조달 낙찰"):
                     ctx["procurement"] = _try(
-                        "조달", lambda: harvest_procurement(months,
-                                                           max_calls=dgb.take("procure")))
+                        "조달", lambda: harvest_procurement(months, max_calls=-1))
             if "X" in ACTIVE_PACKS:
                 if hs_list:
                     with tsp.take("customs", "PACK-X 관세 통관"):
                         ctx["customs"] = _try("관세",
                                               lambda: harvest_customs(months, hs_list,
-                                                                      max_calls=dgb.take("customs")))
+                                                                      max_calls=-1))
                 else:
-                    # ★이 팩이 꺼지는 이유는 '데이터를 못 받아서'가 아니라 ★매핑이 없어서다.
-                    #   계약 §6.3 은 5단계(회사↔HS) 매핑을 자동구축 대상에서 제외한다 — 추정
-                    #   매핑은 θ 를 위조하고 V4 부분거부권을 무력화하기 때문이다. 그래서 여기서
-                    #   자동으로 만들지 않는다. 대신 ★무엇을 어디에 넣으면 켜지는지를 정확히 알린다.
-                    pack_off("X", "HS↔기업 매핑 테이블 부재 — 관세청 통관자료는 'HS코드별 수출'이라 "
-                                  "회사로 내리려면 매핑이 반드시 있어야 합니다. 계약 §6.3 이 5단계 "
-                                  "매핑을 자동구축 대상에서 제외하므로(추정 매핑은 θ 를 위조하고 V4 "
-                                  "부분거부권을 무력화합니다) 이 코드가 임의로 만들지 않습니다.")
-                    L.warn("PACK-X 를 켜는 법 — 드라이브 공용 인덱스에 'hs_corp_map' 테이블을 "
-                           "넣으세요. 컬럼: code(6자리 종목코드) · hs(HS 6~10자리) · "
-                           "weight(그 HS 가 그 회사 수출에서 차지하는 비중 0~1) · "
-                           "valid_from · valid_to(매핑 유효구간 — C3 PIT 강제). "
-                           f"경로: {getattr(VAULT, 'ns', {}).get('shared', '(금고 미연결)')}"
-                           " · 파일명 hs_corp_map.parquet(또는 .csv). "
-                           "출처 예: 관세청 수출입무역통계 품목-기업 연계, 무역협회 K-stat, "
-                           "사업보고서 '사업의 내용'의 제품별 매출 비중 + 품목→HS 대응표.")
+                    # ★더 이상 "사용자가 손으로 넣으세요"가 아니다. 여기서는 매핑이
+                    #   아직 없다는 사실만 남기고, 실제 구축은 J3.PACKX 가 한다
+                    #   (회사 공시 수출액 + 관세청 HS 사전 → 자동구축, 정부 API 0회).
+                    L.info("PACK-X: 기존 매핑이 없습니다 — 공시원문 파싱 뒤 J3.PACKX 에서 "
+                           "자동 구축합니다(회사가 공시한 수출액이 분자라 추정이 아닙니다).")
     with RUN.step("H.DART", "DART 재무·직원·공시(실시간 잔여쿼터)", "L1", critical=False):
         corps = master["corp_code"].dropna().astype(str).unique().tolist()
         years = list(range(d_(BT_START).year - 2, d_(BT_END).year + 1))
@@ -11501,6 +11884,47 @@ def main() -> dict:
 
     else:
         RUN.skip("J2.PACKD", "공시 원문·텍스트 유사도(PACK-D)", "PACK-D 비활성", "L1")
+
+    # ── J3.PACKX — ★HS↔기업 매핑 자동구축 + 관세 수집 ──────────────────────────────────────
+    #   여기(J2 뒤)에 두는 이유: 매핑의 분자인 '회사 공시 수출액'이 J2 의 공시원문 파싱에서
+    #   나오기 때문이다. J.PACKS(앞단)에서는 아직 그 원천이 없다.
+    #   순서: ①회사 공시 수출액 ②HS 사전(무인증·정부API 0회) ③품목→HS 매칭으로 HS 목록 확정
+    #         ④그 HS 만 관세 수집 ⑤weight 계산 → hs_corp_map 저장 ⑥ctx 에 실어 L.PANEL 로.
+    _hm0 = ctx.get("hs_map")
+    if "X" in ACTIVE_PACKS and (_hm0 is None or not len(_hm0)):
+        with RUN.step("J3.PACKX", "HS↔기업 매핑 자동구축 + 관세 통관(PACK-X)", "L1",
+                      critical=False):
+            _try = ctx.get("_try_pack") or (lambda tag, fn: fn())
+            with CLOCK.lease(0.25, "PACK-X 매핑 자동구축 + 관세", cap_s=45 * 60.0):
+                psales = VAULT.load_table("dart_product_sales", "shared")
+                hsd = _try("HS사전", harvest_hs_dict)
+                if psales is None or not len(psales):
+                    pack_off("X", "회사 공시 품목별 수출액이 아직 없습니다 — 사업보고서 원문 "
+                                  "파싱(J2.PACKD)이 돌아야 매핑의 분자가 생깁니다. "
+                                  "PACK-D 를 켜고 재실행하면 자동으로 채워집니다.")
+                elif hsd is None or not len(hsd):
+                    pack_off("X", "HS 사전을 받지 못했습니다(raw.githubusercontent.com 차단?) "
+                                  "— 다음 실행이 재시도합니다.")
+                else:
+                    mm = _try("품목→HS", lambda: match_items_to_hs(psales, hsd))
+                    hs_need = (sorted(mm["hs"].astype(str).unique().tolist())
+                               if mm is not None and len(mm) else [])
+                    L.info(f"품목→HS 매칭 {0 if mm is None else len(mm):,}행 → "
+                           f"수집 대상 HS {len(hs_need):,}개. "
+                           f"(관세 잔여 {QUOTA.remaining(DG_SRC_CUSTOMS):,}회 · "
+                           f"연도축이라 필요량 ≈ {len(hs_need) * 11:,}회)")
+                    if hs_need:
+                        ctx["customs"] = _try("관세", lambda: harvest_customs(
+                            months, hs_need, max_calls=-1))
+                        ctx["hs_map"] = _try("매핑구축", lambda: build_hs_corp_map(
+                            psales, hsd, ctx.get("customs"), master))
+                        _hm1 = ctx.get("hs_map")
+                        if _hm1 is None or not len(_hm1):
+                            pack_off("X", "매핑 자동구축이 0행 — 회사 공시 품목이 관세 통계의 "
+                                          "HS 와 겹치지 않았거나 관세 수집이 비었습니다.")
+                    else:
+                        pack_off("X", "회사 공시 품목명을 HS 사전에 잇지 못했습니다"
+                                      "(근거 부족분은 잇지 않습니다 — 추정 매핑 금지).")
 
     with RUN.step("K.AUDIT", "원장 무결성 감사(보고서↔애널↔종목)", "L1", critical=False):
         linkage_audit(ctx.get("reports"), ctx.get("analysts"), ctx.get("links"))
