@@ -158,7 +158,66 @@ HTTP 수집 감사(소스별 성공률/차단) · 런타임 감사(C10) · 데�
 
 ---
 
-## 7. 개발
+## 7. PHASE 0 — 대체데이터 3축 수집 가능성 검증 (`phase0/`)
+
+전략과 **완전히 분리된** 선행 작업이다. 시가총액 하위 1,000종목 유니버스에 대해 세 개의
+대체데이터 축이 기계적으로 수집 가능한지, 커버리지와 과거 깊이가 얼마인지를 숫자로 재고
+판정표를 만든다. **팩터·시그널·수익률을 일절 계산하지 않는다.**
+
+| 축 | 데이터 | 원재료로서의 용도 |
+|---|---|---|
+| A | DART 임원현황 (`exctvSttus`) | 이사·임원 겸직 네트워크 |
+| B | Google Patents (BigQuery `patents-public-data`) | 기업 단위 특허 품질 지표 |
+| C | 국민연금 사업장 월별 가입자 (data.go.kr) | 월간 고용 flow |
+
+```
+phase0/phase0_altdata_3axis_validation.ipynb   ← 산출물. 코드 셀 1개 (JupyterLab 에서 실행)
+phase0/phase0_altdata_3axis_validation.py      ← 위 셀과 바이트 단위로 동일한 원본
+phase0/phase0_smoke.py                         ← 합성데이터로 전 경로 실행 검증
+tools/make_phase0_notebook.py                  ← .py → .ipynb 생성기 (--check 로 동기화 검사)
+```
+
+```bash
+python3 phase0/phase0_smoke.py                  # 키·네트워크 없이 전 경로 검증
+python3 tools/make_phase0_notebook.py --check   # 노트북이 .py 와 동기화되어 있는지
+python3 tools/make_phase0_notebook.py           # .py 수정 후 노트북 재생성
+```
+
+### 계약을 선언이 아니라 구조로 강제한다
+
+7개 계약(`P0_NO_STRATEGY`, `P0_PIT_UNIVERSE`, `P0_CANARY_FIRST`, `P0_INDEPENDENT_AXES`,
+`P0_FAIL_LOUD`, `P0_NO_HARDCODED_PATH`, `P0_RESUMABLE`)은 주석이 아니다. 실행 첫 단계에서
+**자기 소스를 AST 로 파싱해** 위반을 찾고, 하나라도 걸리면 데이터 수집을 시작하지 않는다.
+
+- `P0_NO_STRATEGY` — 정의된 이름·인자에 `alpha/sharpe/backtest/weight/…` 조각이 있으면 중단
+- `P0_FAIL_LOUD` — `.fillna()/.interpolate()/.ffill()` 호출이 소스에 존재하면 중단
+- `P0_NO_HARDCODED_PATH` — 환경 전용 절대경로 리터럴이 있으면 중단 (`PROJECT_ROOT` 는 런타임 감지)
+- `P0_INDEPENDENT_AXES` — 축 함수 본문이 다른 축의 산출물 전역을 참조하면 중단
+- `SELECT *` 금지 / `get_index_portfolio_deposit_file` 호출 금지(§2.3 영구 실패)도 같은 방식
+
+노트북에는 `__file__` 이 없으므로 이때는 IPython 셀 원문(`In[-1]`)으로 같은 검사를 한다.
+소스를 못 읽으면 조용히 넘어가지 않고 판정표에 "검사 못 함"을 남긴다.
+
+### 이 단계에서 정면으로 측정하는 것들
+
+- **PIT 유니버스** — pykrx 시점별 시가총액이 1순위 경로(상장폐지 종목 포함 → 생존편향 없음).
+  실패 시 FDR 현재 목록으로 폴백하되, 생존편향과 시총 소급적용을 `known_limitations` 에
+  **명시적으로 기록**한다. 조용히 넘어가지 않는다.
+- **축 A 접수일자 PIT** — 응답의 `rcept_no` 앞 8자리가 기준일보다 늦은 레코드는 버리고 개수를 남긴다.
+- **축 B 비용** — 모든 쿼리를 `dry_run` 으로 먼저 재고 100GB 초과면 **실행하지 않는다**.
+  피인용은 "0회 인용"과 "데이터 없음"을 구분할 수 있는 경로를 우선 고른다.
+  `filing_date`(측정 변수)와 `publication_date`(관측 가능성 필터)를 혼용하지 않는다.
+- **축 C 사업자번호 마스킹** — 자릿수 분포를 실제로 세서 C-1 을 Y/N 으로 판정한다.
+  `dataCrtYm` 파라미터가 실제로 먹는지(과거 월을 주는지)까지 확인한다 — 무시된다면 과거 시점
+  측정값은 그 시점의 값이 아니다.
+- **수기 검증** — 겸직 링크 200건 · 사업장 매칭 100건을 CSV 로만 뽑고 게이트는 `PENDING` 이다.
+  정확도 판정은 사람이 한다. 자동 판정하지 않는다.
+
+판정은 **두 기준일(2026-06-30 / 2021-06-30) 중 나쁜 쪽** 기준이다.
+
+---
+
+## 8. 개발
 
 ```
 build/          조각 소스 (계층별)
@@ -174,7 +233,7 @@ python3 tools/smoke.py     # 6개 파일 전부 실제 실행 검증
 
 ---
 
-## 8. 알려진 한계 (숨기지 않는다)
+## 9. 알려진 한계 (숨기지 않는다)
 
 1. **컨센서스 fwd EPS 시계열은 과거 복원이 불가능하다.** D축 `d1` 의 E 는 후행 12M 이익
    대리변수를 쓴다. 초기 구간일수록 오차가 크다. (§16.2)
