@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A26 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A31 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -791,12 +791,164 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A26", "D2 윈저라이즈 기간 분리", a26)
 
+    # ── A27  축 A 결측이 '점수 축소'로 사실상 탈락시키지 않는가 ───────────────────────────
+    def a27():
+        # A10 은 FINAL_SCORE 가 NaN 이 아닌지만 본다. 결측군의 분산이 절반으로 줄면 NaN 은
+        # 아니면서도 상위 N 꼬리에 도달하지 못한다 — 여기서는 **선정률**로 검사한다.
+        rng2 = np.random.default_rng(7)
+        n, cov, K = 600, 0.20, 30
+        P = pd.DataFrame({
+            "code": [f"{i*10:06d}" for i in range(n)],
+            "corp_code": [f"C{i}" for i in range(n)],
+            "asof": [pd.Timestamp("2020-06-01")] * n, "q": ["2020Q1"] * n,
+            "sector": ["기타"] * n, "cell": ["2020Q1|기타"] * n,
+            "cell_all": ["2020Q1|ALL"] * n,
+            "D1_SCORE": rng2.normal(size=n), "D2_SCORE": rng2.normal(size=n),
+            "D3_SCORE": rng2.normal(size=n), "EXCLUDE": 0.0})
+        has_a = rng2.random(n) < cov                       # 축 A 보유 여부 ⟂ 축 B 점수
+        t = rng2.normal(size=n)
+        P["dTONE"] = np.where(has_a, t, np.nan)
+        P["dTONE_resid"] = P["dTONE"]
+        Q = assemble_final(P, use_axes=("A", "D1", "D2", "D3"), use_excl=True)
+        top = Q.nlargest(K, "FINAL_SCORE")
+        share = float(top["dTONE_resid"].notna().mean())
+        ratio = share / max(cov, 1e-9)
+        if Q["FINAL_SCORE"].isna().any():
+            return False, "축 B 가 있는데도 FINAL_SCORE 가 결측인 행이 있습니다"
+        if ratio > 1.6:
+            return False, (f"★축 A 보유 종목이 상위 {K} 를 {ratio:.2f}배 과대점유합니다 "
+                           f"(커버리지 {cov:.0%} · 상위 점유 {share:.0%}). 축 A 결측 행은 "
+                           f"AXIS_A_Z=0 으로 채워져 FINAL 의 분산이 절반이 되고, 선정은 "
+                           f"꼬리에서 일어나므로 NaN 이 아닌데도 구조적으로 밀립니다 — "
+                           f"§7.2 '탈락시키지 말 것'의 실질 위반입니다.")
+        return True, (f"커버리지 {cov:.0%} · 상위 {K} 중 축 A 보유 {share:.0%} "
+                      f"(과대선택 {ratio:.2f}배, 허용 1.6배 이하)")
+
+    _ac("A27", "축 A 결측 종목의 실질 편입률 (§7.2)", a27)
+
+    # ── A28  매도 슬리피지가 폴백(2%)으로 새지 않는가 ─────────────────────────────────────
+    def a28():
+        rb = pd.to_datetime(["2019-03-01", "2019-06-01", "2019-09-01"])
+        codes = [f"{i*10:06d}" for i in range(1, 61)]
+        rows = []
+        for ti, t in enumerate(rb):
+            for i, c in enumerate(codes):
+                # 분기마다 신호를 완전히 뒤집어 100% 회전을 만든다
+                s = (i if ti % 2 == 0 else len(codes) - i) / len(codes)
+                rows.append({"code": c, "asof": t, "adtv60": 5e8, "fwd_ret_1q": 0.0,
+                             "FINAL_RANK": s, "FINAL_SCORE": s, "EXCLUDE": 0.0,
+                             "vol_q": 0.3})
+        P = pd.DataFrame(rows)
+
+        class _U:
+            def delisting_map(self): return {}
+            def audit_row(self, *a, **k): pass
+        bt = run_backtest(P, rb, _U(), None, top_n=10, apply_costs=True, label="A28")
+        R = bt["returns"]
+        cost_q = float(R.loc[R["measurable"], "cost"].mean())
+        # 전 종목 ADTV 가 동일하므로 매수·매도 슬리피지가 같아야 한다.
+        # adv=0 폴백(2%)이 매도 쪽에만 걸리면 비용이 대략 2배 이상으로 뛴다.
+        w, notional = 0.1, 0.1 * ARC_ACCOUNT_KRW
+        sl = arc_slippage(notional, 5e8)
+        expect = 2.0 * 10 * w * (ARC_COMMISSION_BPS / 1e4 + sl) + \
+                 10 * w * arc_sell_tax(rb[1])
+        if cost_q > expect * 1.5:
+            return False, (f"★분기 비용 {cost_q:.4f} 가 기대치 {expect:.4f} 의 1.5배를 "
+                           f"넘습니다. 전량 매도 종목이 advmap 에 없어 슬리피지가 일괄 2% "
+                           f"폴백으로 매겨지고 있습니다 — 회전율이 다른 어블레이션 팔이 "
+                           f"부당한 벌점을 받습니다.")
+        return True, (f"분기 비용 {cost_q:.4f} (기대 {expect:.4f}) · "
+                      f"매도 슬리피지 폴백 없음")
+
+    _ac("A28", "매도 슬리피지 ADTV 폴백 누수", a28)
+
+    # ── A29  Sortino · 파산 경로 방어 ─────────────────────────────────────────────────────
+    def a29():
+        r = np.array([0.12, -0.030, 0.09, -0.0305, 0.11, -0.0298, 0.08, -0.0302] * 3)
+        R = pd.DataFrame({"asof": pd.date_range("2016-03-01", periods=len(r), freq="QS"),
+                          "ret": r, "ret_gross": r, "n": 30, "turnover": 1.0,
+                          "cost": 0.0, "n_elig": 100, "measurable": True})
+        st = perf_stats(R)
+        dd_def = float(np.sqrt((np.minimum(r, 0.0) ** 2).mean()) * math.sqrt(4))
+        want = (st["CAGR"]) / dd_def
+        if abs(st["Sortino"] - want) > 0.05:
+            return False, (f"★Sortino {st['Sortino']:.2f} 가 정의값 {want:.2f} 와 다릅니다. "
+                           f"하방편차를 '음수 수익률들의 자기 평균 대비 표본표준편차'로 "
+                           f"계산하면 손실의 크기가 아니라 균일함을 보상하게 되어 "
+                           f"손실이 뭉친 팔이 세 자리 Sortino 로 최우수처럼 보입니다.")
+        # 파산 경로: 1+r<0 이 두 번 나오면 cumprod 가 부호를 뒤집어 되살아난다
+        r2 = np.array([0.1, -1.10, 0.2, -1.10, 0.3, 0.4])
+        R2 = pd.DataFrame({"asof": pd.date_range("2016-03-01", periods=6, freq="QS"),
+                           "ret": r2, "ret_gross": r2, "n": 1, "turnover": 1.0,
+                           "cost": 0.0, "n_elig": 1, "measurable": True})
+        s2 = perf_stats(R2)
+        if s2["MDD"] < -1.0 - 1e-9:
+            return False, f"★MDD {s2['MDD']:.2%} — 정의상 -100% 아래는 불가능합니다"
+        if not (np.isnan(s2["CAGR"]) or s2["CAGR"] <= -0.999):
+            return False, (f"★자본곡선이 0 을 통과했는데 CAGR {s2['CAGR']:+.2%} 로 "
+                           f"계산됐습니다(파산 경로가 양의 자본으로 되살아남).")
+        return True, (f"Sortino 정의 일치 ({st['Sortino']:.2f}) · "
+                      f"파산 경로 CAGR {s2['CAGR']:+.0%} · MDD {s2['MDD']:.0%}")
+
+    _ac("A29", "Sortino 정의 · 파산 경로 방어", a29)
+
+    # ── A30  '모름' 이 D3 합산에서 0 으로 붕괴하지 않는가 ─────────────────────────────────
+    def a30():
+        H = pd.DataFrame({"corp_code": ["C1", "C2"],
+                          "event_date": pd.to_datetime(["2019-03-31"] * 2),
+                          "knowledge_date": pd.to_datetime(["2019-04-01"] * 2)})
+        for i, c in enumerate(D3_COLS):
+            H[c] = [1.0 if i < 2 else 0.0, np.nan]        # C2 는 전 태그 '모름'
+        H["D3_N_OBS"] = H[D3_COLS].notna().sum(axis=1).astype("int16")
+        H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True).where(H["D3_N_OBS"] > 0)
+        if pd.notna(H.loc[1, "DELTA_NONFIN"]):
+            return False, ("★전 태그가 '모름'인 법인의 ΔNONFIN 이 0.0 으로 계산됐습니다. "
+                           "문서 파싱에 실패한 법인이 '사실이 하나도 없는 법인'과 같은 "
+                           "척도로 z-scoring 되어, D3_SCORE 가 사실 건수가 아니라 데이터 "
+                           "커버리지의 함수가 됩니다(최종 점수의 10%).")
+        if float(H.loc[0, "DELTA_NONFIN"]) != 2.0:
+            return False, f"관측이 있는 법인의 ΔNONFIN 이 틀렸습니다: {H.loc[0, 'DELTA_NONFIN']}"
+        return True, "전 태그 결측 → ΔNONFIN 결측 · 관측 있으면 정상 합산 · D3_N_OBS 병기"
+
+    _ac("A30", "D3 '모름' vs '미발화' 구분", a30)
+
+    # ── A31  직교화 자유도 가드 ───────────────────────────────────────────────────────────
+    def a31():
+        rng3 = np.random.default_rng(3)
+        p = 13                                   # 통제 6 + 섹터더미 7
+        corrs = {}
+        for nobs in (17, 60, 200):
+            acc = []
+            for _ in range(60):
+                X = rng3.normal(size=(nobs, p))
+                y = rng3.normal(size=nobs)       # y ⟂ X (진짜 신호는 전부 잔차여야 한다)
+                res = ols_resid_np(y, X)
+                if np.isfinite(res).sum() < 3:
+                    continue
+                m = np.isfinite(res)
+                acc.append(abs(float(np.corrcoef(y[m], res[m])[0, 1])))
+            corrs[nobs] = (float(np.mean(acc)) if acc else np.nan, len(acc))
+        thin, _ = corrs[17]
+        if np.isfinite(thin) and thin < 0.80:
+            return False, (f"★관측 17개 · 파라미터 {p+1}개에서 잔차가 원신호를 {1-thin:.0%} "
+                           f"만큼 먹었습니다(corr={thin:.2f}). 'ΔTONE_resid' 가 실제로는 "
+                           f"규모·모멘텀·섹터의 적합오차, 즉 위장된 사이즈 베팅이 되고 "
+                           f"그 값이 FINAL_SCORE 의 50% 를 차지합니다.")
+        n_ok = corrs[200][1]
+        if n_ok == 0:
+            return False, "관측 200개에서도 잔차가 생성되지 않습니다(가드가 과도)"
+        return True, (f"자유도 부족(n=17) 시 잔차 미생성 · "
+                      f"n=60 corr {corrs[60][0]:.2f} · n=200 corr {corrs[200][0]:.2f} "
+                      f"(하한 {OLS_MIN_OBS_PER_PARAM}×파라미터)")
+
+    _ac("A31", "직교화 자유도 하한", a31)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A26 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A31 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

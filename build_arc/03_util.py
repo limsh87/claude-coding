@@ -762,6 +762,9 @@ def winsor_series(s, p: float = 0.01) -> pd.Series:
     return v.clip(lower=lo, upper=hi)
 
 
+OLS_MIN_OBS_PER_PARAM = 5      # 횡단면 회귀 자유도 하한 (관측수 / 파라미터수)
+
+
 def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
     """단일 횡단면 OLS 잔차. 절편은 호출자가 넣지 않아도 여기서 붙인다.
 
@@ -779,7 +782,13 @@ def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarra
     A = np.column_stack([np.ones(n), X])
     ok = np.isfinite(y) & np.isfinite(A).all(axis=1)
     out = np.full(n, np.nan)
-    if ok.sum() < A.shape[1] + 3:
+    # ★ 자유도 가드를 파라미터 수의 '비율'로 잡는다. p+3 은 너무 헐거웠다 —
+    #   통제변수 6개 + 섹터더미 7개 + 절편 = 14 파라미터인데 관측 17개면 통과했고,
+    #   그때 잔차와 원신호의 상관은 0.42 에 불과했다(나머지 58%가 적합오차). 그러면
+    #   '직교화된 톤'이 실제로는 규모·모멘텀·섹터의 결정적 함수, 즉 위장된 사이즈 베팅이
+    #   되고 그 값이 FINAL_SCORE 의 50% 를 차지한다. 실측 상관: n=17 0.42 · n=30 0.74 ·
+    #   n=60 0.88 · n=120 0.94. 5p 를 최소선으로 둔다.
+    if ok.sum() < max(A.shape[1] + 3, OLS_MIN_OBS_PER_PARAM * A.shape[1]):
         return out
     Ao, yo = A[ok], y[ok]
     G = Ao.T @ Ao
@@ -790,6 +799,9 @@ def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarra
         beta = np.linalg.pinv(G) @ (Ao.T @ yo)
     out[ok] = yo - Ao @ beta
     return out
+
+
+XSEC_RESID_DOF: List[dict] = []      # 직교화 자유도 진단(셀별 관측수/파라미터수)
 
 
 def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
@@ -804,11 +816,25 @@ def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
     Xv = X.reindex(idx).apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     g = pd.Series(cells).reindex(idx).astype(object).fillna("__NA__")
     out = pd.Series(np.nan, index=idx, dtype="float64")
-    for _, pos in g.groupby(g, observed=True).groups.items():
+    # ★ 셀 가드는 '셀 전체 행수'가 아니라 **y 가 실제로 관측된 행수**로 봐야 한다.
+    #   전자는 분기 총 행수(≈1000)라 항상 통과하고, 실제 회귀는 dTONE 이 있는 20~60행으로
+    #   돌아간다. 진단용으로 셀별 (관측수/파라미터수) 비를 남긴다.
+    XSEC_RESID_DOF.clear()
+    n_par = int(Xv.shape[1]) + 1
+    for gk, pos in g.groupby(g, observed=True).groups.items():
         sl = list(pos)
+        n_obs = int((yv.loc[sl].notna() & Xv.loc[sl].notna().all(axis=1)).sum())
+        XSEC_RESID_DOF.append({"cell": str(gk), "n_obs": n_obs, "n_param": n_par,
+                               "ratio": (n_obs / n_par) if n_par else np.nan})
         if len(sl) < 12:                     # 표본이 너무 적으면 회귀가 잡음을 학습한다
             continue
         out.loc[sl] = ols_resid_np(yv.loc[sl].to_numpy(), Xv.loc[sl].to_numpy())
+    _thin = [d for d in XSEC_RESID_DOF if 0 < d["n_obs"] and d["ratio"] < OLS_MIN_OBS_PER_PARAM]
+    if _thin:
+        LOG.warn(f"직교화 자유도 부족으로 잔차를 만들지 못한 셀 {len(_thin)}개 "
+                 f"(관측/파라미터 비 < {OLS_MIN_OBS_PER_PARAM}). 해당 기간의 ΔTONE_resid 는 "
+                 f"결측입니다 — 적합오차를 신호로 쓰지 않기 위한 의도된 결측입니다. "
+                 f"최소 비율 {min(d['ratio'] for d in _thin):.1f} · 파라미터 {n_par}개")
     return out.astype("float32")
 
 
@@ -856,7 +882,18 @@ def info_coef(sig, fwd, groups) -> Tuple[float, float, int]:
     arr = np.asarray(ics, dtype=float)
     mu = float(arr.mean())
     sd = float(arr.std(ddof=1))
+    # ★ 반환 2번째 값은 **t통계량**이다(IR × √n). IC-IR 의 표준 정의는 mean/std 이므로
+    #   같은 숫자를 'IC-IR' 로 표기하면 분기 40개에서 √40 = 6.32배 부풀려진 값을 읽게 된다
+    #   (진짜 IR 0.25 → 표에 1.58). 기간 수가 다른 팔끼리는 부풀림 배수까지 달라져 순위가
+    #   뒤집힌다. 소비 측은 info_coef_full() 로 IR 과 t 를 분리해 받는다.
     return (mu, (mu / sd * math.sqrt(len(arr))) if sd > 0 else float("nan"), len(arr))
+
+
+def info_coef_full(sig, fwd, groups) -> Tuple[float, float, float, int]:
+    """(평균 IC, IC-IR = mean/std, t통계량 = IR×√n, 기간수). 표에 쓸 때는 이쪽을 쓴다."""
+    mu, tstat, n = info_coef(sig, fwd, groups)
+    ir = (tstat / math.sqrt(n)) if (n > 0 and np.isfinite(tstat)) else float("nan")
+    return (mu, ir, tstat, n)
 
 
 def next_trading_on_or_after(trading_days: np.ndarray, t) -> Optional[pd.Timestamp]:

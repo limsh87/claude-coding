@@ -167,17 +167,25 @@ def attach_d2(P: pd.DataFrame, d2: Optional[pd.DataFrame]) -> pd.DataFrame:
     #   전 기간 백분위로 자르면 2016년 관측치의 클리핑 상·하한이 2025년 데이터로 정해지고,
     #   분기 내 극단값들이 미래가 정하는 값으로 동점 처리되어 그들 사이의 순위가 사라진다.
     _qkey = P["q"].astype(str) if "q" in P.columns else P["asof"].astype(str)
+    _cellkey = P["cell"].astype(str) if "cell" in P.columns else _qkey
+    forced = pd.to_numeric(P["D2_FORCED_LOW"], errors="coerce").fillna(0) > 0
     zs = []
     for c, sgn in D2_ITEMS:
         v = (pd.to_numeric(col(P, c), errors="coerce")
                .groupby(_qkey, observed=True)
                .transform(lambda s: winsor_series(s, ARC_D2_WINSOR_P))) * float(sgn)
-        # 강제 최하위: 방향 통일 후이므로 '그 분기에서 가장 작은 값'을 준다
-        forced = pd.to_numeric(P["D2_FORCED_LOW"], errors="coerce").fillna(0) > 0
-        if forced.any() and v.notna().any():
-            qmin = v.groupby(_qkey, observed=True).transform("min")
-            v = v.mask(forced, qmin - 1e-6)
-        z = xsec_z_arc(P.assign(**{f"_v_{c}": v}), f"_v_{c}")
+        # ★ §6.2 는 '해당 지표 **최하위 순위**로 강제 배정' 이다. '최하위 값'을 넣고 나서
+        #   z 를 돌리면, 대입값의 범위(분기 전체)와 표준화 범위(분기×섹터 셀)가 어긋나
+        #   분산이 좁은 셀에 극단값이 꽂힌다 — 실측에서 바닥분모 종목 1개 때문에 같은 셀
+        #   39종목 전원의 z 표준편차가 1.01 → 0.36 으로 압축됐다. 그 셀 종목들은 다른 셀과
+        #   경쟁할 때 꼬리에 도달하지 못해 상위 N 에서 구조적으로 밀린다. 지표마다 압축률이
+        #   달라 '동일가중 평균'도 더 이상 동일가중이 아니게 된다.
+        #   → 강제 배정은 값이 아니라 **z 계산 후 셀 내 최하위 z** 로 한다.
+        z = xsec_z_arc(P.assign(**{f"_v_{c}": v.mask(forced)}), f"_v_{c}")
+        if forced.any() and z.notna().any():
+            zmin = z.groupby(_cellkey, observed=True).transform("min")
+            zmin = zmin.fillna(float(np.nanmin(z.to_numpy())) if z.notna().any() else 0.0)
+            z = z.mask(forced, zmin - 1e-6)
         P[f"z_{c}"] = z
         zs.append(f"z_{c}")
     P["D2_SCORE"] = xsec_z_arc(P.assign(_d2raw=nanmean_cols(P, zs)), "_d2raw")

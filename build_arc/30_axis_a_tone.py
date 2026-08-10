@@ -483,16 +483,54 @@ def attach_axis_a(P: pd.DataFrame, tone_q: pd.DataFrame,
         LOG.info(f"직교화 통제변수 결측 {n_before:,}칸 중 {n_before - n_after:,}칸을 "
                  f"기간 중앙값으로 대체했습니다 (잔여 결측 {n_after:,}칸). "
                  f"대체율이 높으면 직교화 통제력이 약해집니다.")
-    X = pd.concat([X, sec_d], axis=1).fillna(0.0)
+    X_full = pd.concat([X, sec_d], axis=1).fillna(0.0)
 
-    P["dTONE_resid"] = xsec_resid(P["dTONE"], X, P["q"].astype(str))
+    # ── 직교화 사다리 (§5.3) ──────────────────────────────────────────────────────────────
+    # ★ 자유도 하한(관측수 ≥ 5 × 파라미터수)을 걸면, 리포트 커버리지가 얇은 초기 분기는
+    #   파라미터 14개(통제 6 + 섹터더미 7 + 절편)를 감당하지 못해 축 A 가 통째로 사라진다.
+    #   그렇다고 하한을 풀면 잔차의 절반 이상이 규모·모멘텀·섹터의 적합오차가 되어
+    #   '직교화된 톤'이 위장된 사이즈 베팅이 된다(실측: n=17 에서 corr 0.42).
+    #   → 파라미터를 줄이며 내려가는 사다리를 쓴다. §5.3 이 요구하는 핵심은 **명시된 통제
+    #     변수와의 직교화**이고 섹터 중립은 그 위의 추가 조치이므로, 먼저 섹터더미를 버린다.
+    #     모든 단계가 실패하면 그 분기는 결측이다 — 직교화 없는 원신호를 쓰지는 않는다.
+    _LADDER = [("통제 + 섹터더미", X_full),
+               ("통제만(섹터더미 제외)", X),
+               ("축소통제(규모·모멘텀·수정률)",
+                X[[c for c in ("mom_12_1", "log_mktcap", "eps_rev") if c in X.columns]])]
+    resid = pd.Series(np.nan, index=P.index, dtype="float64")
+    used: List[str] = []
+    qkey = P["q"].astype(str)
+    for lab, Xi in _LADDER:
+        if Xi.shape[1] == 0 or resid.notna().sum() == int(P["dTONE"].notna().sum()):
+            continue
+        need = P["dTONE"].notna() & resid.isna()
+        if not need.any():
+            break
+        r = xsec_resid(P["dTONE"].where(need), Xi, qkey)
+        got = int((r.notna() & need).sum())
+        if got:
+            resid = resid.where(~(r.notna() & need), r)
+            used.append(f"{lab} {got:,}행")
+    P["dTONE_resid"] = resid.astype("float32")
+
     n_ok = int(P["dTONE_resid"].notna().sum())
     n_raw = int(P["dTONE"].notna().sum())
     LOG.ok(f"ΔTONE 직교화 완료 — 원신호 {n_raw:,}행 → 잔차 {n_ok:,}행 "
            f"(통제변수 {len(ctrl)}개 + 섹터더미 {sec_d.shape[1]}개)")
+    if used:
+        LOG.info("직교화 사다리 적용: " + " · ".join(used) +
+                 f" — 자유도 하한 {OLS_MIN_OBS_PER_PARAM}×파라미터를 못 채우면 파라미터를 "
+                 f"줄여 내려갑니다. 전 단계 실패 시 그 분기 축 A 는 결측입니다"
+                 f"(직교화 없는 원신호는 쓰지 않습니다 — §5.3).")
+    if XSEC_RESID_DOF:
+        _rt = [d["ratio"] for d in XSEC_RESID_DOF if d["n_obs"] > 0]
+        if _rt:
+            LOG.info(f"직교화 자유도(관측수/파라미터수) — 최소 {min(_rt):.1f} · "
+                     f"중앙값 {float(np.median(_rt)):.1f} · 최대 {max(_rt):.1f}")
     if n_raw and n_ok / max(n_raw, 1) < 0.7:
-        LOG.warn(f"잔차 산출률이 {100*n_ok/max(n_raw,1):.0f}% 로 낮습니다. 기간별 표본이 12개 "
-                 f"미만인 분기가 많다는 뜻이며, 그 분기의 축 A 는 통째로 결측입니다.")
+        LOG.warn(f"잔차 산출률이 {100*n_ok/max(n_raw,1):.0f}% 로 낮습니다. 리포트 커버리지가 "
+                 f"얇아 자유도를 채우지 못한 분기가 많다는 뜻이며, 그 분기의 축 A 는 "
+                 f"결측입니다(§7.2 에 따라 종목은 축 B 로 평가되고 탈락하지 않습니다).")
     P = ensure_cols(P, AXIS_A_COLS)
     return P
 

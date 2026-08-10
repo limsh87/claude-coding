@@ -108,7 +108,7 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
     delist = uni.delisting_map() if uni is not None else {}
     rows, holdings = [], []
     prev_w: Dict[str, float] = {}
-    n_impute_tot, w_impute_tot = 0, 0.0
+    n_impute_tot, w_impute_tot, n_adv_miss = 0, 0.0, 0
 
     need = [c for c in ("code", "asof", "adtv60", "fwd_ret_1q", signal_col, "FINAL_SCORE",
                         "vol_q", "EXCLUDE") if c in P.columns]
@@ -166,9 +166,17 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
 
         cost = 0.0
         if apply_costs:
-            advmap = dict(zip(pick["code"].astype(str),
-                              pd.to_numeric(pick.get("adtv60", pd.Series(np.nan)),
+            # ★ advmap 은 그 분기 패널 전체(sub)에서 만든다. 예전에는 pick('새로 담을 종목')
+            #   으로만 만들었는데, 비용 루프는 set(w_new) | set(prev_w) 를 돌기 때문에
+            #   **전량 매도되는 종목은 adv=0 으로 조회되어 arc_slippage 의 '데이터 없음'
+            #   폴백(일괄 2%)** 을 탔다. 매도 슬리피지가 매수의 2.4배로 매겨져 연 3~4%p
+            #   유령 비용이 붙고, 회전율이 다른 어블레이션 팔끼리의 비용후 비교가 왜곡된다.
+            advmap = dict(zip(sub["code"].astype(str),
+                              pd.to_numeric(sub.get("adtv60", pd.Series(np.nan, index=sub.index)),
                                             errors="coerce").fillna(0.0)))
+            _miss_adv = [c for c in (set(w_new) | set(prev_w)) if advmap.get(c, 0.0) <= 0]
+            if _miss_adv:
+                n_adv_miss += len(_miss_adv)
             tax = arc_sell_tax(t)
             comm = ARC_COMMISSION_BPS / 1e4
             for c in set(w_new) | set(prev_w):
@@ -206,11 +214,19 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
         if n_imputed:
             n_impute_tot += n_imputed
             w_impute_tot += w_imputed
-        rows.append({"asof": t, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
+        # ★ ret 는 -1 아래로 내려갈 수 없다. Σw≤1 · fwd≥-1 이므로 gross 는 ≥-1 이지만
+        #   비용을 빼면 -1 을 밑돌 수 있고, 그러면 cumprod 가 부호를 뒤집어 파산한 경로가
+        #   양의 자본곡선으로 되살아난다(MDD -112% 같은 정의상 불가능한 값이 표에 찍힌다).
+        ret = float(max(ret, -1.0))
+        rows.append({"asof": t, "ret": max(ret - cost, -1.0), "ret_gross": ret,
+                     "n": len(w_new),
                      "turnover": turn, "cost": cost, "n_elig": n_elig,
                      "n_imputed": n_imputed, "w_imputed": w_imputed, "measurable": True})
         prev_w = w_new
 
+    if n_adv_miss:
+        LOG.info(f"[{label}] 거래대금(ADTV)을 못 찾은 매매 {n_adv_miss:,}건은 슬리피지 "
+                 f"보수 폴백(2%)을 적용했습니다.")
     if n_impute_tot:
         LOG.warn(f"[{label}] 전방수익률 측정 불가 {n_impute_tot:,}건(누적 비중 "
                  f"{w_impute_tot:.2f})을 해당 분기 유니버스 중앙값으로 대치했습니다. "
@@ -243,18 +259,33 @@ def perf_stats(R: pd.DataFrame, rf: float = 0.0, gross: bool = False) -> dict:
         return {}
     eq = np.cumprod(1.0 + r)
     years = n / float(PERIODS_PER_YEAR)
-    cagr = (eq[-1] ** (1.0 / years) - 1.0) if years > 0 and eq[-1] > 0 else np.nan
+    # ★ 자본곡선이 0 이하를 '통과'하면 그 경로는 파산이다. 예전에는 최종값(eq[-1])만 봤는데,
+    #   1+r<0 이 두 번 나오면 cumprod 가 부호를 두 번 뒤집어 파산 경로가 양의 자본으로
+    #   되살아나고 CAGR·MDD·Calmar 가 전부 유한값으로 인쇄됐다(MDD -112% 같은 값).
+    ruined = bool(np.any(eq <= 0))
+    if ruined:
+        cagr = -1.0
+    else:
+        cagr = (eq[-1] ** (1.0 / years) - 1.0) if years > 0 and eq[-1] > 0 else np.nan
     vol = r.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if n > 1 else np.nan
-    dn = r[r < 0]
-    dvol = dn.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if len(dn) > 1 else np.nan
+    # ★ Sortino 의 하방편차는 '목표(=rf) 대비' 제곱평균이지, '음수 수익률들의 자기 평균 대비
+    #   표본표준편차'가 아니다. 후자는 손실이 비슷한 크기로 반복될수록 0 에 수렴해
+    #   손실의 '크기'가 아니라 '균일함'을 보상한다 — 실측에서 정의값 3.88 이 393 으로 나왔다.
+    rf_q = rf / float(PERIODS_PER_YEAR)
+    _dn = np.minimum(r - rf_q, 0.0)
+    dvol = float(np.sqrt((_dn ** 2).mean()) * math.sqrt(PERIODS_PER_YEAR)) if n else np.nan
     peak = np.maximum.accumulate(eq)
     dd = eq / peak - 1.0
-    mdd = float(dd.min()) if n else np.nan
+    mdd = float(max(dd.min(), -1.0)) if n else np.nan     # -100% 아래는 정의상 불가
+    if ruined:
+        mdd = -1.0
     mx = cur = 0
     for x in dd:
         cur = cur + 1 if x < -1e-9 else 0
         mx = max(mx, cur)
     mu, tstat = hac_tstat(r)
+    # ★ 평균 통계도 측정 가능한 분기(Rm)에서만 낸다. 측정 불가 분기는 n=0 ·
+    #   turnover=전량청산 으로 기록되므로 원본 R 을 쓰면 평균종목수·평균회전율이 어긋난다.
     return {
         "기간수(분기)": n, "누적수익": float(eq[-1] - 1.0), "CAGR": cagr, "연변동성": vol,
         "Sharpe": (cagr - rf) / vol if vol and np.isfinite(vol) and vol > 0 else np.nan,
@@ -262,10 +293,10 @@ def perf_stats(R: pd.DataFrame, rf: float = 0.0, gross: bool = False) -> dict:
         "MDD": mdd, "Calmar": (cagr / abs(mdd)) if mdd and mdd < 0 else np.nan,
         "승률": float((r > 0).mean()), "분기평균": float(r.mean()),
         "t통계량(HAC)": tstat, "최장언더워터(분기)": int(mx),
-        "평균종목수": float(R["n"].mean()) if "n" in R.columns else np.nan,
-        "평균회전율": float(R["turnover"].mean()) if "turnover" in R.columns else np.nan,
-        "평균비용": float(R["cost"].mean()) if "cost" in R.columns else np.nan,
-        "평균편입가능": float(R["n_elig"].mean()) if "n_elig" in R.columns else np.nan,
+        "평균종목수": float(Rm["n"].mean()) if "n" in Rm.columns else np.nan,
+        "평균회전율": float(Rm["turnover"].mean()) if "turnover" in Rm.columns else np.nan,
+        "평균비용": float(Rm["cost"].mean()) if "cost" in Rm.columns else np.nan,
+        "평균편입가능": float(Rm["n_elig"].mean()) if "n_elig" in Rm.columns else np.nan,
     }
 
 

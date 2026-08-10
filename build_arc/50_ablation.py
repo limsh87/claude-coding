@@ -38,7 +38,7 @@ ABLATIONS = [
 
 ABLATION_RESULTS: "OrderedDict[str, dict]" = OrderedDict()
 
-_ABL_METRIC_ORDER = ["CAGR", "MDD", "Sharpe", "Sortino", "IC", "IC-IR", "회전율",
+_ABL_METRIC_ORDER = ["CAGR", "MDD", "Sharpe", "Sortino", "IC", "IC-IR", "t(IC)", "회전율",
                      "평균종목수", "승률", "평균편입가능"]
 
 
@@ -46,7 +46,8 @@ def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
              purpose: str, kw: dict) -> dict:
     """한 팔 실행 — 신호 재조립 → 비용 전/후 백테스트 → 지표 산출."""
     rec = {"id": aid, "name": name, "purpose": purpose, "ok": False, "err": "",
-           "net": {}, "gross": {}, "ic": np.nan, "icir": np.nan, "n_ic": 0,
+           "net": {}, "gross": {}, "ic": np.nan, "icir": np.nan,
+           "ic_t": np.nan, "n_ic": 0,
            "p": np.nan, "excess": np.nan}
     try:
         Q = assemble_final(P, **kw)
@@ -56,8 +57,11 @@ def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
         bt_net = run_fn(Q, label=f"ABL_{aid}", apply_costs=True, top_n=top_n)
         rec["net"] = perf_stats(bt_net["returns"])
         rec["gross"] = perf_stats(bt_net["returns"], gross=True)
-        ic, icir, n_ic = bt_ic(Q, "FINAL_RANK")
-        rec["ic"], rec["icir"], rec["n_ic"] = ic, icir, n_ic
+        # ★ bt_ic 의 2번째 값은 t통계량이다(IR × √n). 표에 'IC-IR' 로 찍으면 분기 40개에서
+        #   6.32배 부풀려진 값을 읽게 되므로 IR 과 t 를 분리해 둘 다 보고한다.
+        ic, icir, ic_t, n_ic = info_coef_full(Q["FINAL_RANK"], Q["fwd_ret_1q"],
+                                              Q["asof"].astype(str))
+        rec["ic"], rec["icir"], rec["ic_t"], rec["n_ic"] = ic, icir, ic_t, n_ic
         # 초과수익 = 전략 − U-1000 동일가중 (지수 대신 같은 유니버스를 쓴다 — 41 모듈 주석 참조)
         bench = equal_weight_universe_return(P)
         R = bt_net["returns"].set_index("asof")["ret"]
@@ -132,11 +136,15 @@ def report_ablation_table() -> pd.DataFrame:
             f(n, "MDD", True), f(n, "Sortino"),
             (f"{r['ic']:+.4f}" if np.isfinite(r["ic"]) else "—"),
             (f"{r['icir']:+.2f}" if np.isfinite(r["icir"]) else "—"),
+            (f"{r.get('ic_t', float('nan')):+.2f}"
+             if np.isfinite(r.get("ic_t", float("nan"))) else "—"),
             f"{n.get('평균종목수', float('nan')):.1f}",
         ])
     LOG.table(rows, ["ID", "구성", "CAGR(전)", "CAGR(후)", "Sharpe(전)", "Sharpe(후)",
-                     "MDD", "Sortino", "IC", "IC-IR", "종목수"],
-              ["l", "l", "r", "r", "r", "r", "r", "r", "r", "r", "r"], maxw=32)
+                     "MDD", "Sortino", "IC", "IC-IR", "t(IC)", "종목수"],
+              ["l", "l", "r", "r", "r", "r", "r", "r", "r", "r", "r", "r"], maxw=32)
+    LOG.info("IC-IR = mean(IC)/std(IC) (표준 정의) · t(IC) = IC-IR × √기간수. "
+             "둘을 혼동하면 분기 40개에서 6.32배 부풀려진 값을 IR 로 읽게 됩니다.")
 
     rows2 = []
     for aid, name, purpose, _kw in ABLATIONS:

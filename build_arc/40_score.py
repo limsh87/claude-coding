@@ -45,6 +45,26 @@ def _score_axis_a(P: pd.DataFrame, use_raw: bool = False,
     return ((z.fillna(0.0) if neutral_fill else z).astype("float32"), miss)
 
 
+_REGROUP_MIN_N = 20
+
+
+def _regroup_z(P: pd.DataFrame, v: pd.Series, gcol: str) -> pd.Series:
+    """(기간 × 가용성그룹) 안에서 재표준화. 그룹이 작으면 원값을 그대로 둔다.
+
+    ★ 이 함수의 목적은 '데이터가 몇 개 있는가'가 순위를 정하지 못하게 하는 것이다.
+      축을 1개만 가진 행과 2개 가진 행은 합성 후 분산이 다르고(1.0 vs 0.71), 상위 N
+      선정은 꼬리에서 일어나므로 분산이 좁은 쪽이 NaN 도 아닌 채로 구조적으로 밀린다.
+    """
+    x = pd.to_numeric(v, errors="coerce").astype("float64")
+    key = P["asof"].astype(str) + "|" + P[gcol].astype(str)
+    g = x.groupby(key, observed=True)
+    n = g.transform("count")
+    mu = g.transform("mean")
+    sd = g.transform("std")
+    ok = (n >= _REGROUP_MIN_N) & (sd > 0) & sd.notna()
+    return x.where(~ok, (x - mu) / sd.where(sd > 0, 1.0))
+
+
 def _score_d1_variant(P: pd.DataFrame, d1_metric: Optional[str],
                       d1_equal_weights: bool) -> pd.Series:
     """D1 점수 선택 — 기본 합성 / 지표 단독 / 섹션 균등가중 (§8.4 강건성용)."""
@@ -125,13 +145,28 @@ def assemble_final(P: pd.DataFrame,
     # ── 최종 합성 (§7.2) ──────────────────────────────────────────────────────────────────
     if has_a and has_b:
         b = pd.to_numeric(Q["DART_SCORE"], errors="coerce")
-        fin = (ARC_W_AXIS_A * Q["AXIS_A_Z"].astype("float64") + ARC_W_AXIS_B * b)
-        # 축 B 가 결측인 행은 축 A 단독으로 평가한다(가중치 재배분). 반대도 마찬가지.
-        fin = fin.where(b.notna(), Q["AXIS_A_Z"].astype("float64"))
+        az64 = Q["AXIS_A_Z"].astype("float64")
+        fin = (ARC_W_AXIS_A * az64 + ARC_W_AXIS_B * b)
+        # ★ 가중치 재배분은 **양방향 대칭**이어야 한다.
+        #   예전에는 '축 B 결측 → 축 A 에 100% 재배분'만 있고 반대가 없었다. 축 A 결측 행은
+        #   AXIS_A_Z 를 0 으로 채운 채 축 B 가중치가 0.5 로 남아, FINAL 의 **분산이 절반으로
+        #   줄었다**(0.5·B vs 0.5·A+0.5·B). 상위 N 선정은 꼬리에서 일어나므로 분산이 좁은
+        #   쪽은 NaN 이 아닌데도 구조적으로 밀린다 — 커버리지 50% 에서는 리포트 없는 종목이
+        #   상위 30 에 사실상 한 종목도 들어가지 못했다. §7.2 '탈락시키지 말 것'의 실질 위반.
+        #   A10 은 점수가 NaN 이 아닌지만 봐서 이 붕괴를 잡지 못했다.
+        fin = fin.where(b.notna(), az64)                 # 축 B 결측 → 축 A 단독
+        fin = fin.where(~a_miss, b)                      # 축 A 결측 → 축 B 단독 (대칭)
         # ★ 두 축이 모두 결측인 행은 '중립 0' 이 아니라 '정보 없음' 이다. 0 으로 두면
         #   아무 근거도 없는 종목이 중간 순위를 차지하고, 표본이 얇은 분기에는 그 종목들이
         #   실제로 편입된다. 명세 §7.2 의 '중립 0' 은 '축 B 가 있을 때' 의 규정이다.
         fin = fin.where(~(a_miss & b.isna()))
+        # ★ 재배분만으로는 부족하다. 축이 1개인 행은 sd≈1, 2개인 행은 sd≈0.71 이라
+        #   이번에는 반대 방향으로 기운다. 가용성 그룹별로 기간 안에서 재표준화해
+        #   '데이터가 몇 개 있는가'가 순위를 정하지 못하게 한다. 그룹이 너무 작으면
+        #   재표준화가 오히려 잡음이므로 그때는 손대지 않는다.
+        Q["_avail"] = np.where(a_miss.to_numpy(), "B", np.where(b.isna().to_numpy(), "A", "AB"))
+        fin = _regroup_z(Q, fin, "_avail")
+        Q = Q.drop(columns=["_avail"])
     elif has_a:
         fin = Q["AXIS_A_Z"].astype("float64")
     elif has_b:

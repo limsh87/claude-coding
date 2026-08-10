@@ -106,7 +106,8 @@ def _d3_text_by_doc(T: pd.DataFrame) -> pd.DataFrame:
 def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
                       dis: pd.DataFrame, notes: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """§6.3 하드팩트 추출. 반환 (PIT frame): corp_code, event_date, knowledge_date, NF_*, DELTA_NONFIN."""
-    cols = ["corp_code", "event_date", "knowledge_date"] + D3_COLS + ["DELTA_NONFIN"]
+    cols = ["corp_code", "event_date", "knowledge_date"] + D3_COLS + \
+           ["DELTA_NONFIN", "D3_N_OBS"]
     parts: List[pd.DataFrame] = []
 
     # ── (A) 재무 기반 이벤트: 정량이라 가장 신뢰도 높다 ────────────────────────────────────
@@ -221,7 +222,14 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
     #   D3 는 '직전 1년 안에 이 사실이 관측되었는가' 의 합이 된다 — 분기 내 여러 이벤트가
     #   마지막 1행으로 대체되어 사라지던 문제도 함께 해소된다.
     H = _event_state_table(H, D3_COLS, D3_VALID_DAYS)
-    H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True)
+    # ★ sum(skipna=True) 는 NaN 을 0 으로 취급하고 전부 NaN 인 행도 0.0 을 돌려준다.
+    #   _event_state_table 이 방금 보존한 '모름 ≠ 미발화' 불변식이 두 줄 뒤에서 깨진다.
+    #   D3 태그는 재무·직원·수시공시·문서텍스트 네 소스에서 오는데, 문서 파싱이 실패한
+    #   법인은 5개 태그가 통째로 '모름'이 된다. 그대로 합산하면 D3_SCORE 가 '사실 건수'가
+    #   아니라 '데이터 커버리지'의 함수가 되고, 그 값이 최종 점수의 10%(0.20×0.50)를 쥔다.
+    #   → 관측된 태그 수를 함께 남기고, 관측이 0 인 행은 NaN 으로 둔다.
+    H["D3_N_OBS"] = H[D3_COLS].notna().sum(axis=1).astype("int16")
+    H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True).where(H["D3_N_OBS"] > 0)
     H = pit_frame(H, "event_date", "knowledge_date", source="dart_d3")
     H = ensure_cols(H, cols)
     fired = {c: int(pd.to_numeric(H[c], errors="coerce").fillna(0).sum()) for c in D3_COLS}
@@ -450,9 +458,10 @@ def attach_d3(P: pd.DataFrame, d3: Optional[pd.DataFrame],
     if d3 is not None and len(d3) and "corp_code" in P.columns:
         PIT.register("arc_d3", d3, key_cols=["corp_code"])
         P = PIT.asof_join(P, "arc_d3", by="corp_code", left_time="asof",
-                          cols=["corp_code", "knowledge_date"] + D3_COLS + ["DELTA_NONFIN"],
+                          cols=["corp_code", "knowledge_date"] + D3_COLS +
+                               ["DELTA_NONFIN", "D3_N_OBS"],
                           suffix="_d3")
-    P = ensure_cols(P, D3_COLS + ["DELTA_NONFIN"])
+    P = ensure_cols(P, D3_COLS + ["DELTA_NONFIN", "D3_N_OBS"])
 
     if excl is not None and len(excl) and "corp_code" in P.columns:
         PIT.register("arc_excl", excl, key_cols=["corp_code"])

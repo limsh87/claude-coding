@@ -247,7 +247,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0614"
+BUILD_VERSION = "v2.20260810.0623"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -1746,6 +1746,9 @@ def winsor_series(s, p: float = 0.01) -> pd.Series:
     return v.clip(lower=lo, upper=hi)
 
 
+OLS_MIN_OBS_PER_PARAM = 5      # 횡단면 회귀 자유도 하한 (관측수 / 파라미터수)
+
+
 def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
     """단일 횡단면 OLS 잔차. 절편은 호출자가 넣지 않아도 여기서 붙인다.
 
@@ -1763,7 +1766,13 @@ def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarra
     A = np.column_stack([np.ones(n), X])
     ok = np.isfinite(y) & np.isfinite(A).all(axis=1)
     out = np.full(n, np.nan)
-    if ok.sum() < A.shape[1] + 3:
+    # ★ 자유도 가드를 파라미터 수의 '비율'로 잡는다. p+3 은 너무 헐거웠다 —
+    #   통제변수 6개 + 섹터더미 7개 + 절편 = 14 파라미터인데 관측 17개면 통과했고,
+    #   그때 잔차와 원신호의 상관은 0.42 에 불과했다(나머지 58%가 적합오차). 그러면
+    #   '직교화된 톤'이 실제로는 규모·모멘텀·섹터의 결정적 함수, 즉 위장된 사이즈 베팅이
+    #   되고 그 값이 FINAL_SCORE 의 50% 를 차지한다. 실측 상관: n=17 0.42 · n=30 0.74 ·
+    #   n=60 0.88 · n=120 0.94. 5p 를 최소선으로 둔다.
+    if ok.sum() < max(A.shape[1] + 3, OLS_MIN_OBS_PER_PARAM * A.shape[1]):
         return out
     Ao, yo = A[ok], y[ok]
     G = Ao.T @ Ao
@@ -1774,6 +1783,9 @@ def ols_resid_np(y: np.ndarray, X: np.ndarray, ridge: float = 1e-8) -> np.ndarra
         beta = np.linalg.pinv(G) @ (Ao.T @ yo)
     out[ok] = yo - Ao @ beta
     return out
+
+
+XSEC_RESID_DOF: List[dict] = []      # 직교화 자유도 진단(셀별 관측수/파라미터수)
 
 
 def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
@@ -1788,11 +1800,25 @@ def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
     Xv = X.reindex(idx).apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     g = pd.Series(cells).reindex(idx).astype(object).fillna("__NA__")
     out = pd.Series(np.nan, index=idx, dtype="float64")
-    for _, pos in g.groupby(g, observed=True).groups.items():
+    # ★ 셀 가드는 '셀 전체 행수'가 아니라 **y 가 실제로 관측된 행수**로 봐야 한다.
+    #   전자는 분기 총 행수(≈1000)라 항상 통과하고, 실제 회귀는 dTONE 이 있는 20~60행으로
+    #   돌아간다. 진단용으로 셀별 (관측수/파라미터수) 비를 남긴다.
+    XSEC_RESID_DOF.clear()
+    n_par = int(Xv.shape[1]) + 1
+    for gk, pos in g.groupby(g, observed=True).groups.items():
         sl = list(pos)
+        n_obs = int((yv.loc[sl].notna() & Xv.loc[sl].notna().all(axis=1)).sum())
+        XSEC_RESID_DOF.append({"cell": str(gk), "n_obs": n_obs, "n_param": n_par,
+                               "ratio": (n_obs / n_par) if n_par else np.nan})
         if len(sl) < 12:                     # 표본이 너무 적으면 회귀가 잡음을 학습한다
             continue
         out.loc[sl] = ols_resid_np(yv.loc[sl].to_numpy(), Xv.loc[sl].to_numpy())
+    _thin = [d for d in XSEC_RESID_DOF if 0 < d["n_obs"] and d["ratio"] < OLS_MIN_OBS_PER_PARAM]
+    if _thin:
+        LOG.warn(f"직교화 자유도 부족으로 잔차를 만들지 못한 셀 {len(_thin)}개 "
+                 f"(관측/파라미터 비 < {OLS_MIN_OBS_PER_PARAM}). 해당 기간의 ΔTONE_resid 는 "
+                 f"결측입니다 — 적합오차를 신호로 쓰지 않기 위한 의도된 결측입니다. "
+                 f"최소 비율 {min(d['ratio'] for d in _thin):.1f} · 파라미터 {n_par}개")
     return out.astype("float32")
 
 
@@ -1840,7 +1866,18 @@ def info_coef(sig, fwd, groups) -> Tuple[float, float, int]:
     arr = np.asarray(ics, dtype=float)
     mu = float(arr.mean())
     sd = float(arr.std(ddof=1))
+    # ★ 반환 2번째 값은 **t통계량**이다(IR × √n). IC-IR 의 표준 정의는 mean/std 이므로
+    #   같은 숫자를 'IC-IR' 로 표기하면 분기 40개에서 √40 = 6.32배 부풀려진 값을 읽게 된다
+    #   (진짜 IR 0.25 → 표에 1.58). 기간 수가 다른 팔끼리는 부풀림 배수까지 달라져 순위가
+    #   뒤집힌다. 소비 측은 info_coef_full() 로 IR 과 t 를 분리해 받는다.
     return (mu, (mu / sd * math.sqrt(len(arr))) if sd > 0 else float("nan"), len(arr))
+
+
+def info_coef_full(sig, fwd, groups) -> Tuple[float, float, float, int]:
+    """(평균 IC, IC-IR = mean/std, t통계량 = IR×√n, 기간수). 표에 쓸 때는 이쪽을 쓴다."""
+    mu, tstat, n = info_coef(sig, fwd, groups)
+    ir = (tstat / math.sqrt(n)) if (n > 0 and np.isfinite(tstat)) else float("nan")
+    return (mu, ir, tstat, n)
 
 
 def next_trading_on_or_after(trading_days: np.ndarray, t) -> Optional[pd.Timestamp]:
@@ -8637,16 +8674,54 @@ def attach_axis_a(P: pd.DataFrame, tone_q: pd.DataFrame,
         LOG.info(f"직교화 통제변수 결측 {n_before:,}칸 중 {n_before - n_after:,}칸을 "
                  f"기간 중앙값으로 대체했습니다 (잔여 결측 {n_after:,}칸). "
                  f"대체율이 높으면 직교화 통제력이 약해집니다.")
-    X = pd.concat([X, sec_d], axis=1).fillna(0.0)
+    X_full = pd.concat([X, sec_d], axis=1).fillna(0.0)
 
-    P["dTONE_resid"] = xsec_resid(P["dTONE"], X, P["q"].astype(str))
+    # ── 직교화 사다리 (§5.3) ──────────────────────────────────────────────────────────────
+    # ★ 자유도 하한(관측수 ≥ 5 × 파라미터수)을 걸면, 리포트 커버리지가 얇은 초기 분기는
+    #   파라미터 14개(통제 6 + 섹터더미 7 + 절편)를 감당하지 못해 축 A 가 통째로 사라진다.
+    #   그렇다고 하한을 풀면 잔차의 절반 이상이 규모·모멘텀·섹터의 적합오차가 되어
+    #   '직교화된 톤'이 위장된 사이즈 베팅이 된다(실측: n=17 에서 corr 0.42).
+    #   → 파라미터를 줄이며 내려가는 사다리를 쓴다. §5.3 이 요구하는 핵심은 **명시된 통제
+    #     변수와의 직교화**이고 섹터 중립은 그 위의 추가 조치이므로, 먼저 섹터더미를 버린다.
+    #     모든 단계가 실패하면 그 분기는 결측이다 — 직교화 없는 원신호를 쓰지는 않는다.
+    _LADDER = [("통제 + 섹터더미", X_full),
+               ("통제만(섹터더미 제외)", X),
+               ("축소통제(규모·모멘텀·수정률)",
+                X[[c for c in ("mom_12_1", "log_mktcap", "eps_rev") if c in X.columns]])]
+    resid = pd.Series(np.nan, index=P.index, dtype="float64")
+    used: List[str] = []
+    qkey = P["q"].astype(str)
+    for lab, Xi in _LADDER:
+        if Xi.shape[1] == 0 or resid.notna().sum() == int(P["dTONE"].notna().sum()):
+            continue
+        need = P["dTONE"].notna() & resid.isna()
+        if not need.any():
+            break
+        r = xsec_resid(P["dTONE"].where(need), Xi, qkey)
+        got = int((r.notna() & need).sum())
+        if got:
+            resid = resid.where(~(r.notna() & need), r)
+            used.append(f"{lab} {got:,}행")
+    P["dTONE_resid"] = resid.astype("float32")
+
     n_ok = int(P["dTONE_resid"].notna().sum())
     n_raw = int(P["dTONE"].notna().sum())
     LOG.ok(f"ΔTONE 직교화 완료 — 원신호 {n_raw:,}행 → 잔차 {n_ok:,}행 "
            f"(통제변수 {len(ctrl)}개 + 섹터더미 {sec_d.shape[1]}개)")
+    if used:
+        LOG.info("직교화 사다리 적용: " + " · ".join(used) +
+                 f" — 자유도 하한 {OLS_MIN_OBS_PER_PARAM}×파라미터를 못 채우면 파라미터를 "
+                 f"줄여 내려갑니다. 전 단계 실패 시 그 분기 축 A 는 결측입니다"
+                 f"(직교화 없는 원신호는 쓰지 않습니다 — §5.3).")
+    if XSEC_RESID_DOF:
+        _rt = [d["ratio"] for d in XSEC_RESID_DOF if d["n_obs"] > 0]
+        if _rt:
+            LOG.info(f"직교화 자유도(관측수/파라미터수) — 최소 {min(_rt):.1f} · "
+                     f"중앙값 {float(np.median(_rt)):.1f} · 최대 {max(_rt):.1f}")
     if n_raw and n_ok / max(n_raw, 1) < 0.7:
-        LOG.warn(f"잔차 산출률이 {100*n_ok/max(n_raw,1):.0f}% 로 낮습니다. 기간별 표본이 12개 "
-                 f"미만인 분기가 많다는 뜻이며, 그 분기의 축 A 는 통째로 결측입니다.")
+        LOG.warn(f"잔차 산출률이 {100*n_ok/max(n_raw,1):.0f}% 로 낮습니다. 리포트 커버리지가 "
+                 f"얇아 자유도를 채우지 못한 분기가 많다는 뜻이며, 그 분기의 축 A 는 "
+                 f"결측입니다(§7.2 에 따라 종목은 축 B 로 평가되고 탈락하지 않습니다).")
     P = ensure_cols(P, AXIS_A_COLS)
     return P
 
@@ -9321,17 +9396,25 @@ def attach_d2(P: pd.DataFrame, d2: Optional[pd.DataFrame]) -> pd.DataFrame:
     #   전 기간 백분위로 자르면 2016년 관측치의 클리핑 상·하한이 2025년 데이터로 정해지고,
     #   분기 내 극단값들이 미래가 정하는 값으로 동점 처리되어 그들 사이의 순위가 사라진다.
     _qkey = P["q"].astype(str) if "q" in P.columns else P["asof"].astype(str)
+    _cellkey = P["cell"].astype(str) if "cell" in P.columns else _qkey
+    forced = pd.to_numeric(P["D2_FORCED_LOW"], errors="coerce").fillna(0) > 0
     zs = []
     for c, sgn in D2_ITEMS:
         v = (pd.to_numeric(col(P, c), errors="coerce")
                .groupby(_qkey, observed=True)
                .transform(lambda s: winsor_series(s, ARC_D2_WINSOR_P))) * float(sgn)
-        # 강제 최하위: 방향 통일 후이므로 '그 분기에서 가장 작은 값'을 준다
-        forced = pd.to_numeric(P["D2_FORCED_LOW"], errors="coerce").fillna(0) > 0
-        if forced.any() and v.notna().any():
-            qmin = v.groupby(_qkey, observed=True).transform("min")
-            v = v.mask(forced, qmin - 1e-6)
-        z = xsec_z_arc(P.assign(**{f"_v_{c}": v}), f"_v_{c}")
+        # ★ §6.2 는 '해당 지표 **최하위 순위**로 강제 배정' 이다. '최하위 값'을 넣고 나서
+        #   z 를 돌리면, 대입값의 범위(분기 전체)와 표준화 범위(분기×섹터 셀)가 어긋나
+        #   분산이 좁은 셀에 극단값이 꽂힌다 — 실측에서 바닥분모 종목 1개 때문에 같은 셀
+        #   39종목 전원의 z 표준편차가 1.01 → 0.36 으로 압축됐다. 그 셀 종목들은 다른 셀과
+        #   경쟁할 때 꼬리에 도달하지 못해 상위 N 에서 구조적으로 밀린다. 지표마다 압축률이
+        #   달라 '동일가중 평균'도 더 이상 동일가중이 아니게 된다.
+        #   → 강제 배정은 값이 아니라 **z 계산 후 셀 내 최하위 z** 로 한다.
+        z = xsec_z_arc(P.assign(**{f"_v_{c}": v.mask(forced)}), f"_v_{c}")
+        if forced.any() and z.notna().any():
+            zmin = z.groupby(_cellkey, observed=True).transform("min")
+            zmin = zmin.fillna(float(np.nanmin(z.to_numpy())) if z.notna().any() else 0.0)
+            z = z.mask(forced, zmin - 1e-6)
         P[f"z_{c}"] = z
         zs.append(f"z_{c}")
     P["D2_SCORE"] = xsec_z_arc(P.assign(_d2raw=nanmean_cols(P, zs)), "_d2raw")
@@ -9485,7 +9568,8 @@ def _d3_text_by_doc(T: pd.DataFrame) -> pd.DataFrame:
 def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
                       dis: pd.DataFrame, notes: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """§6.3 하드팩트 추출. 반환 (PIT frame): corp_code, event_date, knowledge_date, NF_*, DELTA_NONFIN."""
-    cols = ["corp_code", "event_date", "knowledge_date"] + D3_COLS + ["DELTA_NONFIN"]
+    cols = ["corp_code", "event_date", "knowledge_date"] + D3_COLS + \
+           ["DELTA_NONFIN", "D3_N_OBS"]
     parts: List[pd.DataFrame] = []
 
     # ── (A) 재무 기반 이벤트: 정량이라 가장 신뢰도 높다 ────────────────────────────────────
@@ -9600,7 +9684,14 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
     #   D3 는 '직전 1년 안에 이 사실이 관측되었는가' 의 합이 된다 — 분기 내 여러 이벤트가
     #   마지막 1행으로 대체되어 사라지던 문제도 함께 해소된다.
     H = _event_state_table(H, D3_COLS, D3_VALID_DAYS)
-    H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True)
+    # ★ sum(skipna=True) 는 NaN 을 0 으로 취급하고 전부 NaN 인 행도 0.0 을 돌려준다.
+    #   _event_state_table 이 방금 보존한 '모름 ≠ 미발화' 불변식이 두 줄 뒤에서 깨진다.
+    #   D3 태그는 재무·직원·수시공시·문서텍스트 네 소스에서 오는데, 문서 파싱이 실패한
+    #   법인은 5개 태그가 통째로 '모름'이 된다. 그대로 합산하면 D3_SCORE 가 '사실 건수'가
+    #   아니라 '데이터 커버리지'의 함수가 되고, 그 값이 최종 점수의 10%(0.20×0.50)를 쥔다.
+    #   → 관측된 태그 수를 함께 남기고, 관측이 0 인 행은 NaN 으로 둔다.
+    H["D3_N_OBS"] = H[D3_COLS].notna().sum(axis=1).astype("int16")
+    H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True).where(H["D3_N_OBS"] > 0)
     H = pit_frame(H, "event_date", "knowledge_date", source="dart_d3")
     H = ensure_cols(H, cols)
     fired = {c: int(pd.to_numeric(H[c], errors="coerce").fillna(0).sum()) for c in D3_COLS}
@@ -9829,9 +9920,10 @@ def attach_d3(P: pd.DataFrame, d3: Optional[pd.DataFrame],
     if d3 is not None and len(d3) and "corp_code" in P.columns:
         PIT.register("arc_d3", d3, key_cols=["corp_code"])
         P = PIT.asof_join(P, "arc_d3", by="corp_code", left_time="asof",
-                          cols=["corp_code", "knowledge_date"] + D3_COLS + ["DELTA_NONFIN"],
+                          cols=["corp_code", "knowledge_date"] + D3_COLS +
+                               ["DELTA_NONFIN", "D3_N_OBS"],
                           suffix="_d3")
-    P = ensure_cols(P, D3_COLS + ["DELTA_NONFIN"])
+    P = ensure_cols(P, D3_COLS + ["DELTA_NONFIN", "D3_N_OBS"])
 
     if excl is not None and len(excl) and "corp_code" in P.columns:
         PIT.register("arc_excl", excl, key_cols=["corp_code"])
@@ -9957,6 +10049,26 @@ def _score_axis_a(P: pd.DataFrame, use_raw: bool = False,
     return ((z.fillna(0.0) if neutral_fill else z).astype("float32"), miss)
 
 
+_REGROUP_MIN_N = 20
+
+
+def _regroup_z(P: pd.DataFrame, v: pd.Series, gcol: str) -> pd.Series:
+    """(기간 × 가용성그룹) 안에서 재표준화. 그룹이 작으면 원값을 그대로 둔다.
+
+    ★ 이 함수의 목적은 '데이터가 몇 개 있는가'가 순위를 정하지 못하게 하는 것이다.
+      축을 1개만 가진 행과 2개 가진 행은 합성 후 분산이 다르고(1.0 vs 0.71), 상위 N
+      선정은 꼬리에서 일어나므로 분산이 좁은 쪽이 NaN 도 아닌 채로 구조적으로 밀린다.
+    """
+    x = pd.to_numeric(v, errors="coerce").astype("float64")
+    key = P["asof"].astype(str) + "|" + P[gcol].astype(str)
+    g = x.groupby(key, observed=True)
+    n = g.transform("count")
+    mu = g.transform("mean")
+    sd = g.transform("std")
+    ok = (n >= _REGROUP_MIN_N) & (sd > 0) & sd.notna()
+    return x.where(~ok, (x - mu) / sd.where(sd > 0, 1.0))
+
+
 def _score_d1_variant(P: pd.DataFrame, d1_metric: Optional[str],
                       d1_equal_weights: bool) -> pd.Series:
     """D1 점수 선택 — 기본 합성 / 지표 단독 / 섹션 균등가중 (§8.4 강건성용)."""
@@ -10037,13 +10149,28 @@ def assemble_final(P: pd.DataFrame,
     # ── 최종 합성 (§7.2) ──────────────────────────────────────────────────────────────────
     if has_a and has_b:
         b = pd.to_numeric(Q["DART_SCORE"], errors="coerce")
-        fin = (ARC_W_AXIS_A * Q["AXIS_A_Z"].astype("float64") + ARC_W_AXIS_B * b)
-        # 축 B 가 결측인 행은 축 A 단독으로 평가한다(가중치 재배분). 반대도 마찬가지.
-        fin = fin.where(b.notna(), Q["AXIS_A_Z"].astype("float64"))
+        az64 = Q["AXIS_A_Z"].astype("float64")
+        fin = (ARC_W_AXIS_A * az64 + ARC_W_AXIS_B * b)
+        # ★ 가중치 재배분은 **양방향 대칭**이어야 한다.
+        #   예전에는 '축 B 결측 → 축 A 에 100% 재배분'만 있고 반대가 없었다. 축 A 결측 행은
+        #   AXIS_A_Z 를 0 으로 채운 채 축 B 가중치가 0.5 로 남아, FINAL 의 **분산이 절반으로
+        #   줄었다**(0.5·B vs 0.5·A+0.5·B). 상위 N 선정은 꼬리에서 일어나므로 분산이 좁은
+        #   쪽은 NaN 이 아닌데도 구조적으로 밀린다 — 커버리지 50% 에서는 리포트 없는 종목이
+        #   상위 30 에 사실상 한 종목도 들어가지 못했다. §7.2 '탈락시키지 말 것'의 실질 위반.
+        #   A10 은 점수가 NaN 이 아닌지만 봐서 이 붕괴를 잡지 못했다.
+        fin = fin.where(b.notna(), az64)                 # 축 B 결측 → 축 A 단독
+        fin = fin.where(~a_miss, b)                      # 축 A 결측 → 축 B 단독 (대칭)
         # ★ 두 축이 모두 결측인 행은 '중립 0' 이 아니라 '정보 없음' 이다. 0 으로 두면
         #   아무 근거도 없는 종목이 중간 순위를 차지하고, 표본이 얇은 분기에는 그 종목들이
         #   실제로 편입된다. 명세 §7.2 의 '중립 0' 은 '축 B 가 있을 때' 의 규정이다.
         fin = fin.where(~(a_miss & b.isna()))
+        # ★ 재배분만으로는 부족하다. 축이 1개인 행은 sd≈1, 2개인 행은 sd≈0.71 이라
+        #   이번에는 반대 방향으로 기운다. 가용성 그룹별로 기간 안에서 재표준화해
+        #   '데이터가 몇 개 있는가'가 순위를 정하지 못하게 한다. 그룹이 너무 작으면
+        #   재표준화가 오히려 잡음이므로 그때는 손대지 않는다.
+        Q["_avail"] = np.where(a_miss.to_numpy(), "B", np.where(b.isna().to_numpy(), "A", "AB"))
+        fin = _regroup_z(Q, fin, "_avail")
+        Q = Q.drop(columns=["_avail"])
     elif has_a:
         fin = Q["AXIS_A_Z"].astype("float64")
     elif has_b:
@@ -10206,7 +10333,7 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
     delist = uni.delisting_map() if uni is not None else {}
     rows, holdings = [], []
     prev_w: Dict[str, float] = {}
-    n_impute_tot, w_impute_tot = 0, 0.0
+    n_impute_tot, w_impute_tot, n_adv_miss = 0, 0.0, 0
 
     need = [c for c in ("code", "asof", "adtv60", "fwd_ret_1q", signal_col, "FINAL_SCORE",
                         "vol_q", "EXCLUDE") if c in P.columns]
@@ -10264,9 +10391,17 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
 
         cost = 0.0
         if apply_costs:
-            advmap = dict(zip(pick["code"].astype(str),
-                              pd.to_numeric(pick.get("adtv60", pd.Series(np.nan)),
+            # ★ advmap 은 그 분기 패널 전체(sub)에서 만든다. 예전에는 pick('새로 담을 종목')
+            #   으로만 만들었는데, 비용 루프는 set(w_new) | set(prev_w) 를 돌기 때문에
+            #   **전량 매도되는 종목은 adv=0 으로 조회되어 arc_slippage 의 '데이터 없음'
+            #   폴백(일괄 2%)** 을 탔다. 매도 슬리피지가 매수의 2.4배로 매겨져 연 3~4%p
+            #   유령 비용이 붙고, 회전율이 다른 어블레이션 팔끼리의 비용후 비교가 왜곡된다.
+            advmap = dict(zip(sub["code"].astype(str),
+                              pd.to_numeric(sub.get("adtv60", pd.Series(np.nan, index=sub.index)),
                                             errors="coerce").fillna(0.0)))
+            _miss_adv = [c for c in (set(w_new) | set(prev_w)) if advmap.get(c, 0.0) <= 0]
+            if _miss_adv:
+                n_adv_miss += len(_miss_adv)
             tax = arc_sell_tax(t)
             comm = ARC_COMMISSION_BPS / 1e4
             for c in set(w_new) | set(prev_w):
@@ -10304,11 +10439,19 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
         if n_imputed:
             n_impute_tot += n_imputed
             w_impute_tot += w_imputed
-        rows.append({"asof": t, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
+        # ★ ret 는 -1 아래로 내려갈 수 없다. Σw≤1 · fwd≥-1 이므로 gross 는 ≥-1 이지만
+        #   비용을 빼면 -1 을 밑돌 수 있고, 그러면 cumprod 가 부호를 뒤집어 파산한 경로가
+        #   양의 자본곡선으로 되살아난다(MDD -112% 같은 정의상 불가능한 값이 표에 찍힌다).
+        ret = float(max(ret, -1.0))
+        rows.append({"asof": t, "ret": max(ret - cost, -1.0), "ret_gross": ret,
+                     "n": len(w_new),
                      "turnover": turn, "cost": cost, "n_elig": n_elig,
                      "n_imputed": n_imputed, "w_imputed": w_imputed, "measurable": True})
         prev_w = w_new
 
+    if n_adv_miss:
+        LOG.info(f"[{label}] 거래대금(ADTV)을 못 찾은 매매 {n_adv_miss:,}건은 슬리피지 "
+                 f"보수 폴백(2%)을 적용했습니다.")
     if n_impute_tot:
         LOG.warn(f"[{label}] 전방수익률 측정 불가 {n_impute_tot:,}건(누적 비중 "
                  f"{w_impute_tot:.2f})을 해당 분기 유니버스 중앙값으로 대치했습니다. "
@@ -10341,18 +10484,33 @@ def perf_stats(R: pd.DataFrame, rf: float = 0.0, gross: bool = False) -> dict:
         return {}
     eq = np.cumprod(1.0 + r)
     years = n / float(PERIODS_PER_YEAR)
-    cagr = (eq[-1] ** (1.0 / years) - 1.0) if years > 0 and eq[-1] > 0 else np.nan
+    # ★ 자본곡선이 0 이하를 '통과'하면 그 경로는 파산이다. 예전에는 최종값(eq[-1])만 봤는데,
+    #   1+r<0 이 두 번 나오면 cumprod 가 부호를 두 번 뒤집어 파산 경로가 양의 자본으로
+    #   되살아나고 CAGR·MDD·Calmar 가 전부 유한값으로 인쇄됐다(MDD -112% 같은 값).
+    ruined = bool(np.any(eq <= 0))
+    if ruined:
+        cagr = -1.0
+    else:
+        cagr = (eq[-1] ** (1.0 / years) - 1.0) if years > 0 and eq[-1] > 0 else np.nan
     vol = r.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if n > 1 else np.nan
-    dn = r[r < 0]
-    dvol = dn.std(ddof=1) * math.sqrt(PERIODS_PER_YEAR) if len(dn) > 1 else np.nan
+    # ★ Sortino 의 하방편차는 '목표(=rf) 대비' 제곱평균이지, '음수 수익률들의 자기 평균 대비
+    #   표본표준편차'가 아니다. 후자는 손실이 비슷한 크기로 반복될수록 0 에 수렴해
+    #   손실의 '크기'가 아니라 '균일함'을 보상한다 — 실측에서 정의값 3.88 이 393 으로 나왔다.
+    rf_q = rf / float(PERIODS_PER_YEAR)
+    _dn = np.minimum(r - rf_q, 0.0)
+    dvol = float(np.sqrt((_dn ** 2).mean()) * math.sqrt(PERIODS_PER_YEAR)) if n else np.nan
     peak = np.maximum.accumulate(eq)
     dd = eq / peak - 1.0
-    mdd = float(dd.min()) if n else np.nan
+    mdd = float(max(dd.min(), -1.0)) if n else np.nan     # -100% 아래는 정의상 불가
+    if ruined:
+        mdd = -1.0
     mx = cur = 0
     for x in dd:
         cur = cur + 1 if x < -1e-9 else 0
         mx = max(mx, cur)
     mu, tstat = hac_tstat(r)
+    # ★ 평균 통계도 측정 가능한 분기(Rm)에서만 낸다. 측정 불가 분기는 n=0 ·
+    #   turnover=전량청산 으로 기록되므로 원본 R 을 쓰면 평균종목수·평균회전율이 어긋난다.
     return {
         "기간수(분기)": n, "누적수익": float(eq[-1] - 1.0), "CAGR": cagr, "연변동성": vol,
         "Sharpe": (cagr - rf) / vol if vol and np.isfinite(vol) and vol > 0 else np.nan,
@@ -10360,10 +10518,10 @@ def perf_stats(R: pd.DataFrame, rf: float = 0.0, gross: bool = False) -> dict:
         "MDD": mdd, "Calmar": (cagr / abs(mdd)) if mdd and mdd < 0 else np.nan,
         "승률": float((r > 0).mean()), "분기평균": float(r.mean()),
         "t통계량(HAC)": tstat, "최장언더워터(분기)": int(mx),
-        "평균종목수": float(R["n"].mean()) if "n" in R.columns else np.nan,
-        "평균회전율": float(R["turnover"].mean()) if "turnover" in R.columns else np.nan,
-        "평균비용": float(R["cost"].mean()) if "cost" in R.columns else np.nan,
-        "평균편입가능": float(R["n_elig"].mean()) if "n_elig" in R.columns else np.nan,
+        "평균종목수": float(Rm["n"].mean()) if "n" in Rm.columns else np.nan,
+        "평균회전율": float(Rm["turnover"].mean()) if "turnover" in Rm.columns else np.nan,
+        "평균비용": float(Rm["cost"].mean()) if "cost" in Rm.columns else np.nan,
+        "평균편입가능": float(Rm["n_elig"].mean()) if "n_elig" in Rm.columns else np.nan,
     }
 
 
@@ -10495,7 +10653,7 @@ ABLATIONS = [
 
 ABLATION_RESULTS: "OrderedDict[str, dict]" = OrderedDict()
 
-_ABL_METRIC_ORDER = ["CAGR", "MDD", "Sharpe", "Sortino", "IC", "IC-IR", "회전율",
+_ABL_METRIC_ORDER = ["CAGR", "MDD", "Sharpe", "Sortino", "IC", "IC-IR", "t(IC)", "회전율",
                      "평균종목수", "승률", "평균편입가능"]
 
 
@@ -10503,7 +10661,8 @@ def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
              purpose: str, kw: dict) -> dict:
     """한 팔 실행 — 신호 재조립 → 비용 전/후 백테스트 → 지표 산출."""
     rec = {"id": aid, "name": name, "purpose": purpose, "ok": False, "err": "",
-           "net": {}, "gross": {}, "ic": np.nan, "icir": np.nan, "n_ic": 0,
+           "net": {}, "gross": {}, "ic": np.nan, "icir": np.nan,
+           "ic_t": np.nan, "n_ic": 0,
            "p": np.nan, "excess": np.nan}
     try:
         Q = assemble_final(P, **kw)
@@ -10513,8 +10672,11 @@ def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
         bt_net = run_fn(Q, label=f"ABL_{aid}", apply_costs=True, top_n=top_n)
         rec["net"] = perf_stats(bt_net["returns"])
         rec["gross"] = perf_stats(bt_net["returns"], gross=True)
-        ic, icir, n_ic = bt_ic(Q, "FINAL_RANK")
-        rec["ic"], rec["icir"], rec["n_ic"] = ic, icir, n_ic
+        # ★ bt_ic 의 2번째 값은 t통계량이다(IR × √n). 표에 'IC-IR' 로 찍으면 분기 40개에서
+        #   6.32배 부풀려진 값을 읽게 되므로 IR 과 t 를 분리해 둘 다 보고한다.
+        ic, icir, ic_t, n_ic = info_coef_full(Q["FINAL_RANK"], Q["fwd_ret_1q"],
+                                              Q["asof"].astype(str))
+        rec["ic"], rec["icir"], rec["ic_t"], rec["n_ic"] = ic, icir, ic_t, n_ic
         # 초과수익 = 전략 − U-1000 동일가중 (지수 대신 같은 유니버스를 쓴다 — 41 모듈 주석 참조)
         bench = equal_weight_universe_return(P)
         R = bt_net["returns"].set_index("asof")["ret"]
@@ -10589,11 +10751,15 @@ def report_ablation_table() -> pd.DataFrame:
             f(n, "MDD", True), f(n, "Sortino"),
             (f"{r['ic']:+.4f}" if np.isfinite(r["ic"]) else "—"),
             (f"{r['icir']:+.2f}" if np.isfinite(r["icir"]) else "—"),
+            (f"{r.get('ic_t', float('nan')):+.2f}"
+             if np.isfinite(r.get("ic_t", float("nan"))) else "—"),
             f"{n.get('평균종목수', float('nan')):.1f}",
         ])
     LOG.table(rows, ["ID", "구성", "CAGR(전)", "CAGR(후)", "Sharpe(전)", "Sharpe(후)",
-                     "MDD", "Sortino", "IC", "IC-IR", "종목수"],
-              ["l", "l", "r", "r", "r", "r", "r", "r", "r", "r", "r"], maxw=32)
+                     "MDD", "Sortino", "IC", "IC-IR", "t(IC)", "종목수"],
+              ["l", "l", "r", "r", "r", "r", "r", "r", "r", "r", "r", "r"], maxw=32)
+    LOG.info("IC-IR = mean(IC)/std(IC) (표준 정의) · t(IC) = IC-IR × √기간수. "
+             "둘을 혼동하면 분기 40개에서 6.32배 부풀려진 값을 IR 로 읽게 됩니다.")
 
     rows2 = []
     for aid, name, purpose, _kw in ABLATIONS:
@@ -11600,7 +11766,7 @@ def report_dataflow_map() -> None:
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A26 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A31 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -12390,12 +12556,164 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A26", "D2 윈저라이즈 기간 분리", a26)
 
+    # ── A27  축 A 결측이 '점수 축소'로 사실상 탈락시키지 않는가 ───────────────────────────
+    def a27():
+        # A10 은 FINAL_SCORE 가 NaN 이 아닌지만 본다. 결측군의 분산이 절반으로 줄면 NaN 은
+        # 아니면서도 상위 N 꼬리에 도달하지 못한다 — 여기서는 **선정률**로 검사한다.
+        rng2 = np.random.default_rng(7)
+        n, cov, K = 600, 0.20, 30
+        P = pd.DataFrame({
+            "code": [f"{i*10:06d}" for i in range(n)],
+            "corp_code": [f"C{i}" for i in range(n)],
+            "asof": [pd.Timestamp("2020-06-01")] * n, "q": ["2020Q1"] * n,
+            "sector": ["기타"] * n, "cell": ["2020Q1|기타"] * n,
+            "cell_all": ["2020Q1|ALL"] * n,
+            "D1_SCORE": rng2.normal(size=n), "D2_SCORE": rng2.normal(size=n),
+            "D3_SCORE": rng2.normal(size=n), "EXCLUDE": 0.0})
+        has_a = rng2.random(n) < cov                       # 축 A 보유 여부 ⟂ 축 B 점수
+        t = rng2.normal(size=n)
+        P["dTONE"] = np.where(has_a, t, np.nan)
+        P["dTONE_resid"] = P["dTONE"]
+        Q = assemble_final(P, use_axes=("A", "D1", "D2", "D3"), use_excl=True)
+        top = Q.nlargest(K, "FINAL_SCORE")
+        share = float(top["dTONE_resid"].notna().mean())
+        ratio = share / max(cov, 1e-9)
+        if Q["FINAL_SCORE"].isna().any():
+            return False, "축 B 가 있는데도 FINAL_SCORE 가 결측인 행이 있습니다"
+        if ratio > 1.6:
+            return False, (f"★축 A 보유 종목이 상위 {K} 를 {ratio:.2f}배 과대점유합니다 "
+                           f"(커버리지 {cov:.0%} · 상위 점유 {share:.0%}). 축 A 결측 행은 "
+                           f"AXIS_A_Z=0 으로 채워져 FINAL 의 분산이 절반이 되고, 선정은 "
+                           f"꼬리에서 일어나므로 NaN 이 아닌데도 구조적으로 밀립니다 — "
+                           f"§7.2 '탈락시키지 말 것'의 실질 위반입니다.")
+        return True, (f"커버리지 {cov:.0%} · 상위 {K} 중 축 A 보유 {share:.0%} "
+                      f"(과대선택 {ratio:.2f}배, 허용 1.6배 이하)")
+
+    _ac("A27", "축 A 결측 종목의 실질 편입률 (§7.2)", a27)
+
+    # ── A28  매도 슬리피지가 폴백(2%)으로 새지 않는가 ─────────────────────────────────────
+    def a28():
+        rb = pd.to_datetime(["2019-03-01", "2019-06-01", "2019-09-01"])
+        codes = [f"{i*10:06d}" for i in range(1, 61)]
+        rows = []
+        for ti, t in enumerate(rb):
+            for i, c in enumerate(codes):
+                # 분기마다 신호를 완전히 뒤집어 100% 회전을 만든다
+                s = (i if ti % 2 == 0 else len(codes) - i) / len(codes)
+                rows.append({"code": c, "asof": t, "adtv60": 5e8, "fwd_ret_1q": 0.0,
+                             "FINAL_RANK": s, "FINAL_SCORE": s, "EXCLUDE": 0.0,
+                             "vol_q": 0.3})
+        P = pd.DataFrame(rows)
+
+        class _U:
+            def delisting_map(self): return {}
+            def audit_row(self, *a, **k): pass
+        bt = run_backtest(P, rb, _U(), None, top_n=10, apply_costs=True, label="A28")
+        R = bt["returns"]
+        cost_q = float(R.loc[R["measurable"], "cost"].mean())
+        # 전 종목 ADTV 가 동일하므로 매수·매도 슬리피지가 같아야 한다.
+        # adv=0 폴백(2%)이 매도 쪽에만 걸리면 비용이 대략 2배 이상으로 뛴다.
+        w, notional = 0.1, 0.1 * ARC_ACCOUNT_KRW
+        sl = arc_slippage(notional, 5e8)
+        expect = 2.0 * 10 * w * (ARC_COMMISSION_BPS / 1e4 + sl) + \
+                 10 * w * arc_sell_tax(rb[1])
+        if cost_q > expect * 1.5:
+            return False, (f"★분기 비용 {cost_q:.4f} 가 기대치 {expect:.4f} 의 1.5배를 "
+                           f"넘습니다. 전량 매도 종목이 advmap 에 없어 슬리피지가 일괄 2% "
+                           f"폴백으로 매겨지고 있습니다 — 회전율이 다른 어블레이션 팔이 "
+                           f"부당한 벌점을 받습니다.")
+        return True, (f"분기 비용 {cost_q:.4f} (기대 {expect:.4f}) · "
+                      f"매도 슬리피지 폴백 없음")
+
+    _ac("A28", "매도 슬리피지 ADTV 폴백 누수", a28)
+
+    # ── A29  Sortino · 파산 경로 방어 ─────────────────────────────────────────────────────
+    def a29():
+        r = np.array([0.12, -0.030, 0.09, -0.0305, 0.11, -0.0298, 0.08, -0.0302] * 3)
+        R = pd.DataFrame({"asof": pd.date_range("2016-03-01", periods=len(r), freq="QS"),
+                          "ret": r, "ret_gross": r, "n": 30, "turnover": 1.0,
+                          "cost": 0.0, "n_elig": 100, "measurable": True})
+        st = perf_stats(R)
+        dd_def = float(np.sqrt((np.minimum(r, 0.0) ** 2).mean()) * math.sqrt(4))
+        want = (st["CAGR"]) / dd_def
+        if abs(st["Sortino"] - want) > 0.05:
+            return False, (f"★Sortino {st['Sortino']:.2f} 가 정의값 {want:.2f} 와 다릅니다. "
+                           f"하방편차를 '음수 수익률들의 자기 평균 대비 표본표준편차'로 "
+                           f"계산하면 손실의 크기가 아니라 균일함을 보상하게 되어 "
+                           f"손실이 뭉친 팔이 세 자리 Sortino 로 최우수처럼 보입니다.")
+        # 파산 경로: 1+r<0 이 두 번 나오면 cumprod 가 부호를 뒤집어 되살아난다
+        r2 = np.array([0.1, -1.10, 0.2, -1.10, 0.3, 0.4])
+        R2 = pd.DataFrame({"asof": pd.date_range("2016-03-01", periods=6, freq="QS"),
+                           "ret": r2, "ret_gross": r2, "n": 1, "turnover": 1.0,
+                           "cost": 0.0, "n_elig": 1, "measurable": True})
+        s2 = perf_stats(R2)
+        if s2["MDD"] < -1.0 - 1e-9:
+            return False, f"★MDD {s2['MDD']:.2%} — 정의상 -100% 아래는 불가능합니다"
+        if not (np.isnan(s2["CAGR"]) or s2["CAGR"] <= -0.999):
+            return False, (f"★자본곡선이 0 을 통과했는데 CAGR {s2['CAGR']:+.2%} 로 "
+                           f"계산됐습니다(파산 경로가 양의 자본으로 되살아남).")
+        return True, (f"Sortino 정의 일치 ({st['Sortino']:.2f}) · "
+                      f"파산 경로 CAGR {s2['CAGR']:+.0%} · MDD {s2['MDD']:.0%}")
+
+    _ac("A29", "Sortino 정의 · 파산 경로 방어", a29)
+
+    # ── A30  '모름' 이 D3 합산에서 0 으로 붕괴하지 않는가 ─────────────────────────────────
+    def a30():
+        H = pd.DataFrame({"corp_code": ["C1", "C2"],
+                          "event_date": pd.to_datetime(["2019-03-31"] * 2),
+                          "knowledge_date": pd.to_datetime(["2019-04-01"] * 2)})
+        for i, c in enumerate(D3_COLS):
+            H[c] = [1.0 if i < 2 else 0.0, np.nan]        # C2 는 전 태그 '모름'
+        H["D3_N_OBS"] = H[D3_COLS].notna().sum(axis=1).astype("int16")
+        H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True).where(H["D3_N_OBS"] > 0)
+        if pd.notna(H.loc[1, "DELTA_NONFIN"]):
+            return False, ("★전 태그가 '모름'인 법인의 ΔNONFIN 이 0.0 으로 계산됐습니다. "
+                           "문서 파싱에 실패한 법인이 '사실이 하나도 없는 법인'과 같은 "
+                           "척도로 z-scoring 되어, D3_SCORE 가 사실 건수가 아니라 데이터 "
+                           "커버리지의 함수가 됩니다(최종 점수의 10%).")
+        if float(H.loc[0, "DELTA_NONFIN"]) != 2.0:
+            return False, f"관측이 있는 법인의 ΔNONFIN 이 틀렸습니다: {H.loc[0, 'DELTA_NONFIN']}"
+        return True, "전 태그 결측 → ΔNONFIN 결측 · 관측 있으면 정상 합산 · D3_N_OBS 병기"
+
+    _ac("A30", "D3 '모름' vs '미발화' 구분", a30)
+
+    # ── A31  직교화 자유도 가드 ───────────────────────────────────────────────────────────
+    def a31():
+        rng3 = np.random.default_rng(3)
+        p = 13                                   # 통제 6 + 섹터더미 7
+        corrs = {}
+        for nobs in (17, 60, 200):
+            acc = []
+            for _ in range(60):
+                X = rng3.normal(size=(nobs, p))
+                y = rng3.normal(size=nobs)       # y ⟂ X (진짜 신호는 전부 잔차여야 한다)
+                res = ols_resid_np(y, X)
+                if np.isfinite(res).sum() < 3:
+                    continue
+                m = np.isfinite(res)
+                acc.append(abs(float(np.corrcoef(y[m], res[m])[0, 1])))
+            corrs[nobs] = (float(np.mean(acc)) if acc else np.nan, len(acc))
+        thin, _ = corrs[17]
+        if np.isfinite(thin) and thin < 0.80:
+            return False, (f"★관측 17개 · 파라미터 {p+1}개에서 잔차가 원신호를 {1-thin:.0%} "
+                           f"만큼 먹었습니다(corr={thin:.2f}). 'ΔTONE_resid' 가 실제로는 "
+                           f"규모·모멘텀·섹터의 적합오차, 즉 위장된 사이즈 베팅이 되고 "
+                           f"그 값이 FINAL_SCORE 의 50% 를 차지합니다.")
+        n_ok = corrs[200][1]
+        if n_ok == 0:
+            return False, "관측 200개에서도 잔차가 생성되지 않습니다(가드가 과도)"
+        return True, (f"자유도 부족(n=17) 시 잔차 미생성 · "
+                      f"n=60 corr {corrs[60][0]:.2f} · n=200 corr {corrs[200][0]:.2f} "
+                      f"(하한 {OLS_MIN_OBS_PER_PARAM}×파라미터)")
+
+    _ac("A31", "직교화 자유도 하한", a31)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A26 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A31 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))
