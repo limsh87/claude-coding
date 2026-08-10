@@ -247,7 +247,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0540"
+BUILD_VERSION = "v2.20260810.0542"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -7468,19 +7468,28 @@ def build_liquidity_panel(px_daily: pd.DataFrame, rebals: pd.DatetimeIndex) -> p
     d["px_12m"] = g["close"].shift(252)
     d["mom_12_1"] = safe_div(d["px_1m"], d["px_12m"]) - 1.0
 
-    R = pd.DataFrame({"asof": pd.DatetimeIndex(rebals)})
-    frames = []
-    right = d[["code", "date", "adtv60", "close", "mom_12_1"]].dropna(subset=["date"])
-    for t in R["asof"]:
-        sub = right[right["date"] < as_ts(t)]
-        if sub.empty:
-            continue
-        last = sub.groupby("code", observed=True).tail(1).copy()
-        last["asof"] = as_ts(t)
-        frames.append(last[["code", "asof", "adtv60", "close", "mom_12_1"]])
-    if not frames:
+    # ★ 리밸일마다 일봉 전체를 필터링하면 (40시점 × 875만행) 스캔이 되고, 매 반복이
+    #   수백 MB 복사본을 만든다. merge_asof 로 한 번에 푼다 — 의미는 동일하고
+    #   allow_exact_matches=False 가 '리밸일 당일 제외'(§4 t-1 종가까지) 를 강제한다.
+    right = (d[["code", "date", "adtv60", "close", "mom_12_1"]]
+             .dropna(subset=["date", "code"]).sort_values("date", kind="stable"))
+    right["code"] = right["code"].astype(str)
+    codes = right["code"].unique()
+    if len(codes) == 0 or len(rebals) == 0:
         return pd.DataFrame(columns=cols)
-    L = pd.concat(frames, ignore_index=True)
+    left = pd.DataFrame({"code": np.repeat(codes, len(rebals)),
+                         "asof": np.tile(pd.DatetimeIndex(rebals).values, len(codes))})
+    left["asof"] = as_ts_series(left["asof"])
+    left = left.sort_values("asof", kind="stable")
+    try:
+        L = pd.merge_asof(left, right, left_on="asof", right_on="date", by="code",
+                          direction="backward", allow_exact_matches=False)
+    except Exception as e:                                       # noqa
+        LOG.warn(f"유동성 패널 as-of 결합 실패({type(e).__name__}) — 빈 패널을 돌려줍니다.")
+        return pd.DataFrame(columns=cols)
+    L = L.dropna(subset=["date"])[["code", "asof", "adtv60", "close", "mom_12_1"]]
+    if L.empty:
+        return pd.DataFrame(columns=cols)
     PIPE.io("OUT", "MEM", "liquidity_panel", L)
     return downcast(L)
 
@@ -7496,23 +7505,32 @@ def build_exec_prices(px_daily: pd.DataFrame, rebals: pd.DatetimeIndex) -> pd.Da
         return pd.DataFrame(columns=cols)
     d = px_daily[["code", "date", "open", "close"]].dropna(subset=["code", "date"]).copy()
     d["date"] = as_ts_series(d["date"])
-    d = d.sort_values(["code", "date"], kind="stable")
-    frames = []
-    for t in rebals:
-        t = as_ts(t)
-        fwd = d[(d["date"] >= t) & (d["date"] <= t + pd.Timedelta(days=10))]
-        if len(fwd):
-            first = fwd.groupby("code", observed=True).head(1).copy()
-            first["exec_px"] = pd.to_numeric(first["open"], errors="coerce")
-            first["exec_src"] = "익영업일시가"
-            bad = ~np.isfinite(first["exec_px"]) | (first["exec_px"] <= 0)
-            first.loc[bad, "exec_px"] = pd.to_numeric(first.loc[bad, "close"], errors="coerce")
-            first.loc[bad, "exec_src"] = "동일일종가(시가없음)"
-            first["asof"] = t
-            frames.append(first.rename(columns={"date": "exec_date"})[cols])
-    if not frames:
+    # ★ 여기도 merge_asof(direction="forward") 로 한 번에 푼다. tolerance 10일은
+    #   '거래정지·상폐 직전이라 첫 거래일이 너무 멀면 그 가격으로 체결했다고 볼 수 없다' 규칙.
+    right = d.dropna(subset=["date", "code"]).sort_values("date", kind="stable").copy()
+    right["code"] = right["code"].astype(str)
+    codes = right["code"].unique()
+    if len(codes) == 0 or len(rebals) == 0:
         return pd.DataFrame(columns=cols)
-    E = pd.concat(frames, ignore_index=True)
+    left = pd.DataFrame({"code": np.repeat(codes, len(rebals)),
+                         "asof": np.tile(pd.DatetimeIndex(rebals).values, len(codes))})
+    left["asof"] = as_ts_series(left["asof"])
+    left = left.sort_values("asof", kind="stable")
+    try:
+        M = pd.merge_asof(left, right, left_on="asof", right_on="date", by="code",
+                          direction="forward", tolerance=pd.Timedelta(days=10))
+    except Exception as e:                                       # noqa
+        LOG.warn(f"체결가 as-of 결합 실패({type(e).__name__}) — 빈 결과를 돌려줍니다.")
+        return pd.DataFrame(columns=cols)
+    M = M.dropna(subset=["date"])
+    if M.empty:
+        return pd.DataFrame(columns=cols)
+    M["exec_px"] = pd.to_numeric(M["open"], errors="coerce")
+    M["exec_src"] = "익영업일시가"
+    bad = ~np.isfinite(M["exec_px"]) | (M["exec_px"] <= 0)
+    M.loc[bad, "exec_px"] = pd.to_numeric(M.loc[bad, "close"], errors="coerce")
+    M.loc[bad, "exec_src"] = "동일일종가(시가없음)"
+    E = M.rename(columns={"date": "exec_date"})[cols]
     E = E[np.isfinite(E["exec_px"]) & (E["exec_px"] > 0)]
     n_fb = int((E["exec_src"] != "익영업일시가").sum())
     if n_fb:
@@ -9948,18 +9966,25 @@ def attach_volatility(P: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame:
     d["r1"] = d.groupby("code", observed=True)["close"].pct_change()
     d["vol"] = (d.groupby("code", observed=True)["r1"]
                  .transform(lambda s: s.rolling(60, min_periods=20).std()) * math.sqrt(252))
-    frames = []
-    for t in sorted(P["asof"].dropna().unique()):
-        sub = d[d["date"] < as_ts(t)]
-        if sub.empty:
-            continue
-        last = sub.groupby("code", observed=True).tail(1)[["code", "vol"]].copy()
-        last["asof"] = as_ts(t)
-        frames.append(last)
-    if frames:
-        V = pd.concat(frames, ignore_index=True).rename(columns={"vol": "vol_q"})
+    # ★ 리밸일마다 일봉 전체를 필터링하지 않는다(메모리 스파이크). merge_asof 한 번으로 끝낸다.
+    right = (d[["code", "date", "vol"]].dropna(subset=["date", "code"])
+             .sort_values("date", kind="stable"))
+    right["code"] = right["code"].astype(str)
+    left = P[["code", "asof"]].copy()
+    left["code"] = left["code"].astype(str)
+    left["asof"] = as_ts_series(left["asof"])
+    left = left.dropna(subset=["asof"]).sort_values("asof", kind="stable")
+    try:
+        V = pd.merge_asof(left, right, left_on="asof", right_on="date", by="code",
+                          direction="backward", allow_exact_matches=False)
+        V = (V.dropna(subset=["vol"])[["code", "asof", "vol"]]
+              .rename(columns={"vol": "vol_q"})
+              .drop_duplicates(["code", "asof"], keep="last"))
         P = P.merge(V, on=["code", "asof"], how="left")
-    else:
+    except Exception as e:                                       # noqa
+        LOG.warn(f"변동성 as-of 결합 실패({type(e).__name__}) — 역변동성 가중을 건너뜁니다.")
+        P["vol_q"] = np.nan
+    if "vol_q" not in P.columns:
         P["vol_q"] = np.nan
     return P
 

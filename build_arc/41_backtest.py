@@ -244,18 +244,25 @@ def attach_volatility(P: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame:
     d["r1"] = d.groupby("code", observed=True)["close"].pct_change()
     d["vol"] = (d.groupby("code", observed=True)["r1"]
                  .transform(lambda s: s.rolling(60, min_periods=20).std()) * math.sqrt(252))
-    frames = []
-    for t in sorted(P["asof"].dropna().unique()):
-        sub = d[d["date"] < as_ts(t)]
-        if sub.empty:
-            continue
-        last = sub.groupby("code", observed=True).tail(1)[["code", "vol"]].copy()
-        last["asof"] = as_ts(t)
-        frames.append(last)
-    if frames:
-        V = pd.concat(frames, ignore_index=True).rename(columns={"vol": "vol_q"})
+    # ★ 리밸일마다 일봉 전체를 필터링하지 않는다(메모리 스파이크). merge_asof 한 번으로 끝낸다.
+    right = (d[["code", "date", "vol"]].dropna(subset=["date", "code"])
+             .sort_values("date", kind="stable"))
+    right["code"] = right["code"].astype(str)
+    left = P[["code", "asof"]].copy()
+    left["code"] = left["code"].astype(str)
+    left["asof"] = as_ts_series(left["asof"])
+    left = left.dropna(subset=["asof"]).sort_values("asof", kind="stable")
+    try:
+        V = pd.merge_asof(left, right, left_on="asof", right_on="date", by="code",
+                          direction="backward", allow_exact_matches=False)
+        V = (V.dropna(subset=["vol"])[["code", "asof", "vol"]]
+              .rename(columns={"vol": "vol_q"})
+              .drop_duplicates(["code", "asof"], keep="last"))
         P = P.merge(V, on=["code", "asof"], how="left")
-    else:
+    except Exception as e:                                       # noqa
+        LOG.warn(f"변동성 as-of 결합 실패({type(e).__name__}) — 역변동성 가중을 건너뜁니다.")
+        P["vol_q"] = np.nan
+    if "vol_q" not in P.columns:
         P["vol_q"] = np.nan
     return P
 
