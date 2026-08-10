@@ -6691,6 +6691,9 @@ DISC_SPECS = [
 ]
 DISC_MIN_YIELD = 0.02      # 한 페이지(100건)에서 우리가 쓰는 공시가 이 비율 미만이면 접는다
 DISC_NARROW_KEEP = 0.50    # 좁힌 후보가 광역의 이 비율 이상을 건지면 광역을 버린다
+DISC_NARROW_COST = 0.85    # ★그리고 이 비율 이하로 실제로 싸야 '좁혔다'고 인정한다.
+#                            같은 페이지 수가 오면 상세유형 필터가 무시된 것이므로, 절감을
+#                            주장하지 말고 그 사실을 로그에 적어야 다른 수단을 찾게 된다.
 
 
 def _disc_kind_mask(nm: pd.Series) -> pd.Series:
@@ -6736,22 +6739,38 @@ def disc_plan(start: str, end: str, avail: Optional[int] = None) -> dict:
     months = [m for m in allm if str(m) not in mons][::-1]   # ★최근 월 우선(본문 주석 참조)
     if RUN_MODE == "CACHED" or not months or not DART_API_KEY:
         return {"jobs": [], "specs": [], "need": 0}
-    probe_m = months[0]
+    # ★표본 월을 하나만 쓰면 안 된다. 공시량은 계절성이 극심하다 — 3월은 사업보고서
+    #   제출 피크라 정기공시(A)가 평월의 3배가 넘는다(실측: 2026-03 에서 A=37페이지,
+    #   평월 추정은 12). 최근 월 하나로 재면 실수요가 과대추정되고, 그 결과 예산이
+    #   모자란 것으로 판정되어 ★불필요하게 손실 있는 절감(집중월만 훑기)으로 내려간다.
+    #   실제로 그렇게 배당·소각 recall 7%를 그냥 버렸다. 그래서 분기 간격으로 흩어
+    #   최대 3개월을 재고 ★중앙값을 쓴다(비용은 후보 4종 × 3 = 최대 12회).
+    pick = [months[0]] + [months[i] for i in (len(months) // 3, 2 * len(months) // 3)
+                          if 0 < i < len(months)]
+    pick = list(dict.fromkeys(pick))[:3]
     obs: List[dict] = []
     for sp in DISC_SPECS:
-        js = dart_call("list.json", {"bgn_de": probe_m.start_time.strftime("%Y%m%d"),
-                                     "end_de": probe_m.end_time.strftime("%Y%m%d"),
-                                     "page_no": 1, "page_count": 100,
-                                     "last_reprt_at": "N", **sp["params"]})
-        lst = (js or {}).get("list")
-        if not js or not isinstance(lst, list) or not lst:
+        pgs, cns, pys, notes = [], [], [], []
+        for pm in pick:
+            js = dart_call("list.json", {"bgn_de": pm.start_time.strftime("%Y%m%d"),
+                                         "end_de": pm.end_time.strftime("%Y%m%d"),
+                                         "page_no": 1, "page_count": 100,
+                                         "last_reprt_at": "N", **sp["params"]})
+            lst = (js or {}).get("list")
+            if not js or not isinstance(lst, list) or not lst:
+                notes.append(str((js or {}).get("status", "무응답")))
+                continue
+            pgs.append(max(1, int(js.get("total_page", 1) or 1)))
+            cns.append(int(js.get("total_count", len(lst)) or len(lst)))
+            nm = pd.Series([str(x.get("report_nm", "")) for x in lst])
+            pys.append(float(_disc_kind_mask(nm).mean()))
+        if not pgs:
             obs.append({**sp, "pages": 0, "cnt": 0, "hits": 0.0, "pyield": 0.0,
-                        "note": f"응답 0건({(js or {}).get('status', '무응답')})"})
+                        "note": f"응답 0건({notes[0] if notes else '무응답'})"})
             continue
-        pages = max(1, int(js.get("total_page", 1) or 1))
-        cnt = int(js.get("total_count", len(lst)) or len(lst))
-        nm = pd.Series([str(x.get("report_nm", "")) for x in lst])
-        py = float(_disc_kind_mask(nm).mean())
+        pages = int(np.median(pgs))
+        cnt = int(np.median(cns))
+        py = float(np.median(pys))
         obs.append({**sp, "pages": pages, "cnt": cnt, "hits": cnt * py, "pyield": py,
                     "note": ""})
     keep = [o for o in obs if o["must"] and o["pages"] > 0]
@@ -6759,12 +6778,25 @@ def disc_plan(start: str, end: str, avail: Optional[int] = None) -> dict:
                  key=lambda o: -(o["hits"] / max(o["pages"], 1)))
     narrow = next((o for o in opt if o["key"] == "I001"), None)
     broad = next((o for o in opt if o["key"] == "I"), None)
+    # ★'좁혔다'고 말하려면 실제로 싸져야 한다. 실측에서 I001 과 I 가 페이지·건수까지
+    #   완전히 동일하게 돌아왔다(138페이지 · 13,735건) — 서버가 pblntf_detail_ty 를
+    #   무시했다는 뜻이다. 그런데도 옛 판정은 '수확 100%를 건졌으니 광역 접음'이라고
+    #   적었다. 절감이 0인데 절감했다고 말하는 로그다. 그러면 다른 절감 수단을 찾지 않는다.
+    if (narrow is not None and broad is not None and narrow["pages"] > 0
+            and narrow["pages"] > DISC_NARROW_COST * max(broad["pages"], 1)):
+        narrow["dead"] = True
+        narrow["note"] = (f"★상세유형 필터가 서버에서 무시된 듯합니다 — 광역과 같은 "
+                          f"{narrow['pages']}페이지·{narrow['cnt']:,}건이 왔습니다. "
+                          f"좁히기 절감이 0 이므로 광역을 그대로 씁니다")
     for o in opt:
+        if o.get("dead"):
+            continue
         if o["pyield"] < DISC_MIN_YIELD:
             o["note"] = f"페이지당 유효 수확 {o['pyield']*100:.1f}% — 접음"
             continue
-        # ★좁힌 후보가 광역의 절반 이상을 건지면 광역은 버린다(같은 것을 비싸게 사지 않는다).
-        if (o is broad and narrow is not None and narrow["pyield"] >= DISC_MIN_YIELD
+        # ★좁힌 후보가 (더 싸면서) 광역의 절반 이상을 건지면 광역은 버린다.
+        if (o is broad and narrow is not None and not narrow.get("dead")
+                and narrow["pyield"] >= DISC_MIN_YIELD
                 and narrow["hits"] >= DISC_NARROW_KEEP * max(broad["hits"], 1e-9)):
             o["note"] = (f"좁힌 후보 I001 이 수확의 "
                          f"{narrow['hits']/max(broad['hits'],1e-9)*100:.0f}%를 "
@@ -6802,7 +6834,8 @@ def disc_plan(start: str, end: str, avail: Optional[int] = None) -> dict:
              if o in keep else (o["note"] or "접음")] for o in obs]
     L.grid(rows, ["유형", "무엇을 얻나", "월페이지", "월건수", "유효비율", "판정"],
            ["l", "l", "r", "r", "r", "l"],
-           title=f"공시 스윕 유형 선택 — {probe_m} 한 달을 실측해 '비용(페이지) 대비 수확'으로 "
+           title=f"공시 스윕 유형 선택 — {', '.join(str(x) for x in pick)} "
+                 f"{len(pick)}개월을 실측해 중앙값으로 '비용(페이지) 대비 수확'을 "
                  f"고릅니다. 채택 유형 월 {per_month}회 · 남은 (월×유형) {len(jobs):,}건 → "
                  f"실수요 {need:,}회(프리플라이트 {len(obs)}회 소비). 이 값을 예산에 "
                  f"'선언'하므로, 순번 때문에 비율만 받고 굶는 일은 이제 없습니다.")
@@ -7544,7 +7577,7 @@ def _nps_preflight(names: Sequence[Tuple[str, str]]) -> bool:
 
 
 def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
-                priority: Sequence[str] = (), max_calls: int = 0) -> pd.DataFrame:
+                priority: Sequence[str] = (), max_calls: int = -1) -> pd.DataFrame:
     """상장사명 → 사업장 seq → 월별 가입자·고지금액 패널.
 
     ★축: 종목축 1회 검색 + seq 당 상세/기간 조회. 월은 ★응답에서 나오지 요청에 넣지 않는다.
@@ -7591,7 +7624,10 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
         #   검색 1 + 기간 1 + 상세 ≤NPS_MAX_SITES 를 쓴다. 잔여를 잡 수로 그대로 쓰면
         #   실제로는 몇 배를 쏜다(실측: 10,000잡 캡으로 20,000호출을 태웠다).
         per_job = 2 + NPS_MAX_SITES
-        room = max(0, min(int(max_calls) or 10 ** 9, QUOTA.remaining("datagokr")))
+        # ★cap_of 규약 — None(무제한)일 때만 잔여 전량. 옛 `or 10**9` 는 배정 0 을
+        #   무제한으로 뒤집어, 예산을 한 건도 못 받은 팩이 오히려 다 태우게 했다.
+        _mc = cap_of(max_calls)
+        room = max(0, min(10 ** 9 if _mc is None else _mc, QUOTA.remaining("datagokr")))
         cap_n = min(int(NPS_MAX_CALLS) or len(jobs),
                     (room // per_job) if room else len(jobs))
         if cap_n <= 0:
@@ -7710,7 +7746,7 @@ G2B_URL = ("https://apis.data.go.kr/1230000/ao/ScsbidInfoService/"
            "getScsbidListSttusThngPPSSrch")
 
 
-def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = 0) -> pd.DataFrame:
+def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.DataFrame:
     """낙찰정보 월 스윕 — 낙찰업체명·낙찰가/예정가(낙찰률)·발주기관. 사업자번호 직접 식별."""
     cols = ["ym", "corp_nm", "biz_no", "award_amt", "plan_amt", "rate", "org", "item_cls"]
     if not DATA_GO_KR_KEY:
@@ -7768,8 +7804,9 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = 0) -> pd.Data
     _sp0 = QUOTA.spent("datagokr")
     with stage_bar(len(todo), "조달 낙찰(월축)") as bar:
         for batch in chunked(todo, 6):
+            _mc2 = cap_of(max_calls)
             if CLOCK.over() or not QUOTA.allow("datagokr") or \
-                    (max_calls and QUOTA.spent("datagokr") - _sp0 >= max_calls):
+                    (_mc2 is not None and QUOTA.spent("datagokr") - _sp0 >= _mc2):
                 CLOCK.cut(f"조달 낙찰: {len(got):,}행 수집 후 중단(완주 월만 완료 처리)")
                 break
             for item in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
@@ -7816,7 +7853,7 @@ def load_hs_map() -> pd.DataFrame:
 
 
 def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
-                    max_calls: int = 0) -> pd.DataFrame:
+                    max_calls: int = -1) -> pd.DataFrame:
     """HS별 월 수출 중량/금액/국가군. 키·매핑 없으면 빈 결과(팩 비활성)."""
     cols = ["ym", "hs", "grp", "exp_usd", "exp_kg"]
     if not (CUSTOMS_API_KEY or DATA_GO_KR_KEY) or not hs_codes:
@@ -7860,8 +7897,9 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
     _sx0 = QUOTA.spent(key_src)
     with stage_bar(len(jobs), "관세 통관(월×HS축)") as bar:
         for batch in chunked(jobs, 200):
+            _mc2 = cap_of(max_calls)
             if CLOCK.over() or not QUOTA.allow(key_src) or \
-                    (max_calls and QUOTA.spent(key_src) - _sx0 >= max_calls):
+                    (_mc2 is not None and QUOTA.spent(key_src) - _sx0 >= _mc2):
                 CLOCK.cut(f"관세 통관: {len(got):,}행 수집 후 중단")
                 break
             for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
@@ -10678,7 +10716,7 @@ def main() -> dict:
         # ★공공데이터포털 잔여도 DART 와 같은 배분기로 나눈다. 국민연금이 잔여를 다 먹으면
         #   조달·관세가 매 실행 0건이 된다(실측: NPS 가 20,000회를 태우는 동안 나머지는 굶었다).
         dgb = CallBudget("datagokr", DATAGOKR_BUDGET_SHARE)
-        dgb.table({"nps": "국민연금 사업장", "procure": "조달 낙찰", "customs": "관세 통관"})
+
         # ★수집기별 개별 격리 — 한 팩의 예외가 나머지 팩 수집까지 무산시키지 않게 한다
         def _try(tag, fn):
             try:
@@ -10688,6 +10726,18 @@ def main() -> dict:
                        f"해당 팩만 결측으로 두고 계속 진행합니다.")
                 RUN.note(f"WARN: 팩 수집 {tag} 실패")
                 return None
+
+        # ★DART 와 같은 2단계 배분(수요 선언 → 정산). 관세는 수요를 ★정확히 셀 수 있다 —
+        #   (월 × HS코드)이고, HS 매핑이 없으면 0 이다. 0 을 선언하면 그 몫이 회수되어
+        #   국민연금·조달로 흘러간다. 선언이 없으면 '수요 미상'으로 10%를 깔고 앉는다.
+        ctx["hs_map"] = _try("HS매핑", load_hs_map) if "X" in ACTIVE_PACKS else None
+        hs_list = (ctx["hs_map"]["hs"].astype(str).unique().tolist()
+                   if ctx.get("hs_map") is not None and len(ctx["hs_map"]) else [])
+        dgb.declare("customs", len(months) * len(hs_list))
+        dgb.declare("nps", None)          # 종목별 검색 1 + 기간 1 + 상세 ≤3 — 사전에 못 센다
+        dgb.declare("procure", None)      # 월당 페이지 수가 응답에서 나온다
+        dgb.settle()
+        dgb.table({"nps": "국민연금 사업장", "procure": "조달 낙찰", "customs": "관세 통관"})
         _ar = ctx.get("adv_rank", pd.Series(dtype=float))
         prio_codes = list(_ar.index) if len(_ar) else master["code"].tolist()
         if "N" in ACTIVE_PACKS:
@@ -10703,16 +10753,27 @@ def main() -> dict:
                                       lambda: harvest_procurement(months,
                                                                   max_calls=dgb.take("procure")))
         if "X" in ACTIVE_PACKS:
-            ctx["hs_map"] = _try("HS매핑", load_hs_map)
-            hs_list = (ctx["hs_map"]["hs"].astype(str).unique().tolist()
-                       if ctx.get("hs_map") is not None and len(ctx["hs_map"]) else [])
             if hs_list:
                 ctx["customs"] = _try("관세",
                                       lambda: harvest_customs(months, hs_list,
                                                               max_calls=dgb.take("customs")))
             else:
-                pack_off("X", "HS↔기업 매핑 테이블(hs_corp_map) 부재 — 5단계 매핑은 자동구축 "
-                              "대상이 아님(§6.3). 드라이브 공용 인덱스에 넣으면 활성화됩니다.")
+                # ★이 팩이 꺼지는 이유는 '데이터를 못 받아서'가 아니라 ★매핑이 없어서다.
+                #   계약 §6.3 은 5단계(회사↔HS) 매핑을 자동구축 대상에서 제외한다 — 추정
+                #   매핑은 θ 를 위조하고 V4 부분거부권을 무력화하기 때문이다. 그래서 여기서
+                #   자동으로 만들지 않는다. 대신 ★무엇을 어디에 넣으면 켜지는지를 정확히 알린다.
+                pack_off("X", "HS↔기업 매핑 테이블 부재 — 관세청 통관자료는 'HS코드별 수출'이라 "
+                              "회사로 내리려면 매핑이 반드시 있어야 합니다. 계약 §6.3 이 5단계 "
+                              "매핑을 자동구축 대상에서 제외하므로(추정 매핑은 θ 를 위조하고 V4 "
+                              "부분거부권을 무력화합니다) 이 코드가 임의로 만들지 않습니다.")
+                L.warn("PACK-X 를 켜는 법 — 드라이브 공용 인덱스에 'hs_corp_map' 테이블을 "
+                       "넣으세요. 컬럼: code(6자리 종목코드) · hs(HS 6~10자리) · "
+                       "weight(그 HS 가 그 회사 수출에서 차지하는 비중 0~1) · "
+                       "valid_from · valid_to(매핑 유효구간 — C3 PIT 강제). "
+                       f"경로: {getattr(VAULT, 'ns', {}).get('shared', '(금고 미연결)')}"
+                       " · 파일명 hs_corp_map.parquet(또는 .csv). "
+                       "출처 예: 관세청 수출입무역통계 품목-기업 연계, 무역협회 K-stat, "
+                       "사업보고서 '사업의 내용'의 제품별 매출 비중 + 품목→HS 대응표.")
         if "D" in ACTIVE_PACKS:
             bows = _try("공시원문", lambda: harvest_doc_texts(
                 ctx.get("disclosures", pd.DataFrame()), master))
