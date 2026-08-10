@@ -39,7 +39,8 @@ ORDER = [
     "q40_backtest.py",          # 분기 백테스트 · 비용 모델
     "q50_robust.py",            # 실험 매트릭스 · BH-FDR · 강건성
     "q60_report.py",            # Phase0 · §9 판정 · §10.4 · 산출물
-    "q70_contracts.py",         # 계약 Q1~Q12
+    "q70_contracts.py",         # 계약 Q1~Q14 (원칙)
+    "q71_specaudit.py",         # 명세 전수조사 §3.1~§10.4 (숫자)
     "q80_selftest.py",          # 스모크 + 실경로 리허설
     "q90_main.py",              # 오케스트레이터
 ]
@@ -332,7 +333,7 @@ def check(path: str) -> None:
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    version = datetime.datetime.now().strftime("qvf1.%Y%m%d.%H%M")
+    version = datetime.datetime.now().strftime("qvf1.1.%Y%m%d.%H%M")
     blob = build(version)
     path = os.path.join(OUT, SPEC["fname"])
     with open(path, "w", encoding="utf-8") as f:

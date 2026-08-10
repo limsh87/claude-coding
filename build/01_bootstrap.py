@@ -233,8 +233,35 @@ def _import_fdr():
 
 
 def _import_pykrx():
-    from pykrx import stock as _m                 # type: ignore
-    return _m
+    """pykrx import. 윈도우 기본 인코딩(cp949)에서 깨지는 경로를 한 번 자동 우회한다.
+
+    ★ pykrx 는 패키지 안의 JSON/CSV 를 `open(...)` 인코딩 인자 없이 읽는다. 윈도우의 기본
+      인코딩이 cp949 라 UTF-8 내용이 UnicodeDecodeError / JSONDecodeError 로 깨진다.
+      실측: 사용자 환경(Windows · py3.14)에서 pykrx 만 import 실패 → PIT 시가총액을 못 받아
+      U-1000(=시총 하위 1000) 자체가 구성되지 않고 실행이 멈췄다.
+    ★ 우회는 '재시도 동안만' locale.getpreferredencoding 을 UTF-8 로 보이게 하는 것이다.
+      전역을 영구 변경하지 않으며, 실패하면 원래 예외를 그대로 올려 사유가 표에 남는다.
+      (근본 해결은 환경변수 PYTHONUTF8=1 이며, 실패 시 그 안내가 출력된다.)
+    """
+    try:
+        from pykrx import stock as _m             # type: ignore
+        return _m
+    except BaseException as first:                # noqa
+        if not str(sys.platform).startswith("win"):
+            raise
+        import locale as _loc
+        _orig = _loc.getpreferredencoding
+        try:
+            _loc.getpreferredencoding = lambda do_setlocale=True: "UTF-8"   # type: ignore
+            for _k in [k for k in list(sys.modules) if k == "pykrx" or k.startswith("pykrx.")]:
+                sys.modules.pop(_k, None)
+            from pykrx import stock as _m2        # type: ignore
+            IMPORT_FAILURES["pykrx(1차)"] = (
+                f"{type(first).__name__}: {first} — cp949 우회 재시도로 복구했습니다. "
+                f"환경변수 PYTHONUTF8=1 을 설정하면 이 우회 없이 동작합니다.")
+            return _m2
+        finally:
+            _loc.getpreferredencoding = _orig     # 전역을 되돌린다(영구 변경 금지)
 
 
 fdr = _opt_import("FinanceDataReader", _import_fdr)

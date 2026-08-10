@@ -228,13 +228,22 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
         _yrs = sum(len(_span.get(c, ())) for c in corps) or (len(corps) * len(years))
         _naive, _scoped = len(corps) * len(years) * 4, _yrs * len(_rc)
         _lim = DBUDGET.remaining_calls() if DBUDGET is not None else None
-        _d = float(_lim or DART_DAILY_LIMIT_HINT)
-        LOG.table([["예전 (회사 × 전연도 × 4분기)", f"{_naive:,}", f"{_naive/_d:.1f}일"],
+        # ★ '예상 일수'의 분모는 '오늘 남은 호출'이 아니라 '하루치 한도'다.
+        #   잔여가 1회일 때 잔여로 나누면 19,154일 같은 값이 찍힌다 — 콜드빌드가 52년 걸린다는
+        #   뜻으로 읽히지만 실제로는 '오늘은 거의 못 받는다'는 뜻일 뿐이다. 둘은 다른 질문이고,
+        #   표의 '예상'은 '며칠에 걸쳐 완성되는가' 이므로 일일 한도로 나눠야 한다.
+        _daily = float(DQUOTA.daily_limit() if (DQUOTA is not None
+                                                and hasattr(DQUOTA, "daily_limit"))
+                       else DART_DAILY_LIMIT_HINT)
+        _daily = max(1000.0, _daily)
+        _fmt_d = lambda need: ("하루 안" if need <= _daily else f"{need/_daily:.1f}일")
+        LOG.table([["예전 (회사 × 전연도 × 4분기)", f"{_naive:,}", _fmt_d(_naive)],
                    [f"대상=U-1000×{DART_TIER2_BUFFER_MULT} · 소급 {DART_TIER2_LOOKBACK_Y}년",
-                    f"{_yrs*4:,}", f"{_yrs*4/_d:.1f}일"],
-                   [f"+ Tier-2 빈도 = {DART_TIER2_FREQ}", f"{_scoped:,}", f"{_scoped/_d:.1f}일"],
-                   ["오늘 잔여 호출", f"{_lim:,}" if _lim is not None else "미확정", ""]],
-                  headers=["Tier-2 수집 계획", "필요 호출", "예상"],
+                    f"{_yrs*4:,}", _fmt_d(_yrs * 4)],
+                   [f"+ Tier-2 빈도 = {DART_TIER2_FREQ}", f"{_scoped:,}", _fmt_d(_scoped)],
+                   ["오늘 잔여 호출", f"{_lim:,}" if _lim is not None else "미확정",
+                    f"(일일 한도 {_daily:,.0f} 기준 · 잔여는 오늘 진도만 좌우)"]],
+                  headers=["Tier-2 수집 계획", "필요 호출", "예상 소요"],
                   title="DART Tier-2 — 회사별 API 라 job 수가 곧 콜드빌드 기간이다")
         if _lim and _scoped > _lim:
             LOG.warn(f"그래도 오늘 잔여({_lim:,})를 넘습니다. 시총 낮은 순으로 받으므로 오늘 "
@@ -432,6 +441,11 @@ def main() -> dict:
 
     with PIPE.stage("L0.CONTRACT", "계약 자동검정 Q1~Q14", "L0", budget_s=180):
         run_contract_tests(strict=True)
+
+    # ★ 계약은 '원칙'(PIT·생존자편향·결정성)을, 전수조사는 '숫자'(§3.1~§10.4)를 지킨다.
+    #   둘 다 수집 전에 통과해야 한다 — 명세와 다른 값을 만드는 코드로 4시간을 태우지 않는다.
+    with PIPE.stage("L0.SPEC", "명세 전수조사 §3.1~§10.4", "L0", budget_s=300):
+        run_spec_audit(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0",
                     budget_s=(2400 if RUN_MODE == "SMOKE" else 600)):

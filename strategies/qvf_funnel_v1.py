@@ -274,7 +274,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.1427"
+BUILD_VERSION      = "qvf1.1.20260810.1455"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -519,8 +519,35 @@ def _import_fdr():
 
 
 def _import_pykrx():
-    from pykrx import stock as _m                 # type: ignore
-    return _m
+    """pykrx import. 윈도우 기본 인코딩(cp949)에서 깨지는 경로를 한 번 자동 우회한다.
+
+    ★ pykrx 는 패키지 안의 JSON/CSV 를 `open(...)` 인코딩 인자 없이 읽는다. 윈도우의 기본
+      인코딩이 cp949 라 UTF-8 내용이 UnicodeDecodeError / JSONDecodeError 로 깨진다.
+      실측: 사용자 환경(Windows · py3.14)에서 pykrx 만 import 실패 → PIT 시가총액을 못 받아
+      U-1000(=시총 하위 1000) 자체가 구성되지 않고 실행이 멈췄다.
+    ★ 우회는 '재시도 동안만' locale.getpreferredencoding 을 UTF-8 로 보이게 하는 것이다.
+      전역을 영구 변경하지 않으며, 실패하면 원래 예외를 그대로 올려 사유가 표에 남는다.
+      (근본 해결은 환경변수 PYTHONUTF8=1 이며, 실패 시 그 안내가 출력된다.)
+    """
+    try:
+        from pykrx import stock as _m             # type: ignore
+        return _m
+    except BaseException as first:                # noqa
+        if not str(sys.platform).startswith("win"):
+            raise
+        import locale as _loc
+        _orig = _loc.getpreferredencoding
+        try:
+            _loc.getpreferredencoding = lambda do_setlocale=True: "UTF-8"   # type: ignore
+            for _k in [k for k in list(sys.modules) if k == "pykrx" or k.startswith("pykrx.")]:
+                sys.modules.pop(_k, None)
+            from pykrx import stock as _m2        # type: ignore
+            IMPORT_FAILURES["pykrx(1차)"] = (
+                f"{type(first).__name__}: {first} — cp949 우회 재시도로 복구했습니다. "
+                f"환경변수 PYTHONUTF8=1 을 설정하면 이 우회 없이 동작합니다.")
+            return _m2
+        finally:
+            _loc.getpreferredencoding = _orig     # 전역을 되돌린다(영구 변경 금지)
 
 
 fdr = _opt_import("FinanceDataReader", _import_fdr)
@@ -1089,9 +1116,17 @@ def to_code6(x: Any) -> Optional[str]:
         s = s[1:]
     if _TICKER_RE.match(s):
         return s
-    d = re.sub(r"\D", "", s)
-    if d and len(d) <= 6:
-        cand = d.zfill(6)
+    # ★★ 0 채우기는 '순수 숫자' 입력에만 적용한다 ★★
+    #   이 함수의 약속은 "조용히 0으로 채워 잘못된 종목을 만들지 않는다" 인데, 문자가 섞인
+    #   코드에서 숫자만 뽑아 zfill 하면 정확히 그 약속을 깬다:
+    #     '00341A'(쌍용양회4우B, 2014 폐지) → '000341'(쌍용양회 보통주)
+    #   FDR 폐지목록 실측(2026-08-10 · 4,173행)에서 원본≠매핑이 285건, 그중 주권이 13건이다.
+    #   전부 구형 우선주 코드이고, 그 폐지일이 보통주에 붙으면 상장 중인 종목이 유니버스에서
+    #   사라지고 보유분이 −100% 로 청산된다. 못 읽는 코드는 '만들지 말고' 실패해야 한다
+    #   (그 13건은 §3.3 이 어차피 제외하는 우선주라 잃는 것도 없다).
+    #   숫자 입력(5930 → '005930')과 엑셀에서 앞자리 0 이 날아간 경우는 그대로 지원된다.
+    if s.isdigit() and 1 <= len(s) <= 6:
+        cand = s.zfill(6)
         return cand if _TICKER_RE.match(cand) else None
     return None
 
@@ -2698,7 +2733,14 @@ class QVFVault(Vault):
                     try:
                         self.put_table(name, dd, scope=scope, domain="table",
                                        source=f"promoted_from_mirror:{os.path.basename(mr)}")
-                        LOG.ok(f"  → 구글드라이브로 승격 복사 완료 (원본은 그대로 둡니다): {name}")
+                        # ★ 쓰기 루트가 드라이브가 아닐 수도 있다(드라이브 미발견 → 로컬 폴백).
+                        #   그때도 "구글드라이브로 승격" 이라고 찍으면 로그가 거짓말을 한다 —
+                        #   사용자는 절대 1원칙이 지켜졌다고 믿게 된다. 실제 목적지를 적는다.
+                        _m = str(getattr(self, "mode", "") or "").upper()
+                        _dest = ("구글드라이브" if _m.startswith("DRIVE")
+                                 else f"지정 쓰기루트({self.root})" if _m.startswith("EXPLICIT")
+                                 else f"로컬 쓰기루트({self.root}) — 드라이브가 아닙니다")
+                        LOG.ok(f"  → {_dest} 로 승격 복사 완료 (원본은 그대로 둡니다): {name}")
                     except Exception as e:                       # noqa
                         LOG.warn(f"  → 드라이브 승격 실패({type(e).__name__}) — 읽기만 하고 진행합니다.")
                 return dd
@@ -3447,6 +3489,16 @@ class DartQuota:
         cap = max(int(self.hist_limit or 0), int(DART_DAILY_LIMIT_HINT))
         return max(0, cap - used)
 
+    def daily_limit(self) -> int:
+        """'하루에 쓸 수 있는 총량'의 계획용 추정치. remaining_calls() 와 다른 질문이다.
+
+        ★ 콜드빌드 '예상 일수' 는 반드시 이 값으로 나눠야 한다. 잔여로 나누면 잔여가 1일 때
+          19,154일 같은 값이 나와 '52년 걸린다'로 읽힌다 — 실제 뜻은 '오늘은 거의 못 받는다'
+          뿐인데도. 잔여는 오늘 진도를, 일일 한도는 완성까지의 일수를 결정한다.
+        """
+        return int(max(int(self.observed_limit or 0), int(self.hist_limit or 0),
+                       int(DART_DAILY_LIMIT_HINT)))
+
     def remaining_str(self) -> str:
         if self.observed_limit is not None:
             return f"0 (오늘 실측 한도 {self.observed_limit:,} 도달)"
@@ -3765,9 +3817,39 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
                  f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
                  f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
-        if n_badcode > n_raw * 0.25:
+        # ★★ '탈락률 37%' 라는 숫자 하나로는 아무것도 판단할 수 없다 ★★
+        #   실측(2026-08-10 · 원본 4,173행): 탈락 1,536건의 내역은
+        #     신주인수권증서 857 · 수익증권 521 · 신주인수권증권 158 · 주권 0
+        #   즉 탈락분은 전부 워런트·신주인수권·펀드 수익증권이고 U-1000(주권) 후보가
+        #   될 수 있는 종목은 하나도 없다 — 버리는 것이 옳고 생존자편향이 아니다.
+        #   반대로 유형을 안 보고 비율만 경고하면 '남아 있는 편향'을 과대보고하게 된다.
+        #   → 증권 유형별로 분해해서 보고하고, '주권'이 섞였을 때만 경고한다.
+        _grp_c = col.get("secugroup") or col.get("kind")
+        _lost = pd.Series(dtype=object)
+        if _grp_c is not None:
+            _lost = d.loc[codes.isna(), _grp_c].astype(str)
+            LOG.table([[g, f"{c:,}", f"{100*c/max(n_badcode,1):.1f}%"]
+                       for g, c in _lost.value_counts().head(8).items()],
+                      ["탈락분 증권 유형", "건수", "비중"], ["l", "r", "r"],
+                      title="폐지목록 코드형식 불일치 내역 — 주권이 아니면 U-1000 후보가 아니다")
+        _n_stock_lost = int((_lost == "주권").sum()) if len(_lost) else -1
+        if _n_stock_lost > 0:
+            _m = codes.isna() & (d[_grp_c].astype(str) == "주권")
+            _samp = [f"{a} {b}" for a, b in
+                     zip(raw_codes[_m].head(6), d.loc[_m, name_c].astype(str).head(6))]
+            # 실측(2026-08-10)에서 이 13건은 전부 구형 우선주(`00341A` 쌍용양회4우B 등)이며
+            # §3.3 이 어차피 유니버스에서 제외한다. 예전에는 이것들이 숫자만 뽑혀
+            # `000341`(보통주)로 '복구'되어 우선주의 폐지일이 보통주에 붙고 있었다 — 그쪽이
+            # 훨씬 나쁜 오류라 지금은 만들지 않고 버린다. 이름을 함께 찍어 눈으로 확인시킨다.
+            LOG.warn(f"탈락분 중 '주권'이 {_n_stock_lost:,}건 있습니다 — 이름이 우선주(…우/우B)면 "
+                     f"§3.3 이 어차피 제외하므로 손실이 아니고, 보통주가 섞였다면 그만큼 "
+                     f"생존자편향이 남습니다. 확인용 표본: {_samp}")
+        elif _n_stock_lost == 0:
+            LOG.ok(f"  탈락 {n_badcode:,}건은 전부 주권이 아닙니다(워런트·신주인수권·수익증권) — "
+                   f"U-1000 은 주권만 담으므로 생존자편향에 영향이 없습니다.")
+        elif n_badcode > n_raw * 0.25:
             LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
-                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
+                     f"탈락했는데 증권 유형 컬럼이 없어 분해할 수 없습니다 — "
                      f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
     return t
 
@@ -11487,8 +11569,8 @@ QVF_PINNED_SRC = {
     'Vault.put_blob': '    def put_blob(self, domain: str, subtype: str, key: str, data: bytes, fmt: str,\n                 source: str = "", event_date=None, knowledge_date=None,\n                 scope: str = "shared", extra: Optional[dict] = None,\n                 uid: Optional[str] = None) -> Optional[str]:\n        """원본 바이트를 내용해시 경로에 저장하고 인덱스에 등록. 같은 내용이면 재기록하지 않는다."""\n        if not data:\n            return None\n        h = sha1_bytes(data)\n        uid = uid or sha1_str(domain, subtype, key, h)\n        sub = os.path.join(self.blob_dir(scope), domain, subtype, h[:2], h[2:4])\n        fn = f"{h}.{fmt.lstrip(\'.\')}"\n        abspath = os.path.join(sub, fn)\n        rel = os.path.relpath(abspath, self.root)\n        if not os.path.exists(abspath):                    # 존재하면 절대 덮어쓰지 않는다\n            try:\n                atomic_write_bytes(abspath, data)\n            except Exception as e:                          # noqa\n                LOG.warn(f"blob 저장 실패({type(e).__name__}) — 인덱스에만 기록하지 않고 건너뜁니다: {key}")\n                return None\n        else:\n            self.stats["blob_dedup_hit"] += 1\n        self._register(scope, {\n            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),\n            "path": rel, "abs_path": abspath, "fmt": fmt, "bytes": len(data), "sha1": h,\n            "event_date": str(as_ts(event_date) or ""), "knowledge_date": str(as_ts(knowledge_date) or ""),\n            "source": source, "adopted": False,\n            "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),\n        })\n        return abspath',
     'Vault.flush': '    def flush(self, scope: Optional[str] = None):\n        """대기 중인 등록을 append-only 저널에 기록. 기존 줄은 건드리지 않는다."""\n        scopes = [scope] if scope else ["shared", "private"]\n        for sc in scopes:\n            with self._lk:\n                rows, self._pending[sc] = self._pending[sc], []\n            if not rows:\n                continue\n            with self.lock(f"journal_{sc}"):\n                append_jsonl(self.journal(sc), rows)\n            self.stats[f"journal_append:{sc}"] += len(rows)\n            LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")',
     'Vault.compact': '    def compact(self, scope: str):\n        """저널 → index.parquet 재생성. 저널은 남기고, 기존 parquet 은 반드시 백업한 뒤 교체."""\n        self.flush(scope)\n        idx = self.load_index(scope, force=True)\n        p = self.idx_parquet(scope)\n        if os.path.exists(p):\n            bak = os.path.join(self.ns[scope], "index", "_backup",\n                               f"index.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")\n            try:\n                shutil.copy2(p, bak)\n            except Exception as e:                          # noqa\n                LOG.warn(f"인덱스 백업 실패({type(e).__name__}) — 안전을 위해 컴팩션을 건너뜁니다. "\n                         f"저널({os.path.basename(self.journal(scope))})에 모든 기록이 남아 있으므로 "\n                         f"데이터 유실은 없습니다.")\n                return\n        try:\n            atomic_write_parquet(idx.astype({c: str for c in idx.columns if idx[c].dtype == object}), p)\n            LOG.ok(f"인덱스 컴팩션 완료: {scope} — {len(idx):,}행 → {os.path.relpath(p, self.root)}")\n        except Exception as e:                              # noqa\n            LOG.warn(f"인덱스 컴팩션 실패({type(e).__name__}) — 저널이 원천이므로 유실 없음.")',
-    'QVFVault': 'class QVFVault(Vault):\n    """Vault + 다중루트 읽기. 쓰기 경로는 부모 그대로(=self.root 전용)라 미러는 절대 안 건드린다."""\n\n    def __init__(self, root: str, mode: str, mirrors: Optional[Sequence[str]] = None,\n                 promote_tables: bool = True):\n        super().__init__(root, mode)\n        # ★ 미러 중복제거는 생성자에서도 한 번 더 한다. qvf_resolve_roots 만 믿으면, 다른 경로로\n        #   생성자를 부르는 순간(테스트·재구성) 같은 트리를 두 번 읽고 인덱스가 두 배가 된다.\n        #   Colab 의 MyDrive / "My Drive" 처럼 문자열은 다른데 실체가 같은 경우가 실제로 있다.\n        _seen = {_same_place_key(self.root)}\n        _keep: List[str] = []\n        _dupes: List[str] = []\n        for m in (mirrors or []):\n            if not m or not os.path.isdir(m):\n                continue\n            k = _same_place_key(m)\n            if k in _seen:\n                _dupes.append(m)\n                continue\n            _seen.add(k)\n            _keep.append(m)\n        if _dupes:\n            LOG.info(f"쓰기루트와 같은 실체를 가리키는 미러 {len(_dupes)}개를 제외했습니다 "\n                     f"(같은 트리를 두 번 읽지 않습니다): {_trunc(\', \'.join(_dupes[:3]), 60)}")\n        self.mirrors: List[str] = _keep\n        self.promote_tables = bool(promote_tables)\n        self._mirror_idx: Dict[str, pd.DataFrame] = {}\n        self.table_src: Dict[str, str] = {}          # 어느 루트가 이 테이블을 줬는가(감사용)\n        self._own_only = False                       # compact 중 미러 행을 배제하기 위한 스위치\n        self._merged: Dict[str, pd.DataFrame] = {}   # 미러 병합 결과 캐시(더티 시 무효화)\n        self._uidpath: Dict[str, Dict[str, Tuple[str, str, str]]] = {}   # uid → 경로\n        # 이번 실행에서 등록한 행. 코어가 self._idx 를 갱신하지 않으므로 조회 때 얹어준다.\n        self._new_rows: Dict[str, List[dict]] = {}\n        self._idxlk = threading.RLock()              # read_parquet_safe 치환 구간 보호용\n\n    # ── 쓰기 경로 구조적 봉인 ----------------------------------------------------------\n    def _wpath(self, path: str) -> str:\n        """쓰기 대상 경로 검증. 쓰기루트 밖이면 예외. 상속받은 어떤 코드도 미러를 못 쓴다.\n        ★ 주석으로 \'도달하지 않는다\'고 쓰는 것과, 도달하면 터지게 만드는 것은 다르다."""\n        rp = os.path.realpath(path)\n        root = os.path.realpath(self.root)\n        if not (rp == root or rp.startswith(root + os.sep)):\n            raise PermissionError(\n                f"[절대 1원칙 위반 차단] 쓰기루트 밖 경로에 쓰려 했습니다: {path}\\n"\n                f"  쓰기루트: {self.root}\\n"\n                f"  미러는 읽기 전용입니다. 이 예외는 버그를 조용히 넘기지 않기 위한 것입니다.")\n        return path\n\n    def journal(self, scope: str) -> str:\n        return self._wpath(super().journal(scope))\n\n    def idx_parquet(self, scope: str) -> str:\n        return self._wpath(super().idx_parquet(scope))\n\n    def blob_dir(self, scope: str) -> str:\n        return self._wpath(super().blob_dir(scope))\n\n    def table_dir(self, scope: str) -> str:\n        return self._wpath(super().table_dir(scope))\n\n    # ── 미러 인덱스 (읽기 전용) ---------------------------------------------------------\n    def _load_mirror_index(self, scope: str) -> pd.DataFrame:\n        key = scope\n        if key in self._mirror_idx:\n            return self._mirror_idx[key]\n        frames: List[pd.DataFrame] = []\n        for mr in self.mirrors:\n            base = os.path.join(mr, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS)\n            idx_dir = os.path.join(base, "index")\n            if not os.path.isdir(idx_dir):\n                continue\n            got: List[pd.DataFrame] = []\n            d, _st = ro_read_parquet(os.path.join(idx_dir, "index.parquet"))\n            if d is not None and len(d):\n                got.append(d)\n            elif _st not in ("ok", "FileNotFoundError"):\n                LOG.debug(f"미러 인덱스 읽기 건너뜀({_st}): {idx_dir} — 파일은 그대로 둡니다.")\n            jr = read_jsonl(os.path.join(idx_dir, "index.jsonl"))\n            if jr:\n                got.append(pd.DataFrame(jr))\n            if not got:\n                continue\n            allc: List[str] = []\n            for g in got:\n                for c in g.columns:\n                    if c not in allc:\n                        allc.append(c)\n            g2 = pd.concat([g.reindex(columns=allc) for g in got], ignore_index=True)\n            g2["_root"] = mr\n            frames.append(g2)\n            self.stats[f"mirror_index_read:{os.path.basename(mr)}"] += len(g2)\n        if not frames:\n            out = pd.DataFrame(columns=list(INDEX_COLUMNS) + ["_root"])\n        else:\n            allc = []\n            for f in frames:\n                for c in f.columns:\n                    if c not in allc:\n                        allc.append(c)\n            out = pd.concat([f.reindex(columns=allc) for f in frames], ignore_index=True)\n            if "uid" not in out.columns:\n                out["uid"] = np.nan\n            miss = out["uid"].isna() | out["uid"].astype(str).str.strip().isin(("", "nan", "None"))\n            if miss.any():\n                src = [c for c in ("path", "abs_path", "key", "sha1", "_root") if c in out.columns]\n                out.loc[miss, "uid"] = [\n                    sha1_str("mirror", i, *[str(out.iloc[i].get(c, "")) for c in src])\n                    for i in np.where(miss.to_numpy())[0]]\n            out["uid"] = out["uid"].astype(str)\n            out = out.drop_duplicates(subset=["uid"], keep="last").reset_index(drop=True)\n        self._mirror_idx[key] = out\n        return out\n\n    # ★★ 같은 실행에서 저장한 것을 같은 실행에서 반드시 되찾을 수 있어야 한다 ★★\n    #   코어 Vault._register 는 _pending 과 _uidset 만 갱신하고 self._idx 는 손대지 않는다.\n    #   그리고 코어 load_index 는 force 가 아니면 self._idx 의 캐시본을 그대로 돌려준다.\n    #   그래서 "put_blob → flush → get_blob" 이 같은 실행 안에서 None 을 돌려주는 구멍이\n    #   있었다. 콜드런 1회차에 방금 내려받은 PDF 가 TONE 입력에서 통째로 빠지고, 2회차부터\n    #   갑자기 정상이 되는 형태로 나타난다 — \'본문이 짧아 제외\'와 구분되지 않는다.\n    #   저장↔재호출 연결은 이 전략의 절대 1원칙이므로, 등록분을 인덱스에 반드시 얹는다.\n    def _pending_frame(self, scope: str) -> Optional[pd.DataFrame]:\n        with self._lk:\n            rows = list(self._new_rows.get(scope, ()))\n        if not rows:\n            return None\n        f = pd.DataFrame(rows)\n        if "uid" in f.columns:\n            f["uid"] = f["uid"].astype(str)\n        f["_root"] = self.root\n        return f\n\n    def _with_new_rows(self, scope: str, own: pd.DataFrame) -> pd.DataFrame:\n        f = self._pending_frame(scope)\n        if f is None:\n            return own\n        o = own.copy()\n        if "_root" not in o.columns:\n            o["_root"] = self.root\n        allc: List[str] = []\n        for g in (o, f):\n            for c in g.columns:\n                if c not in allc:\n                    allc.append(c)\n        out = pd.concat([o.reindex(columns=allc), f.reindex(columns=allc)], ignore_index=True)\n        if "uid" in out.columns:\n            out["uid"] = out["uid"].astype(str)\n            # 저널을 이미 다시 읽었다면 같은 uid 가 양쪽에 있다 — 먼저 온 쪽(저널)을 남긴다.\n            out = out.drop_duplicates(subset=["uid"], keep="first").reset_index(drop=True)\n        return out\n\n    def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:\n        if force:\n            # ★ force=True 가 오히려 복구를 막던 버그: 파생 캐시를 같이 비우지 않으면\n            #   스테일 인덱스로 만들어진 빈 uid→경로 사전이 그대로 남아 get_blob 이\n            #   영구히 None 을 돌려준다.\n            with self._lk:\n                self._merged.pop(scope, None)\n                self._uidpath.pop(scope, None)\n                self._mirror_idx.pop(scope, None)\n        with self._idxlk:\n            with _suppress_corrupt_rename():\n                own = super().load_index(scope, force=force)\n        own = self._with_new_rows(scope, own)\n        if self._own_only:\n            with self._lk:\n                self._uidset[scope] = set(own["uid"].astype(str).tolist()) if len(own) else set()\n            return own\n        if not force:\n            cached = self._merged.get(scope)\n            if cached is not None:\n                return cached\n        mir = self._load_mirror_index(scope)\n        if mir.empty:\n            self._merged[scope] = own\n            return own\n        o = own.copy()\n        if "_root" not in o.columns:\n            o["_root"] = self.root\n        else:\n            o["_root"] = o["_root"].fillna(self.root)\n        allc: List[str] = []\n        for f in (o, mir):\n            for c in f.columns:\n                if c not in allc:\n                    allc.append(c)\n        merged = pd.concat([o.reindex(columns=allc), mir.reindex(columns=allc)], ignore_index=True)\n        # 쓰기루트(own)를 뒤에 두지 않는다 — 같은 uid 면 \'쓰기루트 우선\'이어야 하므로\n        # keep="first" 로 own 이 이긴다.\n        merged = merged.drop_duplicates(subset=["uid"], keep="first").reset_index(drop=True)\n        with self._lk:\n            self._idx[scope] = merged\n            self._uidset[scope] = set(merged["uid"].astype(str).tolist())\n            self._merged[scope] = merged\n        return merged\n\n    # ── 다중루트 읽기 -------------------------------------------------------------------\n    def get_table(self, name: str, scope: str = "shared",\n                  max_age_days: Optional[float] = None) -> Optional[pd.DataFrame]:\n        # ★★ 인덱스에만 걸어두고 정작 \'데이터 테이블\'은 무방비였다 ★★\n        #   read_parquet_safe 는 못 읽은 파일을 .corrupt 로 개명하고 None 을 준다. 그런데\n        #   못 읽는 가장 흔한 원인 두 가지(드라이브 플레이스홀더 0바이트 · 동기화 중 부분\n        #   파일)는 \'손상\'이 아니라 정상적인 드라이브 동작이다. 그 개명 한 번에\n        #     · 일봉 캐시가 사라짐 → 후보 전량 콜드 재수집\n        #     · put_table 이 \'기존 파일 없음\'으로 보고 백업조차 없이 작은 새 파일로 교체\n        #     · 폐지 종목은 캐시가 유일한 사본이라 되받을 수 없음 → 생존자편향 제거(C2) 붕괴\n        #   가 한꺼번에 일어난다. 인덱스에 쓰던 보호를 데이터 테이블에도 그대로 씌운다.\n        with _suppress_corrupt_rename():\n            d = super().get_table(name, scope=scope, max_age_days=max_age_days)\n        if d is not None:\n            self.table_src[name] = self.root\n            return d\n        for mr in self.mirrors:\n            for sc in (scope, "private" if scope == "shared" else "shared"):\n                ns = GDRIVE_SHARED_NS if sc == "shared" else GDRIVE_PRIVATE_NS\n                p = os.path.join(mr, ns, "table", f"{name}.parquet")\n                if not os.path.exists(p):\n                    continue\n                if max_age_days is not None:\n                    if (time.time() - os.path.getmtime(p)) / 86400.0 > max_age_days:\n                        continue\n                dd, _st = ro_read_parquet(p)\n                if dd is None or not len(dd):\n                    if _st not in ("ok", "FileNotFoundError"):\n                        LOG.debug(f"미러 테이블 읽기 건너뜀({_st}): {p} — 파일은 그대로 둡니다.")\n                    continue\n                self.table_src[name] = mr\n                self.stats[f"mirror_table_hit:{name}"] += 1\n                LOG.info(f"로컬/미러 캐시 적중: {name} ({len(dd):,}행) ← {mr}")\n                PIPE.io("IN", "MIRROR", f"table:{name}", dd, source=mr)\n                if sc != scope:\n                    LOG.warn(f"  ※ 요청 스코프는 \'{scope}\' 인데 \'{sc}\' 스코프의 동명 테이블을 "\n                             f"채택했습니다: {name} — 이름이 겹치는 전략이 있는지 확인하세요.")\n                    self.table_src[name] = f"{mr}#{sc}"\n                # ★★ 승격은 \'드라이브에 파일이 실재하지 않을 때만\' ★★\n                #   super().get_table 은 파일이 있어도 max_age_days 를 넘기면 None 을 준다.\n                #   그 None 을 \'드라이브에 없음\'으로 읽으면, 로컬 미러(복사·동기화로 mtime 만\n                #   최신이고 내용은 과거)가 드라이브의 최신본을 덮어쓴다. dart_corpcode 처럼\n                #   전 파이프라인의 종목 연결 축이 3분의 1로 줄어드는 사고가 실제로 난다.\n                _own_p = os.path.join(self.table_dir(scope), f"{name}.parquet")\n                if self.promote_tables and not os.path.exists(_own_p):\n                    try:\n                        self.put_table(name, dd, scope=scope, domain="table",\n                                       source=f"promoted_from_mirror:{os.path.basename(mr)}")\n                        LOG.ok(f"  → 구글드라이브로 승격 복사 완료 (원본은 그대로 둡니다): {name}")\n                    except Exception as e:                       # noqa\n                        LOG.warn(f"  → 드라이브 승격 실패({type(e).__name__}) — 읽기만 하고 진행합니다.")\n                return dd\n        return None\n\n    def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:\n        rows = self.lookup(scope, uid=uid)\n        if rows.empty:\n            return None\n        for _, r in rows.iterrows():\n            base = str(r.get("_root") or self.root)\n            cands = [r.get("abs_path")]\n            rel = str(r.get("path") or "")\n            if rel:\n                cands.append(os.path.join(base, rel))\n                if base != self.root:\n                    cands.append(os.path.join(self.root, rel))\n            for cand in cands:\n                try:\n                    if cand and isinstance(cand, str) and os.path.exists(cand):\n                        return open(cand, "rb").read()\n                except Exception:\n                    continue\n        return None\n\n    # ── O(1) 인덱스 계층 -----------------------------------------------------------------\n    #  ★ 공용 Vault 는 규모를 가정하지 않고 짜여 있다. 30만 행 인덱스 + 수만 건 blob 조회에서는\n    #    그 가정이 그대로 병목이 된다. 세 곳을 상수시간으로 내린다(코어는 손대지 않는다):\n    #      ① has()      : _pending 리스트 선형탐색 → uid 집합 조회. 신규 uid n 건이면 O(n²)→O(n)\n    #      ② load_index : 호출마다 미러 재병합 → 더티 플래그 캐시\n    #      ③ get_blob   : 전 인덱스 불리언 마스크 → uid→경로 사전\n    def _register(self, scope: str, rec: dict):\n        super()._register(scope, rec)\n        with self._lk:\n            self._new_rows.setdefault(scope, []).append(dict(rec))\n        self._merged.pop(scope, None)\n        self._uidpath.pop(scope, None)\n\n    def flush(self, scope: Optional[str] = None):\n        """코어와 달리 append 가 성공한 뒤에 pending 을 비운다.\n\n        ★ 코어는 `rows, self._pending[sc] = self._pending[sc], []` 로 먼저 비우고 append 한다.\n          드라이브 용량 초과·네트워크 끊김으로 append 가 던지면 그 행들은 영구 소실되고,\n          blob 파일은 이미 쓰여 있으므로 \'인덱스 없는 고아 blob\' 이 남는다. 삭제 API 가\n          없으므로 영구히 남고, 그 세션 내내 has() 는 True 라 재수집도 되지 않는다.\n        """\n        scopes = [scope] if scope else ["shared", "private"]\n        for sc in scopes:\n            with self._lk:\n                rows = list(self._pending.get(sc, ()))\n            if not rows:\n                continue\n            with self.lock(f"journal_{sc}"):\n                append_jsonl(self.journal(sc), rows)     # 실패하면 여기서 예외 — pending 은 그대로\n            with self._lk:\n                del self._pending[sc][:len(rows)]\n            self.stats[f"journal_append:{sc}"] += len(rows)\n            LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")\n\n    def adopt(self, abs_path: str, domain: str, subtype: str, key: str,\n              source: str = "", event_date=None, knowledge_date=None,\n              scope: str = "shared", extra: Optional[dict] = None,\n              size: Optional[int] = None) -> Optional[str]:\n        """size 를 알고 있으면 getsize() 를 생략한다 — 드라이브 FUSE 왕복 1회/파일 절감.\n\n        ★ uid 는 코어와 동일한 sha1_str("adopt", domain, subtype, abspath, size) 여야 한다.\n          계약 Q7 이 \'코어 경로와 size 지정 경로의 uid 가 같은가\'를 회귀로 고정한다.\n        """\n        if size is None:\n            return super().adopt(abs_path, domain, subtype, key, source=source,\n                                 event_date=event_date, knowledge_date=knowledge_date,\n                                 scope=scope, extra=extra)\n        sz = int(size)\n        uid = sha1_str("adopt", domain, subtype, os.path.abspath(abs_path), sz)\n        if self.has(scope, uid):\n            return uid\n        self._register(scope, {\n            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),\n            "path": abs_path, "abs_path": abs_path,\n            "fmt": os.path.splitext(abs_path)[1].lstrip("."),\n            "bytes": sz, "sha1": "", "source": source or "adopted",\n            "event_date": str(as_ts(event_date) or ""),\n            "knowledge_date": str(as_ts(knowledge_date) or ""),\n            "adopted": True, "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),\n        })\n        self.stats["adopted"] += 1\n        return uid\n\n    def has(self, scope: str, uid: str) -> bool:\n        if scope not in self._uidset:\n            self.load_index(scope)\n        with self._lk:\n            # _register 가 이미 _uidset 에 넣으므로 pending 을 따로 훑을 필요가 없다.\n            return str(uid) in self._uidset.get(scope, set())\n\n    def _uid_path_map(self, scope: str) -> Dict[str, Tuple[str, str, str]]:\n        m = self._uidpath.get(scope)\n        if m is not None:\n            return m\n        idx = self.load_index(scope)\n        m = {}\n        if len(idx):\n            root_col = (idx["_root"].astype(str) if "_root" in idx.columns\n                        else pd.Series([self.root] * len(idx), index=idx.index))\n            for u, ap, rel, rt in zip(idx["uid"].astype(str),\n                                      idx.get("abs_path", pd.Series([""] * len(idx))).astype(str),\n                                      idx.get("path", pd.Series([""] * len(idx))).astype(str),\n                                      root_col):\n                m[u] = (ap, rel, rt if rt and rt != "nan" else self.root)\n        self._uidpath[scope] = m\n        return m\n\n    def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:\n        ent = self._uid_path_map(scope).get(str(uid))\n        if ent is None:\n            return None\n        ap, rel, base = ent\n        cands = [ap]\n        if rel and rel not in ("", "nan"):\n            cands.append(os.path.join(base, rel))\n            if base != self.root:\n                cands.append(os.path.join(self.root, rel))\n        for c in cands:\n            try:\n                if c and c not in ("", "nan") and os.path.exists(c):\n                    return open(c, "rb").read()\n            except Exception:\n                continue\n        return None\n\n    # ── 기존 리포트 폴더 흡수 (드라이브 FUSE 안전판) --------------------------------------\n    # ★★ 이름으로 프루닝하면 사용자의 폴더를 먹는다 ★★\n    #   예전에는 {"blob","table","index","_backup","_locks","reports"} 를 \'이름\'으로 잘랐다.\n    #   그러면 트리 어디에 있든 그 이름이면 하위 전체가 사라진다 — GDRIVE_ADOPT_DIRS 기본값에\n    #   `reports` 가 있는데 `research/reports/`, `archive/reports/` 는 리포트를 모아둔\n    #   폴더에서 극히 흔한 이름이다. 실측으로 8개 중 7개가 통째로 누락됐고, 누락 사실은\n    #   어디에도 남지 않았다. 그래서 \'이름\'이 아니라 \'구조\'로 판정한다.\n    _HEX2_RE = re.compile(r"^[0-9a-f]{2}$")\n    _HASH_FANOUT_MIN = 32          # 2자리 16진수 하위폴더가 이만큼이면 내용해시 샤드 트리\n    _MANAGED_NS_CHILD = {"index", "blob", "table", "_backup", "_locks"}\n    _SKIP_DIRNAMES = {".git", "__pycache__", ".ipynb_checkpoints", "node_modules",\n                      ".cache", ".Trash", "$RECYCLE.BIN", "System Volume Information"}\n\n    def _is_cache_ns(self, path: str) -> bool:\n        """`<X>/_shared/blob` 처럼 \'캐시 네임스페이스 바로 아래의 관리 폴더\'인가.\n\n        이름만 보는 것이 아니라 부모가 캐시 네임스페이스인지까지 본다. 사용자의\n        `research/reports`, `archive/table` 은 여기에 걸리지 않는다.\n        """\n        parts = [p for p in os.path.normpath(str(path)).replace("\\\\", "/").split("/") if p]\n        for i in range(len(parts) - 1):\n            if parts[i] in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS) and \\\n                    parts[i + 1] in self._MANAGED_NS_CHILD:\n                return True\n        return False\n\n    def _managed_keys(self) -> set:\n        """쓰기루트·미러의 관리 트리. 여기는 이미 인덱스에 있으므로 절대 걷지 않는다."""\n        out = set()\n        for r in [self.root] + list(self.mirrors):\n            out.add(_same_place_key(r))\n            for ns in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS):\n                p = os.path.join(r, ns)\n                if os.path.isdir(p):\n                    out.add(_same_place_key(p))\n        return out\n\n    def adopt_scan(self, dirs: Sequence[str], max_files: int = None,\n                   max_seconds: float = None) -> pd.DataFrame:\n        """기존에 모아둔 리포트를 \'등록만\' 한다. 이동·개명·삭제 없음.\n\n        ★ 사용자의 실제 Colab 실행이 여기서 멈췄다. 원인은 하나가 아니라 넷이 겹친 것이었다:\n          ① 캐시 루트 자신을 스캔했다 → blob 은 내용해시 2단이라 최대 65,536개 디렉터리이고\n             드라이브 FUSE 에서 listdir 한 번이 50~200ms 다. 열거만 1~2시간인데,\n             그 파일들은 \'이미 인덱스에 있는 것\'이라 전부 무의미한 작업이다.\n          ② /content/drive/MyDrive 와 /content/drive/My Drive 를 중복 스캔했다.\n          ③ 파일마다 getsize() 로 FUSE 왕복이 한 번 더 붙었다.\n          ④ 코어의 max_files 상한은 안쪽 for 만 끊고 os.walk 는 계속 돌았다.\n        → 관리 트리 프루닝 + 실체 기준 중복제거 + scandir 1회 stat + \'진짜\' 상한 +\n          디렉터리 mtime 체크포인트(재실행 시 이어받기) + 진행률 출력.\n        """\n        max_files = int(ADOPT_SCAN_MAX_FILES if max_files is None else max_files)\n        max_seconds = float(ADOPT_SCAN_MAX_SECONDS if max_seconds is None else max_seconds)\n        if not ADOPT_SCAN_ENABLED:\n            LOG.info("ADOPT_SCAN_ENABLED=False — 기존 리포트 폴더 스캔을 건너뜁니다 "\n                     "(인덱스에 이미 등록된 자료는 그대로 사용됩니다).")\n            return pd.DataFrame(columns=["abs_path", "kind", "name"])\n\n        managed = self._managed_keys()\n        roots, skipped_missing, skipped_managed = [], [], []\n        seen_keys = set()\n        for d in dirs:\n            if not d:\n                continue\n            e = _expand(d)\n            if not os.path.isdir(e):\n                skipped_missing.append(d)\n                continue\n            k = _same_place_key(e)\n            if k in managed:\n                skipped_managed.append(e)\n                continue\n            if k in seen_keys:\n                continue\n            seen_keys.add(k)\n            roots.append(e)\n\n        if skipped_missing:\n            LOG.info(f"존재하지 않는 스캔 경로 {len(skipped_missing)}개는 건너뜁니다"\n                     f"(로컬 D: 가 없는 환경에서는 정상): "\n                     f"{_trunc(\', \'.join(skipped_missing[:4]), 70)}")\n        if skipped_managed:\n            LOG.info(f"캐시 관리 트리 {len(skipped_managed)}개는 스캔 대상에서 제외합니다 — "\n                     f"이미 인덱스에 있고, blob 은 내용해시 2단 구조라 드라이브에서 열거만 "\n                     f"수 시간이 걸립니다.")\n        if not roots:\n            LOG.info("스캔할 외부 리포트 폴더가 없습니다. (기존 인덱스는 그대로 사용됩니다)")\n            return pd.DataFrame(columns=["abs_path", "kind", "name"])\n\n        # ── 디렉터리 체크포인트 ──────────────────────────────────────────────────────────\n        #  ★ 예전 체크포인트는 mtime 만 저장하고, 무변경이어도 scandir 는 그대로 했다.\n        #    아끼는 것이 파일 stat 뿐이라 \'디렉터리 열거 절감률 0.0%\' 였고, FUSE 왕복이\n        #    비용의 전부인 드라이브에서는 이어받기가 회차당 +332 → +47 → +7 로 감쇠해\n        #    사실상 수렴하지 않았다. 이제 \'완주한 디렉터리의 하위폴더 목록\'까지 저장해서,\n        #    mtime 이 같으면 scandir 자체를 생략하고 저장된 하위폴더로 바로 내려간다.\n        #  ★ 그리고 상한으로 중도 탈출한 디렉터리는 체크포인트에 넣지 않는다. 예전에는\n        #    scandir \'전에\' 기록해서, 상한에 걸려 10건만 읽은 디렉터리의 나머지 40건이\n        #    (트리가 바뀌지 않는 한) 영구히 등록되지 않았다.\n        ckpt: Dict[str, Tuple[float, List[str]]] = {}\n        cdf = self.get_table("qvf_adopt_scan_state", scope="private")\n        if cdf is not None and len(cdf):\n            try:\n                _mt = pd.to_numeric(cdf["mtime"], errors="coerce").fillna(-1.0)\n                _sd = (cdf["subdirs"].astype(str) if "subdirs" in cdf.columns\n                       else pd.Series(["[]"] * len(cdf)))\n                for _p, _m, _s in zip(cdf["dirpath"].astype(str), _mt, _sd):\n                    try:\n                        kids = json.loads(_s) if _s and _s != "nan" else []\n                    except Exception:\n                        kids = []\n                    ckpt[_p] = (float(_m), list(kids) if isinstance(kids, list) else [])\n            except Exception:\n                ckpt = {}\n            LOG.info(f"이전 스캔 체크포인트 {len(ckpt):,}개 디렉터리 — 변경되지 않은 폴더는 "\n                     f"열거(scandir) 자체를 생략하고 저장된 하위폴더로 바로 내려갑니다.")\n\n        t0 = time.time()\n        found: List[dict] = []\n        new_ckpt: Dict[str, Tuple[float, List[str]]] = dict(ckpt)\n        n_files = n_dirs = n_skipped_dirs = n_ckpt_hit = 0\n        skipped_samples: List[str] = []\n        stopped = ""\n\n        for root in roots:\n            if stopped:\n                break\n            LOG.info(f"기존 리포트 폴더 스캔: {root}")\n            stack = [root]\n            while stack:\n                if time.time() - t0 > max_seconds:\n                    stopped = f"시간 예산 {max_seconds:.0f}초 초과"\n                    break\n                if n_files >= max_files:\n                    stopped = f"파일 상한 {max_files:,}건 도달"\n                    break\n                cur = stack.pop()\n                try:\n                    st_m = os.stat(cur).st_mtime\n                except Exception:\n                    continue\n                n_dirs += 1\n                if n_dirs % 200 == 0:\n                    LOG.info(f"  … 디렉터리 {n_dirs:,} · 파일 {n_files:,} · "\n                             f"{time.time()-t0:.0f}초 경과")\n                prev = ckpt.get(cur)\n                if prev is not None and abs(prev[0] - st_m) < 1e-6:\n                    # 무변경 + 이전에 \'완주\' 한 디렉터리 → 열거를 통째로 생략한다.\n                    n_ckpt_hit += 1\n                    stack.extend(prev[1])\n                    continue\n                completed = True\n                subdirs: List[str] = []\n                hex2 = 0\n                try:\n                    with os.scandir(cur) as it:\n                        for ent in it:\n                            try:\n                                if ent.is_dir(follow_symlinks=False):\n                                    nm = ent.name\n                                    if nm.startswith(".") or nm in self._SKIP_DIRNAMES:\n                                        n_skipped_dirs += 1\n                                        continue\n                                    if self._is_cache_ns(ent.path):\n                                        n_skipped_dirs += 1\n                                        if len(skipped_samples) < 6:\n                                            skipped_samples.append(ent.path)\n                                        continue\n                                    if self._HEX2_RE.match(nm):\n                                        hex2 += 1\n                                        if hex2 >= self._HASH_FANOUT_MIN:\n                                            # 내용해시 샤드 트리(최대 65,536 디렉터리). 여기는\n                                            # 남의 캐시 blob 이지 사용자의 리포트가 아니다.\n                                            n_skipped_dirs += 1\n                                            if len(skipped_samples) < 6:\n                                                skipped_samples.append(ent.path)\n                                            continue\n                                    if _same_place_key(ent.path) in managed:\n                                        n_skipped_dirs += 1\n                                        continue\n                                    subdirs.append(ent.path)\n                                    stack.append(ent.path)\n                                    continue\n                                # ★ 예산 검사가 디렉터리 경계에만 있으면 예산이 상한이 아니다.\n                                #   파일 1만 개짜리 디렉터리 하나가 예산을 통째로 넘긴다.\n                                if (n_files & 0x3FF) == 0 and time.time() - t0 > max_seconds:\n                                    completed = False\n                                    stopped = f"시간 예산 {max_seconds:.0f}초 초과"\n                                    break\n                                low = ent.name.lower()\n                                if low.endswith(".pdf"):\n                                    kind = "report_pdf"\n                                elif low.endswith((".parquet", ".jsonl", ".json", ".csv")) and \\\n                                        any(t in low for t in\n                                            ("report", "consensus", "research", "analyst",\n                                             "hankyung", "naver", "dart", "krx", "price",\n                                             "ohlcv", "universe", "fnltt")):\n                                    kind = "table_like"\n                                else:\n                                    continue\n                                try:\n                                    sz = ent.stat(follow_symlinks=False).st_size\n                                except Exception:\n                                    sz = -1\n                                found.append({"abs_path": ent.path, "kind": kind,\n                                              "name": ent.name, "dir": cur, "bytes": sz})\n                                n_files += 1\n                                if n_files >= max_files:\n                                    completed = False\n                                    break\n                            except Exception:\n                                continue\n                except Exception as e:                              # noqa\n                    completed = False\n                    LOG.warn(f"  디렉터리 열람 실패({type(e).__name__}) — 이 하위 트리는 "\n                             f"이번 실행에서 등록되지 않습니다: {cur}")\n                if completed:\n                    # 완주한 디렉터리만 체크포인트에 남긴다(중도 탈출분은 다음 실행에서 재시도).\n                    new_ckpt[cur] = (st_m, subdirs)\n\n        dur = time.time() - t0\n        if not found:\n            LOG.info(f"새로 등록할 리포트 파일이 없습니다 (디렉터리 {n_dirs:,}개 · {dur:.1f}초"\n                     + (f" · {stopped}" if stopped else "") + "). "\n                     f"이미 인덱스에 있는 자료는 그대로 사용됩니다.")\n        else:\n            df = pd.DataFrame(found)\n            for r in df.itertuples(index=False):\n                m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)\n                ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None\n                # scandir 에서 이미 크기를 알고 있다 — getsize() 를 또 부르면 드라이브 FUSE\n                # 왕복이 파일마다 한 번씩 더 붙는다(리포트 3만 건이면 2.6~6.4분).\n                self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",\n                           subtype=r.kind, key=r.name, source="preexisting_drive_cache",\n                           event_date=ed, knowledge_date=ed, scope="shared",\n                           extra={"dir": r.dir},\n                           size=(int(r.bytes) if int(r.bytes) >= 0 else None))\n            self.flush("shared")\n            LOG.ok(f"기존 리포트 {len(df):,}건을 공용 인덱스에 \'참조 등록\'했습니다 "\n                   f"(파일은 원위치 그대로, 이동·삭제 없음) — "\n                   f"디렉터리 {n_dirs:,}개 · {dur:.1f}초")\n\n        # ★ 프루닝은 \'조용히\' 하면 안 된다. 사용자가 자기 리포트가 왜 안 잡혔는지 알 수 있어야\n        #   한다. 예전에는 n_skipped_dirs 를 증가만 시키고 출력하는 곳이 한 군데도 없었다.\n        LOG.table([["걸은 디렉터리", f"{n_dirs:,}"],\n                   ["체크포인트 적중(열거 생략)", f"{n_ckpt_hit:,}"],\n                   ["프루닝한 하위폴더", f"{n_skipped_dirs:,}"],\n                   ["프루닝 예시", _trunc(" / ".join(skipped_samples), 90) if skipped_samples else "—"],\n                   ["새로 찾은 파일", f"{len(found):,}"],\n                   ["소요", f"{dur:.1f}초"],\n                   ["중단 사유", stopped or "—"]],\n                  ["항목", "값"], ["l", "l"],\n                  title="기존 리포트 폴더 스캔 요약 — 프루닝 건수를 숨기면 누락을 알 수 없다")\n        if stopped:\n            LOG.warn(f"스캔을 중단했습니다: {stopped}. 완주한 디렉터리만 체크포인트에 저장했으므로 "\n                     f"다음 실행에서 남은 폴더부터 이어받습니다(중도 탈출한 폴더는 다시 읽습니다). "\n                     f"상한을 늘리려면 ADOPT_SCAN_MAX_FILES / ADOPT_SCAN_MAX_SECONDS 를 조정하세요.")\n        try:\n            self.put_table("qvf_adopt_scan_state",\n                           pd.DataFrame({"dirpath": list(new_ckpt.keys()),\n                                         "mtime": [v[0] for v in new_ckpt.values()],\n                                         "subdirs": [json.dumps(v[1], ensure_ascii=False)\n                                                     for v in new_ckpt.values()]}),\n                           scope="private", domain="index", source="adopt_scan checkpoint")\n        except Exception as e:                                      # noqa\n            LOG.debug(f"스캔 체크포인트 저장 실패({type(e).__name__}) — 기능에 영향 없음")\n        return pd.DataFrame(found) if found else pd.DataFrame(columns=["abs_path", "kind", "name"])\n\n    def compact(self, scope: str):\n        """★ 미러 행을 드라이브 인덱스에 쓰면 안 된다.\n\n        load_index 는 조회 편의를 위해 미러 행을 합쳐서 돌려주는데, 부모의 compact 는\n        그 결과를 그대로 index.parquet 에 기록한다. 그러면 \'로컬에만 존재하는 파일 경로\'가\n        공용 드라이브 인덱스에 박히고, 다른 기기·다른 전략이 그 경로를 열려다 실패한다.\n        컴팩션 동안만 자기 루트 전용 모드로 내린다.\n        """\n        keep = self._own_only\n        self._own_only = True\n        try:\n            super().compact(scope)\n        finally:\n            self._own_only = keep\n            self._idx.pop(scope, None)      # 합쳐진 조회용 뷰를 다음 조회에서 재구성\n            self._uidset.pop(scope, None)\n            self._merged.pop(scope, None)\n            self._uidpath.pop(scope, None)\n\n    def report_roots(self):\n        rows = [["쓰기 루트 (신규 수집분 저장)", self.root, self.mode]]\n        for m in self.mirrors:\n            rows.append(["읽기 전용 미러", m, "탐색만 — 절대 쓰지 않음"])\n        missing = [m for m in CACHE_MIRROR_ROOTS if not os.path.isdir(_expand(m))]\n        if missing:\n            rows.append(["(없음 — 건너뜀)", _trunc(", ".join(missing), 44),\n                         "이 환경에 없는 경로. 정상입니다"])\n        LOG.table(rows, ["역할", "경로", "비고"], ["l", "l", "l"],\n                  title="캐시 루트 구성 (로컬·드라이브 양쪽 탐색 → 신규는 드라이브에만 기록)")\n        if not self.mirrors:\n            LOG.info("읽기 전용 미러가 없습니다 — 구글드라이브만 탐색합니다. "\n                     "로컬 D: 가 없는 PC나 Colab 에서는 정상이며, 기능에 영향이 없습니다. "\n                     "다른 PC의 로컬 캐시를 함께 쓰려면 CACHE_MIRROR_ROOTS 에 경로를 "\n                     "추가하세요(탐색만 하고 절대 쓰지 않습니다).")',
-    'DartQuota': 'class DartQuota:\n    """DartBudget 의 드롭인 대체(take/refund/close/n/exhausted 동일 인터페이스).\n\n    ★ 공용 스코프에 기록하는 이유: 하나의 DART 키를 여러 전략(TCD, QVF …)이 나눠 쓰면\n      전략별 사설 카운터는 서로를 못 본다. 그러면 각자 \'아직 여유 있다\'고 믿으면서\n      합계로는 한도를 넘겨 020 폭풍을 맞는다.\n    """\n\n    FLUSH_EVERY = 200\n    # DART 한도는 한국시간 자정에 리셋된다. 로컬시간을 쓰면 Colab(UTC)에서 9시간 어긋나고,\n    # 구축 시점에 한 번만 계산하면 자정을 넘긴 장시간 실행이 \'어제 한도\'에 계속 묶인다.\n    KST = _dt.timezone(_dt.timedelta(hours=9))\n\n    @staticmethod\n    def _day_key() -> str:\n        return _dt.datetime.now(DartQuota.KST).date().isoformat()\n\n    def __init__(self, vault: "Vault"):\n        self.vault = vault\n        self.today = self._day_key()\n        self.key_fp = sha1_str("dartkey", DART_API_KEY or "")[:12]\n        self.n = 0                     # 이번 프로세스가 쓴 양\n        self.n_other = 0               # 같은 키로 오늘 다른 프로세스/전략이 쓴 양\n        self.observed_limit: Optional[int] = None   # 오늘 실측된 상한\n        self.hist_limit: Optional[int] = None       # 과거 실측 상한(계획용 추정치)\n        self._exhausted = False\n        self._lk = threading.RLock()\n        self._unflushed = 0\n        self._probe_at = 0.0\n        self._load()\n        # 공용 코어(12_ingest_dart_fin)가 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로\n        # 되돌려 놓는다(조립 순서상 헤더보다 뒤). 사용자가 명시적으로 거부한 값이므로\n        # 실측 소유자인 이 클래스가 되찾아온다. 실측되면 그 값으로 다시 덮인다.\n        globals()["DART_DAILY_LIMIT"] = int(self.hist_limit or DART_DAILY_LIMIT_HINT)\n\n    def _roll_if_needed(self):\n        """자정(KST)을 넘겼으면 카운터를 새 날짜로 되돌린다. 며칠에 걸친 콜드빌드에서\n        \'어제 소진\'을 오늘까지 끌고 가 하루를 통째로 버리는 사고를 막는다."""\n        d = self._day_key()\n        if d == self.today:\n            return\n        self._flush_locked()\n        LOG.ok(f"DART 한도 리셋 감지 (KST {self.today} → {d}) — 카운터를 초기화하고 계속합니다.")\n        self.today = d\n        self.n = 0\n        self.n_other = 0\n        self.observed_limit = None\n        self._exhausted = False\n        self._unflushed = 0\n\n    # -- 저널 ---------------------------------------------------------------------------\n    def _path(self) -> str:\n        return os.path.join(self.vault.ns["shared"], "index", "dart_quota.jsonl")\n\n    def _mirror_paths(self) -> List[str]:\n        out = []\n        for mr in getattr(self.vault, "mirrors", []) or []:\n            p = os.path.join(mr, GDRIVE_SHARED_NS, "index", "dart_quota.jsonl")\n            if os.path.exists(p):\n                out.append(p)\n        return out\n\n    def _reload_other(self):\n        """저널을 다시 읽어 \'남이 오늘 쓴 양\'만 갱신한다(hist/observed 는 건드리지 않는다).\n\n        020 을 기록하기 직전에 부른다. 형제 프로세스의 소비가 안 보이면 내 눈에 보이는\n        누적이 실제보다 작고, 그 작은 값이 그날의 실측 한도로 저널에 영구히 박힌다.\n        """\n        rows: List[dict] = []\n        for p in [self._path()] + self._mirror_paths():\n            rows.extend(read_jsonl(p))\n        seen, tot = set(), 0\n        for r in rows:\n            if r.get("event") != "use" or str(r.get("date")) != self.today:\n                continue\n            eid = r.get("evt_id") or (r.get("host"), r.get("pid"), r.get("ts"), r.get("n"))\n            if eid in seen:\n                continue\n            seen.add(eid)\n            try:\n                tot += max(0, int(r.get("n", 0)))\n            except Exception:\n                pass\n        # 내 몫(self.n)은 이미 저널에 flush 되어 tot 에 포함되므로 빼서 이중계상을 막는다.\n        with self._lk:\n            self.n_other = max(0, tot - int(self.n))\n\n    def _load(self):\n        rows: List[dict] = []\n        for p in [self._path()] + self._mirror_paths():\n            rows.extend(read_jsonl(p))\n        # ★★ 미러의 저널 사본을 중복 합산하면 안 된다 ★★\n        #   로컬 미러가 드라이브 캐시의 복사본이면(= CACHE_MIRROR_ROOTS 의 정상 용도) 같은\n        #   소비 이벤트가 \'미러 수 + 1\' 배로 세어진다. 실측으로 500건 사용이 1,000~1,500건\n        #   으로 잡혔고, take() 의 안전정지가 실제 사용량의 절반 지점에서 걸려 DART 수집이\n        #   조기 중단됐다. 그런데 그 스테이지는 critical=False 라 실패로 잡히지도 않는다.\n        #   → evt_id 로 dedup 한다. 미러를 \'읽는\' 것 자체는 타당하다(다른 기기의 소비를\n        #     봐야 하므로). 중복만 걷어낸다.\n        seen_evt = set()\n        uniq: List[dict] = []\n        for r in rows:\n            eid = r.get("evt_id")\n            if eid:\n                if eid in seen_evt:\n                    continue\n                seen_evt.add(eid)\n            else:\n                # 구버전 저널(evt_id 없음)은 자연키로 대체한다.\n                nk = (r.get("date"), r.get("key_fp"), r.get("host"), r.get("pid"),\n                      r.get("ts"), r.get("event"), r.get("n"), r.get("limit"))\n                if nk in seen_evt:\n                    continue\n                seen_evt.add(nk)\n            uniq.append(r)\n        if len(uniq) != len(rows):\n            LOG.debug(f"DART 쿼터 저널 중복 {len(rows) - len(uniq):,}행 제거(미러 사본)")\n        rows = uniq\n        mine_pid = os.getpid()\n        for r in rows:\n            if str(r.get("key_fp")) != self.key_fp:\n                continue\n            if r.get("event") == "limit_observed":\n                try:\n                    lim = int(r.get("limit", 0))\n                except Exception:\n                    continue\n                if lim > 0:\n                    self.hist_limit = max(self.hist_limit or 0, lim)\n                    if str(r.get("date")) == self.today:\n                        self.observed_limit = lim\n                        self._exhausted = True\n            elif r.get("event") == "use" and str(r.get("date")) == self.today:\n                try:\n                    k = int(r.get("n", 0))\n                except Exception:\n                    k = 0\n                # 같은 pid 의 기록은 재실행 시 \'남이 쓴 양\'으로 다시 세면 안 되지만,\n                # 프로세스가 죽었다 살아난 경우엔 실제로 소비된 양이므로 세는 게 맞다.\n                # 보수적으로(=과다계상 방향) 전부 센다. 과소계상은 020 폭풍을 부른다.\n                self.n_other += max(0, k)\n        if self.n_other:\n            LOG.info(f"오늘 이 DART 키로 이미 사용된 호출 {self.n_other:,}건 "\n                     f"(다른 전략/이전 실행 포함, 공용 저널 기준) — 이어서 진행합니다.")\n        if self.observed_limit:\n            LOG.warn(f"오늘({self.today}) 이 키의 실측 한도 {self.observed_limit:,}건에 이미 "\n                     f"도달한 기록이 있습니다. DART 신규 수집은 건너뛰고 캐시로 진행합니다. "\n                     f"★ 지금 재실행해도 캐시분은 그대로 쓰입니다. 한도는 KST 자정에 리셋됩니다.")\n        elif self.hist_limit:\n            LOG.info(f"과거 실측된 일일 한도 {self.hist_limit:,}건을 \'계획용 추정치\'로만 씁니다. "\n                     f"실제 소비는 서버가 020(한도초과)을 줄 때까지 계속합니다 — "\n                     f"추정치 때문에 남은 호출을 놀리지 않습니다.")\n        else:\n            LOG.info("이 키의 일일 한도 실측 기록이 아직 없습니다. OpenDART 는 잔여량 조회 API 를 "\n                     "제공하지 않으므로, 서버가 020 을 줄 때까지 소비하며 그 지점을 한도로 "\n                     "기록합니다(다음 실행부터 계획에 반영됩니다).")\n\n    def _append(self, rec: dict):\n        self._seq = getattr(self, "_seq", 0) + 1\n        _ts = _dt.datetime.now().isoformat(timespec="microseconds")\n        rec = {"date": self.today, "key_fp": self.key_fp, "pid": os.getpid(),\n               "host": platform.node(), "ts": _ts,\n               # 미러 사본 중복 합산을 막는 고유 id. 없으면 dedup 자체가 불가능하다.\n               "evt_id": sha1_str("dartquota", platform.node(), os.getpid(), _ts, self._seq),\n               **rec}\n        try:\n            with self.vault.lock("dart_quota", timeout=15.0):\n                append_jsonl(self._path(), [rec])\n        except Exception:\n            try:\n                append_jsonl(self._path(), [rec])\n            except Exception:\n                pass\n\n    # -- 인터페이스 ---------------------------------------------------------------------\n    @property\n    def used_today(self) -> int:\n        return self.n + self.n_other\n\n    @property\n    def exhausted(self) -> bool:\n        return self._exhausted\n\n    @exhausted.setter\n    def exhausted(self, v: bool):\n        """★ 공용 코어(dart_api)가 status 020/021 을 보면 여기에 True 를 넣는다.\n        그 순간의 누적 사용량이 곧 \'오늘의 실측 한도\'다. 이 setter 가 발견 지점이다."""\n        v = bool(v)\n        if not v:\n            self._exhausted = False\n            return\n        if self._exhausted:\n            return\n        # ★ 공용 코어는 020(일일한도 초과)과 021(조회 가능 회사 수 초과)을 같은 분기에서\n        #   처리하며 둘 다 여기로 True 를 보낸다. 그런데 021 은 \'요청이 잘못됐다\'는 뜻이지\n        #   한도와 아무 상관이 없다. 이를 한도로 기록하면 (a) 남은 호출을 전부 못 쓰고\n        #   (b) 그 거짓 상한이 공용 저널에 박혀 내일 이후 실행과 \'다른 전략\'까지 오염된다.\n        #   → 값싼 확인 호출을 한 번 던져 진짜 020 인지 확증한 뒤에만 기록한다.\n        self._exhausted = True                      # 확인 전까지는 잠정 정지(호출 폭주 방지)\n        if not self._confirm_exhaustion():\n            self._exhausted = False\n            LOG.warn("DART 오류를 받았지만 확인 호출이 성공했습니다 — 일일한도(020)가 아니라 "\n                     "요청 오류(021 등)로 판단하고 수집을 계속합니다. 한도로 기록하지 않습니다.")\n            return\n        # ★ used_today = self.n + self.n_other 인데 n_other 는 __init__ 의 _load() 에서\n        #   딱 한 번만 읽었다. 이 프로세스가 시작한 뒤 형제 프로세스(TCD·두 번째 QVF 실행)가\n        #   같은 키를 쓴 몫이 안 보이므로, 020 이 왔을 때 내 눈에 보이는 누적은 실제보다\n        #   훨씬 작다. 그 작은 값이 \'그날의 실측 한도\'로 저널에 영구 기록되고, 이후 모든\n        #   실행이 그 근처(및 ×2 안전정지)에서 멈춘다 — 한 번 오염되면 매일 재현된다.\n        #   기록 직전에 저널을 다시 읽어 형제 소비분을 반영한다.\n        self._flush()\n        try:\n            self._reload_other()\n        except Exception as e:\n            LOG.debug(f"저널 재조회 실패({type(e).__name__}) — 프로세스 내 집계로만 기록합니다.")\n        self.observed_limit = int(self.used_today)\n        self._append({"event": "limit_observed", "limit": int(self.observed_limit)})\n        globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)\n        LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 확인했습니다. "\n                 f"여기까지 받은 데이터는 캐시에 저장되어 있습니다. ★ 지금 재실행해도 "\n                 f"이 지점부터 이어받습니다. (한도값을 코드에 고정하지 않고 실측한 값입니다)")\n\n    def _confirm_exhaustion(self) -> bool:\n        """가장 값싼 정상 요청을 한 번 던져 020 이 재현되는지 본다. True = 진짜 한도 소진."""\n        now = time.monotonic()\n        if now - self._probe_at < 30.0:\n            return True                              # 직전에 확인함 — 중복 확인 금지\n        self._probe_at = now\n        if not DART_API_KEY:\n            return True\n        try:\n            d = (_dt.datetime.now(self.KST) - _dt.timedelta(days=3)).strftime("%Y%m%d")\n            js = http_json("https://opendart.fss.or.kr/api/list.json", source="dart", tries=1,\n                           params={"crtfc_key": DART_API_KEY, "bgn_de": d, "end_de": d,\n                                   "page_no": 1, "page_count": 1},\n                           referer="https://opendart.fss.or.kr/")\n        except Exception:\n            return True                              # 확인 불가 → 보수적으로 소진 처리\n        if not isinstance(js, dict):\n            return True\n        st = str(js.get("status", ""))\n        # 000(정상) 또는 013(데이터 없음)이면 키는 살아 있다 = 한도 소진이 아니다.\n        return st not in ("000", "013")\n\n    def take(self, k: int = 1) -> bool:\n        if not DART_API_KEY:\n            return False\n        with self._lk:\n            self._roll_if_needed()\n            if self._exhausted:\n                return False\n            # 과거 실측 상한이 있으면 \'거기서 멈추지 않고\' 계속 쓴다(§요구사항).\n            # 다만 추정치의 2배를 넘어서면 저널이 오염됐을 가능성이 크므로 안전 정지한다.\n            if self.hist_limit and self.used_today > self.hist_limit * 2:\n                LOG.warn(f"누적 사용량({self.used_today:,})이 과거 실측 한도({self.hist_limit:,})의 "\n                         f"2배를 넘었습니다. 저널 오염 가능성이 있어 안전 정지합니다.")\n                self._exhausted = True\n                return False\n            self.n += k\n            self._unflushed += k\n            if self._unflushed >= self.FLUSH_EVERY:\n                self._flush_locked()\n            return True\n\n    def refund(self, k: int = 1):\n        if k <= 0:\n            return\n        with self._lk:\n            self.n = max(0, self.n - k)\n            self._unflushed = max(0, self._unflushed - k)\n\n    def _flush_locked(self):\n        if self._unflushed <= 0:\n            return\n        k, self._unflushed = self._unflushed, 0\n        self._append({"event": "use", "n": int(k)})\n\n    def _flush(self):\n        with self._lk:\n            self._flush_locked()\n\n    def remaining_calls(self) -> Optional[int]:\n        """오늘 더 쓸 수 있는 호출 수의 \'숫자\'. 모르면 None (문자열판 remaining_str 과 짝).\n\n        수집부는 이 값으로 작업 목록을 잘라낸다 — 한도를 코드에 고정하지 않고, 그렇다고\n        전부 던져 놓고 예외를 기다리지도 않기 위해서다. 후자가 실제로 하루치를 통째로\n        태우고도 아무 회사도 완성시키지 못한 원인이었다.\n\n        ★ 실측 상한이 아직 없으면 None 이 아니라 헤더 힌트 기준 잔여를 준다. None 을 주면\n          호출부가 \'무제한\'으로 오해해 예전 동작으로 되돌아간다.\n        """\n        with self._lk:\n            used = int(self.used_today)\n        if self.observed_limit is not None:          # 오늘 020 을 이미 봤다 = 확정적으로 소진\n            return max(0, int(self.observed_limit) - used)\n        # ★ 과거 실측치는 \'그날 그 지점에서 막혔다\'는 하한 증거일 뿐 상한이 아니다.\n        #   (키를 다른 프로세스와 나눠 썼으면 그날치가 낮게 찍힌다 — 실제로 사용자 키는\n        #    14,047 에서 막혔지만 OpenDART 공표 한도는 20,000 이다.)\n        #   이걸 상한으로 쓰면 매일 6,000 호출을 스스로 버리게 된다. 계획은 둘 중 큰 값으로\n        #   잡고, 진짜 중단은 오늘 020 이 실제로 올 때 한다 = "실시간으로 체크해서 그만큼 쓴다".\n        cap = max(int(self.hist_limit or 0), int(DART_DAILY_LIMIT_HINT))\n        return max(0, cap - used)\n\n    def remaining_str(self) -> str:\n        if self.observed_limit is not None:\n            return f"0 (오늘 실측 한도 {self.observed_limit:,} 도달)"\n        if self.hist_limit:\n            return f"약 {max(0, self.hist_limit - self.used_today):,} (과거 실측 {self.hist_limit:,} 기준 추정)"\n        return "미확정 (OpenDART 는 잔여량 API 를 제공하지 않음 — 020 수신 시 확정)"\n\n    def report(self):\n        LOG.table([["오늘 날짜", self.today],\n                   ["키 지문", self.key_fp or "(키 없음)"],\n                   ["이번 실행 사용", f"{self.n:,}"],\n                   ["오늘 누적 사용(공용 저널)", f"{self.used_today:,}"],\n                   ["오늘 실측 한도", f"{self.observed_limit:,}" if self.observed_limit else "미도달"],\n                   ["과거 실측 한도", f"{self.hist_limit:,}" if self.hist_limit else "기록 없음"],\n                   ["남은 호출량", self.remaining_str()]],\n                  ["항목", "값"], ["l", "r"],\n                  title="DART 호출량 (고정 상수가 아니라 실측 — 공용 저널로 전략 간 합산)")\n\n    def close(self):\n        self._flush()',
+    'QVFVault': 'class QVFVault(Vault):\n    """Vault + 다중루트 읽기. 쓰기 경로는 부모 그대로(=self.root 전용)라 미러는 절대 안 건드린다."""\n\n    def __init__(self, root: str, mode: str, mirrors: Optional[Sequence[str]] = None,\n                 promote_tables: bool = True):\n        super().__init__(root, mode)\n        # ★ 미러 중복제거는 생성자에서도 한 번 더 한다. qvf_resolve_roots 만 믿으면, 다른 경로로\n        #   생성자를 부르는 순간(테스트·재구성) 같은 트리를 두 번 읽고 인덱스가 두 배가 된다.\n        #   Colab 의 MyDrive / "My Drive" 처럼 문자열은 다른데 실체가 같은 경우가 실제로 있다.\n        _seen = {_same_place_key(self.root)}\n        _keep: List[str] = []\n        _dupes: List[str] = []\n        for m in (mirrors or []):\n            if not m or not os.path.isdir(m):\n                continue\n            k = _same_place_key(m)\n            if k in _seen:\n                _dupes.append(m)\n                continue\n            _seen.add(k)\n            _keep.append(m)\n        if _dupes:\n            LOG.info(f"쓰기루트와 같은 실체를 가리키는 미러 {len(_dupes)}개를 제외했습니다 "\n                     f"(같은 트리를 두 번 읽지 않습니다): {_trunc(\', \'.join(_dupes[:3]), 60)}")\n        self.mirrors: List[str] = _keep\n        self.promote_tables = bool(promote_tables)\n        self._mirror_idx: Dict[str, pd.DataFrame] = {}\n        self.table_src: Dict[str, str] = {}          # 어느 루트가 이 테이블을 줬는가(감사용)\n        self._own_only = False                       # compact 중 미러 행을 배제하기 위한 스위치\n        self._merged: Dict[str, pd.DataFrame] = {}   # 미러 병합 결과 캐시(더티 시 무효화)\n        self._uidpath: Dict[str, Dict[str, Tuple[str, str, str]]] = {}   # uid → 경로\n        # 이번 실행에서 등록한 행. 코어가 self._idx 를 갱신하지 않으므로 조회 때 얹어준다.\n        self._new_rows: Dict[str, List[dict]] = {}\n        self._idxlk = threading.RLock()              # read_parquet_safe 치환 구간 보호용\n\n    # ── 쓰기 경로 구조적 봉인 ----------------------------------------------------------\n    def _wpath(self, path: str) -> str:\n        """쓰기 대상 경로 검증. 쓰기루트 밖이면 예외. 상속받은 어떤 코드도 미러를 못 쓴다.\n        ★ 주석으로 \'도달하지 않는다\'고 쓰는 것과, 도달하면 터지게 만드는 것은 다르다."""\n        rp = os.path.realpath(path)\n        root = os.path.realpath(self.root)\n        if not (rp == root or rp.startswith(root + os.sep)):\n            raise PermissionError(\n                f"[절대 1원칙 위반 차단] 쓰기루트 밖 경로에 쓰려 했습니다: {path}\\n"\n                f"  쓰기루트: {self.root}\\n"\n                f"  미러는 읽기 전용입니다. 이 예외는 버그를 조용히 넘기지 않기 위한 것입니다.")\n        return path\n\n    def journal(self, scope: str) -> str:\n        return self._wpath(super().journal(scope))\n\n    def idx_parquet(self, scope: str) -> str:\n        return self._wpath(super().idx_parquet(scope))\n\n    def blob_dir(self, scope: str) -> str:\n        return self._wpath(super().blob_dir(scope))\n\n    def table_dir(self, scope: str) -> str:\n        return self._wpath(super().table_dir(scope))\n\n    # ── 미러 인덱스 (읽기 전용) ---------------------------------------------------------\n    def _load_mirror_index(self, scope: str) -> pd.DataFrame:\n        key = scope\n        if key in self._mirror_idx:\n            return self._mirror_idx[key]\n        frames: List[pd.DataFrame] = []\n        for mr in self.mirrors:\n            base = os.path.join(mr, GDRIVE_SHARED_NS if scope == "shared" else GDRIVE_PRIVATE_NS)\n            idx_dir = os.path.join(base, "index")\n            if not os.path.isdir(idx_dir):\n                continue\n            got: List[pd.DataFrame] = []\n            d, _st = ro_read_parquet(os.path.join(idx_dir, "index.parquet"))\n            if d is not None and len(d):\n                got.append(d)\n            elif _st not in ("ok", "FileNotFoundError"):\n                LOG.debug(f"미러 인덱스 읽기 건너뜀({_st}): {idx_dir} — 파일은 그대로 둡니다.")\n            jr = read_jsonl(os.path.join(idx_dir, "index.jsonl"))\n            if jr:\n                got.append(pd.DataFrame(jr))\n            if not got:\n                continue\n            allc: List[str] = []\n            for g in got:\n                for c in g.columns:\n                    if c not in allc:\n                        allc.append(c)\n            g2 = pd.concat([g.reindex(columns=allc) for g in got], ignore_index=True)\n            g2["_root"] = mr\n            frames.append(g2)\n            self.stats[f"mirror_index_read:{os.path.basename(mr)}"] += len(g2)\n        if not frames:\n            out = pd.DataFrame(columns=list(INDEX_COLUMNS) + ["_root"])\n        else:\n            allc = []\n            for f in frames:\n                for c in f.columns:\n                    if c not in allc:\n                        allc.append(c)\n            out = pd.concat([f.reindex(columns=allc) for f in frames], ignore_index=True)\n            if "uid" not in out.columns:\n                out["uid"] = np.nan\n            miss = out["uid"].isna() | out["uid"].astype(str).str.strip().isin(("", "nan", "None"))\n            if miss.any():\n                src = [c for c in ("path", "abs_path", "key", "sha1", "_root") if c in out.columns]\n                out.loc[miss, "uid"] = [\n                    sha1_str("mirror", i, *[str(out.iloc[i].get(c, "")) for c in src])\n                    for i in np.where(miss.to_numpy())[0]]\n            out["uid"] = out["uid"].astype(str)\n            out = out.drop_duplicates(subset=["uid"], keep="last").reset_index(drop=True)\n        self._mirror_idx[key] = out\n        return out\n\n    # ★★ 같은 실행에서 저장한 것을 같은 실행에서 반드시 되찾을 수 있어야 한다 ★★\n    #   코어 Vault._register 는 _pending 과 _uidset 만 갱신하고 self._idx 는 손대지 않는다.\n    #   그리고 코어 load_index 는 force 가 아니면 self._idx 의 캐시본을 그대로 돌려준다.\n    #   그래서 "put_blob → flush → get_blob" 이 같은 실행 안에서 None 을 돌려주는 구멍이\n    #   있었다. 콜드런 1회차에 방금 내려받은 PDF 가 TONE 입력에서 통째로 빠지고, 2회차부터\n    #   갑자기 정상이 되는 형태로 나타난다 — \'본문이 짧아 제외\'와 구분되지 않는다.\n    #   저장↔재호출 연결은 이 전략의 절대 1원칙이므로, 등록분을 인덱스에 반드시 얹는다.\n    def _pending_frame(self, scope: str) -> Optional[pd.DataFrame]:\n        with self._lk:\n            rows = list(self._new_rows.get(scope, ()))\n        if not rows:\n            return None\n        f = pd.DataFrame(rows)\n        if "uid" in f.columns:\n            f["uid"] = f["uid"].astype(str)\n        f["_root"] = self.root\n        return f\n\n    def _with_new_rows(self, scope: str, own: pd.DataFrame) -> pd.DataFrame:\n        f = self._pending_frame(scope)\n        if f is None:\n            return own\n        o = own.copy()\n        if "_root" not in o.columns:\n            o["_root"] = self.root\n        allc: List[str] = []\n        for g in (o, f):\n            for c in g.columns:\n                if c not in allc:\n                    allc.append(c)\n        out = pd.concat([o.reindex(columns=allc), f.reindex(columns=allc)], ignore_index=True)\n        if "uid" in out.columns:\n            out["uid"] = out["uid"].astype(str)\n            # 저널을 이미 다시 읽었다면 같은 uid 가 양쪽에 있다 — 먼저 온 쪽(저널)을 남긴다.\n            out = out.drop_duplicates(subset=["uid"], keep="first").reset_index(drop=True)\n        return out\n\n    def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:\n        if force:\n            # ★ force=True 가 오히려 복구를 막던 버그: 파생 캐시를 같이 비우지 않으면\n            #   스테일 인덱스로 만들어진 빈 uid→경로 사전이 그대로 남아 get_blob 이\n            #   영구히 None 을 돌려준다.\n            with self._lk:\n                self._merged.pop(scope, None)\n                self._uidpath.pop(scope, None)\n                self._mirror_idx.pop(scope, None)\n        with self._idxlk:\n            with _suppress_corrupt_rename():\n                own = super().load_index(scope, force=force)\n        own = self._with_new_rows(scope, own)\n        if self._own_only:\n            with self._lk:\n                self._uidset[scope] = set(own["uid"].astype(str).tolist()) if len(own) else set()\n            return own\n        if not force:\n            cached = self._merged.get(scope)\n            if cached is not None:\n                return cached\n        mir = self._load_mirror_index(scope)\n        if mir.empty:\n            self._merged[scope] = own\n            return own\n        o = own.copy()\n        if "_root" not in o.columns:\n            o["_root"] = self.root\n        else:\n            o["_root"] = o["_root"].fillna(self.root)\n        allc: List[str] = []\n        for f in (o, mir):\n            for c in f.columns:\n                if c not in allc:\n                    allc.append(c)\n        merged = pd.concat([o.reindex(columns=allc), mir.reindex(columns=allc)], ignore_index=True)\n        # 쓰기루트(own)를 뒤에 두지 않는다 — 같은 uid 면 \'쓰기루트 우선\'이어야 하므로\n        # keep="first" 로 own 이 이긴다.\n        merged = merged.drop_duplicates(subset=["uid"], keep="first").reset_index(drop=True)\n        with self._lk:\n            self._idx[scope] = merged\n            self._uidset[scope] = set(merged["uid"].astype(str).tolist())\n            self._merged[scope] = merged\n        return merged\n\n    # ── 다중루트 읽기 -------------------------------------------------------------------\n    def get_table(self, name: str, scope: str = "shared",\n                  max_age_days: Optional[float] = None) -> Optional[pd.DataFrame]:\n        # ★★ 인덱스에만 걸어두고 정작 \'데이터 테이블\'은 무방비였다 ★★\n        #   read_parquet_safe 는 못 읽은 파일을 .corrupt 로 개명하고 None 을 준다. 그런데\n        #   못 읽는 가장 흔한 원인 두 가지(드라이브 플레이스홀더 0바이트 · 동기화 중 부분\n        #   파일)는 \'손상\'이 아니라 정상적인 드라이브 동작이다. 그 개명 한 번에\n        #     · 일봉 캐시가 사라짐 → 후보 전량 콜드 재수집\n        #     · put_table 이 \'기존 파일 없음\'으로 보고 백업조차 없이 작은 새 파일로 교체\n        #     · 폐지 종목은 캐시가 유일한 사본이라 되받을 수 없음 → 생존자편향 제거(C2) 붕괴\n        #   가 한꺼번에 일어난다. 인덱스에 쓰던 보호를 데이터 테이블에도 그대로 씌운다.\n        with _suppress_corrupt_rename():\n            d = super().get_table(name, scope=scope, max_age_days=max_age_days)\n        if d is not None:\n            self.table_src[name] = self.root\n            return d\n        for mr in self.mirrors:\n            for sc in (scope, "private" if scope == "shared" else "shared"):\n                ns = GDRIVE_SHARED_NS if sc == "shared" else GDRIVE_PRIVATE_NS\n                p = os.path.join(mr, ns, "table", f"{name}.parquet")\n                if not os.path.exists(p):\n                    continue\n                if max_age_days is not None:\n                    if (time.time() - os.path.getmtime(p)) / 86400.0 > max_age_days:\n                        continue\n                dd, _st = ro_read_parquet(p)\n                if dd is None or not len(dd):\n                    if _st not in ("ok", "FileNotFoundError"):\n                        LOG.debug(f"미러 테이블 읽기 건너뜀({_st}): {p} — 파일은 그대로 둡니다.")\n                    continue\n                self.table_src[name] = mr\n                self.stats[f"mirror_table_hit:{name}"] += 1\n                LOG.info(f"로컬/미러 캐시 적중: {name} ({len(dd):,}행) ← {mr}")\n                PIPE.io("IN", "MIRROR", f"table:{name}", dd, source=mr)\n                if sc != scope:\n                    LOG.warn(f"  ※ 요청 스코프는 \'{scope}\' 인데 \'{sc}\' 스코프의 동명 테이블을 "\n                             f"채택했습니다: {name} — 이름이 겹치는 전략이 있는지 확인하세요.")\n                    self.table_src[name] = f"{mr}#{sc}"\n                # ★★ 승격은 \'드라이브에 파일이 실재하지 않을 때만\' ★★\n                #   super().get_table 은 파일이 있어도 max_age_days 를 넘기면 None 을 준다.\n                #   그 None 을 \'드라이브에 없음\'으로 읽으면, 로컬 미러(복사·동기화로 mtime 만\n                #   최신이고 내용은 과거)가 드라이브의 최신본을 덮어쓴다. dart_corpcode 처럼\n                #   전 파이프라인의 종목 연결 축이 3분의 1로 줄어드는 사고가 실제로 난다.\n                _own_p = os.path.join(self.table_dir(scope), f"{name}.parquet")\n                if self.promote_tables and not os.path.exists(_own_p):\n                    try:\n                        self.put_table(name, dd, scope=scope, domain="table",\n                                       source=f"promoted_from_mirror:{os.path.basename(mr)}")\n                        # ★ 쓰기 루트가 드라이브가 아닐 수도 있다(드라이브 미발견 → 로컬 폴백).\n                        #   그때도 "구글드라이브로 승격" 이라고 찍으면 로그가 거짓말을 한다 —\n                        #   사용자는 절대 1원칙이 지켜졌다고 믿게 된다. 실제 목적지를 적는다.\n                        _m = str(getattr(self, "mode", "") or "").upper()\n                        _dest = ("구글드라이브" if _m.startswith("DRIVE")\n                                 else f"지정 쓰기루트({self.root})" if _m.startswith("EXPLICIT")\n                                 else f"로컬 쓰기루트({self.root}) — 드라이브가 아닙니다")\n                        LOG.ok(f"  → {_dest} 로 승격 복사 완료 (원본은 그대로 둡니다): {name}")\n                    except Exception as e:                       # noqa\n                        LOG.warn(f"  → 드라이브 승격 실패({type(e).__name__}) — 읽기만 하고 진행합니다.")\n                return dd\n        return None\n\n    def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:\n        rows = self.lookup(scope, uid=uid)\n        if rows.empty:\n            return None\n        for _, r in rows.iterrows():\n            base = str(r.get("_root") or self.root)\n            cands = [r.get("abs_path")]\n            rel = str(r.get("path") or "")\n            if rel:\n                cands.append(os.path.join(base, rel))\n                if base != self.root:\n                    cands.append(os.path.join(self.root, rel))\n            for cand in cands:\n                try:\n                    if cand and isinstance(cand, str) and os.path.exists(cand):\n                        return open(cand, "rb").read()\n                except Exception:\n                    continue\n        return None\n\n    # ── O(1) 인덱스 계층 -----------------------------------------------------------------\n    #  ★ 공용 Vault 는 규모를 가정하지 않고 짜여 있다. 30만 행 인덱스 + 수만 건 blob 조회에서는\n    #    그 가정이 그대로 병목이 된다. 세 곳을 상수시간으로 내린다(코어는 손대지 않는다):\n    #      ① has()      : _pending 리스트 선형탐색 → uid 집합 조회. 신규 uid n 건이면 O(n²)→O(n)\n    #      ② load_index : 호출마다 미러 재병합 → 더티 플래그 캐시\n    #      ③ get_blob   : 전 인덱스 불리언 마스크 → uid→경로 사전\n    def _register(self, scope: str, rec: dict):\n        super()._register(scope, rec)\n        with self._lk:\n            self._new_rows.setdefault(scope, []).append(dict(rec))\n        self._merged.pop(scope, None)\n        self._uidpath.pop(scope, None)\n\n    def flush(self, scope: Optional[str] = None):\n        """코어와 달리 append 가 성공한 뒤에 pending 을 비운다.\n\n        ★ 코어는 `rows, self._pending[sc] = self._pending[sc], []` 로 먼저 비우고 append 한다.\n          드라이브 용량 초과·네트워크 끊김으로 append 가 던지면 그 행들은 영구 소실되고,\n          blob 파일은 이미 쓰여 있으므로 \'인덱스 없는 고아 blob\' 이 남는다. 삭제 API 가\n          없으므로 영구히 남고, 그 세션 내내 has() 는 True 라 재수집도 되지 않는다.\n        """\n        scopes = [scope] if scope else ["shared", "private"]\n        for sc in scopes:\n            with self._lk:\n                rows = list(self._pending.get(sc, ()))\n            if not rows:\n                continue\n            with self.lock(f"journal_{sc}"):\n                append_jsonl(self.journal(sc), rows)     # 실패하면 여기서 예외 — pending 은 그대로\n            with self._lk:\n                del self._pending[sc][:len(rows)]\n            self.stats[f"journal_append:{sc}"] += len(rows)\n            LOG.debug(f"인덱스 저널 append: {sc} +{len(rows)}행")\n\n    def adopt(self, abs_path: str, domain: str, subtype: str, key: str,\n              source: str = "", event_date=None, knowledge_date=None,\n              scope: str = "shared", extra: Optional[dict] = None,\n              size: Optional[int] = None) -> Optional[str]:\n        """size 를 알고 있으면 getsize() 를 생략한다 — 드라이브 FUSE 왕복 1회/파일 절감.\n\n        ★ uid 는 코어와 동일한 sha1_str("adopt", domain, subtype, abspath, size) 여야 한다.\n          계약 Q7 이 \'코어 경로와 size 지정 경로의 uid 가 같은가\'를 회귀로 고정한다.\n        """\n        if size is None:\n            return super().adopt(abs_path, domain, subtype, key, source=source,\n                                 event_date=event_date, knowledge_date=knowledge_date,\n                                 scope=scope, extra=extra)\n        sz = int(size)\n        uid = sha1_str("adopt", domain, subtype, os.path.abspath(abs_path), sz)\n        if self.has(scope, uid):\n            return uid\n        self._register(scope, {\n            "uid": uid, "domain": domain, "subtype": subtype, "key": str(key),\n            "path": abs_path, "abs_path": abs_path,\n            "fmt": os.path.splitext(abs_path)[1].lstrip("."),\n            "bytes": sz, "sha1": "", "source": source or "adopted",\n            "event_date": str(as_ts(event_date) or ""),\n            "knowledge_date": str(as_ts(knowledge_date) or ""),\n            "adopted": True, "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),\n        })\n        self.stats["adopted"] += 1\n        return uid\n\n    def has(self, scope: str, uid: str) -> bool:\n        if scope not in self._uidset:\n            self.load_index(scope)\n        with self._lk:\n            # _register 가 이미 _uidset 에 넣으므로 pending 을 따로 훑을 필요가 없다.\n            return str(uid) in self._uidset.get(scope, set())\n\n    def _uid_path_map(self, scope: str) -> Dict[str, Tuple[str, str, str]]:\n        m = self._uidpath.get(scope)\n        if m is not None:\n            return m\n        idx = self.load_index(scope)\n        m = {}\n        if len(idx):\n            root_col = (idx["_root"].astype(str) if "_root" in idx.columns\n                        else pd.Series([self.root] * len(idx), index=idx.index))\n            for u, ap, rel, rt in zip(idx["uid"].astype(str),\n                                      idx.get("abs_path", pd.Series([""] * len(idx))).astype(str),\n                                      idx.get("path", pd.Series([""] * len(idx))).astype(str),\n                                      root_col):\n                m[u] = (ap, rel, rt if rt and rt != "nan" else self.root)\n        self._uidpath[scope] = m\n        return m\n\n    def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:\n        ent = self._uid_path_map(scope).get(str(uid))\n        if ent is None:\n            return None\n        ap, rel, base = ent\n        cands = [ap]\n        if rel and rel not in ("", "nan"):\n            cands.append(os.path.join(base, rel))\n            if base != self.root:\n                cands.append(os.path.join(self.root, rel))\n        for c in cands:\n            try:\n                if c and c not in ("", "nan") and os.path.exists(c):\n                    return open(c, "rb").read()\n            except Exception:\n                continue\n        return None\n\n    # ── 기존 리포트 폴더 흡수 (드라이브 FUSE 안전판) --------------------------------------\n    # ★★ 이름으로 프루닝하면 사용자의 폴더를 먹는다 ★★\n    #   예전에는 {"blob","table","index","_backup","_locks","reports"} 를 \'이름\'으로 잘랐다.\n    #   그러면 트리 어디에 있든 그 이름이면 하위 전체가 사라진다 — GDRIVE_ADOPT_DIRS 기본값에\n    #   `reports` 가 있는데 `research/reports/`, `archive/reports/` 는 리포트를 모아둔\n    #   폴더에서 극히 흔한 이름이다. 실측으로 8개 중 7개가 통째로 누락됐고, 누락 사실은\n    #   어디에도 남지 않았다. 그래서 \'이름\'이 아니라 \'구조\'로 판정한다.\n    _HEX2_RE = re.compile(r"^[0-9a-f]{2}$")\n    _HASH_FANOUT_MIN = 32          # 2자리 16진수 하위폴더가 이만큼이면 내용해시 샤드 트리\n    _MANAGED_NS_CHILD = {"index", "blob", "table", "_backup", "_locks"}\n    _SKIP_DIRNAMES = {".git", "__pycache__", ".ipynb_checkpoints", "node_modules",\n                      ".cache", ".Trash", "$RECYCLE.BIN", "System Volume Information"}\n\n    def _is_cache_ns(self, path: str) -> bool:\n        """`<X>/_shared/blob` 처럼 \'캐시 네임스페이스 바로 아래의 관리 폴더\'인가.\n\n        이름만 보는 것이 아니라 부모가 캐시 네임스페이스인지까지 본다. 사용자의\n        `research/reports`, `archive/table` 은 여기에 걸리지 않는다.\n        """\n        parts = [p for p in os.path.normpath(str(path)).replace("\\\\", "/").split("/") if p]\n        for i in range(len(parts) - 1):\n            if parts[i] in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS) and \\\n                    parts[i + 1] in self._MANAGED_NS_CHILD:\n                return True\n        return False\n\n    def _managed_keys(self) -> set:\n        """쓰기루트·미러의 관리 트리. 여기는 이미 인덱스에 있으므로 절대 걷지 않는다."""\n        out = set()\n        for r in [self.root] + list(self.mirrors):\n            out.add(_same_place_key(r))\n            for ns in (GDRIVE_SHARED_NS, GDRIVE_PRIVATE_NS):\n                p = os.path.join(r, ns)\n                if os.path.isdir(p):\n                    out.add(_same_place_key(p))\n        return out\n\n    def adopt_scan(self, dirs: Sequence[str], max_files: int = None,\n                   max_seconds: float = None) -> pd.DataFrame:\n        """기존에 모아둔 리포트를 \'등록만\' 한다. 이동·개명·삭제 없음.\n\n        ★ 사용자의 실제 Colab 실행이 여기서 멈췄다. 원인은 하나가 아니라 넷이 겹친 것이었다:\n          ① 캐시 루트 자신을 스캔했다 → blob 은 내용해시 2단이라 최대 65,536개 디렉터리이고\n             드라이브 FUSE 에서 listdir 한 번이 50~200ms 다. 열거만 1~2시간인데,\n             그 파일들은 \'이미 인덱스에 있는 것\'이라 전부 무의미한 작업이다.\n          ② /content/drive/MyDrive 와 /content/drive/My Drive 를 중복 스캔했다.\n          ③ 파일마다 getsize() 로 FUSE 왕복이 한 번 더 붙었다.\n          ④ 코어의 max_files 상한은 안쪽 for 만 끊고 os.walk 는 계속 돌았다.\n        → 관리 트리 프루닝 + 실체 기준 중복제거 + scandir 1회 stat + \'진짜\' 상한 +\n          디렉터리 mtime 체크포인트(재실행 시 이어받기) + 진행률 출력.\n        """\n        max_files = int(ADOPT_SCAN_MAX_FILES if max_files is None else max_files)\n        max_seconds = float(ADOPT_SCAN_MAX_SECONDS if max_seconds is None else max_seconds)\n        if not ADOPT_SCAN_ENABLED:\n            LOG.info("ADOPT_SCAN_ENABLED=False — 기존 리포트 폴더 스캔을 건너뜁니다 "\n                     "(인덱스에 이미 등록된 자료는 그대로 사용됩니다).")\n            return pd.DataFrame(columns=["abs_path", "kind", "name"])\n\n        managed = self._managed_keys()\n        roots, skipped_missing, skipped_managed = [], [], []\n        seen_keys = set()\n        for d in dirs:\n            if not d:\n                continue\n            e = _expand(d)\n            if not os.path.isdir(e):\n                skipped_missing.append(d)\n                continue\n            k = _same_place_key(e)\n            if k in managed:\n                skipped_managed.append(e)\n                continue\n            if k in seen_keys:\n                continue\n            seen_keys.add(k)\n            roots.append(e)\n\n        if skipped_missing:\n            LOG.info(f"존재하지 않는 스캔 경로 {len(skipped_missing)}개는 건너뜁니다"\n                     f"(로컬 D: 가 없는 환경에서는 정상): "\n                     f"{_trunc(\', \'.join(skipped_missing[:4]), 70)}")\n        if skipped_managed:\n            LOG.info(f"캐시 관리 트리 {len(skipped_managed)}개는 스캔 대상에서 제외합니다 — "\n                     f"이미 인덱스에 있고, blob 은 내용해시 2단 구조라 드라이브에서 열거만 "\n                     f"수 시간이 걸립니다.")\n        if not roots:\n            LOG.info("스캔할 외부 리포트 폴더가 없습니다. (기존 인덱스는 그대로 사용됩니다)")\n            return pd.DataFrame(columns=["abs_path", "kind", "name"])\n\n        # ── 디렉터리 체크포인트 ──────────────────────────────────────────────────────────\n        #  ★ 예전 체크포인트는 mtime 만 저장하고, 무변경이어도 scandir 는 그대로 했다.\n        #    아끼는 것이 파일 stat 뿐이라 \'디렉터리 열거 절감률 0.0%\' 였고, FUSE 왕복이\n        #    비용의 전부인 드라이브에서는 이어받기가 회차당 +332 → +47 → +7 로 감쇠해\n        #    사실상 수렴하지 않았다. 이제 \'완주한 디렉터리의 하위폴더 목록\'까지 저장해서,\n        #    mtime 이 같으면 scandir 자체를 생략하고 저장된 하위폴더로 바로 내려간다.\n        #  ★ 그리고 상한으로 중도 탈출한 디렉터리는 체크포인트에 넣지 않는다. 예전에는\n        #    scandir \'전에\' 기록해서, 상한에 걸려 10건만 읽은 디렉터리의 나머지 40건이\n        #    (트리가 바뀌지 않는 한) 영구히 등록되지 않았다.\n        ckpt: Dict[str, Tuple[float, List[str]]] = {}\n        cdf = self.get_table("qvf_adopt_scan_state", scope="private")\n        if cdf is not None and len(cdf):\n            try:\n                _mt = pd.to_numeric(cdf["mtime"], errors="coerce").fillna(-1.0)\n                _sd = (cdf["subdirs"].astype(str) if "subdirs" in cdf.columns\n                       else pd.Series(["[]"] * len(cdf)))\n                for _p, _m, _s in zip(cdf["dirpath"].astype(str), _mt, _sd):\n                    try:\n                        kids = json.loads(_s) if _s and _s != "nan" else []\n                    except Exception:\n                        kids = []\n                    ckpt[_p] = (float(_m), list(kids) if isinstance(kids, list) else [])\n            except Exception:\n                ckpt = {}\n            LOG.info(f"이전 스캔 체크포인트 {len(ckpt):,}개 디렉터리 — 변경되지 않은 폴더는 "\n                     f"열거(scandir) 자체를 생략하고 저장된 하위폴더로 바로 내려갑니다.")\n\n        t0 = time.time()\n        found: List[dict] = []\n        new_ckpt: Dict[str, Tuple[float, List[str]]] = dict(ckpt)\n        n_files = n_dirs = n_skipped_dirs = n_ckpt_hit = 0\n        skipped_samples: List[str] = []\n        stopped = ""\n\n        for root in roots:\n            if stopped:\n                break\n            LOG.info(f"기존 리포트 폴더 스캔: {root}")\n            stack = [root]\n            while stack:\n                if time.time() - t0 > max_seconds:\n                    stopped = f"시간 예산 {max_seconds:.0f}초 초과"\n                    break\n                if n_files >= max_files:\n                    stopped = f"파일 상한 {max_files:,}건 도달"\n                    break\n                cur = stack.pop()\n                try:\n                    st_m = os.stat(cur).st_mtime\n                except Exception:\n                    continue\n                n_dirs += 1\n                if n_dirs % 200 == 0:\n                    LOG.info(f"  … 디렉터리 {n_dirs:,} · 파일 {n_files:,} · "\n                             f"{time.time()-t0:.0f}초 경과")\n                prev = ckpt.get(cur)\n                if prev is not None and abs(prev[0] - st_m) < 1e-6:\n                    # 무변경 + 이전에 \'완주\' 한 디렉터리 → 열거를 통째로 생략한다.\n                    n_ckpt_hit += 1\n                    stack.extend(prev[1])\n                    continue\n                completed = True\n                subdirs: List[str] = []\n                hex2 = 0\n                try:\n                    with os.scandir(cur) as it:\n                        for ent in it:\n                            try:\n                                if ent.is_dir(follow_symlinks=False):\n                                    nm = ent.name\n                                    if nm.startswith(".") or nm in self._SKIP_DIRNAMES:\n                                        n_skipped_dirs += 1\n                                        continue\n                                    if self._is_cache_ns(ent.path):\n                                        n_skipped_dirs += 1\n                                        if len(skipped_samples) < 6:\n                                            skipped_samples.append(ent.path)\n                                        continue\n                                    if self._HEX2_RE.match(nm):\n                                        hex2 += 1\n                                        if hex2 >= self._HASH_FANOUT_MIN:\n                                            # 내용해시 샤드 트리(최대 65,536 디렉터리). 여기는\n                                            # 남의 캐시 blob 이지 사용자의 리포트가 아니다.\n                                            n_skipped_dirs += 1\n                                            if len(skipped_samples) < 6:\n                                                skipped_samples.append(ent.path)\n                                            continue\n                                    if _same_place_key(ent.path) in managed:\n                                        n_skipped_dirs += 1\n                                        continue\n                                    subdirs.append(ent.path)\n                                    stack.append(ent.path)\n                                    continue\n                                # ★ 예산 검사가 디렉터리 경계에만 있으면 예산이 상한이 아니다.\n                                #   파일 1만 개짜리 디렉터리 하나가 예산을 통째로 넘긴다.\n                                if (n_files & 0x3FF) == 0 and time.time() - t0 > max_seconds:\n                                    completed = False\n                                    stopped = f"시간 예산 {max_seconds:.0f}초 초과"\n                                    break\n                                low = ent.name.lower()\n                                if low.endswith(".pdf"):\n                                    kind = "report_pdf"\n                                elif low.endswith((".parquet", ".jsonl", ".json", ".csv")) and \\\n                                        any(t in low for t in\n                                            ("report", "consensus", "research", "analyst",\n                                             "hankyung", "naver", "dart", "krx", "price",\n                                             "ohlcv", "universe", "fnltt")):\n                                    kind = "table_like"\n                                else:\n                                    continue\n                                try:\n                                    sz = ent.stat(follow_symlinks=False).st_size\n                                except Exception:\n                                    sz = -1\n                                found.append({"abs_path": ent.path, "kind": kind,\n                                              "name": ent.name, "dir": cur, "bytes": sz})\n                                n_files += 1\n                                if n_files >= max_files:\n                                    completed = False\n                                    break\n                            except Exception:\n                                continue\n                except Exception as e:                              # noqa\n                    completed = False\n                    LOG.warn(f"  디렉터리 열람 실패({type(e).__name__}) — 이 하위 트리는 "\n                             f"이번 실행에서 등록되지 않습니다: {cur}")\n                if completed:\n                    # 완주한 디렉터리만 체크포인트에 남긴다(중도 탈출분은 다음 실행에서 재시도).\n                    new_ckpt[cur] = (st_m, subdirs)\n\n        dur = time.time() - t0\n        if not found:\n            LOG.info(f"새로 등록할 리포트 파일이 없습니다 (디렉터리 {n_dirs:,}개 · {dur:.1f}초"\n                     + (f" · {stopped}" if stopped else "") + "). "\n                     f"이미 인덱스에 있는 자료는 그대로 사용됩니다.")\n        else:\n            df = pd.DataFrame(found)\n            for r in df.itertuples(index=False):\n                m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)\n                ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None\n                # scandir 에서 이미 크기를 알고 있다 — getsize() 를 또 부르면 드라이브 FUSE\n                # 왕복이 파일마다 한 번씩 더 붙는다(리포트 3만 건이면 2.6~6.4분).\n                self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",\n                           subtype=r.kind, key=r.name, source="preexisting_drive_cache",\n                           event_date=ed, knowledge_date=ed, scope="shared",\n                           extra={"dir": r.dir},\n                           size=(int(r.bytes) if int(r.bytes) >= 0 else None))\n            self.flush("shared")\n            LOG.ok(f"기존 리포트 {len(df):,}건을 공용 인덱스에 \'참조 등록\'했습니다 "\n                   f"(파일은 원위치 그대로, 이동·삭제 없음) — "\n                   f"디렉터리 {n_dirs:,}개 · {dur:.1f}초")\n\n        # ★ 프루닝은 \'조용히\' 하면 안 된다. 사용자가 자기 리포트가 왜 안 잡혔는지 알 수 있어야\n        #   한다. 예전에는 n_skipped_dirs 를 증가만 시키고 출력하는 곳이 한 군데도 없었다.\n        LOG.table([["걸은 디렉터리", f"{n_dirs:,}"],\n                   ["체크포인트 적중(열거 생략)", f"{n_ckpt_hit:,}"],\n                   ["프루닝한 하위폴더", f"{n_skipped_dirs:,}"],\n                   ["프루닝 예시", _trunc(" / ".join(skipped_samples), 90) if skipped_samples else "—"],\n                   ["새로 찾은 파일", f"{len(found):,}"],\n                   ["소요", f"{dur:.1f}초"],\n                   ["중단 사유", stopped or "—"]],\n                  ["항목", "값"], ["l", "l"],\n                  title="기존 리포트 폴더 스캔 요약 — 프루닝 건수를 숨기면 누락을 알 수 없다")\n        if stopped:\n            LOG.warn(f"스캔을 중단했습니다: {stopped}. 완주한 디렉터리만 체크포인트에 저장했으므로 "\n                     f"다음 실행에서 남은 폴더부터 이어받습니다(중도 탈출한 폴더는 다시 읽습니다). "\n                     f"상한을 늘리려면 ADOPT_SCAN_MAX_FILES / ADOPT_SCAN_MAX_SECONDS 를 조정하세요.")\n        try:\n            self.put_table("qvf_adopt_scan_state",\n                           pd.DataFrame({"dirpath": list(new_ckpt.keys()),\n                                         "mtime": [v[0] for v in new_ckpt.values()],\n                                         "subdirs": [json.dumps(v[1], ensure_ascii=False)\n                                                     for v in new_ckpt.values()]}),\n                           scope="private", domain="index", source="adopt_scan checkpoint")\n        except Exception as e:                                      # noqa\n            LOG.debug(f"스캔 체크포인트 저장 실패({type(e).__name__}) — 기능에 영향 없음")\n        return pd.DataFrame(found) if found else pd.DataFrame(columns=["abs_path", "kind", "name"])\n\n    def compact(self, scope: str):\n        """★ 미러 행을 드라이브 인덱스에 쓰면 안 된다.\n\n        load_index 는 조회 편의를 위해 미러 행을 합쳐서 돌려주는데, 부모의 compact 는\n        그 결과를 그대로 index.parquet 에 기록한다. 그러면 \'로컬에만 존재하는 파일 경로\'가\n        공용 드라이브 인덱스에 박히고, 다른 기기·다른 전략이 그 경로를 열려다 실패한다.\n        컴팩션 동안만 자기 루트 전용 모드로 내린다.\n        """\n        keep = self._own_only\n        self._own_only = True\n        try:\n            super().compact(scope)\n        finally:\n            self._own_only = keep\n            self._idx.pop(scope, None)      # 합쳐진 조회용 뷰를 다음 조회에서 재구성\n            self._uidset.pop(scope, None)\n            self._merged.pop(scope, None)\n            self._uidpath.pop(scope, None)\n\n    def report_roots(self):\n        rows = [["쓰기 루트 (신규 수집분 저장)", self.root, self.mode]]\n        for m in self.mirrors:\n            rows.append(["읽기 전용 미러", m, "탐색만 — 절대 쓰지 않음"])\n        missing = [m for m in CACHE_MIRROR_ROOTS if not os.path.isdir(_expand(m))]\n        if missing:\n            rows.append(["(없음 — 건너뜀)", _trunc(", ".join(missing), 44),\n                         "이 환경에 없는 경로. 정상입니다"])\n        LOG.table(rows, ["역할", "경로", "비고"], ["l", "l", "l"],\n                  title="캐시 루트 구성 (로컬·드라이브 양쪽 탐색 → 신규는 드라이브에만 기록)")\n        if not self.mirrors:\n            LOG.info("읽기 전용 미러가 없습니다 — 구글드라이브만 탐색합니다. "\n                     "로컬 D: 가 없는 PC나 Colab 에서는 정상이며, 기능에 영향이 없습니다. "\n                     "다른 PC의 로컬 캐시를 함께 쓰려면 CACHE_MIRROR_ROOTS 에 경로를 "\n                     "추가하세요(탐색만 하고 절대 쓰지 않습니다).")',
+    'DartQuota': 'class DartQuota:\n    """DartBudget 의 드롭인 대체(take/refund/close/n/exhausted 동일 인터페이스).\n\n    ★ 공용 스코프에 기록하는 이유: 하나의 DART 키를 여러 전략(TCD, QVF …)이 나눠 쓰면\n      전략별 사설 카운터는 서로를 못 본다. 그러면 각자 \'아직 여유 있다\'고 믿으면서\n      합계로는 한도를 넘겨 020 폭풍을 맞는다.\n    """\n\n    FLUSH_EVERY = 200\n    # DART 한도는 한국시간 자정에 리셋된다. 로컬시간을 쓰면 Colab(UTC)에서 9시간 어긋나고,\n    # 구축 시점에 한 번만 계산하면 자정을 넘긴 장시간 실행이 \'어제 한도\'에 계속 묶인다.\n    KST = _dt.timezone(_dt.timedelta(hours=9))\n\n    @staticmethod\n    def _day_key() -> str:\n        return _dt.datetime.now(DartQuota.KST).date().isoformat()\n\n    def __init__(self, vault: "Vault"):\n        self.vault = vault\n        self.today = self._day_key()\n        self.key_fp = sha1_str("dartkey", DART_API_KEY or "")[:12]\n        self.n = 0                     # 이번 프로세스가 쓴 양\n        self.n_other = 0               # 같은 키로 오늘 다른 프로세스/전략이 쓴 양\n        self.observed_limit: Optional[int] = None   # 오늘 실측된 상한\n        self.hist_limit: Optional[int] = None       # 과거 실측 상한(계획용 추정치)\n        self._exhausted = False\n        self._lk = threading.RLock()\n        self._unflushed = 0\n        self._probe_at = 0.0\n        self._load()\n        # 공용 코어(12_ingest_dart_fin)가 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로\n        # 되돌려 놓는다(조립 순서상 헤더보다 뒤). 사용자가 명시적으로 거부한 값이므로\n        # 실측 소유자인 이 클래스가 되찾아온다. 실측되면 그 값으로 다시 덮인다.\n        globals()["DART_DAILY_LIMIT"] = int(self.hist_limit or DART_DAILY_LIMIT_HINT)\n\n    def _roll_if_needed(self):\n        """자정(KST)을 넘겼으면 카운터를 새 날짜로 되돌린다. 며칠에 걸친 콜드빌드에서\n        \'어제 소진\'을 오늘까지 끌고 가 하루를 통째로 버리는 사고를 막는다."""\n        d = self._day_key()\n        if d == self.today:\n            return\n        self._flush_locked()\n        LOG.ok(f"DART 한도 리셋 감지 (KST {self.today} → {d}) — 카운터를 초기화하고 계속합니다.")\n        self.today = d\n        self.n = 0\n        self.n_other = 0\n        self.observed_limit = None\n        self._exhausted = False\n        self._unflushed = 0\n\n    # -- 저널 ---------------------------------------------------------------------------\n    def _path(self) -> str:\n        return os.path.join(self.vault.ns["shared"], "index", "dart_quota.jsonl")\n\n    def _mirror_paths(self) -> List[str]:\n        out = []\n        for mr in getattr(self.vault, "mirrors", []) or []:\n            p = os.path.join(mr, GDRIVE_SHARED_NS, "index", "dart_quota.jsonl")\n            if os.path.exists(p):\n                out.append(p)\n        return out\n\n    def _reload_other(self):\n        """저널을 다시 읽어 \'남이 오늘 쓴 양\'만 갱신한다(hist/observed 는 건드리지 않는다).\n\n        020 을 기록하기 직전에 부른다. 형제 프로세스의 소비가 안 보이면 내 눈에 보이는\n        누적이 실제보다 작고, 그 작은 값이 그날의 실측 한도로 저널에 영구히 박힌다.\n        """\n        rows: List[dict] = []\n        for p in [self._path()] + self._mirror_paths():\n            rows.extend(read_jsonl(p))\n        seen, tot = set(), 0\n        for r in rows:\n            if r.get("event") != "use" or str(r.get("date")) != self.today:\n                continue\n            eid = r.get("evt_id") or (r.get("host"), r.get("pid"), r.get("ts"), r.get("n"))\n            if eid in seen:\n                continue\n            seen.add(eid)\n            try:\n                tot += max(0, int(r.get("n", 0)))\n            except Exception:\n                pass\n        # 내 몫(self.n)은 이미 저널에 flush 되어 tot 에 포함되므로 빼서 이중계상을 막는다.\n        with self._lk:\n            self.n_other = max(0, tot - int(self.n))\n\n    def _load(self):\n        rows: List[dict] = []\n        for p in [self._path()] + self._mirror_paths():\n            rows.extend(read_jsonl(p))\n        # ★★ 미러의 저널 사본을 중복 합산하면 안 된다 ★★\n        #   로컬 미러가 드라이브 캐시의 복사본이면(= CACHE_MIRROR_ROOTS 의 정상 용도) 같은\n        #   소비 이벤트가 \'미러 수 + 1\' 배로 세어진다. 실측으로 500건 사용이 1,000~1,500건\n        #   으로 잡혔고, take() 의 안전정지가 실제 사용량의 절반 지점에서 걸려 DART 수집이\n        #   조기 중단됐다. 그런데 그 스테이지는 critical=False 라 실패로 잡히지도 않는다.\n        #   → evt_id 로 dedup 한다. 미러를 \'읽는\' 것 자체는 타당하다(다른 기기의 소비를\n        #     봐야 하므로). 중복만 걷어낸다.\n        seen_evt = set()\n        uniq: List[dict] = []\n        for r in rows:\n            eid = r.get("evt_id")\n            if eid:\n                if eid in seen_evt:\n                    continue\n                seen_evt.add(eid)\n            else:\n                # 구버전 저널(evt_id 없음)은 자연키로 대체한다.\n                nk = (r.get("date"), r.get("key_fp"), r.get("host"), r.get("pid"),\n                      r.get("ts"), r.get("event"), r.get("n"), r.get("limit"))\n                if nk in seen_evt:\n                    continue\n                seen_evt.add(nk)\n            uniq.append(r)\n        if len(uniq) != len(rows):\n            LOG.debug(f"DART 쿼터 저널 중복 {len(rows) - len(uniq):,}행 제거(미러 사본)")\n        rows = uniq\n        mine_pid = os.getpid()\n        for r in rows:\n            if str(r.get("key_fp")) != self.key_fp:\n                continue\n            if r.get("event") == "limit_observed":\n                try:\n                    lim = int(r.get("limit", 0))\n                except Exception:\n                    continue\n                if lim > 0:\n                    self.hist_limit = max(self.hist_limit or 0, lim)\n                    if str(r.get("date")) == self.today:\n                        self.observed_limit = lim\n                        self._exhausted = True\n            elif r.get("event") == "use" and str(r.get("date")) == self.today:\n                try:\n                    k = int(r.get("n", 0))\n                except Exception:\n                    k = 0\n                # 같은 pid 의 기록은 재실행 시 \'남이 쓴 양\'으로 다시 세면 안 되지만,\n                # 프로세스가 죽었다 살아난 경우엔 실제로 소비된 양이므로 세는 게 맞다.\n                # 보수적으로(=과다계상 방향) 전부 센다. 과소계상은 020 폭풍을 부른다.\n                self.n_other += max(0, k)\n        if self.n_other:\n            LOG.info(f"오늘 이 DART 키로 이미 사용된 호출 {self.n_other:,}건 "\n                     f"(다른 전략/이전 실행 포함, 공용 저널 기준) — 이어서 진행합니다.")\n        if self.observed_limit:\n            LOG.warn(f"오늘({self.today}) 이 키의 실측 한도 {self.observed_limit:,}건에 이미 "\n                     f"도달한 기록이 있습니다. DART 신규 수집은 건너뛰고 캐시로 진행합니다. "\n                     f"★ 지금 재실행해도 캐시분은 그대로 쓰입니다. 한도는 KST 자정에 리셋됩니다.")\n        elif self.hist_limit:\n            LOG.info(f"과거 실측된 일일 한도 {self.hist_limit:,}건을 \'계획용 추정치\'로만 씁니다. "\n                     f"실제 소비는 서버가 020(한도초과)을 줄 때까지 계속합니다 — "\n                     f"추정치 때문에 남은 호출을 놀리지 않습니다.")\n        else:\n            LOG.info("이 키의 일일 한도 실측 기록이 아직 없습니다. OpenDART 는 잔여량 조회 API 를 "\n                     "제공하지 않으므로, 서버가 020 을 줄 때까지 소비하며 그 지점을 한도로 "\n                     "기록합니다(다음 실행부터 계획에 반영됩니다).")\n\n    def _append(self, rec: dict):\n        self._seq = getattr(self, "_seq", 0) + 1\n        _ts = _dt.datetime.now().isoformat(timespec="microseconds")\n        rec = {"date": self.today, "key_fp": self.key_fp, "pid": os.getpid(),\n               "host": platform.node(), "ts": _ts,\n               # 미러 사본 중복 합산을 막는 고유 id. 없으면 dedup 자체가 불가능하다.\n               "evt_id": sha1_str("dartquota", platform.node(), os.getpid(), _ts, self._seq),\n               **rec}\n        try:\n            with self.vault.lock("dart_quota", timeout=15.0):\n                append_jsonl(self._path(), [rec])\n        except Exception:\n            try:\n                append_jsonl(self._path(), [rec])\n            except Exception:\n                pass\n\n    # -- 인터페이스 ---------------------------------------------------------------------\n    @property\n    def used_today(self) -> int:\n        return self.n + self.n_other\n\n    @property\n    def exhausted(self) -> bool:\n        return self._exhausted\n\n    @exhausted.setter\n    def exhausted(self, v: bool):\n        """★ 공용 코어(dart_api)가 status 020/021 을 보면 여기에 True 를 넣는다.\n        그 순간의 누적 사용량이 곧 \'오늘의 실측 한도\'다. 이 setter 가 발견 지점이다."""\n        v = bool(v)\n        if not v:\n            self._exhausted = False\n            return\n        if self._exhausted:\n            return\n        # ★ 공용 코어는 020(일일한도 초과)과 021(조회 가능 회사 수 초과)을 같은 분기에서\n        #   처리하며 둘 다 여기로 True 를 보낸다. 그런데 021 은 \'요청이 잘못됐다\'는 뜻이지\n        #   한도와 아무 상관이 없다. 이를 한도로 기록하면 (a) 남은 호출을 전부 못 쓰고\n        #   (b) 그 거짓 상한이 공용 저널에 박혀 내일 이후 실행과 \'다른 전략\'까지 오염된다.\n        #   → 값싼 확인 호출을 한 번 던져 진짜 020 인지 확증한 뒤에만 기록한다.\n        self._exhausted = True                      # 확인 전까지는 잠정 정지(호출 폭주 방지)\n        if not self._confirm_exhaustion():\n            self._exhausted = False\n            LOG.warn("DART 오류를 받았지만 확인 호출이 성공했습니다 — 일일한도(020)가 아니라 "\n                     "요청 오류(021 등)로 판단하고 수집을 계속합니다. 한도로 기록하지 않습니다.")\n            return\n        # ★ used_today = self.n + self.n_other 인데 n_other 는 __init__ 의 _load() 에서\n        #   딱 한 번만 읽었다. 이 프로세스가 시작한 뒤 형제 프로세스(TCD·두 번째 QVF 실행)가\n        #   같은 키를 쓴 몫이 안 보이므로, 020 이 왔을 때 내 눈에 보이는 누적은 실제보다\n        #   훨씬 작다. 그 작은 값이 \'그날의 실측 한도\'로 저널에 영구 기록되고, 이후 모든\n        #   실행이 그 근처(및 ×2 안전정지)에서 멈춘다 — 한 번 오염되면 매일 재현된다.\n        #   기록 직전에 저널을 다시 읽어 형제 소비분을 반영한다.\n        self._flush()\n        try:\n            self._reload_other()\n        except Exception as e:\n            LOG.debug(f"저널 재조회 실패({type(e).__name__}) — 프로세스 내 집계로만 기록합니다.")\n        self.observed_limit = int(self.used_today)\n        self._append({"event": "limit_observed", "limit": int(self.observed_limit)})\n        globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)\n        LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 확인했습니다. "\n                 f"여기까지 받은 데이터는 캐시에 저장되어 있습니다. ★ 지금 재실행해도 "\n                 f"이 지점부터 이어받습니다. (한도값을 코드에 고정하지 않고 실측한 값입니다)")\n\n    def _confirm_exhaustion(self) -> bool:\n        """가장 값싼 정상 요청을 한 번 던져 020 이 재현되는지 본다. True = 진짜 한도 소진."""\n        now = time.monotonic()\n        if now - self._probe_at < 30.0:\n            return True                              # 직전에 확인함 — 중복 확인 금지\n        self._probe_at = now\n        if not DART_API_KEY:\n            return True\n        try:\n            d = (_dt.datetime.now(self.KST) - _dt.timedelta(days=3)).strftime("%Y%m%d")\n            js = http_json("https://opendart.fss.or.kr/api/list.json", source="dart", tries=1,\n                           params={"crtfc_key": DART_API_KEY, "bgn_de": d, "end_de": d,\n                                   "page_no": 1, "page_count": 1},\n                           referer="https://opendart.fss.or.kr/")\n        except Exception:\n            return True                              # 확인 불가 → 보수적으로 소진 처리\n        if not isinstance(js, dict):\n            return True\n        st = str(js.get("status", ""))\n        # 000(정상) 또는 013(데이터 없음)이면 키는 살아 있다 = 한도 소진이 아니다.\n        return st not in ("000", "013")\n\n    def take(self, k: int = 1) -> bool:\n        if not DART_API_KEY:\n            return False\n        with self._lk:\n            self._roll_if_needed()\n            if self._exhausted:\n                return False\n            # 과거 실측 상한이 있으면 \'거기서 멈추지 않고\' 계속 쓴다(§요구사항).\n            # 다만 추정치의 2배를 넘어서면 저널이 오염됐을 가능성이 크므로 안전 정지한다.\n            if self.hist_limit and self.used_today > self.hist_limit * 2:\n                LOG.warn(f"누적 사용량({self.used_today:,})이 과거 실측 한도({self.hist_limit:,})의 "\n                         f"2배를 넘었습니다. 저널 오염 가능성이 있어 안전 정지합니다.")\n                self._exhausted = True\n                return False\n            self.n += k\n            self._unflushed += k\n            if self._unflushed >= self.FLUSH_EVERY:\n                self._flush_locked()\n            return True\n\n    def refund(self, k: int = 1):\n        if k <= 0:\n            return\n        with self._lk:\n            self.n = max(0, self.n - k)\n            self._unflushed = max(0, self._unflushed - k)\n\n    def _flush_locked(self):\n        if self._unflushed <= 0:\n            return\n        k, self._unflushed = self._unflushed, 0\n        self._append({"event": "use", "n": int(k)})\n\n    def _flush(self):\n        with self._lk:\n            self._flush_locked()\n\n    def remaining_calls(self) -> Optional[int]:\n        """오늘 더 쓸 수 있는 호출 수의 \'숫자\'. 모르면 None (문자열판 remaining_str 과 짝).\n\n        수집부는 이 값으로 작업 목록을 잘라낸다 — 한도를 코드에 고정하지 않고, 그렇다고\n        전부 던져 놓고 예외를 기다리지도 않기 위해서다. 후자가 실제로 하루치를 통째로\n        태우고도 아무 회사도 완성시키지 못한 원인이었다.\n\n        ★ 실측 상한이 아직 없으면 None 이 아니라 헤더 힌트 기준 잔여를 준다. None 을 주면\n          호출부가 \'무제한\'으로 오해해 예전 동작으로 되돌아간다.\n        """\n        with self._lk:\n            used = int(self.used_today)\n        if self.observed_limit is not None:          # 오늘 020 을 이미 봤다 = 확정적으로 소진\n            return max(0, int(self.observed_limit) - used)\n        # ★ 과거 실측치는 \'그날 그 지점에서 막혔다\'는 하한 증거일 뿐 상한이 아니다.\n        #   (키를 다른 프로세스와 나눠 썼으면 그날치가 낮게 찍힌다 — 실제로 사용자 키는\n        #    14,047 에서 막혔지만 OpenDART 공표 한도는 20,000 이다.)\n        #   이걸 상한으로 쓰면 매일 6,000 호출을 스스로 버리게 된다. 계획은 둘 중 큰 값으로\n        #   잡고, 진짜 중단은 오늘 020 이 실제로 올 때 한다 = "실시간으로 체크해서 그만큼 쓴다".\n        cap = max(int(self.hist_limit or 0), int(DART_DAILY_LIMIT_HINT))\n        return max(0, cap - used)\n\n    def daily_limit(self) -> int:\n        """\'하루에 쓸 수 있는 총량\'의 계획용 추정치. remaining_calls() 와 다른 질문이다.\n\n        ★ 콜드빌드 \'예상 일수\' 는 반드시 이 값으로 나눠야 한다. 잔여로 나누면 잔여가 1일 때\n          19,154일 같은 값이 나와 \'52년 걸린다\'로 읽힌다 — 실제 뜻은 \'오늘은 거의 못 받는다\'\n          뿐인데도. 잔여는 오늘 진도를, 일일 한도는 완성까지의 일수를 결정한다.\n        """\n        return int(max(int(self.observed_limit or 0), int(self.hist_limit or 0),\n                       int(DART_DAILY_LIMIT_HINT)))\n\n    def remaining_str(self) -> str:\n        if self.observed_limit is not None:\n            return f"0 (오늘 실측 한도 {self.observed_limit:,} 도달)"\n        if self.hist_limit:\n            return f"약 {max(0, self.hist_limit - self.used_today):,} (과거 실측 {self.hist_limit:,} 기준 추정)"\n        return "미확정 (OpenDART 는 잔여량 API 를 제공하지 않음 — 020 수신 시 확정)"\n\n    def report(self):\n        LOG.table([["오늘 날짜", self.today],\n                   ["키 지문", self.key_fp or "(키 없음)"],\n                   ["이번 실행 사용", f"{self.n:,}"],\n                   ["오늘 누적 사용(공용 저널)", f"{self.used_today:,}"],\n                   ["오늘 실측 한도", f"{self.observed_limit:,}" if self.observed_limit else "미도달"],\n                   ["과거 실측 한도", f"{self.hist_limit:,}" if self.hist_limit else "기록 없음"],\n                   ["남은 호출량", self.remaining_str()]],\n                  ["항목", "값"], ["l", "r"],\n                  title="DART 호출량 (고정 상수가 아니라 실측 — 공용 저널로 전략 간 합산)")\n\n    def close(self):\n        self._flush()',
 }
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -12093,6 +12175,1246 @@ def run_contract_tests(strict: bool = True) -> bool:
     else:
         LOG.ok("계약 Q1~Q14 전부 통과 — PIT·생존자편향·부호처리·결측허용·비용·폐기조건·캐시 무결성 확인")
     return ok_all
+
+
+
+# ╔═════════════════════════════════════════════════════════════════════════════════════════╗
+# ║  L0  명세 전수조사 (§3.1 ~ §10.4)  —  계약 Q1~Q14 와 무엇이 다른가                          ║
+# ║                                                                                          ║
+# ║  계약은 '원칙'을 지킨다: PIT 강제 · 생존자편향 · 결정성 · 비용 단조성.                       ║
+# ║  그런데 원칙이 전부 지켜져도 '숫자가 명세와 다를' 수 있다.                                   ║
+# ║    실제로 계약·스모크·리허설을 전부 통과한 상태에서 §5.3 이 지정한 Q축 5개 지표 중           ║
+# ║    3개가 z 를 하나도 만들지 않고 있었다(관측률 100% 인데 z 산출 0행). 어느 계약도            ║
+# ║    "지정된 지표가 실제로 산출되는가" 를 보고 있지 않았기 때문이다.                           ║
+# ║                                                                                          ║
+# ║  그래서 조항 단위로 따로 검정한다. 조항마다                                                 ║
+# ║    ① 정답을 아는 합성 입력을 만들고  ② 실제 함수를 돌리고  ③ 숫자로 PASS/FAIL 판정          ║
+# ║                                                                                          ║
+# ║  ★ 검정을 쓸 때의 규칙: "이 검정이 실패하는 입력을 만들 수 있는가" 를 먼저 확인할 것.        ║
+# ║    검정력 0 인 검정은 통과해도 아무것도 보장하지 않는다 — 계약 8개가 그 상태로 ✔ 였다.      ║
+# ║    아래 검정들이 '검정력 확인' 소검정을 함께 두는 이유다.                                    ║
+# ║                                                                                          ║
+# ║  ★ 이 층은 파이프라인을 오염시키면 안 된다. 전역을 만지는 검정이 있으므로(U1000_N,           ║
+# ║    EXPERIMENTS, 거래일 캘린더 …) 실행 전후로 스냅샷을 떠서 복원하고, 복원 여부 자체를        ║
+# ║    마지막에 검정한다. 검증층이 본 실행의 입력을 바꾸면 그건 검증이 아니라 사고다.            ║
+# ╚═════════════════════════════════════════════════════════════════════════════════════════╝
+
+SPEC_CASES: List[Tuple[str, str, Callable]] = []
+
+
+def spec_clause(cid: str, title: str):
+    def deco(fn):
+        SPEC_CASES.append((cid, title, fn))
+        return fn
+    return deco
+
+
+class SpecChk:
+    """한 조항 안의 소검정 모음. 통과/실패 모두 '숫자'를 남긴다."""
+
+    def __init__(self):
+        self.rows: List[Tuple[str, bool, str]] = []
+
+    def add(self, name: str, ok: bool, evidence: str = ""):
+        self.rows.append((name, bool(ok), evidence))
+        return bool(ok)
+
+    def eq(self, name: str, got, want, tol: float = 0.0):
+        try:
+            ok = abs(float(got) - float(want)) <= tol
+            ev = f"실측 {got!r} · 기대 {want!r}" + (f" (허용 {tol})" if tol else "")
+        except (TypeError, ValueError):
+            ok = got == want
+            ev = f"실측 {got!r} · 기대 {want!r}"
+        return self.add(name, ok, ev)
+
+    @property
+    def passed(self) -> bool:
+        return all(ok for _n, ok, _e in self.rows)
+
+
+# ── 합성 입력 헬퍼 ──────────────────────────────────────────────────────────────────────────
+def _sa_grid(n_codes: int, rebals: Sequence[str], **cols) -> pd.DataFrame:
+    """(code × rebal) 격자. 값은 스칼라 또는 길이 n_codes 시퀀스."""
+    codes = [f"{i:06d}" for i in range(1, n_codes + 1)]
+    rows = []
+    for t in rebals:
+        for i, c in enumerate(codes):
+            r = {"code": c, "rebal": pd.Timestamp(t),
+                 "signal_date": pd.Timestamp(t) - pd.Timedelta(days=1),
+                 "exec_date": pd.Timestamp(t) + pd.Timedelta(days=1)}
+            for k, v in cols.items():
+                r[k] = v[i] if isinstance(v, (list, tuple)) else v
+            rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _sa_cells(P: pd.DataFrame) -> pd.DataFrame:
+    """build_sector_cells 와 같은 규약의 셀 컬럼."""
+    d = P.copy()
+    if "sector" not in d.columns:
+        d["sector"] = "테스트섹터"
+    ym = as_ts_series(d["rebal"]).dt.strftime("%Y%m")
+    d["cell"] = ym + "|" + d["sector"].astype(str)
+    d["cell_l2"] = ym + "|" + d["sector"].astype(str).str.slice(0, 4)
+    d["cell_l3"] = ym + "|ALL"
+    return d
+
+
+def _sa_prices(codes: Sequence[str], dates, amount=1e9, close=1000.0,
+               skip: Optional[Dict[str, set]] = None) -> pd.DataFrame:
+    """일봉 패널. skip[code] 의 인덱스는 행 자체를 만들지 않는다(소스 누락 재현)."""
+    rows = []
+    for c in codes:
+        for i, d in enumerate(dates):
+            if skip and c in skip and i in skip[c]:
+                continue
+            am = amount[c] if isinstance(amount, dict) else amount
+            rows.append({"code": c, "date": pd.Timestamp(d), "open": close,
+                         "high": close * 1.01, "low": close * 0.99, "close": close,
+                         "amount": am, "volume": am / max(close, 1)})
+    return pd.DataFrame(rows)
+
+
+def _sa_bdays(start: str, n: int):
+    return list(pd.bdate_range(start, periods=n))
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  §3  유니버스
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§3.1", "U-1000 = PIT 시총 '하위' N · 해석 A/B 가 실제로 다른 모집단인가")
+def _sc31():
+    k = SpecChk()
+    k.eq("U1000_N", U1000_N, 1000)
+    n = 300
+    G0 = _sa_grid(n, ["2020-03-01"], mktcap=[float(i) * 1e8 for i in range(1, n + 1)],
+                  adtv=5e8, equity=1e9, excl_struct="", sector="X")
+    k.eq("적격 300종목 전부 선정(N<1000)", len(select_u1000(G0)), 300)
+
+    old_n, old_b = U1000_N, U1000_RANK_BEFORE_FILTER
+    try:
+        globals()["U1000_N"] = 50
+        got = sorted(int(c) for c in select_u1000(G0)["code"])
+        k.eq("N=50 선정 수", len(got), 50)
+        k.add("선정 = 시총 최소 50종목", got == list(range(1, 51)),
+              f"선정 코드 min={got[0]} max={got[-1]} (기대 1..50)")
+        # 해석 A(게이트→하위N) vs B(하위N→게이트): 하위 40 의 유동성을 죽이면 갈린다
+        Gb = G0.copy()
+        Gb.loc[Gb["code"].isin([f"{i:06d}" for i in range(1, 41)]), "adtv"] = 1e6
+        globals()["U1000_RANK_BEFORE_FILTER"] = False
+        nA = len(select_u1000(Gb))
+        globals()["U1000_RANK_BEFORE_FILTER"] = True
+        nB = len(select_u1000(Gb))
+    finally:
+        globals()["U1000_N"], globals()["U1000_RANK_BEFORE_FILTER"] = old_n, old_b
+    k.eq("해석 A(기본): 게이트 통과분에서 하위 50", nA, 50)
+    k.eq("해석 B: 하위 50 을 먼저 뽑고 게이트", nB, 10)
+    k.add("기본값은 해석 A", U1000_RANK_BEFORE_FILTER is False,
+          f"U1000_RANK_BEFORE_FILTER={U1000_RANK_BEFORE_FILTER}")
+    return k
+
+
+@spec_clause("§3.2", "유동성 게이트 — 직전 60거래일 평균 거래대금 ≥ 1억원")
+def _sc32():
+    k = SpecChk()
+    k.eq("ADTV_WINDOW_DAYS", ADTV_WINDOW_DAYS, 60)
+    k.eq("MIN_ADTV_KRW", MIN_ADTV_KRW, 100_000_000)
+
+    G0 = _sa_grid(3, ["2020-03-01"], mktcap=1e9,
+                  adtv=[99_999_999.0, 100_000_000.0, 100_000_001.0],
+                  equity=1e9, excl_struct="", sector="X")
+    sel = set(select_u1000(G0)["code"])
+    k.add("adtv = 99,999,999 → 탈락", "000001" not in sel, f"선정={sorted(sel)}")
+    k.add("adtv = 100,000,000 → 통과", "000002" in sel, f"선정={sorted(sel)}")
+
+    # '그 종목이 가진 60개 행'이 아니라 '시장 60거래일' 인가.
+    #   A: 60일 전부 거래(2억) → 2억 · B: 3일에 1일만 행 존재(3억) → 3억×20/60 = 1억
+    days = _sa_bdays("2020-01-01", 80)
+    px = pd.concat([_sa_prices(["000001"], days, amount=2e8),
+                    _sa_prices(["000002"], days, amount=3e8,
+                               skip={"000002": {i for i in range(80) if i % 3 != 0}})],
+                   ignore_index=True)
+    cal = pd.DataFrame([{"rebal": pd.Timestamp("2020-04-01"),
+                         "signal_date": days[79], "exec_date": days[79]}])
+    A = build_adtv_panel(cal, px, window=60)
+    a = dict(zip(A["code"].astype(str), pd.to_numeric(A["adtv"])))
+    k.eq("전일 거래 종목 ADTV", a.get("000001", float("nan")), 2e8, tol=1e3)
+    gb = a.get("000002", float("nan"))
+    k.add("결측일이 있는 종목은 시장격자 기준(0 채움)으로 희석된다", abs(gb - 1.0e8) <= 6e6,
+          f"실측 {gb:,.0f} · 시장격자 기대 ≈100,000,000 · "
+          f"'자기 행 60개' 해석이면 300,000,000 (3배 과대)")
+
+    days2 = _sa_bdays("2020-01-01", 40)
+    cal2 = pd.DataFrame([{"rebal": pd.Timestamp("2020-03-01"),
+                          "signal_date": days2[39], "exec_date": days2[39]}])
+    k.eq("거래일 40일뿐이면 ADTV 산출 없음(min_periods=60)",
+         len(build_adtv_panel(cal2, _sa_prices(["000009"], days2, amount=5e8), window=60)), 0)
+    return k
+
+
+@spec_clause("§3.3", "구조적 제외(우선주·스팩·리츠·ETF) · 상장 12개월 미만 · 완전자본잠식")
+def _sc33():
+    k = SpecChk()
+    k.eq("SEASONING_DAYS", SEASONING_DAYS, 250)
+
+    # ★ 코드 6번째가 '0' 이 아니면 코드 규칙만으로 우선주가 된다. 이름 규칙을 검정하려면
+    #   반드시 '…0' 코드를 써야 한다 — 아니면 이름 규칙에 검정력이 0 이다.
+    for code, name, why in (("005935", "삼성전자우", "우선주"),
+                            ("000000", "삼성전자우선주", "우선주"),
+                            ("000010", "케이비제20호스팩", "스팩"),
+                            ("000020", "이지스밸류리츠", "리츠"),
+                            ("000030", "KODEX 200", "ETF/ETN"),
+                            ("000040", "TIGER 2차전지", "ETF/ETN"),
+                            ("000050", "KODEX 레버리지", "ETF/ETN")):
+        got = classify_exclusion(code, name)
+        k.add(f"제외되어야: {name}", got == why, f"판정='{got}' (기대 '{why}')")
+    # 이름 규칙의 오탐은 실존 소형주를 '시점 불변'으로 지운다 — 전 실험에서 동일하게 빠진다
+    for code, name in (("100130", "동국S&C"), ("115960", "연우"), ("047310", "파워로직스"),
+                       ("037400", "우리조명"), ("032190", "다우데이타"),
+                       ("006800", "미래에셋증권")):
+        got = classify_exclusion(code, name)
+        k.add(f"제외되면 안 됨: {name}", got == "", f"판정='{got}'")
+
+    days = _sa_bdays("2018-01-01", 800)
+    px = _sa_prices(["000010"], days)
+    sec = pd.DataFrame([
+        {"code": "OLD001", "name": "구상장", "market": "KOSPI", "industry": "X",
+         "listing_date": pd.Timestamp("2010-01-01"), "delisting_date": pd.NaT},
+        {"code": "NEW001", "name": "신규상장", "market": "KOSDAQ", "industry": "X",
+         "listing_date": days[700], "delisting_date": pd.NaT},
+        {"code": "MID001", "name": "중간상장", "market": "KOSDAQ", "industry": "X",
+         "listing_date": days[100], "delisting_date": pd.NaT},
+        {"code": "DEL001", "name": "폐지예정", "market": "KOSDAQ", "industry": "X",
+         "listing_date": pd.Timestamp("2010-01-01"), "delisting_date": days[500]}])
+    uni = Universe(sec, pd.DataFrame(columns=["snap_date", "code", "market"]), px)
+    at = set(uni.at(days[600]))
+    k.add("패널 이전 상장 종목은 포함", "OLD001" in at, f"at()={sorted(at)}")
+    k.add("상장 후 250거래일 미만은 제외", "NEW001" not in at, f"at()={sorted(at)}")
+    k.add("상장 후 500거래일은 포함", "MID001" in at, f"at()={sorted(at)}")
+    k.add("이미 폐지된 종목은 제외", "DEL001" not in at, f"at()={sorted(at)}")
+    k.add("폐지 전 시점에는 폐지예정 종목이 포함(생존자편향 방지)",
+          "DEL001" in set(uni.at(days[400])), "at(폐지 100거래일 전)")
+
+    G0 = _sa_grid(3, ["2020-03-01"], mktcap=[1e8, 2e8, 3e8], adtv=5e8,
+                  equity=[1e9, 0.0, float("nan")], excl_struct="", sector="X")
+    sel = set(select_u1000(G0)["code"])
+    k.add("equity > 0 → 포함", "000001" in sel, f"선정={sorted(sel)}")
+    k.add("equity = 0 (완전잠식) → 제외", "000002" not in sel, f"선정={sorted(sel)}")
+    k.add("equity 결측 → 제외하지 않음(모름 ≠ 잠식)", "000003" in sel, f"선정={sorted(sel)}")
+    return k
+
+
+@spec_clause("§3.3b", "종목코드 정규화 — 없는 티커를 '만들어내지' 않는다 (폐지 오적용 방지)")
+def _sc33b():
+    """FDR 폐지목록에는 `00341A`(쌍용양회4우B) 같은 구형 우선주 코드가 실재한다.
+    숫자만 뽑아 0 으로 채우면 `000341`(쌍용양회 보통주)이 된다 — 우선주의 폐지일이
+    보통주에 붙어, 실제로는 상장 중인 종목이 유니버스에서 사라지고 보유분이 −100% 가 된다.
+    실측(2026-08-10 FDR 폐지목록 4,173행): 원본≠매핑 285건, 그중 주권 13건."""
+    k = SpecChk()
+    for raw, want in (("005930", "005930"), (5930, "005930"), ("A005930", "005930"),
+                      ("005930.KS", "005930"), (" 005930 ", "005930"), ("09701K", "09701K")):
+        k.eq(f"정상 입력 {raw!r}", to_code6(raw), want)
+    # 문자가 섞인 코드는 '만들어내지' 말고 실패해야 한다
+    for raw in ("00341A", "00246A", "01683B", "00736C", "722011J7", "002991K5",
+                "KR7005930003"):
+        k.add(f"날조 금지: {raw!r} → None", to_code6(raw) is None, f"실측 {to_code6(raw)!r}")
+    return k
+
+
+@spec_clause("§3.4", "상장폐지 — 정리매매가 관측 시 실가, 아니면 −100% (누락 금지)")
+def _sc34():
+    k = SpecChk()
+    days = _sa_bdays("2020-01-02", 260)
+    cal = pd.DataFrame([
+        {"rebal": pd.Timestamp("2020-03-01"), "signal_date": days[41], "exec_date": days[42]},
+        {"rebal": pd.Timestamp("2020-06-01"), "signal_date": days[104], "exec_date": days[105]},
+        {"rebal": pd.Timestamp("2020-09-01"), "signal_date": days[168], "exec_date": days[169]}])
+    px = pd.concat([_sa_prices(["A"], days), _sa_prices(["B"], days[:70]),
+                    _sa_prices(["C"], days[:60], close=900.0), _sa_prices(["D"], days[:70]),
+                    _sa_prices(["E"], days[:50])], ignore_index=True)
+    px.loc[(px["code"] == "A") & (px["date"] == days[105]), ["open", "close"]] = 1200.0
+    px.loc[(px["code"] == "B") & (px["date"] == days[69]),
+           ["open", "close", "high", "low"]] = 300.0
+    px.loc[(px["code"] == "D") & (px["date"] == days[69]),
+           ["open", "close", "high", "low"]] = 1500.0
+
+    fwd = build_forward_returns(build_exec_prices(cal, px), cal,
+                                {"B": days[71], "C": days[71], "D": days[71], "E": days[180]}, px)
+    f = fwd.set_index(["code", "rebal"])
+
+    def _r(c):
+        try:
+            return float(f.loc[(c, pd.Timestamp("2020-03-01")), "fwd_ret"])
+        except KeyError:
+            return float("nan")
+
+    k.eq("A 정상 보유 수익률", _r("A"), 0.20, tol=1e-5)
+    k.eq("B 정리매매가(300/1000−1) 반영", _r("B"), -0.70, tol=1e-5)
+    k.eq("C 가격 부재 → −100%", _r("C"), -1.0, tol=1e-9)
+    k.eq("D 마지막 관측가가 '이익' → 규정대로 −100%", _r("D"), -1.0, tol=1e-9)
+    k.eq("E 정지 후 다음 분기 이후 폐지 → −100% (0% 로 새지 않는다)", _r("E"), -1.0, tol=1e-9)
+    k.add("E 는 halt_then_delist 로 별도 계상",
+          "halt_then_delist" in {str(v) for c, v in zip(fwd["code"], fwd["exit_kind"]) if c == "E"},
+          f"exit_kind(E)={[v for c, v in zip(fwd['code'], fwd['exit_kind']) if c=='E']}")
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  §4  시점 규약
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§4", "분기 3/1·6/1·9/1·12/1 · 신호=직전 거래일 · 체결=익 거래일 · 공시=접수일+1거래일")
+def _sc4():
+    k = SpecChk()
+    k.eq("REBAL_MONTHS", tuple(REBAL_MONTHS), (3, 6, 9, 12))
+    k.eq("REBAL_DAY", REBAL_DAY, 1)
+
+    days = _sa_bdays("2019-01-01", 700)
+    px = _sa_prices(["000001"], days)
+    cal = qvf_rebal_calendar(px, "2019-01-01", "2021-06-30")
+    k.eq("명목 리밸런싱 월", tuple(sorted(set(pd.DatetimeIndex(cal["rebal"]).month))), (3, 6, 9, 12))
+    k.add("명목일은 매월 1일", bool((pd.DatetimeIndex(cal["rebal"]).day == 1).all()),
+          f"day 집합={sorted(set(pd.DatetimeIndex(cal['rebal']).day))}")
+    n_bad = int((as_ts_series(cal["signal_date"]) >= as_ts_series(cal["exec_date"])).sum())
+    k.add("signal_date < exec_date (전 시점)", n_bad == 0, f"위반 {n_bad}건")
+
+    td = qvf_trading_days(px)
+    ok_e = ok_s = True
+    for r in cal.itertuples(index=False):
+        i = int(np.searchsorted(td, np.datetime64(pd.Timestamp(r.rebal)), side="left"))
+        ok_e &= pd.Timestamp(td[i]) == pd.Timestamp(r.exec_date)
+        ok_s &= pd.Timestamp(td[i - 1]) == pd.Timestamp(r.signal_date)
+    k.add("exec_date = 명목일 이후(포함) 첫 거래일", ok_e, f"전 {len(cal)}시점 검사")
+    k.add("signal_date = exec_date 직전 거래일", ok_s, f"전 {len(cal)}시점 검사")
+    n_gap = int((as_ts_series(cal["exec_date"]) != as_ts_series(cal["rebal"])).sum())
+    k.add("명목일 ≠ 체결일인 분기가 존재(검정력 확인)", n_gap > 0,
+          f"{n_gap}/{len(cal)} 분기에서 명목일이 거래일이 아니다 (3/1 은 삼일절)")
+
+    set_trading_days(px)
+    fri = pd.Timestamp("2019-03-01")
+    k.add("금요일 접수 → 다음 '거래일'(월요일)",
+          pd.Timestamp(next_trading_day(fri)) == pd.Timestamp("2019-03-04"),
+          f"{fri.date()} → {pd.Timestamp(next_trading_day(fri)).date()}")
+    out = apply_t_plus_1(pd.DataFrame({"knowledge_date": [fri], "event_date": [fri]}), "검정")
+    k.add("apply_t_plus_1 은 knowledge_date 만 민다",
+          pd.Timestamp(out["knowledge_date"].iloc[0]) > fri
+          and pd.Timestamp(out["event_date"].iloc[0]) == fri,
+          f"knowledge {pd.Timestamp(out['knowledge_date'].iloc[0]).date()} · "
+          f"event {pd.Timestamp(out['event_date'].iloc[0]).date()}")
+
+    cal5 = qvf_rebal_calendar(px, "2019-01-01", "2021-06-30", shift_days=5)
+    m = cal.merge(cal5, on="rebal", suffixes=("", "_s"))
+    ok5 = all(int(np.searchsorted(td, np.datetime64(pd.Timestamp(r.exec_date_s)), side="left"))
+              - int(np.searchsorted(td, np.datetime64(pd.Timestamp(r.exec_date)), side="left")) == 5
+              for r in m.itertuples(index=False))
+    k.add("shift_days=+5 → 체결일이 정확히 5거래일 뒤", ok5, f"{len(m)}시점 전부 +5거래일")
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  §5  1차 필터
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§5.2", "V축 — EV/EBIT·PBR·PCR · 섹터중립 · 1% 윈저 · 음수분모는 최하위 강제")
+def _sc52():
+    k = SpecChk()
+    k.eq("WINSOR_PCT", WINSOR_PCT, 0.01)
+    k.eq("V축 지표 구성", tuple(_V_METRICS), ("ev_ebit", "pbr", "pcr"))
+
+    P = _sa_cells(_sa_grid(20, ["2020-03-01"], mktcap=1000.0, total_debt=200.0, cash=50.0,
+                           op_income_ttm=[float(10 + i) for i in range(20)],
+                           equity=[float(100 + i) for i in range(20)],
+                           cfo_ttm=[float(20 + i) for i in range(20)],
+                           liabilities=300.0, sector="X"))
+    V = axis_V(P)
+    r0 = V.iloc[0]
+    k.eq("ev_ebit = (시총+차입−현금)/EBIT", float(r0["ev_ebit"]), (1000 + 200 - 50) / 10.0, tol=1e-5)
+    k.eq("pbr = 시총/자기자본", float(r0["pbr"]), 10.0, tol=1e-5)
+    k.eq("pcr = 시총/영업CF", float(r0["pcr"]), 50.0, tol=1e-5)
+    c = float(pd.Series(V["ev_ebit"]).astype(float).corr(pd.Series(V["zV_ev_ebit"]).astype(float)))
+    k.add("EV/EBIT 이 낮을수록 z 가 높다", c < -0.9, f"corr(ev_ebit, z) = {c:+.3f}")
+
+    z = xsec_z_pct(pd.Series([float(i) for i in range(1, 101)] + [1e9]),
+                   pd.Series(["c"] * 101), pct=0.01)
+    k.add("극단값이 상위 1% 분위로 클립된다",
+          abs(float(z.iloc[-1]) - float(z.iloc[:-1].max())) < 1e-3,
+          f"1e9 의 z={float(z.iloc[-1]):.4f} · 나머지 최대 z={float(z.iloc[:-1].max()):.4f} "
+          f"(클립 안 하면 z≈9.9)")
+
+    P2 = _sa_grid(20, ["2020-03-01"], mktcap=1000.0, total_debt=0.0, cash=0.0, equity=1.0,
+                  cfo_ttm=1.0, liabilities=0.0,
+                  op_income_ttm=[float(i) for i in range(1, 11)] * 2,
+                  sector=["S1"] * 10 + ["S2"] * 10)
+    P2.loc[P2["sector"] == "S2", "op_income_ttm"] *= 1000.0
+    V2 = axis_V(_sa_cells(P2))
+    z1 = np.sort(V2[V2["sector"] == "S1"]["zV_ev_ebit"].astype(float).to_numpy())
+    z2 = np.sort(V2[V2["sector"] == "S2"]["zV_ev_ebit"].astype(float).to_numpy())
+    k.add("섹터 수준이 1000배 달라도 z 분포가 같다(섹터중립)",
+          float(np.nanmax(np.abs(z1 - z2))) < 1e-3,
+          f"S1 [{np.nanmin(z1):+.3f},{np.nanmax(z1):+.3f}] · S2 [{np.nanmin(z2):+.3f},{np.nanmax(z2):+.3f}]")
+
+    P3 = _sa_cells(_sa_grid(20, ["2020-03-01"], mktcap=1000.0, total_debt=0.0, cash=0.0,
+                            equity=[float(100 + i) for i in range(18)] + [-50.0, 0.0],
+                            cfo_ttm=1.0, liabilities=0.0, op_income_ttm=50.0, sector="X"))
+    zp = axis_V(P3)["zV_pbr"].astype(float)
+    worst = float(zp.min())
+    k.eq("자기자본 음수 → 횡단면 최하위 z", float(zp.iloc[18]), worst, tol=1e-5)
+    k.eq("자기자본 정확히 0 → 횡단면 최하위 z", float(zp.iloc[19]), worst, tol=1e-5)
+    k.add("강제 최하위가 실제로 '최하위'다(양수 벌점이 아니다)",
+          worst <= float(zp.iloc[:18].min()) + 1e-6,
+          f"강제값 {worst:+.4f} · 유효 관측 최소 {float(zp.iloc[:18].min()):+.4f}")
+    P4 = P3.copy()
+    P4["equity"] = [float(100 + i) for i in range(18)] + [np.nan, np.nan]
+    z4 = axis_V(P4)["zV_pbr"]
+    k.add("자기자본 결측(모름) → 벌점이 아니라 결측",
+          bool(pd.isna(z4.iloc[18])) and bool(pd.isna(z4.iloc[19])),
+          f"z={z4.iloc[18]!r}, {z4.iloc[19]!r}")
+    return k
+
+
+@spec_clause("§5.3", "Q축 — gp/a · ROIC 3년 표준편차 · 발생액 · 부채비율 · 주식수 3년 증가율")
+def _sc53():
+    k = SpecChk()
+    k.eq("Q축 지표 구성", tuple(_Q_METRICS),
+         ("gp_a", "roic_std3y", "accruals", "debt_ratio", "share_growth3y"))
+
+    P = _sa_cells(_sa_grid(20, ["2020-03-01"], assets=1000.0,
+                           gross_profit_ttm=[float(100 + i) for i in range(20)],
+                           net_income_ttm=[float(50 + i) for i in range(20)], cfo_ttm=30.0,
+                           liabilities=[float(200 + 10 * i) for i in range(20)], equity=400.0,
+                           roic_std3y=[0.01 * (i + 1) for i in range(20)],
+                           share_growth3y=[0.02 * (i + 1) for i in range(20)],
+                           revenue_ttm=np.nan, cogs_ttm=np.nan, sector="X"))
+    Q = axis_Q(P)
+    r0 = Q.iloc[0]
+    k.eq("gp_a = 매출총이익TTM / 자산", float(r0["gp_a"]), 0.1, tol=1e-8)
+    k.eq("accruals = (순이익TTM − 영업CF) / 자산", float(r0["accruals"]), 0.02, tol=1e-8)
+    k.eq("debt_ratio = 부채총계 / 자기자본", float(r0["debt_ratio"]), 0.5, tol=1e-8)
+
+    # ★★ 이 다섯 줄이 §5.3 의 핵심이다 ★★
+    #   '지정된 지표가 존재하는가' 가 아니라 '실제로 z 를 만드는가' 를 본다. 예전에는
+    #   발생액·ROIC 표준편차·주식수 증가율 셋이 관측률 100% 에서도 z 산출 0행이었다.
+    for label, raw, zc, want_pos in (("gp_a(높을수록 우수)", "gp_a", "zQ_gp_a", True),
+                                     ("발생액(낮을수록 우수)", "accruals", "zQ_accruals", False),
+                                     ("부채비율(낮을수록 우수)", "debt_ratio", "zQ_debt_ratio", False),
+                                     ("ROIC 표준편차(낮을수록 우수)", "roic_std3y", "zQ_roic_std3y", False),
+                                     ("주식수 3년 증가율(낮을수록 우수)", "share_growth3y",
+                                      "zQ_share_growth3y", False)):
+        n_z = int(Q[zc].notna().sum())
+        c = float(pd.Series(Q[raw]).astype(float).corr(pd.Series(Q[zc]).astype(float)))
+        ok = (n_z == len(Q)) and ((c > 0.9) if want_pos else (c < -0.9))
+        k.add(f"방향·산출 — {label}", ok,
+              f"raw 관측 {int(Q[raw].notna().sum())}행 → z 산출 {n_z}행 · corr(raw,z) = {c:+.3f}")
+    k.eq("Z_Q 행당 가용 지표 수 = 5",
+         float(Q[[f"zQ_{m}" for m in _Q_METRICS]].notna().sum(axis=1).mean()), 5.0, tol=1e-9)
+
+    P2 = P.copy()
+    P2["gross_profit_ttm"] = np.nan
+    P2["revenue_ttm"], P2["cogs_ttm"] = 500.0, 300.0
+    k.eq("gp 결측 → (매출−매출원가)/자산 폴백", float(axis_Q(P2)["gp_a"].iloc[0]), 0.2, tol=1e-8)
+
+    kd = pd.date_range("2015-03-31", periods=16, freq="QE")
+    shares = pd.DataFrame({"corp_code": ["C1"] * 16, "knowledge_date": kd,
+                           "shares_issued": [1e6 * (1.05 ** i) for i in range(16)],
+                           "shares_treasury": 0.0})
+    fin = pd.DataFrame({"corp_code": ["C1"] * 16, "knowledge_date": kd, "period_end": kd,
+                        "equity": 1e9, "liabilities": 1e9, "assets": 2e9, "cash": 1e8,
+                        "op_income_ttm": 1e8, "op_income_q": 2.5e7, "pretax_income_ttm": 1e8,
+                        "tax_expense_ttm": 2.2e7, "net_income_ttm": 8e7, "cfo_ttm": 9e7,
+                        "gross_profit_ttm": 3e8, "revenue_ttm": 1e9, "cogs_ttm": 7e8,
+                        "capital_stock": 5e8})
+    sg = build_quarterly_fundamentals(fin, shares).dropna(subset=["share_growth3y"])
+    k.add("주식수 3년 증가율 산출됨", len(sg) > 0, f"{len(sg)}행")
+    if len(sg):
+        k.eq("증가율 = 12분기 전 대비 (1.05^12 − 1)", float(sg["share_growth3y"].iloc[0]),
+             1.05 ** 12 - 1.0, tol=1e-4)
+    n2 = int(build_quarterly_fundamentals(
+        fin, shares.drop(index=[4, 5, 6, 7]).reset_index(drop=True))["share_growth3y"].notna().sum())
+    k.add("결측 분기가 있으면 '12행 전'을 3년으로 부르지 않는다", n2 < len(sg),
+          f"완전 시계열 {len(sg)}건 → 4분기 결측 시 {n2}건")
+    return k
+
+
+@spec_clause("§5.4", "F축 — 외국인·기관 60일 순매수를 '유동주식 시가총액'으로 정규화")
+def _sc54():
+    k = SpecChk()
+    k.eq("FLOW_WINDOW_DAYS", FLOW_WINDOW_DAYS, 60)
+    P = _sa_cells(_sa_grid(20, ["2020-03-01"], close=1000.0,
+                           shares_issued=[1e6] * 10 + [1e7] * 10, shares_treasury=0.0,
+                           mktcap=1e9, sector="X"))
+    flows = pd.DataFrame({"code": P["code"], "rebal": P["rebal"], "foreign_net": 1e7,
+                          "inst_net": 1e7, "flow_src": "t"})
+    F = axis_F(P, flows)
+    k.eq("float_cap = (발행주식수 − 자기주식) × 종가", float(F["float_cap"].iloc[0]), 1e9, tol=1.0)
+    k.eq("flow_f = 외국인순매수 / 유동시총", float(F["flow_f"].iloc[0]), 0.01, tol=1e-11)
+    k.add("같은 금액이라도 유동시총이 작으면 z 가 높다(절대금액 랭킹이 아니다)",
+          float(F["Z_F"].iloc[0]) > float(F["Z_F"].iloc[-1]),
+          f"유동시총 10억 z={float(F['Z_F'].iloc[0]):+.3f} · "
+          f"100억 z={float(F['Z_F'].iloc[-1]):+.3f}")
+    P2 = P.copy()
+    P2["shares_treasury"] = [2e5] * 10 + [0.0] * 10
+    k.eq("자기주식 20% 차감 → 유동시총 8억", float(axis_F(P2, flows)["float_cap"].iloc[0]),
+         8e8, tol=1.0)
+    F3 = axis_F(P, pd.DataFrame(columns=["code", "rebal", "foreign_net", "inst_net", "flow_src"]))
+    k.add("수급 관측이 없으면 Z_F 는 0 이 아니라 결측", bool(F3["Z_F"].isna().all()),
+          f"Z_F 결측 {int(F3['Z_F'].isna().sum())}/{len(F3)}행")
+
+    nz = pd.DataFrame({"code": P["code"], "rebal": P["rebal"],
+                       "foreign_net": [0.0] * 10 + [1e7] * 10, "inst_net": 0.0, "flow_src": "t"})
+    nz.attrs["flow_window"] = int(FLOW_WINDOW_DAYS)
+    axis_F(P, nz)
+    pre = float(FLOW_NONZERO_RATIO_PREREG)
+    f120 = flows.copy()
+    f120.attrs["flow_window"] = 120
+    axis_F(P, f120)
+    k.eq("사전등록 창의 비영 비율", pre, 0.5, tol=1e-6)
+    k.add("120일 창 재호출이 사전등록 값을 덮지 않는다",
+          abs(float(FLOW_NONZERO_RATIO_PREREG) - pre) < 1e-9,
+          f"재호출 전 {pre:.3f} → 후 {float(FLOW_NONZERO_RATIO_PREREG):.3f} "
+          f"(현재 창 값 {FLOW_NONZERO_BY_WINDOW.get(120)})")
+    return k
+
+
+@spec_clause("§5.5", "Score1 = w_V·Z_V + w_Q·Z_Q + w_F·Z_F · 사전등록 가중치 · U-200")
+def _sc55():
+    k = SpecChk()
+    k.eq("U200_N", U200_N, 200)
+    k.eq("변형 목록", tuple(VARIANTS), ("V", "VQ", "VQF"))
+    k.eq("w(V)", tuple(VARIANT_W["V"]), (1.0, 0.0, 0.0))
+    k.eq("w(VQ)", tuple(VARIANT_W["VQ"]), (0.5, 0.5, 0.0))
+    k.eq("w(VQF)", tuple(VARIANT_W["VQF"]), (0.4, 0.4, 0.2))
+
+    P = _sa_grid(5, ["2020-03-01"], Z_V=[1.0, 2.0, 3.0, 4.0, 5.0], Z_Q=[5.0, 4.0, 3.0, 2.0, 1.0],
+                 Z_F=[0.0, 1.0, 0.0, 1.0, 0.0], sector="X")
+    for v, (wv, wq, wf) in VARIANT_W.items():
+        s = score1(P, v).astype(float).to_numpy()
+        want = (wv * P["Z_V"].to_numpy() + wq * P["Z_Q"].to_numpy()
+                + wf * P["Z_F"].to_numpy()) / (wv + wq + wf)
+        err = float(np.nanmax(np.abs(s - want)))
+        k.add(f"Score1[{v}] 산식 일치", err < 1e-5, f"최대 오차 {err:.2e} · 실측 {np.round(s,4).tolist()}")
+    P2 = P.copy()
+    P2.loc[0, "Z_F"] = np.nan
+    k.eq("Z_F 결측 행은 가용 축으로 재정규화(0 채움 아님)",
+         float(score1(P2, "VQF").astype(float).iloc[0]), (0.4 * 1.0 + 0.4 * 5.0) / 0.8, tol=1e-5)
+
+    n = 500
+    d = build_u200(_sa_grid(n, ["2020-03-01"], Z_V=[float(i) for i in range(n)], Z_Q=0.0,
+                            Z_F=0.0, mktcap=1e9, sector="X"), variants=("V",), n=200)
+    sel = d[d["u200_V"]]
+    k.eq("u200 선정 수", int(len(sel)), 200)
+    k.add("선정 = Score1 상위 200", int(sel["Z_V"].min()) == n - 200,
+          f"선정 Z_V 최소 {float(sel['Z_V'].min()):.0f} (기대 {n-200})")
+
+    m = 20
+    P4 = _sa_grid(m, ["2020-03-01"], Z_V=[1.0] * m, Z_Q=0.0, Z_F=0.0,
+                  mktcap=[float(m - i) for i in range(m)], sector="X")
+    a = set(build_u200(P4, variants=("V",), n=10).query("u200_V")["code"])
+    b = set(build_u200(P4.sample(frac=1.0, random_state=7).reset_index(drop=True),
+                       variants=("V",), n=10).query("u200_V")["code"])
+    k.add("전원 동점 · 커트라인이 동점을 가로질러도 선정이 같다", a == b,
+          f"원순서 {sorted(a)[:4]}… / 섞은 순서 {sorted(b)[:4]}…")
+    return k
+
+
+@spec_clause("§5.6", "필수 보고 — 변형 간 중복률 · 특성 · 리포트 커버리지 · 회전율")
+def _sc56():
+    k = SpecChk()
+    n = 60
+    P = build_u200(_sa_grid(n, ["2020-03-01", "2020-06-01"],
+                            Z_V=[float(i) for i in range(n)],
+                            Z_Q=[float(n - i) for i in range(n)],
+                            Z_F=[float((i * 7) % n) for i in range(n)],
+                            mktcap=[1e8 * (i + 1) for i in range(n)], adtv=5e8,
+                            n_reports=[1 if i % 2 == 0 else 0 for i in range(n)], sector="X"),
+                   variants=VARIANTS, n=20)
+    res = report_variant_comparison(P, VARIANTS, rep_cov=P[["code", "rebal", "n_reports"]])
+    for key in ("overlap", "coverage", "turnover", "sets"):
+        k.add(f"보고 항목 '{key}' 산출", key in res and bool(res[key]), f"{key} → {type(res.get(key))}")
+    t0 = sorted(res["sets"]["V"])[0]
+    a, b = set(res["sets"]["V"][t0]), set(res["sets"]["VQ"][t0])
+    k.eq("V∩VQ 중복률 = 교집합/합집합", res["overlap"]["V~VQ"], len(a & b) / len(a | b), tol=0.05)
+    k.add("중복률이 [0,1] 범위", all(0.0 <= v <= 1.0 for v in res["overlap"].values()),
+          f"overlap={ {kk: round(vv,3) for kk, vv in res['overlap'].items()} }")
+    k.add("커버리지가 [0,1] 범위", all(0.0 <= v <= 1.0 for v in res["coverage"].values()),
+          f"coverage={ {kk: round(vv,3) for kk, vv in res['coverage'].items()} }")
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  §6  2차 필터
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§6.1", "배제 플래그 6종 — 임계값 · 근거 없으면 배제하지 않음")
+def _sc61():
+    k = SpecChk()
+    k.eq("RELATED_PARTY_TOPQ", RELATED_PARTY_TOPQ, 0.20)
+    k.eq("CONTINGENT_EQ_PP", CONTINGENT_EQ_PP, 0.05)
+    k.eq("LAWSUIT_EQ_2ND", LAWSUIT_EQ_2ND, 0.05)
+    k.eq("배제 플래그 개수", len(EXCL_FLAGS), 6)
+
+    n = 20
+    BASE = dict(equity=1000.0, related_sales_ratio=np.nan, related_sales_ratio_prev=np.nan,
+                related_purchase_ratio=np.nan, related_purchase_ratio_prev=np.nan,
+                contingent_amt=np.nan, contingent_amt_prev=np.nan, lawsuit_amt=np.nan,
+                lawsuit_new=np.nan, lawsuit_filed=np.nan, audit_emphasis=np.nan,
+                major_holder_chg=np.nan, cb_issue=np.nan, bw_issue=np.nan, sector="X")
+    k.eq("근거가 전부 결측이면 배제 0건",
+         int(build_exclusion_flags(_sa_grid(n, ["2020-03-01"], **BASE))["EXCLUDED"].sum()), 0)
+
+    P2 = _sa_grid(n, ["2020-03-01"], **BASE)
+    P2["related_sales_ratio_prev"] = 0.10
+    P2["related_sales_ratio"] = [0.10 + 0.01 * i for i in range(n)]
+    P2["contingent_amt_prev"] = 0.0
+    P2["contingent_amt"] = [0.0] * (n - 2) + [50.0, 49.0]        # 5.0%p / 4.9%p
+    P2["lawsuit_new"] = [0.0] * (n - 3) + [1.0, 1.0, 0.0]
+    P2["lawsuit_amt"] = [0.0] * (n - 3) + [60.0, 40.0, 600.0]    # 6%신규 / 4%신규 / 60%비신규
+    P2["audit_emphasis"] = [0.0] * (n - 1) + [1.0]
+    P2["major_holder_chg"] = [0.0] * (n - 1) + [1.0]
+    P2["cb_issue"] = [0.0] * (n - 1) + [1.0]
+    P2["bw_issue"] = 0.0
+    E = build_exclusion_flags(P2)
+
+    n_rel = int(E["x_related_up"].sum())
+    k.add("① 특수관계자 상승폭 상위 20% ≈ 4/20 종목", 3 <= n_rel <= 5,
+          f"발동 {n_rel}건 (상위 20% = 4건 기대)")
+    k.add("② 우발부채 5.0%p → 발동 / 4.9%p → 미발동",
+          float(E["x_contingent"].iloc[n - 2]) == 1.0 and float(E["x_contingent"].iloc[n - 1]) == 0.0,
+          f"5.0%p={E['x_contingent'].iloc[n-2]} · 4.9%p={E['x_contingent'].iloc[n-1]}")
+    k.add("③ 신규소송 6% 발동 / 4% 미발동 / 60%(신규 아님) 미발동",
+          float(E["x_lawsuit"].iloc[n - 3]) == 1.0 and float(E["x_lawsuit"].iloc[n - 2]) == 0.0
+          and float(E["x_lawsuit"].iloc[n - 1]) == 0.0,
+          f"{[float(E['x_lawsuit'].iloc[i]) for i in (n-3, n-2, n-1)]}")
+    k.eq("④ 감사의견 강조사항 발동", int(E["x_audit"].sum()), 1)
+    k.eq("⑤ 최대주주 변경 발동", int(E["x_holder_chg"].sum()), 1)
+    k.eq("⑥ CB/BW 발행 발동", int(E["x_cbbw"].sum()), 1)
+    k.add("EXCLUDED = 6종 OR",
+          bool((E["EXCLUDED"] == (E[EXCL_FLAGS].sum(axis=1) > 0).astype(int)).all()),
+          f"배제 {int(E['EXCLUDED'].sum())}/{n}행")
+    return k
+
+
+@spec_clause("§6.2", "ΔTONE 결측 허용 — 관측치 z 를 만든 '뒤에' 0(중립) 주입")
+def _sc62():
+    k = SpecChk()
+    n, obs = 100, [10.0 + i for i in range(12)]
+    P = _sa_cells(_sa_grid(n, ["2020-03-01"], dTONE_resid=[np.nan] * (n - 12) + obs, sector="X"))
+    mask = col(P, "dTONE_resid").notna()
+    z = zscore_observed_then_neutral(P, "dTONE_resid", mask)
+    zo = z[mask.to_numpy()].astype(float)
+    k.eq("관측치 z 평균 ≈ 0 (관측치만으로 표준화)", float(zo.mean()), 0.0, tol=1e-4)
+    k.eq("관측치 z 표준편차 ≈ 1", float(zo.std(ddof=0)), 1.0, tol=1e-3)
+    k.add("비관측치는 정확히 0.0", bool((z[~mask.to_numpy()].astype(float) == 0.0).all()),
+          f"비관측 {int((~mask).sum())}행 전부 0.0")
+    # 검정력 확인 — 0 을 먼저 채우면 관측치 z 가 한쪽으로 쏠린다
+    v0 = pd.Series([0.0] * (n - 12) + obs)
+    z_wrong = (v0 - v0.mean()) / v0.std(ddof=0)
+    k.add("검정력 확인 — 선(先)0채움이면 관측치 z 평균이 크게 양수",
+          float(z_wrong[n - 12:].mean()) > 1.0,
+          f"올바른 순서 {float(zo.mean()):+.4f} vs 0 먼저 채운 경우 "
+          f"{float(z_wrong[n-12:].mean()):+.4f}")
+
+    m = 60
+    P2 = _sa_cells(_sa_grid(m, ["2020-03-01"], sector="X",
+                            dNONFIN=[float(i % 7) for i in range(m)],
+                            dTONE_resid=[float(i) if i < 20 else np.nan for i in range(m)],
+                            n_reports=[1 if i < 20 else 0 for i in range(m)],
+                            score1_V=[float(m - i) for i in range(m)], u200_V=True, EXCLUDED=0))
+    res = verify_missing_tolerance(apply_filter2(P2, "V", n=30), "V")
+    rw, ro = res.get("pass_with_report", np.nan), res.get("pass_without_report", np.nan)
+    k.add("리포트 없는 종목의 통과율이 보유 종목의 절반 이상",
+          np.isfinite(ro) and np.isfinite(rw) and ro >= rw * 0.5,
+          f"보유 {100*rw:.1f}% · 없음 {100*ro:.1f}%")
+    return k
+
+
+@spec_clause("§6.3", "Score2 = 2.0·z(ΔNONFIN) + 1.0·z(ΔTONE_resid) − 배제(하드) → 60~80종목")
+def _sc63():
+    k = SpecChk()
+    k.eq("SCORE2_W_NONFIN", SCORE2_W_NONFIN, 2.0)
+    k.eq("SCORE2_W_TONE", SCORE2_W_TONE, 1.0)
+    k.eq("가중 비율 2:1", SCORE2_W_NONFIN / SCORE2_W_TONE, 2.0)
+    k.add("SECOND_N 이 명세 범위 60~80", 60 <= SECOND_N <= 80, f"SECOND_N={SECOND_N}")
+
+    n = 100
+    P = _sa_cells(_sa_grid(n, ["2020-03-01"], sector="X", u200_V=True, EXCLUDED=0,
+                           dNONFIN=[float(i) for i in range(n)],
+                           dTONE_resid=[float(n - i) for i in range(n)], score1_V=0.0))
+    d = apply_filter2(P, "V", n=70)
+    want = (2.0 * zscore_observed_then_neutral(P, "dNONFIN", col(P, "dNONFIN").notna()).astype(float)
+            + 1.0 * zscore_observed_then_neutral(P, "dTONE_resid",
+                                                 col(P, "dTONE_resid").notna()).astype(float))
+    err = float(np.nanmax(np.abs(d["score2_V"].astype(float).to_numpy() - want.to_numpy())))
+    k.add("Score2 산식 일치", err < 1e-5, f"최대 오차 {err:.2e}")
+    k.eq("2차 선정 수 = n", int(d["f2_V"].sum()), 70)
+
+    P2 = P.copy()
+    P2["EXCLUDED"] = [1 if i >= n - 10 else 0 for i in range(n)]
+    picked = apply_filter2(P2, "V", n=70).query("f2_V")
+    k.add("배제 종목은 최고점이어도 선정되지 않는다", int(picked["EXCLUDED"].sum()) == 0,
+          f"선정 {len(picked)}종목 중 배제 {int(picked['EXCLUDED'].sum())}건")
+    P3 = P.copy()
+    P3["u200_V"] = [i < 50 for i in range(n)]
+    k.eq("U-200 밖은 2차 후보가 아니다", int(apply_filter2(P3, "V", n=70)["f2_V"].sum()), 50)
+    return k
+
+
+@spec_clause("§6.4", "인과 순서 점검 — 보고만 하고 가중치를 자동 조정하지 않는다")
+def _sc64():
+    k = SpecChk()
+    before = (SCORE2_W_NONFIN, SCORE2_W_TONE)
+    n = 40
+    P = _sa_grid(n, ["2020-03-01"], sector="X", dNONFIN=[float(i) for i in range(n)],
+                 dTONE=[float(i) + 0.01 for i in range(n)],
+                 dTONE_resid=[float(i) for i in range(n)], n_reports=1)
+    rep = pd.DataFrame({"stock_code": P["code"].head(10).to_numpy(),
+                        "pub_date": pd.Timestamp("2020-02-01")})
+    dis = pd.DataFrame({"code": P["code"].head(10).to_numpy(),
+                        "rcept_dt": pd.Timestamp("2020-02-10"), "report_nm": "주요사항보고서"})
+    try:
+        check_causal_order(rep, dis, P)
+        ran, err = True, "ok"
+    except Exception as e:                                        # noqa
+        ran, err = False, f"{type(e).__name__}: {e}"
+    k.add("check_causal_order 가 예외 없이 실행", ran, err)
+    k.add("실행 후에도 Score2 가중치가 그대로",
+          before == (SCORE2_W_NONFIN, SCORE2_W_TONE),
+          f"{before} → {(SCORE2_W_NONFIN, SCORE2_W_TONE)}")
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  §7  3차 필터 · 포트폴리오
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§7.2", "3-A 규칙 6개 — 사전등록 임계값에서 정확히 발동 · 근거 결측은 제외 안 함")
+def _sc72():
+    k = SpecChk()
+    k.eq("RULE_LAWSUIT_EQ", RULE_LAWSUIT_EQ, 0.10)
+    k.eq("RULE_RELATED_SALES", RULE_RELATED_SALES, 0.30)
+    k.eq("RULE_MAJOR_HOLDER", RULE_MAJOR_HOLDER, 0.15)
+    k.eq("RULE_OP_LOSS_QUARTERS", RULE_OP_LOSS_QUARTERS, 4)
+    k.eq("RULE_IMPAIRMENT", RULE_IMPAIRMENT, 0.30)
+    k.eq("3-A 규칙 개수", len(RULE_FLAGS), 6)
+
+    BASE = dict(sector="X", equity=2000.0, capital_stock=2000.0, lawsuit_ratio=np.nan,
+                related_sales_ratio=np.nan, major_holder_pct=np.nan, audit_emphasis=np.nan,
+                op_loss_4q=np.nan)
+    k.eq("근거 전부 결측 → 차단 0건",
+         int(apply_filter3a(_sa_grid(3, ["2020-03-01"], **BASE))["RULE3A_BLOCK"].sum()), 0)
+
+    def one(**kw):
+        return apply_filter3a(_sa_grid(1, ["2020-03-01"], **{**BASE, **kw})).iloc[0]
+
+    k.add("소송 10.0% 미발동 / 10.1% 발동",
+          float(one(lawsuit_ratio=0.10)["r_lawsuit"]) == 0.0
+          and float(one(lawsuit_ratio=0.101)["r_lawsuit"]) == 1.0, "임계 '초과'만 발동")
+    k.add("특수관계자 매출 30.0% 미발동 / 30.1% 발동",
+          float(one(related_sales_ratio=0.30)["r_related"]) == 0.0
+          and float(one(related_sales_ratio=0.301)["r_related"]) == 1.0, "임계 '초과'만 발동")
+    k.add("최대주주 15.0% 미발동 / 14.9% 발동",
+          float(one(major_holder_pct=0.15)["r_holder"]) == 0.0
+          and float(one(major_holder_pct=0.149)["r_holder"]) == 1.0, "임계 '미만'만 발동")
+    k.add("최대주주 지분율 결측 → 미발동(모른다고 버리지 않는다)",
+          float(one()["r_holder"]) == 0.0, f"결측→{one()['r_holder']}")
+    k.add("감사 강조사항 → 발동", float(one(audit_emphasis=1.0)["r_audit"]) == 1.0)
+    k.add("4분기 연속 영업적자 → 발동", float(one(op_loss_4q=1.0)["r_oploss"]) == 1.0)
+    r = one(equity=1300.0)
+    k.eq("자본잠식률 = (자본금 − 자기자본)/자본금", float(r["impair_ratio"]), 0.35, tol=1e-9)
+    k.add("자본잠식률 35% → 발동", float(r["r_impair"]) == 1.0,
+          f"impair={float(r['impair_ratio']):.3f}")
+    r2 = one(equity=1400.0)
+    k.add("자본잠식률 정확히 30% → 미발동", float(r2["r_impair"]) == 0.0,
+          f"impair={float(r2['impair_ratio']):.3f} · flag={float(r2['r_impair'])}")
+    return k
+
+
+@spec_clause("§7.4", "최종 20~40종목 · 동일가중 기준 · 하한 미달은 억지로 채우지 않는다")
+def _sc74():
+    k = SpecChk()
+    k.eq("FINAL_N_MIN", FINAL_N_MIN, 20)
+    k.eq("FINAL_N", FINAL_N, 30)
+    k.eq("FINAL_N_MAX", FINAL_N_MAX, 40)
+    k.eq("가중 방식", tuple(WEIGHT_SCHEMES), ("equal", "invvol"))
+
+    n = 100
+    P = _sa_grid(n, ["2020-03-01"], sector="X", f2_V=True, RULE3A_BLOCK=0,
+                 score2_V=[float(i) for i in range(n)], score1_V=0.0)
+    sel = build_final_selection(P, "V", n_final=30)
+    k.eq("풀 100 · n_final 30 → 30종목", int(sel.sum()), 30)
+    k.add("선정 = Score2 상위 30", float(P.loc[sel, "score2_V"].min()) == float(n - 30),
+          f"선정 score2 최소 {float(P.loc[sel,'score2_V'].min()):.0f} (기대 {n-30})")
+    k.eq("n_final=100 요청 → 40 으로 클램프", int(build_final_selection(P, "V", n_final=100).sum()), 40)
+    k.eq("n_final=5 요청 → 20 으로 클램프", int(build_final_selection(P, "V", n_final=5).sum()), 20)
+    P2 = P.copy()
+    P2["f2_V"] = [i < 7 for i in range(n)]
+    k.eq("풀 7종목 → 7종목 (억지로 20 을 채우지 않는다)",
+         int(build_final_selection(P2, "V", n_final=30).sum()), 7)
+    P3 = P.copy()
+    P3["RULE3A_BLOCK"] = [1 if i >= n - 40 else 0 for i in range(n)]
+    k.eq("3-A 차단 종목은 최고점이어도 선정 안 됨",
+         int(P3.loc[build_final_selection(P3, "V", n_final=30), "RULE3A_BLOCK"].sum()), 0)
+    w = compute_weights(P.head(25), "equal")
+    k.add("동일가중 = 1/n · 합 1",
+          abs(float(w.sum()) - 1.0) < 1e-12 and float(w.max() - w.min()) < 1e-15,
+          f"n=25 · w={float(w.iloc[0]):.6f} (기대 {1/25:.6f})")
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  §8  비용 · 실험 · 다중검정 · 강건성
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§8.1", "비용 = 증권거래세(이력) + 실측 스프레드/2 · 비용 전/후 병기")
+def _sc81():
+    k = SpecChk()
+    k.eq("기본 비용모형", str(QVF_COST_MODEL), "spec")
+    for d, want in (("2016-01-01", 0.0030), ("2019-06-02", 0.0030), ("2019-06-03", 0.0025),
+                    ("2021-01-01", 0.0023), ("2023-01-01", 0.0020), ("2024-01-01", 0.0018),
+                    ("2025-06-01", 0.0015)):
+        k.eq(f"거래세 {d}", qvf_sell_tax(d), want, tol=1e-12)
+
+    days = _sa_bdays("2020-01-02", 300)
+    cal = pd.DataFrame([
+        {"rebal": pd.Timestamp("2020-03-01"), "signal_date": days[41], "exec_date": days[42]},
+        {"rebal": pd.Timestamp("2020-06-01"), "signal_date": days[104], "exec_date": days[105]}])
+    P = pd.DataFrame([
+        {"code": "A", "rebal": pd.Timestamp("2020-03-01"), "sel": True, "adtv": 1e10,
+         "cs_spread": 0.01, "vol_d": 0.02, "mktcap": 1e9},
+        {"code": "A", "rebal": pd.Timestamp("2020-06-01"), "sel": False, "adtv": 1e10,
+         "cs_spread": 0.01, "vol_d": 0.02, "mktcap": 1e9},
+        {"code": "B", "rebal": pd.Timestamp("2020-06-01"), "sel": True, "adtv": 1e10,
+         "cs_spread": 0.01, "vol_d": 0.02, "mktcap": 1e9}])
+    fwd = pd.DataFrame([{"code": "A", "rebal": pd.Timestamp("2020-03-01"), "fwd_ret": 0.10},
+                        {"code": "B", "rebal": pd.Timestamp("2020-06-01"), "fwd_ret": 0.0}])
+    bt = run_qbacktest(P, cal, "sel", fwd, apply_costs=True, label="검정",
+                       delist={}, cost_model="spec")
+    R = bt["returns"].set_index("rebal")
+    k.eq("t0 매수 비용 = |Δw|·spread/2", float(R.loc[pd.Timestamp("2020-03-01"), "cost"]),
+         0.005, tol=1e-9)
+    k.eq("t1 비용 = 매도(스프레드/2 + 세금) + 매수(스프레드/2)",
+         float(R.loc[pd.Timestamp("2020-06-01"), "cost"]),
+         0.005 + 0.005 + qvf_sell_tax(days[105]), tol=1e-9)
+    k.eq("t0 비용 전 수익", float(R.loc[pd.Timestamp("2020-03-01"), "ret_gross"]), 0.10, tol=1e-9)
+    k.eq("t0 비용 후 = 비용 전 − 비용", float(R.loc[pd.Timestamp("2020-03-01"), "ret"]),
+         0.095, tol=1e-9)
+    k.add("비용 전/후가 모두 산출된다(병기 강제)",
+          {"ret", "ret_gross", "equity", "equity_gross"} <= set(bt["returns"].columns),
+          f"컬럼 {sorted(bt['returns'].columns)}")
+    c_ext = float(run_qbacktest(P, cal, "sel", fwd, apply_costs=True, label="검정",
+                                delist={}, cost_model="extended")["returns"]["cost"].sum())
+    c_spec = float(bt["returns"]["cost"].sum())
+    k.add("extended 비용 > spec 비용 (명세 초과분은 기본에 없다)", c_ext > c_spec,
+          f"spec {c_spec:.6f} · extended {c_ext:.6f}")
+    P3 = P.copy()
+    P3["cs_spread"] = 1e-9
+    k.eq("스프레드 하한이 적용된다",
+         float(run_qbacktest(P3, cal, "sel", fwd, apply_costs=True, label="검정", delist={},
+                             cost_model="spec")["returns"].set_index("rebal")
+               .loc[pd.Timestamp("2020-03-01"), "cost"]),
+         (SLIPPAGE_FLOOR_BPS / 1e4) / 2.0, tol=1e-12)
+    k.eq("Q_PER_YEAR (분기 연율화 √4)", Q_PER_YEAR, 4.0)
+    return k
+
+
+@spec_clause("§8.2", "실험 매트릭스 — 주 실험 3 + X1~X4 · X1 에는 3-A·2차가 없다")
+def _sc82():
+    k = SpecChk()
+    n = 120
+    P = _sa_cells(_sa_grid(n, ["2020-03-01"], sector="X", Z_V=[float(i) for i in range(n)],
+                           Z_Q=0.0, Z_F=0.0, dNONFIN=[float((i * 13) % n) for i in range(n)],
+                           dTONE_resid=np.nan, EXCLUDED=0,
+                           RULE3A_BLOCK=[1 if i >= n - 10 else 0 for i in range(n)],
+                           mktcap=1e9, adtv=1e10, cs_spread=0.01, vol_d=0.02, n_reports=0))
+    P = build_u200(P, variants=("V",), n=100)
+    sel_x1 = build_final_selection(P, "V", n_final=30, use_rule3a=True, stage="x1")
+    n_blk = int(P.loc[sel_x1, "RULE3A_BLOCK"].sum())
+    k.add("X1(1차만)에는 3-A 가 적용되지 않는다", n_blk > 0,
+          f"X1 선정 30종목 중 3-A 차단 {n_blk}건 (0 이면 X1 이 사실상 '1차+3차')")
+    Pf = apply_filter2(P, "V", n=70)
+    k.eq("full 에는 3-A 가 적용된다",
+         int(Pf.loc[build_final_selection(Pf, "V", n_final=30, use_rule3a=True), "RULE3A_BLOCK"].sum()), 0)
+    k.add("X4(3-A 없음)는 차단 종목을 담을 수 있다",
+          int(Pf.loc[build_final_selection(Pf, "V", n_final=30, use_rule3a=False),
+                     "RULE3A_BLOCK"].sum()) > 0)
+    sd2 = float(apply_filter2(P, "V", n=70, use_tone=False, use_nonfin=False,
+                              use_exclusion=True)["score2_V"].astype(float).std())
+    k.add("X2 는 Score2 가 상수(배제만 작동)", sd2 < 1e-9, f"score2 표준편차 {sd2:.2e}")
+    sd3 = float(apply_filter2(P, "V", n=70, use_tone=False, use_nonfin=True,
+                              use_exclusion=False)["score2_V"].astype(float).std())
+    k.add("X3 는 ΔNONFIN 만으로 Score2 가 변한다", sd3 > 0.1, f"score2 표준편차 {sd3:.4f}")
+    return k
+
+
+@spec_clause("§8.3", "BH-FDR(q=0.10) — 단측 '알파>0' · 차이검정을 같은 패밀리에")
+def _sc83():
+    k = SpecChk()
+    k.eq("BH_FDR_Q", BH_FDR_Q, 0.10)
+    p_neg, p_pos = _pval_from_t(-4.0, 40), _pval_from_t(4.0, 40)
+    k.add("t = −4 (강한 음의 알파) → p 가 1 에 가깝다(단측)", p_neg > 0.99,
+          f"p(t=−4) = {p_neg:.6f} · 양측이면 ≈0.0003 으로 '유의' 오판")
+    k.add("t = +4 → p 가 0 에 가깝다", p_pos < 0.001, f"p(t=+4) = {p_pos:.6f}")
+    #  m=5, q=0.10 → 임계 0.02/0.04/0.06/0.08/0.10. p(3)=0.04 ≤ 0.06 이 성립하는 최대 rank.
+    got = list(map(bool, bh_fdr([0.001, 0.02, 0.04, 0.30, 0.60], q=0.10)))
+    k.add("BH 절차 판정", got == [True, True, True, False, False], f"→ {got}")
+    got2 = list(map(bool, bh_fdr([0.07, 0.30, 0.50, 0.70, 0.90], q=0.10)))
+    k.add("검정력 확인 — 최소 p 가 임계(0.02)를 넘으면 전부 기각", not any(got2), f"→ {got2}")
+
+    EXPERIMENTS.clear()
+    for nm, t in (("V-full", 2.5), ("VQ-full", 2.2), ("VQF-full", 2.4), ("X1", 1.8),
+                  ("X2", 1.2), ("X3", 0.9), ("X4", 2.0)):
+        EXPERIMENTS[nm] = {"name": nm, "net": {}, "gross": {}, "R": None, "t": t,
+                           "p": _pval_from_t(t, 40), "n": 40}
+    extra = {"name": "VQF-full−VQ-full(차이)", "t": 0.4, "p": _pval_from_t(0.4, 40), "n": 40}
+    res = report_bh_fdr(["V-full", "VQ-full", "VQF-full", "X1", "X2", "X3", "X4"],
+                        extra_tests=[extra])
+    k.eq("패밀리 크기 = 주3 + 어블4 + 차이1", len(res), 8)
+    k.add("차이검정이 같은 패밀리에 들어간다", "VQF-full−VQ-full(차이)" in res, f"패밀리={sorted(res)}")
+
+    # ★ hac_tstat 는 (평균, t) 를 준다. 언패킹을 뒤집으면 t 자리에 평균이 들어가
+    #   p ≈ 0.48 이 되어 §9-C2 는 영영 통과 못 하고 §10.4 ②는 항상 발동한다.
+    m = 40
+    idx = pd.date_range("2016-03-01", periods=m, freq="QS")
+    base = np.random.default_rng(11).normal(0.02, 0.08, m)
+    EXPERIMENTS["AA"] = {"name": "AA", "net": {}, "gross": {}, "t": np.nan, "p": np.nan, "n": m,
+                         "R": pd.DataFrame({"rebal": idx, "ret": base + 0.05})}
+    EXPERIMENTS["BB"] = {"name": "BB", "net": {}, "gross": {}, "t": np.nan, "p": np.nan, "n": m,
+                         "R": pd.DataFrame({"rebal": idx, "ret": base})}
+    dt = paired_diff_test("AA", "BB")
+    k.eq("차이의 평균 = +0.05", dt["mean"], 0.05, tol=1e-9)
+    k.add("t 는 평균이 아니라 평균/HAC표준오차",
+          np.isfinite(dt["t"]) and dt["t"] > 5.0 and abs(dt["t"] - dt["mean"]) > 1.0,
+          f"t={dt['t']:.3f} · mean={dt['mean']:.5f} · p={dt['p']:.2e} "
+          f"(언패킹이 뒤집히면 t=mean=0.05 → p≈0.48)")
+    k.add("결정적인 차이는 p 가 0 에 가깝다", dt["p"] < 0.01, f"p={dt['p']:.3e}")
+    return k
+
+
+@spec_clause("§8.4", "강건성 축 — U-200 크기 · 보유종목수 · 수급창 · 리밸 시점 ±5거래일")
+def _sc84():
+    k = SpecChk()
+    k.eq("SENS_U200_SIZES", tuple(SENS_U200_SIZES), (150, 200, 300))
+    k.eq("SENS_FINAL_SIZES", tuple(SENS_FINAL_SIZES), (20, 30, 40))
+    k.eq("SENS_FLOW_WINDOWS", tuple(SENS_FLOW_WINDOWS), (20, 60, 120))
+    k.eq("SENS_REBAL_SHIFTS", tuple(SENS_REBAL_SHIFTS), (-5, 0, 5))
+    k.add("기준값이 민감도 축의 가운데에 있다",
+          U200_N in SENS_U200_SIZES and FINAL_N in SENS_FINAL_SIZES
+          and FLOW_WINDOW_DAYS in SENS_FLOW_WINDOWS,
+          f"U200={U200_N} · FINAL={FINAL_N} · FLOW={FLOW_WINDOW_DAYS}")
+    k.eq("INVVOL_WINDOW_DAYS", INVVOL_WINDOW_DAYS, 120)
+
+    n = 400
+    px = _sa_prices([f"{i:06d}" for i in range(1, 6)], _sa_bdays("2019-01-02", 400))
+    set_trading_days(px)
+    cal = qvf_rebal_calendar(px, "2019-06-01", "2020-06-30")
+    reb = [str(t.date()) for t in as_ts_series(cal["rebal"])]
+    P = _sa_cells(_sa_grid(n, reb, sector="X", Z_V=[float(i) for i in range(n)], Z_Q=0.0,
+                           Z_F=0.0, dNONFIN=[float((i * 7) % n) for i in range(n)],
+                           dTONE_resid=np.nan, EXCLUDED=0, RULE3A_BLOCK=0, mktcap=1e9,
+                           adtv=1e10, cs_spread=0.01, vol_d=0.02))
+    P = P.drop(columns=["signal_date", "exec_date"]).merge(
+        cal[["rebal", "signal_date", "exec_date"]], on="rebal", how="left")
+    fwd = P[["code", "rebal"]].copy()
+    fwd["fwd_ret"] = np.random.default_rng(0).normal(0.01, 0.10, len(fwd))
+    s = {}
+    for n2 in SENS_U200_SIZES:
+        s[n2] = qperf_stats(run_experiment(P, cal, fwd, "V", u200_n=n2,
+                                           label=f"U{n2}")["returns"]).get("CAGR", np.nan)
+    k.add("U-200 크기를 바꾸면 성과가 실제로 달라진다(축이 살아 있다)",
+          len({round(v, 8) for v in s.values()}) == len(s),
+          " · ".join(f"U200={a}: CAGR {b*100:+.2f}%" for a, b in s.items()))
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  §9 · §10
+# ════════════════════════════════════════════════════════════════════════════════════════════
+@spec_clause("§9", "수급 축 채택 C1~C5 — 판정불가를 충족으로 세지 않는다")
+def _sc9():
+    k = SpecChk()
+    EXPERIMENTS.clear()
+    EXPERIMENTS["VQ-full"] = {"name": "VQ-full", "net": {"Sharpe": 0.50}, "gross": {},
+                              "R": None, "t": 1.0, "p": 0.2, "n": 40}
+    EXPERIMENTS["VQF-full"] = {"name": "VQF-full", "net": {"Sharpe": 0.80}, "gross": {},
+                               "R": None, "t": 1.5, "p": 0.1, "n": 40}
+    EXPERIMENTS["VQF-full−VQ-full(차이)"] = {"name": "VQF-full−VQ-full(차이)", "net": {},
+                                             "gross": {}, "R": None, "t": 2.0, "p": 0.03, "n": 40}
+    cmp_res = {"overlap": {"VQ~VQF": 0.60}, "coverage": {"VQ": 0.40, "VQF": 0.45}}
+    fdr = {"VQF-full−VQ-full(차이)": True, "VQF-full": True}
+    globals()["PHASE0_FLOW_OK"] = True
+    globals()["FLOW_NONZERO_RATIO_PREREG"] = 0.40
+    v = report_flow_verdict(cmp_res, fdr_pass=fdr)
+    k.add("전부 충족 시 C1~C5 True", all(v[c] is True for c in ("C1", "C2", "C3", "C4", "C5")),
+          f"{ {c: v[c] for c in ('C1','C2','C3','C4','C5')} }")
+    k.add("adopt_flow True", v["adopt_flow"] is True)
+
+    v2 = report_flow_verdict(cmp_res, fdr_pass={"VQF-full": True})
+    k.add("차이검정이 패밀리에 없으면 C2 는 '판정 불가'(자기 유의성으로 대체하지 않는다)",
+          v2["C2"] is None, f"C2={v2['C2']}")
+    k.add("판정 불가가 있으면 채택 권고가 아니다", v2["adopt_flow"] is False)
+    v3 = report_flow_verdict({"overlap": {"VQ~VQF": 0.85},
+                              "coverage": {"VQ": 0.4, "VQF": 0.45}}, fdr_pass=fdr)
+    k.add("중복률 0.85 → C3 미충족(< 0.85 여야 한다)", v3["C3"] is False, f"C3={v3['C3']}")
+    globals()["FLOW_NONZERO_RATIO_PREREG"] = 0.20
+    globals()["FLOW_NONZERO_RATIO"] = 0.90
+    k.add("C4 는 사전등록 창의 값을 쓴다 — 강건성 실행값(0.90)을 읽지 않는다",
+          report_flow_verdict(cmp_res, fdr_pass=fdr)["C4"] is False,
+          "사전등록 0.20 / 전역 폴백 0.90")
+    globals()["FLOW_NONZERO_RATIO_PREREG"] = 0.40
+    v5 = report_flow_verdict({"overlap": {"VQ~VQF": 0.6},
+                              "coverage": {"VQ": 0.40, "VQF": 0.55}}, fdr_pass=fdr)
+    k.add("커버리지 격차 +15%p → C5 미충족", v5["C5"] is False, f"C5={v5['C5']}")
+    globals()["PHASE0_FLOW_OK"] = False
+    v6 = report_flow_verdict(cmp_res, fdr_pass=fdr)
+    k.add("flow_cov 미달 → C1·C2 판정 불가", v6["C1"] is None and v6["C2"] is None,
+          f"C1={v6['C1']} C2={v6['C2']}")
+    return k
+
+
+@spec_clause("§10.4", "사전등록 폐기조건 ①②③ — 충족 시 실제로 멈춘다")
+def _sc104():
+    k = SpecChk()
+    k.add("STOP_ON_KILL_CRITERIA 기본 True", STOP_ON_KILL_CRITERIA is True)
+
+    def setup(cagrs, mdd_full, mdd_x1, diff_mean, diff_sd, n=40):
+        EXPERIMENTS.clear()
+        rng = np.random.default_rng(3)
+        base = rng.normal(0.02, 0.08, n)
+        idx = pd.date_range("2016-03-01", periods=n, freq="QS")
+        for nm, c in cagrs.items():
+            EXPERIMENTS[nm] = {"name": nm, "gross": {}, "t": 1.0, "p": 0.2, "n": n,
+                               "R": pd.DataFrame({"rebal": idx, "ret": base}),
+                               "net": {"CAGR": c, "Sharpe": 0.5,
+                                       "MDD": mdd_full if nm == "VQ-full" else np.nan}}
+        EXPERIMENTS["X1"] = {"name": "X1", "gross": {}, "t": 1.0, "p": 0.2, "n": n,
+                             "R": pd.DataFrame({"rebal": idx,
+                                                "ret": base - diff_mean + rng.normal(0, diff_sd, n)}),
+                             "net": {"CAGR": 0.05, "MDD": mdd_x1, "Sharpe": 0.4}}
+
+    MAIN = ["V-full", "VQ-full", "VQF-full"]
+    old_stop = STOP_ON_KILL_CRITERIA
+    try:
+        globals()["STOP_ON_KILL_CRITERIA"] = False
+        setup({"V-full": -0.03, "VQ-full": -0.02, "VQF-full": -0.01}, -0.40, -0.50, 0.05, 0.01)
+        k.add("① 세 변형 모두 음의 CAGR → 충족",
+              report_preregistration_kill(MAIN, "VQ-full", "X1")["all_alpha_dead"] is True)
+        setup({"V-full": 0.03, "VQ-full": 0.05, "VQF-full": -0.01}, -0.40, -0.50, 0.05, 0.01)
+        k.add("① 하나라도 양의 CAGR → 미충족",
+              report_preregistration_kill(MAIN, "VQ-full", "X1")["all_alpha_dead"] is False)
+        setup({"V-full": 0.03, "VQ-full": 0.05, "VQF-full": 0.02}, -0.40, -0.50, 0.0005, 0.05)
+        k.add("② 차이가 0 에 가까우면 '미미'로 판정",
+              report_preregistration_kill(MAIN, "VQ-full", "X1")["funnel_worthless"] is True)
+        setup({"V-full": 0.03, "VQ-full": 0.05, "VQF-full": 0.02}, -0.40, -0.50, 0.05, 0.01)
+        k.add("② 차이가 뚜렷하면 미충족(검정력 확인)",
+              report_preregistration_kill(MAIN, "VQ-full", "X1")["funnel_worthless"] is False)
+        setup({"V-full": 0.03, "VQ-full": 0.05, "VQF-full": 0.02}, -0.50, -0.40, 0.05, 0.01)
+        k.add("③ full MDD(−50%)가 X1(−40%)보다 깊다 → 개선 실패",
+              report_preregistration_kill(MAIN, "VQ-full", "X1")["exclusion_no_mdd_help"] is True)
+        setup({"V-full": 0.03, "VQ-full": 0.05, "VQF-full": 0.02}, -0.30, -0.40, 0.05, 0.01)
+        k.add("③ full MDD(−30%)가 X1(−40%)보다 얕다 → 개선 있음",
+              report_preregistration_kill(MAIN, "VQ-full", "X1")["exclusion_no_mdd_help"] is False)
+
+        globals()["STOP_ON_KILL_CRITERIA"] = True
+        setup({"V-full": -0.03, "VQ-full": -0.02, "VQF-full": -0.01}, -0.40, -0.50, 0.05, 0.01)
+        halted = False
+        try:
+            report_preregistration_kill(MAIN, "VQ-full", "X1")
+        except KillCriteria:
+            halted = True
+        k.add("폐기조건 충족 시 KillCriteria 로 중단(편입 종목표를 출력하지 않는다)", halted)
+    finally:
+        globals()["STOP_ON_KILL_CRITERIA"] = old_stop
+    return k
+
+
+@spec_clause("§10.1", "임의선택 원장 · §10.2 귀속 · §10.3 산출물 — 보고 함수가 실제로 돈다")
+def _sc101():
+    k = SpecChk()
+    for fname in ("report_discretion_ledger", "report_cell_ladder", "report_dataflow_map"):
+        try:
+            globals()[fname]()
+            ok, err = True, "ok"
+        except Exception as e:                                    # noqa
+            ok, err = False, f"{type(e).__name__}: {e}"
+        k.add(f"{fname}() 실행", ok, err)
+    n = 40
+    P = _sa_grid(n, ["2020-03-01"], sector="X", mktcap=1e9, adtv=5e8,
+                 score1_V=[float(i) for i in range(n)], score2_V=[float(i) for i in range(n)],
+                 dNONFIN=1.0, dTONE_resid=0.5, n_reports=1,
+                 _sel=[i >= n - 30 for i in range(n)])
+    sec = pd.DataFrame({"code": P["code"].unique(), "name": "검정종목"})
+    try:
+        k.eq("최종 편입 종목표 행수", len(report_final_holdings(P, "V", "_sel", sec)), 30)
+    except Exception as e:                                        # noqa
+        k.add("최종 편입 종목표 산출", False, f"{type(e).__name__}: {e}")
+    return k
+
+
+@spec_clause("§구조", "미정의 전역 참조 · 성과지표 키 오타 — 조용히 NameError/nan 이 되는 부류")
+def _scstruct():
+    """조립기의 '정의 전 참조' 검사는 최상위만 본다. 함수 '본문 안'의 미정의 전역은
+    그 분기가 실행될 때만 NameError 가 된다(실제로 ADTV_MIN_KRW 가 그랬다).
+    소스 파일이 없어도(원셀 실행) 돌아야 하므로 이미 정의된 코드객체를 직접 걷는다."""
+    import builtins as _bi
+    import dis as _dis
+
+    k = SpecChk()
+    g = globals()
+    # ★ 우리 파일에서 컴파일된 코드객체만 본다. globals() 에는 stdlib 클래스(ProcessPoolExecutor
+    #   등)도 들어 있어 그 메서드까지 걷으면 남의 모듈 전역이 '미정의'로 잡힌다(오탐).
+    own = _scstruct.__code__.co_filename
+    seen: set = set()
+    undefined: Dict[str, str] = {}
+    consts: set = set()
+
+    def walk(co, where: str):
+        if id(co) in seen:
+            return
+        seen.add(id(co))
+        for ins in _dis.get_instructions(co):
+            if ins.opname in ("LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL"):
+                nm = ins.argval
+                if (isinstance(nm, str) and not nm.startswith("__")
+                        and nm not in g and not hasattr(_bi, nm)):
+                    undefined.setdefault(nm, where)
+        for c in co.co_consts:
+            if isinstance(c, str):
+                consts.add(c)
+            elif hasattr(c, "co_code"):
+                walk(c, getattr(c, "co_qualname", None) or getattr(c, "co_name", where))
+
+    for name, obj in list(g.items()):
+        code = getattr(obj, "__code__", None)
+        if code is not None:
+            if code.co_filename == own:
+                walk(code, name)
+        elif isinstance(obj, type):
+            for _mn, _m in list(vars(obj).items()):
+                mc = getattr(_m, "__code__", None)
+                if mc is not None and mc.co_filename == own:
+                    walk(mc, f"{name}.{_mn}")
+    k.add("함수 본문에서 참조하는 전역이 모두 정의되어 있다", not undefined,
+          "미정의 전역 없음" if not undefined
+          else " · ".join(f"{n} (in {w})" for n, w in sorted(undefined.items())[:12]))
+
+    stats_keys = set(qperf_stats(pd.DataFrame({"ret": [0.01] * 20, "n": [10] * 20,
+                                               "turnover": [0.1] * 20, "cost": [0.001] * 20})))
+    lower = {kk.lower() for kk in stats_keys if kk.isascii()}
+    bad = sorted(c for c in consts
+                 if c.isascii() and c.lower() in lower and c not in stats_keys)
+    k.add("성과지표를 잘못된 키(대소문자)로 조회하지 않는다", not bad,
+          f"성과 키 집합에 없는 문자열 상수 {bad}" if bad
+          else f"이상 없음 (키: {sorted(kk for kk in stats_keys if kk.isascii())})")
+    return k
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  실행 — 전역 스냅샷/복원으로 파이프라인을 오염시키지 않는다
+# ════════════════════════════════════════════════════════════════════════════════════════════
+#  검정이 만지는 전역 목록. 여기 빠진 이름이 있으면 검증층이 본 실행의 입력을 바꾼다.
+_SPEC_GUARDED = ("U1000_N", "U1000_RANK_BEFORE_FILTER", "QVF_TRADING_DAYS",
+                 "FLOW_NONZERO_RATIO", "FLOW_NONZERO_RATIO_PREREG", "FLOW_NONZERO_BY_WINDOW",
+                 "PHASE0_FLOW_OK", "QVF_DELIST_MAP", "STOP_ON_KILL_CRITERIA",
+                 "QVF_REBAL_SHIFT_DAYS", "SCORE2_W_NONFIN", "SCORE2_W_TONE")
+
+
+def _spec_snapshot() -> dict:
+    import copy as _copy
+    snap = {}
+    for nm in _SPEC_GUARDED:
+        if nm in globals():
+            v = globals()[nm]
+            try:
+                snap[nm] = _copy.deepcopy(v)
+            except Exception:                                     # noqa
+                snap[nm] = v
+    snap["_EXPERIMENTS"] = OrderedDict(EXPERIMENTS)
+    snap["_ROBUST"] = list(ROBUST_RESULTS)
+    snap["_LADDER"] = dict(CELL_LADDER_USAGE)
+    return snap
+
+
+def _spec_restore(snap: dict) -> List[str]:
+    """복원하고, 복원되지 않은 이름을 돌려준다(빈 리스트여야 정상)."""
+    for nm in _SPEC_GUARDED:
+        if nm in snap:
+            globals()[nm] = snap[nm]
+    EXPERIMENTS.clear()
+    EXPERIMENTS.update(snap.get("_EXPERIMENTS") or {})
+    ROBUST_RESULTS[:] = snap.get("_ROBUST") or []
+    CELL_LADDER_USAGE.clear()
+    CELL_LADDER_USAGE.update(snap.get("_LADDER") or {})
+    bad = []
+    for nm in _SPEC_GUARDED:
+        if nm not in snap:
+            continue
+        a, b = snap[nm], globals().get(nm)
+        try:
+            if isinstance(a, np.ndarray):
+                same = bool(np.array_equal(a, b))
+            elif isinstance(a, float) and isinstance(b, float):
+                # NaN == NaN 은 False 다. 사전등록 창 비율 등은 초기값이 nan 이므로
+                # 그대로 비교하면 '복원 실패'로 오판한다.
+                same = (a == b) or (not np.isfinite(a) and not np.isfinite(b))
+            else:
+                same = bool(a == b)
+        except Exception:                                         # noqa
+            same = True
+        if not same:
+            bad.append(nm)
+    return bad
+
+
+def run_spec_audit(strict: bool = True, only: Optional[Sequence[str]] = None) -> bool:
+    """§3.1~§10.4 전수조사. strict 면 실패 시 ContractViolation 을 던진다."""
+    LOG.banner("명세 전수조사 (§3.1 ~ §10.4)",
+               "조항마다 정답을 아는 합성 입력을 만들어 실제 함수를 돌리고 숫자로 판정한다")
+    sel = [(cid, t, fn) for cid, t, fn in SPEC_CASES
+           if not only or any(cid.lstrip("§").startswith(str(w).lstrip("§")) for w in only)]
+    snap = _spec_snapshot()
+    keep = LOG.min
+    rows, failures, n_sub, n_sub_bad = [], [], 0, 0
+    try:
+        LOG.min = LOG.LEVELS["WARN"]        # 검정 중 본문 로그는 억제(판정표만 남긴다)
+        for cid, title, fn in sel:
+            try:
+                chk = fn()
+                ok = chk.passed
+                n_sub += len(chk.rows)
+                bad = [(n, e) for n, o, e in chk.rows if not o]
+                n_sub_bad += len(bad)
+                detail = ("전 항목 통과" if ok else bad[0][0])
+                if not ok:
+                    failures += [f"{cid} · {n} — {e}" for n, e in bad]
+            except Exception as e:                                # noqa
+                ok, detail = False, f"{type(e).__name__}: {e}"
+                failures.append(f"{cid} · 실행 오류 — {detail}")
+                if VERBOSE:
+                    LOG.min = keep
+                    LOG.debug(traceback.format_exc())
+                    LOG.min = LOG.LEVELS["WARN"]
+            rows.append([cid, _trunc(title, 58), "✔" if ok else "✘", _trunc(detail, 40)])
+    finally:
+        LOG.min = keep
+        leaked = _spec_restore(snap)
+
+    LOG.table(rows, ["조항", "내용", "판정", "비고"], ["l", "l", "c", "l"], maxw=60,
+              title=f"명세 전수조사 — 조항 {len(sel)}개 · 소검정 {n_sub}개")
+    k_ok = sum(1 for r in rows if r[2] == "✔")
+    LOG.add_pipe = getattr(LOG, "add_pipe", None)
+    if leaked:
+        LOG.warn(f"검정층이 전역을 복원하지 못했습니다: {leaked} — 이 값들이 본 실행의 입력을 "
+                 f"바꿉니다. 전수조사 자체가 오염원이 되므로 반드시 고쳐야 합니다.")
+        failures.append(f"전역 복원 실패: {leaked}")
+    if failures:
+        LOG.table([[_trunc(f, 110)] for f in failures[:20]], ["실패한 소검정"], ["l"], maxw=112,
+                  title=f"실패 상세 (소검정 {n_sub_bad}건)")
+        msg = (f"명세 전수조사 실패 — 조항 {len(sel)-k_ok}/{len(sel)}개, 소검정 {n_sub_bad}/{n_sub}개.\n"
+               f"  이 층은 '숫자가 명세와 같은가'를 봅니다. 계약(Q1~Q14)이 통과해도 여기서 걸리면\n"
+               f"  선정·판정 결과가 명세와 다르다는 뜻이므로 수집을 시작하지 않습니다.")
+        if strict:
+            raise ContractViolation(msg)
+        LOG.warn(msg)
+        return False
+    LOG.ok(f"명세 전수조사 통과 — 조항 {k_ok}/{len(sel)} · 소검정 {n_sub}개 · "
+           f"전역 복원 확인 완료")
+    PIPE.note(f"명세 전수조사 {k_ok}조항/{n_sub}소검정 통과")
+    return True
 
 
 
@@ -12724,13 +14046,22 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
         _yrs = sum(len(_span.get(c, ())) for c in corps) or (len(corps) * len(years))
         _naive, _scoped = len(corps) * len(years) * 4, _yrs * len(_rc)
         _lim = DBUDGET.remaining_calls() if DBUDGET is not None else None
-        _d = float(_lim or DART_DAILY_LIMIT_HINT)
-        LOG.table([["예전 (회사 × 전연도 × 4분기)", f"{_naive:,}", f"{_naive/_d:.1f}일"],
+        # ★ '예상 일수'의 분모는 '오늘 남은 호출'이 아니라 '하루치 한도'다.
+        #   잔여가 1회일 때 잔여로 나누면 19,154일 같은 값이 찍힌다 — 콜드빌드가 52년 걸린다는
+        #   뜻으로 읽히지만 실제로는 '오늘은 거의 못 받는다'는 뜻일 뿐이다. 둘은 다른 질문이고,
+        #   표의 '예상'은 '며칠에 걸쳐 완성되는가' 이므로 일일 한도로 나눠야 한다.
+        _daily = float(DQUOTA.daily_limit() if (DQUOTA is not None
+                                                and hasattr(DQUOTA, "daily_limit"))
+                       else DART_DAILY_LIMIT_HINT)
+        _daily = max(1000.0, _daily)
+        _fmt_d = lambda need: ("하루 안" if need <= _daily else f"{need/_daily:.1f}일")
+        LOG.table([["예전 (회사 × 전연도 × 4분기)", f"{_naive:,}", _fmt_d(_naive)],
                    [f"대상=U-1000×{DART_TIER2_BUFFER_MULT} · 소급 {DART_TIER2_LOOKBACK_Y}년",
-                    f"{_yrs*4:,}", f"{_yrs*4/_d:.1f}일"],
-                   [f"+ Tier-2 빈도 = {DART_TIER2_FREQ}", f"{_scoped:,}", f"{_scoped/_d:.1f}일"],
-                   ["오늘 잔여 호출", f"{_lim:,}" if _lim is not None else "미확정", ""]],
-                  headers=["Tier-2 수집 계획", "필요 호출", "예상"],
+                    f"{_yrs*4:,}", _fmt_d(_yrs * 4)],
+                   [f"+ Tier-2 빈도 = {DART_TIER2_FREQ}", f"{_scoped:,}", _fmt_d(_scoped)],
+                   ["오늘 잔여 호출", f"{_lim:,}" if _lim is not None else "미확정",
+                    f"(일일 한도 {_daily:,.0f} 기준 · 잔여는 오늘 진도만 좌우)"]],
+                  headers=["Tier-2 수집 계획", "필요 호출", "예상 소요"],
                   title="DART Tier-2 — 회사별 API 라 job 수가 곧 콜드빌드 기간이다")
         if _lim and _scoped > _lim:
             LOG.warn(f"그래도 오늘 잔여({_lim:,})를 넘습니다. 시총 낮은 순으로 받으므로 오늘 "
@@ -12928,6 +14259,11 @@ def main() -> dict:
 
     with PIPE.stage("L0.CONTRACT", "계약 자동검정 Q1~Q14", "L0", budget_s=180):
         run_contract_tests(strict=True)
+
+    # ★ 계약은 '원칙'(PIT·생존자편향·결정성)을, 전수조사는 '숫자'(§3.1~§10.4)를 지킨다.
+    #   둘 다 수집 전에 통과해야 한다 — 명세와 다른 값을 만드는 코드로 4시간을 태우지 않는다.
+    with PIPE.stage("L0.SPEC", "명세 전수조사 §3.1~§10.4", "L0", budget_s=300):
+        run_spec_audit(strict=True)
 
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0",
                     budget_s=(2400 if RUN_MODE == "SMOKE" else 600)):
