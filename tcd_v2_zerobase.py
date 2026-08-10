@@ -10675,9 +10675,19 @@ def R10_policy(P: pd.DataFrame, cal: pd.DataFrame, months, run_fn):
             + ("정책 이벤트를 빼도 알파 유지." if kept else
                "★정책구간 제외 시 알파 소멸 → 수요가 아니라 제도를 관측한 것 — 팩 폐기 대상(§15-4)."),
             metrics={"s_full": s_f, "s_clean": s_c})
+    # ★R10 이 ★전역 팩을 끄지 않는다 — 판정만 남긴다.
+    #   R10 은 '전략 전체' 단위의 단일 판정(s_c>0 and mu_c>0 and s_c>=0.5*s_f)인데,
+    #   여기서 packs_on() 전부를 끄면 그 뒤의 Q.INTERP·진단카드·R11 상관행렬이
+    #   ★'팩이 하나도 없는 세계'를 그린다. L.PANEL 이 방금 'C 활성·D 활성'을 찍었는데
+    #   같은 실행의 뒤쪽 표가 '활성 팩 없음'이 되는 자기모순이 그렇게 생겼다.
+    #   특히 PACK-D 의 유일 캘린더 항목은 BT 창(2016-08~)에서 마스킹 개월이 0개다 —
+    #   정책마스크에 한 달도 기여하지 않은 팩이 연대 폐기되는 것은 근거가 없다.
+    #   팩 폐기가 필요하다면 그것은 P.ROBUST 가 끝난 뒤 ★명시적으로 결정할 일이다.
     if not kept:
-        for p in packs_on():
-            pack_off(p["id"], "R10 정책 반증 미통과 — 자동 비활성화")
+        L.warn("R10 미통과 — 정책구간을 빼면 알파가 소멸합니다(§15-4 팩 폐기 '대상'). "
+               "다만 이 판정만으로 팩을 끄지는 않습니다: R10 은 전략 전체 단위 판정이라 "
+               "어느 팩이 원인인지 지목하지 못하고, 그 사이 정책마스크에 한 달도 기여하지 "
+               "않은 팩까지 연대 폐기됩니다. 판정은 강건성 표에 그대로 남습니다.")
 
 
 # ── R5: 절제 ────────────────────────────────────────────────────────────────────────────────
@@ -11225,8 +11235,15 @@ def drift_audit(P: pd.DataFrame, bt: Optional[Union[pd.DataFrame, dict]] = None,
             c_m = float(pd.to_numeric(bt["cost"], errors="coerce").mean())
             dn.append(["거래비용", f"월 {c_m*100:.3f}%p", f"-{c_m*1e4:.0f}bp/월",
                        "편향이 아니라 실비 — 회전율이 높으면 성과를 지배"])
-        if "n_hold" in bt.columns:
-            nh = float(pd.to_numeric(bt["n_hold"], errors="coerce").mean())
+        # ★run_engine 이 만드는 컬럼명은 "n" 이다("n_hold" 는 파일 어디에서도 생성되지 않는다).
+        #   그래서 이 가지는 ★한 번도 실행된 적이 없고, 하향 요인 중 유일하게 '정성(큼)'
+        #   등급을 갖는 '보유 집중' 축이 통째로 죽어 있었다(big() 판정의 유일 트리거다).
+        #   빈 달(n=0)은 평균을 희석하므로 제외한다 — 안 그러면 데이터 공백에 오발화한다.
+        _nc = "n" if "n" in bt.columns else ("n_hold" if "n_hold" in bt.columns else None)
+        if _nc:
+            _nv = pd.to_numeric(bt[_nc], errors="coerce")
+            _nv = _nv[_nv > 0]
+            nh = float(_nv.mean()) if len(_nv) else float("nan")
             if nh < MIN_NAMES * 2:
                 dn.append(["보유 집중", f"평균 {nh:.1f}종목 (상한 {MAX_NAMES})", "정성(큼)",
                            "표본이 적어 성과가 개별 종목 운에 지배 — 신뢰구간이 매우 넓다"])
