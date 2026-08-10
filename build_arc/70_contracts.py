@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A19 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A20 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -573,12 +573,41 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A19", "DART T+1 규약 (재무 계열)", a19)
 
+    # ── A20  게이트가 실제로 축을 끄는가 (skip_if 함정) ───────────────────────────────────
+    def a20():
+        """★ PIPE.stage(skip_if=True) 는 스테이지를 SKIP 으로 '표시'만 하고 with 본문은
+        그대로 실행한다(컨텍스트 매니저의 구조적 한계). 이걸 모르고 쓰면 '축을 껐다'고
+        로그에는 찍히는데 계산은 다 돌고 값까지 반영되는 조용한 사고가 난다.
+        여기서 ① 그 성질을 명시적으로 확인하고 ② 오케스트레이터가 명시 분기로 막았는지 본다.
+        """
+        ran = {"n": 0}
+        with PIPE.stage("T.SKIP", "계약검정용", "L0", skip_if=True, skip_reason="검정"):
+            ran["n"] += 1
+        if ran["n"] == 0:
+            return True, ("skip_if 가 본문 실행까지 막습니다(파이썬 버전/구현 변경). "
+                          "이 경우 호출부의 명시 분기는 불필요하지만 무해합니다.")
+        # 본문이 실행되는 것이 정상이므로, 오케스트레이터가 명시 분기로 막고 있어야 한다.
+        import inspect
+        src = inspect.getsource(G["arc_build_signals"]) if "arc_build_signals" in G else ""
+        for var, why in (("_d1_on", "D1"), ("_axis_a_on", "축 A")):
+            if var not in src:
+                return False, (f"★게이트가 {why} 를 실제로 끄지 못합니다. skip_if 는 표시만 "
+                               f"하므로 with 본문 안에서 `if {var}:` 로 분기해야 합니다. "
+                               f"현재 구조에서는 Phase 0 에서 축을 껐다고 보고해 놓고 "
+                               f"계산 결과가 그대로 신호에 들어갑니다.")
+        if "attach_d1(P, None)" not in src or "attach_axis_a(P, None, None)" not in src:
+            return False, "게이트 off 경로에서 축을 결측 처리하는 호출이 없습니다"
+        return True, ("skip_if 는 표시 전용임을 확인 · 오케스트레이터가 _d1_on/_axis_a_on 으로 "
+                      "명시 분기하고 off 경로에서 축을 결측 처리함 확인")
+
+    _ac("A20", "게이트가 실제로 축을 끄는가", a20)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A19 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A20 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

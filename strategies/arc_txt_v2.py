@@ -247,7 +247,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0534"
+BUILD_VERSION = "v2.20260810.0540"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -834,6 +834,16 @@ class Pipeline:
     def stage(self, sid: str, name: str, layer: str = "L?",
               budget_s: Optional[float] = None, critical: bool = True,
               skip_if: bool = False, skip_reason: str = ""):
+        """★★ skip_if 는 '스테이지를 SKIP 으로 표시' 할 뿐 **본문 실행을 막지 않는다**.
+
+        파이썬 컨텍스트 매니저는 구조적으로 with 블록의 본문을 건너뛸 수 없다(yield 이후
+        제어가 본문으로 넘어간 뒤 돌아온다). 그래서 `with PIPE.stage(..., skip_if=True):`
+        안의 코드는 그대로 실행된다 — 이 사실을 모르고 쓰면 '축을 껐다'고 로그에는 찍히는데
+        실제로는 계산이 다 돌아가고 값까지 반영되는 조용한 사고가 난다.
+
+        → 호출부는 반드시 본문 안에서 명시적으로 `if <조건>:` 로 분기해야 한다.
+          stage_skipped(rec) 로 레코드에서 스킵 여부를 확인할 수도 있다.
+        """
         rec = StageRecord(sid=sid, name=name, layer=layer, budget_s=budget_s)
         self.stages[sid] = rec
         prev, self.current = self.current, rec
@@ -947,6 +957,11 @@ class Pipeline:
                      "✔ 예산 내" if sum(agg.values()) <= 4 * 3600 else "❗ 초과 — 아키텍처 수정 필요"])
         LOG.table(rows, ["계층", "실측(초)", "실측(분)", "계약예산", "판정"], ["c", "r", "r", "r", "l"])
         LOG.info("계층 정의 — L0:부트/캐시  L1:수집·피처패널  L2:스코어  L3:백테스트  L5:강건성  L6:리포트")
+
+
+def stage_skipped(rec: "StageRecord") -> bool:
+    """스테이지가 SKIP 으로 표시되었는가. with 본문 안에서 분기할 때 쓴다."""
+    return getattr(rec, "status", "") == "SKIP"
 
 
 PIPE = Pipeline()
@@ -11140,7 +11155,7 @@ def report_dataflow_map() -> None:
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A19 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A20 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -11712,12 +11727,41 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A19", "DART T+1 규약 (재무 계열)", a19)
 
+    # ── A20  게이트가 실제로 축을 끄는가 (skip_if 함정) ───────────────────────────────────
+    def a20():
+        """★ PIPE.stage(skip_if=True) 는 스테이지를 SKIP 으로 '표시'만 하고 with 본문은
+        그대로 실행한다(컨텍스트 매니저의 구조적 한계). 이걸 모르고 쓰면 '축을 껐다'고
+        로그에는 찍히는데 계산은 다 돌고 값까지 반영되는 조용한 사고가 난다.
+        여기서 ① 그 성질을 명시적으로 확인하고 ② 오케스트레이터가 명시 분기로 막았는지 본다.
+        """
+        ran = {"n": 0}
+        with PIPE.stage("T.SKIP", "계약검정용", "L0", skip_if=True, skip_reason="검정"):
+            ran["n"] += 1
+        if ran["n"] == 0:
+            return True, ("skip_if 가 본문 실행까지 막습니다(파이썬 버전/구현 변경). "
+                          "이 경우 호출부의 명시 분기는 불필요하지만 무해합니다.")
+        # 본문이 실행되는 것이 정상이므로, 오케스트레이터가 명시 분기로 막고 있어야 한다.
+        import inspect
+        src = inspect.getsource(G["arc_build_signals"]) if "arc_build_signals" in G else ""
+        for var, why in (("_d1_on", "D1"), ("_axis_a_on", "축 A")):
+            if var not in src:
+                return False, (f"★게이트가 {why} 를 실제로 끄지 못합니다. skip_if 는 표시만 "
+                               f"하므로 with 본문 안에서 `if {var}:` 로 분기해야 합니다. "
+                               f"현재 구조에서는 Phase 0 에서 축을 껐다고 보고해 놓고 "
+                               f"계산 결과가 그대로 신호에 들어갑니다.")
+        if "attach_d1(P, None)" not in src or "attach_axis_a(P, None, None)" not in src:
+            return False, "게이트 off 경로에서 축을 결측 처리하는 호출이 없습니다"
+        return True, ("skip_if 는 표시 전용임을 확인 · 오케스트레이터가 _d1_on/_axis_a_on 으로 "
+                      "명시 분기하고 off 경로에서 축을 결측 처리함 확인")
+
+    _ac("A20", "게이트가 실제로 축을 끄는가", a20)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A19 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A20 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))
@@ -12832,45 +12876,52 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
         LOG.info(f"문서 토큰 원본 {_mb:.0f}MB → 매니페스트만 보관 "
                  f"({mem_mb(ctx['doc_tokens']):.0f}MB). D1 은 연도 샤드에서 스트리밍합니다.")
 
+    _research_on = bool(RESEARCH_COLLECT or RUN_MODE == "CACHED")
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 · 본문", "L1",
-                    budget_s=5400, critical=False,
-                    skip_if=(not RESEARCH_COLLECT and RUN_MODE != "CACHED"),
-                    skip_reason="RESEARCH_COLLECT=False"):
-        LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
-                 "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
-                 "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
-        cached = VAULT.get_table("research_report_master", scope="shared")
-        frames = []
-        if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
-            if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
-            if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(BACKTEST_START, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
-        if cached is not None and len(cached):
-            LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용")
-            frames.append(cached)
-        rep = build_report_master(frames, ctx["sec"])
-        if len(rep):
-            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
-            if "pdf_target" in rep.columns:
-                fill = rep["target_price"].isna() & rep["pdf_target"].notna()
-                if fill.any():
-                    rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
-                    LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건 보강")
-            rep = tag_sponsored_reports(rep)
-            VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
-                            source="hankyung+naver")
-            VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",
-                            domain="research", source="strategy view")
-        A, L = build_analyst_ledger(rep)
-        if len(A):
-            VAULT.put_table("analyst_master", A, scope="shared", domain="research",
-                            source="entity_resolution")
-            VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
-                            source="entity_resolution")
-        ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
-        ctx["report_text"] = build_report_text_store(rep) if len(rep) else pd.DataFrame()
+                    budget_s=5400, critical=False, skip_if=(not _research_on),
+                    skip_reason="RESEARCH_COLLECT=False") as _st_res:
+      # ★ skip_if 는 표시만 한다(본문을 막지 못한다) — 실제 분기는 여기서 명시적으로 한다.
+      if not _research_on:
+        ctx["reports"] = pd.DataFrame(columns=REPORT_COLS)
+        ctx["analysts"] = pd.DataFrame()
+        ctx["links"] = pd.DataFrame()
+        ctx["report_text"] = pd.DataFrame()
+      else:
+          LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
+                   "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
+                   "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
+          cached = VAULT.get_table("research_report_master", scope="shared")
+          frames = []
+          if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+              if "hankyung" in RESEARCH_SOURCES:
+                  frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+              if "naver" in RESEARCH_SOURCES:
+                  nv = naver_collect(BACKTEST_START, BACKTEST_END)
+                  frames.append(naver_enrich_detail(nv))
+          if cached is not None and len(cached):
+              LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용")
+              frames.append(cached)
+          rep = build_report_master(frames, ctx["sec"])
+          if len(rep):
+              rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+              if "pdf_target" in rep.columns:
+                  fill = rep["target_price"].isna() & rep["pdf_target"].notna()
+                  if fill.any():
+                      rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
+                      LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건 보강")
+              rep = tag_sponsored_reports(rep)
+              VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
+                              source="hankyung+naver")
+              VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",
+                              domain="research", source="strategy view")
+          A, L = build_analyst_ledger(rep)
+          if len(A):
+              VAULT.put_table("analyst_master", A, scope="shared", domain="research",
+                              source="entity_resolution")
+              VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
+                              source="entity_resolution")
+          ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
+          ctx["report_text"] = build_report_text_store(rep) if len(rep) else pd.DataFrame()
     return ctx
 
 
@@ -12892,15 +12943,19 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
         P = build_arc_panel(uni, rebals, U, ctx.get("liq"), ctx.get("exec"), ctx["sec"])
         ctx["panel_base"] = P
 
+    _d1_on = bool(gate.get("d1", True))
     with PIPE.stage("L2.D1", "D1 텍스트 변화량", "L2", budget_s=1800, critical=False,
-                    skip_if=(not gate.get("d1", True)),
+                    skip_if=(not _d1_on),
                     skip_reason="Phase 0 GATE_4/5 실패 — D1 비활성화"):
-        struct = build_struct_flags(ctx.get("dis"))
-        # ★ 연도 2개씩만 올리는 스트리밍 경로. 전 구간 토큰을 한 번에 들면 수 GB 가 된다.
-        d1 = build_d1_streaming(struct, T_manifest=ctx.get("doc_tokens"))
-        P = attach_d1(P, d1)
-    if not gate.get("d1", True):
-        P = attach_d1(P, None)
+        # ★ skip_if 는 표시만 한다. 실제로 계산을 막으려면 여기서 분기해야 한다 —
+        #   그러지 않으면 '축을 껐다'고 로그에만 찍히고 값은 그대로 반영된다.
+        if _d1_on:
+            struct = build_struct_flags(ctx.get("dis"))
+            # 연도 2개씩만 올리는 스트리밍 경로. 전 구간 토큰을 한 번에 들면 수 GB 가 된다.
+            d1 = build_d1_streaming(struct, T_manifest=ctx.get("doc_tokens"))
+            P = attach_d1(P, d1)
+        else:
+            P = attach_d1(P, None)          # 컬럼만 보장하고 전 구간 결측 처리
 
     with PIPE.stage("L2.D2", "D2 재무제표 이상현상", "L2", budget_s=600, critical=False):
         P = attach_d2(P, build_d2_panel(ctx.get("fin"), ctx.get("shares"))
@@ -12927,17 +12982,20 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
                               cols=["corp_code", "knowledge_date", "net_income_ttm", "assets"],
                               suffix="_fin")
 
+    _axis_a_on = bool(gate.get("axis_a", True))
     with PIPE.stage("L2.A", "축 A — TONE 분류 · ΔTONE · 직교화", "L2", budget_s=5400,
-                    critical=False, skip_if=(not gate.get("axis_a", True)),
+                    critical=False, skip_if=(not _axis_a_on),
                     skip_reason="Phase 0 GATE_1/2/3 실패 — DART-ONLY 폴백"):
-        train = build_tone_training(ctx.get("report_text"), ctx.get("px"), ctx["sec"])
-        tone_rep = score_tone_reports(ctx.get("report_text"), train, rebals)
-        tone_q = aggregate_tone(tone_rep, rebals)
-        rev = build_revision_panel(ctx.get("links"), rebals)
-        P = attach_axis_a(P, tone_q, rev)
-        ctx["tone_q"], ctx["rev"] = tone_q, rev
-    if not gate.get("axis_a", True):
-        P = attach_axis_a(P, None, None)
+        if _axis_a_on:
+            train = build_tone_training(ctx.get("report_text"), ctx.get("px"), ctx["sec"])
+            tone_rep = score_tone_reports(ctx.get("report_text"), train, rebals)
+            tone_q = aggregate_tone(tone_rep, rebals)
+            rev = build_revision_panel(ctx.get("links"), rebals)
+            P = attach_axis_a(P, tone_q, rev)
+            ctx["tone_q"], ctx["rev"] = tone_q, rev
+        else:
+            # DART-ONLY 폴백 — 축 A 를 전 구간 결측으로 두되 종목은 탈락시키지 않는다(§7.2)
+            P = attach_axis_a(P, None, None)
 
     with PIPE.stage("L2.VOL", "역변동성 가중용 변동성", "L2", budget_s=300, critical=False):
         P = attach_volatility(P, ctx.get("px"))
@@ -12996,7 +13054,7 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A19", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A20", "L0", budget_s=300):
         run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
 
     with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",

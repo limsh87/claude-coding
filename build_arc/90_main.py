@@ -111,45 +111,52 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
         LOG.info(f"문서 토큰 원본 {_mb:.0f}MB → 매니페스트만 보관 "
                  f"({mem_mb(ctx['doc_tokens']):.0f}MB). D1 은 연도 샤드에서 스트리밍합니다.")
 
+    _research_on = bool(RESEARCH_COLLECT or RUN_MODE == "CACHED")
     with PIPE.stage("L1.RESEARCH", "애널리스트 리포트 수집 · 원장 · 본문", "L1",
-                    budget_s=5400, critical=False,
-                    skip_if=(not RESEARCH_COLLECT and RUN_MODE != "CACHED"),
-                    skip_reason="RESEARCH_COLLECT=False"):
-        LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
-                 "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
-                 "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
-        cached = VAULT.get_table("research_report_master", scope="shared")
-        frames = []
-        if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
-            if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
-            if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(BACKTEST_START, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
-        if cached is not None and len(cached):
-            LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용")
-            frames.append(cached)
-        rep = build_report_master(frames, ctx["sec"])
-        if len(rep):
-            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
-            if "pdf_target" in rep.columns:
-                fill = rep["target_price"].isna() & rep["pdf_target"].notna()
-                if fill.any():
-                    rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
-                    LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건 보강")
-            rep = tag_sponsored_reports(rep)
-            VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
-                            source="hankyung+naver")
-            VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",
-                            domain="research", source="strategy view")
-        A, L = build_analyst_ledger(rep)
-        if len(A):
-            VAULT.put_table("analyst_master", A, scope="shared", domain="research",
-                            source="entity_resolution")
-            VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
-                            source="entity_resolution")
-        ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
-        ctx["report_text"] = build_report_text_store(rep) if len(rep) else pd.DataFrame()
+                    budget_s=5400, critical=False, skip_if=(not _research_on),
+                    skip_reason="RESEARCH_COLLECT=False") as _st_res:
+      # ★ skip_if 는 표시만 한다(본문을 막지 못한다) — 실제 분기는 여기서 명시적으로 한다.
+      if not _research_on:
+        ctx["reports"] = pd.DataFrame(columns=REPORT_COLS)
+        ctx["analysts"] = pd.DataFrame()
+        ctx["links"] = pd.DataFrame()
+        ctx["report_text"] = pd.DataFrame()
+      else:
+          LOG.info("※ 한경컨센서스·네이버금융은 robots.txt 가 Disallow:/ 입니다. "
+                   "사용자의 명시적 지시에 따라 수집하되 보수적 속도로 제한합니다. "
+                   "PDF 원문은 증권사 저작물이므로 로컬 분석 용도로만 사용하세요.")
+          cached = VAULT.get_table("research_report_master", scope="shared")
+          frames = []
+          if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+              if "hankyung" in RESEARCH_SOURCES:
+                  frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+              if "naver" in RESEARCH_SOURCES:
+                  nv = naver_collect(BACKTEST_START, BACKTEST_END)
+                  frames.append(naver_enrich_detail(nv))
+          if cached is not None and len(cached):
+              LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용")
+              frames.append(cached)
+          rep = build_report_master(frames, ctx["sec"])
+          if len(rep):
+              rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+              if "pdf_target" in rep.columns:
+                  fill = rep["target_price"].isna() & rep["pdf_target"].notna()
+                  if fill.any():
+                      rep.loc[fill, "target_price"] = rep.loc[fill, "pdf_target"]
+                      LOG.ok(f"PDF 본문에서 목표주가 {int(fill.sum()):,}건 보강")
+              rep = tag_sponsored_reports(rep)
+              VAULT.put_table("research_report_master", rep, scope="shared", domain="research",
+                              source="hankyung+naver")
+              VAULT.put_table(f"report_master_{STRATEGY_ID}", rep, scope="private",
+                              domain="research", source="strategy view")
+          A, L = build_analyst_ledger(rep)
+          if len(A):
+              VAULT.put_table("analyst_master", A, scope="shared", domain="research",
+                              source="entity_resolution")
+              VAULT.put_table("report_analyst_link", L, scope="shared", domain="research",
+                              source="entity_resolution")
+          ctx["reports"], ctx["analysts"], ctx["links"] = rep, A, L
+          ctx["report_text"] = build_report_text_store(rep) if len(rep) else pd.DataFrame()
     return ctx
 
 
@@ -171,15 +178,19 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
         P = build_arc_panel(uni, rebals, U, ctx.get("liq"), ctx.get("exec"), ctx["sec"])
         ctx["panel_base"] = P
 
+    _d1_on = bool(gate.get("d1", True))
     with PIPE.stage("L2.D1", "D1 텍스트 변화량", "L2", budget_s=1800, critical=False,
-                    skip_if=(not gate.get("d1", True)),
+                    skip_if=(not _d1_on),
                     skip_reason="Phase 0 GATE_4/5 실패 — D1 비활성화"):
-        struct = build_struct_flags(ctx.get("dis"))
-        # ★ 연도 2개씩만 올리는 스트리밍 경로. 전 구간 토큰을 한 번에 들면 수 GB 가 된다.
-        d1 = build_d1_streaming(struct, T_manifest=ctx.get("doc_tokens"))
-        P = attach_d1(P, d1)
-    if not gate.get("d1", True):
-        P = attach_d1(P, None)
+        # ★ skip_if 는 표시만 한다. 실제로 계산을 막으려면 여기서 분기해야 한다 —
+        #   그러지 않으면 '축을 껐다'고 로그에만 찍히고 값은 그대로 반영된다.
+        if _d1_on:
+            struct = build_struct_flags(ctx.get("dis"))
+            # 연도 2개씩만 올리는 스트리밍 경로. 전 구간 토큰을 한 번에 들면 수 GB 가 된다.
+            d1 = build_d1_streaming(struct, T_manifest=ctx.get("doc_tokens"))
+            P = attach_d1(P, d1)
+        else:
+            P = attach_d1(P, None)          # 컬럼만 보장하고 전 구간 결측 처리
 
     with PIPE.stage("L2.D2", "D2 재무제표 이상현상", "L2", budget_s=600, critical=False):
         P = attach_d2(P, build_d2_panel(ctx.get("fin"), ctx.get("shares"))
@@ -206,17 +217,20 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
                               cols=["corp_code", "knowledge_date", "net_income_ttm", "assets"],
                               suffix="_fin")
 
+    _axis_a_on = bool(gate.get("axis_a", True))
     with PIPE.stage("L2.A", "축 A — TONE 분류 · ΔTONE · 직교화", "L2", budget_s=5400,
-                    critical=False, skip_if=(not gate.get("axis_a", True)),
+                    critical=False, skip_if=(not _axis_a_on),
                     skip_reason="Phase 0 GATE_1/2/3 실패 — DART-ONLY 폴백"):
-        train = build_tone_training(ctx.get("report_text"), ctx.get("px"), ctx["sec"])
-        tone_rep = score_tone_reports(ctx.get("report_text"), train, rebals)
-        tone_q = aggregate_tone(tone_rep, rebals)
-        rev = build_revision_panel(ctx.get("links"), rebals)
-        P = attach_axis_a(P, tone_q, rev)
-        ctx["tone_q"], ctx["rev"] = tone_q, rev
-    if not gate.get("axis_a", True):
-        P = attach_axis_a(P, None, None)
+        if _axis_a_on:
+            train = build_tone_training(ctx.get("report_text"), ctx.get("px"), ctx["sec"])
+            tone_rep = score_tone_reports(ctx.get("report_text"), train, rebals)
+            tone_q = aggregate_tone(tone_rep, rebals)
+            rev = build_revision_panel(ctx.get("links"), rebals)
+            P = attach_axis_a(P, tone_q, rev)
+            ctx["tone_q"], ctx["rev"] = tone_q, rev
+        else:
+            # DART-ONLY 폴백 — 축 A 를 전 구간 결측으로 두되 종목은 탈락시키지 않는다(§7.2)
+            P = attach_axis_a(P, None, None)
 
     with PIPE.stage("L2.VOL", "역변동성 가중용 변동성", "L2", budget_s=300, critical=False):
         P = attach_volatility(P, ctx.get("px"))
@@ -275,7 +289,7 @@ def main() -> dict:
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 
-    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A19", "L0", budget_s=300):
+    with PIPE.stage("L0.CONTRACT", "계약 자동검정 A1~A20", "L0", budget_s=300):
         run_contract_tests(strict=STOP_ON_CONTRACT_FAIL)
 
     with PIPE.stage("L0.SMOKE", "합성 엔드투엔드 스모크", "L0",

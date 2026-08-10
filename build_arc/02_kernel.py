@@ -278,6 +278,16 @@ class Pipeline:
     def stage(self, sid: str, name: str, layer: str = "L?",
               budget_s: Optional[float] = None, critical: bool = True,
               skip_if: bool = False, skip_reason: str = ""):
+        """★★ skip_if 는 '스테이지를 SKIP 으로 표시' 할 뿐 **본문 실행을 막지 않는다**.
+
+        파이썬 컨텍스트 매니저는 구조적으로 with 블록의 본문을 건너뛸 수 없다(yield 이후
+        제어가 본문으로 넘어간 뒤 돌아온다). 그래서 `with PIPE.stage(..., skip_if=True):`
+        안의 코드는 그대로 실행된다 — 이 사실을 모르고 쓰면 '축을 껐다'고 로그에는 찍히는데
+        실제로는 계산이 다 돌아가고 값까지 반영되는 조용한 사고가 난다.
+
+        → 호출부는 반드시 본문 안에서 명시적으로 `if <조건>:` 로 분기해야 한다.
+          stage_skipped(rec) 로 레코드에서 스킵 여부를 확인할 수도 있다.
+        """
         rec = StageRecord(sid=sid, name=name, layer=layer, budget_s=budget_s)
         self.stages[sid] = rec
         prev, self.current = self.current, rec
@@ -391,6 +401,11 @@ class Pipeline:
                      "✔ 예산 내" if sum(agg.values()) <= 4 * 3600 else "❗ 초과 — 아키텍처 수정 필요"])
         LOG.table(rows, ["계층", "실측(초)", "실측(분)", "계약예산", "판정"], ["c", "r", "r", "r", "l"])
         LOG.info("계층 정의 — L0:부트/캐시  L1:수집·피처패널  L2:스코어  L3:백테스트  L5:강건성  L6:리포트")
+
+
+def stage_skipped(rec: "StageRecord") -> bool:
+    """스테이지가 SKIP 으로 표시되었는가. with 본문 안에서 분기할 때 쓴다."""
+    return getattr(rec, "status", "") == "SKIP"
 
 
 PIPE = Pipeline()
