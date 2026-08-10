@@ -257,13 +257,27 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         jobs = []
     if jobs:
         total_needed = len(jobs)
-        LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 "
-                 f"(오늘 가용 호출 {max(0, DART_DAILY_LIMIT - (DBUDGET.n if DBUDGET else 0)):,}건)")
-        if total_needed > DART_DAILY_LIMIT:
-            LOG.warn(f"필요 호출({total_needed:,})이 일일 한도({DART_DAILY_LIMIT:,})를 초과합니다. "
-                     f"오늘 받을 수 있는 만큼 받고 저장합니다. "
-                     f"약 {math.ceil(total_needed / DART_DAILY_LIMIT)}일에 걸쳐 콜드빌드가 완성됩니다. "
-                     f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
+        # ★★ 예전에는 jobs 전체를 그대로 pmap_io 에 넘기고 '한도에 걸리면 예외가 나겠지'에
+        #    맡겼다. 그 결과 하루치 호출을 통째로 태우고도 아무 회사도 완성되지 않았다
+        #    (실측: 사용자 키가 14,117회 소진). 요구사항은 "남은 호출량을 실시간으로 체크해서
+        #    그만큼만 쓰라"이므로, 던지기 전에 살아 있는 잔여 예산으로 잘라낸다.
+        _left = DBUDGET.remaining_calls() if DBUDGET is not None else None
+        if _left is not None and _left <= 0:
+            LOG.warn(f"DART 잔여 호출이 0 입니다 — Tier-2(전체 재무제표) 신규 수집을 건너뜁니다. "
+                     f"Tier-1(주요계정)만으로 V축·자본잠식 판정은 동작합니다. "
+                     f"내일 재실행하면 정확히 이 지점부터 이어받습니다.")
+            jobs = []
+        elif _left is not None and total_needed > _left:
+            LOG.warn(f"필요 호출({total_needed:,})이 오늘 잔여({_left:,})를 넘습니다 — "
+                     f"잔여만큼인 {_left:,}건만 받고 나머지는 다음 실행으로 넘깁니다. "
+                     f"약 {math.ceil(total_needed / max(_left, 1))}일에 걸쳐 콜드빌드가 완성됩니다. "
+                     f"(우선순위 정렬이 되어 있어 '투자 가능한 종목의 최근 데이터'부터 채워집니다)")
+            jobs = jobs[:_left]
+        else:
+            LOG.info(f"DART 재무 신규 수집 대상 {total_needed:,}건 (오늘 잔여 "
+                     f"{_left if _left is not None else '미상':,}건 이내)"
+                     if _left is not None else f"DART 재무 신규 수집 대상 {total_needed:,}건")
+    if jobs:
         res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
         got = [d for d in res if d is not None and len(d)]
     else:

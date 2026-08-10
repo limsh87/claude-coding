@@ -337,12 +337,25 @@ def _q12():
     # ★ 조립본에서 '실효' 상수를 확인한다. 공용 코어(12_ingest_dart_fin)가 헤더보다 뒤에서
     #   DART_DAILY_LIMIT = 19_000 으로 되돌려 놓기 때문에, 선언만 보면 통과하고 실제로는
     #   사용자가 거부한 값이 살아 있다. 계약은 선언이 아니라 실효값을 봐야 한다.
-    if int(DART_DAILY_LIMIT) != int(DART_DAILY_LIMIT_HINT):
+    #
+    #   ★★ 단, '헤더값과 같아야 한다'로 검정하면 안 된다 ★★
+    #   DartQuota 는 과거 실측 한도를 DART_DAILY_LIMIT 에 되돌려 넣는다(q06:938). 그게 바로
+    #   "남은 호출량을 실시간으로 체크해서 그만큼 쓰라"는 요구사항의 구현이다. 그런데 옛 검정은
+    #   실효값 != 헤더값이면 무조건 위반으로 봤다 — 실측이 성공할수록 계약이 깨지는 구조였고,
+    #   실제로 사용자의 실행이 시작 4초 만에 여기서 멈췄다(실측 14,047 vs 헤더 20,000).
+    #   그래서 '무엇과 같은가'가 아니라 '어디서 온 값인가'를 검정한다:
+    #     허용 = 헤더 힌트 | 저널에서 실측된 값(과거/오늘)
+    #     위반 = 그 어느 쪽도 아닌 값 = 코드에 박힌 상수가 이긴 경우
+    _eff, _hint = int(DART_DAILY_LIMIT), int(DART_DAILY_LIMIT_HINT)
+    _measured = {int(v) for v in (getattr(DQUOTA, "hist_limit", None),
+                                  getattr(DQUOTA, "observed_limit", None)) if v}
+    if _eff != _hint and _eff not in _measured:
         raise ContractViolation(
-            f"실효 DART_DAILY_LIMIT 이 {DART_DAILY_LIMIT:,} 로 헤더 값 "
-            f"{DART_DAILY_LIMIT_HINT:,} 과 다릅니다 — 조립 순서상 뒤에 오는 하드코딩이 "
-            f"헤더를 이기고 있습니다. DartQuota 생성 시 되찾아오는지 확인하세요.")
-    return f"실측 기반 · 공용 저널 합산 · 020/021 구분 · 실효 한도 {DART_DAILY_LIMIT:,}"
+            f"실효 DART_DAILY_LIMIT 이 {_eff:,} 인데 헤더 힌트({_hint:,})도 아니고 "
+            f"저널 실측치{sorted(_measured) or '(없음)'}도 아닙니다 — 조립 순서상 뒤에 오는 "
+            f"하드코딩이 헤더를 이기고 있습니다. DartQuota 생성 시 되찾아오는지 확인하세요.")
+    _src = "실측" if _eff in _measured else "헤더 힌트(실측 기록 없음)"
+    return f"공용 저널 합산 · 020/021 구분 · 실효 한도 {_eff:,} ({_src})"
 
 
 @_contract("Q13", "§10.4 폐기조건 — 충족 시 실제로 멈춘다(보고만 하고 지나가지 않는다)")

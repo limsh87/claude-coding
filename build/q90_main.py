@@ -117,13 +117,49 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
         ctx["cal"] = qvf_rebal_calendar(ctx["px"], BACKTEST_START, BACKTEST_END)
 
     with PIPE.stage("L1.DART", "DART 재무 · 주식총수", "L1", budget_s=3600, critical=False):
-        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+        # ★★ 호출량 폭발의 진원지였다 ★★
+        #   예전에는 전 상장사(폐지 포함 ~5,000)를 그대로 넘겼다. Tier-2(fnlttSinglAcntAll)는
+        #   회사×연도×보고서마다 1회이므로 5,000 × 11 × 4 ≈ 220,000회 — 하루 한도가 2만이든
+        #   4만이든 애초에 끝날 수 없는 설계였다. 실측으로 사용자 키가 하루 14,117회를 태웠다.
+        #   가격에 적용한 '후보 먼저' 원칙을 여기에도 적용한다. 시총 하위 1000 전략이므로
+        #   U-1000 후보 합집합 밖의 회사는 어느 분기에도 편입될 수 없다 = 재무가 필요 없다.
+        _sec = ctx["sec"]
+        _cand = set(ctx.get("candidates") or [])
+        if _cand:
+            _m = _sec[_sec["code"].astype(str).isin(_cand)]
+            corps = _m["corp_code"].dropna().astype(str).unique().tolist()
+            _all_n = _sec["corp_code"].dropna().nunique()
+            LOG.table([["전 상장사 corp_code", f"{_all_n:,}"],
+                       ["U-1000 후보로 축소", f"{len(corps):,}"],
+                       ["절감", f"{100*(1-len(corps)/max(1,_all_n)):.0f}%"],
+                       ["Tier-1 예상 호출", f"약 {math.ceil(len(corps)/100)*len(range(as_ts(BACKTEST_START).year-4, as_ts(BACKTEST_END).year+1))*(1 if DART_STATEMENT_FREQ=='annual' else 4):,}회 (100사 배치)"]],
+                      headers=["DART 수집 범위", "값"],
+                      title="DART 호출 범위 — 시총 하위 1000 전략이므로 후보 밖 회사는 받지 않는다")
+        else:
+            corps = _sec["corp_code"].dropna().astype(str).unique().tolist()
+            LOG.warn(f"U-1000 후보를 못 만들어 전 상장사 {len(corps):,}개로 DART 를 받습니다 — "
+                     f"호출량이 수만 회로 늘어납니다. 시총 스냅샷 단계를 먼저 확인하세요.")
         years = list(range(as_ts(BACKTEST_START).year - 4, as_ts(BACKTEST_END).year + 1))
         multi = fetch_dart_multi_accounts(corps, years)
         fs = fetch_dart_financials(corps, years)
         fin = tidy_financials(merge_financial_tiers(fs, multi))
         ctx["fin"] = apply_t_plus_1(fin, "재무제표")
-        ctx["shares"] = fetch_dart_share_counts(corps, years)
+        # ★ 주식총수는 DART 로 받지 않는다. (corp × year) 마다 1호출이라 후보 2,000사 × 11년
+        #   = 22,000회 — 그것 하나로 하루 한도를 태운다. 그런데 KRX 시총 스냅샷이 '상장주식수'를
+        #   같은 호출에 이미 담아 준다(q21:288). 게다가 일별이라 DART 분기치보다 촘촘하고,
+        #   '그 날 실제 주식수'라 정의상 PIT 이다. Q축 share_growth3y 는 이걸 쓰는 편이 낫다.
+        #   DART 는 '자기주식(유동시총 보정)'에만 필요하므로, 다른 수집을 끝내고 호출이
+        #   남을 때만 받는다 — 남으면 정밀도가 올라가고, 없어도 전략은 돌아간다.
+        _left = DBUDGET.remaining_calls() if DBUDGET is not None else 0
+        _need = len(corps) * len(years)
+        if _left and _left >= _need:
+            ctx["shares"] = fetch_dart_share_counts(corps, years)
+        else:
+            ctx["shares"] = shares_from_cap_snapshots(ctx.get("snaps_cap"), _sec)
+            LOG.info(f"자기주식(DART 주식총수) 수집은 건너뜁니다 — 필요 {_need:,}회 / 잔여 "
+                     f"{_left:,}회. 상장주식수는 KRX 시총 스냅샷에서 이미 확보되어 있어 "
+                     f"Q축 주식수증가율({len(ctx['shares']):,}행)과 시총 계산은 그대로 동작하고, "
+                     f"유동시총만 자기주식 미차감 근사가 됩니다.")
         if len(ctx["fin"]):
             PIT.register("dart_financials", ctx["fin"], key_cols=["corp_code"])
 

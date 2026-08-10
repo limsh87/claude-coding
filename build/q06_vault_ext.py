@@ -1147,6 +1147,28 @@ class DartQuota:
         with self._lk:
             self._flush_locked()
 
+    def remaining_calls(self) -> Optional[int]:
+        """오늘 더 쓸 수 있는 호출 수의 '숫자'. 모르면 None (문자열판 remaining_str 과 짝).
+
+        수집부는 이 값으로 작업 목록을 잘라낸다 — 한도를 코드에 고정하지 않고, 그렇다고
+        전부 던져 놓고 예외를 기다리지도 않기 위해서다. 후자가 실제로 하루치를 통째로
+        태우고도 아무 회사도 완성시키지 못한 원인이었다.
+
+        ★ 실측 상한이 아직 없으면 None 이 아니라 헤더 힌트 기준 잔여를 준다. None 을 주면
+          호출부가 '무제한'으로 오해해 예전 동작으로 되돌아간다.
+        """
+        with self._lk:
+            used = int(self.used_today)
+        if self.observed_limit is not None:          # 오늘 020 을 이미 봤다 = 확정적으로 소진
+            return max(0, int(self.observed_limit) - used)
+        # ★ 과거 실측치는 '그날 그 지점에서 막혔다'는 하한 증거일 뿐 상한이 아니다.
+        #   (키를 다른 프로세스와 나눠 썼으면 그날치가 낮게 찍힌다 — 실제로 사용자 키는
+        #    14,047 에서 막혔지만 OpenDART 공표 한도는 20,000 이다.)
+        #   이걸 상한으로 쓰면 매일 6,000 호출을 스스로 버리게 된다. 계획은 둘 중 큰 값으로
+        #   잡고, 진짜 중단은 오늘 020 이 실제로 올 때 한다 = "실시간으로 체크해서 그만큼 쓴다".
+        cap = max(int(self.hist_limit or 0), int(DART_DAILY_LIMIT_HINT))
+        return max(0, cap - used)
+
     def remaining_str(self) -> str:
         if self.observed_limit is not None:
             return f"0 (오늘 실측 한도 {self.observed_limit:,} 도달)"

@@ -837,3 +837,36 @@ def build_sector_cells(P: pd.DataFrame, min_n: int = CELL_MIN_N) -> pd.DataFrame
     for c in ("cell", "cell_l2", "cell_l3"):
         p[c] = p[c].astype("category")
     return p
+
+
+def shares_from_cap_snapshots(snaps: Optional[pd.DataFrame],
+                              sec: pd.DataFrame) -> pd.DataFrame:
+    """KRX 시총 스냅샷의 '상장주식수'로 DART 주식총수 테이블과 같은 모양을 만든다.
+
+    왜 이게 대체재가 아니라 상위 호환인가:
+      · DART stockTotqySttus 는 (회사 × 연도)마다 1호출이다. 후보 2,000사 × 11년 = 22,000회로
+        그것 하나가 하루 한도를 태운다. 반면 상장주식수는 시총 스냅샷 호출에 이미 실려 온다(0원).
+      · DART 는 분기 공시 시차가 있지만 스냅샷은 '그 날 실제 주식수'라 정의상 PIT 이다.
+      · 스냅샷 격자 = 분기 신호일이므로 share_growth3y 의 shift(12) 가 정확히 3년 전을 가리킨다.
+
+    자기주식(shares_treasury)만은 KRX 가 주지 않으므로 결측으로 둔다 — 유동시총이 자기주식
+    미차감 근사가 된다는 뜻이고, 그 사실은 호출부가 로그로 밝힌다.
+    """
+    cols = ["corp_code", "knowledge_date", "shares_issued", "shares_treasury", "period_end"]
+    if snaps is None or not len(snaps) or sec is None or not len(sec):
+        return pd.DataFrame(columns=cols)
+    m = (sec[["code", "corp_code"]].dropna().astype(str).drop_duplicates("code"))
+    S = snaps.copy()
+    S["code"] = S["code"].astype(str)
+    S = S.merge(m, on="code", how="inner")
+    S["knowledge_date"] = as_ts_series(S["snap_date"])
+    S = S.dropna(subset=["corp_code", "knowledge_date", "shares"])
+    S = S[pd.to_numeric(S["shares"], errors="coerce") > 0]
+    if not len(S):
+        return pd.DataFrame(columns=cols)
+    S["shares_issued"] = pd.to_numeric(S["shares"], errors="coerce")
+    S["shares_treasury"] = np.nan          # KRX 미제공 — 0 으로 채우면 자기주식 0 이라 우기는 셈
+    S["period_end"] = S["knowledge_date"]
+    S = (S.sort_values(["corp_code", "knowledge_date"], kind="stable")
+          .drop_duplicates(["corp_code", "knowledge_date"], keep="last"))
+    return S[cols].reset_index(drop=True)
