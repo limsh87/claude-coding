@@ -211,6 +211,14 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
+        # ★ download_pdfs 가 붙이는 PDF 추출 컬럼은 '캐시된 원장'에만 존재한다. named
+        #   aggregation 은 열거하지 않은 컬럼을 통째로 버리므로, 여기서 명시하지 않으면
+        #   재실행마다 pdf_uid/pdf_analysts/pdf_emails/pdf_target 가 사라지고 그 손실이
+        #   그대로 공용 볼트에 덮어써진다 — build_analyst_ledger 의 pdf_header 폴백이
+        #   그때부터 빈손이 되어 애널리스트 연결이 통째로 끊긴다.
+        **{c: (c, lambda s: next((v for v in s if pd.notna(v) and str(v).strip()), None))
+           for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target")
+           if c in d.columns},
     })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")

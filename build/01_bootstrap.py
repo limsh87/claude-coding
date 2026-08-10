@@ -211,6 +211,46 @@ if OPT.get("pykrx"):
         from pykrx import stock as pykrx_stock    # type: ignore
     except Exception:
         pykrx_stock = None
+
+# ★ pykrx 1.2.8 의 get_auth_session() 은 모듈 전역 _auth_session 에 대해 '락 없는 검사-후-생성'
+#   이다. 스레드 N 개가 동시에 None(또는 만료)을 보면 N 번 로그인하고, KRX 는 중복 로그인을
+#   skipDup 으로 처리하며 앞선 세션을 강제 종료한다. 살아남는 건 1개, 나머지는 죽은 쿠키로
+#   요청해 JSON 대신 로그인 HTML 을 받는다("Expecting value: line 13 column 1"). 만료(3600-300초
+#   =55분) 갱신도 같은 무락 경로라, 공유 세션 하나에 대해 여러 스레드가 동시에 refresh() 를
+#   돌리면 서로가 쓰고 있는 소켓을 close() 한다.
+#   KRXGate(10_ingest_universe.py)는 자기 자신을 통해 들어오는 호출만 직렬화한다. 가격·수급
+#   수집처럼 별도 스레드풀에서 pykrx 를 직접 부르는 호출까지 다 막으려면, 게이트가 아니라
+#   라이브러리 경계에서 막아야 한다 — 호출 지점을 하나라도 놓치면 폭풍이 되살아나기 때문이다.
+#   webio 는 함수를 '이름으로' import 했으므로(from ... import get_auth_session) auth 모듈만
+#   패치하면 효과가 없다 — 두 바인딩을 모두 교체한다. 데이터 호출 자체는 계속 병렬로 둔다.
+if pykrx_stock is not None:
+    try:
+        import pykrx.website.comm.auth as _kauth
+        import pykrx.website.comm.webio as _kwebio
+
+        _KRX_AUTH_LK = threading.RLock()
+        _KRX_AUTH_FAIL = [0.0]          # 음성 캐시 — 틀린 자격증명 재시도 폭주 억제 (10분)
+        _kx_orig_get_auth = _kauth.get_auth_session
+
+        def _kx_get_auth_locked():
+            with _KRX_AUTH_LK:
+                if _KRX_AUTH_FAIL[0] and (time.time() - _KRX_AUTH_FAIL[0]) < 600:
+                    return None
+                try:
+                    s = _kx_orig_get_auth()
+                except Exception:
+                    s = None
+                if s is None and os.environ.get("KRX_ID") and os.environ.get("KRX_PW"):
+                    _KRX_AUTH_FAIL[0] = time.time()
+                else:
+                    _KRX_AUTH_FAIL[0] = 0.0
+                return s
+
+        _kauth.get_auth_session = _kx_get_auth_locked
+        _kwebio.get_auth_session = _kx_get_auth_locked
+    except Exception:
+        pass
+
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore

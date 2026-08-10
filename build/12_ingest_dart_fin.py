@@ -533,16 +533,6 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     if not DART_API_KEY:
         return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])
     cached = VAULT.get_table("dart_disclosures", scope="shared")
-    have_months = set()
-    if cached is not None and len(cached):
-        cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
-        have_months = set(cached["rcept_dt"].dt.to_period("M").astype(str))
-        LOG.info(f"공용 캐시에서 공시목록 {len(cached):,}행 재사용")
-
-    months = pd.period_range(as_ts(start), as_ts(end), freq="M")
-    todo = [m for m in months if str(m) not in have_months]
-    if RUN_MODE == "CACHED":
-        todo = []
 
     # ★ 파이프라인이 실제로 소비하는 공시 유형을 전부 훑어야 한다.
     #   B(주요사항보고)만 훑으면 PACK-C 의 자사주·증자는 잡히지만
@@ -550,6 +540,29 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     #   그러면 fetch_dart_documents 가 걸러낼 대상이 없어 팩 전체가 조용히 죽는다.
     #   (실경로에서만 드러나는 유형 — 합성 스모크는 dis 를 직접 만들어 넣으므로 못 본다)
     DISCLOSURE_TYPES = ("A", "B")            # A=정기공시(사업/반기/분기보고서), B=주요사항보고
+
+    have_months = set()
+    if cached is not None and len(cached):
+        cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
+        if "pblntf_ty" not in cached.columns:
+            cached["pblntf_ty"] = ""         # 유형 태그가 없던 구버전 캐시 = 커버리지 미상
+        cached["pblntf_ty"] = cached["pblntf_ty"].astype(str)
+        # ★ 스킵 기준은 '그 달을 받았다'가 아니라 '그 달을 지금 필요한 유형 전부로 받았다'다.
+        #   DISCLOSURE_TYPES 를 넓혀도, 예전 스윕이 만든 공용 캐시가 그 달을 이미 덮고 있으면
+        #   넓힌 스윕이 단 한 번도 실행되지 않는다. 코드는 고쳐졌는데 실행 결과는 그대로
+        #   굶는다 — 실경로에서만, 그것도 조용히 드러나는 실패다(fail-open 금지).
+        _cov = (cached.groupby(cached["rcept_dt"].dt.to_period("M").astype(str),
+                               observed=True)["pblntf_ty"].agg(set))
+        _need = set(DISCLOSURE_TYPES)
+        have_months = {mo for mo, tys in _cov.items() if _need <= tys}
+        LOG.info(f"공용 캐시에서 공시목록 {len(cached):,}행 재사용 — 유형 "
+                 f"{'/'.join(DISCLOSURE_TYPES)} 가 모두 채워진 달 {len(have_months):,}개월만 "
+                 f"건너뜁니다(나머지 {len(_cov) - len(have_months):,}개월은 재수집).")
+
+    months = pd.period_range(as_ts(start), as_ts(end), freq="M")
+    todo = [m for m in months if str(m) not in have_months]
+    if RUN_MODE == "CACHED":
+        todo = []
 
     def _one(m):
         rows = []
@@ -563,6 +576,10 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
                     "last_reprt_at": "N"})
                 if not js or not isinstance(js.get("list"), list) or not js["list"]:
                     break
+                # ★ 어느 유형 스윕에서 나온 행인지 캐시에 각인한다. 이게 없으면
+                #   다음 실행이 '이 달은 이미 다 받았다'를 판단할 근거가 사라진다.
+                for _r in js["list"]:
+                    _r["pblntf_ty"] = ty
                 rows.extend(js["list"])
                 if page >= int(js.get("total_page", 1) or 1):
                     break
@@ -580,7 +597,7 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
     if new:
         d = pd.DataFrame(new)
         keep = [c for c in ("corp_code", "corp_name", "stock_code", "rcept_no", "rcept_dt",
-                            "report_nm", "flr_nm", "corp_cls") if c in d.columns]
+                            "report_nm", "flr_nm", "corp_cls", "pblntf_ty") if c in d.columns]
         frames.append(d[keep])
     if not frames:
         return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "report_nm", "event"])

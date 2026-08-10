@@ -116,8 +116,14 @@ KRX = KRXAuth(KRX_MARKETPLACE_ID, KRX_MARKETPLACE_PW, KRX_OPENAPI_KEY)
 def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if pykrx_stock is None:
         return None
+    # ★ get_market_ohlcv(from, to, code) 는 adjusted=True 가 기본이라 내부적으로
+    #   get_market_ohlcv_by_date → pykrx.website.naver 를 거쳐 fchart.stock.naver.com 을 친다.
+    #   data.krx.co.kr 을 전혀 두드리지 않는다 — 즉 KRX 세션 유무와 무관하게 동작하고(그래서
+    #   자격증명 없는 기본 모드에서도 이 경로가 동작하는 것이다), 계량은 naver 버킷이어야 한다.
+    #   krx 버킷으로 세면 KRX 를 쓰지도 않는 요청이 2.0qps 상한을 다 잡아먹어, 실제로
+    #   두들겨지는 네이버 호스트는 상한 밖에서 무제한으로 맞는다.
     try:
-        limiter("krx").wait()
+        limiter("naver").wait()
         d = pykrx_stock.get_market_ohlcv(start.replace("-", ""), end.replace("-", ""), code)
     except Exception:
         return None
@@ -129,15 +135,27 @@ def _px_pykrx(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     d = d.rename(columns={k: v for k, v in ren.items() if k in d.columns})
     if "date" not in d.columns:
         d = d.rename(columns={d.columns[0]: "date"})
-    d["code"], d["src"] = code, "pykrx"
+    # ★ 네이버 경로는 거래대금(거래대금)을 주지 않는다 — 시가/고가/저가/종가/거래량/등락률뿐.
+    #   폴백이 없으면 reindex 가 amount 를 전 행 NaN 으로 만들고, 그 결과 adv20 이 전 행 NaN,
+    #   V6 유동성 거부권이 100% 발동해 유니버스가 통째로 비어 백테스트 자체가 사라진다.
+    #   _px_fdr/_px_naver 와 동일한 근사를 쓰고, 근사임을 소스명(pykrx(naver))으로 감사표에 남긴다.
+    if "amount" not in d.columns or pd.to_numeric(d["amount"], errors="coerce").notna().sum() == 0:
+        d["amount"] = pd.to_numeric(d.get("close"), errors="coerce") * \
+            pd.to_numeric(d.get("volume"), errors="coerce")      # 근사 — 감사표에 명시된다
+        d["src"] = "pykrx(naver)"
+    else:
+        d["src"] = "pykrx"
+    d["code"] = code
     return d.reindex(columns=PRICE_COLS)
 
 
 def _px_fdr(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if fdr is None:
         return None
+    # ★ 6자리 코드에 대한 FDR 기본 리더는 NaverDailyReader(fchart.stock.naver.com) 다.
+    #   KRX 를 두드리지 않으므로 위 _px_pykrx 와 같은 이유로 naver 버킷을 쓴다.
     try:
-        limiter("krx").wait()
+        limiter("naver").wait()
         d = fdr.DataReader(code, start, end)
     except Exception:
         return None
@@ -376,9 +394,13 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
     if src_used:
         LOG.table([[k, f"{v:,}"] for k, v in src_used.most_common()],
                   ["사용 소스", "종목수"], ["l", "r"], title="가격 소스 감사 (신규 수집분)")
-        if src_used.get("naver", 0) or src_used.get("yfinance", 0):
-            LOG.warn("네이버/yfinance 경로로 받은 종목은 거래대금이 종가×거래량 근사입니다. "
-                     "V6 유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향).")
+        # ★ "pykrx" 라는 이름만 보고 거래대금이 진짜라고 믿으면 안 된다. pykrx 는 KRX 세션이
+        #   없으면(기본 모드) 내부적으로 네이버 경로를 타는데, 그 경로는 거래대금을 안 주므로
+        #   _px_pykrx 가 종가×거래량 근사를 채우고 소스명을 "pykrx(naver)"로 남겨 둔다.
+        _approx = sum(v for k, v in src_used.items() if k in ("naver", "yfinance") or "(naver)" in k)
+        if _approx:
+            LOG.warn(f"거래대금이 종가×거래량 근사인 종목 {_approx:,}개 (naver/yfinance/pykrx(naver) "
+                     f"경로). V6 유동성 필터의 엄밀성이 그만큼 떨어집니다(과대추정 방향).")
     PIPE.io("OUT", "DRIVE", "krx_ohlcv_daily", px, source="price chain")
     return downcast(px)
 
@@ -444,14 +466,24 @@ def fetch_investor_flows(codes: Sequence[str], start: str, end: str) -> pd.DataF
         LOG.warn("수급 데이터 미수집 (pykrx 없음 또는 CACHED 모드) — D축 d3 는 결측 처리되고 "
                  "U 는 가용 축 평균으로 계산됩니다. 0으로 채우지 않습니다.")
         return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
+    if not KRXG.warmup():
+        LOG.info("KRX 세션이 없어 수급(기관·외국인 순매수) 수집을 건너뜁니다 — "
+                 "이 엔드포인트는 인증이 필요합니다. D축 d3 는 결측 처리됩니다.")
+        return pd.DataFrame(columns=["code", "date", "inst_net", "foreign_net"])
 
     codes = sorted({c for c in map(to_code6, codes) if c})
 
     def _one(code: str):
+        # ★ get_market_trading_value_by_date 는 data.krx.co.kr 을 직접 친다(POST
+        #   getJsonData.cmd) — _px_pykrx 의 시세 조회와 달리 네이버로 안 빠진다. 즉 이 호출은
+        #   KRX 인증 세션을 실제로 쓰는데, 이 함수는 여기서 그걸 8개 스레드로 병렬 호출한다.
+        #   pykrx 의 get_auth_session() 은 잠금 없는 check-then-refresh 라 여러 스레드가 동시에
+        #   만료를 감지하면 서로의 세션을 밀어내며 재로그인한다(KRX CD011) — 그 순간부터
+        #   JSON 대신 로그인 HTML 이 돌아와 이후 요청이 전부 실패한다. KRXG.call 로 직렬화한다
+        #   (10_ingest_universe.py 의 KRXGate — 상장 스냅샷 수집이 쓰는 것과 동일한 게이트).
         try:
-            limiter("krx").wait()
-            d = pykrx_stock.get_market_trading_value_by_date(
-                as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
+            d = KRXG.call(pykrx_stock.get_market_trading_value_by_date,
+                          as_ts(start).strftime("%Y%m%d"), as_ts(end).strftime("%Y%m%d"), code)
         except Exception:
             return None
         if d is None or len(d) == 0:
