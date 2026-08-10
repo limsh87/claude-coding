@@ -270,7 +270,7 @@ def _syn_build_panel(S: dict) -> Tuple[pd.DataFrame, Any, dict]:
     exd = classify_excluded(sec)
     uni = ArcUniverse(base, sec, exd)
     U = uni.build(rebals, mc, liq[["code", "asof", "adtv60"]] if len(liq) else liq)
-    P = build_arc_panel(uni, rebals, U, liq, execp, sec)
+    P = build_arc_panel(uni, rebals, U, liq, execp, sec, px_daily=px)
 
     # 축 B
     pairs = arc_doc_pairs(S["doc_tokens"])

@@ -600,7 +600,27 @@ def arc_doc_pairs(T: pd.DataFrame) -> pd.DataFrame:
     d["bsns_year"] = pd.to_numeric(d["bsns_year"], errors="coerce")
     d = d.dropna(subset=["bsns_year"])
     d["bsns_year"] = d["bsns_year"].astype(int)
-    # 같은 기수에 정정본이 여러 개면 마지막 접수본이 대표
+    # ★ 계약 §4.1: 정정공시(is_amend)는 플래그만 기록하고 신호에는 쓰지 않는다.
+    #   예전에는 keep="last" 만 걸려 있어 **정정본이 원본을 프레임에서 삭제**했다. 그러면
+    #   ① 원본이 실제로 공개됐던 시점의 D1 이 통째로 사라지고(D1_MISSING),
+    #   ② 다음 해의 비교 기준이 '당시 공개돼 있던 텍스트'가 아니라 '나중에 정정된 텍스트'가
+    #      된다 — 그 시점에 읽을 수 없었던 문서를 비교 대상으로 쓰는 미래 참조다.
+    #   정정공시를 내는 기업은 부실기업 쪽으로 치우쳐 있어, 이 손실은 무작위가 아니다.
+    if "is_amend" in d.columns:
+        am = d["is_amend"].astype(bool)
+        n_am = int(am.sum())
+        if n_am:
+            # 원본이 존재하는 기수의 정정본만 뺀다. 정정본밖에 없으면 그거라도 써야
+            # 그 기수가 통째로 사라지지 않는다(근거 없는 결측 금지).
+            key = ["corp_code", "doc_type", "bsns_year", "section"]
+            has_orig = d.loc[~am, key].drop_duplicates().assign(_orig=1)
+            d = d.merge(has_orig, on=key, how="left")
+            drop = am.to_numpy() & (d["_orig"] == 1).to_numpy()
+            LOG.info(f"정정공시 {n_am:,}건 중 원본이 있는 {int(drop.sum()):,}건을 페어링에서 "
+                     f"제외했습니다(§4.1 — 플래그만 기록, 신호 미사용). "
+                     f"원본이 없는 {n_am - int(drop.sum()):,}건은 유지합니다.")
+            d = d[~drop].drop(columns=["_orig"])
+    # 같은 기수에 같은 종류가 여러 개면 마지막 접수본이 대표
     d = (d.sort_values("rcept_dt", kind="stable")
            .drop_duplicates(["corp_code", "doc_type", "bsns_year", "section"], keep="last"))
 

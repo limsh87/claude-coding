@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A21 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A26 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -630,12 +630,173 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A21", "'정보 없음' vs '중립 0' 구분", a21)
 
+    # ── A22  배제 플래그가 소스별로 서로를 지우지 않는가 ──────────────────────────────────
+    def a22():
+        # 한국 소형주에서 흔한 조합: FY 감사의견 '의견거절'(3월 접수) → CB 발행(4월) →
+        # 1분기보고서 정상(5월). 예전에는 5월 행이 최근행이 되어 3·4월 플래그를 지웠다.
+        X = pd.DataFrame([
+            {"corp_code": "C1", "event_date": pd.Timestamp("2018-12-31"),
+             "knowledge_date": pd.Timestamp("2019-03-26"), "EX_AUDIT": 1.0},
+            {"corp_code": "C1", "event_date": pd.Timestamp("2019-04-10"),
+             "knowledge_date": pd.Timestamp("2019-04-11"), "EX_CBBW": 1.0},
+            {"corp_code": "C1", "event_date": pd.Timestamp("2019-03-31"),
+             "knowledge_date": pd.Timestamp("2019-05-16"), "EX_LOSS4Q": 0.0,
+             "EX_IMPAIR": 0.0},
+        ])
+        X = ensure_cols(X, EXCL_COLS, fill=np.nan)
+        S = _event_state_table(X, EXCL_COLS, EXCL_VALID_DAYS)
+        S = pit_frame(S, "event_date", "knowledge_date", source="t")
+        P = pd.DataFrame({"corp_code": ["C1"] * 3, "code": ["000010"] * 3,
+                          "asof": pd.to_datetime(["2019-06-01", "2019-09-01", "2021-06-01"]),
+                          "q": ["2019Q1", "2019Q2", "2021Q1"], "sector": ["기타"] * 3,
+                          "DELTA_NONFIN": [np.nan] * 3})
+        Q = attach_d3(P, None, S)
+        got = pd.to_numeric(Q["EXCLUDE"], errors="coerce").fillna(0).tolist()
+        if got[0] < 1 or got[1] < 1:
+            return False, ("★감사의견 '의견거절'과 CB 발행이 걸린 종목이 다음 분기보고서 "
+                           "접수만으로 제외 해제됐습니다. 소스별 행이 서로의 플래그를 NaN 으로 "
+                           "덮고, as-of 결합이 최근 1행만 붙이기 때문입니다 — §6.4 하드 "
+                           f"제외가 사실상 작동하지 않습니다. EXCLUDE={got}")
+        if got[2] > 0:
+            return False, (f"2년이 지난 뒤에도 제외가 유지됩니다(유효기간 미적용). EXCLUDE={got}")
+        return True, ("소스가 다른 EX_AUDIT·EX_CBBW 가 동시에 유지되고(2019-06/09 제외), "
+                      "유효기간 경과 후 해제됨(2021-06) 확인")
+
+    _ac("A22", "배제 플래그 소스 간 상호 소거 방지", a22)
+
+    # ── A23  전방수익률이 다음 분기 유니버스 잔류에 조건 지워지지 않는가 ─────────────────
+    def a23():
+        # WINNER 는 다음 리밸일에 U-1000 밖으로 나가지만(=크게 오른 종목) 가격은 계속 있다.
+        rb = pd.to_datetime(["2019-03-01", "2019-06-01"])
+        U = pd.DataFrame({"code": ["WIN", "LOS", "LOS"],
+                          "asof": [rb[0], rb[0], rb[1]],
+                          "mktcap": [1e10, 1e10, 1e10], "uni_rank": [1, 2, 1],
+                          "adtv60": [5e8, 5e8, 5e8]})
+        execp = pd.DataFrame({"code": ["WIN", "WIN", "LOS", "LOS"],
+                              "asof": [rb[0], rb[1], rb[0], rb[1]],
+                              "exec_px": [100.0, 118.0, 100.0, 97.0],
+                              "exec_date": [rb[0], rb[1], rb[0], rb[1]]})
+        sec = pd.DataFrame({"code": ["WIN", "LOS"], "name": ["승자", "패자"],
+                            "market": ["KOSDAQ"] * 2, "industry": ["기타"] * 2,
+                            "corp_code": ["W", "L"], "listing_date": [pd.NaT] * 2})
+
+        class _U:
+            def delisting_map(self): return {}
+        P = build_arc_panel(_U(), rb, U, pd.DataFrame(), execp, sec, px_daily=None)
+        w = P[(P["code"] == "WIN") & (P["asof"] == rb[0])]
+        if w.empty or not np.isfinite(float(w["fwd_ret_1q"].iloc[0])):
+            return False, ("★다음 분기에 U-1000 을 이탈하는 종목의 전방수익률이 NaN 입니다. "
+                           "run_backtest 의 elig 필터가 그 종목을 **오늘의 편입 후보에서** "
+                           "지우므로, 오늘의 편입 자격이 내일의 유니버스 잔류 여부로 "
+                           "결정됩니다(방향성 있는 편향).")
+        r = float(w["fwd_ret_1q"].iloc[0])
+        if abs(r - 0.18) > 1e-3:
+            return False, f"전방수익률이 체결가 격자와 불일치: {r:+.4f} (기대 +0.1800)"
+        return True, f"유니버스 이탈 종목도 execp 격자에서 정상 계산 ({r:+.2%})"
+
+    _ac("A23", "전방수익률 ⊥ 미래 유니버스 멤버십", a23)
+
+    # ── A24  상장폐지: 정상 폐지는 청산가, 거래정지 후 폐지는 복원 ────────────────────────
+    def a24():
+        rb = pd.to_datetime(["2019-09-01", "2019-12-01", "2020-03-01"])
+        # MERGE: 2019-12-27 피흡수합병(정상 폐지). 직전까지 정상 거래 → -100% 면 가짜 손실.
+        # HALT : 2019-12-10 거래정지 → 2020-09-30 폐지. 패널에서 먼저 사라지는 경로.
+        U = pd.DataFrame({"code": ["MRG", "HLT"], "asof": [rb[1], rb[1]],
+                          "mktcap": [1e10, 1e10], "uni_rank": [1, 2],
+                          "adtv60": [5e8, 5e8]})
+        execp = pd.DataFrame({"code": ["MRG", "HLT"], "asof": [rb[1], rb[1]],
+                              "exec_px": [100.0, 100.0], "exec_date": [rb[1], rb[1]]})
+        px = pd.DataFrame({
+            "code": ["MRG"] * 2 + ["HLT"] * 2,
+            "date": pd.to_datetime(["2019-12-02", "2019-12-20",
+                                    "2019-12-02", "2019-12-09"]),
+            "open": [100.0, 98.0, 100.0, 40.0], "close": [99.0, 98.0, 95.0, 38.0]})
+        sec = pd.DataFrame({"code": ["MRG", "HLT"], "name": ["합병", "정지"],
+                            "market": ["KOSDAQ"] * 2, "industry": ["기타"] * 2,
+                            "corp_code": ["M", "H"], "listing_date": [pd.NaT] * 2})
+
+        class _U:
+            def delisting_map(self):
+                return {"MRG": pd.Timestamp("2019-12-27"),
+                        "HLT": pd.Timestamp("2020-09-30")}
+        P = build_arc_panel(_U(), rb, U, pd.DataFrame(), execp, sec, px_daily=px)
+        g = {c: float(v) for c, v in zip(P["code"], P["fwd_ret_1q"])}
+        if abs(g.get("MRG", -9) + 1.0) < 1e-6:
+            return False, ("★합병·완전자회사화 같은 정상 폐지에 -100% 가 붙었습니다. "
+                           "실제로는 합병비율·공개매수가로 원금 수준이 회수됩니다 — "
+                           "폐지목록의 34%가 정상 사유이므로 상시 가짜 손실이 됩니다.")
+        if abs(g.get("MRG", 0) - (98.0 / 100.0 - 1.0)) > 1e-6:
+            return False, f"정상 폐지 청산가가 폐지일 직전 종가가 아닙니다: {g.get('MRG')}"
+        if not (g.get("HLT", 0) < -0.5):
+            return False, ("★거래정지 후 폐지 종목의 손실이 계상되지 않았습니다. "
+                           "거래정지 → 시총 격자 소실 → 폐지 순서라 패널에 행이 없어지고, "
+                           "한국의 감사의견거절·자본잠식 폐지는 대부분 이 경로입니다 "
+                           f"— 손실만 선택적으로 사라집니다. fwd_ret={g.get('HLT')}")
+        return True, (f"정상 폐지는 직전 종가 청산({g['MRG']:+.2%}) · "
+                      f"거래정지 후 폐지는 복원({g['HLT']:+.2%})")
+
+    _ac("A24", "§3.4 상장폐지 청산가 · 거래정지 경로", a24)
+
+    # ── A25  결정적 해시 (프로세스 간 재현성) ─────────────────────────────────────────────
+    def a25():
+        import subprocess as _sp
+        src = ("import hashlib;"
+               "print(int.from_bytes(hashlib.blake2b('영업이익'.encode(),"
+               "digest_size=8).digest(),'little')%262144)")
+        outs = set()
+        for _ in range(2):
+            r = _sp.run([sys.executable, "-c", src], capture_output=True, text=True,
+                        timeout=30, env={**os.environ, "PYTHONHASHSEED": "random"})
+            outs.add(r.stdout.strip())
+        if len(outs) != 1:
+            return False, f"해시가 프로세스마다 다릅니다: {outs}"
+        if "hash(w)" in inspect.getsource(_ToneNaiveBayes):
+            return False, ("★폴백 TONE 분류기가 파이썬 내장 hash() 를 씁니다. CPython 의 "
+                           "문자열 해시는 PYTHONHASHSEED 로 프로세스마다 랜덤화되므로 같은 "
+                           "SEED·같은 캐시로 두 번 돌리면 보유 종목이 달라집니다. A14 는 "
+                           "동일 프로세스 안에서 돌아 이것을 잡지 못합니다.")
+        return True, f"blake2b 결정적 해시 사용 · 프로세스 간 동일값({outs.pop()})"
+
+    _ac("A25", "폴백 분류기 해시 결정성", a25)
+
+    # ── A26  D2 윈저 · D1 최종 z 가 기간을 섞지 않는가 ────────────────────────────────────
+    def a26():
+        rng = np.random.default_rng(11)
+        n = 200
+        base = pd.DataFrame({
+            "code": [f"{i:06d}" for i in range(n)] * 2,
+            "corp_code": [f"C{i}" for i in range(n)] * 2,
+            "asof": [pd.Timestamp("2016-09-01")] * n + [pd.Timestamp("2025-09-01")] * n,
+            "q": ["2016Q2"] * n + ["2025Q2"] * n, "sector": ["기타"] * (2 * n),
+            "cell": ["2016Q2|기타"] * n + ["2025Q2|기타"] * n,
+            "cell_all": ["2016Q2|ALL"] * n + ["2025Q2|ALL"] * n,
+            "D2_FORCED_LOW": 0.0})
+        for c, _s in D2_ITEMS:
+            base[c] = rng.normal(size=2 * n)
+        A = attach_d2(base.copy(), None)
+        B = base.copy()
+        # 2025년 코호트의 한 지표만 8배로 부풀린다 — 2016년 점수는 변하면 안 된다.
+        c0 = D2_ITEMS[0][0]
+        B.loc[n:, c0] = B.loc[n:, c0] * 8.0
+        Bz = attach_d2(B, None)
+        d = (pd.to_numeric(A.loc[:n - 1, "D2_SCORE"], errors="coerce") -
+             pd.to_numeric(Bz.loc[:n - 1, "D2_SCORE"], errors="coerce")).abs().max()
+        if not np.isfinite(d):
+            return None, "D2_SCORE 를 계산할 수 없어 건너뜁니다"
+        if d > 1e-6:
+            return False, ("★2025년 데이터를 바꿨더니 2016년 D2_SCORE 가 달라졌습니다 "
+                           f"(최대 {d:.4f}z). 윈저라이즈 경계·강제최하위 값이 전 기간 "
+                           "백분위로 잡혀 있어, 과거 관측치의 클리핑 한계가 미래로 정해집니다.")
+        return True, f"2025년 코호트 변경이 2016년 D2_SCORE 에 영향 없음 (최대 {d:.2e}z)"
+
+    _ac("A26", "D2 윈저라이즈 기간 분리", a26)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A21 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A26 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

@@ -175,7 +175,8 @@ def arc_build_signals(ctx: dict, rebals: pd.DatetimeIndex, gate: dict):
         uni = ArcUniverse(base, ctx["sec"], classify_excluded(ctx["sec"]))
         U = uni.build(rebals, mc, ctx["liq"][["code", "asof", "adtv60"]]
                       if len(ctx.get("liq", [])) else pd.DataFrame())
-        P = build_arc_panel(uni, rebals, U, ctx.get("liq"), ctx.get("exec"), ctx["sec"])
+        P = build_arc_panel(uni, rebals, U, ctx.get("liq"), ctx.get("exec"),
+                            ctx["sec"], px_daily=ctx.get("px"))
         ctx["panel_base"] = P
 
     _d1_on = bool(gate.get("d1", True))

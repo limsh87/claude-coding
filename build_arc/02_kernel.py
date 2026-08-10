@@ -297,7 +297,22 @@ class Pipeline:
             rec.notes.append(skip_reason or "조건 미충족")
             LOG.warn(f"건너뜀 — {skip_reason}")
             LOG.ctx.pop(); self.current = prev
-            yield rec
+            # ★ 본문은 어차피 실행되므로(위 docstring), 예외 가드도 실행 경로와 **동일하게**
+            #   걸어야 한다. 예전에는 이 yield 가 try 밖에 있어서, skip 표시된 스테이지에서는
+            #   critical=False 가 무력화됐다. 게이트가 실패하는 상황은 곧 데이터가 부실한
+            #   상황이므로, 본문이 던질 확률이 가장 높은 바로 그때 가드가 사라졌다.
+            try:
+                yield rec
+            except BaseException as e:                              # noqa
+                rec.err_type = type(e).__name__
+                rec.err_msg = str(e)
+                rec.err_tb = traceback.format_exc()
+                rec.notes.append(f"WARN: SKIP 스테이지 본문에서 {rec.err_type}: {rec.err_msg}")
+                LOG.error(f"건너뛴 스테이지 본문에서 예외 — {rec.err_type}: {rec.err_msg}")
+                if critical:
+                    rec.status = "FAIL"
+                    raise
+                rec.status = "WARN"
             return
         rec.status = "RUNNING"
         rec.t_start = time.time()

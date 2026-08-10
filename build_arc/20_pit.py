@@ -161,6 +161,16 @@ class Universe:
         self.sec["delisting_date"] = as_ts_series(self.sec["delisting_date"])
         self.sec = self.sec.drop_duplicates("code").reset_index(drop=True)
 
+        # ★ 추정 상장일(첫 스냅샷 관측일)로는 종목을 탈락시키지 않는다. 그 값은 대개
+        #   '백테 시작월'이라, 그대로 앵커로 쓰면 스냅샷 커버리지가 짧은 폐지 종목만
+        #   초기 구간에서 사라진다 — 생존군과 폐지군에 다른 규칙이 적용되는 비대칭이다.
+        if "listing_date_src" in self.sec.columns:
+            est = self.sec["listing_date_src"].astype(str).str.contains("추정", na=False)
+            if int(est.sum()):
+                LOG.info(f"추정 상장일 {int(est.sum()):,}종목은 시즈닝 앵커에서 제외합니다 "
+                         f"(근거 없는 제외 금지).")
+            self.sec.loc[est, "listing_date"] = pd.NaT
+
         # 벡터화용 배열 (at() 이 매월 3,500행 itertuples 를 도는 것을 없앤다)
         self._codes_arr = self.sec["code"].to_numpy(dtype=object)
         self._ld_arr = self.sec["listing_date"].to_numpy(dtype="datetime64[ns]")
@@ -339,7 +349,17 @@ def build_cells(panel: pd.DataFrame, sec: pd.DataFrame, min_n: int = CELL_MIN_N)
 # 2024 영숫자 체계는 6번째 자리가 K/L/M/N.
 _PREF_NEW_RE = re.compile(r"^\d{4}[0-9A-HJ-NP-TV-Z][KLMN]$")     # 2024 영숫자 체계 우선주
 _SPAC_RE = re.compile(r"스팩|기업인수목적")
-_REIT_RE = re.compile(r"리츠|리 츠|REIT", re.I)
+# ★ '리츠' 부분문자열 매칭은 보통주를 상시 제외한다 — 실제 KRX 명단에서 메리츠금융지주·
+#   메리츠증권·메리츠화재·블리츠웨이엔터테인먼트·유레스메리츠1 이 리츠로 오분류됐다.
+#   블리츠웨이는 KOSDAQ 소형주라 U-1000 을 직격한다. 어미 기준으로 좁힌다.
+_REIT_RE = re.compile(r"(?:^|[^가-힣A-Za-z])리\s?츠(?:$|[0-9]*\s*호?$)|"
+                      r"리\s?츠(?:부동산)?투자회사|\bREITs?\b", re.I)
+# 종목명보다 신뢰도가 높은 판정 근거. 폐지목록 CSV 의 SecuGroup 에 실제로 들어 있다.
+_REIT_SECUGROUP_RE = re.compile(r"부동산투자회사|REIT", re.I)
+# §3.1 은 KOSPI + KOSDAQ 이다. KONEX·수익증권·투자회사·선박투자회사는 유니버스 밖이다.
+ARC_ALLOWED_MARKETS = ("KOSPI", "KOSDAQ")
+_NONEQUITY_SECUGROUP_RE = re.compile(
+    r"수익증권|투자회사|선박투자회사|신주인수권|출자증권|외국주권예탁증서|ETN|ETF", re.I)
 _PREF_NAME_RE = re.compile(r"\d?\s*우(?:B|C)?$|우선주$")
 
 
@@ -378,24 +398,49 @@ def classify_excluded(sec: pd.DataFrame) -> pd.DataFrame:
     배제 플래그가 잡으며, ③ 거래정지는 '유동성 하한 미달'로 자연 탈락한다.
     이 근사는 리포트에 명시한다 — 숨기지 않는다.
     """
-    cols = ["code", "ex_spac", "ex_pref", "ex_reit", "ex_static"]
+    cols = ["code", "ex_spac", "ex_pref", "ex_reit", "ex_market", "ex_static"]
     if sec is None or sec.empty:
         return pd.DataFrame(columns=cols)
     S = sec.copy()
     S["code"] = S["code"].astype(str)
     nm = S.get("name", pd.Series("", index=S.index)).astype(str)
+    sg = S.get("secugroup", pd.Series("", index=S.index)).astype(str)
     S["ex_spac"] = nm.str.contains(_SPAC_RE, na=False).astype("int8")
-    S["ex_reit"] = nm.str.contains(_REIT_RE, na=False).astype("int8")
+    S["ex_reit"] = (nm.str.contains(_REIT_RE, na=False) |
+                    sg.str.contains(_REIT_SECUGROUP_RE, na=False)).astype("int8")
     _base = set(S["code"].astype(str))
     S["ex_pref"] = [1 if is_preferred(c, n, _base) else 0 for c, n in zip(S["code"], nm)]
-    S["ex_static"] = ((S["ex_spac"] + S["ex_reit"] + S["ex_pref"]) > 0).astype("int8")
+
+    # ★ §3.1 시장 필터. 이게 없으면 KONEX·수익증권·선박투자회사가 U-1000 에 들어온다.
+    #   U-1000 은 '시총 오름차순 하위 1000' 이므로 시총이 극소인 이들이 정의상 컷 안쪽에
+    #   확정 편입되어 정규 KOSDAQ 소형주를 밀어낸다. 시장 정보가 아예 없는 종목은
+    #   제외하지 않는다(근거 없는 제외 금지) — 대신 건수를 로그로 드러낸다.
+    mk = S.get("market", pd.Series("", index=S.index)).astype(str).str.upper().str.strip()
+    known_mk = mk.str.len() > 0
+    ok_mk = mk.str.startswith(tuple(m.upper() for m in ARC_ALLOWED_MARKETS))
+    S["ex_market"] = ((known_mk & ~ok_mk) |
+                      sg.str.contains(_NONEQUITY_SECUGROUP_RE, na=False)).astype("int8")
+
+    S["ex_static"] = ((S["ex_spac"] + S["ex_reit"] + S["ex_pref"] +
+                       S["ex_market"]) > 0).astype("int8")
     n = int(S["ex_static"].sum())
     LOG.info(f"§3.3 상시 제외 {n:,}종목 — 스팩 {int(S['ex_spac'].sum()):,} · "
-             f"우선주 {int(S['ex_pref'].sum()):,} · 리츠 {int(S['ex_reit'].sum()):,}")
+             f"우선주 {int(S['ex_pref'].sum()):,} · 리츠 {int(S['ex_reit'].sum()):,} · "
+             f"시장/증권종류 밖 {int(S['ex_market'].sum()):,}")
+    if int((~known_mk).sum()):
+        LOG.info(f"  시장 정보가 없는 {int((~known_mk).sum()):,}종목은 시장 필터를 "
+                 f"적용하지 않았습니다(근거 없는 제외 금지).")
+    if int(S["ex_market"].sum()):
+        _mk_cnt = mk[S["ex_market"] > 0].replace("", "미상").value_counts()
+        LOG.info("  제외된 시장 구성: " +
+                 " · ".join(f"{k} {v:,}" for k, v in _mk_cnt.head(6).items()))
     # ★ 안전밸브: 상시 제외가 과도하면 규칙이 오작동하고 있다는 뜻이다. 조용히 넘기면
     #   유니버스가 붕괴한 채로 백테스트가 끝까지 돌아가 '표본이 적은 좋은 성과'를 만든다.
-    if len(S) and n / len(S) > 0.15:
-        LOG.warn(f"상시 제외 비율이 {100*n/len(S):.1f}% 로 과도합니다(정상 범위 5~12%). "
+    #   시장 필터는 정의상 제외(§3.1)라 오작동 지표가 아니므로 경보 분자에서 뺀다.
+    n_heur = int(((S["ex_spac"] + S["ex_reit"] + S["ex_pref"]) > 0).sum())
+    if len(S) and n_heur / len(S) > 0.15:
+        LOG.warn(f"이름 규칙 기반 상시 제외 비율이 {100*n_heur/len(S):.1f}% 로 과도합니다"
+                 f"(정상 범위 5~12%). "
                  f"우선주 판정 규칙이 오작동해 보통주를 걸러내고 있을 가능성이 큽니다 — "
                  f"유니버스 감쇠 감사표에서 종목수를 반드시 확인하세요.")
         PIPE.note(f"WARN: 상시 제외 {100*n/len(S):.0f}%")
@@ -654,12 +699,53 @@ def build_exec_prices(px_daily: pd.DataFrame, rebals: pd.DatetimeIndex) -> pd.Da
     return downcast(E)
 
 
+def _last_close_before(px_daily: Optional[pd.DataFrame],
+                       codes: Sequence[str], cutoffs: pd.Series) -> pd.Series:
+    """각 (code, cutoff) 에 대해 cutoff 이하 마지막 종가. 상장폐지 청산가 산출용."""
+    idx = pd.RangeIndex(len(codes))
+    if px_daily is None or px_daily.empty:
+        return pd.Series(np.nan, index=idx, dtype="float64")
+    d = px_daily[["code", "date", "close"]].dropna(subset=["code", "date"]).copy()
+    d["code"] = d["code"].astype(str)
+    d["date"] = as_ts_series(d["date"])
+    d["close"] = pd.to_numeric(d["close"], errors="coerce")
+    d = d[np.isfinite(d["close"]) & (d["close"] > 0)].sort_values("date", kind="stable")
+    if d.empty:
+        return pd.Series(np.nan, index=idx, dtype="float64")
+    left = pd.DataFrame({"_i": idx, "code": pd.Series(codes, dtype=object).astype(str),
+                         "_cut": as_ts_series(pd.Series(list(cutoffs)))})
+    keep = left["_cut"].notna()
+    L = left[keep].sort_values("_cut", kind="stable")
+    if L.empty:
+        return pd.Series(np.nan, index=idx, dtype="float64")
+    try:
+        M = pd.merge_asof(L, d, left_on="_cut", right_on="date", by="code",
+                          direction="backward")
+    except Exception as e:                                          # noqa
+        LOG.warn(f"상장폐지 최종 종가 조회 실패({type(e).__name__}) — -100% 로 처리합니다.")
+        return pd.Series(np.nan, index=idx, dtype="float64")
+    out = pd.Series(np.nan, index=idx, dtype="float64")
+    out.loc[M["_i"].to_numpy()] = M["close"].to_numpy(dtype="float64")
+    return out
+
+
 def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFrame,
-                    liq: pd.DataFrame, execp: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
+                    liq: pd.DataFrame, execp: pd.DataFrame, sec: pd.DataFrame,
+                    px_daily: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """U-1000 멤버십 + 유동성 + 체결가 + 전방수익률 → 기본 패널 P.
 
-    ★ 전방수익률은 '바로 다음 리밸일'과만 짝지어야 한다. 중간 리밸일이 패널에서 빠지면
-      shift(-1) 이 두 분기 뒤 가격을 끌어와 한 분기 수익으로 둔갑시킨다(수익 과대계상).
+    ★ 전방수익률은 패널(=U-1000 멤버십) 내부 shift 로 만들면 안 된다. 세 가지가 동시에 깨진다:
+      ① 다음 리밸일에 U-1000 밖으로 나간 종목(시총이 커진 '큰 승자', 유동성이 마른 '붕괴
+         종목')은 전방수익률이 NaN 이 되고, run_backtest 의 elig 필터가 그 종목을 **오늘의
+         편입 후보에서** 지운다 → 오늘의 편입 자격이 내일의 유니버스 잔류 여부로 결정된다.
+      ② 거래정지가 한 분기 이상 이어지면 시총 격자에서 먼저 사라지므로, 폐지일이 왔을 때
+         -100% 를 계상할 행 자체가 없다. 한국의 감사의견거절·자본잠식 폐지는 대부분
+         '수개월 거래정지 → 폐지' 경로라, 이 손실이 통째로 사라진다.
+      ③ 합병·완전자회사화 같은 정상 폐지에까지 -100% 가 붙는다(실제로는 합병비율·공개매수가로
+         원금 수준이 회수된다).
+      → 전방수익률은 execp(전 종목 × 전 리밸일 체결가 격자)에서 (code, asof+3k월) 로 직접
+        만들고, 폐지는 delisting_map() 전수 기준으로 판정하며 청산가는 폐지일 이전 마지막
+        종가를 쓴다. 마지막 종가조차 없을 때만 -100%.
     """
     if U is None or U.empty:
         raise RuntimeError(
@@ -703,27 +789,73 @@ def build_arc_panel(uni: "ArcUniverse", rebals: pd.DatetimeIndex, U: pd.DataFram
         LOG.info(f"상장 {ARC_MIN_LISTING_M}개월 미만 {int(young.sum()):,}행 제외 (§3.3)")
         P = P[~young]
 
-    # ── 전방수익률 (1Q / 2Q / 4Q) ─────────────────────────────────────────────────────────
+    # ── 전방수익률 (1Q / 2Q / 4Q) — execp 전수 격자 기준 ────────────────────────────────────
     P = P.sort_values(["code", "asof"], kind="stable").reset_index(drop=True)
-    g = P.groupby("code", observed=True)
     delist = uni.delisting_map()
     dl = P["code"].map(lambda c: delist.get(c)).astype("datetime64[ns]")
+
+    if execp is not None and len(execp):
+        EG = execp[["code", "asof", "exec_px"]].dropna(subset=["code", "asof"]).copy()
+        EG["code"] = EG["code"].astype(str)
+        EG["asof"] = as_ts_series(EG["asof"])
+        EG = EG.drop_duplicates(["code", "asof"])
+    else:
+        EG = pd.DataFrame(columns=["code", "asof", "exec_px"])
+
+    src_counts: Dict[str, int] = {}
     for k, lab in ((1, "fwd_ret_1q"), (2, "fwd_ret_2q"), (4, "fwd_ret_4q")):
-        nxt_px = g["exec_px"].shift(-k)
-        nxt_as = g["asof"].shift(-k)
-        # 인접성: k 분기 뒤 리밸일이 정확히 k×3개월 뒤여야 한다
-        gap_m = ((nxt_as.dt.year - P["asof"].dt.year) * 12 +
-                 (nxt_as.dt.month - P["asof"].dt.month))
-        adjacent = gap_m == (3 * k)
-        r = (nxt_px / P["exec_px"] - 1.0).where(adjacent)
-        # ★ §3.4 상장폐지: 보유 구간 안에 폐지일이 들어오면 -100%. 결측으로 두면 생존자편향이다.
-        horizon_end = P["asof"] + pd.DateOffset(months=3 * k)
-        died = dl.notna() & (dl > P["asof"]) & (dl <= horizon_end)
-        r = r.mask(died & r.isna(), -1.0)
+        tgt = P["asof"] + pd.DateOffset(months=3 * k)
+        if len(EG):
+            nxt = (pd.DataFrame({"code": P["code"].astype(str), "asof": tgt})
+                     .merge(EG.rename(columns={"exec_px": "_nxt"}),
+                            on=["code", "asof"], how="left")["_nxt"])
+            nxt.index = P.index
+        else:
+            nxt = pd.Series(np.nan, index=P.index, dtype="float64")
+        base = pd.to_numeric(P["exec_px"], errors="coerce")
+        r = pd.to_numeric(nxt, errors="coerce") / base - 1.0
+
+        # ★ 폐지는 전방가격 유무와 무관하게 폐지 처리가 이긴다(정상 청산도 폐지가 최종 사건).
+        died = dl.notna() & (dl > P["asof"]) & (dl <= tgt)
+        # ★ '거래정지 → 유니버스 소실 → 몇 분기 뒤 폐지' 경로. 보유 중에 팔 수 없었고 결국
+        #   폐지됐으므로, 청산 결과를 이 분기에 계상한다. 결측으로 두면 손실만 사라진다.
+        stuck = r.isna() & dl.notna() & (dl > P["asof"]) & ~died
+        resolve = died | stuck
+        if resolve.any():
+            lc = _last_close_before(px_daily, P["code"].astype(str).tolist(),
+                                    dl.where(resolve))
+            lc.index = P.index
+            r_die = pd.to_numeric(lc, errors="coerce") / base - 1.0
+            # 폐지일이 진입 체결일보다 앞서면 애초에 보유할 수 없다 → 청산가로 쓰지 않는다.
+            too_early = as_ts_series(P.get("exec_date", P["asof"])) > dl
+            r_die = r_die.mask(too_early)
+            r = r.mask(resolve, r_die.fillna(-1.0))
+            if k == 1:
+                src_counts = {
+                    "폐지_최종종가청산": int((resolve & r_die.notna()).sum()),
+                    "폐지_종가없음_-100%": int((resolve & r_die.isna()).sum()),
+                    "거래정지후폐지_복원": int(stuck.sum())}
         P[lab] = r.astype("float32")
-    n_died = int((dl.notna() & (dl > P["asof"]) &
-                  (dl <= P["asof"] + pd.DateOffset(months=3))).sum())
-    LOG.info(f"보유 구간 내 상장폐지 관측 {n_died:,}건 → 정리매매가 없으면 -100% 로 반영 (§3.4)")
+
+    # 폐지 계상 누락 감시 — 패널 행이 있는 종목만 세면 '거래정지 후 폐지' 경로가 통째로 빠진다.
+    n_died_panel = int((dl.notna() & (dl > P["asof"]) &
+                        (dl <= P["asof"] + pd.DateOffset(months=3))).sum())
+    reb = pd.DatetimeIndex(rebals)
+    n_died_all = 0
+    for c, d0 in (delist or {}).items():
+        d0 = as_ts(d0)
+        if d0 is None or pd.isna(d0):
+            continue
+        n_died_all += int(((reb < d0) & (d0 <= reb + pd.DateOffset(months=3))).sum())
+    LOG.info(f"보유 구간 내 상장폐지: 패널 계상 {n_died_panel:,}건 "
+             f"(청산가 반영 {src_counts.get('폐지_최종종가청산', 0):,} · "
+             f"-100% {src_counts.get('폐지_종가없음_-100%', 0):,}) · "
+             f"거래정지 후 폐지 복원 {src_counts.get('거래정지후폐지_복원', 0):,}건 · "
+             f"폐지목록 전수 기준 {n_died_all:,}건 (§3.4)")
+    if n_died_all and (n_died_panel + src_counts.get("거래정지후폐지_복원", 0)) == 0:
+        LOG.warn(f"폐지목록에는 보유 구간 내 폐지가 {n_died_all:,}건 있는데 패널에서 계상된 "
+                 f"것이 0건입니다. 폐지 종목이 폐지 전에 유니버스에서 사라졌다는 뜻이므로 "
+                 f"생존자편향입니다 — 시총 격자·유동성 필터를 확인하세요.")
 
     P["log_mktcap"] = np.log(pd.to_numeric(P["mktcap"], errors="coerce").where(lambda s: s > 0))
     P["log_adtv"] = np.log(pd.to_numeric(P["adtv60"], errors="coerce").where(lambda s: s > 0))

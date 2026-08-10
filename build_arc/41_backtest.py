@@ -108,6 +108,7 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
     delist = uni.delisting_map() if uni is not None else {}
     rows, holdings = [], []
     prev_w: Dict[str, float] = {}
+    n_impute_tot, w_impute_tot = 0, 0.0
 
     need = [c for c in ("code", "asof", "adtv60", "fwd_ret_1q", signal_col, "FINAL_SCORE",
                         "vol_q", "EXCLUDE") if c in P.columns]
@@ -116,17 +117,37 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
     for t in rebals:
         t = as_ts(t)
         sub = B[B["asof"] == t]
-        if sub.empty:
-            rows.append({"asof": t, "ret": 0.0, "ret_gross": 0.0, "n": 0,
-                         "turnover": 0.0, "cost": 0.0, "n_elig": 0})
+        # ★ 측정 가능한 분기인가. 마지막 리밸일은 다음 리밸일이 없어 전 종목 fwd_ret 이 결측인데,
+        #   예전에는 그 분기를 '수익률 0' 으로 성과 시계열에 넣었다. 그러면 CAGR 분모의 연수가
+        #   9.75년 대신 10년이 되고, 변동성이 희석되고, 승률 분모가 부풀려진다.
+        #   measurable=False 로 표시해 perf_stats 에서 제외한다. 청산 비용만 따로 계상한다.
+        measurable = bool(len(sub)) and bool(
+            pd.to_numeric(sub["fwd_ret_1q"], errors="coerce").notna().any())
+        if sub.empty or not measurable:
+            liq_cost = 0.0
+            if apply_costs and prev_w:
+                liq_cost = sum(abs(v) for v in prev_w.values()) * (
+                    ARC_COMMISSION_BPS / 1e4 + arc_sell_tax(t))
+            rows.append({"asof": t, "ret": -liq_cost, "ret_gross": 0.0, "n": 0,
+                         "turnover": float(sum(abs(v) for v in prev_w.values())),
+                         "cost": liq_cost, "n_elig": 0, "n_imputed": 0, "w_imputed": 0.0,
+                         "measurable": False})
+            prev_w = {}
             continue
-        elig = sub[sub[signal_col].notna() & sub["fwd_ret_1q"].notna()]
+        # ★ 편입 자격은 '오늘 신호가 있는가' 만으로 판정한다. 예전에는 여기에
+        #   `& sub["fwd_ret_1q"].notna()` 가 붙어 있었는데, 그러면 **t 시점의 편입 가능
+        #   여부가 t+1 시점의 정보(다음 분기에 유니버스에 남아 있는가 / 가격이 있는가)로
+        #   결정된다.** 방향성 있는 편향이다 — 시총이 커져 U-1000 을 이탈하는 종목(=크게
+        #   오른 종목)과 유동성이 말라 이탈하는 종목(=붕괴 중인 종목)이 둘 다 후보에서
+        #   지워졌다. 측정 불가는 아래에서 '유니버스 중앙값으로 대치 + 건수 보고'로 다룬다.
+        elig = sub[sub[signal_col].notna()]
         n_elig = len(elig)
         if uni is not None:
             uni.audit_row("신호보유", t, elig["code"].tolist())
         if n_elig == 0:
             rows.append({"asof": t, "ret": 0.0, "ret_gross": 0.0, "n": 0,
-                         "turnover": 0.0, "cost": 0.0, "n_elig": 0})
+                         "turnover": 0.0, "cost": 0.0, "n_elig": 0,
+                         "n_imputed": 0, "w_imputed": 0.0, "measurable": True})
             prev_w = {}
             continue
 
@@ -163,20 +184,38 @@ def run_backtest(P: pd.DataFrame, rebals: pd.DatetimeIndex, uni, sec: pd.DataFra
                       pd.to_numeric(pick["fwd_ret_1q"], errors="coerce")))
         sig = dict(zip(pick["code"].astype(str),
                        pd.to_numeric(pick[signal_col], errors="coerce")))
+        # 측정 불가 종목의 대치값 = 그 분기 유니버스 전체의 중앙값 수익률.
+        # 0 으로 채우면 '현금 보유'라는 없는 가정을 넣게 되고, 버리면 표본이 선택된다.
+        uni_r = pd.to_numeric(sub["fwd_ret_1q"], errors="coerce")
+        fallback = float(uni_r.median()) if uni_r.notna().any() else 0.0
+        n_imputed, w_imputed = 0, 0.0
         for c, ww in w_new.items():
             fr = fw.get(c, np.nan)
             dl = delist.get(c)
-            # ★ §3.4 상장폐지: 보유 구간 안에 폐지가 들어오면 −100%. 누락 처리는 생존자편향이다.
-            if dl is not None and pd.notna(dl) and t < dl <= t + pd.DateOffset(months=3):
-                fr = -1.0 if not np.isfinite(fr) else fr
+            # ★ §3.4 2중 방어: 패널이 폐지를 놓쳤어도 여기서 잡는다. 예전에는 위쪽 elig 가
+            #   fwd_ret 결측 행을 이미 지워 이 분기가 도달 불가능한 죽은 코드였다.
+            if (not np.isfinite(fr)) and dl is not None and pd.notna(dl) and dl > t:
+                fr = -1.0
             if not np.isfinite(fr):
-                fr = 0.0
+                fr = fallback
+                n_imputed += 1
+                w_imputed += float(ww)
             ret += ww * float(fr)
             holdings.append({"asof": t, "code": c, "weight": float(ww), "ret": float(fr),
                              "signal": float(sig.get(c, np.nan))})
+        if n_imputed:
+            n_impute_tot += n_imputed
+            w_impute_tot += w_imputed
         rows.append({"asof": t, "ret": ret - cost, "ret_gross": ret, "n": len(w_new),
-                     "turnover": turn, "cost": cost, "n_elig": n_elig})
+                     "turnover": turn, "cost": cost, "n_elig": n_elig,
+                     "n_imputed": n_imputed, "w_imputed": w_imputed, "measurable": True})
         prev_w = w_new
+
+    if n_impute_tot:
+        LOG.warn(f"[{label}] 전방수익률 측정 불가 {n_impute_tot:,}건(누적 비중 "
+                 f"{w_impute_tot:.2f})을 해당 분기 유니버스 중앙값으로 대치했습니다. "
+                 f"거래정지 후 재개 또는 가격 결측 구간입니다 — 폐지 종목은 위 §3.4 경로로 "
+                 f"이미 청산 처리되었습니다.")
 
     R = pd.DataFrame(rows)
     if len(R):
@@ -193,7 +232,12 @@ def perf_stats(R: pd.DataFrame, rf: float = 0.0, gross: bool = False) -> dict:
     if R is None or len(R) == 0:
         return {}
     key = "ret_gross" if (gross and "ret_gross" in R.columns) else "ret"
-    r = pd.to_numeric(R[key], errors="coerce").fillna(0).to_numpy(dtype=float)
+    # ★ 측정 불가 분기(마지막 리밸일 등)는 성과 통계에서 뺀다. 수익률 0 으로 끼워 넣으면
+    #   연수·변동성·승률 분모가 전부 조용히 왜곡된다.
+    Rm = R[R["measurable"].astype(bool)] if "measurable" in R.columns else R
+    if len(Rm) == 0:
+        Rm = R
+    r = pd.to_numeric(Rm[key], errors="coerce").fillna(0).to_numpy(dtype=float)
     n = len(r)
     if n == 0:
         return {}

@@ -16,8 +16,9 @@
 # ║    조용히 쪼그라들어 곧바로 선택편향이 된다.                                               ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
-SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "delisting_date",
-                   "corp_code", "industry", "sector_src", "src"]
+SEC_MASTER_COLS = ["code", "name", "market", "listing_date", "listing_date_src",
+                   "delisting_date", "corp_code", "industry", "sector_src", "src",
+                   "delist_reason", "secugroup"]
 
 # 스냅샷 주기: "Q"(분기·기본) | "M"(월) | "A"(연) | "off"
 #   월 단위는 120개월 × 2시장 = 240 호출이라 KRX 세션을 자주 건드리고 차단 위험이 커진다.
@@ -250,8 +251,15 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     if not code_c:
         LOG.warn(f"상장폐지 파일에서 종목코드 컬럼을 찾지 못했습니다: {list(d.columns)[:12]}")
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
-    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
-                                  "listingdate") if k in col), None)
+    # ★ 'listingdate' 를 폐지일 폴백으로 쓰면 안 된다 — 상장일을 폐지일로 읽는 순간
+    #   그 종목은 상장 당일 폐지된 것으로 취급되어 유니버스에서 통째로 사라진다.
+    dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date")
+                 if k in col), None)
+    # ★ 폐지목록 CSV 에는 ListingDate 가 실제로 들어 있다. 이것을 버리면 build_security_master
+    #   가 '첫 스냅샷 등장일'(≈백테 시작월)을 상장일로 날조하고, 그 위에 250거래일 시즈닝이
+    #   걸려 **폐지 종목만** 백테 초기 구간에서 사라진다(생존자편향의 정확한 반대 경로).
+    ld_c = next((col[k] for k in ("listingdate", "listing_date", "listdate") if k in col), None)
+    rs_c = next((col[k] for k in ("reason", "delistingreason", "note") if k in col), None)
     name_c = col.get("name") or col.get("isu_nm") or code_c
 
     n_raw = len(d)
@@ -262,6 +270,8 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        "listing_date": as_ts_series(d[ld_c]) if ld_c else pd.NaT,
+        "delist_reason": d[rs_c].astype(str) if rs_c else "",
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
         "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
@@ -274,6 +284,20 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_nodate = int(t["delisting_date"].isna().sum())
 
     LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
+    n_ld = int(t["listing_date"].notna().sum())
+    LOG.info(f"  폐지목록에서 상장일 {n_ld:,}건 확보 "
+             f"({100*n_ld/max(len(t),1):.0f}%) — 시즈닝 앵커 날조 방지용")
+    if rs_c:
+        rc = t["delist_reason"].astype(str).str.strip().replace("", "미상").value_counts()
+        NORMAL = r"합병|완전자회사|자회사\s*편입|신청|이전\s*상장|재상장|스팩"
+        n_norm = int(t["delist_reason"].astype(str).str.contains(NORMAL, na=False).sum())
+        LOG.info(f"  폐지 사유 상위: " +
+                 " · ".join(f"{k} {v:,}" for k, v in rc.head(6).items()))
+        LOG.info(f"  이 중 정상 사유(합병·완전자회사화·자진상장폐지 등) {n_norm:,}건 "
+                 f"({100*n_norm/max(len(t),1):.0f}%) — 이들에 -100% 를 붙이면 가짜 손실이 "
+                 f"됩니다. 청산가는 폐지일 직전 종가를 씁니다(§3.4).")
+    else:
+        LOG.warn("폐지 사유 컬럼이 없어 정상 폐지(합병 등)와 부실 폐지를 구분할 수 없습니다.")
     if n_raw - len(t):
         LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
                  f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
@@ -506,8 +530,14 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        # ★ 폐지목록이 상장일을 주면 반드시 쓴다. 버리면 아래 snap_first 백필이
+        #   '첫 스냅샷 등장일'을 상장일로 날조하고, 그 위에 시즈닝이 걸려 폐지 종목만
+        #   백테 초기에서 사라진다.
+        _dcols = ["code", "name", "delisting_date", "market"] + \
+                 [c for c in ("listing_date", "delist_reason") if c in dead.columns]
+        d2 = dead.reindex(columns=_dcols).copy()
+        if "listing_date" not in d2.columns:
+            d2["listing_date"] = pd.NaT
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
@@ -565,8 +595,20 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         g = snapshots.groupby("code")["snap_date"]
         agg = agg.merge(g.min().rename("snap_first"), left_on="code", right_index=True, how="left")
         agg = agg.merge(g.max().rename("snap_last"), left_on="code", right_index=True, how="left")
+        # ★ 스냅샷 백필은 '관측 시작일'이지 상장일이 아니다. 백테 시작월 이전에 상장된
+        #   종목은 전부 백테 시작월이 상장일로 찍히고, 그 위에 250거래일 시즈닝 +
+        #   ARC_MIN_LISTING_M 이 걸려 **그 종목만** 초기 구간에서 사라진다.
+        #   폐지 종목은 스냅샷 커버리지가 짧아 이 경로에 훨씬 많이 걸리므로, 생존군과
+        #   폐지군에 서로 다른 규칙이 적용되는 비대칭이 생긴다. 출처를 기록해 시즈닝
+        #   앵커에서 제외한다(=추정 상장일로는 종목을 탈락시키지 않는다).
         need = agg["listing_date"].isna() & agg["snap_first"].notna()
+        agg["listing_date_src"] = np.where(agg["listing_date"].notna(), "source", "")
         agg.loc[need, "listing_date"] = agg.loc[need, "snap_first"]
+        agg.loc[need, "listing_date_src"] = "snapshot(추정)"
+        if int(need.sum()):
+            LOG.info(f"상장일이 없는 {int(need.sum()):,}종목을 첫 스냅샷 관측일로 보완했습니다. "
+                     f"이 값은 **추정치**이므로 시즈닝·상장 {ARC_MIN_LISTING_M}개월 필터의 "
+                     f"근거로는 쓰지 않습니다(근거 없는 제외 금지).")
         last_snap = snapshots["snap_date"].max()
         gone = (agg["delisting_date"].isna() & agg["snap_last"].notna() &
                 (agg["snap_last"] < last_snap - pd.Timedelta(days=200)))

@@ -528,8 +528,16 @@ def fetch_market_cap_snapshots(rebals: pd.DatetimeIndex) -> pd.DataFrame:
         LOG.info(f"PIT 시가총액 스냅샷 {len(todo)}개 시점 수집 (직렬)")
         bad_streak = 0
         for d in tqdm(todo, desc="PIT 시가총액", ncols=88, leave=False):
+            # ★ 당일 누수 차단. pykrx 의 get_nearest_business_day_in_a_week(prev=True) 는
+            #   [d-7, d] 구간 지수 OHLCV 의 마지막 인덱스를 돌려주므로, **d 가 거래일이면
+            #   d 를 그대로 반환**한다. 그러면 mktcap 은 리밸일 '당일 종가' 기준인데
+            #   체결은 같은 날 '시가'다 → 그날 급락한 종목이 시총이 줄어 하위 1000 안으로
+            #   들어오고, 우리는 급락 직전 시가에 그 종목을 살 수 있게 된다.
+            #   조회 기준일을 하루 앞으로 밀어 t-1 영업일 종가를 쓰게 만든다.
+            #   (build_liquidity_panel 이 allow_exact_matches=False 로 강제하는 것과 동일 규약)
+            _q = (as_ts(d) - pd.Timedelta(days=1)).strftime("%Y%m%d")
             bd = KRXG.call(pykrx_stock.get_nearest_business_day_in_a_week,
-                           d.strftime("%Y%m%d"), prev=True) or d.strftime("%Y%m%d")
+                           _q, prev=True) or _q
             got_any = False
             for mkt in ("KOSPI", "KOSDAQ"):
                 t = KRXG.call(pykrx_stock.get_market_cap_by_ticker, bd, market=mkt)
@@ -553,7 +561,11 @@ def fetch_market_cap_snapshots(rebals: pd.DatetimeIndex) -> pd.DataFrame:
                                       errors="coerce")):
                     cc = to_code6(_c)
                     if cc and np.isfinite(_mc) and _mc > 0:
-                        rows.append({"date": d.strftime("%Y-%m-%d"), "code": cc,
+                        # ★ 라벨은 요청한 격자일(d)이 아니라 **실제 관측일(bd)** 이다.
+                        #   d 로 찍으면 소비 측 merge_asof 가 date==asof 를 정확히 매칭해
+                        #   당일 정보를 쓰게 된다.
+                        rows.append({"date": pd.Timestamp(bd).strftime("%Y-%m-%d"),
+                                     "grid_date": d.strftime("%Y-%m-%d"), "code": cc,
                                      "mktcap": float(_mc), "shares_listed": float(_sh),
                                      "close_mc": float(_cl), "mc_src": "pykrx"})
             bad_streak = 0 if got_any else bad_streak + 1
@@ -618,9 +630,12 @@ def build_mktcap_panel(rebals: pd.DatetimeIndex, px_monthly: pd.DataFrame,
         L["code"] = L["code"].astype(str)
         S["code"] = S["code"].astype(str)
         try:
+            # ★ allow_exact_matches=False — 리밸일 당일 관측치는 쓰지 않는다(§4 t-1 규약).
+            #   상류에서 이미 t-1 영업일로 조회하지만, 캐시에 예전 라벨링의 행이 남아 있을
+            #   수 있으므로 소비 측에서도 이중으로 막는다.
             M = pd.merge_asof(L, S[["date", "code", "mktcap", "shares_listed"]],
                               left_on="asof", right_on="date", by="code",
-                              direction="backward",
+                              direction="backward", allow_exact_matches=False,
                               tolerance=pd.Timedelta(days=120), suffixes=("", "_s"))
             hit = M["mktcap_s"].notna() if "mktcap_s" in M.columns else M["mktcap"].notna()
             if "mktcap_s" in M.columns:

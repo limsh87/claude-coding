@@ -206,11 +206,21 @@ class _ToneNaiveBayes:
     def _toks(s: str) -> List[str]:
         return [w for w in re.findall(r"[가-힣]{2,}|[A-Za-z]{3,}", str(s))]
 
+    @staticmethod
+    def _h(w: str) -> int:
+        """★ 파이썬 내장 hash() 를 쓰면 안 된다. CPython 의 문자열 해시는 PYTHONHASHSEED
+        기반으로 **프로세스마다 랜덤화**되므로, 같은 코드·같은 SEED·같은 캐시로 두 번 돌리면
+        해시 충돌 패턴이 달라져 문장 라벨 → TONE_report → dTONE → FINAL_RANK → 보유 종목까지
+        전부 달라진다. random.seed / np.random.seed 는 여기에 영향을 주지 않고, 계약검정
+        A14(결정성)는 동일 프로세스 안에서 돌아 이 문제를 절대 잡지 못한다."""
+        return int.from_bytes(hashlib.blake2b(w.encode("utf-8", "ignore"),
+                                              digest_size=8).digest(), "little")
+
     def _idx(self, s: str) -> np.ndarray:
         t = self._toks(s)
         if not t:
             return np.empty(0, dtype=np.int64)
-        return np.fromiter((hash(w) % self.D for w in t), dtype=np.int64, count=len(t))
+        return np.fromiter((self._h(w) % self.D for w in t), dtype=np.int64, count=len(t))
 
     def fit(self, X: Sequence[str], y: Sequence[int]):
         cnt = np.zeros((2, self.D), dtype=np.float64)

@@ -217,6 +217,10 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
     H = H.groupby(["corp_code", "knowledge_date"], as_index=False).agg(
         **{"event_date": ("event_date", "min"),
            **{c: (c, "max") for c in D3_COLS}})
+    # ★ 배제 플래그와 같은 이유로(소스별 행이 서로를 덮음) 상태 테이블로 변환한다.
+    #   D3 는 '직전 1년 안에 이 사실이 관측되었는가' 의 합이 된다 — 분기 내 여러 이벤트가
+    #   마지막 1행으로 대체되어 사라지던 문제도 함께 해소된다.
+    H = _event_state_table(H, D3_COLS, D3_VALID_DAYS)
     H["DELTA_NONFIN"] = H[D3_COLS].sum(axis=1, skipna=True)
     H = pit_frame(H, "event_date", "knowledge_date", source="dart_d3")
     H = ensure_cols(H, cols)
@@ -238,6 +242,86 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
 # ── 배제 플래그 (§6.4) ──────────────────────────────────────────────────────────────────────
 _EX_OWNER_PAT = r"최대주주\s*변경|최대주주변경"
 _EX_CBBW_PAT = r"전환사채|신주인수권부사채|교환사채"
+
+# 플래그별 유효기간(일). 감사의견은 연 1회 갱신되므로 다음 감사보고서까지(≈15개월),
+# 나머지 이벤트는 1년 남짓 유효한 것으로 사전등록한다. 튜닝 대상이 아니다.
+EXCL_VALID_DAYS = {"EX_RELATED": 400, "EX_CONTINGENT": 400, "EX_LITIGATION": 400,
+                   "EX_AUDIT": 460, "EX_OWNER": 370, "EX_CBBW": 370,
+                   "EX_LOSS4Q": 400, "EX_IMPAIR": 400}
+D3_VALID_DAYS = 370          # 하드팩트 이벤트는 직전 1년치를 센다
+
+
+def _event_state_table(X: pd.DataFrame, cols: Sequence[str],
+                       valid_days, key: str = "corp_code",
+                       tcol: str = "knowledge_date") -> pd.DataFrame:
+    """소스별로 흩어진 '이벤트' 행들을 시점마다 완결된 '상태' 행으로 바꾼다.
+
+    ★ 이 함수가 없으면 §6.4 하드 제외가 사실상 작동하지 않는다. 왜인지 남긴다:
+      build_exclusion_flags 는 재무·공시목록·감사의견을 **각각 다른 접수일**로 행을 만들고,
+      그 행에는 다른 소스의 플래그가 NaN 으로 남는다. 병합 키가 (corp_code, knowledge_date)
+      이므로 접수일이 다르면 병합되지 않는다. 그런데 소비 측(attach_d3)은 asof 결합이라
+      corp_code 당 **가장 최근 1행만** 붙이고, 그 행에 없는 플래그는 NaN → fillna(0) →
+      **제외 해제**가 된다. 재무 행은 매 분기 무조건 생성되므로, 연 1회짜리 EX_AUDIT
+      ('의견거절' 등)은 다음 분기보고서가 접수되는 순간 영구히 덮인다. 리밸일이 3/6/9/12월
+      1일이므로 EX_AUDIT 이 살아 있는 리밸일은 사실상 존재하지 않았다.
+
+    해법: 발화 이벤트마다 유효기간을 부여하고 **만료 시점에 'off' 행을 명시적으로 생성**해,
+    어느 시점을 집어도 그 한 행 안에서 모든 플래그의 상태가 완결되게 만든다.
+    관측 자체가 없는 플래그는 0 이 아니라 NaN 으로 남긴다('미발화'와 '모름'은 다르다).
+    """
+    if X is None or len(X) == 0:
+        return X
+    cols = [c for c in cols if c in X.columns]
+    if not cols:
+        return X
+    W = {c: int(valid_days.get(c, 400) if isinstance(valid_days, dict) else valid_days)
+         for c in cols}
+
+    B = X[[key, tcol]].copy()
+    B[tcol] = as_ts_series(B[tcol])
+    B = B.dropna(subset=[key, tcol])
+
+    # 타임라인 = 원 관측 시점 ∪ 발화 만료 시점
+    tls = [B]
+    fired: Dict[str, pd.DataFrame] = {}
+    for c in cols:
+        v = pd.to_numeric(X[c], errors="coerce")
+        f = X.loc[v > 0, [key, tcol]].copy()
+        f[tcol] = as_ts_series(f[tcol])
+        f = f.dropna(subset=[key, tcol]).sort_values([tcol], kind="stable")
+        fired[c] = f.rename(columns={tcol: "_fired"})
+        if len(f):
+            e = f.copy()
+            e[tcol] = e[tcol] + pd.Timedelta(days=W[c])
+            tls.append(e[[key, tcol]])
+    TL = (pd.concat(tls, ignore_index=True)
+            .drop_duplicates([key, tcol]).sort_values([tcol, key], kind="stable")
+            .reset_index(drop=True))
+
+    # 플래그별로 '가장 최근 발화'를 as-of 로 찾아 유효기간 내면 1, 아니면 0
+    for c in cols:
+        f = fired[c]
+        if len(f):
+            m = pd.merge_asof(TL, f.sort_values("_fired", kind="stable"),
+                              left_on=tcol, right_on="_fired", by=key, direction="backward")
+            age = (m[tcol] - m["_fired"]).dt.days
+            TL[c] = np.where(age.notna() & (age < W[c]), 1.0, 0.0)
+        else:
+            TL[c] = 0.0
+        # 그 법인에 대해 해당 플래그의 관측이 애초에 없었다면 0 이 아니라 NaN(모름)
+        obs = X.loc[pd.to_numeric(X[c], errors="coerce").notna(), key].astype(str).unique()
+        TL[c] = TL[c].where(TL[key].astype(str).isin(set(obs)))
+
+    # event_date 는 그 시점까지 알려진 가장 이른 원 이벤트일 — 없으면 관측 시점 자체
+    if "event_date" in X.columns:
+        ed = (X[[key, tcol, "event_date"]].copy())
+        ed[tcol] = as_ts_series(ed[tcol]); ed["event_date"] = as_ts_series(ed["event_date"])
+        ed = ed.dropna(subset=[key, tcol]).sort_values(tcol, kind="stable")
+        m = pd.merge_asof(TL, ed, left_on=tcol, right_on=tcol, by=key, direction="backward")
+        TL["event_date"] = m["event_date"].fillna(TL[tcol])
+    else:
+        TL["event_date"] = TL[tcol]
+    return TL
 
 
 def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
@@ -341,9 +425,18 @@ def build_exclusion_flags(fin: pd.DataFrame, dis: pd.DataFrame,
     X = ensure_cols(X, EXCL_COLS, fill=np.nan)
     X = X.groupby(["corp_code", "knowledge_date"], as_index=False).agg(
         **{"event_date": ("event_date", "min"), **{c: (c, "max") for c in EXCL_COLS}})
+    n_raw_fire = int(sum(int((pd.to_numeric(X[c], errors="coerce") > 0).sum())
+                         for c in EXCL_COLS))
+    # ★ 소스별 행이 서로의 플래그를 지우는 문제를 여기서 잡는다(_event_state_table 주석 참조).
+    X = _event_state_table(X, EXCL_COLS, EXCL_VALID_DAYS)
     X = pit_frame(X, "event_date", "knowledge_date", source="dart_excl")
     X = ensure_cols(X, cols)
-    LOG.ok(f"배제 플래그 {len(X):,}행 · {X['corp_code'].nunique():,}사")
+    n_state_on = int((pd.DataFrame({c: pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+                                    for c in EXCL_COLS}).sum(axis=1) > 0).sum())
+    LOG.ok(f"배제 플래그 {len(X):,}상태행 · {X['corp_code'].nunique():,}사 · "
+           f"원 발화 {n_raw_fire:,}건 → 유효기간 반영 후 '제외 상태' {n_state_on:,}행")
+    LOG.info("플래그 유효기간(사전등록): " +
+             " · ".join(f"{c} {EXCL_VALID_DAYS.get(c, 400)}일" for c in EXCL_COLS))
     for n in miss_note:
         LOG.warn(f"[배제 플래그 한계] {n}")
     PIPE.io("OUT", "MEM", "exclusion_flags", X)

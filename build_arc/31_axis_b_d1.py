@@ -269,7 +269,16 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
                  f"(가중치 비례 재배분 적용, 탈락시키지 않음).")
 
     # D1_SCORE = −z(CHANGE_composite). 변화가 클수록 낮은 점수(§6.1.7).
-    W["_yr"] = as_ts_series(W["rcept_dt"]).dt.year.astype(str)
+    # ★ 셀은 '달력연도'가 아니라 **동시 제출 코호트(사업연도|보고서종류)** 여야 한다.
+    #   달력연도로 잡으면 3월 접수분(사업보고서)의 평균·표준편차·윈저 경계가 같은 해
+    #   11월 접수분(3분기보고서)으로부터 계산된다 — 3월 문서의 점수가 11월 데이터로
+    #   정해지는 명백한 미래 참조다. 코호트별 섹션 수·파싱 성공률이 실제로 다르므로
+    #   코호트 간 상대 스케일이 바뀌고, 결산월이 섞인 한 리밸일의 횡단면 순위가 달라진다.
+    _by = as_ts_series(W["rcept_dt"]).dt.year.astype(str)
+    if "bsns_year" in W.columns:
+        _by = W["bsns_year"].astype(str)
+    _dt_ = W["doc_type"].astype(str) if "doc_type" in W.columns else ""
+    W["_yr"] = _by.astype(str) + "|" + (_dt_ if isinstance(_dt_, str) else _dt_)
     W["D1_SCORE"] = -xsec_z(W["CHANGE_composite"], W["_yr"], min_n=CELL_MIN_N)
     W["D1_SCORE_equalw"] = -xsec_z(W["CHANGE_equalw"], W["_yr"], min_n=CELL_MIN_N)
     for m in D1_METRICS:

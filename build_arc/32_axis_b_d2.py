@@ -163,13 +163,20 @@ def attach_d2(P: pd.DataFrame, d2: Optional[pd.DataFrame]) -> pd.DataFrame:
                           suffix="_d2")
     P = ensure_cols(P, D2_COLS + ["D2_FORCED_LOW"])
 
+    # ★ 윈저라이즈 경계와 '강제 최하위' 값은 반드시 **분기 횡단면 안에서** 잡는다.
+    #   전 기간 백분위로 자르면 2016년 관측치의 클리핑 상·하한이 2025년 데이터로 정해지고,
+    #   분기 내 극단값들이 미래가 정하는 값으로 동점 처리되어 그들 사이의 순위가 사라진다.
+    _qkey = P["q"].astype(str) if "q" in P.columns else P["asof"].astype(str)
     zs = []
     for c, sgn in D2_ITEMS:
-        v = winsor_series(col(P, c), ARC_D2_WINSOR_P) * float(sgn)   # 방향 통일(높을수록 우수)
-        # 강제 최하위: 방향 통일 후이므로 '가장 작은 값'을 준다
+        v = (pd.to_numeric(col(P, c), errors="coerce")
+               .groupby(_qkey, observed=True)
+               .transform(lambda s: winsor_series(s, ARC_D2_WINSOR_P))) * float(sgn)
+        # 강제 최하위: 방향 통일 후이므로 '그 분기에서 가장 작은 값'을 준다
         forced = pd.to_numeric(P["D2_FORCED_LOW"], errors="coerce").fillna(0) > 0
         if forced.any() and v.notna().any():
-            v = v.mask(forced, float(np.nanmin(v.to_numpy())) - 1e-6)
+            qmin = v.groupby(_qkey, observed=True).transform("min")
+            v = v.mask(forced, qmin - 1e-6)
         z = xsec_z_arc(P.assign(**{f"_v_{c}": v}), f"_v_{c}")
         P[f"z_{c}"] = z
         zs.append(f"z_{c}")
