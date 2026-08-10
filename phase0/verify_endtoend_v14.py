@@ -380,12 +380,18 @@ _boot("s4")
 M.plan_a_pykrx = plan_ng("A", "pykrx import 실패: JSONDecodeError")
 M.plan_b_marketplace = plan_ng("B", "로그인 응답이 JSON 이 아니다(차단 페이지)")
 M.plan_c_reconstruct = plan_ng("C", "DART 주식총수 카나리 실패")
+# 지난 실행이 남긴 시장 캐시가 있어도 §2.4 는 그대로 적용되어야 한다
+_stale = pd.DataFrame({"cap": [CAPS[c] for c in CODES], "mkt": MKTS}, index=CODES)
+for _d in ("2025-06-30", "2025-09-30", "2025-12-30", "2026-03-31"):
+    M._snap_write_csv(_stale, M._krx_snap_path(_d))
 V4 = M.main()
 check("선택된 Plan 없음", V4["data_sources"]["selected_plan"], "NONE")
 s4 = {s["id"]: s for s in V4["snapshots"]}
 check("4개 전부 UNVERIFIED", [s4[k]["status"] for k in ("S1", "S2", "S3", "S4")],
       ["UNVERIFIED"] * 4)
 check("사유는 NO_MARKET_SOURCE", s4["S1"]["status_reason"], "NO_MARKET_SOURCE")
+check("지난 실행이 남긴 시장 캐시가 있어도 쓰지 않는다 (§2.4)",
+      [s4[k]["status"] for k in ("S1", "S2", "S3", "S4")], ["UNVERIFIED"] * 4)
 check("임원현황 수집에 진입하지 않았다", len([x for x in _fetch_log if x[0] == "exctv"]), 0)
 check("전이 3개 전부 UNVERIFIED",
       [t["status"] for t in V4["transitions"]], ["UNVERIFIED"] * 3)
@@ -499,6 +505,37 @@ check("임계까지 남은 50건만 쓰고 멈춘다 (예약 카운터 기준)",
 truthy("수집된 분량으로 측정은 계속된다 — 중단이지 실패가 아니다",
        any(s["files_read"] > 0 for s in V9["snapshots"] if "files_read" in s))
 truthy("남은 작업은 중복 없이 실린다", len(_rj["remaining"]) == len({tuple(x) for x in _rj["remaining"]}))
+
+print("\n[10] §5.1 — 레코드가 있는데 PIT 폐기 0건이면 산출물을 남긴 뒤 중단")
+_boot("s10")
+M.plan_a_pykrx = plan_ok("A", "pykrx")
+M.snap_plan_a = stub_snap
+_real_rows = _officer_rows
+
+
+def _clean_rows(corp_code, as_of, sid):
+    """정정공시도 접수번호 불량도 없는 세계 — 그러면 PIT 폐기가 0건이 된다."""
+    return [r for r in _real_rows(corp_code, as_of, sid)
+            if M.rcept_dt_of(r["rcept_no"]) <= M.compact(as_of)]
+
+
+globals()["_officer_rows"] = _clean_rows
+_raised = ""
+try:
+    M.main()
+except M.ContractViolation as ex:
+    _raised = str(ex)
+finally:
+    globals()["_officer_rows"] = _real_rows
+truthy("계약 위반으로 중단된다", "P0_PIT_STRICT_DELTA" in _raised)
+truthy("어느 스냅샷인지 메시지에 있다", "S1" in _raised)
+truthy("근거 파일을 가리킨다", "diag_pit_dropped_delta.csv" in _raised)
+for f in ("phase0_verdict_v14.json", "phase0_summary_v14.md", "diag_market_source.json",
+          "diag_edge_events.csv", "diag_pit_dropped_delta.csv"):
+    truthy(f"중단 전에 산출물 {f} 이 남는다", (M.DIR_REPORTS / f).exists())
+_v10 = json.loads((M.DIR_REPORTS / "phase0_verdict_v14.json").read_text(encoding="utf-8"))
+check("판정표에도 성공조건 미충족으로 기록된다",
+      _v10["success_conditions"]["pit_evidence"], False)
 
 M.plan_a_pykrx, M.plan_b_marketplace = _real_plan_a, _real_plan_b
 M.plan_c_reconstruct, M.load_corpcode = _real_plan_c, _real_load_corpcode

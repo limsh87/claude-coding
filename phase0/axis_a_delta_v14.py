@@ -178,6 +178,17 @@ class HardStop(RuntimeError):
     """예산 소진·서킷브레이커·인증 실패 등 계속할 수 없는 상태."""
 
 
+def _reraise_control(e: BaseException) -> None:
+    """넓은 except 안에서 반드시 먼저 부른다.
+
+    이 파일은 여러 곳에서 `except BaseException` 을 쓴다(pykrx import 처럼 무엇이
+    날아올지 모르는 지점이 실제로 있다). 그대로 두면 사용자가 Ctrl-C 를 눌러도
+    '네트워크 실패'로 분류되어 재시도로 들어간다 — 수천 콜짜리 실행에서 멈출 수가 없다.
+    """
+    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+        raise e
+
+
 # ══════════════════════════════════════════════════════════════════════════════════════════
 #  ▣ 3. 실행 경로 검사 (P0_LOCAL_ROOT_ONLY)
 # ══════════════════════════════════════════════════════════════════════════════════════════
@@ -581,6 +592,7 @@ def _try_import_pykrx(with_creds: bool):
             from pykrx import stock as _stock   # ← 여기서 실제 로그인 네트워크 I/O 가 돈다
         return _stock, "", buf.getvalue()
     except BaseException as e:                       # noqa: BLE001 — 의도적으로 전부 잡는다
+        _reraise_control(e)
         _purge_pykrx_modules()
         return None, f"{type(e).__module__}.{type(e).__qualname__}: {e}", buf.getvalue()
 
@@ -644,9 +656,13 @@ def pykrx_call(fn_name: str, *a, **kw):
     import contextlib as _ctx
     buf = io.StringIO()
     try:
-        with _ctx.redirect_stdout(buf):
+        # pykrx 는 data.krx.co.kr 로 나가는 KRX 계열 호출이다. Plan B 만 게이트를 통과하고
+        # 여기가 빠져 있으면 §8 의 '단일 스레드 + 요청 간 1초'가 절반만 지켜진다 —
+        # 스냅샷 하나에 시총 1회 + 시장별 티커목록 3회가 연달아 나간다.
+        with KRX_GATE, _ctx.redirect_stdout(buf):
             return fn(*a, **kw)
     except BaseException as e:                          # noqa: BLE001
+        _reraise_control(e)
         WARN(f"    pykrx.{fn_name} 호출 실패({type(e).__name__}: {str(e)[:120]})")
         return None
 
@@ -1009,6 +1025,7 @@ TRANSITIONS = [("S1", "S2"), ("S2", "S3"), ("S3", "S4")]
 MEASURE_N = 1000            # 측정 대상 = 시총 하위 1,000종목
 EMPTY_UNIVERSE_MIN = 100    # 시총>0 이 이보다 적으면 수집 진입 금지
 TRADING_DAY_LOOKBACK = 10   # 직전 거래일 탐색 최대 역행 일수
+PLANA_LABEL_TOLERANCE = 3   # Plan A 에서 시장구분 미확인이 이보다 많으면 그 날짜를 쓰지 않는다
 HOMONYM_FLAG_K = 8          # 이 이상 종목에 겸직으로 잡히는 인물은 동명이인 의심으로 진단 출력
 LARGE_COLLECTION_GATE = 5000
 
@@ -1022,6 +1039,8 @@ LARGE_COLLECTION_GATE = 5000
 CALL_BUDGET_DAILY = 19500
 CALL_BUDGET_STOP_CUMULATIVE = 12000
 CIRCUIT_FAIL_N = 10          # '재시도를 모두 소진한 콜'이 연속 이만큼이면 서킷 발동
+BAD_STATUS_STREAK_STOP = 200  # 재시도·halt 어디에도 안 걸리는 status 가 연속 이만큼이면 중단
+BUDGET_PERSIST_EVERY = 250    # 이 횟수마다 오늘 소진량을 디스크에 저장
 CIRCUIT_SLEEP = 60
 CIRCUIT_MAX_TRIPS = 3
 HTTP_TIMEOUT = 30
@@ -1130,6 +1149,7 @@ def dart_request(key: str, params: dict, timeout: int = HTTP_TIMEOUT, session=No
                   headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                          "phase0-axisA-delta/1.4"})
     except BaseException as e:                              # noqa: BLE001
+        _reraise_control(e)
         out["elapsed"] = time.time() - t0
         out["exc_type"] = f"{type(e).__module__}.{type(e).__qualname__}"
         out["exc_message"] = str(e)
@@ -1223,19 +1243,29 @@ def run_dart_preflight() -> dict:
                            "[인증키 신청/관리]" if not fixable else
                            "일시적 응답이다. 재시도 정책이 처리한다.")})
             ERR(f"  DART status={st} ({_dart_status_msg(st)}) — {DART_PREFLIGHT['action']}")
+    elif res["http_status"] is not None:
+        # ★ 응답은 도달했는데 JSON 이 아니다(점검 안내·차단 페이지·프록시 로그인 폼 등).
+        #   이 분기를 exc_type 검사 뒤에 두면, dart_request 가 남긴 ValueError 이름이
+        #   먼저 걸려 '미분류 → 코드로 해결 불가'가 되고 수집이 통째로 막힌다.
+        #   연결 자체는 살아 있으므로 '해결 가능'으로 둔다.
+        DART_PREFLIGHT.update({"ok": False, "code_fixable": True,
+                               "classification": f"HTTP {res['http_status']} 응답(JSON 아님)",
+                               "action": "본문 앞 500자를 확인할 것 — 점검 안내/차단 페이지/"
+                                         "프록시 로그인 폼일 수 있다. 연결 자체는 도달했다."})
+        ERR(f"  분류: {DART_PREFLIGHT['classification']}")
     elif res["exc_type"]:
         # 예외 객체를 다시 만들 수 없으므로 이름으로 분류한다 — dart_request 가 MRO 이름을
         # 잃지 않도록 예외 전체 이름을 남겨 두었다.
-        fake_names = res["exc_type"].split(".")[-1]
-        cause, action, fixable = _classify_by_name(fake_names, res["exc_message"])
+        cause, action, fixable = _classify_by_name(res["exc_type"].split(".")[-1],
+                                                   res["exc_message"])
         DART_PREFLIGHT.update({"ok": False, "code_fixable": fixable,
                                "classification": cause, "action": action})
         ERR(f"  분류: {cause}")
         ERR(f"  조치: {action}")
     else:
-        DART_PREFLIGHT.update({"ok": False, "code_fixable": True,
-                               "classification": f"HTTP {res['http_status']} 응답(JSON 아님)",
-                               "action": "본문 앞 500자를 확인할 것 — 차단 페이지/점검 안내일 수 있다."})
+        DART_PREFLIGHT.update({"ok": False, "code_fixable": False,
+                               "classification": "응답도 예외도 없다(원인 불명)",
+                               "action": "예외 전문을 그대로 보고할 것."})
         ERR(f"  분류: {DART_PREFLIGHT['classification']}")
 
     det["classification"] = DART_PREFLIGHT["classification"]
@@ -1582,13 +1612,34 @@ def snap_plan_a(date_iso: str):
     df = pykrx_call("get_market_cap_by_ticker", compact(date_iso), market="ALL")
     if df is None or not len(df) or "시가총액" not in getattr(df, "columns", []):
         return None, "빈 응답(휴장일 또는 세션 문제)"
-    lab = {}
+    # ★ 이 provider 의 약점: 시가총액은 market="ALL" 한 번에 오지만 시장구분은 시장별 3회를
+    #   따로 물어야 한다(get_market_cap_by_ticker 가 MKT_ID 컬럼을 떨어뜨린다). 그 3회 중
+    #   하나라도 빈 응답이면 그 시장 종목이 통째로 무라벨이 되고, 아래 build_universe 가
+    #   'KNX 가 아니다'로 읽어 KOSPI+KOSDAQ 에 섞는다 — KONEX 는 시총이 가장 작은 집단이라
+    #   '시총 하위 1,000종목'을 그대로 점유해 측정 대상이 조용히 바뀐다.
+    #   게다가 pykrx 1.2.8 의 dataframe_empty_handler 는 예외를 삼키고 빈 값을 돌려주므로
+    #   pykrx_call 의 경고조차 뜨지 않는다. 그래서 라벨이 불완전하면 그 날짜를 쓰지 않는다.
+    lab, counts = {}, {}
     for mk, tag in (("KOSPI", "STK"), ("KOSDAQ", "KSQ"), ("KONEX", "KNX")):
-        for t in (pykrx_call("get_market_ticker_list", compact(date_iso), market=mk) or []):
+        lst = []
+        for _try in range(2):        # 일시적 빈 응답은 한 번 되짚어 본다
+            lst = pykrx_call("get_market_ticker_list", compact(date_iso), market=mk) or []
+            if lst:
+                break
+        counts[mk] = len(lst)
+        for t in lst:
             lab[to_code6(t)] = tag
-    mkts = [lab.get(to_code6(i), "") for i in df.index]
-    snap = _mk_snapshot(df.index, _num(df["시가총액"]), mkts)
-    return (snap, f"{len(snap):,}종목") if snap is not None else (None, "시총>0 부족(휴장일 추정)")
+    if any(n == 0 for n in counts.values()):
+        return None, f"시장별 티커목록에 빈 응답이 있다 {counts} — 라벨이 불완전해 쓰지 않는다"
+    codes = [to_code6(i) for i in df.index]
+    unlabeled = [c for c in codes if c and c not in lab]
+    if len(unlabeled) > max(PLANA_LABEL_TOLERANCE, int(len(codes) * 0.002)):
+        return None, (f"시장구분을 확인하지 못한 종목 {len(unlabeled):,}건 "
+                      f"(전체 {len(codes):,}) — 라벨이 불완전해 쓰지 않는다 {counts}")
+    snap = _mk_snapshot(df.index, _num(df["시가총액"]), [lab.get(c, "") for c in codes])
+    if snap is None:
+        return None, "시총>0 부족(휴장일 추정)"
+    return snap, f"{len(snap):,}종목 (시장별 {counts}, 미확인 {len(unlabeled)})"
 
 
 # ── Plan B: 마켓플레이스 세션 직접 구성 ─────────────────────────────────────────────────────
@@ -1969,11 +2020,20 @@ class KrxMarketplaceSession:
         if not (str(KRX_ID or "").strip() and str(KRX_PW or "").strip()):
             out.update({"attempted": False, "note": "KRX_ID/KRX_PW 미설정 — 로그인 시도 생략"})
             return out
+        id_key, pw_key = self.d.get("login_id_key"), self.d.get("login_pw_key")
+        if not (id_key and pw_key):
+            # 소스에서 어느 필드가 ID·PW 인지 읽지 못했다. 'mbrId/pw 겠지' 하고 채워 넣는
+            # 순간 P0_NO_URL_GUESSING 위반이고, 틀린 필드로 로그인을 두들기는 셈이다.
+            # 로그인은 포기하고 비로그인 경로만 시도한다(그쪽은 소스가 실제로 취하는 폴백이다).
+            out.update({"attempted": False,
+                        "note": "설치된 pykrx 소스에서 로그인 ID/PW 필드명을 읽지 못했다 — "
+                                "추측으로 채우지 않고 로그인을 건너뛴다"})
+            return out
         if self.s is None:
             self.warmup()
         payload = {k: "" for k in (self.d.get("login_payload_keys") or [])}
-        payload[self.d["login_id_key"]] = KRX_ID.strip()
-        payload[self.d["login_pw_key"]] = KRX_PW.strip()
+        payload[id_key] = KRX_ID.strip()
+        payload[pw_key] = KRX_PW.strip()
         hd = {"Referer": (self.d.get("warmup_urls") or [""])[0]}
         ekey = self.d.get("error_code_key", "_error_code")
         okcode = self.d.get("login_success_code", "CD001")
@@ -2181,6 +2241,7 @@ class Collector:
         self.calls_today = int(st.get("calls", 0))      # 같은 날 이전 실행분까지 누적
         self.calls_run = 0
         self.consec_exhausted = 0
+        self.consec_bad_status = 0
         self.trips = 0
         self.pause_until = 0.0
         self.halt = ""
@@ -2206,7 +2267,15 @@ class Collector:
                 return False
             self.calls_run += 1
             self.calls_today += 1
-            return True
+            due = (self.calls_run % BUDGET_PERSIST_EVERY == 0)
+        if due:
+            # 배치가 끝날 때만 저장하면 중간에 프로세스가 죽었을 때 오늘 소진량이 통째로
+            # 사라지고, 다음 실행이 예산을 처음부터 다시 센다.
+            try:
+                self.persist_budget()
+            except (OSError, DiskFull):
+                pass
+        return True
 
     def persist_budget(self):
         write_json(self.budget_state,
@@ -2294,7 +2363,10 @@ class Collector:
 
             js = res["json"] or {}
             st = str(js.get("status", ""))
-            if st in ("011", "012", "020", "021"):
+            if st in ("010", "011", "012", "020", "021"):
+                # 010(등록되지 않은 키)을 빼 두면 죽은 키로 하루치 예산을 통째로 태운다:
+                # 010 은 재시도 대상이 아니라서 서킷 카운터를 올리지 않고, 성공 경로로
+                # 빠지면서 오히려 카운터를 리셋한다. 영구 조건이므로 그 자리에서 멈춘다.
                 # ★ 020(요청 제한 초과)은 우리 자체 카운터보다 권위 있는 실시간 신호다.
                 with self.lk:
                     self.halt = f"DART_{st}"
@@ -2310,6 +2382,27 @@ class Collector:
 
             self._on_call_ok()
             self.stat[f"dart_{st or '?'}"] += 1
+            if st in ("000", "013"):
+                with self.lk:
+                    self.consec_bad_status = 0
+            else:
+                # 재시도로도 halt 로도 안 잡히는 status(100/101/901/빈값 …)가 계속 오면
+                # 서킷은 조용한 채로 예산만 탄다. 연속으로 쌓이면 멈추고 사유를 남긴다.
+                with self.lk:
+                    self.consec_bad_status += 1
+                    if self.consec_bad_status >= BAD_STATUS_STREAK_STOP:
+                        self.halt = f"DART_BAD_STATUS_STREAK_{st or 'EMPTY'}"
+                        ERR(f"  DART status={st or '(빈값)'} "
+                            f"({_dart_status_msg(st)}) 가 연속 "
+                            f"{BAD_STATUS_STREAK_STOP}건 — 계속하면 예산만 태운다. 중단한다.")
+                        return st
+            if st not in ("000", "013"):
+                # ★ 확정된 사실만 캐시한다. 000(정상)과 013(데이터 없음)만이 '다시 물어도
+                #   답이 같은' 응답이다. 100(필드 부적절)·101(부적절한 접근)·901 같은 응답을
+                #   캐시에 남기면, 다음 실행의 인벤토리 스캔이 파일 존재만 보고 '보유'로
+                #   판정해 그 회사를 영영 다시 조회하지 않는다 — 오류 응답이 영구 결측으로
+                #   굳는 경로다. 캐시하지 않고 status 만 세어 두면 다음 실행이 재시도한다.
+                return st
             data = json.dumps(js, ensure_ascii=False).encode("utf-8")
             write_json(path, js)           # ← 원본 응답 그대로. PIT 필터는 읽을 때 건다.
             with self._journal_lk:
@@ -2345,6 +2438,8 @@ class Collector:
                 seen.add(j)
                 try:
                     _tally(j, fu.result())
+                except DiskFull:
+                    raise                       # ENOSPC 는 즉시 실패한다 — 삼키지 않는다
                 except Exception as e:                          # noqa: BLE001
                     _tally(j, f"EXC_{type(e).__name__}")
                 if i % 200 == 0 or i == len(jobs):
@@ -2361,6 +2456,8 @@ class Collector:
                 continue
             try:
                 _tally(j, fu.result(timeout=0))
+            except DiskFull:
+                raise
             except Exception as e:                              # noqa: BLE001
                 _tally(j, f"EXC_{type(e).__name__}")
         self.persist_budget()
@@ -2499,9 +2596,19 @@ class PriceStore:
     def _meta_path(self, ticker: str, year: int) -> Path:
         return DIR_CACHE_PX / str(ticker) / f"{year}.meta.json"
 
+    def _year_files(self, ticker: str, year: int):
+        """parquet 과 csv 를 둘 다 후보로 본다.
+
+        px_path() 는 PARQUET_AVAILABLE 에 따라 확장자를 바꾼다. 메타(json)만 보고 커버리지를
+        판정하면, pyarrow 가 빠진 환경에서 예전 parquet 캐시를 '있다'고 믿고 읽지는 못해
+        전 종목 종가가 조용히 사라진다 — 메타와 데이터 파일을 함께 확인해야 한다.
+        """
+        d = DIR_CACHE_PX / str(ticker)
+        return [d / f"{year}.parquet", d / f"{year}.csv"]
+
     def _read_year(self, ticker: str, year: int):
-        p = px_path(ticker, year)
-        if not p.exists():
+        p = next((c for c in self._year_files(ticker, year) if c.exists()), None)
+        if p is None:
             return None
         try:
             df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
@@ -2518,8 +2625,12 @@ class PriceStore:
         df = df.sort_values("date")
         try:
             if p.suffix == ".parquet":
-                p.parent.mkdir(parents=True, exist_ok=True)
-                df.to_parquet(p, index=False)
+                # 직접 쓰면 원자적이지 않다 — 중간에 죽으면 반쪽 parquet 이 남고, 다음
+                # 실행은 그걸 '있는 캐시'로 믿는다. 바이트로 만들어 write_bytes 로 넘긴다
+                # (tmp → os.replace + ENOSPC 즉시 실패까지 그대로 적용된다).
+                _buf = io.BytesIO()
+                df.to_parquet(_buf, index=False)
+                write_bytes(p, _buf.getvalue())
             else:
                 write_text(p, df.to_csv(index=False))
             write_json(self._meta_path(ticker, year),
@@ -2528,8 +2639,9 @@ class PriceStore:
                         "fetched_at": _dt.datetime.now().isoformat(timespec="seconds"),
                         "fetch_range": [self.fetch_start, self.fetch_end]})
         except DiskFull:
-            raise
+            raise                                    # §8 — ENOSPC 는 즉시 실패한다
         except Exception as e:                               # noqa: BLE001
+            _reraise_control(e)
             WARN(f"    종가 캐시 저장 실패 {ticker}/{year}: {type(e).__name__}: {e}")
 
     def _nodata_path(self, ticker: str) -> Path:
@@ -2567,12 +2679,16 @@ class PriceStore:
         구간 밖이면 캐시가 그 날짜를 아직 안 덮은 것이므로 다시 받는다.
         """
         for d in needed_dates:
-            m = read_json(self._meta_path(ticker, int(str(d)[:4])))
+            y = int(str(d)[:4])
+            m = read_json(self._meta_path(ticker, y))
             if not m:
                 return False
             fr = m.get("fetch_range") or ["", ""]
             if not (str(fr[0]) <= str(d) <= str(fr[1])):
                 return False
+            if int(m.get("rows") or 0) > 0 and \
+                    not any(c.exists() for c in self._year_files(ticker, y)):
+                return False        # 메타는 있는데 데이터 파일이 없다 — 다시 받는다
         return True
 
     def set_keep_window(self, nominal_dates, back_days: int):
@@ -2593,6 +2709,7 @@ class PriceStore:
         try:
             df = fdr.DataReader(ticker, self.fetch_start, self.fetch_end)
         except BaseException as e:                           # noqa: BLE001
+            _reraise_control(e)
             return None, f"{type(e).__name__}: {str(e)[:120]}"
         if df is None or not len(df):
             return None, "빈 응답"
@@ -2928,6 +3045,7 @@ def planc_build_snapshots(cc_df, code2corp, col: "Collector"):
         n_no_shares = n_no_price = n_stale = 0
         stale_max = 0
         treasury_sum = 0
+        field_use = Counter()
         for t in want_by_sid.get(sid, []):
             cp = code2corp.get(t, "")
             p = shares_path(cp, yy, rc)
@@ -2949,6 +3067,7 @@ def planc_build_snapshots(cc_df, code2corp, col: "Collector"):
             if PLANC_DEDUCT_TREASURY and parsed.get("treasury"):
                 sh = max(0, sh - int(parsed["treasury"]))
             treasury_sum += int(parsed.get("treasury") or 0)
+            field_use[parsed.get("field_used") or "?"] += 1
             codes.append(t)
             caps.append(float(sh) * float(close))
             mkts.append(parsed.get("corp_cls") or "")
@@ -2958,7 +3077,13 @@ def planc_build_snapshots(cc_df, code2corp, col: "Collector"):
                     "no_shares": n_no_shares, "no_price": n_no_price,
                     "stale_price_used": n_stale, "stale_price_max_days": stale_max,
                     "treasury_shares_total": treasury_sum,
-                    "treasury_deducted": PLANC_DEDUCT_TREASURY}
+                    "treasury_deducted": PLANC_DEDUCT_TREASURY,
+                    # ★ 종목 단위 폴백을 숨기지 않는다. istc_totqy 가 없어 distb_stock_co
+                    #   (유통주식수 = 발행 − 자기주식)로 내려간 종목은 '자기주식 차감 안 함'
+                    #   정책과 사실상 다르게 계산된 것이다 — 그 건수를 그대로 남긴다.
+                    "shares_field_counts": dict(field_use),
+                    "shares_field_fallback_n": int(
+                        field_use.get(PLANC_SHARES_FIELD_FALLBACK, 0))}
         if snap is not None:
             try:
                 _snap_write_csv(snap, _planc_snap_path(eff))
@@ -2970,6 +3095,12 @@ def planc_build_snapshots(cc_df, code2corp, col: "Collector"):
         LOG(f"    {sid} 재구성 완료 — {0 if snap is None else len(snap):,}종목 "
             f"(주식총수 결측 {n_no_shares:,} / 종가 결측 {n_no_price:,} / "
             f"직전종가 사용 {n_stale:,}, 최대 {stale_max}일)")
+        LOG(f"      발행주식총수 필드: {dict(field_use)}")
+        if field_use.get(PLANC_SHARES_FIELD_FALLBACK):
+            WARN(f"      {field_use[PLANC_SHARES_FIELD_FALLBACK]:,}종목은 "
+                 f"{PLANC_SHARES_FIELD_PRIMARY} 가 없어 {PLANC_SHARES_FIELD_FALLBACK}"
+                 f"(유통주식수 = 발행 − 자기주식)로 계산했다 — 이 종목들만 사실상 "
+                 f"자기주식이 차감된 값이다(판정표에 건수 기록).")
     PLANC["coverage"] = cov
     diag["coverage"] = cov
     return {"status": "OK", "snapshots": out, "diag": diag}
@@ -3093,6 +3224,17 @@ def get_market_snapshot(date_iso: str):
 
     plan = MARKET_SOURCE.get("plan", "")
     trail = []
+    if not plan:
+        # ★ §2.4 — 3단이 모두 실패하면 전 스냅샷 UNVERIFIED(NO_MARKET_SOURCE) 다. 지난 실행이
+        #   남긴 캐시가 있어도 여기서 쓰지 않는다. 쓰기 시작하면 '시장 소스를 확보하지 못한
+        #   실행'이 일부 스냅샷만 조용히 성공한 것처럼 보이고, 그 상태로 임원현황 수집에까지
+        #   들어가 호출을 낭비한다(§2.4 가 막으려는 것이 정확히 그것이다).
+        #   캐시가 있다는 사실 자체는 숨기지 않고 로그·판정표에 남긴다.
+        cached = _krx_snap_path(date_iso).exists() or _planc_snap_path(date_iso).exists()
+        with _SNAP_LK:
+            _SNAP_MEM[date_iso] = (None, "")
+        return None, "", [f"시장 소스 없음(3단 실패) — §2.4 에 따라 캐시를 사용하지 않는다 "
+                          f"(로컬 캐시 {'있음' if cached else '없음'})"]
     if plan == "C":
         # 균일 모드에서는 실측 캐시를 쳐다보지 않는다. 스냅샷별로 소스가 섞이면 그 차이가
         # 전이의 born/died 로 위장하기 때문이다.
@@ -3177,7 +3319,14 @@ def build_universe(sid: str, nominal_iso: str):
             WARN(f"  {sid} 시장구분 라벨이 전혀 없는 소스({src}) — KONEX 필터를 적용하지 못했다. "
                  f"측정 대상(시총 하위 {MEASURE_N})에 KONEX 가 섞일 수 있다(판정표에 기록).")
     else:
-        listed = set(snap.index[snap["mkt"] != "KNX"])
+        # ★ 시장구분이 비어 있는 종목은 'KNX 가 아니다'가 아니라 '모른다'이다. 그걸
+        #   KOSPI+KOSDAQ 에 밀어 넣는 것은 보간이고(P0_FAIL_LOUD 위반), 실제로 KONEX 였다면
+        #   시총이 가장 작아 '시총 하위 1,000종목'을 통째로 점유한다. 결측은 결측으로 둔다.
+        listed = set(snap.index[(snap["mkt"] != "KNX") & (snap["mkt"] != "")])
+        if n_unlabeled:
+            WARN(f"  {sid} 시장구분을 확인하지 못한 종목 {n_unlabeled:,}건 — KONEX 여부를 "
+                 f"확정할 수 없어 전 상장사에서 제외했다(추정하지 않는다). "
+                 f"판정표 n_unlabeled_market 에 기록된다.")
 
     if len(listed) < EMPTY_UNIVERSE_MIN:
         WARN(f"  {sid} 시장 필터 후 {len(listed)}종목 — P0_EMPTY_UNIVERSE_GUARD 발동")
@@ -3456,6 +3605,11 @@ def main():
     write_json(DIR_REPORTS / "cache_inventory.json", inventory)
 
     # ── 3. corpCode ──────────────────────────────────────────────────────────────────
+    # ★ 진단을 여기서 먼저 돌린다. corpCode 수신이 이 실행의 첫 DART 네트워크 사용인데,
+    #   DART 가 막혀 있으면 load_corpcode() 가 HardStop 으로 죽으면서 §3 진단물이 한 줄도
+    #   안 남는다 — 정작 원인을 알려 줄 파일이 없는 채로 끝나는 것이다. 멱등이라 §7 단계에서
+    #   다시 불려도 호출은 한 번뿐이고, 명령서의 보고 순서는 산출물에서 그대로 유지된다.
+    run_dart_preflight()
     RULE("3. corpCode")
     cc = load_corpcode()
     corp2code = dict(zip(cc["corp_code"], cc["code"]))
@@ -3629,7 +3783,7 @@ def main():
 
     # ── 9. PIT 필터 + 그래프 ─────────────────────────────────────────────────────────
     RULE("9. PIT 필터 + 그래프 구성")
-    snap_out, pit_rows = [], []
+    snap_out, pit_rows, pit_zero = [], [], []
     for sid, nom, _pe, yy, rc, as_of, _need in SNAPSHOT_SPEC:
         u = universes[sid]
         rec = {"id": sid, "date": u["date"] or nom, "date_nominal": nom, "as_of": as_of,
@@ -3696,6 +3850,8 @@ def main():
             raise ContractViolation(
                 f"P0_PIT_STRICT_DELTA 위반: {sid} 최종접수일 {rec['last_rcept_dt']} > "
                 f"as_of {compact(as_of)}. 필터가 걸리지 않았다 — 즉시 중단한다.")
+        if len(dropped) == 0 and len(raw_recs) > 0:
+            pit_zero.append(sid)
         if n_look == 0 and len(raw_recs) > 0:
             WARN(f"    ★ {sid} 룩어헤드 폐기 0건 — 명령서 §5.1 은 이 경우 '필터가 안 걸린 "
                  f"것이므로 즉시 중단하고 보고'하라고 한다. diag_pit_dropped_delta.csv 를 "
@@ -3907,6 +4063,15 @@ def main():
         LOG(f"  {'✓' if p.exists() else '✗'} {p}")
     rt = DIR_REPORTS / "resume_todo.json"
     LOG(f"  {'✓' if rt.exists() else '·'} {rt}  ({'중단 있음' if col.halt else '중단 없음'})")
+    if pit_zero:
+        # §5.1 — "어떤 스냅샷이든 PIT 폐기가 0건으로 나오면 필터가 안 걸린 것이므로 즉시
+        # 중단하고 보고할 것." 다만 증거 없이 죽으면 다음 실행의 출발점이 사라지므로,
+        # 산출물을 전부 남긴 '뒤에' 계약 위반으로 올린다. 폐기 분포표가 곧 보고서다.
+        raise ContractViolation(
+            f"P0_PIT_STRICT_DELTA: 레코드가 있는데 PIT 폐기가 0건인 스냅샷이 있다 "
+            f"({', '.join(pit_zero)}). 필터가 걸리지 않았다는 신호다(§5.1).\n"
+            f"  근거: {DIR_REPORTS / 'diag_pit_dropped_delta.csv'}\n"
+            f"  산출물은 전부 기록했다 — 위 파일의 스냅샷별 분포를 먼저 확인할 것.")
     RULE("완료")
     return verdict
 

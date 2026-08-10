@@ -34,6 +34,8 @@ spec = importlib.util.spec_from_file_location("axd14", SRC)
 M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
 M.pd = pd
+import requests as _requests_mod                 # 세션 객체만 쓴다 — 네트워크는 타지 않는다
+M.requests = _requests_mod
 
 TMP = Path(tempfile.mkdtemp())
 FAIL, N = [], 0
@@ -593,6 +595,195 @@ check("카나리 날짜는 명령서 지정값", M.CANARY_DATE, "2025-06-30")
 check("카나리 성공 기준 100종목", M.CANARY_MIN_ROWS, 100)
 check("초기 상태에서는 선택된 소스가 없다", M.MARKET_SOURCE["plan"], "")
 M.LADDER_DIAG["plans"] = []
+
+print("\n[24b] 적대적 리뷰에서 확인된 결함 3건의 회귀 고정")
+_dirs("regress")
+
+# (1) 소스에서 로그인 ID/PW 필드명을 못 읽었는데 자격증명이 있으면, 예전 코드는
+#     payload[self.d["login_id_key"]] 에서 KeyError 로 실행 전체를 죽였다.
+#     추측으로 채우지 않고 로그인만 건너뛰어야 한다.
+_saved_id, _saved_pw = M.KRX_ID, M.KRX_PW
+M.KRX_ID, M.KRX_PW = "someid", "somepw"
+_sess = M.KrxMarketplaceSession({"login_url": "https://example.test/l",
+                                 "login_payload_keys": ["a", "b"],
+                                 "warmup_urls": ["https://example.test/p"]})
+_lg = _sess.login()
+check("로그인 필드명을 못 읽으면 시도조차 하지 않는다", _lg["attempted"], False)
+check("추측으로 로그인하지 않는다", _lg["ok"], False)
+truthy("사유가 남는다", "읽지 못했다" in _lg["note"])
+M.KRX_ID, M.KRX_PW = _saved_id, _saved_pw
+
+# (2) 확정된 사실(000/013)만 캐시한다. 100/101/901 같은 응답을 캐시에 남기면 다음 실행의
+#     인벤토리 스캔이 파일 존재만 보고 '보유'로 판정해 그 회사를 영영 다시 조회하지 않는다.
+_col = M.Collector("k" * 40)
+_real_dr = M.dart_request
+for _st, _should_cache in (("000", True), ("013", True), ("100", False),
+                           ("101", False), ("901", False), ("", False)):
+    M.dart_request = (lambda st: (lambda *a, **k: {
+        "ok": True, "exc_type": "", "exc_message": "", "http_status": 200,
+        "body_head": "", "json": {"status": st, "list": []}, "elapsed": 0.0}))(_st)
+    _cp = f"9999{_st or 'X':>04}"[:8]
+    _got = _col.fetch("exctv", _cp, "2025", "11012")
+    check(f"status={_st or '(빈값)'} → 반환값", _got, _st)
+    check(f"status={_st or '(빈값)'} → 캐시 {'저장' if _should_cache else '미저장'}",
+          M.cache_path(_cp, "2025", "11012").exists(), _should_cache)
+M.dart_request = _real_dr
+_inv = M.scan_blob_inventory(M.DIR_CACHE_RAW)
+check("오류 응답은 인벤토리에도 잡히지 않는다(다음 실행이 재시도한다)",
+      len(_inv[("2025", "11012")]), 2)
+
+# (3) 3단이 모두 실패하면 지난 실행이 남긴 캐시가 있어도 쓰지 않는다 (§2.4).
+_snap = M._mk_snapshot([f"{i:06d}" for i in range(1, 301)],
+                       [float(i) * 1e8 for i in range(1, 301)], ["STK"] * 300)
+M._snap_write_csv(_snap, M._krx_snap_path("2025-06-30"))
+M._SNAP_MEM.clear()
+M.MARKET_SOURCE.update({"plan": "", "name": "", "detail": ""})
+_df, _src, _trail = M.get_market_snapshot("2025-06-30")
+check("소스가 없으면 캐시가 있어도 스냅샷을 내주지 않는다", _df, None)
+truthy("캐시가 있다는 사실은 숨기지 않는다", "로컬 캐시 있음" in _trail[0])
+M._SNAP_MEM.clear()
+M.MARKET_SOURCE.update({"plan": "A", "name": "pykrx", "detail": ""})
+_df2, _src2, _ = M.get_market_snapshot("2025-06-30")
+check("소스가 확보된 실행에서는 같은 캐시가 정상적으로 쓰인다", len(_df2), 300)
+check("출처가 캐시로 기록된다", _src2, "local_cache")
+M._SNAP_MEM.clear()
+M.MARKET_SOURCE.update({"plan": "", "name": "", "detail": ""})
+
+print("\n[24c] 적대적 리뷰 2차 — 추가 확인분의 회귀 고정")
+_dirs("regress2")
+
+# (A) pykrx 호출도 KRX 게이트를 통과한다 (§8: KRX 계열은 단일 스레드 + 1초 간격)
+class _StockStub:
+    @staticmethod
+    def get_market_cap_by_ticker(*a, **k):
+        return "OK"
+
+
+_saved_avail, _saved_stock, _saved_gate = M.PYKRX_AVAILABLE, M.stock, M.KRX_GATE
+M.PYKRX_AVAILABLE, M.stock = True, _StockStub()
+M.KRX_GATE = M.SerialGate(0.0)
+_before = M.KRX_GATE.calls
+check("pykrx 호출이 정상 반환", M.pykrx_call("get_market_cap_by_ticker", "20250630"), "OK")
+check("pykrx 호출이 KRX 게이트를 통과한다", M.KRX_GATE.calls - _before, 1)
+M.PYKRX_AVAILABLE, M.stock, M.KRX_GATE = _saved_avail, _saved_stock, _saved_gate
+
+# (B) HTTP 200 인데 JSON 이 아닌 응답(점검 안내·차단 페이지)은 '해결 가능'이어야 한다.
+#     예전에는 dart_request 가 남긴 ValueError 이름이 먼저 걸려 '미분류 → 해결 불가'가
+#     되면서 수집 전체가 막혔다.
+_real_dr = M.dart_request
+M.dart_request = lambda *a, **k: {
+    "ok": False, "exc_type": "builtins.ValueError",
+    "exc_message": "응답이 JSON 이 아니다", "http_status": 200,
+    "body_head": "<html>시스템 점검 중입니다</html>", "json": None, "elapsed": 0.1}
+M.DART_PREFLIGHT.update({"done": False, "ok": False, "code_fixable": True})
+_pf = M.run_dart_preflight()
+check("HTTP 200 비JSON 은 코드로 해결 가능으로 분류", _pf["code_fixable"], True)
+truthy("분류에 HTTP 상태가 들어간다", "HTTP 200" in _pf["classification"])
+truthy("진단물이 남는다", (M.DIR_REPORTS / "diag_dart_preflight.json").exists())
+
+# 응답도 예외도 없는 경우는 낙관하지 않는다
+M.dart_request = lambda *a, **k: {"ok": False, "exc_type": "", "exc_message": "",
+                                  "http_status": None, "body_head": "", "json": None,
+                                  "elapsed": 0.0}
+M.DART_PREFLIGHT.update({"done": False, "ok": False, "code_fixable": True})
+check("응답도 예외도 없으면 해결 가능으로 위장하지 않는다",
+      M.run_dart_preflight()["code_fixable"], False)
+M.dart_request = _real_dr
+
+# (C) 죽은 키(010)는 즉시 중단한다. 예전에는 재시도 대상도 halt 대상도 아니라서
+#     서킷 카운터를 리셋하며 하루치 예산을 통째로 태웠다.
+_col = M.Collector("k" * 40)
+M.dart_request = lambda *a, **k: {"ok": True, "exc_type": "", "exc_message": "",
+                                  "http_status": 200, "body_head": "",
+                                  "json": {"status": "010"}, "elapsed": 0.0}
+check("010 반환", _col.fetch("exctv", "00000001", "2025", "11012"), "010")
+check("010 은 즉시 halt", _col.halt, "DART_010")
+check("010 응답은 캐시하지 않는다", M.cache_path("00000001", "2025", "11012").exists(), False)
+
+# 재시도에도 halt 에도 안 걸리는 status 가 연속으로 쌓이면 방지턱이 작동한다
+_col2 = M.Collector("k" * 40)
+M.dart_request = lambda *a, **k: {"ok": True, "exc_type": "", "exc_message": "",
+                                  "http_status": 200, "body_head": "",
+                                  "json": {"status": "100"}, "elapsed": 0.0}
+for _i in range(M.BAD_STATUS_STREAK_STOP):
+    if _col2.halt:
+        break
+    _col2.fetch("exctv", f"{_i:08d}", "2025", "11012")
+truthy("비정상 status 연속 방지턱이 작동한다", _col2.halt.startswith("DART_BAD_STATUS_STREAK"))
+check("방지턱 임계", M.BAD_STATUS_STREAK_STOP, 200)
+_col3 = M.Collector("k" * 40)
+_seq = ["100"] * 5 + ["000"]
+M.dart_request = (lambda box: (lambda *a, **k: {
+    "ok": True, "exc_type": "", "exc_message": "", "http_status": 200, "body_head": "",
+    "json": {"status": box.pop(0) if box else "000", "list": []}, "elapsed": 0.0}))(list(_seq))
+for _i in range(6):
+    _col3.fetch("exctv", f"9{_i:07d}", "2025", "11012")
+check("정상 응답 1건이 비정상 연속을 끊는다", _col3.consec_bad_status, 0)
+M.dart_request = _real_dr
+
+# (E) 메타만 있고 데이터 파일이 없으면 커버된 것으로 보지 않는다.
+#     (pyarrow 가 빠진 환경에서 예전 parquet 캐시를 '있다'고 믿고 전 종목 종가가 사라지던 경로)
+ps2 = M.PriceStore([2025], "2025-01-01", "2025-12-31")
+ps2._write_year("000123", 2025, {"2025-06-30": 100.0})
+check("메타+데이터가 다 있으면 커버", ps2._covered("000123", ["2025-06-30"]), True)
+for _c in ps2._year_files("000123", 2025):
+    if _c.exists():
+        _c.unlink()
+check("데이터 파일이 사라지면 다시 받는다", ps2._covered("000123", ["2025-06-30"]), False)
+ps2._write_year("000124", 2025, {})
+check("체결이 없던 해(rows=0)는 데이터 파일 없이도 커버로 본다",
+      ps2._covered("000124", ["2025-06-30"]), True)
+check("종가 저장이 원자적이다(tmp 잔여물 없음)",
+      [f.name for f in (M.DIR_CACHE_PX / "000124").iterdir() if ".tmp" in f.name], [])
+
+print("\n[24d] 확인된 결함 — Plan A 의 시장 라벨 오염 (측정 대상이 조용히 바뀌던 경로)")
+_dirs("konex")
+_ALL = [f"{i:06d}" for i in range(1, 1201)]          # KOSPI 400 + KOSDAQ 700 + KONEX 100
+_LAB = {"KOSPI": _ALL[:400], "KOSDAQ": _ALL[400:1100], "KONEX": _ALL[1100:]}
+_drop = {"market": None}
+
+
+class _StockA:
+    @staticmethod
+    def get_market_cap_by_ticker(date, market="ALL", **k):
+        return pd.DataFrame({"시가총액": [float(i + 1) * 1e8 for i in range(len(_ALL))]},
+                            index=_ALL)
+
+    @staticmethod
+    def get_market_ticker_list(date, market="KOSPI", **k):
+        return [] if market == _drop["market"] else list(_LAB[market])
+
+
+_sa, _ss, _sg = M.PYKRX_AVAILABLE, M.stock, M.KRX_GATE
+M.PYKRX_AVAILABLE, M.stock, M.KRX_GATE = True, _StockA(), M.SerialGate(0.0)
+
+_snap, _note = M.snap_plan_a("2025-06-30")
+check("라벨이 온전하면 정상 스냅샷", None if _snap is None else len(_snap), 1200)
+check("KONEX 100종목이 라벨링된다", int((_snap["mkt"] == "KNX").sum()), 100)
+
+_drop["market"] = "KONEX"                 # 한 시장의 목록만 빈 응답으로 돌아오는 상황
+_snap2, _note2 = M.snap_plan_a("2025-06-30")
+check("KONEX 목록이 비면 그 날짜를 쓰지 않는다(오염된 스냅샷을 만들지 않는다)", _snap2, None)
+truthy("사유에 시장별 건수가 남는다", "KONEX" in _note2 and "0" in _note2)
+_drop["market"] = "KOSPI"
+check("어느 시장이든 빈 목록이면 마찬가지", M.snap_plan_a("2025-06-30")[0], None)
+_drop["market"] = None
+M.PYKRX_AVAILABLE, M.stock, M.KRX_GATE = _sa, _ss, _sg
+
+# 라벨이 '일부만' 없는 스냅샷이 어떤 경로로든 들어왔을 때: 무라벨은 KOSPI+KOSDAQ 으로
+# 밀어 넣지 않는다(그게 KONEX 였다면 시총이 가장 작아 하위 1,000 을 통째로 점유한다).
+_mixed = M._mk_snapshot(_ALL, [float(i + 1) * 1e8 for i in range(len(_ALL))],
+                        ["STK"] * 400 + ["KSQ"] * 700 + [""] * 100)
+M._SNAP_MEM.clear()
+M.MARKET_SOURCE.update({"plan": "A", "name": "pykrx", "detail": ""})
+M._snap_write_csv(_mixed, M._krx_snap_path("2025-06-30"))
+_u = M.build_universe("SX", "2025-06-30")
+check("무라벨 종목은 전 상장사에서 제외된다(추정하지 않는다)", len(_u["listed"]), 1100)
+check("무라벨 건수가 판정표에 남는다", _u["n_unlabeled_market"], 100)
+check("측정 대상이 무라벨로 오염되지 않는다",
+      len(_u["measure"] & set(_ALL[1100:])), 0)
+M._SNAP_MEM.clear()
+M.MARKET_SOURCE.update({"plan": "", "name": "", "detail": ""})
 
 print("\n[25] 계약 목록 — v1.4 §6 과 일치")
 _expect = {"P0_MARKET_SOURCE_LADDER", "P0_NO_URL_GUESSING", "P0_DART_PREFLIGHT",
