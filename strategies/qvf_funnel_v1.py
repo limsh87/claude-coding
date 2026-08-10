@@ -268,7 +268,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.1051"
+BUILD_VERSION      = "qvf1.20260810.1106"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -1379,9 +1379,77 @@ def bh_fdr(pvals: Sequence[float], q: float = 0.10) -> np.ndarray:
 
 
 
+class _ThreadTee:
+    """스레드별로 출력을 갈라 보내는 stdout/stderr 대역.
+
+    ★★ 왜 이게 필요한가 — 전역 교체는 멀티스레드에서 반드시 깨진다 ★★
+      sys.stdout 은 프로세스 전역이다. 워커 스레드 12개가 각자
+        o = sys.stdout; sys.stdout = buf ... sys.stdout = o
+      를 하면, 스레드 B 가 스레드 A 의 buf 를 '원본'으로 저장했다가 복구하는 순간
+      stdout 이 죽은 StringIO 로 영구 고정된다. 그때부터 tqdm 진행바도 LOG 도
+      화면에 한 글자도 나오지 않는다 — 실행은 도는데 멈춘 것처럼 보인다.
+      실측으로 사용자의 일봉 수집이 0% 에서 얼어붙은 것처럼 보인 원인이 정확히 이것이다.
+    → 대역을 '한 번만' 설치하고, 캡처는 스레드로컬 버퍼의 유무로만 결정한다.
+      캡처 중인 스레드의 출력만 버퍼로 가고 나머지는 그대로 화면에 나간다.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+
+    def _buf(self):
+        return getattr(self._local, "buf", None)
+
+    def _push(self):
+        b = io.StringIO()
+        self._local.buf = b
+        return b
+
+    def _pop(self):
+        b = getattr(self._local, "buf", None)
+        self._local.buf = None
+        return b.getvalue() if b is not None else ""
+
+    def write(self, s):
+        b = self._buf()
+        if b is not None:
+            return b.write(s)
+        return self._real.write(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._real.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, k):
+        return getattr(self._real, k)
+
+
+def _install_tee():
+    """대역을 딱 한 번 설치한다(재실행·중복 import 대비)."""
+    out = sys.stdout
+    if not isinstance(out, _ThreadTee):
+        sys.stdout = _ThreadTee(out)
+    err = sys.stderr
+    if not isinstance(err, _ThreadTee):
+        sys.stderr = _ThreadTee(err)
+    return sys.stdout, sys.stderr
+
+
+_TEE_OUT, _TEE_ERR = _install_tee()
+NOISE_COUNT: Dict[str, int] = {}
+
+
 @contextmanager
 def capture_noise(tag: str = ""):
-    """블록 안의 stdout/stderr 를 가로채 LOG.debug 로 돌린다. 실패는 세지 되 화면은 지킨다.
+    """이 블록 '안의 이 스레드' 출력만 가로채 LOG.debug 로 돌린다.
 
     ★ FDR·pykrx 는 logging 을 쓰지 않는다. 둘 다 builtin print() 로 직접 뱉는다:
         FinanceDataReader/naver/data.py : '"000010" invalid symbol or has no data'
@@ -1391,20 +1459,27 @@ def capture_noise(tag: str = ""):
     ★ pykrx 의 @dataframe_empty_handler 는 JSONDecodeError 를 삼키고 빈 DataFrame 을
       돌려준다. 세션 만료로 JSON 대신 로그인 HTML 을 받은 '실패'가 호출부에는 '그 날짜에
       상장 종목이 없음' 이라는 사실로 보인다 — 이 캡처가 그 구분을 되살린다.
+    ★ 다른 스레드(tqdm 진행바·LOG)는 영향을 받지 않는다. 전역 교체가 아니다.
     yield 는 캡처된 텍스트를 담을 리스트다(블록 종료 후 확인).
     """
-    buf, box = io.StringIO(), []
-    o, e = sys.stdout, sys.stderr
-    sys.stdout = sys.stderr = buf
+    box: List[str] = []
+    _TEE_OUT._push()
+    _TEE_ERR._push()
     try:
         yield box
     finally:
-        sys.stdout, sys.stderr = o, e
-        txt = buf.getvalue().strip()
+        txt = (_TEE_OUT._pop() + "\n" + _TEE_ERR._pop()).strip()
         if txt:
             box.append(txt)
-            head = txt.splitlines()[0][:200]
-            LOG.debug(f"[{tag}] 라이브러리 출력 {len(txt.splitlines())}줄 (첫 줄: {head})")
+            # ★ 종목마다 한 줄이면 1,500줄이 된다 — 억제한 소음을 다른 형태로 되살리는 꼴이다.
+            #   접두어별로 앞 3건만 남기고 나머지는 세기만 한다(끝에 합계를 보고한다).
+            k = str(tag).split(":", 1)[0]
+            n = NOISE_COUNT[k] = NOISE_COUNT.get(k, 0) + 1
+            if n <= 3:
+                LOG.debug(f"[{tag}] 라이브러리 출력 {len(txt.splitlines())}줄 "
+                          f"(첫 줄: {txt.splitlines()[0][:160]})")
+            elif n == 4:
+                LOG.debug(f"[{k}] 이후 같은 종류의 라이브러리 출력은 세기만 합니다.")
 
 
 def noise_is_failure(box: List[str]) -> bool:
@@ -4437,6 +4512,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             else:
                 todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
                 n_fwd += 1
+    if NOISE_COUNT:
+        LOG.info("수집 중 라이브러리 자체 출력 — "
+                 + " · ".join(f"{k} {v:,}건" for k, v in sorted(NOISE_COUNT.items()))
+                 + " (대부분 폐지·비상장 종목의 정상적인 '데이터 없음' 입니다)")
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
                  f"(요청 시작일 이전으로 물어본 적이 없는 종목만).")

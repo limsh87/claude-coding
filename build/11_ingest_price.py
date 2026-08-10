@@ -429,6 +429,10 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             else:
                 todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
                 n_fwd += 1
+    if NOISE_COUNT:
+        LOG.info("수집 중 라이브러리 자체 출력 — "
+                 + " · ".join(f"{k} {v:,}건" for k, v in sorted(NOISE_COUNT.items()))
+                 + " (대부분 폐지·비상장 종목의 정상적인 '데이터 없음' 입니다)")
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
                  f"(요청 시작일 이전으로 물어본 적이 없는 종목만).")
