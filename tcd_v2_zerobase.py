@@ -986,21 +986,6 @@ def pace(source: str) -> _Pace:
         return _PACERS[source]
 
 
-def with_retry(times: int = 3, base: float = 1.7):
-    def deco(fn):
-        def run(*a, **k):
-            last = None
-            for i in range(times):
-                try:
-                    return fn(*a, **k)
-                except Exception as e:                            # noqa
-                    last = e
-                    if i < times - 1:
-                        time.sleep(base ** i + random.random() * 0.3)
-            raise last                                            # type: ignore
-        run.__name__ = getattr(fn, "__name__", "run")
-        return run
-    return deco
 
 
 NET_TASK_TIMEOUT_S = 300      # 병렬 작업 1건의 상한(초)
@@ -1263,21 +1248,6 @@ def pmap_net(fn: Callable, items: Sequence, workers: Optional[int] = None,
     return out
 
 
-def pmap_calc(fn: Callable, items: Sequence, label: str = "") -> List[Any]:
-    """연산 병렬 — fork 가능하면 프로세스, 아니면 순차(결과 동일·속도만 차이)."""
-    items = list(items)
-    if not items:
-        return []
-    if len(items) == 1 or not _FORK_OK:
-        return [fn(x) for x in tqdm(items, desc=label or "연산", leave=False, ncols=86)]
-    try:
-        with ProcessPoolExecutor(max_workers=min(N_CPU_WORKERS, len(items)),
-                                 mp_context=_mp.get_context("fork")) as ex:
-            return list(tqdm(ex.map(fn, items), total=len(items),
-                             desc=label or "연산", leave=False, ncols=86))
-    except Exception as e:                                        # noqa
-        L.warn(f"프로세스 병렬 실패({type(e).__name__}) — 순차 실행 폴백(결과 동일)")
-        return [fn(x) for x in items]
 
 
 # ★드리프트 감사용 집계 — 편향은 '있다/없다'가 아니라 ★방향과 크기로 재야 판단이 된다.
@@ -2207,12 +2177,6 @@ def smart_decode(raw: bytes, declared: Optional[str] = None, prefer: Optional[st
     return best if best is not None else raw.decode("utf-8", "replace")
 
 
-def euckr_quote(s: str) -> str:
-    """네이버/한경 레거시 경로의 한글 파라미터는 EUC-KR 퍼센트인코딩 — 틀리면 '결과 0건'."""
-    try:
-        return quote(str(s), encoding="euc-kr")
-    except Exception:
-        return quote(str(s))
 
 
 # ★봇차단 안내 페이지 지문. ★오탐이 미탐보다 훨씬 위험하다 — 정상 페이지를 차단으로 오판하면
@@ -2855,6 +2819,32 @@ def chunked(seq: Sequence, size: int) -> Iterable[list]:
     seq = list(seq)
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
+
+
+def budget_batches(jobs: Sequence, size: int, src: str, what: str,
+                   cap: Optional[int] = None, unit: str = "건") -> Iterable[list]:
+    """★예산·시계 가드가 걸린 배치 이터레이터 — 모든 수집기가 이걸 쓴다.
+
+    이 열 줄이 7개 수집기에 각자 복사돼 있었고, 그래서 ★같은 결함을 매번 7번씩 고쳐야
+    했다. 실제로 그렇게 고친 것들:
+      · max_calls=0 이 '무제한'으로 뒤집히던 것(dart 4곳 + datagokr 3곳)
+      · 중단 사유가 원인과 무관하게 '배정 소진'으로 찍히던 것(4곳)
+      · CLOCK 체크가 배치 경계에만 있어 예산 만료 뒤 수천 회를 더 태우던 것
+    한 곳으로 모으면 다음 결함은 한 번만 고치면 된다 — 그게 이 함수의 존재 이유다.
+
+    cap 규약은 cap_of() 와 같다: None/-1=무제한 · 0=금지 · 양수=상한.
+    """
+    base = QUOTA.spent(src)
+    c = cap_of(cap)
+    left = len(jobs)
+    for b in chunked(jobs, size):
+        over, noq = CLOCK.over(), not QUOTA.allow(src)
+        if over or noq or (c is not None and QUOTA.spent(src) - base >= c):
+            why = "시간예산" if over else ("호출 잔여량 소진" if noq else "배정 소진")
+            CLOCK.cut(f"{what}: {left:,}{unit} 남기고 중단({why}) — 다음 실행이 이어받습니다")
+            return
+        yield b
+        left -= len(b)
 
 
 CLOCK = HarvestClock(HARVEST_TIME_BUDGET_H)
@@ -6001,16 +5991,7 @@ def harvest_dart_multi(corps: Sequence[str], years: Sequence[int],
     spent0 = QUOTA.spent("dart")
     _cap = cap_of(max_calls)
     with stage_bar(len(jobs), "DART 주요계정(회사 100개/호출)") as bar:
-        for batch in chunked(jobs, 200):
-            _over, _noq = CLOCK.over(), not QUOTA.allow("dart")
-            if _over or _noq or (_cap is not None and
-                                 QUOTA.spent("dart") - spent0 >= _cap):
-                # ★사유를 실제 원인대로 적는다. 옛 코드는 max_calls 가 truthy 이기만 하면
-                #   원인이 일일 한도 소진이어도 '배정 소진'으로 찍었다 — 이번 병목을 정확히
-                #   그렇게 오독했다. 진단을 반대로 유도하는 로그는 없느니만 못하다.
-                why = "시간예산" if _over else ("호출 잔여량 소진" if _noq else "배정 소진")
-                CLOCK.cut(f"DART 주요계정 벌크: {len(jobs)-bar.n:,}회 남기고 중단({why})")
-                break
+        for batch in budget_batches(jobs, 200, "dart", "DART 주요계정 벌크", cap=max_calls, unit="회"):
             res = pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True)
             bar.update(len(batch))
             got += [t[0] for t in res if t and t[0] is not None and len(t[0])]
@@ -6182,16 +6163,7 @@ def harvest_dart_financials(corps: Sequence[str], years: Sequence[int],
         spent0 = QUOTA.spent("dart")
         _cap = cap_of(max_calls)
         with stage_bar(len(jobs), "DART 전체재무제표(심층)") as bar:
-          for batch in chunked(jobs, 400):
-            _over, _noq = CLOCK.over(), not QUOTA.allow("dart")
-            if _over or _noq or (_cap is not None and
-                                 QUOTA.spent("dart") - spent0 >= _cap):
-                # ★사유를 실제 원인대로 적는다. 옛 코드는 max_calls 가 truthy 이기만 하면
-                #   원인이 일일 한도 소진이어도 '배정 소진'으로 찍었다 — 이번 병목을 정확히
-                #   그렇게 오독했다. 진단을 반대로 유도하는 로그는 없느니만 못하다.
-                why = "시간예산" if _over else ("호출 잔여량 소진" if _noq else "배정 소진")
-                CLOCK.cut(f"DART 재무: {len(jobs)-bar.n:,}건 남기고 중단({why}) — 다음 실행 이어받음")
-                break
+          for batch in budget_batches(jobs, 400, "dart", "DART 재무", cap=max_calls, unit="건"):
             res = pmap_net(one, batch, workers=min(IO_THREADS, 10), quiet=True)
             bar.update(len(batch))
             for d in res:
@@ -7012,16 +6984,7 @@ def harvest_dart_disclosures(start: str, end: str, max_calls: int = -1,
     _cap = cap_of(max_calls)
     _n_ok = 0
     with stage_bar(len(jobs), "DART 공시목록(월×유형 스윕)") as bar:
-        for batch in chunked(jobs, 48):
-            _over, _noq = CLOCK.over(), not QUOTA.allow("dart")
-            if _over or _noq or (_cap is not None and
-                                 QUOTA.spent("dart") - spent0 >= _cap):
-                # ★사유를 실제 원인대로 적는다. 옛 코드는 max_calls 가 truthy 이기만 하면
-                #   원인이 일일 한도 소진이어도 '배정 소진'으로 찍었다 — 이번 병목을 정확히
-                #   그렇게 오독했다. 진단을 반대로 유도하는 로그는 없느니만 못하다.
-                why = "시간예산" if _over else ("호출 잔여량 소진" if _noq else "배정 소진")
-                CLOCK.cut(f"공시목록: (월×유형) {len(jobs)-bar.n:,}건 남기고 중단({why})")
-                break
+        for batch in budget_batches(jobs, 48, "dart", "공시목록", cap=max_calls, unit="건"):
             for item in pmap_net(one, batch, workers=min(IO_THREADS, 8), quiet=True):
                 if not item:
                     continue
@@ -7906,12 +7869,8 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
     done_new: List[str] = []
     _sp0 = QUOTA.spent("datagokr")
     with stage_bar(len(todo), "조달 낙찰(월축)") as bar:
-        for batch in chunked(todo, 6):
-            _mc2 = cap_of(max_calls)
-            if CLOCK.over() or not QUOTA.allow("datagokr") or \
-                    (_mc2 is not None and QUOTA.spent("datagokr") - _sp0 >= _mc2):
-                CLOCK.cut(f"조달 낙찰: {len(got):,}행 수집 후 중단(완주 월만 완료 처리)")
-                break
+        for batch in budget_batches(todo, 6, "datagokr", "조달 낙찰",
+                                    cap=max_calls, unit="개월"):
             for item in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
                 if not item:
                     continue
@@ -8042,12 +8001,8 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
     got: List[dict] = []
     _sx0 = QUOTA.spent(key_src)
     with stage_bar(len(jobs), "관세 통관(월×HS축)") as bar:
-        for batch in chunked(jobs, 200):
-            _mc2 = cap_of(max_calls)
-            if CLOCK.over() or not QUOTA.allow(key_src) or \
-                    (_mc2 is not None and QUOTA.spent(key_src) - _sx0 >= _mc2):
-                CLOCK.cut(f"관세 통관: {len(got):,}행 수집 후 중단")
-                break
+        for batch in budget_batches(jobs, 200, key_src, "관세 통관",
+                                    cap=max_calls, unit="건"):
             for r in pmap_net(one, batch, workers=min(IO_THREADS, 6), quiet=True):
                 if r:
                     got += r
@@ -8215,41 +8170,81 @@ def packs_on() -> List[dict]:
     return [p for pid, p in SENSOR_PACKS.items() if p["enabled"] and pid in ACTIVE_PACKS]
 
 
+_PACK_QUIET: Dict[str, Any] = {"on": False, "hit": []}   # 합성 구간 판정 침묵 + 기록
+
+
 def pack_off(pid: str, why: str):
     if pid in SENSOR_PACKS and SENSOR_PACKS[pid]["enabled"]:
         SENSOR_PACKS[pid]["enabled"] = False
         SENSOR_PACKS[pid]["why_off"] = why
+        if _PACK_QUIET["on"]:
+            # ★합성 구간 — 로그 대신 여기 적어 둔다. 나가면서 한 줄로 요약한다.
+            #   (상태 복원은 run_smoke 의 reset_transient_state 가 이미 한다. 그게 우리
+            #    finally 보다 먼저 돌기 때문에, '무엇이 꺼졌었나'는 이렇게만 알 수 있다.)
+            if pid not in _PACK_QUIET["hit"]:
+                _PACK_QUIET["hit"].append(pid)
+            return
         L.warn(f"센서팩 '{pid}' 비활성화 — {why} (조용히 남겨두지 않고 명시적으로 끕니다)")
 
 
 @contextmanager
 def pack_state_guard(restore: bool = True):
-    """★센서팩 활성 상태를 스냅샷했다가 되돌린다.
+    """★합성 구간의 팩 판정을 침묵시키고, 나올 때 상태를 되돌린다.
 
-    pack_off() 는 전역 SENSOR_PACKS 를 끈다. 그래서 ★합성 스모크가 실데이터 실행을
-    오염시킬 수 있다 — 합성 패널에는 관세(X)·조달(P)의 원천이 애초에 없으므로 커버리지
-    0% 판정이 나고, 그 판정이 그대로 남아 실데이터에 그 팩이 아무리 많이 들어와도
-    packs_on() 이 영영 제외한다. 실측에서 매 실행 'X·P 비활성화'가 뜬 원인이 이것이고,
-    hs_corp_map 을 넣어도 조달을 다 받아도 죽는 상태였다. 수집은 하는데 피처가 안
-    만들어지므로 쿼터만 태우고 축은 사라지는, 가장 나쁜 형태의 결함이다.
+    ★사실관계 정정: 팩이 실데이터 실행까지 꺼진 채 남지는 ★않는다 —
+      run_smoke 의 finally 가 reset_transient_state() 를 부르고 거기서 전 팩을
+      enabled=True 로 되돌린다. 앞선 진단('스모크가 팩을 영구히 끈다')은 틀렸다.
 
-    스모크는 ★배관 검증이지 데이터 판정이 아니다. 판정은 실데이터로만 한다(§8.4).
+    진짜 문제는 ★로그다. 합성 패널에는 관세(X)·조달(P)의 원천이 애초에 없으므로
+    커버리지 0% 판정이 나고, 매 실행 "센서팩 'X' 비활성화"가 찍힌다. 사용자는 그걸
+    보고 그 팩이 죽은 것으로 읽는다 — 실제로는 실데이터 판정을 아직 하지도 않았는데도.
+    없는 데이터를 두고 내린 판정을 경고로 찍는 것은 정보가 아니라 소음이다.
+
+    그래서 합성 구간에서는 판정을 ★조용히 수행하고(계산 경로는 그대로 검증된다),
+    나올 때 상태를 복원한 뒤 무엇을 건너뛰었는지 ★한 줄로만 남긴다.
+    활성 여부는 실데이터 수집 뒤 pack_status_table() 이 표로 보여준다.
     """
     snap = {k: (v["enabled"], v["why_off"]) for k, v in SENSOR_PACKS.items()}
+    prev, prev_hit = _PACK_QUIET["on"], _PACK_QUIET["hit"]
+    _PACK_QUIET["on"], _PACK_QUIET["hit"] = True, []
     try:
         yield snap
     finally:
+        skipped = list(_PACK_QUIET["hit"])
+        _PACK_QUIET["on"], _PACK_QUIET["hit"] = prev, prev_hit
         if restore:
-            back = [k for k, v in SENSOR_PACKS.items()
-                    if not v["enabled"] and snap.get(k, (True, ""))[0]]
             for k, (en, why) in snap.items():
                 if k in SENSOR_PACKS:
                     SENSOR_PACKS[k]["enabled"] = en
                     SENSOR_PACKS[k]["why_off"] = why
-            if back:
-                L.info(f"스모크가 끈 팩 {back} 을 되돌립니다 — 합성데이터엔 그 팩의 원천이 "
-                       f"애초에 없으므로 그건 데이터 판정이 아닙니다. 활성 여부는 실데이터 "
-                       f"커버리지로 다시 판정합니다(§8.4).")
+        if skipped and restore:
+            L.info(f"합성 스모크에는 팩 {skipped} 의 실제 원천이 없어 그 판정은 건너뜁니다"
+                   f"(계산 경로는 그대로 검증됐습니다). ★활성 여부는 실데이터 수집 뒤 "
+                   f"L.PANEL 의 '센서팩 활성 현황' 표가 유일한 판정 근거입니다.")
+
+
+def pack_status_table(P: Optional[pd.DataFrame] = None):
+    """★실데이터 기준 센서팩 활성 현황 — 무엇이 켜졌고 왜 꺼졌는지 한 표로.
+
+    사용자가 매 실행 물어 온 질문이 정확히 이것이다("모든 축이 활성화돼야 정상 아닌가").
+    합성 스모크의 경고와 섞이지 않도록, 실데이터 패널이 만들어진 뒤 ★한 번만 찍는다.
+    """
+    rows = []
+    for pid, p in SENSOR_PACKS.items():
+        if pid not in ACTIVE_PACKS:
+            rows.append([pid, p["name"], "설정에서 제외", "—", "—", "ACTIVE_PACKS 미포함"])
+            continue
+        ec, tc = p["E_col"], p.get("theta_col")
+        cov = (f"{float(P[ec].notna().mean())*100:.1f}%"
+               if P is not None and ec in P.columns and len(P) else "—")
+        th = (f"{float(P[tc].notna().mean())*100:.1f}%"
+              if P is not None and tc and tc in P.columns and len(P) else "—")
+        rows.append([pid, p["name"], "✔ 활성" if p["enabled"] else "✘ 비활성",
+                     cov, th, (p["why_off"] or "")[:60] if not p["enabled"] else
+                     ("거부권 전용(증거층 축 아님)" if p.get("veto_only") else "")])
+    L.grid(rows, ["팩", "이름", "상태", "E 커버리지", "θ 커버리지", "비고"],
+           ["l", "l", "l", "r", "r", "l"],
+           title="센서팩 활성 현황 (실데이터 기준 — 위 합성 스모크 경고와 무관합니다)")
 
 
 # ── 기본 패널 ───────────────────────────────────────────────────────────────────────────────
@@ -11038,6 +11033,9 @@ def main() -> dict:
         cons = build_consensus_monthly(ctx.get("links", pd.DataFrame()), months)
         ctx["consensus"] = cons
         P = _feature_chain(P0, master, ctx, ctx.get("flows"), cons)
+        # ★실데이터 기준 팩 활성 현황을 여기서 한 번 찍는다. 위 합성 스모크의 경고와
+        #   섞여 "축이 또 꺼졌다"로 읽히던 문제를 없앤다 — 이 표가 유일한 판정 근거다.
+        pack_status_table(P)
         VAULT.save_table(f"l1_features_{STRATEGY_TAG}" + ("_INTERIM" if CLOCK.tripped else ""),
                          P, "private", domain="features", source="L1",
                          note="시간예산 중단분" if CLOCK.tripped else "")
