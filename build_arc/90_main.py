@@ -54,8 +54,14 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
         ctx["sec"], ctx["snapshots"] = sec, snaps
 
     with PIPE.stage("L1.PX", "가격 · 유동성 · PIT 시가총액", "L1", budget_s=2400):
+        # ★ 순서 주의: KRXG.warmup() 이 pykrx 세션을 확인하는데, 그 전에 마켓플레이스
+        #   로그인이 끝나 있어야 한다. 예전에는 L1.UNI 에서 warmup 이 먼저 돌아 'KRX 세션
+        #   없음'으로 굳었고, 로그인이 성공한 뒤에도 시총 스냅샷 80개 시점을 전부 건너뛰었다.
         KRX.login()
+        KRXG._warm = False
+        KRXG.warmup()
         _px_codes = price_fetch_candidates(ctx["sec"], BACKTEST_START, BACKTEST_END)
+        ctx["px_codes"] = _px_codes
         px = fetch_prices(_px_codes,
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
                           BACKTEST_END, sec=ctx["sec"])
@@ -66,7 +72,15 @@ def arc_collect(rebals: pd.DatetimeIndex) -> dict:
 
     with PIPE.stage("L1.DART", "DART 재무 · 직원 · 공시 · 주식총수 · 감사의견", "L1",
                     budget_s=3600, critical=False):
-        corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()
+        # ★ DART 수집 대상을 '일봉 수집 대상'과 일치시킨다. 스팩·우선주·KONEX·백테 구간 밖
+        #   폐지 종목은 U-1000 후보가 아니므로 재무를 받을 이유가 없다(호출량 절반).
+        _pxset = set(ctx.get("px_codes") or [])
+        _S = ctx["sec"]
+        if _pxset:
+            _S = _S[_S["code"].astype(str).isin(_pxset)]
+        corps = _S["corp_code"].dropna().astype(str).unique().tolist()
+        LOG.info(f"DART 수집 대상 법인 {len(corps):,}사 "
+                 f"(전체 {ctx['sec']['corp_code'].nunique():,}사 중 U-1000 후보만)")
         prio: List[str] = []
         try:
             adv = (ctx["liq"].groupby("code", observed=True)["adtv60"].median()

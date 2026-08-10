@@ -6,7 +6,15 @@
 # ────────────────────────────────────────────────────────────────────────────────────────
 
 DART_BASE = "https://opendart.fss.or.kr/api/"
-DART_STATEMENT_FREQ = "quarterly"         # "quarterly" | "annual"
+# 전체재무제표(fnlttSinglAcntAll)를 어느 보고서까지 받을지. 호출량·소요시간이 여기서 갈린다.
+#   "annual"     FY 만            — 법인 2,400사 기준 1단 9,600콜(≈1.1h) + 2단 19,200콜(≈2.1h)
+#   "semiannual" FY + 반기        — 1단 24,000콜(≈2.7h) + 2단 33,600콜(≈3.7h)   ★기본값
+#   "quarterly"  FY + 분기 3종    — 1단 52,800콜(≈5.9h) + 2단 62,400콜(≈6.9h) = 12.8h (12h 초과)
+# ★ D2 의 6개 지표(ACCRUAL·NOA·AR/INV_DIVERGE·CFO_NI_GAP)는 전부 **연간/YoY 개념**이라
+#   연간 전체재무제표로 정확히 산출된다. 분기 갱신이 필요한 자산·부채·자본·매출·순이익은
+#   fnlttMultiAcnt(100사 배치)로 거의 공짜로 받으므로, EX_LOSS4Q·EX_IMPAIR 는 분기 그대로다.
+#   즉 "quarterly" 로 올려도 얻는 것은 '깊은 계정의 분기 갱신'뿐이고 시간은 4배가 된다.
+DART_STATEMENT_FREQ = "semiannual"        # "annual" | "semiannual" | "quarterly"
 REPRT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "FY": "11011"}
 REPRT_DEADLINE_DAYS = {"11013": 45, "11012": 45, "11014": 45, "11011": 90}
 REPRT_PERIOD_END = {"11013": (3, 31), "11012": (6, 30), "11014": (9, 30), "11011": (12, 31)}
@@ -38,8 +46,12 @@ class DartBudget:
         mode = globals().get("ARC_DART_LIMIT_MODE", "auto")
         if isinstance(mode, (int, float)) and not isinstance(mode, bool):
             return int(mode)
-        base = int(self.learned_limit or globals().get("ARC_DART_LIMIT_HINT", 20_000))
-        return max(100, base - int(globals().get("ARC_DART_SAFETY", 200)))
+        # ★ 학습값이 없으면 **상한을 두지 않는다.** 남은 호출량은 조회할 수 없고, 서버가
+        #   020 을 줄 때가 진짜 한계다. 힌트값을 상한처럼 쓰면 아직 쓸 수 있는데도 스스로
+        #   멈추고 "며칠 걸린다"는 잘못된 안내를 하게 된다(실제로 그랬다).
+        if self.learned_limit:
+            return max(100, int(self.learned_limit) - int(globals().get("ARC_DART_SAFETY", 200)))
+        return 10 ** 9
 
     def remaining(self) -> int:
         return max(0, self.limit() - self.n)
@@ -72,9 +84,12 @@ class DartBudget:
                 self.n = int(j.get("n", 0))
         except Exception:
             pass
-        src = ("실측 학습값" if self.learned_limit else "추정 힌트값(아직 실측 전)")
-        LOG.info(f"DART 호출 예산 — 오늘 사용 {self.n:,}건 / 상한 {self.limit():,}건 ({src}) → "
-                 f"남은 호출 {self.remaining():,}건. 이 값은 실행 중 실시간으로 갱신됩니다.")
+        if self.learned_limit:
+            LOG.info(f"DART 호출 예산 — 오늘 사용 {self.n:,}건 / 실측 학습 상한 "
+                     f"{self.limit():,}건 → 남은 호출 {self.remaining():,}건.")
+        else:
+            LOG.info(f"DART 호출 예산 — 오늘 사용 {self.n:,}건. 상한을 미리 정하지 않고 "
+                     f"서버가 한도초과(020)를 줄 때까지 씁니다(그 지점을 학습해 기록).")
 
     def _save(self):
         try:
@@ -212,26 +227,68 @@ def _knowledge_from_rcept(rcept_no: Any, reprt_code: str, year: int) -> pd.Times
     return as_ts(f"{year}-{mm:02d}-{dd:02d}") + pd.Timedelta(days=REPRT_DEADLINE_DAYS.get(reprt_code, 90))
 
 # ── 전체 재무제표 ───────────────────────────────────────────────────────────────────────────
+# ★★ 호출량을 3배 줄이는 핵심.
+#   fnlttSinglAcntAll 응답에는 당기(thstrm)·전기(frmtrm)·전전기(bfefrmtrm) 금액이 **한 번에**
+#   들어 있다. 예전에는 thstrm 만 남기고 나머지 둘을 버린 뒤, 그 연도를 다시 호출했다.
+#   사업보고서 1콜 = 3개 연도이므로 12년치는 4콜이면 끝난다(2017·2020·2023·2026).
+#   실측 필요 호출 205,890회가 여기서만 1/3 로 떨어진다.
 _FS_KEEP = ["corp_code", "bsns_year", "reprt_code", "fs_div", "sj_div",
-            "account_id", "account_nm", "thstrm_amount", "rcept_no"]
+            "account_id", "account_nm", "thstrm_amount",
+            "frmtrm_amount", "bfefrmtrm_amount", "rcept_no"]
+
+# 연간 보고서 1콜이 커버하는 연도 수(당기+전기+전전기). 분기는 당기+전기 2개.
+FS_SPAN_ANNUAL = 3
+FS_SPAN_QUARTER = 2
+# 법인별로 어느 fs_div 가 통했는지 기억해 재시도를 없앤다.
+_FS_DIV_MEMO: Dict[str, str] = {}
 
 def _fs_one(job) -> Optional[pd.DataFrame]:
+    """전체재무제표 1콜 → **여러 연도 행**으로 전개해서 돌려준다.
+
+    ★ fs_div 순서: 상장사 대부분은 연결(CFS)을 제출한다. 예전에는 OFS 를 먼저 때리고
+      실패하면 CFS 를 다시 때려 흔한 경우에 호출이 2배가 됐다. CFS 를 먼저 보고,
+      법인별로 성공한 구분을 기억해 다음 연도부터는 한 번에 맞춘다.
+    """
     corp, year, reprt = job
-    js = dart_api("fnlttSinglAcntAll.json",
-                  {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "OFS"})
-    if not js or "list" not in js:
+    order = ([_FS_DIV_MEMO[corp]] if corp in _FS_DIV_MEMO else []) + \
+            [x for x in ("CFS", "OFS") if x != _FS_DIV_MEMO.get(corp)]
+    js = None
+    for fsd in order:
         js = dart_api("fnlttSinglAcntAll.json",
-                      {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt, "fs_div": "CFS"})
-    if not js or not isinstance(js.get("list"), list) or not js["list"]:
+                      {"corp_code": corp, "bsns_year": str(year),
+                       "reprt_code": reprt, "fs_div": fsd})
+        if js and isinstance(js.get("list"), list) and js["list"]:
+            _FS_DIV_MEMO[corp] = fsd
+            break
+        js = None
+    if js is None:
         return None
     d = pd.DataFrame(js["list"])
     for c in _FS_KEEP:
         if c not in d.columns:
             d[c] = None
     d["corp_code"] = corp
-    d["bsns_year"] = int(year)
     d["reprt_code"] = reprt
-    return d[_FS_KEEP]
+
+    # ★ 당기·전기·전전기를 각각 독립된 '연도 행'으로 전개한다. 이 전개가 호출 절감의 실체다.
+    span = FS_SPAN_ANNUAL if str(reprt) == REPRT_CODES["FY"] else FS_SPAN_QUARTER
+    parts = []
+    for k, col_amt in enumerate(("thstrm_amount", "frmtrm_amount", "bfefrmtrm_amount")[:span]):
+        if col_amt not in d.columns:
+            continue
+        v = d[col_amt]
+        if v.isna().all():
+            continue
+        q = d.copy()
+        q["bsns_year"] = int(year) - k
+        q["thstrm_amount"] = v
+        # 전기·전전기 값은 그 시점 보고서가 아니라 **이번 보고서로 알게 된 값**이다.
+        # knowledge_date 는 이번 접수일 기준이어야 한다(그게 실제로 알 수 있었던 시점).
+        q["_from_rcept_year"] = int(year)
+        parts.append(q[_FS_KEEP + ["_from_rcept_year"]])
+    if not parts:
+        return None
+    return pd.concat(parts, ignore_index=True)
 
 # ── Tier-1: 다중회사 주요계정 (배치) ────────────────────────────────────────────────────────
 #   fnlttMultiAcnt 는 corp_code 를 콤마로 최대 100개까지 받는다.
@@ -312,16 +369,78 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                        cached["reprt_code"].astype(str)))
         LOG.info(f"공용 캐시에서 DART 재무 {len(cached):,}행 재사용 ({len(done):,} 조합)")
 
-    reprts = ([REPRT_CODES["FY"]] if DART_STATEMENT_FREQ == "annual"
-              else [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+    reprts = {"annual": [REPRT_CODES["FY"]],
+              "semiannual": [REPRT_CODES["FY"], REPRT_CODES["H1"]],
+              }.get(DART_STATEMENT_FREQ,
+                    [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]])
+
+    # ★★ 연도 격자를 '한 콜이 커버하는 폭'만큼 성기게 잡는다.
+    #   사업보고서 1콜 = 당기+전기+전전기 3개 연도. 그래서 12년치는 2026·2023·2020·2017
+    #   네 번이면 전부 덮인다(전수조사를 줄이는 게 아니라, 같은 데이터를 세 번 사는 걸 멈추는 것).
+    #   분기보고서는 당기+전기 2개 연도라 2년 간격.
+    def _anchor_years(rep: str) -> List[int]:
+        span = FS_SPAN_ANNUAL if str(rep) == REPRT_CODES["FY"] else FS_SPAN_QUARTER
+        ys = sorted({int(y) for y in years}, reverse=True)
+        if not ys:
+            return []
+        lo = min(ys)
+        out, cur = [], max(ys)
+        while cur >= lo:
+            out.append(cur)
+            cur -= span
+        # 가장 오래된 앵커가 lo 를 못 덮으면 하나 더(전수조사에 구멍을 내지 않는다)
+        if out and (out[-1] - (span - 1)) > lo:
+            out.append(lo + span - 1)
+        return out
     # ★ 수집 순서가 중요하다. 일일 한도(20,000)로 중간에 끊기는 것이 정상 시나리오이므로,
     #   끊겼을 때 남아 있는 것이 '투자 가능한 종목의 최근 데이터'가 되도록 정렬한다.
     #   (무작위 순서로 받으면 며칠 뒤에도 어느 종목도 완성되지 않아 백테스트를 못 돌린다)
     order = {str(c): i for i, c in enumerate(priority or [])}
     corp_sorted = sorted((str(c) for c in corp_codes),
                          key=lambda c: (order.get(c, 10 ** 9), c))
-    jobs = [(c, y, r) for y in sorted(years, reverse=True) for c in corp_sorted for r in reprts
-            if (c, int(y), str(r)) not in done]
+    # ── 2단 설계 ────────────────────────────────────────────────────────────────────────
+    #  1단 '앵커': 3년 간격으로 쳐서 **전 구간 전수 커버리지를 한 번에 확보**한다.
+    #      전기·전전기 값의 knowledge_date 는 그 값을 실제로 알게 된 시점(= 앵커 보고서
+    #      접수일)이 된다. 보수적이라 미래누수는 없지만 최대 2년 늦다.
+    #  2단 '정밀': 해당 연도 보고서를 직접 쳐서 knowledge_date 를 정확한 접수일로 **덮어쓴다**.
+    #      최신 연도부터 돌리고, 남은 호출·시간만큼만 진행한다.
+    #  → 1회 실행으로 전수 커버가 끝나고, 예산이 남는 만큼 정밀도가 올라간다.
+    exact_done = set()
+    if cached is not None and len(cached) and "_from_rcept_year" in cached.columns:
+        _ex = cached[pd.to_numeric(cached["_from_rcept_year"], errors="coerce")
+                     == pd.to_numeric(cached["bsns_year"], errors="coerce")]
+        exact_done = set(zip(_ex["corp_code"].astype(str), _ex["bsns_year"].astype(int),
+                             _ex["reprt_code"].astype(str)))
+
+    _anch = {r: _anchor_years(r) for r in reprts}
+    jobs_anchor, jobs_exact = [], []
+    for r in reprts:
+        span = FS_SPAN_ANNUAL if str(r) == REPRT_CODES["FY"] else FS_SPAN_QUARTER
+        for y in _anch[r]:
+            covered = [y - k for k in range(span)]
+            for c in corp_sorted:
+                if not all((c, int(cy), str(r)) in done for cy in covered):
+                    jobs_anchor.append((c, int(y), str(r)))
+        for y in sorted({int(v) for v in years}, reverse=True):
+            if y in _anch[r]:
+                continue                      # 앵커 연도는 1단에서 이미 정확히 받는다
+            for c in corp_sorted:
+                if (c, int(y), str(r)) not in exact_done:
+                    jobs_exact.append((c, int(y), str(r)))
+    jobs = jobs_anchor + jobs_exact
+    n_naive = len(corp_sorted) * len(years) * len(reprts)
+    _rate = float(globals().get("DART_QPS_EST", 2.5))
+    LOG.table([["1단 앵커(전수 커버)", f"{len(jobs_anchor):,}", f"{len(jobs_anchor)/_rate/3600:.1f}h"],
+               ["2단 정밀(선택)", f"{len(jobs_exact):,}", f"{len(jobs_exact)/_rate/3600:.1f}h"],
+               ["합계", f"{len(jobs):,}", f"{len(jobs)/_rate/3600:.1f}h"],
+               ["── 참고: 이 설계 없이", f"{n_naive:,}", f"{n_naive/_rate/3600:.1f}h"]],
+              ["단계", "호출", f"예상({_rate}콜/초)"], ["l", "r", "r"],
+              title=f"DART 전체재무제표 예산 (모드={DART_STATEMENT_FREQ}) — "
+                    f"1단만 끝나도 전 구간 전수 커버리지는 확보됩니다")
+    LOG.info(f"DART 전체재무제표 호출 설계 — 순진하게 짜면 {n_naive:,}콜. "
+             f"1단 앵커 {len(jobs_anchor):,}콜로 전 구간 전수 커버, "
+             f"2단 정밀 {len(jobs_exact):,}콜로 knowledge_date 를 정확화(예산 되는 만큼). "
+             f"앵커 연도: " + " · ".join(f"{k}:{v}" for k, v in _anch.items()))
     if RUN_MODE == "CACHED":
         jobs = []
     if jobs:
@@ -334,8 +453,33 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
                      f"오늘 받을 수 있는 만큼 받고 저장합니다. "
                      f"약 {math.ceil(total_needed / _avail)}일에 걸쳐 콜드빌드가 완성됩니다. "
                      f"(§3 — 콜드빌드는 4시간 반복예산 밖입니다)")
-        res = pmap_io(_fs_one, jobs, workers=min(N_WORKERS_IO, 12), desc="DART 재무제표")
+        # ★ 벽시계 예산. 전수조사를 지키되 정해진 시간 안에 끝내야 하므로, 1단 앵커는
+        #   무조건 끝내고 2단 정밀은 남은 시간만큼만 돌린다(정밀도는 재실행 때 더 올라간다).
+        _t_budget = float(globals().get("ARC_DART_TIME_BUDGET_S", 6 * 3600))
+        _t0 = time.time()
+        res = pmap_io(_fs_one, jobs_anchor, workers=min(N_WORKERS_IO, 12),
+                      desc="DART 재무(1단 앵커·전수)") if jobs_anchor else []
         got = [d for d in res if d is not None and len(d)]
+        _el = time.time() - _t0
+        if jobs_anchor:
+            LOG.ok(f"1단 앵커 완료 — {len(jobs_anchor):,}콜 {_el/60:.1f}분. "
+                   f"전 구간 전수 커버리지 확보(전기·전전기 전개).")
+        _left = _t_budget - _el
+        if jobs_exact and _left > 60 and (DBUDGET is None or DBUDGET.remaining() > 100):
+            _rate = max(1e-6, len(jobs_anchor) / max(_el, 1e-6)) if jobs_anchor else 3.0
+            _can_t = int(_rate * _left)
+            _can_b = DBUDGET.remaining() if DBUDGET else len(jobs_exact)
+            _take = max(0, min(len(jobs_exact), _can_t, _can_b))
+            LOG.info(f"2단 정밀 — 남은 시간 {_left/60:.0f}분 · 남은 호출 {_can_b:,}건 → "
+                     f"{_take:,}/{len(jobs_exact):,}콜 진행(최신 연도 우선). "
+                     f"미진행분은 앵커 값이 그대로 쓰이며 knowledge_date 가 최대 2년 보수적입니다.")
+            if _take:
+                res2 = pmap_io(_fs_one, jobs_exact[:_take], workers=min(N_WORKERS_IO, 12),
+                               desc="DART 재무(2단 정밀)")
+                got += [d for d in res2 if d is not None and len(d)]
+        elif jobs_exact:
+            LOG.warn(f"2단 정밀 {len(jobs_exact):,}콜을 시간/호출 예산 부족으로 건너뜁니다. "
+                     f"전수 커버리지는 1단으로 이미 확보돼 있습니다.")
     else:
         got = []
 
@@ -344,8 +488,21 @@ def fetch_dart_financials(corp_codes: Sequence[str], years: Sequence[int],
         LOG.warn("DART 재무 데이터를 확보하지 못했습니다.")
         return pd.DataFrame(columns=_FS_KEEP)
     fs = pd.concat(frames, ignore_index=True)
-    fs = fs.drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id",
-                             "account_nm"], keep="last")
+    if "_from_rcept_year" not in fs.columns:
+        fs["_from_rcept_year"] = fs["bsns_year"]
+    # ★ 같은 계정이 앵커본과 정밀본 양쪽에 있으면 **정밀본(그 연도 보고서에서 직접 받은 것)**
+    #   을 남긴다. 정밀본은 knowledge_date 가 실제 접수일이라 더 이르고, 정정 이전 원값이다.
+    fs["_lag"] = (pd.to_numeric(fs["_from_rcept_year"], errors="coerce")
+                  - pd.to_numeric(fs["bsns_year"], errors="coerce")).fillna(9)
+    fs = (fs.sort_values("_lag", kind="stable")
+            .drop_duplicates(["corp_code", "bsns_year", "reprt_code", "sj_div", "account_id",
+                              "account_nm"], keep="first")
+            .drop(columns=["_lag"]))
+    _n_exact = int((pd.to_numeric(fs["_from_rcept_year"], errors="coerce")
+                    == pd.to_numeric(fs["bsns_year"], errors="coerce")).sum())
+    LOG.info(f"재무 계정 {len(fs):,}행 — 그 연도 보고서에서 직접 받은 값 {_n_exact:,}행 "
+             f"({100*_n_exact/max(len(fs),1):.0f}%), 나머지는 이후 보고서의 전기·전전기 값"
+             f"(knowledge_date 가 그만큼 보수적 — 미래누수는 없습니다).")
     if got:
         VAULT.put_table("dart_fnltt_raw", fs, scope="shared", domain="dart", source="opendart")
     n_have = fs.groupby(["corp_code", "bsns_year", "reprt_code"]).ngroups if len(fs) else 0

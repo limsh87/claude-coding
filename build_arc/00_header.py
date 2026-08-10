@@ -239,6 +239,9 @@ RESEARCH_PDF_FULL_PAGES    = 12       # TONE 학습용 본문 추출 페이지 �
 #               응답 status=020(한도초과)을 만나면 그 지점을 실제 상한으로 학습해 기록합니다.
 #               다음 실행부터는 학습된 상한을 씁니다. 즉 남은 양을 실시간으로 추적합니다.
 #   정수를 직접 넣으면 그 값을 상한으로 고정합니다(디버깅용).
+PRICE_SOURCE_DEAD_AFTER = 40          # 가격 소스가 성공 0 · 연속 실패 N 이면 이번 실행에서 끔
+DART_QPS_EST = 2.5                    # 소요시간 예측용 실측 호출속도(콜/초)
+ARC_DART_TIME_BUDGET_S = 8 * 3600     # DART 전체재무제표 수집 벽시계 상한(초)
 ARC_DART_LIMIT_MODE   = "auto"
 ARC_DART_LIMIT_HINT   = 20_000        # auto 모드의 초기 추정치 (학습되면 덮어씀)
 ARC_DART_SAFETY       = 200           # 마지막 여유분 — 다음 실행의 메타 조회용으로 남겨둠

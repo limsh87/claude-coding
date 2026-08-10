@@ -289,28 +289,33 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    # todo 원소 = (code, 요청시작, 요청종료). ★ 결손 '구간만' 받는다.
+    #   예전에는 앞 구간이 비면 start~end 전체를 다시 받았다(실측 1,049종목 × 10년치).
+    #   캐시에 2019~2026 이 있고 2015~2018 만 없으면 그 4년만 받으면 된다.
+    todo, n_back, n_fwd, n_skip, n_both = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
             if _recently_failed(c, start_ts):
                 n_skip += 1
                 continue
-            todo.append((c, start))
+            todo.append((c, start, end))
             continue
-        # ★ 과거 방향 백필을 반드시 함께 본다.
-        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
-        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
-        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
-        if mn is not None and mn > start_ts + pd.Timedelta(days=10):
-            todo.append((c, start))
+        # ★ 과거 방향 백필을 반드시 함께 본다. 앞선 실행이 최근 구간만 캐시했다면
+        #   max 만 보고 판단해 2016~2022 를 영원히 못 받는 사고가 난다.
+        head = mn is not None and mn > start_ts + pd.Timedelta(days=10)
+        tail = mx < end_ts - pd.Timedelta(days=5)
+        if head:
+            todo.append((c, start, (mn - pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_back += 1
-        elif mx < end_ts - pd.Timedelta(days=5):
-            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
+        if tail:
+            todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), end))
             n_fwd += 1
+        if head and tail:
+            n_both += 1
     if n_back:
-        LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+        LOG.info(f"앞 구간이 비어 있는 {n_back:,}종목 — **빠진 구간만** 받습니다"
+                 f"(전체 재수집 아님).")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -325,25 +330,43 @@ def fetch_prices(codes: Sequence[str], start: str, end: str,
         LOG.info(f"일봉 신규/증분 수집 대상 {len(todo):,}종목")
 
         _chain_stat: Counter = Counter()
+        # ★ 죽은 소스 차단기. 실측 로그에서 pykrx 가 **0성공 / 1,322빈손** 이었다(세션이 있는데도
+        #   JSON 대신 로그인 HTML 을 받는 상태). 체인 맨 앞이라 종목마다 헛호출을 하나씩 먹었다.
+        #   연속 실패가 임계를 넘으면 그 소스를 이번 실행에서 끈다.
+        _dead: set = set()
+        _streak: Counter = Counter()
+        _DEAD_AFTER = int(globals().get("PRICE_SOURCE_DEAD_AFTER", 40))
+        _lk_dead = threading.Lock()
 
         def _one(job):
-            code, st = job
+            code, st, en = job
             for nm, fn in PRICE_CHAIN:
+                if nm in _dead:
+                    continue
                 try:
-                    d = fn(code, st, end)
+                    d = fn(code, st, en)
                 except Exception:
                     d = None
                 if d is not None and len(d):
                     d = d.dropna(subset=["date"])
                     if len(d):
                         _chain_stat[f"성공:{nm}"] += 1
+                        with _lk_dead:
+                            _streak[nm] = 0
                         return d
                 _chain_stat[f"실패:{nm}"] += 1
+                with _lk_dead:
+                    _streak[nm] += 1
+                    if _streak[nm] >= _DEAD_AFTER and nm not in _dead and _chain_stat[f"성공:{nm}"] == 0:
+                        _dead.add(nm)
+                        LOG.warn(f"가격 소스 '{nm}' 를 이번 실행에서 끕니다 — "
+                                 f"성공 0건 · 연속 실패 {_streak[nm]}건. 남은 종목에서는 "
+                                 f"건너뛰어 헛호출을 없앱니다(다른 소스는 그대로 동작).")
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
         failed = []
-        for (c, st), d in zip(todo, res):
+        for (c, st, _en), d in zip(todo, res):
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
