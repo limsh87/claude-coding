@@ -159,6 +159,12 @@ DART_TIER2_BUFFER_MULT = 1.25
 #  ▸ Tier-2 소급 연수. 연간(FY) 기준에서 roic_std3y 는 3개 관측(Y, Y-1, Y-2)이면 되므로 2 다.
 #    share_growth3y 는 이제 DART 가 아니라 KRX 시총 스냅샷의 상장주식수를 쓰므로 무관하다.
 DART_TIER2_LOOKBACK_Y = 2
+
+#  ▸ 톤 분류기 학습용으로 '후보 밖' 리포트를 연 몇 건까지 받을지.
+#    PDF 는 건당 약 0.6초(한경 2qps)라 대상 수가 곧 시간이다 — 전 코퍼스 19.8만건이면 34시간.
+#    ΔTONE 이 실제로 쓰는 것은 U-1000 후보 종목의 리포트뿐이고, 나머지는 분류기 일반화용
+#    표본일 뿐이다. 0 이면 후보 종목 리포트만 받는다(가장 빠름).
+RESEARCH_PDF_TRAIN_PER_YEAR = 300
 ADTV_WINDOW_DAYS = 60               # §3.2 직전 60거래일
 MIN_ADTV_KRW     = 100_000_000      # §3.2 1억원
 SEASONING_DAYS   = 250              # §3.3 상장 12개월 미만 제외 (≈250거래일)

@@ -159,6 +159,12 @@ DART_TIER2_BUFFER_MULT = 1.25
 #  ▸ Tier-2 소급 연수. 연간(FY) 기준에서 roic_std3y 는 3개 관측(Y, Y-1, Y-2)이면 되므로 2 다.
 #    share_growth3y 는 이제 DART 가 아니라 KRX 시총 스냅샷의 상장주식수를 쓰므로 무관하다.
 DART_TIER2_LOOKBACK_Y = 2
+
+#  ▸ 톤 분류기 학습용으로 '후보 밖' 리포트를 연 몇 건까지 받을지.
+#    PDF 는 건당 약 0.6초(한경 2qps)라 대상 수가 곧 시간이다 — 전 코퍼스 19.8만건이면 34시간.
+#    ΔTONE 이 실제로 쓰는 것은 U-1000 후보 종목의 리포트뿐이고, 나머지는 분류기 일반화용
+#    표본일 뿐이다. 0 이면 후보 종목 리포트만 받는다(가장 빠름).
+RESEARCH_PDF_TRAIN_PER_YEAR = 300
 ADTV_WINDOW_DAYS = 60               # §3.2 직전 60거래일
 MIN_ADTV_KRW     = 100_000_000      # §3.2 1억원
 SEASONING_DAYS   = 250              # §3.3 상장 12개월 미만 제외 (≈250거래일)
@@ -268,7 +274,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.1106"
+BUILD_VERSION      = "qvf1.20260810.1254"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -5828,7 +5834,9 @@ def pdf_extract_fields(text: str) -> dict:
     return out
 
 
-def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
+def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0,
+                  codes: Optional[Sequence[str]] = None,
+                  train_per_year: int = 0) -> pd.DataFrame:
     """PDF 를 공용 인덱스에 저장(내용해시 경로 → 중복 저장 없음)하고 본문 필드를 추출한다."""
     if df.empty or not RESEARCH_DOWNLOAD_PDF:
         for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target"):
@@ -5844,6 +5852,33 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     _done_pdf = (df["pdf_uid"].astype(str).str.len() > 0) if "pdf_uid" in df.columns \
         else pd.Series(False, index=df.index)
     work = df[df["pdf_url"].notna() & ~_done_pdf].copy()
+    # ★★ 여기서 범위를 좁히지 않으면 전 코퍼스를 받는다 ★★
+    #   실측: 대상 198,128건 × 1.6건/초 = 34시간. 그런데 이 PDF 의 소비처는
+    #   build_report_text_table 하나뿐이고, 그것이 실제로 쓰는 것은
+    #     ① U-200 종목의 리포트(ΔTONE 계산 대상)  ② 톤 분류기 학습표본(연 상한)
+    #   둘뿐이다. 시총 하위 1000 전략이므로 후보 밖 종목의 리포트는 어느 패널에도
+    #   붙지 않는다 — 대형주 리포트가 코퍼스의 대부분인데 전부 받고 있었다.
+    if codes is not None and "stock_code" in work.columns:
+        _cs = {str(c) for c in codes}
+        n0 = len(work)
+        keep = work["stock_code"].astype(str).isin(_cs)
+        # 학습표본: 후보 밖 리포트도 연 상한만큼은 남긴다(분류기 일반화용).
+        if train_per_year > 0 and "pub_date" in work.columns:
+            _y = as_ts_series(work["pub_date"]).dt.year
+            extra = (work[~keep].assign(_y=_y[~keep])
+                     .sort_values("pub_date", kind="stable")
+                     .groupby("_y", observed=True).head(int(train_per_year)).index)
+            keep = keep | work.index.isin(extra)
+        work = work[keep]
+        LOG.table([["전체 PDF 대상", f"{n0:,}"],
+                   ["U-1000 후보 종목 리포트", f"{int(work['stock_code'].astype(str).isin(_cs).sum()):,}"],
+                   [f"학습표본(후보 밖 · 연 {train_per_year:,}건)",
+                    f"{len(work) - int(work['stock_code'].astype(str).isin(_cs).sum()):,}"],
+                   ["실제 수집 대상", f"{len(work):,}"],
+                   ["절감", f"{100*(1-len(work)/max(1,n0)):.0f}%"],
+                   ["예상 소요", f"약 {len(work)/max(RATE_LIMIT_QPS.get('hankyung',2.0),0.1)/3600:.1f}시간"]],
+                  ["항목", "건수"], ["l", "r"],
+                  title="PDF 수집 범위 — 소비처(ΔTONE)가 실제로 쓰는 것만 받는다")
     if int(_done_pdf.sum()):
         LOG.info(f"PDF {int(_done_pdf.sum()):,}건은 이미 원장에 pdf_uid 가 있어 건너뜁니다 "
                  f"(신규 대상 {len(work):,}건).")
@@ -5860,7 +5895,20 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
                   (idx["subtype"].astype(str) == "report_pdf")]
         # iterrows 는 30만 행에서 13초를 쓴다. zip 은 같은 결과를 0.2초에 만든다.
         known = dict(zip(sub["key"].astype(str), sub["uid"].astype(str)))
-    LOG.info(f"PDF 대상 {len(work):,}건 (드라이브 캐시 보유 {sum(1 for k in work['report_uid'] if k in known):,}건)")
+    # ★ 캐시 보유분을 앞으로 보낸다. _one 은 캐시면 http_get 을 타지 않으므로(네트워크 0)
+    #   앞 청크가 즉시 끝나고, 중간에 끊겨도 '이미 가진 것'이 먼저 원장에 기록된다.
+    #   그리고 예상 시간은 '신규 다운로드분'으로만 계산해야 정직하다 — 예전 로그는 캐시분까지
+    #   포함해 34시간처럼 보이게 했다.
+    _hit = work["report_uid"].astype(str).isin(known.keys())
+    work = pd.concat([work[_hit], work[~_hit]], ignore_index=False)
+    _n_new = int((~_hit).sum())
+    _qps = max(float(RATE_LIMIT_QPS.get("hankyung", 2.0)), 0.1)
+    LOG.table([["PDF 대상", f"{len(work):,}"],
+               ["드라이브 캐시 보유 (네트워크 0)", f"{int(_hit.sum()):,}"],
+               ["신규 다운로드", f"{_n_new:,}"],
+               ["예상 소요 (신규분만)", f"약 {_n_new/_qps/3600:.1f}시간"]],
+              ["항목", "건수"], ["l", "r"],
+              title="PDF 수집 — 캐시 보유분 먼저 처리하고, 시간은 신규분으로만 추정한다")
 
     def _one(rec):
         uid, url = rec
@@ -12620,7 +12668,9 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
             frames.append(cached)
         rep = build_report_master(frames, ctx["sec"])
         if len(rep):
-            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH,
+                                codes=ctx.get("candidates"),
+                                train_per_year=RESEARCH_PDF_TRAIN_PER_YEAR)
             if "pdf_target" in rep.columns:
                 fill = rep["target_price"].isna() & rep["pdf_target"].notna()
                 if fill.any():

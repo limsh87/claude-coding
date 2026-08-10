@@ -297,7 +297,9 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
             frames.append(cached)
         rep = build_report_master(frames, ctx["sec"])
         if len(rep):
-            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH)
+            rep = download_pdfs(rep, cap_per_month=RESEARCH_PDF_MAX_PER_MONTH,
+                                codes=ctx.get("candidates"),
+                                train_per_year=RESEARCH_PDF_TRAIN_PER_YEAR)
             if "pdf_target" in rep.columns:
                 fill = rep["target_price"].isna() & rep["pdf_target"].notna()
                 if fill.any():
