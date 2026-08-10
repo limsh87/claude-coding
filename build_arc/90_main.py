@@ -312,7 +312,13 @@ def main() -> dict:
                 LOG.warn("여유 공간이 3GB 미만입니다. RESEARCH_DOWNLOAD_PDF=False 를 권합니다.")
         VAULT.load_index("shared")
         VAULT.load_index("private")
-        VAULT.adopt_scan([os.path.expanduser(p) for p in CACHE_SEARCH_DIRS])
+        # ★ 흡수 스캔은 어떤 경우에도 실행을 막지 않는다(부가 기능). 드라이브가 느리거나
+        #   경로가 거대하면 예산에서 끊고 계속 진행한다.
+        try:
+            VAULT.adopt_scan([os.path.expanduser(p) for p in CACHE_SEARCH_DIRS])
+        except Exception as e:                                      # noqa
+            LOG.warn(f"기존 캐시 흡수 스캔 실패({type(e).__name__}: {str(e)[:120]}) — "
+                     f"건너뛰고 진행합니다. 백테스트에는 영향이 없습니다.")
         DBUDGET = DartBudget()
         globals()["DBUDGET"] = DBUDGET
 

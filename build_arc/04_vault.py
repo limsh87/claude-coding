@@ -193,7 +193,10 @@ class Vault:
         if scope not in self._uidset:
             self.load_index(scope)
         with self._lk:
-            return uid in self._uidset[scope] or any(r.get("uid") == uid for r in self._pending[scope])
+            # ★ _pending 선형탐색을 하면 안 된다. _register 가 이미 _uidset 에 uid 를 넣으므로
+            #   중복이고, adopt_scan 처럼 파일마다 has() 를 부르는 경로에서 O(n²)가 되어
+            #   파일 수가 늘면 사실상 멈춘다(8,000건 3.3초 → 배가마다 3.3배).
+            return uid in self._uidset[scope]
 
     def lookup(self, scope: str, **eq) -> pd.DataFrame:
         idx = self.load_index(scope)
@@ -292,8 +295,11 @@ class Vault:
         if df is None:
             return None
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        self._prune_backups(scope, name)
 
-        #   (상세 근거는 커밋 로그 참조)
+        # ★ 공용 테이블은 전부 누적 수집물이라 정상 실행에서 크게 줄 수 없다. 수집 실패로
+        #   빈 프레임이 오면 살아 있는 캐시가 비어버리므로(백업은 남지만 다음 실행이 그
+        #   빈 값을 읽는다) 여기서 막는다 — 절대 원칙.
         if (scope == "shared" and not allow_shrink and os.path.exists(path)):
             try:
                 n_old = int(pq_num_rows(path))
@@ -338,9 +344,39 @@ class Vault:
         })
         return path
 
+    BACKUP_KEEP = 3          # 테이블당 남길 백업 세대 수
+
+    def _prune_backups(self, scope: str, name: str):
+        """백업 세대 상한. 무한 증식하면 드라이브가 차고, 그 순간 신규 수집분이 소실된다."""
+        try:
+            bdir = os.path.join(self.ns[scope], "index", "_backup")
+            pre = f"{name}."
+            fs = sorted(f for f in os.listdir(bdir)
+                        if f.startswith(pre) and f.endswith(".parquet"))
+            if len(fs) > self.BACKUP_KEEP:
+                for f in fs[:-self.BACKUP_KEEP]:
+                    try:
+                        os.remove(os.path.join(bdir, f))   # 백업의 구세대만 지운다(원본 아님)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def get_table(self, name: str, scope: str = "shared", max_age_days: Optional[float] = None
                   ) -> Optional[pd.DataFrame]:
         path = os.path.join(self.table_dir(scope), f"{name}.parquet")
+        # ★ 백업 실패로 rev 파일에만 저장된 경우가 있다. 정본이 없으면 최신 rev 를 읽는다 —
+        #   그러지 않으면 그 테이블은 영원히 갱신되지 않고 rev 만 쌓인다.
+        if not os.path.exists(path):
+            try:
+                td = self.table_dir(scope)
+                revs = sorted(f for f in os.listdir(td)
+                              if f.startswith(f"{name}.rev") and f.endswith(".parquet"))
+                if revs:
+                    LOG.info(f"테이블 '{name}' 정본이 없어 최신 리비전을 사용합니다: {revs[-1]}")
+                    return read_parquet_safe(os.path.join(td, revs[-1]))
+            except Exception:
+                pass
         if not os.path.exists(path):
             # 공용에 없으면 전용에서, 전용에 없으면 공용에서 — 다른 전략이 만든 걸 재활용한다
             alt = "private" if scope == "shared" else "shared"
@@ -360,12 +396,16 @@ class Vault:
 
     def adopt(self, abs_path: str, domain: str, subtype: str, key: str,
               source: str = "", event_date=None, knowledge_date=None,
-              scope: str = "shared", extra: Optional[dict] = None) -> Optional[str]:
+              scope: str = "shared", extra: Optional[dict] = None,
+              size: Optional[int] = None) -> Optional[str]:
         """이미 드라이브에 있는 파일을 옮기지 않고 '경로만' 등록한다. 파일은 읽기만 한다."""
-        try:
-            sz = os.path.getsize(abs_path)
-        except Exception:
-            return None
+        if size is not None and size >= 0:
+            sz = int(size)          # 스캔에서 이미 얻은 크기를 재사용(FUSE stat 왕복 절약)
+        else:
+            try:
+                sz = os.path.getsize(abs_path)
+            except Exception:
+                return None
         uid = sha1_str("adopt", domain, subtype, os.path.abspath(abs_path), sz)
         if self.has(scope, uid):
             return uid
@@ -418,9 +458,41 @@ class Vault:
     _PDF_PAT = re.compile(r"\.(pdf)$", re.I)
     _DATE_PAT = re.compile(r"(20\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])")
 
-    def adopt_scan(self, dirs: Sequence[str], max_files: int = 400_000) -> pd.DataFrame:
-        """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음."""
-        seen, found = set(), []
+    def adopt_scan(self, dirs: Sequence[str], max_files: Optional[int] = None,
+                   budget_s: Optional[float] = None) -> pd.DataFrame:
+        """기존에 모아둔 리포트/테이블을 재귀 스캔해 '등록만' 한다. 이동·개명·삭제 없음.
+
+        ★ 구글드라이브 FUSE 에서 os.walk 는 디렉터리 하나당 왕복이 발생해 매우 느리다.
+          그래서 ① 시간 예산 ② 진행 표시 ③ 볼트 자신의 blob/table/index 제외
+          ④ scandir 의 DirEntry 로 stat 왕복 1회로 축소 를 전부 건다. 예산을 넘기면
+          '멈춘 것처럼' 보이지 않게 남은 경로를 보고하고 중단한다 — 흡수는 부가 기능이지
+          백테스트의 전제가 아니다.
+        """
+        max_files = int(max_files if max_files is not None
+                        else globals().get("ADOPT_SCAN_MAX_FILES", 60_000))
+        budget_s = float(budget_s if budget_s is not None
+                         else globals().get("ADOPT_SCAN_BUDGET_S", 180.0))
+        if not globals().get("ADOPT_SCAN_ENABLED", True):
+            LOG.info("기존 캐시 흡수 스캔이 꺼져 있습니다(ADOPT_SCAN_ENABLED=False).")
+            return pd.DataFrame(columns=["abs_path", "kind", "name"])
+
+        # 볼트 자신의 내부 디렉터리는 스캔 대상이 아니다(자기 blob/table 을 다시 등록하게 된다)
+        self_dirs = set()
+        for sc in ("shared", "private"):
+            try:
+                self_dirs |= {os.path.realpath(self.blob_dir(sc)),
+                              os.path.realpath(self.table_dir(sc)),
+                              os.path.realpath(os.path.join(self.ns[sc], "index"))}
+            except Exception:
+                pass
+        SKIP_DIR = {"_backup", "index", "blob", "table", "__pycache__", ".git",
+                    ".ipynb_checkpoints", ".shortcut-targets-by-id", ".Trash", ".tmp"}
+        KEY = ("report", "consensus", "research", "analyst", "hankyung", "naver",
+               "dart", "krx", "nps", "price", "ohlcv", "universe", "fnltt")
+
+        t0 = time.time()
+        seen, found, stopped = set(), [], []
+        n_all = 0
         for d in dirs:
             if not d or not os.path.isdir(d):
                 continue
@@ -428,43 +500,84 @@ class Vault:
             if rd in seen:
                 continue
             seen.add(rd)
+            if time.time() - t0 > budget_s or n_all >= max_files:
+                stopped.append(d)
+                continue
             LOG.info(f"기존 캐시 스캔: {d}")
-            n = 0
-            for dirpath, dirnames, filenames in os.walk(d):
-                dirnames[:] = [x for x in dirnames if not x.startswith(".") and x != "_backup"]
-                for fn in filenames:
-                    if n >= max_files:
+            n, t_dir, last = 0, time.time(), time.time()
+            stack = [rd]
+            hit_limit = False
+            while stack:
+                cur = stack.pop()
+                if os.path.realpath(cur) in self_dirs:
+                    continue
+                try:
+                    it = list(os.scandir(cur))
+                except Exception:
+                    continue
+                for e in it:
+                    if time.time() - t0 > budget_s or n_all >= max_files:
+                        hit_limit = True
                         break
-                    fp = os.path.join(dirpath, fn)
-                    low = fn.lower()
-                    if low.endswith(".pdf"):
-                        kind = "report_pdf"
-                    elif low.endswith((".parquet", ".jsonl", ".json", ".csv")) and \
-                            any(t in low for t in ("report", "consensus", "research", "analyst",
-                                                   "hankyung", "naver", "dart", "krx", "nps",
-                                                   "price", "ohlcv", "universe", "fnltt")):
-                        kind = "table_like"
-                    else:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            nm = e.name
+                            if nm.startswith(".") or nm in SKIP_DIR:
+                                continue
+                            if os.path.realpath(e.path) in self_dirs:
+                                continue
+                            stack.append(e.path)
+                            continue
+                        low = e.name.lower()
+                        if low.endswith(".pdf"):
+                            kind = "report_pdf"
+                        elif low.endswith((".parquet", ".jsonl", ".json", ".csv")) and \
+                                any(t in low for t in KEY):
+                            kind = "table_like"
+                        else:
+                            continue
+                        try:
+                            sz = e.stat(follow_symlinks=False).st_size
+                        except Exception:
+                            sz = -1
+                        found.append({"abs_path": e.path, "kind": kind, "name": e.name,
+                                      "dir": cur, "bytes": sz})
+                        n += 1; n_all += 1
+                    except Exception:
                         continue
-                    found.append({"abs_path": fp, "kind": kind, "name": fn,
-                                  "dir": dirpath, "bytes": _safe_size(fp)})
-                    n += 1
-            LOG.info(f"  → {n:,}개 후보 발견")
+                    if time.time() - last > 20.0:
+                        last = time.time()
+                        LOG.info(f"  … 스캔 중 {n:,}건 ({time.time()-t_dir:.0f}s 경과, "
+                                 f"예산 {budget_s:.0f}s)")
+                if hit_limit:
+                    break
+            LOG.info(f"  → {n:,}개 후보 발견 ({time.time()-t_dir:.0f}s)")
+            if hit_limit:
+                stopped.append(d)
+                break
+        if stopped:
+            LOG.warn(f"흡수 스캔을 예산({budget_s:.0f}s / {max_files:,}건)에서 중단했습니다. "
+                     f"미완 경로: {', '.join(stopped[:4])}. 드라이브 FUSE 는 디렉터리마다 왕복이 "
+                     f"생겨 느립니다 — 흡수는 부가 기능이므로 백테스트는 그대로 진행합니다. "
+                     f"전부 흡수하려면 ADOPT_SCAN_BUDGET_S 를 늘리거나 CACHE_SEARCH_DIRS 를 "
+                     f"실제 리포트 폴더로 좁히세요.")
         if not found:
-            LOG.warn("기존 캐시에서 흡수할 파일을 찾지 못했습니다. "
-                     "GDRIVE_ADOPT_DIRS 경로를 확인하세요(오타/미마운트가 가장 흔합니다).")
+            LOG.info("기존 캐시에서 흡수할 파일을 찾지 못했습니다(정상일 수 있습니다).")
             return pd.DataFrame(columns=["abs_path", "kind", "name"])
         df = pd.DataFrame(found)
+        n_new = 0
         for r in df.itertuples(index=False):
             m = self._DATE_PAT.search(r.name) or self._DATE_PAT.search(r.dir)
             ed = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+            before = self.stats.get("adopted", 0)
             self.adopt(r.abs_path, domain="research" if r.kind == "report_pdf" else "table",
                        subtype=r.kind, key=r.name, source="preexisting_drive_cache",
                        event_date=ed, knowledge_date=ed, scope="shared",
-                       extra={"dir": r.dir})
+                       extra={"dir": r.dir}, size=int(r.bytes))
+            n_new += int(self.stats.get("adopted", 0) > before)
         self.flush("shared")
-        LOG.ok(f"기존 캐시 {len(df):,}건을 공용 인덱스에 '참조 등록'했습니다 "
-               f"(파일은 원위치 그대로, 이동·삭제 없음).")
+        LOG.ok(f"기존 캐시 {len(df):,}건 확인 · 신규 참조 등록 {n_new:,}건 "
+               f"(파일은 원위치 그대로, 이동·삭제 없음) · {time.time()-t0:.0f}s")
         return df
 
     # ── 감사 --------------------------------------------------------------------------

@@ -146,17 +146,43 @@ def pq_num_rows(path: str) -> int:
             return -1
 
 def read_parquet_safe(path: str) -> Optional[pd.DataFrame]:
+    """parquet 안전 읽기.
+
+    ★ 읽기 실패를 곧바로 '파일 손상'으로 단정하면 안 된다. 구글드라이브 FUSE 의 OSError(5),
+      스트리밍 마운트 미실체화, arrow 버전/코덱 문제도 전부 같은 예외로 온다. 예전에는
+      그때마다 원본을 `.corrupt.<ts>` 로 개명했는데, get_table 은 `{name}.parquet` 만 찾고
+      adopt_scan 의 확장자 필터에도 안 걸려 **영구 고아**가 됐다(= 삭제와 구분되지 않는다).
+      → 짧은 백오프로 재시도하고, 그래도 실패하면 매직바이트를 확인해 진짜 손상일 때만
+        격리하되 `.parquet` 확장자를 유지해 회수 가능하게 둔다.
+    """
     if not os.path.exists(path):
         return None
+    last = None
+    for k in range(3):
+        try:
+            return pd.read_parquet(path)
+        except Exception as e:                                      # noqa
+            last = e
+            if k < 2:
+                time.sleep(0.4 * (k + 1))
     try:
-        return pd.read_parquet(path)
-    except Exception as e:
-        LOG.warn(f"parquet 손상 추정 — 무시하고 재생성합니다: {os.path.basename(path)} ({type(e).__name__})")
-        try:                                   # 손상 파일은 지우지 않고 격리 보관 (원본 보호 원칙)
-            os.replace(path, path + f".corrupt.{int(time.time())}")
-        except Exception:
-            pass
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except Exception:
+        magic = b""
+    if magic == b"PAR1":
+        LOG.warn(f"parquet 읽기 실패({type(last).__name__}) — 파일 자체는 정상(PAR1)입니다. "
+                 f"드라이브 I/O 문제일 수 있어 **개명하지 않고** 그대로 둡니다: "
+                 f"{os.path.basename(path)}")
         return None
+    dst = f"{os.path.splitext(path)[0]}.corrupt-{int(time.time())}.parquet"
+    try:
+        os.replace(path, dst)
+        LOG.warn(f"parquet 헤더가 손상되어 격리했습니다(.parquet 확장자 유지 — 회수 가능): "
+                 f"{os.path.basename(dst)}")
+    except Exception:
+        pass
+    return None
 
 def read_jsonl(path: str) -> List[dict]:
     if not os.path.exists(path):
