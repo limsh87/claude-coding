@@ -1,3 +1,13 @@
+> **이 저장소에는 두 개의 독립 전략이 있습니다.**
+> · **TCD v2** (이 문서) — 트레이드오프 붕괴 탐지. `strategies/tcd_v2_*.py`
+> · **ARC-TXT v2** — 애널리스트 텍스트톤 × DART 3층 교차확증. `strategies/arc_txt_v2.py`
+>   → **[ARC-TXT v2 문서: `README_ARC_TXT.md`](README_ARC_TXT.md)**
+>
+> 두 전략은 **구글드라이브 공용 인덱스(`_shared`)를 함께 쓴다.** 가격·재무·공시·리포트 원장은
+> 한 번만 수집하면 양쪽이 재사용하고, 전략 고유 산출물만 각자의 전용 인덱스에 들어간다.
+
+---
+
 # TCD v2 — 트레이드오프 붕괴 탐지 (Trade-off Collapse Detection)
 
 한국 상장사 「질적 전환」 탐지 퀀트 시스템. 명세서 v2 (2026-08-07) 구현체.
