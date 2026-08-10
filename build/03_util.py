@@ -8,6 +8,20 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 # ── 날짜 정규화 ─────────────────────────────────────────────────────────────────────────────
+# ── 시간 해상도 고정 ────────────────────────────────────────────────────────────────────────
+#  ★★ pandas 3.x 는 기본 해상도를 ns 에서 us 로 바꿨다 ★★
+#    · pd.Timestamp("2020-01-01").unit == "us",  pd.to_datetime(["2020-01-01"]) → datetime64[us]
+#    · 그런데 pd.to_datetime(datetime64[ns] 배열) 은 ns 를 그대로 유지한다.
+#    즉 같은 파이프라인 안에서 '문자열/Timestamp 에서 만든 열(us)' 과 '넘파이 ns 배열에서 만든
+#    열(ns)' 이 섞인다. merge_asof 는 결합키 dtype 이 다르면 MergeError 로 죽는다:
+#      "incompatible merge keys [1] dtype('<M8[us]') and dtype('<M8[ns]')"
+#    실제로 이것 하나로 build_nonfin_panel 이 죽어 스모크가 통과하지 못했다. 조용한 열화가
+#    아니라 즉사라서 그나마 낫지만, 원인이 날짜 '값'이 아니라 '단위'라 로그만 봐서는 안 잡힌다.
+#    → 날짜를 만드는 두 함수에서 해상도를 ns 로 못박는다. 이 프로젝트의 시간 범위(1970~2100)는
+#      ns 표현 범위(1677~2262) 안이므로 정보 손실이 없다.
+TS_UNIT = "ns"
+
+
 def as_ts(x) -> Optional[pd.Timestamp]:
     """무엇이 들어오든 tz-naive 로 정규화된 Timestamp. tz 혼재는 이 프로젝트 최빈 버그였다."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -23,7 +37,11 @@ def as_ts(x) -> Optional[pd.Timestamp]:
         return None
     if getattr(t, "tzinfo", None) is not None:
         t = t.tz_localize(None) if t.tz is None else t.tz_convert(None).tz_localize(None)
-    return t.normalize()
+    t = t.normalize()
+    try:
+        return t.as_unit(TS_UNIT)
+    except (AttributeError, ValueError):        # pandas < 2.0 은 항상 ns 라 할 일이 없다
+        return t
 
 
 _DATE_FMTS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d")
@@ -64,7 +82,14 @@ def as_ts_series(s, where: str = "") -> pd.Series:
             out = out.dt.tz_localize(None)
     except Exception:
         pass
-    return out.dt.normalize()
+    out = out.dt.normalize()
+    # 해상도 고정 — 여기서 통일하지 않으면 하류 merge_asof 가 dtype 불일치로 죽는다(위 주석).
+    if str(out.dtype).startswith("datetime64") and str(out.dtype) != f"datetime64[{TS_UNIT}]":
+        try:
+            out = out.astype(f"datetime64[{TS_UNIT}]")
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def month_end(x) -> Optional[pd.Timestamp]:
@@ -136,17 +161,31 @@ def to_code6(x: Any) -> Optional[str]:
         s = s[1:]
     if _TICKER_RE.match(s):
         return s
-    # ★ \D 를 지우고 zfill 하면 안 된다. 비(非)주권 단축코드가 '살아있는 다른 종목'으로
-    #   둔갑한다. '008465W'(신주인수권증권) → '008465', '00846W' → '000846',
-    #   'J00123' → '000123'. 상장폐지 피드(MDCSTAT23801)에는 신주인수권증권/증서·수익증권이
-    #   대량으로 섞여 있는데, SecuGroup 필터가 없어 전부 들어온다. 그 권리행사기간
-    #   만료일이 멀쩡히 상장돼 있는 회사의 delisting_date 로 집계되고
-    #   (build_security_master 의 agg 는 delisting_date="max") 그 회사가 유니버스에서
-    #   영구 제외된다 — 게다가 이 손실은 절단된 코드가 '유효해 보이므로' 어떤 카운터에도
-    #   안 걸린다(오히려 겹치면 n_dupe 를 늘려 "중복"으로 오귀속된다).
-    #   복구는 '앞자리 0 이 날아간 순수 정수 코드'(예: KIND 의 5930)에만 허용한다 —
-    #   문자가 하나라도 섞여 있으면 그건 절단 대상이지 zero-padding 대상이 아니다.
-    if s.isdigit() and len(s) < 6:
+    # ★★ 0 채우기는 '순수 숫자' 입력에만 적용한다 ★★
+    #   이 함수의 약속은 "조용히 0으로 채워 잘못된 종목을 만들지 않는다" 인데, 문자가 섞인
+    #   코드에서 숫자만 뽑아 zfill 하면 정확히 그 약속을 깬다. 두 세션이 독립적으로
+    #   **서로 다른 실사례**를 통해 같은 결함에 도달했다 — 같은 버그의 두 얼굴이다:
+    #
+    #   (a) 우선주가 보통주로 둔갑    '00341A'(쌍용양회4우B, 2014 폐지) → '000341'(보통주)
+    #       FDR 폐지목록 실측(2026-08-10 · 4,173행): 원본≠매핑 285건, 그중 주권 13건.
+    #       폐지일이 보통주에 붙으면 상장 중인 종목이 유니버스에서 사라지고 보유분이
+    #       −100% 로 청산된다(그 13건은 §3.3 이 어차피 제외하는 우선주라 잃는 것은 없다).
+    #
+    #   (b) 신주인수권증권이 살아있는 회사로 둔갑
+    #       '008465W' → '008465', '00846W' → '000846', 'J00123' → '000123'.
+    #       상장폐지 피드(MDCSTAT23801)는 SecuGroup 필터가 없어 신주인수권증권/증서·
+    #       수익증권이 대량으로 섞여 들어온다. 그 **권리행사기간 만료일**이 멀쩡히
+    #       상장돼 있는 회사의 delisting_date 로 집계되고(build_security_master 의 agg 가
+    #       delisting_date="max") 그 회사가 유니버스에서 영구 제외된다.
+    #
+    #   두 경우 모두 절단된 코드가 '유효해 보이므로' 어떤 카운터에도 안 걸린다 — 오히려
+    #   겹치면 n_dupe 를 늘려 "중복"으로 오귀속된다. 못 읽는 코드는 '만들지 말고' 실패해야
+    #   한다. 복구는 '앞자리 0 이 날아간 순수 정수 코드'에만 허용한다(KIND 의 5930,
+    #   엑셀에서 앞자리 0 이 날아간 경우). 문자가 하나라도 섞이면 절단 대상이지
+    #   zero-padding 대상이 아니다.
+    #   (상한 6 은 위 _TICKER_RE 가 순수 6자리를 이미 반환하므로 실질적으로 len<6 과
+    #    동치다. 앞의 검사가 바뀌어도 의도가 남도록 경계를 명시해 둔다.)
+    if s.isdigit() and 1 <= len(s) <= 6:
         cand = s.zfill(6)
         return cand if _TICKER_RE.match(cand) else None
     return None

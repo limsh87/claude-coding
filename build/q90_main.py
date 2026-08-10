@@ -228,13 +228,22 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
         _yrs = sum(len(_span.get(c, ())) for c in corps) or (len(corps) * len(years))
         _naive, _scoped = len(corps) * len(years) * 4, _yrs * len(_rc)
         _lim = DBUDGET.remaining_calls() if DBUDGET is not None else None
-        _d = float(_lim or DART_DAILY_LIMIT_HINT)
-        LOG.table([["예전 (회사 × 전연도 × 4분기)", f"{_naive:,}", f"{_naive/_d:.1f}일"],
+        # ★ '예상 일수'의 분모는 '오늘 남은 호출'이 아니라 '하루치 한도'다.
+        #   잔여가 1회일 때 잔여로 나누면 19,154일 같은 값이 찍힌다 — 콜드빌드가 52년 걸린다는
+        #   뜻으로 읽히지만 실제로는 '오늘은 거의 못 받는다'는 뜻일 뿐이다. 둘은 다른 질문이고,
+        #   표의 '예상'은 '며칠에 걸쳐 완성되는가' 이므로 일일 한도로 나눠야 한다.
+        _daily = float(DQUOTA.daily_limit() if (DQUOTA is not None
+                                                and hasattr(DQUOTA, "daily_limit"))
+                       else DART_DAILY_LIMIT_HINT)
+        _daily = max(1000.0, _daily)
+        _fmt_d = lambda need: ("하루 안" if need <= _daily else f"{need/_daily:.1f}일")
+        LOG.table([["예전 (회사 × 전연도 × 4분기)", f"{_naive:,}", _fmt_d(_naive)],
                    [f"대상=U-1000×{DART_TIER2_BUFFER_MULT} · 소급 {DART_TIER2_LOOKBACK_Y}년",
-                    f"{_yrs*4:,}", f"{_yrs*4/_d:.1f}일"],
-                   [f"+ Tier-2 빈도 = {DART_TIER2_FREQ}", f"{_scoped:,}", f"{_scoped/_d:.1f}일"],
-                   ["오늘 잔여 호출", f"{_lim:,}" if _lim is not None else "미확정", ""]],
-                  headers=["Tier-2 수집 계획", "필요 호출", "예상"],
+                    f"{_yrs*4:,}", _fmt_d(_yrs * 4)],
+                   [f"+ Tier-2 빈도 = {DART_TIER2_FREQ}", f"{_scoped:,}", _fmt_d(_scoped)],
+                   ["오늘 잔여 호출", f"{_lim:,}" if _lim is not None else "미확정",
+                    f"(일일 한도 {_daily:,.0f} 기준 · 잔여는 오늘 진도만 좌우)"]],
+                  headers=["Tier-2 수집 계획", "필요 호출", "예상 소요"],
                   title="DART Tier-2 — 회사별 API 라 job 수가 곧 콜드빌드 기간이다")
         if _lim and _scoped > _lim:
             LOG.warn(f"그래도 오늘 잔여({_lim:,})를 넘습니다. 시총 낮은 순으로 받으므로 오늘 "
@@ -350,7 +359,9 @@ def build_panel_pass2(P: pd.DataFrame, ctx: dict, cal: pd.DataFrame) -> pd.DataF
                               exclude_irc=IRC_EXCLUDE, T=ctx.get("rtext"))
     P = P.merge(tpanel[["code", "rebal", "tone_q", "n_reports", "dTONE"]],
                 on=["code", "rebal"], how="left")
-    P = orthogonalize_tone(P)
+    P = orthogonalize_tone(P)                     # 종목단위 잔차 — TM 층이 A3 대조군으로 보존
+    # TONE-MEASURE v1.0 — §6.2 의 ΔTONE_resid '정의'를 대체한다(T2 자기참조 · 축 B 결합).
+    P = tm_panel(P, ctx, cal)
     P = build_exclusion_flags(P)
     P = apply_filter3a(P)
     return downcast_q(P)
@@ -433,6 +444,11 @@ def main() -> dict:
     with PIPE.stage("L0.CONTRACT", "계약 자동검정 Q1~Q14", "L0", budget_s=180):
         run_contract_tests(strict=True)
 
+    # ★ 계약은 '원칙'(PIT·생존자편향·결정성)을, 전수조사는 '숫자'(§3.1~§10.4)를 지킨다.
+    #   둘 다 수집 전에 통과해야 한다 — 명세와 다른 값을 만드는 코드로 4시간을 태우지 않는다.
+    with PIPE.stage("L0.SPEC", "명세 전수조사 §3.1~§10.4", "L0", budget_s=300):
+        run_spec_audit(strict=True)
+
     with PIPE.stage("L0.SMOKE", "합성데이터 엔드투엔드 스모크", "L0",
                     budget_s=(2400 if RUN_MODE == "SMOKE" else 600)):
         if not run_selftest(full_chain=(RUN_MODE == "SMOKE")):
@@ -483,6 +499,7 @@ def main() -> dict:
                 targets = ar[["corp_code", "bsns_year", "rcept_no", "rcept_dt"]].drop_duplicates("rcept_no")
         facts, pstats = fetch_annual_report_facts(targets)
         ctx["facts"] = facts
+        ctx["facts_targets"] = targets            # TONE-MEASURE B1/B2 섹션 텍스트도 같은 범위
         ctx["parse_rate"] = report_parse_rate(facts, pstats)
         # 3-A 의 '최대주주 지분율 < 15%' 는 하드 규칙인데 본문 표 레이아웃에 따라 추출 실패가
         # 잦다. 실패한 (회사, 연도) 에만 구조화 엔드포인트로 보강한다(전량 호출은 낭비).
@@ -523,6 +540,10 @@ def main() -> dict:
         verify_boilerplate_leak(T)
         lab = build_car_labels(T, ctx["px"])
         ctx["tone"] = build_tone_scores(T, lab)
+        # ── TONE-MEASURE 축 B 입력 — U-200 합집합 × 사업보고서만 (전 종목 수집 금지) ──────
+        ctx["sect"] = fetch_dart_section_texts(ctx.get("facts_targets", pd.DataFrame()))
+        ctx["b1"] = build_b1_change(ctx["sect"], ctx["sec"], P)
+        ctx["b2"] = build_b2_tone(ctx["sect"], ctx["sec"], ctx["px"])
 
     with PIPE.stage("L2.PANEL2", "[8]~[10] 하드팩트 · TONE · 배제 · 3-A", "L2", budget_s=1200):
         P = build_panel_pass2(P, ctx, cal)
@@ -628,6 +649,9 @@ def main() -> dict:
             #   패밀리에 섞으면 보정 대상 수만 부풀려 실제 가설들의 검정력을 깎는다.
             ctx["x0_smallcap"] = b0
             _s0 = qperf_stats(b0["returns"])
+            # ★ qperf_stats 의 키는 'CAGR'/'Sharpe'/'MDD' 다(한글 키와 섞여 있다).
+            #   소문자로 조회하면 전부 기본값 nan 이 찍혀 X0 벤치마크 표가 통째로 비었다 —
+            #   §10.2 귀속의 '비교 기준선'이 읽을 수 없는 상태로 출력되고 있었다.
             LOG.table([["분기 평균 종목수", f"{float(b0['returns']['n'].mean()):,.0f}"],
                        # ★ qperf_stats 는 'CAGR'/'Sharpe'/'MDD' (대문자)로 돌려준다. 소문자 키를 읽어
                        #   X0 벤치마크 표가 전부 nan 으로 찍혔다 — §10.2 가 '소형주 프리미엄과
@@ -645,6 +669,27 @@ def main() -> dict:
             summarize_experiment(nm, b, b["panel"], best_v, fwd, desc)
             abl_names.append(nm)
         report_experiment_table(abl_names, f"보조 어블레이션 (§8.2) — 최우수 변형 {best_v} 기준")
+
+    with PIPE.stage("L3.TMABL", "[12b] TONE-MEASURE 어블레이션 11종 (§6 고정)", "L3",
+                    budget_s=2400, critical=False):
+        # 명세 §6: 11개 버전으로 고정, 임의 추가 금지. 입력이 없는 버전(축 비활성)은 그
+        # 사실을 남기고 건너뛴다 — 조용히 사라지게 두지 않는다.
+        tm_names = []
+        for aid, desc, colname in TM_ABLATIONS:
+            if colname not in P.columns or int(P[colname].notna().sum()) == 0:
+                LOG.info(f"  TM-{aid}: 입력({colname}) 없음 — 건너뜀 (축 비활성/데이터 부재)")
+                continue
+            b = run_experiment(P, cal, fwd, best_v, label=f"TM-{aid}", quiet=True,
+                               score_col=colname,
+                               score_raw=(colname in ("score_f1", "score_f2")))
+            summarize_experiment(f"TM-{aid}", b, b["panel"], best_v, fwd, desc)
+            tm_names.append(f"TM-{aid}")
+        if tm_names:
+            report_experiment_table(tm_names, "TONE-MEASURE 어블레이션 (§6 — 11개 고정)")
+            # §2.3 — TM 버전들은 자체 검정 패밀리로 BH-FDR 보정 (개별 유의성 주장 금지)
+            report_bh_fdr(tm_names)
+            tm_required_comparisons()
+            tm_bottom_and_interact(P, fwd)
 
     with PIPE.stage("L5.FDR", "[13] BH-FDR 다중검정 보정", "L5", budget_s=120, critical=False):
         # §9-C2 는 'VQF 자신의 알파'가 아니라 'VQF − VQ 차이'의 유의성을 요구한다.
@@ -702,6 +747,9 @@ def main() -> dict:
 
     with PIPE.stage("L6.VERDICT", "[14] 수급 축 판정 · 사전등록 폐기조건", "L6", budget_s=120,
                     critical=False):
+        # TONE-MEASURE §5.3 인과 점검(|ρ|>0.5 중단보고) + §7 폐기조건 TM[1~8]
+        _tm_causal = tm_causal_check(P)
+        ctx["tm_kill"] = report_tm_kill(P, fwd, ctx.get("tm_gates", {}), _tm_causal)
         ctx["flow_verdict"] = report_flow_verdict(ctx.get("cmp", {}), fdr_pass=ctx.get("fdr"))
         report_cell_ladder()
         report_discretion_ledger()

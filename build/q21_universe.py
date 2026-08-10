@@ -24,8 +24,8 @@ LISTING_SEASONING_DAYS = SEASONING_DAYS
 #    (실제로 계약 Q3 가 이 경로를 잡아냈다)
 #    merge/merge_asof 의 결합키가 한쪽만 category 인 경우에도 조용히 어긋날 수 있다.
 #    → 키·식별자 컬럼만 문자열로 되돌린다. 수치 컬럼의 다운캐스트 이득은 그대로 남는다.
-_NEVER_CAT = ("code", "corp_code", "rcept_no", "report_uid", "analyst_id", "stock_code",
-              "broker_id", "src_cap", "exit_kind", "flow_src", "parse_status")
+# 단일 원본: 캐시 관문(QVFVault.get_table)이 강제하는 목록과 같은 것을 쓴다 — 두 벌이면 갈라진다.
+_NEVER_CAT = QVFVault.KEY_STR_COLS
 
 
 def downcast_q(df: pd.DataFrame) -> pd.DataFrame:
@@ -458,10 +458,15 @@ def build_cap_panel(cal: pd.DataFrame, px_daily: pd.DataFrame, snaps: pd.DataFra
       ③만 쓰면 증자·감자가 반영되지 않아 시총이 조용히 틀어진다. 셋을 순서대로 쓴다.
     """
     px = px_daily[["code", "date", "close"]].copy()
+    # 캐시 관문(get_table)이 category 키를 str 로 되돌리지만, px 가 다른 경로로 들어와도
+    # 여기서 한 번 더 강제한다 — merge_asof(by="code") 는 dtype 불일치를 MergeError 로 던진다.
+    if str(px["code"].dtype) not in ("object", "str"):
+        px["code"] = px["code"].astype(str)
     px["date"] = as_ts_series(px["date"])
     px = px.dropna(subset=["code", "date", "close"]).sort_values(["date", "code"], kind="stable")
 
     sig = cal[["rebal", "signal_date"]].copy()
+    sig["signal_date"] = as_ts_series(sig["signal_date"])   # 결합키 단위 고정(as_ts 주석)
     # 신호일 종가 (그 날 거래가 없으면 직전 거래일 종가로 backward as-of)
     L = (sig.assign(_k=1).merge(pd.DataFrame({"code": sorted(px["code"].unique()), "_k": 1}),
                                 on="_k").drop(columns="_k"))
@@ -477,6 +482,8 @@ def build_cap_panel(cal: pd.DataFrame, px_daily: pd.DataFrame, snaps: pd.DataFra
     # ① KRX 스냅샷 — signal_date 이하의 가장 최근 스냅샷 (미래 스냅샷 사용 금지)
     if snaps is not None and len(snaps):
         S = snaps.copy()
+        if str(S["code"].dtype) not in ("object", "str"):   # category 캐시 방어(위 px 와 동일)
+            S["code"] = S["code"].astype(str)
         S["snap_date"] = as_ts_series(S["snap_date"])
         S = S.dropna(subset=["code", "snap_date"]).sort_values("snap_date", kind="stable")
         M = M.sort_values("signal_date", kind="stable")
@@ -566,7 +573,11 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
     _seen = _amt.notna().cumsum() > 0
     _amt = _amt.where(~(_seen & _amt.isna()), 0.0)
     _adtv = _amt.rolling(int(window), min_periods=int(window)).mean()
-    _adtv = _adtv.stack(dropna=True).rename("adtv").reset_index()
+    # ★ stack(dropna=) 은 pandas 3.x 에서 ValueError 로 제거됐다(같은 저장소의 p_x_customs 가
+    #   이미 그 이유로 melt 를 쓴다). 여기만 남아 있어서 pandas 3 에서는 §3.2 유동성 게이트가
+    #   통째로 죽는다 — L1.PANEL1 이 시작도 못 한다. 버전 안정적인 melt 로 바꾼다(결과 동일).
+    _adtv = (_adtv.reset_index().melt(id_vars="date", var_name="code", value_name="adtv")
+                  .dropna(subset=["adtv"]))
     _adtv.columns = ["date", "code", "adtv"]
     _adtv["code"] = _adtv["code"].astype(str)
     px["code"] = px["code"].astype(str)
@@ -605,7 +616,9 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
         lambda s: s.rolling(INVVOL_WINDOW_DAYS, min_periods=max(20, INVVOL_WINDOW_DAYS // 3)).std())
 
     keep = px[["code", "date", "adtv", "cs_spread", "vol_d"]].dropna(subset=["date"])
-    sig = cal[["rebal", "signal_date"]].drop_duplicates().sort_values("signal_date", kind="stable")
+    sig = cal[["rebal", "signal_date"]].drop_duplicates().copy()
+    sig["signal_date"] = as_ts_series(sig["signal_date"])       # 결합키 단위 고정(as_ts 주석)
+    sig = sig.sort_values("signal_date", kind="stable")
     L = (sig.assign(_k=1).merge(pd.DataFrame({"code": sorted(keep["code"].unique()), "_k": 1}),
                                 on="_k").drop(columns="_k")).sort_values("signal_date", kind="stable")
     R = keep.rename(columns={"date": "px_date"}).sort_values("px_date", kind="stable")

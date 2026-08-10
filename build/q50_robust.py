@@ -32,7 +32,8 @@ def run_experiment(P: pd.DataFrame, cal: pd.DataFrame, fwd: pd.DataFrame, varian
                    use_tone: bool = True, use_nonfin: bool = True,
                    use_exclusion: bool = True, use_rule3a: bool = True,
                    stage: str = "full", scheme: str = "equal",
-                   label: str = "", quiet: bool = True) -> dict:
+                   label: str = "", quiet: bool = True,
+                   score_col: Optional[str] = None, score_raw: bool = False) -> dict:
     """한 실험(변형 × 구성)을 끝까지 돌린다. 패널 재계산 없이 선정 단계만 다시 돈다.
 
     ★ 실험 7개 + 민감도 수십 개를 매번 데이터 수집부터 돌리면 4시간 예산(§0.5)을 넘긴다.
@@ -45,7 +46,8 @@ def run_experiment(P: pd.DataFrame, cal: pd.DataFrame, fwd: pd.DataFrame, varian
         d = build_u200(P, variants=(variant,), n=u200_n)
         if stage != "x1":
             d = apply_filter2(d, variant, n=second_n, use_tone=use_tone,
-                              use_nonfin=use_nonfin, use_exclusion=use_exclusion)
+                              use_nonfin=use_nonfin, use_exclusion=use_exclusion,
+                              score_col=score_col, score_raw=score_raw)
         d["_sel"] = build_final_selection(d, variant, n_final=final_n,
                                           use_rule3a=use_rule3a, stage=stage)
         bt = run_qbacktest(d, cal, "_sel", fwd, scheme=scheme, apply_costs=True,

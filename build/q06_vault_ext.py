@@ -417,6 +417,25 @@ class QVFVault(Vault):
         return merged
 
     # ── 다중루트 읽기 -------------------------------------------------------------------
+    # ★★ 캐시에서 읽은 키 컬럼은 반드시 문자열이어야 한다 ★★
+    #   과거 실행(다른 전략 포함)이 downcast 로 code 를 category 로 만들어 parquet 에 저장한
+    #   캐시가 실재한다. merge_asof 는 결합키 dtype 이 정확히 같아야 하며(object vs category
+    #   → MergeError), 실측으로 사용자 환경에서 krx_ohlcv_daily(7,055,639행)의 code 가
+    #   category 라 L1.PANEL1 의 build_cap_panel 이 즉사했다. 병합 지점마다 고치면 언젠가
+    #   한 곳을 빠뜨린다 — 캐시가 파이프라인에 들어오는 유일한 관문(get_table)에서 강제한다.
+    KEY_STR_COLS = ("code", "corp_code", "stock_code", "rcept_no", "report_uid",
+                    "analyst_id", "broker_id", "reprt_code", "src_cap", "exit_kind",
+                    "flow_src", "parse_status")
+
+    @staticmethod
+    def _decat_keys(d: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        if d is None or not len(d):
+            return d
+        for c in QVFVault.KEY_STR_COLS:
+            if c in d.columns and str(d[c].dtype) == "category":
+                d[c] = d[c].astype(str)
+        return d
+
     def get_table(self, name: str, scope: str = "shared",
                   max_age_days: Optional[float] = None) -> Optional[pd.DataFrame]:
         # ★★ 인덱스에만 걸어두고 정작 '데이터 테이블'은 무방비였다 ★★
@@ -431,7 +450,7 @@ class QVFVault(Vault):
             d = super().get_table(name, scope=scope, max_age_days=max_age_days)
         if d is not None:
             self.table_src[name] = self.root
-            return d
+            return self._decat_keys(d)
         for mr in self.mirrors:
             for sc in (scope, "private" if scope == "shared" else "shared"):
                 ns = GDRIVE_SHARED_NS if sc == "shared" else GDRIVE_PRIVATE_NS
@@ -464,10 +483,17 @@ class QVFVault(Vault):
                     try:
                         self.put_table(name, dd, scope=scope, domain="table",
                                        source=f"promoted_from_mirror:{os.path.basename(mr)}")
-                        LOG.ok(f"  → 구글드라이브로 승격 복사 완료 (원본은 그대로 둡니다): {name}")
+                        # ★ 쓰기 루트가 드라이브가 아닐 수도 있다(드라이브 미발견 → 로컬 폴백).
+                        #   그때도 "구글드라이브로 승격" 이라고 찍으면 로그가 거짓말을 한다 —
+                        #   사용자는 절대 1원칙이 지켜졌다고 믿게 된다. 실제 목적지를 적는다.
+                        _m = str(getattr(self, "mode", "") or "").upper()
+                        _dest = ("구글드라이브" if _m.startswith("DRIVE")
+                                 else f"지정 쓰기루트({self.root})" if _m.startswith("EXPLICIT")
+                                 else f"로컬 쓰기루트({self.root}) — 드라이브가 아닙니다")
+                        LOG.ok(f"  → {_dest} 로 승격 복사 완료 (원본은 그대로 둡니다): {name}")
                     except Exception as e:                       # noqa
                         LOG.warn(f"  → 드라이브 승격 실패({type(e).__name__}) — 읽기만 하고 진행합니다.")
-                return dd
+                return self._decat_keys(dd)
         return None
 
     def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:
@@ -1212,6 +1238,16 @@ class DartQuota:
         #   잡고, 진짜 중단은 오늘 020 이 실제로 올 때 한다 = "실시간으로 체크해서 그만큼 쓴다".
         cap = max(int(self.hist_limit or 0), int(DART_DAILY_LIMIT_HINT))
         return max(0, cap - used)
+
+    def daily_limit(self) -> int:
+        """'하루에 쓸 수 있는 총량'의 계획용 추정치. remaining_calls() 와 다른 질문이다.
+
+        ★ 콜드빌드 '예상 일수' 는 반드시 이 값으로 나눠야 한다. 잔여로 나누면 잔여가 1일 때
+          19,154일 같은 값이 나와 '52년 걸린다'로 읽힌다 — 실제 뜻은 '오늘은 거의 못 받는다'
+          뿐인데도. 잔여는 오늘 진도를, 일일 한도는 완성까지의 일수를 결정한다.
+        """
+        return int(max(int(self.observed_limit or 0), int(self.hist_limit or 0),
+                       int(DART_DAILY_LIMIT_HINT)))
 
     def remaining_str(self) -> str:
         if self.observed_limit is not None:

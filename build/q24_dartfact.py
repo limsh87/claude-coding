@@ -183,6 +183,10 @@ _SECTIONS = {
     "lawsuit":   r"(소송|계류중인\s*소송|법적\s*분쟁)",
     "audit":     r"(강조사항|특기사항|감사의견|핵심감사사항)",
     "holder":    r"(최대주주\s*(?:에?\s*관한\s*사항|현황)|주주에\s*관한\s*사항)",
+    # TONE-MEASURE §4.2.3 — B1/B2 섹션 분해용 앵커 (문서 전체 유사도로 뭉개지 않는다)
+    "business":  r"(사업의\s*내용|II\.?\s*사업의\s*내용)",
+    "mdna":      r"(이사의\s*경영진단\s*및\s*분석의견|경영진단\s*및\s*분석)",
+    "risk":      r"(주요\s*위험\s*및\s*관리|위험관리|기타\s*투자자\s*보호를?\s*위하여?\s*필요한\s*사항)",
 }
 _SECTION_RE = {k: re.compile(v) for k, v in _SECTIONS.items()}
 
@@ -790,6 +794,7 @@ def _asof_attach(base: pd.DataFrame, R: pd.DataFrame, sec: pd.DataFrame,
         return d.drop(columns=["_ord"])
     L = d[m].copy()
     L["corp_code"] = L["corp_code"].astype(str)
+    L["signal_date"] = as_ts_series(L["signal_date"])           # 결합키 단위 고정(as_ts 주석)
     L = L.sort_values("signal_date", kind="stable")
     M = pd.merge_asof(L, RR, left_on="signal_date", right_on="knowledge_date",
                       by="corp_code", direction="backward", suffixes=("", "_r"))

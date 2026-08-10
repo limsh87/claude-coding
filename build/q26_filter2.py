@@ -92,20 +92,36 @@ def zscore_observed_then_neutral(P: pd.DataFrame, colname: str, mask: pd.Series)
 
 def apply_filter2(P: pd.DataFrame, variant: str, n: int = SECOND_N,
                   use_tone: bool = True, use_nonfin: bool = True,
-                  use_exclusion: bool = True) -> pd.DataFrame:
-    """U-200(변형별) → 상위 n 종목. 어블레이션(X2/X3)을 위해 구성요소를 켜고 끌 수 있다."""
+                  use_exclusion: bool = True,
+                  score_col: Optional[str] = None, score_raw: bool = False) -> pd.DataFrame:
+    """U-200(변형별) → 상위 n 종목. 어블레이션(X2/X3)을 위해 구성요소를 켜고 끌 수 있다.
+
+    score_col: TONE-MEASURE 어블레이션용 — 지정하면 그 컬럼이 Score2 를 통째로 대체한다.
+               score_raw=False 면 관측치 z → 결측 0(§6.2 순서), True 면 원값 그대로(이미
+               합성 z 인 score_f1/f2 용 — 두 번 z 하면 셀 사다리로 순서가 뒤틀린다).
+    ★ 축 B 백본: TONE-MEASURE 결합층이 만든 dAXISB(B1+B2+B3 부호정렬 합성)가 있으면
+      그것을, 없으면(스모크 등) 기존 dNONFIN 을 쓴다 — 명세 §5 의 'w_d × 축B점수' 구현.
+    """
     d = P.copy()
     inu = col(d, f"u200_{variant}").fillna(0).astype(bool) if f"u200_{variant}" in d.columns \
         else pd.Series(True, index=d.index)
 
-    zN = pd.Series(0.0, index=d.index, dtype="float32")
-    if use_nonfin:
-        zN = zscore_observed_then_neutral(d, "dNONFIN", inu & col(d, "dNONFIN").notna())
-    zT = pd.Series(0.0, index=d.index, dtype="float32")
-    if use_tone:
-        zT = zscore_observed_then_neutral(d, "dTONE_resid", inu & col(d, "dTONE_resid").notna())
-
-    d[f"score2_{variant}"] = (SCORE2_W_NONFIN * zN + SCORE2_W_TONE * zT).astype("float32")
+    if score_col is not None:
+        if score_raw:
+            d[f"score2_{variant}"] = pd.to_numeric(col(d, score_col), errors="coerce") \
+                .fillna(0.0).astype("float32")
+        else:
+            d[f"score2_{variant}"] = zscore_observed_then_neutral(
+                d, score_col, inu & col(d, score_col).notna())
+    else:
+        nonfin_src = "dAXISB" if "dAXISB" in d.columns else "dNONFIN"
+        zN = pd.Series(0.0, index=d.index, dtype="float32")
+        if use_nonfin:
+            zN = zscore_observed_then_neutral(d, nonfin_src, inu & col(d, nonfin_src).notna())
+        zT = pd.Series(0.0, index=d.index, dtype="float32")
+        if use_tone:
+            zT = zscore_observed_then_neutral(d, "dTONE_resid", inu & col(d, "dTONE_resid").notna())
+        d[f"score2_{variant}"] = (SCORE2_W_NONFIN * zN + SCORE2_W_TONE * zT).astype("float32")
     excl = col(d, "EXCLUDED").fillna(0).astype(bool) if use_exclusion else \
         pd.Series(False, index=d.index)
 

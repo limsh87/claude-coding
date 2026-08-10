@@ -307,9 +307,16 @@ TONE_TRAIN_LOG: List[dict] = []
 def build_tone_scores(T: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
     """리포트별 TONE. 시점 t 의 리포트는 't 이전에 라벨이 확정된' 표본으로만 학습한 모델로 채점.
 
-    반환: report_uid · pub_date · stock_code · tone · n_sent · model_epoch
+    반환: report_uid · pub_date · stock_code · broker_id · tone · pos_frac · neg_frac ·
+          n_sent · model_epoch
+
+    ★ TONE-MEASURE §3.4 — 긍정/부정 분리. 문서 확률(tone)과 별도로, 같은 모델로 문장을
+      채점해 마진 투표(TONE_SENT_MARGIN)로 POS/NEG 비율을 만든다. 문장 채점의 신호 희석
+      위험은 실측으로 알고 있으므로(문서상관 −0.008 사건) 주 신호는 문서 tone 을 유지하고,
+      POS/NEG 는 명세가 요구하는 병렬 계열(ΔPOS/ΔNEG · A5 어블레이션)로만 쓴다.
     """
-    out_cols = ["report_uid", "pub_date", "stock_code", "tone", "n_sent", "model_epoch"]
+    out_cols = ["report_uid", "pub_date", "stock_code", "broker_id", "tone",
+                "pos_frac", "neg_frac", "n_sent", "model_epoch"]
     # ★★ 예전엔 여기서 조용히 빈 프레임을 돌려줬다 ★★
     #   TONE 은 이 전략의 유일한 머신러닝 구성요소(TF-IDF + 로지스틱 회귀)인데,
     #   sklearn 이 없으면 아무 말 없이 사라졌다. 사용자는 로그 어디에서도 '학습이
@@ -389,27 +396,40 @@ def build_tone_scores(T: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
                                "CV정확도(3-fold)": "—" if not np.isfinite(_acc) else f"{_acc:.3f}",
                                "채점대상": int(apply_mask.sum())})
 
-        # 문장 단위 채점 → TONE = (긍정문장 − 부정문장) / 전체문장
-        recs = []
+        # 문서 채점(주 신호) + 문장 마진투표(POS/NEG 병렬 계열 — TONE-MEASURE §3.4)
         sents_all: List[str] = []
         owner: List[int] = []
-        for j, (uid, txt) in enumerate(zip(sub["report_uid"].astype(str), sub["text"].astype(str))):
+        for j, txt in enumerate(sub["text"].astype(str)):
             ss = split_sentences_ko(txt)
-            if not ss:
-                continue
             sents_all.extend(ss)
             owner.extend([j] * len(ss))
-        if not sents_all:
-            continue
         try:
             _pd_ = clf.predict_proba(vec.transform(sub["text"].astype(str)))[:, 1]
         except Exception:
             continue
         tone = 2.0 * _pd_ - 1.0                  # [-1, +1]
+        pos_f = np.full(len(sub), np.nan)
+        neg_f = np.full(len(sub), np.nan)
+        if sents_all:
+            try:
+                _ps = clf.predict_proba(vec.transform(sents_all))[:, 1]
+                own = np.asarray(owner)
+                vote_p = (_ps > 0.5 + TONE_SENT_MARGIN).astype(float)
+                vote_n = (_ps < 0.5 - TONE_SENT_MARGIN).astype(float)
+                cnt = np.bincount(own, minlength=len(sub)).astype(float)
+                with np.errstate(all="ignore"):
+                    pos_f = np.where(cnt > 0, np.bincount(own, vote_p, len(sub)) / cnt, np.nan)
+                    neg_f = np.where(cnt > 0, np.bincount(own, vote_n, len(sub)) / cnt, np.nan)
+                del _ps
+            except Exception:
+                pass
         tot = sub["n_sent"].astype(float).to_numpy() if "n_sent" in sub.columns \
             else np.ones(len(sub))
         recs = sub[["report_uid", "pub_date", "stock_code"]].copy()
+        recs["broker_id"] = sub.get("broker_id", pd.Series([""] * len(sub))).astype(str).to_numpy()
         recs["tone"] = tone
+        recs["pos_frac"] = pos_f
+        recs["neg_frac"] = neg_f
         recs["n_sent"] = tot
         recs["model_epoch"] = e
         scored.append(recs)

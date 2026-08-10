@@ -306,9 +306,39 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         LOG.info(f"  폐지목록 정규화: 원본 {n_raw:,} → {len(t):,} "
                  f"(코드형식 불일치 {n_badcode:,} · 동일코드 중복 {n_dupe:,}) · "
                  f"폐지일 결측 {n_nodate:,}건은 상장기간 추정에서 제외됩니다.")
-        if n_badcode > n_raw * 0.25:
+        # ★★ '탈락률 37%' 라는 숫자 하나로는 아무것도 판단할 수 없다 ★★
+        #   실측(2026-08-10 · 원본 4,173행): 탈락 1,536건의 내역은
+        #     신주인수권증서 857 · 수익증권 521 · 신주인수권증권 158 · 주권 0
+        #   즉 탈락분은 전부 워런트·신주인수권·펀드 수익증권이고 U-1000(주권) 후보가
+        #   될 수 있는 종목은 하나도 없다 — 버리는 것이 옳고 생존자편향이 아니다.
+        #   반대로 유형을 안 보고 비율만 경고하면 '남아 있는 편향'을 과대보고하게 된다.
+        #   → 증권 유형별로 분해해서 보고하고, '주권'이 섞였을 때만 경고한다.
+        _grp_c = col.get("secugroup") or col.get("kind")
+        _lost = pd.Series(dtype=object)
+        if _grp_c is not None:
+            _lost = d.loc[codes.isna(), _grp_c].astype(str)
+            LOG.table([[g, f"{c:,}", f"{100*c/max(n_badcode,1):.1f}%"]
+                       for g, c in _lost.value_counts().head(8).items()],
+                      ["탈락분 증권 유형", "건수", "비중"], ["l", "r", "r"],
+                      title="폐지목록 코드형식 불일치 내역 — 주권이 아니면 U-1000 후보가 아니다")
+        _n_stock_lost = int((_lost == "주권").sum()) if len(_lost) else -1
+        if _n_stock_lost > 0:
+            _m = codes.isna() & (d[_grp_c].astype(str) == "주권")
+            _samp = [f"{a} {b}" for a, b in
+                     zip(raw_codes[_m].head(6), d.loc[_m, name_c].astype(str).head(6))]
+            # 실측(2026-08-10)에서 이 13건은 전부 구형 우선주(`00341A` 쌍용양회4우B 등)이며
+            # §3.3 이 어차피 유니버스에서 제외한다. 예전에는 이것들이 숫자만 뽑혀
+            # `000341`(보통주)로 '복구'되어 우선주의 폐지일이 보통주에 붙고 있었다 — 그쪽이
+            # 훨씬 나쁜 오류라 지금은 만들지 않고 버린다. 이름을 함께 찍어 눈으로 확인시킨다.
+            LOG.warn(f"탈락분 중 '주권'이 {_n_stock_lost:,}건 있습니다 — 이름이 우선주(…우/우B)면 "
+                     f"§3.3 이 어차피 제외하므로 손실이 아니고, 보통주가 섞였다면 그만큼 "
+                     f"생존자편향이 남습니다. 확인용 표본: {_samp}")
+        elif _n_stock_lost == 0:
+            LOG.ok(f"  탈락 {n_badcode:,}건은 전부 주권이 아닙니다(워런트·신주인수권·수익증권) — "
+                   f"U-1000 은 주권만 담으므로 생존자편향에 영향이 없습니다.")
+        elif n_badcode > n_raw * 0.25:
             LOG.warn(f"폐지목록의 {100*n_badcode/max(n_raw,1):.0f}% 가 코드 형식 불일치로 "
-                     f"탈락했습니다. 이 비율이 크면 생존자편향이 그만큼 남습니다 — "
+                     f"탈락했는데 증권 유형 컬럼이 없어 분해할 수 없습니다 — "
                      f"원본 코드 예시: {raw_codes[codes.isna()].head(5).tolist()}")
     return t
 
