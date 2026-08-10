@@ -250,7 +250,7 @@ SELFTEST = True                       # 검증 하네스 실행 여부. 하네�
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0719"
+BUILD_VERSION = "v2.20260810.0939"
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -3873,11 +3873,19 @@ class DartBudget:
 
 DBUDGET: Optional[DartBudget] = None
 
+_DART_TLS = threading.local()
+
+
+def dart_last_status() -> str:
+    return getattr(_DART_TLS, "status", "")
+
+
 def dart_api(endpoint: str, params: dict, source: str = "dart",
              tries: int = 2) -> Optional[dict]:
     """★ 예산 계산 주의: http_get 은 내부적으로 최대 `tries` 회 실제 요청을 보낸다.
     호출당 1건으로 계산하면 실사용량을 최대 tries 배 과소집계해 DART 한도를 넘겨버린다.
     → 최악을 먼저 예약(take)하고, 실제 시도 횟수를 알고 나면 차액을 환급한다."""
+    _DART_TLS.status = ""
     if not DART_API_KEY:
         return None
     if DBUDGET is not None and not DBUDGET.take(tries):
@@ -3892,6 +3900,7 @@ def dart_api(endpoint: str, params: dict, source: str = "dart",
     if not isinstance(js, dict):
         return None
     st = str(js.get("status", ""))
+    _DART_TLS.status = st
     if st and st != "000":
         if st == "020":
             # ★ 여기가 '실측 상한'을 배우는 유일한 지점이다. 상수를 믿지 않고 서버가 거부한
@@ -4222,20 +4231,108 @@ def tidy_financials(fs: pd.DataFrame) -> pd.DataFrame:
     return downcast(W)
 
 # ── 직원현황 (θ_N, TP_C2) ───────────────────────────────────────────────────────────────────
-def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
+# ── DART 엔드포인트 공용 러너 ───────────────────────────────────────────────────────────────
+#   empSttus / stockTotqySttus / accnutAdtorNmNdAdtOpinion 은 바깥 골격이 동일하다:
+#   캐시 재사용 → 미수집 키만 추림 → 병렬 호출 → 병합 → period_end/knowledge_date →
+#   공용 인덱스 저장 → PIT frame. 다른 것은 응답 한 건을 dict 로 바꾸는 부분뿐이다.
+#   ★ 여기에 '빈 응답 음성캐시'를 함께 넣는다. 상장 전/폐지 후 연도처럼 정상적으로 데이터가
+#     없는 조합은 성공 캐시에 남지 않아 매 실행 전량 재조회됐고(실측 16조합 중 15조합 재호출),
+#     콜드빌드가 수렴하지 않아 DART 예산이 늘 소진되고 뒤쪽 정기보고서 원문이 예산을
+#     배정받지 못했다. 여기 한 곳에 넣으면 세 엔드포인트가 모두 고쳐진다.
+_DART_MISS_TABLE = "dart_empty_attempts"
+_DART_MISS_TTL_D = 180
+
+
+def _dart_miss_load(ep: str) -> set:
+    t = VAULT.get_table(_DART_MISS_TABLE, scope="shared")
+    if t is None or not len(t) or "endpoint" not in t.columns:
+        return set()
+    t = t[t["endpoint"].astype(str) == ep]
+    if not len(t):
+        return set()
+    age = (as_ts(_dt.date.today()) - as_ts_series(t["attempted_at"])).dt.days
+    return set(t.loc[age < _DART_MISS_TTL_D, "jobkey"].astype(str))
+
+
+def _dart_miss_save(ep: str, keys: Sequence[str]) -> None:
+    if not keys:
+        return
+    new = pd.DataFrame([{"endpoint": ep, "jobkey": str(k),
+                         "attempted_at": str(_dt.date.today())} for k in keys])
+    old = VAULT.get_table(_DART_MISS_TABLE, scope="shared")
+    allf = pd.concat([old, new], ignore_index=True) if old is not None and len(old) else new
+    allf = allf.drop_duplicates(["endpoint", "jobkey"], keep="last")
+    VAULT.put_table(_DART_MISS_TABLE, allf, scope="shared", domain="dart",
+                    source="dart:negative_cache", allow_shrink=True)
+
+
+def _dart_collect(name: str, table: str, cols: Sequence[str], jobs_all: Sequence[tuple],
+                  key_cols: Sequence[str], parse: Callable[..., Optional[dict]],
+                  source: str, workers: int = 12) -> pd.DataFrame:
+    """DART (법인 × 연도 [× 보고서]) 엔드포인트 수집기.
+
+    parse(*job) 가 행 dict 또는 None(데이터 없음)을 돌려준다. 나머지 골격은 전부 공통.
+    """
     if not DART_API_KEY:
-        return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
-    cached = VAULT.get_table("dart_employees", scope="shared")
+        return pd.DataFrame(columns=list(cols))
+    cached = VAULT.get_table(table, scope="shared")
     done = set()
-    if cached is not None and len(cached):
-        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
-        LOG.info(f"공용 캐시에서 직원현황 {len(cached):,}행 재사용")
-    jobs = [(c, y) for c in corp_codes for y in years if (str(c), int(y)) not in done]
+    if cached is not None and len(cached) and all(c in cached.columns for c in key_cols):
+        done = {"|".join(str(v) for v in row)
+                for row in cached[list(key_cols)].astype(str).to_numpy()}
+        LOG.info(f"공용 캐시에서 {name} {len(cached):,}행 재사용")
+    miss = _dart_miss_load(table)
+    if miss:
+        LOG.info(f"{name}: 데이터 없음으로 기록된 {len(miss):,}조합을 건너뜁니다 "
+                 f"({_DART_MISS_TTL_D}일 후 재시도).")
+    jobs = [j for j in jobs_all
+            if "|".join(str(v) for v in j) not in done
+            and "|".join(str(v) for v in j) not in miss]
     if RUN_MODE == "CACHED":
         jobs = []
 
-    def _one(job):
-        corp, year = job
+    def _run(job):
+        try:
+            r = parse(*job)
+        except Exception:                                       # noqa
+            return ("ERR", job, None)
+        if r:
+            return ("OK", job, r)
+        # ★ '데이터 없음(013)' 일 때만 음성캐시에 남긴다. 네트워크 오류·예산 소진·파싱 실패를
+        #   기록하면 일시적 장애가 180일짜리 영구 블랙리스트가 된다(가격 쪽에서 이미 겪은 사고).
+        return (("MISS" if dart_last_status() == "013" else "ERR"), job, None)
+
+    res = pmap_io(_run, jobs, workers=min(N_WORKERS_IO, workers),
+                  desc=f"DART {name}") if jobs else []
+    got = [r for st, _, r in res if st == "OK" and r]
+    _dart_miss_save(table, ["|".join(str(v) for v in jb) for st, jb, _ in res if st == "MISS"])
+
+    frames = ([cached] if cached is not None and len(cached) else [])
+    if got:
+        frames.append(pd.DataFrame(got))
+    if not frames:
+        return pd.DataFrame(columns=list(cols))
+    D = pd.concat(frames, ignore_index=True).drop_duplicates(list(key_cols), keep="last")
+    # ★ 컬럼이 없으면 D.get() 이 문자열을 돌려주고 zip 이 글자 단위로 훑어 knowledge_date 가
+    #   전부 깨진다. 존재를 먼저 보장한다.
+    if "rcept_no" not in D.columns:
+        D["rcept_no"] = ""
+    rc = D["reprt_code"].astype(str) if "reprt_code" in D.columns \
+        else pd.Series([REPRT_CODES["FY"]] * len(D), index=D.index)
+    D["period_end"] = [as_ts(f"{int(y)}-{REPRT_PERIOD_END.get(str(r), (12, 31))[0]:02d}-"
+                             f"{REPRT_PERIOD_END.get(str(r), (12, 31))[1]:02d}")
+                       for y, r in zip(D["bsns_year"], rc)]
+    D["knowledge_date"] = [_knowledge_from_rcept(rn, str(r), int(y))
+                           for rn, r, y in zip(D["rcept_no"], rc, D["bsns_year"])]
+    if got:
+        VAULT.put_table(table, D, scope="shared", domain="dart", source=source)
+    D = pit_frame(D, "period_end", "knowledge_date", source="dart")
+    PIPE.io("OUT", "DRIVE", table, D, source=source)
+    return D
+
+
+def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
+    def _parse(corp: str, year: int) -> Optional[dict]:
         js = dart_api("empSttus.json", {"corp_code": corp, "bsns_year": str(year),
                                         "reprt_code": REPRT_CODES["FY"]})
         if not js or not isinstance(js.get("list"), list):
@@ -4258,26 +4355,9 @@ def fetch_dart_employees(corp_codes: Sequence[str], years: Sequence[int]) -> pd.
         return {"corp_code": corp, "bsns_year": int(year), "employees": float(emp),
                 "payroll": float(pay), "rcept_no": rn}
 
-    got = [r for r in pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 12),
-                              desc="DART 직원현황") if r] if jobs else []
-    frames = ([cached] if cached is not None and len(cached) else [])
-    if got:
-        frames.append(pd.DataFrame(got))
-    if not frames:
-        return pd.DataFrame(columns=["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"])
-    E = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"], keep="last")
-    # ★ E.get("rcept_no", "") 는 컬럼이 없으면 '문자열'을 돌려주고, zip 이 그걸 글자 단위로
-    #   훑어 knowledge_date 가 전부 깨진다. 컬럼 존재를 먼저 보장한다.
-    if "rcept_no" not in E.columns:
-        E["rcept_no"] = ""
-    E["period_end"] = as_ts_series(E["bsns_year"].astype(int).astype(str) + "-12-31")
-    E["knowledge_date"] = [_knowledge_from_rcept(rn, REPRT_CODES["FY"], int(y))
-                           for rn, y in zip(E["rcept_no"], E["bsns_year"])]
-    if got:
-        VAULT.put_table("dart_employees", E, scope="shared", domain="dart", source="opendart empSttus")
-    E = pit_frame(E, "period_end", "knowledge_date", source="dart")
-    PIPE.io("OUT", "DRIVE", "dart_employees", E, source="opendart empSttus")
-    return E
+    return _dart_collect("직원현황", "dart_employees", ["corp_code", "bsns_year", "employees", "payroll", "knowledge_date"],
+                         [(str(c), int(y)) for c in corp_codes for y in years],
+                         ["corp_code", "bsns_year"], _parse, "opendart empSttus", workers=12)
 
 # ── 공시목록 스윕 (시장 전체를 날짜로 훑는다 — 회사별 호출보다 수십 배 싸다) ──────────────────
 DISCLOSURE_PATTERNS = {
@@ -4368,40 +4448,13 @@ def fetch_dart_disclosures(start: str, end: str) -> pd.DataFrame:
 # ║    재무제표에는 '자본금'만 있고 주식수가 없는 경우가 많아 전용 엔드포인트가 필요하다.       ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+_SHARE_REPRTS = [REPRT_CODES["Q1"], REPRT_CODES["H1"],
+                 REPRT_CODES["Q3"], REPRT_CODES["FY"]]
 _SHARE_COLS = ["corp_code", "bsns_year", "reprt_code", "shares_common", "shares_total",
                "treasury_shares", "period_end", "knowledge_date", "rcept_no"]
 
 def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    """주식의 총수 현황(stockTotqySttus). D2 의 SHARE_GROWTH 입력.
-
-    ★ 응답은 '보통주 / 우선주 / 합계' 행으로 쪼개져 온다. 합계 행이 있으면 그걸 쓰고,
-      없으면 보통주+우선주를 더한다. 두 방식을 섞으면 같은 기업이 연도마다 다른 정의로
-      계산되어 증가율이 통째로 거짓이 된다.
-    """
-    if not DART_API_KEY:
-        LOG.warn("DART_API_KEY 미입력 — 주식총수를 받을 수 없어 D2 의 SHARE_GROWTH 가 결측됩니다.")
-        return pd.DataFrame(columns=_SHARE_COLS)
-
-    cached = VAULT.get_table("dart_shares", scope="shared")
-    done = set()
-    if cached is not None and len(cached):
-        try:
-            done = set(zip(cached["corp_code"].astype(str),
-                           cached["bsns_year"].astype(int),
-                           cached["reprt_code"].astype(str)))
-            LOG.info(f"공용 캐시에서 주식총수 {len(cached):,}행 재사용 ({len(done):,} 조합)")
-        except Exception:
-            done = set()
-
-    reprts = [REPRT_CODES["Q1"], REPRT_CODES["H1"], REPRT_CODES["Q3"], REPRT_CODES["FY"]]
-    jobs = [(str(c), int(y), r) for y in sorted(years, reverse=True)
-            for c in corp_codes for r in reprts
-            if (str(c), int(y), str(r)) not in done]
-    if RUN_MODE == "CACHED":
-        jobs = []
-
-    def _one(job):
-        corp, year, reprt = job
+    def _parse(corp: str, year: int, reprt: str) -> Optional[dict]:
         js = dart_api("stockTotqySttus.json",
                       {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt})
         if not js or not isinstance(js.get("list"), list) or not js["list"]:
@@ -4430,31 +4483,10 @@ def fetch_dart_shares(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Dat
                 "treasury_shares": float(tesstk.sum(skipna=True)) if tesstk.notna().any() else np.nan,
                 "rcept_no": rn}
 
-    got = [r for r in pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 10),
-                              desc="DART 주식총수") if r] if jobs else []
-    frames = ([cached] if cached is not None and len(cached) else [])
-    if got:
-        frames.append(pd.DataFrame(got))
-    if not frames:
-        LOG.warn("주식총수를 한 건도 확보하지 못했습니다 — SHARE_GROWTH 는 결측 처리됩니다.")
-        return pd.DataFrame(columns=_SHARE_COLS)
-
-    S = pd.concat(frames, ignore_index=True)
-    S = S.drop_duplicates(["corp_code", "bsns_year", "reprt_code"], keep="last")
-    if "rcept_no" not in S.columns:
-        S["rcept_no"] = ""
-    S["period_end"] = [as_ts(f"{int(y)}-{REPRT_PERIOD_END.get(str(r), (12,31))[0]:02d}-"
-                             f"{REPRT_PERIOD_END.get(str(r), (12,31))[1]:02d}")
-                       for y, r in zip(S["bsns_year"], S["reprt_code"])]
-    S["knowledge_date"] = [_knowledge_from_rcept(rn, str(r), int(y))
-                           for rn, r, y in zip(S["rcept_no"], S["reprt_code"], S["bsns_year"])]
-    if got:
-        VAULT.put_table("dart_shares", S, scope="shared", domain="dart",
-                        source="opendart stockTotqySttus")
-    S = pit_frame(S, "period_end", "knowledge_date", source="dart")
-    LOG.ok(f"주식총수 {len(S):,}행 · {S['corp_code'].nunique():,}사")
-    PIPE.io("OUT", "DRIVE", "dart_shares", S, source="opendart stockTotqySttus")
-    return downcast(S)
+    return _dart_collect("주식총수", "dart_shares", _SHARE_COLS,
+                         [(str(c), int(y), r) for y in sorted(years, reverse=True)
+             for c in corp_codes for r in _SHARE_REPRTS],
+                         ["corp_code", "bsns_year", "reprt_code"], _parse, "opendart stockTotqySttus", workers=12)
 
 def _num_kr_series(s) -> pd.Series:
     return pd.to_numeric(
@@ -4468,28 +4500,9 @@ _AUDIT_COLS = ["corp_code", "bsns_year", "audit_opinion", "emphasis", "key_matte
                "auditor", "period_end", "knowledge_date"]
 
 def fetch_dart_audit(corp_codes: Sequence[str], years: Sequence[int]) -> pd.DataFrame:
-    """감사의견 + 특기사항/강조사항 (accnutAdtorNmNdAdtOpinion). 배제 플래그 EX_AUDIT 입력.
-
-    ★ '적정의견'이라도 강조사항(계속기업 불확실성 등)이 붙으면 그것 자체가 경고다.
-      명세(§6.4)가 '감사의견 특기사항/강조사항 존재 시' 를 하드 제외로 규정한 이유다.
-      필드명이 연도별로 흔들리므로(adt_reprt_spcmnt_matter / emphs_matter / core_adt_matter)
-      후보를 전부 훑어 하나라도 비어있지 않으면 존재로 본다.
-    """
-    if not DART_API_KEY:
-        return pd.DataFrame(columns=_AUDIT_COLS)
-    cached = VAULT.get_table("dart_audit", scope="shared")
-    done = set()
-    if cached is not None and len(cached):
-        try:
-            done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
-            LOG.info(f"공용 캐시에서 감사의견 {len(cached):,}행 재사용")
-        except Exception:
-            done = set()
-    jobs = [(str(c), int(y)) for y in sorted(years, reverse=True) for c in corp_codes
-            if (str(c), int(y)) not in done]
-    if RUN_MODE == "CACHED":
-        jobs = []
-
+    """감사의견 + 특기사항/강조사항. 배제 플래그 EX_AUDIT 입력.
+    ★ '적정의견'이라도 강조사항(계속기업 불확실성 등)이 붙으면 그 자체가 경고다(§6.4).
+      필드명이 연도별로 흔들리므로 후보를 전부 훑어 하나라도 비어있지 않으면 존재로 본다."""
     _OPI = ("adt_opinion", "adt_opinion_nm", "opinion")
     _EMP = ("emphs_matter", "adt_reprt_spcmnt_matter", "spcmnt_matter")
     _KEY = ("core_adt_matter", "core_adt_matter_nm")
@@ -4498,14 +4511,13 @@ def fetch_dart_audit(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Data
     def _pick_field(d: pd.DataFrame, names) -> str:
         for n in names:
             if n in d.columns:
-                v = " ".join(str(x) for x in d[n].dropna().astype(str).tolist())
-                v = re.sub(r"\s+", " ", v).strip()
+                v = re.sub(r"\s+", " ",
+                           " ".join(str(x) for x in d[n].dropna().astype(str).tolist())).strip()
                 if v and v not in ("-", "해당사항 없음", "해당사항없음", "없음", "nan"):
                     return v[:400]
         return ""
 
-    def _one(job):
-        corp, year = job
+    def _parse(corp: str, year: int) -> Optional[dict]:
         js = dart_api("accnutAdtorNmNdAdtOpinion.json",
                       {"corp_code": corp, "bsns_year": str(year),
                        "reprt_code": REPRT_CODES["FY"]})
@@ -4519,29 +4531,9 @@ def fetch_dart_audit(corp_codes: Sequence[str], years: Sequence[int]) -> pd.Data
                 "key_matter": _pick_field(d, _KEY),
                 "auditor": _pick_field(d, _AUD), "rcept_no": rn}
 
-    got = [r for r in pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 10),
-                              desc="DART 감사의견") if r] if jobs else []
-    frames = ([cached] if cached is not None and len(cached) else [])
-    if got:
-        frames.append(pd.DataFrame(got))
-    if not frames:
-        LOG.warn("감사의견을 확보하지 못했습니다 — EX_AUDIT 은 사업보고서 텍스트 폴백으로만 판정됩니다.")
-        return pd.DataFrame(columns=_AUDIT_COLS)
-    A = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"],
-                                                             keep="last")
-    if "rcept_no" not in A.columns:
-        A["rcept_no"] = ""
-    A["period_end"] = as_ts_series(A["bsns_year"].astype(int).astype(str) + "-12-31")
-    A["knowledge_date"] = [_knowledge_from_rcept(rn, REPRT_CODES["FY"], int(y))
-                           for rn, y in zip(A["rcept_no"], A["bsns_year"])]
-    if got:
-        VAULT.put_table("dart_audit", A, scope="shared", domain="dart",
-                        source="opendart accnutAdtorNmNdAdtOpinion")
-    A = pit_frame(A, "period_end", "knowledge_date", source="dart")
-    n_emp = int((A["emphasis"].astype(str).str.len() > 0).sum()) if len(A) else 0
-    LOG.ok(f"감사의견 {len(A):,}행 (강조/특기사항 보유 {n_emp:,}건)")
-    PIPE.io("OUT", "DRIVE", "dart_audit", A, source="opendart audit")
-    return A
+    return _dart_collect("감사의견", "dart_audit", _AUDIT_COLS,
+                         [(str(c), int(y)) for y in sorted(years, reverse=True) for c in corp_codes],
+                         ["corp_code", "bsns_year"], _parse, "opendart accnutAdtorNmNdAdtOpinion", workers=10)
 
 
 # ────────────────────────────────────────────────────────────────────────────────────────
