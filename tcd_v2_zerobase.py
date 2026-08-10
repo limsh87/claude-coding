@@ -2820,8 +2820,30 @@ class QuotaBook:
         return int(self.HINT.get(src, 10 ** 8) * self.RUNAWAY_X)
 
     def hint(self, src: str) -> int:
+        """지금 믿는 상한. ★서버가 거부한 적이 없으면 '이미 쓴 만큼'이 곧 실측 하한이다.
+
+        ★2026-08-10 사고 — 사용자가 "4시간짜리인데 2~4만회가 왜 부족하냐"고 물은 것의
+          최종 답이 여기다. 로그는 이렇게 말했다:
+            "dg_nps: 오늘 이미 20,240건 사용 (잔여 추정 0건)"
+          이 0 은 ★서버가 알려준 값이 아니다. data.go.kr 에는 잔여조회 엔드포인트가 없다.
+          `max(0, HINT(10,000) - spent(20,240))` 이라는 ★우리 뺄셈의 결과일 뿐이다.
+          그런데 20,240 까지 갔다는 것은 ★서버가 10,000 을 넘겨서도 계속 답했다는 뜻이다
+          (실측 상향 soft 가 그렇게 밀어 올렸다). 즉 실제 한도는 10,000 이 아니었다.
+          문제는 soft 가 ★메모리에만 있어서 재시작하면 그 실측을 잊고 10,000 으로
+          되돌아간다는 것이다 — 그래서 다음 실행이 첫 배치도 못 돌고 죽었다.
+
+        규칙: ①서버가 실제로 거부한 지점(learned_cap)이 있으면 그것이 진실이다.
+              ②없으면, 이미 쓴 양은 ★서버가 받아준 양이므로 그보다 낮은 상한은 거짓이다.
+                 거기에 탐침 폭을 더해 계속 열어 둔다. 멈추는 것은 ★서버가 정한다.
+        """
         lc = self.learned(src)
-        return int(lc) if lc is not None else int(self.HINT.get(src, 10 ** 8))
+        if lc is not None:
+            return int(lc)
+        base = int(self.HINT.get(src, 10 ** 8))
+        sp = self.spent(src)
+        if sp >= base:
+            return int(sp + max(1, round(base * self.PROBE_STEP)))
+        return base
 
     def spent(self, src: str) -> int:
         return int(self.used.get(f"{src}:{self._fp(src)}", 0))
@@ -8032,6 +8054,12 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
         cached["month"] = ds_(cached["month"])
         L.info(f"캐시 재사용: 국민연금 패널 {len(cached):,}행 · "
                f"{cached['code'].nunique():,}종목")
+    else:
+        # ★비어 있어도 ★반드시 말한다. 조용히 넘어가면 사용자는 "호출은 태웠는데
+        #   캐시가 왜 없냐"를 로그만으로 알 수 없다(실제로 그 질문을 받았다).
+        L.warn("국민연금 캐시가 비어 있습니다 — 이번 실행이 처음부터 모읍니다. "
+               "이전 실행에서 호출을 쓰고도 캐시가 없다면 그때 저장 전에 끊긴 것입니다"
+               "(이번 판부터는 ★배치마다 즉시 저장하므로 그 손실이 재발하지 않습니다).")
     # ★원장은 '종목 단위'다 — 한 번 조회하면 그 종목의 전 기간이 한꺼번에 들어오기 때문이다.
     today_ts = pd.Timestamp(dtm.date.today())
     done_codes, led = led_read("nps_codes_done", "code", ttl_days=90,
@@ -8175,6 +8203,18 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                         new_led.append({"code": r["_code"], "n_rows": len(r["_rows"]),
                                         "tried_at": today_ts,
                                         "rule_ver": NPS_RULE_VER})
+                # ★배치가 끝날 때마다 적재 — 다음 배치에서 끊겨도 여기까지는 남는다.
+                if got:
+                    _n = flush_rows("nps_corp_monthly", got, cols, ["code", "month"],
+                                    domain="nps",
+                                    source="data.go.kr NpsBplcInfoInqireServiceV2",
+                                    note="종목축 수집분 — 배치 단위 즉시 적재")
+                    if _n:
+                        bar.set_postfix_str(f"누적 {_n:,}행", refresh=False)
+                        got = []
+                    led_write("nps_codes_done", led, new_led, "code", domain="nps",
+                              source="code_ledger", note="처리 완료 종목")
+                    new_led = []
     N = merge_keep(cached, got, cols, ["code", "month"])
     N["month"] = ds_(N["month"])
     N = N.dropna(subset=["code", "month"])
@@ -8261,6 +8301,17 @@ def harvest_procurement(months: pd.DatetimeIndex, max_calls: int = -1) -> pd.Dat
                     got += r
                 if ok_ym:
                     done_new.append(ok_ym)
+            # ★배치 단위 즉시 적재(절대1원칙) — 시간 몫으로 끊겨도 여기까지는 남는다
+            if got:
+                _n = flush_rows("g2b_awards_monthly", got, cols, cols, domain="procure",
+                                source="data.go.kr ScsbidInfoService",
+                                note="월축 수집분 — 배치 단위 즉시 적재")
+                if _n:
+                    got = []
+                    led_write("g2b_done_months", done_tbl,
+                              [{"ym": y} for y in done_new], "ym", domain="procure",
+                              source="sweep_complete_months")
+                    done_new = []
     G = merge_keep(cached, got, cols, cols)
     if got:
         VAULT.save_table("g2b_awards_monthly", G, "shared", domain="procure",
@@ -8540,6 +8591,25 @@ def extract_product_sales(txt: str, corp_code: str, rcept_no: str, rcept_dt) -> 
 
 import html as _html          # ★DART 원문의 &amp;·&nbsp; 등 엔티티 복원용
 
+def flush_rows(name: str, rows: List[dict], cols: Sequence[str], keys: Sequence[str],
+               *, domain: str, source: str, note: str = "") -> int:
+    """★배치마다 즉시 드라이브에 적재한다 — '신규 수집분은 무조건 캐시 저장'(절대1원칙).
+
+    ★왜 필요한가(실측 사고): 국민연금은 50분 · 약 6,000콜을 태워 634행을 모았는데,
+      저장이 ★함수 맨 끝에 한 번뿐이었다. 시간 몫 만료·예외·커널 중단 중 어느 하나만
+      걸려도 그 사이 받은 것이 통째로 증발하고, 다음 실행은 같은 호출을 다시 태운다.
+      (DART 일괄 ZIP 은 이미 _flush() 로 이 문제를 풀어 뒀는데 팩 수집기 셋은 안 되어
+       있었다 — 같은 형태를 한 곳에만 고친 전형적인 사고다.)
+    반환: 누적 저장 행수.
+    """
+    if not rows or VAULT is None:
+        return 0
+    base = VAULT.load_table(name, "shared")
+    M = merge_keep(base, list(rows), cols, keys)
+    ok = VAULT.save_table(name, M, "shared", domain=domain, source=source, note=note)
+    return len(M) if ok is not None else 0
+
+
 _TOK = re.compile(r"[가-힣A-Za-z]{2,}")
 
 
@@ -8764,6 +8834,15 @@ def harvest_customs(months: pd.DatetimeIndex, hs_codes: Sequence[str],
                               on_done=lambda: bar.update(1)):
                 if r:
                     got += r
+            if got:                       # ★배치 단위 즉시 적재(절대1원칙)
+                _n = flush_rows("customs_hs_monthly", got, cols, ["ym", "hs", "cc"],
+                                domain="customs",
+                                source="data.go.kr:1220000/nitemtrade",
+                                note="연도축 수집분 — 배치 단위 즉시 적재")
+                if _n:
+                    bar.set_postfix_str(f"누적 {_n:,}행", refresh=False)
+                    got = []
+    cached = VAULT.load_table("customs_hs_monthly", "shared") if VAULT is not None else cached
     X = merge_keep(cached, got, cols, ["ym", "hs", "cc"])
     if not len(X):
         if jobs:
