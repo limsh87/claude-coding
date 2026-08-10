@@ -237,11 +237,40 @@ _LOG_LK = threading.Lock()
 _LOG_FH = None
 
 
+def _force_utf8_stdout() -> str:
+    """Windows 콘솔 기본 인코딩(cp949)에서 로그가 통째로 죽는 것을 막는다.
+
+    이 파일이 쓰는 문자 중 cp949 로 인코딩이 **불가능**한 것들이 있다:
+      '—'(EM DASH) '✓' '✗' '═' '║' '╔' '╗' '╚' '╝'
+    (반면 '─' '★' '▣' 'Δ' '①' '≤' '→' 는 cp949 안전이다 — 정확히 저 글자군만 문제다)
+    JupyterLab 은 stdout 이 UTF-8 이라 무사하지만, README 가 안내하는
+    `python axis_a_delta_v13.py` 를 cmd/PowerShell 에서 돌리면 첫 출력 줄에서
+    UnicodeEncodeError 로 즉사한다. 측정과 무관한 이유로 실행이 죽는 건 말이 안 된다.
+    """
+    try:
+        enc = (sys.stdout.encoding or "").lower()
+    except Exception:                                        # noqa: BLE001
+        enc = ""
+    if enc.replace("-", "") in ("utf8", "utf8mb4"):
+        return enc or "utf-8"
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Python 3.7+
+        return "utf-8(reconfigured)"
+    except Exception:                                        # noqa: BLE001
+        return enc or "unknown"     # 실패해도 LOG() 가 줄 단위로 방어한다(아래)
+
+
 def LOG(msg: str = "", tag: str = "") -> None:
     t = _dt.datetime.now().strftime("%H:%M:%S")
     line = f"[{t}] {msg}" if not tag else f"[{t}] {tag:<5} {msg}"
     with _LOG_LK:
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            # 콘솔이 못 그리는 글자는 '?' 로 바꿔서라도 출력한다. 화면이 조금 깨지는 것과
+            # 실행이 죽는 것은 완전히 다른 문제다 — run_log.txt 에는 항상 원본이 남는다.
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
         if _LOG_FH is None:
             return
         try:
@@ -281,8 +310,33 @@ def _guard_enospc(e: BaseException, what: str):
                        f"공간을 확보한 뒤 다시 실행할 것.") from e
 
 
+def _replace_with_retry(tmp: Path, path: Path, tries: int = 6) -> None:
+    """POSIX 의 rename(2) 은 대상이 열려 있어도 성공하지만 Windows 는 다르다.
+
+    MoveFileEx 는 tmp 나 목적지에 다른 프로세스의 핸들이 하나라도 남아 있으면
+    PermissionError(WinError 5) 또는 OSError(WinError 32, '다른 프로세스가 사용 중')
+    를 던진다. 방금 닫힌 .json 을 실시간 검사하는 Windows Defender, 폴더를 훑는
+    Google Drive 동기화 클라이언트가 대표적인 원인이고 둘 다 수백 ms 안에 손을 뗀다.
+    여기서 포기하면 이미 API 호출을 써서 받아 온 응답을 그냥 버리는 셈이다 — 짧게
+    되짚어 기다린다. ENOSPC 는 기다려도 안 풀리므로 즉시 올려보낸다.
+    """
+    for i in range(tries):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.ENOSPC:
+                raise
+            transient = isinstance(e, PermissionError) or getattr(e, "winerror", None) in (5, 32)
+            if not transient or i == tries - 1:
+                raise
+            time.sleep(0.08 * (2 ** i) * random.uniform(0.8, 1.2))
+
+
 def write_bytes(path: Path, data: bytes) -> None:
-    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    # 스레드마다 다른 tmp 이름을 쓴다 — 같은 경로를 두 워커가 동시에 쓰면 서로의 tmp 를
+    # 지워 버리는 사고가 난다(finally 의 unlink 가 남의 파일을 지우는 형태로).
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}_{threading.get_ident()}")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "wb") as f:
@@ -292,7 +346,7 @@ def write_bytes(path: Path, data: bytes) -> None:
                 os.fsync(f.fileno())
             except OSError:
                 pass                                   # 일부 FUSE 드라이브 마운트는 fsync 미지원
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except OSError as e:
         _guard_enospc(e, str(path))
         raise
@@ -489,6 +543,10 @@ def _bootstrap():
     global ROOT, DIR_CACHE_RAW, DIR_CACHE_META, DIR_STATE, DIR_REPORTS, DIR_CACHE_MARKET
     global pd, requests, stock, fdr, _LOG_FH, KRX_MDC
 
+    # 경로 검사보다 먼저 — 그 예외 메시지 자체가 '—' 같은 cp949 불가 문자를 담고 있어서,
+    # 인코딩을 먼저 손보지 않으면 진짜 원인 대신 UnicodeEncodeError 가 보인다.
+    enc = _force_utf8_stdout()
+
     ROOT = resolve_project_root(PROJECT_ROOT)          # P0_LOCAL_ROOT_ONLY — 여기서 터진다
     DIR_CACHE_RAW = ROOT / "cache" / "raw" / "dart_exctv"
     DIR_CACHE_META = ROOT / "cache" / "meta"
@@ -498,6 +556,8 @@ def _bootstrap():
     for d in (DIR_CACHE_RAW, DIR_CACHE_META, DIR_STATE, DIR_REPORTS, DIR_CACHE_MARKET):
         d.mkdir(parents=True, exist_ok=True)
     _LOG_FH = open(DIR_REPORTS / "run_log.txt", "a", encoding="utf-8")
+    if "reconfigured" in enc or "utf8" not in enc.replace("-", ""):
+        LOG(f"콘솔 인코딩: {enc}  (Windows cp949 등에서 로그가 죽지 않도록 UTF-8 로 맞춤)")
 
     _ensure_packages(["pandas", "requests", "pykrx", "FinanceDataReader"])
     import pandas as _pd
@@ -550,6 +610,8 @@ KRX_MDC_JSON_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 KRX_MDC_WARMUP_URL = "https://data.krx.co.kr/contents/MDC/MDI/mainPage/index.cmd"
 KRX_MDC_REFERER = "https://data.krx.co.kr/contents/MDC/MDI/mainPage/index.cmd"
 KRX_MDC_BLD_ALL_QUOTES = "dbms/MDC/STAT/standard/MDCSTAT01501"     # 전종목 시세(시가총액 포함)
+KRX_MDC_OTP_URL = "https://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
+KRX_MDC_DOWNLOAD_URL = "https://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
 
 # 시장구분 정규화 — 소스마다 표기가 다르다. STK=유가증권, KSQ=코스닥, KNX=코넥스.
 # "KOSDAQ GLOBAL" 은 코스닥의 세부 소속이므로 KSQ 로 접는다(별도 시장이 아니다).
@@ -631,11 +693,28 @@ def _provider_fail(name: str, why: str = ""):
 
 
 # ── provider 1: FDR GitHub 캐시 (검증 완료) ────────────────────────────────────────────────
+# FDR 캐시는 최근 약 5개월만 보관하는 롤링 윈도우다. 커버리지 밖 날짜는 몇 번 두들겨 보면
+# 그 사실이 드러나므로, 한 번 확인된 하한보다 오래된 날짜는 아예 요청하지 않는다.
+# (이게 없으면 S1~S3 의 11일 역행 × 3 = 33회를 매 실행 404 받으려고 날린다)
+_FDR_BOUND = {"oldest_ok": None, "newest_404": None}
+_FDR_BOUND_LK = threading.Lock()
+
+
+def _fdr_below_coverage(date_iso: str) -> bool:
+    with _FDR_BOUND_LK:
+        ok, bad = _FDR_BOUND["oldest_ok"], _FDR_BOUND["newest_404"]
+    # 성공한 적 있는 가장 오래된 날짜보다 더 오래됐고, 그보다 최근에 404 를 맞은 적이 있다면
+    # 이 날짜는 윈도우 밖이 거의 확실하다(커버리지는 연속 구간이다).
+    return bool(ok and bad and date_iso < bad < ok)
+
+
 def snap_fdr_cache(date_iso: str):
     """반환 (df|None, note). 404 는 '휴장일'이거나 '롤링 윈도우 밖'이다 — 구분은 호출측에서."""
     name = "fdr_cache"
     if requests is None or not _provider_alive(name):
         return None, "skip"
+    if _fdr_below_coverage(date_iso):
+        return None, "커버리지밖(확인된 하한보다 과거 — 요청 생략)"
     try:
         r = requests.get(FDR_KRX_LISTING_URL.format(d=date_iso), timeout=30,
                          headers={"User-Agent": "Mozilla/5.0"})
@@ -644,6 +723,9 @@ def snap_fdr_cache(date_iso: str):
         return None, f"네트워크실패({type(e).__name__})"
     if r.status_code == 404:
         _provider_ok(name)          # 404 는 소스가 살아있다는 뜻이다(그 날짜가 없을 뿐)
+        with _FDR_BOUND_LK:
+            if not _FDR_BOUND["newest_404"] or date_iso > _FDR_BOUND["newest_404"]:
+                _FDR_BOUND["newest_404"] = date_iso
         return None, "404(휴장일 또는 커버리지밖)"
     if r.status_code != 200 or len(r.content) < 500:
         _provider_fail(name, f"http{r.status_code}")
@@ -665,6 +747,9 @@ def snap_fdr_cache(date_iso: str):
         _provider_fail(name, "유효행부족")
         return None, "유효행 부족"
     _provider_ok(name)
+    with _FDR_BOUND_LK:
+        if not _FDR_BOUND["oldest_ok"] or date_iso < _FDR_BOUND["oldest_ok"]:
+            _FDR_BOUND["oldest_ok"] = date_iso
     return snap, f"{len(snap):,}종목"
 
 
@@ -701,28 +786,78 @@ class KrxMdcClient:
         self.s = s
         return s
 
-    def all_quotes(self, date_c: str):
-        with self.lk:
-            s = self._session()
+    def _json_path(self, s, date_c: str):
+        """경로 A: getJsonData 직접 POST. 되면 가장 싸다(요청 1회)."""
         body = {"bld": KRX_MDC_BLD_ALL_QUOTES, "locale": "ko_KR", "mktId": "ALL",
                 "trdDd": date_c, "share": "1", "money": "1", "csvxls_isNo": "false"}
         r = s.post(KRX_MDC_JSON_URL, data=body, timeout=40)
         if r.status_code != 200:
             raise RuntimeError(f"http{r.status_code}")
         txt = r.text.lstrip()
-        if not txt[:1] in ("{", "["):
-            # 로그인 HTML 이 오면 여기서 잡힌다 — JSONDecodeError 를 엉뚱한 곳에서 만나지 않게.
+        if txt[:1] not in ("{", "["):
             raise RuntimeError("JSON 이 아닌 응답(로그인/차단 페이지 추정)")
         js = r.json()
-        for k, v in js.items():
+        for _k, v in js.items():
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 return v
         raise RuntimeError(f"행 배열 없음(keys={list(js)[:5]})")
 
+    def _otp_csv_path(self, s, date_c: str):
+        """경로 B: OTP 발급 → CSV 다운로드. 요청 2회지만 JSON 경로가 막혔을 때 통하는 경우가 많다.
+
+        KRX 는 화면 조회(getJsonData)와 파일 다운로드(GenerateOTP→download)를 별개 관문으로
+        두고 있어서, 한쪽이 로그인 벽에 막혀도 다른 쪽은 열려 있는 일이 흔하다.
+        """
+        otp_params = {
+            "locale": "ko_KR", "mktId": "ALL", "trdDd": date_c,
+            "share": "1", "money": "1", "csvxls_isNo": "false",
+            "name": "fileDown", "url": KRX_MDC_BLD_ALL_QUOTES,
+        }
+        r = s.get(KRX_MDC_OTP_URL, params=otp_params, timeout=40,
+                  headers={"Referer": KRX_MDC_REFERER})
+        if r.status_code != 200 or not r.text.strip():
+            raise RuntimeError(f"OTP 발급 실패(http{r.status_code})")
+        otp = r.text.strip()
+        if "<" in otp[:200]:
+            raise RuntimeError("OTP 대신 HTML(로그인/차단 페이지 추정)")
+        d = s.post(KRX_MDC_DOWNLOAD_URL, data={"code": otp}, timeout=60,
+                   headers={"Referer": KRX_MDC_REFERER})
+        if d.status_code != 200 or len(d.content) < 200:
+            raise RuntimeError(f"CSV 다운로드 실패(http{d.status_code})")
+        # KRX CSV 는 EUC-KR/CP949 다. utf-8 로 읽으면 헤더 한글이 깨져 컬럼 매칭이 실패한다.
+        txt = None
+        for enc in ("cp949", "euc-kr", "utf-8-sig", "utf-8"):
+            try:
+                cand = d.content.decode(enc)
+            except UnicodeDecodeError:
+                continue
+            if "종목" in cand[:2000] or "ISU" in cand[:2000].upper():
+                txt = cand
+                break
+            txt = txt or cand
+        if not txt:
+            raise RuntimeError("CSV 디코딩 실패")
+        rows = pd.read_csv(io.StringIO(txt)).to_dict("records")
+        if not rows:
+            raise RuntimeError("CSV 행 없음")
+        return rows
+
+    def all_quotes(self, date_c: str):
+        with self.lk:
+            s = self._session()
+        errs = []
+        for name, fn in (("json", self._json_path), ("otp_csv", self._otp_csv_path)):
+            try:
+                return fn(s, date_c)
+            except Exception as e:                           # noqa: BLE001
+                errs.append(f"{name}:{type(e).__name__}:{str(e)[:60]}")
+        raise RuntimeError(" / ".join(errs))
+
 
 KRX_MDC = None       # _bootstrap 이후에 만든다(requests 필요)
 
-_MDC_CODE_KEYS = ("ISU_SRT_CD", "ISU_CD", "종목코드")
+# JSON 경로는 영문 키, OTP/CSV 경로는 한글 헤더로 온다 — 양쪽 다 받는다.
+_MDC_CODE_KEYS = ("ISU_SRT_CD", "ISU_CD", "종목코드", "단축코드")
 _MDC_CAP_KEYS = ("MKTCAP", "시가총액")
 _MDC_MKT_KEYS = ("MKT_NM", "MKT_TP_NM", "시장구분")
 
@@ -779,10 +914,19 @@ def probe_krx_openapi() -> bool:
             KRX_OPENAPI_OK, KRX_OPENAPI_MODE = True, mode
             return True
         if isinstance(js, dict):
-            last = str(js.get("message") or js.get("msg") or list(js)[:3])[:120]
+            # ★ 키 이름이 아니라 값을 찍어야 한다. 'respMsg/respCode' 라고만 적어 두면
+            #   사용자가 무엇을 고쳐야 하는지 알 수 없다 — 거부 사유 원문이 곧 조치 안내다.
+            code = js.get("respCode") or js.get("resultCode") or js.get("code") or ""
+            msg = (js.get("respMsg") or js.get("resultMsg") or js.get("message")
+                   or js.get("msg") or "")
+            last = f"[{mode}] respCode={code!r} respMsg={str(msg)[:160]!r}" if (code or msg) \
+                else f"[{mode}] {json.dumps(js, ensure_ascii=False)[:200]}"
     KRX_OPENAPI_OK = False
     if last:
         LOG(f"    KRX Open API 거부 사유: {last}")
+        LOG("      → 대개 '엔드포인트 이용신청 미승인'이다. https://data.krx.co.kr → [Open API]")
+        LOG("        → [이용신청] 에서 '주식 일별매매정보'(sto/stk_bydd_trd) 를 신청하고")
+        LOG("        승인(하루 정도)된 뒤 다시 실행하면 2025년 스냅샷(S1~S3)이 풀린다.")
     return False
 
 
@@ -2178,9 +2322,16 @@ def main():
 
     LOG("")
     LOG("캐시 인벤토리 (로컬 보유분 — 부족분은 4b 에서 드라이브까지 마저 확인한다)")
+    _total_have = 0
     for sid, nom, _pe, yy, rc, as_of, need in SNAPSHOT_SPEC:
         have0 = n_local.get((yy, rc), 0)
+        _total_have += have0
         LOG(f"  {yy}/{rc} ({sid} {REPRT_NAME[rc]:<6}) : 로컬 {have0:>5,}건 / 필요 ~{need:,}건")
+    if _total_have == 0:
+        LOG("  ※ 임원 캐시가 0건인 이유: 이전 실행이 4c(임원현황 수집)에 도달하기 전에")
+        LOG("     끝났기 때문이다(유니버스 확보 실패 등). 수집을 한 번이라도 통과하면")
+        LOG("     응답 1건당 파일 1개로 즉시 저장되고, 다음 실행부터는 그만큼 건너뛴다.")
+        LOG("     중간에 끊어도 그때까지 받은 분량은 그대로 남는다 — 처음부터 다시 받지 않는다.")
     corpcode_cached = _corpcode_parsed().exists()
     LOG(f"  corpCode 파싱 결과 : {'있음' if corpcode_cached else '없음(드라이브 공용 인덱스 확인 예정)'}")
 
@@ -2278,6 +2429,15 @@ def main():
             WARN(f"수집 중단({col.halt}) — 남은 {len(left):,}건을 resume_todo.json 에 저장했다. "
                  f"수집된 분량으로 측정을 계속한다(결측은 결측으로 남는다).")
         LOG(f"  응답 분포: {dict(col.stat)}")
+        # 수집분이 실제로 디스크에 남았는지 눈으로 확인시켜 준다 — '다음에 또 받는 건 아닌가'
+        # 하는 의심을 로그가 직접 해소해야 한다.
+        _after = scan_cache_inventory()
+        _saved = sum(len(v) for v in _after.values())
+        OK(f"  저장 확인: 임원 캐시 총 {_saved:,}건이 디스크에 있다 → 다음 실행은 이만큼 건너뛴다")
+        for sid, _n, _p, yy, rc, _a, _need in SNAPSHOT_SPEC:
+            got = len(_after.get((yy, rc), set()))
+            if got:
+                LOG(f"    {sid} {yy}/{rc}: {got:,}건 저장됨")
     else:
         OK("  신규 호출 0건 — 전량 캐시 히트(로컬+드라이브)")
 

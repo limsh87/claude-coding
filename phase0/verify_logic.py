@@ -706,6 +706,129 @@ check("사유 EMPTY_UNIVERSE", u3["status_reason"], "EMPTY_UNIVERSE")
 M.MARKET_PROVIDERS = _real_providers
 _reset_market_state()
 
+print("\n[23] Windows 이식성 — cp949 콘솔 / 파일 락 (사용자 실행환경이 Windows 다)")
+import io as _io
+import os as _os
+import errno as _errno
+
+
+class _Cp949Out(_io.TextIOBase):
+    """실제 cp949 스트림. 인코딩 불가 문자가 오면 진짜로 UnicodeEncodeError 를 낸다."""
+    encoding = "cp949"
+
+    def __init__(self):
+        self.buf = []
+
+    def write(self, s):
+        s.encode("cp949")
+        self.buf.append(s)
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+_real_stdout = sys.stdout
+sys.stdout = _Cp949Out()
+_died = None
+try:
+    # 이 파일이 실제로 쓰는 cp949 불가 문자들 — 예전엔 첫 줄에서 프로세스가 즉사했다
+    M.LOG("cp949 불가: — ✓ ✗ ═ ║ ╔ ╗ ╚ ╝")
+    M.RULE("PHASE 0 — 축 A-Δ 재측정 v1.3")
+    M.OK("완료 — 정상")
+except BaseException as e:
+    _died = f"{type(e).__name__}: {e}"
+finally:
+    _cap = sys.stdout.buf
+    sys.stdout = _real_stdout
+check("cp949 콘솔에서 LOG/RULE/OK 가 죽지 않는다 (Windows cmd/PowerShell 직접 실행)",
+      _died, None)
+check("죽지 않고 실제로 출력은 나간다", len(_cap) > 0, True)
+
+_tmpw = Path(tempfile.mkdtemp())
+_real_replace = _os.replace
+
+
+def _flaky(n_fail):
+    st = {"n": 0}
+
+    def f(a, b):
+        st["n"] += 1
+        if st["n"] <= n_fail:
+            e = PermissionError(13, "Access is denied")
+            e.winerror = 32                      # '다른 프로세스가 파일을 사용 중입니다'
+            raise e
+        return _real_replace(a, b)
+    return f, st
+
+
+_os.replace, _st = _flaky(3)
+try:
+    M.write_bytes(_tmpw / "paid.json", b'{"dart":"response"}')
+    check("Windows 일시적 파일 락(Defender/Drive)은 되짚어 기다렸다가 성공한다",
+          (_tmpw / "paid.json").read_bytes(), b'{"dart":"response"}')
+    check("이미 지불한 API 응답을 락 때문에 버리지 않는다", _st["n"], 4)
+finally:
+    _os.replace = _real_replace
+
+
+def _always_locked(a, b):
+    e = PermissionError(13, "Access is denied")
+    e.winerror = 32
+    raise e
+
+
+_os.replace = _always_locked
+_raised = None
+try:
+    M.write_bytes(_tmpw / "never.json", b"z")
+except OSError as e:
+    _raised = type(e).__name__
+finally:
+    _os.replace = _real_replace
+check("영구 락이면 조용히 삼키지 않고 예외로 올린다", _raised, "PermissionError")
+
+
+def _enospc(a, b):
+    e = OSError(_errno.ENOSPC, "No space left")
+    e.errno = _errno.ENOSPC
+    raise e
+
+
+_os.replace = _enospc
+_r2 = None
+try:
+    M.write_bytes(_tmpw / "full.json", b"z")
+except M.DiskFull:
+    _r2 = "DiskFull"
+except OSError:
+    _r2 = "OSError"
+finally:
+    _os.replace = _real_replace
+check("ENOSPC 는 기다려도 안 풀리므로 재시도 없이 즉시 DiskFull", _r2, "DiskFull")
+
+# 같은 경로에 여러 스레드가 동시에 쓸 때 서로의 tmp 를 지워 실패하지 않는지 (실동작 확인)
+import threading as _th
+_errs = []
+
+
+def _concurrent_write(i):
+    try:
+        for _ in range(12):
+            M.write_bytes(_tmpw / "shared.json", b'{"w":%d}' % i)
+    except BaseException as e:                                # noqa: BLE001
+        _errs.append(f"{type(e).__name__}: {e}")
+
+
+_ths = [_th.Thread(target=_concurrent_write, args=(i,)) for i in range(6)]
+for x in _ths:
+    x.start()
+for x in _ths:
+    x.join()
+check("같은 경로 동시 쓰기 6스레드 × 12회 — 서로의 tmp 를 지워 터지지 않는다", _errs, [])
+check("동시 쓰기 후에도 파일이 온전한 JSON 이다",
+      json.loads((_tmpw / "shared.json").read_text(encoding="utf-8")).get("w") in range(6), True)
+
 print("\n" + "=" * 70)
 if FAIL:
     print(f"실패 {len(FAIL)}/{N}")
