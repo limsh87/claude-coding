@@ -265,6 +265,26 @@ class Vault:
         })
         return abspath
 
+    def get_blob_by_key(self, domain: str, subtype: str, key: str,
+                        scope: str = "shared") -> Optional[bytes]:
+        """(domain, subtype, key) 로 원본 바이트를 찾는다.
+
+        put_blob 의 uid 는 내용해시를 포함하므로 호출자가 재구성할 수 없다. 그래서
+        uid 를 모르는 소비자(§6.3 완료형 판정 등)는 이 경로로 인덱스를 조회해야 한다.
+        ★ 인덱스를 읽기만 한다 — 어떤 경우에도 기존 인덱스를 변형하지 않는다.
+        """
+        rows = self.lookup(scope, domain=domain, subtype=subtype, key=str(key))
+        if rows is None or rows.empty:
+            return None
+        for _, r in rows.iterrows():
+            for cand in (r.get("abs_path"), os.path.join(self.root, str(r.get("path") or ""))):
+                try:
+                    if cand and isinstance(cand, str) and os.path.exists(cand):
+                        return open(cand, "rb").read()
+                except Exception:
+                    continue
+        return None
+
     def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:
         rows = self.lookup(scope, uid=uid)
         if rows.empty:

@@ -43,7 +43,7 @@ def report_performance(bt: dict, bench: Dict[str, pd.Series], label: str = "",
               title="포트폴리오 성과 (§8.1 — 비용 전만 보고하는 것은 금지)")
 
     # 벤치마크 대비
-    Rs = R.set_index("asof")["ret"]
+    Rs = measurable_ret(R)          # perf_stats 와 동일 표본(측정 불가 분기 제외)
     brows = []
     if uni_bench is not None and len(uni_bench):
         bb = uni_bench.reindex(Rs.index).fillna(0.0)
@@ -282,8 +282,8 @@ def report_kill_criteria(ctx: dict) -> dict:
     b2 = ABLATION_RESULTS.get("B2")
     if f1 and b2 and f1.get("ok") and b2.get("ok"):
         try:
-            ra = f1["returns"].set_index("asof")["ret"]
-            rb = b2["returns"].set_index("asof")["ret"].reindex(ra.index)
+            ra = measurable_ret(f1["returns"])
+            rb = measurable_ret(b2["returns"]).reindex(ra.index)
             d = (ra.fillna(0) - rb.fillna(0)).to_numpy()
             mu, t = hac_tstat(d)
             c4 = not (np.isfinite(t) and t > 1.0 and mu > 0)

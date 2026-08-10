@@ -838,6 +838,22 @@ def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
     return out.astype("float32")
 
 
+def measurable_ret(R: pd.DataFrame, key: str = "ret") -> pd.Series:
+    """성과·유의성 계산에 쓸 수익률 시계열. **측정 불가 분기를 일관되게 제외한다.**
+
+    ★ perf_stats 는 R[R["measurable"]] 로 마지막 리밸일(전 종목 fwd_ret 결측)을 빼는데,
+      어블레이션의 초과수익·p(HAC)·§9.2-(8) BH-FDR 판정은 원본 R 을 그대로 썼다. 그러면
+      §9.2-(6) 표의 '초과수익·p(HAC)' 열과 성과표(CAGR/Sharpe)가 서로 다른 39 vs 40 분기
+      표본에서 나온다. 사전등록된 유의성 판정이 정의와 어긋나면 안 되므로 한 곳으로 모은다.
+    """
+    if R is None or len(R) == 0:
+        return pd.Series(dtype="float64")
+    Rm = R[R["measurable"].astype(bool)] if "measurable" in R.columns else R
+    if len(Rm) == 0:
+        Rm = R
+    return Rm.set_index("asof")[key]
+
+
 def newey_west_p(x, lags: Optional[int] = None) -> float:
     """HAC t → 양측 p-value. scipy 가 없으면 정규근사로 폴백한다."""
     a = np.asarray(x, dtype=float)

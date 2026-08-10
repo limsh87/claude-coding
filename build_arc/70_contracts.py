@@ -1,7 +1,7 @@
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A34 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A38 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -1055,12 +1055,137 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A34", "캐시 스키마 변화 내성 (tok_len)", a34)
 
+    # ── A35  D1 최종 z 셀이 동시 제출 코호트인가 (A26 의 D1 판) ───────────────────────────
+    def a35():
+        def _mk(n_sec_nov: int, seed: int) -> pd.DataFrame:
+            rg = np.random.default_rng(seed)
+            rows = []
+            for lab, dt_, yr, rd, nsec in (("FY", "FY", 2018, "2019-03-20", 7),
+                                           ("Q3", "Q3", 2019, "2019-11-14", n_sec_nov)):
+                for i in range(60):
+                    for s in ARC_SECTIONS[:nsec]:
+                        rows.append({"corp_code": f"{lab}{i:03d}", "rcept_dt": as_ts(rd),
+                                     "bsns_year": yr, "doc_type": dt_, "section": s,
+                                     "cosine": float(rg.normal(0.8, 0.05)),
+                                     "jaccard": float(rg.normal(0.7, 0.05)),
+                                     "simple": float(rg.normal(0.7, 0.05)),
+                                     "len_ratio": float(rg.normal(0.9, 0.03))})
+            return pd.DataFrame(rows)
+        a = d1_composite(_mk(1, 5))
+        b = d1_composite(_mk(7, 5))
+        ka = a[a["corp_code"].astype(str).str.startswith("FY")].set_index("corp_code")["D1_SCORE"]
+        kb = b[b["corp_code"].astype(str).str.startswith("FY")].set_index("corp_code")["D1_SCORE"]
+        j = ka.to_frame("a").join(kb.to_frame("b"), how="inner").dropna()
+        if j.empty:
+            return None, "3월 코호트 D1_SCORE 가 생성되지 않아 건너뜁니다"
+        d = float((j["a"] - j["b"]).abs().max())
+        if d > 1e-6:
+            return False, (f"★11월 코호트(3분기보고서)만 바꿨는데 3월 코호트(사업보고서)의 "
+                           f"D1_SCORE 가 최대 {d:.3f}z 움직였습니다. 최종 z 셀이 동시 제출 "
+                           f"코호트가 아니라 달력연도라는 뜻이며, 2019-06/09 리밸일에 쓰이는 "
+                           f"값이 11월 제출분으로 결정됩니다 — 정의상 미래 참조입니다.")
+        return True, f"미래 코호트 변경이 과거 D1_SCORE 에 영향 없음 (최대 {d:.2e}z, {len(j)}종목)"
+
+    _ac("A35", "D1 최종 z = 동시 제출 코호트", a35)
+
+    # ── A36  STRUCT_FLAG 가 미래 공시로 과거 D1 을 지우지 않는가 ──────────────────────────
+    def a36():
+        rg = np.random.default_rng(9)
+        rows = []
+        for i in range(40):
+            for s in ARC_SECTIONS:
+                rows.append({"corp_code": f"{i:08d}", "rcept_dt": as_ts("2019-03-20"),
+                             "bsns_year": 2018, "doc_type": "FY", "section": s,
+                             "cosine": float(rg.normal(0.8, 0.05)),
+                             "jaccard": float(rg.normal(0.7, 0.05)),
+                             "simple": float(rg.normal(0.7, 0.05)),
+                             "len_ratio": float(rg.normal(0.9, 0.03))})
+        S = pd.DataFrame(rows)
+        # 문서 접수 9개월 **뒤** 의 합병 공시 — 그 시점에는 알 수 없는 정보다
+        fut = pd.DataFrame({"corp_code": ["00000000"],
+                            "event_date": [as_ts("2019-12-20")],
+                            "knowledge_date": [as_ts("2019-12-20")], "STRUCT_FLAG": [1.0]})
+        base = d1_composite(S).set_index("corp_code")["D1_SCORE"]
+        withf = d1_composite(S, fut).set_index("corp_code")["D1_SCORE"]
+        if pd.notna(base.get("00000000")) and pd.isna(withf.get("00000000")):
+            return False, ("★문서 접수 9개월 뒤의 합병 공시로 과거 문서의 D1 이 지워졌습니다. "
+                           "'앞으로 12개월 안에 합병을 공시할 기업' 이라는 미래 정보로 그 "
+                           "종목의 스코어 구성(§6.5 재배분)이 바뀝니다 — 합병 대상 종목은 "
+                           "전방수익률이 체계적으로 다르므로 방향성 있는 편향입니다.")
+        # 과거 공시는 정상적으로 발동해야 한다
+        past = fut.copy()
+        past["knowledge_date"] = [as_ts("2018-09-20")]
+        past["event_date"] = [as_ts("2018-09-20")]
+        wp = d1_composite(S, past).set_index("corp_code")["D1_SCORE"]
+        if pd.notna(wp.get("00000000")):
+            return False, "문서 접수 6개월 전의 구조적 변화 공시가 STRUCT_FLAG 를 발동시키지 않았습니다"
+        return True, "미래 공시는 무시 · 접수 이전 1년 공시만 STRUCT_FLAG 발동 확인"
+
+    _ac("A36", "STRUCT_FLAG 단방향 (§6.1.6)", a36)
+
+    # ── A37  D3 텍스트 규칙이 영구 0 / 상시 1 로 굳지 않는가 ──────────────────────────────
+    def a37():
+        T = pd.DataFrame({
+            "corp_code": ["C1", "C1"], "rcept_no": ["R1", "R1"],
+            "rcept_dt": [as_ts("2019-03-25")] * 2, "doc_type": ["FY"] * 2,
+            "bsns_year": [2018] * 2, "section": ["S_BIZ", "S_MDA"],
+            "tf": ['{"해외": 3, "법인": 5, "설립": 2}', '{"특허": 1, "등록": 2}'],
+            "bigram": ["{}"] * 2, "tok_len": [100, 80], "n_tokens": [100, 80]})
+        DOC = _d3_text_by_doc(T)
+        if DOC.empty:
+            return False, "문서 텍스트 프레임이 비었습니다"
+        toks = DOC["tokens"].iloc[0]
+        if not _d3_tokens_hit(toks, "NF_OVERSEAS"):
+            return False, ("★'해외'+'법인' 토큰이 둘 다 있는데 NF_OVERSEAS 가 발화하지 "
+                           "않습니다. 두 단어 패턴을 JSON 토큰 덤프 문자열에 정규식으로 "
+                           "걸면 두 토큰 사이에 항상 '\": 3, \"' 가 끼어 **원리상 매칭될 수 "
+                           "없습니다** — 해당 이벤트가 어떤 데이터에서도 영구 0 이 됩니다.")
+        H = extract_hardfacts(T, None, None, None)
+        if H.empty:
+            return None, "하드팩트가 생성되지 않아 건너뜁니다"
+        for k in sorted(_D3_WEAK_CONSTANT):
+            if k in H.columns and pd.to_numeric(H[k], errors="coerce").notna().any():
+                return False, (f"★원문 없이 단일 토큰만으로 {k} 가 판정됐습니다. "
+                               f"'이 단어가 보고서 어딘가에 나오는가'는 이벤트가 아니라 "
+                               f"상수입니다(실측 발화율 67%) — 0/1 이 아니라 결측이어야 합니다.")
+        return True, ("다단어 규칙이 토큰 집합으로 발화 · 단일 토큰 상수 태그"
+                      f"({' · '.join(sorted(_D3_WEAK_CONSTANT))})는 결측 처리")
+
+    _ac("A37", "D3 텍스트 규칙 실효성 (§6.3)", a37)
+
+    # ── A38  NOA 가 현금 결측을 0 으로 채우지 않는가 (§0.5) ───────────────────────────────
+    def a38():
+        def _fin(cash_val):
+            return pd.DataFrame({
+                "corp_code": ["C1", "C1"], "bsns_year": [2018, 2019],
+                "reprt_code": ["11011", "11011"],
+                "knowledge_date": pd.to_datetime(["2019-03-25", "2020-03-25"]),
+                "assets": [1000.0, 1000.0], "liabilities": [400.0, 400.0],
+                "cash": [cash_val, cash_val], "net_income_ttm": [50.0, 50.0],
+                "cfo_ttm": [60.0, 60.0], "revenue_ttm": [500.0, 500.0],
+                "inventory": [100.0, 100.0], "receivable": [80.0, 80.0]})
+        a = build_d2_panel(_fin(200.0))
+        b = build_d2_panel(_fin(np.nan))
+        va = pd.to_numeric(a.get("NOA", pd.Series(dtype=float)), errors="coerce").dropna()
+        vb = pd.to_numeric(b.get("NOA", pd.Series(dtype=float)), errors="coerce").dropna()
+        if va.empty:
+            return None, "현금이 있는 경우에도 NOA 가 생성되지 않아 건너뜁니다"
+        if not vb.empty:
+            return False, (f"★현금성자산이 결측인데 NOA 가 {float(vb.iloc[0]):.4f} 로 "
+                           f"계산됐습니다(현금 있을 때 {float(va.iloc[0]):.4f}). cash.fillna(0) "
+                           f"은 §0.5 위반이고, NOA 는 방향 −1 이라 현금 라인만 못 읽은 법인이 "
+                           f"D2 에서 체계적으로 불리해집니다. fillna 는 NaN 을 없애므로 "
+                           f"커버리지 표에는 100% 로 보고되어 흔적조차 남지 않습니다.")
+        return True, f"현금 결측 → NOA 결측(§6.5 재배분) · 현금 있으면 {float(va.iloc[0]):.4f}"
+
+    _ac("A38", "NOA 현금 결측 처리 (§0.5)", a38)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A34 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A38 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

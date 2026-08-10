@@ -64,7 +64,7 @@ def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
         rec["ic"], rec["icir"], rec["ic_t"], rec["n_ic"] = ic, icir, ic_t, n_ic
         # 초과수익 = 전략 − U-1000 동일가중 (지수 대신 같은 유니버스를 쓴다 — 41 모듈 주석 참조)
         bench = equal_weight_universe_return(P)
-        R = bt_net["returns"].set_index("asof")["ret"]
+        R = measurable_ret(bt_net["returns"])   # 측정 불가 분기 제외(성과표와 동일 표본)
         b = bench.reindex(R.index).fillna(0.0)
         ex = (R.fillna(0.0) - b).to_numpy(dtype=float)
         rec["excess"] = float(np.nanmean(ex)) if len(ex) else np.nan

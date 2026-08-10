@@ -203,6 +203,7 @@ ARC_DOC_MAX           = 120_000       # 한 실행에서 새로 받을 원문 �
 ARC_D2_WINSOR_P       = 0.01          # 상하위 1% 윈저라이징
 
 # ── §6.5 축 B 합성 (사전등록 가중치) ────────────────────────────────────────────────────────
+ARC_D3_EXACT_MAX_DOCS = 4000    # §6.3 완료형 판정을 위해 원문 zip 을 다시 열 최대 문서 수
 ARC_W_D1, ARC_W_D2, ARC_W_D3 = 0.40, 0.40, 0.20
 # §7.2 최종 스코어
 ARC_W_AXIS_A, ARC_W_AXIS_B   = 0.50, 0.50
@@ -247,7 +248,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0630"
+BUILD_VERSION = "v2.20260810.0639"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -1822,6 +1823,22 @@ def xsec_resid(y, X: pd.DataFrame, cells) -> pd.Series:
     return out.astype("float32")
 
 
+def measurable_ret(R: pd.DataFrame, key: str = "ret") -> pd.Series:
+    """성과·유의성 계산에 쓸 수익률 시계열. **측정 불가 분기를 일관되게 제외한다.**
+
+    ★ perf_stats 는 R[R["measurable"]] 로 마지막 리밸일(전 종목 fwd_ret 결측)을 빼는데,
+      어블레이션의 초과수익·p(HAC)·§9.2-(8) BH-FDR 판정은 원본 R 을 그대로 썼다. 그러면
+      §9.2-(6) 표의 '초과수익·p(HAC)' 열과 성과표(CAGR/Sharpe)가 서로 다른 39 vs 40 분기
+      표본에서 나온다. 사전등록된 유의성 판정이 정의와 어긋나면 안 되므로 한 곳으로 모은다.
+    """
+    if R is None or len(R) == 0:
+        return pd.Series(dtype="float64")
+    Rm = R[R["measurable"].astype(bool)] if "measurable" in R.columns else R
+    if len(Rm) == 0:
+        Rm = R
+    return Rm.set_index("asof")[key]
+
+
 def newey_west_p(x, lags: Optional[int] = None) -> float:
     """HAC t → 양측 p-value. scipy 가 없으면 정규근사로 폴백한다."""
     a = np.asarray(x, dtype=float)
@@ -2206,6 +2223,26 @@ class Vault:
             "extra": json.dumps(extra or {}, ensure_ascii=False, default=str),
         })
         return abspath
+
+    def get_blob_by_key(self, domain: str, subtype: str, key: str,
+                        scope: str = "shared") -> Optional[bytes]:
+        """(domain, subtype, key) 로 원본 바이트를 찾는다.
+
+        put_blob 의 uid 는 내용해시를 포함하므로 호출자가 재구성할 수 없다. 그래서
+        uid 를 모르는 소비자(§6.3 완료형 판정 등)는 이 경로로 인덱스를 조회해야 한다.
+        ★ 인덱스를 읽기만 한다 — 어떤 경우에도 기존 인덱스를 변형하지 않는다.
+        """
+        rows = self.lookup(scope, domain=domain, subtype=subtype, key=str(key))
+        if rows is None or rows.empty:
+            return None
+        for _, r in rows.iterrows():
+            for cand in (r.get("abs_path"), os.path.join(self.root, str(r.get("path") or ""))):
+                try:
+                    if cand and isinstance(cand, str) and os.path.exists(cand):
+                        return open(cand, "rb").read()
+                except Exception:
+                    continue
+        return None
 
     def get_blob(self, uid: str, scope: str = "shared") -> Optional[bytes]:
         rows = self.lookup(scope, uid=uid)
@@ -9064,8 +9101,21 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
 
     # 섹션 → 문서 단위 피벗. 합성 지표와 4개 개별 지표를 모두 만든다
     # (개별 지표는 §8.4 '유사도 4종 각각 단독 사용 시 성과' 강건성 검사에 필요하다).
+    # ★ 최종 z 의 셀 키(사업연도|보고서종류)를 만들려면 pivot index 에 두 컬럼이 있어야 한다.
+    #   예전에는 index 가 (corp_code, rcept_dt) 뿐이라 아래 `if "bsns_year" in W.columns`
+    #   가드가 **항상 빗나가고** 셀이 조용히 달력연도 단독으로 폴백했다(문자열 연결이
+    #   정상 동작해 "2019|" 라는 그럴듯한 키가 만들어져 예외도 나지 않았다).
+    _PIV_IDX = ["corp_code", "rcept_dt"] + [c for c in ("bsns_year", "doc_type")
+                                            if c in d.columns]
+    if len(_PIV_IDX) < 4:
+        raise RuntimeError(
+            "d1_composite: bsns_year/doc_type 이 없어 동시 제출 코호트 셀을 만들 수 없습니다.\n"
+            "  달력연도로 폴백하면 3월 접수분(사업보고서)의 평균·표준편차·윈저 경계가 같은 해\n"
+            "  11월 접수분(3분기보고서)으로부터 계산됩니다 — 명백한 미래 참조이므로 중단합니다.\n"
+            f"  현재 컬럼: {sorted(d.columns)[:14]}")
+
     def _pivot(valcol: str, prefix: str) -> pd.DataFrame:
-        pv = d.pivot_table(index=["corp_code", "rcept_dt"], columns="section",
+        pv = d.pivot_table(index=_PIV_IDX, columns="section",
                            values=valcol, aggfunc="mean")
         pv = pv.reindex(columns=ARC_SECTIONS)
         pv.columns = [f"{prefix}{s}" for s in ARC_SECTIONS]
@@ -9113,11 +9163,7 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
     #   11월 접수분(3분기보고서)으로부터 계산된다 — 3월 문서의 점수가 11월 데이터로
     #   정해지는 명백한 미래 참조다. 코호트별 섹션 수·파싱 성공률이 실제로 다르므로
     #   코호트 간 상대 스케일이 바뀌고, 결산월이 섞인 한 리밸일의 횡단면 순위가 달라진다.
-    _by = as_ts_series(W["rcept_dt"]).dt.year.astype(str)
-    if "bsns_year" in W.columns:
-        _by = W["bsns_year"].astype(str)
-    _dt_ = W["doc_type"].astype(str) if "doc_type" in W.columns else ""
-    W["_yr"] = _by.astype(str) + "|" + (_dt_ if isinstance(_dt_, str) else _dt_)
+    W["_yr"] = W["bsns_year"].astype(str) + "|" + W["doc_type"].astype(str)
     W["D1_SCORE"] = -xsec_z(W["CHANGE_composite"], W["_yr"], min_n=CELL_MIN_N)
     W["D1_SCORE_equalw"] = -xsec_z(W["CHANGE_equalw"], W["_yr"], min_n=CELL_MIN_N)
     for m in D1_METRICS:
@@ -9136,8 +9182,14 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
             flags = []
             for cc, rd in zip(W["corp_code"].astype(str), as_ts_series(W["rcept_dt"])):
                 ds = key.get(cc)
-                # 문서 접수일 기준 ±1년 안에 구조적 변화 공시가 있으면 그 문서는 노이즈
-                hit = bool(ds) and any(abs((rd - d0).days) <= 365 for d0 in ds if pd.notna(d0))
+                # ★ 단방향이어야 한다. 예전에는 abs(...) 라 **문서 접수 이후** 최대 1년의
+                #   공시까지 매칭했다. 그러면 "앞으로 12개월 안에 합병·분할·지주전환을
+                #   공시할 기업" 이라는 미래 정보로 그 문서의 D1 이 지워지고, §6.5 에 따라
+                #   D1 가중치 0.40 이 D2·D3 로 재배분된다. 합병 대상 종목은 전방수익률이
+                #   체계적으로 다르므로 방향성 있는 편향이다. struct 는 PIT.register 를
+                #   거치지 않고 파이썬 리스트로 직접 조회되므로 as-of 강제도 없었다.
+                hit = bool(ds) and any(0 <= (rd - d0).days <= 365
+                                       for d0 in ds if pd.notna(d0))
                 flags.append(1.0 if hit else 0.0)
             W["STRUCT_FLAG"] = flags
             n_s = int(W["STRUCT_FLAG"].sum())
@@ -9376,7 +9428,17 @@ def build_d2_panel(fin: pd.DataFrame, shares: Optional[pd.DataFrame] = None) -> 
     if not has_debt:
         LOG.info("총차입금 계정이 없어 NOA 를 (자산−현금) − 부채 로 근사합니다 "
                  "[방법론적 한계 — 차입 의존도가 높은 기업에서 NOA 가 과소평가됩니다].")
-    noa_num = (assets - cash.fillna(0)) - (liab - debt.fillna(0))
+    # ★ cash 결측을 0 으로 채우면 §0.5(결측을 0 으로 채우지 않는다) 위반이고, 실제로
+    #   "현금 라인만 못 읽은 법인" 이 조용히 불리해진다(실측: 자산 1000·부채 400 동일 회사가
+    #   cash=200 → NOA 0.40, cash=NaN → NOA 0.60. NOA 는 방향 −1 이라 페널티다).
+    #   fillna(0) 은 NaN 을 없애므로 결측률 표에는 흔적조차 남지 않고 커버리지 100% 로 보고된다.
+    #   debt 는 데이터셋에 아예 없는 계정이라 0 대체가 불가피하지만, cash 는 있어야 하는데
+    #   빠진 값이므로 대우가 달라야 한다 → NOA 를 결측으로 두고 §6.5 재배분에 맡긴다.
+    _n_cash_na = int(cash.isna().sum())
+    if _n_cash_na:
+        LOG.info(f"현금성자산 결측 {_n_cash_na:,}행 — 해당 행의 NOA 를 결측 처리합니다 "
+                 f"(0 으로 채우면 그 법인이 D2 에서 체계적으로 불리해집니다).")
+    noa_num = ((assets - cash) - (liab - debt.fillna(0))).where(cash.notna())
     out["NOA"] = safe_div(noa_num, assets_prev.where(assets_prev.notna(), assets))
 
     # ③④ 매출채권 / 재고 괴리 (YoY 증가율 차이)
@@ -9612,24 +9674,109 @@ def _d3_count_facts(text: str, pat: "re.Pattern") -> int:
 
 
 def _d3_text_by_doc(T: pd.DataFrame) -> pd.DataFrame:
-    """정규화 토큰 테이블에서 문서 단위 '토큰 나열 문자열' 을 만든다.
+    """정규화 토큰 테이블 → 문서 단위 **토큰 집합**.
 
-    ★ 한계: 15 모듈은 원문이 아니라 토큰 빈도(tf)만 저장한다(용량 때문). 따라서 문장 단위
-      완료형 판정을 정확히 하려면 원문 blob 을 다시 읽어야 한다. 여기서는 두 경로를 쓴다:
-        ① 원문 blob 이 인덱스에 있으면 그걸 읽어 문장 판정(정확)
-        ② 없으면 tf 키워드 존재만으로 '약한 증거' 판정 (그 사실을 반환 플래그에 남긴다)
-      ②는 완료형/전망형을 구분할 수 없으므로 D3 를 과대계상할 수 있다. 그래서 ②로 잡힌
-      이벤트는 별도로 세어 보고하고, 커버리지 표에 명시한다.
+    ★ 예전에는 tf(JSON dict 문자열)들을 이어붙인 문자열에 정규식을 그대로 걸었다. 두 가지가
+      동시에 깨졌다:
+        ① 두 단어 패턴(`해외\s*법인`, `지분\s*취득`, `정부\s*과제`, `신규\s*사업` …)은
+           JSON 덤프에서 **원리상 매칭될 수 없다** — 두 토큰 사이에 항상 `": 3, "` 가 낀다.
+           해당 이벤트는 어떤 데이터를 넣어도 영구 0 이었다(NF_GOVRND·NF_NEWBIZ·
+           NF_SUBSID·NF_OVERSEAS 실측 전부 0건).
+        ② 단일 토큰 패턴(`특허`, `자회사`, `출자` …)은 '이 단어가 보고서 어딘가에 나오는가'
+           가 되어 이벤트가 아니라 상수가 됐다(NF_PATENT 실측 67% 발화).
+      → 토큰 집합으로 바꾸고, 다단어 패턴은 **모든 구성 토큰이 집합에 있는지**로 판정한다.
+
+    ★ 그리고 §6.3 의 핵심인 '완료형만' 필터(_d3_count_facts)는 exact=True 경로에서만
+      돌아가는데 그 경로에 도달하는 코드가 없었다 — 규정 전체가 죽은 코드였다.
+      원문이 공용 인덱스에 남아 있으면 그걸 읽어 exact 경로를 실제로 태운다.
     """
+    cols = ["corp_code", "rcept_no", "rcept_dt", "blob", "tokens", "exact"]
     if T is None or T.empty:
-        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "blob", "exact"])
+        return pd.DataFrame(columns=cols)
+
+    def _tokset(ss) -> set:
+        out: set = set()
+        for x in ss:
+            d = _d1_load(x) if "_d1_load" in globals() else None
+            if isinstance(d, dict) and d:
+                out.update(map(str, d.keys()))
+            else:
+                out.update(re.findall(r"[가-힣]{2,}|[A-Za-z]{3,}|<[A-Z]+>", str(x)))
+        return out
+
     g = (T.sort_values("section")
           .groupby(["corp_code", "rcept_no"], observed=True)
-          .agg(rcept_dt=("rcept_dt", "min"),
-               tf_all=("tf", lambda s: " ".join(map(str, s))[:200_000])).reset_index())
-    g["blob"] = g["tf_all"]
-    g["exact"] = False
-    return g[["corp_code", "rcept_no", "rcept_dt", "blob", "exact"]]
+          .agg(rcept_dt=("rcept_dt", "min"), tokens=("tf", _tokset)).reset_index())
+
+    # ── 원문 재조회 → §6.3 완료형 판정(정확 경로)을 **실제로** 태운다 ──────────────────
+    #   원문 zip 은 15 모듈이 공용 인덱스에 ("dart_doc","raw", rcept_no) 로 저장해 둔다.
+    #   put_blob 의 uid 는 내용해시를 포함해 재구성할 수 없으므로 get_blob_by_key 로 찾는다.
+    #   ★ 전 문서를 다시 여는 건 비싸다 → **약한 규칙이 하나라도 걸린 후보 문서만** 연다.
+    #     완료형 필터는 같은 키워드 정규식에 '완료형 동사 + 날짜 + 숫자' 를 더한 것이므로
+    #     약한 판정을 통과하지 못한 문서는 정확 판정도 통과할 수 없다(안전한 사전 선별).
+    _keys = list(_D3_KEY_RE.keys())
+    cand = g["tokens"].map(lambda ts: any(_d3_tokens_hit(ts, k) for k in _keys) or
+                                      any(_d3_tokens_hit(ts, k) for k in _D3_WEAK_CONSTANT))
+    cap = int(globals().get("ARC_D3_EXACT_MAX_DOCS", 4000))
+    order = [i for i, c in enumerate(cand.to_numpy()) if c][:cap]
+    n_cand, n_over = int(cand.sum()), max(0, int(cand.sum()) - len(order))
+    blobs = [""] * len(g)
+    exacts = [False] * len(g)
+    _v = globals().get("VAULT")
+    if _v is not None and order:
+        rn_all = g["rcept_no"].astype(str).tolist()
+        for i in order:
+            raw = None
+            try:
+                raw = _v.get_blob_by_key("dart_doc", "raw", rn_all[i])
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            try:
+                txt = _doc_unzip_text(raw) if isinstance(raw, (bytes, bytearray)) else str(raw)
+            except Exception:
+                continue
+            if txt and len(txt) > 500:
+                # 원문 그대로 쓰면 표·태그가 문장 판정을 망친다 → 6단계 정규화를 태운다.
+                try:
+                    txt = arc_normalize_text(txt)
+                except Exception:
+                    pass
+                blobs[i] = txt[:400_000]
+                exacts[i] = True
+    g["blob"] = blobs
+    g["exact"] = exacts
+    n_ex = int(sum(exacts))
+    if n_cand:
+        LOG.info(f"§6.3 정확 판정 후보 {n_cand:,}건 중 원문 확보 {n_ex:,}건"
+                 + (f" · 상한({cap:,})으로 {n_over:,}건 미처리" if n_over else "")
+                 + ". 원문이 없는 후보는 토큰 집합 기반 약한 판정으로 남습니다.")
+    return g[cols]
+
+
+# 다단어 판정용 — 패턴을 '있어야 할 토큰들의 선택지 집합' 으로 표현한다.
+#   값: [[대안1토큰들], [대안2토큰들], ...]  (한 대안의 토큰이 전부 있으면 발화)
+_D3_TOKEN_RULES: Dict[str, List[List[str]]] = {
+    "NF_PATENT":   [["특허"], ["실용신안"], ["지식재산권"], ["지적재산권"]],
+    "NF_GOVRND":   [["국가연구개발"], ["정부", "과제"], ["국책", "과제"],
+                    ["산업통상자원부"], ["중소벤처기업부"], ["과학기술정보통신부"]],
+    "NF_SUBSID":   [["종속회사"], ["관계기업"], ["자회사"], ["지분", "취득"], ["출자"]],
+    "NF_OVERSEAS": [["해외", "법인"], ["현지", "법인"], ["해외", "지점"], ["해외", "공장"],
+                    ["베트남"], ["인도"], ["멕시코"], ["폴란드"], ["헝가리"]],
+    "NF_NEWBIZ":   [["사업", "목적", "추가"], ["사업", "목적", "변경"],
+                    ["신규", "사업"], ["신사업"]],
+}
+# 단일 토큰만으로 발화하는 규칙은 '이 단어가 보고서 어딘가에 있는가' 라 사실상 상수가 된다.
+# 원문(exact) 경로가 없을 때는 이 태그들을 0 이 아니라 **NaN(미판정)** 으로 둔다.
+_D3_WEAK_CONSTANT = {"NF_PATENT", "NF_SUBSID"}
+
+
+def _d3_tokens_hit(tokens: set, key: str) -> bool:
+    for alt in _D3_TOKEN_RULES.get(key, []):
+        if all(t in tokens for t in alt):
+            return True
+    return False
 
 
 def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
@@ -9709,23 +9856,32 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
             parts.append(C[["corp_code", "event_date", "knowledge_date", "NF_CONTRACT"]])
 
     # ── (D) 문서 텍스트 기반: 특허·정부과제·종속회사·해외거점·신규사업 ─────────────────────
-    n_weak = 0
+    n_weak, n_exact, n_doc_txt = 0, 0, 0
     if T is not None and len(T):
         DOC = _d3_text_by_doc(T)
+        n_doc_txt = int(len(DOC))
         if len(DOC):
             rows = []
             for r in DOC.itertuples(index=False):
-                blob = str(r.blob or "")
+                blob = str(getattr(r, "blob", "") or "")
+                toks = getattr(r, "tokens", None) or set()
                 rec = {"corp_code": str(r.corp_code),
                        "event_date": as_ts(r.rcept_dt),
                        "knowledge_date": as_ts(r.rcept_dt) + pd.Timedelta(days=ARC_DART_LAG_DAYS)}
+                if bool(r.exact):
+                    n_exact += 1
                 for k, rx in _D3_KEY_RE.items():
                     if bool(r.exact):
+                        # §6.3 정확 경로 — 완료형 동사 + 날짜 + 숫자를 갖춘 문장만 센다.
                         rec[k] = 1.0 if _d3_count_facts(blob, rx) > 0 else 0.0
+                    elif k in _D3_WEAK_CONSTANT:
+                        # ★ 단일 토큰 존재 여부는 이벤트가 아니라 상수다. 0 으로 두면
+                        #   '사실 없음' 으로 오독되므로 NaN(미판정) 으로 남긴다.
+                        rec[k] = np.nan
                     else:
-                        # ★ 약한 증거 경로: 토큰 나열만 있어 완료형/전망형을 구분할 수 없다.
-                        #   존재 여부만 보되, 이 경로로 잡힌 건수를 따로 센다.
-                        rec[k] = 1.0 if rx.search(blob) else 0.0
+                        # 약한 증거 경로: 토큰 집합 기반 다단어 판정. 완료형/전망형은
+                        #   구분할 수 없으므로 과대계상 가능 — 건수를 따로 보고한다.
+                        rec[k] = 1.0 if _d3_tokens_hit(toks, k) else 0.0
                 rows.append(rec)
             Dx = pd.DataFrame(rows)
             if len(Dx):
@@ -9769,9 +9925,18 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
               title="D3 이벤트별 발화 (v2.0 에서 전 섹터 항목 4개 추가)")
     if n_weak:
         LOG.warn(f"문서 텍스트 기반 이벤트 {n_weak:,}건은 '약한 증거' 경로로 판정되었습니다. "
-                 f"15 모듈이 원문이 아닌 토큰 빈도만 저장하므로 완료형/전망형을 구분하지 "
-                 f"못합니다 → D3 가 과대계상될 수 있습니다. D3 가중치가 0.20 으로 낮고 "
-                 f"가점으로만 쓰이는 것이 이 한계를 완충합니다.")
+                 f"원문 blob 이 없는 문서는 토큰 집합만으로 판정하므로 완료형/전망형을 "
+                 f"구분하지 못합니다 → D3 가 과대계상될 수 있습니다. D3 가중치가 0.20 으로 "
+                 f"낮고 가점으로만 쓰이는 것이 이 한계를 완충합니다.")
+    if n_doc_txt:
+        LOG.info(f"§6.3 완료형 판정 — 원문 확보 {n_exact:,}/{n_doc_txt:,}건에서만 문장 단위 "
+                 f"(완료형 동사 + 날짜 + 숫자) 필터가 적용됩니다. 나머지는 토큰 집합 기반 "
+                 f"약한 판정이며, 단일 토큰만으로 발화하는 태그"
+                 f"({' · '.join(sorted(_D3_WEAK_CONSTANT))})는 0 이 아니라 결측입니다.")
+        if n_exact == 0:
+            LOG.warn("원문 blob 을 하나도 확보하지 못해 §6.3 '완료형만' 필터가 한 건도 "
+                     "적용되지 않았습니다. 문서 텍스트 기반 NF_* 는 '그 단어가 보고서에 "
+                     "나오는가' 수준의 약한 증거입니다 — D3 해석 시 반드시 감안하세요.")
     PIPE.io("OUT", "MEM", "d3_hardfacts", H)
     return H[cols]
 
@@ -10746,7 +10911,7 @@ def _abl_one(P: pd.DataFrame, rebals, uni, sec, run_fn, aid: str, name: str,
         rec["ic"], rec["icir"], rec["ic_t"], rec["n_ic"] = ic, icir, ic_t, n_ic
         # 초과수익 = 전략 − U-1000 동일가중 (지수 대신 같은 유니버스를 쓴다 — 41 모듈 주석 참조)
         bench = equal_weight_universe_return(P)
-        R = bt_net["returns"].set_index("asof")["ret"]
+        R = measurable_ret(bt_net["returns"])   # 측정 불가 분기 제외(성과표와 동일 표본)
         b = bench.reindex(R.index).fillna(0.0)
         ex = (R.fillna(0.0) - b).to_numpy(dtype=float)
         rec["excess"] = float(np.nanmean(ex)) if len(ex) else np.nan
@@ -11460,7 +11625,7 @@ def report_performance(bt: dict, bench: Dict[str, pd.Series], label: str = "",
               title="포트폴리오 성과 (§8.1 — 비용 전만 보고하는 것은 금지)")
 
     # 벤치마크 대비
-    Rs = R.set_index("asof")["ret"]
+    Rs = measurable_ret(R)          # perf_stats 와 동일 표본(측정 불가 분기 제외)
     brows = []
     if uni_bench is not None and len(uni_bench):
         bb = uni_bench.reindex(Rs.index).fillna(0.0)
@@ -11699,8 +11864,8 @@ def report_kill_criteria(ctx: dict) -> dict:
     b2 = ABLATION_RESULTS.get("B2")
     if f1 and b2 and f1.get("ok") and b2.get("ok"):
         try:
-            ra = f1["returns"].set_index("asof")["ret"]
-            rb = b2["returns"].set_index("asof")["ret"].reindex(ra.index)
+            ra = measurable_ret(f1["returns"])
+            rb = measurable_ret(b2["returns"]).reindex(ra.index)
             d = (ra.fillna(0) - rb.fillna(0)).to_numpy()
             mu, t = hac_tstat(d)
             c4 = not (np.isfinite(t) and t > 1.0 and mu > 0)
@@ -11833,7 +11998,7 @@ def report_dataflow_map() -> None:
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
-# ║  계약 자동검정 A1~A34 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
+# ║  계약 자동검정 A1~A38 — 주석이나 관례는 무효. 테스트로만 강제한다.                          ║
 # ║  파이프라인 실행 전 자동 실행. 실패 시 즉시 중단(fail-fast).                                ║
 # ║                                                                                          ║
 # ║  ★ 이 파일의 존재 이유: "정규화가 잘 되어 있다", "미래 시총을 쓰지 않는다" 같은 문장은       ║
@@ -12887,12 +13052,137 @@ def run_contract_tests(strict: bool = True) -> bool:
 
     _ac("A34", "캐시 스키마 변화 내성 (tok_len)", a34)
 
+    # ── A35  D1 최종 z 셀이 동시 제출 코호트인가 (A26 의 D1 판) ───────────────────────────
+    def a35():
+        def _mk(n_sec_nov: int, seed: int) -> pd.DataFrame:
+            rg = np.random.default_rng(seed)
+            rows = []
+            for lab, dt_, yr, rd, nsec in (("FY", "FY", 2018, "2019-03-20", 7),
+                                           ("Q3", "Q3", 2019, "2019-11-14", n_sec_nov)):
+                for i in range(60):
+                    for s in ARC_SECTIONS[:nsec]:
+                        rows.append({"corp_code": f"{lab}{i:03d}", "rcept_dt": as_ts(rd),
+                                     "bsns_year": yr, "doc_type": dt_, "section": s,
+                                     "cosine": float(rg.normal(0.8, 0.05)),
+                                     "jaccard": float(rg.normal(0.7, 0.05)),
+                                     "simple": float(rg.normal(0.7, 0.05)),
+                                     "len_ratio": float(rg.normal(0.9, 0.03))})
+            return pd.DataFrame(rows)
+        a = d1_composite(_mk(1, 5))
+        b = d1_composite(_mk(7, 5))
+        ka = a[a["corp_code"].astype(str).str.startswith("FY")].set_index("corp_code")["D1_SCORE"]
+        kb = b[b["corp_code"].astype(str).str.startswith("FY")].set_index("corp_code")["D1_SCORE"]
+        j = ka.to_frame("a").join(kb.to_frame("b"), how="inner").dropna()
+        if j.empty:
+            return None, "3월 코호트 D1_SCORE 가 생성되지 않아 건너뜁니다"
+        d = float((j["a"] - j["b"]).abs().max())
+        if d > 1e-6:
+            return False, (f"★11월 코호트(3분기보고서)만 바꿨는데 3월 코호트(사업보고서)의 "
+                           f"D1_SCORE 가 최대 {d:.3f}z 움직였습니다. 최종 z 셀이 동시 제출 "
+                           f"코호트가 아니라 달력연도라는 뜻이며, 2019-06/09 리밸일에 쓰이는 "
+                           f"값이 11월 제출분으로 결정됩니다 — 정의상 미래 참조입니다.")
+        return True, f"미래 코호트 변경이 과거 D1_SCORE 에 영향 없음 (최대 {d:.2e}z, {len(j)}종목)"
+
+    _ac("A35", "D1 최종 z = 동시 제출 코호트", a35)
+
+    # ── A36  STRUCT_FLAG 가 미래 공시로 과거 D1 을 지우지 않는가 ──────────────────────────
+    def a36():
+        rg = np.random.default_rng(9)
+        rows = []
+        for i in range(40):
+            for s in ARC_SECTIONS:
+                rows.append({"corp_code": f"{i:08d}", "rcept_dt": as_ts("2019-03-20"),
+                             "bsns_year": 2018, "doc_type": "FY", "section": s,
+                             "cosine": float(rg.normal(0.8, 0.05)),
+                             "jaccard": float(rg.normal(0.7, 0.05)),
+                             "simple": float(rg.normal(0.7, 0.05)),
+                             "len_ratio": float(rg.normal(0.9, 0.03))})
+        S = pd.DataFrame(rows)
+        # 문서 접수 9개월 **뒤** 의 합병 공시 — 그 시점에는 알 수 없는 정보다
+        fut = pd.DataFrame({"corp_code": ["00000000"],
+                            "event_date": [as_ts("2019-12-20")],
+                            "knowledge_date": [as_ts("2019-12-20")], "STRUCT_FLAG": [1.0]})
+        base = d1_composite(S).set_index("corp_code")["D1_SCORE"]
+        withf = d1_composite(S, fut).set_index("corp_code")["D1_SCORE"]
+        if pd.notna(base.get("00000000")) and pd.isna(withf.get("00000000")):
+            return False, ("★문서 접수 9개월 뒤의 합병 공시로 과거 문서의 D1 이 지워졌습니다. "
+                           "'앞으로 12개월 안에 합병을 공시할 기업' 이라는 미래 정보로 그 "
+                           "종목의 스코어 구성(§6.5 재배분)이 바뀝니다 — 합병 대상 종목은 "
+                           "전방수익률이 체계적으로 다르므로 방향성 있는 편향입니다.")
+        # 과거 공시는 정상적으로 발동해야 한다
+        past = fut.copy()
+        past["knowledge_date"] = [as_ts("2018-09-20")]
+        past["event_date"] = [as_ts("2018-09-20")]
+        wp = d1_composite(S, past).set_index("corp_code")["D1_SCORE"]
+        if pd.notna(wp.get("00000000")):
+            return False, "문서 접수 6개월 전의 구조적 변화 공시가 STRUCT_FLAG 를 발동시키지 않았습니다"
+        return True, "미래 공시는 무시 · 접수 이전 1년 공시만 STRUCT_FLAG 발동 확인"
+
+    _ac("A36", "STRUCT_FLAG 단방향 (§6.1.6)", a36)
+
+    # ── A37  D3 텍스트 규칙이 영구 0 / 상시 1 로 굳지 않는가 ──────────────────────────────
+    def a37():
+        T = pd.DataFrame({
+            "corp_code": ["C1", "C1"], "rcept_no": ["R1", "R1"],
+            "rcept_dt": [as_ts("2019-03-25")] * 2, "doc_type": ["FY"] * 2,
+            "bsns_year": [2018] * 2, "section": ["S_BIZ", "S_MDA"],
+            "tf": ['{"해외": 3, "법인": 5, "설립": 2}', '{"특허": 1, "등록": 2}'],
+            "bigram": ["{}"] * 2, "tok_len": [100, 80], "n_tokens": [100, 80]})
+        DOC = _d3_text_by_doc(T)
+        if DOC.empty:
+            return False, "문서 텍스트 프레임이 비었습니다"
+        toks = DOC["tokens"].iloc[0]
+        if not _d3_tokens_hit(toks, "NF_OVERSEAS"):
+            return False, ("★'해외'+'법인' 토큰이 둘 다 있는데 NF_OVERSEAS 가 발화하지 "
+                           "않습니다. 두 단어 패턴을 JSON 토큰 덤프 문자열에 정규식으로 "
+                           "걸면 두 토큰 사이에 항상 '\": 3, \"' 가 끼어 **원리상 매칭될 수 "
+                           "없습니다** — 해당 이벤트가 어떤 데이터에서도 영구 0 이 됩니다.")
+        H = extract_hardfacts(T, None, None, None)
+        if H.empty:
+            return None, "하드팩트가 생성되지 않아 건너뜁니다"
+        for k in sorted(_D3_WEAK_CONSTANT):
+            if k in H.columns and pd.to_numeric(H[k], errors="coerce").notna().any():
+                return False, (f"★원문 없이 단일 토큰만으로 {k} 가 판정됐습니다. "
+                               f"'이 단어가 보고서 어딘가에 나오는가'는 이벤트가 아니라 "
+                               f"상수입니다(실측 발화율 67%) — 0/1 이 아니라 결측이어야 합니다.")
+        return True, ("다단어 규칙이 토큰 집합으로 발화 · 단일 토큰 상수 태그"
+                      f"({' · '.join(sorted(_D3_WEAK_CONSTANT))})는 결측 처리")
+
+    _ac("A37", "D3 텍스트 규칙 실효성 (§6.3)", a37)
+
+    # ── A38  NOA 가 현금 결측을 0 으로 채우지 않는가 (§0.5) ───────────────────────────────
+    def a38():
+        def _fin(cash_val):
+            return pd.DataFrame({
+                "corp_code": ["C1", "C1"], "bsns_year": [2018, 2019],
+                "reprt_code": ["11011", "11011"],
+                "knowledge_date": pd.to_datetime(["2019-03-25", "2020-03-25"]),
+                "assets": [1000.0, 1000.0], "liabilities": [400.0, 400.0],
+                "cash": [cash_val, cash_val], "net_income_ttm": [50.0, 50.0],
+                "cfo_ttm": [60.0, 60.0], "revenue_ttm": [500.0, 500.0],
+                "inventory": [100.0, 100.0], "receivable": [80.0, 80.0]})
+        a = build_d2_panel(_fin(200.0))
+        b = build_d2_panel(_fin(np.nan))
+        va = pd.to_numeric(a.get("NOA", pd.Series(dtype=float)), errors="coerce").dropna()
+        vb = pd.to_numeric(b.get("NOA", pd.Series(dtype=float)), errors="coerce").dropna()
+        if va.empty:
+            return None, "현금이 있는 경우에도 NOA 가 생성되지 않아 건너뜁니다"
+        if not vb.empty:
+            return False, (f"★현금성자산이 결측인데 NOA 가 {float(vb.iloc[0]):.4f} 로 "
+                           f"계산됐습니다(현금 있을 때 {float(va.iloc[0]):.4f}). cash.fillna(0) "
+                           f"은 §0.5 위반이고, NOA 는 방향 −1 이라 현금 라인만 못 읽은 법인이 "
+                           f"D2 에서 체계적으로 불리해집니다. fillna 는 NaN 을 없애므로 "
+                           f"커버리지 표에는 100% 로 보고되어 흔적조차 남지 않습니다.")
+        return True, f"현금 결측 → NOA 결측(§6.5 재배분) · 현금 있으면 {float(va.iloc[0]):.4f}"
+
+    _ac("A38", "NOA 현금 결측 처리 (§0.5)", a38)
+
     # ── 결과 ──────────────────────────────────────────────────────────────────────────────
     rows = [[r["id"], _trunc(r["name"], 30),
              {True: "✔ 통과", False: "✘ 실패", None: "— 건너뜀"}[r["pass"]],
              _trunc(r["msg"], 78)] for r in CONTRACT_RESULTS]
     LOG.table(rows, ["계약", "내용", "판정", "상세"], ["l", "l", "c", "l"], maxw=82,
-              title="계약 자동검정 A1~A34 (협상 대상이 아님)")
+              title="계약 자동검정 A1~A38 (협상 대상이 아님)")
     failed = [r for r in CONTRACT_RESULTS if r["pass"] is False]
     if failed:
         LOG.error(f"계약 위반 {len(failed)}건: " + ", ".join(r["id"] for r in failed))

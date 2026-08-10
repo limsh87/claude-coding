@@ -225,8 +225,21 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
 
     # 섹션 → 문서 단위 피벗. 합성 지표와 4개 개별 지표를 모두 만든다
     # (개별 지표는 §8.4 '유사도 4종 각각 단독 사용 시 성과' 강건성 검사에 필요하다).
+    # ★ 최종 z 의 셀 키(사업연도|보고서종류)를 만들려면 pivot index 에 두 컬럼이 있어야 한다.
+    #   예전에는 index 가 (corp_code, rcept_dt) 뿐이라 아래 `if "bsns_year" in W.columns`
+    #   가드가 **항상 빗나가고** 셀이 조용히 달력연도 단독으로 폴백했다(문자열 연결이
+    #   정상 동작해 "2019|" 라는 그럴듯한 키가 만들어져 예외도 나지 않았다).
+    _PIV_IDX = ["corp_code", "rcept_dt"] + [c for c in ("bsns_year", "doc_type")
+                                            if c in d.columns]
+    if len(_PIV_IDX) < 4:
+        raise RuntimeError(
+            "d1_composite: bsns_year/doc_type 이 없어 동시 제출 코호트 셀을 만들 수 없습니다.\n"
+            "  달력연도로 폴백하면 3월 접수분(사업보고서)의 평균·표준편차·윈저 경계가 같은 해\n"
+            "  11월 접수분(3분기보고서)으로부터 계산됩니다 — 명백한 미래 참조이므로 중단합니다.\n"
+            f"  현재 컬럼: {sorted(d.columns)[:14]}")
+
     def _pivot(valcol: str, prefix: str) -> pd.DataFrame:
-        pv = d.pivot_table(index=["corp_code", "rcept_dt"], columns="section",
+        pv = d.pivot_table(index=_PIV_IDX, columns="section",
                            values=valcol, aggfunc="mean")
         pv = pv.reindex(columns=ARC_SECTIONS)
         pv.columns = [f"{prefix}{s}" for s in ARC_SECTIONS]
@@ -274,11 +287,7 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
     #   11월 접수분(3분기보고서)으로부터 계산된다 — 3월 문서의 점수가 11월 데이터로
     #   정해지는 명백한 미래 참조다. 코호트별 섹션 수·파싱 성공률이 실제로 다르므로
     #   코호트 간 상대 스케일이 바뀌고, 결산월이 섞인 한 리밸일의 횡단면 순위가 달라진다.
-    _by = as_ts_series(W["rcept_dt"]).dt.year.astype(str)
-    if "bsns_year" in W.columns:
-        _by = W["bsns_year"].astype(str)
-    _dt_ = W["doc_type"].astype(str) if "doc_type" in W.columns else ""
-    W["_yr"] = _by.astype(str) + "|" + (_dt_ if isinstance(_dt_, str) else _dt_)
+    W["_yr"] = W["bsns_year"].astype(str) + "|" + W["doc_type"].astype(str)
     W["D1_SCORE"] = -xsec_z(W["CHANGE_composite"], W["_yr"], min_n=CELL_MIN_N)
     W["D1_SCORE_equalw"] = -xsec_z(W["CHANGE_equalw"], W["_yr"], min_n=CELL_MIN_N)
     for m in D1_METRICS:
@@ -297,8 +306,14 @@ def d1_composite(S: pd.DataFrame, struct: Optional[pd.DataFrame] = None) -> pd.D
             flags = []
             for cc, rd in zip(W["corp_code"].astype(str), as_ts_series(W["rcept_dt"])):
                 ds = key.get(cc)
-                # 문서 접수일 기준 ±1년 안에 구조적 변화 공시가 있으면 그 문서는 노이즈
-                hit = bool(ds) and any(abs((rd - d0).days) <= 365 for d0 in ds if pd.notna(d0))
+                # ★ 단방향이어야 한다. 예전에는 abs(...) 라 **문서 접수 이후** 최대 1년의
+                #   공시까지 매칭했다. 그러면 "앞으로 12개월 안에 합병·분할·지주전환을
+                #   공시할 기업" 이라는 미래 정보로 그 문서의 D1 이 지워지고, §6.5 에 따라
+                #   D1 가중치 0.40 이 D2·D3 로 재배분된다. 합병 대상 종목은 전방수익률이
+                #   체계적으로 다르므로 방향성 있는 편향이다. struct 는 PIT.register 를
+                #   거치지 않고 파이썬 리스트로 직접 조회되므로 as-of 강제도 없었다.
+                hit = bool(ds) and any(0 <= (rd - d0).days <= 365
+                                       for d0 in ds if pd.notna(d0))
                 flags.append(1.0 if hit else 0.0)
             W["STRUCT_FLAG"] = flags
             n_s = int(W["STRUCT_FLAG"].sum())

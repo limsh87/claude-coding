@@ -80,7 +80,17 @@ def build_d2_panel(fin: pd.DataFrame, shares: Optional[pd.DataFrame] = None) -> 
     if not has_debt:
         LOG.info("총차입금 계정이 없어 NOA 를 (자산−현금) − 부채 로 근사합니다 "
                  "[방법론적 한계 — 차입 의존도가 높은 기업에서 NOA 가 과소평가됩니다].")
-    noa_num = (assets - cash.fillna(0)) - (liab - debt.fillna(0))
+    # ★ cash 결측을 0 으로 채우면 §0.5(결측을 0 으로 채우지 않는다) 위반이고, 실제로
+    #   "현금 라인만 못 읽은 법인" 이 조용히 불리해진다(실측: 자산 1000·부채 400 동일 회사가
+    #   cash=200 → NOA 0.40, cash=NaN → NOA 0.60. NOA 는 방향 −1 이라 페널티다).
+    #   fillna(0) 은 NaN 을 없애므로 결측률 표에는 흔적조차 남지 않고 커버리지 100% 로 보고된다.
+    #   debt 는 데이터셋에 아예 없는 계정이라 0 대체가 불가피하지만, cash 는 있어야 하는데
+    #   빠진 값이므로 대우가 달라야 한다 → NOA 를 결측으로 두고 §6.5 재배분에 맡긴다.
+    _n_cash_na = int(cash.isna().sum())
+    if _n_cash_na:
+        LOG.info(f"현금성자산 결측 {_n_cash_na:,}행 — 해당 행의 NOA 를 결측 처리합니다 "
+                 f"(0 으로 채우면 그 법인이 D2 에서 체계적으로 불리해집니다).")
+    noa_num = ((assets - cash) - (liab - debt.fillna(0))).where(cash.notna())
     out["NOA"] = safe_div(noa_num, assets_prev.where(assets_prev.notna(), assets))
 
     # ③④ 매출채권 / 재고 괴리 (YoY 증가율 차이)

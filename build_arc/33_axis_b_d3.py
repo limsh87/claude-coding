@@ -83,24 +83,109 @@ def _d3_count_facts(text: str, pat: "re.Pattern") -> int:
 
 
 def _d3_text_by_doc(T: pd.DataFrame) -> pd.DataFrame:
-    """정규화 토큰 테이블에서 문서 단위 '토큰 나열 문자열' 을 만든다.
+    """정규화 토큰 테이블 → 문서 단위 **토큰 집합**.
 
-    ★ 한계: 15 모듈은 원문이 아니라 토큰 빈도(tf)만 저장한다(용량 때문). 따라서 문장 단위
-      완료형 판정을 정확히 하려면 원문 blob 을 다시 읽어야 한다. 여기서는 두 경로를 쓴다:
-        ① 원문 blob 이 인덱스에 있으면 그걸 읽어 문장 판정(정확)
-        ② 없으면 tf 키워드 존재만으로 '약한 증거' 판정 (그 사실을 반환 플래그에 남긴다)
-      ②는 완료형/전망형을 구분할 수 없으므로 D3 를 과대계상할 수 있다. 그래서 ②로 잡힌
-      이벤트는 별도로 세어 보고하고, 커버리지 표에 명시한다.
+    ★ 예전에는 tf(JSON dict 문자열)들을 이어붙인 문자열에 정규식을 그대로 걸었다. 두 가지가
+      동시에 깨졌다:
+        ① 두 단어 패턴(`해외\s*법인`, `지분\s*취득`, `정부\s*과제`, `신규\s*사업` …)은
+           JSON 덤프에서 **원리상 매칭될 수 없다** — 두 토큰 사이에 항상 `": 3, "` 가 낀다.
+           해당 이벤트는 어떤 데이터를 넣어도 영구 0 이었다(NF_GOVRND·NF_NEWBIZ·
+           NF_SUBSID·NF_OVERSEAS 실측 전부 0건).
+        ② 단일 토큰 패턴(`특허`, `자회사`, `출자` …)은 '이 단어가 보고서 어딘가에 나오는가'
+           가 되어 이벤트가 아니라 상수가 됐다(NF_PATENT 실측 67% 발화).
+      → 토큰 집합으로 바꾸고, 다단어 패턴은 **모든 구성 토큰이 집합에 있는지**로 판정한다.
+
+    ★ 그리고 §6.3 의 핵심인 '완료형만' 필터(_d3_count_facts)는 exact=True 경로에서만
+      돌아가는데 그 경로에 도달하는 코드가 없었다 — 규정 전체가 죽은 코드였다.
+      원문이 공용 인덱스에 남아 있으면 그걸 읽어 exact 경로를 실제로 태운다.
     """
+    cols = ["corp_code", "rcept_no", "rcept_dt", "blob", "tokens", "exact"]
     if T is None or T.empty:
-        return pd.DataFrame(columns=["corp_code", "rcept_no", "rcept_dt", "blob", "exact"])
+        return pd.DataFrame(columns=cols)
+
+    def _tokset(ss) -> set:
+        out: set = set()
+        for x in ss:
+            d = _d1_load(x) if "_d1_load" in globals() else None
+            if isinstance(d, dict) and d:
+                out.update(map(str, d.keys()))
+            else:
+                out.update(re.findall(r"[가-힣]{2,}|[A-Za-z]{3,}|<[A-Z]+>", str(x)))
+        return out
+
     g = (T.sort_values("section")
           .groupby(["corp_code", "rcept_no"], observed=True)
-          .agg(rcept_dt=("rcept_dt", "min"),
-               tf_all=("tf", lambda s: " ".join(map(str, s))[:200_000])).reset_index())
-    g["blob"] = g["tf_all"]
-    g["exact"] = False
-    return g[["corp_code", "rcept_no", "rcept_dt", "blob", "exact"]]
+          .agg(rcept_dt=("rcept_dt", "min"), tokens=("tf", _tokset)).reset_index())
+
+    # ── 원문 재조회 → §6.3 완료형 판정(정확 경로)을 **실제로** 태운다 ──────────────────
+    #   원문 zip 은 15 모듈이 공용 인덱스에 ("dart_doc","raw", rcept_no) 로 저장해 둔다.
+    #   put_blob 의 uid 는 내용해시를 포함해 재구성할 수 없으므로 get_blob_by_key 로 찾는다.
+    #   ★ 전 문서를 다시 여는 건 비싸다 → **약한 규칙이 하나라도 걸린 후보 문서만** 연다.
+    #     완료형 필터는 같은 키워드 정규식에 '완료형 동사 + 날짜 + 숫자' 를 더한 것이므로
+    #     약한 판정을 통과하지 못한 문서는 정확 판정도 통과할 수 없다(안전한 사전 선별).
+    _keys = list(_D3_KEY_RE.keys())
+    cand = g["tokens"].map(lambda ts: any(_d3_tokens_hit(ts, k) for k in _keys) or
+                                      any(_d3_tokens_hit(ts, k) for k in _D3_WEAK_CONSTANT))
+    cap = int(globals().get("ARC_D3_EXACT_MAX_DOCS", 4000))
+    order = [i for i, c in enumerate(cand.to_numpy()) if c][:cap]
+    n_cand, n_over = int(cand.sum()), max(0, int(cand.sum()) - len(order))
+    blobs = [""] * len(g)
+    exacts = [False] * len(g)
+    _v = globals().get("VAULT")
+    if _v is not None and order:
+        rn_all = g["rcept_no"].astype(str).tolist()
+        for i in order:
+            raw = None
+            try:
+                raw = _v.get_blob_by_key("dart_doc", "raw", rn_all[i])
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            try:
+                txt = _doc_unzip_text(raw) if isinstance(raw, (bytes, bytearray)) else str(raw)
+            except Exception:
+                continue
+            if txt and len(txt) > 500:
+                # 원문 그대로 쓰면 표·태그가 문장 판정을 망친다 → 6단계 정규화를 태운다.
+                try:
+                    txt = arc_normalize_text(txt)
+                except Exception:
+                    pass
+                blobs[i] = txt[:400_000]
+                exacts[i] = True
+    g["blob"] = blobs
+    g["exact"] = exacts
+    n_ex = int(sum(exacts))
+    if n_cand:
+        LOG.info(f"§6.3 정확 판정 후보 {n_cand:,}건 중 원문 확보 {n_ex:,}건"
+                 + (f" · 상한({cap:,})으로 {n_over:,}건 미처리" if n_over else "")
+                 + ". 원문이 없는 후보는 토큰 집합 기반 약한 판정으로 남습니다.")
+    return g[cols]
+
+
+# 다단어 판정용 — 패턴을 '있어야 할 토큰들의 선택지 집합' 으로 표현한다.
+#   값: [[대안1토큰들], [대안2토큰들], ...]  (한 대안의 토큰이 전부 있으면 발화)
+_D3_TOKEN_RULES: Dict[str, List[List[str]]] = {
+    "NF_PATENT":   [["특허"], ["실용신안"], ["지식재산권"], ["지적재산권"]],
+    "NF_GOVRND":   [["국가연구개발"], ["정부", "과제"], ["국책", "과제"],
+                    ["산업통상자원부"], ["중소벤처기업부"], ["과학기술정보통신부"]],
+    "NF_SUBSID":   [["종속회사"], ["관계기업"], ["자회사"], ["지분", "취득"], ["출자"]],
+    "NF_OVERSEAS": [["해외", "법인"], ["현지", "법인"], ["해외", "지점"], ["해외", "공장"],
+                    ["베트남"], ["인도"], ["멕시코"], ["폴란드"], ["헝가리"]],
+    "NF_NEWBIZ":   [["사업", "목적", "추가"], ["사업", "목적", "변경"],
+                    ["신규", "사업"], ["신사업"]],
+}
+# 단일 토큰만으로 발화하는 규칙은 '이 단어가 보고서 어딘가에 있는가' 라 사실상 상수가 된다.
+# 원문(exact) 경로가 없을 때는 이 태그들을 0 이 아니라 **NaN(미판정)** 으로 둔다.
+_D3_WEAK_CONSTANT = {"NF_PATENT", "NF_SUBSID"}
+
+
+def _d3_tokens_hit(tokens: set, key: str) -> bool:
+    for alt in _D3_TOKEN_RULES.get(key, []):
+        if all(t in tokens for t in alt):
+            return True
+    return False
 
 
 def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
@@ -180,23 +265,32 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
             parts.append(C[["corp_code", "event_date", "knowledge_date", "NF_CONTRACT"]])
 
     # ── (D) 문서 텍스트 기반: 특허·정부과제·종속회사·해외거점·신규사업 ─────────────────────
-    n_weak = 0
+    n_weak, n_exact, n_doc_txt = 0, 0, 0
     if T is not None and len(T):
         DOC = _d3_text_by_doc(T)
+        n_doc_txt = int(len(DOC))
         if len(DOC):
             rows = []
             for r in DOC.itertuples(index=False):
-                blob = str(r.blob or "")
+                blob = str(getattr(r, "blob", "") or "")
+                toks = getattr(r, "tokens", None) or set()
                 rec = {"corp_code": str(r.corp_code),
                        "event_date": as_ts(r.rcept_dt),
                        "knowledge_date": as_ts(r.rcept_dt) + pd.Timedelta(days=ARC_DART_LAG_DAYS)}
+                if bool(r.exact):
+                    n_exact += 1
                 for k, rx in _D3_KEY_RE.items():
                     if bool(r.exact):
+                        # §6.3 정확 경로 — 완료형 동사 + 날짜 + 숫자를 갖춘 문장만 센다.
                         rec[k] = 1.0 if _d3_count_facts(blob, rx) > 0 else 0.0
+                    elif k in _D3_WEAK_CONSTANT:
+                        # ★ 단일 토큰 존재 여부는 이벤트가 아니라 상수다. 0 으로 두면
+                        #   '사실 없음' 으로 오독되므로 NaN(미판정) 으로 남긴다.
+                        rec[k] = np.nan
                     else:
-                        # ★ 약한 증거 경로: 토큰 나열만 있어 완료형/전망형을 구분할 수 없다.
-                        #   존재 여부만 보되, 이 경로로 잡힌 건수를 따로 센다.
-                        rec[k] = 1.0 if rx.search(blob) else 0.0
+                        # 약한 증거 경로: 토큰 집합 기반 다단어 판정. 완료형/전망형은
+                        #   구분할 수 없으므로 과대계상 가능 — 건수를 따로 보고한다.
+                        rec[k] = 1.0 if _d3_tokens_hit(toks, k) else 0.0
                 rows.append(rec)
             Dx = pd.DataFrame(rows)
             if len(Dx):
@@ -240,9 +334,18 @@ def extract_hardfacts(T: pd.DataFrame, fin: pd.DataFrame, emp: pd.DataFrame,
               title="D3 이벤트별 발화 (v2.0 에서 전 섹터 항목 4개 추가)")
     if n_weak:
         LOG.warn(f"문서 텍스트 기반 이벤트 {n_weak:,}건은 '약한 증거' 경로로 판정되었습니다. "
-                 f"15 모듈이 원문이 아닌 토큰 빈도만 저장하므로 완료형/전망형을 구분하지 "
-                 f"못합니다 → D3 가 과대계상될 수 있습니다. D3 가중치가 0.20 으로 낮고 "
-                 f"가점으로만 쓰이는 것이 이 한계를 완충합니다.")
+                 f"원문 blob 이 없는 문서는 토큰 집합만으로 판정하므로 완료형/전망형을 "
+                 f"구분하지 못합니다 → D3 가 과대계상될 수 있습니다. D3 가중치가 0.20 으로 "
+                 f"낮고 가점으로만 쓰이는 것이 이 한계를 완충합니다.")
+    if n_doc_txt:
+        LOG.info(f"§6.3 완료형 판정 — 원문 확보 {n_exact:,}/{n_doc_txt:,}건에서만 문장 단위 "
+                 f"(완료형 동사 + 날짜 + 숫자) 필터가 적용됩니다. 나머지는 토큰 집합 기반 "
+                 f"약한 판정이며, 단일 토큰만으로 발화하는 태그"
+                 f"({' · '.join(sorted(_D3_WEAK_CONSTANT))})는 0 이 아니라 결측입니다.")
+        if n_exact == 0:
+            LOG.warn("원문 blob 을 하나도 확보하지 못해 §6.3 '완료형만' 필터가 한 건도 "
+                     "적용되지 않았습니다. 문서 텍스트 기반 NF_* 는 '그 단어가 보고서에 "
+                     "나오는가' 수준의 약한 증거입니다 — D3 해석 시 반드시 감안하세요.")
     PIPE.io("OUT", "MEM", "d3_hardfacts", H)
     return H[cols]
 
