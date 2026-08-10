@@ -438,6 +438,7 @@ def main() -> dict:
     with PIPE.stage("L6.VERDICT", "[14] 수급 축 판정 · 사전등록 폐기조건", "L6", budget_s=120,
                     critical=False):
         ctx["flow_verdict"] = report_flow_verdict(ctx.get("cmp", {}), fdr_pass=ctx.get("fdr"))
+        report_cell_ladder()
         report_discretion_ledger()
         # ★ 폐기 판정은 마지막에 둔다. STOP_ON_KILL_CRITERIA=True 면 여기서 KillCriteria 를
         #   던져 '폐기된 전략의 최종 편입 종목표'가 출력되는 것을 막는다(§10.4 의 이행).

@@ -45,17 +45,24 @@ def is_completed_fact(sent: str) -> bool:
 
 
 # ── 공시목록 스윕 (거래소공시·외부감사 포함) ────────────────────────────────────────────────
+#  ★★ '해지·철회·취소·기각' 을 '체결·발행·제기' 와 구분해야 한다 ★★
+#    공시 제목은 "단일판매·공급계약 해지", "전환사채 발행결정 철회", "소송 제기 취하" 처럼
+#    반대 사건도 같은 어간을 쓴다. 구분하지 않으면 공급계약 '해지'가 긍정 하드팩트로,
+#    CB 발행 '철회'가 배제 사유로 계상된다 — 두 방향 모두 신호를 뒤집는다.
+_DIS_NEG = r"(?!.*(해지|철회|취소|취하|기각|각하|무효|불성립|해제))"
 QVF_DISCLOSURE_PATTERNS = {
     # 긍정 하드팩트
-    "supply_contract":  r"단일판매[·ㆍ・]?\s*공급계약|공급계약\s*체결|수주",
+    "supply_contract":  _DIS_NEG + r".*(단일판매[·ㆍ・]?\s*공급계약|공급계약\s*체결|수주)",
     # 배제 플래그
-    "cb_issue":         r"전환사채",
-    "bw_issue":         r"신주인수권부사채",
-    "major_holder_chg": r"최대주주\s*(?:변경|변동)",
+    "cb_issue":         _DIS_NEG + r".*전환사채",
+    "bw_issue":         _DIS_NEG + r".*신주인수권부사채",
+    "major_holder_chg": _DIS_NEG + r".*최대주주\s*(?:변경|변동)",
     "audit_report":     r"감사보고서|감사의견",
-    "lawsuit_filed":    r"소송\s*(?:등의?\s*)?(?:제기|판결)",
+    "lawsuit_filed":    _DIS_NEG + r".*소송\s*(?:등의?\s*)?(?:제기|판결)",
     "capital_impair":   r"자본잠식",
 }
+# 반대 사건도 별도로 세어 표에 남긴다(무시하는 것과 '없었다'는 다르다).
+QVF_DISCLOSURE_REVERSALS = r"(해지|철회|취소|취하|기각|각하|무효|불성립|해제)"
 QVF_DISCLOSURE_TYPES = ("A", "B", "F", "I")   # 정기 · 주요사항 · 외부감사 · 거래소공시
 
 
@@ -143,8 +150,13 @@ def fetch_disclosures_qvf(start: str, end: str) -> pd.DataFrame:
     D["knowledge_date"] = next_trading_day_series(D["rcept_dt"])
     D = pit_frame(D, "rcept_dt", "knowledge_date", source="dart")
     counts = {k: int((D["event"] == k).sum()) for k in QVF_DISCLOSURE_PATTERNS}
+    _rev = int(D["report_nm"].str.contains(QVF_DISCLOSURE_REVERSALS, regex=True, na=False).sum())
     LOG.ok(f"QVF 공시목록 {len(D):,}건 — " +
            ", ".join(f"{k}={v:,}" for k, v in counts.items() if v))
+    if _rev:
+        LOG.info(f"  그중 '해지·철회·취소·기각' 류 {_rev:,}건은 어떤 이벤트로도 태그하지 "
+                 f"않았습니다 — 공급계약 '해지'를 긍정 하드팩트로, CB 발행 '철회'를 배제 "
+                 f"사유로 세면 신호가 정반대로 뒤집힙니다.")
     PIPE.io("OUT", "DRIVE", "dart_disclosures_qvf", D, source="opendart list.json")
     return downcast_q(D)
 
@@ -674,6 +686,12 @@ def build_nonfin_panel(G: pd.DataFrame, facts: pd.DataFrame, dis: pd.DataFrame,
             # ★ 배제플래그의 '전분기 대비 상승' 은 연 1회 관측인 원 프레임에서 차분해야 한다.
             #   as-of 로 패널에 퍼뜨린 뒤 diff 하면 같은 값이 4분기 반복되어 3번은 0, 1번만
             #   진짜 변화가 되고, 그 1번이 어느 분기에 떨어지는지가 접수일에 좌우된다.
+            #   ★★ 다만 솔직하게 적어 둔다: 이 항목들의 원천은 '사업보고서 본문'이므로
+            #      관측 주기가 연 1회다. 따라서 여기의 shift(1) 은 §6.1 문언의 '전분기 대비'가
+            #      아니라 사실상 '전년 대비' 다. 분기보고서 주석에는 이 수치가 없으므로
+            #      분기 차분 자체가 데이터상 불가능하다 — 근사이며 동일하지 않다.
+            #      (연 1회 관측을 억지로 분기로 쪼개면 없는 변화를 만들어내는 것이 되므로
+            #       그쪽이 더 큰 위반이다. 이 사실은 §10.1 임의선택 원장에 실린다.)
             for src in ("related_sales_ratio", "related_purchase_ratio", "contingent_amt"):
                 A[f"{src}_prev"] = ga[src].shift(1)
             keep = ["corp_code", "knowledge_date", "patent_up", "rnd_headcount_up", "gov_rnd",
@@ -692,8 +710,22 @@ def build_nonfin_panel(G: pd.DataFrame, facts: pd.DataFrame, dis: pd.DataFrame,
 
     have = [c for c in NONFIN_ITEMS if c in d.columns]
     n_ok = d[have].notna().sum(axis=1)
-    d["dNONFIN"] = d[have].astype("float64").sum(axis=1, skipna=True).where(n_ok > 0)
+    # ★★ '합'을 그대로 쓰면 커버리지가 곧 점수가 된다 ★★
+    #   결측을 0 으로 채우지 않고 합계에서 빼는 것은 옳지만, 그러면 항목을 6개 다 관측한
+    #   종목이 2개만 관측한 종목보다 구조적으로 큰 값을 받는다. 즉 ΔNONFIN 이 '증분 이벤트'가
+    #   아니라 '데이터를 얼마나 확보했는가' 를 재게 된다 — 대형·공시 성실 종목 쪽으로 기운다.
+    #   → 가용 항목 수로 정규화한 평균(=항목당 발생률)을 쓰고, 원합계는 참고용으로 남긴다.
+    #   ※ 항목 수가 1~2개뿐인 관측은 평균의 분산이 크므로 개수를 함께 실어 해석하게 한다.
+    _sum = d[have].astype("float64").sum(axis=1, skipna=True)
+    d["dNONFIN_raw_sum"] = _sum.where(n_ok > 0)
+    d["dNONFIN"] = (_sum / n_ok.replace(0, np.nan)).where(n_ok > 0)
     d["dNONFIN_n_items"] = n_ok
+    if int((n_ok > 0).sum()):
+        _c = np.corrcoef(n_ok[n_ok > 0].to_numpy(dtype=float),
+                         d.loc[n_ok > 0, "dNONFIN_raw_sum"].to_numpy(dtype=float))[0, 1]
+        LOG.info(f"ΔNONFIN 정규화: 가용 항목 수로 나눈 평균을 사용합니다. "
+                 f"(정규화 전 원합계와 가용 항목 수의 상관 {_c:+.3f} — 이 값이 높을수록 "
+                 f"'커버리지가 곧 점수'가 되던 정도가 큽니다)")
 
     LOG.table([[c, f"{int(d[c].notna().sum()):,}",
                 f"{100*d[c].notna().mean():.1f}%",

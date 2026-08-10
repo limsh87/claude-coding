@@ -280,6 +280,7 @@ def run_selftest(full_chain: bool = False) -> bool:
         report_robustness()
         report_phase0(0.95, 0.60, 0.85, 0.35, 120)
         report_flow_verdict(cmp_res, fdr_pass=fdr)
+        report_cell_ladder()
         report_discretion_ledger()
         # ★ 스모크의 목적은 '배관이 끝까지 흐르는가' 이지 '전략이 통과하는가' 가 아니다.
         #   합성 난수에는 알파가 없으므로 §10.4 는 발동하는 것이 정상이며, 그 발동으로

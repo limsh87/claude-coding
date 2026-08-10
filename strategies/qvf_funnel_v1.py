@@ -234,7 +234,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0627"
+BUILD_VERSION      = "qvf1.20260810.0630"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -7344,18 +7344,53 @@ def xsec_z_pct(values: pd.Series, cells: pd.Series, pct: float = WINSOR_PCT,
     return z.where(cnt >= min_n).astype("float32")
 
 
+# ★★ 폴백 사다리를 cell_l3(=전 시장)까지 내리면 §5.2/5.3 의 '섹터중립'이 깨진다 ★★
+#   cell_l3 는 "ym|ALL" 이라 섹터중립이 아니라 전 시장 z 다. 그런데 폴백은 '지표별 유효
+#   관측 수' 기준이라, 커버리지가 낮은 섹터'만' 섹터중립을 잃는다. 실측: PBR 커버리지가
+#   15% 인 섹터의 종목이 오직 그 이유로 일괄 −2.5σ 를 맞고, 상위 20 을 커버리지 100% 인
+#   섹터가 독점했다. 그건 알파가 아니라 섹터 베팅이며 §5.2 가 명시적으로 금지한 것이다.
+#   → 사다리는 cell_l2(같은 대분류 섹터)에서 멈춘다. 거기서도 표본이 모자라면 그 지표는
+#     '결측'이며, 축 평균은 남은 지표로 계산된다(결측을 0 으로 채우지 않는 원칙 그대로).
+#   ※ 전 시장 폴백을 굳이 쓰려면 "cell_l3" 로 바꾸되, 그 실행은 섹터중립이 아니다.
+CELL_LADDER_MAX_LEVEL = "cell_l2"
+CELL_LADDER_USAGE: Dict[str, int] = defaultdict(int)
+
+
 def _cell_ladder_z(P: pd.DataFrame, v: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
     """셀 폴백 사다리를 적용한 백분위-윈저 z. 표본 부족 셀을 통째로 NaN 으로 만들지 않는다."""
     if v.notna().sum() == 0:
         return pd.Series(np.nan, index=P.index, dtype="float32")
     z = xsec_z_pct(v, P["cell"], min_n=min_n) if "cell" in P.columns else \
         pd.Series(np.nan, index=P.index, dtype="float32")
-    for lvl in ("cell_l2", "cell_l3"):
+    CELL_LADDER_USAGE["cell"] += int(z.notna().sum())
+    ladder = ["cell_l2"] if CELL_LADDER_MAX_LEVEL == "cell_l2" else ["cell_l2", "cell_l3"]
+    for lvl in ladder:
         if not z.isna().any():
             break
         if lvl in P.columns:
+            before = z.notna()
             z = z.where(z.notna(), xsec_z_pct(v, P[lvl], min_n=min_n))
+            CELL_LADDER_USAGE[lvl] += int((z.notna() & ~before).sum())
+    CELL_LADDER_USAGE["missing"] += int(z.isna().sum() - v.isna().sum()
+                                        if z.isna().sum() >= v.isna().sum() else 0)
     return z
+
+
+def report_cell_ladder():
+    """z 가 어느 셀 레벨에서 산출됐는지. 섹터중립이 실제로 유지됐는지 여기서만 확인된다."""
+    tot = sum(v for k, v in CELL_LADDER_USAGE.items() if k != "missing")
+    if not tot:
+        return
+    LOG.table([[k, f"{CELL_LADDER_USAGE[k]:,}", f"{100*CELL_LADDER_USAGE[k]/tot:.1f}%"]
+               for k in ("cell", "cell_l2", "cell_l3") if CELL_LADDER_USAGE.get(k)]
+              + [["표본부족으로 결측", f"{CELL_LADDER_USAGE.get('missing', 0):,}", "—"]],
+              ["z 산출 셀 레벨", "관측수", "비중"], ["l", "r", "r"],
+              title=f"섹터중립 z 의 셀 레벨 분포 (§5.2/5.3) — 사다리 상한 "
+                    f"'{CELL_LADDER_MAX_LEVEL}'. cell_l3(전 시장)은 섹터중립이 아니다")
+    if CELL_LADDER_USAGE.get("cell_l3"):
+        LOG.warn(f"전 시장 폴백(cell_l3)에서 산출된 z 가 {CELL_LADDER_USAGE['cell_l3']:,}건 "
+                 f"있습니다 — 그만큼은 섹터중립이 아니며, 커버리지가 낮은 섹터가 일괄 벌점을 "
+                 f"받는 방향입니다(§5.2 위반). CELL_LADDER_MAX_LEVEL='cell_l2' 를 권장합니다.")
 
 
 def _denom_ok(x: pd.Series) -> pd.Series:
@@ -8076,17 +8111,24 @@ def is_completed_fact(sent: str) -> bool:
 
 
 # ── 공시목록 스윕 (거래소공시·외부감사 포함) ────────────────────────────────────────────────
+#  ★★ '해지·철회·취소·기각' 을 '체결·발행·제기' 와 구분해야 한다 ★★
+#    공시 제목은 "단일판매·공급계약 해지", "전환사채 발행결정 철회", "소송 제기 취하" 처럼
+#    반대 사건도 같은 어간을 쓴다. 구분하지 않으면 공급계약 '해지'가 긍정 하드팩트로,
+#    CB 발행 '철회'가 배제 사유로 계상된다 — 두 방향 모두 신호를 뒤집는다.
+_DIS_NEG = r"(?!.*(해지|철회|취소|취하|기각|각하|무효|불성립|해제))"
 QVF_DISCLOSURE_PATTERNS = {
     # 긍정 하드팩트
-    "supply_contract":  r"단일판매[·ㆍ・]?\s*공급계약|공급계약\s*체결|수주",
+    "supply_contract":  _DIS_NEG + r".*(단일판매[·ㆍ・]?\s*공급계약|공급계약\s*체결|수주)",
     # 배제 플래그
-    "cb_issue":         r"전환사채",
-    "bw_issue":         r"신주인수권부사채",
-    "major_holder_chg": r"최대주주\s*(?:변경|변동)",
+    "cb_issue":         _DIS_NEG + r".*전환사채",
+    "bw_issue":         _DIS_NEG + r".*신주인수권부사채",
+    "major_holder_chg": _DIS_NEG + r".*최대주주\s*(?:변경|변동)",
     "audit_report":     r"감사보고서|감사의견",
-    "lawsuit_filed":    r"소송\s*(?:등의?\s*)?(?:제기|판결)",
+    "lawsuit_filed":    _DIS_NEG + r".*소송\s*(?:등의?\s*)?(?:제기|판결)",
     "capital_impair":   r"자본잠식",
 }
+# 반대 사건도 별도로 세어 표에 남긴다(무시하는 것과 '없었다'는 다르다).
+QVF_DISCLOSURE_REVERSALS = r"(해지|철회|취소|취하|기각|각하|무효|불성립|해제)"
 QVF_DISCLOSURE_TYPES = ("A", "B", "F", "I")   # 정기 · 주요사항 · 외부감사 · 거래소공시
 
 
@@ -8174,8 +8216,13 @@ def fetch_disclosures_qvf(start: str, end: str) -> pd.DataFrame:
     D["knowledge_date"] = next_trading_day_series(D["rcept_dt"])
     D = pit_frame(D, "rcept_dt", "knowledge_date", source="dart")
     counts = {k: int((D["event"] == k).sum()) for k in QVF_DISCLOSURE_PATTERNS}
+    _rev = int(D["report_nm"].str.contains(QVF_DISCLOSURE_REVERSALS, regex=True, na=False).sum())
     LOG.ok(f"QVF 공시목록 {len(D):,}건 — " +
            ", ".join(f"{k}={v:,}" for k, v in counts.items() if v))
+    if _rev:
+        LOG.info(f"  그중 '해지·철회·취소·기각' 류 {_rev:,}건은 어떤 이벤트로도 태그하지 "
+                 f"않았습니다 — 공급계약 '해지'를 긍정 하드팩트로, CB 발행 '철회'를 배제 "
+                 f"사유로 세면 신호가 정반대로 뒤집힙니다.")
     PIPE.io("OUT", "DRIVE", "dart_disclosures_qvf", D, source="opendart list.json")
     return downcast_q(D)
 
@@ -8705,6 +8752,12 @@ def build_nonfin_panel(G: pd.DataFrame, facts: pd.DataFrame, dis: pd.DataFrame,
             # ★ 배제플래그의 '전분기 대비 상승' 은 연 1회 관측인 원 프레임에서 차분해야 한다.
             #   as-of 로 패널에 퍼뜨린 뒤 diff 하면 같은 값이 4분기 반복되어 3번은 0, 1번만
             #   진짜 변화가 되고, 그 1번이 어느 분기에 떨어지는지가 접수일에 좌우된다.
+            #   ★★ 다만 솔직하게 적어 둔다: 이 항목들의 원천은 '사업보고서 본문'이므로
+            #      관측 주기가 연 1회다. 따라서 여기의 shift(1) 은 §6.1 문언의 '전분기 대비'가
+            #      아니라 사실상 '전년 대비' 다. 분기보고서 주석에는 이 수치가 없으므로
+            #      분기 차분 자체가 데이터상 불가능하다 — 근사이며 동일하지 않다.
+            #      (연 1회 관측을 억지로 분기로 쪼개면 없는 변화를 만들어내는 것이 되므로
+            #       그쪽이 더 큰 위반이다. 이 사실은 §10.1 임의선택 원장에 실린다.)
             for src in ("related_sales_ratio", "related_purchase_ratio", "contingent_amt"):
                 A[f"{src}_prev"] = ga[src].shift(1)
             keep = ["corp_code", "knowledge_date", "patent_up", "rnd_headcount_up", "gov_rnd",
@@ -8723,8 +8776,22 @@ def build_nonfin_panel(G: pd.DataFrame, facts: pd.DataFrame, dis: pd.DataFrame,
 
     have = [c for c in NONFIN_ITEMS if c in d.columns]
     n_ok = d[have].notna().sum(axis=1)
-    d["dNONFIN"] = d[have].astype("float64").sum(axis=1, skipna=True).where(n_ok > 0)
+    # ★★ '합'을 그대로 쓰면 커버리지가 곧 점수가 된다 ★★
+    #   결측을 0 으로 채우지 않고 합계에서 빼는 것은 옳지만, 그러면 항목을 6개 다 관측한
+    #   종목이 2개만 관측한 종목보다 구조적으로 큰 값을 받는다. 즉 ΔNONFIN 이 '증분 이벤트'가
+    #   아니라 '데이터를 얼마나 확보했는가' 를 재게 된다 — 대형·공시 성실 종목 쪽으로 기운다.
+    #   → 가용 항목 수로 정규화한 평균(=항목당 발생률)을 쓰고, 원합계는 참고용으로 남긴다.
+    #   ※ 항목 수가 1~2개뿐인 관측은 평균의 분산이 크므로 개수를 함께 실어 해석하게 한다.
+    _sum = d[have].astype("float64").sum(axis=1, skipna=True)
+    d["dNONFIN_raw_sum"] = _sum.where(n_ok > 0)
+    d["dNONFIN"] = (_sum / n_ok.replace(0, np.nan)).where(n_ok > 0)
     d["dNONFIN_n_items"] = n_ok
+    if int((n_ok > 0).sum()):
+        _c = np.corrcoef(n_ok[n_ok > 0].to_numpy(dtype=float),
+                         d.loc[n_ok > 0, "dNONFIN_raw_sum"].to_numpy(dtype=float))[0, 1]
+        LOG.info(f"ΔNONFIN 정규화: 가용 항목 수로 나눈 평균을 사용합니다. "
+                 f"(정규화 전 원합계와 가용 항목 수의 상관 {_c:+.3f} — 이 값이 높을수록 "
+                 f"'커버리지가 곧 점수'가 되던 정도가 큽니다)")
 
     LOG.table([[c, f"{int(d[c].notna().sum()):,}",
                 f"{100*d[c].notna().mean():.1f}%",
@@ -10796,6 +10863,18 @@ def report_discretion_ledger():
          "위와 동일. 반대로 하면 재무 결측이 많은 초소형주가 통째로 사라져 선택편향이 된다"],
         ["유동시총 ≈ (발행주식수 − 자기주식) × 주가", "§5.4 '유동주식 시가총액'", "중립",
          "대주주·우리사주 미차감 → 분모 과대 → F축 정규화 강도 약화(신호 희석)"],
+        [f"셀 폴백 사다리 상한 = {CELL_LADDER_MAX_LEVEL}", "§5.2/5.3 '섹터중립'", "중립",
+         "전 시장(cell_l3)까지 내리면 커버리지가 낮은 섹터만 섹터중립을 잃고 일괄 벌점을 "
+         "받는다(실측 −2.5σ). 대분류 섹터에서 멈추고, 거기서도 표본 부족이면 결측 처리"],
+        ["ΔNONFIN = 가용 항목 수로 나눈 평균", "§6.1 '항목별 증분 이벤트'", "중립",
+         "원합계를 쓰면 항목을 다 관측한 종목이 구조적으로 큰 값을 받아, ΔNONFIN 이 "
+         "'증분'이 아니라 '데이터 확보량'을 재게 된다(대형·공시성실 종목 쪽으로 기움)"],
+        ["본문 기반 배제플래그의 차분 = 전년 대비", "§6.1 은 '전분기 대비'", "불명",
+         "이 항목들의 원천이 사업보고서 본문이라 관측이 연 1회다. 분기보고서 주석에 수치가 "
+         "없어 분기 차분이 데이터상 불가능하다. 억지로 쪼개면 없는 변화를 만들게 된다"],
+        ["공시 '해지·철회·취소·기각' 은 태그하지 않음", "명세 침묵", "중립",
+         "공급계약 '해지'를 긍정 하드팩트로, CB 발행 '철회'를 배제 사유로 세면 신호가 "
+         "정반대로 뒤집힌다. 반대 사건 건수는 별도로 로그에 남긴다"],
         ["TONE 라벨 = 횡단면 중앙값 조정 2일 수익", "§6.2 '2일 CAR'", "중립",
          "시장모형 대신 당일 횡단면 조정. 같은 날 정보만 쓰므로 누수가 없다"],
         ["직교화에서 EPS 컨센서스 수정률 제외", "§6.2 는 포함 요구", "불명",
@@ -11612,6 +11691,7 @@ def run_selftest(full_chain: bool = False) -> bool:
         report_robustness()
         report_phase0(0.95, 0.60, 0.85, 0.35, 120)
         report_flow_verdict(cmp_res, fdr_pass=fdr)
+        report_cell_ladder()
         report_discretion_ledger()
         # ★ 스모크의 목적은 '배관이 끝까지 흐르는가' 이지 '전략이 통과하는가' 가 아니다.
         #   합성 난수에는 알파가 없으므로 §10.4 는 발동하는 것이 정상이며, 그 발동으로
@@ -12161,6 +12241,7 @@ def main() -> dict:
     with PIPE.stage("L6.VERDICT", "[14] 수급 축 판정 · 사전등록 폐기조건", "L6", budget_s=120,
                     critical=False):
         ctx["flow_verdict"] = report_flow_verdict(ctx.get("cmp", {}), fdr_pass=ctx.get("fdr"))
+        report_cell_ladder()
         report_discretion_ledger()
         # ★ 폐기 판정은 마지막에 둔다. STOP_ON_KILL_CRITERIA=True 면 여기서 KillCriteria 를
         #   던져 '폐기된 전략의 최종 편입 종목표'가 출력되는 것을 막는다(§10.4 의 이행).

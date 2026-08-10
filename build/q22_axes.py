@@ -57,18 +57,53 @@ def xsec_z_pct(values: pd.Series, cells: pd.Series, pct: float = WINSOR_PCT,
     return z.where(cnt >= min_n).astype("float32")
 
 
+# ★★ 폴백 사다리를 cell_l3(=전 시장)까지 내리면 §5.2/5.3 의 '섹터중립'이 깨진다 ★★
+#   cell_l3 는 "ym|ALL" 이라 섹터중립이 아니라 전 시장 z 다. 그런데 폴백은 '지표별 유효
+#   관측 수' 기준이라, 커버리지가 낮은 섹터'만' 섹터중립을 잃는다. 실측: PBR 커버리지가
+#   15% 인 섹터의 종목이 오직 그 이유로 일괄 −2.5σ 를 맞고, 상위 20 을 커버리지 100% 인
+#   섹터가 독점했다. 그건 알파가 아니라 섹터 베팅이며 §5.2 가 명시적으로 금지한 것이다.
+#   → 사다리는 cell_l2(같은 대분류 섹터)에서 멈춘다. 거기서도 표본이 모자라면 그 지표는
+#     '결측'이며, 축 평균은 남은 지표로 계산된다(결측을 0 으로 채우지 않는 원칙 그대로).
+#   ※ 전 시장 폴백을 굳이 쓰려면 "cell_l3" 로 바꾸되, 그 실행은 섹터중립이 아니다.
+CELL_LADDER_MAX_LEVEL = "cell_l2"
+CELL_LADDER_USAGE: Dict[str, int] = defaultdict(int)
+
+
 def _cell_ladder_z(P: pd.DataFrame, v: pd.Series, min_n: int = CELL_MIN_N) -> pd.Series:
     """셀 폴백 사다리를 적용한 백분위-윈저 z. 표본 부족 셀을 통째로 NaN 으로 만들지 않는다."""
     if v.notna().sum() == 0:
         return pd.Series(np.nan, index=P.index, dtype="float32")
     z = xsec_z_pct(v, P["cell"], min_n=min_n) if "cell" in P.columns else \
         pd.Series(np.nan, index=P.index, dtype="float32")
-    for lvl in ("cell_l2", "cell_l3"):
+    CELL_LADDER_USAGE["cell"] += int(z.notna().sum())
+    ladder = ["cell_l2"] if CELL_LADDER_MAX_LEVEL == "cell_l2" else ["cell_l2", "cell_l3"]
+    for lvl in ladder:
         if not z.isna().any():
             break
         if lvl in P.columns:
+            before = z.notna()
             z = z.where(z.notna(), xsec_z_pct(v, P[lvl], min_n=min_n))
+            CELL_LADDER_USAGE[lvl] += int((z.notna() & ~before).sum())
+    CELL_LADDER_USAGE["missing"] += int(z.isna().sum() - v.isna().sum()
+                                        if z.isna().sum() >= v.isna().sum() else 0)
     return z
+
+
+def report_cell_ladder():
+    """z 가 어느 셀 레벨에서 산출됐는지. 섹터중립이 실제로 유지됐는지 여기서만 확인된다."""
+    tot = sum(v for k, v in CELL_LADDER_USAGE.items() if k != "missing")
+    if not tot:
+        return
+    LOG.table([[k, f"{CELL_LADDER_USAGE[k]:,}", f"{100*CELL_LADDER_USAGE[k]/tot:.1f}%"]
+               for k in ("cell", "cell_l2", "cell_l3") if CELL_LADDER_USAGE.get(k)]
+              + [["표본부족으로 결측", f"{CELL_LADDER_USAGE.get('missing', 0):,}", "—"]],
+              ["z 산출 셀 레벨", "관측수", "비중"], ["l", "r", "r"],
+              title=f"섹터중립 z 의 셀 레벨 분포 (§5.2/5.3) — 사다리 상한 "
+                    f"'{CELL_LADDER_MAX_LEVEL}'. cell_l3(전 시장)은 섹터중립이 아니다")
+    if CELL_LADDER_USAGE.get("cell_l3"):
+        LOG.warn(f"전 시장 폴백(cell_l3)에서 산출된 z 가 {CELL_LADDER_USAGE['cell_l3']:,}건 "
+                 f"있습니다 — 그만큼은 섹터중립이 아니며, 커버리지가 낮은 섹터가 일괄 벌점을 "
+                 f"받는 방향입니다(§5.2 위반). CELL_LADDER_MAX_LEVEL='cell_l2' 를 권장합니다.")
 
 
 def _denom_ok(x: pd.Series) -> pd.Series:
