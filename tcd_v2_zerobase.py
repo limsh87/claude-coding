@@ -153,6 +153,10 @@ DART_BULK_ZIP    = True   # ★재무제표 '일괄 ZIP'(연도×보고서×제�
 #                           단건 API 78,000회를 약 150회 다운로드로 대체하며, 이 경로는
 #                           crtfc_key 를 쓰지 않아 ★일일 호출한도를 전혀 소비하지 않는다.
 #                           재고자산·매출채권·영업CF·CAPEX 가 십수 분 만에 채워진다.
+USDKRW_CONST = 1300.0     # θ_X 계산용 환산율. 관세 통계는 USD, 재무는 KRW 라 축을 맞춰야 한다.
+#                           θ_X 는 '수출/매출 비율이 그럴듯한가'라는 정합성 지표라 환율의
+#                           연도별 변동(1,100~1,400)이 판정을 뒤집지 않는다. 정밀 환산이
+#                           필요해지면 여기를 월별 환율 시계열로 바꾸세요.
 DART_ZIP_WORKERS = 4      # ★일괄 ZIP 동시 다운로드 수(정부 사이트라 4 이상은 이득 없이 위험).
 #                           파일은 개당 2~8MB · 129개 총 0.5~0.9GB 로 작다 — 진짜 비용은
 #                           압축 해제 후 40~55MB 짜리 TSV 를 pandas 로 읽는 CPU 쪽이다.
@@ -8511,7 +8515,18 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     agg["x3"] = -agg.groupby("code", observed=True)["dest_hhi"].diff(12)
     P = P.merge(agg[["code", "month", "x1", "x2", "x3", "exp_usd"]],
                 on=["code", "month"], how="left")
-    P["theta_X"] = sdiv(colx(P, "exp_usd") * 1300.0 * 12, colx(P, "revenue_ttm")).clip(0, 1.2)
+    # ★θ_X = 매핑이 귀속시킨 연간 수출액 ÷ 매출(TTM). 이건 '내가 매기는 신뢰도'가 아니라
+    #   ★매핑의 결과가 회사의 실제 규모와 정합하는지의 실측이다. 그래서 매핑을 자동으로
+    #   만들어도 엉터리면 여기서 드러나고 V4 가 그 팩을 죽인다 — 단, 한 방향으로만 그렇다.
+    #
+    #   ★구멍: 옛 식은 과소귀속만 잡고 ★과대귀속은 오히려 보상했다. 한 HS 의 국가 전체
+    #   수출을 소형사 하나에 몰아주면 비율이 3.0 이 되는데, clip(0,1.2)→clip(0,1) 이
+    #   그걸 '완벽한 매핑(θ=1)'으로 만든다. 즉 매핑이 틀릴수록 가중치가 올라간다.
+    #   수출액이 매출을 넘는 것은 회계적으로 불가능하므로(수출은 매출의 부분집합),
+    #   비율 1 을 정점으로 하고 넘어가면 ★같은 기울기로 떨어뜨린다: 1.0→1.0, 1.5→0.5,
+    #   2.0→0. 그러면 과대귀속도 θ 를 깎아 V4 임계 0.50 아래로 밀어낸다.
+    _xr = sdiv(colx(P, "exp_usd") * USDKRW_CONST * 12, colx(P, "revenue_ttm"))
+    P["theta_X"] = np.where(_xr.notna(), np.minimum(_xr, np.maximum(0.0, 2.0 - _xr)), np.nan)
     P["TP_X1"] = tp_pair(zx(P, "x1"), zx(P, "x2"))
     P["TP_X2"] = tp_pair(zx(P, "x3"), zx(P, "x2"))
     P["E_X"] = nrow_mean(P, ["TP_X1", "TP_X2"]) * P["theta_X"].clip(0, 1)
