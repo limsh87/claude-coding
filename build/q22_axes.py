@@ -157,11 +157,20 @@ def build_quarterly_fundamentals(fin: pd.DataFrame, shares: pd.DataFrame) -> pd.
         #   shift(12) 를 믿으면 5년 전 주식수를 3년 증가율이라 부르게 된다.
         contiguous = (S["_n"] - prev_n) == 12
         S["share_growth3y"] = (safe_div(S["shares_issued"], prev) - 1.0).where(contiguous)
-        S = S[["corp_code", "knowledge_date", "shares_issued", "shares_treasury", "share_growth3y"]]
-        F = F.merge(S, on=["corp_code", "knowledge_date"], how="outer", suffixes=("", "_sh"))
-        F = F.sort_values(["corp_code", "knowledge_date"], kind="stable")
-        for c in ("shares_issued", "shares_treasury", "share_growth3y"):
-            F[c] = F.groupby("corp_code", observed=True)[c].ffill()
+        S = S[["corp_code", "knowledge_date", "shares_issued", "shares_treasury",
+               "share_growth3y"]].sort_values("knowledge_date", kind="stable")
+        # ★★ outer merge 를 쓰면 안 된다 (적대적 감사가 잡은 조용한 실패) ★★
+        #   주식총수(stockTotqySttus)는 전체 재무제표(fnlttSinglAcntAll)보다 훨씬 자주 성공한다
+        #   — 특히 소형주에서. outer merge 는 '주식수만 있는 날짜'에 재무 컬럼이 전부 NaN 인
+        #   행을 새로 만들고, 하류의 merge_asof(backward)가 신호일 직전의 그 행을 집어간다.
+        #   결과: equity=NaN → PBR·부채비율·자본잠식 판정 불가 → fin_cov 붕괴 → §2.2 킬 기준이
+        #   "DART 콜드빌드 미완"이라는 엉뚱한 메시지로 전략을 중단시킨다. 원인은 전혀 다른데.
+        #   → 재무 관측을 기준 프레임으로 두고, 주식수는 as-of 로 '그 시점까지 알려진 최신값'을
+        #     붙인다. 행이 늘어나지 않으므로 재무 결측 행이 생성될 수 없다.
+        F = F.sort_values("knowledge_date", kind="stable")
+        F["corp_code"] = F["corp_code"].astype(str)
+        S["corp_code"] = S["corp_code"].astype(str)
+        F = pd.merge_asof(F, S, on="knowledge_date", by="corp_code", direction="backward")
     else:
         for c in ("shares_issued", "shares_treasury", "share_growth3y"):
             F[c] = np.nan
@@ -176,9 +185,16 @@ def build_quarterly_fundamentals(fin: pd.DataFrame, shares: pd.DataFrame) -> pd.
     out = F[keep].dropna(subset=["corp_code", "knowledge_date"])
     out = out.rename(columns={"_debt": "total_debt"})
     out = pit_frame(out, "period_end", "knowledge_date", source="dart_q")
+    _eqc = float(out["equity"].notna().mean()) if len(out) else 0.0
     LOG.ok(f"분기 재무 파생 {len(out):,}행 · {out['corp_code'].nunique():,}사 "
-           f"(ROIC 3년 표준편차 {int(out['roic_std3y'].notna().sum()):,}건 · "
-           f"주식수 3년 증가율 {int(out['share_growth3y'].notna().sum()):,}건)")
+           f"(자기자본 보유 {100*_eqc:.1f}% · ROIC 3년 표준편차 "
+           f"{int(out['roic_std3y'].notna().sum()):,}건 · 주식수 3년 증가율 "
+           f"{int(out['share_growth3y'].notna().sum()):,}건 · 주식수 결합 "
+           f"{100*float(out['shares_issued'].notna().mean()) if len(out) else 0:.1f}%)")
+    if len(out) and _eqc < 0.90:
+        LOG.warn(f"자기자본 보유율이 {100*_eqc:.1f}% 로 낮습니다. 이 값이 그대로 Phase 0 의 "
+                 f"fin_cov 가 되어 §2.2 중단 조건에 걸릴 수 있습니다. 원인은 대개 "
+                 f"fnlttSinglAcntAll 콜드빌드 미완이며, 재실행하면 이어받습니다.")
     return downcast_q(out)
 
 

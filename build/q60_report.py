@@ -5,6 +5,9 @@
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 PHASE0: Dict[str, Any] = {}
+# Phase 0 판정을 하류가 실제로 읽는다. 표에 "미달 시 행동"을 적어 놓고 아무것도 하지 않으면
+# 그 표는 거짓말이 된다(적대적 감사가 지적한 그대로).
+PHASE0_FLOW_OK: Optional[bool] = None
 
 
 def report_phase0(fin_cov: float, flow_cov: float, dart_parse: float,
@@ -14,7 +17,10 @@ def report_phase0(fin_cov: float, flow_cov: float, dart_parse: float,
                "게이트 실패 시 해당 컴포넌트만 비활성화한다. fin_cov 실패만 전략 중단 사유다.")
     spec = [
         ("fin_cov", fin_cov, 0.90, "U-1000 재무데이터 가용률", "게이트", "전략 중단"),
-        ("flow_cov", flow_cov, 0.95, "외국인·기관 순매수 가용률", "게이트", "F축 비활성 → VQF=VQ"),
+        # ★ '미달 시 행동' 칸은 코드가 실제로 하는 일과 정확히 일치해야 한다. 하지도 않을
+        #   조치를 적어두면 그 표 자체가 거짓 보증이 된다(적대적 감사가 잡아낸 유형).
+        ("flow_cov", flow_cov, 0.95, "외국인·기관 순매수 가용률", "게이트",
+         "VQF 는 참고 산출, §9 C1·C2 판정 불가"),
         ("dart_parse_rate", dart_parse, 0.80, "DART 본문 기계판독 성공률", "게이트",
          "사유 분해 보고 후 진행(§2.2)"),
         ("report_cov_200", report_cov_200, None, "U-200 내 리포트 ≥1건 비율", "측정만", "—"),
@@ -38,6 +44,11 @@ def report_phase0(fin_cov: float, flow_cov: float, dart_parse: float,
     LOG.info("§2.2 — report_cov_200 이 낮게 나오는 것은 예상된 결과이며 실패가 아닙니다. "
              "애널리스트 축은 결측 허용 설계(§6.2)이므로 그대로 진행하되 실측치를 보고합니다.")
     PHASE0.update(verdict)
+    globals()["PHASE0_FLOW_OK"] = verdict.get("flow_cov", {}).get("pass")
+    if verdict.get("flow_cov", {}).get("pass") is False:
+        LOG.warn("flow_cov 게이트 미달 — 수급(F) 축의 표본이 부분적입니다. VARIANT-VQF 는 "
+                 "참고용으로 끝까지 산출하되, §9 의 C1·C2 는 '판정 불가'로 처리합니다. "
+                 "부분 표본으로 계산한 Sharpe 차이를 채택 근거로 쓰지 않기 위함입니다(§10.1).")
     return verdict
 
 
@@ -52,12 +63,22 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
     s_vqf = (e_vqf.get("net") or {}).get("Sharpe", np.nan)
 
     # C1: 비용 차감 후 Sharpe 우위
-    c1 = bool(np.isfinite(s_vq) and np.isfinite(s_vqf) and s_vqf > s_vq)
-    c1_d = (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f}"
-            if np.isfinite(s_vq) and np.isfinite(s_vqf) else "산출 불가")
+    #  ★ flow_cov 게이트가 미달이면 F축 표본 자체가 부분적이라 이 비교가 성립하지 않는다.
+    #    숫자는 보여주되 판정은 내리지 않는다 — 근거 없는 채택/기각 둘 다 §10.1 위반이다.
+    _flow_ok = globals().get("PHASE0_FLOW_OK")
+    if _flow_ok is False:
+        c1, c1_d = None, (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f} — 단, flow_cov 게이트 미달로 "
+                          f"판정 불가" if np.isfinite(s_vqf) and np.isfinite(s_vq)
+                          else "flow_cov 게이트 미달 — 판정 불가")
+    else:
+        c1 = bool(np.isfinite(s_vq) and np.isfinite(s_vqf) and s_vqf > s_vq)
+        c1_d = (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f}"
+                if np.isfinite(s_vq) and np.isfinite(s_vqf) else "산출 불가")
 
     # C2: 그 차이가 BH-FDR 보정 후에도 유의
-    if fdr_pass is None:
+    if _flow_ok is False:
+        c2, c2_d = None, "flow_cov 게이트 미달 — 판정 불가"
+    elif fdr_pass is None:
         c2, c2_d = None, "BH-FDR 결과 없음"
     else:
         c2 = bool(fdr_pass.get(exp_vqf, False)) and c1
@@ -97,6 +118,7 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
                for k, d, ok, det in items],
               ["조건", "내용", "판정", "근거 수치"], ["c", "l", "c", "l"], maxw=52)
 
+    # ★ '판정 불가(None)'를 충족으로 세지 않는다. 모르는 것을 근거로 채택하면 안 된다.
     all_ok = all(ok is True for _k, _d, ok, _t in items)
     unknown = [k for k, _d, ok, _t in items if ok is None]
     if all_ok:

@@ -333,6 +333,8 @@ def run_rehearsal(strict: bool = True) -> bool:
                 {"corp_code": ["00126380"], "bsns_year": [2024],
                  "rcept_no": ["20240101000001"], "rcept_dt": [as_ts("2024-03-25")]}))),
             ("시총 스냅샷", lambda: fetch_krx_cap_snapshots([as_ts("2024-03-01")])),
+            ("최대주주 지분율", lambda: fetch_major_holder_stake(pd.DataFrame(
+                {"corp_code": ["00126380"], "bsns_year": [2024]}))),
             ("XML→텍스트 판별", lambda: _xml_to_text(b"not a zip at all")),
             ("완료형 사실 판정", lambda: (
                 is_completed_fact("2024년 3월 15일 특허 3건을 등록하였다."),

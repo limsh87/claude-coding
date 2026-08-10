@@ -13,6 +13,34 @@
 # ║     이미 있으면 승격 자체가 일어나지 않으므로 최신본을 과거본으로 덮을 수 없다.            ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+def ro_read_parquet(path: str) -> Tuple[Optional[pd.DataFrame], str]:
+    """읽기 전용 parquet 리더. (프레임, 상태). ★ 어떤 경우에도 파일을 건드리지 않는다.
+
+    ★★ 왜 read_parquet_safe 를 쓰면 안 되는가 (적대적 감사가 실증한 치명 결함) ★★
+      공용 코어의 read_parquet_safe 는 읽기에 실패하면 손상 추정 파일을 `.corrupt.<ts>` 로
+      **개명**한다. 자기 캐시에는 타당한 처리지만, 미러(사용자의 로컬 D: 또는 다른 전략의
+      드라이브 캐시)에 대고 실행하면 남의 파일을 파괴하는 것이다.
+      게다가 실패 원인 1·2위가 이상 상황도 아니다:
+        · Drive for Desktop / rclone 의 placeholder(구체화 전 0바이트)
+        · 동기화가 진행 중인 부분 파일
+      둘 다 ArrowInvalid 를 던진다. 즉 '정상 동작 중인 드라이브'가 곧 파괴 조건이다.
+      → 미러는 반드시 이 함수로만 읽는다. 실패는 그냥 결측으로 돌린다.
+    """
+    try:
+        st1 = os.stat(path)
+        if st1.st_size == 0:
+            return None, "empty(동기화 미완료 추정)"
+        time.sleep(0.05)
+        st2 = os.stat(path)
+        if (st2.st_size, st2.st_mtime_ns) != (st1.st_size, st1.st_mtime_ns):
+            return None, "syncing(동기화 진행 중)"
+        with open(path, "rb") as f:
+            blob = f.read()
+        return pd.read_parquet(io.BytesIO(blob)), "ok"
+    except Exception as e:                                      # noqa
+        return None, type(e).__name__
+
+
 def _expand(p: str) -> str:
     try:
         return os.path.abspath(os.path.expanduser(os.path.expandvars(str(p))))
@@ -155,6 +183,32 @@ class QVFVault(Vault):
         self.promote_tables = bool(promote_tables)
         self._mirror_idx: Dict[str, pd.DataFrame] = {}
         self.table_src: Dict[str, str] = {}          # 어느 루트가 이 테이블을 줬는가(감사용)
+        self._own_only = False                       # compact 중 미러 행을 배제하기 위한 스위치
+
+    # ── 쓰기 경로 구조적 봉인 ----------------------------------------------------------
+    def _wpath(self, path: str) -> str:
+        """쓰기 대상 경로 검증. 쓰기루트 밖이면 예외. 상속받은 어떤 코드도 미러를 못 쓴다.
+        ★ 주석으로 '도달하지 않는다'고 쓰는 것과, 도달하면 터지게 만드는 것은 다르다."""
+        rp = os.path.realpath(path)
+        root = os.path.realpath(self.root)
+        if not (rp == root or rp.startswith(root + os.sep)):
+            raise PermissionError(
+                f"[절대 1원칙 위반 차단] 쓰기루트 밖 경로에 쓰려 했습니다: {path}\n"
+                f"  쓰기루트: {self.root}\n"
+                f"  미러는 읽기 전용입니다. 이 예외는 버그를 조용히 넘기지 않기 위한 것입니다.")
+        return path
+
+    def journal(self, scope: str) -> str:
+        return self._wpath(super().journal(scope))
+
+    def idx_parquet(self, scope: str) -> str:
+        return self._wpath(super().idx_parquet(scope))
+
+    def blob_dir(self, scope: str) -> str:
+        return self._wpath(super().blob_dir(scope))
+
+    def table_dir(self, scope: str) -> str:
+        return self._wpath(super().table_dir(scope))
 
     # ── 미러 인덱스 (읽기 전용) ---------------------------------------------------------
     def _load_mirror_index(self, scope: str) -> pd.DataFrame:
@@ -168,9 +222,11 @@ class QVFVault(Vault):
             if not os.path.isdir(idx_dir):
                 continue
             got: List[pd.DataFrame] = []
-            d = read_parquet_safe(os.path.join(idx_dir, "index.parquet"))
+            d, _st = ro_read_parquet(os.path.join(idx_dir, "index.parquet"))
             if d is not None and len(d):
                 got.append(d)
+            elif _st not in ("ok", "FileNotFoundError"):
+                LOG.debug(f"미러 인덱스 읽기 건너뜀({_st}): {idx_dir} — 파일은 그대로 둡니다.")
             jr = read_jsonl(os.path.join(idx_dir, "index.jsonl"))
             if jr:
                 got.append(pd.DataFrame(jr))
@@ -209,6 +265,8 @@ class QVFVault(Vault):
 
     def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:
         own = super().load_index(scope, force=force)
+        if self._own_only:
+            return own
         mir = self._load_mirror_index(scope)
         if mir.empty:
             return own
@@ -247,8 +305,10 @@ class QVFVault(Vault):
                 if max_age_days is not None:
                     if (time.time() - os.path.getmtime(p)) / 86400.0 > max_age_days:
                         continue
-                dd = read_parquet_safe(p)
+                dd, _st = ro_read_parquet(p)
                 if dd is None or not len(dd):
+                    if _st not in ("ok", "FileNotFoundError"):
+                        LOG.debug(f"미러 테이블 읽기 건너뜀({_st}): {p} — 파일은 그대로 둡니다.")
                     continue
                 self.table_src[name] = mr
                 self.stats[f"mirror_table_hit:{name}"] += 1
@@ -285,6 +345,23 @@ class QVFVault(Vault):
                     continue
         return None
 
+    def compact(self, scope: str):
+        """★ 미러 행을 드라이브 인덱스에 쓰면 안 된다.
+
+        load_index 는 조회 편의를 위해 미러 행을 합쳐서 돌려주는데, 부모의 compact 는
+        그 결과를 그대로 index.parquet 에 기록한다. 그러면 '로컬에만 존재하는 파일 경로'가
+        공용 드라이브 인덱스에 박히고, 다른 기기·다른 전략이 그 경로를 열려다 실패한다.
+        컴팩션 동안만 자기 루트 전용 모드로 내린다.
+        """
+        keep = self._own_only
+        self._own_only = True
+        try:
+            super().compact(scope)
+        finally:
+            self._own_only = keep
+            self._idx.pop(scope, None)      # 합쳐진 조회용 뷰를 다음 조회에서 재구성
+            self._uidset.pop(scope, None)
+
     def report_roots(self):
         rows = [["쓰기 루트 (신규 수집분 저장)", self.root, self.mode]]
         for m in self.mirrors:
@@ -318,10 +395,17 @@ class DartQuota:
     """
 
     FLUSH_EVERY = 200
+    # DART 한도는 한국시간 자정에 리셋된다. 로컬시간을 쓰면 Colab(UTC)에서 9시간 어긋나고,
+    # 구축 시점에 한 번만 계산하면 자정을 넘긴 장시간 실행이 '어제 한도'에 계속 묶인다.
+    KST = _dt.timezone(_dt.timedelta(hours=9))
+
+    @staticmethod
+    def _day_key() -> str:
+        return _dt.datetime.now(DartQuota.KST).date().isoformat()
 
     def __init__(self, vault: "Vault"):
         self.vault = vault
-        self.today = _dt.date.today().isoformat()
+        self.today = self._day_key()
         self.key_fp = sha1_str("dartkey", DART_API_KEY or "")[:12]
         self.n = 0                     # 이번 프로세스가 쓴 양
         self.n_other = 0               # 같은 키로 오늘 다른 프로세스/전략이 쓴 양
@@ -330,7 +414,27 @@ class DartQuota:
         self._exhausted = False
         self._lk = threading.RLock()
         self._unflushed = 0
+        self._probe_at = 0.0
         self._load()
+        # 공용 코어(12_ingest_dart_fin)가 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로
+        # 되돌려 놓는다(조립 순서상 헤더보다 뒤). 사용자가 명시적으로 거부한 값이므로
+        # 실측 소유자인 이 클래스가 되찾아온다. 실측되면 그 값으로 다시 덮인다.
+        globals()["DART_DAILY_LIMIT"] = int(self.hist_limit or DART_DAILY_LIMIT_HINT)
+
+    def _roll_if_needed(self):
+        """자정(KST)을 넘겼으면 카운터를 새 날짜로 되돌린다. 며칠에 걸친 콜드빌드에서
+        '어제 소진'을 오늘까지 끌고 가 하루를 통째로 버리는 사고를 막는다."""
+        d = self._day_key()
+        if d == self.today:
+            return
+        self._flush_locked()
+        LOG.ok(f"DART 한도 리셋 감지 (KST {self.today} → {d}) — 카운터를 초기화하고 계속합니다.")
+        self.today = d
+        self.n = 0
+        self.n_other = 0
+        self.observed_limit = None
+        self._exhausted = False
+        self._unflushed = 0
 
     # -- 저널 ---------------------------------------------------------------------------
     def _path(self) -> str:
@@ -414,22 +518,57 @@ class DartQuota:
         """★ 공용 코어(dart_api)가 status 020/021 을 보면 여기에 True 를 넣는다.
         그 순간의 누적 사용량이 곧 '오늘의 실측 한도'다. 이 setter 가 발견 지점이다."""
         v = bool(v)
-        if v and not self._exhausted:
-            self._exhausted = True
-            self.observed_limit = int(self.used_today)
-            self._flush()
-            self._append({"event": "limit_observed", "limit": int(self.observed_limit)})
-            globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)
-            LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 받았습니다. "
-                     f"여기까지 받은 데이터는 캐시에 저장되어 있으며, 내일 재실행하면 정확히 "
-                     f"이 지점부터 이어받습니다. (한도값을 코드에 고정하지 않고 실측한 값입니다)")
-        else:
-            self._exhausted = v
+        if not v:
+            self._exhausted = False
+            return
+        if self._exhausted:
+            return
+        # ★ 공용 코어는 020(일일한도 초과)과 021(조회 가능 회사 수 초과)을 같은 분기에서
+        #   처리하며 둘 다 여기로 True 를 보낸다. 그런데 021 은 '요청이 잘못됐다'는 뜻이지
+        #   한도와 아무 상관이 없다. 이를 한도로 기록하면 (a) 남은 호출을 전부 못 쓰고
+        #   (b) 그 거짓 상한이 공용 저널에 박혀 내일 이후 실행과 '다른 전략'까지 오염된다.
+        #   → 값싼 확인 호출을 한 번 던져 진짜 020 인지 확증한 뒤에만 기록한다.
+        self._exhausted = True                      # 확인 전까지는 잠정 정지(호출 폭주 방지)
+        if not self._confirm_exhaustion():
+            self._exhausted = False
+            LOG.warn("DART 오류를 받았지만 확인 호출이 성공했습니다 — 일일한도(020)가 아니라 "
+                     "요청 오류(021 등)로 판단하고 수집을 계속합니다. 한도로 기록하지 않습니다.")
+            return
+        self.observed_limit = int(self.used_today)
+        self._flush()
+        self._append({"event": "limit_observed", "limit": int(self.observed_limit)})
+        globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)
+        LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 확인했습니다. "
+                 f"여기까지 받은 데이터는 캐시에 저장되어 있으며, 내일 재실행하면 정확히 "
+                 f"이 지점부터 이어받습니다. (한도값을 코드에 고정하지 않고 실측한 값입니다)")
+
+    def _confirm_exhaustion(self) -> bool:
+        """가장 값싼 정상 요청을 한 번 던져 020 이 재현되는지 본다. True = 진짜 한도 소진."""
+        now = time.monotonic()
+        if now - self._probe_at < 30.0:
+            return True                              # 직전에 확인함 — 중복 확인 금지
+        self._probe_at = now
+        if not DART_API_KEY:
+            return True
+        try:
+            d = (_dt.datetime.now(self.KST) - _dt.timedelta(days=3)).strftime("%Y%m%d")
+            js = http_json("https://opendart.fss.or.kr/api/list.json", source="dart", tries=1,
+                           params={"crtfc_key": DART_API_KEY, "bgn_de": d, "end_de": d,
+                                   "page_no": 1, "page_count": 1},
+                           referer="https://opendart.fss.or.kr/")
+        except Exception:
+            return True                              # 확인 불가 → 보수적으로 소진 처리
+        if not isinstance(js, dict):
+            return True
+        st = str(js.get("status", ""))
+        # 000(정상) 또는 013(데이터 없음)이면 키는 살아 있다 = 한도 소진이 아니다.
+        return st not in ("000", "013")
 
     def take(self, k: int = 1) -> bool:
         if not DART_API_KEY:
             return False
         with self._lk:
+            self._roll_if_needed()
             if self._exhausted:
                 return False
             # 과거 실측 상한이 있으면 '거기서 멈추지 않고' 계속 쓴다(§요구사항).

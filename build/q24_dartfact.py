@@ -469,6 +469,89 @@ def report_parse_rate(F: pd.DataFrame, stats: dict) -> float:
     return rate
 
 
+# ── 최대주주 지분율: 구조화 엔드포인트 폴백 ─────────────────────────────────────────────────
+#  §7.2 의 '최대주주 지분율 < 15% 제외'는 3-A 의 하드 규칙인데, 본문 정규식으로 뽑는 지분율은
+#  표 레이아웃에 따라 실패율이 높다. 정기보고서 주요정보에 구조화 엔드포인트가 있으므로
+#  '본문 추출이 실패한 (회사, 연도)'에 한해서만 추가 호출한다(전량 호출은 호출량 낭비다).
+#  ★ 응답 스키마가 기대와 다르면 조용히 결측을 돌려주고, 어느 경로가 값을 채웠는지 로그에 남긴다.
+USE_HYSLR_ENDPOINT = True
+
+
+def fetch_major_holder_stake(targets: pd.DataFrame) -> pd.DataFrame:
+    """targets: corp_code · bsns_year  →  corp_code · knowledge_date · major_holder_pct_api
+
+    최대주주 '및 특수관계인 합계' 기말 지분율을 쓴다.
+    ★ 행이 (인별 × 주식종류별)로 쪼개져 오고 '계/합계' 소계 행이 섞여 있다. 둘을 함께 더하면
+      이중계상이라 지분율이 100% 를 넘는다(코어가 empSttus 에서 이미 겪은 함정과 같은 형태).
+    """
+    cols = ["corp_code", "bsns_year", "knowledge_date", "major_holder_pct_api"]
+    if not (USE_HYSLR_ENDPOINT and DART_API_KEY) or targets is None or targets.empty:
+        return pd.DataFrame(columns=cols)
+    cached = VAULT.get_table("dart_major_holder", scope="shared")
+    done: set = set()
+    if cached is not None and len(cached):
+        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
+        LOG.info(f"캐시에서 최대주주 지분율 {len(cached):,}건 재사용")
+    jobs = [(str(c), int(y)) for c, y in
+            zip(targets["corp_code"], targets["bsns_year"])
+            if (str(c), int(y)) not in done]
+    if RUN_MODE == "CACHED":
+        jobs = []
+
+    def _one(job):
+        corp, y = job
+        js = dart_api("hyslrSttus.json", {"corp_code": corp, "bsns_year": str(y),
+                                          "reprt_code": REPRT_CODES["FY"]})
+        if not js or not isinstance(js.get("list"), list) or not js["list"]:
+            return None
+        d = pd.DataFrame(js["list"])
+        rate_col = next((c for c in ("trmend_posesn_stock_qota_rt",
+                                     "bsis_posesn_stock_qota_rt") if c in d.columns), None)
+        if rate_col is None:
+            return None
+        rt = pd.to_numeric(d[rate_col].astype(str).str.replace(r"[^\d.\-]", "", regex=True),
+                           errors="coerce")
+        knd = d["stock_knd"].astype(str) if "stock_knd" in d.columns else pd.Series([""] * len(d))
+        nm = d["nm"].astype(str) if "nm" in d.columns else pd.Series([""] * len(d))
+        common = knd.str.contains("보통", na=False) | (knd.str.strip() == "")
+        if not common.any():
+            common = pd.Series(True, index=d.index)
+        sub_rt, sub_nm = rt[common], nm[common]
+        tot = sub_nm.str.replace(r"\s+", "", regex=True).str.contains("계|합계|소계", na=False)
+        # 합계 행이 있으면 그것만, 없으면 구성원 합. 둘을 더하면 이중계상이다.
+        val = float(sub_rt[tot].max()) if tot.any() and sub_rt[tot].notna().any() \
+            else float(sub_rt[~tot].sum(skipna=True))
+        if not np.isfinite(val) or val <= 0 or val > 100:
+            return None
+        rn = str(d["rcept_no"].iloc[0]) if "rcept_no" in d.columns and len(d) else ""
+        return {"corp_code": corp, "bsns_year": int(y), "rcept_no": rn,
+                "major_holder_pct_api": val / 100.0}
+
+    got = []
+    if jobs:
+        LOG.info(f"최대주주 지분율 구조화 조회 {len(jobs):,}건 (본문 추출 실패분만) — "
+                 f"남은 DART 호출: {DQUOTA.remaining_str() if DQUOTA else '?'}")
+        got = [r for r in pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8),
+                                  desc="최대주주 지분율") if r]
+
+    frames = [cached] if cached is not None and len(cached) else []
+    if got:
+        frames.append(pd.DataFrame(got))
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    H = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"],
+                                                             keep="last")
+    if "rcept_no" not in H.columns:
+        H["rcept_no"] = ""
+    H["knowledge_date"] = [dart_knowledge_date(rn, REPRT_CODES["FY"], int(y))
+                           for rn, y in zip(H["rcept_no"], H["bsns_year"])]
+    if got:
+        VAULT.put_table("dart_major_holder", H, scope="shared", domain="dart",
+                        source="opendart hyslrSttus")
+    LOG.ok(f"최대주주 지분율(구조화) {len(H):,}건 확보 — 3-A '지분율 < 15%' 규칙의 근거 보강")
+    return downcast_q(H[cols])
+
+
 # ── ΔNONFIN 조립 ────────────────────────────────────────────────────────────────────────────
 NONFIN_ITEMS = ["rnd_headcount_up", "rnd_ratio_up", "patent_up", "capex_up",
                 "supply_contract", "gov_rnd"]
@@ -551,6 +634,21 @@ def build_nonfin_panel(G: pd.DataFrame, facts: pd.DataFrame, dis: pd.DataFrame,
     return d
 
 
+def attach_major_holder(P: pd.DataFrame, H: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
+    """구조화 조회 결과로 본문 추출값의 빈칸을 메운다(덮어쓰지 않는다)."""
+    if H is None or H.empty:
+        return P
+    d = _asof_attach(P, H[["corp_code", "knowledge_date", "major_holder_pct_api"]],
+                     sec, ["major_holder_pct_api"])
+    before = float(col(d, "major_holder_pct").notna().mean())
+    d["major_holder_pct"] = col(d, "major_holder_pct").where(
+        col(d, "major_holder_pct").notna(), col(d, "major_holder_pct_api"))
+    after = float(col(d, "major_holder_pct").notna().mean())
+    LOG.ok(f"최대주주 지분율 커버리지 {100*before:.1f}% → {100*after:.1f}% "
+           f"(본문 추출 + 구조화 엔드포인트 보강)")
+    return d
+
+
 def _asof_attach(base: pd.DataFrame, R: pd.DataFrame, sec: pd.DataFrame,
                  value_cols: Sequence[str]) -> pd.DataFrame:
     """corp_code 기준 as-of 결합. 결합키 결측 행은 반드시 보존한다(생존자편향 방지)."""
@@ -619,8 +717,17 @@ def _attach_disclosure_events(d: pd.DataFrame, dis: pd.DataFrame,
     ev_cols = {"supply_contract": "supply_contract", "cb_issue": "cb_issue",
                "bw_issue": "bw_issue", "major_holder_chg": "major_holder_chg",
                "lawsuit_filed": "lawsuit_filed", "capital_impair": "capital_impair_dis"}
+    # ★ 0.0 으로 초기화하면 '스윕을 안 했다'와 '스윕했는데 해당 없음'이 구별되지 않는다.
+    #   전자는 근거 부재(배제하면 안 됨), 후자는 근거 있음(배제 판단 가능)이다.
+    #   공시 원장이 실제로 덮은 구간에서만 0 을 채우고, 나머지는 결측으로 남긴다.
+    _cov_lo = as_ts_series(D["knowledge_date"]).min()
+    _cov_hi = as_ts_series(D["knowledge_date"]).max()
+    _covered = (as_ts_series(d["signal_date"]) >= _cov_lo) & (as_ts_series(d["signal_date"]) <= _cov_hi)
     for c in ev_cols.values():
-        d[c] = 0.0
+        d[c] = np.where(_covered.to_numpy(), 0.0, np.nan)
+    if int((~_covered).sum()):
+        LOG.info(f"공시 원장이 덮지 못한 {int((~_covered).sum()):,}행은 이벤트를 0 이 아니라 "
+                 f"결측으로 둡니다 (근거 없이 '해당 없음'으로 처리하지 않습니다).")
 
     reb = sorted(pd.unique(as_ts_series(d["rebal"])))
     sig_by_rebal = (d.groupby("rebal", observed=True)["signal_date"].first().to_dict())

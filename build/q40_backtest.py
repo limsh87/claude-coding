@@ -104,7 +104,11 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
     px = px.dropna(subset=["code", "date", "close"])
     last_px = (px.sort_values("date").groupby("code", observed=True)
                  .agg(last_date=("date", "max"), last_close=("close", "last")))
-    nxt_rebal = {t: (reb[i + 1] if i + 1 < len(reb) else None) for i, t in enumerate(reb)}
+    # ★ 보유구간의 오른쪽 끝은 '다음 체결일'이다. 다음 명목일로 잡으면 그 사이 1~3일의
+    #   이음매에서 폐지된 종목이 창 밖으로 새어 −100% 대신 0% 가 된다(분기마다 반복).
+    _exec_of = {as_ts(r.rebal): as_ts(r.exec_date) for r in cal.itertuples(index=False)}
+    nxt_rebal = {t: (_exec_of.get(reb[i + 1]) if i + 1 < len(reb) else None)
+                 for i, t in enumerate(reb)}
 
     n_liq = n_zero = 0
     if delist:
@@ -176,17 +180,45 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
     F = fwd.set_index(["code", "rebal"])["fwd_ret"] if len(fwd) else pd.Series(dtype="float64")
 
     reb = sorted(pd.unique(as_ts_series(cal["rebal"])))
-    nxt_rebal = {t: (reb[i + 1] if i + 1 < len(reb) else None) for i, t in enumerate(reb)}
+    # ★ 보유구간은 [체결일, 다음 체결일) 이지 [명목일, 다음 명목일) 이 아니다.
+    #   3/1 은 삼일절이라 결코 거래일이 아니고 6/1·12/1 도 주말에 자주 걸린다. 두 구간의
+    #   차이(1~3일의 이음매)에서 폐지된 종목은 '창 밖'으로 판정되어 −100% 대신 0% 가 된다.
+    #   즉 분기마다 며칠씩 생존자편향이 새는 뒷문이 열려 있었다.
+    exec_of = {as_ts(r.rebal): as_ts(r.exec_date) for r in cal.itertuples(index=False)}
+    exec_next = {t: (exec_of.get(reb[i + 1]) if i + 1 < len(reb) else None)
+                 for i, t in enumerate(reb)}
     dlmap = ({str(k): as_ts(v) for k, v in dict(delist).items()} if delist
              else dict(QVF_DELIST_MAP))
     prev_w: Dict[str, float] = {}
     rows, holds = [], []
-    n_missing, n_forced_delist = 0, 0
+    n_missing, n_forced_delist, n_empty_q = 0, 0, 0
     for t in reb:
         sub = d[d["rebal"] == t].copy()
         if sub.empty:
-            rows.append({"rebal": t, "ret": 0.0, "ret_gross": 0.0, "n": 0,
-                         "turnover": float(sum(abs(v) for v in prev_w.values())), "cost": 0.0})
+            # ★ 3-A 통과 종목이 0 인 분기는 설계상 발생할 수 있는 정상 결과다(사전등록).
+            #   그런데 예전 코드는 회전율만 기록하고 비용 0, 수익 0 으로 넘겼다 — 전량 청산을
+            #   공짜로 처리하고, 그 분기 보유분의 실제 수익을 통째로 증발시킨 것이다.
+            turn0 = float(sum(abs(v) for v in prev_w.values()))
+            g0 = 0.0
+            nx0 = exec_next.get(t)
+            te0 = exec_of.get(t, t)
+            for c, w in prev_w.items():
+                fr = F.get((c, t), np.nan) if len(F) else np.nan
+                fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan
+                if not np.isfinite(fr):
+                    dl = dlmap.get(str(c))
+                    fr = -1.0 if (dl is not None and nx0 is not None and te0 < dl <= as_ts(nx0)) else 0.0
+                g0 += w * fr
+            c0 = 0.0
+            if apply_costs and prev_w:
+                tax0 = qvf_sell_tax(te0)
+                sp0 = float(np.clip(SLIPPAGE_FLOOR_BPS / 1e4,
+                                    SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))
+                for w in prev_w.values():
+                    c0 += abs(w) * (COMMISSION_BPS / 1e4 + sp0 / 2.0 + tax0)
+            n_empty_q += 1
+            rows.append({"rebal": t, "ret": g0 - c0, "ret_gross": g0, "n": 0,
+                         "turnover": turn0, "cost": c0})
             prev_w = {}
             continue
         sub["w"] = compute_weights(sub, scheme)
@@ -196,11 +228,16 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                    for c in set(w_new) | set(prev_w))
         cost = 0.0
         if apply_costs:
+            # ★ sub.get(없는컬럼) 은 None 을 돌려주고 pd.to_numeric(None) 은 스칼라 nan 이라
+            #   zip 이 "float is not iterable" 로 죽는다. 축소된 강건성 실행에서 실제로 도달한다.
             spread = dict(zip(sub["code"].astype(str),
-                              pd.to_numeric(sub.get("cs_spread"), errors="coerce")))
+                              pd.to_numeric(col(sub, "cs_spread"), errors="coerce")))
             advm = dict(zip(sub["code"].astype(str),
-                            pd.to_numeric(sub.get("adtv"), errors="coerce")))
-            tax = qvf_sell_tax(t)
+                            pd.to_numeric(col(sub, "adtv"), errors="coerce")))
+            # ★ 세율 구간 경계가 2019-06-03 인데 2019-06-01 은 토요일이라 그 분기 체결일이
+            #   정확히 2019-06-03 이다. 명목일로 조회하면 그 한 분기만 구세율(0.30%)이 적용돼
+            #   매도 레그 전체에 20bp 를 과다계상한다. 체결일 기준으로 조회한다.
+            tax = qvf_sell_tax(exec_of.get(t, t))
             for c in set(w_new) | set(prev_w):
                 dw = w_new.get(c, 0.0) - prev_w.get(c, 0.0)
                 if abs(dw) < 1e-9:
@@ -217,7 +254,8 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                 cost += abs(dw) * one_way + (abs(dw) * tax if dw < 0 else 0.0)
 
         gross = 0.0
-        nx = nxt_rebal.get(t)
+        nx = exec_next.get(t)
+        t_exec = exec_of.get(t, t)
         for c, w in w_new.items():
             fr = F.get((c, t), np.nan) if len(F) else np.nan
             fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan
@@ -226,7 +264,7 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                 #   소스에서 사라지는 종목이 전부 '무손실'이 된다 — 생존자편향의 뒷문이다.
                 #   보유구간 안에서 폐지가 확인되면 §3.4 규정대로 −100% 를 적용한다.
                 dl = dlmap.get(str(c))
-                if dl is not None and nx is not None and t < dl <= as_ts(nx):
+                if dl is not None and nx is not None and t_exec < dl <= as_ts(nx):
                     fr = -1.0
                     n_forced_delist += 1
                 else:
@@ -242,9 +280,13 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
     if len(R):
         R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
         R["equity_gross"] = (1.0 + R["ret_gross"].fillna(0)).cumprod()
-    if n_forced_delist or n_missing:
-        LOG.debug(f"[{label}] 체결가 결측 보정 — 보유구간 내 폐지 확인 {n_forced_delist:,}건은 "
-                  f"−100%, 그 외 {n_missing:,}건은 0% (마지막 분기 등)")
+    if n_forced_delist or n_missing or n_empty_q:
+        LOG.info(f"[{label}] 체결가 결측 보정 — 보유구간 내 폐지 확인 {n_forced_delist:,}건은 "
+                 f"−100% · 그 외 {n_missing:,}건은 0%(마지막 분기 등) · "
+                 f"선정 0종목 분기 {n_empty_q:,}회(청산비용 부과·보유수익 반영)")
+        if n_missing > max(20, 0.02 * len(holds)):
+            LOG.warn(f"0% 로 처리된 보유가 {n_missing:,}건으로 많습니다. 폐지·거래정지가 "
+                     f"'무손실'로 새고 있을 수 있습니다 — 위 '보유 종료 유형' 표와 함께 보세요.")
     return {"returns": R, "holdings": pd.DataFrame(holds), "label": label, "scheme": scheme,
             "n_forced_delist": n_forced_delist, "n_missing": n_missing}
 
@@ -333,7 +375,7 @@ def qvf_benchmarks(cal: pd.DataFrame, px_daily: pd.DataFrame) -> Dict[str, pd.Se
         M = pd.merge_asof(L, cl.rename(columns={"date": "px_date"}),
                           left_on="exec_date", right_on="px_date", direction="forward",
                           tolerance=pd.Timedelta(days=15))
-        s = pd.Series(M["close"].to_numpy(), index=pd.Index(reb, name="rebal")).pct_change().shift(-1)
+        s = pd.Series(M["close"].to_numpy(), index=pd.Index(reb, name="rebal")).pct_change(fill_method=None).shift(-1)
         out[name] = s
     if not out:
         LOG.warn("지수 벤치마크를 받지 못했습니다 — 벤치마크 비교표는 생략됩니다.")

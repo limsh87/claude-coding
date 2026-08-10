@@ -216,5 +216,9 @@ STRATEGY_NAME      = "@@STRATEGY_NAME@@"
 BUILD_VERSION      = "@@BUILD_VERSION@@"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
-# 공용 코어(12_ingest_dart_fin) 로그가 참조하는 값. DartQuota 가 실측치로 갱신합니다.
-DART_DAILY_LIMIT = 20_000
+# 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
+# 놓습니다(조립 순서상 이 헤더보다 뒤). 사용자가 명시적으로 거부한 고정값이므로, 실측 소유자인
+# DartQuota 가 생성 시점에 아래 '힌트'로 되찾아오고 020 을 확인하면 실측치로 다시 덮습니다.
+# ★ 이 값은 '계획용 표시치'일 뿐이며 소비를 막지 않습니다(계약 Q12 가 강제).
+DART_DAILY_LIMIT_HINT = 20_000
+DART_DAILY_LIMIT = DART_DAILY_LIMIT_HINT

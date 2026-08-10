@@ -172,6 +172,7 @@ def build_panel_pass2(P: pd.DataFrame, ctx: dict, cal: pd.DataFrame) -> pd.DataF
     """[6]~[10] — DART 하드팩트 · TONE · 2차필터 입력 · 3-A 규칙."""
     P = build_nonfin_panel(P, ctx.get("facts", pd.DataFrame()), ctx.get("dis", pd.DataFrame()),
                            ctx.get("fq", pd.DataFrame()), ctx["sec"])
+    P = attach_major_holder(P, ctx.get("holder", pd.DataFrame()), ctx["sec"])
     mom = build_momentum(cal, ctx["px"])
     P = P.merge(mom, on=["code", "rebal"], how="left")
     tp = build_tp_revision(ctx.get("links", pd.DataFrame()), P, cal)
@@ -297,6 +298,16 @@ def main() -> dict:
         facts, pstats = fetch_annual_report_facts(targets)
         ctx["facts"] = facts
         ctx["parse_rate"] = report_parse_rate(facts, pstats)
+        # 3-A 의 '최대주주 지분율 < 15%' 는 하드 규칙인데 본문 표 레이아웃에 따라 추출 실패가
+        # 잦다. 실패한 (회사, 연도) 에만 구조화 엔드포인트로 보강한다(전량 호출은 낭비).
+        need_h = pd.DataFrame(columns=["corp_code", "bsns_year"])
+        if len(facts):
+            miss = facts[pd.to_numeric(facts.get("major_holder_pct"), errors="coerce").isna()]
+            if len(miss):
+                need_h = miss[["corp_code", "bsns_year"]].dropna().drop_duplicates()
+        elif len(targets):
+            need_h = targets[["corp_code", "bsns_year"]].dropna().drop_duplicates()
+        ctx["holder"] = fetch_major_holder_stake(need_h)
 
     with PIPE.stage("L1.TONE", "[7] 리포트 본문 · TONE 분류기 (확장윈도우)", "L1",
                     budget_s=5400, critical=False):

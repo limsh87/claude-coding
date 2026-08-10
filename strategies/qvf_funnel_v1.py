@@ -213,11 +213,15 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0402"
+BUILD_VERSION      = "qvf1.20260810.0439"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
-# 공용 코어(12_ingest_dart_fin) 로그가 참조하는 값. DartQuota 가 실측치로 갱신합니다.
-DART_DAILY_LIMIT = 20_000
+# 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
+# 놓습니다(조립 순서상 이 헤더보다 뒤). 사용자가 명시적으로 거부한 고정값이므로, 실측 소유자인
+# DartQuota 가 생성 시점에 아래 '힌트'로 되찾아오고 020 을 확인하면 실측치로 다시 덮습니다.
+# ★ 이 값은 '계획용 표시치'일 뿐이며 소비를 막지 않습니다(계약 Q12 가 강제).
+DART_DAILY_LIMIT_HINT = 20_000
+DART_DAILY_LIMIT = DART_DAILY_LIMIT_HINT
 
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -2261,6 +2265,34 @@ def report_http():
 # ║     이미 있으면 승격 자체가 일어나지 않으므로 최신본을 과거본으로 덮을 수 없다.            ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+def ro_read_parquet(path: str) -> Tuple[Optional[pd.DataFrame], str]:
+    """읽기 전용 parquet 리더. (프레임, 상태). ★ 어떤 경우에도 파일을 건드리지 않는다.
+
+    ★★ 왜 read_parquet_safe 를 쓰면 안 되는가 (적대적 감사가 실증한 치명 결함) ★★
+      공용 코어의 read_parquet_safe 는 읽기에 실패하면 손상 추정 파일을 `.corrupt.<ts>` 로
+      **개명**한다. 자기 캐시에는 타당한 처리지만, 미러(사용자의 로컬 D: 또는 다른 전략의
+      드라이브 캐시)에 대고 실행하면 남의 파일을 파괴하는 것이다.
+      게다가 실패 원인 1·2위가 이상 상황도 아니다:
+        · Drive for Desktop / rclone 의 placeholder(구체화 전 0바이트)
+        · 동기화가 진행 중인 부분 파일
+      둘 다 ArrowInvalid 를 던진다. 즉 '정상 동작 중인 드라이브'가 곧 파괴 조건이다.
+      → 미러는 반드시 이 함수로만 읽는다. 실패는 그냥 결측으로 돌린다.
+    """
+    try:
+        st1 = os.stat(path)
+        if st1.st_size == 0:
+            return None, "empty(동기화 미완료 추정)"
+        time.sleep(0.05)
+        st2 = os.stat(path)
+        if (st2.st_size, st2.st_mtime_ns) != (st1.st_size, st1.st_mtime_ns):
+            return None, "syncing(동기화 진행 중)"
+        with open(path, "rb") as f:
+            blob = f.read()
+        return pd.read_parquet(io.BytesIO(blob)), "ok"
+    except Exception as e:                                      # noqa
+        return None, type(e).__name__
+
+
 def _expand(p: str) -> str:
     try:
         return os.path.abspath(os.path.expanduser(os.path.expandvars(str(p))))
@@ -2403,6 +2435,32 @@ class QVFVault(Vault):
         self.promote_tables = bool(promote_tables)
         self._mirror_idx: Dict[str, pd.DataFrame] = {}
         self.table_src: Dict[str, str] = {}          # 어느 루트가 이 테이블을 줬는가(감사용)
+        self._own_only = False                       # compact 중 미러 행을 배제하기 위한 스위치
+
+    # ── 쓰기 경로 구조적 봉인 ----------------------------------------------------------
+    def _wpath(self, path: str) -> str:
+        """쓰기 대상 경로 검증. 쓰기루트 밖이면 예외. 상속받은 어떤 코드도 미러를 못 쓴다.
+        ★ 주석으로 '도달하지 않는다'고 쓰는 것과, 도달하면 터지게 만드는 것은 다르다."""
+        rp = os.path.realpath(path)
+        root = os.path.realpath(self.root)
+        if not (rp == root or rp.startswith(root + os.sep)):
+            raise PermissionError(
+                f"[절대 1원칙 위반 차단] 쓰기루트 밖 경로에 쓰려 했습니다: {path}\n"
+                f"  쓰기루트: {self.root}\n"
+                f"  미러는 읽기 전용입니다. 이 예외는 버그를 조용히 넘기지 않기 위한 것입니다.")
+        return path
+
+    def journal(self, scope: str) -> str:
+        return self._wpath(super().journal(scope))
+
+    def idx_parquet(self, scope: str) -> str:
+        return self._wpath(super().idx_parquet(scope))
+
+    def blob_dir(self, scope: str) -> str:
+        return self._wpath(super().blob_dir(scope))
+
+    def table_dir(self, scope: str) -> str:
+        return self._wpath(super().table_dir(scope))
 
     # ── 미러 인덱스 (읽기 전용) ---------------------------------------------------------
     def _load_mirror_index(self, scope: str) -> pd.DataFrame:
@@ -2416,9 +2474,11 @@ class QVFVault(Vault):
             if not os.path.isdir(idx_dir):
                 continue
             got: List[pd.DataFrame] = []
-            d = read_parquet_safe(os.path.join(idx_dir, "index.parquet"))
+            d, _st = ro_read_parquet(os.path.join(idx_dir, "index.parquet"))
             if d is not None and len(d):
                 got.append(d)
+            elif _st not in ("ok", "FileNotFoundError"):
+                LOG.debug(f"미러 인덱스 읽기 건너뜀({_st}): {idx_dir} — 파일은 그대로 둡니다.")
             jr = read_jsonl(os.path.join(idx_dir, "index.jsonl"))
             if jr:
                 got.append(pd.DataFrame(jr))
@@ -2457,6 +2517,8 @@ class QVFVault(Vault):
 
     def load_index(self, scope: str, force: bool = False) -> pd.DataFrame:
         own = super().load_index(scope, force=force)
+        if self._own_only:
+            return own
         mir = self._load_mirror_index(scope)
         if mir.empty:
             return own
@@ -2495,8 +2557,10 @@ class QVFVault(Vault):
                 if max_age_days is not None:
                     if (time.time() - os.path.getmtime(p)) / 86400.0 > max_age_days:
                         continue
-                dd = read_parquet_safe(p)
+                dd, _st = ro_read_parquet(p)
                 if dd is None or not len(dd):
+                    if _st not in ("ok", "FileNotFoundError"):
+                        LOG.debug(f"미러 테이블 읽기 건너뜀({_st}): {p} — 파일은 그대로 둡니다.")
                     continue
                 self.table_src[name] = mr
                 self.stats[f"mirror_table_hit:{name}"] += 1
@@ -2533,6 +2597,23 @@ class QVFVault(Vault):
                     continue
         return None
 
+    def compact(self, scope: str):
+        """★ 미러 행을 드라이브 인덱스에 쓰면 안 된다.
+
+        load_index 는 조회 편의를 위해 미러 행을 합쳐서 돌려주는데, 부모의 compact 는
+        그 결과를 그대로 index.parquet 에 기록한다. 그러면 '로컬에만 존재하는 파일 경로'가
+        공용 드라이브 인덱스에 박히고, 다른 기기·다른 전략이 그 경로를 열려다 실패한다.
+        컴팩션 동안만 자기 루트 전용 모드로 내린다.
+        """
+        keep = self._own_only
+        self._own_only = True
+        try:
+            super().compact(scope)
+        finally:
+            self._own_only = keep
+            self._idx.pop(scope, None)      # 합쳐진 조회용 뷰를 다음 조회에서 재구성
+            self._uidset.pop(scope, None)
+
     def report_roots(self):
         rows = [["쓰기 루트 (신규 수집분 저장)", self.root, self.mode]]
         for m in self.mirrors:
@@ -2566,10 +2647,17 @@ class DartQuota:
     """
 
     FLUSH_EVERY = 200
+    # DART 한도는 한국시간 자정에 리셋된다. 로컬시간을 쓰면 Colab(UTC)에서 9시간 어긋나고,
+    # 구축 시점에 한 번만 계산하면 자정을 넘긴 장시간 실행이 '어제 한도'에 계속 묶인다.
+    KST = _dt.timezone(_dt.timedelta(hours=9))
+
+    @staticmethod
+    def _day_key() -> str:
+        return _dt.datetime.now(DartQuota.KST).date().isoformat()
 
     def __init__(self, vault: "Vault"):
         self.vault = vault
-        self.today = _dt.date.today().isoformat()
+        self.today = self._day_key()
         self.key_fp = sha1_str("dartkey", DART_API_KEY or "")[:12]
         self.n = 0                     # 이번 프로세스가 쓴 양
         self.n_other = 0               # 같은 키로 오늘 다른 프로세스/전략이 쓴 양
@@ -2578,7 +2666,27 @@ class DartQuota:
         self._exhausted = False
         self._lk = threading.RLock()
         self._unflushed = 0
+        self._probe_at = 0.0
         self._load()
+        # 공용 코어(12_ingest_dart_fin)가 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로
+        # 되돌려 놓는다(조립 순서상 헤더보다 뒤). 사용자가 명시적으로 거부한 값이므로
+        # 실측 소유자인 이 클래스가 되찾아온다. 실측되면 그 값으로 다시 덮인다.
+        globals()["DART_DAILY_LIMIT"] = int(self.hist_limit or DART_DAILY_LIMIT_HINT)
+
+    def _roll_if_needed(self):
+        """자정(KST)을 넘겼으면 카운터를 새 날짜로 되돌린다. 며칠에 걸친 콜드빌드에서
+        '어제 소진'을 오늘까지 끌고 가 하루를 통째로 버리는 사고를 막는다."""
+        d = self._day_key()
+        if d == self.today:
+            return
+        self._flush_locked()
+        LOG.ok(f"DART 한도 리셋 감지 (KST {self.today} → {d}) — 카운터를 초기화하고 계속합니다.")
+        self.today = d
+        self.n = 0
+        self.n_other = 0
+        self.observed_limit = None
+        self._exhausted = False
+        self._unflushed = 0
 
     # -- 저널 ---------------------------------------------------------------------------
     def _path(self) -> str:
@@ -2662,22 +2770,57 @@ class DartQuota:
         """★ 공용 코어(dart_api)가 status 020/021 을 보면 여기에 True 를 넣는다.
         그 순간의 누적 사용량이 곧 '오늘의 실측 한도'다. 이 setter 가 발견 지점이다."""
         v = bool(v)
-        if v and not self._exhausted:
-            self._exhausted = True
-            self.observed_limit = int(self.used_today)
-            self._flush()
-            self._append({"event": "limit_observed", "limit": int(self.observed_limit)})
-            globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)
-            LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 받았습니다. "
-                     f"여기까지 받은 데이터는 캐시에 저장되어 있으며, 내일 재실행하면 정확히 "
-                     f"이 지점부터 이어받습니다. (한도값을 코드에 고정하지 않고 실측한 값입니다)")
-        else:
-            self._exhausted = v
+        if not v:
+            self._exhausted = False
+            return
+        if self._exhausted:
+            return
+        # ★ 공용 코어는 020(일일한도 초과)과 021(조회 가능 회사 수 초과)을 같은 분기에서
+        #   처리하며 둘 다 여기로 True 를 보낸다. 그런데 021 은 '요청이 잘못됐다'는 뜻이지
+        #   한도와 아무 상관이 없다. 이를 한도로 기록하면 (a) 남은 호출을 전부 못 쓰고
+        #   (b) 그 거짓 상한이 공용 저널에 박혀 내일 이후 실행과 '다른 전략'까지 오염된다.
+        #   → 값싼 확인 호출을 한 번 던져 진짜 020 인지 확증한 뒤에만 기록한다.
+        self._exhausted = True                      # 확인 전까지는 잠정 정지(호출 폭주 방지)
+        if not self._confirm_exhaustion():
+            self._exhausted = False
+            LOG.warn("DART 오류를 받았지만 확인 호출이 성공했습니다 — 일일한도(020)가 아니라 "
+                     "요청 오류(021 등)로 판단하고 수집을 계속합니다. 한도로 기록하지 않습니다.")
+            return
+        self.observed_limit = int(self.used_today)
+        self._flush()
+        self._append({"event": "limit_observed", "limit": int(self.observed_limit)})
+        globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)
+        LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 확인했습니다. "
+                 f"여기까지 받은 데이터는 캐시에 저장되어 있으며, 내일 재실행하면 정확히 "
+                 f"이 지점부터 이어받습니다. (한도값을 코드에 고정하지 않고 실측한 값입니다)")
+
+    def _confirm_exhaustion(self) -> bool:
+        """가장 값싼 정상 요청을 한 번 던져 020 이 재현되는지 본다. True = 진짜 한도 소진."""
+        now = time.monotonic()
+        if now - self._probe_at < 30.0:
+            return True                              # 직전에 확인함 — 중복 확인 금지
+        self._probe_at = now
+        if not DART_API_KEY:
+            return True
+        try:
+            d = (_dt.datetime.now(self.KST) - _dt.timedelta(days=3)).strftime("%Y%m%d")
+            js = http_json("https://opendart.fss.or.kr/api/list.json", source="dart", tries=1,
+                           params={"crtfc_key": DART_API_KEY, "bgn_de": d, "end_de": d,
+                                   "page_no": 1, "page_count": 1},
+                           referer="https://opendart.fss.or.kr/")
+        except Exception:
+            return True                              # 확인 불가 → 보수적으로 소진 처리
+        if not isinstance(js, dict):
+            return True
+        st = str(js.get("status", ""))
+        # 000(정상) 또는 013(데이터 없음)이면 키는 살아 있다 = 한도 소진이 아니다.
+        return st not in ("000", "013")
 
     def take(self, k: int = 1) -> bool:
         if not DART_API_KEY:
             return False
         with self._lk:
+            self._roll_if_needed()
             if self._exhausted:
                 return False
             # 과거 실측 상한이 있으면 '거기서 멈추지 않고' 계속 쓴다(§요구사항).
@@ -6301,8 +6444,11 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
         hi_ = px["high"].where(px["high"] > 0)
         lo_ = px["low"].where(px["low"] > 0)
         hl = np.log(hi_ / lo_)
-        hl_n = g["high"].shift(-1)
-        lo_n = g["low"].shift(-1)
+        # ★ CS 는 2일 추정량이다. (t, t+1) 로 잡으면 signal_date 에서 읽는 스프레드가
+        #   '체결일의 고저'를 포함하게 되어 비용 모델에 1일치 미래정보가 들어간다.
+        #   (t-1, t) 로 잡으면 동일한 추정량이면서 t 까지의 정보만 쓴다.
+        hl_n = g["high"].shift(1)
+        lo_n = g["low"].shift(1)
         hl2 = np.log(hl_n.where(hl_n > 0) / lo_n.where(lo_n > 0))
         beta = hl ** 2 + hl2 ** 2
         h2 = pd.concat([hi_, hl_n.where(hl_n > 0)], axis=1).max(axis=1)
@@ -6313,7 +6459,7 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
     px["_cs"] = pd.Series(s_cs, index=px.index).replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
     px["cs_spread"] = (px.groupby("code", observed=True)["_cs"]
                          .transform(lambda s: s.rolling(window, min_periods=max(10, window // 3)).mean()))
-    px["ret1d"] = g["close"].pct_change()
+    px["ret1d"] = g["close"].pct_change(fill_method=None)
     px["vol_d"] = px.groupby("code", observed=True)["ret1d"].transform(
         lambda s: s.rolling(INVVOL_WINDOW_DAYS, min_periods=max(20, INVVOL_WINDOW_DAYS // 3)).std())
 
@@ -6640,11 +6786,20 @@ def build_quarterly_fundamentals(fin: pd.DataFrame, shares: pd.DataFrame) -> pd.
         #   shift(12) 를 믿으면 5년 전 주식수를 3년 증가율이라 부르게 된다.
         contiguous = (S["_n"] - prev_n) == 12
         S["share_growth3y"] = (safe_div(S["shares_issued"], prev) - 1.0).where(contiguous)
-        S = S[["corp_code", "knowledge_date", "shares_issued", "shares_treasury", "share_growth3y"]]
-        F = F.merge(S, on=["corp_code", "knowledge_date"], how="outer", suffixes=("", "_sh"))
-        F = F.sort_values(["corp_code", "knowledge_date"], kind="stable")
-        for c in ("shares_issued", "shares_treasury", "share_growth3y"):
-            F[c] = F.groupby("corp_code", observed=True)[c].ffill()
+        S = S[["corp_code", "knowledge_date", "shares_issued", "shares_treasury",
+               "share_growth3y"]].sort_values("knowledge_date", kind="stable")
+        # ★★ outer merge 를 쓰면 안 된다 (적대적 감사가 잡은 조용한 실패) ★★
+        #   주식총수(stockTotqySttus)는 전체 재무제표(fnlttSinglAcntAll)보다 훨씬 자주 성공한다
+        #   — 특히 소형주에서. outer merge 는 '주식수만 있는 날짜'에 재무 컬럼이 전부 NaN 인
+        #   행을 새로 만들고, 하류의 merge_asof(backward)가 신호일 직전의 그 행을 집어간다.
+        #   결과: equity=NaN → PBR·부채비율·자본잠식 판정 불가 → fin_cov 붕괴 → §2.2 킬 기준이
+        #   "DART 콜드빌드 미완"이라는 엉뚱한 메시지로 전략을 중단시킨다. 원인은 전혀 다른데.
+        #   → 재무 관측을 기준 프레임으로 두고, 주식수는 as-of 로 '그 시점까지 알려진 최신값'을
+        #     붙인다. 행이 늘어나지 않으므로 재무 결측 행이 생성될 수 없다.
+        F = F.sort_values("knowledge_date", kind="stable")
+        F["corp_code"] = F["corp_code"].astype(str)
+        S["corp_code"] = S["corp_code"].astype(str)
+        F = pd.merge_asof(F, S, on="knowledge_date", by="corp_code", direction="backward")
     else:
         for c in ("shares_issued", "shares_treasury", "share_growth3y"):
             F[c] = np.nan
@@ -6659,9 +6814,16 @@ def build_quarterly_fundamentals(fin: pd.DataFrame, shares: pd.DataFrame) -> pd.
     out = F[keep].dropna(subset=["corp_code", "knowledge_date"])
     out = out.rename(columns={"_debt": "total_debt"})
     out = pit_frame(out, "period_end", "knowledge_date", source="dart_q")
+    _eqc = float(out["equity"].notna().mean()) if len(out) else 0.0
     LOG.ok(f"분기 재무 파생 {len(out):,}행 · {out['corp_code'].nunique():,}사 "
-           f"(ROIC 3년 표준편차 {int(out['roic_std3y'].notna().sum()):,}건 · "
-           f"주식수 3년 증가율 {int(out['share_growth3y'].notna().sum()):,}건)")
+           f"(자기자본 보유 {100*_eqc:.1f}% · ROIC 3년 표준편차 "
+           f"{int(out['roic_std3y'].notna().sum()):,}건 · 주식수 3년 증가율 "
+           f"{int(out['share_growth3y'].notna().sum()):,}건 · 주식수 결합 "
+           f"{100*float(out['shares_issued'].notna().mean()) if len(out) else 0:.1f}%)")
+    if len(out) and _eqc < 0.90:
+        LOG.warn(f"자기자본 보유율이 {100*_eqc:.1f}% 로 낮습니다. 이 값이 그대로 Phase 0 의 "
+                 f"fin_cov 가 되어 §2.2 중단 조건에 걸릴 수 있습니다. 원인은 대개 "
+                 f"fnlttSinglAcntAll 콜드빌드 미완이며, 재실행하면 이어받습니다.")
     return downcast_q(out)
 
 
@@ -7615,6 +7777,89 @@ def report_parse_rate(F: pd.DataFrame, stats: dict) -> float:
     return rate
 
 
+# ── 최대주주 지분율: 구조화 엔드포인트 폴백 ─────────────────────────────────────────────────
+#  §7.2 의 '최대주주 지분율 < 15% 제외'는 3-A 의 하드 규칙인데, 본문 정규식으로 뽑는 지분율은
+#  표 레이아웃에 따라 실패율이 높다. 정기보고서 주요정보에 구조화 엔드포인트가 있으므로
+#  '본문 추출이 실패한 (회사, 연도)'에 한해서만 추가 호출한다(전량 호출은 호출량 낭비다).
+#  ★ 응답 스키마가 기대와 다르면 조용히 결측을 돌려주고, 어느 경로가 값을 채웠는지 로그에 남긴다.
+USE_HYSLR_ENDPOINT = True
+
+
+def fetch_major_holder_stake(targets: pd.DataFrame) -> pd.DataFrame:
+    """targets: corp_code · bsns_year  →  corp_code · knowledge_date · major_holder_pct_api
+
+    최대주주 '및 특수관계인 합계' 기말 지분율을 쓴다.
+    ★ 행이 (인별 × 주식종류별)로 쪼개져 오고 '계/합계' 소계 행이 섞여 있다. 둘을 함께 더하면
+      이중계상이라 지분율이 100% 를 넘는다(코어가 empSttus 에서 이미 겪은 함정과 같은 형태).
+    """
+    cols = ["corp_code", "bsns_year", "knowledge_date", "major_holder_pct_api"]
+    if not (USE_HYSLR_ENDPOINT and DART_API_KEY) or targets is None or targets.empty:
+        return pd.DataFrame(columns=cols)
+    cached = VAULT.get_table("dart_major_holder", scope="shared")
+    done: set = set()
+    if cached is not None and len(cached):
+        done = set(zip(cached["corp_code"].astype(str), cached["bsns_year"].astype(int)))
+        LOG.info(f"캐시에서 최대주주 지분율 {len(cached):,}건 재사용")
+    jobs = [(str(c), int(y)) for c, y in
+            zip(targets["corp_code"], targets["bsns_year"])
+            if (str(c), int(y)) not in done]
+    if RUN_MODE == "CACHED":
+        jobs = []
+
+    def _one(job):
+        corp, y = job
+        js = dart_api("hyslrSttus.json", {"corp_code": corp, "bsns_year": str(y),
+                                          "reprt_code": REPRT_CODES["FY"]})
+        if not js or not isinstance(js.get("list"), list) or not js["list"]:
+            return None
+        d = pd.DataFrame(js["list"])
+        rate_col = next((c for c in ("trmend_posesn_stock_qota_rt",
+                                     "bsis_posesn_stock_qota_rt") if c in d.columns), None)
+        if rate_col is None:
+            return None
+        rt = pd.to_numeric(d[rate_col].astype(str).str.replace(r"[^\d.\-]", "", regex=True),
+                           errors="coerce")
+        knd = d["stock_knd"].astype(str) if "stock_knd" in d.columns else pd.Series([""] * len(d))
+        nm = d["nm"].astype(str) if "nm" in d.columns else pd.Series([""] * len(d))
+        common = knd.str.contains("보통", na=False) | (knd.str.strip() == "")
+        if not common.any():
+            common = pd.Series(True, index=d.index)
+        sub_rt, sub_nm = rt[common], nm[common]
+        tot = sub_nm.str.replace(r"\s+", "", regex=True).str.contains("계|합계|소계", na=False)
+        # 합계 행이 있으면 그것만, 없으면 구성원 합. 둘을 더하면 이중계상이다.
+        val = float(sub_rt[tot].max()) if tot.any() and sub_rt[tot].notna().any() \
+            else float(sub_rt[~tot].sum(skipna=True))
+        if not np.isfinite(val) or val <= 0 or val > 100:
+            return None
+        rn = str(d["rcept_no"].iloc[0]) if "rcept_no" in d.columns and len(d) else ""
+        return {"corp_code": corp, "bsns_year": int(y), "rcept_no": rn,
+                "major_holder_pct_api": val / 100.0}
+
+    got = []
+    if jobs:
+        LOG.info(f"최대주주 지분율 구조화 조회 {len(jobs):,}건 (본문 추출 실패분만) — "
+                 f"남은 DART 호출: {DQUOTA.remaining_str() if DQUOTA else '?'}")
+        got = [r for r in pmap_io(_one, jobs, workers=min(N_WORKERS_IO, 8),
+                                  desc="최대주주 지분율") if r]
+
+    frames = [cached] if cached is not None and len(cached) else []
+    if got:
+        frames.append(pd.DataFrame(got))
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    H = pd.concat(frames, ignore_index=True).drop_duplicates(["corp_code", "bsns_year"],
+                                                             keep="last")
+    if "rcept_no" not in H.columns:
+        H["rcept_no"] = ""
+    H["knowledge_date"] = [dart_knowledge_date(rn, REPRT_CODES["FY"], int(y))
+                           for rn, y in zip(H["rcept_no"], H["bsns_year"])]
+    if got:
+        VAULT.put_table("dart_major_holder", H, scope="shared", domain="dart",
+                        source="opendart hyslrSttus")
+    LOG.ok(f"최대주주 지분율(구조화) {len(H):,}건 확보 — 3-A '지분율 < 15%' 규칙의 근거 보강")
+    return downcast_q(H[cols])
+
+
 # ── ΔNONFIN 조립 ────────────────────────────────────────────────────────────────────────────
 NONFIN_ITEMS = ["rnd_headcount_up", "rnd_ratio_up", "patent_up", "capex_up",
                 "supply_contract", "gov_rnd"]
@@ -7697,6 +7942,21 @@ def build_nonfin_panel(G: pd.DataFrame, facts: pd.DataFrame, dis: pd.DataFrame,
     return d
 
 
+def attach_major_holder(P: pd.DataFrame, H: pd.DataFrame, sec: pd.DataFrame) -> pd.DataFrame:
+    """구조화 조회 결과로 본문 추출값의 빈칸을 메운다(덮어쓰지 않는다)."""
+    if H is None or H.empty:
+        return P
+    d = _asof_attach(P, H[["corp_code", "knowledge_date", "major_holder_pct_api"]],
+                     sec, ["major_holder_pct_api"])
+    before = float(col(d, "major_holder_pct").notna().mean())
+    d["major_holder_pct"] = col(d, "major_holder_pct").where(
+        col(d, "major_holder_pct").notna(), col(d, "major_holder_pct_api"))
+    after = float(col(d, "major_holder_pct").notna().mean())
+    LOG.ok(f"최대주주 지분율 커버리지 {100*before:.1f}% → {100*after:.1f}% "
+           f"(본문 추출 + 구조화 엔드포인트 보강)")
+    return d
+
+
 def _asof_attach(base: pd.DataFrame, R: pd.DataFrame, sec: pd.DataFrame,
                  value_cols: Sequence[str]) -> pd.DataFrame:
     """corp_code 기준 as-of 결합. 결합키 결측 행은 반드시 보존한다(생존자편향 방지)."""
@@ -7765,8 +8025,17 @@ def _attach_disclosure_events(d: pd.DataFrame, dis: pd.DataFrame,
     ev_cols = {"supply_contract": "supply_contract", "cb_issue": "cb_issue",
                "bw_issue": "bw_issue", "major_holder_chg": "major_holder_chg",
                "lawsuit_filed": "lawsuit_filed", "capital_impair": "capital_impair_dis"}
+    # ★ 0.0 으로 초기화하면 '스윕을 안 했다'와 '스윕했는데 해당 없음'이 구별되지 않는다.
+    #   전자는 근거 부재(배제하면 안 됨), 후자는 근거 있음(배제 판단 가능)이다.
+    #   공시 원장이 실제로 덮은 구간에서만 0 을 채우고, 나머지는 결측으로 남긴다.
+    _cov_lo = as_ts_series(D["knowledge_date"]).min()
+    _cov_hi = as_ts_series(D["knowledge_date"]).max()
+    _covered = (as_ts_series(d["signal_date"]) >= _cov_lo) & (as_ts_series(d["signal_date"]) <= _cov_hi)
     for c in ev_cols.values():
-        d[c] = 0.0
+        d[c] = np.where(_covered.to_numpy(), 0.0, np.nan)
+    if int((~_covered).sum()):
+        LOG.info(f"공시 원장이 덮지 못한 {int((~_covered).sum()):,}행은 이벤트를 0 이 아니라 "
+                 f"결측으로 둡니다 (근거 없이 '해당 없음'으로 처리하지 않습니다).")
 
     reb = sorted(pd.unique(as_ts_series(d["rebal"])))
     sig_by_rebal = (d.groupby("rebal", observed=True)["signal_date"].first().to_dict())
@@ -8729,7 +8998,11 @@ def build_forward_returns(execp: pd.DataFrame, cal: pd.DataFrame,
     px = px.dropna(subset=["code", "date", "close"])
     last_px = (px.sort_values("date").groupby("code", observed=True)
                  .agg(last_date=("date", "max"), last_close=("close", "last")))
-    nxt_rebal = {t: (reb[i + 1] if i + 1 < len(reb) else None) for i, t in enumerate(reb)}
+    # ★ 보유구간의 오른쪽 끝은 '다음 체결일'이다. 다음 명목일로 잡으면 그 사이 1~3일의
+    #   이음매에서 폐지된 종목이 창 밖으로 새어 −100% 대신 0% 가 된다(분기마다 반복).
+    _exec_of = {as_ts(r.rebal): as_ts(r.exec_date) for r in cal.itertuples(index=False)}
+    nxt_rebal = {t: (_exec_of.get(reb[i + 1]) if i + 1 < len(reb) else None)
+                 for i, t in enumerate(reb)}
 
     n_liq = n_zero = 0
     if delist:
@@ -8801,17 +9074,45 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
     F = fwd.set_index(["code", "rebal"])["fwd_ret"] if len(fwd) else pd.Series(dtype="float64")
 
     reb = sorted(pd.unique(as_ts_series(cal["rebal"])))
-    nxt_rebal = {t: (reb[i + 1] if i + 1 < len(reb) else None) for i, t in enumerate(reb)}
+    # ★ 보유구간은 [체결일, 다음 체결일) 이지 [명목일, 다음 명목일) 이 아니다.
+    #   3/1 은 삼일절이라 결코 거래일이 아니고 6/1·12/1 도 주말에 자주 걸린다. 두 구간의
+    #   차이(1~3일의 이음매)에서 폐지된 종목은 '창 밖'으로 판정되어 −100% 대신 0% 가 된다.
+    #   즉 분기마다 며칠씩 생존자편향이 새는 뒷문이 열려 있었다.
+    exec_of = {as_ts(r.rebal): as_ts(r.exec_date) for r in cal.itertuples(index=False)}
+    exec_next = {t: (exec_of.get(reb[i + 1]) if i + 1 < len(reb) else None)
+                 for i, t in enumerate(reb)}
     dlmap = ({str(k): as_ts(v) for k, v in dict(delist).items()} if delist
              else dict(QVF_DELIST_MAP))
     prev_w: Dict[str, float] = {}
     rows, holds = [], []
-    n_missing, n_forced_delist = 0, 0
+    n_missing, n_forced_delist, n_empty_q = 0, 0, 0
     for t in reb:
         sub = d[d["rebal"] == t].copy()
         if sub.empty:
-            rows.append({"rebal": t, "ret": 0.0, "ret_gross": 0.0, "n": 0,
-                         "turnover": float(sum(abs(v) for v in prev_w.values())), "cost": 0.0})
+            # ★ 3-A 통과 종목이 0 인 분기는 설계상 발생할 수 있는 정상 결과다(사전등록).
+            #   그런데 예전 코드는 회전율만 기록하고 비용 0, 수익 0 으로 넘겼다 — 전량 청산을
+            #   공짜로 처리하고, 그 분기 보유분의 실제 수익을 통째로 증발시킨 것이다.
+            turn0 = float(sum(abs(v) for v in prev_w.values()))
+            g0 = 0.0
+            nx0 = exec_next.get(t)
+            te0 = exec_of.get(t, t)
+            for c, w in prev_w.items():
+                fr = F.get((c, t), np.nan) if len(F) else np.nan
+                fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan
+                if not np.isfinite(fr):
+                    dl = dlmap.get(str(c))
+                    fr = -1.0 if (dl is not None and nx0 is not None and te0 < dl <= as_ts(nx0)) else 0.0
+                g0 += w * fr
+            c0 = 0.0
+            if apply_costs and prev_w:
+                tax0 = qvf_sell_tax(te0)
+                sp0 = float(np.clip(SLIPPAGE_FLOOR_BPS / 1e4,
+                                    SLIPPAGE_FLOOR_BPS / 1e4, SLIPPAGE_CAP_BPS / 1e4))
+                for w in prev_w.values():
+                    c0 += abs(w) * (COMMISSION_BPS / 1e4 + sp0 / 2.0 + tax0)
+            n_empty_q += 1
+            rows.append({"rebal": t, "ret": g0 - c0, "ret_gross": g0, "n": 0,
+                         "turnover": turn0, "cost": c0})
             prev_w = {}
             continue
         sub["w"] = compute_weights(sub, scheme)
@@ -8821,11 +9122,16 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                    for c in set(w_new) | set(prev_w))
         cost = 0.0
         if apply_costs:
+            # ★ sub.get(없는컬럼) 은 None 을 돌려주고 pd.to_numeric(None) 은 스칼라 nan 이라
+            #   zip 이 "float is not iterable" 로 죽는다. 축소된 강건성 실행에서 실제로 도달한다.
             spread = dict(zip(sub["code"].astype(str),
-                              pd.to_numeric(sub.get("cs_spread"), errors="coerce")))
+                              pd.to_numeric(col(sub, "cs_spread"), errors="coerce")))
             advm = dict(zip(sub["code"].astype(str),
-                            pd.to_numeric(sub.get("adtv"), errors="coerce")))
-            tax = qvf_sell_tax(t)
+                            pd.to_numeric(col(sub, "adtv"), errors="coerce")))
+            # ★ 세율 구간 경계가 2019-06-03 인데 2019-06-01 은 토요일이라 그 분기 체결일이
+            #   정확히 2019-06-03 이다. 명목일로 조회하면 그 한 분기만 구세율(0.30%)이 적용돼
+            #   매도 레그 전체에 20bp 를 과다계상한다. 체결일 기준으로 조회한다.
+            tax = qvf_sell_tax(exec_of.get(t, t))
             for c in set(w_new) | set(prev_w):
                 dw = w_new.get(c, 0.0) - prev_w.get(c, 0.0)
                 if abs(dw) < 1e-9:
@@ -8842,7 +9148,8 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                 cost += abs(dw) * one_way + (abs(dw) * tax if dw < 0 else 0.0)
 
         gross = 0.0
-        nx = nxt_rebal.get(t)
+        nx = exec_next.get(t)
+        t_exec = exec_of.get(t, t)
         for c, w in w_new.items():
             fr = F.get((c, t), np.nan) if len(F) else np.nan
             fr = float(fr) if fr is not None and np.isfinite(fr) else np.nan
@@ -8851,7 +9158,7 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
                 #   소스에서 사라지는 종목이 전부 '무손실'이 된다 — 생존자편향의 뒷문이다.
                 #   보유구간 안에서 폐지가 확인되면 §3.4 규정대로 −100% 를 적용한다.
                 dl = dlmap.get(str(c))
-                if dl is not None and nx is not None and t < dl <= as_ts(nx):
+                if dl is not None and nx is not None and t_exec < dl <= as_ts(nx):
                     fr = -1.0
                     n_forced_delist += 1
                 else:
@@ -8867,9 +9174,13 @@ def run_qbacktest(P: pd.DataFrame, cal: pd.DataFrame, sel_col: str, fwd: pd.Data
     if len(R):
         R["equity"] = (1.0 + R["ret"].fillna(0)).cumprod()
         R["equity_gross"] = (1.0 + R["ret_gross"].fillna(0)).cumprod()
-    if n_forced_delist or n_missing:
-        LOG.debug(f"[{label}] 체결가 결측 보정 — 보유구간 내 폐지 확인 {n_forced_delist:,}건은 "
-                  f"−100%, 그 외 {n_missing:,}건은 0% (마지막 분기 등)")
+    if n_forced_delist or n_missing or n_empty_q:
+        LOG.info(f"[{label}] 체결가 결측 보정 — 보유구간 내 폐지 확인 {n_forced_delist:,}건은 "
+                 f"−100% · 그 외 {n_missing:,}건은 0%(마지막 분기 등) · "
+                 f"선정 0종목 분기 {n_empty_q:,}회(청산비용 부과·보유수익 반영)")
+        if n_missing > max(20, 0.02 * len(holds)):
+            LOG.warn(f"0% 로 처리된 보유가 {n_missing:,}건으로 많습니다. 폐지·거래정지가 "
+                     f"'무손실'로 새고 있을 수 있습니다 — 위 '보유 종료 유형' 표와 함께 보세요.")
     return {"returns": R, "holdings": pd.DataFrame(holds), "label": label, "scheme": scheme,
             "n_forced_delist": n_forced_delist, "n_missing": n_missing}
 
@@ -8958,7 +9269,7 @@ def qvf_benchmarks(cal: pd.DataFrame, px_daily: pd.DataFrame) -> Dict[str, pd.Se
         M = pd.merge_asof(L, cl.rename(columns={"date": "px_date"}),
                           left_on="exec_date", right_on="px_date", direction="forward",
                           tolerance=pd.Timedelta(days=15))
-        s = pd.Series(M["close"].to_numpy(), index=pd.Index(reb, name="rebal")).pct_change().shift(-1)
+        s = pd.Series(M["close"].to_numpy(), index=pd.Index(reb, name="rebal")).pct_change(fill_method=None).shift(-1)
         out[name] = s
     if not out:
         LOG.warn("지수 벤치마크를 받지 못했습니다 — 벤치마크 비교표는 생략됩니다.")
@@ -8978,14 +9289,19 @@ EXPERIMENTS: "OrderedDict[str, dict]" = OrderedDict()
 
 
 def _pval_from_t(t: float, n: int) -> float:
-    """양측 p값. scipy 가 있으면 t분포, 없으면 정규근사."""
+    """★ 단측(우측) p값. 검정 가설은 '알파 > 0' 이다.
+
+    양측 p를 쓰면 t = −4 (강하게 '음의' 알파) 인 실험이 p ≈ 0.0001 로 나와 BH-FDR 를
+    통과하고 표에 '✔ 유의' 로 찍힌다. 손실이 유의하다는 뜻인데 읽는 사람은 정반대로 읽는다.
+    단측이면 같은 실험의 p ≈ 0.9999 로 정확히 기각된다.
+    """
     if t is None or not np.isfinite(t) or n < 3:
         return float("nan")
     try:
         from scipy import stats as _st                       # type: ignore
-        return float(2.0 * (1.0 - _st.t.cdf(abs(t), df=max(1, n - 1))))
+        return float(1.0 - _st.t.cdf(t, df=max(1, n - 1)))
     except Exception:
-        return float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(t) / math.sqrt(2.0)))))
+        return float(1.0 - 0.5 * (1.0 + math.erf(t / math.sqrt(2.0))))
 
 
 def run_experiment(P: pd.DataFrame, cal: pd.DataFrame, fwd: pd.DataFrame, variant: str,
@@ -9078,7 +9394,8 @@ def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q) -> dict:
                      "✔ 유의" if passed[idx] else "✘ 기각"])
     LOG.table(rows, ["실험", "HAC t", "p값", "BH 임계값", f"판정(q={q})"],
               ["l", "r", "r", "r", "c"],
-              title=f"BH-FDR 다중검정 보정 (패밀리 {m}개 · q={q}) — 보정 없이 개별 유의성을 주장하지 않는다")
+              title=f"BH-FDR 다중검정 보정 (패밀리 {m}개 · q={q}, 단측 '알파>0') — "
+                    f"보정 없이 개별 유의성을 주장하지 않는다")
     n_pass = int(passed.sum())
     if n_pass == 0:
         LOG.warn(f"패밀리 {m}개 중 BH-FDR 보정 후 유의한 실험이 하나도 없습니다. "
@@ -9246,6 +9563,9 @@ def report_robustness():
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 PHASE0: Dict[str, Any] = {}
+# Phase 0 판정을 하류가 실제로 읽는다. 표에 "미달 시 행동"을 적어 놓고 아무것도 하지 않으면
+# 그 표는 거짓말이 된다(적대적 감사가 지적한 그대로).
+PHASE0_FLOW_OK: Optional[bool] = None
 
 
 def report_phase0(fin_cov: float, flow_cov: float, dart_parse: float,
@@ -9255,7 +9575,10 @@ def report_phase0(fin_cov: float, flow_cov: float, dart_parse: float,
                "게이트 실패 시 해당 컴포넌트만 비활성화한다. fin_cov 실패만 전략 중단 사유다.")
     spec = [
         ("fin_cov", fin_cov, 0.90, "U-1000 재무데이터 가용률", "게이트", "전략 중단"),
-        ("flow_cov", flow_cov, 0.95, "외국인·기관 순매수 가용률", "게이트", "F축 비활성 → VQF=VQ"),
+        # ★ '미달 시 행동' 칸은 코드가 실제로 하는 일과 정확히 일치해야 한다. 하지도 않을
+        #   조치를 적어두면 그 표 자체가 거짓 보증이 된다(적대적 감사가 잡아낸 유형).
+        ("flow_cov", flow_cov, 0.95, "외국인·기관 순매수 가용률", "게이트",
+         "VQF 는 참고 산출, §9 C1·C2 판정 불가"),
         ("dart_parse_rate", dart_parse, 0.80, "DART 본문 기계판독 성공률", "게이트",
          "사유 분해 보고 후 진행(§2.2)"),
         ("report_cov_200", report_cov_200, None, "U-200 내 리포트 ≥1건 비율", "측정만", "—"),
@@ -9279,6 +9602,11 @@ def report_phase0(fin_cov: float, flow_cov: float, dart_parse: float,
     LOG.info("§2.2 — report_cov_200 이 낮게 나오는 것은 예상된 결과이며 실패가 아닙니다. "
              "애널리스트 축은 결측 허용 설계(§6.2)이므로 그대로 진행하되 실측치를 보고합니다.")
     PHASE0.update(verdict)
+    globals()["PHASE0_FLOW_OK"] = verdict.get("flow_cov", {}).get("pass")
+    if verdict.get("flow_cov", {}).get("pass") is False:
+        LOG.warn("flow_cov 게이트 미달 — 수급(F) 축의 표본이 부분적입니다. VARIANT-VQF 는 "
+                 "참고용으로 끝까지 산출하되, §9 의 C1·C2 는 '판정 불가'로 처리합니다. "
+                 "부분 표본으로 계산한 Sharpe 차이를 채택 근거로 쓰지 않기 위함입니다(§10.1).")
     return verdict
 
 
@@ -9293,12 +9621,22 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
     s_vqf = (e_vqf.get("net") or {}).get("Sharpe", np.nan)
 
     # C1: 비용 차감 후 Sharpe 우위
-    c1 = bool(np.isfinite(s_vq) and np.isfinite(s_vqf) and s_vqf > s_vq)
-    c1_d = (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f}"
-            if np.isfinite(s_vq) and np.isfinite(s_vqf) else "산출 불가")
+    #  ★ flow_cov 게이트가 미달이면 F축 표본 자체가 부분적이라 이 비교가 성립하지 않는다.
+    #    숫자는 보여주되 판정은 내리지 않는다 — 근거 없는 채택/기각 둘 다 §10.1 위반이다.
+    _flow_ok = globals().get("PHASE0_FLOW_OK")
+    if _flow_ok is False:
+        c1, c1_d = None, (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f} — 단, flow_cov 게이트 미달로 "
+                          f"판정 불가" if np.isfinite(s_vqf) and np.isfinite(s_vq)
+                          else "flow_cov 게이트 미달 — 판정 불가")
+    else:
+        c1 = bool(np.isfinite(s_vq) and np.isfinite(s_vqf) and s_vqf > s_vq)
+        c1_d = (f"VQF {s_vqf:.3f} vs VQ {s_vq:.3f}"
+                if np.isfinite(s_vq) and np.isfinite(s_vqf) else "산출 불가")
 
     # C2: 그 차이가 BH-FDR 보정 후에도 유의
-    if fdr_pass is None:
+    if _flow_ok is False:
+        c2, c2_d = None, "flow_cov 게이트 미달 — 판정 불가"
+    elif fdr_pass is None:
         c2, c2_d = None, "BH-FDR 결과 없음"
     else:
         c2 = bool(fdr_pass.get(exp_vqf, False)) and c1
@@ -9338,6 +9676,7 @@ def report_flow_verdict(cmp_res: dict, exp_vq: str = "VQ-full", exp_vqf: str = "
                for k, d, ok, det in items],
               ["조건", "내용", "판정", "근거 수치"], ["c", "l", "c", "l"], maxw=52)
 
+    # ★ '판정 불가(None)'를 충족으로 세지 않는다. 모르는 것을 근거로 채택하면 안 된다.
     all_ok = all(ok is True for _k, _d, ok, _t in items)
     unknown = [k for k, _d, ok, _t in items if ok is None]
     if all_ok:
@@ -9673,7 +10012,32 @@ def _q7():
     s = _inspect.getsource(QVFVault)
     if re.search(r"os\.(remove|unlink|rmdir)|shutil\.rmtree", s):
         raise ContractViolation("QVFVault 에 파일 삭제 호출이 있습니다 — 절대 1원칙 위반.")
-    return "삭제 API 없음 · 쓰기 함수는 self.root 만 사용"
+
+    # ★ 소스 grep 만으로는 '상속받은 쓰기 코드가 미러 경로를 만들 수 있는가'를 못 본다.
+    #   실제로 미러에 쓰려고 시도시켜 보고, 막히는지 확인한다.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        wroot, mroot = os.path.join(td, "w"), os.path.join(td, "m")
+        os.makedirs(os.path.join(mroot, GDRIVE_SHARED_NS, "table"), exist_ok=True)
+        v = QVFVault(wroot, "TEST", [mroot])
+        blocked = False
+        try:
+            v._wpath(os.path.join(mroot, GDRIVE_SHARED_NS, "table", "x.parquet"))
+        except PermissionError:
+            blocked = True
+        if not blocked:
+            raise ContractViolation("미러 경로가 쓰기 경로 검증을 통과했습니다 — "
+                                    "로컬 미러가 읽기 전용이라는 보장이 구조적이지 않습니다.")
+        # 미러의 손상 파일을 읽어도 원본을 개명하지 않아야 한다.
+        bad = os.path.join(mroot, GDRIVE_SHARED_NS, "table", "broken.parquet")
+        open(bad, "wb").write(b"")                       # 0바이트 = 드라이브 동기화 미완 상황
+        v.get_table("broken", scope="shared")
+        if not os.path.exists(bad):
+            raise ContractViolation("미러의 파일이 사라졌습니다 — 읽기가 파일을 파괴했습니다.")
+        if [f for f in os.listdir(os.path.dirname(bad)) if ".corrupt" in f]:
+            raise ContractViolation("미러 파일이 .corrupt 로 개명되었습니다 — "
+                                    "read_parquet_safe 가 미러에 도달했습니다(절대 1원칙 위반).")
+    return "삭제 API 없음 · 미러 쓰기 차단 확인 · 미러 손상파일 읽어도 원본 보존"
 
 
 @_contract("Q8", "결정성 — 같은 입력에 같은 선정 (동점 처리가 행 순서에 의존하지 않는다)")
@@ -9757,7 +10121,18 @@ def _q12():
     if 'ns["shared"]' not in s:
         raise ContractViolation("DartQuota 저널이 공용 스코프가 아닙니다 — 전략 간 사용량이 "
                                 "합산되지 않아 한도를 넘깁니다.")
-    return "실측 기반 · 공용 저널로 전략 간 합산"
+    if "_confirm_exhaustion" not in s:
+        raise ContractViolation("020(일일한도)과 021(요청오류)을 구분하지 않습니다 — "
+                                "021 을 한도로 기록하면 거짓 상한이 공용 저널을 오염시킵니다.")
+    # ★ 조립본에서 '실효' 상수를 확인한다. 공용 코어(12_ingest_dart_fin)가 헤더보다 뒤에서
+    #   DART_DAILY_LIMIT = 19_000 으로 되돌려 놓기 때문에, 선언만 보면 통과하고 실제로는
+    #   사용자가 거부한 값이 살아 있다. 계약은 선언이 아니라 실효값을 봐야 한다.
+    if int(DART_DAILY_LIMIT) != int(DART_DAILY_LIMIT_HINT):
+        raise ContractViolation(
+            f"실효 DART_DAILY_LIMIT 이 {DART_DAILY_LIMIT:,} 로 헤더 값 "
+            f"{DART_DAILY_LIMIT_HINT:,} 과 다릅니다 — 조립 순서상 뒤에 오는 하드코딩이 "
+            f"헤더를 이기고 있습니다. DartQuota 생성 시 되찾아오는지 확인하세요.")
+    return f"실측 기반 · 공용 저널 합산 · 020/021 구분 · 실효 한도 {DART_DAILY_LIMIT:,}"
 
 
 def run_contract_tests(strict: bool = True) -> bool:
@@ -10120,6 +10495,8 @@ def run_rehearsal(strict: bool = True) -> bool:
                 {"corp_code": ["00126380"], "bsns_year": [2024],
                  "rcept_no": ["20240101000001"], "rcept_dt": [as_ts("2024-03-25")]}))),
             ("시총 스냅샷", lambda: fetch_krx_cap_snapshots([as_ts("2024-03-01")])),
+            ("최대주주 지분율", lambda: fetch_major_holder_stake(pd.DataFrame(
+                {"corp_code": ["00126380"], "bsns_year": [2024]}))),
             ("XML→텍스트 판별", lambda: _xml_to_text(b"not a zip at all")),
             ("완료형 사실 판정", lambda: (
                 is_completed_fact("2024년 3월 15일 특허 3건을 등록하였다."),
@@ -10335,6 +10712,7 @@ def build_panel_pass2(P: pd.DataFrame, ctx: dict, cal: pd.DataFrame) -> pd.DataF
     """[6]~[10] — DART 하드팩트 · TONE · 2차필터 입력 · 3-A 규칙."""
     P = build_nonfin_panel(P, ctx.get("facts", pd.DataFrame()), ctx.get("dis", pd.DataFrame()),
                            ctx.get("fq", pd.DataFrame()), ctx["sec"])
+    P = attach_major_holder(P, ctx.get("holder", pd.DataFrame()), ctx["sec"])
     mom = build_momentum(cal, ctx["px"])
     P = P.merge(mom, on=["code", "rebal"], how="left")
     tp = build_tp_revision(ctx.get("links", pd.DataFrame()), P, cal)
@@ -10460,6 +10838,16 @@ def main() -> dict:
         facts, pstats = fetch_annual_report_facts(targets)
         ctx["facts"] = facts
         ctx["parse_rate"] = report_parse_rate(facts, pstats)
+        # 3-A 의 '최대주주 지분율 < 15%' 는 하드 규칙인데 본문 표 레이아웃에 따라 추출 실패가
+        # 잦다. 실패한 (회사, 연도) 에만 구조화 엔드포인트로 보강한다(전량 호출은 낭비).
+        need_h = pd.DataFrame(columns=["corp_code", "bsns_year"])
+        if len(facts):
+            miss = facts[pd.to_numeric(facts.get("major_holder_pct"), errors="coerce").isna()]
+            if len(miss):
+                need_h = miss[["corp_code", "bsns_year"]].dropna().drop_duplicates()
+        elif len(targets):
+            need_h = targets[["corp_code", "bsns_year"]].dropna().drop_duplicates()
+        ctx["holder"] = fetch_major_holder_stake(need_h)
 
     with PIPE.stage("L1.TONE", "[7] 리포트 본문 · TONE 분류기 (확장윈도우)", "L1",
                     budget_s=5400, critical=False):

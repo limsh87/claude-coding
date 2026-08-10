@@ -12,14 +12,19 @@ EXPERIMENTS: "OrderedDict[str, dict]" = OrderedDict()
 
 
 def _pval_from_t(t: float, n: int) -> float:
-    """양측 p값. scipy 가 있으면 t분포, 없으면 정규근사."""
+    """★ 단측(우측) p값. 검정 가설은 '알파 > 0' 이다.
+
+    양측 p를 쓰면 t = −4 (강하게 '음의' 알파) 인 실험이 p ≈ 0.0001 로 나와 BH-FDR 를
+    통과하고 표에 '✔ 유의' 로 찍힌다. 손실이 유의하다는 뜻인데 읽는 사람은 정반대로 읽는다.
+    단측이면 같은 실험의 p ≈ 0.9999 로 정확히 기각된다.
+    """
     if t is None or not np.isfinite(t) or n < 3:
         return float("nan")
     try:
         from scipy import stats as _st                       # type: ignore
-        return float(2.0 * (1.0 - _st.t.cdf(abs(t), df=max(1, n - 1))))
+        return float(1.0 - _st.t.cdf(t, df=max(1, n - 1)))
     except Exception:
-        return float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(t) / math.sqrt(2.0)))))
+        return float(1.0 - 0.5 * (1.0 + math.erf(t / math.sqrt(2.0))))
 
 
 def run_experiment(P: pd.DataFrame, cal: pd.DataFrame, fwd: pd.DataFrame, variant: str,
@@ -112,7 +117,8 @@ def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q) -> dict:
                      "✔ 유의" if passed[idx] else "✘ 기각"])
     LOG.table(rows, ["실험", "HAC t", "p값", "BH 임계값", f"판정(q={q})"],
               ["l", "r", "r", "r", "c"],
-              title=f"BH-FDR 다중검정 보정 (패밀리 {m}개 · q={q}) — 보정 없이 개별 유의성을 주장하지 않는다")
+              title=f"BH-FDR 다중검정 보정 (패밀리 {m}개 · q={q}, 단측 '알파>0') — "
+                    f"보정 없이 개별 유의성을 주장하지 않는다")
     n_pass = int(passed.sum())
     if n_pass == 0:
         LOG.warn(f"패밀리 {m}개 중 BH-FDR 보정 후 유의한 실험이 하나도 없습니다. "

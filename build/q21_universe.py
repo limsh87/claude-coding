@@ -470,8 +470,11 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
         hi_ = px["high"].where(px["high"] > 0)
         lo_ = px["low"].where(px["low"] > 0)
         hl = np.log(hi_ / lo_)
-        hl_n = g["high"].shift(-1)
-        lo_n = g["low"].shift(-1)
+        # ★ CS 는 2일 추정량이다. (t, t+1) 로 잡으면 signal_date 에서 읽는 스프레드가
+        #   '체결일의 고저'를 포함하게 되어 비용 모델에 1일치 미래정보가 들어간다.
+        #   (t-1, t) 로 잡으면 동일한 추정량이면서 t 까지의 정보만 쓴다.
+        hl_n = g["high"].shift(1)
+        lo_n = g["low"].shift(1)
         hl2 = np.log(hl_n.where(hl_n > 0) / lo_n.where(lo_n > 0))
         beta = hl ** 2 + hl2 ** 2
         h2 = pd.concat([hi_, hl_n.where(hl_n > 0)], axis=1).max(axis=1)
@@ -482,7 +485,7 @@ def build_adtv_panel(cal: pd.DataFrame, px_daily: pd.DataFrame,
     px["_cs"] = pd.Series(s_cs, index=px.index).replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
     px["cs_spread"] = (px.groupby("code", observed=True)["_cs"]
                          .transform(lambda s: s.rolling(window, min_periods=max(10, window // 3)).mean()))
-    px["ret1d"] = g["close"].pct_change()
+    px["ret1d"] = g["close"].pct_change(fill_method=None)
     px["vol_d"] = px.groupby("code", observed=True)["ret1d"].transform(
         lambda s: s.rolling(INVVOL_WINDOW_DAYS, min_periods=max(20, INVVOL_WINDOW_DAYS // 3)).std())
 

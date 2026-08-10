@@ -197,7 +197,32 @@ def _q7():
     s = _inspect.getsource(QVFVault)
     if re.search(r"os\.(remove|unlink|rmdir)|shutil\.rmtree", s):
         raise ContractViolation("QVFVault 에 파일 삭제 호출이 있습니다 — 절대 1원칙 위반.")
-    return "삭제 API 없음 · 쓰기 함수는 self.root 만 사용"
+
+    # ★ 소스 grep 만으로는 '상속받은 쓰기 코드가 미러 경로를 만들 수 있는가'를 못 본다.
+    #   실제로 미러에 쓰려고 시도시켜 보고, 막히는지 확인한다.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        wroot, mroot = os.path.join(td, "w"), os.path.join(td, "m")
+        os.makedirs(os.path.join(mroot, GDRIVE_SHARED_NS, "table"), exist_ok=True)
+        v = QVFVault(wroot, "TEST", [mroot])
+        blocked = False
+        try:
+            v._wpath(os.path.join(mroot, GDRIVE_SHARED_NS, "table", "x.parquet"))
+        except PermissionError:
+            blocked = True
+        if not blocked:
+            raise ContractViolation("미러 경로가 쓰기 경로 검증을 통과했습니다 — "
+                                    "로컬 미러가 읽기 전용이라는 보장이 구조적이지 않습니다.")
+        # 미러의 손상 파일을 읽어도 원본을 개명하지 않아야 한다.
+        bad = os.path.join(mroot, GDRIVE_SHARED_NS, "table", "broken.parquet")
+        open(bad, "wb").write(b"")                       # 0바이트 = 드라이브 동기화 미완 상황
+        v.get_table("broken", scope="shared")
+        if not os.path.exists(bad):
+            raise ContractViolation("미러의 파일이 사라졌습니다 — 읽기가 파일을 파괴했습니다.")
+        if [f for f in os.listdir(os.path.dirname(bad)) if ".corrupt" in f]:
+            raise ContractViolation("미러 파일이 .corrupt 로 개명되었습니다 — "
+                                    "read_parquet_safe 가 미러에 도달했습니다(절대 1원칙 위반).")
+    return "삭제 API 없음 · 미러 쓰기 차단 확인 · 미러 손상파일 읽어도 원본 보존"
 
 
 @_contract("Q8", "결정성 — 같은 입력에 같은 선정 (동점 처리가 행 순서에 의존하지 않는다)")
@@ -281,7 +306,18 @@ def _q12():
     if 'ns["shared"]' not in s:
         raise ContractViolation("DartQuota 저널이 공용 스코프가 아닙니다 — 전략 간 사용량이 "
                                 "합산되지 않아 한도를 넘깁니다.")
-    return "실측 기반 · 공용 저널로 전략 간 합산"
+    if "_confirm_exhaustion" not in s:
+        raise ContractViolation("020(일일한도)과 021(요청오류)을 구분하지 않습니다 — "
+                                "021 을 한도로 기록하면 거짓 상한이 공용 저널을 오염시킵니다.")
+    # ★ 조립본에서 '실효' 상수를 확인한다. 공용 코어(12_ingest_dart_fin)가 헤더보다 뒤에서
+    #   DART_DAILY_LIMIT = 19_000 으로 되돌려 놓기 때문에, 선언만 보면 통과하고 실제로는
+    #   사용자가 거부한 값이 살아 있다. 계약은 선언이 아니라 실효값을 봐야 한다.
+    if int(DART_DAILY_LIMIT) != int(DART_DAILY_LIMIT_HINT):
+        raise ContractViolation(
+            f"실효 DART_DAILY_LIMIT 이 {DART_DAILY_LIMIT:,} 로 헤더 값 "
+            f"{DART_DAILY_LIMIT_HINT:,} 과 다릅니다 — 조립 순서상 뒤에 오는 하드코딩이 "
+            f"헤더를 이기고 있습니다. DartQuota 생성 시 되찾아오는지 확인하세요.")
+    return f"실측 기반 · 공용 저널 합산 · 020/021 구분 · 실효 한도 {DART_DAILY_LIMIT:,}"
 
 
 def run_contract_tests(strict: bool = True) -> bool:
