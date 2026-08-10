@@ -244,6 +244,34 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 # 종목 → 시장(KOSPI/KOSDAQ). 종목 마스터에서 채운다. 비어 있으면 예전처럼 둘 다 시도한다.
 CODE_MARKET: Dict[str, str] = {}
+CODE_LISTED: Dict[str, pd.Timestamp] = {}     # 종목 → 상장일
+CODE_DELISTED: Dict[str, pd.Timestamp] = {}   # 종목 → 폐지일
+
+
+def set_code_dates(sec: pd.DataFrame):
+    """상장일·폐지일 표. '캐시가 완결인가'를 판정하는 1순위 증거다.
+
+    ★ 왜 필요한가: 캐시 최소일이 요청 시작일보다 늦을 때, 그것이 '결손'인지 '그 종목의
+      실제 최초 거래일'인지 구분해야 한다. 예전에는 별도 원장(price_fetch_attempts)에만
+      의존했는데, 그 원장은 구버전에서 실패만 기록했고 다른 PC/전략의 캐시를 물려받으면
+      아예 비어 있다. 실측: 캐시 696만행·3,497종목이 있는데 원장에 없다는 이유로 3,492종목을
+      '처음부터 다시' 받았다. 상장일은 이미 종목 마스터에 있다 — 그걸 쓰는 게 맞다.
+    """
+    lo, ld = CODE_LISTED, CODE_DELISTED
+    lo.clear(); ld.clear()
+    cols = {c.lower(): c for c in sec.columns}
+    c_list = cols.get("listing_date") or cols.get("listed_date") or cols.get("list_date")
+    c_del = cols.get("delisting_date") or cols.get("delist_date")
+    codes = sec["code"].astype(str)
+    if c_list:
+        for c, v in zip(codes, as_ts_series(sec[c_list])):
+            if pd.notna(v):
+                lo[c] = v
+    if c_del:
+        for c, v in zip(codes, as_ts_series(sec[c_del])):
+            if pd.notna(v):
+                ld[c] = v
+    LOG.debug(f"상장일 {len(lo):,}종목 · 폐지일 {len(ld):,}종목 확보 — 캐시 완결성 판정에 사용")
 
 
 def set_code_market(sec: pd.DataFrame):
@@ -363,10 +391,23 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             #   실측: 이 조건 하나로 1,974종목이 매 실행 재수집되어 55분을 썼다.
             #   → 이미 이 시작일(또는 그 이전)로 요청해 본 적이 있으면 mn 이 곧 그 종목의
             #     확정된 최초 거래일이다. 다시 물어도 답은 같다.
+            #   ★ 증거는 세 가지다. 강한 순서대로 본다.
+            #     ① 상장일: 캐시 최소일이 상장일 근처면 그건 결손이 아니라 완결이다. 가장 강하다.
+            #     ② 폐지일: 요청 시작일 이전에 이미 폐지된 종목은 받을 데이터 자체가 없다.
+            #     ③ 시도 원장: 위 둘을 모르는 종목의 마지막 수단.
+            #   예전에는 ③만 봤다. 그런데 원장은 구버전에서 실패만 기록했고 다른 PC/전략의
+            #   캐시를 물려받으면 비어 있다 — 실측으로 캐시 3,497종목 중 3,492종목이
+            #   '원장에 없다'는 이유만으로 전량 재수집됐다. 상장일은 이미 손에 있었다.
+            _L = CODE_LISTED.get(c)
+            _D = CODE_DELISTED.get(c)
             _p = attempts.get(c)
             _asked = _p.get("frm") if _p else None
-            if _asked is not None and pd.notna(_asked) and _asked <= start_ts + pd.Timedelta(days=10):
-                n_ipo += 1
+            if _L is not None and pd.notna(_L) and mn <= as_ts(_L) + pd.Timedelta(days=10):
+                n_ipo += 1                      # ① 상장일 = 캐시 최소일 → 완결
+            elif _D is not None and pd.notna(_D) and as_ts(_D) <= start_ts:
+                n_ipo += 1                      # ② 요청 구간 전에 폐지 → 받을 것이 없음
+            elif _asked is not None and pd.notna(_asked) and _asked <= start_ts + pd.Timedelta(days=10):
+                n_ipo += 1                      # ③ 같은 시작일로 이미 물어봤다
             else:
                 todo.append((c, start))
                 n_back += 1

@@ -268,7 +268,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.1021"
+BUILD_VERSION      = "qvf1.20260810.1037"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -481,16 +481,43 @@ RNG = np.random.default_rng(SEED)
 
 # 선택 모듈 핸들 (자격증명은 위 _ensure_deps 앞에서 이미 주입됨)
 fdr = pykrx_stock = yf = fitz = pdfplumber = rapidfuzz_fuzz = smapi = None
-if OPT.get("FinanceDataReader"):
+
+# ★★ import 실패를 조용히 삼키면 안 된다 ★★
+#   예전에는 `except Exception: pykrx_stock = None` 이었다. 그러면 '설치는 됐지만 import 가
+#   깨진' 상태(파이썬 3.14 + 윈도우에서 실제로 발생)가 '패키지 없음'과 구별되지 않는다.
+#   상단 표에는 "pykrx 설치됨"으로 뜨는데 실제로는 None 이라, 시총 스냅샷이 0건이 되고
+#   → 후보를 못 좁혀 전 종목 5,398개 일봉을 받는 폭주로 이어졌다. 사용자는 원인을 볼 수
+#   없었다. 실패 사유를 반드시 남기고, 능력 표가 '실물 import 결과'를 말하게 한다.
+IMPORT_FAILURES: Dict[str, str] = {}
+
+
+def _opt_import(pkg: str, fn):
+    if not OPT.get(pkg):
+        return None
     try:
-        import FinanceDataReader as fdr           # type: ignore
-    except Exception:
-        fdr = None
-if OPT.get("pykrx"):
-    try:
-        from pykrx import stock as pykrx_stock    # type: ignore
-    except Exception:
-        pykrx_stock = None
+        return fn()
+    except BaseException as e:                    # noqa — SystemExit/ImportError 모두 잡는다
+        IMPORT_FAILURES[pkg] = f"{type(e).__name__}: {e}"
+        return None
+
+
+def _import_fdr():
+    import FinanceDataReader as _m                # type: ignore
+    # FDR 은 종목마다 '"000010" invalid symbol or has no data' 를 직접 출력한다.
+    # 폐지 종목이 정상적으로 섞인 소형주 백테스트에서 수천 줄이 되어 진짜 경고를 밀어낸다.
+    for _n in ("FinanceDataReader", "financedatareader", "requests", "urllib3"):
+        logging.getLogger(_n).setLevel(logging.CRITICAL)
+        logging.getLogger(_n).propagate = False
+    return _m
+
+
+def _import_pykrx():
+    from pykrx import stock as _m                 # type: ignore
+    return _m
+
+
+fdr = _opt_import("FinanceDataReader", _import_fdr)
+pykrx_stock = _opt_import("pykrx", _import_pykrx)
 if OPT.get("yfinance"):
     try:
         import yfinance as yf                     # type: ignore
@@ -4167,6 +4194,34 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
 
 # 종목 → 시장(KOSPI/KOSDAQ). 종목 마스터에서 채운다. 비어 있으면 예전처럼 둘 다 시도한다.
 CODE_MARKET: Dict[str, str] = {}
+CODE_LISTED: Dict[str, pd.Timestamp] = {}     # 종목 → 상장일
+CODE_DELISTED: Dict[str, pd.Timestamp] = {}   # 종목 → 폐지일
+
+
+def set_code_dates(sec: pd.DataFrame):
+    """상장일·폐지일 표. '캐시가 완결인가'를 판정하는 1순위 증거다.
+
+    ★ 왜 필요한가: 캐시 최소일이 요청 시작일보다 늦을 때, 그것이 '결손'인지 '그 종목의
+      실제 최초 거래일'인지 구분해야 한다. 예전에는 별도 원장(price_fetch_attempts)에만
+      의존했는데, 그 원장은 구버전에서 실패만 기록했고 다른 PC/전략의 캐시를 물려받으면
+      아예 비어 있다. 실측: 캐시 696만행·3,497종목이 있는데 원장에 없다는 이유로 3,492종목을
+      '처음부터 다시' 받았다. 상장일은 이미 종목 마스터에 있다 — 그걸 쓰는 게 맞다.
+    """
+    lo, ld = CODE_LISTED, CODE_DELISTED
+    lo.clear(); ld.clear()
+    cols = {c.lower(): c for c in sec.columns}
+    c_list = cols.get("listing_date") or cols.get("listed_date") or cols.get("list_date")
+    c_del = cols.get("delisting_date") or cols.get("delist_date")
+    codes = sec["code"].astype(str)
+    if c_list:
+        for c, v in zip(codes, as_ts_series(sec[c_list])):
+            if pd.notna(v):
+                lo[c] = v
+    if c_del:
+        for c, v in zip(codes, as_ts_series(sec[c_del])):
+            if pd.notna(v):
+                ld[c] = v
+    LOG.debug(f"상장일 {len(lo):,}종목 · 폐지일 {len(ld):,}종목 확보 — 캐시 완결성 판정에 사용")
 
 
 def set_code_market(sec: pd.DataFrame):
@@ -4286,10 +4341,23 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             #   실측: 이 조건 하나로 1,974종목이 매 실행 재수집되어 55분을 썼다.
             #   → 이미 이 시작일(또는 그 이전)로 요청해 본 적이 있으면 mn 이 곧 그 종목의
             #     확정된 최초 거래일이다. 다시 물어도 답은 같다.
+            #   ★ 증거는 세 가지다. 강한 순서대로 본다.
+            #     ① 상장일: 캐시 최소일이 상장일 근처면 그건 결손이 아니라 완결이다. 가장 강하다.
+            #     ② 폐지일: 요청 시작일 이전에 이미 폐지된 종목은 받을 데이터 자체가 없다.
+            #     ③ 시도 원장: 위 둘을 모르는 종목의 마지막 수단.
+            #   예전에는 ③만 봤다. 그런데 원장은 구버전에서 실패만 기록했고 다른 PC/전략의
+            #   캐시를 물려받으면 비어 있다 — 실측으로 캐시 3,497종목 중 3,492종목이
+            #   '원장에 없다'는 이유만으로 전량 재수집됐다. 상장일은 이미 손에 있었다.
+            _L = CODE_LISTED.get(c)
+            _D = CODE_DELISTED.get(c)
             _p = attempts.get(c)
             _asked = _p.get("frm") if _p else None
-            if _asked is not None and pd.notna(_asked) and _asked <= start_ts + pd.Timedelta(days=10):
-                n_ipo += 1
+            if _L is not None and pd.notna(_L) and mn <= as_ts(_L) + pd.Timedelta(days=10):
+                n_ipo += 1                      # ① 상장일 = 캐시 최소일 → 완결
+            elif _D is not None and pd.notna(_D) and as_ts(_D) <= start_ts:
+                n_ipo += 1                      # ② 요청 구간 전에 폐지 → 받을 것이 없음
+            elif _asked is not None and pd.notna(_asked) and _asked <= start_ts + pd.Timedelta(days=10):
+                n_ipo += 1                      # ③ 같은 시작일로 이미 물어봤다
             else:
                 todo.append((c, start))
                 n_back += 1
@@ -12055,10 +12123,31 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
                       ["항목", "종목수"], ["l", "r"],
                       title="일봉 수집 대상 축소 — 시총 하위 후보만 받는다(§3.1)")
         else:
-            cand = all_codes
-            LOG.warn("시총 스냅샷이 없어 후보를 좁히지 못했습니다 — 전 종목 일봉을 받습니다. "
-                     "(스냅샷 실패 사유를 먼저 확인하세요. 이 경로는 매우 느립니다)")
+            # ★★ 예전에는 여기서 '전 종목 일봉을 받습니다'로 확대했다 ★★
+            #   실패는 작업을 좁혀야지 넓히면 안 된다. 실측으로 pykrx import 하나가 깨지자
+            #   후보 3,100 → 전 종목 5,398 로 늘고, 각 종목이 폴백 체인을 전부 타면서
+            #   수집이 수십 분 폭주했다. 게다가 U-1000 은 '시총 하위 1000'으로 정의되므로
+            #   시총이 없으면 유니버스를 만들 수 없다 — 느린 게 아니라 틀린 결과가 나온다.
+            _why = []
+            if pykrx_stock is None:
+                _why.append("pykrx 사용 불가" + (f" ({IMPORT_FAILURES.get('pykrx','미설치')})"
+                                                if "pykrx" in IMPORT_FAILURES else " (미설치)"))
+            if not getattr(KRX, "session_ok", False):
+                _why.append(f"KRX 마켓플레이스 미사용({getattr(KRX, 'status', '?')})")
+            raise KillCriteria(
+                "PIT 시가총액을 어느 경로로도 확보하지 못했습니다 — U-1000 은 '시총 하위 "
+                f"{U1000_N:,}'으로 정의되므로 유니버스를 만들 수 없습니다.\n"
+                f"  사유: {' · '.join(_why) or '시총 스냅샷 0건'}\n"
+                "  전 종목 일봉을 대신 받는 것은 해결이 아닙니다 — 시총 없이는 어차피 "
+                "유니버스가 구성되지 않고, 수집만 수 배로 늘어납니다.\n"
+                "  조치: ① pykrx 를 쓸 수 있게 하거나(대개 파이썬 버전 호환), "
+                "② 시총 스냅샷이 든 캐시(krx_marketcap_snapshots)를 미러 경로에 두거나, "
+                "③ KRX 마켓플레이스 로그인을 성공시키십시오. "
+                "이미 받아둔 일봉 캐시는 그대로 보존되며 재실행 시 이어받습니다.")
         set_code_market(ctx["sec"])
+        # 상장일·폐지일을 넘긴다. '캐시 최소일이 요청 시작일보다 늦다'가 결손인지 완결인지를
+        # 가르는 1순위 증거이며, 이게 없으면 별도 원장에만 기대다가 캐시 전체를 다시 받는다.
+        set_code_dates(ctx["sec"])
         px = fetch_prices(cand,
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
                           BACKTEST_END)
@@ -12287,8 +12376,23 @@ def main() -> dict:
                ["병렬", f"IO {N_WORKERS_IO} 스레드 / CPU {N_CPU} " +
                         ("프로세스(fork)" if CAN_FORK else "스레드(fork 불가 → 폴백)")],
                ["실행 모드", RUN_MODE], ["시드", str(SEED)],
-               ["선택 패키지", ", ".join(k for k, v in OPT.items() if v) or "없음"]],
+               # ★ '설치됨'이 아니라 '실제로 import 되어 쓸 수 있는가'를 적는다. 예전 표는
+               #   설치 여부만 봤고, 파이썬 3.14+윈도우에서 pykrx import 가 깨졌는데도
+               #   "pykrx" 라고 표시했다 — 사용자는 원인을 볼 방법이 없었다.
+               ["사용 가능 패키지", ", ".join(
+                   n for n, o in (("FinanceDataReader", fdr), ("pykrx", pykrx_stock),
+                                  ("yfinance", yf), ("pymupdf", fitz),
+                                  ("pdfplumber", pdfplumber)) if o is not None) or "없음"]],
               ["항목", "값"], ["l", "l"], title="실행 환경")
+    if IMPORT_FAILURES:
+        LOG.table([[k, v[:88]] for k, v in IMPORT_FAILURES.items()],
+                  ["패키지", "import 실패 사유"], ["l", "l"],
+                  title="⚠ 설치는 되어 있으나 import 가 실패한 패키지 — 해당 수집 경로가 죽습니다")
+        if "pykrx" in IMPORT_FAILURES:
+            LOG.warn("pykrx 가 없으면 PIT 시가총액 스냅샷을 받을 수 없고, U-1000 은 시총 랭크로 "
+                     "정의되므로 유니버스 자체가 구성되지 않습니다. 위 사유를 먼저 해결하세요 "
+                     "(대개 파이썬 버전 호환 문제입니다 — `pip install -U pykrx` 또는 파이썬 "
+                     "3.12 환경 사용).")
 
     with PIPE.stage("L0.VAULT", "캐시 연결 (드라이브 쓰기 + 로컬 미러 읽기)", "L0", budget_s=600):
         root, mode, mirrors = qvf_resolve_roots()
