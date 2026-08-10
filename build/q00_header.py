@@ -213,6 +213,7 @@ RATE_LIMIT_QPS = {      # 소스별 초당 요청 상한 — 차단 방지용. �
     "kind":      2.0,
     "generic":   3.0,
 }
+VAULT_BACKUP_MAX_BYTES = 64 * 1024 * 1024   # 이보다 크면 회차별 백업 복사를 생략(원자적 교체로 보호). 삭제는 하지 않는다.
 MEM_BUDGET_GB  = 6.0
 CIRCUIT_BREAKER_FAILS = 40   # §0.3 서킷 브레이커: 한 수집 스테이지에서 연속 실패 N회 → 중단
 

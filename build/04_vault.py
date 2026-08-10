@@ -288,7 +288,19 @@ class Vault:
             bak = os.path.join(self.ns[scope], "index", "_backup",
                                f"{name}.{_dt.datetime.now():%Y%m%d_%H%M%S}.parquet")
             try:
-                shutil.copy2(path, bak)
+                # ★ 대용량 테이블(일봉 패널·DART 원시계정 등)은 백업 전체복사가 드라이브에
+                #   파일 크기의 2배 I/O 를 만든다. 몇 행 추가하려고 수백 MB 를 두 번 쓴다.
+                #   atomic_write_parquet 이 이미 임시파일→교체라 '쓰다 만 파일'은 생기지
+                #   않으므로, 큰 파일은 복사를 건너뛰고 직전 1개만 보존한다.
+                _sz = os.path.getsize(path)
+                if _sz > VAULT_BACKUP_MAX_BYTES:
+                    _prev = os.path.join(self.ns[scope], "index", "_backup", f"{name}.prev.parquet")
+                    if not os.path.exists(_prev):
+                        shutil.copy2(path, _prev)           # 최초 1회만 안전본을 남긴다
+                    LOG.debug(f"{name}: {_sz/1e6:,.0f}MB — 회차별 백업 생략(원자적 교체로 보호). "
+                              f"직전 안전본은 _backup/{name}.prev.parquet")
+                else:
+                    shutil.copy2(path, bak)
             except Exception as e:                          # noqa
                 LOG.warn(f"기존 테이블 백업 실패({type(e).__name__}) — 안전을 위해 덮어쓰지 않고 "
                          f"리비전 파일로 저장합니다: {name}")

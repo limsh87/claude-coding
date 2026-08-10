@@ -964,6 +964,31 @@ class DartQuota:
                 out.append(p)
         return out
 
+    def _reload_other(self):
+        """저널을 다시 읽어 '남이 오늘 쓴 양'만 갱신한다(hist/observed 는 건드리지 않는다).
+
+        020 을 기록하기 직전에 부른다. 형제 프로세스의 소비가 안 보이면 내 눈에 보이는
+        누적이 실제보다 작고, 그 작은 값이 그날의 실측 한도로 저널에 영구히 박힌다.
+        """
+        rows: List[dict] = []
+        for p in [self._path()] + self._mirror_paths():
+            rows.extend(read_jsonl(p))
+        seen, tot = set(), 0
+        for r in rows:
+            if r.get("event") != "use" or str(r.get("date")) != self.today:
+                continue
+            eid = r.get("evt_id") or (r.get("host"), r.get("pid"), r.get("ts"), r.get("n"))
+            if eid in seen:
+                continue
+            seen.add(eid)
+            try:
+                tot += max(0, int(r.get("n", 0)))
+            except Exception:
+                pass
+        # 내 몫(self.n)은 이미 저널에 flush 되어 tot 에 포함되므로 빼서 이중계상을 막는다.
+        with self._lk:
+            self.n_other = max(0, tot - int(self.n))
+
     def _load(self):
         rows: List[dict] = []
         for p in [self._path()] + self._mirror_paths():
@@ -1080,8 +1105,18 @@ class DartQuota:
             LOG.warn("DART 오류를 받았지만 확인 호출이 성공했습니다 — 일일한도(020)가 아니라 "
                      "요청 오류(021 등)로 판단하고 수집을 계속합니다. 한도로 기록하지 않습니다.")
             return
-        self.observed_limit = int(self.used_today)
+        # ★ used_today = self.n + self.n_other 인데 n_other 는 __init__ 의 _load() 에서
+        #   딱 한 번만 읽었다. 이 프로세스가 시작한 뒤 형제 프로세스(TCD·두 번째 QVF 실행)가
+        #   같은 키를 쓴 몫이 안 보이므로, 020 이 왔을 때 내 눈에 보이는 누적은 실제보다
+        #   훨씬 작다. 그 작은 값이 '그날의 실측 한도'로 저널에 영구 기록되고, 이후 모든
+        #   실행이 그 근처(및 ×2 안전정지)에서 멈춘다 — 한 번 오염되면 매일 재현된다.
+        #   기록 직전에 저널을 다시 읽어 형제 소비분을 반영한다.
         self._flush()
+        try:
+            self._reload_other()
+        except Exception as e:
+            LOG.debug(f"저널 재조회 실패({type(e).__name__}) — 프로세스 내 집계로만 기록합니다.")
+        self.observed_limit = int(self.used_today)
         self._append({"event": "limit_observed", "limit": int(self.observed_limit)})
         globals()["DART_DAILY_LIMIT"] = int(self.observed_limit)
         LOG.warn(f"DART 일일 한도 실측: {self.observed_limit:,}건에서 020(한도초과)을 확인했습니다. "

@@ -239,11 +239,42 @@ def _hk_parse(html: str, category: str) -> List[dict]:
     return out
 
 
+def research_covered_years(cached: Optional[pd.DataFrame], source: str) -> set:
+    """캐시에 이미 충분히 담긴 '지난 연도'들. 그 해는 다시 훑지 않는다.
+
+    ★ 예전에는 두 수집기 모두 캐시를 아예 보지 않고 매 실행 10년 전체를 다시 훑었다.
+      한경만 연 375페이지 × 11년 ÷ 2.0qps ≈ 34분, 네이버 상세보강까지 합치면 약 3시간이
+      '이미 가진 것을 다시 받는 데' 쓰였다.
+    ★ 올해는 항상 다시 훑는다 — 새 리포트가 계속 올라오기 때문이다. 지난 연도는 확정이다.
+    """
+    if cached is None or not len(cached) or "pub_date" not in cached.columns:
+        return set()
+    d = cached
+    if "source" in d.columns:
+        d = d[d["source"].astype(str).str.contains(source, na=False)]
+    if not len(d):
+        return set()
+    y = as_ts_series(d["pub_date"]).dt.year.dropna()
+    if not len(y):
+        return set()
+    this_year = pd.Timestamp.today().year
+    cnt = y.value_counts()
+    # 그 해에 리포트가 극소수면 수집이 중간에 끊긴 것으로 보고 다시 훑는다.
+    return {int(k) for k, v in cnt.items() if int(k) < this_year and int(v) >= 100}
+
+
 def hankyung_collect(start: str, end: str, skins: Sequence[str] = ("business",),
-                     page_size: int = 80, max_pages: int = 400) -> pd.DataFrame:
+                     page_size: int = 80, max_pages: int = 400,
+                     skip_years: Optional[set] = None) -> pd.DataFrame:
     """연도 단위로 쪼개서 수집. 한 번에 10년을 요청하면 서버 페이지 상한에 걸린다."""
     rows: List[dict] = []
-    years = list(range(as_ts(start).year, as_ts(end).year + 1))
+    years = [y for y in range(as_ts(start).year, as_ts(end).year + 1)
+             if not (skip_years and y in skip_years)]
+    if skip_years:
+        LOG.info(f"한경: 캐시에 확정된 {len(skip_years)}개 연도는 건너뜁니다 "
+                 f"(재수집 {len(years)}개 연도만 — 연도당 약 375페이지).")
+    if not years:
+        return pd.DataFrame()
     jobs = []
     for skin in skins:
         for y in years:
@@ -437,7 +468,20 @@ def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
 
 
 def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "industry"),
-                  max_pages: int = 1500) -> pd.DataFrame:
+                  max_pages: int = 1500, skip_years: Optional[set] = None) -> pd.DataFrame:
+    # ★ 네이버는 날짜 구간 하나로 훑으므로 '연도 건너뛰기' 대신 시작일을 앞으로 당긴다.
+    #   캐시가 확정한 연도가 start 부터 연속으로 이어지는 만큼만 잘라낸다(중간 구멍은 다시 받는다).
+    if skip_years:
+        y0, y1 = as_ts(start).year, as_ts(end).year
+        y = y0
+        while y <= y1 and y in skip_years:
+            y += 1
+        if y > y0:
+            start = max(as_ts(start), as_ts(f"{y}-01-01")).strftime("%Y-%m-%d")
+            LOG.info(f"네이버: 캐시 확정 구간을 건너뛰고 {start} 부터 수집합니다 "
+                     f"({y - y0}개 연도 절약).")
+            if as_ts(start) > as_ts(end):
+                return pd.DataFrame()
     frames = []
     for cat in cats:
         # ① JSON API 우선
@@ -483,12 +527,31 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     return d
 
 
-def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
-    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다."""
+def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000,
+                        codes: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """네이버는 목표주가/투자의견이 상세페이지에만 있다. 목표주가 없는 종목분석 건만 보강한다.
+
+    ★ 이 함수 하나가 매 실행 2시간 13분을 썼다(20,000건 ÷ 2.5qps). 원인 두 가지:
+      ① 상세를 열어봤는데 목표주가가 없던 건은 다음 실행에도 target_price 가 결측이라
+         '아직 안 해봤다'와 구분되지 않아 영원히 다시 열었다 → detail_tried 로 표시한다.
+      ② 소비처는 build_tp_revision 뿐이고 그건 U-1000 패널에만 붙는다. 후보 밖 종목의
+         목표주가는 어디에도 쓰이지 않는데 다 받고 있었다 → codes 로 좁힌다.
+    """
     if df.empty:
         return df
+    if "detail_tried" not in df.columns:
+        df = df.assign(detail_tried=False)
+    df["detail_tried"] = df["detail_tried"].fillna(False).astype(bool)
     need = df[(df["source"] == "naver") & (df["category"] == "company") &
-              (df["target_price"].isna()) & (df["detail_url"].notna())].copy()
+              (df["target_price"].isna()) & (df["detail_url"].notna()) &
+              (~df["detail_tried"])].copy()
+    if codes is not None and "stock_code" in need.columns:
+        _cs = {str(c) for c in codes}
+        n0 = len(need)
+        need = need[need["stock_code"].astype(str).isin(_cs)]
+        if n0:
+            LOG.info(f"네이버 상세 보강 대상을 U-1000 후보로 축소: {n0:,} → {len(need):,}건 "
+                     f"(후보 밖 종목의 목표주가는 어느 패널에도 붙지 않습니다)")
     if need.empty:
         return df
     if len(need) > limit:
@@ -517,6 +580,9 @@ def naver_enrich_detail(df: pd.DataFrame, limit: int = 20000) -> pd.DataFrame:
 
     res = pmap_io(_one, need["detail_url"].tolist(), workers=min(8, N_WORKERS_IO),
                   desc="네이버 상세(목표주가)")
+    # ★ 시도했다는 사실 자체를 남긴다. 목표주가를 못 찾은 건도 '해봤다'로 표시해야
+    #   다음 실행이 같은 URL 을 다시 열지 않는다(이게 2시간의 절반이었다).
+    df.loc[df["detail_url"].isin(need["detail_url"]), "detail_tried"] = True
     got = pd.DataFrame([r for r in res if r])
     if got.empty:
         return df
@@ -594,7 +660,15 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0) -> pd.DataFrame:
     if fitz is None and pdfplumber is None:
         LOG.warn("PDF 파서(pymupdf/pdfplumber)가 없어 원문 추출을 건너뜁니다. "
                  "한경 리스트의 작성자/목표주가만으로도 애널리스트 연결은 동작합니다.")
-    work = df[df["pdf_url"].notna()].copy()
+    # ★ 이미 받아서 blob 에 넣고 원장에 pdf_uid 를 남긴 건은 다시 열지 않는다. blob 캐시가
+    #   HTTP 는 막아줬지만 예전에는 pdf_uid 가 병합에서 증발해(14_entity:agg 누락) 매 실행
+    #   전 코퍼스를 드라이브에서 다시 읽고 pdf_text() 로 다시 파싱했다 — 최대 30만회.
+    _done_pdf = (df["pdf_uid"].astype(str).str.len() > 0) if "pdf_uid" in df.columns \
+        else pd.Series(False, index=df.index)
+    work = df[df["pdf_url"].notna() & ~_done_pdf].copy()
+    if int(_done_pdf.sum()):
+        LOG.info(f"PDF {int(_done_pdf.sum()):,}건은 이미 원장에 pdf_uid 가 있어 건너뜁니다 "
+                 f"(신규 대상 {len(work):,}건).")
     if cap_per_month and len(work):
         work["_m"] = as_ts_series(work["pub_date"]).dt.to_period("M")
         work = work.groupby("_m", observed=True).head(cap_per_month).drop(columns=["_m"])

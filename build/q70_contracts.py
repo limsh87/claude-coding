@@ -24,13 +24,28 @@ def pinned_src(name: str, obj=None) -> str:
       그 상태가 될 뻔했다(거기서는 아예 OSError 로 죽어서 드러났지만).
     """
     s = QVF_PINNED_SRC.get(name)
-    if s:
-        return s
+    live = None
     if obj is not None:
         try:
-            return _inspect.getsource(obj)
+            live = _inspect.getsource(obj)
         except Exception:
-            pass
+            live = None
+    # ★★ 고정본을 무조건 믿으면 안 된다 ★★
+    #   QVF_PINNED_SRC 는 '빌드 시점'의 글자다. 사용자가 셀에 붙여넣은 뒤 함수를 고치면
+    #   실제로 도는 코드는 바뀌었는데 고정본은 옛 글자를 그대로 들고 있다. 그러면 Q6/Q7/Q12
+    #   같은 '부재 증명' 계약이 돌지도 않는 코드를 검정하고 ✔ 를 찍는다 — 계약층 전체가
+    #   조용히 무력화되는 경로다. 살아 있는 소스를 읽을 수 있으면 그쪽이 진실이다.
+    if s and live is not None:
+        if re.sub(r"\s+", " ", s).strip() != re.sub(r"\s+", " ", live).strip():
+            raise ContractViolation(
+                f"'{name}' 의 실제 소스가 빌드 시점 고정본과 다릅니다 — 파일/셀에서 이 함수를 "
+                f"수정하셨습니다. 고정본으로 검정하면 '돌지 않는 코드'를 검정하게 되므로 "
+                f"통과시키지 않습니다. tools/build_qvf.py 로 다시 빌드하거나 수정을 되돌리세요.")
+        return live
+    if s:
+        return s
+    if live is not None:
+        return live
     raise ContractViolation(
         f"소스 조각 '{name}' 을 찾을 수 없습니다. 빌드 시점 고정본(QVF_PINNED_SRC)이 "
         f"비어 있고 inspect 도 실패했습니다 — 파일을 직접 편집했거나 빌더의 SRC_PIN 목록과 "
@@ -66,7 +81,19 @@ def _q1():
         raise ContractViolation("knowledge_date 이후 시점의 행이 조회되었습니다 — 미래누수입니다.")
     if len(st.get("ok", "2020-02-20")) != 1:
         raise ContractViolation("knowledge_date 이후에도 행이 보이지 않습니다.")
-    return "PIT 등록 거부 + as_of 절단 정상"
+    # ★ 게이트를 실제로 우회하는 경로는 '빈 프레임'이다. PITStore.register 는 len(df)==0 이면
+    #   PIT 컬럼 검사 없이 그냥 등록해 버린다 — 수집기가 빈손으로 돌아오면 PIT 없는 테이블이
+    #   '있음'으로 잡힌다. 1행짜리만 시험하던 옛 검정은 이 경로를 한 번도 안 밟았다.
+    try:
+        st.register("empty", pd.DataFrame(columns=["code", "x"]))
+    except KeyError:
+        pass
+    else:
+        if st.has("empty"):
+            raise ContractViolation(
+                "빈 프레임이 PIT 컬럼 검사 없이 등록되어 'has()=True' 로 보고됩니다 — "
+                "수집 실패가 '데이터 있음'으로 둔갑하는 경로입니다.")
+    return "PIT 등록 거부 + as_of 절단 + 빈 프레임 우회 차단 확인"
 
 
 @_contract("Q2", "시점 규약 — 신호일 < 체결일, 공시는 접수일+1거래일")
@@ -235,9 +262,17 @@ def _q6():
 
 @_contract("Q7", "캐시 무결성 — 삭제 API 부재 · 로컬 미러는 쓰기 경로에 등장하지 않는다")
 def _q7():
-    for nm in ("delete", "remove", "drop_table", "purge", "rmtree"):
-        if hasattr(Vault, nm) or hasattr(QVFVault, nm):
-            raise ContractViolation(f"Vault 에 삭제 API '{nm}' 가 존재합니다 — 절대 1원칙 위반.")
+    # ★ 예전엔 이름 5개짜리 블랙리스트였다 — evict/prune/expire/trim/clear/unlink 로 이름만
+    #   바꾸면 그대로 통과한다. 상속 계층(MRO) 전체를 훑어 '지우는 뜻'의 공개 메서드를 금지한다.
+    _DEL = re.compile(r"(^|_)(del|delete|remov|purge|drop|rm|evict|prune|expire|trim|clear|unlink|wipe)")
+    for _cls in (Vault, QVFVault):
+        for _k in dir(_cls):
+            if _k.startswith("__") or not callable(getattr(_cls, _k, None)):
+                continue
+            if _DEL.search(_k.lower()):
+                raise ContractViolation(
+                    f"{_cls.__name__} 에 삭제 성격의 API '{_k}' 가 있습니다 — 절대 1원칙 위반. "
+                    f"(이름만 바꾼 삭제도 삭제입니다)")
     for nm, fn in (("Vault.put_table", Vault.put_table), ("Vault.put_blob", Vault.put_blob),
                    ("Vault.flush", Vault.flush), ("Vault.compact", Vault.compact)):
         s = pinned_src(nm, fn)
@@ -277,14 +312,24 @@ def _q7():
 
 @_contract("Q8", "결정성 — 같은 입력에 같은 선정 (동점 처리가 행 순서에 의존하지 않는다)")
 def _q8():
+    # ★★ 예전에는 정규난수를 소수 2자리로 반올림해 '동점이 생기기를 기대'했다. SEED
+    #   20260810 에서 실측하면 동점 6쌍이 생기긴 하지만 20위(0.295)와 21위(0.255) 사이를
+    #   가로지르는 동점이 없어, 선정 집합이 점수만으로 유일하게 결정된다 — 즉 tie-break 를
+    #   통째로 없애도 이 계약은 통과했다. 검정력이 0이었고, 그 사실이 무관한 상수(SEED)에
+    #   달려 있었다. 커트라인 위에 동점을 '설계해서' 만든다.
     n = 50
     rng = np.random.default_rng(SEED)
+    zv = np.round(rng.normal(size=n), 2)
+    # 19~23위가 될 5종목의 점수를 완전히 같게 만들어 커트라인(20위)을 동점이 가로지르게 한다.
+    order = np.argsort(-zv)
+    tie_at = order[18:23]
+    zv[tie_at] = float(zv[order[19]])
     base = pd.DataFrame({
         "code": [f"{i:06d}" for i in range(n)],
         "rebal": [as_ts("2020-03-01")] * n,
         "sector": ["기계"] * n,
-        "Z_V": np.round(rng.normal(size=n), 2),      # 반올림으로 동점을 일부러 만든다
-        "Z_Q": np.round(rng.normal(size=n), 2),
+        "Z_V": zv,
+        "Z_Q": zv,                                   # VQ = 0.5·V + 0.5·Q → 동점이 그대로 유지
         "Z_F": np.nan, "mktcap": rng.lognormal(23, 1, n),
     })
     a = build_u200(base, variants=("VQ",), n=20)
@@ -296,7 +341,14 @@ def _q8():
         raise ContractViolation(
             f"행 순서를 섞었더니 선정이 달라졌습니다({len(sa ^ sb)}종목 차이) — "
             f"포트폴리오가 데이터가 아니라 정렬의 함수입니다.")
-    return f"행 순서 무관 · 선정 {len(sa)}종목 동일"
+    # ★ 검정이 실제로 '동점 구간'을 통과했는지 확인한다. 동점이 커트라인을 가로지르지 않으면
+    #   위 비교는 tie-break 가 없어도 성립하므로 계약이 아무것도 보장하지 못한다.
+    _sel = set(base.loc[base.index[tie_at], "code"]) & sa
+    if not (0 < len(_sel) < len(tie_at)):
+        raise ContractViolation(
+            f"동점 {len(tie_at)}종목이 커트라인을 가로지르지 않아 이 검정에 검정력이 없습니다 "
+            f"(선정된 동점 {len(_sel)}종목). 테스트 픽스처를 고치세요.")
+    return f"행 순서 무관 · 선정 {len(sa)}종목 동일 · 커트라인 동점 {len(tie_at)}종목 통과"
 
 
 @_contract("Q9", "분기 연율화 — √4 를 쓴다 (√12 를 쓰면 변동성이 1.7배 과대계상된다)")
@@ -318,17 +370,53 @@ def _q9():
 
 @_contract("Q10", "비용 — 비용 차감 후 수익은 항상 차감 전 이하다")
 def _q10():
-    src = pinned_src("run_qbacktest", run_qbacktest) + pinned_src("qvf_sell_tax", qvf_sell_tax)
-    if "ret_gross" not in src or "gross - cost" not in src:
-        raise ContractViolation("백테스트가 비용 전/후를 분리해 산출하지 않습니다 (§8.1 위반).")
-    for pat, nm in ((r"QVF_TAX_SCHEDULE", "거래세 이력"),
-                    (r"cs_spread|SLIPPAGE_FLOOR_BPS", "실측 스프레드"),
-                    (r"IMPACT_K", "시장충격")):
-        if not re.search(pat, src):
-            raise ContractViolation(f"비용 모델에 {nm} 이 반영되지 않았습니다.")
+    # ★★ 예전 Q10 은 제목이 "비용 차감 후 수익은 항상 차감 전 이하다"인데 정작 백테스트를
+    #   돌리지도, 두 값을 비교하지도 않았다. 소스에 "ret_gross"/"gross - cost" 라는 글자가
+    #   있는지만 봤다 — 주석 안에 있어도 통과하고, 변수명을 g/c 로 줄이면 멀쩡한 코드가
+    #   실패한다. 게다가 IMPACT_K 검사는 기본 설정(QVF_COST_MODEL="spec", §8.1 문언)에서
+    #   '있으면 안 되는' 확장 비용을 강제하고 있었다. 실제로 돌려서 부등식을 확인한다.
+    _n = 12
+    _cal = pd.DataFrame({"rebal": pd.date_range("2020-03-01", periods=4, freq="QS")})
+    _cal["signal_date"] = _cal["rebal"] - pd.Timedelta(days=1)
+    _cal["exec_date"] = _cal["rebal"] + pd.Timedelta(days=1)
+    _rng = np.random.default_rng(SEED)
+    _rows = []
+    for t in _cal["rebal"]:
+        for i in range(_n):
+            _rows.append({"code": f"{i:06d}", "rebal": t, "sel": True,
+                          "mktcap": 3e10, "adtv": 5e8, "cs_spread": 0.004})
+    _P = pd.DataFrame(_rows)
+    _fwd = _P[["code", "rebal"]].copy()
+    _fwd["fwd_ret"] = _rng.normal(0.01, 0.05, len(_fwd))
+    _fwd["exit_kind"] = "normal"
+    _kw = dict(P=_P, cal=_cal, sel_col="sel", fwd=_fwd, label="Q10", delist={})
+    _R = run_qbacktest(apply_costs=True, **_kw)["returns"]
+    _R0 = run_qbacktest(apply_costs=False, **_kw)["returns"]
+    for _c in ("ret", "ret_gross", "cost"):
+        if _c not in _R.columns:
+            raise ContractViolation(f"백테스트 결과에 '{_c}' 이 없습니다 — 비용 전/후를 "
+                                    f"분리해 산출하지 않습니다 (§8.1 위반).")
+    if bool((_R["ret"] > _R["ret_gross"] + 1e-12).any()):
+        raise ContractViolation(
+            f"비용 차감 후 수익이 차감 전보다 큰 분기가 "
+            f"{int((_R['ret'] > _R['ret_gross'] + 1e-12).sum())}개 있습니다 — "
+            f"비용이 음수이거나 부호가 뒤집혔습니다 (§8.1 위반).")
+    if bool((_R["cost"] < -1e-12).any()):
+        raise ContractViolation("음수 비용이 산출되었습니다 — 거래가 수익을 만들고 있습니다.")
+    if float(_R["cost"].sum()) <= 0:
+        raise ContractViolation("매매가 있었는데 비용이 0 입니다 — 비용 모델이 적용되지 "
+                                "않고 있습니다(회전율 > 0 인 분기가 존재).")
+    if float(_R0["cost"].abs().sum()) > 1e-12:
+        raise ContractViolation("apply_costs=False 인데 비용이 발생했습니다 — "
+                                "비용 스위치가 동작하지 않습니다.")
+    # 거래세는 '이력'이어야 한다 — 단일 세율이면 10년 중 어느 시점을 골라도 값이 같다.
     if len(QVF_TAX_SCHEDULE) < 5:
         raise ContractViolation("증권거래세를 단일 세율로 처리하고 있습니다 — 10년간 여섯 번 바뀌었습니다.")
-    return f"비용 전/후 분리 · 거래세 {len(QVF_TAX_SCHEDULE)}단계 · 스프레드+충격 반영"
+    if abs(qvf_sell_tax(as_ts("2017-06-01")) - qvf_sell_tax(as_ts("2024-06-01"))) < 1e-9:
+        raise ContractViolation("거래세 이력표가 시점에 따라 다른 세율을 주지 않습니다 — "
+                                "표만 있고 적용되지 않고 있습니다.")
+    return (f"실제 백테스트로 net ≤ gross 확인 · 거래세 {len(QVF_TAX_SCHEDULE)}단계가 "
+            f"시점별로 다르게 적용됨 (cost_model={QVF_COST_MODEL})")
 
 
 @_contract("Q11", "결측을 0 으로 채우지 않는다 — z-score 는 표본 부족 시 NaN 을 유지한다")

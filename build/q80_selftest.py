@@ -328,6 +328,14 @@ def run_rehearsal(strict: bool = True) -> bool:
 
     def fake_json(url, source="generic", **kw):
         calls[f"{source}:JSON"] += 1
+        # ★ dart_api 는 DBUDGET.take(tries=2) 로 먼저 예산을 잡고, 실제 시도 횟수만큼
+        #   on_attempt 로 되돌려 받는다. 가짜 http_json 이 on_attempt 를 안 부르면
+        #   시도 0회로 집계돼 환불이 1건 모자라고, '하지도 않은 호출'이 공용 저널에
+        #   기록된다(실행당 약 40건). 다른 전략의 잔여량까지 갉아먹는다.
+        cb = kw.get("on_attempt")
+        if callable(cb):
+            for _ in range(int(kw.get("tries", 1) or 1)):
+                cb()
         return None
 
     checks: List[Tuple[str, str]] = []

@@ -47,23 +47,28 @@ def build_momentum(cal: pd.DataFrame, px_daily: pd.DataFrame) -> pd.DataFrame:
     px["date"] = as_ts_series(px["date"])
     px = px.dropna(subset=["code", "date", "close"]).sort_values("date", kind="stable")
     R = px.rename(columns={"date": "px_date"})
-    out = []
+    if not len(cal) or not len(R):
+        return pd.DataFrame(columns=["code", "rebal", "mom12_1"])
+    # ★ 예전엔 리밸 시점마다 merge_asof 를 2회 돌렸다 — 40시점 × 2 = 800만행 패널을 80번
+    #   훑는다. 게다가 sorted(px["code"].unique()) 를 루프 안에서 매번 다시 계산했다.
+    #   패널 재구축이 4회(기준 + 시프트 3회) 있으므로 320 패스가 된다.
+    #   (종목 × 앵커시점) 을 한 프레임으로 쌓아 merge_asof 를 '단 2회'로 줄인다. 결과 동일.
+    codes = pd.DataFrame({"code": sorted(px["code"].unique())})
+    anchors = []
     for r in cal.itertuples(index=False):
         sd = as_ts(r.signal_date)
-        anchors = {"p1": sd - pd.DateOffset(months=1), "p12": sd - pd.DateOffset(months=12)}
-        L = pd.DataFrame({"code": sorted(px["code"].unique())})
-        vals = {}
-        for k, dt in anchors.items():
-            LL = L.assign(t=dt).sort_values("t", kind="stable")
-            M = pd.merge_asof(LL, R, left_on="t", right_on="px_date", by="code",
-                              direction="backward", tolerance=pd.Timedelta(days=20))
-            vals[k] = M.set_index("code")["close"]
-        m = (vals["p1"] / vals["p12"] - 1.0).rename("mom12_1").reset_index()
-        m["rebal"] = r.rebal
-        out.append(m)
-    if not out:
-        return pd.DataFrame(columns=["code", "rebal", "mom12_1"])
-    return downcast_q(pd.concat(out, ignore_index=True))
+        anchors.append({"rebal": r.rebal, "p1": sd - pd.DateOffset(months=1),
+                        "p12": sd - pd.DateOffset(months=12)})
+    A = pd.DataFrame(anchors)
+    grid = codes.merge(A, how="cross")
+    vals = {}
+    for k in ("p1", "p12"):
+        LL = grid[["code", "rebal", k]].rename(columns={k: "t"}).sort_values("t", kind="stable")
+        M = pd.merge_asof(LL, R, left_on="t", right_on="px_date", by="code",
+                          direction="backward", tolerance=pd.Timedelta(days=20))
+        vals[k] = M.set_index(["code", "rebal"])["close"]
+    m = (vals["p1"] / vals["p12"] - 1.0).rename("mom12_1").reset_index()
+    return downcast_q(m[["code", "rebal", "mom12_1"]])
 
 
 def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
@@ -196,11 +201,18 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
         cached = VAULT.get_table("research_report_master", scope="shared")
         frames = []
         if RUN_MODE != "CACHED" and RESEARCH_COLLECT:
+            # ★ 예전엔 수집기가 캐시를 아예 안 보고 매 실행 10년을 다시 훑었다(약 3시간).
+            #   캐시가 확정한 지난 연도를 넘겨 그 해는 건너뛰게 한다. 올해는 항상 다시 훑는다.
             if "hankyung" in RESEARCH_SOURCES:
-                frames.append(hankyung_collect(BACKTEST_START, BACKTEST_END))
+                frames.append(hankyung_collect(
+                    BACKTEST_START, BACKTEST_END,
+                    skip_years=research_covered_years(cached, "hankyung")))
             if "naver" in RESEARCH_SOURCES:
-                nv = naver_collect(BACKTEST_START, BACKTEST_END)
-                frames.append(naver_enrich_detail(nv))
+                nv = naver_collect(BACKTEST_START, BACKTEST_END,
+                                   skip_years=research_covered_years(cached, "naver"))
+                # 상세 보강은 U-1000 후보로만. 소비처(build_tp_revision)가 U-1000 패널에만
+                # 붙으므로 후보 밖 종목의 목표주가는 어디에도 쓰이지 않는다.
+                frames.append(naver_enrich_detail(nv, codes=ctx.get("candidates")))
         if cached is not None and len(cached):
             LOG.info(f"공용 캐시에서 보고서 원장 {len(cached):,}건 재사용")
             frames.append(cached)

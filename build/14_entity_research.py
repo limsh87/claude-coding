@@ -220,6 +220,9 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         **({k: (k, _pick_str) for k in ("pdf_uid", "pdf_analysts", "pdf_emails")
             if k in d.columns}),
         **({"pdf_target": ("pdf_target", "max")} if "pdf_target" in d.columns else {}),
+        # 상세페이지 조회 여부도 같은 이유로 반드시 살아남아야 한다 — 떨어지면 목표주가를
+        # 못 찾은 건을 매 실행 다시 연다(네이버 상세 2시간의 원인).
+        **({"detail_tried": ("detail_tried", "max")} if "detail_tried" in d.columns else {}),
     })
     LOG.info(f"보고서 원장 병합: 수집 {n_raw0:,}건 → 날짜유효 {n_raw:,}건 → 고유 {len(m):,}건 "
              f"(날짜 탈락 {n_raw0 - n_raw:,} · 소스 간 중복 병합 {n_raw - len(m):,})")
