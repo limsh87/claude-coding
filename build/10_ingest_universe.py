@@ -266,6 +266,15 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         return pd.DataFrame(columns=["code", "name", "delisting_date", "market"])
     dl_c = next((col[k] for k in ("delistingdate", "delisting_date", "dedate", "date",
                                   "listingdate") if k in col), None)
+    # ★ 폐지파일에는 ListingDate 도 같이 들어 있다(KrxDelistingCache: LIST_DD→ListingDate).
+    #   이걸 안 읽으면 폐지종목은 상장일이 영영 결측이 된다 — 폐지종목은 정의상 상장목록·
+    #   KIND 스냅샷 어디에도 없어서 다른 보강 경로가 없기 때문이다. 그 결과 build_security_master
+    #   가 상장일을 NaT 로 못박고(§ d2["listing_date"]=NaT), Universe 는 그 종목을 250거래일
+    #   시즈닝 없이 백테스트 첫 달부터 넣어버린다(상장 전인데도 멤버가 되는 경우까지 있다).
+    #   dl_c 가 listingdate 로 폴백된 경우엔 같은 컬럼을 두 번 쓰지 않도록 비운다.
+    ld_c = next((col[k] for k in ("listingdate", "listing_date", "list_dd") if k in col), None)
+    if ld_c is not None and ld_c == dl_c:
+        ld_c = None
     name_c = col.get("name") or col.get("isu_nm") or code_c
 
     n_raw = len(d)
@@ -276,6 +285,7 @@ def fetch_fdr_delisting() -> pd.DataFrame:
         "code": codes,
         "name": d[name_c].astype(str),
         "delisting_date": as_ts_series(d[dl_c]) if dl_c else pd.NaT,
+        "listing_date": as_ts_series(d[ld_c]) if ld_c else pd.NaT,
         "market": d[col["market"]].astype(str) if "market" in col else "KRX",
         "secugroup": (d[col["secugroup"]].astype(str) if "secugroup" in col
                       else d[col["kind"]].astype(str) if "kind" in col else ""),
@@ -284,7 +294,11 @@ def fetch_fdr_delisting() -> pd.DataFrame:
     n_dupe = int(t["code"].duplicated().sum())
     # 같은 코드가 재상장/재폐지로 여러 번 나오면 '가장 늦은 폐지일'을 남긴다.
     # (가장 이른 것을 남기면 재상장 구간이 통째로 유니버스에서 빠져 표본이 준다)
-    t = t.sort_values("delisting_date").drop_duplicates("code", keep="last")
+    # ★ na_position="first" 가 반드시 필요하다. 기본값은 "last" 라서 NaT 가 실제 폐지일보다
+    #   뒤로 정렬되고, keep="last" 가 그 NaT 를 채택해 '아는 폐지일'을 버려버린다. 그러면
+    #   listing_date 도 NaT 인 이 행은 두 날짜가 모두 NaT 가 되어 유니버스에서 통째로
+    #   사라진다(상장~폐지 전 구간이 조용히 증발 — C2 위반).
+    t = t.sort_values("delisting_date", na_position="first").drop_duplicates("code", keep="last")
     n_nodate = int(t["delisting_date"].isna().sum())
 
     LOG.ok(f"상장폐지 목록(로그인 불필요 경로) {len(t):,}건 — 생존자편향 제거 입력 확보")
@@ -520,8 +534,12 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
     PIPE.io("IN", "HTTP", "fdr:KRX-DELISTING", dead, source="FinanceDataReader",
             ok=len(dead) > 0, note="생존자편향 제거 입력")
     if len(dead):
-        d2 = dead.reindex(columns=["code", "name", "delisting_date", "market"]).copy()
-        d2["listing_date"] = pd.NaT
+        # ★ 여기서 listing_date 를 무조건 NaT 로 지우면 안 된다. fetch_fdr_delisting 이 이제
+        #   ListingDate 를 함께 읽어 오므로(위 패치), 그 값을 살려야 폐지종목도 250거래일
+        #   시즈닝을 정상적으로 거친다 — 안 그러면 상장 직후 종목이 시즈닝 없이 유니버스에
+        #   들어오거나(있으면 안 되는 조기 편입), agg 의 listing_date="min" 이 채울 근거가
+        #   아예 없어 폐지종목 전체가 '근거 없는 종목'으로 유니버스에서 통째로 빠진다.
+        d2 = dead.reindex(columns=["code", "name", "delisting_date", "listing_date", "market"]).copy()
         d2["industry"] = ""
         d2["corp_code"] = np.nan
         d2["sector_src"] = "fdr-del"
@@ -568,11 +586,39 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         name=("name", _first_str),
         market=("market", _first_str),
         listing_date=("listing_date", "min"),
+        listing_date_late=("listing_date", "max"),
         delisting_date=("delisting_date", "max"),
         industry=("industry", _first_str),
         src=("src", lambda s: "|".join(sorted(set(map(str, s))))),
     )
     assert_no_dup_cols(agg, "security_master:agg")
+
+    # ★ 상장일 충돌을 min() 으로 조용히 덮지 않는다.
+    #   FDR ListingDate 와 KIND 상장일은 이전상장(KONEX→KOSDAQ→KOSPI)·재상장·지주회사
+    #   전환·물적분할에서 서로 다른 값을 준다. min() 은 언제나 '이른 쪽'을 채택하므로,
+    #   값이 틀린 종목은 상장 후 시즈닝 기준점이 통째로 앞당겨져 실제 상장 첫 달부터
+    #   유니버스에 편입된다(에러도 로그도 없이 — 시즈닝 게이트가 통째로 우회된다).
+    #   멤버십 채택 규칙은 min 을 유지한다 — max 로 바꾸면 이전상장 종목이 원상장~이전
+    #   구간(카카오형이면 18년) 통째로 유니버스에서 빠져 반대 방향 선택편향이 된다.
+    #   대신 보수적 기준일(늦은 쪽)을 listing_date_late 로 보존하고 충돌을 전부 로깅한다.
+    _ld_lo = as_ts_series(agg["listing_date"])
+    _ld_hi = as_ts_series(agg["listing_date_late"])
+    _gap = (_ld_hi - _ld_lo).dt.days.fillna(0)
+    _conf = agg.loc[_gap > 5].assign(gap=_gap[_gap > 5])
+    if len(_conf):
+        _conf = _conf.sort_values("gap", ascending=False)
+        LOG.warn(f"상장일이 소스마다 다른 종목 {len(_conf):,}건 — 채택 규칙은 무조건 "
+                 f"'이른 날짜'입니다. 이 {len(_conf):,}건은 실제보다 이른 시점부터 "
+                 f"유니버스에 편입되고 상장 후 시즈닝이 사실상 면제됩니다. "
+                 f"보수적 기준일은 listing_date_late 컬럼에 보존했습니다.")
+        LOG.table([[r["code"], str(r["name"])[:14],
+                    str(pd.Timestamp(r["listing_date"]).date()),
+                    str(pd.Timestamp(r["listing_date_late"]).date()),
+                    f"{int(r['gap']):,}일", str(r["src"])[:30]]
+                   for r in _conf.head(15).to_dict("records")],
+                  ["코드", "종목명", "채택(이른쪽)", "다른 소스", "차이", "소스"],
+                  ["l", "l", "l", "l", "r", "l"],
+                  title="상장일 소스 충돌 (차이 상위 15건)")
 
     # 스냅샷으로 상장/폐지일 보정 — 소스 날짜가 없을 때만 관측으로 채운다
     if snapshots is not None and len(snapshots):
@@ -582,12 +628,35 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
         need = agg["listing_date"].isna() & agg["snap_first"].notna()
         agg.loc[need, "listing_date"] = agg.loc[need, "snap_first"]
         last_snap = snapshots["snap_date"].max()
-        gone = (agg["delisting_date"].isna() & agg["snap_last"].notna() &
-                (agg["snap_last"] < last_snap - pd.Timedelta(days=200)))
+        _lag = pd.Timedelta(days=200)
+        # ★ 스냅샷의 '결손'은 폐지의 증거가 아니다. KRX 세션이 한쪽 시장만 죽거나
+        #   티커 목록이 꼬리에서 잘리면(§8.0% 임계 가드는 '전체 종목수 급감'만 본다 —
+        #   KOSDAQ 전체가 죽고 KOSPI 는 멀쩡하면 중앙값 자체가 낮아져 가드를 통과한다)
+        #   살아있는 종목이 통째로 관측에서 사라지는데, 그걸 폐지일로 쓰면 그 종목이
+        #   유니버스에서 영구히 빠진다 — 반대 방향 선택편향이다. 그것도 이 캐시가
+        #   VAULT 에 저장되므로 다음 실행의 KRX 가 멀쩡해도 스스로 못 고친다.
+        #   두 가지가 동시에 성립할 때만 폐지로 인정한다:
+        #     ① 그 종목이 마지막으로 관측된 '그 시장'의 스냅샷이 끝까지 이어졌을 것
+        #        (그 시장 자체가 도중에 끊겼다면 결손은 종목이 아니라 시장의 문제다)
+        #     ② FDR 상장목록(=지금 상장중이라는 권위 있는 진술)에 없을 것
+        smk = (snapshots.sort_values("snap_date").drop_duplicates("code", keep="last")
+                        .set_index("code")["market"])
+        covered = {mk for mk, d in snapshots.groupby("market")["snap_date"].max().items()
+                   if pd.notna(d) and d >= last_snap - _lag}
+        still_listed = set(lst["code"].dropna()) if len(lst) else set()
+        miss = (agg["delisting_date"].isna() & agg["snap_last"].notna() &
+                (agg["snap_last"] < last_snap - _lag))
+        gone = miss & agg["code"].map(smk).isin(covered) & (~agg["code"].isin(still_listed))
         agg.loc[gone, "delisting_date"] = agg.loc[gone, "snap_last"] + pd.offsets.MonthEnd(1)
         if int(gone.sum()):
             LOG.info(f"스냅샷에서 사라진 {int(gone.sum()):,}종목을 폐지로 추정 "
                      f"(폐지명단 누락 보완 — 생존자편향 2차 방어)")
+        _veto = int(miss.sum()) - int(gone.sum())
+        if _veto:
+            LOG.warn(f"스냅샷에서 사라졌지만 상장목록에 살아있거나 해당 시장 스냅샷이 "
+                     f"중간에 끊긴 {_veto:,}종목은 폐지로 찍지 않았습니다. 이 숫자가 크면 "
+                     f"폐지가 많은 게 아니라 KRX 스냅샷 세션이 그만큼 망가진 것입니다 "
+                     f"(스냅샷은 검증용이지 의존 대상이 아닙니다).")
         agg = agg.drop(columns=[c for c in ("snap_first", "snap_last") if c in agg.columns])
 
     cc = fetch_dart_corpcode()

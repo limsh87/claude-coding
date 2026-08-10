@@ -83,8 +83,21 @@ def fetch_disclosures_qvf(start: str, end: str) -> pd.DataFrame:
     if cached is not None and len(cached):
         cached = cached.copy()
         cached["rcept_dt"] = as_ts_series(cached["rcept_dt"])
-        have = set(cached["rcept_dt"].dropna().dt.to_period("M").astype(str))
-        LOG.info(f"캐시에서 QVF 공시목록 {len(cached):,}행 · {len(have)}개월 재사용")
+        # ★ 스킵 기준은 '그 달을 받았다'가 아니라 '그 달을 지금 필요한 유형 전부로 받았다'다.
+        #   위 docstring 은 코어 테이블을 분리한 이유를 적어 뒀지만, 분리만으로는 절반이다 —
+        #   QVF_DISCLOSURE_TYPES 를 나중에 넓히면(예: E 지분공시 추가) 이전 스윕이 만든
+        #   자기 캐시가 그 달을 덮고 있어 넓힌 스윕이 단 한 번도 실행되지 않는다. 코드는
+        #   고쳐졌는데 결과는 그대로 굶고, 로그는 '재사용'이라 말한다. 유형 태그로 판정한다.
+        if "pblntf_ty" not in cached.columns:
+            cached["pblntf_ty"] = ""         # 유형 태그가 없던 구버전 캐시 = 커버리지 미상
+        cached["pblntf_ty"] = cached["pblntf_ty"].astype(str)
+        _cov = (cached.groupby(cached["rcept_dt"].dt.to_period("M").astype(str),
+                               observed=True)["pblntf_ty"].agg(set))
+        _need = set(QVF_DISCLOSURE_TYPES)
+        have = {mo for mo, tys in _cov.items() if _need <= tys}
+        LOG.info(f"캐시에서 QVF 공시목록 {len(cached):,}행 재사용 — 유형 "
+                 f"{'/'.join(QVF_DISCLOSURE_TYPES)} 가 모두 채워진 {len(have)}개월 건너뜀 "
+                 f"(나머지 {len(_cov) - len(have):,}개월은 재수집)")
 
     months = pd.period_range(as_ts(start) - pd.DateOffset(months=6), as_ts(end), freq="M")
     todo = [m for m in months if str(m) not in have]

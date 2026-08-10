@@ -197,7 +197,9 @@ _DIAG_RULES: List[Tuple[str, str]] = [
     (r"Expecting value: line \d+ column 1|JSONDecodeError|Error occurred in get_market",
      "JSON 대신 HTML(대개 로그인/에러 페이지)을 받았습니다. KRX 계열이면 세션이 끊긴 것입니다. "
      "pykrx 는 스레드마다 재로그인하며 KRX 는 중복 로그인 시 이전 세션을 끊습니다 — "
-     "모든 pykrx 호출은 KRXG.call() 게이트로 직렬화해야 합니다. "
+     "로그인 자체는 01_bootstrap 이 pykrx auth/webio 경계에 락을 걸어 직렬화하므로 "
+     "이 오류가 계속 보이면 그 패치가 적용되지 않은 것입니다(pykrx 버전 확인). "
+     "data.krx.co.kr 을 직접 치는 호출은 그와 별개로 KRXG.call() 을 거쳐야 합니다. "
      "KRX ID/PW 를 다른 브라우저 탭에서 동시에 쓰고 있지 않은지도 확인하세요."),
     (r"UnicodeEncodeError|cp949|charmap",
      "콘솔 인코딩 문제입니다(윈도우 기본 cp949 는 罫線문자 ╔═║ 와 ✔✘ 를 못 씁니다). "

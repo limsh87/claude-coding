@@ -461,6 +461,11 @@ def naver_collect_json(cat: str, start: str, end: str, page_size: int = 100,
         if len(items) < page_size:
             break
         index += len(items)
+    else:
+        # ★ while 이 hard_cap 소진으로(=고갈이 아니라 상한으로) 끝났다는 뜻이다. 조용히 두면
+        #   하류는 "시장이 그만큼만 발간했다"로 읽는다 — 구분이 안 된다.
+        LOG.warn(f"CAPHIT cat={cat} {start}~{end} hard_cap={hard_cap:,} rows={len(rows):,} — "
+                 f"상한에 걸려 잘렸습니다(고갈 아님). 창을 더 잘게 쪼개야 합니다.")
     d = pd.DataFrame(rows)
     if len(d):
         d = d[d["src_report_id"].astype(str).str.len() > 0]
@@ -485,8 +490,22 @@ def naver_collect(start: str, end: str, cats: Sequence[str] = ("company", "indus
     frames = []
     for cat in cats:
         # ① JSON API 우선
+        #   ★ 10년 창을 한 번에 요청하면 hard_cap(60,000)에 걸려 조용히 잘린다. 잘린 지점이
+        #     날짜 경계라 특정 연도들이 통째로 0건이 되는데, 하류에서는 '시장이 그만큼만
+        #     발간했다'로 보여 구분이 안 된다. 한경(hankyung_collect)이 연 단위로 쪼개는 것과
+        #     같은 이유 — 여기서는 분기 단위로 쪼갠다(카테고리당 60,000 상한을 안전하게 벗어남).
         try:
-            dj = naver_collect_json(cat, start, end)
+            _qs = pd.period_range(as_ts(start), as_ts(end), freq="Q")
+            _jobs = [(cat,
+                      max(q.start_time, as_ts(start)).strftime("%Y-%m-%d"),
+                      min(q.end_time.normalize(), as_ts(end)).strftime("%Y-%m-%d"))
+                     for q in _qs]
+            _res = pmap_io(lambda j: naver_collect_json(*j), _jobs,
+                           workers=min(4, N_WORKERS_IO), desc=f"네이버 JSON {cat}")
+            _ok = [r for r in _res if r is not None and len(r)]
+            dj = pd.concat(_ok, ignore_index=True) if _ok else pd.DataFrame()
+            if len(dj):
+                dj = dj.drop_duplicates(subset=["src_report_id"], ignore_index=True)
         except Exception:
             dj = pd.DataFrame()
         if len(dj) > 50:
@@ -778,6 +797,23 @@ def download_pdfs(df: pd.DataFrame, cap_per_month: int = 0,
                 df[c] = None
         return df
     ext = pd.DataFrame(rows)
-    df = df.merge(ext, on="report_uid", how="left")
+    # ★ 단순 merge 는 안 된다. df 가 이미 (캐시에서 물려받은) pdf_uid/pdf_analysts/pdf_emails/
+    #   pdf_target 을 갖고 있으면 pandas 가 ext 쪽에 _x/_y 접미사를 붙여 두 컬럼 다 못 쓰게 된다.
+    #   그리고 이번 실행에서 URL 이 죽어 스킵된 행(ext 에 없음)의 값을 그냥 NaN 으로 덮으면
+    #   전에 성공적으로 뽑아둔 값을 잃는다. → 이번 회차 추출값을 우선하되(신선도), 없으면
+    #   기존 값으로 떨어진다(가용성). combine_first 방향(새 값 우선)을 명시적으로 구현한다.
+    pdf_ext_cols = [c for c in ("pdf_uid", "pdf_analysts", "pdf_emails", "pdf_target")
+                   if c in ext.columns]
+    ext2 = ext.rename(columns={c: f"__new_{c}" for c in pdf_ext_cols})
+    df = df.merge(ext2, on="report_uid", how="left")
+    for c in pdf_ext_cols:
+        nc = f"__new_{c}"
+        fresh = df[nc]
+        has_fresh = fresh.notna() & (fresh.astype(str).str.strip() != "")
+        if c in df.columns:
+            df[c] = fresh.where(has_fresh, df[c])
+        else:
+            df[c] = fresh
+        df = df.drop(columns=[nc])
     PIPE.io("OUT", "DRIVE", "research:pdf", ext, source="hankyung/naver pdf")
     return df

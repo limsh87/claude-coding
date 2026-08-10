@@ -234,9 +234,11 @@ N_WORKERS_CPU  = 0      # 연산 병렬(프로세스). 0 = CPU 코어수 자동(
 RATE_LIMIT_QPS = {      # 소스별 초당 요청 상한 — 차단 방지용. 낮출수록 안전/느림.
     "dart":      8.0,
     "hankyung":  2.0,
+    # ★ pykrx(get_market_ohlcv, adjusted=True)와 FinanceDataReader(6자리 코드)는 둘 다
+    #   fchart.stock.naver.com 을 친다. 한 호스트는 한 버킷으로 센다 — 경로별로 버킷을 나누면
+    #   그 호스트가 상한들의 '합'을 맞게 되어, 계량표는 지키는데 실제 서버는 초과당한다.
     "naver":     2.5,
-    "krx":       2.0,   # KRX 웹세션 — 올리면 차단 위험. KRXGate 가 추가로 직렬화한다.
-    "fdr":       6.0,   # FinanceDataReader 자체/깃허브 캐시 경로. KRX 버킷과 분리(병목 해소).
+    "krx":       2.0,   # data.krx.co.kr 웹세션 — 올리면 차단 위험. KRXGate 가 추가로 직렬화한다.
     "datagokr":  5.0,
     "customs":   3.0,
     "kind":      2.0,

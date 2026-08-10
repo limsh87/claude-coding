@@ -211,14 +211,19 @@ def build_report_master(frames: Sequence[pd.DataFrame], sec: pd.DataFrame) -> pd
         "opinion": ("opinion", lambda s: _pick_str(s) or None),
         "pdf_url": ("pdf_url", lambda s: _pick_str(s) or None),
         "detail_url": ("detail_url", lambda s: _pick_str(s) or None),
-        # ★★ 이 4개가 빠져 있어서 PDF 캐시가 '쓰고도 못 읽는' 상태였다 ★★
+        # ★★ 이 5개가 빠져 있어서 PDF 캐시가 '쓰고도 못 읽는' 상태였다 ★★
         #   download_pdfs 는 pdf_uid/pdf_analysts/pdf_emails/pdf_target 를 돌려주고
         #   원장에 저장까지 된다. 그런데 다음 실행에서 원장을 다시 읽어 이 agg 를 통과시키면
-        #   여기 없는 컬럼은 통째로 사라진다 → download_pdfs 가 pdf_uid 를 못 봐서
-        #   전 코퍼스(최대 30만건)를 매번 다시 내려받고 다시 파싱했다. blob 캐시가 HTTP 는
-        #   막아줬지만 드라이브 blob 읽기 + pdf_text() 파싱 30만회는 그대로 났다.
+        #   named aggregation 은 열거하지 않은 컬럼을 통째로 버린다 → download_pdfs 가
+        #   pdf_uid 를 못 봐서 전 코퍼스(최대 30만건)를 매번 다시 내려받고 다시 파싱했다.
+        #   blob 캐시가 HTTP 는 막아줬지만 드라이브 blob 읽기 + pdf_text() 파싱 30만회는
+        #   그대로 났다. 게다가 그 손실이 공용 볼트에 그대로 덮어써지므로 다른 전략까지
+        #   같이 잃는다 — build_analyst_ledger 의 pdf_header 폴백이 빈손이 되어 애널리스트
+        #   연결이 통째로 끊긴다.
         **({k: (k, _pick_str) for k in ("pdf_uid", "pdf_analysts", "pdf_emails")
             if k in d.columns}),
+        # pdf_target 은 수치다 — 네이티브 max 로 NaN 을 무시한다(위 target_price 와 같은 이유:
+        # 파이썬 람다는 30만건에서 50초, 게다가 '첫 비결측'은 그룹 내 행 순서에 의존한다).
         **({"pdf_target": ("pdf_target", "max")} if "pdf_target" in d.columns else {}),
         # 상세페이지 조회 여부도 같은 이유로 반드시 살아남아야 한다 — 떨어지면 목표주가를
         # 못 찾은 건을 매 실행 다시 연다(네이버 상세 2시간의 원인).
