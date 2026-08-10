@@ -161,6 +161,10 @@ RESEARCH_PDF_MAX_PER_MONTH = 0   # 0 = 무제한
 #      주지 않아, 행 수로 세면 '충분'으로 오판되어 한경컨센서스를 영구히 수집하지 않고
 #      F4 가 40개 분기 전부 결측이 됩니다(실운행에서 발생).
 RESEARCH_MIN_USABLE_PER_YEAR = 800
+#    ★ 네이버 리서치 신규 수집 여부. 실측 결과 네이버는 애널리스트·목표주가를 한 건도
+#      주지 않아 F4(스마트-일반 컨센서스 갭)에 기여가 정확히 0인데, 12개 연도를 받는 데
+#      35분을 썼습니다. 기본 False — 종목/제목 커버리지가 더 필요할 때만 True 로.
+RESEARCH_NAVER_BACKFILL = False
 
 # ── ⑦ 성능 / 자원 ───────────────────────────────────────────────────────────────────────────
 N_WORKERS_IO   = 12     # 네트워크 병렬(스레드). 403/429 가 보이면 8 이하로.
@@ -1105,6 +1109,31 @@ def col(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
     if name in df.columns:
         return pd.to_numeric(df[name], errors="coerce")
     return pd.Series(default, index=df.index, dtype="float64")
+
+
+def fnum(x, default: float = np.nan) -> float:
+    """딕셔너리에서 꺼낸 지표를 float 로 안전 변환. None/""/문자열/NaN 모두 흡수한다.
+    ★ np.isfinite(d.get("CAGR", np.nan)) 는 값이 None 이면 TypeError 로 죽는다 —
+      성과 dict 는 백테스트가 비면 통째로 {} 가 되므로 .get() 이 None 을 돌려준다.
+      (팩터 결손으로 축소 런을 돌릴 때 LOFO 표에서 실제로 터졌다.)"""
+    try:
+        if x is None:
+            return float(default)
+        v = float(x)
+        return v if np.isfinite(v) else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def fpct(x, digits: int = 2, dash: str = "—") -> str:
+    """퍼센트 포맷 — 값이 없으면 dash."""
+    v = fnum(x)
+    return f"{v:+.{digits}%}" if np.isfinite(v) else dash
+
+
+def fflt(x, digits: int = 2, dash: str = "—") -> str:
+    v = fnum(x)
+    return f"{v:.{digits}f}" if np.isfinite(v) else dash
 
 
 def safe_div(a, b, eps: float = 1e-12):
@@ -3619,7 +3648,8 @@ def spine_snapshots(panel: pd.DataFrame) -> Dict[pd.Timestamp, pd.DataFrame]:
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
 PRICE_COLS = ["code", "date", "open", "high", "low", "close", "volume", "amount", "src"]
-ATTEMPT_COLS = ["code", "requested_from", "attempted_at", "n_fail", "best_src", "permanent"]
+ATTEMPT_COLS = ["code", "requested_from", "attempted_at", "n_fail", "best_src", "permanent",
+                "eff_first"]   # eff_first = 실측으로 확인된 가장 이른 거래일(실효 상장일)
 
 
 @contextmanager
@@ -3800,6 +3830,7 @@ class AttemptLedger:
         d["requested_from"] = as_ts_series(d["requested_from"])
         d["n_fail"] = pd.to_numeric(d["n_fail"], errors="coerce").fillna(1).astype(int)
         d["permanent"] = d["permanent"].fillna(False).astype(bool)
+        d["eff_first"] = as_ts_series(d["eff_first"])
         d["code"] = d["code"].astype(str)
         d = (d.sort_values("attempted_at", na_position="first")
               .drop_duplicates("code", keep="last").reset_index(drop=True))
@@ -3836,6 +3867,27 @@ class AttemptLedger:
         if want_from is not None and frm is not None and pd.notna(frm) and frm > want_from:
             return False
         return (self.today - pd.Timestamp(at)).days < wait
+
+    def eff_first(self, code: str) -> Optional[pd.Timestamp]:
+        """실측으로 확인된 가장 이른 거래일. 상장일 정보가 틀렸을 때 헛조회를 끊는 근거."""
+        r = self._map.get(str(code))
+        v = (r or {}).get("eff_first")
+        return pd.Timestamp(v) if v is not None and pd.notna(v) else None
+
+    def learn_eff_first(self, code: str, observed_min: Any):
+        """★ 실운행 3회차 로그가 증명한 낭비: 신규 127,690행을 받았는데 순증이 410행이었다.
+        상장일이 실제보다 이르게(또는 결측으로) 기록된 111종목에 대해 '앞구간 결손'을 계속
+        판정해 매 실행 재조회한 것이다. 요청 구간의 시작보다 이른 데이터가 실제로 없었다면
+        그 관측 최초일을 실효 상장일로 확정해 다음 실행부터 요구하지 않는다."""
+        t = as_ts(observed_min)
+        if t is None or pd.isna(t):
+            return
+        r = dict(self._map.get(str(code)) or {"code": str(code), "n_fail": 0})
+        prev = r.get("eff_first")
+        if prev is None or pd.isna(prev) or pd.Timestamp(t) > pd.Timestamp(prev):
+            r["eff_first"] = pd.Timestamp(t)
+            self._map[str(code)] = r
+            self._dirty = True
 
     def best_src(self, code: str) -> Optional[str]:
         r = self._map.get(str(code))
@@ -3875,6 +3927,7 @@ class AttemptLedger:
         d["n_fail"] = pd.to_numeric(d["n_fail"], errors="coerce").fillna(0).astype(int)
         d["attempted_at"] = as_ts_series(d["attempted_at"]).astype(str)
         d["requested_from"] = as_ts_series(d["requested_from"]).astype(str)
+        d["eff_first"] = as_ts_series(d["eff_first"]).astype(str)
         VAULT.put_table("price_fetch_attempts", d[ATTEMPT_COLS], scope="shared",
                         domain="price", source="negative_cache(backoff+best_src)")
         LOG.info(f"수집 시도 원장 {len(d):,}종목 저장 — 다음 실행은 실패 종목을 "
@@ -4157,6 +4210,9 @@ def price_gap_plan(codes: Sequence[str], start: str, end: str, sec: pd.DataFrame
         w0 = start_ts
         if c in lst:
             w0 = max(w0, lst[c] - pd.Timedelta(days=5))
+        _ef = LEDGER.eff_first(c)          # 실측 최초일이 더 늦으면 그게 진짜 상장일이다
+        if _ef is not None:
+            w0 = max(w0, _ef - pd.Timedelta(days=2))
         w1 = end_ts
         if c in dl:
             w1 = min(w1, dl[c] + pd.Timedelta(days=10))
@@ -4456,6 +4512,34 @@ def fetch_prices(codes: Sequence[str], start: str, end: str, sec: pd.DataFrame,
                      f"실패 횟수를 누적하지 않아 영구제외로 굳지 않습니다.")
         for c, (ok, st, nm) in per_code.items():
             LEDGER.record(c, ok, st, nm, env_failure=(_env_fail and not ok))
+        # ★ 관측 최초일 학습 — '앞구간을 요청했는데 더 이른 데이터가 없었다'를 기억한다.
+        #   이게 없으면 상장일이 틀린 종목을 매 실행 영구 재조회한다(실측 111종목).
+        if new_frames:
+            _nf = pd.concat(new_frames, ignore_index=True)
+            _nf["date"] = as_ts_series(_nf["date"])
+            _nf["code"] = _nf["code"].astype(str).map(to_code6)
+            _mins = _nf.dropna(subset=["code", "date"]).groupby("code")["date"].min()
+            # 수집 전 보유분의 종목별 최초일 (have 는 캐시+marcap 병합본)
+            _pre_min = {}
+            if have is not None and len(have):
+                _hh = have[["code", "date"]].dropna()
+                _pre_min = _hh.groupby("code")["date"].min().to_dict()
+            _n_learn = 0
+            for c, (ok, st, nm) in per_code.items():
+                if not ok:
+                    continue
+                _asked = as_ts(st)
+                _got = _mins.get(c)
+                _have_min = _pre_min.get(c)
+                _obs = min([x for x in (_got, _have_min) if x is not None and pd.notna(x)],
+                           default=None)
+                if _obs is not None and _asked is not None and \
+                        pd.Timestamp(_obs) > pd.Timestamp(_asked) + pd.Timedelta(days=10):
+                    LEDGER.learn_eff_first(c, _obs)
+                    _n_learn += 1
+            if _n_learn:
+                LOG.ok(f"실효 상장일 학습 {_n_learn:,}종목 — 요청 구간보다 이른 데이터가 실제로 "
+                       f"없었습니다. 다음 실행부터 이 앞구간을 재조회하지 않습니다.")
         LEDGER.save()
         LOG.ok(f"일봉 결손 수집 결과 — 성공 {n_ok:,}건 · 실패 {len(fail_codes):,}건"
                + (f" (실패는 원장에 기록되어 {PRICE_NEG_BACKOFF_D[0]}일 이상 재시도하지 "
@@ -5370,19 +5454,43 @@ def hankyung_collect(start: str, end: str, page_size: int = 80, max_pages: int =
     jobs = [(as_ts(max(as_ts(f"{y}-01-01"), as_ts(start))),
              as_ts(min(as_ts(f"{y}-12-31"), as_ts(end)))) for y in years]
 
+    # ★ 실운행 3회차: 2015~2020 은 받아지고 2021년 이후는 0건이었다(애널연결률도 그때부터
+    #   0%). 원인을 코드에서 단정할 수 없으므로 ① 파라미터 프로파일을 2가지 시도하고
+    #   ② 'HTML 을 못 받음'과 'HTML 은 받았는데 0행 파싱'을 구분해 기록한다.
+    #   그러면 다음 실행 로그가 파서 문제인지 접근 문제인지 스스로 알려준다.
+    diag = {"http_fail": 0, "html_bytes": 0, "pages": 0, "parsed": 0, "profile": ""}
+
+    def _params(profile: int, sd, ed, page):
+        base = {"sdate": sd.strftime("%Y-%m-%d"), "edate": ed.strftime("%Y-%m-%d"),
+                "now_page": page, "pagenum": page_size}
+        if profile == 0:
+            return {**base, "skinType": "business", "report_type": "CO",
+                    "order_type": "", "search_text": "", "business_code": ""}
+        # 프로파일 1: report_type/skinType 을 비우고 최소 파라미터로 — 최근 구간에서
+        # 필터가 결과를 0으로 만드는 경우를 우회한다.
+        return {**base, "search_text": ""}
+
     def _sweep(job):
         sd, ed = job
         got, seen, empty_streak = [], set(), 0
+        profile = 0
         for page in range(1, max_pages + 1):
             html = http_get(HK_LIST, source="hankyung", tries=3, referer=HK_BASE + "/",
-                            timeout=30, params={
-                                "skinType": "business", "sdate": sd.strftime("%Y-%m-%d"),
-                                "edate": ed.strftime("%Y-%m-%d"), "now_page": page,
-                                "pagenum": page_size, "report_type": "CO",
-                                "order_type": "", "search_text": "", "business_code": ""})
+                            timeout=30, params=_params(profile, sd, ed, page))
             if not html:
+                diag["http_fail"] += 1
+                if page == 1 and profile == 0:
+                    profile = 1                      # 1페이지부터 실패 → 프로파일 교체 재시도
+                    continue
                 break
+            diag["pages"] += 1
+            diag["html_bytes"] += len(html)
             batch = _hk_parse(html)
+            diag["parsed"] += len(batch)
+            if page == 1 and not batch and profile == 0:
+                profile = 1                          # HTML 은 왔는데 0행 → 프로파일 교체
+                diag["profile"] = "fallback"
+                continue
             fresh = [b for b in batch if b["src_report_id"] not in seen]
             seen.update(b["src_report_id"] for b in fresh)
             got.extend(fresh)
@@ -5402,6 +5510,17 @@ def hankyung_collect(start: str, end: str, page_size: int = 80, max_pages: int =
     LOG.ok(f"한경컨센서스 {len(d):,}건 (작성자 보유 "
            f"{int(d['analyst_raw'].astype(str).str.len().gt(0).sum()) if len(d) else 0:,} · "
            f"목표주가 {int(d['target_price'].notna().sum()) if len(d) else 0:,})")
+    if not len(d):
+        LOG.table([["요청 연도", f"{years[0]}~{years[-1]}"],
+                   ["HTTP 실패 페이지", f"{diag['http_fail']}"],
+                   ["HTML 수신 페이지", f"{diag['pages']}"],
+                   ["HTML 총 바이트", f"{diag['html_bytes']:,}"],
+                   ["파싱된 행", f"{diag['parsed']}"],
+                   ["파라미터 프로파일", diag["profile"] or "기본"],
+                   ["판정", ("HTML 자체를 못 받음 → 접근/차단 문제"
+                             if diag["pages"] == 0 else
+                             "HTML 은 받았으나 0행 파싱 → 목록 레이아웃/파라미터 문제")]],
+                  ["항목", "값"], ["l", "r"], title="한경 응답 진단 (0건일 때만 출력)")
     PIPE.io("IN", "HTTP", "hankyung:list", d, source=HK_LIST)
     return d
 
@@ -6775,15 +6894,15 @@ def run_robustness(sr: StrategyRun, base: dict, bench_daily: Optional[pd.Series]
                "계약: 성과 최고 변형을 '원형'으로 채택하지 않는다. Primary=사전고정 baseline")
     LOG.table([[r.get("variant", ""),
                 f"{r['CAGR']:+.2%}" if isinstance(r.get("CAGR"), float) and
-                np.isfinite(r.get("CAGR", np.nan)) else "—",
+                np.isfinite(fnum(r.get("CAGR"))) else "—",
                 f"{r['Sharpe']:.2f}" if isinstance(r.get("Sharpe"), float) and
-                np.isfinite(r.get("Sharpe", np.nan)) else "—",
+                np.isfinite(fnum(r.get("Sharpe"))) else "—",
                 f"{r['MDD']:+.1%}" if isinstance(r.get("MDD"), float) and
-                np.isfinite(r.get("MDD", np.nan)) else "—",
+                np.isfinite(fnum(r.get("MDD"))) else "—",
                 f"{r['IR']:.2f}" if isinstance(r.get("IR"), float) and
-                np.isfinite(r.get("IR", np.nan)) else "—",
+                np.isfinite(fnum(r.get("IR"))) else "—",
                 f"{r['hit']:.0%}" if isinstance(r.get("hit"), float) and
-                np.isfinite(r.get("hit", np.nan)) else "—",
+                np.isfinite(fnum(r.get("hit"))) else "—",
                 _trunc(str(r.get("note", "")), 44)]
                for r in R.to_dict("records")],
               ["변형", "CAGR", "Sharpe", "MDD", "IR", "적중률", "비고"],
@@ -6791,18 +6910,30 @@ def run_robustness(sr: StrategyRun, base: dict, bench_daily: Optional[pd.Series]
     return R
 
 
-def run_lofo(sr: StrategyRun, bench_daily: Optional[pd.Series]) -> pd.DataFrame:
-    """leave-one-factor-out — 각 팩터를 빼고 6팩터 합성으로 재실행."""
+def run_lofo(sr: StrategyRun, bench_daily: Optional[pd.Series],
+             base_drop: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """leave-one-factor-out — 각 팩터를 하나 더 빼고 재실행.
+
+    ★ base_drop: 입력을 확보하지 못해 이미 제외된 팩터들. 이걸 넘기지 않으면
+      ① 기준선이 '7팩터 baseline'(축소 런에서는 빈 결과)이 되어 ΔCAGR 이 전부 NaN 이고
+      ② 이미 전량 결측인 팩터를 '제외'해도 결과가 같아 무의미한 행만 늘어난다."""
     rows = []
-    base = sr.run()
+    base_drop = list(base_drop or [])
+    base = sr.run(drop_factor=(base_drop or None))
     st0 = perf_stats_daily(base["daily"], base["quarterly"], bench_daily)
-    for f in FACTOR_NAMES:
+    c0 = fnum(st0.get("CAGR"))
+    alive = [f for f in FACTOR_NAMES if f not in base_drop]
+    if len(alive) <= 2:
+        LOG.info(f"LOFO 생략 — 가용 팩터가 {len(alive)}개뿐입니다.")
+        return pd.DataFrame(columns=["dropped", "CAGR", "Sharpe", "dCAGR"])
+    for f in alive:
         try:
-            bt = sr.run(drop_factor=f, tag=f"LOFO-{f}")
+            bt = sr.run(drop_factor=base_drop + [f], tag=f"LOFO-{f}")
             st = perf_stats_daily(bt["daily"], bt["quarterly"], bench_daily)
-            rows.append({"dropped": f, "CAGR": st.get("CAGR"), "Sharpe": st.get("Sharpe"),
-                         "dCAGR": (st.get("CAGR", np.nan) or np.nan) -
-                                  (st0.get("CAGR", np.nan) or np.nan)})
+            cg = fnum(st.get("CAGR"))
+            rows.append({"dropped": f, "CAGR": cg, "Sharpe": fnum(st.get("Sharpe")),
+                         "dCAGR": (cg - c0) if (np.isfinite(cg) and np.isfinite(c0))
+                                  else np.nan})
         except Exception as e:                                      # noqa
             rows.append({"dropped": f, "CAGR": np.nan, "Sharpe": np.nan, "dCAGR": np.nan,
                          "err": type(e).__name__})
@@ -7257,14 +7388,45 @@ def _collect_research(sec: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd
                      "보수적 속도로만 수집합니다. PDF 원문은 재배포 금지.")
             LOG.info("※ 한경컨센서스가 애널리스트·목표주가를 주는 유일한 소스입니다 "
                      "(실측 연결률 100% · TP율 90%) → 이쪽을 먼저 채웁니다.")
-            for y in need_years:                       # 한경 먼저 전 연도
-                if "hankyung" in RESEARCH_SOURCES:
-                    frames.append(hankyung_collect(f"{y}-01-01", f"{y}-12-31"))
-            _u2 = _usable_by_year(frames)
-            for y in need_years:                       # 그래도 부족한 연도만 네이버
-                if "naver" in RESEARCH_SOURCES and \
-                        _u2.get(y, 0) < RESEARCH_MIN_USABLE_PER_YEAR:
+            # ★ 실운행 3회차 병목: L1.RESEARCH 가 3,203초(53분)로 전체의 86% 였고, 그 중
+            #   약 35분이 네이버였다. 그런데 네이버는 애널리스트·목표주가를 **한 건도** 주지
+            #   않아(감사표 연결률 0.0% · TP율 0.0%) F4 커버리지에 기여가 정확히 0 이다.
+            #   → F4 목적의 수집 루프에서 네이버를 제외한다. 종목/제목 커버리지용으로 이미
+            #     캐시에 쌓인 분은 그대로 쓰고, 신규 수집은 RESEARCH_NAVER_BACKFILL 로만.
+            _zero_streak = 0
+            for y in need_years:
+                if "hankyung" not in RESEARCH_SOURCES:
+                    break
+                _hk = hankyung_collect(f"{y}-01-01", f"{y}-12-31")
+                _n_use = int(_usable_by_year([_hk]).get(y, 0)) if _hk is not None else 0
+                frames.append(_hk)
+                if _n_use == 0:
+                    _zero_streak += 1
+                    LOG.warn(f"한경컨센서스 {y}년 F4 가용 0건 "
+                             f"(수집 {0 if _hk is None else len(_hk):,}건) — 연속 {_zero_streak}회")
+                    if _zero_streak >= 2:
+                        LOG.error(f"한경컨센서스가 {y}년 이후 연속 2년 0건입니다 — 남은 연도 "
+                                  f"{[z for z in need_years if z > y]} 수집을 중단합니다.")
+                        LOG.error("  원인 후보: ① 사이트가 최근 구간에 다른 파라미터를 요구 "
+                                  "② 일시 차단/레이트리밋 ③ 목록 레이아웃 변경.")
+                        LOG.error("  위 '한경 응답 진단' 표(HTTP 상태·바이트·파싱행)를 보면 "
+                                  "'HTML 을 못 받음'인지 'HTML 은 받았는데 0행 파싱'인지 "
+                                  "구분됩니다. 후자면 파서를, 전자면 접근을 고치면 됩니다.")
+                        break
+                else:
+                    _zero_streak = 0
+            if RESEARCH_NAVER_BACKFILL and "naver" in RESEARCH_SOURCES:
+                _u2 = _usable_by_year(frames)
+                _nv = [y for y in need_years
+                       if _u2.get(y, 0) < RESEARCH_MIN_USABLE_PER_YEAR]
+                LOG.info(f"네이버 백필 {len(_nv)}개 연도 (RESEARCH_NAVER_BACKFILL=True) — "
+                         f"네이버는 애널리스트·목표주가를 주지 않아 F4 에는 기여하지 않습니다.")
+                for y in _nv:
                     frames.append(naver_collect(f"{y}-01-01", f"{y}-12-31"))
+            else:
+                LOG.info("네이버 신규 수집 생략 — 애널리스트·목표주가를 주지 않아 F4 커버리지에 "
+                         "기여가 0이고, 실측 35분을 소모했습니다(RESEARCH_NAVER_BACKFILL=True "
+                         "로 켜면 종목/제목 커버리지 목적으로 다시 받습니다).")
         else:
             LOG.ok("모든 연도에 F4 가용 리포트가 충분 — 신규 수집 생략.")
     rep = build_report_master(frames, sec)
@@ -7611,6 +7773,8 @@ def main() -> dict:
     delist = {r.code: r.delisting_date for r in SEC.itertuples(index=False)
               if pd.notna(r.delisting_date)}
 
+    DEGRADED = {"active": False, "dead": [], "alive": list(FACTOR_NAMES), "status": ""}
+    RUN_LABEL = RECON_LABEL
     with PIPE.stage("L3.BT", "백테스트 (본전략)", "L3"):
         sr = StrategyRun(RECON_LABEL, snaps, sch, px, delist)
         bt = sr.run(tag=RECON_LABEL)
@@ -7627,37 +7791,42 @@ def main() -> dict:
                      if len(snaps) and int(pd.to_numeric(snaps[f], errors="coerce")
                                            .notna().sum()) == 0]
             _alive = [f for f in FACTOR_NAMES if f not in _dead]
-            if ALLOW_DEGRADED_DIAGNOSTIC and _dead and len(_alive) >= 3:
-                LOG.banner(f"진단용 축소 런 — {len(_alive)}팩터",
-                           "계약 baseline 아님 · Primary 대체 아님 · 라벨 분리")
-                LOG.warn(f"입력을 확보하지 못한 팩터: {_dead}")
-                LOG.warn(f"가용 팩터 {len(_alive)}개로만 계산한 결과를 별도 라벨"
-                         f"({DEGRADED_LABEL})로 출력합니다. STATUS="
-                         f"DEGRADED_FACTOR_SUBSET_NOT_CONTRACT_BASELINE")
-                _btd = sr.run(drop_factor=_dead, tag=DEGRADED_LABEL)
-                if len(_btd.get("quarterly", [])):
-                    _bd = fetch_benchmark_k200(BACKTEST_START, BACKTEST_END)
-                    _bds = None
-                    if _bd is not None and len(_bd):
-                        _s = _bd.set_index(as_ts_series(_bd["date"]))["close"].astype(float)
-                        _bds = _s.sort_index().pct_change().dropna()
-                    print_perf_block(f"진단용 축소 런 ({len(_alive)}팩터) — 계약 baseline 아님",
-                                     perf_stats_daily(_btd["daily"], _btd["quarterly"], _bds))
-                    globals()["_DEGRADED_BT"] = _btd
-                    globals()["_DEGRADED_FACTORS"] = _alive
-                    LOG.warn("★ 위 수치는 계약 baseline(7팩터 전부 유효)이 아닙니다. "
-                             "결손 팩터의 입력을 확보한 뒤 재실행해야 Primary 가 나옵니다.")
-            raise RuntimeError(
-                "백테스트(계약 baseline)가 빈 결과를 냈습니다 — 전 분기에서 적격 종목이 "
-                f"{MIN_ELIGIBLE}개 미만입니다.\n"
-                "  위에 출력된 '입력 결손 진단' 표가 어느 입력이 비었는지 알려줍니다. "
-                "진단 파일은 이미 드라이브에 저장되었습니다.")
+            if not (ALLOW_DEGRADED_DIAGNOSTIC and _dead and len(_alive) >= 3):
+                raise RuntimeError(
+                    "백테스트(계약 baseline)가 빈 결과를 냈습니다 — 전 분기에서 적격 종목이 "
+                    f"{MIN_ELIGIBLE}개 미만입니다.\n"
+                    "  위에 출력된 '입력 결손 진단' 표가 어느 입력이 비었는지 알려줍니다. "
+                    "진단 파일은 이미 드라이브에 저장되었습니다.")
+            # ★ v1.1.2 — 여기서 예외를 던지면 성과검증·강건성·해석표·산출물이 하나도 안 나온다.
+            #   결손 팩터가 특정되고 가용 팩터가 3개 이상이면 **축소 팩터셋을 이번 실행의
+            #   본류로 채택하고 끝까지 완주**한다. 계약 baseline 이 아님은 라벨·STATUS·모든
+            #   산출물 헤더에 못박는다(Primary 를 대체하지 않는다).
+            LOG.banner(f"축소 팩터셋으로 완주 — {len(_alive)}팩터",
+                       "계약 baseline 미달 · Primary 아님 · 라벨/STATUS 분리")
+            LOG.warn(f"입력을 확보하지 못한 팩터: {_dead}")
+            LOG.warn(f"→ 가용 팩터 {len(_alive)}개({[f[:2] for f in _alive]})로 계산을 계속하고 "
+                     f"성과·강건성·해석표·산출물까지 모두 생성합니다.")
+            LOG.warn(f"   라벨 {DEGRADED_LABEL} · "
+                     f"STATUS=DEGRADED_FACTOR_SUBSET_NOT_CONTRACT_BASELINE")
+            LOG.warn("   ★ 결손 팩터의 입력을 확보한 뒤 재실행해야 계약 Primary 가 나옵니다.")
+            bt = sr.run(drop_factor=_dead, tag=DEGRADED_LABEL)
+            if not len(bt.get("quarterly", [])):
+                raise RuntimeError(
+                    f"축소 팩터셋({len(_alive)}개)으로도 적격 종목이 없습니다 — "
+                    f"유니버스·가격까지 함께 확인해야 합니다. 진단 파일을 저장했습니다.")
+            DEGRADED = {"active": True, "dead": list(_dead), "alive": list(_alive),
+                        "status": "DEGRADED_FACTOR_SUBSET_NOT_CONTRACT_BASELINE"}
+            globals()["_DEGRADED"] = DEGRADED
+            RUN_LABEL = DEGRADED_LABEL
+            LOG.ok(f"축소 팩터셋 백테스트 완료 — 분기 {len(bt['quarterly'])}개. "
+                   f"이후 단계는 이 결과를 사용합니다.")
 
     sr_cmp, bt_cmp = None, None
     if len(snaps_cmp):
         with PIPE.stage("L3.BT.CMP", "백테스트 (비교전략)", "L3", critical=False):
             sr_cmp = StrategyRun(CMP_LABEL, snaps_cmp, sch, px, delist)
-            bt_cmp = sr_cmp.run(tag=CMP_LABEL)
+            # 본전략이 축소 팩터셋으로 돌았다면 비교전략도 같은 팩터셋이어야 비교가 성립한다
+            bt_cmp = sr_cmp.run(drop_factor=(DEGRADED["dead"] or None), tag=CMP_LABEL)
     else:
         PIPE.mark_skipped("L3.BT.CMP", "비교전략 백테스트", "L3", "비교 스냅샷 없음")
 
@@ -7668,7 +7837,10 @@ def main() -> dict:
             b = bench.set_index("date")["close"].astype(float).sort_index()
             bench_daily = b.pct_change().dropna()
         st_main = perf_stats_daily(bt["daily"], bt["quarterly"], bench_daily)
-        print_perf_block(f"성과 검증표 — {RECON_LABEL} (Primary)", st_main)
+        print_perf_block(
+            f"성과 검증표 — {RUN_LABEL}"
+            + (f" (★계약 baseline 아님 · 결손 {len(DEGRADED['dead'])}팩터)"
+               if DEGRADED["active"] else " (Primary)"), st_main)
         ann = annual_table(bt["daily"], bench_daily)
         if len(ann):
             LOG.table([[str(y)] + [f"{v:+.1%}" if isinstance(v, float) and np.isfinite(v)
@@ -7696,13 +7868,14 @@ def main() -> dict:
                        for f in FACTOR_NAMES],
                       ["팩터"] + [f[:6] for f in FACTOR_NAMES],
                       ["l"] + ["r"] * len(FACTOR_NAMES), title="팩터 상관 (분기 평균 스피어만)")
-        lofo = run_lofo(sr, bench_daily)
+        lofo = run_lofo(sr, bench_daily, base_drop=DEGRADED["dead"])
         if len(lofo):
-            LOG.table([[r["dropped"], f"{r['CAGR']:+.2%}" if np.isfinite(r.get("CAGR", np.nan))
-                        else "—", f"{r['dCAGR']:+.2%}" if np.isfinite(r.get("dCAGR", np.nan))
-                        else "—"] for r in lofo.to_dict("records")],
+            LOG.table([[r["dropped"], fpct(r.get("CAGR")), fpct(r.get("dCAGR"))]
+                       for r in lofo.to_dict("records")],
                       ["제외 팩터", "CAGR", "ΔCAGR(vs 원형)"], ["l", "r", "r"],
-                      title="leave-one-factor-out")
+                      title="leave-one-factor-out"
+                      + (f" (축소 기준선 {len(DEGRADED['alive'])}팩터)"
+                         if DEGRADED["active"] else ""))
         # 원문 앵커(참고 전용 — 계약: 이 숫자에 맞춘 정규화 선택 금지)
         anchor_2022 = None
         try:
@@ -7762,7 +7935,7 @@ def main() -> dict:
     timed_core_s = time.time() - t_core
 
     with PIPE.stage("L6.INTERP", "해석표", "L6", critical=False):
-        _interpretation_tables(sr, bt, snaps, bench_daily, RECON_LABEL)
+        _interpretation_tables(sr, bt, snaps, bench_daily, RUN_LABEL)
         if bt_cmp is not None and len(snaps_cmp):
             _interpretation_tables(sr_cmp, bt_cmp, snaps_cmp, bench_daily, CMP_LABEL)
 
@@ -7801,6 +7974,15 @@ def main() -> dict:
             extra_cov.append({"signal_date": _mq, "factor": "UNIVERSE_MISSING",
                               "grade": "cash_quarter", "n_universe": 0, "n_valid": 0,
                               "valid_pct": 0.0})
+        if DEGRADED["active"]:
+            extra_cov.append({"signal_date": "STATUS", "factor": "DEGRADED_FACTOR_SUBSET",
+                              "grade": DEGRADED["status"],
+                              "n_universe": len(FACTOR_NAMES),
+                              "n_valid": len(DEGRADED["alive"]), "valid_pct": np.nan})
+            for _df in DEGRADED["dead"]:
+                extra_cov.append({"signal_date": "STATUS", "factor": f"DROPPED_{_df}",
+                                  "grade": "input_unavailable", "n_universe": 0,
+                                  "n_valid": 0, "valid_pct": 0.0})
         extra_cov.append({"signal_date": "SOURCE", "factor": "universe_method",
                           "grade": str(uni_meta.get("method", "")),
                           "n_universe": int(uni_meta.get("n_observed", 0)),
@@ -7815,7 +7997,7 @@ def main() -> dict:
                                       "n_universe": len(g_), "n_valid": int(v_),
                                       "valid_pct": round(100.0 * v_ / len(g_), 1)})
         coverage = _coverage_report(snaps, vendor, extra_cov)
-        perf_rows = [{"strategy": RECON_LABEL, "metric": k, "value": v}
+        perf_rows = [{"strategy": RUN_LABEL, "metric": k, "value": v}
                      for k, v in st_main.items()]
         perf_rows += [{"strategy": CMP_LABEL, "metric": k, "value": v}
                       for k, v in (st_cmp or {}).items()]
@@ -7823,40 +8005,40 @@ def main() -> dict:
         try:
             for y_, row_ in annual_table(bt["daily"], bench_daily).iterrows():
                 for cn_, v_ in row_.items():
-                    perf_rows.append({"strategy": RECON_LABEL,
+                    perf_rows.append({"strategy": RUN_LABEL,
                                       "metric": f"연간_{y_}_{cn_}", "value": v_})
             for r_ in rolling12m_table(bt["daily"]).to_dict("records"):
-                perf_rows.append({"strategy": RECON_LABEL,
+                perf_rows.append({"strategy": RUN_LABEL,
                                   "metric": f"롤링12M_{r_['stat']}",
                                   "value": r_["rolling_12m"]})
             for r_ in run_lofo(sr, bench_daily).to_dict("records"):
-                perf_rows.append({"strategy": RECON_LABEL,
+                perf_rows.append({"strategy": RUN_LABEL,
                                   "metric": f"LOFO_dCAGR_{r_['dropped']}",
                                   "value": r_.get("dCAGR")})
             for r_ in factor_contribution_table(bt.get("scored", pd.DataFrame())
                                                 ).to_dict("records"):
-                perf_rows.append({"strategy": RECON_LABEL,
+                perf_rows.append({"strategy": RUN_LABEL,
                                   "metric": f"기여_{r_['factor']}",
                                   "value": r_["contribution"]})
             for r_ in concentration_table(bt, SEC).to_dict("records"):
-                perf_rows.append({"strategy": RECON_LABEL,
+                perf_rows.append({"strategy": RUN_LABEL,
                                   "metric": f"집중도_{r_['항목']}", "value": r_["값"]})
         except Exception as e_:                                     # noqa
             LOG.warn(f"성과 확장표 영속화 일부 실패({type(e_).__name__}) — 로그에는 있음.")
         trades = bt["quarterly"].copy()
-        trades["strategy"] = RECON_LABEL
+        trades["strategy"] = RUN_LABEL
         if bt_cmp is not None and len(bt_cmp["quarterly"]):
             t2 = bt_cmp["quarterly"].copy()
             t2["strategy"] = CMP_LABEL
             trades = pd.concat([trades, t2], ignore_index=True)
         holds = bt["holdings"].copy()
-        holds["strategy"] = RECON_LABEL
+        holds["strategy"] = RUN_LABEL
         if bt_cmp is not None and len(bt_cmp["holdings"]):
             h2 = bt_cmp["holdings"].copy()
             h2["strategy"] = CMP_LABEL
             holds = pd.concat([holds, h2], ignore_index=True)
         rob_all = rob.copy()
-        rob_all["strategy"] = RECON_LABEL
+        rob_all["strategy"] = RUN_LABEL
         if len(rob_cmp):
             r2 = rob_cmp.copy()
             r2["strategy"] = CMP_LABEL
@@ -7870,11 +8052,11 @@ def main() -> dict:
             "anchor_2022": anchor_2022, "fixture_overlap": fixture_overlap})
         # 전용 인덱스 재호출용 테이블 (다음 실행·다른 분석에서 즉시 재사용)
         VAULT.put_table(f"{STRATEGY_ID}_factor_snapshots", snaps, scope="private",
-                        domain="features", source=RECON_LABEL)
+                        domain="features", source=RUN_LABEL)
         VAULT.put_table(f"{STRATEGY_ID}_portfolios", holds, scope="private",
-                        domain="backtest", source=RECON_LABEL)
+                        domain="backtest", source=RUN_LABEL)
         VAULT.put_table(f"{STRATEGY_ID}_returns_daily", bt["daily"], scope="private",
-                        domain="backtest", source=RECON_LABEL)
+                        domain="backtest", source=RUN_LABEL)
         if len(snaps_cmp):
             VAULT.put_table(f"{STRATEGY_ID}_factor_snapshots_cmp", snaps_cmp, scope="private",
                             domain="features", source=CMP_LABEL)
@@ -7896,8 +8078,15 @@ def main() -> dict:
     LOG.banner("완료", f"총 {(time.time() - t_all) / 60:.1f}분 · STATUS={vendor['status']} · "
                        f"산출물 {len(outs)}개는 전용 인덱스({GDRIVE_PRIVATE_NS})에 저장")
     LOG.info("한계 명시: FnGuide 벤더 팩터 부재로 F1~F5 는 공개 프록시입니다. 이 결과는 "
-             f"{RECON_LABEL} 이며 신한 원문 성과의 재현이 아닙니다. 상세는 "
+             f"{RUN_LABEL} 이며 신한 원문 성과의 재현이 아닙니다. 상세는 "
              "10_exact_vs_reconstructed.md 참조.")
+    if DEGRADED["active"]:
+        LOG.banner("★ 이 실행은 계약 baseline 이 아닙니다",
+                   f"STATUS={DEGRADED['status']}")
+        LOG.warn(f"결손 팩터 {DEGRADED['dead']} 의 입력을 확보하지 못해 "
+                 f"가용 {len(DEGRADED['alive'])}팩터로 계산했습니다.")
+        LOG.warn("계약 Primary(7팩터 전부 유효 · 상위30 동일가중)는 결손 입력을 채운 뒤 "
+                 "재실행해야 산출됩니다. 위 수치를 원문 성과와 비교하지 마세요.")
     offer_download(outs)
     return {"snaps": snaps, "backtest": bt, "backtest_cmp": bt_cmp, "robust": rob,
             "coverage": coverage, "outputs": outs}
