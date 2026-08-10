@@ -276,7 +276,7 @@ RUNTIME_4H_LIMIT_ABOLISHED = True
 # ║ [1] 부트스트랩 — 환경 감지(Colab/JupyterLab/CLI) · 의존성 자동 설치 · 표준 임포트          ║
 # ║     실패하면 "무엇이 없고 어떻게 설치하는지"를 한글로 출력하고 멈춥니다.                    ║
 # ╚══════════════════════════════════════════════════════════════════════════════════════════╝
-import os, sys, io, re, gc, json, math, time, zlib, random, shutil, string, hashlib, zipfile
+import os, sys, io, re, gc, csv, json, math, time, zlib, random, shutil, string, hashlib, zipfile
 import platform, tempfile, threading, traceback, subprocess, unicodedata, warnings
 import xml.etree.ElementTree as _ET
 import datetime as dtm
@@ -8218,16 +8218,8 @@ def harvest_nps_month(master: pd.DataFrame, months: pd.DatetimeIndex,
     """
     cols = ["code", "month", "nps_members", "nps_amt", "nps_new", "nps_lost",
             "n_sites", "match_conf"]
-    # 상장사 정규화명 색인 — 콜당 1,000행을 메모리에서 즉시 걸러낸다
-    nm = master.dropna(subset=["code"]).copy()
-    nm["_n"] = nm["name"].astype(str).map(clean_corp)
-    nm = nm[nm["_n"].str.len() >= 2]
-    idx: Dict[str, str] = {}
-    for r in nm.itertuples(index=False):
-        idx.setdefault(r._n, r.code)
-    pre = defaultdict(list)
-    for n, c in idx.items():
-        pre[n[:2]].append((n, c))
+    # 상장사 정규화명 색인 — 콜당 1,000행을 메모리에서 즉시 걸러낸다(파일축과 공용)
+    pre = _nps_name_index(master)
     done_ym, led = led_read("nps_months_done", "ym", what="PACK-N 월축")
     want = [m.strftime("%Y%m") for m in months]
     # ★최신월부터 역순 — 12개월 차분에 13개월이 필요하므로 최근이 먼저 값을 만든다.
@@ -8267,15 +8259,9 @@ def harvest_nps_month(master: pd.DataFrame, months: pd.DatetimeIndex,
                     w = clean_corp(it.get("wkplNm", ""))
                     if len(w) < 2:
                         continue
-                    best, bs = None, 0.0
-                    for cand, code in pre.get(w[:2], ()):
-                        if w == cand or w.startswith(cand):
-                            best, bs = code, 100.0
-                            break
-                        s = float(name_sim(w, cand))
-                        if s > bs:
-                            best, bs = code, s
-                    if best is None or bs < NPS_SIM_MIN:
+                    # ★파일축과 ★같은 함수 — 판정을 두 곳에 복사해 두지 않는다.
+                    best, bs = _nps_best_match(w, pre)
+                    if best is None:
                         continue
                     rows.append({"code": best,
                                  "month": pd.Timestamp(f"{ym[:4]}-{ym[4:]}-01")
@@ -8322,6 +8308,419 @@ def harvest_nps_month(master: pd.DataFrame, months: pd.DatetimeIndex,
     return out.reindex(columns=cols)
 
 
+# ── ★파일데이터 아카이브 경로 — 10년치의 유일한 실경로 ────────────────────────────────
+#   ★왜 이 경로인가. 공단 OpenAPI(serviceKey)는 ★현황 명부다 — 이번 달 것만 서비스하고
+#   지난달 것은 지운다. 그래서 API 를 아무리 잘 돌려도 10년은 원리적으로 안 나온다.
+#   반면 공공데이터포털의 ★파일데이터는 매월 올린 CSV 를 ★버전(uddi)으로 남긴다.
+#   과거 스냅샷이 남아 있는 유일한 곳이고, 페이지가 스스로 이렇게 적어 둔다:
+#       "파일데이터는 ★로그인 없이 다운로드를 통해 이용하실 수 있습니다."
+#   즉 serviceKey 쿼터를 ★한 콜도 쓰지 않는다(계수 채널이 DGK_SRC 로 따로 나가는 이유).
+#
+#   ★내려받는 3단 사슬(포털 페이지의 자바스크립트를 그대로 옮긴 것이다. 추측이 아니다):
+#     ① GET /data/15083277/fileData.do                      → 세션 쿠키 + 현재 uddi
+#     ② GET /tcs/dss/selectFileDataDownload.do              → {status, atchFileId, fileDetailSn}
+#          (fn_fileDataDown = function(publicDataPk, publicDataDetailPk){ … })
+#     ③ GET /cmm/cmm/fileDownload.do?atchFileId=…&fileDetailSn=…  → CSV 본문
+#   ★atchFileId 는 캐시하지 않는다 — ②가 매번 새로 발급하며, 묵은 값은 조용히 만료된다.
+#
+#   ★컬럼이 API 와 ★같다(포털 '데이터항목 정보' 표로 확인):
+#       DATA_CRT_YM/WKPL_NM/WKPL_JNNG_STCD/JNNGP_CNT/CRRMM_NTC_AMT/NW_ACQZR_CNT/LSS_JNNGP_CNT
+#   그래서 이 경로는 월축과 ★완전히 같은 산식으로 같은 패널을 만든다(정의 드리프트 0).
+NPS_FILE_PK = "15083277"
+DGK = "https://www.data.go.kr"
+NPS_FILE_PAGE = f"{DGK}/data/{NPS_FILE_PK}/fileData.do"
+NPS_FILE_RESOLVE = f"{DGK}/tcs/dss/selectFileDataDownload.do"
+NPS_FILE_HIST = f"{DGK}/tcs/dss/selectHistAndCsvData.do"
+NPS_FILE_DOWN = f"{DGK}/cmm/cmm/fileDownload.do"
+NPS_OAS = "https://infuser.odcloud.kr/oas/docs"
+DGK_SRC = "dgk_file"          # ★serviceKey 쿼터와 무관한 채널(파일 다운로드는 키가 없다)
+NPS_FILE_ON = True            # False 로 두면 파일 경로를 건너뛰고 곧장 API 월축으로 간다
+NPS_FILE_MIN_BYTES = 1 << 20  # 1MB 미만은 CSV 가 아니라 오류 HTML 이다
+NPS_FILE_DL_S = 900.0         # 파일 1개 다운로드 절대 마감선(수십~수백 MB)
+NPS_FILE_SPOOL = 8 << 20      # 이 크기를 넘으면 ★임시파일로 흘린다(RAM 에 안 올린다)
+_UDDI = re.compile(r"uddi:[0-9a-f-]{8,}")
+
+#   ★씨앗 색인 — 2024-01~2026-03 의 월↔uddi 대응(실측 수집분). 색인 조회가 막혀도
+#   이만큼은 즉시 내려받을 수 있게 코드에 박아 둔다. atchFileId 는 ★일부러 넣지 않는다.
+NPS_FILE_SEED: Dict[str, str] = {
+    "202401": "uddi:c70b85ac-0146-41a9-8f4a-d2acafaa3c92",
+    "202402": "uddi:67ccdcc5-727f-408d-802a-dce95772acb8",
+    "202403": "uddi:f2d5995e-5b47-4476-9f04-c8b2519735a3",
+    "202404": "uddi:ccc6764a-b232-494e-a453-d21b929878f8",
+    "202405": "uddi:5ae3f030-6646-4239-b0f5-8e1b7b284007",
+    "202406": "uddi:fbc9aff6-7496-4c14-bc49-adfefb93557d",
+    "202407": "uddi:3f8e431e-efcf-4d25-b6f6-cef316722b84",
+    "202408": "uddi:ae2d6a33-e33b-4312-a902-c9a8c22d9ab0",
+    "202409": "uddi:a1d51e9d-f55a-4f94-a06c-ef98691479fd",
+    "202410": "uddi:f6873590-8c0d-4328-af24-8b24f81deb8b",
+    "202411": "uddi:819641d2-a9ba-498a-a689-db8ad2c9800a",
+    "202412": "uddi:3a89a14e-7230-467a-bf07-9ca33d06812d",
+    "202501": "uddi:45ba8ffb-ab8c-44da-abd6-b10ec30821cd",
+    "202502": "uddi:6d064493-1c29-4ddb-9bc5-be98e40a1e57",
+    "202503": "uddi:45b0b01c-16bd-4621-ad04-fdaeb400b4f6",
+    "202504": "uddi:6ec70fba-037c-4e20-8d47-88e26912b4e2",
+    "202505": "uddi:58d465f8-71bf-4378-b4e8-e4b265e805da",
+    "202506": "uddi:7c8ebb8e-baf4-49a0-a281-aa483c3158b8",
+    "202507": "uddi:20ddf65d-51d8-421f-8ee5-b64f05554151",
+    "202508": "uddi:14c0beb5-b153-4b03-892b-8d30a7600de1",
+    "202509": "uddi:466a4aef-5a2d-4b2b-a3d9-8a6c11b81d23",
+    "202510": "uddi:f9787983-d48a-4c94-b7b6-c805a5be3cca",
+    "202511": "uddi:06b329ca-54a4-47f8-8c8f-8268d61c7d7c",
+    "202512": "uddi:10a6e7bd-a2ee-4ee1-967c-bb9a6aea89a9",
+    "202601": "uddi:74d9aa39-bc2c-4124-9cff-ec389dbf51e3",
+    "202602": "uddi:7e1553a3-6b4a-4de0-81bf-86b37ee4d61a",
+    "202603": "uddi:210fa01d-23ea-4599-9a93-98a23ac53a18",
+}
+
+# CSV 헤더(한글) → 내부 이름. 포털 '데이터항목(컬럼) 정보' 표에서 그대로 옮겼다.
+# ★위치 인덱스로 읽지 않는다 — 월마다 컬럼 순서가 바뀌어도 헤더명은 바뀌지 않았다.
+NPS_FILE_COLS = {
+    "ym": ("자료생성년월",), "name": ("사업장명",),
+    "stat": ("사업장가입상태코드",),           # 실제 헤더는 설명이 붙기도 한다 → 접두 비교
+    "mem": ("가입자수",), "amt": ("당월고지금액",),
+    "new": ("신규취득자수",), "lost": ("상실가입자수",),
+    "sgg": ("법정동주소광역시시군구코드",),
+}
+
+
+def _nps_best_match(w: str, pre: Dict[str, list]) -> Tuple[Optional[str], float]:
+    """정규화 사업장명 → (종목코드, 점수). ★월축·파일축이 ★같은 함수를 쓴다.
+
+    같은 판정을 두 곳에 복사해 두면 한쪽만 고쳐지는 날이 반드시 온다(이미 겪었다).
+    """
+    best, bs = None, 0.0
+    for cand, code in pre.get(w[:2], ()):
+        if w == cand or w.startswith(cand):
+            return code, 100.0
+        s = float(name_sim(w, cand))
+        if s > bs:
+            best, bs = code, s
+    return (best, bs) if (best is not None and bs >= NPS_SIM_MIN) else (None, bs)
+
+
+def _nps_name_index(master: pd.DataFrame) -> Dict[str, list]:
+    """상장사 정규화명 2글자 접두 색인 — 60만 행을 메모리에서 즉시 걸러내기 위한 것."""
+    nm = master.dropna(subset=["code"]).copy()
+    # ★컬럼명이 밑줄로 시작하면 안 된다. itertuples 는 유효 식별자가 아닌 이름을
+    #   `_2` 같은 위치명으로 ★말없이 바꾼다 — 옛 이름(`_n`)으로는 AttributeError 가
+    #   나고, 그게 월축 프로브가 성공하는 순간 터질 지뢰로 남아 있었다.
+    nm["nkey"] = nm["name"].astype(str).map(clean_corp)
+    nm = nm[nm["nkey"].str.len() >= 2]
+    idx: Dict[str, str] = {}
+    for r in nm.itertuples(index=False):
+        idx.setdefault(r.nkey, r.code)
+    pre: Dict[str, list] = defaultdict(list)
+    for n, c in idx.items():
+        pre[n[:2]].append((n, c))
+    return pre
+
+
+def _ym_near(txt: str) -> Optional[str]:
+    """자유 텍스트에서 YYYYMM 을 뽑는다. 'YYYY년 M월'·'YYYY-MM'·'YYYYMM' 전부 받는다."""
+    t = str(txt or "")
+    m = re.search(r"(20\d{2})\s*[-.년]\s*(1[0-2]|0?[1-9])\s*월?", t)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)):02d}"
+    m = re.search(r"(20\d{2})(0[1-9]|1[0-2])", t)
+    return f"{m.group(1)}{m.group(2)}" if m else None
+
+
+def _nps_file_index() -> Dict[str, str]:
+    """월(YYYYMM) → uddi. 세 경로를 ★전부 시도해 합친다(하나가 막혀도 나머지가 산다).
+
+    ★색인의 월은 '힌트'다. 확정은 내려받은 CSV 의 DATA_CRT_YM 이 한다 — 게시월과
+    자료생성월은 한 달 어긋나고, 그 어긋남을 색인에서 추측하면 패널이 통째로 밀린다.
+    """
+    idx: Dict[str, str] = dict(NPS_FILE_SEED)
+    found = {"seed": len(idx)}
+    # ① odcloud OAS — 이 데이터셋의 버전별 uddi 가 경로로 노출된다(키 불필요).
+    try:
+        js = net_get(NPS_OAS, source=DGK_SRC, params={"namespace": f"{NPS_FILE_PK}/v1"},
+                     timeout=30, tries=2)
+        d = json.loads(js) if js else {}
+        n0 = len(idx)
+        for path, spec in (d.get("paths") or {}).items():
+            u = _UDDI.search(str(path))
+            if not u:
+                continue
+            ym = _ym_near(json.dumps(spec, ensure_ascii=False)) or _ym_near(path)
+            if ym:
+                idx.setdefault(ym, u.group(0))
+        found["oas"] = len(idx) - n0
+    except Exception as e:                                    # noqa
+        L.info(f"   PACK-N 파일색인 OAS 실패({type(e).__name__}) — 다음 경로로.")
+    # ② 상세페이지 — 현재 버전 uddi 와 최근 이력이 HTML 에 그대로 박혀 있다.
+    cur = None
+    try:
+        h = net_get(NPS_FILE_PAGE, source=DGK_SRC, timeout=30, tries=2)
+        if h:
+            m = re.search(r'id="publicDataDetailPk"[^>]*value="(uddi:[0-9a-f-]+)"', h)
+            cur = m.group(1) if m else None
+            n0 = len(idx)
+            for mm in re.finditer(r"fn_fileDataDown\('%s',\s*'(uddi:[0-9a-f-]+)'" % NPS_FILE_PK, h):
+                idx.setdefault("_cur", mm.group(1))
+            found["page"] = len(idx) - n0
+    except Exception as e:                                    # noqa
+        L.info(f"   PACK-N 파일색인 상세페이지 실패({type(e).__name__}) — 다음 경로로.")
+    # ③ 이력 조각 — 포털이 '이력' 탭을 이 조각으로 그린다. 과거 uddi 가 여기 있다.
+    try:
+        frag = net_get(NPS_FILE_HIST, source=DGK_SRC, referer=NPS_FILE_PAGE, timeout=30,
+                       tries=2, params={"publicDataPk": NPS_FILE_PK,
+                                        "publicDataDetailPk": cur or NPS_FILE_SEED["202507"]})
+        if frag:
+            n0 = len(idx)
+            for mm in re.finditer(r"(uddi:[0-9a-f-]+)", frag):
+                seg = frag[max(0, mm.start() - 300): mm.start() + 300]
+                ym = _ym_near(seg)
+                if ym:
+                    idx.setdefault(ym, mm.group(1))
+            found["hist"] = len(idx) - n0
+    except Exception as e:                                    # noqa
+        L.info(f"   PACK-N 파일색인 이력조각 실패({type(e).__name__}).")
+    if cur:
+        idx.pop("_cur", None)
+        idx.setdefault(_ym_near(str(pd.Timestamp.today() - pd.DateOffset(months=1))) or "", cur)
+    idx = {k: v for k, v in idx.items() if re.fullmatch(r"20\d{4}", k or "")}
+    L.info(f"PACK-N 파일색인 {len(idx)}개월 확보 — 내역 {found} "
+           f"({min(idx) if idx else '—'}~{max(idx) if idx else '—'}).")
+    return idx
+
+
+def _nps_file_resolve(uddi: str) -> Optional[Tuple[str, str, str]]:
+    """uddi → (atchFileId, fileDetailSn, dataNm). ★매번 새로 받는다(묵으면 만료된다)."""
+    js = net_get(NPS_FILE_RESOLVE, source=DGK_SRC, referer=NPS_FILE_PAGE, timeout=30, tries=2,
+                 params={"publicDataPk": NPS_FILE_PK, "publicDataDetailPk": uddi})
+    if not js:
+        st, hd = NET_LAST.get(DGK_SRC, ("—", ""))
+        L.info(f"   uddi {uddi[5:13]} 발급 응답 없음 — HTTP {st} · {str(hd)[:120]}")
+        return None
+    try:
+        d = json.loads(js)
+    except Exception:                                         # noqa
+        L.info(f"   uddi {uddi[5:13]} 발급 응답이 JSON 이 아닙니다 — {str(js)[:120]}")
+        return None
+    if not d.get("status") or not d.get("atchFileId"):
+        L.info(f"   uddi {uddi[5:13]} 발급 거부 — status={d.get('status')} "
+               f"error={str(d.get('error'))[:80]}")
+        return None
+    nm = ((d.get("dataSetFileDetailInfo") or {}).get("dataNm")
+          or (d.get("dataSetFileDetailInfo") or {}).get("publicDataSj") or "")
+    return str(d["atchFileId"]), str(d.get("fileDetailSn") or 1), str(nm)
+
+
+def _nps_file_open(blob) -> Tuple[Any, Any, str]:
+    """(핸들, DictReader, 인코딩). ZIP 이면 첫 CSV 멤버를 연다. ★전량 메모리 적재 금지."""
+    if isinstance(blob, str):                                  # 스풀 파일 경로
+        raw = open(blob, "rb")
+    else:
+        raw = io.BytesIO(blob)
+    head = raw.read(4)
+    raw.seek(0)
+    if head[:4] == b"PK\x03\x04":
+        zf = zipfile.ZipFile(raw)
+        names = [n for n in zf.namelist() if n.lower().endswith(".csv")] or zf.namelist()
+        if not names:
+            raise ValueError("ZIP 안에 CSV 가 없습니다")
+        raw = zf.open(names[0])
+    probe = raw.read(1 << 12)
+    for enc in ("utf-8-sig", "cp949", "utf-8"):
+        try:
+            if "사업장명" in probe.decode(enc, "strict"):
+                break
+        except Exception:                                     # noqa
+            continue
+    else:
+        raise ValueError(f"헤더에서 '사업장명' 을 찾지 못했습니다 — 선두 {probe[:80]!r}")
+    # ZipExtFile 은 seek 이 안 되는 판이 있어 ★다시 연다(경로/바이트 둘 다 대응).
+    raw.close()
+    if isinstance(blob, str):
+        base = open(blob, "rb")
+    else:
+        base = io.BytesIO(blob)
+    if head[:4] == b"PK\x03\x04":
+        zf = zipfile.ZipFile(base)
+        names = [n for n in zf.namelist() if n.lower().endswith(".csv")] or zf.namelist()
+        base = zf.open(names[0])
+    txt = io.TextIOWrapper(base, encoding=enc, errors="replace", newline="")
+    return txt, csv.DictReader(txt), enc
+
+
+def _nps_file_colmap(fields: Sequence[str]) -> Dict[str, str]:
+    """헤더명 → 내부 이름. 접두 비교(설명이 덧붙은 헤더가 있다)."""
+    got: Dict[str, str] = {}
+    fs = [(f or "").strip() for f in (fields or [])]
+    for key, cands in NPS_FILE_COLS.items():
+        for f in fs:
+            if any(f.startswith(c) or c in f for c in cands):
+                got[key] = f
+                break
+    return got
+
+
+def _nps_file_month(blob, pre: Dict[str, list]) -> Tuple[Optional[str], pd.DataFrame, int]:
+    """CSV 한 달치 → (자료생성년월, 종목×월 집계, 원본행수). 스트리밍(수십만 행)."""
+    txt, rd, _enc = _nps_file_open(blob)
+    try:
+        cm = _nps_file_colmap(rd.fieldnames or [])
+        need = ("name", "mem")
+        miss = [k for k in need if k not in cm]
+        if miss:
+            raise ValueError(f"필수 컬럼 없음 {miss} — 헤더 {list(rd.fieldnames or [])[:12]}")
+        rows: List[dict] = []
+        ymc: Counter = Counter()
+        n = 0
+        for r in rd:
+            n += 1
+            if cm.get("stat") and str(r.get(cm["stat"]) or "1").strip() not in ("1", ""):
+                continue                                       # 등록 상태 사업장만(월축과 동일)
+            w = clean_corp(r.get(cm["name"], ""))
+            if len(w) < 2:
+                continue
+            code, bs = _nps_best_match(w, pre)
+            if code is None:
+                continue
+            ym = re.sub(r"\D", "", str(r.get(cm.get("ym", ""), "")))[:6]
+            if len(ym) == 6:
+                ymc[ym] += 1
+            rows.append({"code": code, "_ym": ym,
+                         "_mem": _nps_num(r.get(cm["mem"])),
+                         "_amt": _nps_num(r.get(cm.get("amt", ""))),
+                         "_new": _nps_num(r.get(cm.get("new", ""))),
+                         "_lost": _nps_num(r.get(cm.get("lost", ""))),
+                         "_site": f"{w}|{r.get(cm.get('sgg', ''), '') or ''}",
+                         "_conf": bs / 100.0})
+    finally:
+        try:
+            txt.close()
+        except Exception:                                     # noqa
+            pass
+    if not rows:
+        return (ymc.most_common(1)[0][0] if ymc else None), pd.DataFrame(), n
+    ym = ymc.most_common(1)[0][0] if ymc else None
+    if ym is None:
+        return None, pd.DataFrame(), n
+    D = pd.DataFrame(rows)
+    D = D[D["_ym"] == ym]                                      # 파일에 섞인 타월 행 배제
+    D["month"] = pd.Timestamp(f"{ym[:4]}-{ym[4:]}-01") + pd.offsets.MonthEnd(0)
+    agg = (D.groupby(["code", "month"], as_index=False)
+           .agg(nps_members=("_mem", "sum"), nps_amt=("_amt", "sum"),
+                nps_new=("_new", "sum"), nps_lost=("_lost", "sum"),
+                n_sites=("_site", "nunique"), match_conf=("_conf", "max")))
+    return ym, agg, n
+
+
+def harvest_nps_file(master: pd.DataFrame, months: pd.DatetimeIndex) -> Optional[pd.DataFrame]:
+    """★파일데이터 아카이브에서 월 스냅샷을 받아 패널을 만든다. serviceKey 0콜.
+
+    반환: 패널(성공) / None(경로 자체가 불가 — 호출부가 API 축으로 내려간다).
+    ★첫 달이 '확인 파일'이다 — 받아서 파싱까지 성공해야 나머지를 계속한다. 실패하면
+    ★왜 실패했는지를 원문으로 남기고 즉시 손을 뗀다(수백 MB 를 헛되이 반복하지 않는다).
+    """
+    cols = ["code", "month", "nps_members", "nps_amt", "nps_new", "nps_lost",
+            "n_sites", "match_conf"]
+    idx = _nps_file_index()
+    if not idx:
+        L.warn("PACK-N 파일경로: 월↔uddi 색인을 하나도 얻지 못했습니다 — API 축으로 내려갑니다.")
+        return None
+    done_ym, led = led_read("nps_months_done", "ym", what="PACK-N 파일축")
+    want = {m.strftime("%Y%m") for m in months}
+    todo = [y for y in sorted(set(idx) & want, reverse=True) if y not in done_ym]
+    outside = sorted(set(idx) - want)
+    L.info(f"PACK-N ★파일데이터 아카이브 — 목표 {len(want)}개월 중 아카이브가 가진 것 "
+           f"{len(set(idx) & want)}개월, 그중 미확보 {len(todo)}개월. "
+           f"(아카이브에 없는 구간은 포털이 그 시절 파일을 보관하지 않는 것이다 — "
+           f"{len(want - set(idx))}개월. 목표 밖 {len(outside)}개월은 건너뛴다.) "
+           f"★serviceKey 0콜 · 최신월부터.")
+    if not todo:
+        # ★이미 다 받은 상태다. 여기서 None 을 돌려주면 호출부가 API 축으로 내려가
+        #   ★같은 것을 다시 받으려 든다("쓸데없이 반복하지 마"). 캐시를 그대로 돌려준다.
+        C = VAULT.load_table("nps_corp_monthly", "shared") if VAULT is not None else None
+        if C is not None and len(C):
+            C = C.copy()
+            C["month"] = ds_(C["month"])
+            L.ok(f"PACK-N 파일경로: 아카이브가 가진 달은 전부 원장에 있습니다 — 신규 다운로드 "
+                 f"0건, 캐시 {len(C):,}행 · {C['month'].nunique():,}개월 재사용.")
+            return C.reindex(columns=cols)
+        L.ok("PACK-N 파일경로: 아카이브가 가진 달은 전부 원장에 있습니다 — 신규 다운로드 없음.")
+        return None
+    pre = _nps_name_index(master)          # ★루프 밖에서 한 번 — 달마다 다시 짓지 않는다
+    got: List[dict] = []
+    new_led: List[dict] = []
+    ok_n = 0
+    with stage_bar(len(todo), "국민연금 사업장(★파일아카이브)") as bar:
+        for i, ym in enumerate(todo):
+            if CLOCK.over():
+                CLOCK.cut(f"국민연금 파일축: {len(todo) - bar.n}개월 남기고 중단"
+                          f"(원장이 다음 실행에서 정확히 이어받습니다)")
+                break
+            bar.update(1)
+            res = _nps_file_resolve(idx[ym])
+            if not res:
+                if ok_n == 0 and i == 0:
+                    L.warn("PACK-N 파일경로 확인 실패 — 다운로드 발급 단계에서 막혔습니다"
+                           "(위 응답 참조). API 축으로 내려갑니다.")
+                    return None
+                continue
+            fid, sn, nm = res
+            blob = net_download(NPS_FILE_DOWN, source=DGK_SRC, referer=NPS_FILE_PAGE,
+                                params={"atchFileId": fid, "fileDetailSn": sn,
+                                        "insertDataPrcus": "N"},
+                                tries=2, spool_over=NPS_FILE_SPOOL,
+                                total_s=NPS_FILE_DL_S)
+            size = (os.path.getsize(blob) if isinstance(blob, str)
+                    else (len(blob) if blob else 0))
+            try:
+                if size < NPS_FILE_MIN_BYTES:
+                    st, hd = NET_LAST.get(DGK_SRC, ("—", ""))
+                    L.info(f"   {ym}: 받은 것이 {size:,}B 뿐 — CSV 가 아닙니다"
+                           f"(HTTP {st} · {str(hd)[:100]}).")
+                    if ok_n == 0:
+                        L.warn("PACK-N 파일경로 확인 실패 — 본문이 CSV 가 아닙니다. API 축으로.")
+                        return None
+                    continue
+                f_ym, agg, nraw = _nps_file_month(blob, pre)
+            except Exception as e:                            # noqa
+                L.info(f"   {ym}: 파싱 실패 {type(e).__name__}: {str(e)[:160]}")
+                if ok_n == 0:
+                    L.warn("PACK-N 파일경로 확인 실패 — 첫 파일을 파싱하지 못했습니다. API 축으로.")
+                    return None
+                continue
+            finally:
+                if isinstance(blob, str):
+                    try:
+                        os.remove(blob)                        # ★수백 MB 를 즉시 버린다
+                    except Exception:                          # noqa
+                        pass
+            if f_ym and f_ym != ym:
+                L.info(f"   색인 힌트 {ym} ≠ 파일 자료생성년월 {f_ym} — ★파일을 따릅니다.")
+            key_ym = f_ym or ym
+            ok_n += 1
+            got += agg.to_dict("records")
+            new_led.append({"ym": key_ym, "n_rows": int(len(agg)), "tried_at": today_iso()})
+            bar.set_postfix_str(f"{key_ym} {len(agg):,}종목 / 원본 {nraw:,}행 · "
+                                f"{size / (1 << 20):.0f}MB", refresh=False)
+            # ★달마다 즉시 적재 — 다음 달에서 끊겨도 여기까지는 남는다(절대1원칙).
+            if flush_rows("nps_corp_monthly", got, cols, ["code", "month"], domain="nps",
+                          source="data.go.kr 파일데이터(15083277)",
+                          note="월 스냅샷 CSV — 월 단위 즉시 적재"):
+                got = []
+                led_write("nps_months_done", led, new_led, "ym", domain="nps",
+                          source="month_ledger")
+                new_led = []
+    if not ok_n:
+        return None
+    out = VAULT.load_table("nps_corp_monthly", "shared") if VAULT is not None else None
+    if out is None or not len(out):
+        return None
+    out = out.copy()
+    out["month"] = ds_(out["month"])
+    L.ok(f"PACK-N 파일아카이브 {ok_n}개월 신규 — 누적 {len(out):,}행 · "
+         f"{out['code'].nunique():,}종목 · {out['month'].nunique():,}개월 "
+         f"({out['month'].min():%Y-%m}~{out['month'].max():%Y-%m}). "
+         f"13개월이 모이면 TP_N1·N3·N4 가 살아납니다.")
+    return out.reindex(columns=cols)
+
+
 def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
                 priority: Sequence[str] = (), max_calls: int = -1) -> pd.DataFrame:
     """상장사명 → 사업장 seq → 월별 가입자·고지금액 패널.
@@ -8332,6 +8731,17 @@ def harvest_nps(master: pd.DataFrame, months: pd.DatetimeIndex,
     """
     cols = ["code", "month", "nps_members", "nps_amt", "nps_new", "nps_lost",
             "n_sites", "match_conf"]
+    # ★① 파일데이터 아카이브가 ★맨 앞이다. 이유는 하나뿐 — ★10년치가 여기에만 있다.
+    #   API(serviceKey)는 현황 명부라 과거를 지운다. 그리고 이 경로는 ★키가 필요 없어서
+    #   DATA_GO_KR_KEY 가 없어도, 쿼터가 0 이어도 돈다(그래서 키 검사보다도 앞이다).
+    if NPS_FILE_ON and RUN_MODE != "CACHED":
+        try:
+            F = harvest_nps_file(master, months)
+            if F is not None and len(F):
+                return F.reindex(columns=cols)
+            L.warn("PACK-N: 파일 아카이브에서 새로 얻은 달이 없습니다 — API 축으로 내려갑니다.")
+        except Exception as e:                                # noqa
+            L.warn(f"PACK-N 파일축 실패({type(e).__name__}: {str(e)[:120]}) — API 축 폴백.")
     if not DATA_GO_KR_KEY:
         L.info("PACK-N: DATA_GO_KR_KEY 미입력 — 국민연금 팩 자동 비활성(§8.4).")
         return pd.DataFrame(columns=cols)
