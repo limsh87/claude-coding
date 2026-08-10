@@ -646,6 +646,9 @@ def main() -> dict:
             #   소문자로 조회하면 전부 기본값 nan 이 찍혀 X0 벤치마크 표가 통째로 비었다 —
             #   §10.2 귀속의 '비교 기준선'이 읽을 수 없는 상태로 출력되고 있었다.
             LOG.table([["분기 평균 종목수", f"{float(b0['returns']['n'].mean()):,.0f}"],
+                       # ★ qperf_stats 는 'CAGR'/'Sharpe'/'MDD' (대문자)로 돌려준다. 소문자 키를 읽어
+                       #   X0 벤치마크 표가 전부 nan 으로 찍혔다 — §10.2 가 '소형주 프리미엄과
+                       #   깔때기 알파'를 구분하려고 만든 기준선인데 읽을 수가 없었다.
                        ["CAGR (비용차감)", f"{_s0.get('CAGR', float('nan')):+.2%}"],
                        ["Sharpe", f"{_s0.get('Sharpe', float('nan')):.3f}"],
                        ["MDD", f"{_s0.get('MDD', float('nan')):.1%}"]],

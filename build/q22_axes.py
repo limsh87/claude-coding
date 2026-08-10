@@ -385,11 +385,17 @@ def axis_Q(P: pd.DataFrame) -> pd.DataFrame:
     # 높을수록 우수 → 그대로 z
     d["zQ_gp_a"] = _cell_ladder_z(d, d["gp_a"])
     # 낮을수록 우수 → 부호 반전 후 z.
-    #  ★ '분모 부적격' 개념이 없는 지표(ROIC 표준편차·발생액·주식수 증가율)는 valid 를 전부
-    #    <NA> 로 준다. 예전처럼 notna() 를 주면 '관측이 없다'가 '부적격'으로 읽혀 재무를
-    #    확보하지 못한 종목 전체가 최하위 벌점을 맞는다 — 그건 §5.2 가 말하는 부호 처리가
-    #    아니라 커버리지에 대한 처벌이다.
-    _na = pd.Series(pd.NA, index=d.index, dtype="boolean")
+    #  ★★ 여기서 <NA> 를 주면 지표가 통째로 죽는다 ★★
+    #    '분모 부적격' 개념이 없는 지표(ROIC 표준편차·발생액·주식수 증가율)는 아무도 벌점을
+    #    맞으면 안 된다. 그 의도로 valid 에 <NA> 를 줬는데, z_lower_is_better 는
+    #    `vb = valid.fillna(False)` 로 받는다 — <NA> 는 False 가 되어 '전 관측 계산 불가'가
+    #    되고 z 가 전부 NaN 이 된다. 벌점을 안 주는 게 아니라 지표 자체가 사라진다.
+    #    실측: 원시값이 76%·100%·60% 채워져 있는데 z 는 0.0%. Z_Q 는 5개 중 2개(gp_a·
+    #    부채비율)로만 만들어졌고 — 둘 다 재무상태표 수준 지표라 이익 안정성·발생액 품질·
+    #    희석이 전부 빠진 축이 됐다. 자가검정은 통과했다(TONE 과 같은 부류의 결함).
+    #    영향: U-200 자카드가 VQ 0.854 / VQF 0.849 — 매 분기 15% 가 다른 종목이었다.
+    #    '아무도 벌점 주지 않는다'를 표현하는 값은 True 다(분모가 전부 적격).
+    _na = pd.Series(True, index=d.index, dtype="boolean")
     d["zQ_roic_std3y"] = z_lower_is_better(d, col(d, "roic_std3y"), _na, "ROIC 3년 표준편차")
     d["zQ_accruals"] = z_lower_is_better(d, d["accruals"], _na, "발생액")
     # 부채비율은 자기자본이 0 이하면 의미가 뒤집힌다(음수 부채비율=최우량). 부적격 처리.

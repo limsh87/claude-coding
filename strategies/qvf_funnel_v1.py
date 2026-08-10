@@ -274,7 +274,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.1.20260810.1455"
+BUILD_VERSION      = "qvf1.1.20260810.1536"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -8162,11 +8162,17 @@ def axis_Q(P: pd.DataFrame) -> pd.DataFrame:
     # 높을수록 우수 → 그대로 z
     d["zQ_gp_a"] = _cell_ladder_z(d, d["gp_a"])
     # 낮을수록 우수 → 부호 반전 후 z.
-    #  ★ '분모 부적격' 개념이 없는 지표(ROIC 표준편차·발생액·주식수 증가율)는 valid 를 전부
-    #    <NA> 로 준다. 예전처럼 notna() 를 주면 '관측이 없다'가 '부적격'으로 읽혀 재무를
-    #    확보하지 못한 종목 전체가 최하위 벌점을 맞는다 — 그건 §5.2 가 말하는 부호 처리가
-    #    아니라 커버리지에 대한 처벌이다.
-    _na = pd.Series(pd.NA, index=d.index, dtype="boolean")
+    #  ★★ 여기서 <NA> 를 주면 지표가 통째로 죽는다 ★★
+    #    '분모 부적격' 개념이 없는 지표(ROIC 표준편차·발생액·주식수 증가율)는 아무도 벌점을
+    #    맞으면 안 된다. 그 의도로 valid 에 <NA> 를 줬는데, z_lower_is_better 는
+    #    `vb = valid.fillna(False)` 로 받는다 — <NA> 는 False 가 되어 '전 관측 계산 불가'가
+    #    되고 z 가 전부 NaN 이 된다. 벌점을 안 주는 게 아니라 지표 자체가 사라진다.
+    #    실측: 원시값이 76%·100%·60% 채워져 있는데 z 는 0.0%. Z_Q 는 5개 중 2개(gp_a·
+    #    부채비율)로만 만들어졌고 — 둘 다 재무상태표 수준 지표라 이익 안정성·발생액 품질·
+    #    희석이 전부 빠진 축이 됐다. 자가검정은 통과했다(TONE 과 같은 부류의 결함).
+    #    영향: U-200 자카드가 VQ 0.854 / VQF 0.849 — 매 분기 15% 가 다른 종목이었다.
+    #    '아무도 벌점 주지 않는다'를 표현하는 값은 True 다(분모가 전부 적격).
+    _na = pd.Series(True, index=d.index, dtype="boolean")
     d["zQ_roic_std3y"] = z_lower_is_better(d, col(d, "roic_std3y"), _na, "ROIC 3년 표준편차")
     d["zQ_accruals"] = z_lower_is_better(d, d["accruals"], _na, "발생액")
     # 부채비율은 자기자본이 0 이하면 의미가 뒤집힌다(음수 부채비율=최우량). 부적격 처리.
@@ -10954,17 +10960,19 @@ def paired_diff_test(a: str, b: str, label: Optional[str] = None) -> dict:
     d = d.dropna().to_numpy(dtype=float)
     if len(d) < 4:
         return {"name": nm, "t": np.nan, "p": np.nan, "n": int(len(d)), "mean": np.nan}
-    # ★★ hac_tstat 는 (평균, t) 를 돌려준다 — 프로젝트의 다른 8개 호출부는 전부 그렇게 받는다.
-    #   여기만 `t, _se = ...` 로 받아 '평균'을 t 통계량으로 쓰고 있었다. 분기수익률 차이의
-    #   평균은 통상 0.001~0.05 라 p = 1 − t.cdf(0.05, 39) ≈ 0.48 이 되어:
-    #     · §9-C2 ('차이'가 BH-FDR 후에도 유의) 는 사실상 절대 통과하지 못하고,
-    #     · §10.4 ② ('깔때기 기여가 미미' = p ≥ 0.10) 는 사실상 항상 충족되어
-    #       STOP_ON_KILL_CRITERIA=True 인 기본 실행이 매번 폐기 판정으로 끝난다.
-    #   즉 전략이 성과가 아니라 언패킹 한 줄 때문에 폐기된다. 스모크(n<12 → nan → 폴백)
-    #   에서는 드러나지 않고 40분기 실행에서만 나타나므로 지금까지 잡히지 않았다.
-    mu, t = hac_tstat(d)
+    # ★★ hac_tstat 는 (평균, t통계량) 을 돌려준다 — (t, se) 가 아니다 ★★
+    #   예전엔 `t, _se = hac_tstat(d)` 라 '평균'을 t 통계량 자리에 받았다. 분기 평균차는
+    #   보통 0.0x 수준이므로 p 값이 항상 0.49 근처가 되고, 그 결과
+    #     · §10.4 폐기조건 ②(p ≥ 0.10)가 '매 실행' 발동 → FULL 실행이 L6.VERDICT 에서
+    #       KillCriteria 로 중단되고 최종 종목표가 나오지 않는다
+    #     · §9-C2 가 영원히 통과하지 못해 수급축 채택 판정이 데이터와 무관하게 고정된다
+    #     · §8.3 BH-FDR 패밀리에 가짜 p 가 섞여 진짜 가설들의 임계가 낮아진다
+    #   실측(분기 +3.0% 차이를 심고 40분기): 보고된 t 0.029 · p 0.4885 인데
+    #   실제 HAC t 는 20.49 · p < 1e-15 였다. 벗어나려면 분기 평균차가 +130% 를 넘어야 했다.
+    #   다른 호출부 두 곳은 올바르게 풀고 있었고 여기만 틀렸다.
+    _mu, t = hac_tstat(d)
     return {"name": nm, "t": float(t), "p": _pval_from_t(float(t), len(d)),
-            "n": int(len(d)), "mean": float(mu)}
+            "n": int(len(d)), "mean": float(_mu)}
 
 
 def report_bh_fdr(names: Sequence[str], q: float = BH_FDR_Q,
@@ -12452,7 +12460,14 @@ def _sc34():
     k.eq("A 정상 보유 수익률", _r("A"), 0.20, tol=1e-5)
     k.eq("B 정리매매가(300/1000−1) 반영", _r("B"), -0.70, tol=1e-5)
     k.eq("C 가격 부재 → −100%", _r("C"), -1.0, tol=1e-9)
-    k.eq("D 마지막 관측가가 '이익' → 규정대로 −100%", _r("D"), -1.0, tol=1e-9)
+    # ⚠ 이 한 줄은 '현재의 보수적 동작'을 사전등록으로 못박은 것이지 명세가 못박은 것이 아니다.
+    #   정리매매가를 '손실일 때만' 인정하는 이유: 소스가 폐지 직전에 종목을 드롭하면 마지막
+    #   정상가가 청산가로 둔갑해 '상장폐지 = 0% 손실'이 되고, 그게 생존자편향의 재유입이다.
+    #   반대 비용도 실재한다 — 합병·공개매수·자진상장폐지 같은 '상향 청산'이 −100% 로 계상된다.
+    #   ★ 그쪽을 인정하도록 고치려면 이 소검정을 먼저 고쳐야 한다. 실패하면 회귀가 아니라
+    #     의도된 변경이다. 어느 방향이 옳은지는 실데이터에서 각 경우의 건수를 세야 정해진다.
+    k.eq("D 마지막 관측가가 '이익' → 현재는 규정대로 −100% (상향청산 미인정 · 열린 쟁점)",
+         _r("D"), -1.0, tol=1e-9)
     k.eq("E 정지 후 다음 분기 이후 폐지 → −100% (0% 로 새지 않는다)", _r("E"), -1.0, tol=1e-9)
     k.add("E 는 halt_then_delist 로 별도 계상",
           "halt_then_delist" in {str(v) for c, v in zip(fwd["code"], fwd["exit_kind"]) if c == "E"},
@@ -14464,6 +14479,9 @@ def main() -> dict:
             #   소문자로 조회하면 전부 기본값 nan 이 찍혀 X0 벤치마크 표가 통째로 비었다 —
             #   §10.2 귀속의 '비교 기준선'이 읽을 수 없는 상태로 출력되고 있었다.
             LOG.table([["분기 평균 종목수", f"{float(b0['returns']['n'].mean()):,.0f}"],
+                       # ★ qperf_stats 는 'CAGR'/'Sharpe'/'MDD' (대문자)로 돌려준다. 소문자 키를 읽어
+                       #   X0 벤치마크 표가 전부 nan 으로 찍혔다 — §10.2 가 '소형주 프리미엄과
+                       #   깔때기 알파'를 구분하려고 만든 기준선인데 읽을 수가 없었다.
                        ["CAGR (비용차감)", f"{_s0.get('CAGR', float('nan')):+.2%}"],
                        ["Sharpe", f"{_s0.get('Sharpe', float('nan')):.3f}"],
                        ["MDD", f"{_s0.get('MDD', float('nan')):.1%}"]],
