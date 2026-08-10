@@ -127,6 +127,15 @@ REBAL_DAY      = 1
 
 # ── ⑥ 유니버스 U-1000 (§3) ──────────────────────────────────────────────────────────────────
 U1000_N          = 1000             # PIT 시가총액 랭크 '하위' N종목 (KOSPI+KOSDAQ 통합)
+#  ▸ 일봉을 받을 '후보' 배수. 후보 = 각 신호일 시총 하위 (U1000_N × 이 값) 의 합집합.
+#    전 종목(5,000+)의 일봉을 받는 것은 낭비다 — 시총 스냅샷은 날짜당 1~2호출로 전 종목
+#    시총을 주므로 후보를 먼저 확정할 수 있다. 버퍼가 필요한 이유는 유동성·구조제외 게이트가
+#    하위 종목을 걸러내 '적격 하위 1000' 이 전체 하위 1000 보다 아래로 내려가기 때문이다.
+#    실제로 버퍼가 모자랐는지는 실행 중 실현 랭크로 검증해 표로 보고한다(모자라면 경고).
+#    ★ 배수를 크게 잡으면 안전하지만 절감이 사라진다. 실측 감쇠(전체상장 186 → 적격 148,
+#      약 20% 탈락)를 근거로 2.0 을 기본으로 둔다. 게이트 탈락률이 50% 를 넘는 시장 국면이면
+#      경고가 뜨고, 그때 이 값을 올려 재실행하면 된다.
+CANDIDATE_BUFFER_MULT = 2.0
 ADTV_WINDOW_DAYS = 60               # §3.2 직전 60거래일
 MIN_ADTV_KRW     = 100_000_000      # §3.2 1억원
 SEASONING_DAYS   = 250              # §3.3 상장 12개월 미만 제외 (≈250거래일)
@@ -234,7 +243,7 @@ STOP_ON_KILL_CRITERIA = True   # §10.4 사전등록 폐기 조건 위반 시 �
 
 STRATEGY_ID        = "QVF_FUNNEL_V1"
 STRATEGY_NAME      = "가치·퀄리티·수급 깔때기 (U-1000 → U-200 → 60~80 → 20~40)"
-BUILD_VERSION      = "qvf1.20260810.0649"
+BUILD_VERSION      = "qvf1.20260810.0807"
 ACTIVE_PACKS: list = []          # 공용 코어 호환용(이 전략은 센서팩 구조를 쓰지 않습니다)
 
 # 공용 코어(12_ingest_dart_fin)는 모듈 로드 시점에 DART_DAILY_LIMIT 를 19,000 으로 되돌려
@@ -4086,6 +4095,13 @@ def build_security_master(snapshots: pd.DataFrame) -> pd.DataFrame:
 PRICE_COLS = ["code", "date", "open", "high", "low", "close", "volume", "amount", "src"]
 
 
+def _krx_recent_bizday() -> str:
+    d = _dt.date.today() - _dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= _dt.timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
 class KRXAuth:
     """KRX 데이터 마켓플레이스 인증(2025-12 변경 대응). 실패해도 절대 죽지 않고 폴백으로 넘긴다.
 
@@ -4127,26 +4143,48 @@ class KRXAuth:
         # 워밍업 없이 바로 POST 하면 세션 쿠키가 없어 항상 실패한다
         http_get(self.LOGIN_WARM1, source="krx", tries=1)
         http_get(self.LOGIN_WARM2, source="krx", tries=1, referer=self.LOGIN_WARM1)
+        # ★★ 로그인 성공을 '실패 단어가 없더라' 로 판정하면 안 된다 ★★
+        #   예전 판정은 응답 앞 600자에 (실패|오류|error|fail) 가 없으면 성공으로 봤다.
+        #   그러면 (a) 엔드포인트가 바뀌어 엉뚱한 200 응답이 와도 '성공', (b) 네트워크
+        #   실패·차단·캡차로 txt=None 이면 전부 'ID/PW 를 확인하세요' 가 된다.
+        #   사용자가 자격증명을 정확히 넣고도 틀렸다는 말을 듣는 이유가 정확히 (b) 다.
+        #   → 성공은 '실제 인증이 필요한 호출이 되는가' 로만 증명하고, 실패는 사유를 나눈다.
+        reasons = []
         for extra in ({}, {"skipDup": "Y"}):
             body = {"mbrNm": "", "telNo": "", "di": "", "certType": "",
                     "mbrId": self.user, "pw": self.pw, **extra}
             txt = http_post(self.LOGIN_POST, source="krx", data=body, referer=self.LOGIN_WARM1,
                             headers={"X-Requested-With": "XMLHttpRequest"})
             if txt is None:
+                reasons.append("네트워크/차단: 로그인 엔드포인트가 응답하지 않음")
                 continue
-            if re.search(r"CD011|중복\s*로그인", str(txt)):
-                LOG.warn("KRX 중복 로그인(CD011) 감지 — 같은 계정이 브라우저나 다른 노트북에서 "
-                         "이미 로그인되어 있습니다. skipDup 으로 재시도하면 기존 세션이 강제 종료됩니다. "
-                         "두 노트북을 동시에 돌리면 서로를 계속 밀어냅니다.")
+            body_s = str(txt)
+            if re.search(r"CD011|중복\s*로그인", body_s):
+                reasons.append("중복 로그인(CD011): 같은 계정이 다른 곳에 로그인되어 있음")
+                LOG.warn("KRX 중복 로그인(CD011) — 같은 계정이 브라우저나 다른 노트북에서 이미 "
+                         "로그인되어 있습니다. 두 곳을 동시에 돌리면 서로를 계속 밀어냅니다.")
                 continue
-            if not re.search(r"(실패|불일치|오류|error|fail|로그인이\s*필요)", str(txt)[:600], re.I):
-                self.session_ok = True
+            if re.search(r"(비밀번호|아이디).{0,20}(불일치|틀|확인)|존재하지\s*않는\s*(회원|아이디)",
+                         body_s[:1500]):
+                reasons.append("자격증명 불일치: KRX 가 ID/PW 오류로 응답함")
+                continue
+            # 여기까지 왔으면 '아마 성공' 이다. 말이 아니라 기능으로 확인한다.
+            self.session_ok = True
+            probe = self.json_data("dbms/MDC/STAT/standard/MDCSTAT01501",
+                                   mktId="ALL", trdDd=_krx_recent_bizday())
+            if isinstance(probe, dict) and probe.get("OutBlock_1"):
                 self.status = "LOGIN_OK"
-                LOG.ok("KRX 마켓플레이스 로그인 성공.")
+                LOG.ok("KRX 마켓플레이스 로그인 성공 (인증 호출로 확인).")
                 return True
+            self.session_ok = False
+            reasons.append("로그인 응답은 정상이나 인증 호출이 데이터를 주지 않음 "
+                           "(세션 미형성 또는 bld 변경)")
         self.status = "LOGIN_FAILED"
-        LOG.warn("KRX 마켓플레이스 로그인 실패. ID/PW 를 확인하세요. "
-                 "로그인 불필요 경로로 폴백하며 백테스트는 정상 진행됩니다.")
+        LOG.warn("KRX 마켓플레이스를 사용하지 못했습니다 — 사유: "
+                 + " / ".join(dict.fromkeys(reasons)) + "\n"
+                 "  ※ 이 단계는 '검증·보강' 이며 백테스트에 필수가 아닙니다. 상장/폐지 목록과 "
+                 "시총은 로그인 불필요 경로(FDR·KIND·pykrx)로 이미 확보됩니다.\n"
+                 "  ※ 자격증명이 맞는데도 위 사유가 '네트워크/차단' 이면 ID/PW 문제가 아닙니다.")
         return self.openapi_ok
 
     def _probe_openapi(self) -> bool:
@@ -4277,10 +4315,36 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+# 종목 → 시장(KOSPI/KOSDAQ). 종목 마스터에서 채운다. 비어 있으면 예전처럼 둘 다 시도한다.
+CODE_MARKET: Dict[str, str] = {}
+
+
+def set_code_market(sec: pd.DataFrame):
+    """yfinance 접미사를 '추측'하지 않기 위한 시장 구분표.
+
+    ★ 예전에는 모든 종목에 .KS 와 .KQ 를 둘 다 시도했다. 시장 구분은 종목 마스터에 이미
+      있는데도 그랬다. 그 결과 (a) 호출이 정확히 2배가 되고 (b) 실패하는 쪽이 항상 하나씩
+      생겨 로그가 'possibly delisted' 로 도배되어 진짜 오류가 묻힌다.
+    """
+    if sec is None or not len(sec) or "market" not in sec.columns:
+        return
+    m = {}
+    for c, mk in zip(sec["code"].astype(str), sec["market"].astype(str)):
+        u = mk.upper()
+        if "KOSDAQ" in u:
+            m[c] = ".KQ"
+        elif "KOSPI" in u or "STK" in u:
+            m[c] = ".KS"
+    CODE_MARKET.update(m)
+    LOG.debug(f"yfinance 접미사 확정 {len(m):,}종목 (추측 대신 시장 구분 사용)")
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if yf is None:
         return None
-    for suf in (".KS", ".KQ"):
+    known = CODE_MARKET.get(str(code))
+    sufs = (known,) if known else (".KS", ".KQ")
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
@@ -4348,7 +4412,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_ipo = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
@@ -4357,19 +4421,34 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 continue
             todo.append((c, start))
             continue
-        # ★ 과거 방향 백필을 반드시 함께 본다.
-        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
-        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
-        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
+        # ★ 과거 방향 백필을 함께 본다. 앞선 실행이 최근 구간만 캐시했다면
+        #   max 만 보고 판단하면 앞 구간을 영원히 못 받는다.
         if mn is not None and mn > start_ts + pd.Timedelta(days=10):
-            todo.append((c, start))
-            n_back += 1
+            # ★★ 여기서 무조건 재수집하면 '무한 재수집 루프'가 된다 ★★
+            #   2019년 상장 종목의 캐시 최소일은 당연히 2019년이다. 그건 '결손'이 아니라
+            #   그 종목의 실제 최초 거래일이다. 그런데 요청 시작일(2015)과만 비교하면
+            #   매 실행 전 구간을 다시 받고, 상장 전 데이터는 존재하지 않으므로 캐시
+            #   최소일이 움직이지 않아, 다음 실행도 똑같이 다시 받는다 — 영원히.
+            #   실측: 이 조건 하나로 1,974종목이 매 실행 재수집되어 55분을 썼다.
+            #   → 이미 이 시작일(또는 그 이전)로 요청해 본 적이 있으면 mn 이 곧 그 종목의
+            #     확정된 최초 거래일이다. 다시 물어도 답은 같다.
+            _p = attempts.get(c)
+            _asked = _p.get("frm") if _p else None
+            if _asked is not None and pd.notna(_asked) and _asked <= start_ts + pd.Timedelta(days=10):
+                n_ipo += 1
+            else:
+                todo.append((c, start))
+                n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+                 f"(요청 시작일 이전으로 물어본 적이 없는 종목만).")
+    if n_ipo:
+        LOG.info(f"캐시 최소일이 요청 시작일보다 늦지만 이미 확인된 {n_ipo:,}종목은 재수집하지 "
+                 f"않습니다 (상장이 그 이후 = 결손이 아님). 이 판정이 없으면 매 실행 전 구간을 "
+                 f"다시 받고도 캐시가 그대로라 영원히 반복합니다.")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -4397,26 +4476,34 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
-        failed = []
+        failed, asked = [], []
         for (c, st), d in zip(todo, res):
+            # ★ 성공/실패와 무관하게 '무엇을 언제 어느 시작일로 물어봤는지'를 남긴다.
+            #   성공분을 안 남기면 위의 무한 재수집 판정이 근거를 잃는다.
+            asked.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if asked:
+            _prev = _att if _att is not None and len(_att) else None
+            _all = pd.concat([_prev, pd.DataFrame(asked)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(asked)
+            # 같은 종목은 '가장 이른 시작일로 물어본 기록'을 남긴다(그게 확정 근거다).
+            _all = (_all.sort_values(["code", "requested_from", "attempted_at"])
+                        .drop_duplicates("code", keep="first").reset_index(drop=True))
+            try:
+                VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
+                                source="fetch_prices:asked_ledger")
+            except Exception as e:                                   # noqa
+                LOG.warn(f"수집 시도 원장 저장 실패({type(e).__name__}) — 다음 실행이 같은 "
+                         f"구간을 다시 받을 수 있습니다.")
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
-            # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
-            #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
-            _prev = _att if _att is not None and len(_att) else None
-            _new = pd.DataFrame(failed)
-            _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
-            _all = (_all.sort_values("attempted_at")
-                        .drop_duplicates("code", keep="last").reset_index(drop=True))
-            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
-                            source="fetch_prices:negative_cache")
+            # 실패분은 위 asked 원장에 이미 포함되어 있다(중복 저장하지 않는다).
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:
@@ -6696,6 +6783,72 @@ def classify_exclusion(code: str, name: str) -> str:
 
 
 # ── 거래일 캘린더 / 리밸런싱 격자 ────────────────────────────────────────────────────────────
+def fetch_trading_calendar(start: str, end: str) -> np.ndarray:
+    """거래일 격자를 '지수 1종목' 으로 만든다. 전 종목 일봉이 필요 없다.
+
+    ★★ 왜 필요한가 ★★
+      예전 순서는 [전 종목 일봉 수집] → [거래일 확정] → [리밸 캘린더] → [시총 스냅샷] 이었다.
+      즉 '하위 1000 종목이 누구인지' 를 알기도 전에 5,000종목이 넘는 일봉을 전부 받았다.
+      시총 스냅샷은 날짜당 1~2호출로 전 종목 시총을 주므로, 순서만 뒤집으면 후보를
+      먼저 확정하고 그 종목만 받을 수 있다. 그 순서 반전을 막고 있던 것이 이 순환 의존
+      (캘린더 ← 일봉) 이었고, 지수 하나면 끊어진다.
+    """
+    lo = (as_ts(start) - pd.DateOffset(months=18)).strftime("%Y-%m-%d")
+    hi = as_ts(end).strftime("%Y-%m-%d")
+    for nm, fn in (("pykrx-index", lambda: (pykrx_stock.get_index_ohlcv(
+                        lo.replace("-", ""), hi.replace("-", ""), "1001")
+                        if pykrx_stock is not None else None)),
+                   ("fdr-KS11", lambda: (fdr.DataReader("KS11", lo, hi)
+                                         if fdr is not None else None))):
+        try:
+            d = fn()
+        except Exception as e:                                      # noqa
+            LOG.debug(f"거래일 격자 {nm} 실패({type(e).__name__})")
+            continue
+        if d is None or not len(d):
+            continue
+        idx = pd.DatetimeIndex(pd.to_datetime(d.index)).normalize()
+        idx = idx[(idx >= as_ts(lo)) & (idx <= as_ts(hi))]
+        if len(idx) > 200:
+            LOG.ok(f"거래일 격자 {len(idx):,}일 확보 ({nm}, 호출 1회) — "
+                   f"전 종목 일봉 없이 캘린더를 만든다")
+            return np.sort(pd.unique(idx.values))
+    LOG.warn("지수로 거래일 격자를 만들지 못했습니다 — 영업일(Mon-Fri) 격자로 폴백합니다. "
+             "공휴일이 거래일로 잡히면 signal/exec 이 하루씩 어긋날 수 있으니 로그를 확인하세요.")
+    return np.sort(pd.bdate_range(lo, hi).values)
+
+
+def select_universe_candidates(caps: pd.DataFrame, signal_dates: Sequence[Any],
+                               n_target: int = U1000_N,
+                               buffer_mult: float = CANDIDATE_BUFFER_MULT) -> Tuple[List[str], dict]:
+    """일봉을 받을 '후보' 종목만 고른다 = 각 신호일 시총 하위 K 의 합집합.
+
+    ★ K = n_target × buffer_mult. 버퍼가 필요한 이유: §3.2/§3.3 게이트(유동성·구조제외·
+      자본잠식)가 하위 종목을 걸러내므로, 적격 하위 1000 은 전체 하위 1000 보다 아래로
+      더 내려간다. 버퍼가 모자랐는지는 build_u1000 이 실현 랭크로 검증해 보고한다.
+    """
+    if caps is None or not len(caps):
+        return [], {"reason": "시총 스냅샷 없음"}
+    c = caps.copy()
+    c["snap_date"] = as_ts_series(c["snap_date"])
+    c["mktcap"] = pd.to_numeric(c["mktcap"], errors="coerce")
+    c = c.dropna(subset=["code", "snap_date", "mktcap"])
+    c = c[c["mktcap"] > 0]
+    k = int(max(n_target, round(n_target * float(buffer_mult))))
+    want = {as_ts(d) for d in signal_dates}
+    picked: set = set()
+    per_date = []
+    for d, g in c.groupby("snap_date", observed=True):
+        if as_ts(d) not in want:
+            continue
+        gg = g.nsmallest(min(k, len(g)), "mktcap")
+        picked.update(gg["code"].astype(str).tolist())
+        per_date.append(len(g))
+    info = {"K": k, "n_dates": len(per_date), "n_candidates": len(picked),
+            "n_listed_avg": float(np.mean(per_date)) if per_date else float("nan")}
+    return sorted(picked), info
+
+
 def qvf_trading_days(px_daily: pd.DataFrame) -> np.ndarray:
     """전 종목 일봉에서 유도한 실제 거래일 배열. 공휴일 테이블을 따로 두지 않는다
     (테이블을 두면 그 테이블이 틀렸을 때 조용히 하루씩 밀린다)."""
@@ -6703,6 +6856,12 @@ def qvf_trading_days(px_daily: pd.DataFrame) -> np.ndarray:
         return np.array([], dtype="datetime64[ns]")
     d = as_ts_series(px_daily["date"]).dropna()
     return np.sort(pd.unique(d.values))
+
+
+def qvf_rebal_calendar_from_days(start: str, end: str, shift_days: int = 0) -> pd.DataFrame:
+    """이미 확정된 QVF_TRADING_DAYS 로 캘린더를 만든다(일봉 패널 없이)."""
+    return qvf_rebal_calendar(pd.DataFrame({"date": pd.Series(QVF_TRADING_DAYS)}),
+                              start, end, shift_days=shift_days)
 
 
 def qvf_rebal_calendar(px_daily: pd.DataFrame, start: str, end: str,
@@ -7205,6 +7364,28 @@ def select_u1000(G: pd.DataFrame) -> pd.DataFrame:
             "겹침": (len(set(g.loc[g["in_u1000"], "code"]) &
                          set(alt.loc[alt["elig"], "code"])) /
                      max(1, int(g["in_u1000"].sum()))) if len(alt) else np.nan})
+
+    # ★ 후보 버퍼가 실제로 충분했는지 검증한다. 후보를 K 로 잘랐는데 적격 하위 1000 이
+    #   K 밖까지 내려가야 했다면, 그만큼의 종목이 '데이터가 없어서' 빠진 것이지
+    #   '규칙에 걸려서' 빠진 것이 아니다. 그건 조용한 유니버스 손실이다.
+    _K = int(max(U1000_N, round(U1000_N * float(CANDIDATE_BUFFER_MULT))))
+    _bind = []
+    for t, g in d.groupby("rebal", observed=True):
+        gm = g[g["mktcap"].notna()]
+        if not len(gm) or not int(g["in_u1000"].sum()):
+            continue
+        r_all = gm["mktcap"].rank(method="first", ascending=True)
+        r_sel = r_all[g.loc[gm.index, "in_u1000"].to_numpy()]
+        if len(r_sel) and float(r_sel.max()) >= _K * 0.95:
+            _bind.append((t, int(r_sel.max()), int(g["in_u1000"].sum())))
+    if _bind:
+        LOG.warn(f"후보 버퍼(K={_K:,})가 빠듯한 분기 {len(_bind)}회 — "
+                 + ", ".join(f"{as_ts(t):%Y-%m}:최대랭크 {r:,}" for t, r, _n in _bind[:6])
+                 + (" …" if len(_bind) > 6 else "")
+                 + ". CANDIDATE_BUFFER_MULT 를 올려 다시 실행하면 그만큼 종목이 더 들어옵니다. "
+                   "지금 결과는 '데이터가 없어 빠진 종목'이 있을 수 있다는 뜻입니다.")
+    else:
+        LOG.debug(f"후보 버퍼 K={_K:,} 충분 — 전 분기에서 적격 하위 {U1000_N:,} 가 K 안에 들어옴")
 
     U = d[d["in_u1000"]].drop(columns=[c for c in ("_prerank",) if c in d.columns]).copy()
     if U.empty:
@@ -11926,19 +12107,45 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
         ctx["snapshots"] = snaps
         ctx["sec"] = build_security_master(snaps)
 
-    with PIPE.stage("L1.PX", "가격 · 거래대금 (폴백 체인)", "L1", budget_s=2400):
+    # ★★ 수집 순서를 뒤집었다: [캘린더] → [전종목 시총] → [후보 확정] → [후보만 일봉] ★★
+    #   예전에는 전 종목(5,398) 일봉을 먼저 받고 나서야 하위 1000 을 골랐다. 실측 55분.
+    #   시총 스냅샷은 날짜당 1~2호출로 전 종목 시총을 주므로 순서만 바꾸면 된다.
+    with PIPE.stage("L1.CAL", "거래일 격자 · 분기 리밸런싱 캘린더 (§4)", "L1", budget_s=120):
+        globals()["QVF_TRADING_DAYS"] = fetch_trading_calendar(BACKTEST_START, BACKTEST_END)
+        ctx["cal"] = qvf_rebal_calendar_from_days(BACKTEST_START, BACKTEST_END)
+
+    with PIPE.stage("L1.CAP", "PIT 시가총액 스냅샷 (전 종목 · 날짜당 1~2호출)", "L1",
+                    budget_s=900, critical=False):
         KRX.login()
-        px = fetch_prices(ctx["sec"]["code"].tolist(),
+        ctx["snaps_cap"] = fetch_krx_cap_snapshots(list(as_ts_series(ctx["cal"]["signal_date"])))
+
+    with PIPE.stage("L1.PX", "가격 · 거래대금 (U-1000 후보만)", "L1", budget_s=2400):
+        cand, cinfo = select_universe_candidates(ctx.get("snaps_cap"),
+                                                 list(as_ts_series(ctx["cal"]["signal_date"])))
+        all_codes = ctx["sec"]["code"].astype(str).tolist()
+        if cand:
+            ctx["candidates"] = cand
+            LOG.table([["전 상장·폐지 종목", f"{len(all_codes):,}"],
+                       ["신호일 평균 상장 종목", f"{cinfo.get('n_listed_avg', float('nan')):,.0f}"],
+                       [f"후보 기준 K (하위 {U1000_N:,} × {CANDIDATE_BUFFER_MULT})",
+                        f"{cinfo.get('K', 0):,}"],
+                       ["일봉 수집 대상(후보 합집합)", f"{len(cand):,}"],
+                       ["절감", f"{100*(1-len(cand)/max(1,len(all_codes))):.0f}%"],
+                       ["절감의 출처", "백테스트 창 밖 폐지분 + 시총 상위 제외"]],
+                      ["항목", "종목수"], ["l", "r"],
+                      title="일봉 수집 대상 축소 — 시총 하위 후보만 받는다(§3.1)")
+        else:
+            cand = all_codes
+            LOG.warn("시총 스냅샷이 없어 후보를 좁히지 못했습니다 — 전 종목 일봉을 받습니다. "
+                     "(스냅샷 실패 사유를 먼저 확인하세요. 이 경로는 매우 느립니다)")
+        set_code_market(ctx["sec"])
+        px = fetch_prices(cand,
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
                           BACKTEST_END)
         ctx["px"] = px
+        # 지수 격자에 없던 실거래일이 있으면 보강한다(지수 휴장·데이터 결손 대비).
         set_trading_days(px)
-
-    with PIPE.stage("L1.CAL", "분기 리밸런싱 캘린더 (§4)", "L1", budget_s=60):
         ctx["cal"] = qvf_rebal_calendar(ctx["px"], BACKTEST_START, BACKTEST_END)
-
-    with PIPE.stage("L1.CAP", "PIT 시가총액 스냅샷", "L1", budget_s=900, critical=False):
-        ctx["snaps_cap"] = fetch_krx_cap_snapshots(list(as_ts_series(ctx["cal"]["signal_date"])))
 
     with PIPE.stage("L1.DART", "DART 재무 · 주식총수", "L1", budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()

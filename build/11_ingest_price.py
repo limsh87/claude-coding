@@ -12,6 +12,13 @@
 PRICE_COLS = ["code", "date", "open", "high", "low", "close", "volume", "amount", "src"]
 
 
+def _krx_recent_bizday() -> str:
+    d = _dt.date.today() - _dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= _dt.timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
 class KRXAuth:
     """KRX 데이터 마켓플레이스 인증(2025-12 변경 대응). 실패해도 절대 죽지 않고 폴백으로 넘긴다.
 
@@ -53,26 +60,48 @@ class KRXAuth:
         # 워밍업 없이 바로 POST 하면 세션 쿠키가 없어 항상 실패한다
         http_get(self.LOGIN_WARM1, source="krx", tries=1)
         http_get(self.LOGIN_WARM2, source="krx", tries=1, referer=self.LOGIN_WARM1)
+        # ★★ 로그인 성공을 '실패 단어가 없더라' 로 판정하면 안 된다 ★★
+        #   예전 판정은 응답 앞 600자에 (실패|오류|error|fail) 가 없으면 성공으로 봤다.
+        #   그러면 (a) 엔드포인트가 바뀌어 엉뚱한 200 응답이 와도 '성공', (b) 네트워크
+        #   실패·차단·캡차로 txt=None 이면 전부 'ID/PW 를 확인하세요' 가 된다.
+        #   사용자가 자격증명을 정확히 넣고도 틀렸다는 말을 듣는 이유가 정확히 (b) 다.
+        #   → 성공은 '실제 인증이 필요한 호출이 되는가' 로만 증명하고, 실패는 사유를 나눈다.
+        reasons = []
         for extra in ({}, {"skipDup": "Y"}):
             body = {"mbrNm": "", "telNo": "", "di": "", "certType": "",
                     "mbrId": self.user, "pw": self.pw, **extra}
             txt = http_post(self.LOGIN_POST, source="krx", data=body, referer=self.LOGIN_WARM1,
                             headers={"X-Requested-With": "XMLHttpRequest"})
             if txt is None:
+                reasons.append("네트워크/차단: 로그인 엔드포인트가 응답하지 않음")
                 continue
-            if re.search(r"CD011|중복\s*로그인", str(txt)):
-                LOG.warn("KRX 중복 로그인(CD011) 감지 — 같은 계정이 브라우저나 다른 노트북에서 "
-                         "이미 로그인되어 있습니다. skipDup 으로 재시도하면 기존 세션이 강제 종료됩니다. "
-                         "두 노트북을 동시에 돌리면 서로를 계속 밀어냅니다.")
+            body_s = str(txt)
+            if re.search(r"CD011|중복\s*로그인", body_s):
+                reasons.append("중복 로그인(CD011): 같은 계정이 다른 곳에 로그인되어 있음")
+                LOG.warn("KRX 중복 로그인(CD011) — 같은 계정이 브라우저나 다른 노트북에서 이미 "
+                         "로그인되어 있습니다. 두 곳을 동시에 돌리면 서로를 계속 밀어냅니다.")
                 continue
-            if not re.search(r"(실패|불일치|오류|error|fail|로그인이\s*필요)", str(txt)[:600], re.I):
-                self.session_ok = True
+            if re.search(r"(비밀번호|아이디).{0,20}(불일치|틀|확인)|존재하지\s*않는\s*(회원|아이디)",
+                         body_s[:1500]):
+                reasons.append("자격증명 불일치: KRX 가 ID/PW 오류로 응답함")
+                continue
+            # 여기까지 왔으면 '아마 성공' 이다. 말이 아니라 기능으로 확인한다.
+            self.session_ok = True
+            probe = self.json_data("dbms/MDC/STAT/standard/MDCSTAT01501",
+                                   mktId="ALL", trdDd=_krx_recent_bizday())
+            if isinstance(probe, dict) and probe.get("OutBlock_1"):
                 self.status = "LOGIN_OK"
-                LOG.ok("KRX 마켓플레이스 로그인 성공.")
+                LOG.ok("KRX 마켓플레이스 로그인 성공 (인증 호출로 확인).")
                 return True
+            self.session_ok = False
+            reasons.append("로그인 응답은 정상이나 인증 호출이 데이터를 주지 않음 "
+                           "(세션 미형성 또는 bld 변경)")
         self.status = "LOGIN_FAILED"
-        LOG.warn("KRX 마켓플레이스 로그인 실패. ID/PW 를 확인하세요. "
-                 "로그인 불필요 경로로 폴백하며 백테스트는 정상 진행됩니다.")
+        LOG.warn("KRX 마켓플레이스를 사용하지 못했습니다 — 사유: "
+                 + " / ".join(dict.fromkeys(reasons)) + "\n"
+                 "  ※ 이 단계는 '검증·보강' 이며 백테스트에 필수가 아닙니다. 상장/폐지 목록과 "
+                 "시총은 로그인 불필요 경로(FDR·KIND·pykrx)로 이미 확보됩니다.\n"
+                 "  ※ 자격증명이 맞는데도 위 사유가 '네트워크/차단' 이면 ID/PW 문제가 아닙니다.")
         return self.openapi_ok
 
     def _probe_openapi(self) -> bool:
@@ -203,10 +232,36 @@ def _px_naver(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     return d.reindex(columns=PRICE_COLS) if len(d) else None
 
 
+# 종목 → 시장(KOSPI/KOSDAQ). 종목 마스터에서 채운다. 비어 있으면 예전처럼 둘 다 시도한다.
+CODE_MARKET: Dict[str, str] = {}
+
+
+def set_code_market(sec: pd.DataFrame):
+    """yfinance 접미사를 '추측'하지 않기 위한 시장 구분표.
+
+    ★ 예전에는 모든 종목에 .KS 와 .KQ 를 둘 다 시도했다. 시장 구분은 종목 마스터에 이미
+      있는데도 그랬다. 그 결과 (a) 호출이 정확히 2배가 되고 (b) 실패하는 쪽이 항상 하나씩
+      생겨 로그가 'possibly delisted' 로 도배되어 진짜 오류가 묻힌다.
+    """
+    if sec is None or not len(sec) or "market" not in sec.columns:
+        return
+    m = {}
+    for c, mk in zip(sec["code"].astype(str), sec["market"].astype(str)):
+        u = mk.upper()
+        if "KOSDAQ" in u:
+            m[c] = ".KQ"
+        elif "KOSPI" in u or "STK" in u:
+            m[c] = ".KS"
+    CODE_MARKET.update(m)
+    LOG.debug(f"yfinance 접미사 확정 {len(m):,}종목 (추측 대신 시장 구분 사용)")
+
+
 def _px_yf(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     if yf is None:
         return None
-    for suf in (".KS", ".KQ"):
+    known = CODE_MARKET.get(str(code))
+    sufs = (known,) if known else (".KS", ".KQ")
+    for suf in sufs:
         try:
             limiter("generic").wait()
             d = yf.download(code + suf, start=start, end=end, progress=False,
@@ -274,7 +329,7 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return False
         return (_today - p["at"]).days < RETRY_AFTER_DAYS
 
-    todo, n_back, n_fwd, n_skip = [], 0, 0, 0
+    todo, n_back, n_fwd, n_skip, n_ipo = [], 0, 0, 0, 0
     for c in codes:
         mx, mn = have_max.get(c), have_min.get(c)
         if mx is None:
@@ -283,19 +338,34 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
                 continue
             todo.append((c, start))
             continue
-        # ★ 과거 방향 백필을 반드시 함께 본다.
-        #   앞선 실행이 최근 구간만 캐시했다면(예: 캐시가 2023~2026 뿐),
-        #   max 만 보고 판단하면 2016~2022 를 영원히 못 받는다.
-        #   → 10년 백테스트인데 앞 7년이 조용히 비는 사고가 된다.
+        # ★ 과거 방향 백필을 함께 본다. 앞선 실행이 최근 구간만 캐시했다면
+        #   max 만 보고 판단하면 앞 구간을 영원히 못 받는다.
         if mn is not None and mn > start_ts + pd.Timedelta(days=10):
-            todo.append((c, start))
-            n_back += 1
+            # ★★ 여기서 무조건 재수집하면 '무한 재수집 루프'가 된다 ★★
+            #   2019년 상장 종목의 캐시 최소일은 당연히 2019년이다. 그건 '결손'이 아니라
+            #   그 종목의 실제 최초 거래일이다. 그런데 요청 시작일(2015)과만 비교하면
+            #   매 실행 전 구간을 다시 받고, 상장 전 데이터는 존재하지 않으므로 캐시
+            #   최소일이 움직이지 않아, 다음 실행도 똑같이 다시 받는다 — 영원히.
+            #   실측: 이 조건 하나로 1,974종목이 매 실행 재수집되어 55분을 썼다.
+            #   → 이미 이 시작일(또는 그 이전)로 요청해 본 적이 있으면 mn 이 곧 그 종목의
+            #     확정된 최초 거래일이다. 다시 물어도 답은 같다.
+            _p = attempts.get(c)
+            _asked = _p.get("frm") if _p else None
+            if _asked is not None and pd.notna(_asked) and _asked <= start_ts + pd.Timedelta(days=10):
+                n_ipo += 1
+            else:
+                todo.append((c, start))
+                n_back += 1
         elif mx < end_ts - pd.Timedelta(days=5):
             todo.append((c, (mx + pd.Timedelta(days=1)).strftime("%Y-%m-%d")))
             n_fwd += 1
     if n_back:
         LOG.info(f"과거 구간이 비어 있는 {n_back:,}종목을 처음부터 다시 받습니다 "
-                 f"(캐시 최소일이 요청 시작일보다 늦음 = 앞 구간 결손).")
+                 f"(요청 시작일 이전으로 물어본 적이 없는 종목만).")
+    if n_ipo:
+        LOG.info(f"캐시 최소일이 요청 시작일보다 늦지만 이미 확인된 {n_ipo:,}종목은 재수집하지 "
+                 f"않습니다 (상장이 그 이후 = 결손이 아님). 이 판정이 없으면 매 실행 전 구간을 "
+                 f"다시 받고도 캐시가 그대로라 영원히 반복합니다.")
     if n_skip:
         LOG.info(f"최근 {RETRY_AFTER_DAYS}일 내 전 소스에서 실패한 {n_skip:,}종목은 이번엔 "
                  f"건너뜁니다 (대부분 상장폐지분). {RETRY_AFTER_DAYS}일 뒤 자동 재시도합니다.")
@@ -323,26 +393,34 @@ def fetch_prices(codes: Sequence[str], start: str, end: str) -> pd.DataFrame:
             return None
 
         res = pmap_io(_one, todo, workers=min(N_WORKERS_IO, 12), desc="일봉 수집")
-        failed = []
+        failed, asked = [], []
         for (c, st), d in zip(todo, res):
+            # ★ 성공/실패와 무관하게 '무엇을 언제 어느 시작일로 물어봤는지'를 남긴다.
+            #   성공분을 안 남기면 위의 무한 재수집 판정이 근거를 잃는다.
+            asked.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
             if d is not None and len(d):
                 new_frames.append(d)
                 src_used[str(d["src"].iloc[0])] += 1
             else:
                 failed.append({"code": c, "requested_from": as_ts(st), "attempted_at": _today})
+        if asked:
+            _prev = _att if _att is not None and len(_att) else None
+            _all = pd.concat([_prev, pd.DataFrame(asked)], ignore_index=True) \
+                if _prev is not None else pd.DataFrame(asked)
+            # 같은 종목은 '가장 이른 시작일로 물어본 기록'을 남긴다(그게 확정 근거다).
+            _all = (_all.sort_values(["code", "requested_from", "attempted_at"])
+                        .drop_duplicates("code", keep="first").reset_index(drop=True))
+            try:
+                VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
+                                source="fetch_prices:asked_ledger")
+            except Exception as e:                                   # noqa
+                LOG.warn(f"수집 시도 원장 저장 실패({type(e).__name__}) — 다음 실행이 같은 "
+                         f"구간을 다시 받을 수 있습니다.")
         if failed:
             LOG.warn(f"일봉 수집 실패 {len(failed):,}종목 — 전 소스에서 데이터를 못 받았습니다. "
                      f"(상장폐지 종목은 소스에 따라 조회가 안 되는 게 정상입니다) "
                      f"시도 원장에 기록하여 {RETRY_AFTER_DAYS}일간 재시도하지 않습니다.")
-            # ★ 성공 캐시 저장(if new_frames)과 별개로 무조건 기록한다. 전부 실패한 실행에서
-            #   아무것도 남기지 않으면 다음 실행이 똑같은 헛수고를 그대로 반복한다.
-            _prev = _att if _att is not None and len(_att) else None
-            _new = pd.DataFrame(failed)
-            _all = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
-            _all = (_all.sort_values("attempted_at")
-                        .drop_duplicates("code", keep="last").reset_index(drop=True))
-            VAULT.put_table("price_fetch_attempts", _all, scope="shared", domain="price",
-                            source="fetch_prices:negative_cache")
+            # 실패분은 위 asked 원장에 이미 포함되어 있다(중복 저장하지 않는다).
 
     frames = ([cached] if cached is not None and len(cached) else []) + new_frames
     if not frames:

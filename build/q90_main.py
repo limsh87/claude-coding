@@ -76,19 +76,45 @@ def collect_core(cal_hint: Optional[pd.DataFrame] = None) -> dict:
         ctx["snapshots"] = snaps
         ctx["sec"] = build_security_master(snaps)
 
-    with PIPE.stage("L1.PX", "가격 · 거래대금 (폴백 체인)", "L1", budget_s=2400):
+    # ★★ 수집 순서를 뒤집었다: [캘린더] → [전종목 시총] → [후보 확정] → [후보만 일봉] ★★
+    #   예전에는 전 종목(5,398) 일봉을 먼저 받고 나서야 하위 1000 을 골랐다. 실측 55분.
+    #   시총 스냅샷은 날짜당 1~2호출로 전 종목 시총을 주므로 순서만 바꾸면 된다.
+    with PIPE.stage("L1.CAL", "거래일 격자 · 분기 리밸런싱 캘린더 (§4)", "L1", budget_s=120):
+        globals()["QVF_TRADING_DAYS"] = fetch_trading_calendar(BACKTEST_START, BACKTEST_END)
+        ctx["cal"] = qvf_rebal_calendar_from_days(BACKTEST_START, BACKTEST_END)
+
+    with PIPE.stage("L1.CAP", "PIT 시가총액 스냅샷 (전 종목 · 날짜당 1~2호출)", "L1",
+                    budget_s=900, critical=False):
         KRX.login()
-        px = fetch_prices(ctx["sec"]["code"].tolist(),
+        ctx["snaps_cap"] = fetch_krx_cap_snapshots(list(as_ts_series(ctx["cal"]["signal_date"])))
+
+    with PIPE.stage("L1.PX", "가격 · 거래대금 (U-1000 후보만)", "L1", budget_s=2400):
+        cand, cinfo = select_universe_candidates(ctx.get("snaps_cap"),
+                                                 list(as_ts_series(ctx["cal"]["signal_date"])))
+        all_codes = ctx["sec"]["code"].astype(str).tolist()
+        if cand:
+            ctx["candidates"] = cand
+            LOG.table([["전 상장·폐지 종목", f"{len(all_codes):,}"],
+                       ["신호일 평균 상장 종목", f"{cinfo.get('n_listed_avg', float('nan')):,.0f}"],
+                       [f"후보 기준 K (하위 {U1000_N:,} × {CANDIDATE_BUFFER_MULT})",
+                        f"{cinfo.get('K', 0):,}"],
+                       ["일봉 수집 대상(후보 합집합)", f"{len(cand):,}"],
+                       ["절감", f"{100*(1-len(cand)/max(1,len(all_codes))):.0f}%"],
+                       ["절감의 출처", "백테스트 창 밖 폐지분 + 시총 상위 제외"]],
+                      ["항목", "종목수"], ["l", "r"],
+                      title="일봉 수집 대상 축소 — 시총 하위 후보만 받는다(§3.1)")
+        else:
+            cand = all_codes
+            LOG.warn("시총 스냅샷이 없어 후보를 좁히지 못했습니다 — 전 종목 일봉을 받습니다. "
+                     "(스냅샷 실패 사유를 먼저 확인하세요. 이 경로는 매우 느립니다)")
+        set_code_market(ctx["sec"])
+        px = fetch_prices(cand,
                           (as_ts(BACKTEST_START) - pd.DateOffset(months=18)).strftime("%Y-%m-%d"),
                           BACKTEST_END)
         ctx["px"] = px
+        # 지수 격자에 없던 실거래일이 있으면 보강한다(지수 휴장·데이터 결손 대비).
         set_trading_days(px)
-
-    with PIPE.stage("L1.CAL", "분기 리밸런싱 캘린더 (§4)", "L1", budget_s=60):
         ctx["cal"] = qvf_rebal_calendar(ctx["px"], BACKTEST_START, BACKTEST_END)
-
-    with PIPE.stage("L1.CAP", "PIT 시가총액 스냅샷", "L1", budget_s=900, critical=False):
-        ctx["snaps_cap"] = fetch_krx_cap_snapshots(list(as_ts_series(ctx["cal"]["signal_date"])))
 
     with PIPE.stage("L1.DART", "DART 재무 · 주식총수", "L1", budget_s=3600, critical=False):
         corps = ctx["sec"]["corp_code"].dropna().astype(str).unique().tolist()

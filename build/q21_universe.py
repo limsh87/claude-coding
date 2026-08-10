@@ -155,6 +155,72 @@ def classify_exclusion(code: str, name: str) -> str:
 
 
 # ── 거래일 캘린더 / 리밸런싱 격자 ────────────────────────────────────────────────────────────
+def fetch_trading_calendar(start: str, end: str) -> np.ndarray:
+    """거래일 격자를 '지수 1종목' 으로 만든다. 전 종목 일봉이 필요 없다.
+
+    ★★ 왜 필요한가 ★★
+      예전 순서는 [전 종목 일봉 수집] → [거래일 확정] → [리밸 캘린더] → [시총 스냅샷] 이었다.
+      즉 '하위 1000 종목이 누구인지' 를 알기도 전에 5,000종목이 넘는 일봉을 전부 받았다.
+      시총 스냅샷은 날짜당 1~2호출로 전 종목 시총을 주므로, 순서만 뒤집으면 후보를
+      먼저 확정하고 그 종목만 받을 수 있다. 그 순서 반전을 막고 있던 것이 이 순환 의존
+      (캘린더 ← 일봉) 이었고, 지수 하나면 끊어진다.
+    """
+    lo = (as_ts(start) - pd.DateOffset(months=18)).strftime("%Y-%m-%d")
+    hi = as_ts(end).strftime("%Y-%m-%d")
+    for nm, fn in (("pykrx-index", lambda: (pykrx_stock.get_index_ohlcv(
+                        lo.replace("-", ""), hi.replace("-", ""), "1001")
+                        if pykrx_stock is not None else None)),
+                   ("fdr-KS11", lambda: (fdr.DataReader("KS11", lo, hi)
+                                         if fdr is not None else None))):
+        try:
+            d = fn()
+        except Exception as e:                                      # noqa
+            LOG.debug(f"거래일 격자 {nm} 실패({type(e).__name__})")
+            continue
+        if d is None or not len(d):
+            continue
+        idx = pd.DatetimeIndex(pd.to_datetime(d.index)).normalize()
+        idx = idx[(idx >= as_ts(lo)) & (idx <= as_ts(hi))]
+        if len(idx) > 200:
+            LOG.ok(f"거래일 격자 {len(idx):,}일 확보 ({nm}, 호출 1회) — "
+                   f"전 종목 일봉 없이 캘린더를 만든다")
+            return np.sort(pd.unique(idx.values))
+    LOG.warn("지수로 거래일 격자를 만들지 못했습니다 — 영업일(Mon-Fri) 격자로 폴백합니다. "
+             "공휴일이 거래일로 잡히면 signal/exec 이 하루씩 어긋날 수 있으니 로그를 확인하세요.")
+    return np.sort(pd.bdate_range(lo, hi).values)
+
+
+def select_universe_candidates(caps: pd.DataFrame, signal_dates: Sequence[Any],
+                               n_target: int = U1000_N,
+                               buffer_mult: float = CANDIDATE_BUFFER_MULT) -> Tuple[List[str], dict]:
+    """일봉을 받을 '후보' 종목만 고른다 = 각 신호일 시총 하위 K 의 합집합.
+
+    ★ K = n_target × buffer_mult. 버퍼가 필요한 이유: §3.2/§3.3 게이트(유동성·구조제외·
+      자본잠식)가 하위 종목을 걸러내므로, 적격 하위 1000 은 전체 하위 1000 보다 아래로
+      더 내려간다. 버퍼가 모자랐는지는 build_u1000 이 실현 랭크로 검증해 보고한다.
+    """
+    if caps is None or not len(caps):
+        return [], {"reason": "시총 스냅샷 없음"}
+    c = caps.copy()
+    c["snap_date"] = as_ts_series(c["snap_date"])
+    c["mktcap"] = pd.to_numeric(c["mktcap"], errors="coerce")
+    c = c.dropna(subset=["code", "snap_date", "mktcap"])
+    c = c[c["mktcap"] > 0]
+    k = int(max(n_target, round(n_target * float(buffer_mult))))
+    want = {as_ts(d) for d in signal_dates}
+    picked: set = set()
+    per_date = []
+    for d, g in c.groupby("snap_date", observed=True):
+        if as_ts(d) not in want:
+            continue
+        gg = g.nsmallest(min(k, len(g)), "mktcap")
+        picked.update(gg["code"].astype(str).tolist())
+        per_date.append(len(g))
+    info = {"K": k, "n_dates": len(per_date), "n_candidates": len(picked),
+            "n_listed_avg": float(np.mean(per_date)) if per_date else float("nan")}
+    return sorted(picked), info
+
+
 def qvf_trading_days(px_daily: pd.DataFrame) -> np.ndarray:
     """전 종목 일봉에서 유도한 실제 거래일 배열. 공휴일 테이블을 따로 두지 않는다
     (테이블을 두면 그 테이블이 틀렸을 때 조용히 하루씩 밀린다)."""
@@ -162,6 +228,12 @@ def qvf_trading_days(px_daily: pd.DataFrame) -> np.ndarray:
         return np.array([], dtype="datetime64[ns]")
     d = as_ts_series(px_daily["date"]).dropna()
     return np.sort(pd.unique(d.values))
+
+
+def qvf_rebal_calendar_from_days(start: str, end: str, shift_days: int = 0) -> pd.DataFrame:
+    """이미 확정된 QVF_TRADING_DAYS 로 캘린더를 만든다(일봉 패널 없이)."""
+    return qvf_rebal_calendar(pd.DataFrame({"date": pd.Series(QVF_TRADING_DAYS)}),
+                              start, end, shift_days=shift_days)
 
 
 def qvf_rebal_calendar(px_daily: pd.DataFrame, start: str, end: str,
@@ -664,6 +736,28 @@ def select_u1000(G: pd.DataFrame) -> pd.DataFrame:
             "겹침": (len(set(g.loc[g["in_u1000"], "code"]) &
                          set(alt.loc[alt["elig"], "code"])) /
                      max(1, int(g["in_u1000"].sum()))) if len(alt) else np.nan})
+
+    # ★ 후보 버퍼가 실제로 충분했는지 검증한다. 후보를 K 로 잘랐는데 적격 하위 1000 이
+    #   K 밖까지 내려가야 했다면, 그만큼의 종목이 '데이터가 없어서' 빠진 것이지
+    #   '규칙에 걸려서' 빠진 것이 아니다. 그건 조용한 유니버스 손실이다.
+    _K = int(max(U1000_N, round(U1000_N * float(CANDIDATE_BUFFER_MULT))))
+    _bind = []
+    for t, g in d.groupby("rebal", observed=True):
+        gm = g[g["mktcap"].notna()]
+        if not len(gm) or not int(g["in_u1000"].sum()):
+            continue
+        r_all = gm["mktcap"].rank(method="first", ascending=True)
+        r_sel = r_all[g.loc[gm.index, "in_u1000"].to_numpy()]
+        if len(r_sel) and float(r_sel.max()) >= _K * 0.95:
+            _bind.append((t, int(r_sel.max()), int(g["in_u1000"].sum())))
+    if _bind:
+        LOG.warn(f"후보 버퍼(K={_K:,})가 빠듯한 분기 {len(_bind)}회 — "
+                 + ", ".join(f"{as_ts(t):%Y-%m}:최대랭크 {r:,}" for t, r, _n in _bind[:6])
+                 + (" …" if len(_bind) > 6 else "")
+                 + ". CANDIDATE_BUFFER_MULT 를 올려 다시 실행하면 그만큼 종목이 더 들어옵니다. "
+                   "지금 결과는 '데이터가 없어 빠진 종목'이 있을 수 있다는 뜻입니다.")
+    else:
+        LOG.debug(f"후보 버퍼 K={_K:,} 충분 — 전 분기에서 적격 하위 {U1000_N:,} 가 K 안에 들어옴")
 
     U = d[d["in_u1000"]].drop(columns=[c for c in ("_prerank",) if c in d.columns]).copy()
     if U.empty:
