@@ -338,8 +338,8 @@ def _doc_classify(report_nm: str, rcept_dt) -> Optional[Tuple[str, int, bool]]:
 # ── 수집 ────────────────────────────────────────────────────────────────────────────────────
 ARC_DOC_COLS = ["corp_code", "rcept_no", "rcept_dt", "doc_type", "bsns_year", "section",
                 "n_tokens", "tf", "bigram", "tok_len", "is_amend"]
-ARC_DOC_TF_TOP = 450          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
-ARC_DOC_BG_TOP = 150
+ARC_DOC_TF_TOP = 350          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
+ARC_DOC_BG_TOP = 120
 
 _ARC_DOC_FAIL: "Counter" = Counter()
 

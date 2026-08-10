@@ -247,7 +247,7 @@ STOP_ON_CONTRACT_FAIL = True          # 계약 위반 시 즉시 중단 (False �
 
 STRATEGY_ID   = "ARC_TXT_V2"
 STRATEGY_NAME = "애널리스트 텍스트톤 변화 × DART 3층 교차확증"
-BUILD_VERSION = "v2.20260810.0545"
+BUILD_VERSION = "v2.20260810.0551"
 
 # 하위 호환 별칭 — 재사용하는 L0/L1 조각들이 이 이름을 참조합니다.
 CUSTOMS_API_KEY = ""
@@ -6515,8 +6515,8 @@ def _doc_classify(report_nm: str, rcept_dt) -> Optional[Tuple[str, int, bool]]:
 # ── 수집 ────────────────────────────────────────────────────────────────────────────────────
 ARC_DOC_COLS = ["corp_code", "rcept_no", "rcept_dt", "doc_type", "bsns_year", "section",
                 "n_tokens", "tf", "bigram", "tok_len", "is_amend"]
-ARC_DOC_TF_TOP = 450          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
-ARC_DOC_BG_TOP = 150
+ARC_DOC_TF_TOP = 350          # 섹션당 저장 토큰 수. 코사인/자카드에 충분하고 용량은 억제.
+ARC_DOC_BG_TOP = 120
 
 _ARC_DOC_FAIL: "Counter" = Counter()
 
@@ -8868,6 +8868,7 @@ def build_d1_streaming(struct: Optional[pd.DataFrame] = None,
         return pd.DataFrame(columns=D1_OUT_COLS)
     df_state = {"df": Counter(), "n": 0}
     sims: List[pd.DataFrame] = []
+    peak = 0.0
     for y in sorted(ys):
         if (y - 1) not in ys:
             continue                       # 전년 문서가 없으면 페어가 만들어지지 않는다
@@ -8876,20 +8877,35 @@ def build_d1_streaming(struct: Optional[pd.DataFrame] = None,
             continue
         pr = arc_doc_pairs(T2)
         del T2
+        gc.collect()
         if pr is None or pr.empty:
             continue
-        s1 = d1_similarity(pr, df_state=df_state)
+        peak = max(peak, mem_mb(pr))
+        # ★ 월 단위로 잘라 넘긴다. d1_similarity 는 내부적으로 월 배치로 IDF 를 고정하므로
+        #   한 달씩 주는 것과 한 해를 통째로 주는 것이 수치적으로 동일하고, 상주량만 줄어든다.
+        pr["_m"] = as_ts_series(pr["rcept_dt"]).dt.to_period("M")
+        for _mk in sorted(pr["_m"].dropna().unique()):
+            chunk = pr[pr["_m"] == _mk].drop(columns=["_m"])
+            if chunk.empty:
+                continue
+            s1 = d1_similarity(chunk, df_state=df_state)
+            del chunk
+            if s1 is not None and len(s1):
+                sims.append(s1)
         del pr
-        if s1 is not None and len(s1):
-            sims.append(s1)
         gc.collect()
     if not sims:
         LOG.warn("연도 스트리밍 D1 에서 유사도를 한 건도 만들지 못했습니다.")
         return pd.DataFrame(columns=D1_OUT_COLS)
     S = pd.concat(sims, ignore_index=True)
     del sims
-    LOG.ok(f"D1 연도 스트리밍 완료 — 유사도 {len(S):,}행 (연도 {len(ys)}개, "
-           f"상주 연도 2개씩 유지)")
+    LOG.ok(f"D1 연도 스트리밍 완료 — 유사도 {len(S):,}행 · 연도 {len(ys)}개 · "
+           f"페어 프레임 최대 상주 {peak:,.0f}MB (연도 2개 + 월 단위 청크)")
+    _bud = float(globals().get("MEM_BUDGET_GB", 6.0)) * 1000.0
+    if peak > _bud * 0.5:
+        LOG.warn(f"D1 페어 프레임이 {peak:,.0f}MB 로 메모리 예산({_bud:,.0f}MB)의 절반을 "
+                 f"넘었습니다. ARC_DOC_TF_TOP 을 낮추면(현재 {ARC_DOC_TF_TOP}) 선형으로 "
+                 f"줄어듭니다 — 유사도 정확도는 거의 변하지 않습니다.")
     return d1_composite(S, struct)
 
 
