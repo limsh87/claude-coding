@@ -160,6 +160,14 @@ PACK_TIME_SHARE = 0.25    # ★센서팩(N·P·X) 수집에 줄 시간 몫 — �
 #                           ★분모가 사라져 그 팩 축이 통째로 죽는다 — 팩을 먼저 받으려던
 #                           목적과 정확히 반대의 결과다. 그래서 몫을 물리적으로 건다.
 PACK_TIME_CAP_MIN = 50    # 위 비율과 무관하게 넘지 않을 절대 상한(분). 0 = 비율만 적용.
+PACK_MIN_MONTH_COV = 0.50  # ★센서팩이 백테스트 ★기간의 몇 할에 존재해야 축으로 인정하는가.
+#                            왜 필요한가: 기존 게이트는 '패널 셀 커버리지'만 봤다. 그런데
+#                            국민연금처럼 ★최근 몇 달만 있는 원천은 셀 커버리지가 16% 라
+#                            1% 문턱을 가볍게 넘고 팩이 ★켜진다. 그러면 앞 8년은 축 2개,
+#                            뒤 19개월은 축 3개로 ★도중에 전략이 바뀐 곡선 하나가 그려진다.
+#                            그건 10년 백테스트가 아니라 서로 다른 두 전략을 이어 붙인
+#                            그림이다. 기간 커버리지가 이 값 미만이면 그 사실을 말하고 끈다.
+#                            (0 으로 두면 이 검사를 끄고 옛 동작으로 돌아간다.)
 THETA_X_ANNUALIZE = False  # ★θ_X 의 분자를 연율화할 것인가. 기본 False = ★원전 산식 그대로.
 #                            원전(build/p_x_customs.py): theta_X = (월 exp_usd × 1300) / revenue_ttm
 #                            분자는 '한 달' 수출인데 분모는 'TTM(12개월)' 매출이라 차원이
@@ -8416,12 +8424,37 @@ def _nps_name_index(master: pd.DataFrame) -> Dict[str, list]:
 
 
 def _ym_near(txt: str) -> Optional[str]:
-    """자유 텍스트에서 YYYYMM 을 뽑는다. 'YYYY년 M월'·'YYYY-MM'·'YYYYMM' 전부 받는다."""
+    """자유 텍스트에서 자료생성월(YYYYMM)을 뽑는다.
+
+    ★포털의 버전 제목은 한 서식이 아니다(실측 5종):
+        "…내역 2019년 7월"          ← 자료월을 직접 적은 것
+        "…내역 2020년 5월_20200520"  ← 자료월 + 게시일
+        "…내역_20210217"            ← ★게시일만
+        "…내역_09/24/2021"          ← ★게시일만, 게다가 MM/DD/YYYY
+    앞의 두 종만 읽던 판이 있었다. 뒤의 두 종은 ★한 달도 못 잡아 그 구간이 색인에서
+    통째로 빠졌다 — 10년을 뚫겠다면서 정작 옛 서식을 못 읽는 파서였던 것이다.
+
+    ★게시일과 자료월은 다르다. 공단은 그 달 명부를 ★다음 달에 올린다(자료 2021-01 →
+    게시 2021-02-17). 그래서 게시일 서식은 ★한 달을 뺀다. 자료월을 직접 적은 서식이
+    있으면 그쪽이 언제나 우선이다. 어차피 확정은 CSV 의 DATA_CRT_YM 이 하므로 이
+    보정이 틀려도 헛다운로드 한 번일 뿐 저장되는 값은 흔들리지 않는다.
+    """
     t = str(txt or "")
-    m = re.search(r"(20\d{2})\s*[-.년]\s*(1[0-2]|0?[1-9])\s*월?", t)
+    m = re.search(r"(20\d{2})\s*[-.년]\s*(1[0-2]|0?[1-9])\s*월", t)   # ★'월'을 요구한다
     if m:
         return f"{m.group(1)}{int(m.group(2)):02d}"
-    m = re.search(r"(20\d{2})(0[1-9]|1[0-2])", t)
+    def _back1(y: int, mo: int) -> str:
+        return f"{y - 1}12" if mo == 1 else f"{y}{mo - 1:02d}"
+    m = re.search(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)", t)
+    if m:                                                            # YYYYMMDD = 게시일
+        return _back1(int(m.group(1)), int(m.group(2)))
+    m = re.search(r"(?<!\d)(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/(20\d{2})(?!\d)", t)
+    if m:                                                            # MM/DD/YYYY = 게시일
+        return _back1(int(m.group(3)), int(m.group(1)))
+    m = re.search(r"(20\d{2})\s*[-.]\s*(1[0-2]|0[1-9])(?!\d)", t)     # YYYY-MM
+    if m:
+        return f"{m.group(1)}{int(m.group(2)):02d}"
+    m = re.search(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)", t)        # YYYYMM
     return f"{m.group(1)}{m.group(2)}" if m else None
 
 
@@ -10583,6 +10616,19 @@ def score_by_axes(P: pd.DataFrame, axes: Sequence[str],
             "pcts": pcts, "axes": axes}
 
 
+def month_cov(P: pd.DataFrame, c: str) -> float:
+    """축 c 가 ★몇 할의 달에 존재하는가(0~1). 셀 커버리지와 다른 것을 잰다.
+
+    셀 커버리지는 '패널 전체 칸 중 값이 있는 칸의 비율'이라, 최근 몇 달에만 몰려 있어도
+    문턱을 넘는다. 여기서 재는 것은 ★시간축의 폭이다 — 한 달이라도 쓸 만한 단면
+    (그 달 안 관측률 1% 이상)이 있으면 그 달을 '있다'로 센다.
+    """
+    if c not in P.columns or not len(P) or "month" not in P.columns:
+        return 0.0
+    g = P.groupby("month", observed=True)[c].apply(lambda s: float(s.notna().mean()) >= 0.01)
+    return float(g.mean()) if len(g) else 0.0
+
+
 def assemble_signal(P: pd.DataFrame) -> pd.DataFrame:
     """E = mean(활성 팩 + 공용축 B·C) — 전부 동일가중(C7: 기본값이자 최종값, 최적화 금지)."""
     pack_axes = []
@@ -10611,8 +10657,24 @@ def assemble_signal(P: pd.DataFrame) -> pd.DataFrame:
                        + (f" · θ {th_cov*100:.1f}%" if th_cov == th_cov else "")
                        + " — 데이터 부재 자동 비활성(§8.4)")
             pack_off(p["id"], why)
-        else:
-            pack_axes.append(c)
+            continue
+        # ★기간 커버리지 — 셀 커버리지가 넘겼다고 끝이 아니다. 원천이 ★최근 몇 달에만
+        #   있으면(국민연금 파일 아카이브가 정확히 그런 모양이다) 셀 커버리지는 문턱을
+        #   넘는데 축은 뒤쪽 구간에만 존재한다. 그대로 두면 앞 구간 축 2개 · 뒤 구간
+        #   축 3개짜리 곡선이 ★한 전략인 척 그려진다. 그건 백테스트가 아니다.
+        mcov = month_cov(P, c)
+        if PACK_MIN_MONTH_COV > 0 and mcov < PACK_MIN_MONTH_COV:
+            nm = int(P["month"].nunique()) if "month" in P.columns else 0
+            pack_off(p["id"],
+                     f"★기간 커버리지 {mcov*100:.1f}% — 백테스트 {nm}개월 중 약 "
+                     f"{int(round(mcov*nm))}개월에만 존재합니다. 셀 커버리지는 "
+                     f"{cov*100:.1f}% 로 문턱을 넘지만, 이 축을 켜면 앞 구간과 뒤 구간의 "
+                     f"증거층 축 개수가 달라져 ★한 곡선 안에 두 전략이 섞입니다. "
+                     f"기간이 더 확보될 때까지 끕니다(PACK_MIN_MONTH_COV="
+                     f"{PACK_MIN_MONTH_COV:.0%}). ★원천을 못 받은 것이 아니라 "
+                     f"'받은 기간이 짧다'는 뜻입니다 — 수집 로그의 확보 개월수를 보세요.")
+            continue
+        pack_axes.append(c)
     axes = pack_axes + [c for c in ("E_AXB", "E_AXC") if c in P.columns
                         and P[c].notna().mean() >= 0.01]
     if not axes:
@@ -10625,10 +10687,13 @@ def assemble_signal(P: pd.DataFrame) -> pd.DataFrame:
         P[f"pct_{c}"] = v
     P.attrs["signal_axes"] = axes
     keep = float(P["FLOOR"].mean()) if len(P) else 0.0
+    # ★'기간 커버리지'를 늘 함께 찍는다 — 축이 백테스트 앞뒤 중 ★어디에 있는지가
+    #   보이지 않으면, 뒤쪽에만 있는 축을 켠 채 10년 곡선을 그려도 아무도 눈치채지 못한다.
     L.grid([[c, f"{100*float(P[c].notna().mean()):.1f}%",
+             f"{100*month_cov(P, c):.1f}%",
              f"{100*float((P[f'pct_{c}'] >= 0.5).mean()):.1f}%"] for c in axes],
-           ["증거층 축", "관측 커버리지", "50th 이상"], ["l", "r", "r"],
-           title="하한선 구성 축 (§8.2 — 빈 축이 없을 것)")
+           ["증거층 축", "관측 커버리지", "기간 커버리지", "50th 이상"], ["l", "r", "r", "r"],
+           title="하한선 구성 축 (§8.2 — 빈 축이 없을 것 · 기간이 짧은 축은 위에서 껐다)")
     L.ok(f"Signal 조립 — 축 {len(axes)}개 동일가중(C7) · 하한선 통과 "
          f"{int(P['FLOOR'].sum()):,}행({100*keep:.1f}%)")
     if keep < 0.03:
