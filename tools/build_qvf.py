@@ -69,6 +69,51 @@ def strip_head(src: str, keep: bool) -> str:
     return "\n".join(out)
 
 
+# ★ 계약 Q6/Q7/Q12 는 '소스에 이런 것이 없다'를 검정한다(부재는 실행으로 증명할 수 없다).
+#   그런데 Colab 처럼 파일 대신 셀에 붙여넣는 실행에서는 inspect.getsource 가
+#   OSError: source code not available 로 죽는다 — 원셀실행형이 요구사항인데 정작
+#   원셀에서 검정이 깨졌다. 그래서 필요한 소스 조각을 '빌드 시점에' 파일 안에 심는다.
+SRC_PIN = [
+    "score1", "build_u200", "apply_filter2", "build_final_selection", "run_experiment",
+    "run_qbacktest", "qvf_sell_tax",
+    "Vault.put_table", "Vault.put_blob", "Vault.flush", "Vault.compact",
+    "QVFVault", "DartQuota",
+]
+
+
+def _extract_sources(blob: str, names) -> dict:
+    """조립본에서 지정한 최상위 함수/클래스/메서드의 소스를 잘라낸다."""
+    tree = ast.parse(blob)
+    lines = blob.split("\n")
+    top = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            top[node.name] = node
+    out = {}
+    missing = []
+    for nm in names:
+        if "." in nm:
+            cls, meth = nm.split(".", 1)
+            node = top.get(cls)
+            tgt = None
+            if node is not None:
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == meth:
+                        tgt = sub
+                        break
+        else:
+            tgt = top.get(nm)
+        if tgt is None:
+            missing.append(nm)
+            continue
+        lo = min([tgt.lineno] + [d.lineno for d in getattr(tgt, "decorator_list", [])])
+        out[nm] = "\n".join(lines[lo - 1: tgt.end_lineno])
+    if missing:
+        raise SystemExit(f"SRC_PIN 대상이 조립본에 없습니다: {missing} "
+                         f"(이름을 바꿨다면 SRC_PIN 도 함께 고치세요)")
+    return out
+
+
 def build(version: str) -> str:
     parts = []
     for i, fn in enumerate(ORDER):
@@ -81,12 +126,72 @@ def build(version: str) -> str:
     left = sorted(set(re.findall(r"@@\w+@@", blob)))
     if left:
         raise SystemExit(f"치환되지 않은 플레이스홀더: {left}")
+
+    # 소스 고정 블록을 계약 계층 '앞'에 끼워 넣는다(정의 순서 = 조립 순서).
+    srcmap = _extract_sources(blob, SRC_PIN)
+    pin = ["", "# " + "=" * 90,
+           "#  빌드 시점에 고정한 소스 조각 — 계약 Q6/Q7/Q12 의 '부재 증명'용.",
+           "#  Colab 처럼 셀에 붙여넣어 실행하면 inspect.getsource 가 OSError 로 죽는다.",
+           "#  파일 실행/셀 실행 어디서든 같은 검정이 돌도록 여기에 심어 둔다.",
+           "# " + "=" * 90,
+           "QVF_PINNED_SRC = {"]
+    for k, v in srcmap.items():
+        pin.append(f"    {k!r}: {v!r},")
+    pin.append("}")
+    pin.append("")
+    marker = "# ╔═════════════════════════════════════════════════════════════════════════════════════════╗\n# ║  L0-H  계약 자동검정"
+    idx = blob.find(marker)
+    if idx < 0:
+        raise SystemExit("계약 계층 시작 지점을 찾지 못했습니다 — SRC_PIN 삽입 위치 불명")
+    blob = blob[:idx] + "\n".join(pin) + "\n" + blob[idx:]
     return blob
 
 
 def check(path: str) -> None:
     src = open(path, encoding="utf-8").read()
     tree = ast.parse(src, filename=path)              # 문법 검사
+
+    # ★ 원셀실행형(R1)을 구조로 지킨다. 셀에 붙여넣으면 소스 파일이 없어
+    #   inspect.getsource 가 OSError 로 죽는다 — 실제로 사용자의 Colab 실행을 죽였다.
+    #   주석·문자열이 아니라 '실제 호출'만 봐야 하므로 AST 로 검사한다.
+    _BAD_ATTR = {"getsource", "getsourcefile", "getsourcelines", "getfile"}
+    _allowed_fn = "pinned_src"
+    bad_calls, bad_file = [], []
+
+    class _OneCellGuard(ast.NodeVisitor):
+        def __init__(self):
+            self.fn = []
+
+        def visit_FunctionDef(self, node):
+            self.fn.append(node.name)
+            self.generic_visit(node)
+            self.fn.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Attribute(self, node):
+            base = node.value
+            if isinstance(base, ast.Name) and base.id.lstrip("_") == "inspect" \
+                    and node.attr in _BAD_ATTR:
+                if _allowed_fn not in self.fn:
+                    bad_calls.append((node.attr, node.lineno))
+            self.generic_visit(node)
+
+        def visit_Name(self, node):
+            if node.id == "__file__":
+                bad_file.append(node.lineno)
+            self.generic_visit(node)
+
+    _OneCellGuard().visit(tree)
+    if bad_calls:
+        a, ln = bad_calls[0]
+        raise SystemExit(
+            f"{os.path.basename(path)}:{ln} — inspect.{a} 직접 호출 {len(bad_calls)}건.\n"
+            f"  Colab 처럼 셀에 붙여넣어 실행하면 소스 파일이 없어 OSError 로 죽습니다.\n"
+            f"  pinned_src(\"이름\", 객체) 를 쓰고 그 이름을 SRC_PIN 에 추가하세요.")
+    if bad_file:
+        raise SystemExit(f"{os.path.basename(path)}:{bad_file[0]} — __file__ 참조 금지"
+                         f"(셀 실행에는 __file__ 이 없습니다).")
     seen, dups = {}, []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):

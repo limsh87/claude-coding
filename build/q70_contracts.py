@@ -12,6 +12,30 @@ import inspect as _inspect
 
 CONTRACTS: List[dict] = []
 
+# 빌더가 심어 둔 소스 조각. 파일이 아니라 셀에서 실행될 때 inspect 대신 이걸 쓴다.
+QVF_PINNED_SRC: Dict[str, str] = globals().get("QVF_PINNED_SRC", {})
+
+
+def pinned_src(name: str, obj=None) -> str:
+    """이름으로 소스를 가져온다. 빌드 시점 고정본 우선, 없으면 inspect 폴백.
+
+    ★ 둘 다 실패하면 '' 를 돌려주지 않고 예외를 낸다. 소스를 못 읽었는데 조용히 통과시키면
+      '부재 증명' 계약이 아무것도 증명하지 않는 채로 ✔ 를 찍게 된다 — Colab 에서 정확히
+      그 상태가 될 뻔했다(거기서는 아예 OSError 로 죽어서 드러났지만).
+    """
+    s = QVF_PINNED_SRC.get(name)
+    if s:
+        return s
+    if obj is not None:
+        try:
+            return _inspect.getsource(obj)
+        except Exception:
+            pass
+    raise ContractViolation(
+        f"소스 조각 '{name}' 을 찾을 수 없습니다. 빌드 시점 고정본(QVF_PINNED_SRC)이 "
+        f"비어 있고 inspect 도 실패했습니다 — 파일을 직접 편집했거나 빌더의 SRC_PIN 목록과 "
+        f"이름이 어긋났을 수 있습니다. 소스 기반 계약을 검정할 수 없으므로 통과시키지 않습니다.")
+
 
 def _contract(cid: str, name: str, critical: bool = True):
     def deco(fn):
@@ -172,11 +196,11 @@ def _q6():
     if (SCORE2_W_NONFIN, SCORE2_W_TONE) != (2.0, 1.0):
         raise ContractViolation("Score2 가중치가 §6.3 사전등록 값(2:1)과 다릅니다.")
     src = ""
-    for fn in (score1, build_u200, apply_filter2, build_final_selection, run_experiment):
-        try:
-            src += _inspect.getsource(fn)
-        except Exception:
-            pass
+    for nm, fn in (("score1", score1), ("build_u200", build_u200),
+                   ("apply_filter2", apply_filter2),
+                   ("build_final_selection", build_final_selection),
+                   ("run_experiment", run_experiment)):
+        src += pinned_src(nm, fn) + "\n"
     bad = re.findall(r"\b(minimize|curve_fit|GridSearch|RandomizedSearch|optimize|"
                      r"differential_evolution|fmin|argmax\s*\(\s*sharpe|best_weight)\b", src)
     if bad:
@@ -189,12 +213,13 @@ def _q7():
     for nm in ("delete", "remove", "drop_table", "purge", "rmtree"):
         if hasattr(Vault, nm) or hasattr(QVFVault, nm):
             raise ContractViolation(f"Vault 에 삭제 API '{nm}' 가 존재합니다 — 절대 1원칙 위반.")
-    for fn in (Vault.put_table, Vault.put_blob, Vault.flush, Vault.compact):
-        s = _inspect.getsource(fn)
+    for nm, fn in (("Vault.put_table", Vault.put_table), ("Vault.put_blob", Vault.put_blob),
+                   ("Vault.flush", Vault.flush), ("Vault.compact", Vault.compact)):
+        s = pinned_src(nm, fn)
         if "mirror" in s.lower():
-            raise ContractViolation(f"쓰기 함수 {fn.__name__} 가 미러 경로를 참조합니다 — "
+            raise ContractViolation(f"쓰기 함수 {nm} 가 미러 경로를 참조합니다 — "
                                     f"로컬 미러는 구조적으로 읽기 전용이어야 합니다.")
-    s = _inspect.getsource(QVFVault)
+    s = pinned_src("QVFVault", QVFVault)
     if re.search(r"os\.(remove|unlink|rmdir)|shutil\.rmtree", s):
         raise ContractViolation("QVFVault 에 파일 삭제 호출이 있습니다 — 절대 1원칙 위반.")
 
@@ -268,7 +293,7 @@ def _q9():
 
 @_contract("Q10", "비용 — 비용 차감 후 수익은 항상 차감 전 이하다")
 def _q10():
-    src = _inspect.getsource(run_qbacktest) + _inspect.getsource(qvf_sell_tax)
+    src = pinned_src("run_qbacktest", run_qbacktest) + pinned_src("qvf_sell_tax", qvf_sell_tax)
     if "ret_gross" not in src or "gross - cost" not in src:
         raise ContractViolation("백테스트가 비용 전/후를 분리해 산출하지 않습니다 (§8.1 위반).")
     for pat, nm in ((r"QVF_TAX_SCHEDULE", "거래세 이력"),
@@ -297,7 +322,7 @@ def _q11():
 
 @_contract("Q12", "DART 호출 한도 — 고정 상수가 아니라 실측으로 확정된다")
 def _q12():
-    s = _inspect.getsource(DartQuota)
+    s = pinned_src("DartQuota", DartQuota)
     if "limit_observed" not in s:
         raise ContractViolation("DartQuota 가 실측 한도를 기록하지 않습니다.")
     if not re.search(r"def\s+take", s) or re.search(r"self\.n\s*\+\s*k\s*>\s*DART_DAILY_LIMIT", s):
