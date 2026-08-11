@@ -153,13 +153,16 @@ DART_BULK_ZIP    = True   # ★재무제표 '일괄 ZIP'(연도×보고서×제�
 #                           단건 API 78,000회를 약 150회 다운로드로 대체하며, 이 경로는
 #                           crtfc_key 를 쓰지 않아 ★일일 호출한도를 전혀 소비하지 않는다.
 #                           재고자산·매출채권·영업CF·CAPEX 가 십수 분 만에 채워진다.
-PACK_TIME_SHARE = 0.25    # ★센서팩(N·P·X) 수집에 줄 시간 몫 — 진입 시 '잔여 시간'의 비율.
+PACK_TIME_SHARE = 1.00    # ★센서팩(N·P·X) 수집에 줄 시간 몫 — 진입 시 '잔여 시간'의 비율.
 #                           호출 예산은 소스별로 나뉘지만 ★시간 예산은 하나다. 센서팩을
 #                           DART 앞으로 옮긴 뒤 이 몫이 없으면, 팩이 4시간을 다 먹고
 #                           DART 가 굶는다. 그러면 θ_N(=가입자수/직원수)·θ_X(=수출/매출)의
 #                           ★분모가 사라져 그 팩 축이 통째로 죽는다 — 팩을 먼저 받으려던
 #                           목적과 정확히 반대의 결과다. 그래서 몫을 물리적으로 건다.
-PACK_TIME_CAP_MIN = 50    # 위 비율과 무관하게 넘지 않을 절대 상한(분). 0 = 비율만 적용.
+PACK_TIME_CAP_MIN = 0    # 위 비율과 무관하게 넘지 않을 절대 상한(분). 0 = 비율만 적용.
+THETA_KEEP_NA = True      # ★θ 가 결측인 행의 E_pack 을 0 이 아니라 ★NaN 으로 둔다.
+#                           0 으로 두면 '정보 없음'이 '값 0'으로 둔갑해 하한선 판정에
+#                           참여한다 — 빈 축으로 하한선을 통과하게 된다.
 PACK_MIN_MONTH_COV = 0.50  # ★센서팩이 백테스트 ★기간의 몇 할에 존재해야 축으로 인정하는가.
 #                            왜 필요한가: 기존 게이트는 '패널 셀 커버리지'만 봤다. 그런데
 #                            국민연금처럼 ★최근 몇 달만 있는 원천은 셀 커버리지가 16% 라
@@ -168,7 +171,10 @@ PACK_MIN_MONTH_COV = 0.50  # ★센서팩이 백테스트 ★기간의 몇 할�
 #                            그건 10년 백테스트가 아니라 서로 다른 두 전략을 이어 붙인
 #                            그림이다. 기간 커버리지가 이 값 미만이면 그 사실을 말하고 끈다.
 #                            (0 으로 두면 이 검사를 끄고 옛 동작으로 돌아간다.)
-THETA_X_ANNUALIZE = False  # ★θ_X 의 분자를 연율화할 것인가. 기본 False = ★원전 산식 그대로.
+TP_SIGN_GATE = "gain"     # ★TP 부호 분면 게이트. "gain"=개선축이 양수일 때만 TP 성립(기본),
+#                           "both"=양축 모두 양수, "off"=원전 그대로(음×음=양 허용).
+#                           ★off 로 두면 축소·부실 기업이 최고점을 받는다 — 근거는 tp_pair 주석.
+THETA_X_ANNUALIZE = True   # ★θ_X 의 분자를 연율화할 것인가. 기본 False = ★원전 산식 그대로.
 #                            원전(build/p_x_customs.py): theta_X = (월 exp_usd × 1300) / revenue_ttm
 #                            분자는 '한 달' 수출인데 분모는 'TTM(12개월)' 매출이라 차원이
 #                            어긋나 있고, 그래서 수출 100% 기업도 θ≈0.083 이 나온다.
@@ -193,11 +199,11 @@ DART_ZIP_WORKERS = 2      # ★일괄 ZIP 동시 다운로드 수. 4 → 2 로 �
 #                           ★이 값은 이제 상한일 뿐이다 — 아래 ZIP 스테이지가 실측 처리량을
 #                           재서 남은 시간에 몇 개가 들어가는지 계산하고, 못 들어가는 몫은
 #                           원장에 남겨 다음 실행이 이어받는다(정체 대신 정직한 부분 완주).
-ZIP_TIME_SHARE  = 0.30    # ★일괄 ZIP 에 줄 시간 몫 — 진입 시 '잔여 시간'의 비율.
+ZIP_TIME_SHARE  = 1.00    # ★일괄 ZIP 에 줄 시간 몫 — 진입 시 '잔여 시간'의 비율.
 #                           이 몫이 없으면 129개가 남은 예산 전부(실측 ETA 2h20m)를 먹고
 #                           직원현황·공시가 굶는다. 재무는 다음 실행이 원장에서 이어받지만
 #                           직원현황(θ_N 분모)은 대체 경로가 없다 — 굶으면 팩 축이 죽는다.
-ZIP_TIME_CAP_MIN = 40     # 위 비율과 무관하게 넘지 않을 절대 상한(분). 0 = 비율만 적용.
+ZIP_TIME_CAP_MIN = 0     # 위 비율과 무관하게 넘지 않을 절대 상한(분). 0 = 비율만 적용.
 DART_BULK_MULTI  = True   # 다중회사 주요계정(fnlttMultiAcnt): 회사 100개를 한 번에 조회.
 #                           전 시장 12년을 약 1,600회로 덮는다(단건이면 16만회).
 DART_MULTI_BATCH = 100    # 한 요청에 넣을 회사 수(공식 상한 100). status 021 이 나면 낮추세요.
@@ -245,6 +251,12 @@ DART_DEEP_TOP_N  = 1500   # 전체재무제표 '단건 꼬리 보충'을 받을 
 # ── ⑨ 포지션·사이징 상수 (§8.5 — 드로다운 한가운데서 정하지 않도록 지금 못박음) ──────────────
 ENTRY_TOP_PCT   = 0.05          # 신호 상위 5% 진입
 MAX_NAMES       = 25
+D_ENTRY_GATE    = True    # ★D축 진입 게이트 — ΔlogE>0 일 때만 d1(=−ΔlogM)이 성립한다.
+#                           False 로 두면 '이익 붕괴 + 주가 더 붕괴'가 최고 U 를 받는다.
+ENTRY_MIN_SIGNAL = True   # ★Signal>0 인 후보만 진입. 후보가 모자라면 ★그만큼만 산다(현금 보유).
+#                           옛 판은 MIN_NAMES 를 하한으로 강제해, 후보가 마르는 달에는
+#                           Signal 이 전부 0 으로 동점이 되고 tie-break 이 code 오름차순이라
+#                           ★'코드 번호가 가장 작은 5종목'을 샀다. 결정적이지만 정보가 아니다.
 MIN_NAMES       = 5
 MAX_WEIGHT      = 0.12          # 종목당 최대 비중
 ADV_PARTICIP    = 0.10          # 20일 평균거래대금의 10% 이내
@@ -2529,7 +2541,7 @@ def net_post(url: str, source: str = "generic", data: Optional[dict] = None,
     return None
 
 
-DL_TOTAL_S   = 900      # ★파일 1개에 허용하는 총시간(초) — ★재시도를 전부 포함한 마감선
+DL_TOTAL_S   = 7200      # ★파일 1개에 허용하는 총시간(초) — ★재시도를 전부 포함한 마감선
 DL_STALL_S   = 75       # 무진전 상한(초) — 이만큼 단 1바이트도 안 들어오면 끊는다
 DL_CHUNK     = 1 << 18  # 256KB 청크 — 1MB 였을 때 무진전 감지가 사실상 죽어 있었다(아래)
 DL_MIN_BPS   = 24 << 10  # 처리량 바닥(24KB/s). 이 밑이면 '느린 게 아니라 막힌 것'으로 본다
@@ -3076,7 +3088,16 @@ QUOTA = QuotaBook()
 # ║    · 무엇이 어디까지 수집됐는지 '수집 완성도' 표로 명시, 재실행하면 정확히 이어받는다      ║
 # ╚══════════════════════════════════════════════════════════════════════════════════════════╝
 
-HARVEST_TIME_BUDGET_H = 4.0        # 수집 단계 벽시계 예산(시간). 0 또는 음수 = 무제한.
+HARVEST_TIME_BUDGET_H = 0.0        # 수집 단계 벽시계 예산(시간). ★0 = 무제한(현재 설정).
+#   ★2026-08-11 사용자 지시로 해제: "데이터수집시간에 한계를 두는 모든 제한을 해제한다.
+#     단 그렇다고 무한정 수집가능하다는 것이 아니다. 전수수집을 통한 신뢰도 높은 결과를
+#     지향하되 효율성있게 수집하여 시간단축도 병행하라."
+#   그래서 '총량 상한'만 풀고, ★멈춰 있는 것을 끊는 장치는 전부 남긴다:
+#     · net_download 의 무진전 상한(DL_STALL_S)·처리량 바닥(DL_MIN_BPS) — 트리클을 끊는다
+#     · 파일 1개 마감선(DL_TOTAL_S) — 늘리되 0 으로 두지는 않는다(무한 정체 방지)
+#     · 소스별 호출 쿼터(QuotaBook) — 서버가 거부하는 지점은 여전히 진실이다
+#     · 원장 — 받은 것은 두 번 받지 않는다(시간 상한이 풀렸다고 중복 수집하면 안 된다)
+#   즉 '오래 걸려도 끝까지 받는다'는 되고, '멈춘 채로 영원히 매달린다'는 안 된다.
 
 
 class HarvestClock:
@@ -3487,9 +3508,34 @@ def rx(P: pd.DataFrame, name_or_s, min_n: int = CELL_MIN) -> pd.Series:
 
 def tp_pair(z_gain: pd.Series, z_nocost: pd.Series) -> pd.Series:
     """TP = z(개선) × z(치르지 않은 대가) — ★반드시 곱(§1.1). 합산 금지.
-    한쪽 결측이면 결과도 결측 — 0으로 채우면 '대가를 안 치렀다'는 거짓 주장이 된다."""
-    return (pd.to_numeric(z_gain, errors="coerce") *
-            pd.to_numeric(z_nocost, errors="coerce")).astype("float32")
+    한쪽 결측이면 결과도 결측 — 0으로 채우면 '대가를 안 치렀다'는 거짓 주장이 된다.
+
+    ★2026-08-11 부호 분면 교정 — 이 전략의 방향을 뒤집고 있던 결함.
+      실수의 곱은 ★음×음=양이다. z 를 그대로 곱하면 (개선↓, 대가↑) 사분면 —
+      즉 ★축소·부실 기업이 (개선↑, 대가↓)와 ★똑같이 큰 양수를 받는다.
+      기업 개선 지표는 음의 왜도(감원·구조조정은 급격, 성장은 완만)라 극단 꼬리를
+      (−,−)가 지배하고, 이 전략은 상위 5%만 뽑으므로 ★정확히 그 꼬리만 본다.
+      결과: 이름은 '제약이 풀린 기업'인데 실행되는 것은 '축소기업 스크리너'.
+
+      ★이 결함은 우리 구현이 아니라 원전(build/03_util.py:485 tp_product)에도 있다.
+      즉 정의 드리프트가 아니라 ★계약 자체의 결함이다. 그래서 몰래 고치지 않고
+      TP_SIGN_GATE 라는 이름으로 ★명시적으로 선언하고 끌 수 있게 둔다.
+
+      게이트를 ★개선축에만 거는 이유(양쪽에 걸지 않는 이유):
+        · 이 저장소가 이미 그렇게 하고 있었다 — TP_P2 만 zi.where(zi > 0) 로 개선축을
+          막아 두었고, 주석까지 같은 논리를 적어 두었다. 나머지 15곳에 안 걸었을 뿐이다.
+        · 개선이 없으면 '대가를 안 치렀다'를 논할 대상이 아니다(→ 결측이 옳다).
+        · 개선이 있으면 대가축의 ★부호는 살아야 한다 — 개선했지만 대가를 치른 기업은
+          치르지 않은 기업보다 ★낮아야 하므로 음수가 되는 것이 맞다.
+        · 양쪽에 걸면 결측이 ~75%로 뛰어 표본이 붕괴한다. 개선축만이면 ~50%다.
+    """
+    a = pd.to_numeric(z_gain, errors="coerce")
+    b = pd.to_numeric(z_nocost, errors="coerce")
+    if TP_SIGN_GATE == "gain":
+        a = a.where(a > 0)
+    elif TP_SIGN_GATE == "both":
+        a, b = a.where(a > 0), b.where(b > 0)
+    return (a * b).astype("float32")
 
 
 # ── 셀 (C11) ────────────────────────────────────────────────────────────────────────────────
@@ -8344,7 +8390,10 @@ NPS_OAS = "https://infuser.odcloud.kr/oas/docs"
 DGK_SRC = "dgk_file"          # ★serviceKey 쿼터와 무관한 채널(파일 다운로드는 키가 없다)
 NPS_FILE_ON = True            # False 로 두면 파일 경로를 건너뛰고 곧장 API 월축으로 간다
 NPS_FILE_MIN_BYTES = 1 << 20  # 1MB 미만은 CSV 가 아니라 오류 HTML 이다
-NPS_FILE_DL_S = 900.0         # 파일 1개 다운로드 절대 마감선(수십~수백 MB)
+NPS_FILE_DL_S = 7200.0        # 파일 1개 다운로드 절대 마감선(수십~수백 MB). ★2026-08-11
+#   사용자 지시로 시간 제한 해제 — 10년치를 다 받는 것이 목적이므로 한 달치 파일 때문에
+#   중도 포기하지 않는다. 0(무제한)으로 두지 않는 이유는 ★무한 정체를 막기 위해서다
+#   (100MB를 2시간 안에 못 받으면 그건 느린 게 아니라 막힌 것이다 — 처리량 바닥이 먼저 끊는다).
 NPS_FILE_SPOOL = 8 << 20      # 이 크기를 넘으면 ★임시파일로 흘린다(RAM 에 안 올린다)
 _UDDI = re.compile(r"uddi:[0-9a-f-]{8,}")
 
@@ -10021,8 +10070,20 @@ def axis_discount(P: pd.DataFrame, flows: pd.DataFrame, cons: pd.DataFrame) -> p
     g = lambda c: gcol(P, c)
     P["dlog_E"] = g("net_income_ttm").transform(lambda s: dlog(s, 6))
     P["dlog_P"] = g("close").transform(lambda s: dlog(s, 6))
-    P["dlog_M"] = P["dlog_P"] - P["dlog_E"]
-    P["d1"] = -P["dlog_M"]
+    # ★PER = 시가총액/순이익 이므로 ΔlogM = ΔlogP + Δlog(주식수) − ΔlogE 다.
+    #   옛 판은 Δlog(주식수)를 빠뜨렸다. 그러면 ★자사주 소각 기업(주식수↓)의 멀티플
+    #   축소를 과소평가해 진짜 목표상태를 놓치고, 유상증자 기업(주식수↑)을 목표상태로
+    #   오인한다. 하필 ★자사주 소각은 PACK-C 가 정조준하는 대상이라, D축이 그 표적을
+    #   체계적으로 잘못 평가하고 있었다. 주식수는 이미 가격 수집에서 받아 둔다.
+    P["dlog_shares"] = (g("shares").transform(lambda s: dlog(s, 6))
+                        if "shares" in P.columns else np.nan)
+    P["dlog_M"] = P["dlog_P"] + colx(P, "dlog_shares").fillna(0.0) - P["dlog_E"]
+    # ★진입 게이트(계약 §7.3) — 'ΔlogE > 0 인데 ΔlogM ≤ 0' 이 목표상태다. 그런데 옛 판은
+    #   D_state 를 ★리포트에만 쓰고 진입에는 안 걸었다. d1 = −ΔlogM 뿐이라, ★이익이
+    #   무너지는 속도보다 주가가 더 빨리 무너지면 "멀티플이 축소됐다"로 읽혀 ★최고점을
+    #   받았다. 미스프라이싱 탐지기가 아니라 낙하하는 칼 탐지기였다.
+    #   (청산 규칙은 계약대로 있었다 — 진입만 빠진 비대칭 누락이다.)
+    P["d1"] = (-P["dlog_M"]).where(P["dlog_E"] > 0) if D_ENTRY_GATE else -P["dlog_M"]
     P["D_state"] = np.select(
         [(P["dlog_E"] > 0) & (P["dlog_M"] <= 0), (P["dlog_E"] > 0) & (P["dlog_M"] > 0),
          (P["dlog_E"] <= 0) & (P["dlog_M"] > 0)],
@@ -10257,8 +10318,12 @@ def pack_n_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
                f"DART 직원수의 {NPS_THETA_MAX}배를 넘는 것은 그 회사가 특별한 게 아니라 "
                f"★사업장 매칭이 남의 회사를 끌어온 것입니다. clip(0,1) 만 두면 이런 행이 "
                f"오히려 최대 신뢰(θ=1)를 받습니다.")
+    # ★θ 결측을 0 으로 심지 않는다 — 그 0 은 결측이 아니라 ★값이라서 하한선
+    #   (pct >= 0.50) 판정에 참여한다. 즉 '정보가 하나도 없는 축'으로 하한선을 통과할 수
+    #   있었다. 하한선의 존재 이유("보유한 축엔 빈 축이 없을 것")를 정면으로 무력화한다.
+    #   θ 를 모르면 그 축은 ★없는 것이다(NaN) — 0 점이 아니다.
     P["E_N"] = (nrow_mean(P, ["TP_N1", "TP_N2", "TP_N3", "TP_N4"])
-                * P["theta_N"].clip(0, 1).fillna(0.0))
+                * (P["theta_N"].clip(0, 1) if THETA_KEEP_NA else P["theta_N"].clip(0, 1).fillna(0.0)))
     return P
 
 
@@ -10378,8 +10443,12 @@ def pack_x_features(P: pd.DataFrame, ctx: dict) -> pd.DataFrame:
     _sg = sdiv(colx(P, "sgna_ttm"), colx(P, "revenue_ttm"))
     P["d_sgna_ratio"] = _sg.groupby(P["code"], observed=True).diff(12)
     P["TP_X3"] = tp_pair(zx(P, "x3_2"), -zx(P, "d_sgna_ratio"))
+    # ★θ 결측을 0 으로 심지 않는다 — 그 0 은 결측이 아니라 ★값이라서 하한선
+    #   (pct >= 0.50) 판정에 참여한다. 즉 '정보가 하나도 없는 축'으로 하한선을 통과할 수
+    #   있었다. 하한선의 존재 이유("보유한 축엔 빈 축이 없을 것")를 정면으로 무력화한다.
+    #   θ 를 모르면 그 축은 ★없는 것이다(NaN) — 0 점이 아니다.
     P["E_X"] = (nrow_mean(P, ["TP_X1", "TP_X2", "TP_X3"])
-                * P["theta_X"].clip(0, 1).fillna(0.0))
+                * (P["theta_X"].clip(0, 1) if THETA_KEEP_NA else P["theta_X"].clip(0, 1).fillna(0.0)))
     return P
 
 
@@ -10875,8 +10944,17 @@ def run_engine(P: pd.DataFrame, months: pd.DatetimeIndex, uni: "PITUniverse",
             uni.gate("유동성(V6)", m, liq["code"].tolist())
             uni.gate("거부권통과", m, vet["code"].tolist())
             uni.gate("하한선통과", m, flr["code"].tolist())
-        k = int(max(MIN_NAMES, min(MAX_NAMES, round(len(elig) * ENTRY_TOP_PCT))))
-        entry = pick_top(elig, k, rank_col)
+        # ★Signal 이 0 인 후보는 '정보가 없다'는 뜻이다. 그 행들은 랭크가 전부 동점이 되고
+        #   동점은 code 오름차순으로 깨지므로, 후보가 마르는 달엔 ★코드 번호 순으로 사게 된다.
+        #   그래서 진입 대상을 Signal>0 으로 좁히고, 모자라면 ★그만큼만 산다(나머지는 현금).
+        if ENTRY_MIN_SIGNAL and "Signal" in elig.columns:
+            _live = elig[colx(elig, "Signal") > 0]
+            if len(_live) < len(elig):
+                RUN.note(f"{m:%Y-%m} 진입후보 {len(elig):,} → Signal>0 {len(_live):,}")
+            elig = _live
+        k = int(min(MAX_NAMES, round(len(elig) * ENTRY_TOP_PCT)))
+        k = min(len(elig), max(k, MIN_NAMES if len(elig) >= MIN_NAMES else len(elig)))
+        entry = pick_top(elig, k, rank_col) if k > 0 else elig.head(0)
         if audit_gates:
             uni.gate("최종선정", m, entry["code"].tolist())
         keep = []
