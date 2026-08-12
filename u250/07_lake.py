@@ -236,7 +236,8 @@ class CacheLake:
         LOG.info(f"캐시 스캔 시작 — 루트 {len(roots)}개: " + ", ".join(_names))
         cands: List[Tuple[str, str]] = []
         for root, kind in roots:
-            base_depth = root.rstrip("/\\").count(os.sep)
+            base_depth = root.rstrip("/" + os.sep).count(os.sep)
+            t0, n0, timed_out = time.time(), len(cands), False
             for dirpath, dirnames, filenames in os.walk(root):
                 if dirpath.count(os.sep) - base_depth >= CACHE_SCAN_MAX_DEPTH:
                     dirnames[:] = []
@@ -245,10 +246,20 @@ class CacheLake:
                 for fn in filenames:
                     if fn.lower().endswith(DATA_EXT) and not fn.startswith("."):
                         cands.append((os.path.join(dirpath, fn), kind))
-                        if len(cands) >= CACHE_SCAN_MAX_FILES:
-                            break
                 if len(cands) >= CACHE_SCAN_MAX_FILES:
                     break
+                #   구글드라이브 스트리밍은 디렉터리 하나 여는 데도 수백 ms 가 걸린다.
+                #   루트 하나가 느리다고 실행 전체가 멈추면 안 되므로 예산을 둔다.
+                if time.time() - t0 > CACHE_SCAN_BUDGET_S:
+                    timed_out = True
+                    break
+            if timed_out:
+                LOG.warn(f"캐시 스캔 시간 예산({CACHE_SCAN_BUDGET_S:.0f}s) 초과 — {root} 는 "
+                         f"여기까지 찾은 {len(cands)-n0:,}개만 씁니다. 더 정확히 잡으려면 "
+                         f"CACHE_SEARCH_DIRS 에 하위 폴더를 직접 지정하세요.")
+            if len(cands) >= CACHE_SCAN_MAX_FILES:
+                LOG.warn(f"후보 파일 상한({CACHE_SCAN_MAX_FILES:,})에 도달해 스캔을 멈춥니다.")
+                break
         # 같은 파일이 여러 루트로 잡히면 한 번만
         uniq: Dict[str, str] = {}
         for p, k in cands:

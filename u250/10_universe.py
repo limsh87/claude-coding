@@ -60,10 +60,9 @@ def rebalance_dates(panel_dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
     d = pd.DatetimeIndex(sorted(pd.unique(panel_dates)))
     if len(d) == 0:
         return d
-    if REBAL_FREQ.upper().startswith("M"):
-        key = d.to_period("M")
-    else:
-        key = d.to_period("W-FRI")
+    f = REBAL_FREQ.upper()
+    key = d.to_period("Q") if f.startswith("Q") else \
+        d.to_period("M") if f.startswith("M") else d.to_period("W-FRI")
     s = pd.Series(d, index=key)
     out = pd.DatetimeIndex(s.groupby(level=0).last().values)
     LOG.info(f"리밸런싱 주기 = {REBAL_FREQ} → 시점 {len(out):,}개 "

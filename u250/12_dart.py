@@ -20,19 +20,32 @@ class DartBudget:
     LIMIT = 20000
 
     def __init__(self):
-        self.path = os.path.join(CACHE_DIR or ".", "_dart_budget.json")
         self.day = _dt.date.today().isoformat()
         self.used = 0
+        self._loaded = False
         self._lk = threading.Lock()
+
+    @property
+    def path(self) -> str:
+        #   CACHE_DIR 은 _prep_dirs() 에서야 정해진다. 임포트 시점에 굳혀 두면
+        #   예산 파일이 엉뚱한 폴더(cwd)에 떨어져 재실행에서 이어받지 못한다.
+        return os.path.join(CACHE_DIR or ".", "_dart_budget.json")
+
+    def _load_once(self):
+        if self._loaded:
+            return
+        self._loaded = True
         try:
             j = json.loads(open(self.path, encoding="utf-8").read())
             if j.get("day") == self.day:
                 self.used = int(j.get("used", 0))
+                LOG.info(f"오늘 이미 사용한 DART 호출 {self.used:,}건을 이어받습니다.")
         except Exception:
             pass
 
     def take(self, k: int = 1) -> bool:
         with self._lk:
+            self._load_once()
             if self.used + k > self.LIMIT:
                 return False
             self.used += k

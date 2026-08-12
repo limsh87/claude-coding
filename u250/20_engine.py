@@ -9,6 +9,21 @@
 # ║  (마이크로캡에서 스프레드를 상수로 두면 소형일수록 비용이 과소계상돼 결론이 뒤집힌다)       ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+def periods_per_year(freq: Optional[str] = None) -> float:
+    f = (freq or REBAL_FREQ).upper()
+    return 4.0 if f.startswith("Q") else 12.0 if f.startswith("M") else 52.0
+
+
+def freq_tag(freq: Optional[str] = None) -> str:
+    f = (freq or REBAL_FREQ).upper()
+    return "quarterly" if f.startswith("Q") else "monthly" if f.startswith("M") else "weekly"
+
+
+def freq_kr(freq: Optional[str] = None) -> str:
+    f = (freq or REBAL_FREQ).upper()
+    return "분기" if f.startswith("Q") else "월간" if f.startswith("M") else "주간"
+
+
 def tax_rate(year: int, market: str) -> float:
     """연도별 증권거래세 실효율 (매도 시). 하드코딩이 아니라 테이블 조회다(§5)."""
     row = SPEC_TAX_TABLE[0]
@@ -156,7 +171,7 @@ class Engine:
         self.fwd = fwd                 # index=rebal, columns=code, 값=구간 총수익률
         self.cost = cost
         self.delist = delist           # index=rebal, columns=code, True=이 구간에 폐지
-        self.ppy = 52.0 if not REBAL_FREQ.upper().startswith("M") else 12.0
+        self.ppy = periods_per_year()
 
     def run(self, select: Callable[[pd.Timestamp], Sequence[str]], name: str,
             aum0: float = 100_000_000, dynamic_aum: bool = False,

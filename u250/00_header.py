@@ -80,9 +80,13 @@ CACHE_SEARCH_DIRS = [
     r"D:\quant\cache",
     r"D:\quant\data",
     r"D:\data",
+    "D:\\",                           # D 드라이브 전체 (깊이 제한 + 시간 예산으로 보호)
     "./tcd_cache",                    # 이 저장소의 로컬 캐시 폴백
     "~/quant",
 ]
+#    ▸ 루트 하나가 느리다고 실행 전체가 멈추면 안 된다(구글드라이브 스트리밍이 특히 느리다).
+#      루트당 이 시간을 넘기면 거기까지 찾은 것만 쓰고 다음 루트로 넘어간다.
+CACHE_SCAN_BUDGET_S = 120.0
 #    ▸ 구글드라이브 — Colab 이면 자동 마운트, 로컬 동기화 폴더면 그 경로를 그대로 씁니다.
 GDRIVE_ROOT       = "/content/drive/MyDrive/tcd_cache"
 GDRIVE_SHARED_NS  = "_shared"          # 공용 인덱스 — 다른 전략이 모은 원본을 그대로 재활용
@@ -92,8 +96,11 @@ GDRIVE_ADOPT_DIRS = [
     "/content/drive/MyDrive/quant",
     "/content/drive/MyDrive/quant_cache",
     "/content/drive/MyDrive/u250",
-    r"G:\내 드라이브\tcd_cache",        # Windows 구글드라이브 동기화 기본 경로
+    r"G:\내 드라이브",                  # ★ Windows 구글드라이브(G:) 전체
+    r"G:\My Drive",                    #   (로캘에 따라 둘 중 하나만 존재한다)
+    r"G:\내 드라이브\tcd_cache",
     r"G:\My Drive\tcd_cache",
+    "G:\\",
 ]
 LOCAL_CACHE_ROOT = "./u250_cache"      # 드라이브가 없을 때의 폴백 루트
 
@@ -121,11 +128,13 @@ GATE_MIN_LIST_DAYS = 180               # 상장 ≥ 180일
 UNIV_MAIN_N        = 250               # 주 유니버스: 시총 하위 250
 UNIV_AUX_N         = 500               # 보조 유니버스: 시총 하위 500
 
-#    리밸런싱 주기 — "기존 구현과 동일 주기 유지"(§1).
-#    ▸ 선행 문서의 NW lag 규약 `ceil(보유세션 / 4.7063)` 은 '주' 단위 수익률 계열을 뜻하므로
-#      기본값을 주간(금요일)으로 둔다. 월간 구현이었다면 "M" 으로 바꾸면 전 산출물이 따라간다.
-#      어느 쪽이든 실행 로그와 run_log 에 명시되어 사후에 구분 가능하다.
-REBAL_FREQ = "W-FRI"                   # "W-FRI"(주간) | "M"(월말)
+#    리밸런싱 주기 — "기존 구현과 동일 주기 유지"(§1). 원본 파일이 없어 주기를 특정할 수
+#    없으므로 주간·월간·분기 셋을 전부 돌리고, 셋 다 세금·거래비용·슬리피지를 차감한
+#    순수익으로만 비교한다.
+#    ★ 주기를 하나 고를 근거가 없으므로 '세 주기 전부에서 G1~G7 을 통과해야 유효'로 본다.
+#      하나에서만 통과하면 그건 팩터가 아니라 주기 선택에 기댄 결과다.
+REBAL_FREQ_LIST = ["W-FRI", "M", "Q"]  # 주간(금) · 월말 · 분기말
+REBAL_FREQ = REBAL_FREQ_LIST[0]        # 실행 중 주기별로 교체된다 (run_log 에 기록)
 
 #    패널 기간 — "기존 패널 전 구간". 비워두면 캐시가 실제로 덮는 전 구간을 자동 사용.
 PANEL_START = ""                       # 예: "2016-08-01"
@@ -144,6 +153,8 @@ RATE_LIMIT_QPS = {"dart": 8.0, "datagokr": 5.0, "krx": 2.0, "naver": 3.0,
 #              계산경로(커버리지→베이스라인→팩터→게이트→스코어카드)를 실데이터 전에 증명한다.
 #    "FULL"  : 스모크 → 캐시 하베스트 → 부족분 수집 → 전체 검정  (기본)
 #    "CACHED": 스모크 → 캐시만으로 전체 검정 (COLLECT_POLICY 를 NEVER 로 강제)
+#    "SCAN"  : ★캐시 발굴만 하고 끝낸다. 역할별로 뭐가 있고 뭐가 없는지 표로 보여준 뒤 종료.
+#              전체 실행 전에 "경로가 맞나"를 몇 분 안에 확인하는 용도.
 RUN_MODE = "FULL"
 
 SEED    = 20260812                     # 결정성: 모든 난수는 이 시드에서 파생 (B4·플라시보 포함)

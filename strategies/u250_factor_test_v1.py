@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================================
 #  U250 대체데이터 팩터 독립 검정  —  명세서 v1.0 구현체
-#  u250-20260812-3219e74
+#  u250-20260812-3eb1106
 #
 #  게이트 적용 U250/U500 유니버스에 대해 4개 후보 팩터(F1~F4)의 "독립적" 유효성을 검정한다.
 #  팩터를 결합하지 않는다. 4개를 각각 단독으로 얹어 베이스라인 대비 순수익 초과분만 측정한다.
@@ -80,9 +80,13 @@ CACHE_SEARCH_DIRS = [
     r"D:\quant\cache",
     r"D:\quant\data",
     r"D:\data",
+    "D:\\",                           # D 드라이브 전체 (깊이 제한 + 시간 예산으로 보호)
     "./tcd_cache",                    # 이 저장소의 로컬 캐시 폴백
     "~/quant",
 ]
+#    ▸ 루트 하나가 느리다고 실행 전체가 멈추면 안 된다(구글드라이브 스트리밍이 특히 느리다).
+#      루트당 이 시간을 넘기면 거기까지 찾은 것만 쓰고 다음 루트로 넘어간다.
+CACHE_SCAN_BUDGET_S = 120.0
 #    ▸ 구글드라이브 — Colab 이면 자동 마운트, 로컬 동기화 폴더면 그 경로를 그대로 씁니다.
 GDRIVE_ROOT       = "/content/drive/MyDrive/tcd_cache"
 GDRIVE_SHARED_NS  = "_shared"          # 공용 인덱스 — 다른 전략이 모은 원본을 그대로 재활용
@@ -92,8 +96,11 @@ GDRIVE_ADOPT_DIRS = [
     "/content/drive/MyDrive/quant",
     "/content/drive/MyDrive/quant_cache",
     "/content/drive/MyDrive/u250",
-    r"G:\내 드라이브\tcd_cache",        # Windows 구글드라이브 동기화 기본 경로
+    r"G:\내 드라이브",                  # ★ Windows 구글드라이브(G:) 전체
+    r"G:\My Drive",                    #   (로캘에 따라 둘 중 하나만 존재한다)
+    r"G:\내 드라이브\tcd_cache",
     r"G:\My Drive\tcd_cache",
+    "G:\\",
 ]
 LOCAL_CACHE_ROOT = "./u250_cache"      # 드라이브가 없을 때의 폴백 루트
 
@@ -121,11 +128,13 @@ GATE_MIN_LIST_DAYS = 180               # 상장 ≥ 180일
 UNIV_MAIN_N        = 250               # 주 유니버스: 시총 하위 250
 UNIV_AUX_N         = 500               # 보조 유니버스: 시총 하위 500
 
-#    리밸런싱 주기 — "기존 구현과 동일 주기 유지"(§1).
-#    ▸ 선행 문서의 NW lag 규약 `ceil(보유세션 / 4.7063)` 은 '주' 단위 수익률 계열을 뜻하므로
-#      기본값을 주간(금요일)으로 둔다. 월간 구현이었다면 "M" 으로 바꾸면 전 산출물이 따라간다.
-#      어느 쪽이든 실행 로그와 run_log 에 명시되어 사후에 구분 가능하다.
-REBAL_FREQ = "W-FRI"                   # "W-FRI"(주간) | "M"(월말)
+#    리밸런싱 주기 — "기존 구현과 동일 주기 유지"(§1). 원본 파일이 없어 주기를 특정할 수
+#    없으므로 주간·월간·분기 셋을 전부 돌리고, 셋 다 세금·거래비용·슬리피지를 차감한
+#    순수익으로만 비교한다.
+#    ★ 주기를 하나 고를 근거가 없으므로 '세 주기 전부에서 G1~G7 을 통과해야 유효'로 본다.
+#      하나에서만 통과하면 그건 팩터가 아니라 주기 선택에 기댄 결과다.
+REBAL_FREQ_LIST = ["W-FRI", "M", "Q"]  # 주간(금) · 월말 · 분기말
+REBAL_FREQ = REBAL_FREQ_LIST[0]        # 실행 중 주기별로 교체된다 (run_log 에 기록)
 
 #    패널 기간 — "기존 패널 전 구간". 비워두면 캐시가 실제로 덮는 전 구간을 자동 사용.
 PANEL_START = ""                       # 예: "2016-08-01"
@@ -144,6 +153,8 @@ RATE_LIMIT_QPS = {"dart": 8.0, "datagokr": 5.0, "krx": 2.0, "naver": 3.0,
 #              계산경로(커버리지→베이스라인→팩터→게이트→스코어카드)를 실데이터 전에 증명한다.
 #    "FULL"  : 스모크 → 캐시 하베스트 → 부족분 수집 → 전체 검정  (기본)
 #    "CACHED": 스모크 → 캐시만으로 전체 검정 (COLLECT_POLICY 를 NEVER 로 강제)
+#    "SCAN"  : ★캐시 발굴만 하고 끝낸다. 역할별로 뭐가 있고 뭐가 없는지 표로 보여준 뒤 종료.
+#              전체 실행 전에 "경로가 맞나"를 몇 분 안에 확인하는 용도.
 RUN_MODE = "FULL"
 
 SEED    = 20260812                     # 결정성: 모든 난수는 이 시드에서 파생 (B4·플라시보 포함)
@@ -155,7 +166,7 @@ VERBOSE = True
 
 STRATEGY_ID   = "U250_FACTOR_TEST"
 STRATEGY_NAME = "U250 대체데이터 팩터 독립 검정 v1.0"
-BUILD_VERSION = "u250-20260812-3219e74"
+BUILD_VERSION = "u250-20260812-3eb1106"
 SPEC_VERSION  = "1.0"
 ACTIVE_PACKS  = ["F1", "F2", "F3", "F4"]
 
@@ -2760,7 +2771,8 @@ class CacheLake:
         LOG.info(f"캐시 스캔 시작 — 루트 {len(roots)}개: " + ", ".join(_names))
         cands: List[Tuple[str, str]] = []
         for root, kind in roots:
-            base_depth = root.rstrip("/\\").count(os.sep)
+            base_depth = root.rstrip("/" + os.sep).count(os.sep)
+            t0, n0, timed_out = time.time(), len(cands), False
             for dirpath, dirnames, filenames in os.walk(root):
                 if dirpath.count(os.sep) - base_depth >= CACHE_SCAN_MAX_DEPTH:
                     dirnames[:] = []
@@ -2769,10 +2781,20 @@ class CacheLake:
                 for fn in filenames:
                     if fn.lower().endswith(DATA_EXT) and not fn.startswith("."):
                         cands.append((os.path.join(dirpath, fn), kind))
-                        if len(cands) >= CACHE_SCAN_MAX_FILES:
-                            break
                 if len(cands) >= CACHE_SCAN_MAX_FILES:
                     break
+                #   구글드라이브 스트리밍은 디렉터리 하나 여는 데도 수백 ms 가 걸린다.
+                #   루트 하나가 느리다고 실행 전체가 멈추면 안 되므로 예산을 둔다.
+                if time.time() - t0 > CACHE_SCAN_BUDGET_S:
+                    timed_out = True
+                    break
+            if timed_out:
+                LOG.warn(f"캐시 스캔 시간 예산({CACHE_SCAN_BUDGET_S:.0f}s) 초과 — {root} 는 "
+                         f"여기까지 찾은 {len(cands)-n0:,}개만 씁니다. 더 정확히 잡으려면 "
+                         f"CACHE_SEARCH_DIRS 에 하위 폴더를 직접 지정하세요.")
+            if len(cands) >= CACHE_SCAN_MAX_FILES:
+                LOG.warn(f"후보 파일 상한({CACHE_SCAN_MAX_FILES:,})에 도달해 스캔을 멈춥니다.")
+                break
         # 같은 파일이 여러 루트로 잡히면 한 번만
         uniq: Dict[str, str] = {}
         for p, k in cands:
@@ -3298,19 +3320,32 @@ class DartBudget:
     LIMIT = 20000
 
     def __init__(self):
-        self.path = os.path.join(CACHE_DIR or ".", "_dart_budget.json")
         self.day = _dt.date.today().isoformat()
         self.used = 0
+        self._loaded = False
         self._lk = threading.Lock()
+
+    @property
+    def path(self) -> str:
+        #   CACHE_DIR 은 _prep_dirs() 에서야 정해진다. 임포트 시점에 굳혀 두면
+        #   예산 파일이 엉뚱한 폴더(cwd)에 떨어져 재실행에서 이어받지 못한다.
+        return os.path.join(CACHE_DIR or ".", "_dart_budget.json")
+
+    def _load_once(self):
+        if self._loaded:
+            return
+        self._loaded = True
         try:
             j = json.loads(open(self.path, encoding="utf-8").read())
             if j.get("day") == self.day:
                 self.used = int(j.get("used", 0))
+                LOG.info(f"오늘 이미 사용한 DART 호출 {self.used:,}건을 이어받습니다.")
         except Exception:
             pass
 
     def take(self, k: int = 1) -> bool:
         with self._lk:
+            self._load_once()
             if self.used + k > self.LIMIT:
                 return False
             self.used += k
@@ -3623,10 +3658,9 @@ def rebalance_dates(panel_dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
     d = pd.DatetimeIndex(sorted(pd.unique(panel_dates)))
     if len(d) == 0:
         return d
-    if REBAL_FREQ.upper().startswith("M"):
-        key = d.to_period("M")
-    else:
-        key = d.to_period("W-FRI")
+    f = REBAL_FREQ.upper()
+    key = d.to_period("Q") if f.startswith("Q") else \
+        d.to_period("M") if f.startswith("M") else d.to_period("W-FRI")
     s = pd.Series(d, index=key)
     out = pd.DatetimeIndex(s.groupby(level=0).last().values)
     LOG.info(f"리밸런싱 주기 = {REBAL_FREQ} → 시점 {len(out):,}개 "
@@ -3786,6 +3820,21 @@ def build_universe(elig: pd.DataFrame) -> pd.DataFrame:
 # ║  (마이크로캡에서 스프레드를 상수로 두면 소형일수록 비용이 과소계상돼 결론이 뒤집힌다)       ║
 # ╚═════════════════════════════════════════════════════════════════════════════════════════╝
 
+def periods_per_year(freq: Optional[str] = None) -> float:
+    f = (freq or REBAL_FREQ).upper()
+    return 4.0 if f.startswith("Q") else 12.0 if f.startswith("M") else 52.0
+
+
+def freq_tag(freq: Optional[str] = None) -> str:
+    f = (freq or REBAL_FREQ).upper()
+    return "quarterly" if f.startswith("Q") else "monthly" if f.startswith("M") else "weekly"
+
+
+def freq_kr(freq: Optional[str] = None) -> str:
+    f = (freq or REBAL_FREQ).upper()
+    return "분기" if f.startswith("Q") else "월간" if f.startswith("M") else "주간"
+
+
 def tax_rate(year: int, market: str) -> float:
     """연도별 증권거래세 실효율 (매도 시). 하드코딩이 아니라 테이블 조회다(§5)."""
     row = SPEC_TAX_TABLE[0]
@@ -3933,7 +3982,7 @@ class Engine:
         self.fwd = fwd                 # index=rebal, columns=code, 값=구간 총수익률
         self.cost = cost
         self.delist = delist           # index=rebal, columns=code, True=이 구간에 폐지
-        self.ppy = 52.0 if not REBAL_FREQ.upper().startswith("M") else 12.0
+        self.ppy = periods_per_year()
 
     def run(self, select: Callable[[pd.Timestamp], Sequence[str]], name: str,
             aum0: float = 100_000_000, dynamic_aum: bool = False,
@@ -4506,7 +4555,7 @@ def f3_redundancy(daily: pd.DataFrame, sig: pd.DataFrame, rebals: pd.DatetimeInd
     d["code"] = d["code"].astype(str)
     px = d.pivot_table(index="date", columns="code", values="close", aggfunc="last").sort_index()
     px = px.reindex(pd.DatetimeIndex(sorted(set(px.index) | set(rebals)))).ffill().reindex(rebals)
-    per = 12 if REBAL_FREQ.upper().startswith("M") else 52
+    per = int(periods_per_year())              # 12개월 모멘텀 = 1년치 구간 수
     mom = px / px.shift(per) - 1.0
     rev = px / px.shift(max(1, per // 12)) - 1.0
     S = sig.pivot_table(index="rebal", columns="code", values="score", aggfunc="last")
@@ -4581,6 +4630,43 @@ def build_F4(con: pd.DataFrame, fin: pd.DataFrame, rebals: pd.DatetimeIndex, uni
     return FactorSignal("F4", variant, obs, sig, "event",
                         f"임계 {p['ratio_threshold']:.2f} · 유효 {p['horizon_m']}M"
                         + ("" if track_cancel else " · ★해지 미처리(대조용)"))
+
+
+def f3_momentum_neutral_selector(fs: FactorSignal, univ_by_t, daily: pd.DataFrame,
+                                 rebals: pd.DatetimeIndex, n: int):
+    """§4 F3 이중정렬 — 모멘텀 5분위 안에서만 F3 상위를 뽑는다.
+
+    이렇게 하면 포트폴리오의 모멘텀 노출이 유니버스와 같아지므로, 남는 초과수익은
+    모멘텀이 아니라 F3 고유의 것이다. 여기서 초과수익이 소멸하면 F3 은 기각된다.
+    """
+    d = daily[["code", "date", "close"]].copy()
+    d["code"] = d["code"].astype(str)
+    px = d.pivot_table(index="date", columns="code", values="close", aggfunc="last").sort_index()
+    px = px.reindex(pd.DatetimeIndex(sorted(set(px.index) | set(rebals)))).ffill().reindex(rebals)
+    per = int(periods_per_year())
+    mom = px / px.shift(per) - 1.0
+    sig_by_t = {t: g.set_index("code")["score"] for t, g in fs.sig.groupby("rebal", observed=True)}
+
+    def sel(t):
+        s = sig_by_t.get(t)
+        if s is None or t not in mom.index:
+            return []
+        cand = [c for c in s.index if c in set(univ_by_t.get(t, []))]
+        m = mom.loc[t].reindex(cand).dropna()
+        if len(m) < 25:
+            return []
+        s2 = s.reindex(m.index)
+        try:
+            q = pd.qcut(m.rank(method="first"), 5, labels=False)
+        except (ValueError, IndexError):
+            return []
+        per_q = max(1, n // 5)
+        out = []
+        for k in range(5):
+            sub = s2[q.to_numpy() == k].sort_values(ascending=False)
+            out += list(sub.head(per_q).index)
+        return out
+    return sel
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
 # ║  §6.3 판정 게이트 G1~G7 + §6.2 다중검정(DSR/PBO)                                          ║
@@ -4847,8 +4933,11 @@ FACTOR_DIR = {"F1": "F1_capital_events", "F2": "F2_insider",
               "F3": "F3_liquidity", "F4": "F4_contracts"}
 
 
+_SUBDIR = ""          # 주기별 산출물 하위 폴더 (weekly / monthly / quarterly)
+
+
 def _out(*parts) -> str:
-    p = os.path.join(OUTPUT_DIR, *parts)
+    p = os.path.join(OUTPUT_DIR, _SUBDIR, *parts) if _SUBDIR else os.path.join(OUTPUT_DIR, *parts)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     return p
 
@@ -4965,7 +5054,8 @@ _GATE_NAME = {"G1": "무작위 대비", "G2": "순수익 초과", "G3": "연도 
 
 def master_scorecard(all_gates: Dict[str, List[GateResult]], excess: Dict[str, dict],
                      covs: Dict[str, Coverage], capacity: pd.DataFrame,
-                     amendments: List[str]) -> str:
+                     amendments: List[str], rejects: Optional[Dict[str, str]] = None) -> str:
+    rejects = rejects or {}
     L = ["# MASTER SCORECARD — U250 대체데이터 팩터 독립 검정", "",
          f"- 명세 v{SPEC_VERSION} · 사전등록 해시 `{spec_sha256()}`",
          f"- 실행 {_dt.datetime.now():%Y-%m-%d %H:%M} · 유니버스 U{SPEC_UNIV['main_n']} EW · "
@@ -4985,7 +5075,7 @@ def master_scorecard(all_gates: Dict[str, List[GateResult]], excess: Dict[str, d
         # G6 가 '해당 없음(필터형)'인 경우를 제외하고 전부 통과해야 유효
         req = [gs.get(k) for k in ("G1", "G2", "G3", "G4", "G5", "G7")]
         valid = all(g is not None and g.passed is True for g in req) and \
-            (gs.get("G6") is None or gs["G6"].passed is not False)
+            (gs.get("G6") is None or gs["G6"].passed is not False) and f not in rejects
         any_pass |= valid
         cv = covs.get(f)
         L.append(f"| {f} {FACTOR_META[f]['name']} | {cv.verdict if cv else '—'}"
@@ -5001,6 +5091,9 @@ def master_scorecard(all_gates: Dict[str, List[GateResult]], excess: Dict[str, d
             return f"{v:+.2%}p" if isinstance(v, float) and np.isfinite(v) else "—"
         L.append(f"| {f} | {_f('is')} | {_f('oos')} | {_f('dyn')} | {_f('bcov')} |")
 
+    if rejects:
+        L += ["", "### 별도 기각 (게이트와 무관하게 무효)", ""]
+        L += [f"- **{f}** — {why}" for f, why in rejects.items()]
     L += ["", "## 3. 판정", ""]
     if any_pass:
         L.append("일부 팩터가 G1~G7 을 통과했다. 위 격자와 §7 팩터별 산출물을 함께 볼 것.")
@@ -5028,6 +5121,90 @@ def master_scorecard(all_gates: Dict[str, List[GateResult]], excess: Dict[str, d
         L += [f"{i+1}. {a}" for i, a in enumerate(amendments)]
     L += ["", "---", "", "### 실행 기록", "",
           "```", json.dumps(RUNLOG, ensure_ascii=False, indent=2, default=str)[:6000], "```"]
+    return "\n".join(L)
+
+
+def master_scorecard_multi(ALL: Dict[str, dict], amendments: List[str]) -> str:
+    """주기 3종 통합 스코어카드 — 주기를 고를 근거가 없으므로 '셋 다 통과'만 유효로 본다."""
+    freqs = list(ALL.keys())
+    L = ["# MASTER SCORECARD — U250 대체데이터 팩터 독립 검정",
+         "",
+         f"- 명세 v{SPEC_VERSION} · 사전등록 해시 `{spec_sha256()}`",
+         f"- 실행 {_dt.datetime.now():%Y-%m-%d %H:%M} · 유니버스 U{SPEC_UNIV['main_n']} EW · "
+         f"시드 {SEED}",
+         f"- 리밸런싱 주기 **{' / '.join(freq_kr(f) for f in freqs)}** 전부 산출 "
+         f"(§1 원본 미확인 → 주기 선택에 기대지 않기 위함)",
+         f"- 캐시 재활용: {len(LAKE.items):,}개 파일 (스캔 {LAKE.scanned:,}개 중)",
+         "- **전 수치는 순수익이다** — 증권거래세(연도별 실효세율표) · 위탁수수료 · "
+         "호가스프레드(Corwin-Schultz 실측 우선) · 시장충격(√주문/ADV) · 슬리피지 전액 차감",
+         "",
+         "## 0. 유효 판정 (세 주기 전부 통과해야 유효)",
+         "",
+         "| 팩터 | " + " | ".join(freq_kr(f) for f in freqs) + " | 종합 |",
+         "|---|" + "---|" * (len(freqs) + 1)]
+    verdicts = {}
+    for f in ("F1", "F2", "F3", "F4"):
+        cells, oks = [], []
+        for fq in freqs:
+            R = ALL[fq]
+            gs = {g.gate: g for g in R["gates"].get(f, [])}
+            req = [gs.get(k) for k in ("G1", "G2", "G3", "G4", "G5", "G7")]
+            ok = (all(g is not None and g.passed is True for g in req)
+                  and (gs.get("G6") is None or gs["G6"].passed is not False)
+                  and f not in R["rejects"])
+            oks.append(ok)
+            npass = sum(1 for g in R["gates"].get(f, []) if g.passed is True)
+            nfail = sum(1 for g in R["gates"].get(f, []) if g.passed is False)
+            cells.append(("✅ 통과" if ok else "❌ 미달") + f" ({npass}✓/{nfail}✗)")
+        verdicts[f] = all(oks)
+        L.append(f"| {f} {FACTOR_META[f]['name']} | " + " | ".join(cells) +
+                 f" | {'**유효**' if all(oks) else '무효'} |")
+
+    L += ["", "## 1. B2 대비 순수익 초과 CAGR (AUM 1억, IS)", "",
+          "| 팩터 | " + " | ".join(freq_kr(f) for f in freqs) + " |",
+          "|---|" + "---|" * len(freqs)]
+    for f in ("F1", "F2", "F3", "F4"):
+        row = []
+        for fq in freqs:
+            v = ALL[fq]["excess"].get(f, {}).get("is")
+            row.append(f"{v:+.2%}p" if isinstance(v, float) and np.isfinite(v) else "—")
+        L.append(f"| {f} | " + " | ".join(row) + " |")
+
+    L += ["", "## 2. 베이스라인 B2 (U250 전종목 EW 순수익) — 주기별", "",
+          "| 주기 | 리밸 시점수 | B2 CAGR(순) | B2 연회전율 | B1 CAGR(총) | 비용 드래그 |",
+          "|---|---|---|---|---|---|"]
+    for fq in freqs:
+        R = ALL[fq]
+        b1 = R["base"]["B1"].stats(R["ppy"])
+        b2 = R["base"]["B2"].stats(R["ppy"])
+        L.append(f"| {freq_kr(fq)} | {b2['n']:,} | {b2['cagr']:.2%} | {b2['turnover']:.1f}x | "
+                 f"{b1['cagr']:.2%} | {b1['cagr'] - b2['cagr']:.2%}p |")
+
+    rejects_all = {}
+    for fq in freqs:
+        for f, why in ALL[fq]["rejects"].items():
+            rejects_all.setdefault(f, []).append(f"{freq_kr(fq)}: {why}")
+    if rejects_all:
+        L += ["", "## 3. 별도 기각 (게이트와 무관하게 무효)", ""]
+        for f, whys in rejects_all.items():
+            L.append(f"- **{f}** — " + " / ".join(whys))
+
+    L += ["", "## 4. 판정", ""]
+    if any(verdicts.values()):
+        L.append("유효: " + ", ".join(f for f, v in verdicts.items() if v) +
+                 " — 주기별 상세는 `outputs/<주기>/MASTER_SCORECARD.md` 를 볼 것.")
+    else:
+        L += ["> ### ★ 전 팩터가 G1~G7 을 통과하지 못했다.", ">",
+              "> 명세서 §7 의 요구대로 이 사실을 명시적으로 기록한다. 통과 팩터를 만들기 위해 "
+              "명세를 수정하지 않았다.", ">",
+              "> 민감도 격자는 팩터당 4개로 상한이 걸려 있고(코드가 강제), 임계값·기간·N값은 "
+              "1차 결과를 본 뒤 조정하지 않았으며, OOS 는 Step 7 이전에는 잠겨 있었다.", ""]
+
+    if amendments:
+        L += ["", "## 5. 명세 개정 요청 (코드를 고치지 않고 기록만 한다 — §8)", ""]
+        L += [f"{i+1}. {a}" for i, a in enumerate(amendments)]
+    L += ["", "---", "", "### 실행 기록", "", "```",
+          json.dumps(RUNLOG, ensure_ascii=False, indent=2, default=str)[:8000], "```"]
     return "\n".join(L)
 
 # ╔═════════════════════════════════════════════════════════════════════════════════════════╗
@@ -5092,10 +5269,31 @@ def run_all():
     LOG.banner(STRATEGY_NAME, f"명세 v{SPEC_VERSION} · 사전등록 해시 {spec_sha256()[:16]} · "
                               f"빌드 {BUILD_VERSION}")
     RUNLOG.update(spec_sha256=spec_sha256(), spec_version=SPEC_VERSION, run_mode=RUN_MODE,
-                  rebal_freq=REBAL_FREQ, collect_policy=COLLECT_POLICY, seed=SEED,
-                  started=_dt.datetime.now().isoformat(timespec="seconds"))
+                  rebal_freq_list=list(REBAL_FREQ_LIST), collect_policy=COLLECT_POLICY,
+                  seed=SEED, started=_dt.datetime.now().isoformat(timespec="seconds"))
 
-    # ── Step 0. 캐시 하베스트 ─────────────────────────────────────────────────────────
+    AMENDMENTS.extend([
+        "§1 은 리밸런싱을 '기존 구현과 동일 주기 유지'라고만 하고 원본(KR_QUANT_SUITE_V1.py)이 "
+        "실행 환경에 없어 주기를 특정할 수 없었다. 주간·월간·분기 셋을 전부 산출하고, "
+        "주기를 고를 근거가 없으므로 '셋 전부에서 G1~G7 통과'를 유효 조건으로 삼았다. "
+        "하나에서만 통과하는 것은 팩터가 아니라 주기 선택에 기댄 결과로 본다.",
+        "위 주기 축이 늘어난 만큼 실제 시행수는 120 × 3 = 360 이다. G5 판정은 사전등록대로 "
+        "120 으로 하되, 360 기준 SR−SR₀ 를 비고에 함께 남겼다(§8-3 준수, 다만 다중검정 "
+        "통제의 취지상 360 쪽이 실질에 가깝다).",
+        "§2 의 B4 정의('U250 내 무작위 N종목 EW')는 매 리밸런싱마다 새로 뽑는지, 뽑은 뒤 "
+        "보유하는지를 명시하지 않는다. 코드는 문자 그대로 '매 리밸 새로 추출'로 구현했고 G1 "
+        "판정도 그 분포로만 한다. 다만 그 경우 귀무 포트폴리오 회전율이 100%에 가까워져 "
+        "비용 차가 선별력과 섞이므로, 팩터의 실현 회전율에 맞춘 귀무분포를 '진단'으로 "
+        "함께 산출해 G1 비고란에 남겼다(판정에는 쓰지 않음).",
+        "§6.2 의 시행수 계산 120 = 4팩터×5×N3×2 는 F1(필터형)에 N 차원이 없다는 점을 "
+        "반영하지 않는다. DSR 은 명세대로 120 을 그대로 썼다(실제보다 큰 시행수는 보수적 "
+        "방향이므로 결론을 유리하게 만들지 않는다).",
+        "§6.3 G5 의 'DSR > 0' 은 DSR 을 확률로 정의하면 항상 참이라 사실상 비구속 조건이다. "
+        "코드는 명세대로 판정하되, 실질 판정에 해당하는 SR > SR₀ 결과를 비고란에 남겼다. "
+        "임계 변경은 명세 개정 사항이므로 코드에서 바꾸지 않았다.",
+    ])
+
+    # ── Step 0. 캐시 하베스트 (주기와 무관 — 한 번만) ─────────────────────────────────
     _prep_dirs()
     global VAULT
     VAULT = Vault(*_mount_drive())
@@ -5106,29 +5304,126 @@ def run_all():
     if RUN_MODE == "CACHED":
         globals()["COLLECT_POLICY"] = "NEVER"
     verify_dart_endpoints()
+    if RUN_MODE == "SCAN":
+        scan_report()
+        return
 
     D = _load_all()
-    with PIPE.stage("L1.PANEL", "패널 조립", "L1", budget_s=900):
+    with PIPE.stage("L1.PANEL", "패널 조립 (주기 무관)", "L1", budget_s=1800):
         daily = build_daily_panel(D["price"])
         if PANEL_START:
             daily = daily[daily["date"] >= as_ts(PANEL_START)]
         if PANEL_END:
             daily = daily[daily["date"] <= as_ts(PANEL_END)]
         sec, fin = D["sec"], D["fin"]
+        RUNLOG["panel"] = dict(codes=int(daily["code"].nunique()), rows=int(len(daily)),
+                               start=str(daily["date"].min().date()),
+                               end=str(daily["date"].max().date()))
+        #   스프레드 실측과 DART 원천은 리밸 주기와 무관하다 — 세 번 만들 이유가 없다.
+        cs = corwin_schultz_spread(daily)
+        start, end = daily["date"].min(), daily["date"].max()
+        codes = sorted(daily["code"].astype(str).unique())
+        src = {
+            "F1": D["cap_events"] if D["cap_events"] is not None else load_capital_events(codes, start, end),
+            "F2": D["insider"] if D["insider"] is not None else load_insider(codes, start, end),
+            "F4": D["contracts"] if D["contracts"] is not None else load_contracts(codes, start, end),
+        }
+
+    # ── 주기별 전체 검정 (§1 주기를 특정할 수 없어 셋을 모두 돌린다) ──────────────────
+    ALL: Dict[str, dict] = {}
+    for freq in REBAL_FREQ_LIST:
+        globals()["REBAL_FREQ"] = freq
+        globals()["_SUBDIR"] = freq_tag(freq)
+        globals()["SEAL"] = OOSSeal()
+        LOG.banner(f"리밸런싱 {freq_kr(freq)} ({freq})",
+                   f"세금·수수료·스프레드·시장충격·슬리피지를 전부 차감한 순수익으로만 판정합니다 "
+                   f"· 산출물 → outputs/{freq_tag(freq)}/")
+        ALL[freq] = run_one_frequency(daily, sec, fin, cs, src, codes)
+
+    # ── 통합 스코어카드 ───────────────────────────────────────────────────────────────
+    globals()["_SUBDIR"] = ""
+    write_md(_out("MASTER_SCORECARD.md"), master_scorecard_multi(ALL, AMENDMENTS))
+    RUNLOG["elapsed_s"] = round(time.time() - t0, 1)
+    atomic_write_text(os.path.join(LOG_DIR, f"run_log_{_dt.datetime.now():%Y%m%d_%H%M%S}.json"),
+                      json.dumps(RUNLOG, ensure_ascii=False, indent=2, default=str))
+    VAULT.flush()
+    DARTB.close()
+    PIPE.report_stages()
+    PIPE.report_flow()
+    report_http()
+    PIPE.report_runtime()
+    VAULT.report()
+    LOG.banner("완료", f"{OUTPUT_DIR} · {RUNLOG['elapsed_s']}초 · "
+                       f"MASTER_SCORECARD.md 를 먼저 보세요")
+
+
+ROLE_NEED = [
+    ("price_daily", "일별 가격·거래대금", True,
+     "없으면 아무것도 못 한다. 이전 프로젝트의 OHLCV parquet/csv 폴더를 CACHE_SEARCH_DIRS 에 추가"),
+    ("mktcap_daily", "일별 시가총액", False,
+     "가격 테이블에 시총·상장주식수가 있으면 불필요"),
+    ("sec_master", "종목마스터(상장일·폐지일)", True,
+     "폐지일이 없으면 생존자편향. 없으면 깃허브 FDR 캐시에서 자동 보충"),
+    ("financials", "재무(매출·자본총계·자본금)", True,
+     "자본잠식·재무결측 게이트의 입력. dart_fin 원시 계정표도 가능"),
+    ("dart_fin", "DART 원시 계정표", False, "financials 가 없을 때의 대체 입력"),
+    ("corp_map", "corp_code ↔ 종목코드", False, "DART 계열 데이터를 종목에 붙이는 데 필요"),
+    ("dart_disclosure", "공시목록", False, "F1 자본거래 이벤트의 원천"),
+    ("dart_insider", "임원·주요주주 지분공시", False, "F2 의 원천. 없으면 F2 는 Phase 0 보류"),
+    ("dart_contract", "단일판매·공급계약", False, "F4 의 원천. 없으면 F4 는 Phase 0 보류"),
+]
+
+
+def scan_report():
+    """RUN_MODE='SCAN' — 캐시 발굴 결과만 보고 끝낸다. 전체 실행 전 경로 점검용."""
+    rows = []
+    for role, label, required, hint in ROLE_NEED:
+        items = [i for i in LAKE.items if i.role == role]
+        n = len(items)
+        rows.append([label, role, f"{n:,}" if n else "—",
+                     f"{sum(max(i.rows, 0) for i in items):,}" if n else "—",
+                     ("✔ 있음" if n else ("✘ 없음(필수)" if required else "— 없음(선택)")),
+                     "" if n else hint])
+    LOG.table(rows, ["데이터", "역할키", "파일", "행수(추정)", "상태", "없을 때"],
+              ["l", "l", "r", "r", "c", "l"], title="★ 역할별 캐시 확보 현황")
+    miss = [r[0] for r in rows if r[4].startswith("✘")]
+    if miss:
+        LOG.warn(f"필수 데이터 미확보: {', '.join(miss)} — 이대로 FULL 을 돌리면 합성데이터로 "
+                 f"폴백하거나 신규 수집(수 시간)에 들어갑니다. 경로를 먼저 잡으세요.")
+        if LAKE.rejected:
+            LOG.info("판별 실패한 파일 예시 — 컬럼명이 별칭표에 없으면 여기 뜹니다 "
+                     "(ALIAS 에 이름을 추가하면 즉시 인식됩니다):")
+            for pth, cols in LAKE.rejected[:12]:
+                LOG.info(f"    {os.path.basename(pth)} → {cols}")
+    else:
+        LOG.ok("필수 데이터가 전부 캐시에 있습니다. RUN_MODE 를 'CACHED' 로 두면 "
+               "네트워크 없이 전체 검정이 돕니다.")
+    if LAKE.roots_used:
+        LOG.table([[k, p] for p, k in LAKE.roots_used], ["출처", "스캔 루트"], ["l", "l"],
+                  title="스캔한 경로")
+    write_xlsx(_out("cache_scan_report.xlsx"), {
+        "역할별_현황": pd.DataFrame(rows, columns=["데이터", "역할키", "파일", "행수", "상태", "없을때"]),
+        "채택_파일": pd.DataFrame([{"역할": i.role, "출처": i.origin, "점수": i.score,
+                                  "행수": i.rows, "경로": i.path, "테이블": i.sub}
+                                 for i in LAKE.items]),
+        "판별실패_예시": pd.DataFrame([{"파일": p, "컬럼": ", ".join(map(str, c))}
+                                    for p, c in LAKE.rejected[:500]]),
+    })
+
+
+def run_one_frequency(daily, sec, fin, cs, src, codes) -> dict:
+    """한 리밸런싱 주기에 대해 Step 1~9 를 명세대로 끝까지."""
+    global FWD_GLOBAL
+    tag = freq_tag()
+    with PIPE.stage(f"L1.{tag}", f"유니버스 ({freq_kr()})", "L1", budget_s=900):
         rebals = rebalance_dates(pd.DatetimeIndex(daily["date"].unique()))
         SEAL.set_boundary(rebals)
         elig = build_eligibility(daily, sec, fin, rebals)
         univ = build_universe(elig)
-        RUNLOG["panel"] = dict(codes=int(daily["code"].nunique()), rows=int(len(daily)),
-                               start=str(daily["date"].min().date()),
-                               end=str(daily["date"].max().date()),
-                               rebals=int(len(rebals)))
 
-    global FWD_GLOBAL
-    with PIPE.stage("L2.COST", "비용 모형 · 수익률 행렬", "L2", budget_s=900):
+    with PIPE.stage(f"L2.{tag}", f"비용 모형 · 수익률 행렬 ({freq_kr()})", "L2", budget_s=900):
         FWD, DEL = build_forward_returns(daily, rebals, sec)
         FWD_GLOBAL = FWD
-        cs = corwin_schultz_spread(daily)
         spread_map = ({t: g.set_index("code")["spread_cs"]
                        for t, g in cs[cs["date"].isin(rebals)].groupby("date", observed=True)}
                       if len(cs) else {})
@@ -5140,7 +5435,6 @@ def run_all():
                 q = pd.qcut(g["market_cap"].rank(method="first"), 5, labels=[1, 2, 3, 4, 5])
                 qmap[t] = pd.Series(q.astype(int).values, index=g["code"].astype(str).values)
             except (ValueError, IndexError):
-                #   종목이 5개 미만이면 분위를 못 나눈다 → 가장 보수적인 1분위로 둔다.
                 qmap[t] = pd.Series(1, index=g["code"].astype(str).values)
         cost = CostModel(spread_map=spread_map,
                          market_map=sec.drop_duplicates("code").set_index("code").get("market"),
@@ -5149,35 +5443,31 @@ def run_all():
         ppy = eng.ppy
         univ_by_t = {t: list(g["code"]) for t, g in univ[univ["u250"]].groupby("rebal", observed=True)}
 
-    # ── Step 1. Phase 0 커버리지 진단 ─────────────────────────────────────────────────
-    with PIPE.stage("S1.PHASE0", "Phase 0 커버리지 진단 (게이트)", "L3", budget_s=1800):
-        start, end = daily["date"].min(), daily["date"].max()
-        codes = sorted(daily["code"].unique())
-        src = {}
-        src["F1"] = D["cap_events"] if D["cap_events"] is not None else load_capital_events(codes, start, end)
-        src["F2"] = D["insider"] if D["insider"] is not None else load_insider(codes, start, end)
-        src["F4"] = D["contracts"] if D["contracts"] is not None else load_contracts(codes, start, end)
-        prim = {}
-        prim["F1"] = build_F1(src["F1"], rebals, univ_by_t, daily, "primary", {})
-        prim["F2"] = build_F2(src["F2"], rebals, univ_by_t, univ, "primary", {})
-        prim["F3"] = build_F3(daily, rebals, univ_by_t, "primary", {})
-        prim["F4"] = build_F4(src["F4"], fin, rebals, univ_by_t, "primary", {})
-        covs, b_cov = {}, {}
+    # ── Step 1. Phase 0 ───────────────────────────────────────────────────────────────
+    with PIPE.stage(f"S1.{tag}", f"Phase 0 커버리지 진단 ({freq_kr()})", "L3", budget_s=1800):
+        prim = {
+            "F1": build_F1(src["F1"], rebals, univ_by_t, daily, "primary", {}),
+            "F2": build_F2(src["F2"], rebals, univ_by_t, univ, "primary", {}),
+            "F3": build_F3(daily, rebals, univ_by_t, "primary", {}),
+            "F4": build_F4(src["F4"], fin, rebals, univ_by_t, "primary", {}),
+        }
+        covs = {}
         for f in ("F1", "F2", "F3", "F4"):
             c = coverage_diag(f, prim[f].obs, prim[f].sig, univ, rebals, codes)
             coverage_bias(c, univ, sec)
             covs[f] = c
 
-    # ── Step 2. 베이스라인 B1~B4 ──────────────────────────────────────────────────────
-    with PIPE.stage("S2.BASE", "베이스라인 B1~B4", "L3", budget_s=3600):
+    # ── Step 2. 베이스라인 ────────────────────────────────────────────────────────────
+    with PIPE.stage(f"S2.{tag}", f"베이스라인 B1~B4 ({freq_kr()})", "L3", budget_s=3600):
         base = run_baselines(eng, univ, elig, "IS")
         LOG.table([[k, f"{r.stats(ppy)['cagr']:.2%}", f"{r.stats(ppy)['mdd']:.1%}",
                     f"{r.stats(ppy)['vol']:.1%}", f"{r.stats(ppy)['turnover']:.1f}x",
                     f"{r.stats(ppy)['cost']:.3f}"] for k, r in base.items()],
                   ["베이스라인", "CAGR", "MDD", "변동성", "연회전율", "누적비용"],
-                  ["l", "r", "r", "r", "r", "r"], title="§2 베이스라인 (IS 구간)")
+                  ["l", "r", "r", "r", "r", "r"],
+                  title=f"§2 베이스라인 (IS · {freq_kr()} · B2~B4 는 전부 순수익)")
         nulls = {n: random_null(eng, univ, n, SPEC_B4_SIMS, "IS") for n in SPEC_N_VALUES}
-        # 커버 종목만 담은 B_cov — '커버되는 것 자체가 알파'인 경우를 분리한다(§3)
+        b_cov = {}
         for f, c in covs.items():
             if c.median_cov <= 0:
                 continue
@@ -5187,67 +5477,58 @@ def run_all():
         baseline_report(base, nulls, ppy)
         phase0_report(covs, b_cov, ppy, base.get("B2"))
 
-    # ── Step 3~6. 팩터별 단독 백테스트 (IS) ───────────────────────────────────────────
+    # ── Step 3~6. 팩터 ────────────────────────────────────────────────────────────────
     FR: Dict[str, dict] = {}
     for f in ("F1", "F2", "F3", "F4"):
-        with PIPE.stage(f"S{2+int(f[1])}.{f}", f"{f} 단독 백테스트 (IS)", "L3", budget_s=3600):
+        with PIPE.stage(f"S{2+int(f[1])}.{tag}.{f}", f"{f} 단독 백테스트 (IS · {freq_kr()})",
+                        "L3", budget_s=3600):
             FR[f] = run_factor(f, src, daily, fin, rebals, univ, univ_by_t, sec,
                                eng, base, nulls, covs[f], b_cov.get(f), ppy)
 
-    # ── Step 7. OOS 개봉 ──────────────────────────────────────────────────────────────
-    with PIPE.stage("S7.OOS", "IS 통과 팩터만 OOS 개봉 → G4", "L3", budget_s=3600):
+    # ── Step 7. OOS ───────────────────────────────────────────────────────────────────
+    with PIPE.stage(f"S7.{tag}", f"OOS 개봉 → G4 ({freq_kr()})", "L3", budget_s=3600):
         ok = [f for f, r in FR.items()
-              if r.get("gates") and all(g.passed is not False
-                                        for g in r["gates"] if g.gate in ("G1", "G2", "G3"))]
+              if r.get("sel_primary") and r.get("gates")
+              and all(g.passed is not False for g in r["gates"] if g.gate in ("G1", "G2", "G3"))]
         LOG.info(f"IS 에서 G1·G2·G3 를 하나도 실패하지 않은 팩터: {ok or '없음'}")
         SEAL.open(f"Step 7 — IS 확정 후 개봉 (대상 {ok or '없음'})")
         base_oos = run_baselines(eng, univ, elig, "OOS")
         for f in ok:
             r = FR[f]
-            e2 = Engine(_window_rebals(rebals, "OOS"), FWD, cost, DEL)
-            res = e2.run(r["sel_primary"], f"{f} OOS")
+            res = Engine(_window_rebals(rebals, "OOS"), FWD, cost, DEL).run(
+                r["sel_primary"], f"{f} OOS")
             r["oos"] = res
             r["excess"]["oos"] = excess_cagr(res, base_oos["B2"], ppy)
-            r["gates"].append(gate_G4(r["excess"]["is"], r["excess"]["oos"]))
+            r["gates"].append(gate_G4(r["excess"].get("is", np.nan), r["excess"]["oos"]))
         for f in FR:
             if f not in ok:
                 FR[f]["gates"].append(GateResult(
                     "G4", None, "—", f"OOS ≥ IS × {SPEC_GATE['g4_oos_ratio']:.0%}",
                     "IS 미통과 — OOS 미개봉(§9 Step 7)"))
 
-    # ── Step 8. 전체 시행수 기준 DSR / PBO ────────────────────────────────────────────
-    with PIPE.stage("S8.MULTI", f"다중검정 — 시행수 {SPEC_TRIALS_TOTAL} 기준 DSR/PBO", "L3",
-                    budget_s=1200):
+    # ── Step 8. DSR / PBO ─────────────────────────────────────────────────────────────
+    with PIPE.stage(f"S8.{tag}", f"다중검정 DSR/PBO ({freq_kr()})", "L3", budget_s=1200):
+        n_adj = SPEC_TRIALS_TOTAL * len(REBAL_FREQ_LIST)
         for f, r in FR.items():
             if r.get("primary") is None:
                 r["gates"].append(GateResult("G5", None, "—", "DSR>0 · PBO<0.5", "백테스트 미실행"))
                 continue
             d = deflated_sharpe(r["primary"].ret, SPEC_TRIALS_TOTAL, ppy)
+            d_adj = deflated_sharpe(r["primary"].ret, n_adj, ppy)
             grid = pd.DataFrame({k: v.ret for k, v in r["grid"].items()}) if r.get("grid") else pd.DataFrame()
             p = pbo_cscv(grid) if len(grid.columns) >= 2 else dict(pbo=np.nan)
-            r["dsr"], r["pbo"] = d, p
-            r["gates"].append(gate_G5(d, p))
+            r["dsr"], r["dsr_adj"], r["pbo"] = d, d_adj, p
+            g = gate_G5(d, p)
+            #   판정은 사전등록대로 시행수 120 으로 한다. 주기 축이 늘어난 만큼의
+            #   보정치(360)는 '보이게' 남기되 게이트를 바꾸지 않는다(§8-3).
+            g.note += (f" · 주기축 반영 시행수 {n_adj} 기준 SR−SR₀ "
+                       f"{d_adj.get('excess', float('nan')):+.4f}")
+            r["gates"].append(g)
             LOG.info(f"[{f}] SR {d['sr']:.3f} · SR₀ {d['sr0']:.3f} · DSR {d['dsr']:.3f} · "
-                     f"PBO {p.get('pbo', float('nan')):.3f} (격자 {p.get('K', 0)}개, "
-                     f"조합 {p.get('n_comb', 0):,})")
-        AMENDMENTS.append(
-            "§2 의 B4 정의('U250 내 무작위 N종목 EW')는 매 리밸런싱마다 새로 뽑는지, "
-            "뽑은 뒤 보유하는지를 명시하지 않는다. 코드는 문자 그대로 '매 리밸 새로 추출'로 "
-            "구현했고 G1 판정도 그 분포로만 한다. 다만 그 경우 귀무 포트폴리오의 회전율이 "
-            "100%에 가까워져 비용 차가 선별력과 섞이므로, 팩터의 실현 회전율에 맞춘 "
-            "귀무분포를 '진단'으로 함께 산출해 G1 비고란에 남겼다(판정에는 쓰지 않음).")
-        AMENDMENTS.append(
-            f"§6.2 의 시행수 계산 120 = 4팩터×5×N3×2 는 F1(필터형)에 N 차원이 없다는 점을 "
-            f"반영하지 않는다. 실제 격자는 F1 {len(FR['F1'].get('grid', {}))}개 + F2~F4 각 "
-            f"{len(FR['F2'].get('grid', {}))}개 안팎이다. DSR 은 명세대로 120 을 그대로 썼다 "
-            f"(실제보다 큰 시행수는 보수적 방향이므로 결론을 유리하게 만들지 않는다).")
-        AMENDMENTS.append(
-            "§6.3 G5 의 'DSR > 0' 은 DSR 을 확률로 정의하면 항상 참이라 사실상 비구속 조건이다. "
-            "코드는 명세대로 'DSR > 0' 으로 판정하되, 실질 판정에 해당하는 SR > SR₀ 결과를 "
-            "비고란에 함께 남겼다. 임계 변경은 명세 개정 사항이므로 코드에서 바꾸지 않았다.")
+                     f"PBO {p.get('pbo', float('nan')):.3f} (격자 {p.get('K', 0)}개)")
 
-    # ── Step 9. 용량 시뮬레이션 ───────────────────────────────────────────────────────
-    with PIPE.stage("S9.CAP", "용량 시뮬레이션 (AUM 사다리 + 동적 AUM)", "L3", budget_s=3600):
+    # ── Step 9. 용량 ──────────────────────────────────────────────────────────────────
+    with PIPE.stage(f"S9.{tag}", f"용량 시뮬레이션 ({freq_kr()})", "L3", budget_s=3600):
         cap_rows = []
         targets = [("B2 U250 EW", lambda t: univ_by_t.get(t, []))]
         targets += [(f"{f} 주명세", FR[f]["sel_primary"]) for f in FR if FR[f].get("sel_primary")]
@@ -5266,26 +5547,20 @@ def run_all():
         write_xlsx(_out("capacity_curves.xlsx"), {"AUM별_CAGR": capacity})
         cost.report()
 
-    # ── 산출물 ────────────────────────────────────────────────────────────────────────
     all_gates = {f: r["gates"] for f, r in FR.items()}
     excess = {f: r["excess"] for f, r in FR.items()}
+    rejects = {f: r["reject_reason"] for f, r in FR.items() if r.get("reject_reason")}
     for f, r in FR.items():
         write_md(_out(FACTOR_DIR[f], f"{f}_gate_scorecard.md"),
                  gate_scorecard_md(f, r["gates"], r["head"]))
     write_md(_out("MASTER_SCORECARD.md"),
-             master_scorecard(all_gates, excess, covs, capacity, AMENDMENTS))
-    RUNLOG["elapsed_s"] = round(time.time() - t0, 1)
-    atomic_write_text(os.path.join(LOG_DIR, f"run_log_{_dt.datetime.now():%Y%m%d_%H%M%S}.json"),
-                      json.dumps(RUNLOG, ensure_ascii=False, indent=2, default=str))
-    VAULT.flush()
-    DARTB.close()
-    PIPE.report_stages()
-    PIPE.report_flow()
-    report_http()
-    PIPE.report_runtime()
-    VAULT.report()
-    LOG.banner("완료", f"{OUTPUT_DIR} · {RUNLOG['elapsed_s']}초 · "
-                       f"MASTER_SCORECARD.md 를 먼저 보세요")
+             master_scorecard(all_gates, excess, covs, capacity, AMENDMENTS, rejects))
+    RUNLOG.setdefault("by_freq", {})[freq_tag()] = dict(
+        rebals=int(len(rebals)), b2_cagr=float(base["B2"].stats(ppy)["cagr"]),
+        b2_turnover=float(base["B2"].stats(ppy)["turnover"]),
+        excess={f: excess[f].get("is") for f in excess})
+    return dict(gates=all_gates, excess=excess, covs=covs, capacity=capacity,
+                rejects=rejects, base=base, ppy=ppy, freq=REBAL_FREQ)
 
 
 def run_factor(f: str, src: dict, daily, fin, rebals, univ, univ_by_t, sec,
@@ -5375,6 +5650,27 @@ def run_factor(f: str, src: dict, daily, fin, rebals, univ, univ_by_t, sec,
         p2 = excess_cagr(r2, base["B2"], ppy)
         p3 = prim.stats(ppy)["cagr"] - r3.stats(ppy)["cagr"]
     out["gates"].append(gate_G7(p1, p2, p3, out["excess"]["is"]))
+
+    # ── §4 F3 중복성 검사 (필수) — 이 검사만으로 팩터가 기각될 수 있다 ────────────────
+    if f == "F3" and fsp is not None and len(fsp.sig):
+        red = f3_redundancy(daily, fsp.sig, rebals)
+        mn_sel = f3_momentum_neutral_selector(fsp, univ_by_t, daily, rebals, SPEC_N_PRIMARY)
+        r_mn = e_is.run(mn_sel, "F3 모멘텀중립(이중정렬)")
+        x_mn = excess_cagr(r_mn, base["B2"], ppy)
+        red["excess_mom_neutral"] = x_mn
+        red["reject"] = bool(red["reject"] or x_mn <= 0)
+        out["redundancy"] = red
+        LOG.info(f"[F3] 모멘텀 통제(이중정렬) 후 초과수익 {x_mn:+.2%}p — "
+                 f"{'소멸 → F3 기각' if x_mn <= 0 else '잔존'}")
+        if red["reject"]:
+            out["reject_reason"] = (
+                f"중복성 검사 기각 — |ρ_모멘텀|={abs(red['rho_mom']):.2f}, "
+                f"|ρ_반전|={abs(red['rho_rev']):.2f} (기준 {SPEC_F3['redundancy_rho']}), "
+                f"모멘텀 통제 후 초과수익 {x_mn:+.2%}p")
+            LOG.warn(f"[F3] {out['reject_reason']} → 다른 게이트 결과와 무관하게 무효입니다(§4 F3).")
+        sheets_red = pd.DataFrame([red])
+    else:
+        sheets_red = None
     out["head"] = {"커버리지 판정": f"{cov.verdict} (중앙 {cov.median_cov:.0f}종목)",
                    "주명세 CAGR": f"{prim.stats(ppy)['cagr']:.2%}",
                    "B2 대비 초과": f"{out['excess']['is']:+.2%}p",
@@ -5393,6 +5689,7 @@ def run_factor(f: str, src: dict, daily, fin, rebals, univ, univ_by_t, sec,
         sheets_null = None
     sheets = {"격자결과": pd.DataFrame(rows),
               "B4_귀무분포_비교": sheets_null,
+              "F3_중복성검사": sheets_red,
               "연도별": yearly_table({"주명세": prim, "B2": base["B2"]}),
               "플라시보": pd.DataFrame([{"P1(−60영업일)": p1, "P2(라벨셔플)": p2,
                                        "P3(매칭대조군 대비)": p3}])}

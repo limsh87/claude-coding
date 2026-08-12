@@ -250,7 +250,7 @@ def f3_redundancy(daily: pd.DataFrame, sig: pd.DataFrame, rebals: pd.DatetimeInd
     d["code"] = d["code"].astype(str)
     px = d.pivot_table(index="date", columns="code", values="close", aggfunc="last").sort_index()
     px = px.reindex(pd.DatetimeIndex(sorted(set(px.index) | set(rebals)))).ffill().reindex(rebals)
-    per = 12 if REBAL_FREQ.upper().startswith("M") else 52
+    per = int(periods_per_year())              # 12개월 모멘텀 = 1년치 구간 수
     mom = px / px.shift(per) - 1.0
     rev = px / px.shift(max(1, per // 12)) - 1.0
     S = sig.pivot_table(index="rebal", columns="code", values="score", aggfunc="last")
@@ -325,3 +325,40 @@ def build_F4(con: pd.DataFrame, fin: pd.DataFrame, rebals: pd.DatetimeIndex, uni
     return FactorSignal("F4", variant, obs, sig, "event",
                         f"임계 {p['ratio_threshold']:.2f} · 유효 {p['horizon_m']}M"
                         + ("" if track_cancel else " · ★해지 미처리(대조용)"))
+
+
+def f3_momentum_neutral_selector(fs: FactorSignal, univ_by_t, daily: pd.DataFrame,
+                                 rebals: pd.DatetimeIndex, n: int):
+    """§4 F3 이중정렬 — 모멘텀 5분위 안에서만 F3 상위를 뽑는다.
+
+    이렇게 하면 포트폴리오의 모멘텀 노출이 유니버스와 같아지므로, 남는 초과수익은
+    모멘텀이 아니라 F3 고유의 것이다. 여기서 초과수익이 소멸하면 F3 은 기각된다.
+    """
+    d = daily[["code", "date", "close"]].copy()
+    d["code"] = d["code"].astype(str)
+    px = d.pivot_table(index="date", columns="code", values="close", aggfunc="last").sort_index()
+    px = px.reindex(pd.DatetimeIndex(sorted(set(px.index) | set(rebals)))).ffill().reindex(rebals)
+    per = int(periods_per_year())
+    mom = px / px.shift(per) - 1.0
+    sig_by_t = {t: g.set_index("code")["score"] for t, g in fs.sig.groupby("rebal", observed=True)}
+
+    def sel(t):
+        s = sig_by_t.get(t)
+        if s is None or t not in mom.index:
+            return []
+        cand = [c for c in s.index if c in set(univ_by_t.get(t, []))]
+        m = mom.loc[t].reindex(cand).dropna()
+        if len(m) < 25:
+            return []
+        s2 = s.reindex(m.index)
+        try:
+            q = pd.qcut(m.rank(method="first"), 5, labels=False)
+        except (ValueError, IndexError):
+            return []
+        per_q = max(1, n // 5)
+        out = []
+        for k in range(5):
+            sub = s2[q.to_numpy() == k].sort_values(ascending=False)
+            out += list(sub.head(per_q).index)
+        return out
+    return sel
