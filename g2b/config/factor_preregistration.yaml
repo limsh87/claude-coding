@@ -1,0 +1,72 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  G2B-DEMAND-GRAPH-V1 — 팩터 사전등록 (§1.1)
+#  이 파일이 동결(SHA256 기록)되기 전에는 FUTURE_RETURN_LOCK 이 풀리지 않는다.
+#  동결 이후 이 파일을 고치면 해시가 어긋나 잠금이 자동으로 다시 걸린다.
+# ══════════════════════════════════════════════════════════════════════════════
+version: "v1"
+frozen_by: "scripts/09_freeze_preregistration.py"
+
+primary_factor:
+  name: G2B_DWA
+  formula: "sqrt(P_D * P_W)"
+  description: "Demand-Win Alignment — 역량정합 정부수요 이동(D)과 실제 수주전환(W)의 기하평균"
+  neutralization: sector_size          # §44 PRIMARY 는 sector + log(mcap) 중립
+  min_cross_section_n: 20              # 월별 스코어 기업이 이보다 적으면 그 달은 NaN
+  # ── D 축 (정부수요 이동) ──────────────────────────────────────────────────
+  demand_axis:
+    column: D1_DS_YOY
+    formula: "log1p(EligibleDemandFlow_3M_t) - log1p(EligibleDemandFlow_3M_{t-12})"
+    source_stages: [PLAN, PRESPEC, BID]     # §20 winner 를 보기 전 단계만
+    leave_one_firm_out: true                # §45 (이미 알려진 자사 낙찰건 제외)
+    stage_probability_weighted: true        # §22
+  # ── W 축 (실제 수주 전환) ─────────────────────────────────────────────────
+  win_axis:
+    column: win_accel_log
+    formula: "log1p(TTM award) - log1p(TTM award 12M ago)"
+    alternative_not_used: win_accel_rate    # §27 둘 다 산출하되 PRIMARY 는 하나만 동결
+    amount_basis: attributed_amount         # §16 컨소시엄 지분 반영, 지분불명은 제외
+
+capability:                                  # §17
+  lookback_months: 36
+  halflife_months: 18
+  source_stages: [AWARD]
+  normalization: "share of firm's decayed award across categories"
+  warmup_required_months: 36                 # §19
+
+stage_probability:                           # §22 §23
+  method: walk_forward_hierarchical_shrinkage
+  hierarchy: [category, broad_category, proc_type, global]
+  shrink_k: 25.0
+  maturity_embargo_days: null                # ← 09 스크립트가 실측 분포 p90 으로 채우고 동결
+  training_rule: "label_available_at <= t 인 라벨만 사용 (training_end < t)"
+
+secondary_factors:                           # §78 PRIMARY 는 하나, 나머지는 전부 Secondary
+  - D1_DS_YOY
+  - D2_PIPELINE_YOY
+  - WIN_MCAP
+  - WIN_SALES
+  - win_accel_rate
+  - new_agency_count
+  - new_category_award_share
+  - REPEAT_WIN_RATE
+  - AGENCY_HHI
+  - CATEGORY_HHI
+  - TOP1_SHARE
+  - CONTRACT_REVISION_RATIO
+  - resid_bidder_count
+multiple_testing: "BH/FDR q=0.10 across secondary family"
+
+risk_track:                                  # §42 §43 — PRIMARY 와 섞지 않는다
+  name: PROC_RISK
+  components: [AGENCY_HHI, CATEGORY_HHI, TOP1_SHARE]
+  combination: "mean of monthly cross-sectional percentiles"
+  hard_exclusion: false
+  mixed_with_primary: false
+
+nested_comparison:                           # §84 §99 — 이 표가 연구의 최종 판정 근거
+  - Award_Amount_only
+  - Award_over_MCap
+  - Demand_Shift_only
+  - Win_Acceleration_only
+  - Demand_Win_Alignment
+decision_rule: "Full 모델이 단순모델을 명백히 이기지 못하면 단순모델을 채택한다(§99)."

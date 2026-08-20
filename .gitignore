@@ -4,3 +4,17 @@ build/.smoke_*.log
 tcd_cache/
 .ipynb_checkpoints/
 .audit/
+
+# ── G2B-DEMAND-GRAPH-V1 ───────────────────────────────────────────────────────
+g2b/data/
+g2b/schema_registry/
+g2b/.pytest_cache_vault/
+g2b/audit/prereg_hash.txt          # 동결은 실데이터 실행 시점의 행위다 — 배포하지 않는다
+g2b/audit/checkpoint_*.json
+g2b/audit/call_budget.json
+g2b/audit/run_*.json
+g2b/audit/usable_start_candidate.json
+g2b/audit/maturity_embargo_candidate.json
+g2b/audit/coverage_gate.json
+g2b/audit/entity_gate.json
+g2b/src/**/__pycache__/

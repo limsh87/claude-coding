@@ -1,0 +1,54 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  Point-in-Time 정책 (§6 · §7 · §8 · §11 · §53 · §57 · §58)
+# ══════════════════════════════════════════════════════════════════════════════
+version: "v1"
+timestamps: [event_time, source_published_at, available_at]
+revision_fields: [valid_from, valid_to, revision_no]
+
+publication_lag_days:                 # available_at = source_published_at + lag
+  PLAN: 1
+  PRESPEC: 1
+  BID: 1
+  AWARD: 1
+  CONTRACT: 2
+  DART: 0
+imputed_published_extra_lag_days: 1   # 공개시각을 모르면 보수적으로 하루 더
+
+field_classes:                        # §6.1
+  A: "당시 공개시각·값이 확정 복원 → 사용 허용"
+  B: "변경이력으로 각 리비전 유효기간 복원 후 사용"
+  C: "과거 최종값만 반환·변경과정 불명 → 역사적 백테스트 사용 금지 (PIT_UNCERTIFIED)"
+unknown_field_default: C              # 모르면 쓰지 않는다
+
+double_counting:                      # §8 §11
+  rule: "opportunity 별 '가장 진척된 단계' 계단함수의 증분만 신규수요로 센다"
+  guarantee: "증분 총합 == 최종 알려진 금액 (구조적 보존)"
+  cancel_rebid_handling: "금액이 아니라 상태변수로 보관"
+
+signal_timing:                        # §53
+  rebalance: MONTHLY
+  signal_cutoff: "월말까지 available_at 이 도달한 정보만"
+  execution: "T+1 (장마감 전 공개 여부가 불확실하면 보수적으로 T+1)"
+
+price_pit:                            # §57
+  forbidden:
+    - "현재 수정주가 파일에서 상폐종목 삭제"
+    - "현재 상장주식수 과거 소급"
+    - "현재 섹터분류 과거 소급"
+  total_return: true
+  include_delisting_loss: true
+
+financial_pit:                        # §58
+  rule: "filing_timestamp <= signal_timestamp 인 최신 재무제표만"
+  filing_timestamp_source: "rcept_no 앞 8자리 (접수일자)"
+  fallback_if_missing: "결산일 + 90일 (보수적)"
+
+consortium:                           # §16
+  primary_rule: "지분 있으면 지분비율, 없으면 UNKNOWN_SHARE_CONSORTIUM 으로 금액 팩터 제외"
+  sensitivity_modes: [equal_split, winner_only, full_allocation]
+
+linkage:                              # §10
+  priority: [OFFICIAL_ID, PROCESS_LEDGER, DETERMINISTIC_ATTR, TEXT_SIMILARITY]
+  primary_enabled: [OFFICIAL_ID, PROCESS_LEDGER]
+  record_fields: [link_method, link_score, link_known_at]
+  rule: "애매한 연결을 억지로 확정하지 않는다. 연결 실패 != 사건 실패(§2.F)"
