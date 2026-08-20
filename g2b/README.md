@@ -35,9 +35,41 @@ python strategies/g2b_demand_graph_v1.py
 ### 패키지 형태 (§91 스크립트)
 
 ```bash
+python -m pip install -r g2b/requirements.txt
 cd g2b/scripts && python run_all.py          # 01 → 13 순차
 python run_all.py 10 11                      # 특정 단계만
 ```
+
+### 로컬에서 실제 수집하기
+
+공공데이터포털·OpenDART 는 평범한 공개 엔드포인트이므로 **로컬이나 Colab 에서는 그냥 열립니다.**
+(클라우드 실행환경에서는 이그레스 정책 때문에 막힐 수 있습니다 — 그건 코드 문제가 아닙니다.)
+
+```bash
+git clone -b claude/g2b-demand-graph-v1-h6hkz2 https://github.com/limsh87/claude-coding
+cd claude-coding
+python -m pip install -r g2b/requirements.txt
+
+export DATA_GO_KR_SERVICE_KEY='...'    # 반드시 '일반 인증키(Decoding)'
+export OPENDART_API_KEY='...'
+export G2B_RUN_MODE=FULL
+export G2B_GDRIVE_ROOT="$HOME/Google Drive/MyDrive/tcd_cache"   # 없으면 로컬 폴더로 자동 폴백
+
+cd g2b/scripts && python 01_api_depth_audit.py     # ← 반드시 이것부터
+```
+
+**`01` 을 먼저 돌리는 이유**: 이 스크립트는 서비스별로 10개 표본연도만 호출해(총 60회, 일일
+한도의 1% 미만) *실제로 어느 연도에 데이터가 나오는지*와 *어떤 필드가 실제로 채워지는지*를
+표로 뱉습니다. 전량 수집 전에 이 표를 먼저 보십시오 — 특히 낙찰 API 는 공식 메타데이터가
+사실상 '실시간' 표기라 historical depth 를 직접 재야 합니다(§5).
+
+필드 커버리지가 0 인 정규컬럼이 있으면 그건 제 후보 필드명이 실제 응답과 어긋난 것이므로,
+`src/collectors/<서비스>.py` 의 `fieldmap` 후보 리스트에 실제 필드명을 추가하면 됩니다.
+raw 응답은 `data/raw/<서비스>/` 에 원본 그대로 보존되므로 재수집 없이 정규화만 다시 돌릴 수
+있습니다.
+
+이후 `python run_all.py` 로 02→13 을 이어서 돌리면 됩니다. 중단해도 체크포인트에서 재개하고,
+이미 받은 창(window)은 다시 호출하지 않습니다(§87).
 
 ### 환경변수
 
