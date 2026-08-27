@@ -1,0 +1,43 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  투자 유니버스 정의 (§49 · §50 · §51)
+# ══════════════════════════════════════════════════════════════════════════════
+version: "v1"
+markets: [KOSPI, KOSDAQ]
+security_type: 보통주
+exclude:
+  - SPAC
+  - 우선주
+  - ETF
+  - ETN
+  - REITs            # §49 별도 취급
+point_in_time: true
+survivorship_bias_free: true
+delisted_included: true
+delisting_return: -1.0                # 정리매매 정보가 없으면 -100% (누락 처리 금지)
+admin_issue_rule: "관리·정지 여부는 당시 정보 기준으로만 판정"
+
+liquidity:
+  min_20d_turnover_value_krw: 300000000
+  applied_at: signal_date
+
+procurement_observability:            # §50 — 조달기업만으로 universe 를 사후 정의하지 않는다
+  report_both: true
+  definitions:
+    all_tradable: "PIT 상장 보통주 전체"
+    procurement_observable: "t 시점까지 G2B 낙찰이 1건 이상 '관측된' 기업"
+  forbidden: "현재 나라장터 등록업체 명단으로 과거 universe 를 만드는 것"
+
+usable_start_date: null               # ← 01/03 감사 결과로 09 스크립트가 채우고 동결
+usable_end_date: "2026-07-31"
+warmup_months: 36
+
+coverage_gate:                        # §51
+  median_scored_firms_min: 100
+  p10_scored_firms_min: 60
+  median_holdings_min: 20
+  fail_label: SAMPLE_COLLAPSE
+
+entity_mapping_gate:                  # §52
+  primary_allowed_types: [EXACT_ID, VERIFIED_MANUAL]
+  forbidden: "기업명 fuzzy matching 만으로 자동 확정"
+  report_shares_by: amount

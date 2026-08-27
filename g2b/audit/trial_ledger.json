@@ -1,0 +1,127 @@
+{
+  "version": "v1",
+  "created_at": "2026-08-20T02:15:55",
+  "rule": "성과를 본 뒤 후보를 추가하거나 정의를 바꾸지 않는다. 추가 후보가 생기면 성과를 보기 전에 이 장부에 등록한다(§77).",
+  "primary": "A1",
+  "multiple_testing": {
+    "method": "BH/FDR",
+    "q": 0.1,
+    "scope": "primary 를 제외한 secondary family 전체(§78)"
+  },
+  "candidates": [
+    {
+      "id": "D1",
+      "name": "Demand Flow",
+      "column": "D1_DS_YOY",
+      "family": "demand",
+      "spec": "§24",
+      "hypothesis": "역량정합 신규 정부수요의 YoY 증가가 향후 수익률을 예측한다"
+    },
+    {
+      "id": "D2",
+      "name": "Forward Pipeline",
+      "column": "D2_PIPELINE_YOY",
+      "family": "demand",
+      "spec": "§24",
+      "hypothesis": "이미 공개되었으나 미집행인 파이프라인 잔량 증가가 선행신호다"
+    },
+    {
+      "id": "W1",
+      "name": "Award / MCap",
+      "column": "WIN_MCAP",
+      "family": "win",
+      "spec": "§26",
+      "hypothesis": "시총 대비 수주 규모가 클수록 향후 수익률이 높다"
+    },
+    {
+      "id": "W2",
+      "name": "Award / Sales",
+      "column": "WIN_SALES",
+      "family": "win",
+      "spec": "§26",
+      "hypothesis": "PIT 매출 대비 수주 규모가 클수록 향후 수익률이 높다"
+    },
+    {
+      "id": "W3",
+      "name": "Win Acceleration",
+      "column": "win_accel_log",
+      "family": "win",
+      "spec": "§27",
+      "hypothesis": "수주의 가속(TTM 로그차분)이 향후 수익률을 예측한다"
+    },
+    {
+      "id": "A1",
+      "name": "Demand-Win Alignment",
+      "column": "G2B_DWA",
+      "family": "primary",
+      "spec": "§28",
+      "hypothesis": "수요이동과 수주전환이 동시에 강한 기업이 초과수익을 낸다",
+      "is_primary": true
+    },
+    {
+      "id": "B1",
+      "name": "New Agency Breadth",
+      "column": "new_agency_count",
+      "family": "breadth",
+      "spec": "§30",
+      "hypothesis": "신규 발주기관 확대가 고객저변 확장을 뜻한다"
+    },
+    {
+      "id": "B2",
+      "name": "New Category Entry",
+      "column": "new_category_award_share",
+      "family": "breadth",
+      "spec": "§31",
+      "hypothesis": "신규 사업영역 진입이 성장을 예고한다"
+    },
+    {
+      "id": "B3",
+      "name": "Repeat Win",
+      "column": "REPEAT_WIN_RATE",
+      "family": "breadth",
+      "spec": "§32",
+      "hypothesis": "반복수주는 경쟁력일 수도, 의존성일 수도 있다 — 부호 미확정"
+    },
+    {
+      "id": "R1",
+      "name": "Agency Concentration",
+      "column": "AGENCY_HHI",
+      "family": "risk",
+      "spec": "§33",
+      "hypothesis": "발주기관 집중은 위험이다 — 부호 미확정"
+    },
+    {
+      "id": "R2",
+      "name": "Category Concentration",
+      "column": "CATEGORY_HHI",
+      "family": "risk",
+      "spec": "§34",
+      "hypothesis": "품목 집중은 위험이다 — 부호 미확정"
+    },
+    {
+      "id": "R3",
+      "name": "Mega Deal",
+      "column": "TOP1_SHARE",
+      "family": "risk",
+      "spec": "§41",
+      "hypothesis": "단일 초대형 계약 의존은 위험이다 — 부호 미확정"
+    },
+    {
+      "id": "R4",
+      "name": "Contract Revision",
+      "column": "CONTRACT_REVISION_RATIO",
+      "family": "risk",
+      "spec": "§40",
+      "hypothesis": "계약 감액·취소는 악재다 — 부호 미확정"
+    },
+    {
+      "id": "C1",
+      "name": "Competition",
+      "column": "resid_bidder_count",
+      "family": "diagnostic",
+      "spec": "§35 §76",
+      "hypothesis": "경쟁강도 — 부호가 조달방식마다 다르므로 PRIMARY 에 넣지 않는다"
+    }
+  ],
+  "n_candidates": 14
+}
